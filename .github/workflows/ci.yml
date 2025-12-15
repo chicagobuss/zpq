@@ -25,10 +25,14 @@ jobs:
       - name: Generate Fixtures
         run: python3 tools/fixtures/gen.py
 
+      - name: Read .zig-version
+        id: zig-version
+        run: echo "version=$(cat .zig-version)" >> $GITHUB_OUTPUT
+
       - name: Set up Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: master
+          version: ${{ steps.zig-version.outputs.version }}
 
       - name: Build
         run: zig build

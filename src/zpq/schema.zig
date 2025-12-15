@@ -46,6 +46,64 @@ pub const PageType = enum(i32) {
 const EncodingList = std.ArrayListUnmanaged(Encoding);
 const StringList = std.ArrayListUnmanaged([]const u8);
 
+pub const FieldRepetitionType = enum(i32) {
+    REQUIRED = 0,
+    OPTIONAL = 1,
+    REPEATED = 2,
+};
+
+pub const Levels = struct {
+    max_def: i32,
+    max_rep: i32,
+};
+
+pub const SchemaElement = struct {
+    type: ?Type,
+    type_length: ?i32,
+    repetition_type: ?FieldRepetitionType,
+    name: []const u8,
+    num_children: ?i32,
+    scale: ?i32,
+    precision: ?i32,
+    field_id: ?i32,
+    
+    pub fn read(reader: *thrift.Reader) !SchemaElement {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+        
+        var elem = SchemaElement{
+            .type = null,
+            .type_length = null,
+            .repetition_type = null,
+            .name = "",
+            .num_children = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+
+            switch (field.id) {
+                1 => elem.type = @as(Type, @enumFromInt(try reader.readZigZag(i32))),
+                2 => elem.type_length = try reader.readZigZag(i32),
+                3 => elem.repetition_type = @as(FieldRepetitionType, @enumFromInt(try reader.readZigZag(i32))),
+                4 => elem.name = try reader.readString(),
+                5 => elem.num_children = try reader.readZigZag(i32),
+                6 => try reader.skip(field.type), // converted_type
+                7 => elem.scale = try reader.readZigZag(i32),
+                8 => elem.precision = try reader.readZigZag(i32),
+                9 => elem.field_id = try reader.readZigZag(i32),
+                else => try reader.skip(field.type),
+            }
+        }
+        return elem;
+    }
+};
+
 pub const DataPageHeader = struct {
     num_values: i32,
     encoding: Encoding,
@@ -54,6 +112,9 @@ pub const DataPageHeader = struct {
     // statistics skipped for now
 
     pub fn read(reader: *thrift.Reader) !DataPageHeader {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var header = DataPageHeader{
             .num_values = 0,
             .encoding = .PLAIN,
@@ -84,6 +145,9 @@ pub const DictionaryPageHeader = struct {
     is_sorted: bool,
 
     pub fn read(reader: *thrift.Reader) !DictionaryPageHeader {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var header = DictionaryPageHeader{
             .num_values = 0,
             .encoding = .PLAIN,
@@ -123,6 +187,9 @@ pub const PageHeader = struct {
     // v2 skipped for now
 
     pub fn read(reader: *thrift.Reader) !PageHeader {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var header = PageHeader{
             .type = .DATA_PAGE,
             .uncompressed_page_size = 0,
@@ -164,6 +231,9 @@ pub const ColumnMetaData = struct {
     dictionary_page_offset: ?i64,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnMetaData {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var meta = ColumnMetaData{
             .type = .BOOLEAN, 
             .encodings = .{},
@@ -229,6 +299,9 @@ pub const ColumnChunk = struct {
     meta_data: ?ColumnMetaData,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var chunk = ColumnChunk{
             .file_path = null,
             .file_offset = 0,
@@ -263,6 +336,9 @@ pub const RowGroup = struct {
     num_rows: i64,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !RowGroup {
+        const saved_id = reader.last_field_id;
+        defer reader.last_field_id = saved_id;
+
         var rg = RowGroup{
             .columns = .{},
             .total_byte_size = 0,
@@ -304,6 +380,7 @@ pub const RowGroup = struct {
 
 pub const FileMetaData = struct {
     version: i32,
+    schema: std.ArrayListUnmanaged(SchemaElement),
     num_rows: i64,
     created_by: ?[]const u8,
     row_groups: std.ArrayListUnmanaged(RowGroup),
@@ -311,10 +388,12 @@ pub const FileMetaData = struct {
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         var meta = FileMetaData{
             .version = 0,
+            .schema = .{},
             .num_rows = 0,
             .created_by = null,
             .row_groups = .{},
         };
+        errdefer meta.schema.deinit(allocator);
         errdefer meta.row_groups.deinit(allocator);
 
         reader.readStructBegin();
@@ -325,7 +404,15 @@ pub const FileMetaData = struct {
 
             switch (field.id) {
                 1 => meta.version = try reader.readZigZag(i32),
-                2 => try reader.skip(field.type), // Skip Schema
+                2 => {
+                    const header = try reader.readByte();
+                    var size = @as(usize, header >> 4);
+                    if (size == 0xF) size = try reader.readVarInt(usize);
+                    var i: usize = 0;
+                    while (i < size) : (i += 1) {
+                        try meta.schema.append(allocator, try SchemaElement.read(reader));
+                    }
+                },
                 3 => meta.num_rows = try reader.readZigZag(i64),
                 4 => {
                     const header = try reader.readByte();
@@ -345,9 +432,88 @@ pub const FileMetaData = struct {
     }
     
     pub fn deinit(self: *FileMetaData, allocator: std.mem.Allocator) void {
+        self.schema.deinit(allocator);
         for (self.row_groups.items) |*rg| {
             rg.deinit(allocator);
         }
         self.row_groups.deinit(allocator);
+    }
+
+    pub fn getColumnLevels(self: *const FileMetaData, path: []const []const u8) Levels {
+        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
+        return iter.find(path) catch .{ .max_def = 0, .max_rep = 0 };
+    }
+};
+
+const SchemaIterator = struct {
+    items: []const SchemaElement,
+    pos: usize,
+
+    fn find(self: *SchemaIterator, path: []const []const u8) !Levels {
+        if (self.pos >= self.items.len) return error.NotFound;
+        
+        // Consume root
+        const root = self.items[self.pos];
+        self.pos += 1;
+
+        const num_children = root.num_children orelse 0;
+        var i: i32 = 0;
+        while (i < num_children) : (i += 1) {
+            if (try self.visit(path, 0, 0, 0)) |res| return res;
+        }
+        return error.NotFound;
+    }
+
+    fn visit(self: *SchemaIterator, target_path: []const []const u8, depth: usize, current_def: i32, current_rep: i32) !?Levels {
+        if (self.pos >= self.items.len) return null;
+        const elem = self.items[self.pos];
+        self.pos += 1;
+
+        var def = current_def;
+        var rep = current_rep;
+
+        if (elem.repetition_type) |rt| {
+            if (rt == .OPTIONAL) {
+                def += 1;
+            } else if (rt == .REPEATED) {
+                def += 1;
+                rep += 1;
+            }
+        }
+
+        // Check if matches current path component
+        var matches = false;
+        if (depth < target_path.len) {
+            matches = std.mem.eql(u8, elem.name, target_path[depth]);
+        }
+
+        if (matches) {
+            if (depth == target_path.len - 1) {
+                // Found leaf!
+                // Skip children if any (shouldn't be for leaf column)
+                const num_children = elem.num_children orelse 0;
+                var i: i32 = 0;
+                while (i < num_children) : (i += 1) {
+                     _ = try self.visit(target_path, 999, 0, 0); 
+                }
+                return .{ .max_def = def, .max_rep = rep };
+            } else {
+                // Match segment, recurse
+                const num_children = elem.num_children orelse 0;
+                var i: i32 = 0;
+                while (i < num_children) : (i += 1) {
+                     if (try self.visit(target_path, depth + 1, def, rep)) |res| return res;
+                }
+                return null;
+            }
+        } else {
+            // Name didn't match. Skip this subtree.
+            const num_children = elem.num_children orelse 0;
+            var i: i32 = 0;
+            while (i < num_children) : (i += 1) {
+                 _ = try self.visit(target_path, 999, 0, 0);
+            }
+            return null;
+        }
     }
 };

@@ -32,14 +32,21 @@ fn inspect(allocator: std.mem.Allocator, path: []const u8) !void {
 
     try pf.readFooter();
     
-    if (pf.metadata) |meta| {
-        std.debug.print("File Metadata:\n", .{});
-        std.debug.print("  Version: {d}\n", .{meta.version});
-        std.debug.print("  Rows: {d}\n", .{meta.num_rows});
-        if (meta.created_by) |cb| {
-            std.debug.print("  Created By: {s}\n", .{cb});
-        }
-        std.debug.print("  Row Groups: {d}\n", .{meta.row_groups.items.len});
+            if (pf.metadata) |meta| {
+                std.debug.print("File Metadata:\n", .{});
+                std.debug.print("  Version: {d}\n", .{meta.version});
+                std.debug.print("  Rows: {d}\n", .{meta.num_rows});
+                if (meta.created_by) |cb| {
+                    std.debug.print("  Created By: {s}\n", .{cb});
+                }
+                
+                std.debug.print("  Schema ({d} elements):\n", .{meta.schema.items.len});
+                for (meta.schema.items, 0..) |elem, i| {
+                    std.debug.print("    [{d}] Name: {s}, Repetition: {any}, NumChildren: {any}\n", 
+                        .{i, elem.name, elem.repetition_type, elem.num_children});
+                }
+
+                std.debug.print("  Row Groups: {d}\n", .{meta.row_groups.items.len});
         
         for (meta.row_groups.items, 0..) |rg, i| {
             std.debug.print("  Row Group {d}:\n", .{i});
@@ -59,6 +66,9 @@ fn inspect(allocator: std.mem.Allocator, path: []const u8) !void {
                         std.debug.print("      Dict Page Offset: {d}\n", .{dpo});
                     }
                     
+                    const levels = meta.getColumnLevels(md.path_in_schema.items);
+                    std.debug.print("      Levels: MaxDef={d}, MaxRep={d}\n", .{levels.max_def, levels.max_rep});
+
                     var reader = try zpq.column.ColumnReader.init(pf.file, allocator, col);
                     var page_idx: usize = 0;
                     while (try reader.next()) |page| {
@@ -85,11 +95,43 @@ fn inspect(allocator: std.mem.Allocator, path: []const u8) !void {
                             if (p.header.data_page_header) |dph| {
                                 std.debug.print("        Encoding: {any}\n", .{dph.encoding});
                                 if (dph.encoding == .RLE_DICTIONARY or dph.encoding == .PLAIN_DICTIONARY) {
-                                    if (p.data.len > 0) {
-                                        std.debug.print("        Data: {x}\n", .{p.data});
-                                        const bit_width = p.data[0];
+                                    var data_slice = p.data;
+                                    
+                                    // Skip Repetition Levels
+                                    if (levels.max_rep > 0) {
+                                        if (data_slice.len < 4) {
+                                            std.debug.print("        Error: Not enough data for Repetition Levels length\n", .{});
+                                            continue;
+                                        }
+                                        const len = std.mem.readInt(u32, data_slice[0..4], .little);
+                                        std.debug.print("        Skipping Repetition Levels: {d} bytes\n", .{len});
+                                        if (data_slice.len < 4 + len) {
+                                            std.debug.print("        Error: Not enough data for Repetition Levels\n", .{});
+                                            continue;
+                                        }
+                                        data_slice = data_slice[4 + len ..];
+                                    }
+
+                                    // Skip Definition Levels
+                                    if (levels.max_def > 0) {
+                                        if (data_slice.len < 4) {
+                                            std.debug.print("        Error: Not enough data for Definition Levels length\n", .{});
+                                            continue;
+                                        }
+                                        const len = std.mem.readInt(u32, data_slice[0..4], .little);
+                                        std.debug.print("        Skipping Definition Levels: {d} bytes\n", .{len});
+                                        if (data_slice.len < 4 + len) {
+                                            std.debug.print("        Error: Not enough data for Definition Levels\n", .{});
+                                            continue;
+                                        }
+                                        data_slice = data_slice[4 + len ..];
+                                    }
+
+                                    if (data_slice.len > 0) {
+                                        std.debug.print("        Data: {x}\n", .{data_slice});
+                                        const bit_width = data_slice[0];
                                         std.debug.print("        Bit Width: {d}\n", .{bit_width});
-                                        var rle_dec = zpq.rle.RleDecoder.init(p.data[1..], bit_width);
+                                        var rle_dec = zpq.rle.RleDecoder.init(data_slice[1..], bit_width);
                                         std.debug.print("        Indices:\n", .{});
                                         var k: i32 = 0;
                                         var print_count: usize = 0;

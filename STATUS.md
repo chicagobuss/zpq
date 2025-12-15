@@ -31,8 +31,10 @@
 
 ### In Progress / Next Steps
 *   **Definition/Repetition Levels**:
-    *   Logic to skip or read RLE-encoded definition levels for `OPTIONAL` fields.
-    *   Currently, the reader works perfectly for `REQUIRED` fields but may desync on `OPTIONAL` fields if levels are present.
+    *   Implemented schema traversal to calculate Max Definition/Repetition levels.
+    *   Implemented logic to skip RLE-encoded levels in Data Pages.
+    *   Verified against `simple.parquet` (OPTIONAL fields).
+    *   *Next*: Actually use definition levels to insert NULLs in output.
 *   **Decompression**:
     *   Integrate Snappy/Gzip decompression. Currently assumes `UNCOMPRESSED`.
 *   **Value Reconstruction**:

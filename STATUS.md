@@ -25,7 +25,10 @@ Goal: Feature parity with Apache Arrow, but with superior performance, lower mem
 *   [ ] **Definition Levels (NULLs)**: Actually decode RLE definition levels to reconstruct `?T` (optional) values.
 *   [ ] **Repetition Levels (Lists)**: Decode levels to reconstruct nested Lists/Arrays.
 *   [ ] **Value Reconstruction**: Efficiently map Dictionary Indices -> Values using SIMD-friendly approaches.
-*   [ ] **Decompression**: Integrate Snappy (via Zig port or C lib) and Zstd.
+*   [ ] **Decompression**:
+    *   **Snappy**: Vendor Google's `snappy` (C++) and build with Zig (ensure `libc` linking).
+    *   **Gzip**: Use `zlib` (often available on system, or vendor `miniz`).
+    *   **Zstd**: Vendor `zstd` (C) for modern Parquet.
 *   [ ] **Type Support**: Add `INT64`, `FLOAT`, `DOUBLE`, `INT96` (Timestamp), `FIXED_LEN_BYTE_ARRAY`.
 
 ### Phase 3: Advanced Reader

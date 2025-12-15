@@ -54,3 +54,7 @@ clean:
 # Run local CI via act (requires act installed)
 ci:
     act
+
+# Run local CI in watch mode (requires act)
+watch-ci:
+    act --watch

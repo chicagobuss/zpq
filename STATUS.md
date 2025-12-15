@@ -1,63 +1,53 @@
 # ZPQ: Native Zig Parquet Library
 
-## Goals
-1.  **Native Zig Parquet Reader**: Build a robust, zero-dependency Parquet reader in Zig.
-2.  **AWS Lambda Integration**: Deploy as a lightweight Lambda function to query Parquet files directly from S3.
-3.  **Performance**: Leverage Zig's manual memory management and compile-time features for high performance.
+## Mission
+Build a **modern, high-performance, native Zig Parquet library**.
+Goal: Feature parity with Apache Arrow, but with superior performance, lower memory footprint, and zero external dependencies.
 
-## Progress (as of Late 2025)
+## Architecture
+*   **Zero-Dependency**: Custom Thrift Compact Protocol implementation (no libthrift).
+*   **Zero-Copy (where possible)**: Direct mapping of memory-mapped files to structs.
+*   **Allocator-Aware**: Explicit memory management for predictable scaling in Lambda/WASM.
 
-### Completed
-*   **Project Infrastructure**:
-    *   Renamed to **zpq** (Zig Parquet).
-    *   Set up `build.zig` and project structure.
-    *   Created Python-based fixture generator (`tools/fixtures/gen.py`) using PyArrow.
-    *   Verified against official `parquet-testing` suite.
-*   **Thrift Reader**:
-    *   Implemented native `Thrift Compact Protocol` reader in Zig (`src/zpq/thrift.zig`).
-    *   Supports `readVarInt`, `readZigZag`, `readStruct`, `skip`.
-    *   Unit tested and verified against official metadata.
-*   **Metadata Parsing**:
-    *   Parsing `FileMetaData`, `RowGroup`, `ColumnChunk`, `PageHeader`, `DataPageHeader`, `DictionaryPageHeader`.
-    *   Correctly traverses Row Groups and Columns.
-*   **Encodings**:
-    *   **PLAIN**: Implemented for Dictionary decoding (`src/zpq/decoder.zig`).
-    *   **RLE / Bit-Packed**: Implemented and rigorously verified (`src/zpq/rle.zig`).
-    *   Supports both RLE runs and Bit-Packed runs (including high bit widths).
-*   **Page Reading**:
-    *   Successfully reads and iterates `DICTIONARY_PAGE` and `DATA_PAGE`.
-    *   Extracts values from Dictionary pages.
-    *   Extracts indices from Data pages (RLE/Bit-Packed).
+## Roadmap
 
-### In Progress / Next Steps
-*   **Definition/Repetition Levels**:
-    *   Implemented schema traversal to calculate Max Definition/Repetition levels.
-    *   Implemented logic to skip RLE-encoded levels in Data Pages.
-    *   Verified against `simple.parquet` (OPTIONAL fields).
-    *   *Next*: Actually use definition levels to insert NULLs in output.
-*   **Decompression**:
-    *   Integrate Snappy/Gzip decompression. Currently assumes `UNCOMPRESSED`.
-*   **Value Reconstruction**:
-    *   Map decoded Data Page indices back to Dictionary values to produce final output.
-*   **AWS Integration**:
-    *   Add S3 fetching logic.
+### Phase 1: The Foundation (Current)
+*   [x] **Project Structure**: `zpq` module, `justfile` build system, `act` CI, `gen.py` fixtures.
+*   [x] **Thrift Reader**: Custom Compact Protocol reader (VarInt, ZigZag, Field skipping).
+*   [x] **Metadata Parsing**: File/RowGroup/Column headers, Schema traversal.
+*   [x] **Encodings (Basic)**:
+    *   [x] PLAIN (Integers, ByteArrays)
+    *   [x] RLE / Bit-Packed Hybrid (for Dictionary Indices, Boolean)
+*   [x] **Page Structure**: Iterating Data and Dictionary pages.
+*   [x] **Handling Optional Fields**: Calculating Definition/Repetition levels and skipping them in Data Pages.
+
+### Phase 2: Core Reader (Next Steps)
+*   [ ] **Definition Levels (NULLs)**: Actually decode RLE definition levels to reconstruct `?T` (optional) values.
+*   [ ] **Repetition Levels (Lists)**: Decode levels to reconstruct nested Lists/Arrays.
+*   [ ] **Value Reconstruction**: Efficiently map Dictionary Indices -> Values using SIMD-friendly approaches.
+*   [ ] **Decompression**: Integrate Snappy (via Zig port or C lib) and Zstd.
+*   [ ] **Type Support**: Add `INT64`, `FLOAT`, `DOUBLE`, `INT96` (Timestamp), `FIXED_LEN_BYTE_ARRAY`.
+
+### Phase 3: Advanced Reader
+*   [ ] **Filter Pushdown**: Apply predicates *before* decoding values (Row Group skipping, Page skipping).
+*   [ ] **Column Projection**: Only read IO for requested columns.
+*   [ ] **Vectorized Decoding**: Decode batches of values directly into Arrow-compatible memory layouts.
+
+### Phase 4: S3 / Cloud
+*   [ ] **S3 Reader**: Async HTTP range requests to read footer + specific column chunks.
+*   [ ] **Lambda Handler**: Main entry point for the original "zigaws" goal.
 
 ## Usage
-
-### Generate Test Data
 ```bash
-# Requires uv or python3 with pyarrow
-source .venv/bin/activate
-python3 tools/fixtures/gen.py
-```
+# Quick test
+just test
 
-### Run Inspector
-```bash
-zig build run -- inspect data/required.parquet
-```
+# Verify against official/generated fixtures
+just verify
 
-### Run Tests
-```bash
-zig test src/zpq/rle.zig
-zig test src/zpq/thrift_test.zig
+# Stress test (10k+ rows, edge cases)
+just comprehensive
+
+# Cross-compile check (Linux/Mac/ARM/x64)
+just cross-check
 ```

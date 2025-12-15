@@ -1,0 +1,22 @@
+# Zig / Build
+zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Python / Venv
+.venv/
+__pycache__/
+*.pyc
+
+# Data / Fixtures
+data/*.parquet
+data/*.json
+# Ignore the cloned test suite, we can re-clone via script or submodule
+data/parquet-testing/
+
+# Env
+.env*

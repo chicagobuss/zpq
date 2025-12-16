@@ -136,23 +136,15 @@ test "snappy basic" {
     try std.testing.expectEqualStrings("Wiki", buf[0..len]);
 }
 
-test "snappy repeat" {
-    // "AAAAA"
-    // 5 (len)
-    // 04 (Literal len 1) "A"
-    // 05 (Copy 1-byte offset: len 4 + 0, offset 1? No.)
-    // Tag 01: len=(x>>2)&7 + 4. 
-    // We want len 4. (0 + 4). So bits 2-4 are 0.
-    // Offset high 3 bits (bits 5-7). Offset low 8 bits.
-    // Offset 1. High=0. Low=1.
-    // Tag byte: 0 | 0 | 01 = 0x01.
-    // Next byte: 0x01.
-    
-    // Compressed: 5, 0x04, 'A', 0x01, 0x01
-    const input = [_]u8{ 5, 0x04, 'A', 0x01, 0x01 };
-    var buf: [100]u8 = undefined;
-    const len = try uncompress(&input, &buf);
-    try std.testing.expectEqual(@as(usize, 5), len);
-    try std.testing.expectEqualStrings("AAAAA", buf[0..len]);
-}
+    test "snappy repeat" {
+        // "aaaaa" compressed: 5, 0x00, 'a', 0x01, 0x01
+        // Preamble: 5 (uncompressed len)
+        // 0x00: Literal tag 00, len 1 (0 >> 2 + 1 = 1). Value 'a'.
+        // 0x01: Copy tag 01, len 4 (0x01 >> 2 & 7 + 4 = 4). Offset 1 (0x01).
+        const input = [_]u8{ 0x05, 0x00, 'a', 0x01, 0x01 };
+        var buf: [100]u8 = undefined;
+        const len = try uncompress(&input, &buf);
+        try std.testing.expectEqual(@as(usize, 5), len);
+        try std.testing.expectEqualStrings("aaaaa", buf[0..len]);
+    }
 

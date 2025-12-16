@@ -50,6 +50,11 @@ pub const ParquetFile = struct {
         self.footer_len = std.mem.readInt(u32, &len_buf, .little);
         
         // 3. Read Thrift Metadata
+        // Ensure footer length is reasonable (not larger than file or absurdly large)
+        if (self.footer_len > self.file_size - 8) {
+            return error.InvalidFooterLength;
+        }
+        
         const footer_start = self.file_size - 8 - self.footer_len;
         try self.file.seekTo(footer_start);
         

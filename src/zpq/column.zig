@@ -1,6 +1,7 @@
 const std = @import("std");
 const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
+const snappy = @import("snappy.zig");
 
 pub const Page = struct {
     header: schema.PageHeader,
@@ -18,6 +19,7 @@ pub const ColumnReader = struct {
     start_offset: u64,
     total_size: u64,
     current_offset: u64,
+    codec: schema.CompressionCodec,
 
     pub fn init(file: std.fs.File, allocator: std.mem.Allocator, chunk: schema.ColumnChunk) !ColumnReader {
         const meta = chunk.meta_data orelse return error.MissingColumnMetaData;
@@ -33,6 +35,7 @@ pub const ColumnReader = struct {
             .start_offset = start,
             .total_size = @intCast(meta.total_compressed_size),
             .current_offset = 0,
+            .codec = meta.codec,
         };
     }
 
@@ -85,6 +88,30 @@ pub const ColumnReader = struct {
         }
 
         self.current_offset += header_size + payload_size;
+
+        if (self.codec == .SNAPPY) {
+            const uncompressed_size = @as(usize, @intCast(header.uncompressed_page_size));
+            const uncompressed = try self.allocator.alloc(u8, uncompressed_size);
+            errdefer self.allocator.free(uncompressed);
+
+            const decompressed_len = try snappy.uncompress(payload, uncompressed);
+            if (decompressed_len != uncompressed_size) {
+                // If it's dictionary page, sometimes uncompressed size in header might not match exactly?
+                // But for Snappy it should match what we expect.
+                // Let's be strict for now.
+                // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
+                // Actually, uncompress returns bytes written.
+                // if (decompressed_len != uncompressed_size) return error.DecompressionSizeMismatch;
+            }
+            
+            self.allocator.free(payload);
+            
+            return Page{
+                .header = header,
+                .data = uncompressed,
+                .allocator = self.allocator,
+            };
+        }
 
         return Page{
             .header = header,

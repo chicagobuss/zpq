@@ -93,6 +93,7 @@ pub const RleDecoder = struct {
             result |= @as(u32, byte & 0x7f) << shift;
             if ((byte & 0x80) == 0) break;
             shift += 7;
+            if (shift > 31) return error.CorruptData; // Prevent overflow
         }
         return result;
     }

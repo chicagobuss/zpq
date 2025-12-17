@@ -9,6 +9,10 @@ all: test build verify
 build:
     zig build
 
+# Check compilation (Lint)
+lint:
+    zig build check
+
 # Run unit tests (Fast)
 test:
     zig build test --summary all

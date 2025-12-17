@@ -147,6 +147,23 @@ pub fn build(b: *std.Build) void {
     const run_test_tls = b.addRunArtifact(test_tls_exe);
     test_io_step.dependOn(&run_test_tls.step);
 
+    // test_xev_tcp
+    const test_xev_tcp_mod = b.createModule(.{
+        .root_source_file = b.path("tests/io/test_xev_tcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_xev_tcp_mod.addImport("xev", libxev_mod);
+
+    const test_xev_tcp_exe = b.addExecutable(.{
+        .name = "test_xev_tcp",
+        .root_module = test_xev_tcp_mod,
+    });
+    const run_test_xev_tcp = b.addRunArtifact(test_xev_tcp_exe);
+
+    const step_test_xev_tcp = b.step("test-xev-tcp", "Run basic xev TCP test");
+    step_test_xev_tcp.dependOn(&run_test_xev_tcp.step);
+
     // Check step (Compile only, no run)
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
@@ -155,4 +172,5 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&test_event_loop_exe.step);
     check_step.dependOn(&test_async_source_exe.step);
     check_step.dependOn(&test_tls_exe.step);
+    check_step.dependOn(&test_xev_tcp_exe.step);
 }

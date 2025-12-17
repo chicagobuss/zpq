@@ -427,18 +427,21 @@ fn DynamicPollEvent(comptime xev: type) type {
 /// Preserves the same backing type and integer values for the
 /// subset making it easy to convert between the two.
 fn EnumSubset(comptime T: type, comptime values: []const T) type {
-    var fields: [values.len]std.builtin.Type.EnumField = undefined;
-    for (values, 0..) |value, i| fields[i] = .{
-        .name = @tagName(value),
-        .value = @intFromEnum(value),
+    const fields = comptime fields: {
+        var fields: [values.len]std.builtin.Type.EnumField = undefined;
+        for (values, 0..) |value, i| fields[i] = .{
+            .name = @tagName(value),
+            .value = @intFromEnum(value),
+        };
+        break :fields fields;
     };
 
-    return @Type(.{ .@"enum" = .{
-        .tag_type = @typeInfo(T).@"enum".tag_type,
-        .fields = &fields,
-        .decls = &.{},
-        .is_exhaustive = true,
-    } });
+    return @Enum(
+        @typeInfo(T).@"enum".tag_type,
+        &fields,
+        &.{},
+        true
+    );
 }
 
 /// Creates a union type that can hold the implementation of a given
@@ -458,49 +461,42 @@ fn Union(
     comptime field: []const []const u8,
     comptime tagged: bool,
 ) type {
-    // Keep track of the largest field size, see the conditional
-    // below using this variable for more info.
-    var largest: usize = 0;
+    const info = comptime blk: {
+        var largest: usize = 0;
+        var fields: [bes.len + 1]std.builtin.Type.UnionField = undefined;
+        var attrs: [bes.len + 1]std.builtin.Type.UnionField.Attributes = undefined;
+        for (bes, 0..) |be, i| {
+            var T: type = be.Api();
+            for (field) |f| T = @field(T, f);
+            largest = @max(largest, @sizeOf(T));
+            fields[i] = .{
+                .name = @tagName(be),
+                .type = T,
+                .alignment = @alignOf(T),
+            };
+            attrs[i] = .{};
+        }
 
-    var fields: [bes.len + 1]std.builtin.Type.UnionField = undefined;
-    for (bes, 0..) |be, i| {
-        var T: type = be.Api();
-        for (field) |f| T = @field(T, f);
-        largest = @max(largest, @sizeOf(T));
-        fields[i] = .{
-            .name = @tagName(be),
-            .type = T,
-            .alignment = @alignOf(T),
-        };
-    }
+        var count: usize = bes.len;
+        if (largest == 0) {
+            fields[count] = .{
+                .name = "_zig_bug_padding",
+                .type = u8,
+                .alignment = @alignOf(u8),
+            };
+            attrs[count] = .{};
+            count += 1;
+        }
+        break :blk .{ .fields = fields, .attrs = attrs, .count = count };
+    };
 
-    // If our union only has zero-sized types, we need to add some
-    // non-zero sized padding entry. This avoids a Zig 0.13 compiler
-    // crash when trying to create a zero-sized union using @unionInit
-    // from a switch of a comptime-generated enum. I wasn't able to
-    // minimize this. In future Zig versions we can remove this and if
-    // our examples can build with Dynamic then we're good.
-    var count: usize = bes.len;
-    if (largest == 0) {
-        fields[count] = .{
-            .name = "_zig_bug_padding",
-            .type = u8,
-            .alignment = @alignOf(u8),
-        };
-        count += 1;
-    }
-
-    return @Type(.{
-        .@"union" = .{
-            .layout = .auto,
-            .tag_type = if (tagged) EnumSubset(
-                AllBackend,
-                bes,
-            ) else null,
-            .fields = fields[0..count],
-            .decls = &.{},
-        },
-    });
+    return @Union(
+        .auto,
+        if (tagged) EnumSubset(AllBackend, bes) else null,
+        info.fields[0..info.count],
+        &.{},
+        info.attrs[0..info.count]
+    );
 }
 
 /// Create a new error set from a list of error sets within

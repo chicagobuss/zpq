@@ -1,4 +1,5 @@
 const std = @import("std");
+const shim = @import("../shim_net.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
@@ -42,7 +43,7 @@ fn TCPStream(comptime xev: type) type {
         /// Initialize a new TCP with the family from the given address. Only
         /// the family is used, the actual address has no impact on the created
         /// resource.
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
 
             const fd = if (xev.backend == .iocp)
@@ -71,7 +72,7 @@ fn TCPStream(comptime xev: type) type {
         }
 
         /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             if (xev.backend == .wasi_poll) @compileError("unsupported in WASI");
 
             const fd = if (xev.backend == .iocp) @as(std.os.windows.ws2_32.SOCKET, @ptrCast(self.fd)) else self.fd;
@@ -148,7 +149,7 @@ fn TCPStream(comptime xev: type) type {
             self: Self,
             loop: *xev.Loop,
             c: *xev.Completion,
-            addr: std.net.Address,
+            addr: shim.Address,
             comptime Userdata: type,
             userdata: ?*Userdata,
             comptime cb: *const fn (
@@ -269,7 +270,7 @@ fn TCPDynamic(comptime xev: type) type {
         pub const write = S.write;
         pub const queueWrite = S.queueWrite;
 
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             return .{ .backend = switch (xev.backend) {
                 inline else => |tag| backend: {
                     const api = (comptime xev.superset(tag)).Api();
@@ -295,7 +296,7 @@ fn TCPDynamic(comptime xev: type) type {
             } };
         }
 
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             switch (xev.backend) {
                 inline else => |tag| try @field(
                     self.backend,
@@ -383,7 +384,7 @@ fn TCPDynamic(comptime xev: type) type {
             self: Self,
             loop: *xev.Loop,
             c: *xev.Completion,
-            addr: std.net.Address,
+            addr: shim.Address,
             comptime Userdata: type,
             userdata: ?*Userdata,
             comptime cb: *const fn (
@@ -529,7 +530,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer loop.deinit();
 
             // Choose random available port (Zig #14907)
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+            var address = try shim.Address.parseIp4("127.0.0.1", 0);
             const server = try Impl.init(address);
 
             // Bind and listen
@@ -547,7 +548,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             try posix.getsockname(fd, &address.any, &sock_len);
             const client = try Impl.init(address);
 
-            //const address = try std.net.Address.parseIp4("127.0.0.1", 3132);
+            //const address = try shim.Address.parseIp4("127.0.0.1", 3132);
             //var server = try Impl.init(address);
             //var client = try Impl.init(address);
 
@@ -710,7 +711,7 @@ fn TCPTests(comptime xev: type, comptime Impl: type) type {
             defer loop.deinit();
 
             // Choose random available port (Zig #14907)
-            var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+            var address = try shim.Address.parseIp4("127.0.0.1", 0);
             const server = try Impl.init(address);
 
             // Bind and listen

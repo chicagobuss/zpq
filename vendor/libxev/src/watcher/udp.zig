@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const shim = @import("../shim_net.zig");const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
 const stream = @import("stream.zig");
@@ -56,7 +56,7 @@ fn UDPSendto(comptime xev: type) type {
         /// Initialize a new UDP with the family from the given address. Only
         /// the family is used, the actual address has no impact on the created
         /// resource.
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             return .{
                 .fd = try posix.socket(
                     addr.any.family,
@@ -74,7 +74,7 @@ fn UDPSendto(comptime xev: type) type {
         }
 
         /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             try posix.bind(self.fd, &addr.any, addr.getOsSockLen());
@@ -97,7 +97,7 @@ fn UDPSendto(comptime xev: type) type {
                 l: *xev.Loop,
                 c: *xev.Completion,
                 s: *State,
-                addr: std.net.Address,
+                addr: shim.Address,
                 s: Self,
                 b: xev.ReadBuffer,
                 r: xev.ReadError!usize,
@@ -130,7 +130,7 @@ fn UDPSendto(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    std.net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)),
+                                    shim.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -152,7 +152,7 @@ fn UDPSendto(comptime xev: type) type {
             loop: *xev.Loop,
             c: *xev.Completion,
             s: *State,
-            addr: std.net.Address,
+            addr: shim.Address,
             buf: xev.WriteBuffer,
             comptime Userdata: type,
             userdata: ?*Userdata,
@@ -234,7 +234,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
         /// Initialize a new UDP with the family from the given address. Only
         /// the family is used, the actual address has no impact on the created
         /// resource.
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             const socket = try windows.WSASocketW(addr.any.family, posix.SOCK.DGRAM, 0, null, 0, windows.ws2_32.WSA_FLAG_OVERLAPPED);
 
             return .{
@@ -250,7 +250,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
         }
 
         /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             const socket = @as(windows.ws2_32.SOCKET, @ptrCast(self.fd));
             try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             try posix.bind(socket, &addr.any, addr.getOsSockLen());
@@ -275,7 +275,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
                 l: *xev.Loop,
                 c: *xev.Completion,
                 s: *State,
-                addr: std.net.Address,
+                addr: shim.Address,
                 s: Self,
                 b: xev.ReadBuffer,
                 r: xev.ReadError!usize,
@@ -308,7 +308,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
                                     l_inner,
                                     c_inner,
                                     s_inner,
-                                    std.net.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)),
+                                    shim.Address.initPosix(@alignCast(&c_inner.op.recvfrom.addr)),
                                     initFd(c_inner.op.recvfrom.fd),
                                     c_inner.op.recvfrom.buffer,
                                     r.recvfrom,
@@ -330,7 +330,7 @@ fn UDPSendtoIOCP(comptime xev: type) type {
             loop: *xev.Loop,
             c: *xev.Completion,
             s: *State,
-            addr: std.net.Address,
+            addr: shim.Address,
             buf: xev.WriteBuffer,
             comptime Userdata: type,
             userdata: ?*Userdata,
@@ -414,7 +414,7 @@ fn UDPSendMsg(comptime xev: type) type {
 
                 send: struct {
                     buf: xev.WriteBuffer,
-                    addr: std.net.Address,
+                    addr: shim.Address,
                     msghdr: std.posix.msghdr_const,
                     iov: [1]std.posix.iovec_const,
                 },
@@ -431,7 +431,7 @@ fn UDPSendMsg(comptime xev: type) type {
         /// Initialize a new UDP with the family from the given address. Only
         /// the family is used, the actual address has no impact on the created
         /// resource.
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             // On io_uring we don't use non-blocking sockets because we may
             // just get EAGAIN over and over from completions.
             const flags = flags: {
@@ -453,7 +453,7 @@ fn UDPSendMsg(comptime xev: type) type {
         }
 
         /// Bind the address to the socket.
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             try posix.bind(self.fd, &addr.any, addr.getOsSockLen());
@@ -476,7 +476,7 @@ fn UDPSendMsg(comptime xev: type) type {
                 l: *xev.Loop,
                 c: *xev.Completion,
                 s: *State,
-                addr: std.net.Address,
+                addr: shim.Address,
                 s: Self,
                 b: xev.ReadBuffer,
                 r: xev.ReadError!usize,
@@ -540,7 +540,7 @@ fn UDPSendMsg(comptime xev: type) type {
                             l_inner,
                             c_inner,
                             s_inner,
-                            std.net.Address.initPosix(@ptrCast(&s_inner.op.recv.addr_buffer)),
+                            shim.Address.initPosix(@ptrCast(&s_inner.op.recv.addr_buffer)),
                             initFd(c_inner.op.recvmsg.fd),
                             s_inner.op.recv.buf,
                             if (r.recvmsg) |v| v else |err| err,
@@ -571,7 +571,7 @@ fn UDPSendMsg(comptime xev: type) type {
             loop: *xev.Loop,
             c: *xev.Completion,
             s: *State,
-            addr: std.net.Address,
+            addr: shim.Address,
             buf: xev.WriteBuffer,
             comptime Userdata: type,
             userdata: ?*Userdata,
@@ -700,7 +700,7 @@ fn UDPDynamic(comptime xev: type) type {
         pub const close = S.close;
         pub const poll = S.poll;
 
-        pub fn init(addr: std.net.Address) !Self {
+        pub fn init(addr: shim.Address) !Self {
             return .{ .backend = switch (xev.backend) {
                 inline else => |tag| backend: {
                     const api = (comptime xev.superset(tag)).Api();
@@ -726,7 +726,7 @@ fn UDPDynamic(comptime xev: type) type {
             } };
         }
 
-        pub fn bind(self: Self, addr: std.net.Address) !void {
+        pub fn bind(self: Self, addr: shim.Address) !void {
             switch (xev.backend) {
                 inline else => |tag| try @field(
                     self.backend,
@@ -757,7 +757,7 @@ fn UDPDynamic(comptime xev: type) type {
                 l: *xev.Loop,
                 c: *xev.Completion,
                 s: *State,
-                addr: std.net.Address,
+                addr: shim.Address,
                 s: Self,
                 b: xev.ReadBuffer,
                 r: xev.ReadError!usize,
@@ -772,7 +772,7 @@ fn UDPDynamic(comptime xev: type) type {
                             l_inner: *api.Loop,
                             c_inner: *api.Completion,
                             st_inner: *api.UDP.State,
-                            addr_inner: std.net.Address,
+                            addr_inner: shim.Address,
                             s_inner: api.UDP,
                             b_inner: api.ReadBuffer,
                             r_inner: api.ReadError!usize,
@@ -823,7 +823,7 @@ fn UDPDynamic(comptime xev: type) type {
             loop: *xev.Loop,
             c: *xev.Completion,
             s: *State,
-            addr: std.net.Address,
+            addr: shim.Address,
             buf: xev.WriteBuffer,
             comptime Userdata: type,
             userdata: ?*Userdata,
@@ -921,7 +921,7 @@ fn UDPTests(comptime xev: type, comptime Impl: type) type {
             var loop = try xev.Loop.init(.{ .thread_pool = &tpool });
             defer loop.deinit();
 
-            const address = try std.net.Address.parseIp4("127.0.0.1", 3132);
+            const address = try shim.Address.parseIp4("127.0.0.1", 3132);
             const server = try Impl.init(address);
             const client = try Impl.init(address);
 
@@ -937,7 +937,7 @@ fn UDPTests(comptime xev: type, comptime Impl: type) type {
                     _: *xev.Loop,
                     _: *xev.Completion,
                     _: *Impl.State,
-                    _: std.net.Address,
+                    _: shim.Address,
                     _: Impl,
                     _: xev.ReadBuffer,
                     r: xev.ReadError!usize,

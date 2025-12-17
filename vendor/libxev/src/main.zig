@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-
+pub const shim_net = @import("shim_net.zig");
 /// The low-level IO interfaces using the recommended compile-time
 /// interface for the target system. We forward these as the default
 /// API of this package.

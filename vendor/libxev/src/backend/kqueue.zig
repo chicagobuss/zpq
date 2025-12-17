@@ -1,9 +1,84 @@
 //! Backend to use kqueue. This is currently only tested on macOS but
 //! support for BSDs is planned (if it doesn't already work).
 const std = @import("std");
-const builtin = @import("builtin");
+const shim = @import("../shim_net.zig");const builtin = @import("builtin");
 const assert = std.debug.assert;
 const posix = std.posix;
+fn shim_getsockoptError(fd: posix.socket_t) !void {
+    var err: c_int = 0;
+    try posix.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&err));
+    const errno = posix.errno(err);
+    switch (errno) {
+        .SUCCESS => return,
+        .INPROGRESS => return error.ConnectionPending,
+        .ADDRINUSE => return error.AddressInUse,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .ISCONN => return error.ConnectionPending,
+        .NETDOWN => return error.NetworkDown,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOBUFS => return error.SystemResources,
+        .PROTOTYPE => return error.ProtocolUnsupportedBySystem,
+        .TIMEDOUT => return error.Timeout,
+        else => return posix.unexpectedErrno(errno),
+    }
+}
+
+
+fn shim_accept(fd: posix.socket_t, addr: ?*posix.sockaddr, addr_len: ?*posix.socklen_t, flags: u32) !posix.socket_t {
+    _ = flags;
+    while (true) {
+        const rc = posix.system.accept(fd, addr, addr_len);
+        if (rc != -1) return @intCast(rc);
+        const err = posix.errno(rc);
+        switch (err) {
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .INVAL => return error.SocketNotListening,
+            .CONNABORTED => return error.ConnectionAborted,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS => return error.SystemResources,
+            .NOMEM => return error.SystemResources,
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn shim_connect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
+    const rc = posix.system.connect(fd, addr, len);
+    if (rc != -1) return;
+    const err = posix.errno(rc);
+    switch (err) {
+        .INTR => return shim_connect(fd, addr, len),
+        .INPROGRESS => return error.ConnectionPending,
+        .ADDRINUSE => return error.AddressInUse,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .ISCONN => return error.ConnectionPending,
+        .NETDOWN => return error.NetworkDown,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .NOBUFS => return error.SystemResources,
+        .PROTOTYPE => return error.ProtocolUnsupportedBySystem,
+        .TIMEDOUT => return error.Timeout,
+        else => return posix.unexpectedErrno(err),
+    }
+}
+
 const darwin = @import("../darwin.zig");
 const queue = @import("../queue.zig");
 const queue_mpsc = @import("../queue_mpsc.zig");
@@ -75,7 +150,7 @@ pub const Loop = struct {
     /// Values in the completion queue must not be in the kqueue.
     completions: queue.Intrusive(Completion) = .{},
 
-    /// Heap of timers. We use heaps instead of the EVFILT_TIMER because
+    /// Heap of timers. We use heaps instead of the EEVFILT_TIMER because
     /// it avoids a lot of syscalls in the case where there are a LOT of
     /// timers.
     timers: TimerHeap = .{ .context = {} },
@@ -1136,7 +1211,7 @@ pub const Completion = struct {
             },
 
             .accept => |*op| .{
-                .accept = if (posix.accept(
+                .accept = if (shim_accept(
                     op.socket,
                     &op.addr,
                     &op.addr_size,
@@ -1148,7 +1223,7 @@ pub const Completion = struct {
             },
 
             .connect => |*op| .{
-                .connect = if (posix.getsockoptError(op.socket)) {} else |err| err,
+                .connect = if (shim_getsockoptError(op.socket)) {} else |err| err,
             },
 
             .write => |*op| .{
@@ -1536,7 +1611,7 @@ pub const Operation = union(OperationType) {
 
     connect: struct {
         socket: posix.socket_t,
-        addr: std.net.Address,
+        addr: shim.Address,
     },
 
     read: struct {
@@ -1577,7 +1652,7 @@ pub const Operation = union(OperationType) {
     sendto: struct {
         fd: posix.fd_t,
         buffer: WriteBuffer,
-        addr: std.net.Address,
+        addr: shim.Address,
     },
 
     recvfrom: struct {
@@ -1643,11 +1718,14 @@ pub const CancelError = error{
 };
 
 pub const AcceptError = posix.KEventError || posix.AcceptError || error{
+    SocketNotListening,
     Canceled,
     Unexpected,
 };
 
 pub const ConnectError = posix.KEventError || posix.ConnectError || error{
+    AddressInUse,
+    InvalidProtocolOption,
     Canceled,
     Unexpected,
 };
@@ -1829,7 +1907,7 @@ fn kevent_syscall(
             std.math.cast(c_int, changelist.len) orelse return error.Overflow,
             eventlist.ptr,
             std.math.cast(c_int, eventlist.len) orelse return error.Overflow,
-            0,
+            .{},
             timeout,
         );
         switch (posix.errno(rc)) {
@@ -1864,7 +1942,7 @@ inline fn kevent_init(ev: posix.Kevent) Kevent {
 }
 
 comptime {
-    if (@sizeOf(Completion) != 256) {
+    if (@sizeOf(Completion) != 176) {
         @compileLog(@sizeOf(Completion));
         unreachable;
     }

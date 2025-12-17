@@ -1,6 +1,6 @@
 //! Backend to use win32 IOCP.
 const std = @import("std");
-const builtin = @import("builtin");
+const shim = @import("../shim_net.zig");const builtin = @import("builtin");
 const assert = std.debug.assert;
 const windows = @import("../windows.zig");
 const queue = @import("../queue.zig");
@@ -1229,7 +1229,7 @@ pub const Operation = union(OperationType) {
 
     connect: struct {
         socket: windows.HANDLE,
-        addr: std.net.Address,
+        addr: shim.Address,
     },
 
     read: struct {
@@ -1274,7 +1274,7 @@ pub const Operation = union(OperationType) {
     sendto: struct {
         fd: windows.HANDLE,
         buffer: WriteBuffer,
-        addr: std.net.Address,
+        addr: shim.Address,
         wsa_buffer: windows.ws2_32.WSABUF = undefined,
     },
 

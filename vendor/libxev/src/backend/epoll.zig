@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const shim = @import("../shim_net.zig");const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
@@ -1162,7 +1162,7 @@ pub const Operation = union(OperationType) {
 
     connect: struct {
         socket: posix.socket_t,
-        addr: std.net.Address,
+        addr: shim.Address,
     },
 
     /// Poll for events but do not perform any operations on them being

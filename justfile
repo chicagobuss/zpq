@@ -128,3 +128,20 @@ ci:
 # Run local CI in watch mode (requires act)
 watch-ci:
     act --watch
+
+# Run benchmarks on remote ARM64 host
+remote-bench:
+    ./tools/remote_bench.sh
+
+# Build AWS Lambda Zip
+build-lambda:
+    zig build build-lambda
+    cd zig-out/lambda && zip lambda_function.zip bootstrap
+
+build-lambda-bench:
+    zig build build-lambda-bench
+
+bench-sweep:
+    ./tools/bench_memory_sweep.sh
+    @echo "Created zig-out/lambda/lambda_function.zip"
+

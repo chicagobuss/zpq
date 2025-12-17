@@ -174,7 +174,6 @@ pub fn build(b: *std.Build) void {
     const step_bench_ping_pongs = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
     step_bench_ping_pongs.dependOn(&run_bench_ping_pongs.step);
 
-    // Check step (Compile only, no run)
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&lib_unit_tests.step);
@@ -184,4 +183,48 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&test_tls_exe.step);
     check_step.dependOn(&test_xev_tcp_exe.step);
     check_step.dependOn(&bench_ping_pongs_exe.step);
+
+    // AWS Lambda Bootstrap
+    const bootstrap_mod = b.createModule(.{
+        .root_source_file = b.path("src/lambda_bootstrap.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux }),
+        .optimize = .ReleaseFast,
+    });
+    bootstrap_mod.addImport("zpq", zpq_mod);
+    bootstrap_mod.addImport("xev", libxev_mod);
+
+    const bootstrap_exe = b.addExecutable(.{
+        .name = "bootstrap",
+        .root_module = bootstrap_mod,
+    });
+
+    // Install to zig-out/lambda/bootstrap instead of bin/
+    const install_bootstrap = b.addInstallArtifact(bootstrap_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "lambda" } },
+    });
+
+    const build_lambda_step = b.step("build-lambda", "Build AWS Lambda bootstrap (aarch64-linux)");
+    build_lambda_step.dependOn(&install_bootstrap.step);
+
+    // Benchmark Bootstrap
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/lambda_bench.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux }),
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("zpq", zpq_mod);
+    bench_mod.addImport("xev", libxev_mod);
+
+    const exe_bench = b.addExecutable(.{
+        .name = "bootstrap-bench",
+        .root_module = bench_mod,
+    });
+
+    const install_bench = b.addInstallArtifact(exe_bench, .{
+        .dest_dir = .{ .override = .{ .custom = "lambda-bench" } },
+    });
+
+    const build_lambda_bench_step = b.step("build-lambda-bench", "Build lambda benchmark bootstrap");
+    build_lambda_bench_step.dependOn(&install_bench.step);
 }
+

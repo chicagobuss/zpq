@@ -18,6 +18,10 @@ We successfully patched `libxev` to work with the bleeding-edge Zig 0.16 compile
 *   **Node.js (v24)**: **~54,140 RPS**
 *   **Result**: Zig `libxev` is **~1.3x faster** than Node.js.
 
+## 🛠 Infrastructure
+*   **Backup/Remote**: `oci-josh-arm-vm` (ARM64 Linux) configured as git remote `backup`.
+*   **Use Case**: Native ARM64 builds and `io_uring` verification for AWS Lambda targets.
+
 ## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
 ### 1. Zig 0.16.x Breaking Changes & Patterns

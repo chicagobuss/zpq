@@ -1,7 +1,22 @@
 # ZPQ Technical Context & Deep Dive
 
 **Last Updated**: Dec 16, 2025
-**Current State**: High-Performance "Bare Metal" S3 I/O Stack complete (Async, Evented, TLS-enabled). Integration with Parquet Core is next.
+**Current State**: **Breakthrough**: `libxev` now runs on macOS and Linux (Zig 0.16.0-dev). Moving to TLS integration.
+
+## 🏆 Milestone: Libxev Cross-Platform Stability
+We successfully patched `libxev` to work with the bleeding-edge Zig 0.16 compiler, bypassing significant standard library regressions.
+*   **Problem**: `std.net` removed, `@Type` removed, `std.posix` wrappers missing errors (`SocketNotListening`, `AddressInUse`).
+*   **Solution**:
+    *   Created `shim_net.zig` to replace `std.net.Address`.
+    *   Patched `dynamic.zig` to use `@Enum`/`@Union` instead of `@Type`.
+    *   Injected raw syscall shims (`accept`, `connect`, `getsockopt`) into `kqueue.zig` to bypass `std`.
+*   **Verification**: `test_xev_tcp.zig` passes on macOS (native) and Linux (Docker `debian:bookworm-slim`).
+
+## ⚡ Performance Verification
+*   **Benchmark**: TCP Echo (Sequential, Single Connection, 500k iterations)
+*   **Zig (libxev)**: **~70,121 RPS** (ReleaseFast)
+*   **Node.js (v24)**: **~54,140 RPS**
+*   **Result**: Zig `libxev` is **~1.3x faster** than Node.js.
 
 ## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
@@ -25,43 +40,32 @@
     *   **Do**: Search web/Discord for specific 0.16 migration guides.
     *   **Don't**: Guess method signatures based on 0.13 docs.
 
-## 🏗️ High-Performance I/O Stack (Completed Components)
+## 🚀 New I/O Stack Implementation Plan
 
-### 1. `AsyncS3Source` (`src/zpq/s3/async_s3_source.zig`)
-*   **Role**: Orchestrator. Manages `ConnectionPool`, `EventLoop`, and parallel fetches.
-*   **Capabilities**:
-    *   **Range Coalescing**: Merges adjacent ranges (Polars-style) to minimize requests.
-    *   **Request Splitting**: Splits huge ranges into 64MB chunks.
-    *   **TLS Support**: Automatically upgrades to TLS for `https` schemes using `TlsAdapter`.
-    *   **Reliable DNS**: Uses `std.c.getaddrinfo` for robust resolution (bypassing `std.net` instability in Zig master).
+**Goal**: Replace flaky legacy stack with robust `libxev` (event loop) + `boring_tls` (OpenSSL) implementation.
 
-### 2. `TlsAdapter` (`src/zpq/s3/tls_adapter.zig`)
-*   **Status**: Verified against Cloudflare (1.1.1.1).
-*   **Architecture**:
-    *   Wraps raw `fd` via `std.Io.net.Stream`.
-    *   Uses `std.crypto.tls` (Pure Zig).
-    *   Manages own buffers to avoid hidden allocations.
-    *   Propagates `WouldBlock` for event loop integration.
+### Architecture
+*   **`Client` Struct**: Orchestrates `xev.Loop` and connection pool.
+*   **`Connection` Struct**: Wraps `xev.TCP` + `boring_tls.TlsClient`.
+*   **`readRanges`**: Zero-allocation pipeline directly from socket to user buffers.
 
-### 3. `AsyncRequest` (`src/zpq/s3/async_request.zig`)
-*   **Status**: Working.
-*   **Features**:
-    *   **Scatter/Gather**: Reads directly into multiple user buffers (`addSegment`).
-    *   **Zero-Allocation Gaps**: Skips bytes on the socket (reads into scratch buffer) to handle gaps without allocating heap memory.
-    *   **State Machine**: `Idle` -> `Sending` -> `Headers` -> `Body` -> `Finished`.
+### Development Roadmap (Micro-Test Driven)
 
-## ⏭️ Next Session: Optimization & Hardening
+#### Phase 1: Micro-Tests (Current)
+1.  **[DONE] TCP Connectivity (`test_xev_tcp`)**: 
+    *   Proved `libxev` works on macOS and Linux.
+2.  **[NEXT] TLS Handshake (`test_boring_connect`)**:
+    *   **Goal**: Verify "BIO Pair" pattern for `boring_tls` + `libxev`.
+    *   **Action**: Create `tests/io/test_boring_connect.zig`. Connect to `google.com:443`.
+3.  **S3 Protocol (`test_s3_head`)**:
+    *   **Goal**: Verify S3 specifics (Host header, signature).
+    *   **Action**: Connect to S3 bucket, send HEAD.
 
-### Completed: Phase G (Parquet Integration)
-*   **Integrated**: `AsyncS3Source` is now wired into `ParquetFile` and `main.zig`.
-*   **Verification**:
-    *   **Local Mock**: `debug-s3` works correctly against local HTTP mock server (127.0.0.1:9000).
-    *   **Leak Fix**: Fixed `EventLoop` map leak in `AsyncS3Source.init` error path.
+#### Phase 2: Implementation & Integration
+1.  **Core Client**: Move successful micro-test code into `src/zpq/io/http/Client.zig`.
+2.  **Parquet Wiring**: Implement `readRanges` and hook into `ParquetFile`.
 
-### Current Focus: Real S3 (HTTPS) Hardening
-*   **Issue**: `debug-s3` against real S3 fails with `HeadRequestFailed` / `EndOfStream`.
-*   **Hypothesis**: TLS connection closure or HTTP response handling issue with real S3 (possibly Keep-Alive or Header parsing nuance).
-*   **Plan**:
-    1.  Debug TLS/HTTP interaction with real S3.
-    2.  Verify leak fix in failure scenarios.
-    3.  Run full S3 benchmark.
+## 🏗️ Legacy Stack (Reference/Backup)
+Located in `src/zpq/s3_legacy/`.
+*   `AsyncS3Source`: Pure Zig `std.Io` + `std.crypto.tls` implementation.
+*   **Status**: Works with local Mock S3 (HTTP) but flaky/broken with real S3 (HTTPS/Keep-Alive issues).

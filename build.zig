@@ -116,13 +116,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Raw S3 Source uses relative import for io.zig?
-    // Let's check raw_s3_source.zig. 
-    // It imports zpq_io in my previous thought? No, I added it.
-    // I should probably fix raw_s3_source.zig to use relative too if it's used in library.
-    // If raw_s3_source.zig is in src/zpq/s3/, it can use ../../io.zig
-    
-    // raw_s3_source_mod.addImport("zpq_io", io_mod);
 
     // test_raw_s3
     const test_raw_s3_mod = b.createModule(.{
@@ -164,6 +157,23 @@ pub fn build(b: *std.Build) void {
     const step_test_xev_tcp = b.step("test-xev-tcp", "Run basic xev TCP test");
     step_test_xev_tcp.dependOn(&run_test_xev_tcp.step);
 
+    // bench_ping_pongs
+    const bench_ping_pongs_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench/ping_pongs.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_ping_pongs_mod.addImport("xev", libxev_mod);
+
+    const bench_ping_pongs_exe = b.addExecutable(.{
+        .name = "bench_ping_pongs",
+        .root_module = bench_ping_pongs_mod,
+    });
+    const run_bench_ping_pongs = b.addRunArtifact(bench_ping_pongs_exe);
+
+    const step_bench_ping_pongs = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
+    step_bench_ping_pongs.dependOn(&run_bench_ping_pongs.step);
+
     // Check step (Compile only, no run)
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
@@ -173,4 +183,5 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&test_async_source_exe.step);
     check_step.dependOn(&test_tls_exe.step);
     check_step.dependOn(&test_xev_tcp_exe.step);
+    check_step.dependOn(&bench_ping_pongs_exe.step);
 }

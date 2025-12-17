@@ -2,6 +2,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
+const io = @import("io.zig");
 
 pub const Page = struct {
     header: schema.PageHeader,
@@ -14,14 +15,14 @@ pub const Page = struct {
 };
 
 pub const ColumnReader = struct {
-    file: std.fs.File,
+    source: io.RandomAccessSource,
     allocator: std.mem.Allocator,
     start_offset: u64,
     total_size: u64,
     current_offset: u64,
     codec: schema.CompressionCodec,
 
-    pub fn init(file: std.fs.File, allocator: std.mem.Allocator, chunk: schema.ColumnChunk) !ColumnReader {
+    pub fn init(source: io.RandomAccessSource, allocator: std.mem.Allocator, chunk: schema.ColumnChunk) !ColumnReader {
         const meta = chunk.meta_data orelse return error.MissingColumnMetaData;
         
         var start: u64 = @intCast(meta.data_page_offset);
@@ -30,7 +31,7 @@ pub const ColumnReader = struct {
         }
 
         return ColumnReader{
-            .file = file,
+            .source = source,
             .allocator = allocator,
             .start_offset = start,
             .total_size = @intCast(meta.total_compressed_size),
@@ -43,11 +44,13 @@ pub const ColumnReader = struct {
         if (self.current_offset >= self.total_size) return null;
 
         const abs_pos = self.start_offset + self.current_offset;
-        try self.file.seekTo(abs_pos);
-
+        
         // Read a buffer for the header. Thrift headers are usually small (< 1KB)
         var header_buf: [4096]u8 = undefined;
-        const bytes_read = try self.file.read(&header_buf);
+        // Limit read to remaining column size
+        const bytes_to_read = @min(header_buf.len, self.total_size - self.current_offset);
+        
+        const bytes_read = try self.source.readAt(abs_pos, header_buf[0..bytes_to_read]);
         if (bytes_read == 0) return null;
 
         var reader = thrift.Reader.init(header_buf[0..bytes_read]);
@@ -63,8 +66,6 @@ pub const ColumnReader = struct {
         // We might have read some of the payload into header_buf already?
         // Yes.
         // Bytes available in header_buf after header: bytes_read - header_size
-        // We should copy those, then read the rest.
-        
         const bytes_in_buf = bytes_read - header_size;
         
         if (bytes_in_buf >= payload_size) {
@@ -77,11 +78,15 @@ pub const ColumnReader = struct {
             // Read the rest
             const remaining = payload_size - bytes_in_buf;
             const dest = payload[bytes_in_buf..];
-            try self.file.seekTo(abs_pos + bytes_read); 
+            
+            // Read from source at correct offset (start + header + bytes_in_buf)
+            // But abs_pos points to start of header.
+            // So we want to read at: abs_pos + bytes_read
+            const read_offset = abs_pos + bytes_read;
             
             var total_read: usize = 0;
             while (total_read < remaining) {
-                const n = try self.file.read(dest[total_read..]);
+                const n = try self.source.readAt(read_offset + total_read, dest[total_read..]);
                 if (n == 0) return error.UnexpectedEndOfFile;
                 total_read += n;
             }
@@ -96,12 +101,7 @@ pub const ColumnReader = struct {
 
             const decompressed_len = try snappy.uncompress(payload, uncompressed);
             if (decompressed_len != uncompressed_size) {
-                // If it's dictionary page, sometimes uncompressed size in header might not match exactly?
-                // But for Snappy it should match what we expect.
-                // Let's be strict for now.
-                // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
-                // Actually, uncompress returns bytes written.
-                // if (decompressed_len != uncompressed_size) return error.DecompressionSizeMismatch;
+                 // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
             }
             
             self.allocator.free(payload);
@@ -120,4 +120,3 @@ pub const ColumnReader = struct {
         };
     }
 };
-

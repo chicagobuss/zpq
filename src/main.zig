@@ -54,9 +54,42 @@ pub fn main() !void {
             return;
         }
         try cmdPages(allocator, args[2]);
+    } else if (std.mem.eql(u8, command, "debug-s3")) {
+        if (args.len < 3) {
+            std.debug.print("Usage: {s} debug-s3 <parquet_file>\n", .{args[0]});
+            return;
+        }
+        try cmdDebugS3(allocator, args[2]);
     } else {
         printUsage(args[0]);
     }
+}
+
+fn cmdDebugS3(allocator: std.mem.Allocator, path: []const u8) !void {
+    std.debug.print("Opening file: {s}\n", .{path});
+    var pf = try openFile(allocator, path);
+    defer pf.deinit();
+    
+    // We assume it's S3Source.
+    var buf: [1024]u8 = undefined;
+    
+    std.debug.print("Read 1 (offset 0, 1024 bytes)...\n", .{});
+    var timer = try std.time.Timer.start();
+    _ = try pf.source.readAt(0, &buf);
+    var elapsed = timer.read();
+    std.debug.print("Read 1 took: {d:.4}s\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0});
+    
+    std.debug.print("Read 2 (offset 1024, 1024 bytes)...\n", .{});
+    timer.reset();
+    _ = try pf.source.readAt(1024, &buf);
+    elapsed = timer.read();
+    std.debug.print("Read 2 took: {d:.4}s\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0});
+
+    std.debug.print("Read 3 (offset 2048, 1024 bytes)...\n", .{});
+    timer.reset();
+    _ = try pf.source.readAt(2048, &buf);
+    elapsed = timer.read();
+    std.debug.print("Read 3 took: {d:.4}s\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0});
 }
 
 fn printUsage(exe_name: []const u8) void {
@@ -70,13 +103,139 @@ fn printUsage(exe_name: []const u8) void {
         \\  scan   <file>       Benchmark scan speed (no output)
         \\  pages  <file>       Inspect page headers and encodings (deep dive)
         \\
+        \\Environment Variables:
+        \\  S3_ENDPOINT         Custom S3 endpoint (e.g. http://localhost:9000 for MinIO)
+        \\
     , .{exe_name});
+}
+
+fn cleanupS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const s: *zpq.s3.S3Source = @ptrCast(@alignCast(ctx));
+    s.deinit();
+    allocator.destroy(s);
+}
+
+const AsyncS3Context = struct {
+    pool: zpq.s3.ConnectionPool,
+    source: zpq.s3.AsyncS3Source,
+    allocator: std.mem.Allocator,
+    host_owned: ?[]const u8 = null,
+    
+    pub fn deinit(self: *AsyncS3Context) void {
+        self.source.deinit();
+        self.pool.deinit();
+        if (self.host_owned) |h| self.allocator.free(h);
+    }
+};
+
+fn cleanupAsyncS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const s: *AsyncS3Context = @ptrCast(@alignCast(ctx));
+    s.deinit();
+    allocator.destroy(s);
+}
+
+fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => err,
+    };
+}
+
+fn openFile(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
+    if (std.mem.startsWith(u8, path, "s3://")) {
+        var bucket: []const u8 = undefined;
+        var key: []const u8 = undefined;
+        
+        const no_scheme = path[5..];
+        if (std.mem.indexOf(u8, no_scheme, "/")) |idx| {
+             bucket = no_scheme[0..idx];
+             key = no_scheme[idx+1..];
+        } else {
+             return error.InvalidS3Path;
+        }
+        
+        // Check if we want to use Async (default for now for benchmark)
+        // We'll use AsyncS3Source.
+        
+        const endpoint_env = try getEnvOrNull(allocator, "S3_ENDPOINT");
+        defer if (endpoint_env) |ep| allocator.free(ep);
+        
+        // Parse Endpoint
+        var host: []const u8 = "s3.amazonaws.com"; // Default
+        var port: u16 = 443;
+        var use_tls: bool = true;
+        
+        if (endpoint_env) |ep| {
+            const uri = try std.Uri.parse(ep);
+            if (uri.host) |h| {
+                switch (h) {
+                    .raw => |s| host = s,
+                    .percent_encoded => |s| host = s,
+                }
+            } else return error.InvalidEndpoint;
+            
+            port = uri.port orelse (if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80);
+            use_tls = std.mem.eql(u8, uri.scheme, "https");
+        } else {
+            // TODO: Region support for host resolution
+            // For now assume standard or use env
+            if (try getEnvOrNull(allocator, "AWS_REGION")) |region| {
+                defer allocator.free(region);
+                // Construct host: s3.{region}.amazonaws.com
+                // We need to allocate this host string if it's dynamic
+                // For this quick hack, let's just stick to default or S3_ENDPOINT
+                // If region is us-east-1, it's s3.amazonaws.com
+                if (!std.mem.eql(u8, region, "us-east-1")) {
+                     // Alloc host string
+                     // host = try std.fmt.allocPrint(allocator, "s3.{s}.amazonaws.com", .{region});
+                     // But we can't easily free it down the line without tracking it.
+                     // Let's assume S3_ENDPOINT is used for now or we use default.
+                }
+            }
+        }
+
+        const ctx = try allocator.create(AsyncS3Context);
+        errdefer allocator.destroy(ctx);
+        
+        ctx.allocator = allocator;
+        ctx.pool = zpq.s3.ConnectionPool.init(allocator);
+        errdefer ctx.pool.deinit();
+        
+        // Initialize Source
+        // Note: host is either slice of env var or string literal. 
+        // AsyncS3Source.init copies path, but stores host reference?
+        // Let's check AsyncS3Source.init.
+        // It stores `host: []const u8`. It does NOT copy host.
+        // So we must ensure host stays alive. 
+        // If it came from `endpoint_env`, it's freed at end of scope.
+        // We should duplicate it into `ctx`.
+        
+        const host_copy = try allocator.dupe(u8, host);
+        errdefer allocator.free(host_copy);
+        
+        ctx.host_owned = host_copy;
+        
+        ctx.source = try zpq.s3.AsyncS3Source.init(
+            allocator, 
+            &ctx.pool, 
+            host_copy, 
+            port, 
+            bucket, 
+            key, 
+            use_tls, 
+            null // trusted_cert
+        );
+        
+        return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
+    }
+    
+    return zpq.file.ParquetFile.open(allocator, path);
 }
 
 fn cmdScan(allocator: std.mem.Allocator, path: []const u8) !void {
     var timer = try std.time.Timer.start();
     
-    var pf = try zpq.file.ParquetFile.open(allocator, path);
+    var pf = try openFile(allocator, path);
     defer pf.deinit();
     try pf.readFooter();
     
@@ -88,7 +247,7 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8) !void {
             for (rg.columns.items) |col| {
                 if (col.meta_data) |md| {
                     _ = md; // unused
-                    var reader = try zpq.column.ColumnReader.init(pf.file, allocator, col);
+                    var reader = try zpq.column.ColumnReader.init(pf.source, allocator, col);
                     while (try reader.next()) |page| {
                         var p = page;
                         defer p.deinit();
@@ -113,7 +272,7 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn cmdSchema(allocator: std.mem.Allocator, path: []const u8) !void {
-    var pf = try zpq.file.ParquetFile.open(allocator, path);
+    var pf = try openFile(allocator, path);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -134,7 +293,7 @@ fn cmdSchema(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn cmdMeta(allocator: std.mem.Allocator, path: []const u8) !void {
-    var pf = try zpq.file.ParquetFile.open(allocator, path);
+    var pf = try openFile(allocator, path);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -170,7 +329,7 @@ fn cmdMeta(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
-    var pf = try zpq.file.ParquetFile.open(allocator, path);
+    var pf = try openFile(allocator, path);
     defer pf.deinit();
     try pf.readFooter();
     
@@ -198,7 +357,7 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
                     defer dict_float.deinit(allocator);
 
                     const levels = meta.getColumnLevels(md.path_in_schema.items);
-                    var reader = try zpq.column.ColumnReader.init(pf.file, allocator, col);
+                    var reader = try zpq.column.ColumnReader.init(pf.source, allocator, col);
                     
                     var values_printed: usize = 0;
                     
@@ -322,7 +481,7 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
 
 // The detailed deep-dive inspection (formerly 'inspect')
 fn cmdPages(allocator: std.mem.Allocator, path: []const u8) !void {
-     var pf = try zpq.file.ParquetFile.open(allocator, path);
+     var pf = try openFile(allocator, path);
     defer pf.deinit();
 
     try pf.readFooter();
@@ -354,7 +513,7 @@ fn cmdPages(allocator: std.mem.Allocator, path: []const u8) !void {
                     const levels = meta.getColumnLevels(md.path_in_schema.items);
                     std.debug.print("      Levels: MaxDef={d}, MaxRep={d}\n", .{levels.max_def, levels.max_rep});
 
-                    var reader = try zpq.column.ColumnReader.init(pf.file, allocator, col);
+                    var reader = try zpq.column.ColumnReader.init(pf.source, allocator, col);
                     var page_idx: usize = 0;
                     while (try reader.next()) |page| {
                         var p = page;
@@ -564,3 +723,4 @@ fn cmdPages(allocator: std.mem.Allocator, path: []const u8) !void {
         }
     }
 }
+

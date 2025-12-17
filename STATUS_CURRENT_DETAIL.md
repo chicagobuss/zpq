@@ -1,60 +1,67 @@
 # ZPQ Technical Context & Deep Dive
 
-**Last Updated**: Dec 15, 2025
-**Current State**: Stable, CI-verified, Parsing Metadata & skipping Levels correctly.
+**Last Updated**: Dec 16, 2025
+**Current State**: High-Performance "Bare Metal" S3 I/O Stack complete (Async, Evented, TLS-enabled). Integration with Parquet Core is next.
 
-## Critical Implementation Details
+## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
-### 1. Thrift Reader (`src/zpq/thrift.zig`)
-*   **Status**: robust.
-*   **Key Logic**: `readVarInt` uses `u64` accumulator to avoid overflow. `readFieldBegin` handles field deltas.
-*   **Warning**: `readByte` must read a raw byte, *not* ZigZag. Do not confuse with `readByte` in some other implementations.
-*   **Recent Fix**: Ensured `last_field_id` is saved/restored in nested struct parsing to preventing state corruption in `schema.zig`.
+### 1. Zig 0.16.x Breaking Changes & Patterns
+*   **`std.Io` Overhaul**: `std.io` is now `std.Io`. The API is async-native.
+    *   `Reader.read` is gone. Use `Reader.readVec` (returns bytes read) or `Reader.readSliceShort` (tries to fill buffer).
+    *   `Writer` handles buffering differently.
+*   **`std.crypto.tls.Client`**:
+    *   **Manual Buffering**: Requires explicit `Options` with `read_buffer` (plaintext read) and `write_buffer` (plaintext write).
+    *   **Socket Wrapping**: Wraps `std.Io.net.Stream`, which wraps the raw FD.
+    *   **Error Handling**: Does NOT explicitly list `error.WouldBlock` in inferred return types, requiring `@as(anyerror, err)` casts to handle non-blocking flow correctly.
+*   **`std.net` Removal**: Old `std.net` functions (like `getAddressList`) are moving/changing. Use `std.Io.net` or `std.posix` primitives where possible.
 
-### 2. Schema Traversal (`src/zpq/schema.zig`)
+### 2. Workflow & Testing Strategy
+*   **The Python Wrapper**: ALWAYS use `python3 tools/no_output_timeout.py zig build test-io` for I/O tests.
+    *   **Why**: Zig test runner buffers output and can hang silently on deadlocks/timeouts. The wrapper ensures we see partial output and kills hung processes.
+*   **Micro-Tests First**: Don't try to integrate complex systems immediately.
+    *   *Example*: We built `test_event_loop.zig` (kqueue), `test_tls.zig` (handshake), and `test_async_request.zig` (HTTP state machine) in isolation before wiring them together.
+*   **Search > Guess**: Zig 0.16 is bleeding edge.
+    *   **Do**: Search `lib/std` source code (e.g., `lib/std/http/Client.zig`) for usage patterns.
+    *   **Do**: Search web/Discord for specific 0.16 migration guides.
+    *   **Don't**: Guess method signatures based on 0.13 docs.
+
+## 🏗️ High-Performance I/O Stack (Completed Components)
+
+### 1. `AsyncS3Source` (`src/zpq/s3/async_s3_source.zig`)
+*   **Role**: Orchestrator. Manages `ConnectionPool`, `EventLoop`, and parallel fetches.
+*   **Capabilities**:
+    *   **Range Coalescing**: Merges adjacent ranges (Polars-style) to minimize requests.
+    *   **Request Splitting**: Splits huge ranges into 64MB chunks.
+    *   **TLS Support**: Automatically upgrades to TLS for `https` schemes using `TlsAdapter`.
+    *   **Reliable DNS**: Uses `std.c.getaddrinfo` for robust resolution (bypassing `std.net` instability in Zig master).
+
+### 2. `TlsAdapter` (`src/zpq/s3/tls_adapter.zig`)
+*   **Status**: Verified against Cloudflare (1.1.1.1).
+*   **Architecture**:
+    *   Wraps raw `fd` via `std.Io.net.Stream`.
+    *   Uses `std.crypto.tls` (Pure Zig).
+    *   Manages own buffers to avoid hidden allocations.
+    *   Propagates `WouldBlock` for event loop integration.
+
+### 3. `AsyncRequest` (`src/zpq/s3/async_request.zig`)
 *   **Status**: Working.
-*   **Key Logic**: `FileMetaData` parses the flattened Thrift `SchemaElement` list.
-*   **Helper**: `getColumnLevels(path)` uses `SchemaIterator` to walk the tree and calculate `max_def_level` and `max_rep_level` based on `REQUIRED` (0), `OPTIONAL` (+1), `REPEATED` (+1).
-*   **Output**: Returns `Levels { max_def, max_rep }` which drives the Page Reader.
+*   **Features**:
+    *   **Scatter/Gather**: Reads directly into multiple user buffers (`addSegment`).
+    *   **Zero-Allocation Gaps**: Skips bytes on the socket (reads into scratch buffer) to handle gaps without allocating heap memory.
+    *   **State Machine**: `Idle` -> `Sending` -> `Headers` -> `Body` -> `Finished`.
 
-### 3. RLE Decoder (`src/zpq/rle.zig`)
-*   **Status**: Rigorously tested (unit tests + `large_bitpacked.parquet`).
-*   **Key Logic**: Handles both RLE runs and Bit-Packed runs.
-*   **Bit-Packing**: `unpack8Values` unrolls the bit-shifting for performance.
-*   **Next Challenge**: This same decoder will be used for Definition Levels (which are usually RLE encoded with small bit widths like 1).
+## ⏭️ Next Session: Optimization & Hardening
 
-### 4. Page Reader (`src/main.zig` / `src/zpq/column.zig`)
-*   **Current Behavior**: 
-    1. Reads Page Header.
-    2. Checks `max_def_level` / `max_rep_level`.
-    3. If > 0, reads 4-byte length prefix and **skips** that many bytes of encoded levels.
-    4. Decodes remaining data as Values (Dictionary Indices).
-*   **Immediate Technical Debt**: `src/main.zig` contains too much logic. The level reading/skipping and value decoding should be moved into `src/zpq/column.zig` or a new `src/zpq/page_reader.zig`.
+### Completed: Phase G (Parquet Integration)
+*   **Integrated**: `AsyncS3Source` is now wired into `ParquetFile` and `main.zig`.
+*   **Verification**:
+    *   **Local Mock**: `debug-s3` works correctly against local HTTP mock server (127.0.0.1:9000).
+    *   **Leak Fix**: Fixed `EventLoop` map leak in `AsyncS3Source.init` error path.
 
-## Next Session: Implementation Plan
-
-### Step 1: Definition Level Decoding
-**Goal**: Instead of skipping, *read* the definition levels.
-*   **Logic**:
-    *   Create an `RleDecoder` for the definition levels chunk.
-    *   Decode all levels into a buffer (e.g., `[]u8` or `[]i16` - usually just 0 or 1).
-    *   **Crucial**: Count how many `max_def_level`s exist. This is the number of *actual values* stored in the subsequent data stream.
-    *   Use this count to initialize the Data/Index decoder.
-
-### Step 2: Value Reconstruction
-**Goal**: Produce a clean API like `reader.nextBatch(allocator) -> []?T`.
-*   **Logic**:
-    *   Iterate the definition levels.
-    *   If `level == max_def`, pull one value from the Data Decoder.
-    *   If `level < max_def`, insert `null`.
-
-### Step 3: Decompression
-**Goal**: Stop assuming `UNCOMPRESSED`.
-*   **Task**: Check `page_header.codec`. If `SNAPPY` or `GZIP`, allocate a buffer `uncompressed_page_size` and decompress `p.data` before passing to decoders.
-*   **Dependencies**: Look for `zig-snappy` or link against C snappy.
-
-## Test Data Reference
-*   `data/simple.parquet`: `OPTIONAL` fields. (Def Levels: 1).
-*   `data/large_rle.parquet`: `REQUIRED` fields, RLE data.
-*   `data/large_bitpacked.parquet`: `REQUIRED` fields, Bit-Packed data.
-
+### Current Focus: Real S3 (HTTPS) Hardening
+*   **Issue**: `debug-s3` against real S3 fails with `HeadRequestFailed` / `EndOfStream`.
+*   **Hypothesis**: TLS connection closure or HTTP response handling issue with real S3 (possibly Keep-Alive or Header parsing nuance).
+*   **Plan**:
+    1.  Debug TLS/HTTP interaction with real S3.
+    2.  Verify leak fix in failure scenarios.
+    3.  Run full S3 benchmark.

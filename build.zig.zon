@@ -1,0 +1,8 @@
+.{
+    .name = .zpq,
+    .version = "0.16.0-dev.1484+d0ba6642b",
+    .dependencies = .{
+    },
+    .paths = .{""},
+    .fingerprint = 0xae1a0cc88e4dd7f6,
+}

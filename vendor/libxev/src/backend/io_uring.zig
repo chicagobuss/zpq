@@ -465,7 +465,7 @@ pub const Loop = struct {
             .recvmsg => |*v| {
                 sqe.prep_recvmsg(
                     v.fd,
-                    v.msghdr,
+                    @ptrCast(v.msghdr),
                     0,
                 );
             },

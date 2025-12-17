@@ -214,6 +214,19 @@ fn openFile(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFil
         errdefer allocator.free(host_copy);
         
         ctx.host_owned = host_copy;
+
+        const ca_cert_env = try getEnvOrNull(allocator, "S3_CA_CERT");
+        defer if (ca_cert_env) |c| allocator.free(c);
+
+        var trusted_cert: ?[]const u8 = null;
+        if (ca_cert_env) |path_val| {
+            std.debug.print("[Main] Loading CA cert from {s}\n", .{path_val});
+            const max_size = 1024 * 1024;
+            const content = try std.fs.cwd().readFileAlloc(path_val, allocator, @enumFromInt(max_size));
+            trusted_cert = content;
+            std.debug.print("[Main] Loaded cert: {d} bytes\n", .{content.len});
+        }
+        defer if (trusted_cert) |c| allocator.free(c);
         
         ctx.source = try zpq.s3.AsyncS3Source.init(
             allocator, 
@@ -223,7 +236,7 @@ fn openFile(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFil
             bucket, 
             key, 
             use_tls, 
-            null // trusted_cert
+            trusted_cert
         );
         
         return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);

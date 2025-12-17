@@ -345,6 +345,7 @@ pub const AsyncS3Source = struct {
         defer if (res) |r| c.freeaddrinfo(r);
 
         if (res) |r| {
+            // First pass: look for IPv4
             var curr: ?*c.addrinfo = r;
             while (curr) |info| : (curr = info.next) {
                 if (info.family == c.AF.INET) {
@@ -355,7 +356,13 @@ pub const AsyncS3Source = struct {
                         .bytes = bytes,
                         .port = port, // Use original port or one from getaddrinfo (which should match)
                     }};
-                } else if (info.family == c.AF.INET6) {
+                }
+            }
+            
+            // Second pass: return whatever we find (IPv6)
+            curr = r;
+            while (curr) |info| : (curr = info.next) {
+                if (info.family == c.AF.INET6) {
                     const addr_in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(info.addr));
                     const bytes: [16]u8 = @bitCast(addr_in6.addr);
                     return std.Io.net.IpAddress{ .ip6 = .{

@@ -53,7 +53,10 @@ pub const TlsAdapter = struct {
         errdefer self.bundle.deinit(allocator);
         
         if (trusted_cert) |cert| {
+            std.debug.print("[TlsAdapter] Adding custom cert (len: {d})\n", .{cert.len});
             try addCertToBundle(&self.bundle, allocator, cert, ts.sec);
+        } else {
+            std.debug.print("[TlsAdapter] No custom cert provided\n", .{});
         }
         
         // Setup Stream
@@ -102,11 +105,19 @@ pub const TlsAdapter = struct {
     
     pub fn read(self: *TlsAdapter, buffer: []u8) !usize {
         var buffers = [1][]u8{buffer};
-        return self.client.reader.readVec(&buffers);
+        std.debug.print("[TlsAdapter] calling client.reader.readVec\n", .{});
+        const n = try self.client.reader.readVec(&buffers);
+        std.debug.print("[TlsAdapter] client.reader.readVec returned {d}\n", .{n});
+        if (n == 0) {
+             std.debug.print("[TlsAdapter] Read 0 bytes (EOF?)\n", .{});
+        }
+        return n;
     }
     
     pub fn write(self: *TlsAdapter, buffer: []const u8) !usize {
-        return self.client.writer.write(buffer);
+        const n = try self.client.writer.write(buffer);
+        try self.net_writer.interface.flush();
+        return n;
     }
 };
 
@@ -135,5 +146,6 @@ fn addCertToBundle(bundle: *std.crypto.Certificate.Bundle, allocator: std.mem.Al
         bundle.bytes.items.len += decoded_len;
 
         try bundle.parseCert(allocator, decoded_start, now_sec);
+        std.debug.print("[TlsAdapter] Added custom cert to bundle (len: {d})\n", .{decoded_len});
     }
 }

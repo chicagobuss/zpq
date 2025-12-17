@@ -42,3 +42,7 @@ alwaysApply: true
 ## 7. Zig Master Stdlib Namespaces
 (As of the current version - 0.16.dev)
 `array_hash_map`, `array_list`, `ascii`, `atomic`, `base64`, `bit_set`, `builtin`, `c`, `coff`, `compress`, `crypto`, `debug`, `dwarf`, `elf`, `enums`, `fmt`, `fs`, `gpu`, `hash`, `hash_map`, `heap`, `http`, `json`, `leb`, `log`, `macho`, `math`, `mem`, `meta`, `os`, `pdb`, `pie`, `posix`, `process`, `simd`, `sort`, `start`, `static_string_map`, `tar`, `testing`, `time`, `tz`, `unicode`, `valgrind`, `wasm`, `zig`, `zip`, `zon`
+
+## 8. Communication & Decision Making
+- **Ask Before Destructive Actions**: When considering bigger changes, especially destructive ones, **ALWAYS** ask the user for confirmation first.
+- **When in Doubt, Ask**: If a path is ambiguous or requires an assumption that might be wrong, ask the user. Do not assume permissions or intent, as it is wasteful on time and money to go down unwanted paths of work/exploration.

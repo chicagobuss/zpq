@@ -4,12 +4,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Dependencies
+    const libxev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const libxev_mod = libxev_dep.module("xev");
+
+    const boring_tls_dep = b.dependency("boring_tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const boring_tls_mod = boring_tls_dep.module("boring_tls");
+
     // Create the 'zpq' module
     const zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
         .optimize = optimize,
     });
+    // Link new IO stack deps
+    zpq_mod.addImport("xev", libxev_mod);
+    zpq_mod.addImport("boring_tls", boring_tls_mod);
     
     // Create the exe module
     const exe_mod = b.createModule(.{

@@ -1,7 +1,7 @@
 const std = @import("std");
 const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
-const io = @import("io.zig");
+const io = @import("../io/interface.zig");
 const ColumnReader = @import("column.zig").ColumnReader;
 
 pub const RowGroupReader = struct {

@@ -1,15 +1,15 @@
 const std = @import("std");
-const io = @import("io.zig");
-const sigv4 = @import("s3/sigv4.zig");
+const io = @import("../interface.zig");
+const sigv4 = @import("../../s3_legacy/sigv4.zig");
 
-// Export Async Components
-pub const AsyncS3Source = @import("s3/async_s3_source.zig").AsyncS3Source;
-pub const ConnectionPool = @import("s3/connection_pool.zig").ConnectionPool;
-pub const AsyncRequest = @import("s3/async_request.zig").AsyncRequest;
-pub const EventLoop = @import("s3/event_loop.zig").EventLoop;
-pub const scheduler = @import("s3/scheduler.zig");
-pub const RawS3Source = @import("s3/raw_s3_source.zig").RawS3Source;
-pub const TlsAdapter = @import("s3/tls_adapter.zig").TlsAdapter;
+// Export Async Components (Legacy wrappers)
+pub const AsyncS3Source = @import("../../s3_legacy/async_s3_source.zig").AsyncS3Source;
+pub const ConnectionPool = @import("../../s3_legacy/connection_pool.zig").ConnectionPool;
+pub const AsyncRequest = @import("../../s3_legacy/async_request.zig").AsyncRequest;
+pub const EventLoop = @import("../../s3_legacy/event_loop.zig").EventLoop;
+pub const scheduler = @import("../../s3_legacy/scheduler.zig");
+pub const RawS3Source = @import("../../s3_legacy/raw_s3_source.zig").RawS3Source;
+pub const TlsAdapter = @import("../../s3_legacy/tls_adapter.zig").TlsAdapter;
 
 pub const S3Config = struct {
     access_key: ?[]const u8 = null,

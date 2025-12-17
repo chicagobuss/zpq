@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = @import("../io.zig");
+const io = @import("../io/interface.zig");
 const SigV4 = @import("sigv4.zig");
 const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
 const ConnectionKey = @import("connection_pool.zig").ConnectionKey;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = @import("../io.zig");
+const io = @import("../io/interface.zig");
 pub const Range = io.Range;
 
 /// A merged request that may cover multiple original ranges.

@@ -2,7 +2,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
-const io = @import("io.zig");
+const io = @import("../io/interface.zig");
 
 pub const Page = struct {
     header: schema.PageHeader,

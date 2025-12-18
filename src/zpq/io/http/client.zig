@@ -17,7 +17,22 @@ pub const Client = struct {
         err: ?anyerror = null,
         /// Total number of decrypted bytes delivered to `on_data`.
         bytes: usize = 0,
+        /// Opaque pointer to internal request context, for cleanup after the loop finishes.
+        /// (We cannot safely free inside xev callbacks.)
+        _ctx: ?*anyopaque = null,
     };
+
+    /// Best-effort cleanup for the heap allocations created by `fetchWithResult`.
+    /// Safe to call only after the loop has stopped / `Loop.run()` returned.
+    pub fn cleanupFetchResult(self: *Client, result: *FetchResult) void {
+        const ctx_void = result._ctx orelse return;
+        result._ctx = null;
+
+        const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
+        ctx.conn.deinit();
+        self.allocator.destroy(ctx.conn);
+        self.allocator.destroy(ctx);
+    }
     
     // Simplest fetch: Connects, sends request, prints response (for verification)
     pub fn fetch(self: *Client, host: []const u8, ip: []const u8, port: u16, path: []const u8) !void {
@@ -47,6 +62,7 @@ pub const Client = struct {
             .result = result,
             .finished = false,
         };
+        if (result) |r| r._ctx = ctx;
         
         conn.user_ctx = ctx;
         conn.on_connect = onConnect;
@@ -103,11 +119,6 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
         std.debug.print("HTTP Client: Error: {}\n", .{err});
         // Stop the loop so the caller can decide how to handle the error.
         ctx.conn.loop.stop();
-
-        // Best-effort cleanup: avoid leaking in tests.
-        ctx.conn.deinit();
-        ctx.allocator.destroy(ctx.conn);
-        ctx.allocator.destroy(ctx);
         return;
     }
 

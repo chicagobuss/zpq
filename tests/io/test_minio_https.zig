@@ -32,6 +32,7 @@ pub fn main() !void {
 
     var client = zpq.io.http.Client.init(&loop, allocator);
     var result = zpq.io.http.Client.FetchResult{};
+    defer client.cleanupFetchResult(&result);
     // Client deinit is manual in this simple impl? 
     // It doesn't have deinit, but it allocates ReqContexts.
     

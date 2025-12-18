@@ -12,6 +12,7 @@ pub fn main() !void {
 
     var client = zpq.io.http.Client.init(&loop, allocator);
     var result = zpq.io.http.Client.FetchResult{};
+    defer client.cleanupFetchResult(&result);
 
     std.debug.print("Testing HTTP Client against S3 (52.216.48.72)...\n", .{});
     

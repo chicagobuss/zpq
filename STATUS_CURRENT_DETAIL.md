@@ -1,14 +1,14 @@
 # ZPQ Technical Context & Deep Dive
 
-**Last Updated**: Dec 16, 2025
-**Current State**: **Breakthrough**: `libxev` now runs on macOS and Linux (Zig 0.16.0-dev). Moving to TLS integration.
+**Last Updated**: Dec 17, 2025
+**Current State**: **Breakthrough**: `libxev` + `boring_tls` stack verified. Core `http.Client` and `TlsConnection` implemented and verified against S3.
 
 ## 🏆 Milestone: Libxev + BoringTLS Integration
-We have successfully established a secure TLS 1.3 connection to `google.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on **both macOS M1 and Linux ARM64**.
+We have successfully established a secure TLS 1.3 connection to `google.com` AND `s3.amazonaws.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on **both macOS M1 and Linux ARM64**.
 
 *   **Verification**: 
-    *   **Local (macOS M1)**: `zig build --build-file micro_build.zig test-boring-connect` passes.
-    *   **Remote (Linux ARM64)**: `test-boring-connect` passes on `oci-josh-arm-vm`.
+    *   **Local (macOS M1)**: `zig build --build-file micro_build.zig test-http-client` passes.
+    *   **Remote (Linux ARM64)**: `test-boring-connect` and `test-s3-head` pass on `oci-josh-arm-vm`.
 *   **Key Fixes**:
     *   **"Unknown Target CPU"**: Patched `boring_tls/build.zig` to define `_M_ARM64` for `aarch64` targets, resolving BoringSSL header compilation errors on M1 and Linux ARM.
     *   **Build Isolation**: Created `micro_build.zig` to run experimental tests without polluting the main `build.zig`.
@@ -69,18 +69,21 @@ We have successfully established a secure TLS 1.3 connection to `google.com` usi
 
 ### Development Roadmap (Micro-Test Driven)
 
-#### Phase 1: Micro-Tests (Current)
+#### Phase 1: Micro-Tests (Completed)
 1.  **[DONE] TCP Connectivity (`test_xev_tcp`)**: 
     *   Proved `libxev` works on macOS and Linux.
 2.  **[DONE] TLS Handshake (`test_boring_connect`)**:
     *   **Goal**: Verify "BIO Pair" pattern for `boring_tls` + `libxev`.
     *   **Action**: `tests/io/test_boring_connect.zig` successfully connects to `google.com:443` on macOS and Linux ARM64.
-3.  **[NEXT] S3 Protocol (`test_s3_head`)**:
-    *   **Goal**: Verify S3 specifics (Host header, signature).
-    *   **Action**: Connect to S3 bucket, send HEAD.
+3.  **[DONE] S3 Protocol (`test_s3_head`)**:
+    *   **Goal**: Verify S3 protocol over TLS.
+    *   **Action**: Successfully sent HEAD request to `s3.amazonaws.com` and received HTTP 405 (Method Not Allowed), confirming transport and protocol functionality on both platforms.
 
-#### Phase 2: Implementation & Integration
-1.  **Core Client**: Move successful micro-test code into `src/zpq/io/http/Client.zig`.
+#### Phase 2: Implementation & Integration (In Progress)
+1.  **Core Client**:
+    *   **[DONE] `TlsConnection`**: Implemented in `src/zpq/io/tls/connection.zig`. Supports async connect, read, write, close, and EOF handling.
+    *   **[DONE] `http.Client`**: Implemented in `src/zpq/io/http/client.zig`.
+    *   **Verification**: `zig build --build-file micro_build.zig test-http-client` passes (fetches HEAD from S3).
 2.  **Parquet Wiring**: Implement `readRanges` and hook into `ParquetFile`.
 
 ## 🏗️ Legacy Stack (Reference/Backup)

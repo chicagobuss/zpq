@@ -11,6 +11,8 @@ pub const core = struct {
 
 pub const io = struct {
     pub const interface = @import("zpq/io/interface.zig");
+    pub const http = @import("zpq/io/http/client.zig");
+    pub const tls = @import("zpq/io/tls/connection.zig");
 };
 
 // Aliases for compatibility

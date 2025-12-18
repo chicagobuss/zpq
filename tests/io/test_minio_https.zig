@@ -31,15 +31,24 @@ pub fn main() !void {
     std.debug.print("\nTesting HTTP Client against MinIO ({s}:{d})...\n", .{host, port});
 
     var client = zpq.io.http.Client.init(&loop, allocator);
+    var result = zpq.io.http.Client.FetchResult{};
     // Client deinit is manual in this simple impl? 
     // It doesn't have deinit, but it allocates ReqContexts.
     
     // Attempt a HEAD request to root
     // MinIO root usually returns 403 Forbidden (signature check) or 200 OK (if public)
     // or 400 Bad Request if Host header is missing/wrong.
-    try client.fetch(host, ip, port, "/");
+    try client.fetchWithResult(host, ip, port, "/", &result);
 
     try loop.run(.until_done);
+
+    if (result.err) |err| {
+        // Connection-close after we got a response is expected for `Connection: close`.
+        if (!(result.got_any_data and (err == error.EOF or err == error.TlsConnectionClosed))) {
+            return err;
+        }
+    }
+    if (!result.got_any_data) return error.NoResponse;
 
     std.debug.print("\nMinIO Test Complete.\n", .{});
 }

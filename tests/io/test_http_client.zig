@@ -11,6 +11,7 @@ pub fn main() !void {
     defer loop.deinit();
 
     var client = zpq.io.http.Client.init(&loop, allocator);
+    var result = zpq.io.http.Client.FetchResult{};
 
     std.debug.print("Testing HTTP Client against S3 (52.216.48.72)...\n", .{});
     
@@ -22,8 +23,16 @@ pub fn main() !void {
     // I should improve Client to take separate IP and Hostname if needed.
     // For now, I'll update Client.fetch to take `ip` and `host`.
     
-    try client.fetch("s3.amazonaws.com", "52.216.48.72", 443, "/");
+    try client.fetchWithResult("s3.amazonaws.com", "52.216.48.72", 443, "/", &result);
 
     try loop.run(.until_done);
+
+    if (result.err) |err| {
+        // Connection-close after we got a full response is expected for `Connection: close`.
+        if (!(result.got_any_data and (err == error.EOF or err == error.TlsConnectionClosed))) {
+            return err;
+        }
+    }
+    if (!result.got_any_data) return error.NoResponse;
 }
 

@@ -23,17 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: pip install pyarrow
-
-      - name: Generate Fixtures
-        run: python3 tools/fixtures/gen.py
-
       - name: Set up Zig
         run: |
           ZIG_VERSION=$(cat .zig-version)
@@ -58,6 +47,6 @@ jobs:
 
       - name: Run Inspector Verification
         run: |
-          zig build run -- inspect data/simple.parquet
-          zig build run -- inspect data/required.parquet
+          zig build run -- inspect ci/fixtures/parquet/simple.parquet
+          zig build run -- inspect ci/fixtures/parquet/required.parquet
 

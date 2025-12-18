@@ -123,7 +123,19 @@ clean:
 
 # Run local CI via act (requires act installed)
 ci:
-    act
+    act --container-architecture linux/amd64 -P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Run local CI for ARM64 (Native on M1/M2 Mac)
+ci-arm:
+    act -j test -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
+
+# Cross-check experimental stack
+cross-check-experimental:
+    @echo "Building experimental stack for x86_64-linux..."
+    zig build --build-file micro_build.zig -Dtarget=x86_64-linux
+    @echo "Building experimental stack for aarch64-linux..."
+    zig build --build-file micro_build.zig -Dtarget=aarch64-linux
+    @echo "Experimental targets compile successfully!"
 
 # Run local CI in watch mode (requires act)
 watch-ci:

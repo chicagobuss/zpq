@@ -53,6 +53,9 @@ ssh oci-josh-arm-vm "
     echo 'Zig version:'
     zig version
     
+    echo \"Cleaning zig-cache to ensure fresh build...\"
+    rm -rf .zig-cache zig-out
+
     echo \"Running \$STEP...\"
     zig build -Dexperimental \"\$STEP\"
 "

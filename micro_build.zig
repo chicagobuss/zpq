@@ -51,4 +51,24 @@ pub fn build(b: *std.Build) void {
         const step = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
         step.dependOn(&run.step);
     }
+
+    // 3. test_s3_head
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("tests/io/test_s3_head.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("xev", xev_mod);
+        mod.addImport("boring_tls", boring_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "test_s3_head",
+            .root_module = mod,
+        });
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("test-s3-head", "Run S3 HEAD request test");
+        step.dependOn(&run.step);
+    }
 }

@@ -312,5 +312,35 @@ pub fn build(b: *std.Build) void {
             const step = b.step("test-minio-https", "Run HTTP Client against local MinIO");
             step.dependOn(&run.step);
         }
+
+        // 6. test_minio_range_get
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_minio_range_get.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+            mod.addImport("response_parser", b.createModule(.{
+                .root_source_file = b.path("src/zpq/io/http/response_parser.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+            mod.addImport("minio_fixtures", b.createModule(.{
+                .root_source_file = b.path("ci/fixtures/minio/fixtures.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+
+            const exe_minio_range = b.addExecutable(.{
+                .name = "test_minio_range_get",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_minio_range);
+            const step = b.step("test-minio-range-get", "Run MinIO TLS Range GET integration test");
+            step.dependOn(&run.step);
+        }
     }
 }

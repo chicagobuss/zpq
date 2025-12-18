@@ -1,6 +1,6 @@
 # ZPQ Technical Context & Deep Dive
 
-**Last Updated**: Dec 17, 2025
+**Last Updated**: Dec 18, 2025
 **Current State**: **Breakthrough**: `libxev` + `boring_tls` stack verified. Core `http.Client` and `TlsConnection` implemented and verified against S3.
 
 ## 🏆 Milestone: Libxev + BoringTLS Integration
@@ -85,8 +85,35 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
     *   **[DONE] `http.Client`**: Implemented in `src/zpq/io/http/client.zig`.
     *   **Verification**: `zig build --build-file micro_build.zig test-http-client` passes (fetches HEAD from S3).
     *   **[DONE] MinIO Verification**: Verified `zpq` against local MinIO with self-signed TLS.
+    *   **[DONE] MinIO Range GET (Byte-Exact) Over TLS**:
+        *   **What we proved**:
+            *   TLS handshake + encrypted reads/writes using `libxev` + `boring_tls`.
+            *   HTTP/1.1 request/response over that TLS connection.
+            *   `Range: bytes=a-b` returns **exact expected bytes** for a known binary fixture.
+        *   **What we did NOT test**: **No Parquet parsing yet** (this is transport correctness only).
+        *   **Command**:
+            *   `python3 tools/no_output_timeout.py --idle-seconds 60 tools/minio_tls/setup_fixture.sh`
+            *   `python3 tools/no_output_timeout.py --idle-seconds 10 zig build -Dexperimental test-minio-range-get`
+        *   **Key implementation details**:
+            *   Fixture embedding is via `ci/fixtures/minio/fixtures.zig` (module) to satisfy Zig’s `@embedFile` package-path restriction.
+            *   `build.zig` wires that in as `minio_fixtures` for `test_minio_range_get`.
     *   **[DONE] Build Hygiene**: Added `just cross-check-experimental` to verify Linux compilation locally. Fixed Linux CI by isolating macOS-only `EventLoop`.
 2.  **Parquet Wiring**: Implement `readRanges` and hook into `ParquetFile`.
+
+## 🧠 Next-Session Insights (Keep Us Sane)
+*   **Docker + idle timeouts**: `docker-compose up/down` can be “quiet” for >10s while doing real work. Use a longer idle timeout for these steps (or ensure scripts print progress).
+*   **Always verify HTTPS health**: When MinIO certs are missing, it silently falls back to HTTP. We now generate certs automatically and poll `https://localhost:9000/minio/health/live` before running tests.
+*   **Self-signed TLS warning is expected**: `Certificate verification failed: 18` is fine for local MinIO (we run `--insecure` intentionally). Don’t “fix” it unless we’re testing trust stores.
+*   **Transport-first milestone is real value**: Range GET correctness is the core primitive for Parquet-on-S3 (footer + column chunk reads). Next work should focus on formalizing an S3 transport API and then wiring it into `RandomAccessSource` for Parquet.
+
+### Next: S3 Transport Skeleton (Execution Checklist)
+*   **API shape**: `Transport.head(host, ip, port, path, headers) -> ResponseMeta`
+*   **API shape**: `Transport.getRange(host, ip, port, path, range) -> []u8` (or caller-provided buffer)
+*   **Connection lifecycle**: explicit close; keep-alive later (start with `Connection: close` correctness).
+*   **HTTP parsing**: use `ResponseParser` for status/headers/body; ensure 206 path is solid.
+*   **MinIO as harness**:
+    *   Continue using `tools/minio_tls/setup_fixture.sh` + `test-minio-range-get` as the “golden transport test”.
+    *   Add 1 failing-case test next: missing object → 404, and ensure error path is deterministic.
 
 ## 🏗️ Legacy Stack (Reference/Backup)
 Located in `src/zpq/s3_legacy/`.

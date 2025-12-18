@@ -42,12 +42,24 @@
     *   [x] **Throughput**: ~911 MB/s (ZPQ) vs ~370 MB/s (PyArrow) vs ~265 MB/s (Rust Arrow) on M1 Max.
     *   [x] **Validation**: Verified against `parquet-read` and `pyarrow`.
 
+## ✅ Recent Findings (Dec 18, 2025): MinIO TLS Range GET Works (New I/O Stack)
+We now have a working end-to-end *transport* proof using the new stack (`libxev` + `boring_tls` + `zpq.io.http`):
+
+*   **What was tested**:
+    *   **TLS**: Real TLS handshake + encrypted I/O against a local TLS server (MinIO).
+    *   **HTTP**: Raw HTTP/1.1 request/response over that TLS connection.
+    *   **Range GET correctness**: Server returns exact expected bytes for a given `Range: bytes=a-b` request.
+*   **What was *not* tested**: **Parquet was not involved** (no `.parquet` parsing/decoding yet).
+*   **Why this matters for Parquet-on-S3**: Ranged GET + TLS + correct bytes is the core primitive needed to fetch Parquet footers and column chunks efficiently.
+
 ## 🧭 High-Performance HTTP Plan (Connection Reuse + Evented I/O)
 ZPQ’s current S3 support is functional, but `std.http.Client` has known limitations with aggressive keep-alive reuse in Zig 0.16 dev.
 We are moving to a purpose-built “Bare Metal” HTTP/1.1 client specialized for S3 (`HEAD` + `GET Range`) that:
 - Owns sockets explicitly (no hidden state machine).
 - Reuses connections deterministically (keep-alive + pooling).
 - Evolves from blocking correctness → evented kqueue/epoll for concurrency.
+
+**Next session focus**: Convert the MinIO “Range GET over TLS” proof into the first real **S3 transport** API (`HEAD` + `GET Range`), then wire it into the Parquet reader via `RandomAccessSource`.
 
 ### 📚 Reference Map (Bun)
 We keep Bun as a “how the pros do it” reference, but only need a small subset:

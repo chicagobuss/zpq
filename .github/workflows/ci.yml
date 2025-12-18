@@ -36,6 +36,9 @@ jobs:
           echo "Downloading Zig ${ZIG_VERSION} for ${ZIG_ARCH} from: $ZIG_URL"
           curl -L "$ZIG_URL" -o zig.tar.xz
           tar -xf zig.tar.xz
+          rm -f zig.tar.xz
+          # Make reruns (e.g. local `act`) idempotent
+          rm -rf zig
           mv zig-* zig
           echo "$(pwd)/zig" >> $GITHUB_PATH
 

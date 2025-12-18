@@ -9,7 +9,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64-linux
+            runs-on: ubuntu-latest
+            zig-arch: x86_64-linux
+          - arch: aarch64-linux
+            runs-on: ubuntu-latest-4-cores-arm
+            zig-arch: aarch64-linux
 
     steps:
       - uses: actions/checkout@v4
@@ -25,14 +34,21 @@ jobs:
       - name: Generate Fixtures
         run: python3 tools/fixtures/gen.py
 
-      - name: Read .zig-version
-        id: zig-version
-        run: echo "version=$(cat .zig-version)" >> $GITHUB_OUTPUT
-
       - name: Set up Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: ${{ steps.zig-version.outputs.version }}
+        run: |
+          ZIG_VERSION=$(cat .zig-version)
+          ZIG_ARCH="${{ matrix.zig-arch }}"
+          # Fetch download URL from ziglang.org JSON API
+          if [ "$ZIG_VERSION" = "master" ]; then
+            ZIG_URL=$(curl -s https://ziglang.org/download/index.json | jq -r ".master.\"${ZIG_ARCH}\".tarball")
+          else
+            ZIG_URL=$(curl -s https://ziglang.org/download/index.json | jq -r ".\"${ZIG_VERSION}\".\"${ZIG_ARCH}\".tarball")
+          fi
+          echo "Downloading Zig ${ZIG_VERSION} for ${ZIG_ARCH} from: $ZIG_URL"
+          curl -L "$ZIG_URL" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          mv zig-* zig
+          echo "$(pwd)/zig" >> $GITHUB_PATH
 
       - name: Build
         run: zig build

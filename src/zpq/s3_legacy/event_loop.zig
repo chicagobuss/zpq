@@ -1,8 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// A minimal event loop wrapper around kqueue (macOS/BSD) or epoll (Linux).
 /// Currently hardcoded for kqueue since we are on macOS.
-pub const EventLoop = struct {
+pub const EventLoop = if (builtin.os.tag.isDarwin() or builtin.os.tag == .freebsd) struct {
     kq_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
     
@@ -101,6 +102,23 @@ pub const EventLoop = struct {
         }
         
         return n;
+    }
+} else struct {
+    // Stub for non-macOS/BSD platforms - this should not be used on Linux
+    allocator: std.mem.Allocator = undefined,
+    pub fn init(_: std.mem.Allocator) !@This() {
+        return error.UnsupportedPlatform;
+    }
+    pub fn deinit(_: *@This()) void {}
+    pub fn registerRead(_: *@This(), _: std.posix.fd_t, _: *anyopaque) !void {
+        return error.UnsupportedPlatform;
+    }
+    pub fn registerWrite(_: *@This(), _: std.posix.fd_t, _: *anyopaque) !void {
+        return error.UnsupportedPlatform;
+    }
+    pub fn unregister(_: *@This(), _: std.posix.fd_t) void {}
+    pub fn tick(_: *@This()) !usize {
+        return error.UnsupportedPlatform;
     }
 };
 

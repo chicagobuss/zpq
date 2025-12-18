@@ -3,14 +3,14 @@
 **Last Updated**: Dec 16, 2025
 **Current State**: **Breakthrough**: `libxev` now runs on macOS and Linux (Zig 0.16.0-dev). Moving to TLS integration.
 
-## 🏆 Milestone: Libxev Cross-Platform Stability
-We successfully patched `libxev` to work with the bleeding-edge Zig 0.16 compiler, bypassing significant standard library regressions.
-*   **Problem**: `std.net` removed, `@Type` removed, `std.posix` wrappers missing errors (`SocketNotListening`, `AddressInUse`).
-*   **Solution**:
-    *   Created `shim_net.zig` to replace `std.net.Address`.
-    *   Patched `dynamic.zig` to use `@Enum`/`@Union` instead of `@Type`.
-    *   Injected raw syscall shims (`accept`, `connect`, `getsockopt`) into `kqueue.zig` to bypass `std`.
-*   **Verification**: `test_xev_tcp.zig` passes on macOS (native) and Linux (Docker `debian:bookworm-slim`).
+## 🏆 Milestone: Libxev + BoringTLS Integration
+We have successfully established a secure TLS 1.3 connection to `google.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on macOS M1.
+
+*   **Verification**: `zig build --build-file micro_build.zig test-boring-connect` passes.
+*   **Key Fixes**:
+    *   **"Unknown Target CPU"**: Patched `boring_tls/build.zig` to define `_M_ARM64` for `aarch64` targets, resolving BoringSSL header compilation errors on M1.
+    *   **Build Isolation**: Created `micro_build.zig` to run experimental tests without polluting the main `build.zig`.
+    *   **BIO Pattern**: Verified that `boring_tls` interacts correctly with non-blocking `libxev` sockets via the standard BIO interface.
 
 ## ⚡ Performance Verification
 *   **Benchmark**: TCP Echo (Sequential, Single Connection, 500k iterations)
@@ -70,10 +70,10 @@ We successfully patched `libxev` to work with the bleeding-edge Zig 0.16 compile
 #### Phase 1: Micro-Tests (Current)
 1.  **[DONE] TCP Connectivity (`test_xev_tcp`)**: 
     *   Proved `libxev` works on macOS and Linux.
-2.  **[NEXT] TLS Handshake (`test_boring_connect`)**:
+2.  **[DONE] TLS Handshake (`test_boring_connect`)**:
     *   **Goal**: Verify "BIO Pair" pattern for `boring_tls` + `libxev`.
-    *   **Action**: Create `tests/io/test_boring_connect.zig`. Connect to `google.com:443`.
-3.  **S3 Protocol (`test_s3_head`)**:
+    *   **Action**: `tests/io/test_boring_connect.zig` successfully connects to `google.com:443` and retrieves HTTP response.
+3.  **[NEXT] S3 Protocol (`test_s3_head`)**:
     *   **Goal**: Verify S3 specifics (Host header, signature).
     *   **Action**: Connect to S3 bucket, send HEAD.
 

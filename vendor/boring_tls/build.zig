@@ -33,6 +33,15 @@ pub fn build(b: *std.Build) !void {
     });
 
     boring_tls_mod.addIncludePath(boringssl_dep.path("include"));
+    boring_tls_mod.addCMacro("OPENSSL_64_BIT", "1");
+    boring_tls_mod.addCMacro("OPENSSL_NO_ASM", "1");
+
+    if (target.result.cpu.arch == .x86_64) {
+        boring_tls_mod.addCMacro("__x86_64__", "1");
+    } else if (target.result.cpu.arch == .aarch64) {
+        boring_tls_mod.addCMacro("_M_ARM64", "1");
+    }
+
     boring_tls_mod.linkLibrary(boringssl_crypto);
     boring_tls_mod.linkLibrary(boringssl_ssl);
 }

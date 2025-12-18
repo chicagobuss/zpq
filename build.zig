@@ -157,23 +157,6 @@ pub fn build(b: *std.Build) void {
     const step_test_xev_tcp = b.step("test-xev-tcp", "Run basic xev TCP test");
     step_test_xev_tcp.dependOn(&run_test_xev_tcp.step);
 
-    // bench_ping_pongs
-    const bench_ping_pongs_mod = b.createModule(.{
-        .root_source_file = b.path("tests/bench/ping_pongs.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_ping_pongs_mod.addImport("xev", libxev_mod);
-
-    const bench_ping_pongs_exe = b.addExecutable(.{
-        .name = "bench_ping_pongs",
-        .root_module = bench_ping_pongs_mod,
-    });
-    const run_bench_ping_pongs = b.addRunArtifact(bench_ping_pongs_exe);
-
-    const step_bench_ping_pongs = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
-    step_bench_ping_pongs.dependOn(&run_bench_ping_pongs.step);
-
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&lib_unit_tests.step);
@@ -182,7 +165,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&test_async_source_exe.step);
     check_step.dependOn(&test_tls_exe.step);
     check_step.dependOn(&test_xev_tcp_exe.step);
-    check_step.dependOn(&bench_ping_pongs_exe.step);
 
     // AWS Lambda Bootstrap
     const bootstrap_mod = b.createModule(.{
@@ -227,4 +209,3 @@ pub fn build(b: *std.Build) void {
     const build_lambda_bench_step = b.step("build-lambda-bench", "Build lambda benchmark bootstrap");
     build_lambda_bench_step.dependOn(&install_bench.step);
 }
-

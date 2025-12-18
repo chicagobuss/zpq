@@ -208,4 +208,109 @@ pub fn build(b: *std.Build) void {
 
     const build_lambda_bench_step = b.step("build-lambda-bench", "Build lambda benchmark bootstrap");
     build_lambda_bench_step.dependOn(&install_bench.step);
+
+    // --- Experimental / Micro-tests ---
+    const enable_experimental = b.option(bool, "experimental", "Enable experimental tests/benchmarks") orelse false;
+
+    if (enable_experimental) {
+        // 1. test_boring_connect
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_boring_connect.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("boring_tls", boring_tls_mod);
+
+            const exe_boring = b.addExecutable(.{
+                .name = "test_boring_connect",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_boring);
+            const step = b.step("test-boring-connect", "Run BoringTLS connection test");
+            step.dependOn(&run.step);
+        }
+
+        // 2. bench_ping_pongs
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/bench/ping_pongs.zig"),
+                .target = target,
+                // Benchmark should default to ReleaseFast if not specified, but respect user option
+                .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+
+            const exe_ping = b.addExecutable(.{
+                .name = "bench_ping_pongs",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_ping);
+            const step = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
+            step.dependOn(&run.step);
+        }
+
+        // 3. test_s3_head
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_s3_head.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("boring_tls", boring_tls_mod);
+
+            const exe_s3 = b.addExecutable(.{
+                .name = "test_s3_head",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_s3);
+            const step = b.step("test-s3-head", "Run S3 HEAD request test");
+            step.dependOn(&run.step);
+        }
+
+        // 4. test_http_client
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_http_client.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const exe_http = b.addExecutable(.{
+                .name = "test_http_client",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_http);
+            const step = b.step("test-http-client", "Run HTTP Client Integration Test");
+            step.dependOn(&run.step);
+        }
+
+        // 5. test_minio_https
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_minio_https.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const exe_minio = b.addExecutable(.{
+                .name = "test_minio_https",
+                .root_module = mod,
+            });
+
+            const run = b.addRunArtifact(exe_minio);
+            const step = b.step("test-minio-https", "Run HTTP Client against local MinIO");
+            step.dependOn(&run.step);
+        }
+    }
 }

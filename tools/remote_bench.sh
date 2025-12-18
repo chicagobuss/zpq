@@ -17,12 +17,10 @@ fi
 echo "Latest Zig URL: $ZIG_URL"
 
 STEP=${1:-test-s3-head}
-BUILD_FILE=${2:-micro_build.zig}
 
 # Remote execution
 ssh oci-josh-arm-vm "
     export STEP='$STEP'
-    export BUILD_FILE='$BUILD_FILE'
     export ZIG_URL='$ZIG_URL'
     set -e
     mkdir -p ~/code/zpq-work
@@ -55,6 +53,6 @@ ssh oci-josh-arm-vm "
     echo 'Zig version:'
     zig version
     
-    echo \"Running \$STEP with \$BUILD_FILE...\"
-    zig build --build-file \"\$BUILD_FILE\" \"\$STEP\"
+    echo \"Running \$STEP...\"
+    zig build -Dexperimental \"\$STEP\"
 "

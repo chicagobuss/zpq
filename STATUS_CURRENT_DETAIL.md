@@ -44,6 +44,18 @@ We successfully patched `libxev` to work with the bleeding-edge Zig 0.16 compile
     *   **Do**: Search web/Discord for specific 0.16 migration guides.
     *   **Don't**: Guess method signatures based on 0.13 docs.
 
+## 🔒 TLS Integration Roadmap (BoringTLS)
+**Goal**: Unified, high-performance TLS across all platforms (macOS/Linux) using `boring_tls`.
+
+*   **Strategy**: "Filter Pattern" (BIO).
+    *   Treat TLS as a pure data transformation layer, decoupled from the underlying socket.
+    *   Use `libxev` for transport (already verified).
+    *   Use `boring_tls` for crypto (statically linked, identical behavior everywhere).
+*   **Phases**:
+    1.  **The Dumb Adapter**: Implement a buffer-based BIO shim that `boring_tls` can read/write to.
+    2.  **The Pump (Microtest)**: Manually drive the handshake loop in a single file (`test_boring_connect.zig`).
+    3.  **The Component**: Encapsulate the pump into a reusable `TlsClient` struct adhering to `std.Io`.
+
 ## 🚀 New I/O Stack Implementation Plan
 
 **Goal**: Replace flaky legacy stack with robust `libxev` (event loop) + `boring_tls` (OpenSSL) implementation.

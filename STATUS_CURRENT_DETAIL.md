@@ -85,6 +85,7 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
     *   **[DONE] `http.Client`**: Implemented in `src/zpq/io/http/client.zig`.
     *   **Verification**: `zig build --build-file micro_build.zig test-http-client` passes (fetches HEAD from S3).
     *   **[DONE] MinIO Verification**: Verified `zpq` against local MinIO with self-signed TLS.
+    *   **[DONE] Build Hygiene**: Added `just cross-check-experimental` to verify Linux compilation locally. Fixed Linux CI by isolating macOS-only `EventLoop`.
 2.  **Parquet Wiring**: Implement `readRanges` and hook into `ParquetFile`.
 
 ## 🏗️ Legacy Stack (Reference/Backup)

@@ -72,6 +72,9 @@ ssh "${HOST}" "bash -lc '
 
   cd ${REMOTE_DIR}
 
+  REMOTE_CI_IDLE_SECONDS=\"\${REMOTE_CI_IDLE_SECONDS:-120}\"
+  REMOTE_CI_ZIG_VERBOSE=\"\${REMOTE_CI_ZIG_VERBOSE:-1}\"
+
   # Install Zig if needed (pinned to master build for this session)
   export PATH=\"\$HOME/zig:\$PATH\"
   if ! command -v zig >/dev/null 2>&1; then
@@ -90,24 +93,32 @@ ssh "${HOST}" "bash -lc '
   # Prefer the no-output timeout wrapper if python3 exists
   run() {
     if command -v python3 >/dev/null 2>&1; then
-      python3 tools/no_output_timeout.py --idle-seconds 20 \"\$@\"
+      python3 tools/no_output_timeout.py --idle-seconds \"\${REMOTE_CI_IDLE_SECONDS}\" \"\$@\"
     else
       \"\$@\"
     fi
   }
 
+  zig_build() {
+    if [[ \"\${REMOTE_CI_ZIG_VERBOSE}\" == \"1\" ]]; then
+      run zig build --verbose \"\$@\"
+    else
+      run zig build \"\$@\"
+    fi
+  }
+
   echo \"== zig build check ==\"
-  run zig build check
+  zig_build check
 
   echo \"== zig build test ==\"
-  run zig build test --summary all
+  zig_build test --summary all
 
   echo \"== zig build -Dexperimental test-http-client ==\"
-  run zig build -Dexperimental test-http-client
+  zig_build -Dexperimental test-http-client
 
   if [[ \"${SUITE}\" == \"full\" ]]; then
     echo \"== zig build test-io ==\"
-    run zig build test-io
+    zig_build test-io
   fi
 
   echo \"Remote CI OK\"

@@ -123,11 +123,28 @@ clean:
 
 # Run local CI via act (requires act installed)
 ci:
-    act --container-architecture linux/amd64 -P ubuntu-latest=catthehacker/ubuntu:act-latest
+    act --container-architecture linux/amd64 -P ubuntu-latest=catthehacker/ubuntu:act-latest -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
 
 # Run local CI for ARM64 (Native on M1/M2 Mac)
 ci-arm:
-    act -j test -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
+    act -j test --matrix arch:aarch64-linux --container-architecture linux/arm64 -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
+
+# Remote CI (real hardware)
+remote-ci-arm:
+    ./tools/remote_ci.sh oci-josh-arm-vm
+
+# Run remote CI against an amd64 host you can SSH to:
+#   just remote-ci-amd64 jrmediapyro-zt
+remote-ci-amd64 HOST:
+    ./tools/remote_ci.sh {{HOST}}
+
+# Heavy CI: local fast checks + real-hardware remote CI (arm + amd64)
+#   just heavyci jrmediapyro-zt
+heavyci AMD64_HOST:
+    just lint
+    just cross-check-experimental
+    just remote-ci-arm
+    just remote-ci-amd64 {{AMD64_HOST}}
 
 # Cross-check experimental stack
 cross-check-experimental:

@@ -100,4 +100,24 @@ pub fn build(b: *std.Build) void {
         const step = b.step("test-http-client", "Run HTTP Client Integration Test");
         step.dependOn(&run.step);
     }
+
+    // 5. test_minio_https
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("tests/io/test_minio_https.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("xev", xev_mod);
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "test_minio_https",
+            .root_module = mod,
+        });
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("test-minio-https", "Run HTTP Client against local MinIO");
+        step.dependOn(&run.step);
+    }
 }

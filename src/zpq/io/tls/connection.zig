@@ -2,6 +2,8 @@ const std = @import("std");
 const xev = @import("xev");
 const boring = @import("boring_tls");
 
+const log = std.log.scoped(.tls);
+
 /// A wrapper around a TCP socket and a BoringTLS client.
 /// This struct manages the "pumping" of data between the raw TCP socket
 /// and the TLS state machine.
@@ -74,7 +76,7 @@ pub const Connection = struct {
     }
     
     pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
-         // std.debug.print("DEBUG: Connection.connect called\n", .{});
+         log.debug("Connection.connect called", .{});
          self.tcp = try xev.TCP.init(addr);
          self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
     }
@@ -95,7 +97,7 @@ pub const Connection = struct {
         const out_slice_res = self.tls.processOutgoing(null);
         if (out_slice_res) |out_slice_opt| {
              if (out_slice_opt) |data| {
-                // std.debug.print("DEBUG: TLS wants to write {} bytes to TCP\n", .{data.len});
+                log.debug("TLS wants to write {} bytes to TCP", .{data.len});
                 const buf = self.allocator.dupe(u8, data) catch |err| {
                     if (self.on_error) |cb| cb(self.user_ctx, err);
                     return;
@@ -104,13 +106,13 @@ pub const Connection = struct {
                 return;
              }
         } else |err| {
-             // std.debug.print("DEBUG: pump processOutgoing error: {}\n", .{err});
+             log.debug("pump processOutgoing error: {}", .{err});
              if (self.on_error) |cb| cb(self.user_ctx, err);
              return;
         }
 
         // 2. Need Input? (TCP -> TLS)
-        // std.debug.print("DEBUG: pump reading from TCP\n", .{});
+        // log.debug("pump reading from TCP", .{});
         self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
     }
 
@@ -124,7 +126,7 @@ pub const Connection = struct {
         _ = loop; _ = c; _ = s; 
         _ = self;
         _ = r catch {};
-        // std.debug.print("DEBUG: Connection closed.\n", .{});
+        log.debug("Connection closed.", .{});
         return .disarm;
     }
 
@@ -138,7 +140,7 @@ pub const Connection = struct {
         _ = loop; _ = c; _ = s;
         const me = self.?;
         if (r) |_| {
-            // std.debug.print("DEBUG: TCP Connected\n", .{});
+            log.debug("TCP Connected", .{});
             me.connected = true;
             // Start Handshake
              const out_slice_res = me.tls.startHandshake();
@@ -191,7 +193,7 @@ pub const Connection = struct {
         if (r) |n| {
             if (n == 0) {
                  // EOF
-                 // std.debug.print("DEBUG: TCP EOF. Closing...\n", .{});
+                 log.debug("TCP EOF. Closing...", .{});
                  me.close();
                  // Call user error callback with EOF error? Or just close?
                  if (me.on_error) |cb| cb(me.user_ctx, error.EOF);
@@ -216,7 +218,7 @@ pub const Connection = struct {
             }
             me.pump();
         } else |err| {
-             // std.debug.print("DEBUG: Read Error: {}\n", .{err});
+             log.debug("Read Error: {}", .{err});
              me.close();
              if (me.on_error) |cb| cb(me.user_ctx, err);
         }

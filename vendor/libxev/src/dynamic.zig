@@ -428,11 +428,11 @@ fn DynamicPollEvent(comptime xev: type) type {
 /// subset making it easy to convert between the two.
 fn EnumSubset(comptime T: type, comptime values: []const T) type {
     const fields = comptime fields: {
-        var fields: [values.len]std.builtin.Type.EnumField = undefined;
-        for (values, 0..) |value, i| fields[i] = .{
-            .name = @tagName(value),
-            .value = @intFromEnum(value),
-        };
+    var fields: [values.len]std.builtin.Type.EnumField = undefined;
+    for (values, 0..) |value, i| fields[i] = .{
+        .name = @tagName(value),
+        .value = @intFromEnum(value),
+    };
         break :fields fields;
     };
 
@@ -462,31 +462,31 @@ fn Union(
     comptime tagged: bool,
 ) type {
     const info = comptime blk: {
-        var largest: usize = 0;
-        var fields: [bes.len + 1]std.builtin.Type.UnionField = undefined;
+    var largest: usize = 0;
+    var fields: [bes.len + 1]std.builtin.Type.UnionField = undefined;
         var attrs: [bes.len + 1]std.builtin.Type.UnionField.Attributes = undefined;
-        for (bes, 0..) |be, i| {
-            var T: type = be.Api();
-            for (field) |f| T = @field(T, f);
-            largest = @max(largest, @sizeOf(T));
-            fields[i] = .{
-                .name = @tagName(be),
-                .type = T,
-                .alignment = @alignOf(T),
-            };
+    for (bes, 0..) |be, i| {
+        var T: type = be.Api();
+        for (field) |f| T = @field(T, f);
+        largest = @max(largest, @sizeOf(T));
+        fields[i] = .{
+            .name = @tagName(be),
+            .type = T,
+            .alignment = @alignOf(T),
+        };
             attrs[i] = .{};
         }
 
-        var count: usize = bes.len;
-        if (largest == 0) {
-            fields[count] = .{
-                .name = "_zig_bug_padding",
-                .type = u8,
-                .alignment = @alignOf(u8),
-            };
+    var count: usize = bes.len;
+    if (largest == 0) {
+        fields[count] = .{
+            .name = "_zig_bug_padding",
+            .type = u8,
+            .alignment = @alignOf(u8),
+        };
             attrs[count] = .{};
-            count += 1;
-        }
+        count += 1;
+    }
         break :blk .{ .fields = fields, .attrs = attrs, .count = count };
     };
 

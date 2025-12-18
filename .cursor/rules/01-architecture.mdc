@@ -1,0 +1,26 @@
+---
+description: Architectural Guardrails & Patterns for ZPQ
+alwaysApply: false
+---
+# ZPQ Architecture & Guardrails regarding working with bleeding-edge 0.16.x zig
+
+## 1. The Golden Rule: `std.Io` Only
+*   **Business Logic Constraint**: `ParquetFile` and `S3Source` logic MUST NOT import `xev`, `epoll`, or `kqueue`.
+*   **Interface**: All I/O must go through `std.Io` interfaces (`Reader`, `Writer`, `SeekableStream`).
+*   **Pattern**: Inject `io: std.Io` into structs. Use adapters (e.g., `XevIo`) to bridge `libxev` to `std.Io` in `main.zig` or `bootstrap.zig`.
+
+## 2. Protocol Design: "Sans-I/O"
+*   **Decouple**: Separate protocol logic (S3 request formatting, SigV4, XML parsing) from socket operations.
+*   **Guardrail**: Prefer `Serializer.writeTo(writer)` over `socket.write(bytes)`.
+*   **Benefit**: Allows testing protocol logic with `ArrayList` writers without network mocks.
+
+## 3. Cancellation & Context
+*   **Explicit Context**: Long-running functions (e.g., `fetchRowGroup`) MUST accept a context or `Io` object.
+*   **Check**: Call `io.checkCancellation()` (or equivalent) between large chunks/iterations. Do not rely on implicit timeouts.
+
+## 4. Network Primitives (`shim_net`)
+*   **Compliance**: `shim_net.zig` types (`Stream`, `Address`) MUST strictly match `std.Io.net` signatures.
+*   **Swap-ability**: Ensure `shim_net` can be replaced by `std.Io.net` in blocking builds without code changes.
+
+## 5. TLS Abstraction
+*   **Wrapper**: Do not leak `boring_tls` types into core logic. Wrap implementation in `std.Io.Reader/Writer`.

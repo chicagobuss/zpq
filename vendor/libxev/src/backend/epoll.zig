@@ -958,19 +958,44 @@ pub const Completion = struct {
             => unreachable,
 
             .accept => |*op| .{
-                .accept = if (posix.accept(
-                    op.socket,
-                    &op.addr,
-                    &op.addr_size,
-                    op.flags,
-                )) |v|
-                    v
-                else |_|
-                    error.Unknown,
+                .accept = accept: {
+                    const rc = linux.accept4(
+                        op.socket,
+                        &op.addr,
+                        &op.addr_size,
+                        op.flags,
+                    );
+                    if (rc > -4096 and rc < 0) {
+                        const e: linux.E = @enumFromInt(rc);
+                        break :accept switch (e) {
+                            .AGAIN => error.WouldBlock,
+                            else => error.Unknown,
+                        };
+                    }
+                     break :accept @intCast(rc);
+                },
             },
 
             .connect => |*op| .{
-                .connect = if (posix.getsockoptError(op.socket)) {} else |err| err,
+                .connect = connect: {
+                    var err_val: i32 = 0;
+                    var len: u32 = @sizeOf(i32);
+                    const rc = linux.getsockopt(op.socket, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&err_val), &len);
+                    if (rc != 0) {
+                         break :connect error.Unknown;
+                    }
+                    if (err_val != 0) {
+                        const e: linux.E = @enumFromInt(err_val);
+                        break :connect switch (e) {
+                             .TIMEDOUT => error.Timeout,
+                             .CONNREFUSED => error.ConnectionRefused,
+                             .INPROGRESS => error.WouldBlock,
+                             .ADDRINUSE => error.AddressInUse,
+                             .NETUNREACH => error.NetworkUnreachable,
+                             else => error.Unknown,
+                        };
+                    }
+                },
             },
 
             .poll => .{ .poll = {} },
@@ -1032,15 +1057,18 @@ pub const Completion = struct {
             },
 
             .recvmsg => |*op| res: {
-                const res = std.os.linux.recvmsg(op.fd, op.msghdr, 0);
+                const rc = linux.recvmsg(op.fd, @ptrCast(op.msghdr), 0);
+                if (rc > -4096 and rc < 0) {
+                     const e: linux.E = @enumFromInt(rc);
+                     break :res .{
+                        .recvmsg = switch (e) {
+                            .AGAIN => error.WouldBlock,
+                            else => error.Unknown,
+                        },
+                     };
+                }
                 break :res .{
-                    .recvmsg = if (res == 0)
-                        error.EOF
-                    else if (res > 0)
-                        res
-                    else switch (posix.errno(res)) {
-                        else => |err| posix.unexpectedErrno(err),
-                    },
+                    .recvmsg = if (rc == 0) error.EOF else rc,
                 };
             },
 
@@ -1340,6 +1368,7 @@ pub const ShutdownError = posix.EpollCtlError || posix.ShutdownError || error{
 pub const ConnectError = posix.EpollCtlError || posix.ConnectError || error{
     DupFailed,
     Unknown,
+    AddressInUse,
 };
 
 pub const ReadError = ThreadPoolError || posix.EpollCtlError ||

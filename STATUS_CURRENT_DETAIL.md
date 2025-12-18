@@ -4,11 +4,13 @@
 **Current State**: **Breakthrough**: `libxev` now runs on macOS and Linux (Zig 0.16.0-dev). Moving to TLS integration.
 
 ## 🏆 Milestone: Libxev + BoringTLS Integration
-We have successfully established a secure TLS 1.3 connection to `google.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on macOS M1.
+We have successfully established a secure TLS 1.3 connection to `google.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on **both macOS M1 and Linux ARM64**.
 
-*   **Verification**: `zig build --build-file micro_build.zig test-boring-connect` passes.
+*   **Verification**: 
+    *   **Local (macOS M1)**: `zig build --build-file micro_build.zig test-boring-connect` passes.
+    *   **Remote (Linux ARM64)**: `test-boring-connect` passes on `oci-josh-arm-vm`.
 *   **Key Fixes**:
-    *   **"Unknown Target CPU"**: Patched `boring_tls/build.zig` to define `_M_ARM64` for `aarch64` targets, resolving BoringSSL header compilation errors on M1.
+    *   **"Unknown Target CPU"**: Patched `boring_tls/build.zig` to define `_M_ARM64` for `aarch64` targets, resolving BoringSSL header compilation errors on M1 and Linux ARM.
     *   **Build Isolation**: Created `micro_build.zig` to run experimental tests without polluting the main `build.zig`.
     *   **BIO Pattern**: Verified that `boring_tls` interacts correctly with non-blocking `libxev` sockets via the standard BIO interface.
 
@@ -72,7 +74,7 @@ We have successfully established a secure TLS 1.3 connection to `google.com` usi
     *   Proved `libxev` works on macOS and Linux.
 2.  **[DONE] TLS Handshake (`test_boring_connect`)**:
     *   **Goal**: Verify "BIO Pair" pattern for `boring_tls` + `libxev`.
-    *   **Action**: `tests/io/test_boring_connect.zig` successfully connects to `google.com:443` and retrieves HTTP response.
+    *   **Action**: `tests/io/test_boring_connect.zig` successfully connects to `google.com:443` on macOS and Linux ARM64.
 3.  **[NEXT] S3 Protocol (`test_s3_head`)**:
     *   **Goal**: Verify S3 specifics (Host header, signature).
     *   **Action**: Connect to S3 bucket, send HEAD.

@@ -18,7 +18,7 @@ ZPQ is built for scenarios where resource utilization and execution time are pri
 
 ## Architectural Implementation
 
-The codebase adheres to the following internal standards:
+The codebase does its best to adhere to the following internal standards:
 
 - **Protocol/Transport Separation**: Protocol logic (e.g., S3 request formatting) is decoupled from socket operations. This allows protocol verification against memory buffers without requiring network connectivity.
 - **Abstract I/O**: Business logic interacts with a `RandomAccessSource` interface. Platform-specific primitives (such as `io_uring` or `kqueue`) are isolated within transport implementations.
@@ -29,22 +29,10 @@ The codebase adheres to the following internal standards:
 
 ZPQ is tested for stability across several environments:
 
-- **Platform Support**: Verified on Linux (`io_uring`), macOS (`kqueue`), and WSL2.
+- **Platform Support**: Verified on Linux (`io_uring`), macOS (`kqueue`).
 - **Architecture Support**: Native testing for x86_64 and ARM64.
 - **Component Isolation**: Critical components (DNS stack, TLS integration, HTTP state machine) are verified through independent micro-tests prior to integration.
 - **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
-
-## Performance
-
-Initial measurements for scan throughput and metadata retrieval are documented below.
-
-| Implementation | Local Throughput (Values) | S3 Metadata Latency |
-| :--- | :--- | :--- |
-| **ZPQ (Zig)** | **~857 MVal/s** | **~0.58s** |
-| PyArrow (Python) | N/A | ~0.15s |
-| Polars (Rust) | N/A | ~0.40s |
-
-*S3 metadata retrieval time is currently subject to optimization via persistent connection management.*
 
 ## Documentation
 Additional technical detail is available in the following files:

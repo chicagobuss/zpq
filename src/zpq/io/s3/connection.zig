@@ -46,7 +46,7 @@ pub const Connection = struct {
         self.* = .{
             .loop = loop,
             .tcp = undefined,
-            .tls = if (use_tls) try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = false }) else null,
+            .tls = if (use_tls) try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = true }) else null,
             .allocator = allocator,
             .host = host_dupe,
             .use_tls = use_tls,

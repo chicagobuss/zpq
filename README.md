@@ -8,13 +8,13 @@ ZPQ is built for scenarios where resource utilization and execution time are pri
 
 ### Characteristics:
 - **Asynchronous I/O**: Utilizes a completion-based state machine for interleaved request execution on a single thread.
-- **Native Implementation**: S3, SigV4, and HTTP/1.1 protocols are implemented directly in Zig to minimize external dependencies.
+- **Minimal Dependencies**: The S3, SigV4, and HTTP/1.1 protocols are implemented directly in Zig to eliminate dependencies on large, general-purpose SDKs.
 - **Resource Constraints**: Optimized for low memory overhead and minimal binary size to improve AWS Lambda cold-start times.
 
 ### Scope:
 - **Analytical Workloads**: Focuses on performance for common analytical query patterns rather than exhaustive Parquet feature parity.
 - **Read-Oriented**: Designed for scanning and extracting data; it is not a query engine or storage manager.
-- **Dependency Isolation**: Does not wrap existing C/C++ SDKs; all protocol logic is implemented natively.
+- **Direct Implementation**: Does not wrap the AWS C++ or Rust SDKs; all protocol logic is implemented natively to ensure zero-copy performance.
 
 ## Architectural Implementation
 
@@ -36,11 +36,15 @@ While targeting the latest master branch, ZPQ prioritizes the architectural "spi
 - **Composition over Inheritance**: Transport implementations are composed of independent parts (DNS, TCP, TLS) rather than hidden behind a monolithic client object.
 
 ### Library Selection and the "Re-write" Rationale
-ZPQ is selective about external dependencies, favoring native re-writes for the core protocol stack:
-- **Protocol Re-writes (S3, HTTP/1.1, SigV4)**: These are implemented natively to avoid the significant overhead and "hidden" state machines of general-purpose SDKs. This allows for specialized optimizations like zero-allocation gap skipping.
-- **Bridging Libraries (`libxev`, `boring_tls`)**: We utilize these specific libraries as high-performance bridges:
-    - **`libxev`**: Provides a production-ready abstraction for `io_uring` and `kqueue` that exceeds the current capabilities of `std.Io`. It is isolated behind our `EventLoop` abstraction to allow for a future transition to native Zig async.
-    - **`boring_tls`**: Used to provide secure transport via statically-linked BoringSSL. Like `libxev`, it is wrapped in an adapter to ensure the core logic remains unaware of the TLS implementation details.
+ZPQ is selective about external dependencies, favoring native re-writes for the core protocol stack to maintain performance and small binary sizes.
+
+**Curated Dependencies:**
+- **`libxev`**: A high-performance, cross-platform event loop abstraction. We use it to bridge the gap while Zig's `std.Io` event loop matures. It is isolated behind our internal abstractions for a future transition to native Zig async.
+- **`boring_tls`**: Provides secure transport via statically-linked BoringSSL. This is required for secure communication with S3.
+- **`libc`**: Required for system-level networking primitives and DNS resolution (via `getaddrinfo`).
+
+**Protocol Re-writes (S3, HTTP/1.1, SigV4):**
+These are implemented natively in ZPQ to avoid the significant overhead of general-purpose SDKs. This allows for specialized optimizations like zero-allocation gap skipping.
 
 ## Testing and Verification
 

@@ -8,13 +8,15 @@
 
 ## Philosophy & Architecture
 *   **Lambda-First**: The ultimate goal is high-performance AWS Lambdas with minimal cold starts.
-    *   **Zero-Dependency Core**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
+    *   **No Runtime SDKs**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
     *   **Minimal Footprint**: Reduction of binary size and memory utilization.
 *   **The Spirit of Zig 0.16**: We align with upcoming 0.16 patterns today:
     *   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
     *   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
+    *   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
 *   **Pragmatic Library Usage**:
     *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level primitives (io_uring/kqueue) and secure transport while being isolated for a future transition to a purely native `std` stack.
+    *   **Exit Strategy**: We will migrate to `std.Io` once it reaches feature parity with `libxev` regarding completion-based I/O on Linux and macOS.
 *   **Dependency Boundaries**:
     *   Core Parquet logic remains pure logic with no I/O or transport knowledge.
     *   I/O is abstracted via the `RandomAccessSource` interface.

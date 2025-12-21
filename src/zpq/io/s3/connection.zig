@@ -20,6 +20,8 @@ pub const Connection = struct {
 
     // Internal Buffers
     read_buf: [16 * 1024]u8 = undefined, // S3 packets can be large
+    write_queue: std.ArrayList(u8),
+    write_cursor: usize = 0,
 
     // State
     host: []const u8,
@@ -27,12 +29,17 @@ pub const Connection = struct {
     connected: bool = false,
     handshake_complete: bool = false,
     closed: bool = false,
+    write_in_flight: bool = false,
 
     // Callbacks
     user_ctx: ?*anyopaque = null,
     on_connect: ?*const fn (conn: *Self, ctx: ?*anyopaque) void = null,
     on_data: ?*const fn (conn: *Self, ctx: ?*anyopaque, data: []const u8) void = null,
     on_error: ?*const fn (conn: *Self, ctx: ?*anyopaque, err: anyerror) void = null,
+    on_drain: ?*const fn (conn: *Self, ctx: ?*anyopaque) void = null,
+
+    pub const HIGH_WATER_MARK = 64 * 1024;
+    pub const LOW_WATER_MARK = 16 * 1024;
 
     const Self = @This();
 
@@ -48,6 +55,7 @@ pub const Connection = struct {
             .tcp = undefined,
             .tls = if (use_tls) try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = true }) else null,
             .allocator = allocator,
+            .write_queue = std.ArrayList(u8).empty,
             .host = host_dupe,
             .use_tls = use_tls,
         };
@@ -57,6 +65,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.tls) |*t| t.deinit();
+        self.write_queue.deinit(self.allocator);
         self.allocator.free(self.host);
         self.allocator.destroy(self);
     }
@@ -73,16 +82,40 @@ pub const Connection = struct {
     }
 
     pub fn write(self: *Self, data: []const u8) !void {
+        const current_len = self.write_queue.items.len - self.write_cursor;
+        if (current_len > HIGH_WATER_MARK) return error.WouldBlock;
+
         if (self.use_tls) {
             const enc_data = try self.tls.?.processOutgoing(data);
             if (enc_data) |bytes| {
-                const buf = try self.allocator.dupe(u8, bytes);
-                self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+                try self.write_queue.appendSlice(self.allocator, bytes);
             }
         } else {
-            const buf = try self.allocator.dupe(u8, data);
-            self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+            try self.write_queue.appendSlice(self.allocator, data);
         }
+
+        self.tryWrite();
+    }
+
+    fn tryWrite(self: *Self) void {
+        if (self.write_in_flight) return;
+        const current_len = self.write_queue.items.len - self.write_cursor;
+        if (current_len == 0) {
+            self.write_queue.clearRetainingCapacity();
+            self.write_cursor = 0;
+            return;
+        }
+
+        self.write_in_flight = true;
+        const data = self.write_queue.items[self.write_cursor..];
+
+        // We must dupe because xev expects the buffer to be valid until the callback.
+        const buf = self.allocator.dupe(u8, data) catch |err| {
+            self.write_in_flight = false;
+            if (self.on_error) |cb| cb(self, self.user_ctx, err);
+            return;
+        };
+        self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
     }
 
     fn pump(self: *Self) void {
@@ -90,12 +123,11 @@ pub const Connection = struct {
             const out_slice_res = self.tls.?.processOutgoing(null);
             if (out_slice_res) |out_slice_opt| {
                 if (out_slice_opt) |data| {
-                    const buf = self.allocator.dupe(u8, data) catch |err| {
+                    self.write_queue.appendSlice(self.allocator, data) catch |err| {
                         if (self.on_error) |cb| cb(self, self.user_ctx, err);
                         return;
                     };
-                    self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
-                    return;
+                    self.tryWrite();
                 }
             } else |err| {
                 if (self.on_error) |cb| cb(self, self.user_ctx, err);
@@ -124,8 +156,8 @@ pub const Connection = struct {
                 const out_slice_res = self.tls.?.startHandshake();
                 if (out_slice_res) |out_slice_opt| {
                     if (out_slice_opt) |data| {
-                        const buf = self.allocator.dupe(u8, data) catch unreachable;
-                        self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+                        self.write_queue.appendSlice(self.allocator, data) catch unreachable;
+                        self.tryWrite();
                         return .disarm;
                     }
                 } else |err| {
@@ -156,9 +188,16 @@ pub const Connection = struct {
         _ = c;
         _ = s;
         const self = ctx.?;
+        self.write_in_flight = false;
         self.allocator.free(buf.slice);
-        if (r) |_| {
-            self.pump();
+
+        if (r) |n| {
+            self.write_cursor += n;
+            const remaining = self.write_queue.items.len - self.write_cursor;
+            if (remaining < LOW_WATER_MARK) {
+                if (self.on_drain) |cb| cb(self, self.user_ctx);
+            }
+            self.tryWrite();
         } else |err| {
             if (self.on_error) |cb| cb(self, self.user_ctx, err);
         }

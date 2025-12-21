@@ -452,5 +452,47 @@ pub fn build(b: *std.Build) void {
             const step = b.step("test-connection", "Run S3 connection transport test");
             step.dependOn(&run.step);
         }
+
+        // 11. test_backpressure
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_backpressure.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const bp_exe = b.addExecutable(.{
+                .name = "test_backpressure",
+                .root_module = mod,
+            });
+            bp_exe.linkLibC();
+
+            const run = b.addRunArtifact(bp_exe);
+            const step = b.step("test-backpressure", "Run backpressure integration test");
+            step.dependOn(&run.step);
+        }
+
+        // 12. test_gap_skipping
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_gap_skipping.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const gs_exe = b.addExecutable(.{
+                .name = "test_gap_skipping",
+                .root_module = mod,
+            });
+            gs_exe.linkLibC();
+
+            const run = b.addRunArtifact(gs_exe);
+            const step = b.step("test-gap-skipping", "Run zero-allocation gap skipping integration test");
+            step.dependOn(&run.step);
+        }
     }
 }

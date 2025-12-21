@@ -52,6 +52,7 @@ pub const AsyncRequest = struct {
 
     // Active Connection
     connection: ?*Connection = null,
+    is_waiting_for_drain: bool = false,
 
     // Callback for completion
     done_ctx: ?*anyopaque = null,
@@ -76,6 +77,7 @@ pub const AsyncRequest = struct {
             .segments = .{},
             .current_seg_idx = 0,
             .current_seg_read = 0,
+            .is_waiting_for_drain = false,
         };
     }
 
@@ -95,6 +97,7 @@ pub const AsyncRequest = struct {
         self.body_read_total = 0;
         self.current_seg_idx = 0;
         self.current_seg_read = 0;
+        self.is_waiting_for_drain = false;
     }
 
     /// Add a segment to receive data.
@@ -243,6 +246,7 @@ pub const AsyncRequest = struct {
         conn.on_connect = onConnect;
         conn.on_data = onData;
         conn.on_error = onError;
+        conn.on_drain = onDrain;
 
         // If connection is already connected and handshake done (keep-alive reuse),
         // we can start immediately.
@@ -258,7 +262,23 @@ pub const AsyncRequest = struct {
         if (self.state != .Connecting) return;
 
         self.state = .RequestSent;
-        conn.write(self.write_buf.items) catch {
+        self.trySendRequest(conn);
+    }
+
+    fn onDrain(conn: *Connection, ctx: ?*anyopaque) void {
+        const self: *AsyncRequest = @ptrCast(@alignCast(ctx));
+        if (self.is_waiting_for_drain) {
+            self.is_waiting_for_drain = false;
+            self.trySendRequest(conn);
+        }
+    }
+
+    fn trySendRequest(self: *AsyncRequest, conn: *Connection) void {
+        conn.write(self.write_buf.items) catch |err| {
+            if (err == error.WouldBlock) {
+                self.is_waiting_for_drain = true;
+                return;
+            }
             self.state = .Error;
             if (self.on_done) |cb| cb(self.done_ctx, self);
         };

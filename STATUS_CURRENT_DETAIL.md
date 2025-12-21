@@ -115,7 +115,15 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
     *   Continue using `tools/minio_tls/setup_fixture.sh` + `test-minio-range-get` as the “golden transport test”.
     *   Add 1 failing-case test next: missing object → 404, and ensure error path is deterministic.
 
+### S3 Implementation Status
+- **Sync Stack (`zpq.s3.S3Source`)**: Fully functional with SigV4 support. Uses `std.http.Client`.
+- **Async Stack (`zpq.s3.AsyncS3Source`)**: 
+    - Event loop based on `libxev`.
+    - TLS supported via `boring_tls`.
+    - **NEW**: SigV4 signing integrated into `AsyncRequest`.
+    - **NEW**: Leaner unmanaged container architecture (Zig 0.16.dev compliant).
+    - **NEW**: Consolidated into `src/zpq/s3/`.
+- **Next Step**: Implement Async DNS resolution to remove hardcoded IPs.
+
 ## 🏗️ Legacy Stack (Reference/Backup)
-Located in `src/zpq/s3_legacy/`.
-*   `AsyncS3Source`: Pure Zig `std.Io` + `std.crypto.tls` implementation.
-*   **Status**: Works with local Mock S3 (HTTP) but flaky/broken with real S3 (HTTPS/Keep-Alive issues).
+Removed. All core logic migrated to `src/zpq/s3/`.

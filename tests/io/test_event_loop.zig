@@ -44,24 +44,24 @@ pub fn main() !void {
     defer loop.deinit();
 
     // 1. Create 3 requests
-    var req1 = AsyncRequest.init(allocator);
-    var req2 = AsyncRequest.init(allocator);
-    var req3 = AsyncRequest.init(allocator);
-    defer req1.deinit();
-    defer req2.deinit();
-    defer req3.deinit();
+    var req1 = AsyncRequest.init();
+    var req2 = AsyncRequest.init();
+    var req3 = AsyncRequest.init();
+    defer req1.deinit(allocator);
+    defer req2.deinit(allocator);
+    defer req3.deinit(allocator);
 
     var buf1: [100]u8 = undefined;
     var buf2: [100]u8 = undefined;
     var buf3: [100]u8 = undefined;
 
-    try req1.addSegment(&buf1, 100);
-    try req2.addSegment(&buf2, 100);
-    try req3.addSegment(&buf3, 100);
+    try req1.addSegment(allocator, &buf1, 100);
+    try req2.addSegment(allocator, &buf2, 100);
+    try req3.addSegment(allocator, &buf3, 100);
 
-    try req1.prepare(HOST, PORT, "/req1", 0, 100, null);
-    try req2.prepare(HOST, PORT, "/req2", 100, 200, null);
-    try req3.prepare(HOST, PORT, "/req3", 200, 300, null);
+    try req1.prepare(allocator, HOST, PORT, "/req1", 0, 100, null, null);
+    try req2.prepare(allocator, HOST, PORT, "/req2", 100, 200, null, null);
+    try req3.prepare(allocator, HOST, PORT, "/req3", 200, 300, null, null);
 
     const fd1 = try connect();
     const fd2 = try connect();

@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
     // Link new IO stack deps
     zpq_mod.addImport("xev", libxev_mod);
     zpq_mod.addImport("boring_tls", boring_tls_mod);
-    
+
     // Create the exe module
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
 
     // raw_s3_source (restored)
     const raw_s3_source_mod = b.createModule(.{
-        .root_source_file = b.path("src/zpq/s3_legacy/raw_s3_source.zig"),
+        .root_source_file = b.path("src/zpq/io/s3/raw_s3_source.zig"),
         .target = target,
         .optimize = optimize,
     });

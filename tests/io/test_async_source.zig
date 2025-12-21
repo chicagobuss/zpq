@@ -19,7 +19,7 @@ pub fn main() !void {
     defer pool.deinit();
 
     // Init with TLS=false, Certs=null
-    var source = try AsyncS3Source.init(allocator, &pool, HOST, PORT, "bucket", "key", false, null);
+    var source = try AsyncS3Source.init(allocator, &pool, HOST, PORT, "bucket", "key", false, null, null);
     defer source.deinit();
 
     // Request: 0-5 and 15-20 (Gap 5-15)

@@ -7,22 +7,20 @@ const io = @import("../io/interface.zig");
 pub const Page = struct {
     header: schema.PageHeader,
     data: []u8, 
-    allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *Page) void {
-        self.allocator.free(self.data);
+    pub fn deinit(self: *Page, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
     }
 };
 
 pub const ColumnReader = struct {
     source: io.RandomAccessSource,
-    allocator: std.mem.Allocator,
     start_offset: u64,
     total_size: u64,
     current_offset: u64,
     codec: schema.CompressionCodec,
 
-    pub fn init(source: io.RandomAccessSource, allocator: std.mem.Allocator, chunk: schema.ColumnChunk) !ColumnReader {
+    pub fn init(source: io.RandomAccessSource, chunk: schema.ColumnChunk) !ColumnReader {
         const meta = chunk.meta_data orelse return error.MissingColumnMetaData;
         
         var start: u64 = @intCast(meta.data_page_offset);
@@ -32,7 +30,6 @@ pub const ColumnReader = struct {
 
         return ColumnReader{
             .source = source,
-            .allocator = allocator,
             .start_offset = start,
             .total_size = @intCast(meta.total_compressed_size),
             .current_offset = 0,
@@ -40,7 +37,7 @@ pub const ColumnReader = struct {
         };
     }
 
-    pub fn next(self: *ColumnReader) !?Page {
+    pub fn next(self: *ColumnReader, allocator: std.mem.Allocator) !?Page {
         if (self.current_offset >= self.total_size) return null;
 
         const abs_pos = self.start_offset + self.current_offset;
@@ -60,8 +57,8 @@ pub const ColumnReader = struct {
         const payload_size: u64 = @intCast(header.compressed_page_size);
 
         // Allocate and read payload
-        const payload = try self.allocator.alloc(u8, payload_size);
-        errdefer self.allocator.free(payload);
+        const payload = try allocator.alloc(u8, payload_size);
+        errdefer allocator.free(payload);
 
         // We might have read some of the payload into header_buf already?
         // Yes.
@@ -96,27 +93,25 @@ pub const ColumnReader = struct {
 
         if (self.codec == .SNAPPY) {
             const uncompressed_size = @as(usize, @intCast(header.uncompressed_page_size));
-            const uncompressed = try self.allocator.alloc(u8, uncompressed_size);
-            errdefer self.allocator.free(uncompressed);
+            const uncompressed = try allocator.alloc(u8, uncompressed_size);
+            errdefer allocator.free(uncompressed);
 
             const decompressed_len = try snappy.uncompress(payload, uncompressed);
             if (decompressed_len != uncompressed_size) {
                  // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
             }
             
-            self.allocator.free(payload);
+            allocator.free(payload);
             
             return Page{
                 .header = header,
                 .data = uncompressed,
-                .allocator = self.allocator,
             };
         }
 
         return Page{
             .header = header,
             .data = payload,
-            .allocator = self.allocator,
         };
     }
 };

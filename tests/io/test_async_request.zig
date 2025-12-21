@@ -31,19 +31,19 @@ pub fn main() !void {
     }
 
     // 2. Init Request
-    var req = AsyncRequest.init(allocator);
-    defer req.deinit();
+    var req = AsyncRequest.init();
+    defer req.deinit(allocator);
 
     // We want 0-100.
     // Let's read 0-10, skip 10-90, read 90-100.
     var buf1: [10]u8 = undefined;
     var buf2: [10]u8 = undefined;
     
-    try req.addSegment(&buf1, 10);
-    try req.addSegment(null, 80); // GAP
-    try req.addSegment(&buf2, 10);
+    try req.addSegment(allocator, &buf1, 10);
+    try req.addSegment(allocator, null, 80); // GAP
+    try req.addSegment(allocator, &buf2, 10);
 
-    try req.prepare(HOST, PORT, "/bucket/key", 0, 100, null);
+    try req.prepare(allocator, HOST, PORT, "/bucket/key", 0, 100, null, null);
 
     // 3. Drive State Machine
     while (req.state != .Finished and req.state != .Error) {

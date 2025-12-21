@@ -48,11 +48,11 @@ pub const RowGroupReader = struct {
             break :blk all;
         };
 
-        var ranges = std.ArrayList(io.Range).init(self.allocator);
-        defer ranges.deinit();
+        var ranges = std.ArrayList(io.Range).empty;
+        defer ranges.deinit(self.allocator);
         
-        var buffers = std.ArrayList([]u8).init(self.allocator);
-        defer buffers.deinit(); // We only free the list, not the contents (which move to self.buffers)
+        var buffers = std.ArrayList([]u8).empty;
+        defer buffers.deinit(self.allocator); // We only free the list, not the contents (which move to self.buffers)
         
         // Identify ranges and allocate buffers
         for (targets) |idx| {
@@ -69,10 +69,10 @@ pub const RowGroupReader = struct {
             }
             const len: u64 = @intCast(meta.total_compressed_size);
             
-            try ranges.append(.{ .start = start, .end = start + len });
+            try ranges.append(self.allocator, .{ .start = start, .end = start + len });
             
             const buf = try self.allocator.alloc(u8, @intCast(len));
-            try buffers.append(buf);
+            try buffers.append(self.allocator, buf);
         }
         
         if (ranges.items.len == 0) return;
@@ -121,10 +121,10 @@ pub const RowGroupReader = struct {
 
         if (self.memory_sources[index]) |*mem| {
              // We have a pre-fetched source.
-             return ColumnReader.init(mem.source(), self.allocator, chunk);
+             return ColumnReader.init(mem.source(), chunk);
         }
         
-        return ColumnReader.init(self.file.source, self.allocator, chunk);
+        return ColumnReader.init(self.file.source, chunk);
     }
 };
 

@@ -1,23 +1,13 @@
 const std = @import("std");
 const io = @import("../interface.zig");
-const sigv4 = @import("../../s3_legacy/sigv4.zig");
+const sigv4 = @import("sigv4.zig");
+const types = @import("types.zig");
+
+// Export shared types
+pub const S3Config = types.S3Config;
+pub const Credentials = types.Credentials;
 
 // Export Async Components (Legacy wrappers)
-pub const AsyncS3Source = @import("../../s3_legacy/async_s3_source.zig").AsyncS3Source;
-pub const ConnectionPool = @import("../../s3_legacy/connection_pool.zig").ConnectionPool;
-pub const AsyncRequest = @import("../../s3_legacy/async_request.zig").AsyncRequest;
-pub const EventLoop = @import("../../s3_legacy/event_loop.zig").EventLoop;
-pub const scheduler = @import("../../s3_legacy/scheduler.zig");
-pub const RawS3Source = @import("../../s3_legacy/raw_s3_source.zig").RawS3Source;
-pub const TlsAdapter = @import("../../s3_legacy/tls_adapter.zig").TlsAdapter;
-
-pub const S3Config = struct {
-    access_key: ?[]const u8 = null,
-    secret_key: ?[]const u8 = null,
-    session_token: ?[]const u8 = null,
-    region: ?[]const u8 = null,
-    endpoint: ?[]const u8 = null,
-};
 
 pub const S3Source = struct {
     allocator: std.mem.Allocator,
@@ -32,11 +22,7 @@ pub const S3Source = struct {
     object_size: u64,
     
     // Auth state
-    auth: ?sigv4.SigV4,
-    access_key: ?[]u8,
-    secret_key: ?[]u8,
-    session_token: ?[]u8,
-    region: ?[]u8,
+    config: S3Config,
     
     pub fn init(allocator: std.mem.Allocator, bucket: []const u8, key: []const u8, config: S3Config) !S3Source {
         const threaded = try allocator.create(std.Io.Threaded);
@@ -52,46 +38,44 @@ pub const S3Source = struct {
         };
         errdefer client_ptr.deinit();
         
-        const access_key = if (config.access_key) |s| try allocator.dupe(u8, s) else null;
-        errdefer if (access_key) |s| allocator.free(s);
+        // Unify config storage - we now store the config directly as passed (which might borrow)
+        // or we can dupe it if we want ownership. For the sync S3Source, we'll borror/dupe selectively.
+        // Let's dupe key strings to be safe since this struct might live longer than CLI args.
         
-        const secret_key = if (config.secret_key) |s| try allocator.dupe(u8, s) else null;
-        errdefer if (secret_key) |s| allocator.free(s);
-        
-        const session_token = if (config.session_token) |s| try allocator.dupe(u8, s) else null;
-        errdefer if (session_token) |s| allocator.free(s);
-        
-        const region = if (config.region) |s| try allocator.dupe(u8, s) else null;
-        errdefer if (region) |s| allocator.free(s);
-        
-        var auth: ?sigv4.SigV4 = null;
-        if (access_key) |ak| {
-            if (secret_key) |sk| {
-                if (region) |rg| {
-                    auth = sigv4.SigV4{
-                        .region = rg,
-                        .access_key = ak,
-                        .secret_key = sk,
-                        .session_token = session_token,
-                    };
-                }
+        var owned_config = config;
+        if (config.credentials) |creds| {
+            owned_config.credentials = .{
+                .access_key = try allocator.dupe(u8, creds.access_key),
+                .secret_key = try allocator.dupe(u8, creds.secret_key),
+                .session_token = if (creds.session_token) |st| try allocator.dupe(u8, st) else null,
+            };
+        }
+        owned_config.region = try allocator.dupe(u8, config.region);
+        owned_config.endpoint = if (config.endpoint) |ep| try allocator.dupe(u8, ep) else null;
+
+        errdefer {
+            if (owned_config.credentials) |creds| {
+                allocator.free(creds.access_key);
+                allocator.free(creds.secret_key);
+                if (creds.session_token) |st| allocator.free(st);
             }
+            allocator.free(owned_config.region);
+            if (owned_config.endpoint) |ep| allocator.free(ep);
         }
 
         const encoded_key = try s3Encode(allocator, key);
         defer allocator.free(encoded_key);
 
-        const url = if (config.endpoint) |ep| u: {
+        const url = if (owned_config.endpoint) |ep| u: {
             const clean_ep = std.mem.trimRight(u8, ep, "/");
             break :u try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{clean_ep, bucket, encoded_key});
-        } else if (region) |rg| u: {
-             if (std.mem.eql(u8, rg, "us-east-1")) {
+        } else u: {
+             if (std.mem.eql(u8, owned_config.region, "us-east-1")) {
                  break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.amazonaws.com/{s}", .{bucket, encoded_key});
              } else {
-                 break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.{s}.amazonaws.com/{s}", .{bucket, rg, encoded_key});
+                 break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.{s}.amazonaws.com/{s}", .{bucket, owned_config.region, encoded_key});
              }
-        } else 
-            try std.fmt.allocPrint(allocator, "https://{s}.s3.amazonaws.com/{s}", .{bucket, encoded_key});
+        };
             
         errdefer allocator.free(url);
 
@@ -104,11 +88,7 @@ pub const S3Source = struct {
             .url = url,
             .uri = uri,
             .object_size = 0,
-            .auth = auth,
-            .access_key = access_key,
-            .secret_key = secret_key,
-            .session_token = session_token,
-            .region = region,
+            .config = owned_config,
         };
         
         self.object_size = try self.fetchSize();
@@ -138,10 +118,13 @@ pub const S3Source = struct {
         self.allocator.destroy(self.threaded);
         self.allocator.free(self.url);
         
-        if (self.access_key) |s| self.allocator.free(s);
-        if (self.secret_key) |s| self.allocator.free(s);
-        if (self.session_token) |s| self.allocator.free(s);
-        if (self.region) |s| self.allocator.free(s);
+        if (self.config.credentials) |creds| {
+            self.allocator.free(creds.access_key);
+            self.allocator.free(creds.secret_key);
+            if (creds.session_token) |s| self.allocator.free(s);
+        }
+        self.allocator.free(self.config.region);
+        if (self.config.endpoint) |ep| self.allocator.free(ep);
     }
     
     fn fetchSize(self: *S3Source) !u64 {
@@ -203,8 +186,14 @@ pub const S3Source = struct {
             try headers.append(aa, .{ .name = "Range", .value = range_val });
         }
         
-        if (self.auth) |*a| {
-            try a.sign(aa, @tagName(method), self.uri, &headers, "");
+        if (self.config.credentials) |creds| {
+            var auth = sigv4.SigV4{
+                .region = self.config.region,
+                .access_key = creds.access_key,
+                .secret_key = creds.secret_key,
+                .session_token = creds.session_token,
+            };
+            try auth.sign(aa, @tagName(method), self.uri, &headers, "");
             
              // Remove Host header
              var i: usize = 0;

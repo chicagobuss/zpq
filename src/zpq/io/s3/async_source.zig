@@ -1,7 +1,7 @@
 const std = @import("std");
-const io = @import("../io.zig");
+const io = @import("../interface.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
-const AsyncRequest = @import("async_request.zig").AsyncRequest;
+const AsyncRequest = @import("request.zig").AsyncRequest;
 const connection_pool_mod = @import("connection_pool.zig");
 const ConnectionPool = connection_pool_mod.ConnectionPool;
 const ConnectionKey = connection_pool_mod.ConnectionKey;
@@ -9,6 +9,7 @@ const Connection = connection_pool_mod.Connection;
 pub const scheduler = @import("scheduler.zig");
 const Range = io.Range;
 const TlsAdapter = @import("tls_adapter.zig").TlsAdapter;
+const types = @import("types.zig");
 
 // Re-exports for tests
 pub const connection_pool = connection_pool_mod;
@@ -17,17 +18,18 @@ pub const AsyncS3Source = struct {
     allocator: std.mem.Allocator,
     pool: *ConnectionPool, // Shared pool
     event_loop: EventLoop,
-    
+
     host: []const u8,
     port: u16,
     path_prefix: []const u8, // "/bucket/key"
     use_tls: bool,
     trusted_cert: ?[]const u8,
-    
+    config: ?types.S3Config, // Unified Auth Config
+
     file_size: u64,
 
-    pub fn init(allocator: std.mem.Allocator, pool: *ConnectionPool, host: []const u8, port: u16, bucket: []const u8, key: []const u8, use_tls: bool, trusted_cert: ?[]const u8) !AsyncS3Source {
-        const path = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{bucket, key});
+    pub fn init(allocator: std.mem.Allocator, pool: *ConnectionPool, host: []const u8, port: u16, bucket: []const u8, key: []const u8, use_tls: bool, trusted_cert: ?[]const u8, config: ?types.S3Config) !AsyncS3Source {
+        const path = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ bucket, key });
         errdefer allocator.free(path);
 
         const host_dupe = try allocator.dupe(u8, host);
@@ -38,10 +40,24 @@ pub const AsyncS3Source = struct {
             cert_dupe = try allocator.dupe(u8, cert);
         }
         errdefer if (cert_dupe) |c| allocator.free(c);
-        
+
+        // Deep copy config if present
+        var config_dupe: ?types.S3Config = null;
+        if (config) |c| {
+            config_dupe = types.S3Config{
+                .credentials = if (c.credentials) |creds| types.Credentials{
+                    .access_key = try allocator.dupe(u8, creds.access_key),
+                    .secret_key = try allocator.dupe(u8, creds.secret_key),
+                    .session_token = if (creds.session_token) |t| try allocator.dupe(u8, t) else null,
+                } else null,
+                .region = try allocator.dupe(u8, c.region),
+                .endpoint = if (c.endpoint) |ep| try allocator.dupe(u8, ep) else null,
+            };
+        }
+
         // Note: EventLoop creation might fail
         const loop = try EventLoop.init(allocator);
-        
+
         var self = AsyncS3Source{
             .allocator = allocator,
             .pool = pool,
@@ -51,13 +67,14 @@ pub const AsyncS3Source = struct {
             .path_prefix = path,
             .use_tls = use_tls,
             .trusted_cert = cert_dupe,
+            .config = config_dupe,
             .file_size = 0,
         };
-        errdefer self.event_loop.deinit();
+        errdefer self.deinit();
 
         // Fetch size via HEAD request (synchronously waiting on loop)
         try self.fetchSize();
-        
+
         return self;
     }
 
@@ -66,13 +83,22 @@ pub const AsyncS3Source = struct {
         self.allocator.free(self.path_prefix);
         self.allocator.free(self.host);
         if (self.trusted_cert) |c| self.allocator.free(c);
+        if (self.config) |c| {
+            if (c.credentials) |creds| {
+                self.allocator.free(creds.access_key);
+                self.allocator.free(creds.secret_key);
+                if (creds.session_token) |t| self.allocator.free(t);
+            }
+            self.allocator.free(c.region);
+            if (c.endpoint) |ep| self.allocator.free(ep);
+        }
     }
 
     fn fetchSize(self: *AsyncS3Source) !void {
-        var req = AsyncRequest.init(self.allocator);
-        defer req.deinit();
+        var req = AsyncRequest.init();
+        defer req.deinit(self.allocator);
 
-        try req.prepareHead(self.host, self.port, self.path_prefix, null);
+        try req.prepareHead(self.allocator, self.host, self.port, self.path_prefix, null, self.config);
 
         // Execute single request
         var fd: std.posix.fd_t = undefined;
@@ -87,16 +113,16 @@ pub const AsyncS3Source = struct {
             fd = conn.fd;
             tls = conn.tls;
         }
-        
+
         req.tls = tls;
         try self.event_loop.registerWrite(fd, &req);
         try self.event_loop.registerRead(fd, &req);
 
         while (req.state != .Finished and req.state != .Error) {
-             const events = try self.event_loop.tick();
-             if (events == 0) {
-                 std.debug.print("[AsyncS3Source] Timeout waiting for events (FETCH_SIZE).\n", .{});
-             }
+            const events = try self.event_loop.tick();
+            if (events == 0) {
+                std.debug.print("[AsyncS3Source] Timeout waiting for events (FETCH_SIZE).\n", .{});
+            }
         }
 
         // Cleanup
@@ -106,7 +132,7 @@ pub const AsyncS3Source = struct {
         } else {
             // Unregister before closing to clean up map
             self.event_loop.unregister(fd);
-            
+
             if (tls) |t| t.deinit();
             std.posix.close(fd);
             return error.HeadRequestFailed;
@@ -129,14 +155,14 @@ pub const AsyncS3Source = struct {
         // 2. Prepare AsyncRequests
         var requests = std.ArrayListUnmanaged(AsyncRequest){};
         defer {
-            for (requests.items) |*r| r.deinit();
+            for (requests.items) |*r| r.deinit(self.allocator);
             requests.deinit(self.allocator);
         }
 
         // Track FDs to release them back to pool later
         var fds = std.ArrayListUnmanaged(std.posix.fd_t){};
         defer fds.deinit(self.allocator);
-        
+
         // Track TLS adapters (owned by Connection, passed to Pool or destroyed)
         var tls_adapters = std.ArrayListUnmanaged(?*TlsAdapter){};
         defer tls_adapters.deinit(self.allocator);
@@ -144,7 +170,7 @@ pub const AsyncS3Source = struct {
         for (merged_reqs.items) |merged| {
             // Split huge requests into 64MB chunks
             var splitter = scheduler.RangeSplitter.init(merged.request_range, scheduler.CHUNK_SIZE);
-            
+
             // We need to map the merged range segments to these chunks.
             // First, build the full list of segments for the merged range.
             var all_segments = std.ArrayListUnmanaged(AsyncRequest.Segment){};
@@ -154,13 +180,13 @@ pub const AsyncS3Source = struct {
             for (merged.original_indices.items) |orig_idx| {
                 const target_range = ranges[orig_idx];
                 const target_buffer = buffers[orig_idx];
-                
+
                 // Gap?
                 if (target_range.start > current_offset) {
                     const gap_len = target_range.start - current_offset;
                     try all_segments.append(self.allocator, .{ .buffer = null, .len = gap_len });
                 }
-                
+
                 // Data
                 try all_segments.append(self.allocator, .{ .buffer = target_buffer, .len = target_range.len() });
                 current_offset = target_range.end;
@@ -175,9 +201,9 @@ pub const AsyncS3Source = struct {
             var seg_offset: usize = 0; // Offset into current segment
 
             while (splitter.next()) |chunk_range| {
-                var req = AsyncRequest.init(self.allocator);
+                var req = AsyncRequest.init();
                 // We will add it to 'requests' list later
-                
+
                 var chunk_filled: u64 = 0;
                 const chunk_len = chunk_range.len();
 
@@ -189,10 +215,10 @@ pub const AsyncS3Source = struct {
 
                     if (seg.buffer) |buf| {
                         // Slice the user buffer
-                        try req.addSegment(buf[seg_offset .. seg_offset + to_take], to_take);
+                        try req.addSegment(self.allocator, buf[seg_offset .. seg_offset + to_take], to_take);
                     } else {
                         // Gap
-                        try req.addSegment(null, to_take);
+                        try req.addSegment(self.allocator, null, to_take);
                     }
 
                     chunk_filled += to_take;
@@ -205,7 +231,7 @@ pub const AsyncS3Source = struct {
                 }
 
                 // Note: We don't have TLS adapter yet, pass null for now, set later
-                try req.prepare(self.host, self.port, self.path_prefix, chunk_range.start, chunk_range.end, null);
+                try req.prepare(self.allocator, self.host, self.port, self.path_prefix, chunk_range.start, chunk_range.end, null, self.config);
                 try requests.append(self.allocator, req);
             }
         }
@@ -217,7 +243,7 @@ pub const AsyncS3Source = struct {
             const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
             var fd: std.posix.fd_t = undefined;
             var tls: ?*TlsAdapter = null;
-            
+
             if (self.pool.acquire(key)) |conn| {
                 fd = conn.fd;
                 tls = conn.tls;
@@ -229,7 +255,7 @@ pub const AsyncS3Source = struct {
             }
             try fds.append(self.allocator, fd);
             try tls_adapters.append(self.allocator, tls);
-            
+
             // Set TLS on request
             req.tls = tls;
 
@@ -251,7 +277,7 @@ pub const AsyncS3Source = struct {
 
             const events = try self.event_loop.tick();
             if (events == 0) {
-                 std.debug.print("[AsyncS3Source] Timeout waiting for events (READ_RANGES).\n", .{});
+                std.debug.print("[AsyncS3Source] Timeout waiting for events (READ_RANGES).\n", .{});
             }
         }
 
@@ -261,23 +287,23 @@ pub const AsyncS3Source = struct {
             const tls = tls_adapters.items[i];
             const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
             const conn = Connection{ .fd = fd, .tls = tls };
-            
+
             if (req.state == .Finished) {
                 // Keep-Alive: Release to pool
                 try self.pool.release(key, conn);
             } else {
                 // Error: Close
                 if (tls) |t| t.deinit();
-                std.posix.close(fd); 
+                std.posix.close(fd);
             }
         }
     }
 
     fn connectNew(self: *AsyncS3Source) !Connection {
-        std.debug.print("[AsyncS3Source] Resolving {s}:{d}...\n", .{self.host, self.port});
-        
+        std.debug.print("[AsyncS3Source] Resolving {s}:{d}...\n", .{ self.host, self.port });
+
         const addr = try resolveHost(self.allocator, self.host, self.port);
-        
+
         const fd = try std.posix.socket(switch (addr) {
             .ip4 => std.posix.AF.INET,
             .ip6 => std.posix.AF.INET6,
@@ -305,19 +331,19 @@ pub const AsyncS3Source = struct {
                 try std.posix.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in6));
             },
         }
-        
+
         var tls_adapter: ?*TlsAdapter = null;
         if (self.use_tls) {
             std.debug.print("[AsyncS3Source] Initiating TLS handshake...\n", .{});
             tls_adapter = try TlsAdapter.init(self.allocator, fd, self.host, self.trusted_cert);
         }
-        
+
         // Set Non-Blocking
         const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
         var flags_o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
         flags_o.NONBLOCK = true;
         _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(flags_o)));
-        
+
         std.debug.print("[AsyncS3Source] Connected (FD {d})\n", .{fd});
         return Connection{ .fd = fd, .tls = tls_adapter };
     }
@@ -352,13 +378,15 @@ pub const AsyncS3Source = struct {
                     const addr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(info.addr));
                     // Convert to Io.net.IpAddress.ip4
                     const bytes: [4]u8 = @bitCast(addr_in.addr);
-                    return std.Io.net.IpAddress{ .ip4 = .{
-                        .bytes = bytes,
-                        .port = port, // Use original port or one from getaddrinfo (which should match)
-                    }};
+                    return std.Io.net.IpAddress{
+                        .ip4 = .{
+                            .bytes = bytes,
+                            .port = port, // Use original port or one from getaddrinfo (which should match)
+                        },
+                    };
                 }
             }
-            
+
             // Second pass: return whatever we find (IPv6)
             curr = r;
             while (curr) |info| : (curr = info.next) {
@@ -368,7 +396,7 @@ pub const AsyncS3Source = struct {
                     return std.Io.net.IpAddress{ .ip6 = .{
                         .bytes = bytes,
                         .port = port,
-                    }};
+                    } };
                 }
             }
         }
@@ -382,10 +410,10 @@ pub const AsyncS3Source = struct {
         const range = Range{ .start = offset, .end = offset + buf.len };
         const ranges = &[_]Range{range};
         const buffers = &[_][]u8{buf};
-        
+
         try self.readRanges(ranges, buffers);
         // If readRanges succeeds, it means it filled the buffers (or error)
-        // Check if we hit EOF logic inside readRanges? 
+        // Check if we hit EOF logic inside readRanges?
         // readRanges splits and fills. If EOF, AsyncRequest might error or fill partial?
         // Current AsyncRequest logic errors on short reads unless handled.
         // For now assume full read.

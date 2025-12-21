@@ -96,6 +96,9 @@ pub fn build(b: *std.Build) void {
     const run_test_event_loop = b.addRunArtifact(test_event_loop_exe);
     test_io_step.dependOn(&run_test_event_loop.step);
 
+    const test_event_loop_step = b.step("test-event-loop", "Run EventLoop + AsyncRequest integration test");
+    test_event_loop_step.dependOn(&run_test_event_loop.step);
+
     // test_async_source
     const test_async_source_mod = b.createModule(.{
         .root_source_file = b.path("tests/io/test_async_source.zig"),

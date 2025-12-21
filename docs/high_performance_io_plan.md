@@ -71,4 +71,5 @@ We leverage Zig's low-level control to exceed reference implementations:
     - [x] **Zero-Allocation Gap**: Test skipping bytes on the socket without allocation.
     - [x] **No-HEAD Open**: Test suffix range parsing from mock server.
     - [ ] **Arena Decompression**: (Phase 3) Benchmark arena vs generic allocator for heavy columnar allocs.
-- [ ] **(F) TLS**: add HTTPS + session reuse for real S3 (then validate against MinIO + AWS S3).
+- [x] **(F) TLS**: add HTTPS + session reuse for real S3 (then validate against MinIO + AWS S3).
+- [x] **(G) Pure Async Completion**: Refactor from polling `WouldBlock` to pure `libxev` completion callbacks.

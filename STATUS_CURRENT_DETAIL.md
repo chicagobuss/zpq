@@ -27,15 +27,30 @@ We have successfully implemented a tiered, asynchronous DNS resolver stack that 
 *   [x] **Verification**: `tests/io/test_async_source.zig` confirms that we resolve "127.0.0.1" (or real hosts) and initiate connections to the correct network address.
 
 ### Technical Blueprint (Pure Async Next Steps):
-1.  **Refactor `AsyncRequest`**:
-    *   Current: `WouldBlock` polling loop in `main.zig`.
-    *   Goal: Pure completion-based lifecycle using `libxev` watchers.
-2.  **State Machine Evolution**:
-    *   `AsyncRequest` will register completions for `Connect`, `Send`, and `Recv`.
-    *   The loop will drive state transitions, eliminating "busy waiting" or serial ticks.
-3.  **Connection Pool**:
-    *   Implement persistent socket reuse keyed by `(host, port, tls)`.
-    *   Handle server-side keep-alive timeouts.
+We are transitioning from a **Polling State Machine** (busy-waiting on `WouldBlock`) to a **Pure Completion State Machine**.
+
+1.  **Completion Ownership**:
+    *   `AsyncRequest` will embed `xev.Completion` and `xev.TCP` structs.
+    *   **Probing Strategy**: Create `probe_xev_tcp_lifecycle.zig` to verify the latest `xev.TCP.connect` and `read/write` signatures. The Zig 0.16 `std.posix` transition changed how FDs are passed to event loops.
+    *   **Microtest**: `tests/io/test_async_state_machine.zig` will verify the "Connect -> Send -> Recv" chain without S3 logic.
+
+2.  **Callback-Driven State Machine**:
+    *   Each state will have a dedicated `libxev` callback (e.g., `onConnect`, `onWrite`, `onRead`).
+    *   **Concurrency**: This allows 100+ requests to be truly interleaved on a single thread.
+    *   **Zero-Alloc Transition**: No memory should be allocated when moving between "Headers Received" and "Reading Body Segments".
+
+3.  **TLS "Pump" Integration**:
+    *   **Web Search Task**: Profusely search for "libxev TLS adapter patterns" and "BoringSSL async BIO pump" to ensure our `TlsAdapter` doesn't deadblock when the loop is driving multiple completions.
+    *   **Refactor**: Integrate `TlsAdapter` directly into the `xev` callback chain so TLS handshakes happen "asynchronously" without blocking other requests.
+
+4.  **Persistent Connection Pool**:
+    *   Implement LIFO reuse with keyed host/port/tls.
+    *   Implement "Stale Check": Before handing a connection back, perform a zero-byte `read` completion to see if the server closed it.
+
+### Next Session Focus:
+*   [ ] Create `probe_xev_tcp_lifecycle.zig` to lock down the `libxev` API for 0.16.dev.
+*   [ ] Refactor `AsyncRequest` header serialization to be fully unmanaged.
+*   [ ] Implement the completion-based "Connect" flow in `AsyncS3Source`.
 
 ---
 

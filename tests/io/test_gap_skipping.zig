@@ -27,14 +27,14 @@ pub fn main() !void {
     var server = try xev.TCP.init(addr);
     try server.bind(addr);
     try server.listen(1);
-    
+
     var server_ctx = ServerContext{ .loop = &loop };
     var c_accept: xev.Completion = .{};
     server.accept(&loop, &c_accept, ServerContext, &server_ctx, onAccept);
 
     var conn = try Connection.init(&loop, tracking_allocator, "localhost", false);
     defer conn.deinit();
-    
+
     var req = AsyncRequest.init(tracking_allocator);
     defer req.deinit();
 
@@ -47,7 +47,7 @@ pub fn main() !void {
     try req.addSegment(&buf2, 10);
 
     try req.prepare("localhost", port, "/test", 0, 1010, false, null);
-    
+
     const WaitCtx = struct {
         done: bool = false,
         fn onDone(c: ?*anyopaque, r: *AsyncRequest) void {
@@ -69,8 +69,8 @@ pub fn main() !void {
 
     std.debug.print("Gap Skipping Test Results:\n", .{});
     std.debug.print("- Peak allocated: {} bytes\n", .{tracking.peak_allocated});
-    
-    // We expect peak allocated to be small (socket buffers + request buffers), 
+
+    // We expect peak allocated to be small (socket buffers + request buffers),
     // but definitely NOT including the 990 byte gap.
     // S3 buffers are 16KB, plus request headers, etc.
     if (tracking.peak_allocated > 100 * 1024) { // 100KB is a very safe upper bound
@@ -110,7 +110,9 @@ fn onAccept(s_ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, r: xev.
 }
 
 fn onServerRead(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: xev.TCP, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
-    _ = c; _ = s; _ = buf;
+    _ = c;
+    _ = s;
+    _ = buf;
     const s_ctx = ctx.?;
     if (r) |_| {
         const response = "HTTP/1.1 200 OK\r\nContent-Length: 1010\r\n\r\n";
@@ -120,7 +122,9 @@ fn onServerRead(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: xe
 }
 
 fn onResponseSent(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: xev.TCP, buf: xev.WriteBuffer, r: xev.WriteError!usize) xev.CallbackAction {
-    _ = c; _ = s; _ = buf;
+    _ = c;
+    _ = s;
+    _ = buf;
     const s_ctx = ctx.?;
     if (r) |_| {
         // Send body: 10 'A's, then 990 'X's (gap), then 10 'B's
@@ -128,7 +132,7 @@ fn onResponseSent(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: 
         @memset(body[0..10], 'A');
         @memset(body[10..1000], 'X');
         @memset(body[1000..1010], 'B');
-        
+
         // We must dupe for xev
         const body_copy = std.heap.page_allocator.dupe(u8, &body) catch unreachable;
         s_ctx.conn.?.write(loop, &s_ctx.c_write, .{ .slice = body_copy }, ServerContext, s_ctx, onBodySent);
@@ -137,9 +141,11 @@ fn onResponseSent(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: 
 }
 
 fn onBodySent(ctx: ?*ServerContext, loop: *xev.Loop, c: *xev.Completion, s: xev.TCP, buf: xev.WriteBuffer, r: xev.WriteError!usize) xev.CallbackAction {
-    _ = loop; _ = c; _ = s;
+    _ = loop;
+    _ = c;
+    _ = s;
     std.heap.page_allocator.free(buf.slice);
-    _ = ctx; 
+    _ = ctx;
     _ = r catch {};
     return .disarm;
 }

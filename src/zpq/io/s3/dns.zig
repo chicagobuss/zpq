@@ -1,5 +1,5 @@
 const std = @import("std");
-const xev = @import("xev");
+pub const xev = @import("xev");
 
 pub const Address = xev.shim_net.Address;
 

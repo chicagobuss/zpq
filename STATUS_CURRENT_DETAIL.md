@@ -1,7 +1,7 @@
 # ZPQ Technical Context & Deep Dive
 
 **Last Updated**: Dec 21, 2025
-**Current State**: **DNS Milestone Reached**: High-performance, zero-blocking DNS stack implemented and verified. Ready for integration into the async S3 engine.
+**Current State**: **DNS Integration Reached**: The verified high-performance DNS stack is now wired into the async S3 engine. Connections are spreading across multiple resolved IPs.
 
 ## 🏆 Milestone 6: High-Performance Async DNS (Completed)
 We have successfully implemented a tiered, asynchronous DNS resolver stack that decouples DNS lookups from the main event loop and enables aggressive parallel connection launching.
@@ -13,44 +13,42 @@ We have successfully implemented a tiered, asynchronous DNS resolver stack that 
     *   **Memory Hygiene**: Verified zero leaks using `GeneralPurposeAllocator`.
 *   **Key Components**:
     *   **`ThreadPoolResolver`**: Offloads `getaddrinfo` to `libxev.ThreadPool`.
-    *   **`SingleFlightResolver`**: Deduplicates lookups at the bucket/endpoint level.
+    *   **`SingleFlightResolver`**: Deduplicates lookups at the bucket/endpoint level (6 attempts -> 1 query).
     *   **`SpeculativeResolver`**: Foundations for "Happy Eyeballs" and fast connection startup.
 
-## ⚡ Performance Verification
-*   **Benchmark**: DNS Deduplication (3 parallel requests)
-*   **Result**: 6 logical attempts (3 requests × 2 races) -> **exactly 1 DNS query**.
-*   **Impact**: Massive reduction in DNS round-trip overhead for high-concurrency S3 scanning.
+## 🚀 Milestone 7: DNS Integration & Advanced I/O (In Progress)
+**Goal**: Wire the DNS stack into `AsyncS3Source` and move to a pure event-driven transport lifecycle.
 
-## 🚀 Milestone 7: DNS Integration & Advanced Pooling (CURRENT)
-**Goal**: Wire the new DNS stack into `AsyncS3Source` and implement a production-grade connection pool.
+### Progress & Verification:
+*   [x] **DNS Integration**: `AsyncS3Source` now holds a `dns.Resolver`.
+*   [x] **Dynamic Resolution**: Hardcoded IPs removed. Bucket hosts are resolved at source initialization.
+*   [x] **IP Round-Robin**: Every call to `connectNew()` now cycles through the list of resolved IPs. This maximizes parallel throughput into the AWS frontend fleet.
+*   [x] **EventLoop Refactor**: `src/zpq/io/s3/event_loop.zig` now wraps `libxev.Loop`. This ensures the DNS stack works on Linux/WSL2 and macOS with zero code changes.
+*   [x] **Verification**: `tests/io/test_async_source.zig` confirms that we resolve "127.0.0.1" (or real hosts) and initiate connections to the correct network address.
 
-### Technical Blueprint:
-1.  **Wiring**:
-    *   Modify `AsyncS3Source.init` to accept a `dns.Resolver`.
-    *   Replace hardcoded IP logic in `scheduler.zig` with dynamic resolution.
-    *   Implement "Round-Robin" selection from the `dns.Address` list.
-2.  **Connection Pool**:
+### Technical Blueprint (Pure Async Next Steps):
+1.  **Refactor `AsyncRequest`**:
+    *   Current: `WouldBlock` polling loop in `main.zig`.
+    *   Goal: Pure completion-based lifecycle using `libxev` watchers.
+2.  **State Machine Evolution**:
+    *   `AsyncRequest` will register completions for `Connect`, `Send`, and `Recv`.
+    *   The loop will drive state transitions, eliminating "busy waiting" or serial ticks.
+3.  **Connection Pool**:
     *   Implement persistent socket reuse keyed by `(host, port, tls)`.
-    *   Handle idle timeouts and server-side disconnects.
-3.  **N-Lane Trigger**:
-    *   Enable the "Early Start" optimization: launch connections as soon as the first `N` IPs are resolved.
+    *   Handle server-side keep-alive timeouts.
 
 ---
 
 ## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
 ### 1. Zig 0.16.x Breaking Changes & Patterns
-*   **Unmanaged Containers**: `std.ArrayListUnmanaged` and `std.StringHashMap` are now the standard for performance.
-    *   *Correction*: Always pass `allocator` to `append`, `put`, and `deinit`.
-*   **Alignment Safety**: `xev.shim_net.Address` is critical for handling `sockaddr` alignment correctly.
-    *   *Gotcha*: `@ptrCast(@alignCast(&addr))` is required when moving from raw bytes to specialized `sockaddr` types.
-*   **C-ABI Boundaries**: `std.c.getaddrinfo` requires null-terminated strings. Use `allocator.dupeZ` for safety.
+*   **Unmanaged Containers**: `std.ArrayListUnmanaged` and `std.StringHashMap` are required for high-performance zero-heap paths. Always pass the allocator to every operation.
+*   **Alignment Safety**: `xev.shim_net.Address` is critical for handling `sockaddr` alignment correctly. `@ptrCast(@alignCast(&addr))` is your friend when bridging between raw memory and specialized address types.
+*   **Static vs Dynamic xev**: We chose the Static path (`xev.Loop`) for raw performance, avoiding vtable jumps in the hot I/O loop.
 
 ### 2. Workflow & Testing Strategy
-*   **Micro-Test Driven Development (MTDD)**: 
-    *   We built `tests/io/test_dns.zig` to verify the logic before touching the main `AsyncS3Source`. 
-    *   This saved hours of debugging complex state machine interactions in the larger system.
-*   **Probing is Mandatory**: When in doubt about a new Zig API, a 20-line `probe_*.zig` file is faster than reading the (often outdated) docs.
+*   **Micro-Test Driven Development (MTDD)**: Proving the DNS middleware in isolation (`test_dns.zig`) was the only reason the integration into `AsyncS3Source` was smooth.
+*   **Probing Mandatory**: When Zig 0.16 behavior is unclear, a 20-line `probe_*.zig` file is 10x faster than trying to interpret compiler errors in a large project.
 
 ---
 

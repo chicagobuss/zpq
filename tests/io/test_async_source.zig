@@ -18,8 +18,12 @@ pub fn main() !void {
     var pool = ConnectionPool.init(allocator);
     defer pool.deinit();
 
+    var xev_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+    var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&xev_pool, allocator);
+    const resolver = tp_resolver.resolver();
+
     // Init with TLS=false, Certs=null
-    var source = try AsyncS3Source.init(allocator, &pool, HOST, PORT, "bucket", "key", false, null, null);
+    var source = try AsyncS3Source.init(allocator, &pool, resolver, HOST, PORT, "bucket", "key", false, null, null);
     defer source.deinit();
 
     // Request: 0-5 and 15-20 (Gap 5-15)
@@ -42,7 +46,7 @@ pub fn main() !void {
     // Buf1: 0, 1, 2, 3, 4
     for (buf1, 0..) |b, i| {
         if (b != i % 256) {
-            std.debug.print("Buf1 Mismatch at {d}: Expected {d}, Got {d}\n", .{i, i % 256, b});
+            std.debug.print("Buf1 Mismatch at {d}: Expected {d}, Got {d}\n", .{ i, i % 256, b });
             return error.DataMismatch;
         }
     }
@@ -51,7 +55,7 @@ pub fn main() !void {
     for (buf2, 0..) |b, i| {
         const expected = (15 + i) % 256;
         if (b != expected) {
-            std.debug.print("Buf2 Mismatch at {d}: Expected {d}, Got {d}\n", .{i, expected, b});
+            std.debug.print("Buf2 Mismatch at {d}: Expected {d}, Got {d}\n", .{ i, expected, b });
             return error.DataMismatch;
         }
     }

@@ -25,53 +25,95 @@ pub fn main() !void {
             std.debug.print("Usage: {s} schema <parquet_file>\n", .{args[0]});
             return;
         }
-        try cmdSchema(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdSchema(allocator, args[2], is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "meta")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} meta <parquet_file>\n", .{args[0]});
             return;
         }
-        try cmdMeta(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdMeta(allocator, args[2], is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "cat")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} cat <parquet_file> [limit]\n", .{args[0]});
             return;
         }
         const limit = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 10;
-        try cmdCat(allocator, args[2], limit, is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdCat(allocator, args[2], limit, is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "scan")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} scan <parquet_file>\n", .{args[0]});
             return;
         }
-        try cmdScan(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdScan(allocator, args[2], is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "pages")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} pages <parquet_file>\n", .{args[0]});
             return;
         }
-        try cmdPages(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdPages(allocator, args[2], is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "inspect")) {
         // Legacy support
         if (args.len < 3) {
             std.debug.print("Usage: {s} inspect <parquet_file> [--async]\n", .{args[0]});
             return;
         }
-        try cmdPages(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdPages(allocator, args[2], is_async, spec_resolver.resolver());
     } else if (std.mem.eql(u8, command, "debug-s3")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} debug-s3 <parquet_file> [--async]\n", .{args[0]});
             return;
         }
-        try cmdDebugS3(allocator, args[2], is_async);
+        var thread_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
+        var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
+        var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+        defer sf_resolver.deinit();
+        var spec_resolver = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
+
+        try cmdDebugS3(allocator, args[2], is_async, spec_resolver.resolver());
     } else {
         printUsage(args[0]);
     }
 }
 
-fn cmdDebugS3(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void {
+fn cmdDebugS3(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
     std.debug.print("Opening file: {s}\n", .{path});
-    var pf = try openFile(allocator, path, is_async);
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
 
     // We assume it's S3Source.
@@ -145,7 +187,7 @@ fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     };
 }
 
-fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool) !zpq.file.ParquetFile {
+fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool, resolver: zpq.s3.dns.Resolver) !zpq.file.ParquetFile {
     if (std.mem.startsWith(u8, path, "s3://")) {
         var bucket: []const u8 = undefined;
         var key: []const u8 = undefined;
@@ -257,7 +299,7 @@ fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool) !
         }
         defer if (trusted_cert) |c| allocator.free(c);
 
-        ctx.source = try zpq.s3.AsyncS3Source.init(allocator, &ctx.pool, host_copy, port, bucket, key, use_tls, trusted_cert, null // No credentials for anonymous
+        ctx.source = try zpq.s3.AsyncS3Source.init(allocator, &ctx.pool, resolver, host_copy, port, bucket, key, use_tls, trusted_cert, null // No credentials for anonymous
         );
 
         return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
@@ -266,10 +308,10 @@ fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool) !
     return zpq.file.ParquetFile.open(allocator, path);
 }
 
-fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void {
+fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
     var timer = try std.time.Timer.start();
 
-    var pf = try openFile(allocator, path, is_async);
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -305,8 +347,8 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void
     std.debug.print("Throughput: {d:.2} MB/s (pages), {d:.2} MVal/s\n", .{ mb / elapsed_s, @as(f64, @floatFromInt(total_values)) / elapsed_s / 1_000_000.0 });
 }
 
-fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void {
-    var pf = try openFile(allocator, path, is_async);
+fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -326,8 +368,8 @@ fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !vo
     }
 }
 
-fn cmdMeta(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void {
-    var pf = try openFile(allocator, path, is_async);
+fn cmdMeta(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -363,8 +405,8 @@ fn cmdMeta(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void
     }
 }
 
-fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async: bool) !void {
-    var pf = try openFile(allocator, path, is_async);
+fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -514,8 +556,8 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
 }
 
 // The detailed deep-dive inspection (formerly 'inspect')
-fn cmdPages(allocator: std.mem.Allocator, path: []const u8, is_async: bool) !void {
-    var pf = try openFile(allocator, path, is_async);
+fn cmdPages(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resolver: zpq.s3.dns.Resolver) !void {
+    var pf = try openFile(allocator, path, is_async, resolver);
     defer pf.deinit();
 
     try pf.readFooter();

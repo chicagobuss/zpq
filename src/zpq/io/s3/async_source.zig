@@ -6,6 +6,7 @@ const connection_pool_mod = @import("connection_pool.zig");
 const ConnectionPool = connection_pool_mod.ConnectionPool;
 const ConnectionKey = connection_pool_mod.ConnectionKey;
 const Connection = connection_pool_mod.Connection;
+const dns = @import("dns.zig");
 pub const scheduler = @import("scheduler.zig");
 const Range = io.Range;
 const TlsAdapter = @import("tls_adapter.zig").TlsAdapter;
@@ -18,6 +19,7 @@ pub const AsyncS3Source = struct {
     allocator: std.mem.Allocator,
     pool: *ConnectionPool, // Shared pool
     event_loop: EventLoop,
+    resolver: dns.Resolver,
 
     host: []const u8,
     port: u16,
@@ -27,8 +29,10 @@ pub const AsyncS3Source = struct {
     config: ?types.S3Config, // Unified Auth Config
 
     file_size: u64,
+    resolved_ips: []dns.Address,
+    next_ip_idx: usize,
 
-    pub fn init(allocator: std.mem.Allocator, pool: *ConnectionPool, host: []const u8, port: u16, bucket: []const u8, key: []const u8, use_tls: bool, trusted_cert: ?[]const u8, config: ?types.S3Config) !AsyncS3Source {
+    pub fn init(allocator: std.mem.Allocator, pool: *ConnectionPool, resolver: dns.Resolver, host: []const u8, port: u16, bucket: []const u8, key: []const u8, use_tls: bool, trusted_cert: ?[]const u8, config: ?types.S3Config) !AsyncS3Source {
         const path = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ bucket, key });
         errdefer allocator.free(path);
 
@@ -62,6 +66,7 @@ pub const AsyncS3Source = struct {
             .allocator = allocator,
             .pool = pool,
             .event_loop = loop,
+            .resolver = resolver,
             .host = host_dupe,
             .port = port,
             .path_prefix = path,
@@ -69,10 +74,15 @@ pub const AsyncS3Source = struct {
             .trusted_cert = cert_dupe,
             .config = config_dupe,
             .file_size = 0,
+            .resolved_ips = &.{},
+            .next_ip_idx = 0,
         };
         errdefer self.deinit();
 
-        // Fetch size via HEAD request (synchronously waiting on loop)
+        // 1. Initial DNS Resolution
+        try self.resolveHost();
+
+        // 2. Fetch size via HEAD request (synchronously waiting on loop)
         try self.fetchSize();
 
         return self;
@@ -92,6 +102,54 @@ pub const AsyncS3Source = struct {
             self.allocator.free(c.region);
             if (c.endpoint) |ep| self.allocator.free(ep);
         }
+        if (self.resolved_ips.len > 0) self.allocator.free(self.resolved_ips);
+    }
+
+    fn resolveHost(self: *AsyncS3Source) !void {
+        std.debug.print("[AsyncS3Source] Resolving {s}:{d}...\n", .{ self.host, self.port });
+
+        var dns_comp = dns.Resolver.Completion.init();
+        defer dns_comp.deinit(self.allocator);
+
+        const DnsCtx = struct {
+            results: []dns.Address = &.{},
+            err: ?anyerror = null,
+            done: bool = false,
+            allocator: std.mem.Allocator,
+
+            fn callback(ud: ?*anyopaque, results: []const dns.Address, err: anyerror!void) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ud));
+                err catch |e| {
+                    ctx.err = e;
+                    ctx.done = true;
+                    return;
+                };
+
+                // Copy results
+                const copy = ctx.allocator.alloc(dns.Address, results.len) catch |e| {
+                    ctx.err = e;
+                    ctx.done = true;
+                    return;
+                };
+                @memcpy(copy, results);
+                ctx.results = copy;
+                ctx.done = true;
+            }
+        };
+
+        var dns_ctx = DnsCtx{ .allocator = self.allocator };
+        self.resolver.resolve(&self.event_loop.loop, self.host, self.port, &dns_comp, DnsCtx.callback, &dns_ctx);
+
+        while (!dns_ctx.done) {
+            _ = try self.event_loop.tick();
+        }
+
+        if (dns_ctx.err) |err| return err;
+        if (dns_ctx.results.len == 0) return error.HostNotFound;
+
+        if (self.resolved_ips.len > 0) self.allocator.free(self.resolved_ips);
+        self.resolved_ips = dns_ctx.results;
+        self.next_ip_idx = 0;
     }
 
     fn fetchSize(self: *AsyncS3Source) !void {
@@ -300,37 +358,20 @@ pub const AsyncS3Source = struct {
     }
 
     fn connectNew(self: *AsyncS3Source) !Connection {
-        std.debug.print("[AsyncS3Source] Resolving {s}:{d}...\n", .{ self.host, self.port });
+        if (self.resolved_ips.len == 0) return error.HostNotFound;
 
-        const addr = try resolveHost(self.allocator, self.host, self.port);
+        const addr = self.resolved_ips[self.next_ip_idx];
+        self.next_ip_idx = (self.next_ip_idx + 1) % self.resolved_ips.len;
 
-        const fd = try std.posix.socket(switch (addr) {
-            .ip4 => std.posix.AF.INET,
-            .ip6 => std.posix.AF.INET6,
+        const fd = try std.posix.socket(switch (addr.any.family) {
+            std.posix.AF.INET => std.posix.AF.INET,
+            std.posix.AF.INET6 => std.posix.AF.INET6,
+            else => return error.UnsupportedAddressFamily,
         }, std.posix.SOCK.STREAM, 0);
         errdefer std.posix.close(fd);
 
-        std.debug.print("[AsyncS3Source] Connecting...\n", .{});
-        switch (addr) {
-            .ip4 => |ip4| {
-                const sa = std.posix.sockaddr.in{
-                    .family = std.posix.AF.INET,
-                    .port = std.mem.nativeToBig(u16, ip4.port),
-                    .addr = @bitCast(ip4.bytes), // Assuming ip4.bytes is Big Endian
-                };
-                try std.posix.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
-            },
-            .ip6 => |ip6| {
-                const sa = std.posix.sockaddr.in6{
-                    .family = std.posix.AF.INET6,
-                    .port = std.mem.nativeToBig(u16, ip6.port),
-                    .flowinfo = ip6.flow,
-                    .addr = @bitCast(ip6.bytes),
-                    .scope_id = if (ip6.interface.isNone()) 0 else ip6.interface.index,
-                };
-                try std.posix.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in6));
-            },
-        }
+        std.debug.print("[AsyncS3Source] Connecting to {}...\n", .{addr.any});
+        try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
 
         var tls_adapter: ?*TlsAdapter = null;
         if (self.use_tls) {
@@ -346,61 +387,6 @@ pub const AsyncS3Source = struct {
 
         std.debug.print("[AsyncS3Source] Connected (FD {d})\n", .{fd});
         return Connection{ .fd = fd, .tls = tls_adapter };
-    }
-
-    fn resolveHost(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.Io.net.IpAddress {
-        // Try parsing as IP literal first
-        if (std.Io.net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
-
-        const c = std.c;
-        var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
-        hints.family = c.AF.UNSPEC;
-        hints.socktype = c.SOCK.STREAM;
-        hints.protocol = c.IPPROTO.TCP;
-
-        var res: ?*c.addrinfo = null;
-        const port_str = try std.fmt.allocPrint(allocator, "{d}", .{port});
-        defer allocator.free(port_str);
-        const port_z = try allocator.dupeZ(u8, port_str);
-        defer allocator.free(port_z);
-        const host_z = try allocator.dupeZ(u8, host);
-        defer allocator.free(host_z);
-
-        const rc = c.getaddrinfo(host_z, port_z.ptr, &hints, &res);
-        if (@intFromEnum(rc) != 0) return error.HostNotFound;
-        defer if (res) |r| c.freeaddrinfo(r);
-
-        if (res) |r| {
-            // First pass: look for IPv4
-            var curr: ?*c.addrinfo = r;
-            while (curr) |info| : (curr = info.next) {
-                if (info.family == c.AF.INET) {
-                    const addr_in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(info.addr));
-                    // Convert to Io.net.IpAddress.ip4
-                    const bytes: [4]u8 = @bitCast(addr_in.addr);
-                    return std.Io.net.IpAddress{
-                        .ip4 = .{
-                            .bytes = bytes,
-                            .port = port, // Use original port or one from getaddrinfo (which should match)
-                        },
-                    };
-                }
-            }
-
-            // Second pass: return whatever we find (IPv6)
-            curr = r;
-            while (curr) |info| : (curr = info.next) {
-                if (info.family == c.AF.INET6) {
-                    const addr_in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(info.addr));
-                    const bytes: [16]u8 = @bitCast(addr_in6.addr);
-                    return std.Io.net.IpAddress{ .ip6 = .{
-                        .bytes = bytes,
-                        .port = port,
-                    } };
-                }
-            }
-        }
-        return error.HostNotFound;
     }
 
     // --- RandomAccessSource Implementation ---

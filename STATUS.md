@@ -82,12 +82,13 @@
 *   [x] **Middleware: Single-Flight**: Implemented `SingleFlightResolver` to deduplicate concurrent lookups for the same host.
 *   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for racing (Happy Eyeballs foundation).
 *   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and race logic.
-*   See `@STATUS_CURRENT_DETAIL.md` for the technical blueprint.
 
-### 🚀 Milestone 7: Advanced Connection Pooling & Coalescing (CURRENT)
-*   [ ] **DNS Integration**: Wire `dns.Resolver` into `AsyncS3Source` to remove hardcoded IPs.
-*   [ ] **Threshold Trigger (N-Lane)**: Uncork the pipeline as soon as target IP count is met.
-*   [ ] **Persistent Connection Pool**: Keyed by `(scheme, host, port)` with idle timeout and stale detection.
+### 🚀 Milestone 7: DNS Integration & Advanced I/O (CURRENT)
+*   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source`. Removed hardcoded IPs.
+*   [x] **Round-Robin**: `AsyncS3Source` now cycles through resolved IPs for parallel connections.
+*   [x] **Cross-Platform Loop**: Refactored `EventLoop` to wrap `libxev` for WSL2/macOS compatibility.
+*   [ ] **Pure Async I/O**: Refactor `AsyncRequest` to use `libxev` completions directly (remove `WouldBlock` polling).
+*   [ ] **Persistent Connection Pool**: Keyed by `(host, port, tls)` with idle timeout and stale detection.
 *   [ ] **Repetition Levels**: Support for Lists and Maps.
 
 ---

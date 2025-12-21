@@ -29,15 +29,20 @@ We have successfully implemented a tiered, asynchronous DNS resolver stack that 
 ### Technical Blueprint (Pure Async Next Steps):
 We are transitioning from a **Polling State Machine** (busy-waiting on `WouldBlock`) to a **Pure Completion State Machine**.
 
-1.  **Completion Ownership**:
-    *   `AsyncRequest` will embed `xev.Completion` and `xev.TCP` structs.
-    *   **Probing Strategy**: Create `probe_xev_tcp_lifecycle.zig` to verify the latest `xev.TCP.connect` and `read/write` signatures. The Zig 0.16 `std.posix` transition changed how FDs are passed to event loops.
-    *   **Microtest**: `tests/io/test_async_state_machine.zig` will verify the "Connect -> Send -> Recv" chain without S3 logic.
+1.  **Transport Abstraction (`Connection`)**:
+    *   Create `src/zpq/io/s3/connection.zig` to wrap `xev.TCP`.
+    *   Handle both **Plain TCP** and **BoringTLS** using the "Pump" pattern.
+    *   This decouples `AsyncRequest` (HTTP logic) from the raw network/TLS bytes.
 
-2.  **Callback-Driven State Machine**:
-    *   Each state will have a dedicated `libxev` callback (e.g., `onConnect`, `onWrite`, `onRead`).
-    *   **Concurrency**: This allows 100+ requests to be truly interleaved on a single thread.
-    *   **Zero-Alloc Transition**: No memory should be allocated when moving between "Headers Received" and "Reading Body Segments".
+2.  **AsyncRequest State Machine Evolution**:
+    *   `AsyncRequest` will no longer be an "Observer" of FDs.
+    *   It will interface with the `Connection` via `write(data)` and `on_data(data)` callbacks.
+    *   **States**: `Idle` -> `Connecting` -> `RequestSent` -> `ReadingHeaders` -> `ReadingBody`.
+
+3.  **Probing & Microtesting**:
+    *   [x] `probe_xev_tcp_lifecycle.zig`: Verified raw `xev.TCP` connect/close.
+    *   [ ] `probe_tls_pump.zig`: Verify the `boring_tls` pump with `xev.TCP` in isolation.
+    *   [ ] `tests/io/test_async_request_flow.zig`: Verify the HTTP state machine using a mock `Connection`.
 
 3.  **TLS "Pump" Integration**:
     *   **Web Search Task**: Profusely search for "libxev TLS adapter patterns" and "BoringSSL async BIO pump" to ensure our `TlsAdapter` doesn't deadblock when the loop is driving multiple completions.

@@ -88,6 +88,7 @@
 *   [x] **Round-Robin**: `AsyncS3Source` now cycles through resolved IPs for parallel connections.
 *   [x] **Cross-Platform Loop**: Refactored `EventLoop` to wrap `libxev` for WSL2/macOS compatibility.
 *   [ ] **Pure Async I/O**: Refactor `AsyncRequest` to use `libxev` completions directly (remove `WouldBlock` polling).
+*   [ ] **Transport Abstraction**: Implement `Connection` (TCP/TLS) with "Pump" pattern.
 *   [ ] **Persistent Connection Pool**: Keyed by `(host, port, tls)` with idle timeout and stale detection.
 *   [ ] **Repetition Levels**: Support for Lists and Maps.
 

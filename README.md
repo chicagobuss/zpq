@@ -25,6 +25,23 @@ The codebase does its best to adhere to the following internal standards:
 - **Explicit Memory Management**: Performance-critical paths utilize unmanaged containers. All allocations are explicit, requiring the caller to manage resource lifecycles.
 - **Memory Pinning**: Resources with strict identity requirements, such as event loops and network buffers, are heap-allocated to ensure validity across asynchronous transitions.
 
+## Technical Philosophy
+
+ZPQ balances the use of emerging Zig 0.16.dev features with stable development practices to ensure performance without incurring excessive technical debt.
+
+### Supporting the Spirit of Zig 0.16
+While targeting the latest master branch, ZPQ prioritizes the architectural "spirit" of the upcoming standard library:
+- **Interface-First I/O**: Business logic is restricted to `std.Io` style interfaces. This ensures that the core engine remains decoupled from the specific event loop implementation.
+- **Unmanaged Containers**: We adopt the 0.16 pattern of unmanaged containers (`ArrayListUnmanaged`, etc.) to make memory allocation explicit and visible throughout the hot path.
+- **Composition over Inheritance**: Transport implementations are composed of independent parts (DNS, TCP, TLS) rather than hidden behind a monolithic client object.
+
+### Library Selection and the "Re-write" Rationale
+ZPQ is selective about external dependencies, favoring native re-writes for the core protocol stack:
+- **Protocol Re-writes (S3, HTTP/1.1, SigV4)**: These are implemented natively to avoid the significant overhead and "hidden" state machines of general-purpose SDKs. This allows for specialized optimizations like zero-allocation gap skipping.
+- **Bridging Libraries (`libxev`, `boring_tls`)**: We utilize these specific libraries as high-performance bridges:
+    - **`libxev`**: Provides a production-ready abstraction for `io_uring` and `kqueue` that exceeds the current capabilities of `std.Io`. It is isolated behind our `EventLoop` abstraction to allow for a future transition to native Zig async.
+    - **`boring_tls`**: Used to provide secure transport via statically-linked BoringSSL. Like `libxev`, it is wrapped in an adapter to ensure the core logic remains unaware of the TLS implementation details.
+
 ## Testing and Verification
 
 ZPQ is tested for stability across several environments:
@@ -33,6 +50,10 @@ ZPQ is tested for stability across several environments:
 - **Architecture Support**: Native testing for x86_64 and ARM64.
 - **Component Isolation**: Critical components (DNS stack, TLS integration, HTTP state machine) are verified through independent micro-tests prior to integration.
 - **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
+
+## Performance
+
+// TODO
 
 ## Documentation
 Additional technical detail is available in the following files:

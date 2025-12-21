@@ -8,15 +8,16 @@
 
 ## Philosophy & Architecture
 *   **Lambda-First**: The ultimate goal is high-performance AWS Lambdas with minimal cold starts.
-    *   **Zero-Dependency**: No generic SDKs (e.g., `aws-sdk-for-zig`). We only implement the specific S3 `GET`/`HEAD` logic required.
+    *   **Zero-Dependency Core**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
     *   **Minimal Footprint**: Reduction of binary size and memory utilization.
-*   **Performance Orientation**:
-    *   Prioritize Zig-native performance optimizations (zero-allocation, comptime) over matching standard SDK implementation patterns.
-    *   Pragmatic authentication support: environment variables and basic profiles (as required by Lambda), avoiding complex SSO/MFA flows unless necessary.
+*   **The Spirit of Zig 0.16**: We align with upcoming 0.16 patterns today:
+    *   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
+    *   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
+*   **Pragmatic Library Usage**:
+    *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level primitives (io_uring/kqueue) and secure transport while being isolated for a future transition to a purely native `std` stack.
 *   **Dependency Boundaries**:
-    *   Core Parquet logic (`src/zpq/decoder.zig`, etc.) remains pure logic with no I/O or transport knowledge.
+    *   Core Parquet logic remains pure logic with no I/O or transport knowledge.
     *   I/O is abstracted via the `RandomAccessSource` interface.
-    *   Transport implementation (`src/zpq/io/s3/`) handles HTTP/Authentication logic while remaining dependency-free.
 
 ---
 

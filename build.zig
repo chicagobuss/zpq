@@ -213,6 +213,26 @@ pub fn build(b: *std.Build) void {
     const enable_experimental = b.option(bool, "experimental", "Enable experimental tests/benchmarks") orelse false;
 
     if (enable_experimental) {
+        // 0. probe_async_dns
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probe_async_dns.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+
+            const exe_probe = b.addExecutable(.{
+                .name = "probe_async_dns",
+                .root_module = mod,
+            });
+            exe_probe.linkLibC();
+
+            const run = b.addRunArtifact(exe_probe);
+            const step = b.step("probe-async-dns", "Run Async DNS probe");
+            step.dependOn(&run.step);
+        }
+
         // 1. test_boring_connect
         {
             const mod = b.createModule(.{
@@ -340,6 +360,26 @@ pub fn build(b: *std.Build) void {
 
             const run = b.addRunArtifact(exe_minio_range);
             const step = b.step("test-minio-range-get", "Run MinIO TLS Range GET integration test");
+            step.dependOn(&run.step);
+        }
+        // 7. test_dns
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_dns.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const exe_dns = b.addExecutable(.{
+                .name = "test_dns",
+                .root_module = mod,
+            });
+            exe_dns.linkLibC();
+
+            const run = b.addRunArtifact(exe_dns);
+            const step = b.step("test-dns", "Run Async DNS integration test");
             step.dependOn(&run.step);
         }
     }

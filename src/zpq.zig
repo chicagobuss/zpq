@@ -38,6 +38,7 @@ pub const s3 = struct {
     pub const EventLoop = @import("zpq/io/s3/event_loop.zig").EventLoop;
     pub const TlsAdapter = @import("zpq/io/s3/tls_adapter.zig").TlsAdapter;
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");
+    pub const dns = @import("zpq/io/s3/dns.zig");
 };
 
 test {

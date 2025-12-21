@@ -76,17 +76,19 @@
     *   [x] **Unmanaged pattern**: `AsyncRequest`, `ColumnReader`, and `Page` no longer store allocators.
 *   [x] **CLI**: Added `--async` flag for engine switching.
 
-### 🚀 Milestone 6: High-Performance Async DNS (CURRENT)
-*   [ ] **Speculative resolution**: Race IPv4 vs IPv6 to launch connections earlier.
-*   [ ] **Threshold Trigger (N-Lane)**: Uncork the pipeline as soon as target IP count is met.
-*   [ ] **Single-Flight Broadcast**: Prevent redundant lookups for the same bucket across 100+ parallel requests.
+### ✅ Milestone 6: High-Performance Async DNS
+*   [x] **Interface Design**: Defined `Resolver` interface with `Completion` and `VTable`.
+*   [x] **Tier 1: Stable**: Implemented `ThreadPoolResolver` using `libxev.ThreadPool` + `std.c.getaddrinfo`.
+*   [x] **Middleware: Single-Flight**: Implemented `SingleFlightResolver` to deduplicate concurrent lookups for the same host.
+*   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for racing (Happy Eyeballs foundation).
+*   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and race logic.
 *   See `@STATUS_CURRENT_DETAIL.md` for the technical blueprint.
 
-### 🎯 Milestone 7+: Future Roadmap
+### 🚀 Milestone 7: Advanced Connection Pooling & Coalescing (CURRENT)
+*   [ ] **DNS Integration**: Wire `dns.Resolver` into `AsyncS3Source` to remove hardcoded IPs.
+*   [ ] **Threshold Trigger (N-Lane)**: Uncork the pipeline as soon as target IP count is met.
 *   [ ] **Persistent Connection Pool**: Keyed by `(scheme, host, port)` with idle timeout and stale detection.
-*   [ ] **Nested Types**: Support for Lists and Maps (Repetition Levels).
-*   [ ] **Modern Encodings**: `DELTA_BINARY_PACKED` and `BYTE_STREAM_SPLIT`.
-*   [ ] **Arena Decompression**: Benchmark arena vs generic allocator for heavy columnar throughput.
+*   [ ] **Repetition Levels**: Support for Lists and Maps.
 
 ---
 

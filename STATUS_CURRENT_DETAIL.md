@@ -1,168 +1,58 @@
 # ZPQ Technical Context & Deep Dive
 
 **Last Updated**: Dec 21, 2025
-**Current State**: **Consolidation Milestone Reached**: All S3 code unified under `src/zpq/io/s3/`. Async stack now supports SigV4 and uses leaner Zig 0.16.dev unmanaged patterns.
+**Current State**: **DNS Milestone Reached**: High-performance, zero-blocking DNS stack implemented and verified. Ready for integration into the async S3 engine.
 
-## 🏆 Milestone 3: Libxev + BoringTLS Integration
-We have successfully established a secure TLS 1.3 connection to `google.com` AND `s3.amazonaws.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on **both macOS M1 and Linux ARM64**.
+## 🏆 Milestone 6: High-Performance Async DNS (Completed)
+We have successfully implemented a tiered, asynchronous DNS resolver stack that decouples DNS lookups from the main event loop and enables aggressive parallel connection launching.
 
 *   **Verification**: 
-    *   **Local (macOS M1)**: `zig build --build-file micro_build.zig test-http-client` passes.
-    *   **Remote (Linux ARM64)**: `test-boring-connect` and `test-s3-head` pass on `oci-josh-arm-vm`.
-*   **Key Fixes**:
-    *   **"Unknown Target CPU"**: Patched `boring_tls/build.zig` to define `_M_ARM64` for `aarch64` targets, resolving BoringSSL header compilation errors on M1 and Linux ARM.
-    *   **Build Isolation**: Created `micro_build.zig` to run experimental tests without polluting the main `build.zig`.
-    *   **BIO Pattern**: Verified that `boring_tls` interacts correctly with non-blocking `libxev` sockets via the standard BIO interface.
+    *   **Integration Test**: `tests/io/test_dns.zig` successfully verified the entire stack.
+    *   **Deduplication**: Proved that `SingleFlightResolver` merges concurrent requests for the same host.
+    *   **Racing**: `SpeculativeResolver` correctly launches IPv4/IPv6 races.
+    *   **Memory Hygiene**: Verified zero leaks using `GeneralPurposeAllocator`.
+*   **Key Components**:
+    *   **`ThreadPoolResolver`**: Offloads `getaddrinfo` to `libxev.ThreadPool`.
+    *   **`SingleFlightResolver`**: Deduplicates lookups at the bucket/endpoint level.
+    *   **`SpeculativeResolver`**: Foundations for "Happy Eyeballs" and fast connection startup.
 
 ## ⚡ Performance Verification
-*   **Benchmark**: TCP Echo (Sequential, Single Connection, 500k iterations)
-*   **Zig (libxev)**: **~70,121 RPS** (ReleaseFast)
-*   **Node.js (v24)**: **~54,140 RPS**
-*   **Result**: Zig `libxev` is **~1.3x faster** than Node.js.
+*   **Benchmark**: DNS Deduplication (3 parallel requests)
+*   **Result**: 6 logical attempts (3 requests × 2 races) -> **exactly 1 DNS query**.
+*   **Impact**: Massive reduction in DNS round-trip overhead for high-concurrency S3 scanning.
 
-## 🛠 Infrastructure
-*   **Backup/Remote**: `oci-josh-arm-vm` (ARM64 Linux) configured as git remote `backup`.
-*   **Use Case**: Native ARM64 builds and `io_uring` verification for AWS Lambda targets.
+## 🚀 Milestone 7: DNS Integration & Advanced Pooling (CURRENT)
+**Goal**: Wire the new DNS stack into `AsyncS3Source` and implement a production-grade connection pool.
+
+### Technical Blueprint:
+1.  **Wiring**:
+    *   Modify `AsyncS3Source.init` to accept a `dns.Resolver`.
+    *   Replace hardcoded IP logic in `scheduler.zig` with dynamic resolution.
+    *   Implement "Round-Robin" selection from the `dns.Address` list.
+2.  **Connection Pool**:
+    *   Implement persistent socket reuse keyed by `(host, port, tls)`.
+    *   Handle idle timeouts and server-side disconnects.
+3.  **N-Lane Trigger**:
+    *   Enable the "Early Start" optimization: launch connections as soon as the first `N` IPs are resolved.
+
+---
 
 ## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
 ### 1. Zig 0.16.x Breaking Changes & Patterns
-*   **`std.Io` Overhaul**: `std.io` is now `std.Io`. The API is async-native.
-    *   `Reader.read` is gone. Use `Reader.readVec` (returns bytes read) or `Reader.readSliceShort` (tries to fill buffer).
-    *   `Writer` handles buffering differently.
-*   **`std.crypto.tls.Client`**:
-    *   **Manual Buffering**: Requires explicit `Options` with `read_buffer` (plaintext read) and `write_buffer` (plaintext write).
-    *   **Socket Wrapping**: Wraps `std.Io.net.Stream`, which wraps the raw FD.
-    *   **Error Handling**: Does NOT explicitly list `error.WouldBlock` in inferred return types, requiring `@as(anyerror, err)` casts to handle non-blocking flow correctly.
-*   **`std.net` Removal**: Old `std.net` functions (like `getAddressList`) are moving/changing. Use `std.Io.net` or `std.posix` primitives where possible.
+*   **Unmanaged Containers**: `std.ArrayListUnmanaged` and `std.StringHashMap` are now the standard for performance.
+    *   *Correction*: Always pass `allocator` to `append`, `put`, and `deinit`.
+*   **Alignment Safety**: `xev.shim_net.Address` is critical for handling `sockaddr` alignment correctly.
+    *   *Gotcha*: `@ptrCast(@alignCast(&addr))` is required when moving from raw bytes to specialized `sockaddr` types.
+*   **C-ABI Boundaries**: `std.c.getaddrinfo` requires null-terminated strings. Use `allocator.dupeZ` for safety.
 
 ### 2. Workflow & Testing Strategy
-*   **The Python Wrapper**: ALWAYS use `python3 tools/no_output_timeout.py zig build test-io` for I/O tests.
-    *   **Why**: Zig test runner buffers output and can hang silently on deadlocks/timeouts. The wrapper ensures we see partial output and kills hung processes.
-*   **Micro-Tests First**: Don't try to integrate complex systems immediately.
-    *   *Example*: We built `test_event_loop.zig` (kqueue), `test_tls.zig` (handshake), and `test_async_request.zig` (HTTP state machine) in isolation before wiring them together.
-*   **Search > Guess**: Zig 0.16 is bleeding edge.
-    *   **Do**: Search `lib/std` source code (e.g., `lib/std/http/Client.zig`) for usage patterns.
-    *   **Do**: Search web/Discord for specific 0.16 migration guides.
-    *   **Don't**: Guess method signatures based on 0.13 docs.
+*   **Micro-Test Driven Development (MTDD)**: 
+    *   We built `tests/io/test_dns.zig` to verify the logic before touching the main `AsyncS3Source`. 
+    *   This saved hours of debugging complex state machine interactions in the larger system.
+*   **Probing is Mandatory**: When in doubt about a new Zig API, a 20-line `probe_*.zig` file is faster than reading the (often outdated) docs.
 
-## 🔒 TLS Integration Roadmap (BoringTLS)
-**Goal**: Unified, high-performance TLS across all platforms (macOS/Linux) using `boring_tls`.
-
-*   **Strategy**: "Filter Pattern" (BIO).
-    *   Treat TLS as a pure data transformation layer, decoupled from the underlying socket.
-    *   Use `libxev` for transport (already verified).
-    *   Use `boring_tls` for crypto (statically linked, identical behavior everywhere).
-*   **Phases**:
-    1.  **The Dumb Adapter**: Implement a buffer-based BIO shim that `boring_tls` can read/write to.
-    2.  **The Pump (Microtest)**: Manually drive the handshake loop in a single file (`test_boring_connect.zig`).
-    3.  **The Component**: Encapsulate the pump into a reusable `TlsClient` struct adhering to `std.Io`.
-
-## 🚀 New I/O Stack Implementation Plan
-
-**Goal**: Replace flaky legacy stack with robust `libxev` (event loop) + `boring_tls` (OpenSSL) implementation.
-
-### Architecture
-*   **`Client` Struct**: Orchestrates `xev.Loop` and connection pool.
-*   **`Connection` Struct**: Wraps `xev.TCP` + `boring_tls.TlsClient`.
-*   **`readRanges`**: Zero-allocation pipeline directly from socket to user buffers.
-
-### Development Roadmap (Micro-Test Driven)
-
-### Milestone 3.1: Micro-Tests (Completed)
-1.  **[DONE] TCP Connectivity (`test_xev_tcp`)**: 
-    *   Proved `libxev` works on macOS and Linux.
-2.  **[DONE] TLS Handshake (`test_boring_connect`)**:
-    *   **Goal**: Verify "BIO Pair" pattern for `boring_tls` + `libxev`.
-    *   **Action**: `tests/io/test_boring_connect.zig` successfully connects to `google.com:443` on macOS and Linux ARM64.
-3.  **[DONE] S3 Protocol (`test_s3_head`)**:
-    *   **Goal**: Verify S3 protocol over TLS.
-    *   **Action**: Successfully sent HEAD request to `s3.amazonaws.com` and received HTTP 405 (Method Not Allowed), confirming transport and protocol functionality on both platforms.
-
-### Milestone 3.2: Implementation & Integration (In Progress)
-1.  **Core Client**:
-    *   **[DONE] `TlsConnection`**: Implemented in `src/zpq/io/tls/connection.zig`. Supports async connect, read, write, close, and EOF handling.
-    *   **[DONE] `http.Client`**: Implemented in `src/zpq/io/http/client.zig`.
-    *   **Verification**: `zig build --build-file micro_build.zig test-http-client` passes (fetches HEAD from S3).
-    *   **[DONE] MinIO Verification**: Verified `zpq` against local MinIO with self-signed TLS.
-    *   **[DONE] MinIO Range GET (Byte-Exact) Over TLS**:
-        *   **What we proved**:
-            *   TLS handshake + encrypted reads/writes using `libxev` + `boring_tls`.
-            *   HTTP/1.1 request/response over that TLS connection.
-            *   `Range: bytes=a-b` returns **exact expected bytes** for a known binary fixture.
-        *   **What we did NOT test**: **No Parquet parsing yet** (this is transport correctness only).
-        *   **Command**:
-            *   `python3 tools/no_output_timeout.py --idle-seconds 60 tools/minio_tls/setup_fixture.sh`
-            *   `python3 tools/no_output_timeout.py --idle-seconds 10 zig build -Dexperimental test-minio-range-get`
-        *   **Key implementation details**:
-            *   Fixture embedding is via `ci/fixtures/minio/fixtures.zig` (module) to satisfy Zig’s `@embedFile` package-path restriction.
-            *   `build.zig` wires that in as `minio_fixtures` for `test_minio_range_get`.
-    *   **[DONE] Build Hygiene**: Added `just cross-check-experimental` to verify Linux compilation locally. Fixed Linux CI by isolating macOS-only `EventLoop`.
-2.  **Parquet Wiring**: Implement `readRanges` and hook into `ParquetFile`.
-
-## 🧠 Next-Session Insights (Keep Us Sane)
-*   **Docker + idle timeouts**: `docker-compose up/down` can be “quiet” for >10s while doing real work. Use a longer idle timeout for these steps (or ensure scripts print progress).
-*   **Always verify HTTPS health**: When MinIO certs are missing, it silently falls back to HTTP. We now generate certs automatically and poll `https://localhost:9000/minio/health/live` before running tests.
-*   **Self-signed TLS warning is expected**: `Certificate verification failed: 18` is fine for local MinIO (we run `--insecure` intentionally). Don’t “fix” it unless we’re testing trust stores.
-*   **Transport-first milestone is real value**: Range GET correctness is the core primitive for Parquet-on-S3 (footer + column chunk reads). Next work should focus on formalizing an S3 transport API and then wiring it into `RandomAccessSource` for Parquet.
-
-### Next: S3 Transport Skeleton (Execution Checklist)
-*   **API shape**: `Transport.head(host, ip, port, path, headers) -> ResponseMeta`
-*   **API shape**: `Transport.getRange(host, ip, port, path, range) -> []u8` (or caller-provided buffer)
-*   **Connection lifecycle**: explicit close; keep-alive later (start with `Connection: close` correctness).
-*   **HTTP parsing**: use `ResponseParser` for status/headers/body; ensure 206 path is solid.
-*   **MinIO as harness**:
-    *   Continue using `tools/minio_tls/setup_fixture.sh` + `test-minio-range-get` as the “golden transport test”.
-    *   Add 1 failing-case test next: missing object → 404, and ensure error path is deterministic.
-
-### S3 Implementation Status
-- **Sync Stack (`zpq.s3.S3Source`)**: Fully functional with SigV4 support. Uses `std.http.Client`.
-- **Async Stack (`zpq.s3.AsyncS3Source`)**: 
-    - Event loop based on `libxev`.
-    - TLS supported via `boring_tls`.
-    - **Consolidated Architecture**: All S3 code moved to `src/zpq/io/s3/`.
-    - **Engine Switching**: Added `--async` flag to CLI for easy testing.
-    - **Unmanaged Hot Path**: `AsyncRequest`, `ColumnReader`, and `Page` refactored to be unmanaged (no stored allocator) for better cache locality and Zig 0.16 compliance.
-- **Milestone 6**: Implement Async DNS resolution (The "N-Lane Racecar" Plan).
-
-## 🏆 Milestone 4: MinIO TLS Range GET Works
-We have a working end-to-end *transport* proof using the new stack (`libxev` + `boring_tls` + `zpq.io.http`):
-
-*   **Verification**: `zig build -Dexperimental test-minio-range-get` passes.
-*   **Result**: Proved that TLS handshake + encrypted reads/writes work with `libxev` and return exact bytes for ranged S3-style requests.
-
-## 🏆 Milestone 5: S3 Consolidation & Zig 0.16.dev Alignment
-Completed a major architecture refactor to unify the codebase and adopt high-performance Zig patterns.
-
-*   **Consolidation**: All S3 code moved to `src/zpq/io/s3/`.
-*   **Unmanaged hot-path**: `AsyncRequest`, `ColumnReader`, and `Page` no longer store an allocator, reducing memory overhead.
-*   **Unified Config**: Both sync and async engines now share a single `S3Config` type.
-
-## 🌐 Milestone 6: High-Performance Async DNS Plan (Tiered)
-
-To achieve maximum S3 throughput, ZPQ requires a DNS resolver that never blocks the main event loop and maximizes "lanes" into the AWS network.
-
-### Milestone 6.1: The Interface (`DnsResolver`)
-A pluggable interface that allows ZPQ to swap between stability and "racecar" performance without refactoring the transport logic.
-- **Input**: Hostname, Port, and a "Threshold" (Minimum IPs required).
-- **Output**: A broadcast event containing an `AddressList`.
-
-### Milestone 6.2: Tier 1 - `ThreadPoolResolver` (Boring & Stable)
-The default implementation for maximum compatibility (VPNs, `/etc/hosts`).
-- **Mechanism**: Wraps standard `std.c.getaddrinfo` in a `libxev` thread-pool task.
-- **Role**: Ensures ZPQ "just works" in all environments.
-
-### Milestone 6.3: Tier 2 - `SpeculativeResolver` (The Racecar)
-A specialized resolver designed to "uncork" the pipeline at the earliest possible microsecond.
-- **Multi-Homing Race**: Fires separate threads/queries for IPv4 (A) and IPv6 (AAAA) simultaneously.
-- **Threshold Trigger (N-Lane)**: If ZPQ needs 8 parallel lanes, and the IPv4 result returns 12 IPs in 10ms, the resolver **triggers immediately**. It does not wait for the IPv6 result to return or timeout.
-- **Single-Flight Broadcast**: If 100 requests hit the same bucket, only one resolution is triggered. The result is broadcast to all 100 requests, which then use **Round-Robin** to distribute connections across the returned IPs.
-
-### Milestone 6.4: Implementation Roadmap
-1.  **Resolver Interface**: Define `src/zpq/io/s3/dns.zig`.
-2.  **Thread Pool implementation**: Build the stable base.
-3.  **Single-Flight Wrapper**: Add the broadcast/caching layer.
-4.  **Threshold Logic**: Implement the speculative "early trigger" optimization.
+---
 
 ## 🏗️ Legacy Stack (Reference/Backup)
 Removed. All core logic migrated to `src/zpq/io/s3/`.

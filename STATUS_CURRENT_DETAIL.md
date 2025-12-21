@@ -1,9 +1,9 @@
 # ZPQ Technical Context & Deep Dive
 
-**Last Updated**: Dec 18, 2025
-**Current State**: **Breakthrough**: `libxev` + `boring_tls` stack verified. Core `http.Client` and `TlsConnection` implemented and verified against S3.
+**Last Updated**: Dec 21, 2025
+**Current State**: **Consolidation Milestone Reached**: All S3 code unified under `src/zpq/io/s3/`. Async stack now supports SigV4 and uses leaner Zig 0.16.dev unmanaged patterns.
 
-## 🏆 Milestone: Libxev + BoringTLS Integration
+## 🏆 Milestone 3: Libxev + BoringTLS Integration
 We have successfully established a secure TLS 1.3 connection to `google.com` AND `s3.amazonaws.com` using `libxev` (async I/O) and `boring_tls` (OpenSSL) on **both macOS M1 and Linux ARM64**.
 
 *   **Verification**: 
@@ -69,7 +69,7 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
 
 ### Development Roadmap (Micro-Test Driven)
 
-#### Phase 1: Micro-Tests (Completed)
+### Milestone 3.1: Micro-Tests (Completed)
 1.  **[DONE] TCP Connectivity (`test_xev_tcp`)**: 
     *   Proved `libxev` works on macOS and Linux.
 2.  **[DONE] TLS Handshake (`test_boring_connect`)**:
@@ -79,7 +79,7 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
     *   **Goal**: Verify S3 protocol over TLS.
     *   **Action**: Successfully sent HEAD request to `s3.amazonaws.com` and received HTTP 405 (Method Not Allowed), confirming transport and protocol functionality on both platforms.
 
-#### Phase 2: Implementation & Integration (In Progress)
+### Milestone 3.2: Implementation & Integration (In Progress)
 1.  **Core Client**:
     *   **[DONE] `TlsConnection`**: Implemented in `src/zpq/io/tls/connection.zig`. Supports async connect, read, write, close, and EOF handling.
     *   **[DONE] `http.Client`**: Implemented in `src/zpq/io/http/client.zig`.
@@ -120,10 +120,49 @@ We have successfully established a secure TLS 1.3 connection to `google.com` AND
 - **Async Stack (`zpq.s3.AsyncS3Source`)**: 
     - Event loop based on `libxev`.
     - TLS supported via `boring_tls`.
-    - **NEW**: SigV4 signing integrated into `AsyncRequest`.
-    - **NEW**: Leaner unmanaged container architecture (Zig 0.16.dev compliant).
-    - **NEW**: Consolidated into `src/zpq/s3/`.
-- **Next Step**: Implement Async DNS resolution to remove hardcoded IPs.
+    - **Consolidated Architecture**: All S3 code moved to `src/zpq/io/s3/`.
+    - **Engine Switching**: Added `--async` flag to CLI for easy testing.
+    - **Unmanaged Hot Path**: `AsyncRequest`, `ColumnReader`, and `Page` refactored to be unmanaged (no stored allocator) for better cache locality and Zig 0.16 compliance.
+- **Milestone 6**: Implement Async DNS resolution (The "N-Lane Racecar" Plan).
+
+## 🏆 Milestone 4: MinIO TLS Range GET Works
+We have a working end-to-end *transport* proof using the new stack (`libxev` + `boring_tls` + `zpq.io.http`):
+
+*   **Verification**: `zig build -Dexperimental test-minio-range-get` passes.
+*   **Result**: Proved that TLS handshake + encrypted reads/writes work with `libxev` and return exact bytes for ranged S3-style requests.
+
+## 🏆 Milestone 5: S3 Consolidation & Zig 0.16.dev Alignment
+Completed a major architecture refactor to unify the codebase and adopt high-performance Zig patterns.
+
+*   **Consolidation**: All S3 code moved to `src/zpq/io/s3/`.
+*   **Unmanaged hot-path**: `AsyncRequest`, `ColumnReader`, and `Page` no longer store an allocator, reducing memory overhead.
+*   **Unified Config**: Both sync and async engines now share a single `S3Config` type.
+
+## 🌐 Milestone 6: High-Performance Async DNS Plan (Tiered)
+
+To achieve maximum S3 throughput, ZPQ requires a DNS resolver that never blocks the main event loop and maximizes "lanes" into the AWS network.
+
+### Milestone 6.1: The Interface (`DnsResolver`)
+A pluggable interface that allows ZPQ to swap between stability and "racecar" performance without refactoring the transport logic.
+- **Input**: Hostname, Port, and a "Threshold" (Minimum IPs required).
+- **Output**: A broadcast event containing an `AddressList`.
+
+### Milestone 6.2: Tier 1 - `ThreadPoolResolver` (Boring & Stable)
+The default implementation for maximum compatibility (VPNs, `/etc/hosts`).
+- **Mechanism**: Wraps standard `std.c.getaddrinfo` in a `libxev` thread-pool task.
+- **Role**: Ensures ZPQ "just works" in all environments.
+
+### Milestone 6.3: Tier 2 - `SpeculativeResolver` (The Racecar)
+A specialized resolver designed to "uncork" the pipeline at the earliest possible microsecond.
+- **Multi-Homing Race**: Fires separate threads/queries for IPv4 (A) and IPv6 (AAAA) simultaneously.
+- **Threshold Trigger (N-Lane)**: If ZPQ needs 8 parallel lanes, and the IPv4 result returns 12 IPs in 10ms, the resolver **triggers immediately**. It does not wait for the IPv6 result to return or timeout.
+- **Single-Flight Broadcast**: If 100 requests hit the same bucket, only one resolution is triggered. The result is broadcast to all 100 requests, which then use **Round-Robin** to distribute connections across the returned IPs.
+
+### Milestone 6.4: Implementation Roadmap
+1.  **Resolver Interface**: Define `src/zpq/io/s3/dns.zig`.
+2.  **Thread Pool implementation**: Build the stable base.
+3.  **Single-Flight Wrapper**: Add the broadcast/caching layer.
+4.  **Threshold Logic**: Implement the speculative "early trigger" optimization.
 
 ## 🏗️ Legacy Stack (Reference/Backup)
-Removed. All core logic migrated to `src/zpq/s3/`.
+Removed. All core logic migrated to `src/zpq/io/s3/`.

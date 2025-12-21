@@ -27,7 +27,7 @@ The codebase does its best to adhere to the following internal standards:
 
 ## Technical Philosophy
 
-ZPQ balances the use of emerging Zig 0.16.dev features with stable development practices to ensure performance without incurring excessive technical debt.
+ZPQ tries to balance emerging Zig 0.16.dev features with stable development practices to ensure performance without incurring excessive technical debt.
 
 ### Supporting the Spirit of Zig 0.16
 While targeting the latest master branch, ZPQ prioritizes the architectural "spirit" of the upcoming standard library:

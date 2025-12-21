@@ -239,7 +239,7 @@ pub const AsyncS3Source = struct {
                 }
 
                 try req.prepare(self.host, self.port, self.path_prefix, chunk_range.start, chunk_range.end, self.use_tls, self.config);
-                
+
                 req.done_ctx = &batch_ctx;
                 req.on_done = BatchCtx.onDone;
                 batch_ctx.pending += 1;
@@ -249,7 +249,7 @@ pub const AsyncS3Source = struct {
         }
 
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
-        
+
         for (requests.items) |*req| {
             var conn = self.pool.acquire(key);
             if (conn == null) conn = try self.connectNew();

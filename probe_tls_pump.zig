@@ -12,11 +12,11 @@ const Context = struct {
     tcp: xev.TCP,
     tls: boring.tls_client.TlsClient,
     allocator: std.mem.Allocator,
-    
+
     c_connect: xev.Completion = .{},
     c_read: xev.Completion = .{},
     c_write: xev.Completion = .{},
-    
+
     read_buf: [4096]u8 = undefined,
     request_sent: bool = false,
     done: bool = false,
@@ -44,8 +44,8 @@ pub fn main() !void {
         .allocator = allocator,
     };
 
-    std.debug.print("Connecting to {s}:{d} (TLS)...\n", .{REMOTE_IP, REMOTE_PORT});
-    
+    std.debug.print("Connecting to {s}:{d} (TLS)...\n", .{ REMOTE_IP, REMOTE_PORT });
+
     ctx.tcp.connect(&loop, &ctx.c_connect, addr, Context, &ctx, onConnect);
 
     while (!ctx.done) {
@@ -60,7 +60,9 @@ fn onConnect(
     s: xev.TCP,
     r: xev.ConnectError!void,
 ) xev.CallbackAction {
-    _ = c; _ = s; _ = loop;
+    _ = c;
+    _ = s;
+    _ = loop;
     const self = ctx.?;
     r catch |err| {
         std.debug.print("TCP Connect failed: {}\n", .{err});
@@ -74,7 +76,7 @@ fn onConnect(
         self.done = true;
         return .disarm;
     };
-    
+
     if (out_slice) |data| {
         const buf = self.allocator.dupe(u8, data) catch unreachable;
         self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Context, self, onTcpWrite);
@@ -128,7 +130,9 @@ fn onTcpWrite(
     buf: xev.WriteBuffer,
     r: xev.WriteError!usize,
 ) xev.CallbackAction {
-    _ = loop; _ = c; _ = s;
+    _ = loop;
+    _ = c;
+    _ = s;
     const self = ctx.?;
     self.allocator.free(buf.slice);
     _ = r catch |err| {
@@ -148,7 +152,10 @@ fn onTcpRead(
     buf: xev.ReadBuffer,
     r: xev.ReadError!usize,
 ) xev.CallbackAction {
-    _ = loop; _ = c; _ = s; _ = buf;
+    _ = loop;
+    _ = c;
+    _ = s;
+    _ = buf;
     const self = ctx.?;
     const n = r catch |err| {
         std.debug.print("TCP Read failed: {}\n", .{err});
@@ -178,4 +185,3 @@ fn onTcpRead(
     pump(self);
     return .disarm;
 }
-

@@ -8,9 +8,9 @@ pub const ConnectionKey = struct {
     use_tls: bool,
 
     pub fn eql(self: ConnectionKey, other: ConnectionKey) bool {
-        return self.port == other.port and 
-               self.use_tls == other.use_tls and 
-               std.mem.eql(u8, self.host, other.host);
+        return self.port == other.port and
+            self.use_tls == other.use_tls and
+            std.mem.eql(u8, self.host, other.host);
     }
 };
 

@@ -16,7 +16,7 @@ pub fn main() !void {
     std.debug.print("\n--- Testing AsyncS3Source (Full Stack) ---\n", .{});
 
     var pool = ConnectionPool.init(allocator);
-    
+
     var xev_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
     var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&xev_pool, allocator);
     const resolver = tp_resolver.resolver();

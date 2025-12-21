@@ -25,7 +25,7 @@ pub const AsyncRequest = struct {
 
     allocator: std.mem.Allocator,
     state: State,
-    
+
     // Request Data
     method: enum { GET, HEAD },
     host: []const u8,
@@ -33,7 +33,7 @@ pub const AsyncRequest = struct {
     path: []const u8,
     range_start: u64,
     range_end: u64, // Exclusive
-    
+
     // Auth Data
     config: ?types.S3Config,
 
@@ -41,7 +41,7 @@ pub const AsyncRequest = struct {
     write_buf: std.ArrayListUnmanaged(u8),
     read_buf: std.ArrayListUnmanaged(u8), // Dynamic buffer for push parser
     read_cursor: usize, // Parsed position
-    
+
     content_length: u64,
     body_read_total: u64, // Total bytes read from body (including gaps)
 
@@ -120,17 +120,17 @@ pub const AsyncRequest = struct {
 
         // 1. Build Base Headers
         var headers = std.ArrayList(std.http.Header).empty;
-        
+
         // Host Header Value
-        const host_header_val = if (port == 80 or port == 443) 
+        const host_header_val = if (port == 80 or port == 443)
             try std.fmt.allocPrint(aa, "{s}", .{host})
         else
-            try std.fmt.allocPrint(aa, "{s}:{d}", .{host, port});
-            
+            try std.fmt.allocPrint(aa, "{s}:{d}", .{ host, port });
+
         // Range Header
-        const range_val = try std.fmt.allocPrint(aa, "bytes={d}-{d}", .{start, end - 1});
+        const range_val = try std.fmt.allocPrint(aa, "bytes={d}-{d}", .{ start, end - 1 });
         try headers.append(aa, .{ .name = "Range", .value = range_val });
-        
+
         try headers.append(aa, .{ .name = "Connection", .value = "keep-alive" });
 
         // 2. Sign or Add Host
@@ -142,9 +142,9 @@ pub const AsyncRequest = struct {
                     .session_token = creds.session_token,
                     .region = conf.region,
                 };
-                
+
                 const scheme = if (use_tls) "https" else "http";
-                const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{scheme, host_header_val, path});
+                const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{ scheme, host_header_val, path });
                 const uri = try std.Uri.parse(url);
 
                 // sigv4.sign adds the Host header based on the URI
@@ -162,7 +162,7 @@ pub const AsyncRequest = struct {
         try self.write_buf.appendSlice(self.allocator, "GET ");
         try self.write_buf.appendSlice(self.allocator, path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
-        
+
         // Headers
         for (headers.items) |h| {
             try self.write_buf.appendSlice(self.allocator, h.name);
@@ -190,12 +190,12 @@ pub const AsyncRequest = struct {
 
         // 1. Build Base Headers
         var headers = std.ArrayList(std.http.Header).empty;
-        
-        const host_header_val = if (port == 80 or port == 443) 
+
+        const host_header_val = if (port == 80 or port == 443)
             try std.fmt.allocPrint(aa, "{s}", .{host})
         else
-            try std.fmt.allocPrint(aa, "{s}:{d}", .{host, port});
-            
+            try std.fmt.allocPrint(aa, "{s}:{d}", .{ host, port });
+
         try headers.append(aa, .{ .name = "Connection", .value = "keep-alive" });
 
         // 2. Sign or Add Host
@@ -207,9 +207,9 @@ pub const AsyncRequest = struct {
                     .session_token = creds.session_token,
                     .region = conf.region,
                 };
-                
+
                 const scheme = if (use_tls) "https" else "http";
-                const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{scheme, host_header_val, path});
+                const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{ scheme, host_header_val, path });
                 const uri = try std.Uri.parse(url);
 
                 // sigv4.sign adds the Host header based on the URI
@@ -225,7 +225,7 @@ pub const AsyncRequest = struct {
         try self.write_buf.appendSlice(self.allocator, "HEAD ");
         try self.write_buf.appendSlice(self.allocator, path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
-        
+
         for (headers.items) |h| {
             try self.write_buf.appendSlice(self.allocator, h.name);
             try self.write_buf.appendSlice(self.allocator, ": ");
@@ -243,7 +243,7 @@ pub const AsyncRequest = struct {
         conn.on_connect = onConnect;
         conn.on_data = onData;
         conn.on_error = onError;
-        
+
         // If connection is already connected and handshake done (keep-alive reuse),
         // we can start immediately.
         if (conn.handshake_complete) {
@@ -267,7 +267,7 @@ pub const AsyncRequest = struct {
     fn onData(conn: *Connection, ctx: ?*anyopaque, data: []const u8) void {
         _ = conn;
         const self: *AsyncRequest = @ptrCast(@alignCast(ctx));
-        
+
         self.feed(data) catch |err| {
             std.debug.print("AsyncRequest Feed Error: {}\n", .{err});
             self.state = .Error;
@@ -300,19 +300,19 @@ pub const AsyncRequest = struct {
 
         if (self.state == .ReadingHeaders) {
             try self.read_buf.appendSlice(self.allocator, data);
-            
+
             // Scan for double-CRLF
             const window = self.read_buf.items[self.read_cursor..];
             if (std.mem.indexOf(u8, window, "\r\n\r\n")) |idx| {
                 const end_of_headers = self.read_cursor + idx;
                 const header_block = self.read_buf.items[0 .. end_of_headers + 4];
-                
+
                 if (findHeader(header_block, "Content-Length")) |val| {
                     self.content_length = try std.fmt.parseInt(u64, val, 10);
                 }
 
                 self.read_cursor = end_of_headers + 4;
-                
+
                 if (self.method == .HEAD) {
                     self.state = .Finished;
                     if (self.on_done) |cb| cb(self.done_ctx, self);
@@ -320,14 +320,14 @@ pub const AsyncRequest = struct {
                 }
 
                 self.state = .ReadingBody;
-                
+
                 // Consume any body bytes already in buffer
                 const body_bytes_in_buf = self.read_buf.items.len - self.read_cursor;
                 if (body_bytes_in_buf > 0) {
                     const excess = self.read_buf.items[self.read_cursor..];
                     try self.consumeBodyBytes(excess);
                 }
-                
+
                 // We can clear read_buf now as we only use it for headers.
                 self.read_buf.clearRetainingCapacity();
                 self.read_cursor = 0;
@@ -352,7 +352,7 @@ pub const AsyncRequest = struct {
             if (std.mem.indexOf(u8, line, ":")) |colon_idx| {
                 const key = std.mem.trim(u8, line[0..colon_idx], " ");
                 if (std.ascii.eqlIgnoreCase(key, name)) {
-                    return std.mem.trim(u8, line[colon_idx+1..], " ");
+                    return std.mem.trim(u8, line[colon_idx + 1 ..], " ");
                 }
             }
         }

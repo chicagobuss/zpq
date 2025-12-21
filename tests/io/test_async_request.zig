@@ -31,7 +31,7 @@ pub fn main() !void {
     // Let's read 0-10, skip 10-90, read 90-100.
     var buf1: [10]u8 = undefined;
     var buf2: [10]u8 = undefined;
-    
+
     try req.addSegment(&buf1, 10);
     try req.addSegment(null, 80); // GAP
     try req.addSegment(&buf2, 10);
@@ -60,13 +60,13 @@ pub fn main() !void {
 
     // 5. Verify Data
     std.debug.print("Finished! Read Total: {d}\n", .{req.body_read_total});
-    
+
     if (req.state == .Error) return error.RequestFailed;
 
     // Verify Buf1 (0-9)
     for (buf1, 0..) |b, i| {
         if (b != i % 256) {
-            std.debug.print("Buf1 Mismatch at {d}: Expected {d}, Got {d}\n", .{i, i % 256, b});
+            std.debug.print("Buf1 Mismatch at {d}: Expected {d}, Got {d}\n", .{ i, i % 256, b });
             return error.DataMismatch;
         }
     }
@@ -75,7 +75,7 @@ pub fn main() !void {
     for (buf2, 0..) |b, i| {
         const expected = (90 + i) % 256;
         if (b != expected) {
-            std.debug.print("Buf2 Mismatch at {d}: Expected {d}, Got {d}\n", .{i, expected, b});
+            std.debug.print("Buf2 Mismatch at {d}: Expected {d}, Got {d}\n", .{ i, expected, b });
             return error.DataMismatch;
         }
     }

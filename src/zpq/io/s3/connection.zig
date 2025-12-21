@@ -114,7 +114,9 @@ pub const Connection = struct {
         s: xev.TCP,
         r: xev.ConnectError!void,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s;
+        _ = loop;
+        _ = c;
+        _ = s;
         const self = ctx.?;
         if (r) |_| {
             self.connected = true;
@@ -150,7 +152,9 @@ pub const Connection = struct {
         buf: xev.WriteBuffer,
         r: xev.WriteError!usize,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s;
+        _ = loop;
+        _ = c;
+        _ = s;
         const self = ctx.?;
         self.allocator.free(buf.slice);
         if (r) |_| {
@@ -169,7 +173,10 @@ pub const Connection = struct {
         buf: xev.ReadBuffer,
         r: xev.ReadError!usize,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s; _ = buf;
+        _ = loop;
+        _ = c;
+        _ = s;
+        _ = buf;
         const self = ctx.?;
         if (r) |n| {
             if (n == 0) {
@@ -208,8 +215,11 @@ pub const Connection = struct {
         s: xev.TCP,
         r: xev.CloseError!void,
     ) xev.CallbackAction {
-        _ = ctx; _ = loop; _ = c; _ = s; _ = r catch {};
+        _ = ctx;
+        _ = loop;
+        _ = c;
+        _ = s;
+        _ = r catch {};
         return .disarm;
     }
 };
-

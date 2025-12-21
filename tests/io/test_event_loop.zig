@@ -61,9 +61,12 @@ pub fn main() !void {
     var conn2 = try Connection.init(loop.loop, allocator, HOST, false);
     var conn3 = try Connection.init(loop.loop, allocator, HOST, false);
     defer {
-        conn1.close(); conn1.deinit();
-        conn2.close(); conn2.deinit();
-        conn3.close(); conn3.deinit();
+        conn1.close();
+        conn1.deinit();
+        conn2.close();
+        conn2.deinit();
+        conn3.close();
+        conn3.deinit();
     }
 
     try conn1.connect(addr);
@@ -83,12 +86,12 @@ pub fn main() !void {
     // 5. Verify
     if (req1.state == .Finished and req2.state == .Finished and req3.state == .Finished) {
         std.debug.print("SUCCESS: All 3 requests finished!\n", .{});
-        
+
         // Verify data
         for (buf1, 0..) |b, i| if (b != i % 256) return error.DataMismatch1;
         for (buf2, 0..) |b, i| if (b != (100 + i) % 256) return error.DataMismatch2;
         for (buf3, 0..) |b, i| if (b != (200 + i) % 256) return error.DataMismatch3;
-        
+
         std.debug.print("Data verified.\n", .{});
     } else {
         std.debug.print("FAIL: Requests did not finish correctly.\n", .{});

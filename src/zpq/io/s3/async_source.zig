@@ -5,28 +5,25 @@ const AsyncRequest = @import("request.zig").AsyncRequest;
 const connection_pool_mod = @import("connection_pool.zig");
 const ConnectionPool = connection_pool_mod.ConnectionPool;
 const ConnectionKey = connection_pool_mod.ConnectionKey;
-const Connection = connection_pool_mod.Connection;
+const connection_mod = @import("connection.zig");
+const Connection = connection_mod.Connection;
 const dns = @import("dns.zig");
 pub const scheduler = @import("scheduler.zig");
 const Range = io.Range;
-const TlsAdapter = @import("tls_adapter.zig").TlsAdapter;
 const types = @import("types.zig");
-
-// Re-exports for tests
-pub const connection_pool = connection_pool_mod;
 
 pub const AsyncS3Source = struct {
     allocator: std.mem.Allocator,
-    pool: *ConnectionPool, // Shared pool
+    pool: *ConnectionPool,
     event_loop: EventLoop,
     resolver: dns.Resolver,
 
     host: []const u8,
     port: u16,
-    path_prefix: []const u8, // "/bucket/key"
+    path_prefix: []const u8,
     use_tls: bool,
     trusted_cert: ?[]const u8,
-    config: ?types.S3Config, // Unified Auth Config
+    config: ?types.S3Config,
 
     file_size: u64,
     resolved_ips: []dns.Address,
@@ -45,7 +42,6 @@ pub const AsyncS3Source = struct {
         }
         errdefer if (cert_dupe) |c| allocator.free(c);
 
-        // Deep copy config if present
         var config_dupe: ?types.S3Config = null;
         if (config) |c| {
             config_dupe = types.S3Config{
@@ -59,7 +55,6 @@ pub const AsyncS3Source = struct {
             };
         }
 
-        // Note: EventLoop creation might fail
         const loop = try EventLoop.init(allocator);
 
         var self = AsyncS3Source{
@@ -79,10 +74,7 @@ pub const AsyncS3Source = struct {
         };
         errdefer self.deinit();
 
-        // 1. Initial DNS Resolution
         try self.resolveHost();
-
-        // 2. Fetch size via HEAD request (synchronously waiting on loop)
         try self.fetchSize();
 
         return self;
@@ -106,8 +98,6 @@ pub const AsyncS3Source = struct {
     }
 
     fn resolveHost(self: *AsyncS3Source) !void {
-        std.debug.print("[AsyncS3Source] Resolving {s}:{d}...\n", .{ self.host, self.port });
-
         var dns_comp = dns.Resolver.Completion.init();
         defer dns_comp.deinit(self.allocator);
 
@@ -124,8 +114,6 @@ pub const AsyncS3Source = struct {
                     ctx.done = true;
                     return;
                 };
-
-                // Copy results
                 const copy = ctx.allocator.alloc(dns.Address, results.len) catch |e| {
                     ctx.err = e;
                     ctx.done = true;
@@ -138,7 +126,7 @@ pub const AsyncS3Source = struct {
         };
 
         var dns_ctx = DnsCtx{ .allocator = self.allocator };
-        self.resolver.resolve(&self.event_loop.loop, self.host, self.port, &dns_comp, DnsCtx.callback, &dns_ctx);
+        self.resolver.resolve(self.event_loop.loop, self.host, self.port, &dns_comp, DnsCtx.callback, &dns_ctx);
 
         while (!dns_ctx.done) {
             _ = try self.event_loop.tick();
@@ -153,272 +141,183 @@ pub const AsyncS3Source = struct {
     }
 
     fn fetchSize(self: *AsyncS3Source) !void {
-        var req = AsyncRequest.init();
-        defer req.deinit(self.allocator);
+        var req = AsyncRequest.init(self.allocator);
+        defer req.deinit();
 
-        try req.prepareHead(self.allocator, self.host, self.port, self.path_prefix, null, self.config);
+        try req.prepareHead(self.host, self.port, self.path_prefix, self.use_tls, self.config);
 
-        // Execute single request
-        var fd: std.posix.fd_t = undefined;
-        var tls: ?*TlsAdapter = null;
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
-
-        if (self.pool.acquire(key)) |conn| {
-            fd = conn.fd;
-            tls = conn.tls;
-        } else {
-            const conn = try self.connectNew();
-            fd = conn.fd;
-            tls = conn.tls;
+        var conn = self.pool.acquire(key);
+        if (conn == null) {
+            conn = try self.connectNew();
         }
+        const connection = conn.?;
 
-        req.tls = tls;
-        try self.event_loop.registerWrite(fd, &req);
-        try self.event_loop.registerRead(fd, &req);
-
-        while (req.state != .Finished and req.state != .Error) {
-            const events = try self.event_loop.tick();
-            if (events == 0) {
-                std.debug.print("[AsyncS3Source] Timeout waiting for events (FETCH_SIZE).\n", .{});
+        const WaitCtx = struct {
+            done: bool = false,
+            fn onDone(ctx: ?*anyopaque, r: *AsyncRequest) void {
+                _ = r;
+                const self_ptr: *@This() = @ptrCast(@alignCast(ctx));
+                self_ptr.done = true;
             }
+        };
+        var wait_ctx = WaitCtx{};
+        req.done_ctx = &wait_ctx;
+        req.on_done = WaitCtx.onDone;
+
+        try req.execute(connection);
+
+        while (!wait_ctx.done) {
+            _ = try self.event_loop.tick();
         }
 
-        // Cleanup
         if (req.state == .Finished) {
             self.file_size = req.content_length;
-            try self.pool.release(key, .{ .fd = fd, .tls = tls });
+            try self.pool.release(key, connection);
         } else {
-            // Unregister before closing to clean up map
-            self.event_loop.unregister(fd);
-
-            if (tls) |t| t.deinit();
-            std.posix.close(fd);
+            connection.close();
+            // In a real pool, we'd deinit the connection if it's dead.
+            connection.deinit();
             return error.HeadRequestFailed;
         }
     }
 
-    /// Read multiple ranges into provided buffers.
-    /// ranges[i] corresponds to buffers[i].
     pub fn readRanges(self: *AsyncS3Source, ranges: []const Range, buffers: []const []u8) !void {
         if (ranges.len != buffers.len) return error.InvalidArgs;
         if (ranges.len == 0) return;
 
-        // 1. Coalesce Ranges
         var merged_reqs = try scheduler.mergeRanges(self.allocator, ranges);
         defer {
             for (merged_reqs.items) |*m| m.original_indices.deinit(self.allocator);
             merged_reqs.deinit(self.allocator);
         }
 
-        // 2. Prepare AsyncRequests
         var requests = std.ArrayListUnmanaged(AsyncRequest){};
         defer {
-            for (requests.items) |*r| r.deinit(self.allocator);
+            for (requests.items) |*r| r.deinit();
             requests.deinit(self.allocator);
         }
 
-        // Track FDs to release them back to pool later
-        var fds = std.ArrayListUnmanaged(std.posix.fd_t){};
-        defer fds.deinit(self.allocator);
-
-        // Track TLS adapters (owned by Connection, passed to Pool or destroyed)
-        var tls_adapters = std.ArrayListUnmanaged(?*TlsAdapter){};
-        defer tls_adapters.deinit(self.allocator);
+        const BatchCtx = struct {
+            pending: usize,
+            fn onDone(ctx: ?*anyopaque, r: *AsyncRequest) void {
+                _ = r;
+                const self_ptr: *@This() = @ptrCast(@alignCast(ctx));
+                self_ptr.pending -= 1;
+            }
+        };
+        var batch_ctx = BatchCtx{ .pending = 0 };
 
         for (merged_reqs.items) |merged| {
-            // Split huge requests into 64MB chunks
             var splitter = scheduler.RangeSplitter.init(merged.request_range, scheduler.CHUNK_SIZE);
-
-            // We need to map the merged range segments to these chunks.
-            // First, build the full list of segments for the merged range.
-            var all_segments = std.ArrayListUnmanaged(AsyncRequest.Segment){};
-            defer all_segments.deinit(self.allocator);
-
-            var current_offset = merged.request_range.start;
-            for (merged.original_indices.items) |orig_idx| {
-                const target_range = ranges[orig_idx];
-                const target_buffer = buffers[orig_idx];
-
-                // Gap?
-                if (target_range.start > current_offset) {
-                    const gap_len = target_range.start - current_offset;
-                    try all_segments.append(self.allocator, .{ .buffer = null, .len = gap_len });
-                }
-
-                // Data
-                try all_segments.append(self.allocator, .{ .buffer = target_buffer, .len = target_range.len() });
-                current_offset = target_range.end;
-            }
-            // Trailing gap?
-            if (current_offset < merged.request_range.end) {
-                try all_segments.append(self.allocator, .{ .buffer = null, .len = merged.request_range.end - current_offset });
-            }
-
-            // Now distribute segments across chunks
-            var seg_idx: usize = 0;
-            var seg_offset: usize = 0; // Offset into current segment
-
             while (splitter.next()) |chunk_range| {
-                var req = AsyncRequest.init();
-                // We will add it to 'requests' list later
+                var req = AsyncRequest.init(self.allocator);
+                errdefer req.deinit();
 
-                var chunk_filled: u64 = 0;
-                const chunk_len = chunk_range.len();
+                var current_offset = chunk_range.start;
+                for (merged.original_indices.items) |orig_idx| {
+                    const target_range = ranges[orig_idx];
+                    const target_buffer = buffers[orig_idx];
 
-                while (chunk_filled < chunk_len and seg_idx < all_segments.items.len) {
-                    const seg = all_segments.items[seg_idx];
-                    const seg_remaining = seg.len - seg_offset;
-                    const chunk_remaining = chunk_len - chunk_filled;
-                    const to_take = @as(usize, @intCast(@min(seg_remaining, chunk_remaining)));
+                    if (target_range.start >= chunk_range.end or target_range.end <= chunk_range.start) continue;
 
-                    if (seg.buffer) |buf| {
-                        // Slice the user buffer
-                        try req.addSegment(self.allocator, buf[seg_offset .. seg_offset + to_take], to_take);
-                    } else {
-                        // Gap
-                        try req.addSegment(self.allocator, null, to_take);
+                    const intersection_start = @max(target_range.start, chunk_range.start);
+                    const intersection_end = @min(target_range.end, chunk_range.end);
+
+                    if (intersection_start > current_offset) {
+                        try req.addSegment(null, intersection_start - current_offset);
                     }
 
-                    chunk_filled += to_take;
-                    seg_offset += to_take;
-
-                    if (seg_offset >= seg.len) {
-                        seg_idx += 1;
-                        seg_offset = 0;
-                    }
+                    const buf_offset = intersection_start - target_range.start;
+                    const buf_len = intersection_end - intersection_start;
+                    try req.addSegment(target_buffer[buf_offset .. buf_offset + buf_len], buf_len);
+                    current_offset = intersection_end;
                 }
 
-                // Note: We don't have TLS adapter yet, pass null for now, set later
-                try req.prepare(self.allocator, self.host, self.port, self.path_prefix, chunk_range.start, chunk_range.end, null, self.config);
+                if (chunk_range.end > current_offset) {
+                    try req.addSegment(null, chunk_range.end - current_offset);
+                }
+
+                try req.prepare(self.host, self.port, self.path_prefix, chunk_range.start, chunk_range.end, self.use_tls, self.config);
+                
+                req.done_ctx = &batch_ctx;
+                req.on_done = BatchCtx.onDone;
+                batch_ctx.pending += 1;
+
                 try requests.append(self.allocator, req);
             }
         }
 
-        // 3. Execute Requests
-        // Acquire connections and register
+        const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
+        
         for (requests.items) |*req| {
-            // Get connection
-            const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
-            var fd: std.posix.fd_t = undefined;
-            var tls: ?*TlsAdapter = null;
-
-            if (self.pool.acquire(key)) |conn| {
-                fd = conn.fd;
-                tls = conn.tls;
-            } else {
-                // Connect new
-                const conn = try self.connectNew();
-                fd = conn.fd;
-                tls = conn.tls;
-            }
-            try fds.append(self.allocator, fd);
-            try tls_adapters.append(self.allocator, tls);
-
-            // Set TLS on request
-            req.tls = tls;
-
-            // Register
-            try self.event_loop.registerWrite(fd, req);
-            try self.event_loop.registerRead(fd, req);
+            var conn = self.pool.acquire(key);
+            if (conn == null) conn = try self.connectNew();
+            const connection = conn.?;
+            try req.execute(connection);
         }
 
-        // Drive Loop
-        while (true) {
-            var all_done = true;
-            for (requests.items) |*req| {
-                if (req.state != .Finished and req.state != .Error) {
-                    all_done = false;
-                    break;
+        while (batch_ctx.pending > 0) {
+            _ = try self.event_loop.tick();
+        }
+
+        // Release connections
+        for (requests.items) |*req| {
+            if (req.connection) |conn| {
+                if (req.state == .Finished) {
+                    try self.pool.release(key, conn);
+                } else {
+                    conn.close();
+                    conn.deinit();
                 }
-            }
-            if (all_done) break;
-
-            const events = try self.event_loop.tick();
-            if (events == 0) {
-                std.debug.print("[AsyncS3Source] Timeout waiting for events (READ_RANGES).\n", .{});
-            }
-        }
-
-        // 4. Cleanup / Release Connections
-        for (requests.items, 0..) |*req, i| {
-            const fd = fds.items[i];
-            const tls = tls_adapters.items[i];
-            const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
-            const conn = Connection{ .fd = fd, .tls = tls };
-
-            if (req.state == .Finished) {
-                // Keep-Alive: Release to pool
-                try self.pool.release(key, conn);
-            } else {
-                // Error: Close
-                if (tls) |t| t.deinit();
-                std.posix.close(fd);
             }
         }
     }
 
-    fn connectNew(self: *AsyncS3Source) !Connection {
-        if (self.resolved_ips.len == 0) return error.HostNotFound;
-
+    fn connectNew(self: *AsyncS3Source) !*Connection {
         const addr = self.resolved_ips[self.next_ip_idx];
         self.next_ip_idx = (self.next_ip_idx + 1) % self.resolved_ips.len;
 
-        const fd = try std.posix.socket(switch (addr.any.family) {
-            std.posix.AF.INET => std.posix.AF.INET,
-            std.posix.AF.INET6 => std.posix.AF.INET6,
-            else => return error.UnsupportedAddressFamily,
-        }, std.posix.SOCK.STREAM, 0);
-        errdefer std.posix.close(fd);
-
-        std.debug.print("[AsyncS3Source] Connecting to {}...\n", .{addr.any});
-        try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
-
-        var tls_adapter: ?*TlsAdapter = null;
-        if (self.use_tls) {
-            std.debug.print("[AsyncS3Source] Initiating TLS handshake...\n", .{});
-            tls_adapter = try TlsAdapter.init(self.allocator, fd, self.host, self.trusted_cert);
-        }
-
-        // Set Non-Blocking
-        const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-        var flags_o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
-        flags_o.NONBLOCK = true;
-        _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(flags_o)));
-
-        std.debug.print("[AsyncS3Source] Connected (FD {d})\n", .{fd});
-        return Connection{ .fd = fd, .tls = tls_adapter };
+        const conn = try Connection.init(self.event_loop.loop, self.allocator, self.host, self.use_tls);
+        try conn.connect(addr);
+        return conn;
     }
 
-    // --- RandomAccessSource Implementation ---
-
-    fn readAtImpl(ptr: *anyopaque, offset: u64, buf: []u8) !usize {
-        const self: *AsyncS3Source = @ptrCast(@alignCast(ptr));
+    pub fn readAt(self: *AsyncS3Source, offset: u64, buf: []u8) !usize {
         const range = Range{ .start = offset, .end = offset + buf.len };
-        const ranges = &[_]Range{range};
-        const buffers = &[_][]u8{buf};
-
-        try self.readRanges(ranges, buffers);
-        // If readRanges succeeds, it means it filled the buffers (or error)
-        // Check if we hit EOF logic inside readRanges?
-        // readRanges splits and fills. If EOF, AsyncRequest might error or fill partial?
-        // Current AsyncRequest logic errors on short reads unless handled.
-        // For now assume full read.
+        const buffers = [1][]u8{buf};
+        try self.readRanges(&[1]Range{range}, &buffers);
         return buf.len;
     }
 
-    fn readRangesImpl(ptr: *anyopaque, ranges: []const Range, buffers: []const []u8) !void {
+    pub fn size(self: *AsyncS3Source) u64 {
+        return self.file_size;
+    }
+
+    pub fn close(self: *AsyncS3Source) void {
+        _ = self;
+        // The pool handles closing idle connections.
+        // EventLoop is owned by self and closed in deinit.
+    }
+
+    fn readAtImpl(ptr: *anyopaque, offset: u64, buf: []u8) anyerror!usize {
+        const self: *AsyncS3Source = @ptrCast(@alignCast(ptr));
+        return self.readAt(offset, buf);
+    }
+
+    fn readRangesImpl(ptr: *anyopaque, ranges: []const Range, buffers: []const []u8) anyerror!void {
         const self: *AsyncS3Source = @ptrCast(@alignCast(ptr));
         return self.readRanges(ranges, buffers);
     }
 
     fn sizeImpl(ptr: *anyopaque) u64 {
         const self: *AsyncS3Source = @ptrCast(@alignCast(ptr));
-        return self.file_size;
+        return self.size();
     }
 
     fn closeImpl(ptr: *anyopaque) void {
         const self: *AsyncS3Source = @ptrCast(@alignCast(ptr));
-        self.deinit();
+        self.close();
     }
 
     pub fn source(self: *AsyncS3Source) io.RandomAccessSource {

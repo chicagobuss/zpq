@@ -16,8 +16,7 @@ pub fn main() !void {
     std.debug.print("\n--- Testing AsyncS3Source (Full Stack) ---\n", .{});
 
     var pool = ConnectionPool.init(allocator);
-    defer pool.deinit();
-
+    
     var xev_pool = zpq.s3.dns.xev.ThreadPool.init(.{ .max_threads = 4 });
     var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&xev_pool, allocator);
     const resolver = tp_resolver.resolver();
@@ -25,6 +24,7 @@ pub fn main() !void {
     // Init with TLS=false, Certs=null
     var source = try AsyncS3Source.init(allocator, &pool, resolver, HOST, PORT, "bucket", "key", false, null, null);
     defer source.deinit();
+    defer pool.deinit(); // Pool must be deinit'd BEFORE source (while source's loop is alive)
 
     // Request: 0-5 and 15-20 (Gap 5-15)
     // Mock server data: offset % 256

@@ -83,13 +83,17 @@
 *   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for racing (Happy Eyeballs foundation).
 *   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and race logic.
 
-### 🚀 Milestone 7: DNS Integration & Advanced I/O (CURRENT)
-*   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source`. Removed hardcoded IPs.
-*   [x] **Round-Robin**: `AsyncS3Source` now cycles through resolved IPs for parallel connections.
-*   [x] **Cross-Platform Loop**: Refactored `EventLoop` to wrap `libxev` for WSL2/macOS compatibility.
-*   [ ] **Pure Async I/O**: Refactor `AsyncRequest` to use `libxev` completions directly (remove `WouldBlock` polling).
-*   [ ] **Transport Abstraction**: Implement `Connection` (TCP/TLS) with "Pump" pattern.
-*   [ ] **Persistent Connection Pool**: Keyed by `(host, port, tls)` with idle timeout and stale detection.
+### 🚀 Milestone 7: Pure Async Lifecycle (Completed)
+*   [x] **Transport Abstraction**: Implemented `Connection` (TCP/TLS) with "Pump" pattern.
+*   [x] **Pure Async I/O**: Refactored `AsyncRequest` to use `libxev` completions directly.
+*   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source`.
+*   [x] **Round-Robin**: `AsyncS3Source` cycles through resolved IPs for parallel throughput.
+*   [x] **Pinned Loop**: Fixed `io_uring` crashes by heap-allocating and pinning the `EventLoop`.
+
+### 🚀 Milestone 8: Persistent Pool & Repetition Levels (Next)
+*   [ ] **Enhanced Connection Pool**: Add keep-alive timeouts and stale detection.
+*   [ ] **Repetition Levels**: Support for Lists and Maps (Nested structures).
+*   [ ] **Range Coalescing (Advanced)**: Dynamic merging based on latency/throughput curves.
 *   [ ] **Repetition Levels**: Support for Lists and Maps.
 
 ---

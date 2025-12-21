@@ -2,36 +2,10 @@ const std = @import("std");
 const zpq = @import("zpq");
 const EventLoop = zpq.s3.EventLoop;
 const AsyncRequest = zpq.s3.AsyncRequest;
-const Io = std.Io;
+const Connection = zpq.s3.Connection;
 
 const HOST = "127.0.0.1";
 const PORT = 9000;
-
-fn connect() !std.posix.fd_t {
-    const addr = try Io.net.IpAddress.parse(HOST, PORT);
-    const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    errdefer std.posix.close(fd);
-
-    switch (addr) {
-        .ip4 => |ip4| {
-            const sa = std.posix.sockaddr.in{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @as(u32, @bitCast(ip4.bytes)), 
-            };
-            try std.posix.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
-        },
-        else => return error.UnsupportedAddressFamily,
-    }
-    
-    // Set non-blocking
-    const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    var flags_o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
-    flags_o.NONBLOCK = true;
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(flags_o)));
-    
-    return fd;
-}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -43,68 +17,70 @@ pub fn main() !void {
     var loop = try EventLoop.init(allocator);
     defer loop.deinit();
 
+    const addr = try zpq.s3.dns.xev.shim_net.Address.parseIp4(HOST, PORT);
+
+    const BatchCtx = struct {
+        pending: usize = 0,
+        fn onDone(ctx: ?*anyopaque, r: *AsyncRequest) void {
+            _ = r;
+            const self_ptr: *@This() = @ptrCast(@alignCast(ctx));
+            self_ptr.pending -= 1;
+        }
+    };
+    var batch_ctx = BatchCtx{ .pending = 3 };
+
     // 1. Create 3 requests
-    var req1 = AsyncRequest.init();
-    var req2 = AsyncRequest.init();
-    var req3 = AsyncRequest.init();
-    defer req1.deinit(allocator);
-    defer req2.deinit(allocator);
-    defer req3.deinit(allocator);
+    var req1 = AsyncRequest.init(allocator);
+    var req2 = AsyncRequest.init(allocator);
+    var req3 = AsyncRequest.init(allocator);
+    defer req1.deinit();
+    defer req2.deinit();
+    defer req3.deinit();
+
+    req1.done_ctx = &batch_ctx;
+    req1.on_done = BatchCtx.onDone;
+    req2.done_ctx = &batch_ctx;
+    req2.on_done = BatchCtx.onDone;
+    req3.done_ctx = &batch_ctx;
+    req3.on_done = BatchCtx.onDone;
 
     var buf1: [100]u8 = undefined;
     var buf2: [100]u8 = undefined;
     var buf3: [100]u8 = undefined;
 
-    try req1.addSegment(allocator, &buf1, 100);
-    try req2.addSegment(allocator, &buf2, 100);
-    try req3.addSegment(allocator, &buf3, 100);
+    try req1.addSegment(&buf1, 100);
+    try req2.addSegment(&buf2, 100);
+    try req3.addSegment(&buf3, 100);
 
-    try req1.prepare(allocator, HOST, PORT, "/req1", 0, 100, null, null);
-    try req2.prepare(allocator, HOST, PORT, "/req2", 100, 200, null, null);
-    try req3.prepare(allocator, HOST, PORT, "/req3", 200, 300, null, null);
+    try req1.prepare(HOST, PORT, "/req1", 0, 100, false, null);
+    try req2.prepare(HOST, PORT, "/req2", 100, 200, false, null);
+    try req3.prepare(HOST, PORT, "/req3", 200, 300, false, null);
 
-    const fd1 = try connect();
-    const fd2 = try connect();
-    const fd3 = try connect();
-    defer std.posix.close(fd1);
-    defer std.posix.close(fd2);
-    defer std.posix.close(fd3);
-
-    // 2. Register for WRITE (to send) and READ (to receive)
-    try loop.registerWrite(fd1, &req1);
-    try loop.registerRead(fd1, &req1);
-    
-    try loop.registerWrite(fd2, &req2);
-    try loop.registerRead(fd2, &req2);
-    
-    try loop.registerWrite(fd3, &req3);
-    try loop.registerRead(fd3, &req3);
-
-    // 3. Drive Loop
-    var done_count: usize = 0;
-    var tick_count: usize = 0;
-    const MAX_TICKS = 100; // Increased timeout for slow environments
-    
-    while (done_count < 3) {
-        tick_count += 1;
-        if (tick_count > MAX_TICKS) {
-            std.debug.print("TIMEOUT after {d} ticks! States: req1={s} req2={s} req3={s}\n", 
-                .{tick_count, @tagName(req1.state), @tagName(req2.state), @tagName(req3.state)});
-            return error.TestTimeout;
-        }
-        
-        std.debug.print("Tick #{d}: req1={s} req2={s} req3={s}\n", .{tick_count, @tagName(req1.state), @tagName(req2.state), @tagName(req3.state)});
-        const n = try loop.tick();
-        std.debug.print("  Processed {d} events\n", .{n});
-        
-        // Check status
-        done_count = 0;
-        if (req1.state == .Finished or req1.state == .Error) done_count += 1;
-        if (req2.state == .Finished or req2.state == .Error) done_count += 1;
-        if (req3.state == .Finished or req3.state == .Error) done_count += 1;
+    // 2. Create 3 connections
+    var conn1 = try Connection.init(loop.loop, allocator, HOST, false);
+    var conn2 = try Connection.init(loop.loop, allocator, HOST, false);
+    var conn3 = try Connection.init(loop.loop, allocator, HOST, false);
+    defer {
+        conn1.close(); conn1.deinit();
+        conn2.close(); conn2.deinit();
+        conn3.close(); conn3.deinit();
     }
 
-    // 4. Verify
+    try conn1.connect(addr);
+    try conn2.connect(addr);
+    try conn3.connect(addr);
+
+    // 3. Execute
+    try req1.execute(conn1);
+    try req2.execute(conn2);
+    try req3.execute(conn3);
+
+    // 4. Drive Loop
+    while (batch_ctx.pending > 0) {
+        _ = try loop.tick();
+    }
+
+    // 5. Verify
     if (req1.state == .Finished and req2.state == .Finished and req3.state == .Finished) {
         std.debug.print("SUCCESS: All 3 requests finished!\n", .{});
         
@@ -116,9 +92,6 @@ pub fn main() !void {
         std.debug.print("Data verified.\n", .{});
     } else {
         std.debug.print("FAIL: Requests did not finish correctly.\n", .{});
-        std.debug.print("Req1: {}\n", .{req1.state});
-        std.debug.print("Req2: {}\n", .{req2.state});
-        std.debug.print("Req3: {}\n", .{req3.state});
         return error.TestFailed;
     }
 }

@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_async_request_mod.addImport("zpq", zpq_mod);
+    test_async_request_mod.addImport("xev", libxev_mod);
 
     const test_async_request_exe = b.addExecutable(.{
         .name = "test_async_request",
@@ -109,6 +110,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_test_async_source = b.addRunArtifact(test_async_source_exe);
     test_io_step.dependOn(&run_test_async_source.step);
+
+    const test_async_source_step = b.step("test-async-source", "Run AsyncS3Source integration test");
+    test_async_source_step.dependOn(&run_test_async_source.step);
 
     // raw_s3_source (restored)
     const raw_s3_source_mod = b.createModule(.{
@@ -380,6 +384,69 @@ pub fn build(b: *std.Build) void {
 
             const run = b.addRunArtifact(exe_dns);
             const step = b.step("test-dns", "Run Async DNS integration test");
+            step.dependOn(&run.step);
+        }
+
+        // 8. probe_xev_tcp_lifecycle
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probe_xev_tcp_lifecycle.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+
+            const probe_exe = b.addExecutable(.{
+                .name = "probe_xev_tcp_lifecycle",
+                .root_module = mod,
+            });
+            probe_exe.linkLibC();
+
+            const run = b.addRunArtifact(probe_exe);
+            const step = b.step("probe-xev-tcp", "Run libxev TCP lifecycle probe");
+            step.dependOn(&run.step);
+        }
+
+        // 9. probe_tls_pump
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probe_tls_pump.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("boring_tls", boring_tls_mod);
+
+            const probe_exe = b.addExecutable(.{
+                .name = "probe_tls_pump",
+                .root_module = mod,
+            });
+            probe_exe.linkLibC();
+
+            const run = b.addRunArtifact(probe_exe);
+            const step = b.step("probe-tls-pump", "Run libxev + boring_tls pump probe");
+            step.dependOn(&run.step);
+        }
+
+        // 10. test_connection
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_connection.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("boring_tls", boring_tls_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const conn_exe = b.addExecutable(.{
+                .name = "test_connection",
+                .root_module = mod,
+            });
+            conn_exe.linkLibC();
+
+            const run = b.addRunArtifact(conn_exe);
+            const step = b.step("test-connection", "Run S3 connection transport test");
             step.dependOn(&run.step);
         }
     }

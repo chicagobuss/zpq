@@ -3,18 +3,22 @@ const xev = @import("xev");
 
 /// A wrapper around xev.Loop for the S3 stack.
 pub const EventLoop = struct {
-    loop: xev.Loop,
+    loop: *xev.Loop,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !EventLoop {
+        const loop = try allocator.create(xev.Loop);
+        errdefer allocator.destroy(loop);
+        loop.* = try xev.Loop.init(.{});
         return .{
-            .loop = try xev.Loop.init(.{}),
+            .loop = loop,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *EventLoop) void {
         self.loop.deinit();
+        self.allocator.destroy(self.loop);
     }
 
     /// Register interest in READ events for a socket.

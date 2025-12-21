@@ -1,74 +1,44 @@
 # ZPQ Technical Context & Deep Dive
 
 **Last Updated**: Dec 21, 2025
-**Current State**: **DNS Integration Reached**: The verified high-performance DNS stack is now wired into the async S3 engine. Connections are spreading across multiple resolved IPs.
+**Current State**: **Pure Async Lifecycle Reached**: The entire S3 stack is now event-driven. Polling loops have been replaced with non-blocking callbacks.
 
 ## 🏆 Milestone 6: High-Performance Async DNS (Completed)
 We have successfully implemented a tiered, asynchronous DNS resolver stack that decouples DNS lookups from the main event loop and enables aggressive parallel connection launching.
 
-*   **Verification**: 
-    *   **Integration Test**: `tests/io/test_dns.zig` successfully verified the entire stack.
-    *   **Deduplication**: Proved that `SingleFlightResolver` merges concurrent requests for the same host.
-    *   **Racing**: `SpeculativeResolver` correctly launches IPv4/IPv6 races.
-    *   **Memory Hygiene**: Verified zero leaks using `GeneralPurposeAllocator`.
-*   **Key Components**:
-    *   **`ThreadPoolResolver`**: Offloads `getaddrinfo` to `libxev.ThreadPool`.
-    *   **`SingleFlightResolver`**: Deduplicates lookups at the bucket/endpoint level (6 attempts -> 1 query).
-    *   **`SpeculativeResolver`**: Foundations for "Happy Eyeballs" and fast connection startup.
-
-## 🚀 Milestone 7: DNS Integration & Advanced I/O (In Progress)
-**Goal**: Wire the DNS stack into `AsyncS3Source` and move to a pure event-driven transport lifecycle.
+## 🚀 Milestone 7: Pure Async Lifecycle (Completed)
+**Goal**: Move to a pure event-driven transport lifecycle for S3.
 
 ### Progress & Verification:
 *   [x] **DNS Integration**: `AsyncS3Source` now holds a `dns.Resolver`.
 *   [x] **Dynamic Resolution**: Hardcoded IPs removed. Bucket hosts are resolved at source initialization.
-*   [x] **IP Round-Robin**: Every call to `connectNew()` now cycles through the list of resolved IPs. This maximizes parallel throughput into the AWS frontend fleet.
-*   [x] **EventLoop Refactor**: `src/zpq/io/s3/event_loop.zig` now wraps `libxev.Loop`. This ensures the DNS stack works on Linux/WSL2 and macOS with zero code changes.
-*   [x] **Verification**: `tests/io/test_async_source.zig` confirms that we resolve "127.0.0.1" (or real hosts) and initiate connections to the correct network address.
+*   [x] **IP Round-Robin**: Every call to `connectNew()` now cycles through the list of resolved IPs.
+*   [x] **EventLoop Refactor**: `EventLoop` now heap-allocates `xev.Loop` to ensure pinning and cross-platform safety.
+*   [x] **Transport Abstraction**: `Connection` (Plain/TLS) implemented with a non-blocking "Pump" pattern.
+*   [x] **Pure Async Lifecycle**: `AsyncRequest` refactored to use callbacks. `WouldBlock` polling removed.
+*   [x] **Verification**: All integration tests (`test_async_source`, `test_async_request`, `test_event_loop`) passed on Linux/WSL2.
 
-### Technical Blueprint (Pure Async Next Steps):
-We are transitioning from a **Polling State Machine** (busy-waiting on `WouldBlock`) to a **Pure Completion State Machine**.
+### Technical Blueprint (Next Steps):
+1.  **Persistent Connection Pool (Enhanced)**:
+    *   Currently, the pool is simple. We need to add **Keep-Alive Timeouts** and **Stale Detection** (zero-byte read probe).
+    *   **Goal**: Maximize reuse for heavy columnar scans (1000+ small ranges).
 
-1.  **Transport Abstraction (`Connection`)**:
-    *   Create `src/zpq/io/s3/connection.zig` to wrap `xev.TCP`.
-    *   Handle both **Plain TCP** and **BoringTLS** using the "Pump" pattern.
-    *   This decouples `AsyncRequest` (HTTP logic) from the raw network/TLS bytes.
-
-2.  **AsyncRequest State Machine Evolution**:
-    *   `AsyncRequest` will no longer be an "Observer" of FDs.
-    *   It will interface with the `Connection` via `write(data)` and `on_data(data)` callbacks.
-    *   **States**: `Idle` -> `Connecting` -> `RequestSent` -> `ReadingHeaders` -> `ReadingBody`.
-
-3.  **Probing & Microtesting**:
-    *   [x] `probe_xev_tcp_lifecycle.zig`: Verified raw `xev.TCP` connect/close.
-    *   [ ] `probe_tls_pump.zig`: Verify the `boring_tls` pump with `xev.TCP` in isolation.
-    *   [ ] `tests/io/test_async_request_flow.zig`: Verify the HTTP state machine using a mock `Connection`.
-
-3.  **TLS "Pump" Integration**:
-    *   **Web Search Task**: Profusely search for "libxev TLS adapter patterns" and "BoringSSL async BIO pump" to ensure our `TlsAdapter` doesn't deadblock when the loop is driving multiple completions.
-    *   **Refactor**: Integrate `TlsAdapter` directly into the `xev` callback chain so TLS handshakes happen "asynchronously" without blocking other requests.
-
-4.  **Persistent Connection Pool**:
-    *   Implement LIFO reuse with keyed host/port/tls.
-    *   Implement "Stale Check": Before handing a connection back, perform a zero-byte `read` completion to see if the server closed it.
-
-### Next Session Focus:
-*   [ ] Create `probe_xev_tcp_lifecycle.zig` to lock down the `libxev` API for 0.16.dev.
-*   [ ] Refactor `AsyncRequest` header serialization to be fully unmanaged.
-*   [ ] Implement the completion-based "Connect" flow in `AsyncS3Source`.
+2.  **Repetition Levels (Milestone 8)**:
+    *   Implement logic for nested Lists and Maps.
+    *   **Challenge**: Efficiently skip large nested structures using the async gapped reader.
 
 ---
 
 ## 🧠 Lessons Learned: Working with Zig 0.16.x & ZPQ Workflow
 
 ### 1. Zig 0.16.x Breaking Changes & Patterns
-*   **Unmanaged Containers**: `std.ArrayListUnmanaged` and `std.StringHashMap` are required for high-performance zero-heap paths. Always pass the allocator to every operation.
-*   **Alignment Safety**: `xev.shim_net.Address` is critical for handling `sockaddr` alignment correctly. `@ptrCast(@alignCast(&addr))` is your friend when bridging between raw memory and specialized address types.
-*   **Static vs Dynamic xev**: We chose the Static path (`xev.Loop`) for raw performance, avoiding vtable jumps in the hot I/O loop.
+*   **Pinned Loops**: `xev.Loop` MUST be pinned in memory. Moving the struct (e.g. returning by value from `init()`) will cause random segfaults in `io_uring` as internal pointers become invalid.
+*   **Unmanaged Containers**: `std.ArrayListUnmanaged` is required for high-performance zero-heap paths.
+*   **Alignment Safety**: `xev.shim_net.Address` handles `sockaddr` alignment correctly.
 
 ### 2. Workflow & Testing Strategy
-*   **Micro-Test Driven Development (MTDD)**: Proving the DNS middleware in isolation (`test_dns.zig`) was the only reason the integration into `AsyncS3Source` was smooth.
-*   **Probing Mandatory**: When Zig 0.16 behavior is unclear, a 20-line `probe_*.zig` file is 10x faster than trying to interpret compiler errors in a large project.
+*   **MTDD (Micro-Test Driven Development)**: Proving the `boring_tls` pump in `probe_tls_pump.zig` was critical before integrating it into the production `Connection` struct.
+*   **State Machine Observability**: Adding `on_done` callbacks to `AsyncRequest` made it possible to drive batch operations without manual polling.
 
 ---
 

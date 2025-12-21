@@ -35,6 +35,7 @@ pub const s3 = struct {
 
     // Internal Components
     pub const AsyncRequest = @import("zpq/io/s3/request.zig").AsyncRequest;
+    pub const Connection = @import("zpq/io/s3/connection.zig").Connection;
     pub const EventLoop = @import("zpq/io/s3/event_loop.zig").EventLoop;
     pub const TlsAdapter = @import("zpq/io/s3/tls_adapter.zig").TlsAdapter;
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");

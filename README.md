@@ -1,21 +1,21 @@
-# ZPQ: The High-Performance Zig Parquet Tool
+# ZPQ: High-Performance Zig Parquet Tool
 
-ZPQ is a specialized Parquet tool built for extreme performance, specifically targeting cloud-native environments like AWS S3 and Lambda.
+ZPQ is a specialized Parquet utility designed for high-throughput and low-latency data access, specifically optimized for cloud-native environments such as AWS S3 and Lambda.
 
-## 🚀 The Ferrari Architecture (Milestone 7 Complete)
+## Architecture: Milestone 7 Overview
 
-ZPQ features a custom-built, "Pure Async" I/O engine designed to outperform generic Parquet tools by leveraging Zig's low-level control and modern Linux/macOS primitives.
+ZPQ utilizes a custom-built asynchronous I/O engine designed to maximize throughput by leveraging Zig's low-level control and modern system primitives.
 
-### Key Features:
-- **Pure Event-Driven Lifecycle**: Built on top of `libxev` (Static backend), ZPQ uses a non-blocking completion state machine. No busy-waiting, no `WouldBlock` polling loops.
-- **Aggressive Parallelism**: Interleaves hundreds of concurrent range requests to S3 on a single thread.
-- **Zero-Allocation Gaps**: Our custom HTTP/1.1 engine can skip "gaps" between Parquet columns directly at the socket level without allocating memory for discarded bytes.
-- **Tiered Async DNS**: A high-performance DNS stack that races IPv4/IPv6 (Speculative) and deduplicates lookups (Single-Flight) to minimize connection latency.
-- **Cross-Platform**: Supports `io_uring` on Linux (WSL2) and `kqueue` on macOS with a unified completion-based API.
+### Key Technical Features:
+- **Event-Driven Lifecycle**: Built on `libxev` (Static backend), ZPQ employs a non-blocking completion state machine. This eliminates busy-waiting and polling loops.
+- **Interleaved Concurrency**: Supports hundreds of concurrent range requests to S3 on a single thread.
+- **Zero-Allocation Gaps**: The HTTP/1.1 engine can skip "gaps" between Parquet columns at the socket level without allocating memory for discarded bytes.
+- **Tiered Asynchronous DNS**: Employs a speculative DNS stack that races IPv4/IPv6 and utilizes single-flight deduplication to minimize connection latency.
+- **Cross-Platform Compatibility**: Supports `io_uring` on Linux and `kqueue` on macOS with a unified completion-based API.
 
-## 📈 Benchmarks
+## Benchmarks
 
-ZPQ is designed to be the fastest Parquet reader in the world for cloud-latency scenarios.
+ZPQ aims to be the leading Parquet reader for cloud-latency scenarios.
 
 | Implementation | Local Throughput (Values) | S3 Metadata Latency |
 | :--- | :--- | :--- |
@@ -23,33 +23,32 @@ ZPQ is designed to be the fastest Parquet reader in the world for cloud-latency 
 | PyArrow (Python) | N/A | ~0.15s |
 | Polars (Rust) | N/A | ~0.40s |
 
-*Note: S3 metadata latency is currently bottlenecked by persistent connection reuse, which is the focus of Milestone 8.*
+*S3 metadata latency is currently under optimization in Milestone 8 (Persistent Connection Pooling).*
 
-## 🛠 Project Status
+## Project Status
 
 ZPQ is currently in active development.
 
-- **Milestone 6**: High-Performance Async DNS [COMPLETE]
-- **Milestone 7**: Pure Async Lifecycle & Transport Abstraction [COMPLETE]
+- **Milestone 6**: High-Performance Asynchronous DNS [COMPLETE]
+- **Milestone 7**: Pure Asynchronous Lifecycle & Transport Abstraction [COMPLETE]
 - **Milestone 8**: Enhanced Connection Pooling & Repetition Levels [IN PROGRESS]
 
-## 💻 Building & Testing
+## Usage
 
-ZPQ requires the latest Zig master (0.16.dev).
+ZPQ requires the Zig compiler (0.16.dev).
 
 ```bash
 # Build the project
 just build
 
-# Run all IO tests (Async stack)
+# Run asynchronous I/O integration tests
 zig build test-io -Dexperimental=true
 
-# Run the AsyncS3Source integration test
+# Run the AsyncS3Source full-stack test
 zig build test-async-source -Dexperimental=true
 ```
 
-## 📜 Documentation
+## Documentation
 - `STATUS.md`: High-level roadmap and progress tracking.
-- `STATUS_CURRENT_DETAIL.md`: Granular technical details and lessons learned.
-- `docs/high_performance_io_plan.md`: The architectural blueprint for the async engine.
-
+- `STATUS_CURRENT_DETAIL.md`: Granular technical details and internal benchmarks.
+- `docs/high_performance_io_plan.md`: Architectural blueprint for the asynchronous engine.

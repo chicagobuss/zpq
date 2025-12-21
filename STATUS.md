@@ -1,121 +1,118 @@
 # ZPQ Project Status
 
-## 🚀 High-Level Goals
+## High-Level Goals
 *   **Performance**: Outperform PyArrow and Rust `parquet` crate (Standard Arrow Reader) in scan throughput.
 *   **Safety**: Zero-copy where possible, safe memory management, robust error handling.
 *   **Completeness**: Support all standard Parquet encodings and compression codecs.
 *   **Portability**: Run as a standalone CLI, AWS Lambda (Zig's cross-compilation), or library.
 
-## 🧠 Philosophy & Architecture
-*   **Lambda-First**: The ultimate goal is blazing fast Lambdas with minimal cold starts.
-    *   **Zero-Dependency**: No generic "kitchen sink" SDKs (e.g. `aws-sdk-for-zig`). We only implement the exact S3 `GET`/`HEAD` logic we need.
-    *   **Tiny Footprint**: Minimize binary size and memory usage.
-*   **Performance > Compliance**:
-    *   We favor Zig-native performance optimizations (zero-allocation, comptime) over matching "standard" SDK implementation patterns.
-    *   Auth support is "pragmatic": we support environment variables and basic profiles (what Lambda needs), ignoring complex flows (SSO, MFA) unless critical.
-*   **Dependency Boundary**:
-    *   Core Parquet logic (`src/zpq/decoder.zig`, etc.) must remain pure logic with NO I/O or transport knowledge.
-    *   I/O is abstracted via `RandomAccessSource`.
-    *   Transport implementation (`src/zpq/io/s3/`) is allowed to be "dirty" with HTTP/Auth logic but must remain dependency-free.
+## Philosophy & Architecture
+*   **Lambda-First**: The ultimate goal is high-performance AWS Lambdas with minimal cold starts.
+    *   **Zero-Dependency**: No generic SDKs (e.g., `aws-sdk-for-zig`). We only implement the specific S3 `GET`/`HEAD` logic required.
+    *   **Minimal Footprint**: Reduction of binary size and memory utilization.
+*   **Performance Orientation**:
+    *   Prioritize Zig-native performance optimizations (zero-allocation, comptime) over matching standard SDK implementation patterns.
+    *   Pragmatic authentication support: environment variables and basic profiles (as required by Lambda), avoiding complex SSO/MFA flows unless necessary.
+*   **Dependency Boundaries**:
+    *   Core Parquet logic (`src/zpq/decoder.zig`, etc.) remains pure logic with no I/O or transport knowledge.
+    *   I/O is abstracted via the `RandomAccessSource` interface.
+    *   Transport implementation (`src/zpq/io/s3/`) handles HTTP/Authentication logic while remaining dependency-free.
 
 ---
 
-## 🏆 Project Milestones
+## Project Milestones
 
-### ✅ Milestone 1: Core Parquet Engine & Encodings
+### Milestone 1: Core Parquet Engine & Encodings [COMPLETE]
 *   [x] **Core Reading**: Thrift metadata parsing, Page iteration, Column chunk handling.
 *   [x] **Encodings**:
     *   [x] `PLAIN`
     *   [x] `RLE` (Run-Length Encoding)
-    *   [x] `BIT_PACKED` (Deprecated but present)
+    *   [x] `BIT_PACKED` (Deprecated but supported)
     *   [x] `RLE_DICTIONARY` / `PLAIN_DICTIONARY`
 *   [x] **Decompression**:
-    *   [x] **Snappy**: Native Zig implementation (verified & benchmarked).
+    *   [x] **Snappy**: Native Zig implementation.
 *   [x] **Complex Features**:
-    *   [x] **Definition Levels**: Handling NULL values via RLE decoding.
+    *   [x] **Definition Levels**: NULL value handling via RLE decoding.
     *   [x] **Dictionary Resolution**: Reconstructing values from dictionary pages.
 
-### ✅ Milestone 2: CLI Tools & Initial Benchmarking
+### Milestone 2: CLI Tools & Initial Benchmarking [COMPLETE]
 *   [x] **CLI Tools**: `schema`, `meta`, `pages`, `cat`, `scan`, `debug-s3`.
-*   [x] **Throughput**: ~911 MB/s (ZPQ) vs ~370 MB/s (PyArrow) vs ~265 MB/s (Rust Arrow) on M1 Max.
+*   [x] **Throughput**: Verified ~911 MB/s (ZPQ) vs ~370 MB/s (PyArrow) vs ~265 MB/s (Rust Arrow) on M1 Max.
 *   [x] **Validation**: Verified against `parquet-read` and `pyarrow`.
 
-### ✅ Milestone 3: Async Foundation (`libxev` + `boring_tls`)
+### Milestone 3: Async Foundation (libxev + boring_tls) [COMPLETE]
 *   [x] **Evented I/O**:
-    *   [x] **Micro-test**: `test_event_loop.zig` (prove kqueue/epoll works).
-    *   [x] **Integration**: Integrated `EventLoop` into `AsyncS3Source` to drive parallel range fetches.
+    *   [x] **Micro-test**: `test_event_loop.zig` (proving kqueue/epoll functionality).
+    *   [x] **Integration**: Integrated `EventLoop` into `AsyncS3Source` for parallel range fetches.
     *   [x] **Scaling**: Verified ~1.3x faster TCP echo than Node.js.
 *   [x] **TLS Integration**:
     *   [x] Implemented `TlsAdapter` using `boring_tls` (OpenSSL).
     *   [x] Verified secure handshakes on macOS M1 and Linux ARM64.
     *   [x] Patched `boring_tls` build for ARM architecture compatibility.
 
-### ✅ Milestone 4: Transport Verification (MinIO TLS & Coalescing)
+### Milestone 4: Transport Verification (MinIO TLS & Coalescing) [COMPLETE]
 *   [x] **MinIO TLS Proof**: Verified byte-exact Range GET against local MinIO.
-    *   [x] Proved TLS handshake + encrypted reads/writes work with `libxev`.
-    *   [x] HTTP/1.1 request/response framing (manual implementation).
-*   [x] **Zig Superpowers**:
-    *   [x] **Zero-Allocation Gap**: Skipping bytes on the socket without allocation.
+    *   [x] TLS handshake and encrypted reads/writes verified with `libxev`.
+    *   [x] Manual HTTP/1.1 request/response framing implementation.
+*   [x] **Zig Native Optimizations**:
+    *   [x] **Zero-Allocation Gap**: Skipping bytes at the socket level without allocation.
     *   [x] **No-HEAD Open**: Suffix range parsing from mock server.
-*   [x] **Coalescing**: Polars-style range merging/splitting implemented in `scheduler.zig`.
+*   [x] **Coalescing**: Polars-style range merging and splitting in `scheduler.zig`.
 
-### ✅ Milestone 5: S3 Architecture Consolidation (Zig 0.16 Alignment)
-*   [x] **Architecture**: Consolidated all S3 code (Sync & Async) into `src/zpq/io/s3/`.
+### Milestone 5: S3 Architecture Consolidation (Zig 0.16 Alignment) [COMPLETE]
+*   [x] **Architecture**: Consolidated S3 implementations (Sync & Async) into `src/zpq/io/s3/`.
 *   [x] **I/O Abstraction**: 
-    *   [x] Refactor `ParquetFile` to use `RandomAccessSource` interface.
-    *   [x] Implement `LocalFileSource` and `AsyncS3Source`.
+    *   [x] Refactored `ParquetFile` to utilize the `RandomAccessSource` interface.
+    *   [x] Implemented `LocalFileSource` and `AsyncS3Source`.
 *   [x] **AWS SigV4**:
-    *   [x] Implemented "Clean Room" zero-dependency signer in `sigv4.zig`.
-    *   [x] **Optimized Hot Path**: 
-        *   [x] Zero-heap hot path using `stackFallback` allocator for requests.
-        *   [x] Pre-parsed `std.Uri` to avoid redundant parsing per chunk.
+    *   [x] Implemented zero-dependency signer in `sigv4.zig`.
+    *   [x] **Hot Path Optimization**: 
+        *   [x] Zero-heap hot path using `stackFallback` allocator.
+        *   [x] Pre-parsed `std.Uri` to minimize redundant parsing.
         *   [x] Constant-time hash for empty payloads.
-        *   [x] **Speculative Read**: Optimized `readFooter` to fetch last 64KB in one request (round-trips 3 -> 2).
-*   [x] **Zig 0.16.dev Ready**:
+        *   [x] **Speculative Read**: Optimized `readFooter` to fetch trailing 64KB in a single request.
+*   [x] **Zig 0.16.dev Migration**:
     *   [x] Updated for `std.Io.Writer`, `std.time`, and `std.ArrayList` breaking changes.
-    *   [x] **Unmanaged pattern**: `AsyncRequest`, `ColumnReader`, and `Page` no longer store allocators.
-*   [x] **CLI**: Added `--async` flag for engine switching.
+    *   [x] **Unmanaged Pattern**: Adopted unmanaged containers for `AsyncRequest`, `ColumnReader`, and `Page`.
+*   [x] **CLI**: Introduced `--async` flag for engine selection.
 
-### ✅ Milestone 6: High-Performance Async DNS
+### Milestone 6: High-Performance Async DNS [COMPLETE]
 *   [x] **Interface Design**: Defined `Resolver` interface with `Completion` and `VTable`.
-*   [x] **Tier 1: Stable**: Implemented `ThreadPoolResolver` using `libxev.ThreadPool` + `std.c.getaddrinfo`.
-*   [x] **Middleware: Single-Flight**: Implemented `SingleFlightResolver` to deduplicate concurrent lookups for the same host.
-*   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for racing (Happy Eyeballs foundation).
-*   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and race logic.
+*   [x] **Tier 1: Stable**: Implemented `ThreadPoolResolver` using `libxev.ThreadPool`.
+*   [x] **Middleware: Single-Flight**: Implemented `SingleFlightResolver` for lookup deduplication.
+*   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for IPv4/IPv6 racing.
+*   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and racing.
 
-### 🚀 Milestone 7: Pure Async Lifecycle (Completed)
-*   [x] **Transport Abstraction**: Implemented `Connection` (TCP/TLS) with "Pump" pattern.
-*   [x] **Pure Async I/O**: Refactored `AsyncRequest` to use `libxev` completions directly.
-*   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source`.
-*   [x] **Round-Robin**: `AsyncS3Source` cycles through resolved IPs for parallel throughput.
-*   [x] **Pinned Loop**: Fixed `io_uring` crashes by heap-allocating and pinning the `EventLoop`.
+### Milestone 7: Pure Async Lifecycle [COMPLETE]
+*   [x] **Transport Abstraction**: Implemented `Connection` (TCP/TLS) using a non-blocking "Pump" pattern.
+*   [x] **Pure Async I/O**: Refactored `AsyncRequest` to use `libxev` completions and callbacks.
+*   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source` with round-robin IP distribution.
+*   [x] **Reliability**: Resolved `io_uring` issues by pinning the `EventLoop` in memory.
 
-### 🚀 Milestone 8: Persistent Pool & Repetition Levels (Next)
-*   [ ] **Enhanced Connection Pool**: Add keep-alive timeouts and stale detection.
+### Milestone 8: Persistent Pool & Repetition Levels [IN PROGRESS]
+*   [ ] **Enhanced Connection Pool**: Implementation of keep-alive timeouts and stale detection.
 *   [ ] **Repetition Levels**: Support for Lists and Maps (Nested structures).
-*   [ ] **Range Coalescing (Advanced)**: Dynamic merging based on latency/throughput curves.
-*   [ ] **Repetition Levels**: Support for Lists and Maps.
+*   [ ] **Advanced Range Coalescing**: Dynamic merging based on latency/throughput profiling.
 
 ---
 
-## 🧭 High-Performance HTTP Plan
-ZPQ’s current S3 support is functional, but `std.http.Client` has known limitations with aggressive keep-alive reuse in Zig 0.16 dev.
-We are moving to a purpose-built “Bare Metal” HTTP/1.1 client specialized for S3 (`HEAD` + `GET Range`) that:
-- Owns sockets explicitly (no hidden state machine).
-- Reuses connections deterministically (keep-alive + pooling).
-- Evolves from blocking correctness → evented kqueue/epoll for concurrency.
+## High-Performance HTTP Plan
+ZPQ's S3 support utilizes a purpose-built “Bare Metal” HTTP/1.1 client specialized for S3 (`HEAD` + `GET Range`). Key characteristics include:
+- Explicit socket ownership.
+- Deterministic connection reuse.
+- Event-driven concurrency via `libxev`.
 
-### 📚 Reference Map (Bun)
-We keep Bun as a “how the pros do it” reference for the async stack:
-- **Event loop (kqueue/epoll abstraction)**: `references/bun/src/deps/uws/Loop.zig`
-- **HTTP client thread ownership + lifecycle**: `references/bun/src/http/HTTPThread.zig`
-- **Keep-alive pooling + release semantics**: `references/bun/src/http/HTTPContext.zig`
-- **Request execution plumbing**: `references/bun/src/http/AsyncHTTP.zig`
-- **S3 usage path**: `references/bun/src/s3/client.zig`
+### Reference Material
+We utilize the following references for architectural validation:
+- **Event loop**: `references/bun/src/deps/uws/Loop.zig`
+- **HTTP thread ownership**: `references/bun/src/http/HTTPThread.zig`
+- **Keep-alive semantics**: `references/bun/src/http/HTTPContext.zig`
+- **Request execution**: `references/bun/src/http/AsyncHTTP.zig`
+- **S3 implementation**: `references/bun/src/s3/client.zig`
 
 ---
 
-## 📉 Benchmarks (Local File - M3 Max)
+## Benchmarks (Local File - M3 Max)
 | Implementation | Time (s) | Throughput (File) | Throughput (Values) |
 | :--- | :--- | :--- | :--- |
 | **ZPQ (Zig)** | **0.16s** | **~842 MB/s** | **~857 MVal/s** |
@@ -123,18 +120,18 @@ We keep Bun as a “how the pros do it” reference for the async stack:
 | Rust (Arrow) | 0.65s | ~160 MB/s | N/A |
 | Rust (CLI) | 20.14s | ~5 MB/s | N/A |
 
-## 📉 Benchmarks (S3 Metadata - Cloud Latency)
+## Benchmarks (S3 Metadata - Cloud Latency)
 | Implementation | Time (s) | Notes |
 | :--- | :--- | :--- |
 | **PyArrow (C++)** | ~0.15s | Native C++ S3FS with persistent connection pool. |
 | **Polars (Rust)** | ~0.40s | Rust `object_store` via `reqwest`. |
-| **ZPQ (Zig)** | ~0.58s | 2 Round-trips (Init HEAD + Speculative Footer). Functional but limited by connection reuse. |
+| **ZPQ (Zig)** | ~0.58s | Initial implementation; connection reuse optimizations pending in Milestone 8. |
 
-## ⚡️ Lambda Benchmark (Internal Loop)
-To verify the scalability of our async engine (`libxev` + `epoll`) on AWS Lambda (ARM64):
+## Lambda Benchmark (Internal Loop)
+Verified scalability of the async engine (`libxev` + `epoll`) on AWS Lambda (ARM64):
 | Memory | RPS (Approx) | Scaling Factor | Notes |
 | :--- | :--- | :--- | :--- |
-| 128 MB | ~1,573 | 1.0x | CPU limited / noisy neighbor prone. |
-| 1024 MB | ~15,355 | 9.7x | Strong baseline. ~10x speedup from 128MB. |
-| **2048 MB** | **~30,547** | **19.4x** | **Ideal linear scaling relative to 128MB.** |
-| 4096 MB | ~45,065 | 28.6x | High performance, diminishing returns show. |
+| 128 MB | ~1,573 | 1.0x | CPU limited. |
+| 1024 MB | ~15,355 | 9.7x | Strong performance baseline. |
+| **2048 MB** | **~30,547** | **19.4x** | **Optimal linear scaling.** |
+| 4096 MB | ~45,065 | 28.6x | Diminishing returns observed. |

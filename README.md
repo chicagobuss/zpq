@@ -1,43 +1,42 @@
-# ZPQ: High-Performance Zig Parquet Tool
+# ZPQ: A Zig Parquet Tool
 
-ZPQ is a specialized Parquet utility optimized for high-throughput and low-latency data access in cloud-native environments, specifically targeting AWS S3 and Lambda.
+ZPQ is a Parquet utility designed for data access in cloud environments, with a specific focus on AWS S3 and Lambda.
 
 ## Design Philosophy
 
-ZPQ is engineered for specific use cases where performance and footprint are critical.
+ZPQ is built for scenarios where resource utilization and execution time are primary constraints.
 
-### What ZPQ Is:
-- **Cloud-Latency Optimized**: Specialized for S3 `GET Range` and `HEAD` operations with aggressive connection management.
-- **Async-First**: Built on a non-blocking completion state machine for massive concurrency on a single thread.
-- **Zero-Dependency Core**: Features a "bare-metal" implementation of S3, SigV4, and HTTP/1.1 to eliminate the overhead of generic SDKs.
-- **Embedded-Ready**: Designed with a minimal binary footprint and low memory overhead for AWS Lambda cold-start optimization.
+### Characteristics:
+- **Asynchronous I/O**: Utilizes a completion-based state machine for interleaved request execution on a single thread.
+- **Native Implementation**: S3, SigV4, and HTTP/1.1 protocols are implemented directly in Zig to minimize external dependencies.
+- **Resource Constraints**: Optimized for low memory overhead and minimal binary size to improve AWS Lambda cold-start times.
 
-### What ZPQ Is Not:
-- **General-Purpose Parquet SDK**: Does not aim to support every possible Parquet feature; prioritizes performance for common analytical workloads.
-- **Database Engine**: ZPQ is a tool for reading and scanning data, not for long-term storage management or complex query planning.
-- **Standard SDK Wrapper**: It does not wrap existing libraries (like `aws-sdk-cpp`); it implements the wire protocols directly in Zig.
+### Scope:
+- **Analytical Workloads**: Focuses on performance for common analytical query patterns rather than exhaustive Parquet feature parity.
+- **Read-Oriented**: Designed for scanning and extracting data; it is not a query engine or storage manager.
+- **Dependency Isolation**: Does not wrap existing C/C++ SDKs; all protocol logic is implemented natively.
 
-## Architectural Guardrails
+## Architectural Implementation
 
-The development of ZPQ is guided by strict architectural principles to ensure maintainability and performance:
+The codebase adheres to the following internal standards:
 
-- **Protocol/Transport Decoupling (Sans-I/O)**: Protocol logic (S3 request formatting, SigV4 signing) is strictly separated from socket operations. Logic is tested against abstract buffers, ensuring correctness without network mocks.
-- **Interface-Driven I/O**: Business logic (`ParquetFile`, `Decoder`) interacts exclusively with the `RandomAccessSource` interface. Low-level primitives like `libxev` or `epoll` are isolated within transport implementations.
-- **Unmanaged Container Pattern**: High-performance paths utilize unmanaged containers (`std.ArrayListUnmanaged`). All allocations are explicit, providing the caller with total control over memory lifecycles.
-- **Pinned Resource Lifecycle**: System-level resources (like event loops and network buffers) are heap-allocated and pinned to ensure validity across asynchronous state transitions.
+- **Protocol/Transport Separation**: Protocol logic (e.g., S3 request formatting) is decoupled from socket operations. This allows protocol verification against memory buffers without requiring network connectivity.
+- **Abstract I/O**: Business logic interacts with a `RandomAccessSource` interface. Platform-specific primitives (such as `io_uring` or `kqueue`) are isolated within transport implementations.
+- **Explicit Memory Management**: Performance-critical paths utilize unmanaged containers. All allocations are explicit, requiring the caller to manage resource lifecycles.
+- **Memory Pinning**: Resources with strict identity requirements, such as event loops and network buffers, are heap-allocated to ensure validity across asynchronous transitions.
 
-## Testing and Robustness
+## Testing and Verification
 
-ZPQ undergoes rigorous verification across multiple dimensions:
+ZPQ is tested for stability across several environments:
 
-- **Cross-Platform Portability**: Verified on Linux (utilizing `io_uring`), macOS (utilizing `kqueue`), and WSL2.
-- **Architecture Support**: Native support and testing for both x86_64 and ARM64 (Graviton) architectures.
-- **Isolation Testing**: The tiered DNS stack, TLS pump, and HTTP state machine are verified via standalone micro-tests before integration.
-- **Memory Integrity**: All core operations are validated using the Zig `GeneralPurposeAllocator` to ensure zero memory leaks and correct alignment during high-concurrency interleaved I/O.
+- **Platform Support**: Verified on Linux (`io_uring`), macOS (`kqueue`), and WSL2.
+- **Architecture Support**: Native testing for x86_64 and ARM64.
+- **Component Isolation**: Critical components (DNS stack, TLS integration, HTTP state machine) are verified through independent micro-tests prior to integration.
+- **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
 
-## Benchmarks
+## Performance
 
-Initial performance data indicates ZPQ significantly outperforms generic implementations in scan throughput.
+Initial measurements for scan throughput and metadata retrieval are documented below.
 
 | Implementation | Local Throughput (Values) | S3 Metadata Latency |
 | :--- | :--- | :--- |
@@ -45,10 +44,10 @@ Initial performance data indicates ZPQ significantly outperforms generic impleme
 | PyArrow (Python) | N/A | ~0.15s |
 | Polars (Rust) | N/A | ~0.40s |
 
-*Current optimizations are focused on narrowing the S3 metadata latency gap through persistent connection pooling.*
+*S3 metadata retrieval time is currently subject to optimization via persistent connection management.*
 
 ## Documentation
-Refer to the following files for detailed information:
-- `STATUS.md`: High-level roadmap and progress tracking.
-- `STATUS_CURRENT_DETAIL.md`: Granular technical details and lessons learned.
-- `docs/high_performance_io_plan.md`: The architectural blueprint for the asynchronous engine.
+Additional technical detail is available in the following files:
+- `STATUS.md`: Project roadmap and milestone tracking.
+- `STATUS_CURRENT_DETAIL.md`: Technical implementation notes and lessons learned.
+- `docs/high_performance_io_plan.md`: Architectural design for the asynchronous I/O engine.

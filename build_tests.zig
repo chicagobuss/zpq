@@ -45,7 +45,7 @@ pub fn addAuxiliaryTools(
             .name = "probe-fast-feedback",
             .root_module = mod,
         });
-        pff_exe.linkLibC();
+        pff_exe.root_module.linkSystemLibrary("c", .{});
 
         if (install_all) b.installArtifact(pff_exe);
 
@@ -167,7 +167,7 @@ pub fn addAuxiliaryTools(
             .name = "test_s3_range_get",
             .root_module = mod,
         });
-        exe.linkLibC();
+        exe.root_module.linkSystemLibrary("c", .{});
         if (install_all) b.installArtifact(exe);
         const run = b.addRunArtifact(exe);
 
@@ -190,7 +190,7 @@ pub fn addAuxiliaryTools(
             .name = "bootstrap",
             .root_module = mod,
         });
-        exe.linkLibC();
+        exe.root_module.linkSystemLibrary("c", .{});
 
         const install_bootstrap = b.addInstallArtifact(exe, .{
             .dest_dir = .{ .override = .{ .custom = "lambda" } },
@@ -215,7 +215,7 @@ pub fn addAuxiliaryTools(
             .name = "bench-e2e",
             .root_module = mod,
         });
-        exe.linkLibC();
+        exe.root_module.linkSystemLibrary("c", .{});
         if (install_all) b.installArtifact(exe);
 
         const run = b.addRunArtifact(exe);
@@ -239,7 +239,7 @@ pub fn addAuxiliaryTools(
                 .name = "test_gap_skipping",
                 .root_module = mod,
             });
-            exe.linkLibC();
+            exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
 
             const run = b.addRunArtifact(exe);
@@ -311,7 +311,7 @@ pub fn addAuxiliaryTools(
                 .name = "bench_dns",
                 .root_module = mod,
             });
-            exe.linkLibC();
+            exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
 
             const run = b.addRunArtifact(exe);
@@ -333,7 +333,7 @@ pub fn addAuxiliaryTools(
                 .name = "probe_sf_crash",
                 .root_module = mod,
             });
-            exe.linkLibC();
+            exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
 
             const run = b.addRunArtifact(exe);
@@ -354,7 +354,7 @@ pub fn addAuxiliaryTools(
                 .name = "probe-tls-echo",
                 .root_module = mod,
             });
-            exe.linkLibC();
+            exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
 
             const run = b.addRunArtifact(exe);

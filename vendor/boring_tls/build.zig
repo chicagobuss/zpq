@@ -35,8 +35,8 @@ pub fn build(b: *std.Build) !void {
                 .linkage = .static,
                 .root_module = crypto_mod,
             });
-            crypto.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
-            crypto.linkLibCpp();
+            crypto.root_module.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
+            crypto.root_module.linkSystemLibrary("c++", .{});
 
             const ssl_mod = b.createModule(.{
                 .target = target,
@@ -47,9 +47,9 @@ pub fn build(b: *std.Build) !void {
                 .linkage = .static,
                 .root_module = ssl_mod,
             });
-            ssl.addObjectFile(prebuilt_path.path(b, "libssl.a"));
-            ssl.linkLibCpp();
-            ssl.linkLibrary(crypto);
+            ssl.root_module.addObjectFile(prebuilt_path.path(b, "libssl.a"));
+            ssl.root_module.linkSystemLibrary("c++", .{});
+            ssl.root_module.linkLibrary(crypto);
         }
     }
 
@@ -114,9 +114,9 @@ fn buildBoringCrypto(
         .root_module = crypto_mod,
     });
 
-    crypto.linkLibCpp();
-    crypto.addIncludePath(boringssl_dep.path("include"));
-    crypto.addIncludePath(boringssl_dep.path("src/include"));
+    crypto.root_module.linkSystemLibrary("c++", .{});
+    crypto.root_module.addIncludePath(boringssl_dep.path("include"));
+    crypto.root_module.addIncludePath(boringssl_dep.path("src/include"));
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -184,7 +184,7 @@ fn buildBoringCrypto(
         glob_sources_relative(arena.allocator(), full_dir_path, boringssl_root, ".c", &crypto_sources) catch continue;
     }
 
-    crypto.addCSourceFiles(.{
+    crypto.root_module.addCSourceFiles(.{
         .root = boringssl_dep.path("."),
         .files = crypto_sources.items,
         .flags = &[_][]const u8{
@@ -220,10 +220,10 @@ fn buildBoringSSLSSL(
         .root_module = ssl_mod,
     });
 
-    ssl.linkLibCpp();
-    ssl.linkLibrary(crypto);
-    ssl.addIncludePath(boringssl_dep.path("include"));
-    ssl.addIncludePath(boringssl_dep.path("src/include"));
+    ssl.root_module.linkSystemLibrary("c++", .{});
+    ssl.root_module.linkLibrary(crypto);
+    ssl.root_module.addIncludePath(boringssl_dep.path("include"));
+    ssl.root_module.addIncludePath(boringssl_dep.path("src/include"));
 
     const ssl_files = [_][]const u8{
         "bio_ssl.cc",
@@ -266,7 +266,7 @@ fn buildBoringSSLSSL(
         "tls13_server.cc",
     };
 
-    ssl.addCSourceFiles(.{
+    ssl.root_module.addCSourceFiles(.{
         .root = boringssl_dep.path("ssl"),
         .files = &ssl_files,
         .flags = &[_][]const u8{

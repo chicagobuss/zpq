@@ -56,10 +56,10 @@ pub fn build(b: *std.Build) !void {
             .name = "xev",
             .root_module = c_api_module,
         });
-        static_lib.linkLibC();
+        static_lib.root_module.linkSystemLibrary("c", .{});
         if (target.result.os.tag == .windows) {
-            static_lib.linkSystemLibrary("ws2_32");
-            static_lib.linkSystemLibrary("mswsock");
+            static_lib.root_module.linkSystemLibrary("ws2_32", .{});
+            static_lib.root_module.linkSystemLibrary("mswsock", .{});
         }
         break :lib static_lib;
     };
@@ -129,7 +129,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         switch (target.result.os.tag) {
-            .linux, .macos => test_exe.linkLibC(),
+            .linux, .macos => test_exe.root_module.linkSystemLibrary("c", .{}),
             else => {},
         }
         break :test_exe test_exe;
@@ -271,9 +271,9 @@ fn buildExamples(
                     .optimize = optimize,
                 }),
             });
-            exe.linkLibC();
-            exe.addIncludePath(b.path("include"));
-            exe.addCSourceFile(.{
+            exe.root_module.linkSystemLibrary("c", .{});
+            exe.root_module.addIncludePath(b.path("include"));
+            exe.root_module.addCSourceFile(.{
                 .file = b.path(b.fmt(
                     "examples/{s}",
                     .{entry.name},
@@ -286,7 +286,7 @@ fn buildExamples(
                     "-D_POSIX_C_SOURCE=199309L",
                 },
             });
-            exe.linkLibrary(c_lib);
+            exe.root_module.linkLibrary(c_lib);
             break :exe exe;
         };
 

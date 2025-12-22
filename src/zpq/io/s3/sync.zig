@@ -11,37 +11,40 @@ pub const Credentials = types.Credentials;
 
 pub const S3Source = struct {
     allocator: std.mem.Allocator,
-    
+
     // Own the IO runtime
     threaded: *std.Io.Threaded,
     // Client must be a pointer because it contains a Mutex
     client: *std.http.Client,
-    
+
     url: []u8,
     uri: std.Uri,
     object_size: u64,
-    
+
     // Auth state
     config: S3Config,
-    
+
     pub fn init(allocator: std.mem.Allocator, bucket: []const u8, key: []const u8, config: S3Config) !S3Source {
         const threaded = try allocator.create(std.Io.Threaded);
         threaded.* = std.Io.Threaded.init(allocator);
-        errdefer { threaded.deinit(); allocator.destroy(threaded); }
-        
+        errdefer {
+            threaded.deinit();
+            allocator.destroy(threaded);
+        }
+
         const client_ptr = try allocator.create(std.http.Client);
         errdefer allocator.destroy(client_ptr);
 
-        client_ptr.* = std.http.Client{ 
-            .allocator = allocator, 
+        client_ptr.* = std.http.Client{
+            .allocator = allocator,
             .io = threaded.io(),
         };
         errdefer client_ptr.deinit();
-        
+
         // Unify config storage - we now store the config directly as passed (which might borrow)
         // or we can dupe it if we want ownership. For the sync S3Source, we'll borror/dupe selectively.
         // Let's dupe key strings to be safe since this struct might live longer than CLI args.
-        
+
         var owned_config = config;
         if (config.credentials) |creds| {
             owned_config.credentials = .{
@@ -67,16 +70,16 @@ pub const S3Source = struct {
         defer allocator.free(encoded_key);
 
         const url = if (owned_config.endpoint) |ep| u: {
-            const clean_ep = std.mem.trimRight(u8, ep, "/");
-            break :u try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{clean_ep, bucket, encoded_key});
+            const clean_ep = std.mem.trimEnd(u8, ep, "/");
+            break :u try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ clean_ep, bucket, encoded_key });
         } else u: {
-             if (std.mem.eql(u8, owned_config.region, "us-east-1")) {
-                 break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.amazonaws.com/{s}", .{bucket, encoded_key});
-             } else {
-                 break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.{s}.amazonaws.com/{s}", .{bucket, owned_config.region, encoded_key});
-             }
+            if (std.mem.eql(u8, owned_config.region, "us-east-1")) {
+                break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.amazonaws.com/{s}", .{ bucket, encoded_key });
+            } else {
+                break :u try std.fmt.allocPrint(allocator, "https://{s}.s3.{s}.amazonaws.com/{s}", .{ bucket, owned_config.region, encoded_key });
+            }
         };
-            
+
         errdefer allocator.free(url);
 
         const uri = try std.Uri.parse(url);
@@ -90,7 +93,7 @@ pub const S3Source = struct {
             .object_size = 0,
             .config = owned_config,
         };
-        
+
         self.object_size = try self.fetchSize();
         return self;
     }
@@ -117,7 +120,7 @@ pub const S3Source = struct {
         self.threaded.deinit();
         self.allocator.destroy(self.threaded);
         self.allocator.free(self.url);
-        
+
         if (self.config.credentials) |creds| {
             self.allocator.free(creds.access_key);
             self.allocator.free(creds.secret_key);
@@ -126,7 +129,7 @@ pub const S3Source = struct {
         self.allocator.free(self.config.region);
         if (self.config.endpoint) |ep| self.allocator.free(ep);
     }
-    
+
     fn fetchSize(self: *S3Source) !u64 {
         var size: u64 = 0;
         const Context = struct { size: *u64 };
@@ -139,17 +142,17 @@ pub const S3Source = struct {
                 }
             }
         }.call;
-        
+
         try self.performRequest(.HEAD, null, Context{ .size = &size }, callback);
         return size;
     }
 
     fn readAtImpl(ptr: *anyopaque, offset: u64, buf: []u8) !usize {
         const self: *S3Source = @ptrCast(@alignCast(ptr));
-        
+
         const Context = struct { buf: []u8, n: *usize };
         var n: usize = 0;
-        
+
         const callback = struct {
             fn call(ctx: Context, res: *std.http.Client.Response) !void {
                 var transfer_buf: [4096]u8 = undefined;
@@ -157,20 +160,15 @@ pub const S3Source = struct {
                 ctx.n.* = try reader.readSliceShort(ctx.buf);
             }
         }.call;
-        
-        try self.performRequest(
-            .GET, 
-            .{ .start = offset, .end = offset + buf.len - 1 }, 
-            Context{ .buf = buf, .n = &n }, 
-            callback
-        );
+
+        try self.performRequest(.GET, .{ .start = offset, .end = offset + buf.len - 1 }, Context{ .buf = buf, .n = &n }, callback);
         return n;
     }
 
     fn performRequest(
         self: *S3Source,
         method: std.http.Method,
-        range: ?struct{start: u64, end: u64},
+        range: ?struct { start: u64, end: u64 },
         context: anytype,
         comptime callback: fn (@TypeOf(context), *std.http.Client.Response) anyerror!void,
     ) !void {
@@ -178,14 +176,14 @@ pub const S3Source = struct {
         var arena = std.heap.ArenaAllocator.init(fallback.get());
         defer arena.deinit();
         const aa = arena.allocator();
-        
+
         var headers = std.ArrayList(std.http.Header){};
-        
+
         if (range) |r| {
-            const range_val = try std.fmt.allocPrint(aa, "bytes={d}-{d}", .{r.start, r.end});
+            const range_val = try std.fmt.allocPrint(aa, "bytes={d}-{d}", .{ r.start, r.end });
             try headers.append(aa, .{ .name = "Range", .value = range_val });
         }
-        
+
         if (self.config.credentials) |creds| {
             var auth = sigv4.SigV4{
                 .region = self.config.region,
@@ -194,25 +192,25 @@ pub const S3Source = struct {
                 .session_token = creds.session_token,
             };
             try auth.sign(aa, @tagName(method), self.uri, &headers, "");
-            
-             // Remove Host header
-             var i: usize = 0;
-             while (i < headers.items.len) {
-                 if (std.ascii.eqlIgnoreCase(headers.items[i].name, "Host")) {
-                     _ = headers.orderedRemove(i);
-                 } else {
-                     i += 1;
-                 }
-             }
+
+            // Remove Host header
+            var i: usize = 0;
+            while (i < headers.items.len) {
+                if (std.ascii.eqlIgnoreCase(headers.items[i].name, "Host")) {
+                    _ = headers.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
         }
-        
+
         var req = try self.client.request(method, self.uri, .{
             .extra_headers = headers.items,
         });
         defer req.deinit();
 
         try req.sendBodiless();
-        
+
         var redirect_buf: [1024]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
 
@@ -221,7 +219,7 @@ pub const S3Source = struct {
         }
 
         if (response.head.status != .ok and response.head.status != .partial_content) {
-            std.debug.print("S3 {s} Failed. Status: {any}\n", .{@tagName(method), response.head.status});
+            std.debug.print("S3 {s} Failed. Status: {any}\n", .{ @tagName(method), response.head.status });
             var transfer_buf: [4096]u8 = undefined;
             var reader = response.reader(&transfer_buf);
             var body_buf: [4096]u8 = undefined;
@@ -229,7 +227,7 @@ pub const S3Source = struct {
             std.debug.print("Error Body: {s}\n", .{body_buf[0..n]});
             return if (method == .HEAD) error.S3HeadFailed else error.S3ReadFailed;
         }
-        
+
         try callback(context, &response);
     }
 

@@ -6,6 +6,9 @@ on:
     tags:
       - 'deps-*'
 
+permissions:
+  contents: write
+
 jobs:
   build-boring-ssl:
     runs-on: ${{ matrix.os }}

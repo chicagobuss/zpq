@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-FUNCTION_NAME="diat-bench-zig"
+FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-production-bench-zig}"
 # User requested 2GB (2048) and 4GB (4096). Added 128 and 1024 for context.
 MEMORY_SIZES=(128 1024 2048 4096)
 

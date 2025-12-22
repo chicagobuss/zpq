@@ -60,6 +60,23 @@ ZPQ is tested for stability across several environments:
 
 // TODO
 
+## Getting Started
+### Environment Configuration
+ZPQ uses environment variables for AWS credentials and benchmarking configuration. To get started:
+1. Copy the example environment file: `cp .env.example .env`
+2. Edit `.env` with your specific details (AWS keys, test S3 paths, etc.).
+3. The `.env` file is ignored by git to keep your credentials safe.
+
+### Installation & Build
+```bash
+# Fetch pre-built dependencies
+just fetch-deps
+# Build the project
+just build
+# Run unit tests
+just test
+```
+
 ## Documentation
 Additional technical detail is available in the following files:
 - `STATUS.md`: Project roadmap and milestone tracking.

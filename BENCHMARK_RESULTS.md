@@ -6,7 +6,7 @@ We compare `zpq` against two industry standards:
 2.  **Rust (`parquet` crate)**: The official Rust implementation, using the `arrow` feature for vectorized reading.
 
 ### Workload
-*   **Data**: `data/skyway-export-00002.snappy.parquet` (Multiple row groups, Snappy compression, Dictionary encoding).
+*   **Data**: `data/sample-data.parquet` (Multiple row groups, Snappy compression, Dictionary encoding).
 *   **Operation**: "Scan" (Read all pages, decompress, decode values, count totals).
 *   **Hardware**: Apple M1 Max.
 

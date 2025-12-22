@@ -28,7 +28,7 @@ Successfully stabilized the project on Zig `master` and implemented a high-perfo
 ## Milestone 10: Empirical Proof & Performance (Phase 1 Complete)
 Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate the asynchronous architecture.
 
-### Benchmark Results (ARM64 OCI `josh-oci-work-box-0`):
+### Benchmark Results (ARM64 Remote Host):
 *Target: 84MB Parquet file, us-west-2, 1 column scan.*
 | Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |
 | :--- | :--- | :--- | :--- |

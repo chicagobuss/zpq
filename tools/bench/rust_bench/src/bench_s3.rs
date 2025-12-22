@@ -9,8 +9,11 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() {
-    let bucket = "skyway-diat-staging-data";
-    let key = "raw/cccis-duckbill/skyway/skyway-export/data/BILLING_PERIOD=2025-04/skyway-export-00001.snappy.parquet";
+    let s3_path = std::env::var("ZPQ_TEST_S3_PATH")
+        .unwrap_or_else(|_| "s3://production-sample-bucket/sample-data.parquet".to_string());
+    
+    let path_no_prefix = s3_path.strip_prefix("s3://").unwrap_or(&s3_path);
+    let (bucket, key) = path_no_prefix.split_once('/').expect("Invalid S3 path, must be s3://bucket/key");
     
     let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
     
@@ -18,10 +21,12 @@ async fn main() {
 
     let s3 = AmazonS3Builder::from_env()
         .with_region(region)
-        .with_bucket_name(bucket)
+        .with_bucket_name(bucket_from_env)
         .build()
         .expect("Failed to build S3 client");
     
+    let bucket = "production-sample-bucket";
+    let key = "sample-data.parquet";
     let store = Arc::new(s3);
     let path = ObjPath::from(key);
     let object_meta = store.head(&path).await.expect("Failed to HEAD object");

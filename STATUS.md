@@ -15,10 +15,15 @@
     *   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
     *   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
 *   **Pragmatic Library Usage**:
-    *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level primitives (io_uring/kqueue) and secure transport while being isolated for a future transition to a purely native `std` stack.
-    *   **Exit Strategy**: We will migrate to `std.Io` once it reaches feature parity with `libxev` regarding completion-based I/O on Linux and macOS.
-*   **Dependency Boundaries**:
-    *   Core Parquet logic remains pure logic with no I/O or transport knowledge.
+    *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level    @echo "\n=== Python (PyArrow) ==="
+    uv run python tools/bench/pyarrow_bench.py data/sample-data.parquet
+
+    @echo "\n=== Rust (Arrow RecordBatchReader) ==="
+    @cd tools/bench/rust_bench && cargo run --release --quiet -- ../../../data/sample-data.parquet
+
+    @echo "\n=== Rust (Official CLI: parquet-read) ==="
+    @echo "Note: Includes formatting overhead (piped to /dev/null)"
+    @time parquet-read data/sample-data.parquet > /dev/null
     *   I/O is abstracted via the `RandomAccessSource` interface.
 
 ---
@@ -85,9 +90,12 @@
     *   [x] Implemented zero-dependency signer in `sigv4.zig`.
     *   [x] **Hot Path Optimization**: 
         *   [x] Zero-heap hot path using `stackFallback` allocator.
-        *   [x] Pre-parsed `std.Uri` to minimize redundant parsing.
-        *   [x] Constant-time hash for empty payloads.
-        *   [x] **Speculative Read**: Optimized `readFooter` to fetch trailing 64KB in a single request.
+        # If production sample exists, test it
+    @if [ -f data/production-sample.parquet ]; then \
+        echo "[Check] Production Sample (Snappy + Dict + Nulls)..."; \
+        zig build run -- cat data/production-sample.parquet 5 > /dev/null; \
+        zig build run -- meta data/production-sample.parquet; \
+    fi
 *   [x] **Zig 0.16.dev Migration**:
     *   [x] Updated for `std.Io.Writer`, `std.time`, and `std.ArrayList` breaking changes.
     *   [x] **Unmanaged Pattern**: Adopted unmanaged containers for `AsyncRequest`, `ColumnReader`, and `Page`.
@@ -143,8 +151,8 @@ We utilize the following references for architectural validation:
 
 ---
 
-## Benchmarks (S3 E2E Scan - ARM64 OCI `josh-oci-work-box-0`)
-*Target: 84MB Parquet file (stream_disk_upload), us-west-2, 1 column scan.*
+## Benchmarks (S3 E2E Scan - ARM64 Remote Host)
+*Target: 84MB Parquet file (sample-data), us-west-2, 1 column scan.*
 | Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |
 | :--- | :--- | :--- | :--- |
 | **ZPQ (Async Basic)** | **631.7ms** | **~1.9x** | Full stack + `libxev` + `boring_tls`. |

@@ -1,3 +1,9 @@
+# Configuration
+GH_OWNER := "chicagobuss"
+GH_REPO := "zpq"
+DEPS_TAG := "deps-v0.1"
+ARM_BENCH_HOST := "oci-josh-arm-vm"
+
 # List available recipes
 default:
     @just --list
@@ -65,7 +71,7 @@ check-tls: build
     @echo "Verifying TLS Transport (Google HEAD)..."
     python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-tls-echo
     @echo "Verifying S3 Integration (S3 Footer)..."
-    @bash -c "export \$(grep -v '^#' .env.staging.bot | xargs) && export AWS_REGION=us-west-2 && python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-fast-feedback"
+    @bash -c "([ -f .env ] && export \$(grep -v '^#' .env | xargs)) && python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-fast-feedback"
 
 # Run comprehensive tests including heavy data and edge cases (Slow)
 comprehensive: build gen-fixtures
@@ -105,17 +111,17 @@ bench: build
 # Run comparative benchmark (ZPQ vs Rust vs Python)
 bench-compare: build
     @echo "=== ZPQ ==="
-    zig build run -Doptimize=ReleaseFast -- scan data/skyway-export-00002.snappy.parquet
+    zig build run -Doptimize=ReleaseFast -- scan data/sample-data.parquet
 
     @echo "\n=== Python (PyArrow) ==="
-    uv run python tools/bench/pyarrow_bench.py data/skyway-export-00002.snappy.parquet
+    uv run python tools/bench/pyarrow_bench.py data/sample-data.parquet
 
     @echo "\n=== Rust (Arrow RecordBatchReader) ==="
-    @cd tools/bench/rust_bench && cargo run --release --quiet -- ../../../data/skyway-export-00002.snappy.parquet
+    @cd tools/bench/rust_bench && cargo run --release --quiet -- ../../../data/sample-data.parquet
 
     @echo "\n=== Rust (Official CLI: parquet-read) ==="
     @echo "Note: Includes formatting overhead (piped to /dev/null)"
-    @time parquet-read data/skyway-export-00002.snappy.parquet > /dev/null
+    @time parquet-read data/sample-data.parquet > /dev/null
 
 # Generate malformed fixtures
 gen-malformed:
@@ -141,12 +147,12 @@ verify-malformed: build gen-malformed
 
 # Fetch pre-built dependencies to speed up build
 fetch-deps:
-    @echo "Fetching pre-built BoringSSL static libraries (deps-v0.1)..."
+    @echo "Fetching pre-built BoringSSL static libraries ({{DEPS_TAG}})..."
     @mkdir -p vendor/boring_tls/prebuilt/$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')
     @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-v0.1/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
+    curl -L https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
     @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-v0.1/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
+    curl -L https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
 
 # Clean build artifacts
 clean:
@@ -166,7 +172,7 @@ ci-arm:
 
 # Remote CI (real hardware)
 remote-ci-arm:
-    ./tools/remote_ci.sh oci-josh-arm-vm
+    ./tools/remote_ci.sh {{ARM_BENCH_HOST}}
 
 # Run remote CI against an amd64 host you can SSH to:
 #   just remote-ci-amd64 jrmediapyro-zt

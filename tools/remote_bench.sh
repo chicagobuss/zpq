@@ -2,9 +2,9 @@
 set -e
 
 # Configuration
-HOST="josh-oci-work-box-0"
-REMOTE_DIR="~/code/zpq-work"
-S3_PATH="s3://diat-bench-output-076397969038/manual_check/python/stream_disk_upload.parquet"
+HOST="${BENCH_HOST:-josh-oci-work-box-0}"
+REMOTE_DIR="${BENCH_REMOTE_DIR:-~/code/zpq-work}"
+S3_PATH="${ZPQ_TEST_S3_PATH:-s3://diat-bench-output-076397969038/manual_check/python/stream_disk_upload.parquet}"
 ITERATIONS=${2:-3}
 
 # 1. Sync code
@@ -13,8 +13,12 @@ git push backup main
 
 # 2. Sync credentials and tools
 echo "Syncing credentials and tools..."
-scp .env.staging.bot $HOST:$REMOTE_DIR/.env.staging.bot
-scp tools/no_output_timeout.py $HOST:$REMOTE_DIR/tools/no_output_timeout.py
+if [ -f .env ]; then
+    scp .env "$HOST:$REMOTE_DIR/.env"
+else
+    echo "Warning: No .env found to sync."
+fi
+scp tools/no_output_timeout.py "$HOST:$REMOTE_DIR/tools/no_output_timeout.py"
 
 # 3. Fetch latest Zig URL locally
 echo "Fetching latest Zig version info..."
@@ -63,13 +67,13 @@ ssh -t $HOST "
         local mode=\$1
         local extra_args=\$2
         echo \"--- Running ZPQ (\$mode) ---\"
-        export \$(grep -v '^#' .env.staging.bot | xargs)
+        [ -f .env ] && export \$(grep -v '^#' .env | xargs)
         python3 tools/no_output_timeout.py --idle-seconds 10 -- ./zig-out/bin/bench-e2e \"\$S3_PATH\" \"\$ITERATIONS\" \$extra_args
     }
 
     run_python() {
         echo \"--- Running Python Competitor ---\"
-        export \$(grep -v '^#' .env.staging.bot | xargs)
+        [ -f .env ] && export \$(grep -v '^#' .env | xargs)
         # Use uv run directly - it will handle deps and env
         uv run --with pyarrow --with boto3 python3 tools/bench_e2e/competitor.py \"\$S3_PATH\" \"\$ITERATIONS\"
     }

@@ -4,14 +4,13 @@ set -e
 MODE=${1:-all}
 
 # Load Env
-if [ -f .env.staging.bot ]; then
-    export $(grep -v '^#' .env.staging.bot | xargs)
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
 fi
 export AWS_REGION=us-west-2
 
-BUCKET="skyway-diat-staging-data"
-KEY="raw/cccis-duckbill/skyway/skyway-export/data/BILLING_PERIOD=2025-04/skyway-export-00001.snappy.parquet"
-S3_PATH="s3://$BUCKET/$KEY"
+# S3 Target (Defaults to a production sample placeholder)
+S3_PATH="${ZPQ_TEST_S3_PATH:-s3://production-sample-bucket/sample-data.parquet}"
 
 echo "=== BENCHMARKING S3 PARQUET READ (Mode: $MODE) ==="
 echo "Target: $S3_PATH"

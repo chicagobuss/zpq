@@ -21,10 +21,14 @@ pub fn main() !void {
     defer spec_resolver.deinit();
     const resolver = spec_resolver.resolver();
 
-    const small_s3_path = "s3://diat-bench-output-076397969038/manual_check/python/stream_disk_upload.parquet";
+    const small_s3_path = std.process.getEnvVarOwned(allocator, "ZPQ_TEST_S3_PATH") catch |err| {
+        std.debug.print("Error: Could not find ZPQ_TEST_S3_PATH in environment ({}). Please set it or use .env file.\n", .{err});
+        return;
+    };
+    defer allocator.free(small_s3_path);
 
     std.debug.print("Running cat on {s}...\n", .{small_s3_path});
-    
+
     var pf = zpq.s3.factory.openS3Source(allocator, resolver, small_s3_path, true) catch |err| {
         std.debug.print("Factory failed: {}\n", .{err});
         return;
@@ -36,7 +40,7 @@ pub fn main() !void {
         std.debug.print("Footer read failed: {}\n", .{err});
         return;
     };
-    
+
     std.debug.print("Footer size: {d}\n", .{pf.file_size});
 
     if (pf.metadata) |meta| {

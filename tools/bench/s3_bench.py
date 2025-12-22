@@ -13,10 +13,15 @@ except ImportError:
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "all"
 
-BUCKET = "skyway-diat-staging-data"
-KEY = "raw/cccis-duckbill/skyway/skyway-export/data/BILLING_PERIOD=2025-04/skyway-export-00001.snappy.parquet"
-PATH = f"s3://{BUCKET}/{KEY}"
-PATH_FS = f"{BUCKET}/{KEY}"
+PABUCKET = "production-sample-bucket"
+KEY = "sample-data.parquet"
+PATH = os.environ.get("ZPQ_TEST_S3_PATH", f"s3://{PABUCKET}/{KEY}")
+
+# Helper to strip s3:// for pyarrow.fs
+if PATH.startswith("s3://"):
+    PATH_FS = PATH[5:]
+else:
+    PATH_FS = PATH
 
 region = os.environ.get("AWS_REGION", "us-west-2")
 

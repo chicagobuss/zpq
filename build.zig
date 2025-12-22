@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // AWS Lambda Bootstrap
     const bootstrap_mod = b.createModule(.{
         .root_source_file = b.path("src/lambda_bootstrap.zig"),
-        .target = target,
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux }),
         .optimize = .ReleaseFast,
     });
     bootstrap_mod.addImport("zpq", zpq_mod);

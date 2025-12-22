@@ -67,7 +67,7 @@ pub fn main() !void {
 
         var body_list = std.ArrayList(u8).empty;
         defer body_list.deinit(allocator);
-        
+
         var transfer_buf: [4096]u8 = undefined;
         var rdr = res.reader(&transfer_buf);
         while (true) {

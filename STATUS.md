@@ -107,10 +107,18 @@
 *   [x] **DNS Integration**: Wired `dns.Resolver` into `AsyncS3Source` with round-robin IP distribution.
 *   [x] **Reliability**: Resolved `io_uring` issues by pinning the `EventLoop` in memory.
 
-### Milestone 8: Persistent Pool & Repetition Levels [IN PROGRESS]
-*   [ ] **Enhanced Connection Pool**: Implementation of keep-alive timeouts and stale detection.
-*   [ ] **Repetition Levels**: Support for Lists and Maps (Nested structures).
-*   [ ] **Advanced Range Coalescing**: Dynamic merging based on latency/throughput profiling.
+### Milestone 9: Hardening & Verification (Phase 1-3) [COMPLETE]
+*   [x] **Plan 05: Flow Control**: Implemented Write Queue and High-Water Mark in `Connection.zig`. [Proof](./hardening_plans/05_backpressure_proof.md)
+*   [x] **Plan 06: Gap Skipping**: Verified zero-allocation gap skipping via `test_gap_skipping.zig`. [Proof](./hardening_plans/06_gap_skip_proof.md)
+*   [x] **Plan 07: Fuzzing**: Integrated `minish` for Thrift/HTTP parser fuzzing. [Proof](./hardening_plans/07_fuzzing_proof.md)
+*   [x] **Plan 10: TLS Security**: Enabled verification by default and fixed transport stalls. [Proof](./hardening_plans/10_tls_security_proof.md)
+*   [x] **Plan 04: DNS Justification**: Verified tiered DNS deduplication benefit. [Proof](./hardening_plans/04_dns_justification_proof.md)
+*   [x] **Process**: Codified "Faster Feedback" rules in `.cursor/rules/01-architecture.mdc`. [Learnings](./hardening_plans/DEBUGGING_PROCESS_LEARNINGS.md)
+
+### Milestone 10: Empirical Proof & Performance [IN PROGRESS]
+*   [ ] **Plan 09: Lambda End-to-End**: Build deployable Lambda benchmark.
+*   [ ] **Plan 08: Reproducible Benchmarks**: Dockerized matrix of ZPQ vs Rust vs Python.
+*   [ ] **Milestone 8: Persistent Pool**: Implementation of keep-alive timeouts and stale detection.
 
 ---
 

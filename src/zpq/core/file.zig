@@ -18,7 +18,7 @@ pub const RowGroupReader = struct {
     buffers: std.ArrayListUnmanaged([]u8),
 
     pub fn init(file: *ParquetFile, meta: schema.RowGroup, allocator: std.mem.Allocator) !RowGroupReader {
-        const sources = try allocator.alloc(?io.MemorySource, meta.columns.len);
+        const sources = try allocator.alloc(?io.MemorySource, meta.columns.items.len);
         @memset(sources, null);
         
         return RowGroupReader{
@@ -42,24 +42,24 @@ pub const RowGroupReader = struct {
     pub fn prefetch(self: *RowGroupReader, indices: ?[]const usize) !void {
         const targets = indices orelse blk: {
             // Default to all columns
-            const all = try self.allocator.alloc(usize, self.meta.columns.len);
+            const all = try self.allocator.alloc(usize, self.meta.columns.items.len);
             defer self.allocator.free(all);
-            for (0..self.meta.columns.len) |i| all[i] = i;
+            for (0..self.meta.columns.items.len) |i| all[i] = i;
             break :blk all;
         };
 
-        var ranges = std.ArrayList(io.Range).empty;
-        defer ranges.deinit(self.allocator);
+        var ranges = std.ArrayList(io.Range).init(self.allocator);
+        defer ranges.deinit();
         
-        var buffers = std.ArrayList([]u8).empty;
-        defer buffers.deinit(self.allocator); // We only free the list, not the contents (which move to self.buffers)
+        var buffers = std.ArrayList([]u8).init(self.allocator);
+        defer buffers.deinit(); // We only free the list, not the contents (which move to self.buffers)
         
         // Identify ranges and allocate buffers
         for (targets) |idx| {
-            if (idx >= self.meta.columns.len) return error.InvalidColumnIndex;
+            if (idx >= self.meta.columns.items.len) return error.InvalidColumnIndex;
             if (self.memory_sources[idx] != null) continue; // Already fetched
             
-            const chunk = self.meta.columns[idx];
+            const chunk = self.meta.columns.items[idx];
             const meta = chunk.meta_data orelse return error.MissingColumnMetaData;
             
             // Calculate offset and length
@@ -69,10 +69,10 @@ pub const RowGroupReader = struct {
             }
             const len: u64 = @intCast(meta.total_compressed_size);
             
-            try ranges.append(self.allocator, .{ .start = start, .end = start + len });
+            try ranges.append(.{ .start = start, .end = start + len });
             
             const buf = try self.allocator.alloc(u8, @intCast(len));
-            try buffers.append(self.allocator, buf);
+            try buffers.append(buf);
         }
         
         if (ranges.items.len == 0) return;
@@ -98,30 +98,26 @@ pub const RowGroupReader = struct {
             const buf = buffers.items[buf_idx];
             buf_idx += 1;
             
-            // 1. Store buffer ownership
-            try self.buffers.append(self.allocator, buf);
-            
-            // 2. Create MemorySource
-            const chunk = self.meta.columns[col_idx];
-            // We checked metadata presence in the previous loop
+            const chunk = self.meta.columns.items[col_idx];
             const meta = chunk.meta_data.?;
-            
             var start: u64 = @intCast(meta.data_page_offset);
             if (meta.dictionary_page_offset) |dpo| {
                 if (dpo < start) start = @intCast(dpo);
             }
-            
-            self.memory_sources[col_idx] = io.MemorySource.initWithOffset(buf, start);
+
+            self.memory_sources[col_idx] = io.MemorySource.init(buf, start);
+            try self.buffers.append(self.allocator, buf);
         }
     }
 
-    pub fn column(self: *RowGroupReader, index: usize) !ColumnReader {
-        if (index >= self.meta.columns.len) return error.InvalidColumnIndex;
-        const chunk = self.meta.columns[index];
-
-        if (self.memory_sources[index]) |*mem| {
-             // We have a pre-fetched source.
-             return ColumnReader.init(mem.source(), chunk);
+    pub fn columnReader(self: *RowGroupReader, index: usize) !ColumnReader {
+        if (index >= self.meta.columns.items.len) return error.InvalidColumnIndex;
+        
+        const chunk = self.meta.columns.items[index];
+        
+        // Use memory source if available
+        if (self.memory_sources[index]) |ms| {
+            return ColumnReader.init(ms.source(), chunk);
         }
         
         return ColumnReader.init(self.file.source, chunk);
@@ -209,26 +205,36 @@ pub const ParquetFile = struct {
         };
     }
 
-    pub fn close(self: *ParquetFile) void {
+    pub fn deinit(self: *ParquetFile) void {
+        if (self.metadata) |*m| {
+            m.deinit(self.allocator);
+            self.metadata = null;
+        }
+        if (self.footer_buffer.len > 0) {
+            self.allocator.free(self.footer_buffer);
+            self.footer_buffer = &[_]u8{};
+        }
+        
         if (self.cleanup_fn) |clean| {
             if (self.cleanup_context) |ctx| {
                 clean(ctx, self.allocator);
-                // Prevent double-free
                 self.cleanup_context = null;
                 self.cleanup_fn = null;
             }
         }
     }
 
+    pub fn close(self: *ParquetFile) void {
+        self.deinit();
+    }
+
     pub fn readFooter(self: *ParquetFile) !void {
         // Optimization: Speculatively read the last 64KB (or file size if smaller)
-        // This covers the footer and magic bytes in one IO operation for most files.
         const PREFETCH_SIZE = 65536; // 64KB
         const fetch_len = @min(self.file_size, PREFETCH_SIZE);
         const fetch_start = self.file_size - fetch_len;
         
         var prefetch_buf = try self.allocator.alloc(u8, fetch_len);
-        // We will free this unless we decide to keep it (not implemented here, we copy out)
         defer self.allocator.free(prefetch_buf);
         
         const n = try self.source.readAt(fetch_start, prefetch_buf);
@@ -247,21 +253,16 @@ pub const ParquetFile = struct {
             return error.InvalidFooterLength;
         }
         
-        // Check if footer is fully contained in prefetch_buf
-        // Footer occupies [file_size - 8 - footer_len ... file_size - 8]
-        // This corresponds to local offsets [fetch_len - 8 - footer_len ... fetch_len - 8]
-        
         if (self.footer_len + 8 <= fetch_len) {
-            // Footer is inside buffer.
             const start_in_buf = fetch_len - 8 - self.footer_len;
             const footer_slice = prefetch_buf[start_in_buf .. fetch_len - 8];
             
+            if (self.footer_buffer.len > 0) self.allocator.free(self.footer_buffer);
             self.footer_buffer = try self.allocator.alloc(u8, self.footer_len);
             @memcpy(self.footer_buffer, footer_slice);
         } else {
-            // Footer is larger than 64KB. We need to read the full footer from source.
-            // We discard prefetch_buf (via defer) and read specifically.
             const footer_start = self.file_size - 8 - self.footer_len;
+            if (self.footer_buffer.len > 0) self.allocator.free(self.footer_buffer);
             self.footer_buffer = try self.allocator.alloc(u8, self.footer_len);
             const bytes_read = try self.source.readAt(footer_start, self.footer_buffer);
             if (bytes_read != self.footer_len) return error.UnexpectedEndOfFile;
@@ -269,26 +270,13 @@ pub const ParquetFile = struct {
         
         var reader = thrift.Reader.init(self.footer_buffer);
         self.metadata = try schema.FileMetaData.read(self.allocator, &reader);
-        
-        // Strings in metadata point to self.footer_buffer
     }
     
     pub fn rowGroup(self: *ParquetFile, index: usize) !RowGroupReader {
         if (self.metadata) |*meta| {
-            if (index >= meta.row_groups.len) return error.InvalidRowGroupIndex;
-            return RowGroupReader.init(self, meta.row_groups[index], self.allocator);
+            if (index >= meta.row_groups.items.len) return error.InvalidRowGroupIndex;
+            return RowGroupReader.init(self, meta.row_groups.items[index], self.allocator);
         }
         return error.MetadataNotLoaded;
-    }
-    
-    pub fn deinit(self: *ParquetFile) void {
-        if (self.metadata) |*m| {
-            m.deinit(self.allocator);
-        }
-        if (self.footer_buffer.len > 0) {
-            self.allocator.free(self.footer_buffer);
-        }
-        
-        self.close();
     }
 };

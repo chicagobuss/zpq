@@ -49,10 +49,14 @@ def main():
         obj = s3.get_object(Bucket=bucket, Key=key)
         body = obj['Body'].read()
         f = io.BytesIO(body)
-        table = pq.read_table(f)
+        
+        # Only read the first column to match ZPQ's behavior
+        parquet_file = pq.ParquetFile(f)
+        column_name = parquet_file.schema.names[0]
+        table = parquet_file.read(columns=[column_name])
         
         # Count values to ensure work is done
-        count = len(table)
+        count = table.num_rows
         
         end_time = time.time()
         duration = (end_time - start_time) * 1000 # ms

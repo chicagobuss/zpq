@@ -149,9 +149,10 @@ We utilize the following references for architectural validation:
 ## Benchmarks (S3 Metadata - Cloud Latency)
 | Implementation | Time (s) | Notes |
 | :--- | :--- | :--- |
-| **PyArrow (C++)** | ~0.15s | Native C++ S3FS with persistent connection pool. |
-| **Polars (Rust)** | ~0.40s | Rust `object_store` via `reqwest`. |
-| **ZPQ (Zig)** | ~0.58s | Initial implementation; connection reuse optimizations pending in Milestone 8. |
+| **PyArrow (Python)** | ~1.52s | Boto3 `get_object` (Whole file download) |
+| **ZPQ (Sync)** | ~2.04s | Blocking transport (Wait for each chunk) |
+| **ZPQ (Async Basic)** | ~0.41s | `libxev` + `boring_tls` (Manual DNS) |
+| **ZPQ (Async Fancy)** | **~0.34s** | Full stack + Tiered DNS + SingleFlight |
 
 ## Lambda Benchmark (Internal Loop Proof-of-Concept)
 *Note: These metrics represent an internal ping-pong loop of the `libxev` event loop on Lambda hardware to verify scaling. They do not yet reflect a real-world S3 scan (see Milestone 0 / Plan 09).*

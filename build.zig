@@ -189,6 +189,25 @@ pub fn build(b: *std.Build) void {
     const step_test_xev_tcp = b.step("test-xev-tcp", "Run basic xev TCP test");
     step_test_xev_tcp.dependOn(&run_test_xev_tcp.step);
 
+    // test_s3_range_get (presigned URL; skips unless env vars are set)
+    const test_s3_range_get_mod = b.createModule(.{
+        .root_source_file = b.path("tests/io/test_s3_range_get.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_s3_range_get_mod.addImport("zpq", zpq_mod);
+    test_s3_range_get_mod.addImport("xev", libxev_mod);
+
+    const test_s3_range_get_exe = b.addExecutable(.{
+        .name = "test_s3_range_get",
+        .root_module = test_s3_range_get_mod,
+    });
+    test_s3_range_get_exe.linkLibC(); // uses getaddrinfo in zpq.s3.dns
+    const run_test_s3_range_get = b.addRunArtifact(test_s3_range_get_exe);
+
+    const step_test_s3_range_get = b.step("test-s3-range-get", "Run S3 HTTPS range GET test (presigned URL; opt-in via env)");
+    step_test_s3_range_get.dependOn(&run_test_s3_range_get.step);
+
     const check_step = b.step("check", "Check compilation");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&lib_unit_tests.step);

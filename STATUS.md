@@ -25,6 +25,18 @@
 
 ## Project Milestones
 
+### Milestone 0: Hardening & Verification [IN PROGRESS]
+*   [x] **Philosophy**: Documented "Golden Rules" and "Sans-I/O" patterns.
+*   [x] **Zig 0.16.dev**: Compiler pinned (`.zig-version`), `std.meta.Int` fixes applied.
+*   [x] **Safety**: TLS verification enabled by default.
+*   [x] **Flow Control**: Implemented backpressure (write queue) in `Connection`.
+*   [x] **Verification**: Zero-allocation gap skipping formally proved (`tests/io/test_gap_skipping.zig`).
+*   [ ] **Property-Based Testing (Minish)**:
+    *   [x] **Adoption**: Vendored and patched `minish` for Zig 0.16.
+    *   [x] **Context Injection**: Enabled allocator-aware property testing.
+    *   [ ] **Thrift Fuzzer**: Verify metadata parser robustness.
+    *   [ ] **HTTP Fuzzer**: Verify header parser crash-safety.
+
 ### Milestone 1: Core Parquet Engine & Encodings [COMPLETE]
 *   [x] **Core Reading**: Thrift metadata parsing, Page iteration, Column chunk handling.
 *   [x] **Encodings**:

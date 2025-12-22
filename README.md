@@ -54,6 +54,7 @@ ZPQ is tested for stability across several environments:
 - **Architecture Support**: Native testing for x86_64 and ARM64.
 - **Component Isolation**: Critical components (DNS stack, TLS integration, HTTP state machine) are verified through independent micro-tests prior to integration.
 - **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
+- **Property-Based Verification**: We utilize `minish` for fuzzing and property-based testing. This allows us to verify invariants (e.g., "re-serializing a struct matches the original") and automatically shrink complex crash cases into minimal reproductions. This is particularly critical for the Thrift metadata parser and HTTP header handling.
 
 ## Performance
 

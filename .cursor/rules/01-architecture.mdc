@@ -24,3 +24,11 @@ alwaysApply: false
 
 ## 5. TLS Abstraction
 *   **Wrapper**: Do not leak `boring_tls` types into core logic. Wrap implementation in `std.Io.Reader/Writer`.
+
+## 6. Testing Philosophy: Property-Based Verification
+*   **Tools**: Use `minish` (vendored in `vendor/minish`) for fuzzing and property-based testing.
+*   **Pattern**: Prefer **properties** (invariants) over **examples** (unit tests) for complex parsers and state machines.
+    *   *Example-based*: `expect(parse("123") == 123)`
+    *   *Property-based*: `expect(parse(toString(n)) == n)` for all integers `n`.
+*   **Shrinking**: Leverage Minish's shrinking capability to find minimal reproduction cases for crashes.
+*   **Context**: Inject `allocator` into properties using the Context Wrapper pattern to support memory-managed fuzzing.

@@ -27,6 +27,11 @@ pub fn build(b: *std.Build) void {
     zpq_mod.addImport("xev", libxev_mod);
     zpq_mod.addImport("boring_tls", boring_tls_mod);
 
+    // Minish Module
+    const minish = b.addModule("minish", .{
+        .root_source_file = b.path("vendor/minish/src/lib.zig"),
+    });
+
     // Create the exe module
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -492,6 +497,22 @@ pub fn build(b: *std.Build) void {
 
             const run = b.addRunArtifact(gs_exe);
             const step = b.step("test-gap-skipping", "Run zero-allocation gap skipping integration test");
+            step.dependOn(&run.step);
+        }
+
+        // 13. test_fuzz_demo
+        {
+            const test_exe = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/fuzz/demos/demo_minish_basics.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            test_exe.root_module.addImport("minish", minish);
+
+            const run = b.addRunArtifact(test_exe);
+            const step = b.step("test-fuzz-demo", "Run Minish basics demo");
             step.dependOn(&run.step);
         }
     }

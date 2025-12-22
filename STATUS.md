@@ -36,6 +36,8 @@
     *   [x] **Context Injection**: Enabled allocator-aware property testing.
     *   [x] **Thrift Fuzzer**: Verified metadata parser robustness (Round-Trip).
     *   [x] **HTTP Fuzzer**: Fixed zero-body hang bug discovered by Minish.
+*   [x] **DNS Stack**: Justified tiered architecture with 70x speedup proof.
+*   [ ] **Lambda E2E**: Preparing end-to-end validation suite.
 
 ### Milestone 1: Core Parquet Engine & Encodings [COMPLETE]
 *   [x] **Core Reading**: Thrift metadata parsing, Page iteration, Column chunk handling.

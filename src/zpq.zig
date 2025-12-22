@@ -42,6 +42,7 @@ pub const s3 = struct {
     pub const TlsAdapter = @import("zpq/io/s3/tls_adapter.zig").TlsAdapter;
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");
     pub const dns = @import("zpq/io/s3/dns.zig");
+    pub const factory = @import("zpq/io/s3/factory.zig");
 };
 
 test {

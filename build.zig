@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // AWS Lambda Bootstrap
     const bootstrap_mod = b.createModule(.{
         .root_source_file = b.path("src/lambda_bootstrap.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux }),
+        .target = target,
         .optimize = .ReleaseFast,
     });
     bootstrap_mod.addImport("zpq", zpq_mod);
@@ -228,7 +228,7 @@ pub fn build(b: *std.Build) void {
         // 0. probe_async_dns
         {
             const mod = b.createModule(.{
-                .root_source_file = b.path("probe_async_dns.zig"),
+                .root_source_file = b.path("probes/probe_async_dns.zig"),
                 .target = target,
                 .optimize = optimize,
             });
@@ -398,7 +398,7 @@ pub fn build(b: *std.Build) void {
         // 8. probe_xev_tcp_lifecycle
         {
             const mod = b.createModule(.{
-                .root_source_file = b.path("probe_xev_tcp_lifecycle.zig"),
+                .root_source_file = b.path("probes/probe_xev_tcp_lifecycle.zig"),
                 .target = target,
                 .optimize = optimize,
             });
@@ -418,7 +418,7 @@ pub fn build(b: *std.Build) void {
         // 9. probe_tls_pump
         {
             const mod = b.createModule(.{
-                .root_source_file = b.path("probe_tls_pump.zig"),
+                .root_source_file = b.path("probes/probe_tls_pump.zig"),
                 .target = target,
                 .optimize = optimize,
             });

@@ -155,31 +155,6 @@ fn printUsage(exe_name: []const u8) void {
     , .{exe_name});
 }
 
-fn cleanupS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-    const s: *zpq.s3.S3Source = @ptrCast(@alignCast(ctx));
-    s.deinit();
-    allocator.destroy(s);
-}
-
-const AsyncS3Context = struct {
-    pool: zpq.s3.ConnectionPool,
-    source: zpq.s3.AsyncS3Source,
-    allocator: std.mem.Allocator,
-    host_owned: ?[]const u8 = null,
-
-    pub fn deinit(self: *AsyncS3Context) void {
-        self.source.deinit();
-        self.pool.deinit();
-        if (self.host_owned) |h| self.allocator.free(h);
-    }
-};
-
-fn cleanupAsyncS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-    const s: *AsyncS3Context = @ptrCast(@alignCast(ctx));
-    s.deinit();
-    allocator.destroy(s);
-}
-
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
@@ -187,122 +162,14 @@ fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     };
 }
 
-fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool, resolver: zpq.s3.dns.Resolver) !zpq.file.ParquetFile {
+fn openFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    force_async: bool,
+    resolver: zpq.s3.dns.Resolver,
+) !zpq.file.ParquetFile {
     if (std.mem.startsWith(u8, path, "s3://")) {
-        var bucket: []const u8 = undefined;
-        var key: []const u8 = undefined;
-
-        const no_scheme = path[5..];
-        if (std.mem.indexOf(u8, no_scheme, "/")) |idx| {
-            bucket = no_scheme[0..idx];
-            key = no_scheme[idx + 1 ..];
-        } else {
-            return error.InvalidS3Path;
-        }
-
-        const endpoint_env = try getEnvOrNull(allocator, "S3_ENDPOINT");
-        defer if (endpoint_env) |ep| allocator.free(ep);
-
-        const access_key = try getEnvOrNull(allocator, "AWS_ACCESS_KEY_ID");
-        defer if (access_key) |s| allocator.free(s);
-        const secret_key = try getEnvOrNull(allocator, "AWS_SECRET_ACCESS_KEY");
-        defer if (secret_key) |s| allocator.free(s);
-        const session_token = try getEnvOrNull(allocator, "AWS_SESSION_TOKEN");
-        defer if (session_token) |s| allocator.free(s);
-        const region_env = try getEnvOrNull(allocator, "AWS_REGION");
-        defer if (region_env) |s| allocator.free(s);
-
-        const config = zpq.s3.S3Config{
-            .credentials = if (access_key != null and secret_key != null) .{
-                .access_key = access_key.?,
-                .secret_key = secret_key.?,
-                .session_token = session_token,
-            } else null,
-            .region = region_env orelse "us-east-1",
-            .endpoint = endpoint_env,
-        };
-
-        // Use synchronous S3Source if we have credentials and aren't forcing async
-        if (!force_async and config.credentials != null) {
-            const s3_src = try allocator.create(zpq.s3.S3Source);
-            errdefer allocator.destroy(s3_src);
-            s3_src.* = try zpq.s3.S3Source.init(allocator, bucket, key, config);
-
-            return zpq.file.ParquetFile.initOwned(allocator, s3_src.source(), s3_src, cleanupS3);
-        }
-
-        // Parse Endpoint for Async
-        var host: []const u8 = "s3.amazonaws.com"; // Default
-        var port: u16 = 443;
-        var use_tls: bool = true;
-
-        if (endpoint_env) |ep| {
-            const uri = try std.Uri.parse(ep);
-            if (uri.host) |h| {
-                switch (h) {
-                    .raw => |s| host = s,
-                    .percent_encoded => |s| host = s,
-                }
-            } else return error.InvalidEndpoint;
-
-            port = uri.port orelse (if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80);
-            use_tls = std.mem.eql(u8, uri.scheme, "https");
-        } else {
-            // TODO: Region support for host resolution
-            // For now assume standard or use env
-            if (try getEnvOrNull(allocator, "AWS_REGION")) |region| {
-                defer allocator.free(region);
-                // Construct host: s3.{region}.amazonaws.com
-                // We need to allocate this host string if it's dynamic
-                // For this quick hack, let's just stick to default or S3_ENDPOINT
-                // If region is us-east-1, it's s3.amazonaws.com
-                if (!std.mem.eql(u8, region, "us-east-1")) {
-                    // Alloc host string
-                    // host = try std.fmt.allocPrint(allocator, "s3.{s}.amazonaws.com", .{region});
-                    // But we can't easily free it down the line without tracking it.
-                    // Let's assume S3_ENDPOINT is used for now or we use default.
-                }
-            }
-        }
-
-        const ctx = try allocator.create(AsyncS3Context);
-        errdefer allocator.destroy(ctx);
-
-        ctx.allocator = allocator;
-        ctx.pool = zpq.s3.ConnectionPool.init(allocator);
-        errdefer ctx.pool.deinit();
-
-        // Initialize Source
-        // Note: host is either slice of env var or string literal.
-        // AsyncS3Source.init copies path, but stores host reference?
-        // Let's check AsyncS3Source.init.
-        // It stores `host: []const u8`. It does NOT copy host.
-        // So we must ensure host stays alive.
-        // If it came from `endpoint_env`, it's freed at end of scope.
-        // We should duplicate it into `ctx`.
-
-        const host_copy = try allocator.dupe(u8, host);
-        errdefer allocator.free(host_copy);
-
-        ctx.host_owned = host_copy;
-
-        const ca_cert_env = try getEnvOrNull(allocator, "S3_CA_CERT");
-        defer if (ca_cert_env) |c| allocator.free(c);
-
-        var trusted_cert: ?[]const u8 = null;
-        if (ca_cert_env) |path_val| {
-            std.debug.print("[Main] Loading CA cert from {s}\n", .{path_val});
-            const max_size = 1024 * 1024;
-            const content = try std.fs.cwd().readFileAlloc(path_val, allocator, @enumFromInt(max_size));
-            trusted_cert = content;
-            std.debug.print("[Main] Loaded cert: {d} bytes\n", .{content.len});
-        }
-        defer if (trusted_cert) |c| allocator.free(c);
-
-        ctx.source = try zpq.s3.AsyncS3Source.init(allocator, &ctx.pool, resolver, host_copy, port, bucket, key, use_tls, trusted_cert, null // No credentials for anonymous
-        );
-
-        return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
+        return zpq.s3.factory.openS3Source(allocator, resolver, path, force_async);
     }
 
     return zpq.file.ParquetFile.open(allocator, path);

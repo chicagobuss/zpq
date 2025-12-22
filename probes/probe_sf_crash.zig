@@ -50,5 +50,5 @@ pub fn main() !void {
     ctx1.completion.deinit(allocator);
     ctx2.completion.deinit(allocator);
     std.debug.print("Parallel deduplicated requests passed\n", .{});
+    std.process.exit(0);
 }
-

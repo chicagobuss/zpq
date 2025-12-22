@@ -84,9 +84,9 @@ pub const TlsClient = struct {
     }
 
     pub fn processIncoming(self: *Self, encrypted_data: []const u8) !?[]const u8 {
-        if (encrypted_data.len == 0) return null;
-
-        try tls.writeToBio(self.bio_read, encrypted_data);
+        if (encrypted_data.len > 0) {
+            try tls.writeToBio(self.bio_read, encrypted_data);
+        }
 
         if (!self.handshake_complete) {
             try self.performHandshake();
@@ -119,7 +119,9 @@ pub const TlsClient = struct {
         if (verify_certificate) {
             c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
             if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
-                std.log.warn("Failed to set default verify paths", .{});
+                std.debug.print("[BoringTLS] WARNING: Failed to set default verify paths\n", .{});
+            } else {
+                std.debug.print("[BoringTLS] Default verify paths set successfully\n", .{});
             }
         } else {
             c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);

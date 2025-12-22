@@ -15,13 +15,13 @@ This directory contains detailed responses and remediation plans for the critica
 | **07** | [Fuzzing Strategy](./07_fuzzing_strategy.md) | No Fuzz Testing | **High** | Integrate `minish` for Thrift & HTTP parsers. | [Fuzzing Proof](./07_fuzzing_proof.md) |
 | **08** | [Benchmarks](./08_reproducible_benchmarks.md) | Disingenuous Comparisons | Medium | Create `benches/` with Dockerized repros. | Pending |
 | **09** | [Lambda E2E](./09_lambda_end_to_end.md) | Untested "Lambda-First" | **High** | Create `lambda_bench/` for real-world validation. | Pending |
-| **10** | [TLS Security](./10_tls_security.md) | Insecure Defaults | **Critical** | **Enable Verification**; Load System Roots. | Pending |
+| **10** | [TLS Security](./10_tls_security.md) | Insecure Defaults | **Critical** | **Enable Verification**; Load System Roots. | [TLS Security Proof](./10_tls_security_proof.md) |
 
 ## Implementation Strategy
 
-We will tackle these plans in priority order:
-1.  **Security & Stability First**: Implement Plans 10 (TLS), 05 (Backpressure), and 07 (Fuzzing).
-2.  **Verification**: Implement Plans 06 (Gap Skip) and 09 (Lambda E2E).
-3.  **Documentation & Process**: Address Plans 01, 02, 03, 08.
-4.  **Optimization/Justification**: Address Plan 04 (DNS).
+We are tackling these plans in priority order:
+1.  **Security & Stability (Complete)**: Implemented Plans 10 (TLS), 05 (Backpressure), and 07 (Fuzzing).
+2.  **Verification (In-Progress)**: Plan 06 (Gap Skip - Complete), Plan 09 (Lambda E2E - Started).
+3.  **Documentation & Process**: Plan 01 (Pinned), Plan 02, Plan 03, Plan 08.
+4.  **Optimization/Justification (Complete)**: Plan 04 (DNS).
 

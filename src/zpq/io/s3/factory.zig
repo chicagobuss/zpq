@@ -2,17 +2,28 @@ const std = @import("std");
 const zpq = @import("../../../zpq.zig");
 const s3 = zpq.s3;
 const dns = s3.dns;
+const xev = @import("xev");
 
 pub const S3Context = struct {
     pool: s3.ConnectionPool,
     source: s3.AsyncS3Source,
     allocator: std.mem.Allocator,
     host_owned: ?[]const u8 = null,
+    thread_pool: xev.ThreadPool,
+    tp_resolver: dns.ThreadPoolResolver,
+    sf_resolver: dns.SingleFlightResolver,
+    spec_resolver: dns.SpeculativeResolver,
 
     pub fn deinit(self: *S3Context) void {
-        self.source.deinit();
+        // Correct order: Pool first (closes connections using loop), then Source (deinits loop), then stack.
         self.pool.deinit();
+        self.source.deinit();
         if (self.host_owned) |h| self.allocator.free(h);
+        self.spec_resolver.deinit();
+        self.sf_resolver.deinit();
+        self.tp_resolver.deinit();
+        self.thread_pool.deinit();
+        self.thread_pool.shutdown();
     }
 };
 
@@ -30,22 +41,28 @@ pub fn cleanupAsyncS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     s.allocator.destroy(s);
 }
 
+pub fn openFile(allocator: std.mem.Allocator, path: []const u8, force_async: bool) !zpq.file.ParquetFile {
+    if (std.mem.startsWith(u8, path, "s3://")) {
+        return openS3Internal(allocator, path, force_async);
+    }
+    return zpq.file.ParquetFile.open(allocator, path);
+}
+
 pub fn openS3Source(
     allocator: std.mem.Allocator,
     resolver: dns.Resolver,
     path: []const u8,
     force_async: bool,
 ) !zpq.file.ParquetFile {
-    if (!std.mem.startsWith(u8, path, "s3://")) return error.NotS3Path;
+    _ = resolver;
+    return openFile(allocator, path, force_async);
+}
 
+fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: bool) !zpq.file.ParquetFile {
     const s3_path = path[5..];
     const slash_idx = std.mem.indexOf(u8, s3_path, "/") orelse return error.InvalidS3Path;
     const bucket = s3_path[0..slash_idx];
     const key = s3_path[slash_idx + 1 ..];
-
-    if (bucket.len == 0 or key.len == 0) {
-        return error.InvalidS3Path;
-    }
 
     const endpoint_env = try getEnvOrNull(allocator, "S3_ENDPOINT");
     defer if (endpoint_env) |ep| allocator.free(ep);
@@ -69,17 +86,24 @@ pub fn openS3Source(
         .endpoint = endpoint_env,
     };
 
-    // Use synchronous S3Source if we have credentials and aren't forcing async
     if (!force_async and config.credentials != null) {
         const s3_src = try allocator.create(s3.S3Source);
         errdefer allocator.destroy(s3_src);
         s3_src.* = try s3.S3Source.init(allocator, bucket, key, config);
-
         return zpq.file.ParquetFile.initOwned(allocator, s3_src.source(), s3_src, cleanupS3);
     }
 
-    // Parse Endpoint for Async
-    var host: []const u8 = "s3.amazonaws.com"; // Default
+    // Host discovery based on region to avoid 301
+    var host: []const u8 = "s3.amazonaws.com";
+    var host_allocated = false;
+    if (region_env) |region| {
+        if (!std.mem.eql(u8, region, "us-east-1")) {
+            host = try std.fmt.allocPrint(allocator, "s3.{s}.amazonaws.com", .{region});
+            host_allocated = true;
+        }
+    }
+    defer if (host_allocated) allocator.free(host);
+
     var port: u16 = 443;
     var use_tls: bool = true;
 
@@ -90,57 +114,54 @@ pub fn openS3Source(
                 .raw => |s| host = s,
                 .percent_encoded => |s| host = s,
             }
-        } else return error.InvalidEndpoint;
-
+        }
         port = uri.port orelse (if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80);
         use_tls = std.mem.eql(u8, uri.scheme, "https");
-    } else {
-        // TODO: Region support for host resolution
-        if (region_env) |region| {
-            if (!std.mem.eql(u8, region, "us-east-1")) {
-                // For regions other than us-east-1, we should ideally construct s3.{region}.amazonaws.com
-                // However, doing so requires allocation which we must track.
-                // For now, sticking to default or S3_ENDPOINT.
-            }
-        }
     }
 
+    // Now create the context and initialize fully
     const ctx = try allocator.create(S3Context);
     errdefer allocator.destroy(ctx);
 
     ctx.allocator = allocator;
+    ctx.host_owned = try allocator.dupe(u8, host);
+    errdefer allocator.free(ctx.host_owned.?);
+
     ctx.pool = s3.ConnectionPool.init(allocator);
     errdefer ctx.pool.deinit();
 
-    const host_copy = try allocator.dupe(u8, host);
-    errdefer allocator.free(host_copy);
-    ctx.host_owned = host_copy;
-
-    const ca_cert_env = try getEnvOrNull(allocator, "S3_CA_CERT");
-    defer if (ca_cert_env) |c| allocator.free(c);
-
-    var trusted_cert: ?[]const u8 = null;
-    if (ca_cert_env) |path_val| {
-        const max_size = 1024 * 1024;
-        const content = try std.fs.cwd().readFileAlloc(path_val, allocator, @enumFromInt(max_size));
-        trusted_cert = content;
+    ctx.thread_pool = xev.ThreadPool.init(.{});
+    errdefer {
+        ctx.thread_pool.shutdown();
+        ctx.thread_pool.deinit();
     }
-    defer if (trusted_cert) |c| allocator.free(c);
+
+    ctx.tp_resolver = dns.ThreadPoolResolver.init(&ctx.thread_pool, allocator);
+    errdefer ctx.tp_resolver.deinit();
+
+    ctx.sf_resolver = dns.SingleFlightResolver.init(allocator, ctx.tp_resolver.resolver());
+    errdefer ctx.sf_resolver.deinit();
+
+    ctx.spec_resolver = dns.SpeculativeResolver.init(allocator, ctx.sf_resolver.resolver());
+    errdefer ctx.spec_resolver.deinit();
 
     ctx.source = try s3.AsyncS3Source.init(
-        allocator,
-        &ctx.pool,
-        resolver,
-        host_copy,
-        port,
-        bucket,
-        key,
-        use_tls,
-        trusted_cert,
-        if (config.credentials) |_| config else null,
+        allocator, 
+        &ctx.pool, 
+        ctx.spec_resolver.resolver(), 
+        ctx.host_owned.?, 
+        port, 
+        bucket, 
+        key, 
+        use_tls, 
+        null, 
+        config
     );
 
-    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
+    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3) catch |err| {
+        cleanupAsyncS3(ctx, allocator);
+        return err;
+    };
 }
 
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {

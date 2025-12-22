@@ -31,16 +31,14 @@ pub const AsyncS3Source = struct {
 
     pub fn init(allocator: std.mem.Allocator, pool: *ConnectionPool, resolver: dns.Resolver, host: []const u8, port: u16, bucket: []const u8, key: []const u8, use_tls: bool, trusted_cert: ?[]const u8, config: ?types.S3Config) !AsyncS3Source {
         const path = try std.fmt.allocPrint(allocator, "/{s}/{s}", .{ bucket, key });
-        errdefer allocator.free(path);
+        // No errdefer here, we'll let self.deinit handle it via the errdefer self.deinit() below.
 
         const host_dupe = try allocator.dupe(u8, host);
-        errdefer allocator.free(host_dupe);
 
         var cert_dupe: ?[]const u8 = null;
         if (trusted_cert) |cert| {
             cert_dupe = try allocator.dupe(u8, cert);
         }
-        errdefer if (cert_dupe) |c| allocator.free(c);
 
         var config_dupe: ?types.S3Config = null;
         if (config) |c| {
@@ -72,6 +70,7 @@ pub const AsyncS3Source = struct {
             .resolved_ips = &.{},
             .next_ip_idx = 0,
         };
+        // This is the only errdefer we need for these fields.
         errdefer self.deinit();
 
         try self.resolveHost();
@@ -261,8 +260,12 @@ pub const AsyncS3Source = struct {
             _ = try self.event_loop.tick();
         }
 
-        // Release connections
+        // Check for errors and release connections
+        var first_err: ?anyerror = null;
         for (requests.items) |*req| {
+            if (req.state == .Error) {
+                if (first_err == null) first_err = error.S3ReadError;
+            }
             if (req.connection) |conn| {
                 if (req.state == .Finished) {
                     try self.pool.release(key, conn);
@@ -272,6 +275,8 @@ pub const AsyncS3Source = struct {
                 }
             }
         }
+
+        if (first_err) |err| return err;
     }
 
     fn connectNew(self: *AsyncS3Source) !*Connection {

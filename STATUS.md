@@ -36,7 +36,7 @@
     *   [x] **Context Injection**: Enabled allocator-aware property testing.
     *   [x] **Thrift Fuzzer**: Verified metadata parser robustness (Round-Trip).
     *   [x] **HTTP Fuzzer**: Fixed zero-body hang bug discovered by Minish.
-*   [x] **DNS Stack**: Justified tiered architecture with 70x speedup proof.
+*   [x] **DNS Stack**: Verified deduplication property and non-blocking integration.
 *   [ ] **Lambda E2E**: Preparing end-to-end validation suite.
 
 ### Milestone 1: Core Parquet Engine & Encodings [COMPLETE]
@@ -99,7 +99,7 @@
 *   [x] **Middleware: Single-Flight**: Implemented `SingleFlightResolver` for lookup deduplication.
 *   [x] **Tier 2: Speculative**: Implemented `SpeculativeResolver` for IPv4/IPv6 racing.
 *   [x] **Verification**: `tests/io/test_dns.zig` successfully verified deduplication and racing.
-*   [x] **Justification**: Formally proved **70x performance gain** for parallel S3 resolutions (~88ms -> ~1.2ms) via `tests/io/bench_dns.zig`.
+*   [x] **Justification**: Verified deduplication property (50 parallel requests satisfied by 1 OS call) via `tests/io/bench_dns.zig`.
 
 ### Milestone 7: Pure Async Lifecycle [COMPLETE]
 *   [x] **Transport Abstraction**: Implemented `Connection` (TCP/TLS) using a non-blocking "Pump" pattern.
@@ -145,7 +145,8 @@ We utilize the following references for architectural validation:
 | **Polars (Rust)** | ~0.40s | Rust `object_store` via `reqwest`. |
 | **ZPQ (Zig)** | ~0.58s | Initial implementation; connection reuse optimizations pending in Milestone 8. |
 
-## Lambda Benchmark (Internal Loop)
+## Lambda Benchmark (Internal Loop Proof-of-Concept)
+*Note: These metrics represent an internal ping-pong loop of the `libxev` event loop on Lambda hardware to verify scaling. They do not yet reflect a real-world S3 scan (see Milestone 0 / Plan 09).*
 Verified scalability of the async engine (`libxev` + `epoll`) on AWS Lambda (ARM64):
 | Memory | RPS (Approx) | Scaling Factor | Notes |
 | :--- | :--- | :--- | :--- |

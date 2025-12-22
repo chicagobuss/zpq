@@ -43,3 +43,13 @@ alwaysApply: false
     *   `list.append(item)` -> **REMOVED**. Use `list.append(allocator, item)`.
     *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
     *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()` and manage the opaque platform timestamp.
+
+## 8. High-Performance Debugging & Feedback
+*   **Fix the Loop First**: If a bug takes >60s to reproduce, your priority is NOT the bug; it is **shortening the feedback loop**.
+*   **5-Second Timeout Policy**: All network and I/O experiments MUST be wrapped in `python3 tools/no_output_timeout.py --idle-seconds 5`.
+    *   *Rationale*: If a network operation doesn't produce a log entry in 5s, it is deadlocked or mis-segmented. Do not wait for 60s "jitter".
+*   **Isolation (Probes)**: Never debug complex I/O (TLS, S3, DNS) inside the main application. 
+    *   **Action**: Create a `probes/probe_X.zig` that isolates the single failing component (e.g., `probe_tls_echo.zig`).
+*   **Radical Logging**: Use `std.debug.print` to verify **flow**, not just errors.
+    *   **Required Logs**: Entry/exit of every async callback; number of bytes decrypted from BIO; state transitions (e.g., `handshake_complete=true`).
+*   **The "Halving" Strategy**: Use probes to divide the problem space (e.g., "If Google works but S3 fails, the transport layer is fine, check the AWS config").

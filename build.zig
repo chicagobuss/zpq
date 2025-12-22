@@ -70,6 +70,26 @@ pub fn build(b: *std.Build) void {
     // I/O Integration Tests
     const test_io_step = b.step("test-io", "Run I/O integration tests");
 
+    // Fast Feedback Probe
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/probe_fast_feedback.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const pff_exe = b.addExecutable(.{
+            .name = "probe-fast-feedback",
+            .root_module = mod,
+        });
+        pff_exe.linkLibC();
+
+        const run = b.addRunArtifact(pff_exe);
+        const step = b.step("probe-fast-feedback", "Run fast feedback probe");
+        step.dependOn(&run.step);
+    }
+
     // test_async_request
     const test_async_request_mod = b.createModule(.{
         .root_source_file = b.path("tests/io/test_async_request.zig"),
@@ -191,294 +211,39 @@ pub fn build(b: *std.Build) void {
         .name = "bootstrap",
         .root_module = bootstrap_mod,
     });
+    bootstrap_exe.linkLibC();
 
     // Install to zig-out/lambda/bootstrap instead of bin/
     const install_bootstrap = b.addInstallArtifact(bootstrap_exe, .{
         .dest_dir = .{ .override = .{ .custom = "lambda" } },
     });
 
-    const build_lambda_step = b.step("build-lambda", "Build AWS Lambda bootstrap (aarch64-linux)");
+    const build_lambda_step = b.step("lambda", "Build AWS Lambda bootstrap");
     build_lambda_step.dependOn(&install_bootstrap.step);
 
-    // Benchmark Bootstrap
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/lambda_bench.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux }),
-        .optimize = .ReleaseFast,
+    // bench-e2e
+    const bench_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_e2e/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    bench_mod.addImport("zpq", zpq_mod);
-    bench_mod.addImport("xev", libxev_mod);
+    bench_e2e_mod.addImport("zpq", zpq_mod);
+    bench_e2e_mod.addImport("xev", libxev_mod);
+    bench_e2e_mod.addImport("boring_tls", boring_tls_mod);
 
-    const exe_bench = b.addExecutable(.{
-        .name = "bootstrap-bench",
-        .root_module = bench_mod,
+    const bench_e2e_exe = b.addExecutable(.{
+        .name = "bench-e2e",
+        .root_module = bench_e2e_mod,
     });
+    bench_e2e_exe.linkLibC();
+    b.installArtifact(bench_e2e_exe);
 
-    const install_bench = b.addInstallArtifact(exe_bench, .{
-        .dest_dir = .{ .override = .{ .custom = "lambda-bench" } },
-    });
+    const run_bench_e2e = b.addRunArtifact(bench_e2e_exe);
+    const bench_e2e_step = b.step("bench-e2e", "Run E2E benchmark");
+    bench_e2e_step.dependOn(&run_bench_e2e.step);
 
-    const build_lambda_bench_step = b.step("build-lambda-bench", "Build lambda benchmark bootstrap");
-    build_lambda_bench_step.dependOn(&install_bench.step);
-
-    // --- Experimental / Micro-tests ---
-    const enable_experimental = b.option(bool, "experimental", "Enable experimental tests/benchmarks") orelse false;
-
-    if (enable_experimental) {
-        // 0. probe_async_dns
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("probes/probe_async_dns.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-
-            const exe_probe = b.addExecutable(.{
-                .name = "probe_async_dns",
-                .root_module = mod,
-            });
-            exe_probe.linkLibC();
-
-            const run = b.addRunArtifact(exe_probe);
-            const step = b.step("probe-async-dns", "Run Async DNS probe");
-            step.dependOn(&run.step);
-        }
-
-        // 1. test_boring_connect
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_boring_connect.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("boring_tls", boring_tls_mod);
-
-            const exe_boring = b.addExecutable(.{
-                .name = "test_boring_connect",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_boring);
-            const step = b.step("test-boring-connect", "Run BoringTLS connection test");
-            step.dependOn(&run.step);
-        }
-
-        // 2. bench_ping_pongs
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/bench/ping_pongs.zig"),
-                .target = target,
-                // Benchmark should default to ReleaseFast if not specified, but respect user option
-                .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-
-            const exe_ping = b.addExecutable(.{
-                .name = "bench_ping_pongs",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_ping);
-            const step = b.step("bench-ping-pongs", "Run libxev ping-pong benchmark");
-            step.dependOn(&run.step);
-        }
-
-        // 3. test_s3_head
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_s3_head.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("boring_tls", boring_tls_mod);
-
-            const exe_s3 = b.addExecutable(.{
-                .name = "test_s3_head",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_s3);
-            const step = b.step("test-s3-head", "Run S3 HEAD request test");
-            step.dependOn(&run.step);
-        }
-
-        // 4. test_http_client
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_http_client.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const exe_http = b.addExecutable(.{
-                .name = "test_http_client",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_http);
-            const step = b.step("test-http-client", "Run HTTP Client Integration Test");
-            step.dependOn(&run.step);
-        }
-
-        // 5. test_minio_https
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_minio_https.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const exe_minio = b.addExecutable(.{
-                .name = "test_minio_https",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_minio);
-            const step = b.step("test-minio-https", "Run HTTP Client against local MinIO");
-            step.dependOn(&run.step);
-        }
-
-        // 6. test_minio_range_get
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_minio_range_get.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-            mod.addImport("response_parser", b.createModule(.{
-                .root_source_file = b.path("src/zpq/io/http/response_parser.zig"),
-                .target = target,
-                .optimize = optimize,
-            }));
-            mod.addImport("minio_fixtures", b.createModule(.{
-                .root_source_file = b.path("ci/fixtures/minio/fixtures.zig"),
-                .target = target,
-                .optimize = optimize,
-            }));
-
-            const exe_minio_range = b.addExecutable(.{
-                .name = "test_minio_range_get",
-                .root_module = mod,
-            });
-
-            const run = b.addRunArtifact(exe_minio_range);
-            const step = b.step("test-minio-range-get", "Run MinIO TLS Range GET integration test");
-            step.dependOn(&run.step);
-        }
-        // 7. test_dns
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_dns.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const exe_dns = b.addExecutable(.{
-                .name = "test_dns",
-                .root_module = mod,
-            });
-            exe_dns.linkLibC();
-
-            const run = b.addRunArtifact(exe_dns);
-            const step = b.step("test-dns", "Run Async DNS integration test");
-            step.dependOn(&run.step);
-        }
-
-        // 8. probe_xev_tcp_lifecycle
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("probes/probe_xev_tcp_lifecycle.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-
-            const probe_exe = b.addExecutable(.{
-                .name = "probe_xev_tcp_lifecycle",
-                .root_module = mod,
-            });
-            probe_exe.linkLibC();
-
-            const run = b.addRunArtifact(probe_exe);
-            const step = b.step("probe-xev-tcp", "Run libxev TCP lifecycle probe");
-            step.dependOn(&run.step);
-        }
-
-        // 9. probe_tls_pump
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("probes/probe_tls_pump.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("boring_tls", boring_tls_mod);
-
-            const probe_exe = b.addExecutable(.{
-                .name = "probe_tls_pump",
-                .root_module = mod,
-            });
-            probe_exe.linkLibC();
-
-            const run = b.addRunArtifact(probe_exe);
-            const step = b.step("probe-tls-pump", "Run libxev + boring_tls pump probe");
-            step.dependOn(&run.step);
-        }
-
-        // 10. test_connection
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_connection.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("boring_tls", boring_tls_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const conn_exe = b.addExecutable(.{
-                .name = "test_connection",
-                .root_module = mod,
-            });
-            conn_exe.linkLibC();
-
-            const run = b.addRunArtifact(conn_exe);
-            const step = b.step("test-connection", "Run S3 connection transport test");
-            step.dependOn(&run.step);
-        }
-
-        // 11. test_backpressure
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/io/test_backpressure.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const bp_exe = b.addExecutable(.{
-                .name = "test_backpressure",
-                .root_module = mod,
-            });
-            bp_exe.linkLibC();
-
-            const run = b.addRunArtifact(bp_exe);
-            const step = b.step("test-backpressure", "Run backpressure integration test");
-            step.dependOn(&run.step);
-        }
-
+    // Hardening Proofs / Integration tests
+    {
         // 12. test_gap_skipping
         {
             const mod = b.createModule(.{
@@ -587,6 +352,24 @@ pub fn build(b: *std.Build) void {
 
             const run = b.addRunArtifact(probe_exe);
             const step = b.step("probe-sf-crash", "Run SingleFlight crash probe");
+            step.dependOn(&run.step);
+        }
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probes/probe_tls_echo.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("zpq", zpq_mod);
+
+            const probe_exe = b.addExecutable(.{
+                .name = "probe-tls-echo",
+                .root_module = mod,
+            });
+            probe_exe.linkLibC();
+
+            const run = b.addRunArtifact(probe_exe);
+            const step = b.step("probe-tls-echo", "Run TLS echo micro-test");
             step.dependOn(&run.step);
         }
     }

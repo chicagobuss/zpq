@@ -32,7 +32,7 @@ gen-fixtures:
     python3 tools/fixtures/gen.py
 
 # Run the CLI tools against verified fixtures (Moderate)
-verify: build
+verify: build check-tls
     @echo "Verifying CLI commands..."
     # Schema check
     zig build run -- schema data/simple.parquet
@@ -43,6 +43,13 @@ verify: build
     # Cat check (data dump)
     zig build run -- cat data/simple.parquet 5
     @echo "Verification passed."
+
+# Verify TLS Transport and S3 Factory (Requires Network)
+check-tls: build
+    @echo "Verifying TLS Transport (Google HEAD)..."
+    python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-tls-echo
+    @echo "Verifying S3 Integration (S3 Footer)..."
+    @bash -c "export \$(grep -v '^#' .env.staging.bot | xargs) && export AWS_REGION=us-west-2 && python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-fast-feedback"
 
 # Run comprehensive tests including heavy data and edge cases (Slow)
 comprehensive: build gen-fixtures

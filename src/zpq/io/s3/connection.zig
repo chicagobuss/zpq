@@ -20,7 +20,7 @@ pub const Connection = struct {
 
     // Internal Buffers
     read_buf: [16 * 1024]u8 = undefined, // S3 packets can be large
-    write_queue: std.ArrayList(u8),
+    write_queue: std.ArrayListUnmanaged(u8),
     write_cursor: usize = 0,
 
     // State
@@ -30,6 +30,7 @@ pub const Connection = struct {
     handshake_complete: bool = false,
     closed: bool = false,
     write_in_flight: bool = false,
+    read_in_flight: bool = false,
 
     // Callbacks
     user_ctx: ?*anyopaque = null,
@@ -55,7 +56,7 @@ pub const Connection = struct {
             .tcp = undefined,
             .tls = if (use_tls) try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = true }) else null,
             .allocator = allocator,
-            .write_queue = std.ArrayList(u8).empty,
+            .write_queue = .{},
             .host = host_dupe,
             .use_tls = use_tls,
         };
@@ -86,9 +87,17 @@ pub const Connection = struct {
         if (current_len > HIGH_WATER_MARK) return error.WouldBlock;
 
         if (self.use_tls) {
-            const enc_data = try self.tls.?.processOutgoing(data);
-            if (enc_data) |bytes| {
-                try self.write_queue.appendSlice(self.allocator, bytes);
+            var input: ?[]const u8 = data;
+            while (true) {
+                const enc_data = try self.tls.?.processOutgoing(input);
+                input = null; // Only pass data on the first iteration
+                if (enc_data) |bytes| {
+                    if (bytes.len > 0) {
+                        try self.write_queue.appendSlice(self.allocator, bytes);
+                        continue; // Check if BoringSSL has more records to emit
+                    }
+                }
+                break;
             }
         } else {
             try self.write_queue.appendSlice(self.allocator, data);
@@ -120,23 +129,32 @@ pub const Connection = struct {
 
     fn pump(self: *Self) void {
         if (self.use_tls) {
-            const out_slice_res = self.tls.?.processOutgoing(null);
-            if (out_slice_res) |out_slice_opt| {
-                if (out_slice_opt) |data| {
-                    self.write_queue.appendSlice(self.allocator, data) catch |err| {
-                        if (self.on_error) |cb| cb(self, self.user_ctx, err);
-                        return;
-                    };
-                    self.tryWrite();
+            // Drain the write BIO completely
+            while (true) {
+                const out_slice_res = self.tls.?.processOutgoing(null) catch |err| {
+                    if (self.on_error) |cb| cb(self, self.user_ctx, err);
+                    return;
+                };
+
+                if (out_slice_res) |data| {
+                    if (data.len > 0) {
+                        self.write_queue.appendSlice(self.allocator, data) catch |err| {
+                            if (self.on_error) |cb| cb(self, self.user_ctx, err);
+                            return;
+                        };
+                        continue; // Check for more data in BIO
+                    }
                 }
-            } else |err| {
-                if (self.on_error) |cb| cb(self, self.user_ctx, err);
-                return;
+                break;
             }
+            self.tryWrite();
         }
 
         // If no output to send, we need to read from net
-        self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
+        if (!self.read_in_flight) {
+            self.read_in_flight = true;
+            self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
+        }
     }
 
     fn internalOnConnect(
@@ -158,7 +176,6 @@ pub const Connection = struct {
                     if (out_slice_opt) |data| {
                         self.write_queue.appendSlice(self.allocator, data) catch unreachable;
                         self.tryWrite();
-                        return .disarm;
                     }
                 } else |err| {
                     if (self.on_error) |cb| cb(self, self.user_ctx, err);
@@ -217,6 +234,7 @@ pub const Connection = struct {
         _ = s;
         _ = buf;
         const self = ctx.?;
+        self.read_in_flight = false;
         if (r) |n| {
             if (n == 0) {
                 if (self.on_error) |cb| cb(self, self.user_ctx, error.EOF);
@@ -224,18 +242,40 @@ pub const Connection = struct {
             }
 
             if (self.use_tls) {
-                const dec_res = self.tls.?.processIncoming(self.read_buf[0..n]);
-                if (dec_res) |dec_opt| {
+                var dec_ptr = self.read_buf[0..n];
+                while (dec_ptr.len > 0) {
+                    const dec_res = self.tls.?.processIncoming(dec_ptr) catch |err| {
+                        if (self.on_error) |cb| cb(self, self.user_ctx, err);
+                        return .disarm;
+                    };
+
+                    // Check handshake completion even if no decrypted data was produced
                     if (!self.handshake_complete and self.tls.?.handshake_complete) {
                         self.handshake_complete = true;
                         if (self.on_connect) |cb| cb(self, self.user_ctx);
                     }
-                    if (dec_opt) |pt| {
-                        if (self.on_data) |cb| cb(self, self.user_ctx, pt);
+
+                    if (dec_res) |dec_opt| {
+                        if (dec_opt.len > 0) {
+                            if (self.on_data) |cb| cb(self, self.user_ctx, dec_opt);
+                        }
+
+                        // Check for more data in BIO
+                        while (true) {
+                            const remaining = self.tls.?.processIncoming(&[_]u8{}) catch break;
+                            if (remaining) |pt| {
+                                if (pt.len > 0) {
+                                    if (self.on_data) |cb| cb(self, self.user_ctx, pt);
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
                     }
-                } else |err| {
-                    if (self.on_error) |cb| cb(self, self.user_ctx, err);
-                    return .disarm;
+                    // Currently boring_tls consumes the whole slice into its BIO,
+                    // so we break here. In the future if we support partial consumption,
+                    // we'd update dec_ptr.
+                    break;
                 }
             } else {
                 if (self.on_data) |cb| cb(self, self.user_ctx, self.read_buf[0..n]);

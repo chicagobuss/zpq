@@ -77,6 +77,10 @@ pub const ThreadPoolResolver = struct {
         };
     }
 
+    pub fn deinit(self: *ThreadPoolResolver) void {
+        _ = self;
+    }
+
     pub fn resolver(self: *ThreadPoolResolver) Resolver {
         return .{
             .ptr = self,
@@ -122,6 +126,7 @@ pub const ThreadPoolResolver = struct {
         const completion: *Resolver.Completion = @fieldParentPtr("internal", internal);
         const self: *ThreadPoolResolver = @ptrCast(@alignCast(completion.internal.resolver_ptr.?));
 
+        std.debug.print("[DNS] ThreadPool resolving {s}:{d}...\n", .{ completion.hostname, completion.port });
         const hostname_z = self.allocator.dupeZ(u8, completion.hostname) catch {
             completion.internal.err = error.OutOfMemory;
             if (completion.internal.xev_async) |*a| a.notify() catch {};
@@ -369,6 +374,10 @@ pub const SpeculativeResolver = struct {
             .inner = inner,
             .allocator = allocator,
         };
+    }
+
+    pub fn deinit(self: *SpeculativeResolver) void {
+        _ = self;
     }
 
     pub fn resolver(self: *SpeculativeResolver) Resolver {

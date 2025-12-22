@@ -1,7 +1,7 @@
 # ZPQ Technical Context and Detail
 
 **Last Updated**: Dec 22, 2025
-**Current State**: Milestone 10 (Empirical Proof) verified on ARM64 hardware. ZPQ outperforms PyArrow by ~1.9x in end-to-end S3 scans.
+**Current State**: Milestone 0 (CI & Build Hardening) Completed. Project is stable on Zig master with optimized pre-built dependency workflows. Milestone 10 (Empirical Proof) verified on ARM64 hardware.
 
 ## Milestone 9: Hardening & Transport Stability (Completed)
 Extensive debugging and refactoring to ensure production-grade stability and memory safety.
@@ -15,6 +15,15 @@ Extensive debugging and refactoring to ensure production-grade stability and mem
 *   **Correctness**: 
     *   **Thrift Booleans**: Fixed a critical decoding bug in `DictionaryPageHeader` where booleans were incorrectly read as ZigZag ints.
     *   **Aggressive Draining**: Modified `internalOnTcpRead` to aggressively drain the TLS BIO, preventing truncated requests.
+
+## Milestone 0: Build System Hardening (Completed)
+Successfully stabilized the project on Zig `master` and implemented a high-performance CI/CD pipeline for dependencies.
+
+### Key Achievements:
+*   **Zig 0.16.x Core Migration**: Updated all build logic and standard library calls to comply with the latest Breaking Changes in Zig nightly.
+*   **Pre-built BoringSSL Pipeline**: Automated the cross-compilation and release of static libraries for Linux/Mac (x86 and ARM), reducing local/CI build times by ~90% for clean builds.
+*   **Just Workflow Integration**: Optimized CI and local development using `just` recipes, including `fetch-deps` for instant bootstrapping.
+*   **Unique Artifact Triplets**: Implemented a naming convention for release assets (e.g., `libcrypto-aarch64-macos.a`) to facilitate automated fetching across environments.
 
 ## Milestone 10: Empirical Proof & Performance (Phase 1 Complete)
 Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate the asynchronous architecture.

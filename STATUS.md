@@ -118,8 +118,12 @@
 ### Milestone 10: Empirical Proof & Performance [COMPLETE]
 *   [x] **Plan 08: Reproducible Benchmarks**: Implemented `tools/remote_bench.sh` and `tools/bench_e2e/`.
 *   [x] **Proof**: Formally proved ~1.9x performance advantage over PyArrow on ARM64 hardware.
-*   [ ] **Plan 09: Lambda End-to-End**: Build deployable Lambda benchmark.
-*   [ ] **Milestone 8: Persistent Pool**: Implementation of keep-alive timeouts and stale detection.
+
+### Milestone 11: Production Readiness & Lambda Deployment [PENDING]
+*   [ ] **Plan 09: Lambda End-to-End**: Build deployable Lambda benchmark using the verified ARM64 engine.
+*   [ ] **Milestone 8: Persistent Pool**: Implementation of keep-alive timeouts and stale detection to eliminate the cleanup hang.
+*   [ ] **Milestone 12: Repetition Levels**: Moving beyond simple columnar scans to support nested structures (Lists/Maps).
+*   [ ] **Plan 11: Multi-Column Throughput**: Verify linear scaling when scanning 50+ columns in parallel.
 
 ---
 

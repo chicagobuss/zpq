@@ -44,7 +44,8 @@ Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate t
 
 ---
 
-## Future Technical Objectives:
-1.  **Plan 09: Lambda End-to-End**: Packaging the verified ARM64 engine into a deployable Lambda function.
-2.  **Milestone 8: Repetition Levels**: Moving beyond simple columnar scans to nested structures (Lists/Maps).
-3.  **Connection Pool Refinement**: Addressing the cleanup hang in `AsyncFancy` by implementing formal keep-alive timeouts.
+## Future Technical Objectives (Milestone 11):
+1.  **Plan 09: Lambda End-to-End**: Packaging the verified ARM64 engine into a deployable Lambda function with optimized cold starts.
+2.  **Milestone 8: Persistent Pool & Timeouts**: Addressing the cleanup hang in `AsyncFancy` by implementing formal keep-alive timeouts and idle connection harvesting.
+3.  **Milestone 12: Repetition Levels**: Implementing Dremel-style shredding for nested Parquet structures (Lists and Maps).
+4.  **Plan 11: Massively Parallel Column Scans**: Stress-testing the `AsyncS3Source` with 50+ concurrent column readers to find the next bottleneck in the `libxev` completion queue.

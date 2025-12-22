@@ -40,11 +40,10 @@ jobs:
           cd vendor/boring_tls
           zig build -Dtarget=${{ matrix.target }} -Duse-prebuilt=false --summary all
           
-          # Create the bundle
-          TRIPLE=${{ matrix.target }}
-          mkdir -p ../../bundle/$TRIPLE
-          cp zig-out/lib/libcrypto.a ../../bundle/$TRIPLE/
-          cp zig-out/lib/libssl.a ../../bundle/$TRIPLE/
+          # Create the bundle with unique names
+          mkdir -p ../../bundle
+          cp zig-out/lib/libcrypto.a ../../bundle/libcrypto-${{ matrix.target }}.a
+          cp zig-out/lib/libssl.a ../../bundle/libssl-${{ matrix.target }}.a
           
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -61,8 +60,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: release-artifacts/**/*
+          files: release-artifacts/*
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          make_latest: true

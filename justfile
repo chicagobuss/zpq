@@ -141,12 +141,12 @@ verify-malformed: build gen-malformed
 
 # Fetch pre-built dependencies to speed up build
 fetch-deps:
-    @echo "Fetching pre-built BoringSSL static libraries..."
-    mkdir -p vendor/boring_tls/prebuilt/$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')
-    TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-latest/libcrypto.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
-    TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-latest/libssl.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
+    @echo "Fetching pre-built BoringSSL static libraries (deps-v0.1)..."
+    @mkdir -p vendor/boring_tls/prebuilt/$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')
+    @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
+    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-v0.1/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
+    @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
+    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-v0.1/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
 
 # Clean build artifacts
 clean:

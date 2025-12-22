@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_prebuilt = b.option(bool, "use-prebuilt", "Use pre-built static libraries if available") orelse true;
 
     // Dependencies
     const libxev_dep = b.dependency("libxev", .{
@@ -14,6 +15,7 @@ pub fn build(b: *std.Build) void {
     const boring_tls_dep = b.dependency("boring_tls", .{
         .target = target,
         .optimize = optimize,
+        .@"use-prebuilt" = use_prebuilt,
     });
     const boring_tls_mod = boring_tls_dep.module("boring_tls");
 

@@ -21,13 +21,13 @@ pub const Resolver = struct {
 
     pub const Internal = struct {
         xev_completion: xev.Completion = .{},
-        xev_async: xev.Async = undefined,
+        xev_async: ?xev.Async = null,
         task: xev.ThreadPool.Task = undefined,
         callback: *const fn (ud: ?*anyopaque, results: []const Address, err: anyerror!void) void = undefined,
         userdata: ?*anyopaque = null,
         results: []Address = &.{},
         err: ?anyerror = null,
-        resolver_ptr: *anyopaque = undefined,
+        resolver_ptr: ?*anyopaque = null,
     };
 
     pub const Completion = struct {
@@ -46,6 +46,7 @@ pub const Resolver = struct {
                 allocator.free(self.internal.results);
                 self.internal.results = &.{};
             }
+            // Moved xev_async.deinit() to asyncCallback to avoid deinit-during-callback
         }
     };
 
@@ -110,7 +111,7 @@ pub const ThreadPoolResolver = struct {
         completion.internal.task = .{ .callback = threadCallback };
 
         // Wait on the loop
-        completion.internal.xev_async.wait(loop, &completion.internal.xev_completion, Resolver.Completion, completion, asyncCallback);
+        completion.internal.xev_async.?.wait(loop, &completion.internal.xev_completion, Resolver.Completion, completion, asyncCallback);
 
         // Schedule on thread pool
         self.pool.schedule(xev.ThreadPool.Batch.from(&completion.internal.task));
@@ -119,11 +120,11 @@ pub const ThreadPoolResolver = struct {
     fn threadCallback(task: *xev.ThreadPool.Task) void {
         const internal: *Resolver.Internal = @fieldParentPtr("task", task);
         const completion: *Resolver.Completion = @fieldParentPtr("internal", internal);
-        const self: *ThreadPoolResolver = @ptrCast(@alignCast(completion.internal.resolver_ptr));
+        const self: *ThreadPoolResolver = @ptrCast(@alignCast(completion.internal.resolver_ptr.?));
 
         const hostname_z = self.allocator.dupeZ(u8, completion.hostname) catch {
             completion.internal.err = error.OutOfMemory;
-            completion.internal.xev_async.notify() catch {};
+            if (completion.internal.xev_async) |*a| a.notify() catch {};
             return;
         };
         defer self.allocator.free(hostname_z);
@@ -140,7 +141,7 @@ pub const ThreadPoolResolver = struct {
 
         if (@intFromEnum(rc) != 0) {
             completion.internal.err = error.DnsResolutionFailed;
-            completion.internal.xev_async.notify() catch {};
+            if (completion.internal.xev_async) |*a| a.notify() catch {};
             return;
         }
 
@@ -155,7 +156,7 @@ pub const ThreadPoolResolver = struct {
 
             const addrs = self.allocator.alloc(Address, count) catch {
                 completion.internal.err = error.OutOfMemory;
-                completion.internal.xev_async.notify() catch {};
+                if (completion.internal.xev_async) |*a| a.notify() catch {};
                 return;
             };
 
@@ -168,7 +169,7 @@ pub const ThreadPoolResolver = struct {
             completion.internal.results = addrs;
         }
 
-        completion.internal.xev_async.notify() catch {};
+        if (completion.internal.xev_async) |*a| a.notify() catch {};
     }
 
     fn asyncCallback(
@@ -179,8 +180,19 @@ pub const ThreadPoolResolver = struct {
     ) xev.CallbackAction {
         _ = l;
         _ = c;
-        _ = r catch unreachable;
         const completion = ud.?;
+
+        // Deinit xev_async BEFORE calling the callback, because the callback
+        // (especially in SingleFlightResolver) might destroy the completion itself.
+        if (completion.internal.xev_async) |*a| {
+            a.deinit();
+            completion.internal.xev_async = null;
+        }
+
+        if (r) |_| {} else |err| {
+            completion.internal.callback(completion.internal.userdata, &.{}, err);
+            return .disarm;
+        }
 
         if (completion.internal.err) |err| {
             completion.internal.callback(completion.internal.userdata, &.{}, err);
@@ -310,7 +322,7 @@ pub const SingleFlightResolver = struct {
         };
         self.mutex.unlock();
 
-        self.inner.resolve(loop, hostname, port, &inflight.inner_completion, innerCallback, inflight);
+        self.inner.resolve(loop, inflight.hostname, port, &inflight.inner_completion, innerCallback, inflight);
     }
 
     fn innerCallback(ud: ?*anyopaque, results: []const Address, err: anyerror!void) void {
@@ -326,15 +338,20 @@ pub const SingleFlightResolver = struct {
                 waiter.cb(waiter.userdata, &.{}, e);
                 continue;
             };
+
             // Success!
             // Dupe results for each waiter
-            const duped = self.allocator.alloc(Address, results.len) catch |e| {
-                waiter.cb(waiter.userdata, &.{}, e);
-                continue;
-            };
-            @memcpy(duped, results);
-            waiter.completion.internal.results = duped;
-            waiter.cb(waiter.userdata, duped, {});
+            if (results.len > 0) {
+                const duped = self.allocator.alloc(Address, results.len) catch |e| {
+                    waiter.cb(waiter.userdata, &.{}, e);
+                    continue;
+                };
+                @memcpy(duped, results);
+                waiter.completion.internal.results = duped;
+                waiter.cb(waiter.userdata, duped, {});
+            } else {
+                waiter.cb(waiter.userdata, &.{}, {});
+            }
         }
 
         inflight.deinit();

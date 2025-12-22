@@ -549,5 +549,45 @@ pub fn build(b: *std.Build) void {
             const step = b.step("test-http-fuzz", "Run HTTP response parser fuzzer");
             step.dependOn(&run.step);
         }
+        // 16. bench_dns
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("tests/io/bench_dns.zig"),
+                .target = target,
+                .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const bench_exe = b.addExecutable(.{
+                .name = "bench_dns",
+                .root_module = mod,
+            });
+            bench_exe.linkLibC();
+
+            const run = b.addRunArtifact(bench_exe);
+            const step = b.step("bench-dns", "Run DNS benchmark");
+            step.dependOn(&run.step);
+        }
+        // 17. probe_sf_crash
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probes/probe_sf_crash.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("zpq", zpq_mod);
+
+            const probe_exe = b.addExecutable(.{
+                .name = "probe_sf_crash",
+                .root_module = mod,
+            });
+            probe_exe.linkLibC();
+
+            const run = b.addRunArtifact(probe_exe);
+            const step = b.step("probe-sf-crash", "Run SingleFlight crash probe");
+            step.dependOn(&run.step);
+        }
     }
 }

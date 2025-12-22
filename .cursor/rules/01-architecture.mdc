@@ -42,7 +42,13 @@ alwaysApply: false
     *   `std.ArrayList(T).init(allocator)` -> **REMOVED**. Use `std.ArrayList(T).empty` (unmanaged) or `initCapacity(allocator, n)`.
     *   `list.append(item)` -> **REMOVED**. Use `list.append(allocator, item)`.
     *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
-    *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()` and manage the opaque platform timestamp.
+    *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()`.
+    *   **Build API**: Methods like `linkLibC`, `linkLibCpp`, `addCSourceFiles`, and `addObjectFile` moved from `Step.Compile` to `Build.Module`.
+        *   Access them via `exe.root_module`.
+        *   `linkLibC()` -> `root_module.linkSystemLibrary("c", .{})`.
+        *   `linkLibCpp()` -> `root_module.linkSystemLibrary("c++", .{})`.
+    *   **Executable Configuration**: `addExecutable` options now require an explicit `root_module` (created via `b.createModule`) instead of flat `root_source_file`/`target`/`optimize` fields.
+    *   **Naming Alignment**: `std.mem.trimRight` -> `std.mem.trimEnd`, `std.mem.trimLeft` -> `std.mem.trimStart`.
 
 ## 8. High-Performance Debugging & Feedback
 *   **Fix the Loop First**: If a bug takes >60s to reproduce, your priority is NOT the bug; it is **shortening the feedback loop**.

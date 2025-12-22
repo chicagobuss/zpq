@@ -34,13 +34,14 @@ jobs:
 
       - name: Build BoringSSL
         run: |
+          cd vendor/boring_tls
           zig build -Dtarget=${{ matrix.target }} -Duse-prebuilt=false --summary all
           
           # Create the bundle
           TRIPLE=${{ matrix.target }}
-          mkdir -p bundle/$TRIPLE
-          cp zig-out/lib/libcrypto.a bundle/$TRIPLE/
-          cp zig-out/lib/libssl.a bundle/$TRIPLE/
+          mkdir -p ../../bundle/$TRIPLE
+          cp zig-out/lib/libcrypto.a ../../bundle/$TRIPLE/
+          cp zig-out/lib/libssl.a ../../bundle/$TRIPLE/
           
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

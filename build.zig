@@ -515,5 +515,39 @@ pub fn build(b: *std.Build) void {
             const step = b.step("test-fuzz-demo", "Run Minish basics demo");
             step.dependOn(&run.step);
         }
+
+        // 14. test_thrift_fuzz
+        {
+            const test_exe = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/fuzz/test_thrift_fuzz.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            test_exe.root_module.addImport("minish", minish);
+            test_exe.root_module.addImport("zpq", zpq_mod);
+
+            const run = b.addRunArtifact(test_exe);
+            const step = b.step("test-thrift-fuzz", "Run Thrift metadata fuzzer");
+            step.dependOn(&run.step);
+        }
+
+        // 15. test_http_fuzz
+        {
+            const test_exe = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/fuzz/test_http_fuzz.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            test_exe.root_module.addImport("minish", minish);
+            test_exe.root_module.addImport("zpq", zpq_mod);
+
+            const run = b.addRunArtifact(test_exe);
+            const step = b.step("test-http-fuzz", "Run HTTP response parser fuzzer");
+            step.dependOn(&run.step);
+        }
     }
 }

@@ -12,7 +12,7 @@ This directory contains detailed responses and remediation plans for the critica
 | **04** | [DNS Justification](./04_dns_complexity_justification.md) | Over-engineered DNS | Low | Benchmark current stack; Keep for "Happy Eyeballs" but document rationale. | Pending |
 | **05** | [Flow Control](./05_flow_control.md) | No Backpressure | **High** | Implement Write Queue & High-Water Mark. | [Backpressure Proof](./05_backpressure_proof.md) |
 | **06** | [Gap Verification](./06_gap_skipping_verification.md) | Unverified Features | **High** | Implement `test_gap_skipping.zig` with memory assertions. | [Gap Skip Proof](./06_gap_skip_proof.md) |
-| **07** | [Fuzzing Strategy](./07_fuzzing_strategy.md) | No Fuzz Testing | **High** | Integrate `zig-fuzz` for Thrift & HTTP parsers. | Pending |
+| **07** | [Fuzzing Strategy](./07_fuzzing_strategy.md) | No Fuzz Testing | **High** | Integrate `minish` for Thrift & HTTP parsers. | [Fuzzing Proof](./07_fuzzing_proof.md) |
 | **08** | [Benchmarks](./08_reproducible_benchmarks.md) | Disingenuous Comparisons | Medium | Create `benches/` with Dockerized repros. | Pending |
 | **09** | [Lambda E2E](./09_lambda_end_to_end.md) | Untested "Lambda-First" | **High** | Create `lambda_bench/` for real-world validation. | Pending |
 | **10** | [TLS Security](./10_tls_security.md) | Insecure Defaults | **Critical** | **Enable Verification**; Load System Roots. | Pending |

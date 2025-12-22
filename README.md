@@ -1,6 +1,6 @@
 # ZPQ: A Zig Parquet Tool
 
-ZPQ is a Parquet utility designed for data access in cloud environments, with a specific focus on AWS S3 and Lambda.
+ZPQ is a Parquet utility designed for fast data access across both local filesystems and cloud object storage, with a specific focus on AWS S3 and Lambda. It is built to support multiple storage providers through an abstract I/O interface.
 
 ## Design Philosophy
 

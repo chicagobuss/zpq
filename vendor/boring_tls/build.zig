@@ -7,29 +7,81 @@ pub fn build(b: *std.Build) !void {
 
     const boringssl_dep = b.dependency("boringssl", .{});
 
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var crypto_sources = std.ArrayList([]const u8).initCapacity(arena.allocator(), 10) catch @panic("OOM");
+    const use_prebuilt = b.option(bool, "use-prebuilt", "Use pre-built static libraries if available") orelse true;
+    const target_info = target.result;
+    const triple = try std.fmt.allocPrint(b.allocator, "{s}-{s}", .{ @tagName(target_info.cpu.arch), @tagName(target_info.os.tag) });
+    const prebuilt_path = b.path(b.fmt("prebuilt/{s}", .{triple}));
 
-    const full_path = boringssl_dep.path("crypto/aes").getPath(b);
-    try glob_sources(arena.allocator(), full_path, ".cc", &crypto_sources);
+    var crypto: *std.Build.Step.Compile = undefined;
+    var ssl: *std.Build.Step.Compile = undefined;
 
-    const boringssl_crypto = try buildBoringCrypto(
-        b,
-        target,
-        optimize,
-        boringssl_dep,
-    );
-    const boringssl_ssl = buildBoringSSLSSL(
-        b,
-        target,
-        optimize,
-        boringssl_dep,
-        boringssl_crypto,
-    );
+    var found_prebuilt = false;
+    if (use_prebuilt) {
+        const crypto_path = b.fmt("prebuilt/{s}/libcrypto.a", .{triple});
+        const ssl_path = b.fmt("prebuilt/{s}/libssl.a", .{triple});
+
+        // Check if files exist via std.fs (relative to build.zig)
+        const build_root = b.build_root.handle;
+        if (build_root.access(crypto_path, .{}) catch null != null and
+            build_root.access(ssl_path, .{}) catch null != null)
+        {
+            found_prebuilt = true;
+            const crypto_mod = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+            });
+            crypto = b.addLibrary(.{
+                .name = "crypto",
+                .linkage = .static,
+                .root_module = crypto_mod,
+            });
+            crypto.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
+            crypto.linkLibCpp();
+
+            const ssl_mod = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+            });
+            ssl = b.addLibrary(.{
+                .name = "ssl",
+                .linkage = .static,
+                .root_module = ssl_mod,
+            });
+            ssl.addObjectFile(prebuilt_path.path(b, "libssl.a"));
+            ssl.linkLibCpp();
+            ssl.linkLibrary(crypto);
+        }
+    }
+
+    if (!found_prebuilt) {
+        // We only walk the source tree and gather files if we actually need to build BoringSSL.
+        // This saves significant time on every 'zig build' invocation if pre-built libs are found.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var crypto_sources = std.ArrayList([]const u8).initCapacity(arena.allocator(), 200) catch @panic("OOM");
+
+        const full_path = boringssl_dep.path("crypto/aes").getPath(b);
+        try glob_sources(arena.allocator(), full_path, ".cc", &crypto_sources);
+
+        crypto = try buildBoringCrypto(
+            b,
+            target,
+            optimize,
+            boringssl_dep,
+        );
+        ssl = buildBoringSSLSSL(
+            b,
+            target,
+            optimize,
+            boringssl_dep,
+            crypto,
+        );
+    }
 
     const boring_tls_mod = b.addModule("boring_tls", .{
         .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     boring_tls_mod.addIncludePath(boringssl_dep.path("include"));
@@ -42,8 +94,8 @@ pub fn build(b: *std.Build) !void {
         boring_tls_mod.addCMacro("_M_ARM64", "1");
     }
 
-    boring_tls_mod.linkLibrary(boringssl_crypto);
-    boring_tls_mod.linkLibrary(boringssl_ssl);
+    boring_tls_mod.linkLibrary(crypto);
+    boring_tls_mod.linkLibrary(ssl);
 }
 
 fn buildBoringCrypto(

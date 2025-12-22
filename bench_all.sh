@@ -22,7 +22,7 @@ if [[ "$MODE" == "meta" || "$MODE" == "all" ]]; then
     echo "[Metadata (Schema Read)]"
     start_time=$(python3 -c 'import time; print(time.time())')
     # Redirect stdout/stderr to /dev/null for timing accuracy and cleanliness
-    ./zig-out/bin/zigaws schema "$S3_PATH" > /dev/null 2>&1
+    ./zig-out/bin/zpq schema "$S3_PATH" > /dev/null 2>&1
     end_time=$(python3 -c 'import time; print(time.time())')
     elapsed=$(python3 -c "print(f'{float(\"$end_time\") - float(\"$start_time\"):.4f}')")
     echo "Time: ${elapsed}s"
@@ -35,7 +35,7 @@ if [[ "$MODE" == "scan" || "$MODE" == "all" ]]; then
     echo "[Full Scan]"
     start_time=$(python3 -c 'import time; print(time.time())')
     # Redirect stdout to /dev/null to measure pure read/processing speed without terminal IO
-    ./zig-out/bin/zigaws scan "$S3_PATH" > /dev/null
+    ./zig-out/bin/zpq scan "$S3_PATH" > /dev/null
     end_time=$(python3 -c 'import time; print(time.time())')
     elapsed=$(python3 -c "print(f'{float(\"$end_time\") - float(\"$start_time\"):.4f}')")
     echo "Time: ${elapsed}s"

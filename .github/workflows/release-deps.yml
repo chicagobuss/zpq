@@ -1,0 +1,64 @@
+name: Release Dependencies
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'deps-*'
+
+jobs:
+  build-boring-ssl:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-linux
+          - os: macos-latest
+            target: x86_64-macos
+          - os: macos-latest
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig (via zvm)
+        run: |
+          curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
+          export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
+          echo "$HOME/.zvm/bin" >> $GITHUB_PATH
+          echo "$HOME/.zvm/self" >> $GITHUB_PATH
+          zvm install master
+          zvm use master
+
+      - name: Build BoringSSL
+        run: |
+          zig build -Dtarget=${{ matrix.target }} -Duse-prebuilt=false --summary all
+          
+          # Create the bundle
+          TRIPLE=${{ matrix.target }}
+          mkdir -p bundle/$TRIPLE
+          cp zig-out/lib/libcrypto.a bundle/$TRIPLE/
+          cp zig-out/lib/libssl.a bundle/$TRIPLE/
+          
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: boring-ssl-${{ matrix.target }}
+          path: bundle/
+
+  release:
+    needs: build-boring-ssl
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/deps-')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-artifacts/**/*

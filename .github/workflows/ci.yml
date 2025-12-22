@@ -9,47 +9,34 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64-linux
-            runs-on: ubuntu-latest
-            zig-arch: x86_64-linux
-          - arch: aarch64-linux
-            runs-on: ubuntu-latest-4-cores-arm
-            zig-arch: aarch64-linux
-
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Zig
+      - name: Set up Zig (via zvm)
         run: |
-          ZIG_VERSION=$(cat .zig-version)
-          ZIG_ARCH="${{ matrix.zig-arch }}"
-          # Fetch download URL from ziglang.org JSON API
-          if [ "$ZIG_VERSION" = "master" ]; then
-            ZIG_URL=$(curl -s https://ziglang.org/download/index.json | jq -r ".master.\"${ZIG_ARCH}\".tarball")
-          else
-            ZIG_URL=$(curl -s https://ziglang.org/download/index.json | jq -r ".\"${ZIG_VERSION}\".\"${ZIG_ARCH}\".tarball")
+          curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
+          export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
+          echo "$HOME/.zvm/bin" >> $GITHUB_PATH
+          echo "$HOME/.zvm/self" >> $GITHUB_PATH
+          # Install and use Zig master (dev)
+          zvm install master
+          zvm use master
+
+      - name: Install Just
+        run: |
+          if ! command -v just &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
           fi
-          echo "Downloading Zig ${ZIG_VERSION} for ${ZIG_ARCH} from: $ZIG_URL"
-          curl -L "$ZIG_URL" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          rm -f zig.tar.xz
-          # Make reruns (e.g. local `act`) idempotent
-          rm -rf zig
-          mv zig-* zig
-          echo "$(pwd)/zig" >> $GITHUB_PATH
 
       - name: Build
-        run: zig build
+        run: zig build --summary all --verbose
 
       - name: Run Tests
-        run: zig build test
+        run: zig build test --summary all --verbose
 
       - name: Run Inspector Verification
         run: |
-          zig build run -- inspect ci/fixtures/parquet/simple.parquet
-          zig build run -- inspect ci/fixtures/parquet/required.parquet
+          zig build run --summary all --verbose -- inspect ci/fixtures/parquet/simple.parquet
+          zig build run --summary all --verbose -- inspect ci/fixtures/parquet/required.parquet
 

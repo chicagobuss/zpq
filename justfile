@@ -5,17 +5,33 @@ default:
 # Run all checks (tests + build + verify)
 all: test build verify
 
-# Build the project
+# Build the project (Core only)
 build:
     zig build
+
+# Build everything including tests and probes
+build-and-test:
+    zig build -Dall
 
 # Check compilation (Lint)
 lint:
     zig build check
 
 # Run unit tests (Fast)
-test:
-    zig build test --summary all
+test *args="":
+    zig build test --summary all -- {{args}}
+
+# List all tests defined in the codebase
+list-tests:
+    @grep -rhE 'test ".+"' src tests | sed 's/test "//;s/" {//' | sort
+
+# Run tests with verbose output (shows every compiler command and test names)
+test-verbose *args="":
+    zig build test -Dverbose-tests --summary all --verbose -- {{args}}
+
+# Run specific tests by name filter (useful for debugging)
+test-filter *filter:
+    zig build test --summary all -- --test-filter "{{filter}}"
 
 # Verify compilation for all major targets (Critical for Lambda)
 cross-check:
@@ -123,6 +139,15 @@ verify-malformed: build gen-malformed
 
     @echo "Malformed tests passed (all files rejected)."
 
+# Fetch pre-built dependencies to speed up build
+fetch-deps:
+    @echo "Fetching pre-built BoringSSL static libraries..."
+    mkdir -p vendor/boring_tls/prebuilt/$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')
+    TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
+    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-latest/libcrypto.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
+    TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
+    curl -L https://github.com/chicagobuss/zpq/releases/download/deps-latest/libssl.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
+
 # Clean build artifacts
 clean:
     rm -rf zig-cache zig-out
@@ -130,11 +155,14 @@ clean:
 
 # Run local CI via act (requires act installed)
 ci:
-    act --container-architecture linux/amd64 -P ubuntu-latest=catthehacker/ubuntu:act-latest -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
+    act --container-architecture $([ $(uname -m) == "arm64" ] && echo "linux/arm64" || echo "linux/amd64") -P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Run local CI (alias)
+test-ci: ci
 
 # Run local CI for ARM64 (Native on M1/M2 Mac)
 ci-arm:
-    act -j test --matrix arch:aarch64-linux --container-architecture linux/arm64 -P ubuntu-latest-4-cores-arm=catthehacker/ubuntu:act-latest
+    act -j test --container-architecture linux/arm64 -P ubuntu-latest=catthehacker/ubuntu:act-latest
 
 # Remote CI (real hardware)
 remote-ci-arm:

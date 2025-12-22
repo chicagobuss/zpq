@@ -70,4 +70,3 @@ jobs:
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
-          make_latest: true

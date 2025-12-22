@@ -29,14 +29,17 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
           fi
 
+      - name: Fetch Pre-built Dependencies
+        run: just fetch-deps
+
       - name: Build
-        run: zig build --summary all --verbose
+        run: just build
 
       - name: Run Tests
-        run: zig build test --summary all --verbose
+        run: just test
 
       - name: Run Inspector Verification
         run: |
-          zig build run --summary all --verbose -- inspect ci/fixtures/parquet/simple.parquet
-          zig build run --summary all --verbose -- inspect ci/fixtures/parquet/required.parquet
+          ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
+          ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
 

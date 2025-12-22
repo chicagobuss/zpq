@@ -9,6 +9,7 @@ pub const Page = struct {
     data: []u8, 
 
     pub fn deinit(self: *Page, allocator: std.mem.Allocator) void {
+        std.debug.print("  [LIB_DEBUG] FREEING page data at {*}\n", .{self.data.ptr});
         allocator.free(self.data);
     }
 };

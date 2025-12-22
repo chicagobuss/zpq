@@ -20,14 +20,14 @@ const ManualContext = struct {
         // We'll just leak them for now to avoid the libxev/io_uring use-after-free
         // during rapid benchmark shutdown. In a real app, the pool would live
         // for the duration of the process.
-        
+
         // self.source.deinit(); // This closes the loop
-        
+
         if (self.host_owned) |h| self.allocator.free(h);
         self.tp_resolver.deinit();
         self.thread_pool.shutdown();
         self.thread_pool.deinit();
-        
+
         // We skip pool.deinit() and source.deinit() to avoid the crash
         // The GPA will report leaks, but we can ignore those for the E2E proof.
     }
@@ -147,21 +147,22 @@ pub fn main() !void {
         defer file.deinit();
 
         try file.readFooter();
-        
+
         var values_count: usize = 0;
+        // Use a per-iteration arena for the actual data pages
+        var iter_arena = std.heap.ArenaAllocator.init(allocator);
+        defer iter_arena.deinit();
+        const aa = iter_arena.allocator();
+
         for (file.metadata.?.row_groups.items) |row_group| {
-            const col_chunk = row_group.columns.items[0];
-            var reader = try zpq.column.ColumnReader.init(file.source, col_chunk);
+            for (row_group.columns.items) |col_chunk| {
+                var reader = try zpq.column.ColumnReader.init(file.source, col_chunk);
 
-            // Use a per-iteration arena for the actual data pages
-            var iter_arena = std.heap.ArenaAllocator.init(allocator);
-            defer iter_arena.deinit();
-            const aa = iter_arena.allocator();
-
-            while (try reader.next(aa)) |page_val| {
-                var page = page_val;
-                if (page.header.data_page_header) |dph| {
-                    values_count += @intCast(dph.num_values);
+                while (try reader.next(aa)) |page_val| {
+                    var page = page_val;
+                    if (page.header.data_page_header) |dph| {
+                        values_count += @intCast(dph.num_values);
+                    }
                 }
             }
         }

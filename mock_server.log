@@ -1,0 +1,140 @@
+Mock S3 Server listening on 127.0.0.1:9000
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] Waiting for request #1...
+[Conn] New connection
+[Conn] Client closed connection (EOF)
+[Conn] Client closed connection (EOF)
+[Conn] Waiting for request #1...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Req #2] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-19
+  Responding: 206 Partial Content, Content-Length: 20
+[Conn] Waiting for request #3...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Req #2] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-19
+  Responding: 206 Partial Content, Content-Length: 20
+[Conn] Waiting for request #3...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Req #2] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-19
+  Responding: 206 Partial Content, Content-Length: 20
+[Conn] Waiting for request #3...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-99
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] Waiting for request #2...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Req #2] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-19
+  Responding: 206 Partial Content, Content-Length: 20
+[Conn] Waiting for request #3...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-99
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] Waiting for request #2...
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 87 bytes
+[Conn] Waiting for request #1...
+[Req #1] Received 90 bytes
+  Method: GET, Path: /req2, Range: 100-199
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] New connection
+[Conn] Waiting for request #2...
+  Method: GET, Path: /req1, Range: 0-99
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] Waiting for request #1...
+[Req #1] Received 90 bytes
+  Method: GET, Path: /req3, Range: 200-299
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] Waiting for request #2...
+[Conn] Waiting for request #2...
+[Conn] Client closed connection (EOF)
+[Conn] Client closed connection (EOF)
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 90 bytes
+[Conn] Waiting for request #1...
+[Req #1] Received 87 bytes
+  Method: GET, Path: /req2, Range: 100-199
+  Responding: 206 Partial Content, Content-Length: 100
+[Req #1] Received 90 bytes
+[Conn] Waiting for request #2...
+  Method: GET, Path: /req3, Range: 200-299
+  Responding: 206 Partial Content, Content-Length: 100
+  Method: GET, Path: /req1, Range: 0-99
+  Responding: 206 Partial Content, Content-Length: 100
+[Conn] Waiting for request #2...
+[Conn] Waiting for request #2...
+[Conn] Client closed connection (EOF)
+[Conn] Client closed connection (EOF)
+[Conn] Client closed connection (EOF)
+[Conn] New connection
+[Conn] Waiting for request #1...
+[Req #1] Received 75 bytes
+  Method: HEAD, Path: /bucket/key, Range: null-null
+  Responding: 200 OK, Content-Length: 10485760
+[Conn] Waiting for request #2...
+[Req #2] Received 93 bytes
+  Method: GET, Path: /bucket/key, Range: 0-19
+  Responding: 206 Partial Content, Content-Length: 20
+[Conn] Waiting for request #3...
+[Conn] Client closed connection (EOF)

@@ -22,8 +22,8 @@ pub const S3Context = struct {
         self.spec_resolver.deinit();
         self.sf_resolver.deinit();
         self.tp_resolver.deinit();
-        self.thread_pool.deinit();
         self.thread_pool.shutdown();
+        self.thread_pool.deinit();
     }
 };
 
@@ -145,18 +145,7 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
     ctx.spec_resolver = dns.SpeculativeResolver.init(allocator, ctx.sf_resolver.resolver());
     errdefer ctx.spec_resolver.deinit();
 
-    ctx.source = try s3.AsyncS3Source.init(
-        allocator, 
-        &ctx.pool, 
-        ctx.spec_resolver.resolver(), 
-        ctx.host_owned.?, 
-        port, 
-        bucket, 
-        key, 
-        use_tls, 
-        null, 
-        config
-    );
+    ctx.source = try s3.AsyncS3Source.init(allocator, &ctx.pool, ctx.spec_resolver.resolver(), ctx.host_owned.?, port, bucket, key, use_tls, null, config);
 
     return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3) catch |err| {
         cleanupAsyncS3(ctx, allocator);

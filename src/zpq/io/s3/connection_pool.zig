@@ -32,8 +32,8 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *ConnectionPool) void {
         for (self.idle_connections.items) |entry| {
             // Note: We don't call conn.close() here because it's asynchronous.
-            // The owner of the pool (AsyncS3Source) should ensure connections 
-            // are closed and the loop is ticked before deiniting the pool 
+            // The owner of the pool (AsyncS3Source) should ensure connections
+            // are closed and the loop is ticked before deiniting the pool
             // if they want a clean shutdown.
             entry.conn.deinit();
             self.allocator.free(entry.key.host);

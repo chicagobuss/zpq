@@ -53,6 +53,14 @@ pub const ResponseParser = struct {
                         try self.parseHeaders(headers);
                         self.state = .reading_body;
 
+                        // Check for immediate completion (Content-Length: 0)
+                        if (self.content_length) |len| {
+                            if (len == 0) {
+                                self.state = .done;
+                                return;
+                            }
+                        }
+
                         // Any extra bytes after the header terminator belong to body.
                         const body_start = pos + 4;
                         if (body_start < self.header_len) {
@@ -118,5 +126,3 @@ pub const ResponseParser = struct {
         }
     }
 };
-
-

@@ -32,3 +32,14 @@ alwaysApply: false
     *   *Property-based*: `expect(parse(toString(n)) == n)` for all integers `n`.
 *   **Shrinking**: Leverage Minish's shrinking capability to find minimal reproduction cases for crashes.
 *   **Context**: Inject `allocator` into properties using the Context Wrapper pattern to support memory-managed fuzzing.
+
+## 7. Zig 0.16.dev "Source-First" Mandate
+*   **Volatility**: Assume all `std` signatures are "Broken" until verified against the local source in `/home/joshua/.zvm/master/lib/std/`.
+*   **Verification Path**: Before using or debugging `std.X`, you MUST run:
+    `grep -r "pub fn [function_name]" /home/joshua/.zvm/master/lib/std/[module].zig`
+*   **No Guessing**: If a build fails with "no member named X", stop immediately and read the `std` source file. Do not attempt a second guess based on training data.
+*   **Common 0.16.x Breaking Examples**:
+    *   `std.ArrayList(T).init(allocator)` -> **REMOVED**. Use `std.ArrayList(T).empty` (unmanaged) or `initCapacity(allocator, n)`.
+    *   `list.append(item)` -> **REMOVED**. Use `list.append(allocator, item)`.
+    *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
+    *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()` and manage the opaque platform timestamp.

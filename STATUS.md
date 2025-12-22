@@ -31,11 +31,11 @@
 *   [x] **Safety**: TLS verification enabled by default.
 *   [x] **Flow Control**: Implemented backpressure (write queue) in `Connection`.
 *   [x] **Verification**: Zero-allocation gap skipping formally proved (`tests/io/test_gap_skipping.zig`).
-*   [ ] **Property-Based Testing (Minish)**:
+*   [x] **Property-Based Testing (Minish)**:
     *   [x] **Adoption**: Vendored and patched `minish` for Zig 0.16.
     *   [x] **Context Injection**: Enabled allocator-aware property testing.
-    *   [ ] **Thrift Fuzzer**: Verify metadata parser robustness.
-    *   [ ] **HTTP Fuzzer**: Verify header parser crash-safety.
+    *   [x] **Thrift Fuzzer**: Verified metadata parser robustness (Round-Trip).
+    *   [x] **HTTP Fuzzer**: Fixed zero-body hang bug discovered by Minish.
 
 ### Milestone 1: Core Parquet Engine & Encodings [COMPLETE]
 *   [x] **Core Reading**: Thrift metadata parsing, Page iteration, Column chunk handling.

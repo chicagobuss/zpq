@@ -7,11 +7,13 @@ pub const core = struct {
     pub const decoder = @import("zpq/core/decoder.zig");
     pub const rle = @import("zpq/core/rle.zig");
     pub const snappy = @import("zpq/core/snappy.zig");
+    pub const thrift = @import("zpq/core/thrift.zig");
 };
 
 pub const io = struct {
     pub const interface = @import("zpq/io/interface.zig");
     pub const http = @import("zpq/io/http/client.zig");
+    pub const response_parser = @import("zpq/io/http/response_parser.zig");
     pub const tls = @import("zpq/io/tls/connection.zig");
 };
 

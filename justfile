@@ -76,21 +76,21 @@ check-tls: build
 # Run comprehensive tests including heavy data and edge cases (Slow)
 comprehensive: build gen-fixtures
     @echo "Running comprehensive checks..."
-    
+
     # 1. Correctness on Edge Cases
     @echo "[Check] Large RLE Decoding..."
     zig build run -- cat data/large_rle.parquet 10 > /dev/null
-    
+
     @echo "[Check] Bit-Packed Handling..."
     zig build run -- cat data/large_bitpacked.parquet 10 > /dev/null
-    
+
     @echo "[Check] High Bit Widths..."
     zig build run -- cat data/high_width.parquet 10 > /dev/null
-    
+
     # 2. Performance / Throughput
     @echo "[Bench] Scanning Many Rows (Throughput)..."
     zig build run -- scan data/many_rows.parquet
-    
+
     # 3. Complex/Real-world Data (if available)
     # If skyway-subset exists, test it
     @if [ -f data/skyway-subset.parquet ]; then \
@@ -130,7 +130,7 @@ gen-malformed:
 # Verify that the reader correctly handles malformed files (Should fail gracefully)
 verify-malformed: build gen-malformed
     @echo "Testing corrupt file handling..."
-    
+
     @echo "[Check] Bad Magic Bytes (Should fail)..."
     @! zig build run -- inspect data/malformed/bad_magic.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
@@ -139,7 +139,7 @@ verify-malformed: build gen-malformed
 
     @echo "[Check] Garbage Footer Length (Should fail)..."
     @! zig build run -- inspect data/malformed/garbage_footer_len.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
-    
+
     @echo "[Check] Random Garbage with Valid Magic (Should fail)..."
     @! zig build run -- inspect data/malformed/random_garbage.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
@@ -148,11 +148,11 @@ verify-malformed: build gen-malformed
 # Fetch pre-built dependencies to speed up build
 fetch-deps:
     @echo "Fetching pre-built BoringSSL static libraries ({{DEPS_TAG}})..."
-    @mkdir -p vendor/boring_tls/prebuilt/$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')
     @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a"
-    @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-    curl -L https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
+        mkdir -p vendor/boring_tls/prebuilt/$$TRIPLE && \
+        echo "Detected triple: $$TRIPLE" && \
+        curl -fL https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a" && \
+        curl -fL https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
 
 # Clean build artifacts
 clean:
@@ -160,8 +160,29 @@ clean:
     rm -rf data/*.parquet data/*.json
 
 # Run local CI via act (requires act installed)
+# Note: First run is slow (~5-10min) due to BoringSSL compilation if pre-built deps unavailable
 ci:
-    act --container-architecture $([ $(uname -m) == "arm64" ] && echo "linux/arm64" || echo "linux/amd64") -P ubuntu-latest=catthehacker/ubuntu:act-latest
+    act push -W .github/workflows/ci.yml --container-architecture $([ $(uname -m) == "arm64" ] && echo "linux/arm64" || echo "linux/amd64") -P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Run quick local CI (native, no Docker) - much faster for iteration
+ci-quick: lint test
+    @echo "Quick CI passed (lint + tests)"
+
+# Run full local CI without verbose debug output
+ci-quiet:
+    act push -W .github/workflows/ci.yml --container-architecture $([ $(uname -m) == "arm64" ] && echo "linux/arm64" || echo "linux/amd64") -P ubuntu-latest=catthehacker/ubuntu:act-latest 2>&1 | grep -E "^\\[|Success|Failed|Error"
+
+# Build Linux BoringSSL deps locally (cross-compile, caches in Docker volume)
+# Run this once to speed up future `just ci` runs
+ci-warm-cache:
+    @echo "Building BoringSSL for Linux (this takes ~10 min first time)..."
+    docker run --rm -v zpq-zig-cache:/root/.cache/zig -v $(pwd):/work -w /work \
+        catthehacker/ubuntu:act-latest \
+        bash -c 'curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash && \
+                 export PATH=$$HOME/.zvm/bin:$$HOME/.zvm/self:$$PATH && \
+                 zvm install master && zvm use master && \
+                 cd vendor/boring_tls && zig build -Duse-prebuilt=false --summary all'
+    @echo "Cache warmed! Future 'just ci' runs will be faster."
 
 # Run local CI (alias)
 test-ci: ci
@@ -214,4 +235,3 @@ build-lambda-bench:
 bench-sweep:
     ./tools/bench_memory_sweep.sh
     @echo "Created zig-out/lambda/lambda_function.zip"
-

@@ -2,14 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -24,22 +25,81 @@ jobs:
           zvm use master
 
       - name: Install Just
-        run: |
-          if ! command -v just &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
-          fi
+        uses: extractions/setup-just@v2
 
       - name: Fetch Pre-built Dependencies
-        run: just fetch-deps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "::group::Fetching pre-built BoringSSL libraries"
+          # Determine target triple for this runner
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            TARGET="x86_64-linux"
+          elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            TARGET="aarch64-linux"
+          else
+            echo "Unknown architecture: $ARCH, will build from source"
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "Detected target: $TARGET"
+
+          mkdir -p vendor/boring_tls/prebuilt/$TARGET
+          DEPS_TAG="deps-v0.1"
+
+          # Try fetching with gh CLI (works for private repos with token)
+          if command -v gh &> /dev/null && [ -n "$GH_TOKEN" ]; then
+            echo "Using gh CLI for authenticated download..."
+            gh release download "$DEPS_TAG" \
+              --repo chicagobuss/zpq \
+              --pattern "libcrypto-${TARGET}.a" \
+              --pattern "libssl-${TARGET}.a" \
+              --dir "vendor/boring_tls/prebuilt/${TARGET}/" \
+              --clobber 2>/dev/null && {
+                # Rename files (gh downloads with original names)
+                mv "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || true
+                mv "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" 2>/dev/null || true
+              } || echo "gh download failed, trying curl..."
+          fi
+
+          # Fallback to curl (for when repo becomes public)
+          if [ ! -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ]; then
+            BASE_URL="https://github.com/chicagobuss/zpq/releases/download/${DEPS_TAG}"
+            echo "Fetching from: $BASE_URL"
+            curl -fsSL "${BASE_URL}/libcrypto-${TARGET}.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || true
+            curl -fsSL "${BASE_URL}/libssl-${TARGET}.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" 2>/dev/null || true
+          fi
+
+          # Verify downloads
+          if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ]; then
+            echo "Successfully fetched pre-built dependencies"
+            ls -la vendor/boring_tls/prebuilt/${TARGET}/
+          else
+            echo "Pre-built deps not available, will build from source (~5-10 min)"
+          fi
+          echo "::endgroup::"
 
       - name: Build
-        run: just build
+        run: |
+          echo "::group::Zig Build"
+          zig build --summary all 2>&1
+          echo "::endgroup::"
+          echo "Build artifacts:"
+          ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
 
       - name: Run Tests
-        run: just test
+        run: |
+          echo "::group::Running Tests"
+          zig build test --summary all 2>&1
+          echo "::endgroup::"
 
       - name: Run Inspector Verification
         run: |
+          echo "::group::Inspector Verification"
+          echo "Testing simple.parquet..."
           ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
+          echo "Testing required.parquet..."
           ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
-
+          echo "::endgroup::"
+          echo "All verifications passed!"

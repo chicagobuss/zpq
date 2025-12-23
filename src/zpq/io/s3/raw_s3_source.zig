@@ -5,6 +5,8 @@ const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
 const ConnectionKey = @import("connection_pool.zig").ConnectionKey;
 const Connection = @import("connection_pool.zig").Connection;
 const Io = std.Io;
+const zpq_log = @import("../../zpq.zig").log;
+const log = zpq_log.s3;
 
 pub const RawS3Source = struct {
     allocator: std.mem.Allocator,
@@ -95,11 +97,11 @@ pub const RawS3Source = struct {
         };
         const count = try std.posix.poll(&fds, timeout_ms);
         if (count == 0) {
-            std.debug.print("[RawS3] Read timeout ({d}ms)\n", .{timeout_ms});
+            log.debug("read timeout ({d}ms)", .{timeout_ms});
             return error.Timeout;
         }
         if (fds[0].revents & std.posix.POLL.ERR != 0) {
-            std.debug.print("[RawS3] Socket POLL.ERR\n", .{});
+            log.debug("socket POLL.ERR", .{});
             return error.SocketError;
         }
         if (fds[0].revents & std.posix.POLL.HUP != 0) {
@@ -128,9 +130,9 @@ pub const RawS3Source = struct {
             if (self.pool.acquire(key)) |c| {
                 conn = c;
                 reused = true;
-                std.debug.print("[RawS3] Reusing connection FD {d}\n", .{conn.fd});
+                log.debug("reusing connection FD {d}", .{conn.fd});
             } else {
-                std.debug.print("[RawS3] Connecting new socket...\n", .{});
+                log.debug("connecting new socket...", .{});
                 const fd = try self.connectNew();
                 conn = Connection{ .fd = fd };
                 reused = false;
@@ -140,7 +142,7 @@ pub const RawS3Source = struct {
             const result = performRequest(self, conn.fd, offset, buf) catch |err| {
                 // Handle retryable errors
                 if (reused and (err == error.BrokenPipe or err == error.EndOfStream or err == error.ConnectionReset)) {
-                    std.debug.print("[RawS3] Stale connection detected (FD {d}). Retrying...\n", .{conn.fd});
+                    log.debug("stale connection detected (FD {d}), retrying...", .{conn.fd});
                     std.posix.close(conn.fd); // Close bad socket
                     continue; // Retry loop
                 }

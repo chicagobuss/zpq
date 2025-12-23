@@ -1,31 +1,32 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const log = @import("../../../zpq.zig").log.tls;
 
 pub const TlsAdapter = struct {
     allocator: std.mem.Allocator,
-    
+
     // Low-level IO
     stream: net.Stream,
     threaded: Io.Threaded,
     io: Io,
-    
+
     // Buffered Readers/Writers (Concrete Types)
     net_reader: net.Stream.Reader,
     net_writer: net.Stream.Writer,
-    
+
     // Buffers for the underlying network reader/writer
     // Must be large enough for TLS records (16KB + overhead)
     read_buf: [18 * 1024]u8 = undefined,
     write_buf: [18 * 1024]u8 = undefined,
-    
+
     // TLS Internal Buffers (required by Client.Options)
     tls_read_buf: [18 * 1024]u8 = undefined,
     tls_write_buf: [18 * 1024]u8 = undefined,
-    
+
     // Randomness for handshake
     entropy: [176]u8 = undefined,
-    
+
     // TLS
     client: std.crypto.tls.Client,
     bundle: std.crypto.Certificate.Bundle,
@@ -34,31 +35,31 @@ pub const TlsAdapter = struct {
         // Allocate self on heap to ensure stable pointers
         const self = try allocator.create(TlsAdapter);
         errdefer allocator.destroy(self);
-        
+
         self.allocator = allocator;
-        
+
         // Setup IO
         self.threaded = Io.Threaded.init(allocator);
         errdefer self.threaded.deinit();
         self.io = self.threaded.io();
-        
+
         // Setup Bundle
         self.bundle = std.crypto.Certificate.Bundle{};
-        
+
         const ts = try std.posix.clock_gettime(std.posix.CLOCK.REALTIME);
         const ns = @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec;
         const now = Io.Timestamp{ .nanoseconds = ns };
-        
+
         try self.bundle.rescan(allocator, self.io, now);
         errdefer self.bundle.deinit(allocator);
-        
+
         if (trusted_cert) |cert| {
-            std.debug.print("[TlsAdapter] Adding custom cert (len: {d})\n", .{cert.len});
+            log.debug("adding custom cert (len: {d})", .{cert.len});
             try addCertToBundle(&self.bundle, allocator, cert, ts.sec);
         } else {
-            std.debug.print("[TlsAdapter] No custom cert provided\n", .{});
+            log.debug("no custom cert provided", .{});
         }
-        
+
         // Setup Stream
         self.stream = net.Stream{
             .socket = .{
@@ -66,14 +67,14 @@ pub const TlsAdapter = struct {
                 .address = undefined,
             },
         };
-        
+
         // Setup Reader/Writer
         self.net_reader = self.stream.reader(self.io, &self.read_buf);
         self.net_writer = self.stream.writer(self.io, &self.write_buf);
-        
+
         // Setup Entropy
         std.crypto.random.bytes(&self.entropy);
-        
+
         // Init TLS Client
         const options = std.crypto.tls.Client.Options{
             .host = .{ .explicit = host },
@@ -83,37 +84,33 @@ pub const TlsAdapter = struct {
             .entropy = &self.entropy,
             .realtime_now_seconds = ts.sec,
         };
-        
-        self.client = try std.crypto.tls.Client.init(
-            &self.net_reader.interface, 
-            &self.net_writer.interface, 
-            options
-        );
-        
+
+        self.client = try std.crypto.tls.Client.init(&self.net_reader.interface, &self.net_writer.interface, options);
+
         // Flush the initial ClientHello
         try self.net_writer.interface.flush();
-        
+
         return self;
     }
-    
+
     pub fn deinit(self: *TlsAdapter) void {
         // Cleanup
         self.bundle.deinit(self.allocator);
         self.threaded.deinit();
         self.allocator.destroy(self);
     }
-    
+
     pub fn read(self: *TlsAdapter, buffer: []u8) !usize {
         var buffers = [1][]u8{buffer};
-        std.debug.print("[TlsAdapter] calling client.reader.readVec\n", .{});
+        log.debug("calling client.reader.readVec", .{});
         const n = try self.client.reader.readVec(&buffers);
-        std.debug.print("[TlsAdapter] client.reader.readVec returned {d}\n", .{n});
+        log.debug("readVec returned {d}", .{n});
         if (n == 0) {
-             std.debug.print("[TlsAdapter] Read 0 bytes (EOF?)\n", .{});
+            log.debug("read 0 bytes (EOF?)", .{});
         }
         return n;
     }
-    
+
     pub fn write(self: *TlsAdapter, buffer: []const u8) !usize {
         const n = try self.client.writer.write(buffer);
         try self.net_writer.interface.flush();
@@ -146,6 +143,6 @@ fn addCertToBundle(bundle: *std.crypto.Certificate.Bundle, allocator: std.mem.Al
         bundle.bytes.items.len += decoded_len;
 
         try bundle.parseCert(allocator, decoded_start, now_sec);
-        std.debug.print("[TlsAdapter] Added custom cert to bundle (len: {d})\n", .{decoded_len});
+        log.debug("added custom cert to bundle (len: {d})", .{decoded_len});
     }
 }

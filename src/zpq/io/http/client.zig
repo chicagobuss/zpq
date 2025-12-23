@@ -1,11 +1,12 @@
 const std = @import("std");
 const xev = @import("xev");
 const tls = @import("../tls/connection.zig");
+const log = @import("../../../zpq.zig").log.http;
 
 pub const Client = struct {
     loop: *xev.Loop,
     allocator: std.mem.Allocator,
-    
+
     pub fn init(loop: *xev.Loop, allocator: std.mem.Allocator) Client {
         return .{ .loop = loop, .allocator = allocator };
     }
@@ -33,7 +34,7 @@ pub const Client = struct {
         self.allocator.destroy(ctx.conn);
         self.allocator.destroy(ctx);
     }
-    
+
     // Simplest fetch: Connects, sends request, prints response (for verification)
     pub fn fetch(self: *Client, host: []const u8, ip: []const u8, port: u16, path: []const u8) !void {
         return self.fetchWithResult(host, ip, port, path, null);
@@ -51,7 +52,7 @@ pub const Client = struct {
         // We need to allocate the connection on heap so pointers remain valid
         const conn = try self.allocator.create(tls.Connection);
         conn.* = try tls.Connection.init(self.loop, self.allocator, host);
-        
+
         // Context for callbacks
         const ctx = try self.allocator.create(ReqContext);
         ctx.* = .{
@@ -63,15 +64,15 @@ pub const Client = struct {
             .finished = false,
         };
         if (result) |r| r._ctx = ctx;
-        
+
         conn.user_ctx = ctx;
         conn.on_connect = onConnect;
         conn.on_data = onData;
         conn.on_error = onError;
-        
+
         // Parse IP (blocking for now, or assume IP string)
         const addr = try xev.shim_net.Address.parseIp4(ip, port);
-        
+
         try conn.connect(addr);
     }
 };
@@ -87,15 +88,15 @@ const ReqContext = struct {
 
 fn onConnect(ctx_void: ?*anyopaque) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
-    std.debug.print("HTTP Client: Connected! Sending Request...\n", .{});
-    
+    log.debug("connected, sending request", .{});
+
     // Send HEAD Request
     const req_fmt = "HEAD {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: zpq-client\r\nConnection: close\r\n\r\n";
-    const req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ctx.path, ctx.host}) catch return;
+    const req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ ctx.path, ctx.host }) catch return;
     defer ctx.allocator.free(req);
-    
+
     ctx.conn.write(req) catch |err| {
-        std.debug.print("Write error: {}\n", .{err});
+        log.err("write failed: {}", .{err});
     };
 }
 
@@ -105,7 +106,7 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
         r.got_any_data = true;
         r.bytes += data.len;
     }
-    std.debug.print("HTTP Client: Received {} bytes\n{s}\n", .{data.len, data});
+    log.debug("received {d} bytes:\n{s}", .{ data.len, data });
 }
 
 fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
@@ -116,7 +117,7 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
         if (ctx.result) |r| {
             r.err = err;
         }
-        std.debug.print("HTTP Client: Error: {}\n", .{err});
+        log.err("error: {}", .{err});
         // Stop the loop so the caller can decide how to handle the error.
         ctx.conn.loop.stop();
         return;
@@ -125,4 +126,3 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
     // If already finished, still stop the loop (idempotent).
     ctx.conn.loop.stop();
 }
-

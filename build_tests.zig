@@ -361,5 +361,27 @@ pub fn addAuxiliaryTools(
             const step = b.step("probe-tls-echo", "Run TLS echo micro-test");
             step.dependOn(&run.step);
         }
+
+        // 19. probe_s3_head_hang - diagnose async S3 HEAD request hang
+        {
+            const mod = b.createModule(.{
+                .root_source_file = b.path("probes/probe_s3_head_hang.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            mod.addImport("zpq", zpq_mod);
+            mod.addImport("xev", libxev_mod);
+
+            const exe = b.addExecutable(.{
+                .name = "probe-s3-head-hang",
+                .root_module = mod,
+            });
+            exe.root_module.linkSystemLibrary("c", .{});
+            if (install_all) b.installArtifact(exe);
+
+            const run = b.addRunArtifact(exe);
+            const step = b.step("probe-s3-head-hang", "Run S3 HEAD request hang probe");
+            step.dependOn(&run.step);
+        }
     }
 }

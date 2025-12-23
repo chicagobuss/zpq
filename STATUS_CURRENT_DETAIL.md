@@ -53,6 +53,29 @@ Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate t
 
 ---
 
+## Known Issues / TODO
+
+### Debug Output Leaking to Stdout
+**Status**: Needs fix  
+**Observed**: `[LIB_DEBUG] FREEING page data at ...` messages appear in `cat` and `scan` output.  
+**Root Cause**: Debug print statements in the page deallocation path are unconditionally enabled.  
+**Solution**: Add a `--debug` or `-v` CLI flag to enable verbose/debug output. Debug logging should be gated behind this flag and disabled by default.
+
+### Test Data Available
+S3 test corpus uploaded to `s3://skyway-diat-staging-data/test_data/`:
+```
+valid/
+├── compression/{snappy,gzip,zstd,uncompressed}/basic_1k.parquet
+├── sizes/{tiny/50_rows.parquet, small/10k_rows.parquet}
+└── schemas/{primitives/all_types.parquet, nested/structs_lists_maps.parquet, nulls/sparse_nulls.parquet}
+invalid/
+├── corrupted/{truncated.parquet, random_garbage.parquet}
+└── malformed/{empty.parquet, bad_magic.parquet, bad_footer_magic.parquet}
+```
+Local copies persist at `/mnt/d/work/zpq-scratch/test_data/` (WSL2).
+
+---
+
 ## Future Technical Objectives (Milestone 11):
 1.  **Plan 09: Lambda End-to-End**: Packaging the verified ARM64 engine into a deployable Lambda function with optimized cold starts.
 2.  **Milestone 8: Persistent Pool & Timeouts**: Addressing the cleanup hang in `AsyncFancy` by implementing formal keep-alive timeouts and idle connection harvesting.

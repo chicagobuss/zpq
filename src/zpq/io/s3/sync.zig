@@ -2,6 +2,7 @@ const std = @import("std");
 const io = @import("../interface.zig");
 const sigv4 = @import("sigv4.zig");
 const types = @import("types.zig");
+const log = @import("../../../zpq.zig").log.s3;
 
 // Export shared types
 pub const S3Config = types.S3Config;
@@ -215,16 +216,16 @@ pub const S3Source = struct {
         var response = try req.receiveHead(&redirect_buf);
 
         if (!response.head.keep_alive) {
-            std.debug.print("DEBUG: Connection will close (keep_alive=false)\n", .{});
+            log.debug("connection will close (keep_alive=false)", .{});
         }
 
         if (response.head.status != .ok and response.head.status != .partial_content) {
-            std.debug.print("S3 {s} Failed. Status: {any}\n", .{ @tagName(method), response.head.status });
+            log.err("{s} failed, status: {}", .{ @tagName(method), response.head.status });
             var transfer_buf: [4096]u8 = undefined;
             var reader = response.reader(&transfer_buf);
             var body_buf: [4096]u8 = undefined;
             const n = reader.readSliceShort(&body_buf) catch 0;
-            std.debug.print("Error Body: {s}\n", .{body_buf[0..n]});
+            log.debug("error body: {s}", .{body_buf[0..n]});
             return if (method == .HEAD) error.S3HeadFailed else error.S3ReadFailed;
         }
 

@@ -1,5 +1,8 @@
 const std = @import("std");
 pub const xev = @import("xev");
+const zpq_log = @import("../../../zpq.zig").log;
+
+const log = zpq_log.dns;
 
 pub const Address = xev.shim_net.Address;
 
@@ -126,7 +129,7 @@ pub const ThreadPoolResolver = struct {
         const completion: *Resolver.Completion = @fieldParentPtr("internal", internal);
         const self: *ThreadPoolResolver = @ptrCast(@alignCast(completion.internal.resolver_ptr.?));
 
-        std.debug.print("[DNS] ThreadPool resolving {s}:{d}...\n", .{ completion.hostname, completion.port });
+        log.debug("resolving {s}:{d}", .{ completion.hostname, completion.port });
         const hostname_z = self.allocator.dupeZ(u8, completion.hostname) catch {
             completion.internal.err = error.OutOfMemory;
             if (completion.internal.xev_async) |*a| a.notify() catch {};

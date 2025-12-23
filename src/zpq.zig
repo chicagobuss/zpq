@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// Centralized logging for zpq.
+/// Note: Executables should define their own `std_options` to control log levels.
+/// Example: `pub const std_options: std.Options = .{ .log_level = .warn };`
+pub const log = @import("zpq/log.zig");
+
 pub const core = struct {
     pub const file = @import("zpq/core/file.zig");
     pub const schema = @import("zpq/core/schema.zig");

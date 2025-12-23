@@ -3,13 +3,14 @@ const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
 const io = @import("../io/interface.zig");
+const log = @import("../../zpq.zig").log.core;
 
 pub const Page = struct {
     header: schema.PageHeader,
-    data: []u8, 
+    data: []u8,
 
     pub fn deinit(self: *Page, allocator: std.mem.Allocator) void {
-        std.debug.print("  [LIB_DEBUG] FREEING page data at {*}\n", .{self.data.ptr});
+        log.debug("freeing page data at {*}", .{self.data.ptr});
         allocator.free(self.data);
     }
 };
@@ -23,7 +24,7 @@ pub const ColumnReader = struct {
 
     pub fn init(source: io.RandomAccessSource, chunk: schema.ColumnChunk) !ColumnReader {
         const meta = chunk.meta_data orelse return error.MissingColumnMetaData;
-        
+
         var start: u64 = @intCast(meta.data_page_offset);
         if (meta.dictionary_page_offset) |dpo| {
             if (dpo < start) start = @intCast(dpo);
@@ -42,12 +43,12 @@ pub const ColumnReader = struct {
         if (self.current_offset >= self.total_size) return null;
 
         const abs_pos = self.start_offset + self.current_offset;
-        
+
         // Read a buffer for the header. Thrift headers are usually small (< 1KB)
         var header_buf: [4096]u8 = undefined;
         // Limit read to remaining column size
         const bytes_to_read = @min(header_buf.len, self.total_size - self.current_offset);
-        
+
         const bytes_read = try self.source.readAt(abs_pos, header_buf[0..bytes_to_read]);
         if (bytes_read == 0) return null;
 
@@ -65,23 +66,23 @@ pub const ColumnReader = struct {
         // Yes.
         // Bytes available in header_buf after header: bytes_read - header_size
         const bytes_in_buf = bytes_read - header_size;
-        
+
         if (bytes_in_buf >= payload_size) {
             // Entire payload is in the buffer
             @memcpy(payload, header_buf[header_size .. header_size + payload_size]);
         } else {
             // Copy what we have
             @memcpy(payload[0..bytes_in_buf], header_buf[header_size..bytes_read]);
-            
+
             // Read the rest
             const remaining = payload_size - bytes_in_buf;
             const dest = payload[bytes_in_buf..];
-            
+
             // Read from source at correct offset (start + header + bytes_in_buf)
             // But abs_pos points to start of header.
             // So we want to read at: abs_pos + bytes_read
             const read_offset = abs_pos + bytes_read;
-            
+
             var total_read: usize = 0;
             while (total_read < remaining) {
                 const n = try self.source.readAt(read_offset + total_read, dest[total_read..]);
@@ -99,11 +100,11 @@ pub const ColumnReader = struct {
 
             const decompressed_len = try snappy.uncompress(payload, uncompressed);
             if (decompressed_len != uncompressed_size) {
-                 // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
+                // std.debug.print("Decompression size mismatch: expected {d}, got {d}\n", .{uncompressed_size, decompressed_len});
             }
-            
+
             allocator.free(payload);
-            
+
             return Page{
                 .header = header,
                 .data = uncompressed,

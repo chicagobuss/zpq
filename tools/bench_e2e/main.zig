@@ -2,6 +2,12 @@ const std = @import("std");
 const zpq = @import("zpq");
 const xev = zpq.s3.dns.xev;
 
+/// Suppress debug output for clean benchmark results.
+/// Only warnings and errors are shown.
+pub const std_options: std.Options = .{
+    .log_level = .warn,
+};
+
 const factory = zpq.s3.factory;
 const s3 = zpq.s3;
 const dns = s3.dns;

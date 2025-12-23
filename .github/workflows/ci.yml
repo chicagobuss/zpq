@@ -56,11 +56,17 @@ jobs:
               --pattern "libcrypto-${TARGET}.a" \
               --pattern "libssl-${TARGET}.a" \
               --dir "vendor/boring_tls/prebuilt/${TARGET}/" \
-              --clobber 2>/dev/null && {
-                # Rename files (gh downloads with original names)
-                mv "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || true
-                mv "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" 2>/dev/null || true
-              } || echo "gh download failed, trying curl..."
+              --clobber 2>/dev/null || echo "gh download failed, trying curl..."
+
+            # Rename files (gh downloads with original names like libcrypto-x86_64-linux.a)
+            if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" ]; then
+              mv "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a"
+              echo "Renamed libcrypto-${TARGET}.a -> libcrypto.a"
+            fi
+            if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" ]; then
+              mv "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libssl.a"
+              echo "Renamed libssl-${TARGET}.a -> libssl.a"
+            fi
           fi
 
           # Fallback to curl (for when repo becomes public)

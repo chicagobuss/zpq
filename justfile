@@ -1,7 +1,7 @@
 # Configuration
 GH_OWNER := "chicagobuss"
 GH_REPO := "zpq"
-DEPS_TAG := "deps-v0.1"
+DEPS_TAG := "deps-v0.2"
 ARM_BENCH_HOST := "oci-josh-arm-vm"
 
 # List available recipes

@@ -46,7 +46,7 @@ jobs:
           echo "Detected target: $TARGET"
 
           mkdir -p vendor/boring_tls/prebuilt/$TARGET
-          DEPS_TAG="deps-v0.1"
+          DEPS_TAG="deps-v0.2"
 
           # Try fetching with gh CLI (works for private repos with token)
           if command -v gh &> /dev/null && [ -n "$GH_TOKEN" ]; then

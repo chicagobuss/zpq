@@ -1,7 +1,7 @@
 # ZPQ Technical Context and Detail
 
-**Last Updated**: Dec 22, 2025
-**Current State**: Milestone 0 (CI & Build Hardening) Completed. Project is stable on Zig master with optimized pre-built dependency workflows. Milestone 10 (Empirical Proof) verified on ARM64 hardware.
+**Last Updated**: Dec 23, 2025
+**Current State**: Milestone 0 (CI & Build Hardening) Completed. Project is stable on Zig master with optimized pre-built dependency workflows. Milestone 10 (Empirical Proof) verified on ARM64 hardware. Batched column prefetch optimization delivers 1.7x speedup over PyArrow on cold starts.
 
 ## Milestone 9: Hardening & Transport Stability (Completed)
 Extensive debugging and refactoring to ensure production-grade stability and memory safety.
@@ -28,7 +28,15 @@ Successfully stabilized the project on Zig `master` and implemented a high-perfo
 ## Milestone 10: Empirical Proof & Performance (Phase 1 Complete)
 Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate the asynchronous architecture.
 
-### Benchmark Results (ARM64 Remote Host):
+### Benchmark Results (S3 Cold Start - 10k_rows.parquet, us-west-2):
+*Cold start comparison: fresh process, fresh TLS connection per run.*
+| Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |
+| :--- | :--- | :--- | :--- |
+| **ZPQ (Async + Prefetch)** | **~260ms** | **~1.7x** | Batched column prefetch via `RowGroupReader.prefetch()`. |
+| Python (PyArrow) | ~420-470ms | 1.0x | Fresh connection per process. |
+| ZPQ (Sync) | ~920ms | ~0.5x | Sequential single-range requests. |
+
+### Benchmark Results (ARM64 Remote Host - 84MB file):
 *Target: 84MB Parquet file, us-west-2, 1 column scan.*
 | Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |
 | :--- | :--- | :--- | :--- |
@@ -37,6 +45,7 @@ Formal benchmarking against PyArrow/Boto3 on remote ARM64 hardware to validate t
 | ZPQ (Sync) | 1731.2ms | ~0.7x | Sequential blocking transport. |
 
 ### Technical Achievements:
+*   **Batched Column Prefetch**: `RowGroupReader.prefetch()` reads all columns in a single `readRanges()` call, reducing round trips from 7+ sequential requests to 2-3 batched requests (HEAD + footer + column data). This is the key optimization for cold start performance.
 *   **Remote Benchmark Harness**: Automated sync, build, and execution on remote ARM hosts via `tools/remote_bench.sh`.
 *   **Timeout Robustness**: Integrated `tools/no_output_timeout.py` to handle stalled cleanups in the async engine during benchmarks.
 *   **Columnar Scaling**: Beefed up `bench-e2e` to support multi-column scans and iterative testing with per-run `ArenaAllocator` isolation.

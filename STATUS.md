@@ -151,6 +151,16 @@ We utilize the following references for architectural validation:
 
 ---
 
+## Benchmarks (S3 Cold Start - 10k_rows.parquet, us-west-2)
+*Cold start comparison: fresh process, fresh TLS connection per run.*
+| Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |
+| :--- | :--- | :--- | :--- |
+| **ZPQ (Async + Prefetch)** | **~260ms** | **~1.7x** | Batched column prefetch via `RowGroupReader.prefetch()`. |
+| Python (PyArrow) | ~420-470ms | 1.0x | Fresh connection per process. |
+| ZPQ (Sync) | ~920ms | ~0.5x | Sequential single-range requests. |
+
+*Key optimization: Batched prefetch reads all columns in a single `readRanges()` call, reducing round trips from 7+ sequential requests to 2-3 batched requests (HEAD + footer + column data).*
+
 ## Benchmarks (S3 E2E Scan - ARM64 Remote Host)
 *Target: 84MB Parquet file (sample-data), us-west-2, 1 column scan.*
 | Implementation | Avg Time (ms) | Speedup (vs PyArrow) | Notes |

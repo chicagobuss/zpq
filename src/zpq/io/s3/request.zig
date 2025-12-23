@@ -205,7 +205,7 @@ pub const AsyncRequest = struct {
         }
 
         // 3. Serialize Request (use encoded path in HTTP request line too)
-        const request_path = try encodeS3Path(self.allocator, path);
+        const request_path = try encodeS3Path(aa, path);
         try self.write_buf.appendSlice(self.allocator, "GET ");
         try self.write_buf.appendSlice(self.allocator, request_path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
@@ -270,7 +270,7 @@ pub const AsyncRequest = struct {
         }
 
         // 3. Serialize Request (use encoded path in HTTP request line too)
-        const request_path = try encodeS3Path(self.allocator, path);
+        const request_path = try encodeS3Path(aa, path);
         try self.write_buf.appendSlice(self.allocator, "HEAD ");
         try self.write_buf.appendSlice(self.allocator, request_path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");

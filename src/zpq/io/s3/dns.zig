@@ -263,6 +263,8 @@ pub const SingleFlightResolver = struct {
     }
 
     pub fn deinit(self: *SingleFlightResolver) void {
+        log.debug("SingleFlightResolver.deinit called, self={*}", .{self});
+        log.debug("inflight map count={d}", .{self.inflight.count()});
         var it = self.inflight.valueIterator();
         while (it.next()) |inflight| {
             inflight.*.deinit();

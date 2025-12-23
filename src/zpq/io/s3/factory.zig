@@ -4,6 +4,8 @@ const s3 = zpq.s3;
 const dns = s3.dns;
 const xev = @import("xev");
 
+const log = zpq.log.s3;
+
 pub const S3Context = struct {
     pool: s3.ConnectionPool,
     source: s3.AsyncS3Source,
@@ -15,6 +17,7 @@ pub const S3Context = struct {
     spec_resolver: dns.SpeculativeResolver,
 
     pub fn deinit(self: *S3Context) void {
+        log.debug("S3Context.deinit called", .{});
         // Correct order: Pool first (closes connections using loop), then Source (deinits loop), then stack.
         self.pool.deinit();
         self.source.deinit();
@@ -120,8 +123,11 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
     }
 
     // Now create the context and initialize fully
+    log.debug("factory: creating S3Context", .{});
     const ctx = try allocator.create(S3Context);
     errdefer allocator.destroy(ctx);
+
+    log.debug("factory: ctx={*}", .{ctx});
 
     ctx.allocator = allocator;
     ctx.host_owned = try allocator.dupe(u8, host);
@@ -139,18 +145,24 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
     ctx.tp_resolver = dns.ThreadPoolResolver.init(&ctx.thread_pool, allocator);
     errdefer ctx.tp_resolver.deinit();
 
+    log.debug("factory: sf_resolver init, &ctx.sf_resolver={*}", .{&ctx.sf_resolver});
     ctx.sf_resolver = dns.SingleFlightResolver.init(allocator, ctx.tp_resolver.resolver());
-    errdefer ctx.sf_resolver.deinit();
+    log.debug("factory: sf_resolver initialized, inflight count={d}", .{ctx.sf_resolver.inflight.count()});
+    errdefer {
+        log.debug("factory: errdefer sf_resolver.deinit, &ctx.sf_resolver={*}", .{&ctx.sf_resolver});
+        ctx.sf_resolver.deinit();
+    }
 
     ctx.spec_resolver = dns.SpeculativeResolver.init(allocator, ctx.sf_resolver.resolver());
     errdefer ctx.spec_resolver.deinit();
 
+    log.debug("factory: calling AsyncS3Source.init", .{});
     ctx.source = try s3.AsyncS3Source.init(allocator, &ctx.pool, ctx.spec_resolver.resolver(), ctx.host_owned.?, port, bucket, key, use_tls, null, config);
+    errdefer ctx.source.deinit();
 
-    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3) catch |err| {
-        cleanupAsyncS3(ctx, allocator);
-        return err;
-    };
+    // Note: Don't manually call cleanupAsyncS3 on error - the errdefers above handle cleanup.
+    // Only cleanupAsyncS3 should be called later when ParquetFile.deinit() runs on success path.
+    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
 }
 
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {

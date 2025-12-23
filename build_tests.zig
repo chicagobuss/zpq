@@ -223,6 +223,27 @@ pub fn addAuxiliaryTools(
         step.dependOn(&run.step);
     }
 
+    // test-sf (SingleFlightResolver isolation test)
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("tools/test_sf.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "test-sf",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+        if (install_all) b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("test-sf", "Test SingleFlightResolver in isolation");
+        step.dependOn(&run.step);
+    }
+
     // Hardening Proofs / Integration tests
     {
         // 12. test_gap_skipping

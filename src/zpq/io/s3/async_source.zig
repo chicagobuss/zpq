@@ -1,6 +1,8 @@
 const std = @import("std");
 const io = @import("../interface.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
+const zpq_log = @import("../../../zpq.zig").log;
+const log = zpq_log.s3;
 const AsyncRequest = @import("request.zig").AsyncRequest;
 const connection_pool_mod = @import("connection_pool.zig");
 const ConnectionPool = connection_pool_mod.ConnectionPool;
@@ -75,6 +77,7 @@ pub const AsyncS3Source = struct {
 
         try self.resolveHost();
         try self.fetchSize();
+        // Note: Connection pre-warming moved to readRanges for better parallelism
 
         return self;
     }
@@ -249,11 +252,41 @@ pub const AsyncS3Source = struct {
 
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
 
-        for (requests.items) |*req| {
+        // Acquire or create all connections first
+        var connections = try self.allocator.alloc(*Connection, requests.items.len);
+        defer self.allocator.free(connections);
+
+        var new_conn_count: usize = 0;
+        for (0..requests.items.len) |i| {
             var conn = self.pool.acquire(key);
-            if (conn == null) conn = try self.connectNew();
-            const connection = conn.?;
-            try req.execute(connection);
+            if (conn == null) {
+                conn = try self.connectNew();
+                new_conn_count += 1;
+            }
+            connections[i] = conn.?;
+        }
+
+        // If we created new connections, wait for all TLS handshakes in parallel
+        log.debug("readRanges: {d} requests, {d} new connections (pool had {d})", .{ requests.items.len, new_conn_count, requests.items.len - new_conn_count });
+        if (new_conn_count > 0) {
+            var all_ready = false;
+            while (!all_ready) {
+                all_ready = true;
+                for (connections) |conn| {
+                    if (!conn.handshake_complete) {
+                        all_ready = false;
+                        break;
+                    }
+                }
+                if (!all_ready) {
+                    _ = try self.event_loop.tick();
+                }
+            }
+        }
+
+        // Now execute all requests with ready connections
+        for (requests.items, connections) |*req, conn| {
+            try req.execute(conn);
         }
 
         while (batch_ctx.pending > 0) {
@@ -286,6 +319,57 @@ pub const AsyncS3Source = struct {
         const conn = try Connection.init(self.event_loop.loop, self.allocator, self.host, self.use_tls);
         try conn.connect(addr);
         return conn;
+    }
+
+    /// Pre-warm connections by establishing them in parallel.
+    /// This amortizes TLS handshake latency across multiple connections.
+    fn prewarmConnections(self: *AsyncS3Source, count: usize) !void {
+        if (count == 0) return;
+
+        const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
+
+        // Start all connections in parallel (non-blocking connect)
+        var connections = try self.allocator.alloc(*Connection, count);
+        defer self.allocator.free(connections);
+
+        var started: usize = 0;
+        errdefer {
+            // Clean up any connections we started on error
+            for (connections[0..started]) |conn| {
+                conn.close();
+                conn.deinit();
+            }
+        }
+
+        for (0..count) |i| {
+            const addr = self.resolved_ips[self.next_ip_idx];
+            self.next_ip_idx = (self.next_ip_idx + 1) % self.resolved_ips.len;
+
+            const conn = try Connection.init(self.event_loop.loop, self.allocator, self.host, self.use_tls);
+            try conn.connect(addr);
+            connections[i] = conn;
+            started += 1;
+        }
+
+        // Wait for all TLS handshakes to complete
+        var all_ready = false;
+        while (!all_ready) {
+            all_ready = true;
+            for (connections[0..started]) |conn| {
+                if (!conn.handshake_complete) {
+                    all_ready = false;
+                    break;
+                }
+            }
+            if (!all_ready) {
+                _ = try self.event_loop.tick();
+            }
+        }
+
+        // Release all connections to the pool
+        for (connections[0..started]) |conn| {
+            try self.pool.release(key, conn);
+        }
     }
 
     pub fn readAt(self: *AsyncS3Source, offset: u64, buf: []u8) !usize {

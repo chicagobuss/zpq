@@ -40,19 +40,21 @@ pub const RowGroupReader = struct {
 
     /// Pre-fetch specific columns (or all if indices is null)
     pub fn prefetch(self: *RowGroupReader, indices: ?[]const usize) !void {
-        const targets = indices orelse blk: {
-            // Default to all columns
-            const all = try self.allocator.alloc(usize, self.meta.columns.items.len);
-            defer self.allocator.free(all);
-            for (0..self.meta.columns.items.len) |i| all[i] = i;
-            break :blk all;
+        // If indices is null, we need to generate all column indices
+        var all_indices: ?[]usize = null;
+        defer if (all_indices) |a| self.allocator.free(a);
+
+        const targets: []const usize = if (indices) |i| i else blk: {
+            all_indices = try self.allocator.alloc(usize, self.meta.columns.items.len);
+            for (0..self.meta.columns.items.len) |i| all_indices.?[i] = i;
+            break :blk all_indices.?;
         };
 
-        var ranges = std.ArrayList(io.Range).init(self.allocator);
-        defer ranges.deinit();
+        var ranges = try std.ArrayList(io.Range).initCapacity(self.allocator, targets.len);
+        defer ranges.deinit(self.allocator);
 
-        var buffers = std.ArrayList([]u8).init(self.allocator);
-        defer buffers.deinit(); // We only free the list, not the contents (which move to self.buffers)
+        var buffers = try std.ArrayList([]u8).initCapacity(self.allocator, targets.len);
+        defer buffers.deinit(self.allocator); // We only free the list, not the contents (which move to self.buffers)
 
         // Identify ranges and allocate buffers
         for (targets) |idx| {
@@ -69,10 +71,10 @@ pub const RowGroupReader = struct {
             }
             const len: u64 = @intCast(meta.total_compressed_size);
 
-            try ranges.append(.{ .start = start, .end = start + len });
+            try ranges.append(self.allocator, .{ .start = start, .end = start + len });
 
             const buf = try self.allocator.alloc(u8, @intCast(len));
-            try buffers.append(buf);
+            try buffers.append(self.allocator, buf);
         }
 
         if (ranges.items.len == 0) return;
@@ -105,7 +107,7 @@ pub const RowGroupReader = struct {
                 if (dpo < start) start = @intCast(dpo);
             }
 
-            self.memory_sources[col_idx] = io.MemorySource.init(buf, start);
+            self.memory_sources[col_idx] = io.MemorySource.initWithOffset(buf, start);
             try self.buffers.append(self.allocator, buf);
         }
     }
@@ -116,8 +118,8 @@ pub const RowGroupReader = struct {
         const chunk = self.meta.columns.items[index];
 
         // Use memory source if available
-        if (self.memory_sources[index]) |ms| {
-            return ColumnReader.init(ms.source(), chunk);
+        if (self.memory_sources[index] != null) {
+            return ColumnReader.init(self.memory_sources[index].?.source(), chunk);
         }
 
         return ColumnReader.init(self.file.source, chunk);

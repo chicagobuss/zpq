@@ -160,9 +160,14 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
     ctx.source = try s3.AsyncS3Source.init(allocator, &ctx.pool, ctx.spec_resolver.resolver(), ctx.host_owned.?, port, bucket, key, use_tls, null, config);
     errdefer ctx.source.deinit();
 
+    log.debug("factory: AsyncS3Source.init succeeded, file_size={d}", .{ctx.source.file_size});
+
+    const src = ctx.source.source();
+    log.debug("factory: source.size() returned {d}", .{src.size()});
+
     // Note: Don't manually call cleanupAsyncS3 on error - the errdefers above handle cleanup.
     // Only cleanupAsyncS3 should be called later when ParquetFile.deinit() runs on success path.
-    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupAsyncS3);
+    return zpq.file.ParquetFile.initOwned(allocator, src, ctx, cleanupAsyncS3);
 }
 
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {

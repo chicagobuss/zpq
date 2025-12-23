@@ -160,9 +160,16 @@ pub fn main() !void {
         defer iter_arena.deinit();
         const aa = iter_arena.allocator();
 
-        for (file.metadata.?.row_groups.items) |row_group| {
-            for (row_group.columns.items) |col_chunk| {
-                var reader = try zpq.column.ColumnReader.init(file.source, col_chunk);
+        for (file.metadata.?.row_groups.items, 0..) |_, rg_idx| {
+            var rg_reader = try file.rowGroup(rg_idx);
+            defer rg_reader.deinit();
+
+            // Prefetch ALL columns in one batched readRanges call
+            try rg_reader.prefetch(null); // null = all columns
+
+            // Now read from memory (no network calls)
+            for (0..rg_reader.meta.columns.items.len) |col_idx| {
+                var reader = try rg_reader.columnReader(col_idx);
 
                 while (try reader.next(aa)) |page_val| {
                     var page = page_val;

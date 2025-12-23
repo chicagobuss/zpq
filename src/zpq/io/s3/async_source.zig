@@ -178,7 +178,6 @@ pub const AsyncS3Source = struct {
             try self.pool.release(key, connection);
         } else {
             connection.close();
-            // In a real pool, we'd deinit the connection if it's dead.
             connection.deinit();
             return error.HeadRequestFailed;
         }

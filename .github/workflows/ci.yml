@@ -91,8 +91,12 @@ jobs:
           echo "::group::Zig Build"
           zig build --summary all 2>&1
           echo "::endgroup::"
+          echo "::group::Build Examples (Lambda)"
+          zig build -Dexamples --summary all 2>&1
+          echo "::endgroup::"
           echo "Build artifacts:"
           ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
+          ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
 
       - name: Run Tests
         run: |

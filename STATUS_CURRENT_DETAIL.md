@@ -86,7 +86,7 @@ Local copies persist at `/mnt/d/work/zpq-scratch/test_data/` (WSL2).
 ---
 
 ## Future Technical Objectives (Milestone 11):
-1.  **Plan 09: Lambda End-to-End**: Packaging the verified ARM64 engine into a deployable Lambda function with optimized cold starts.
+1.  **[DONE] Lambda Example & Architecture**: Restructured Lambda bootstrap as a first-class Example (`examples/lambda`), cross-compiled via `zig build -Dexamples`. Verified local execution via Docker/RIE.
 2.  **Milestone 8: Persistent Pool & Timeouts**: Addressing the cleanup hang in `AsyncFancy` by implementing formal keep-alive timeouts and idle connection harvesting.
 3.  **Milestone 12: Repetition Levels**: Implementing Dremel-style shredding for nested Parquet structures (Lists and Maps).
 4.  **Plan 11: Massively Parallel Column Scans**: Stress-testing the `AsyncS3Source` with 50+ concurrent column readers to find the next bottleneck in the `libxev` completion queue.

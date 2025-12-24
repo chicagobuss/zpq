@@ -27,6 +27,16 @@ jobs:
       - name: Install Just
         uses: extractions/setup-just@v2
 
+      - name: Cache Zig Global Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
       - name: Fetch Pre-built Dependencies
         env:
           GH_TOKEN: ${{ github.token }}

@@ -26,30 +26,6 @@ pub fn build(b: *std.Build) !void {
             build_root.access(ssl_path, .{}) catch null != null)
         {
             found_prebuilt = true;
-            const crypto_mod = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-            });
-            crypto = b.addLibrary(.{
-                .name = "crypto",
-                .linkage = .static,
-                .root_module = crypto_mod,
-            });
-            crypto.root_module.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
-            crypto.root_module.linkSystemLibrary("c++", .{});
-
-            const ssl_mod = b.createModule(.{
-                .target = target,
-                .optimize = optimize,
-            });
-            ssl = b.addLibrary(.{
-                .name = "ssl",
-                .linkage = .static,
-                .root_module = ssl_mod,
-            });
-            ssl.root_module.addObjectFile(prebuilt_path.path(b, "libssl.a"));
-            ssl.root_module.linkSystemLibrary("c++", .{});
-            ssl.root_module.linkLibrary(crypto);
         }
     }
 
@@ -94,8 +70,16 @@ pub fn build(b: *std.Build) !void {
         boring_tls_mod.addCMacro("_M_ARM64", "1");
     }
 
-    boring_tls_mod.linkLibrary(crypto);
-    boring_tls_mod.linkLibrary(ssl);
+    if (found_prebuilt) {
+        // Link directly against the prebuilt .a files
+        // We use addObjectFile which handles .a files correctly without nesting them
+        boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
+        boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libssl.a"));
+        boring_tls_mod.linkSystemLibrary("c++", .{});
+    } else {
+        boring_tls_mod.linkLibrary(crypto);
+        boring_tls_mod.linkLibrary(ssl);
+    }
 }
 
 fn buildBoringCrypto(

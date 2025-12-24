@@ -3,12 +3,18 @@ const xev = @import("xev");
 const shim = xev.shim_net;
 const boring = @import("boring_tls");
 
-// 52.216.48.72 (s3.amazonaws.com)
-const REMOTE_IP = "52.216.48.72"; 
+// 142.250.190.46 (Google)
+const REMOTE_IP = "142.250.190.46"; 
 const REMOTE_PORT = 443;
-const HOSTNAME = "s3.amazonaws.com";
+const HOSTNAME = "google.com";
 
 pub fn main() !void {
+    // Skip if ZPQ_TEST_NETWORK not set (requires internet access)
+    if (std.posix.getenv("ZPQ_TEST_NETWORK") == null) {
+        std.debug.print("SKIP: set ZPQ_TEST_NETWORK=1 to run (requires internet)\n", .{});
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -115,7 +121,7 @@ fn pumpTls(self: *Context) xev.CallbackAction {
     if (self.tls.handshake_complete) {
         if (!self.request_sent) {
             std.debug.print("Handshake Complete! Sending HTTP Request...\n", .{});
-            const req = "HEAD / HTTP/1.1\r\nHost: s3.amazonaws.com\r\nUser-Agent: zig-s3-test\r\nConnection: close\r\n\r\n";
+            const req = "GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n";
             // Encrypt request
             const enc_data = self.tls.processOutgoing(req) catch |err| {
                  std.debug.print("Encrypt failed: {}\n", .{err});

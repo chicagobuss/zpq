@@ -10,6 +10,12 @@ pub const std_options = std.Options{
 };
 
 pub fn main() !void {
+    // Skip if ZPQ_TEST_MINIO not set (requires local minio docker)
+    if (std.posix.getenv("ZPQ_TEST_MINIO") == null) {
+        std.debug.print("SKIP: set ZPQ_TEST_MINIO=1 to run (requires local minio)\n", .{});
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33,9 +39,9 @@ pub fn main() !void {
     var client = zpq.io.http.Client.init(&loop, allocator);
     var result = zpq.io.http.Client.FetchResult{};
     defer client.cleanupFetchResult(&result);
-    // Client deinit is manual in this simple impl? 
+    // Client deinit is manual in this simple impl?
     // It doesn't have deinit, but it allocates ReqContexts.
-    
+
     // Attempt a HEAD request to root
     // MinIO root usually returns 403 Forbidden (signature check) or 200 OK (if public)
     // or 400 Bad Request if Host header is missing/wrong.
@@ -53,4 +59,3 @@ pub fn main() !void {
 
     std.debug.print("\nMinIO Test Complete.\n", .{});
 }
-

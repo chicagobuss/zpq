@@ -36,17 +36,17 @@ pub const Reader = struct {
             if (self.pos >= self.data.len) return error.EndOfStream;
             const byte = self.data[self.pos];
             self.pos += 1;
-            
+
             result |= @as(u64, byte & 0x7f) << shift;
             if ((byte & 0x80) == 0) break;
             shift += 7;
         }
-        
+
         // Check for overflow if T is smaller than u64?
         // For signed T, we just bitcast
         // But readVarInt is usually used for Unsigned or just generic "int"
         // If T is signed, we usually just cast.
-        
+
         switch (@typeInfo(T)) {
             .int => |info| {
                 if (info.signedness == .signed) {
@@ -63,7 +63,7 @@ pub const Reader = struct {
         // Read as unsigned equivalent
         const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
         const n = try self.readVarInt(UT);
-        
+
         // (n >> 1) ^ -(n & 1)
         const shifted = n >> 1;
         if ((n & 1) == 0) {
@@ -93,7 +93,7 @@ pub const Reader = struct {
 
         const delta = (byte >> 4) & 0x0f;
         const type_id = byte & 0x0f;
-        
+
         var field_id: i16 = 0;
         if (delta == 0) {
             field_id = try self.readZigZag(i16);
@@ -103,7 +103,7 @@ pub const Reader = struct {
 
         self.last_field_id = field_id;
         const t = @as(Type, @enumFromInt(type_id));
-        
+
         return .{ .type = t, .id = field_id };
     }
 
@@ -167,3 +167,10 @@ pub const Reader = struct {
         }
     }
 };
+
+test "thrift varint decoding" {
+    const data = [_]u8{ 0x85, 0x02 }; // 261 in varint
+    var reader = Reader.init(&data);
+    const val = try reader.readVarInt(u32);
+    try std.testing.expectEqual(@as(u32, 261), val);
+}

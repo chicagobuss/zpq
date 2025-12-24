@@ -23,7 +23,7 @@ pub const SigV4 = struct {
         const now = ts.sec;
         var date_buf: [16]u8 = undefined;
         const iso_date = try fmtIso8601(now, &date_buf);
-        const date_short = iso_date[0..8]; 
+        const date_short = iso_date[0..8];
 
         // 2. Add Required Headers
         // Add Host Header (Required for SigV4)
@@ -36,7 +36,7 @@ pub const SigV4 = struct {
         }
 
         try headers.append(allocator, .{ .name = "X-Amz-Date", .value = try allocator.dupe(u8, iso_date) });
-        
+
         var payload_hash_buf: [64]u8 = undefined;
         const payload_hash = if (payload.len == 0)
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -52,7 +52,7 @@ pub const SigV4 = struct {
         // 3. Create Canonical Request
         var canonical_req = std.ArrayList(u8){};
         defer canonical_req.deinit(allocator);
-        
+
         // Custom Writer for Unmanaged ArrayList with Error Propagation
         const WriterContext = struct {
             vtable: std.Io.Writer.VTable,
@@ -69,7 +69,7 @@ pub const SigV4 = struct {
                 };
                 return res;
             }
-            
+
             fn drainImpl(ctx: *@This(), data: []const []const u8, splat: usize) !usize {
                  if (data.len == 0) return 0;
                  var total: usize = 0;
@@ -93,7 +93,7 @@ pub const SigV4 = struct {
                      return err;
                  };
             }
-            
+
             pub fn writeAll(ctx: *@This(), bytes: []const u8) !void {
                 ctx.writer.writeAll(bytes) catch |err| {
                      if (err == error.WriteFailed and ctx.last_error != null) return ctx.last_error.?;
@@ -115,14 +115,14 @@ pub const SigV4 = struct {
 
         // Method
         try ctx.print("{s}\n", .{method});
-        
+
         // Canonical URI
         const path = uri.path.percent_encoded;
-            
+
         if (path.len == 0) try ctx.writeAll("/\n") else try ctx.print("{s}\n", .{path});
 
         // Canonical Query String
-        try ctx.writeAll("\n"); 
+        try ctx.writeAll("\n");
 
         // Canonical Headers
         var canonical_headers_list = try std.ArrayList(HeaderRef).initCapacity(allocator, headers.items.len);
@@ -137,17 +137,17 @@ pub const SigV4 = struct {
 
         var signed_headers = std.ArrayList(u8){};
         defer signed_headers.deinit(allocator);
-        
+
         for (canonical_headers_list.items) |h| {
             var lower_name_buf: [128]u8 = undefined;
             const lower_name = std.ascii.lowerString(&lower_name_buf, h.name);
-            
+
             try ctx.print("{s}:{s}\n", .{lower_name, h.value});
-            
+
             if (signed_headers.items.len > 0) try signed_headers.append(allocator, ';');
             try signed_headers.appendSlice(allocator, lower_name);
         }
-        try ctx.writeAll("\n"); 
+        try ctx.writeAll("\n");
 
         try ctx.print("{s}\n", .{signed_headers.items});
         try ctx.print("{s}", .{payload_hash});
@@ -188,16 +188,16 @@ pub const SigV4 = struct {
 
         var signature: [32]u8 = undefined;
         try hmacSha256(&k_signing, string_to_sign, &signature);
-        
+
         var signature_hex: [64]u8 = undefined;
         signature_hex = std.fmt.bytesToHex(signature, .lower);
 
         // 6. Add Authorization Header
-        const auth_header = try std.fmt.allocPrint(allocator, 
+        const auth_header = try std.fmt.allocPrint(allocator,
             "{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}",
             .{algorithm, self.access_key, credential_scope, signed_headers.items, &signature_hex}
         );
-        
+
         try headers.append(allocator, .{ .name = "Authorization", .value = auth_header });
     }
 };
@@ -217,11 +217,11 @@ fn fmtIso8601(ts: i64, buf: *[16]u8) ![]const u8 {
     const day = es.getEpochDay();
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
-    
+
     const year_val = yd.year;
     const month_val = md.month.numeric();
     const day_val = md.day_index + 1;
-    
+
     const day_seconds = es.getDaySeconds();
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
@@ -241,4 +241,36 @@ fn hashSha256Hex(data: []const u8, out_hex: *[64]u8) ![]const u8 {
 
 fn hmacSha256(key: []const u8, data: []const u8, out: *[32]u8) !void {
     std.crypto.auth.hmac.sha2.HmacSha256.create(out, data, key);
+}
+
+test "sigv4 produces valid Authorization header" {
+    // We can't easily test the full signature without a fixed clock,
+    // but we can verify the signer doesn't crash and produces an Authorization header.
+    const allocator = std.testing.allocator;
+    const signer = SigV4{
+        .region = "us-east-1",
+        .access_key = "AKIAEXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    };
+
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer {
+        for (headers.items) |h| {
+            allocator.free(h.value);
+        }
+        headers.deinit(allocator);
+    }
+
+    const uri = try std.Uri.parse("https://examplebucket.s3.amazonaws.com/test.txt");
+
+    try signer.sign(allocator, "GET", uri, &headers, "");
+
+    var found_auth = false;
+    for (headers.items) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Authorization")) {
+            found_auth = true;
+            try std.testing.expect(std.mem.startsWith(u8, h.value, "AWS4-HMAC-SHA256"));
+        }
+    }
+    try std.testing.expect(found_auth);
 }

@@ -101,27 +101,32 @@ comprehensive: build gen-fixtures
 
     @echo "Comprehensive suite finished."
 
-# Run a simple benchmark
-bench: build
-    @echo "Benchmarking scan on large RLE..."
-    zig build run -- scan data/large_rle.parquet
-    @echo "Benchmarking scan on many rows..."
-    zig build run -- scan data/many_rows.parquet
+# === Benchmarks ===
+# All benchmarks are run via ./benchmarks/bench.sh for consistency
 
-# Run comparative benchmark (ZPQ vs Rust vs Python)
-bench-compare: build
-    @echo "=== ZPQ ==="
-    zig build run -Doptimize=ReleaseFast -- scan data/sample-data.parquet
+# List available benchmarks
+bench-list:
+    ./benchmarks/bench.sh list
 
-    @echo "\n=== Python (PyArrow) ==="
-    uv run python tools/bench/pyarrow_bench.py data/sample-data.parquet
+# Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
+bench +args:
+    ./benchmarks/bench.sh {{args}}
 
-    @echo "\n=== Rust (Arrow RecordBatchReader) ==="
-    @cd tools/bench/rust_bench && cargo run --release --quiet -- ../../../data/sample-data.parquet
+# Run DNS resolver benchmark
+bench-dns:
+    ./benchmarks/bench.sh dns
 
-    @echo "\n=== Rust (Official CLI: parquet-read) ==="
-    @echo "Note: Includes formatting overhead (piped to /dev/null)"
-    @time parquet-read data/sample-data.parquet > /dev/null
+# Run TCP ping-pong benchmark
+bench-ping:
+    ./benchmarks/bench.sh ping
+
+# Run E2E parquet scan benchmark
+bench-e2e path *args:
+    ./benchmarks/bench.sh e2e {{path}} {{args}}
+
+# Compare ZPQ vs PyArrow on a file
+bench-compare path *args:
+    ./benchmarks/bench.sh compare e2e {{path}} {{args}}
 
 # Generate malformed fixtures
 gen-malformed:

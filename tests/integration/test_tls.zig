@@ -4,6 +4,12 @@ const TlsAdapter = zpq.s3.TlsAdapter;
 const net = std.Io.net;
 
 pub fn main() !void {
+    // Skip if ZPQ_TEST_NETWORK not set (requires internet access)
+    if (std.posix.getenv("ZPQ_TEST_NETWORK") == null) {
+        std.debug.print("SKIP: set ZPQ_TEST_NETWORK=1 to run (requires internet)\n", .{});
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

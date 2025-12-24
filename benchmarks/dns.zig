@@ -12,7 +12,10 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var thread_pool = xev.ThreadPool.init(.{});
-    defer thread_pool.deinit();
+    defer {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    }
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
@@ -27,7 +30,7 @@ pub fn main() !void {
 fn benchSerial(allocator: std.mem.Allocator) !void {
     _ = allocator;
     std.debug.print("1. Serial Blocking (std.c.getaddrinfo)...\n", .{});
-    
+
     var timer = try std.time.Timer.start();
     var i: usize = 0;
     while (i < NUM_REQUESTS) : (i += 1) {
@@ -63,7 +66,7 @@ const Context = struct {
 
 fn benchAsync(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.ThreadPool) !void {
     std.debug.print("2. Async ThreadPool (No Deduplication)...\n", .{});
-    
+
     var tp_resolver = dns.ThreadPoolResolver.init(thread_pool, allocator);
     const resolver = tp_resolver.resolver();
 
@@ -95,11 +98,11 @@ fn benchAsync(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.T
 
 fn benchSingleFlight(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.ThreadPool) !void {
     std.debug.print("3. Async + Single-Flight (Deduplication)...\n", .{});
-    
+
     var tp_resolver = dns.ThreadPoolResolver.init(thread_pool, allocator);
     var sf_resolver = dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
     defer sf_resolver.deinit();
-    
+
     const resolver = sf_resolver.resolver();
 
     const ctxs = try allocator.alloc(Context, NUM_REQUESTS);
@@ -126,5 +129,4 @@ fn benchSingleFlight(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool:
     for (ctxs) |*ctx| {
         ctx.completion.deinit(allocator);
     }
-    std.process.exit(0);
 }

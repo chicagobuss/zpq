@@ -3,12 +3,18 @@ const xev = @import("xev");
 const shim = xev.shim_net;
 const boring = @import("boring_tls");
 
-// 142.250.190.46 (Google)
-const REMOTE_IP = "142.250.190.46"; 
+// 52.216.48.72 (s3.amazonaws.com)
+const REMOTE_IP = "52.216.48.72";
 const REMOTE_PORT = 443;
-const HOSTNAME = "google.com";
+const HOSTNAME = "s3.amazonaws.com";
 
 pub fn main() !void {
+    // Skip if ZPQ_TEST_NETWORK not set (requires internet access)
+    if (std.posix.getenv("ZPQ_TEST_NETWORK") == null) {
+        std.debug.print("SKIP: set ZPQ_TEST_NETWORK=1 to run (requires internet)\n", .{});
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -24,7 +30,7 @@ pub fn main() !void {
     // 3. Setup TLS
     // Use verify_certificate = false to avoid CA bundle complexity in microtest for now.
     // Ideally we load system certs, but that's platform specific logic we want to avoid in this specific test if possible.
-    var tls_client = try boring.tls_client.TlsClient.init(HOSTNAME, .{ .verify_certificate = false }); 
+    var tls_client = try boring.tls_client.TlsClient.init(HOSTNAME, .{ .verify_certificate = false });
     defer tls_client.deinit();
 
     var ctx = Context{
@@ -47,7 +53,7 @@ const Context = struct {
     tcp: xev.TCP,
     tls: *boring.tls_client.TlsClient,
     allocator: std.mem.Allocator,
-    
+
     // Completions
     c_connect: xev.Completion = .{},
     c_read: xev.Completion = .{},
@@ -55,7 +61,7 @@ const Context = struct {
 
     // Buffers
     read_buf: [4096]u8 = undefined,
-    
+
     // State
     handshake_done: bool = false,
     request_sent: bool = false,
@@ -83,7 +89,7 @@ fn onConnect(
         std.debug.print("Start Handshake failed: {}\n", .{err});
         return .disarm;
     };
-    
+
     // If startHandshake produced bytes (ClientHello), send them.
     if (out_slice) |data| {
         std.debug.print("TLS ClientHello ({} bytes)\n", .{data.len});
@@ -115,7 +121,7 @@ fn pumpTls(self: *Context) xev.CallbackAction {
     if (self.tls.handshake_complete) {
         if (!self.request_sent) {
             std.debug.print("Handshake Complete! Sending HTTP Request...\n", .{});
-            const req = "GET / HTTP/1.1\r\nHost: google.com\r\nConnection: close\r\n\r\n";
+            const req = "HEAD / HTTP/1.1\r\nHost: s3.amazonaws.com\r\nUser-Agent: zig-s3-test\r\nConnection: close\r\n\r\n";
             // Encrypt request
             const enc_data = self.tls.processOutgoing(req) catch |err| {
                  std.debug.print("Encrypt failed: {}\n", .{err});
@@ -128,7 +134,7 @@ fn pumpTls(self: *Context) xev.CallbackAction {
                 return .disarm;
             }
         }
-        
+
         // If request sent, we are waiting for response.
         std.debug.print("Waiting for HTTP Response...\n", .{});
         self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Context, self, onTcpRead);
@@ -158,7 +164,7 @@ fn onTcpWrite(
         std.debug.print("TCP Write failed: {}\n", .{err});
         return .disarm;
     };
-    
+
     // Pump again
     return pumpTls(self);
 }
@@ -200,4 +206,3 @@ fn onTcpRead(
     // Pump again (might have output to send, or need more input)
     return pumpTls(self);
 }
-

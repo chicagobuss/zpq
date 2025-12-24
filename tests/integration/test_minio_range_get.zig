@@ -15,6 +15,12 @@ pub const std_options = std.Options{
 const payload = fixtures.range_payload;
 
 pub fn main() !void {
+    // Skip if ZPQ_TEST_MINIO not set (requires local minio docker)
+    if (std.posix.getenv("ZPQ_TEST_MINIO") == null) {
+        std.debug.print("SKIP: set ZPQ_TEST_MINIO=1 to run (requires local minio)\n", .{});
+        return;
+    }
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -205,5 +211,3 @@ fn cleanup(client: *zpq.io.http.Client, ctx: *Ctx) void {
         ctx.conn = null;
     }
 }
-
-

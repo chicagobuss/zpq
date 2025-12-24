@@ -94,4 +94,16 @@ pub fn build(b: *std.Build) void {
         minish,
         install_all,
     );
+
+    // Examples
+    const install_examples = b.option(bool, "examples", "Build examples (including Lambda bootstrap)") orelse false;
+    const build_examples = @import("build_examples.zig");
+    build_examples.addExamples(
+        b,
+        zpq_mod,
+        target,
+        optimize,
+        libxev_mod,
+        install_examples,
+    );
 }

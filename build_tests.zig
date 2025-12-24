@@ -157,30 +157,8 @@ pub fn addAuxiliaryTools(
         step.dependOn(&run.step);
     }
 
-    // AWS Lambda Bootstrap
-    {
-        const lambda_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux });
-        const mod = b.createModule(.{
-            .root_source_file = b.path("src/lambda_bootstrap.zig"),
-            .target = lambda_target,
-            .optimize = .ReleaseFast,
-        });
-        mod.addImport("zpq", zpq_mod);
-        mod.addImport("xev", libxev_mod);
-
-        const exe = b.addExecutable(.{
-            .name = "bootstrap",
-            .root_module = mod,
-        });
-        exe.root_module.linkSystemLibrary("c", .{});
-
-        const install_bootstrap = b.addInstallArtifact(exe, .{
-            .dest_dir = .{ .override = .{ .custom = "lambda" } },
-        });
-
-        const step = b.step("lambda", "Build AWS Lambda bootstrap");
-        step.dependOn(&install_bootstrap.step);
-    }
+    // AWS Lambda Bootstrap -> Moved to examples/lambda (build_examples.zig)
+    // Access via `zig build -Dexamples` or `zig build example-lambda`
 
     // bench-e2e
     {

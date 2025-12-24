@@ -13,18 +13,22 @@ all: test build verify
 
 # Build the project (Core only)
 build:
+    @./tools/just_helpers.sh fetch_deps
     zig build
 
 # Build everything including tests and probes
 build-and-test:
+    @./tools/just_helpers.sh fetch_deps
     zig build -Dall
 
 # Check compilation (Lint)
 lint:
+    @./tools/just_helpers.sh fetch_deps
     zig build check
 
 # Run unit tests (Fast)
 test *args="":
+    @./tools/just_helpers.sh fetch_deps
     zig build test --summary all -- {{args}}
 
 # List all tests defined in the codebase

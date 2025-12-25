@@ -176,6 +176,22 @@ pub fn build(b: *std.Build) void {
         const step_parquet_s3 = b.step("test-parquet-s3", "Run Parquet S3 integration test");
         step_parquet_s3.dependOn(&run_test_parquet_s3.step);
 
+        // 7. bench-s3-cold
+        const bench_s3_cold = b.addExecutable(.{
+            .name = "bench-s3-cold",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("benchmarks/s3_cold_start.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        bench_s3_cold.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(bench_s3_cold);
+
+        const run_bench_s3_cold = b.addRunArtifact(bench_s3_cold);
+        const step_bench_s3_cold = b.step("bench-s3-cold", "Run S3 cold start baseline benchmark");
+        step_bench_s3_cold.dependOn(&run_bench_s3_cold.step);
+
         // Probe for DNS
         const probe_dns_xev = b.addExecutable(.{
             .name = "probe-dns-xev",

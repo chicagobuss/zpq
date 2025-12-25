@@ -81,7 +81,7 @@ pub const XevS3Source = struct {
             allocator.destroy(thread_pool);
         }
 
-        var self = try initWithLoop(allocator, loop, thread_pool, host, bucket, key, region, use_tls, port);
+        var self = try initWithLoop(allocator, loop, thread_pool, host, bucket, key, region, use_tls, port, 4096, true);
         self.owns_loop = true;
         return self;
     }

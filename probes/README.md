@@ -23,6 +23,10 @@ Probes are **point-in-time learning experiments** - one-off code written to unde
 | `probe_xev_tcp_lifecycle.zig` | Learning xev TCP socket lifecycle and completion handling | Dec 2024 |
 | `verify_minish_context.zig` | Verifying minish fuzzer context/allocator patterns | Dec 2024 |
 | `probe_encoding.zig` | Verifying S3 path percent-encoding with special characters | Dec 2024 |
+| `probe_dns_xev.zig` | Standalone verification of the xev-based ThreadPool DNS resolver | Dec 2025 |
+| `probe_timespec_fields.zig` | Investigating `posix.timespec` field naming (Darwin vs Linux) | Dec 2025 |
+| `probe_arraylist_unmanaged.zig` | Documenting the move to `ArrayListUnmanaged` in Zig 0.16.x | Dec 2025 |
+| `probe_rustfs_raw.zig` | Proving raw TCP connectivity to RustFS without TLS | Dec 2025 |
 
 ## Running a Probe
 

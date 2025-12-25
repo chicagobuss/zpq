@@ -81,6 +81,7 @@ alwaysApply: false
     *   *Rationale*: If a network operation doesn't produce a log entry in 5s, it is deadlocked or mis-segmented. Do not wait for 60s "jitter".
 *   **Isolation (Probes)**: Never debug complex I/O (TLS, S3, DNS) inside the main application. 
     *   **Action**: Create a `probes/probe_X.zig` that isolates the single failing component (e.g., `probe_tls_echo.zig`).
+    *   **Persistence**: Maintain `probes/README.md` as a living index. Every new probe MUST be added to the index with its purpose and date to preserve institutional memory.
 *   **Radical Logging**: Use `std.debug.print` to verify **flow**, not just errors.
     *   **Required Logs**: Entry/exit of every async callback; number of bytes decrypted from BIO; state transitions (e.g., `handshake_complete=true`).
 *   **The "Halving" Strategy**: Use probes to divide the problem space (e.g., "If Google works but S3 fails, the transport layer is fine, check the AWS config").

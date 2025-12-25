@@ -73,9 +73,9 @@ verify: build check-tls
 # Verify TLS Transport and S3 Factory (Requires Network)
 check-tls: build
     @echo "Verifying TLS Transport (Google HEAD)..."
-    python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-tls-echo
-    @echo "Verifying S3 Integration (S3 Footer)..."
-    @bash -c "([ -f .env ] && export \$(grep -v '^#' .env | xargs)) && python3 tools/no_output_timeout.py --idle-seconds 5 -- zig build probe-fast-feedback"
+    python3 tools/no_output_timeout.py --idle-seconds 10 -- zig build probe-tls-echo
+    @echo "Verifying S3 Integration (MinIO Parquet)..."
+    @ZPQ_TEST_MINIO=1 python3 tools/no_output_timeout.py --idle-seconds 10 -- zig build -Dexperimental test-parquet-s3
 
 # Run comprehensive tests including heavy data and edge cases (Slow)
 comprehensive: build gen-fixtures
@@ -220,9 +220,9 @@ heavyci AMD64_HOST:
 # Cross-check experimental stack
 cross-check-experimental:
     @echo "Building experimental stack for x86_64-linux..."
-    zig build --build-file micro_build.zig -Dtarget=x86_64-linux
+    zig build -Dexperimental -Dtarget=x86_64-linux
     @echo "Building experimental stack for aarch64-linux..."
-    zig build --build-file micro_build.zig -Dtarget=aarch64-linux
+    zig build -Dexperimental -Dtarget=aarch64-linux
     @echo "Experimental targets compile successfully!"
 
 # Run local CI in watch mode (requires act)

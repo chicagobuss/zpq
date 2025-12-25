@@ -3,10 +3,10 @@ const zpq = @import("zpq");
 const ParquetFile = zpq.file.ParquetFile;
 
 pub const std_options = std.Options{
-    .log_level = .info,
+    .log_level = .debug,
     .log_scope_levels = &[_]std.log.ScopeLevel{
-        .{ .scope = .s3_source, .level = .warn },
-        .{ .scope = .tls, .level = .warn },
+        .{ .scope = .s3_source, .level = .debug },
+        .{ .scope = .tls, .level = .debug },
     },
 };
 

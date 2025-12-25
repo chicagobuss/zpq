@@ -119,15 +119,75 @@ pub const XevS3Source = struct {
 
     fn readRangesImpl(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8) anyerror!void {
         const self: *XevS3Source = @ptrCast(@alignCast(ptr));
-        // Fallback: implement sequential readAt for now.
-        // TODO: Implement parallel fetch
-        for (ranges, 0..) |range, i| {
-            const buf = buffers[i];
-            const len = range.end - range.start;
-            if (buf.len < len) return error.BufferTooSmall;
-            const n = try self.readAt(range.start, buf[0..len]);
-            if (n != len) return error.UnexpectedEndOfFile;
+        if (ranges.len == 0) return;
+        
+        // Use parallel implementation for all range counts >= 1
+        log.debug("readRangesImpl: fetching {d} ranges in parallel", .{ranges.len});
+        const addr = try self.resolve();
+
+        const contexts = try self.allocator.alloc(*ReqContext, ranges.len);
+        defer self.allocator.free(contexts);
+        
+        const conns = try self.allocator.alloc(*tls.Connection, ranges.len);
+        defer self.allocator.free(conns);
+
+        var cleanup_idx: usize = 0;
+        errdefer {
+            for (0..cleanup_idx) |i| {
+                conns[i].deinit();
+                self.allocator.destroy(conns[i]);
+                self.allocator.destroy(contexts[i]);
+            }
         }
+
+        for (ranges, 0..) |range, i| {
+            const conn = try self.allocator.create(tls.Connection);
+            conns[i] = conn;
+            conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            cleanup_idx += 1;
+
+            const ctx = try self.allocator.create(ReqContext);
+            contexts[i] = ctx;
+            ctx.* = .{
+                .source = self,
+                .conn = conn,
+                .buf = buffers[i][0 .. range.end - range.start],
+                .offset = range.start,
+                .allocator = self.allocator,
+                .parser = .{},
+            };
+
+            conn.user_ctx = ctx;
+            conn.on_connect = onConnect;
+            conn.on_data = onData;
+            conn.on_error = onError;
+
+            try conn.connect(addr);
+        }
+
+        // Run loop until ALL requests are finished or one has a fatal error
+        try self.loop.run(.until_done);
+
+        // Check for fatal errors
+        var first_err: ?anyerror = null;
+        for (contexts) |ctx| {
+            if (ctx.err) |err| {
+                if (err != error.EOF and err != error.TlsConnectionClosed) {
+                    if (first_err == null) first_err = err;
+                } else if (!ctx.finished) {
+                    if (first_err == null) first_err = err;
+                }
+            }
+        }
+
+        // Cleanup
+        for (0..ranges.len) |i| {
+            conns[i].deinit();
+            self.allocator.destroy(conns[i]);
+            self.allocator.destroy(contexts[i]);
+        }
+        
+        if (first_err) |err| return err;
     }
 
     fn sizeImpl(ptr: *anyopaque) u64 {
@@ -164,11 +224,8 @@ pub const XevS3Source = struct {
         log.debug("fetchSize: starting HEAD request", .{});
         const addr = try self.resolve();
         
-        var loop = try xev.Loop.init(.{});
-        defer loop.deinit();
-
         const conn = try self.allocator.create(tls.Connection);
-        conn.* = try tls.Connection.init(&loop, self.allocator, self.host);
+        conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
         defer {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -192,9 +249,7 @@ pub const XevS3Source = struct {
         conn.on_error = onError;
 
         try conn.connect(addr);
-        
-        // Use until_done to ensure all completions (including close) are processed
-        try loop.run(.until_done);
+        try self.loop.run(.until_done);
 
         if (ctx.err) |err| {
             if (err == error.EOF or err == error.TlsConnectionClosed) {
@@ -209,13 +264,10 @@ pub const XevS3Source = struct {
         log.debug("readAt: start offset={d} len={d}", .{offset, buf.len});
         const addr = try self.resolve();
 
-        var loop = try xev.Loop.init(.{});
-        defer loop.deinit();
-
         const conn = try self.allocator.create(tls.Connection);
-        conn.* = try tls.Connection.init(&loop, self.allocator, self.host);
+        conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
         defer {
-            conn.deinit(); // This closes socket
+            conn.deinit(); 
             self.allocator.destroy(conn);
         }
         
@@ -239,7 +291,7 @@ pub const XevS3Source = struct {
         try conn.connect(addr);
 
         log.debug("readAt: running loop...", .{});
-        try loop.run(.until_done);
+        try self.loop.run(.until_done);
         log.debug("readAt: loop finished bytes_read={d} finished={}", .{ctx.bytes_read, ctx.finished});
 
         if (ctx.err) |err| {
@@ -253,14 +305,9 @@ pub const XevS3Source = struct {
         return ctx.bytes_read;
     }
     
-    fn resolve(self: *XevS3Source) !xev.shim_net.Address {
+    pub fn resolve(self: *XevS3Source) !xev.shim_net.Address {
         if (self.cached_addr) |a| return a;
         
-        // Blocking resolution for simplicity in this synchronous-interface adapter
-        // We use the thread pool but block efficiently via loop?
-        // Actually, ThreadPoolResolver is async-callback based.
-        // So we need to run the loop to get the result.
-
         var comp = dns.Resolver.Completion.init();
         defer comp.deinit(self.allocator);
         
@@ -286,10 +333,6 @@ pub const XevS3Source = struct {
         };
         
         var dctx = DnsCtx{};
-        
-        // Important: ThreadPool needs to be running tasks?
-        // xev.ThreadPool executes tasks on its own threads.
-        // ThreadPoolResolver schedules a task on the pool, which notifies the loop via Async.
         
         var resolver_iface = self.resolver.resolver();
         log.debug("resolve: starting resolution for {s}:{d}", .{self.host, self.port});
@@ -330,17 +373,13 @@ const ReqContext = struct {
 fn onConnect(ctx_void: ?*anyopaque) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
     
-    // Construct Request
     const path = std.fmt.allocPrint(ctx.allocator, "/{s}/{s}", .{ctx.source.bucket, ctx.source.key}) catch |err| {
         ctx.err = err;
-        ctx.conn.loop.stop();
+        ctx.conn.close();
         return;
     };
     defer ctx.allocator.free(path);
 
-    // TODO: Use SigV4 to sign if credentials present
-    // For now, simple GET Range or HEAD
-    
     var req: []u8 = undefined;
     if (ctx.is_head) {
         const req_fmt =
@@ -351,7 +390,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
             "\r\n";
         req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ path, ctx.source.host }) catch |err| {
             ctx.err = err;
-            ctx.conn.loop.stop();
+            ctx.conn.close();
             return;
         };
     } else {
@@ -366,7 +405,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
 
         req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ path, ctx.source.host, ctx.offset, end_inclusive }) catch |err| {
             ctx.err = err;
-            ctx.conn.loop.stop();
+            ctx.conn.close();
             return;
         };
     }
@@ -376,7 +415,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
 
     ctx.conn.write(req) catch |err| {
         ctx.err = err;
-        ctx.conn.loop.stop();
+        ctx.conn.close();
     };
 }
 
@@ -385,7 +424,7 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
     
     ctx.parser.feed(data, ctx, onBody) catch |err| {
         ctx.err = err;
-        ctx.conn.close(); // Start close sequence
+        ctx.conn.close();
         return;
     };
 
@@ -394,7 +433,7 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
             ctx.source.file_size = len;
         }
         ctx.finished = true;
-        ctx.conn.close(); // Start close sequence
+        ctx.conn.close();
     }
 }
 
@@ -403,11 +442,6 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
     
     if (ctx.parser.status_code != 0) ctx.http_status = ctx.parser.status_code;
     
-    // Verify 206
-    if (ctx.parser.status_code != 0 and ctx.parser.status_code != 206) {
-        // If not 206 Partial Content, something is wrong
-    }
-
     const remaining = ctx.buf.len - ctx.bytes_read;
     const take = @min(remaining, chunk.len);
     
@@ -416,8 +450,8 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
         ctx.bytes_read += take;
     }
     
-    // If full, start close
     if (ctx.bytes_read == ctx.buf.len) {
+        std.debug.print("[s3] Request finished. offset={d} len={d} self={*}\n", .{ctx.offset, ctx.buf.len, ctx.conn});
         ctx.finished = true;
         ctx.conn.close();
     }
@@ -428,4 +462,3 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
     ctx.err = err;
     ctx.conn.close();
 }
-

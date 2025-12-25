@@ -192,6 +192,55 @@ pub fn build(b: *std.Build) void {
         const step_bench_s3_cold = b.step("bench-s3-cold", "Run S3 cold start baseline benchmark");
         step_bench_s3_cold.dependOn(&run_bench_s3_cold.step);
 
+        // 8. probe-tcp-exit
+        const probe_tcp_exit = b.addExecutable(.{
+            .name = "probe-tcp-exit",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_tcp_close_exit.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_tcp_exit.root_module.addImport("xev", libxev_mod);
+        b.installArtifact(probe_tcp_exit);
+
+        const run_probe_tcp_exit = b.addRunArtifact(probe_tcp_exit);
+        const step_probe_tcp_exit = b.step("probe-tcp-exit", "Run TCP close exit probe");
+        step_probe_tcp_exit.dependOn(&run_probe_tcp_exit.step);
+
+        // 9. probe-async-leak
+        const probe_async_leak = b.addExecutable(.{
+            .name = "probe-async-leak",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_async_leak.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_async_leak.root_module.addImport("xev", libxev_mod);
+        b.installArtifact(probe_async_leak);
+
+        const run_probe_async_leak = b.addRunArtifact(probe_async_leak);
+        const step_probe_async_leak = b.step("probe-async-leak", "Run Async leak probe");
+        step_probe_async_leak.dependOn(&run_probe_async_leak.step);
+
+        // 10. probe-loop-active
+        const probe_loop_active = b.addExecutable(.{
+            .name = "probe-loop-active",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_loop_active.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_loop_active.root_module.addImport("xev", libxev_mod);
+        probe_loop_active.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_loop_active);
+
+        const run_probe_loop_active = b.addRunArtifact(probe_loop_active);
+        const step_probe_loop_active = b.step("probe-loop-active", "Run Loop active count probe");
+        step_probe_loop_active.dependOn(&run_probe_loop_active.step);
+
         // Probe for DNS
         const probe_dns_xev = b.addExecutable(.{
             .name = "probe-dns-xev",

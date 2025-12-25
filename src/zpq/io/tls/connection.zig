@@ -31,6 +31,8 @@ pub const Connection = struct {
     connected: bool = false,
     handshake_complete: bool = false,
     closed: bool = false,
+    pending_read: bool = false,
+    pending_write: bool = false,
     
     // User callbacks
     // We use a simplified callback interface for now:
@@ -63,20 +65,18 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (!self.closed) {
-             // Ideally close() was called before.
-        }
         self.tls.deinit(); 
     }
 
     pub fn close(self: *Self) void {
          if (self.closed) return;
          self.closed = true;
+         // We don't cancel pending reads/writes explicitly here, 
+         // but internalOnClose will disarm its completion.
          self.tcp.close(self.loop, &self.c_close, Self, self, internalOnClose);
     }
     
     pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
-         log.debug("Connection.connect called", .{});
          self.tcp = try xev.TCP.init(addr);
 
          // Disable SIGPIPE on this socket for macOS
@@ -89,10 +89,13 @@ pub const Connection = struct {
     }
     
     pub fn write(self: *Self, data: []const u8) !void {
+        if (self.closed) return;
         // Encrypt and send
         const enc_data = try self.tls.processOutgoing(data);
         if (enc_data) |bytes| {
+             if (self.pending_write) return error.WriteInProgress;
              const buf = try self.allocator.dupe(u8, bytes);
+             self.pending_write = true;
              self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
         }
     }
@@ -106,23 +109,25 @@ pub const Connection = struct {
         const out_slice_res = self.tls.processOutgoing(null);
         if (out_slice_res) |out_slice_opt| {
              if (out_slice_opt) |data| {
-                log.debug("TLS wants to write {} bytes to TCP", .{data.len});
+                if (self.pending_write) return; // Wait for current write to finish
                 const buf = self.allocator.dupe(u8, data) catch |err| {
                     if (self.on_error) |cb| cb(self.user_ctx, err);
                     return;
                 };
+                self.pending_write = true;
                 self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
                 return;
              }
         } else |err| {
-             log.debug("pump processOutgoing error: {}", .{err});
              if (self.on_error) |cb| cb(self.user_ctx, err);
              return;
         }
 
         // 2. Need Input? (TCP -> TLS)
-        // log.debug("pump reading from TCP", .{});
-        self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
+        if (!self.pending_read) {
+            self.pending_read = true;
+            self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
+        }
     }
 
     fn internalOnClose(
@@ -137,9 +142,7 @@ pub const Connection = struct {
         _ = watcher;
         _ = result catch {};
         if (self) |me| {
-            log.debug("Connection closed.", .{});
             me.closed = true;
-            me.loop.stop(); // Force loop to exit for this request
         }
         return .disarm;
     }
@@ -156,18 +159,14 @@ pub const Connection = struct {
         _ = watcher;
         const me = self.?;
         if (result) |_| {
-            std.debug.print("[tls] TCP Connected, starting handshake...\n", .{});
             me.connected = true;
             // Start Handshake
              const out_slice_res = me.tls.startHandshake();
-             std.debug.print("[tls] Handshake started\n", .{});
              if (out_slice_res) |out_slice_opt| {
                  if (out_slice_opt) |data| {
-                    std.debug.print("[tls] Handshake wants to write {d} bytes\n", .{data.len});
                     const buf = me.allocator.dupe(u8, data) catch unreachable;
-                    std.debug.print("[tls] Calling tcp.write...\n", .{});
+                    me.pending_write = true;
                     me.tcp.write(me.loop, &me.c_write, .{ .slice = buf }, Self, me, internalOnTcpWrite);
-                    std.debug.print("[tls] tcp.write called\n", .{});
                     return .disarm;
                  }
              } else |err| {
@@ -193,6 +192,7 @@ pub const Connection = struct {
         _ = completion;
         _ = watcher;
         const me = self.?;
+        me.pending_write = false;
         me.allocator.free(buffer.slice); // Free the dupe
         if (result) |_| {
             me.pump();
@@ -215,51 +215,39 @@ pub const Connection = struct {
         _ = watcher;
         _ = buffer;
         const me = self.?;
+        me.pending_read = false;
         if (result) |n| {
-            log.debug("TCP Read complete: {d} bytes", .{n});
             if (n == 0) {
                  // EOF
-                 log.debug("TCP EOF. Closing...", .{});
                  me.close();
-                 // Call user error callback with EOF error? Or just close?
                  if (me.on_error) |cb| cb(me.user_ctx, error.EOF);
                  return .disarm;
             }
             
             // 1. Feed the new encrypted data into the TLS state machine
-            log.debug("TLS processIncoming: {d} bytes", .{n});
             var data_to_feed: ?[]const u8 = me.read_buf[0..n];
             
             while (true) {
                 const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}) catch |err| {
-                    log.debug("TLS processIncoming error: {}", .{err});
                     if (me.on_error) |cb| cb(me.user_ctx, err);
                     return .disarm;
                 };
                 
-                // After the first call, we don't have new data to feed, 
-                // we just want to drain any remaining records from the BIO.
                 data_to_feed = null;
 
-                // Check if handshake just finished
                 if (!me.handshake_complete and me.tls.handshake_complete) {
-                    log.debug("Handshake complete!", .{});
                     me.handshake_complete = true;
                     if (me.on_connect) |cb| cb(me.user_ctx);
                 }
                 
                 if (dec_res) |pt| {
-                    log.debug("Decrypted {d} bytes", .{pt.len});
                     if (me.on_data) |cb| cb(me.user_ctx, pt);
-                    // Continue looping to see if there are more records in the BIO
                 } else {
-                    // No more decrypted data available at this time
                     break;
                 }
             }
             me.pump();
         } else |err| {
-             log.debug("Read Error: {}", .{err});
              me.close();
              if (me.on_error) |cb| cb(me.user_ctx, err);
         }

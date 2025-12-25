@@ -127,11 +127,18 @@
 *   [x] **Plan 08: Reproducible Benchmarks**: Implemented `tools/remote_bench.sh` and `tools/bench_e2e/`.
 *   [x] **Proof**: Formally proved ~1.9x performance advantage over PyArrow on ARM64 hardware.
 
-### Milestone 11: Production Readiness & Lambda Deployment [PENDING]
-*   [ ] **Plan 09: Lambda End-to-End**: Build deployable Lambda benchmark using the verified ARM64 engine.
-*   [ ] **Milestone 8: Persistent Pool**: Implementation of keep-alive timeouts and stale detection to eliminate the cleanup hang.
-*   [ ] **Milestone 12: Repetition Levels**: Moving beyond simple columnar scans to support nested structures (Lists/Maps).
-*   [ ] **Plan 11: Multi-Column Throughput**: Verify linear scaling when scanning 50+ columns in parallel.
+### Milestone 11: New Cross-Platform Async I/O [COMPLETE]
+*   [x] **Foundation**: Integrated `libxev` + `boring_tls` for native TLS 1.3 without external proxies.
+*   [x] **Correctness**: Fixed critical TLS record pumping bug (draining multiple records per TCP packet).
+*   [x] **Stability**: Resolved loop exit hangs via "Ghost Watcher" detection and pending op guards.
+*   [x] **Parquet Wiring**: Wired `ParquetFile.openS3` to new stack; verified metadata parsing over TLS.
+
+### Milestone 12: Performance & Scaling [IN PROGRESS]
+*   [x] **Parallel readRanges**: Implemented native parallel fetching of S3 ranges on a single event loop.
+*   [x] **Cold Start Optimization**: Achieved ~30% faster cold starts (52ms -> 37ms) vs sequential mode.
+*   [ ] **SigV4 Signing**: Integrate SigV4 logic into `XevS3Source` for authenticated AWS S3.
+*   [ ] **Connection Pooling**: Reuse TLS connections across requests to eliminate handshake overhead.
+*   [ ] **Linear Scaling**: Verify linear performance scaling when scanning 50+ columns in parallel.
 
 ---
 

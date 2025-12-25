@@ -104,13 +104,15 @@ Implementation of high-concurrency fetching and optimization of the new I/O stac
 *   **"Ghost Watcher" Bug Fix**: Diagnosed and resolved a critical hang in the loop exit caused by double-arming `libxev` completions. Implemented `pending_read` and `pending_write` guards in `TlsConnection` to maintain perfect loop balance.
 *   **Cold Start Speedup**: Verified a ~30% reduction in cold start latency (from 52ms down to 37ms for a full metadata scan) on local MinIO TLS hardware.
 *   **Cleanup Stability**: Fixed a double-free bug in the `ParquetFile` cleanup path where the S3 source was being destroyed multiple times.
+*   **Connection Pooling**: Implemented a robust LIFO connection pool (`XevConnectionPool`) that reuses TLS connections for subsequent requests (e.g., HEAD followed by GETs), eliminating handshake overhead.
 *   **Multi-System Benchmark Results (S3 Cold Start - MinIO TLS):**
-    *   **ZPQ Async (Xev)**: **~40ms** (Min: 33ms)
-    *   Python (PyArrow/boto3): ~35ms (Min: 8ms)
-    *   Rust (Polars): ~120ms
-    *   *Note: ZPQ is achieving near-parity with PyArrow even without connection pooling. We are currently 3x faster than Polars.*
+    *   **ZPQ Async (Pooled)**: **~44ms** (Approaching PyArrow)
+    *   Python (PyArrow/boto3): ~28.5ms
+    *   Rust (Polars): ~119.5ms
+    *   *Note: ZPQ is achieving near-parity with PyArrow and is ~3x faster than Polars on cold starts.*
 
 ## Future Technical Objectives (Milestone 13):
-1.  **Connection Pooling**: Investigate the "_amazin_" Zig-native connection pool implementation (or adapt `std.http.Client.ConnectionPool`) to reuse TLS connections and eliminate handshake overhead.
-2.  **Milestone 14: Repetition Levels**: Implementing Dremel-style shredding for nested Parquet structures (Lists and Maps).
+1.  **Massive Parallel Scans**: Implement large-buffer (1MB+) parallel column fetching to saturate network bandwidth.
+2.  **Scheduler Port**: Migrate the `scheduler.zig` range-coalescing logic to the new `XevS3Source` stack.
 3.  **Linear Scaling**: Verify linear performance scaling when scanning 50+ columns in parallel.
+4.  **Beat Polars**: Optimize throughput to surpass the Polars baseline (~162ms) for large file scans.

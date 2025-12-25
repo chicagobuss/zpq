@@ -34,9 +34,9 @@ alwaysApply: false
 *   **Context**: Inject `allocator` into properties using the Context Wrapper pattern to support memory-managed fuzzing.
 
 ## 7. Zig 0.16.dev "Source-First" Mandate
-*   **Volatility**: Assume all `std` signatures are "Broken" until verified against the local source in `/home/joshua/.zvm/master/lib/std/`.
+*   **Volatility**: Assume all `std` signatures are "Broken" until verified against the local source in `/Users/joshua/.zvm/master/lib/std/`.
 *   **Verification Path**: Before using or debugging `std.X`, you MUST run:
-    `grep -r "pub fn [function_name]" /home/joshua/.zvm/master/lib/std/[module].zig`
+    `grep -r "pub fn [function_name]" /Users/joshua/.zvm/master/lib/std/[module].zig`
 *   **No Guessing**: If a build fails with "no member named X", stop immediately and read the `std` source file. Do not attempt a second guess based on training data.
 *   **Common 0.16.x Breaking Examples**:
     *   **ArrayList**: `std.ArrayList(T)` (managed) is generally DISCOURAGED in core logic. Use `std.ArrayListUnmanaged(T)`.
@@ -45,6 +45,18 @@ alwaysApply: false
         *   `list.deinit()` -> **REMOVED** (for Unmanaged). Use `list.deinit(allocator)`.
     *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
     *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()`.
+        *   **Note**: `Instant.timestamp` is a `posix.timespec` struct on POSIX systems (macOS/Linux).
+        *   **Accessing sec/nsec**: On macOS (Darwin), `timespec` fields are often `sec` and `nsec`. On Linux, they are `tv_sec` and `tv_nsec`. ALWAYS use `@hasField`.
+        *   **Safe Milliseconds**: 
+            ```zig
+            const now = try std.time.Instant.now();
+            const ms = if (@hasField(@TypeOf(now.timestamp), "sec")) 
+                (now.timestamp.sec * 1000) + @divFloor(now.timestamp.nsec, 1_000_000)
+            else if (@hasField(@TypeOf(now.timestamp), "tv_sec"))
+                (now.timestamp.tv_sec * 1000) + @divFloor(now.timestamp.tv_nsec, 1_000_000)
+            else 
+                @divFloor(@as(i64, @intCast(now.timestamp)), 1_000_000);
+            ```
     *   **Build API**: Methods like `linkLibC`, `linkLibCpp`, `addCSourceFiles`, and `addObjectFile` moved from `Step.Compile` to `Build.Module`.
         *   Access them via `exe.root_module`.
         *   `linkLibC()` -> `root_module.linkSystemLibrary("c", .{})`.

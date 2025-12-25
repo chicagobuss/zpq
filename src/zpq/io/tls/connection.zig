@@ -31,6 +31,7 @@ pub const Connection = struct {
     connected: bool = false,
     handshake_complete: bool = false,
     closed: bool = false,
+    idling: bool = false,
     pending_read: bool = false,
     pending_write: bool = false,
     
@@ -89,14 +90,23 @@ pub const Connection = struct {
     }
     
     pub fn write(self: *Self, data: []const u8) !void {
-        if (self.closed) return;
+        if (self.closed) {
+            log.debug("write: connection closed, ignoring", .{});
+            return;
+        }
         // Encrypt and send
         const enc_data = try self.tls.processOutgoing(data);
         if (enc_data) |bytes| {
-             if (self.pending_write) return error.WriteInProgress;
+             if (self.pending_write) {
+                 log.debug("write: write already in progress", .{});
+                 return error.WriteInProgress;
+             }
              const buf = try self.allocator.dupe(u8, bytes);
              self.pending_write = true;
+             log.debug("write: scheduling TCP write {d} bytes", .{buf.len});
              self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+        } else {
+            log.debug("write: no encrypted data produced by TLS", .{});
         }
     }
 
@@ -109,22 +119,29 @@ pub const Connection = struct {
         const out_slice_res = self.tls.processOutgoing(null);
         if (out_slice_res) |out_slice_opt| {
              if (out_slice_opt) |data| {
-                if (self.pending_write) return; // Wait for current write to finish
+                if (self.pending_write) {
+                    log.debug("pump: write in progress, buffering", .{});
+                    return; // Wait for current write to finish
+                }
                 const buf = self.allocator.dupe(u8, data) catch |err| {
+                    log.debug("pump: alloc failed: {}", .{err});
                     if (self.on_error) |cb| cb(self.user_ctx, err);
                     return;
                 };
                 self.pending_write = true;
+                log.debug("pump: scheduling TCP write {d} bytes", .{buf.len});
                 self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
                 return;
              }
         } else |err| {
+             log.debug("pump: TLS processOutgoing failed: {}", .{err});
              if (self.on_error) |cb| cb(self.user_ctx, err);
              return;
         }
 
         // 2. Need Input? (TCP -> TLS)
-        if (!self.pending_read) {
+        if (!self.pending_read and !self.idling) {
+            log.debug("pump: scheduling TCP read", .{});
             self.pending_read = true;
             self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
         }
@@ -194,9 +211,11 @@ pub const Connection = struct {
         const me = self.?;
         me.pending_write = false;
         me.allocator.free(buffer.slice); // Free the dupe
-        if (result) |_| {
+        if (result) |n| {
+            log.debug("internalOnTcpWrite: wrote {d} bytes", .{n});
             me.pump();
         } else |err| {
+             log.debug("internalOnTcpWrite: write failed: {}", .{err});
              if (me.on_error) |cb| cb(me.user_ctx, err);
         }
         return .disarm;

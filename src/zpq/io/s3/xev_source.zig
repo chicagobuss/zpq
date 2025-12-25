@@ -5,6 +5,9 @@ const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
 const SigV4 = @import("sigv4.zig").SigV4;
 const io = @import("../interface.zig");
 const dns = @import("dns.zig");
+const pool_mod = @import("connection_pool.zig");
+const ConnectionPool = pool_mod.ConnectionPool;
+const ConnectionKey = pool_mod.ConnectionKey;
 
 const log = @import("std").log.scoped(.s3_source);
 
@@ -16,6 +19,7 @@ pub const XevS3Source = struct {
     loop: *xev.Loop,
     thread_pool: *xev.ThreadPool,
     resolver: dns.ThreadPoolResolver,
+    pool: ConnectionPool,
 
     host: []const u8,
     bucket: []const u8,
@@ -61,6 +65,7 @@ pub const XevS3Source = struct {
         self.thread_pool.* = xev.ThreadPool.init(.{});
         
         self.resolver = dns.ThreadPoolResolver.init(self.thread_pool, allocator);
+        self.pool = ConnectionPool.init(allocator);
         
         self.host = try allocator.dupe(u8, host);
         self.bucket = try allocator.dupe(u8, bucket);
@@ -90,6 +95,7 @@ pub const XevS3Source = struct {
     }
 
     pub fn deinit(self: *XevS3Source) void {
+        self.pool.deinit();
         self.resolver.deinit();
         self.thread_pool.shutdown(); // Ensure threads stop
         self.thread_pool.deinit();
@@ -142,9 +148,6 @@ pub const XevS3Source = struct {
             const batch_ranges = ranges[i .. i + batch_size];
             const batch_buffers = buffers[i .. i + batch_size];
 
-            var local_loop = try xev.Loop.init(.{});
-            defer local_loop.deinit();
-
             const contexts = try self.allocator.alloc(*ReqContext, batch_size);
             defer self.allocator.free(contexts);
             
@@ -152,18 +155,23 @@ pub const XevS3Source = struct {
             defer self.allocator.free(conns);
 
             var cleanup_idx: usize = 0;
-            defer {
+            errdefer {
                 for (0..cleanup_idx) |j| {
-                    conns[j].deinit();
-                    self.allocator.destroy(conns[j]);
                     self.allocator.destroy(contexts[j]);
                 }
             }
 
             for (batch_ranges, 0..) |range, j| {
-                const conn = try self.allocator.create(tls.Connection);
+                const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
+                const conn = if (self.pool.acquire(key)) |c| blk: {
+                    c.idling = false;
+                    break :blk c;
+                } else blk: {
+                    const c = try self.allocator.create(tls.Connection);
+                    c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+                    break :blk c;
+                };
                 conns[j] = conn;
-                conn.* = try tls.Connection.init(&local_loop, self.allocator, self.host);
                 cleanup_idx += 1;
 
                 const ctx = try self.allocator.create(ReqContext);
@@ -182,21 +190,31 @@ pub const XevS3Source = struct {
                 conn.on_data = onData;
                 conn.on_error = onError;
 
-                try conn.connect(addr);
-            }
-
-            try local_loop.run(.until_done);
-
-            // Check for errors in batch
-            for (contexts) |ctx| {
-                if (ctx.err) |err| {
-                    if (err != error.EOF and err != error.TlsConnectionClosed) {
-                         return err;
-                    } else if (!ctx.finished) {
-                         return err;
-                    }
+                if (!conn.handshake_complete) {
+                    try conn.connect(addr);
+                } else {
+                    onConnect(ctx);
                 }
             }
+
+            try self.loop.run(.until_done);
+
+            // Check for errors and cleanup contexts
+            var first_err: ?anyerror = null;
+            for (contexts) |ctx| {
+                if (ctx.err) |err| {
+                    if (err == error.EOF or err == error.TlsConnectionClosed) {
+                        if (ctx.finished) {
+                            self.allocator.destroy(ctx);
+                            continue;
+                        }
+                    }
+                    if (first_err == null) first_err = err;
+                }
+                self.allocator.destroy(ctx);
+            }
+
+            if (first_err) |e| return e;
 
             i += batch_size;
         }
@@ -236,13 +254,16 @@ pub const XevS3Source = struct {
         log.debug("fetchSize: starting HEAD request", .{});
         const addr = try self.resolve();
         
-        const conn = try self.allocator.create(tls.Connection);
-        conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
-        defer {
-            conn.deinit();
-            self.allocator.destroy(conn);
-        }
-
+        const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
+        const conn = if (self.pool.acquire(key)) |c| blk: {
+            c.idling = false;
+            break :blk c;
+        } else blk: {
+            const c = try self.allocator.create(tls.Connection);
+            c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            break :blk c;
+        };
+        
         const ctx = try self.allocator.create(ReqContext);
         ctx.* = .{
             .source = self,
@@ -260,7 +281,13 @@ pub const XevS3Source = struct {
         conn.on_data = onData;
         conn.on_error = onError;
 
-        try conn.connect(addr);
+        if (!conn.handshake_complete) {
+            try conn.connect(addr);
+        } else {
+            // Already connected, trigger onConnect manually
+            onConnect(ctx);
+        }
+        
         try self.loop.run(.until_done);
 
         if (ctx.err) |err| {
@@ -276,12 +303,15 @@ pub const XevS3Source = struct {
         log.debug("readAt: start offset={d} len={d}", .{offset, buf.len});
         const addr = try self.resolve();
 
-        const conn = try self.allocator.create(tls.Connection);
-        conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
-        defer {
-            conn.deinit(); 
-            self.allocator.destroy(conn);
-        }
+        const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
+        const conn = if (self.pool.acquire(key)) |c| blk: {
+            c.idling = false;
+            break :blk c;
+        } else blk: {
+            const c = try self.allocator.create(tls.Connection);
+            c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            break :blk c;
+        };
         
         const ctx = try self.allocator.create(ReqContext);
         ctx.* = .{
@@ -299,8 +329,13 @@ pub const XevS3Source = struct {
         conn.on_data = onData;
         conn.on_error = onError;
 
-        log.debug("readAt: connecting...", .{});
-        try conn.connect(addr);
+        if (!conn.handshake_complete) {
+            log.debug("readAt: connecting...", .{});
+            try conn.connect(addr);
+        } else {
+            log.debug("readAt: reusing connection...", .{});
+            onConnect(ctx);
+        }
 
         log.debug("readAt: running loop...", .{});
         try self.loop.run(.until_done);
@@ -405,7 +440,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
         ctx.conn.close();
         return;
     };
-    headers.append(aa, .{ .name = "Connection", .value = "close" }) catch |err| {
+    headers.append(aa, .{ .name = "Connection", .value = "keep-alive" }) catch |err| {
         ctx.err = err;
         ctx.conn.close();
         return;
@@ -531,11 +566,20 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
     };
 
     if (ctx.is_head and ctx.parser.headersComplete()) {
+        log.debug("HEAD response status: {d}", .{ctx.parser.status_code});
         if (ctx.parser.content_length) |len| {
             ctx.source.file_size = len;
+            log.debug("HEAD response content-length: {d}", .{len});
+        } else {
+            log.debug("HEAD response missing content-length", .{});
         }
         ctx.finished = true;
-        ctx.conn.close();
+        // Don't close, pool instead!
+        ctx.conn.user_ctx = null;
+        ctx.conn.idling = true;
+        ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
+            ctx.conn.close();
+        };
     }
 }
 
@@ -553,9 +597,14 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
     }
     
     if (ctx.bytes_read == ctx.buf.len) {
-        std.debug.print("[s3] Request finished. offset={d} len={d} self={*}\n", .{ctx.offset, ctx.buf.len, ctx.conn});
+        log.debug("[s3] Request finished. offset={d} len={d} self={*}", .{ctx.offset, ctx.buf.len, ctx.conn});
         ctx.finished = true;
-        ctx.conn.close();
+        // Don't close, pool instead!
+        ctx.conn.user_ctx = null;
+        ctx.conn.idling = true;
+        ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
+            ctx.conn.close();
+        };
     }
 }
 

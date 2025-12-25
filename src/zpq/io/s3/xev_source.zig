@@ -5,8 +5,8 @@ const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
 const SigV4 = @import("sigv4.zig").SigV4;
 const io = @import("../interface.zig");
 const dns = @import("dns.zig");
-const pool_mod = @import("connection_pool.zig");
-const ConnectionPool = pool_mod.ConnectionPool;
+const pool_mod = @import("xev_connection_pool.zig");
+const XevConnectionPool = pool_mod.XevConnectionPool;
 const ConnectionKey = pool_mod.ConnectionKey;
 
 const log = @import("std").log.scoped(.s3_source);
@@ -19,7 +19,7 @@ pub const XevS3Source = struct {
     loop: *xev.Loop,
     thread_pool: *xev.ThreadPool,
     resolver: dns.ThreadPoolResolver,
-    pool: ConnectionPool,
+    pool: XevConnectionPool,
 
     host: []const u8,
     bucket: []const u8,
@@ -65,7 +65,7 @@ pub const XevS3Source = struct {
         self.thread_pool.* = xev.ThreadPool.init(.{});
         
         self.resolver = dns.ThreadPoolResolver.init(self.thread_pool, allocator);
-        self.pool = ConnectionPool.init(allocator);
+        self.pool = XevConnectionPool.init(allocator);
         
         self.host = try allocator.dupe(u8, host);
         self.bucket = try allocator.dupe(u8, bucket);

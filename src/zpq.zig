@@ -39,6 +39,7 @@ pub const s3 = struct {
     pub const S3Source = @import("zpq/io/s3/sync.zig").S3Source;
     pub const AsyncS3Source = @import("zpq/io/s3/async_source.zig").AsyncS3Source;
     pub const ConnectionPool = @import("zpq/io/s3/connection_pool.zig").ConnectionPool;
+    pub const XevConnectionPool = @import("zpq/io/s3/xev_connection_pool.zig").XevConnectionPool;
 
     // Internal Components
     pub const AsyncRequest = @import("zpq/io/s3/request.zig").AsyncRequest;

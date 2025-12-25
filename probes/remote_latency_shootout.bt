@@ -1,0 +1,80 @@
+#!/usr/bin/bpftrace
+
+/*
+ * remote_latency_shootout.bt
+ *
+ * Purpose: Diagnose the 100Mbps "Monster Pipe" bottleneck in ZPQ.
+ * Tracks the "Dark Matter" time between TCP reception, Application Read, 
+ * and Application Re-arming.
+ *
+ * Usage: sudo bpftrace remote_latency_shootout.bt -c "./zig-out/bin/zpq scan s3://..."
+ */
+
+BEGIN
+{
+    printf("Tracing ZPQ latency... Hit Ctrl-C to end or wait for process to finish.\n");
+    printf("%-10s %-15s %-15s %-15s\n", "EVENT", "DELTA (us)", "TCP_WIN (KB)", "NOTES");
+}
+
+/* 1. KERNEL RECEIVE -> APP READ (Scheduling Lag) */
+kprobe:tcp_rcv_established
+{
+    // Filter for our target process if possible, or just track all for now
+    // In a real environment, we'd filter by port or PID
+    @packet_arrival[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_enter_read
+/comm == "zpq"/
+{
+    if (@packet_arrival[tid]) {
+        $diff = (nsecs - @packet_arrival[tid]) / 1000;
+        printf("%-10s %-15d %-15s %-15s\n", "READ_LAG", $diff, "", "Kernel->App");
+        delete(@packet_arrival[tid]);
+    }
+    @in_read[tid] = nsecs;
+}
+
+/* 2. APP READ -> TLS/PROCESSING -> NEXT READ (Processing Lag / Serial Pumping) */
+tracepoint:syscalls:sys_exit_read
+/comm == "zpq"/
+{
+    $ret = args->ret;
+    if ($ret > 0 && @in_read[tid]) {
+        @last_read_exit[tid] = nsecs;
+        @total_read_bytes += $ret;
+    }
+    delete(@in_read[tid]);
+}
+
+tracepoint:syscalls:sys_enter_read
+/comm == "zpq" && @last_read_exit[tid]/
+{
+    $processing_time = (nsecs - @last_read_exit[tid]) / 1000;
+    printf("%-10s %-15d %-15s %-15s\n", "PROC_LAG", $processing_time, "", "App Processing/Pump");
+    delete(@last_read_exit[tid]);
+}
+
+/* 3. TCP WINDOW MONITORING */
+/* This requires a slightly more complex probe into the tcp_sock struct */
+/* We'll use a simplified version to see if we're hitting zero window */
+kprobe:tcp_cleanup_rbuf
+/comm == "zpq"/
+{
+    // This is called when the app reads data and the window is updated
+    $sk = (struct sock *)arg0;
+    $tp = (struct tcp_sock *)arg0;
+    // Window is in bytes, convert to KB
+    $win = $tp->rcv_wnd / 1024;
+    printf("%-10s %-15s %-15d %-15s\n", "WINDOW", "", $win, "RCV_WND");
+}
+
+END
+{
+    printf("\nShootout Complete.\n");
+    printf("Total bytes read: %d\n", @total_read_bytes);
+    clear(@packet_arrival);
+    clear(@in_read);
+    clear(@last_read_exit);
+}
+

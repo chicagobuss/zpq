@@ -52,18 +52,13 @@ pub fn writeToBio(bio: *c.BIO, data: []const u8) !void {
 
 pub fn readFromBio(bio: *c.BIO, buffer: []u8) !usize {
     var total_read: usize = 0;
-    var temp_buf: [BUFFER_SIZE]u8 = undefined;
 
     while (total_read < buffer.len) {
         const remaining = buffer.len - total_read;
-        const read_size = @min(temp_buf.len, remaining);
-
-        const bytes_read = c.BIO_read(bio, &temp_buf, @intCast(read_size));
+        const bytes_read = c.BIO_read(bio, buffer.ptr + total_read, @intCast(remaining));
         if (bytes_read <= 0) break;
 
-        const actual_read = @as(usize, @intCast(bytes_read));
-        @memcpy(buffer[total_read .. total_read + actual_read], temp_buf[0..actual_read]);
-        total_read += actual_read;
+        total_read += @as(usize, @intCast(bytes_read));
     }
 
     return total_read;

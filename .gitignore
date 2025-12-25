@@ -33,3 +33,4 @@ tools/rustfs_tls/certs/
 !data/simple.parquet
 !data/large_bitpacked.parquet
 !data/large_rle.parquet
+tmp/

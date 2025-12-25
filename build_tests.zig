@@ -383,9 +383,31 @@ pub fn addAuxiliaryTools(
             if (install_all) b.installArtifact(exe);
 
             const run = b.addRunArtifact(exe);
-            const step = b.step("probe-s3-head-hang", "Run S3 HEAD request hang probe");
-            step.dependOn(&run.step);
-        }
+        const step = b.step("probe-s3-head-hang", "Run S3 HEAD request hang probe");
+        step.dependOn(&run.step);
     }
+
+    // shootout-tls - Micro-shootout for TLS throughput strategies
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/shootout_tls_throughput.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+        mod.addImport("xev", libxev_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "shootout-tls",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+        if (install_all) b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("shootout-tls", "Run TLS throughput micro-shootout");
+        step.dependOn(&run.step);
+    }
+}
 
 }

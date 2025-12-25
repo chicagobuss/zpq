@@ -11,6 +11,18 @@ const ConnectionKey = pool_mod.ConnectionKey;
 
 const log = @import("std").log.scoped(.s3_source);
 
+const BatchContext = struct {
+    remaining: usize,
+    loop: *xev.Loop,
+    
+    pub fn signalDone(self: *@This()) void {
+        self.remaining -= 1;
+        if (self.remaining == 0) {
+            self.loop.stop();
+        }
+    }
+};
+
 /// A cross-platform S3 Source that uses libxev + boring_tls.
 /// Implements io.RandomAccessSource for ParquetFile.
 /// This source owns its own EventLoop and blocks on read calls (spinning the loop).
@@ -27,6 +39,12 @@ pub const XevS3Source = struct {
     region: []const u8,
     use_tls: bool,
     port: u16,
+
+    // Throughput Options
+    tcp_read_buf_size: usize = 4096,
+    use_direct: bool = true,
+    
+    owns_loop: bool = false,
 
     // Auth (optional)
     access_key: ?[]const u8 = null,
@@ -48,49 +66,82 @@ pub const XevS3Source = struct {
         use_tls: bool,
         port: u16,
     ) !*XevS3Source {
-        const self = try allocator.create(XevS3Source);
-        errdefer allocator.destroy(self);
-
-        self.allocator = allocator;
-        self.loop = try allocator.create(xev.Loop);
-        errdefer allocator.destroy(self.loop);
-        self.loop.* = try xev.Loop.init(.{});
-        
-        self.thread_pool = try allocator.create(xev.ThreadPool);
+        const loop = try allocator.create(xev.Loop);
+        loop.* = try xev.Loop.init(.{});
         errdefer {
-            self.loop.deinit();
-            allocator.destroy(self.loop);
-            allocator.destroy(self.thread_pool);
+            loop.deinit();
+            allocator.destroy(loop);
         }
-        self.thread_pool.* = xev.ThreadPool.init(.{});
-        
-        self.resolver = dns.ThreadPoolResolver.init(self.thread_pool, allocator);
-        self.pool = XevConnectionPool.init(allocator);
-        
-        self.host = try allocator.dupe(u8, host);
-        self.bucket = try allocator.dupe(u8, bucket);
-        self.key = try allocator.dupe(u8, key);
-        self.region = try allocator.dupe(u8, region);
-        self.use_tls = use_tls;
-        self.port = port;
-        self.cached_addr = null;
-        self.file_size = 0;
-        self.access_key = null;
-        self.secret_key = null;
-        self.session_token = null;
+
+        const thread_pool = try allocator.create(xev.ThreadPool);
+        thread_pool.* = xev.ThreadPool.init(.{});
+        errdefer {
+            thread_pool.shutdown();
+            thread_pool.deinit();
+            allocator.destroy(thread_pool);
+        }
+
+        var self = try initWithLoop(allocator, loop, thread_pool, host, bucket, key, region, use_tls, port);
+        self.owns_loop = true;
+        return self;
+    }
+
+    pub fn initWithLoop(
+        allocator: std.mem.Allocator,
+        loop: *xev.Loop,
+        thread_pool: *xev.ThreadPool,
+        host: []const u8,
+        bucket: []const u8,
+        key: []const u8,
+        region: []const u8,
+        use_tls: bool,
+        port: u16,
+        tcp_read_buf_size: usize,
+        use_direct: bool,
+    ) !*XevS3Source {
+        const self = try allocator.create(XevS3Source);
+        self.* = .{
+            .allocator = allocator,
+            .loop = loop,
+            .thread_pool = thread_pool,
+            .resolver = dns.ThreadPoolResolver.init(thread_pool, allocator),
+            .pool = XevConnectionPool.init(allocator),
+            .host = try allocator.dupe(u8, host),
+            .bucket = try allocator.dupe(u8, bucket),
+            .key = try allocator.dupe(u8, key),
+            .region = try allocator.dupe(u8, region),
+            .use_tls = use_tls,
+            .port = port,
+            .tcp_read_buf_size = tcp_read_buf_size,
+            .use_direct = use_direct,
+            .owns_loop = false,
+        };
 
         return self;
     }
 
     pub fn deinit(self: *XevS3Source) void {
+        // 1. Close all idle connections in the pool
+        self.pool.closeAll();
+        
+        // 2. Pump the loop one last time to process the close completions
+        // We use .once in a loop because .until_done might wait for 
+        // connections that are still in a "connect" state if something went wrong.
+        // Actually, until_done is fine here if we trust our close() logic.
+        self.loop.run(.until_done) catch {};
+
+        // 3. Cleanup the rest
         self.pool.deinit();
         self.resolver.deinit();
-        self.thread_pool.shutdown(); // Ensure threads stop
-        self.thread_pool.deinit();
-        self.loop.deinit();
         
-        self.allocator.destroy(self.thread_pool);
-        self.allocator.destroy(self.loop);
+        if (self.owns_loop) {
+            self.thread_pool.shutdown(); // Ensure threads stop
+            self.thread_pool.deinit();
+            self.loop.deinit();
+            
+            self.allocator.destroy(self.thread_pool);
+            self.allocator.destroy(self.loop);
+        }
         
         self.allocator.free(self.host);
         self.allocator.free(self.bucket);
@@ -100,6 +151,8 @@ pub const XevS3Source = struct {
         if (self.access_key) |k| self.allocator.free(k);
         if (self.secret_key) |k| self.allocator.free(k);
         if (self.session_token) |t| self.allocator.free(t);
+        
+        self.allocator.destroy(self);
     }
 
     pub fn setCredentials(self: *XevS3Source, access_key: []const u8, secret_key: []const u8, session_token: ?[]const u8) !void {
@@ -155,14 +208,20 @@ pub const XevS3Source = struct {
                 }
             }
 
+            var batch_ctx = BatchContext{ .remaining = batch_size, .loop = self.loop };
+
             for (batch_merged, 0..) |merged, j| {
                 const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
                 const conn = if (self.pool.acquire(key)) |c| blk: {
                     c.idling = false;
+                    c.tcp_read_buf_size = self.tcp_read_buf_size;
+                    c.use_direct = self.use_direct;
                     break :blk c;
                 } else blk: {
                     const c = try self.allocator.create(tls.Connection);
                     c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+                    c.tcp_read_buf_size = self.tcp_read_buf_size;
+                    c.use_direct = self.use_direct;
                     break :blk c;
                 };
 
@@ -185,6 +244,7 @@ pub const XevS3Source = struct {
                     .dest_buffers = dest_buffers,
                     .allocator = self.allocator,
                     .parser = .{},
+                    .batch_ctx = &batch_ctx,
                 };
                 cleanup_idx += 1;
 
@@ -208,17 +268,13 @@ pub const XevS3Source = struct {
                 if (ctx.err) |err| {
                     if (err == error.EOF or err == error.TlsConnectionClosed) {
                         if (ctx.finished) {
-                            self.allocator.free(ctx.sub_ranges);
-                            self.allocator.free(ctx.dest_buffers);
-                            self.allocator.destroy(ctx);
+                            ctx.deinit();
                             continue;
                         }
                     }
                     if (first_err == null) first_err = err;
                 }
-                self.allocator.free(ctx.sub_ranges);
-                self.allocator.free(ctx.dest_buffers);
-                self.allocator.destroy(ctx);
+                ctx.deinit();
             }
 
             if (first_err) |e| return e;
@@ -264,10 +320,14 @@ pub const XevS3Source = struct {
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
         const conn = if (self.pool.acquire(key)) |c| blk: {
             c.idling = false;
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         } else blk: {
             const c = try self.allocator.create(tls.Connection);
             c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         };
         
@@ -315,10 +375,14 @@ pub const XevS3Source = struct {
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
         const conn = if (self.pool.acquire(key)) |c| blk: {
             c.idling = false;
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         } else blk: {
             const c = try self.allocator.create(tls.Connection);
             c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         };
         
@@ -445,8 +509,11 @@ const ReqContext = struct {
     err: ?anyerror = null,
     http_status: u16 = 0,
     is_head: bool = false,
+    batch_ctx: ?*anyopaque = null,
     
     pub fn deinit(self: *ReqContext) void {
+        self.allocator.free(self.sub_ranges);
+        self.allocator.free(self.dest_buffers);
         self.allocator.destroy(self);
     }
 };
@@ -624,6 +691,10 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
         ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
             ctx.conn.close();
         };
+        if (ctx.batch_ctx) |bc| {
+            const batch: *BatchContext = @ptrCast(@alignCast(bc));
+            batch.signalDone();
+        }
     }
 }
 
@@ -665,6 +736,10 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
         ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
             ctx.conn.close();
         };
+        if (ctx.batch_ctx) |bc| {
+            const batch: *BatchContext = @ptrCast(@alignCast(bc));
+            batch.signalDone();
+        }
     }
 }
 
@@ -672,4 +747,8 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
     ctx.err = err;
     ctx.conn.close();
+    if (ctx.batch_ctx) |bc| {
+        const batch: *BatchContext = @ptrCast(@alignCast(bc));
+        batch.signalDone();
+    }
 }

@@ -103,6 +103,7 @@ pub const ResponseParser = struct {
             self.body_read += take;
         }
         if (self.body_read == want) {
+            std.log.scoped(.http_parser).debug("consumeBody: reached content-length {d}, state -> done", .{want});
             self.state = .done;
         }
     }
@@ -123,8 +124,10 @@ pub const ResponseParser = struct {
         var it = std.mem.splitSequence(u8, headers[first_crlf + 2 ..], "\r\n");
         while (it.next()) |line| {
             if (line.len == 0) break;
-            if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
-                const v = std.mem.trim(u8, line["Content-Length:".len..], " \t");
+            
+            // Check for Content-Length (case-insensitive)
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                const v = std.mem.trim(u8, line["content-length:".len..], " \t");
                 self.content_length = try std.fmt.parseInt(usize, v, 10);
             }
         }

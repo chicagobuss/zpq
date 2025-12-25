@@ -236,6 +236,7 @@ pub const Connection = struct {
         const me = self.?;
         me.pending_read = false;
         if (result) |n| {
+            log.debug("internalOnTcpRead: read {d} bytes", .{n});
             if (n == 0) {
                  // EOF
                  me.close();

@@ -258,6 +258,57 @@ pub fn build(b: *std.Build) void {
         const step_probe_multi_conn = b.step("probe-multi-conn", "Run multi-connection probe");
         step_probe_multi_conn.dependOn(&run_probe_multi_conn.step);
 
+        // 12. probe-rustfs
+        const probe_rustfs = b.addExecutable(.{
+            .name = "probe-rustfs",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_rustfs.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_rustfs.root_module.addImport("xev", libxev_mod);
+        probe_rustfs.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_rustfs);
+
+        const run_probe_rustfs = b.addRunArtifact(probe_rustfs);
+        const step_probe_rustfs = b.step("probe-rustfs", "Run RustFS compatibility probe");
+        step_probe_rustfs.dependOn(&run_probe_rustfs.step);
+
+        // 14. probe-rustfs-anon
+        const probe_rustfs_anon = b.addExecutable(.{
+            .name = "probe-rustfs-anon",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_rustfs_anon.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_rustfs_anon.root_module.addImport("xev", libxev_mod);
+        probe_rustfs_anon.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_rustfs_anon);
+
+        const run_probe_rustfs_anon = b.addRunArtifact(probe_rustfs_anon);
+        const step_probe_rustfs_anon = b.step("probe-rustfs-anon", "Run anonymous RustFS probe");
+        step_probe_rustfs_anon.dependOn(&run_probe_rustfs_anon.step);
+
+        // 13. probe-rustfs-raw
+        const probe_rustfs_raw = b.addExecutable(.{
+            .name = "probe-rustfs-raw",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_rustfs_raw.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_rustfs_raw.root_module.addImport("xev", libxev_mod);
+        probe_rustfs_raw.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_rustfs_raw);
+
+        const run_probe_rustfs_raw = b.addRunArtifact(probe_rustfs_raw);
+        const step_probe_rustfs_raw = b.step("probe-rustfs-raw", "Run raw TCP RustFS probe");
+        step_probe_rustfs_raw.dependOn(&run_probe_rustfs_raw.step);
+
         // Probe for DNS
         const probe_dns_xev = b.addExecutable(.{
             .name = "probe-dns-xev",

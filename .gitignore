@@ -24,3 +24,12 @@ __pycache__/
 !.env.example
 mock_s3_server
 nc_output.txt
+
+# RustFS / Local Testing
+rustfs_data/
+tools/rustfs_tls/certs/
+*.parquet
+!ci/fixtures/minio/types.parquet
+!data/simple.parquet
+!data/large_bitpacked.parquet
+!data/large_rle.parquet

@@ -122,52 +122,27 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
         use_tls = std.mem.eql(u8, uri.scheme, "https");
     }
 
-    // Now create the context and initialize fully
-    log.debug("factory: creating S3Context", .{});
-    const ctx = try allocator.create(S3Context);
-    errdefer allocator.destroy(ctx);
-
-    log.debug("factory: ctx={*}", .{ctx});
-
-    ctx.allocator = allocator;
-    ctx.host_owned = try allocator.dupe(u8, host);
-    errdefer allocator.free(ctx.host_owned.?);
-
-    ctx.pool = s3.ConnectionPool.init(allocator);
-    errdefer ctx.pool.deinit();
-
-    ctx.thread_pool = xev.ThreadPool.init(.{});
-    errdefer {
-        ctx.thread_pool.shutdown();
-        ctx.thread_pool.deinit();
+    // New high-performance Xev stack
+    const s3_src = try s3.XevS3Source.init(
+        allocator,
+        host,
+        bucket,
+        key,
+        config.region,
+        use_tls,
+        port,
+    );
+    // Note: ParquetFile.openS3 takes ownership of s3_src and will call its deinit.
+    
+    if (config.credentials) |creds| {
+        s3_src.access_key = try allocator.dupe(u8, creds.access_key);
+        s3_src.secret_key = try allocator.dupe(u8, creds.secret_key);
+        if (creds.session_token) |st| {
+            s3_src.session_token = try allocator.dupe(u8, st);
+        }
     }
 
-    ctx.tp_resolver = dns.ThreadPoolResolver.init(&ctx.thread_pool, allocator);
-    errdefer ctx.tp_resolver.deinit();
-
-    log.debug("factory: sf_resolver init, &ctx.sf_resolver={*}", .{&ctx.sf_resolver});
-    ctx.sf_resolver = dns.SingleFlightResolver.init(allocator, ctx.tp_resolver.resolver());
-    log.debug("factory: sf_resolver initialized, inflight count={d}", .{ctx.sf_resolver.inflight.count()});
-    errdefer {
-        log.debug("factory: errdefer sf_resolver.deinit, &ctx.sf_resolver={*}", .{&ctx.sf_resolver});
-        ctx.sf_resolver.deinit();
-    }
-
-    ctx.spec_resolver = dns.SpeculativeResolver.init(allocator, ctx.sf_resolver.resolver());
-    errdefer ctx.spec_resolver.deinit();
-
-    log.debug("factory: calling AsyncS3Source.init", .{});
-    ctx.source = try s3.AsyncS3Source.init(allocator, &ctx.pool, ctx.spec_resolver.resolver(), ctx.host_owned.?, port, bucket, key, use_tls, null, config);
-    errdefer ctx.source.deinit();
-
-    log.debug("factory: AsyncS3Source.init succeeded, file_size={d}", .{ctx.source.file_size});
-
-    const src = ctx.source.source();
-    log.debug("factory: source.size() returned {d}", .{src.size()});
-
-    // Note: Don't manually call cleanupAsyncS3 on error - the errdefers above handle cleanup.
-    // Only cleanupAsyncS3 should be called later when ParquetFile.deinit() runs on success path.
-    return zpq.file.ParquetFile.initOwned(allocator, src, ctx, cleanupAsyncS3);
+    return zpq.file.ParquetFile.openS3(allocator, s3_src);
 }
 
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {

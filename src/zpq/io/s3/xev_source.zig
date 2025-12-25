@@ -482,7 +482,16 @@ fn onConnect(ctx_void: ?*anyopaque) void {
         }
     } else {
         // Must add Host manually for anonymous requests (SigV4 adds it automatically)
-        headers.append(aa, .{ .name = "Host", .value = ctx.source.host }) catch |err| {
+        const host_header = if (ctx.source.port == 443 or ctx.source.port == 80)
+            ctx.source.host
+        else
+            std.fmt.allocPrint(aa, "{s}:{d}", .{ ctx.source.host, ctx.source.port }) catch |err| {
+                ctx.err = err;
+                ctx.conn.close();
+                return;
+            };
+            
+        headers.append(aa, .{ .name = "Host", .value = host_header }) catch |err| {
             ctx.err = err;
             ctx.conn.close();
             return;
@@ -558,6 +567,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
 
 fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
+    log.debug("onData: received {d} bytes", .{data.len});
     
     ctx.parser.feed(data, ctx, onBody) catch |err| {
         ctx.err = err;
@@ -585,6 +595,7 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
 
 fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
+    log.debug("onBody: status={d} chunk={d} remaining={d}", .{ ctx.parser.status_code, chunk.len, ctx.buf.len - ctx.bytes_read });
     
     if (ctx.parser.status_code != 0) ctx.http_status = ctx.parser.status_code;
     
@@ -596,8 +607,11 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
         ctx.bytes_read += take;
     }
     
-    if (ctx.bytes_read == ctx.buf.len) {
-        log.debug("[s3] Request finished. offset={d} len={d} self={*}", .{ctx.offset, ctx.buf.len, ctx.conn});
+    // Finish if we've filled our buffer OR if we've read the full content length
+    const body_done = if (ctx.parser.content_length) |cl| ctx.bytes_read >= cl else false;
+    
+    if (ctx.bytes_read == ctx.buf.len or body_done) {
+        log.debug("[s3] Request finished. read={d} buf_len={d} content_len={?d}", .{ctx.bytes_read, ctx.buf.len, ctx.parser.content_length});
         ctx.finished = true;
         // Don't close, pool instead!
         ctx.conn.user_ctx = null;

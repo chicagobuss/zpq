@@ -77,7 +77,10 @@ fn runTest(
         tcp_read_size,
         use_direct,
     );
-    defer source.deinit();
+    defer {
+        source.deinit();
+        allocator.destroy(source);
+    }
     
     // CONFIGURE STRATEGY
     source.use_direct = use_direct;

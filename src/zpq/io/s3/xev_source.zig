@@ -151,8 +151,6 @@ pub const XevS3Source = struct {
         if (self.access_key) |k| self.allocator.free(k);
         if (self.secret_key) |k| self.allocator.free(k);
         if (self.session_token) |t| self.allocator.free(t);
-        
-        self.allocator.destroy(self);
     }
 
     pub fn setCredentials(self: *XevS3Source, access_key: []const u8, secret_key: []const u8, session_token: ?[]const u8) !void {

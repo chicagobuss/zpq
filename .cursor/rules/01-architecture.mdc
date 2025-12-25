@@ -40,13 +40,15 @@ alwaysApply: false
 *   **No Guessing**: If a build fails with "no member named X", stop immediately and read the `std` source file. Do not attempt a second guess based on training data.
 *   **Common 0.16.x Breaking Examples**:
     *   **ArrayList**: `std.ArrayList(T)` (managed) is generally DISCOURAGED in core logic. Use `std.ArrayListUnmanaged(T)`.
-        *   `list.init(allocator)` -> **REMOVED** (for Unmanaged). Use `var list = std.ArrayListUnmanaged(T){};`.
+        *   `list.init(allocator)` -> **REMOVED** (for both Managed and Unmanaged in 0.16.x). 
+            *   Managed: Use `var list = std.ArrayList(T).init(allocator);`.
+            *   Unmanaged: Use `var list = std.ArrayListUnmanaged(T){};`.
         *   `list.append(item)` -> **REMOVED** (for Unmanaged). Use `list.append(allocator, item)`.
         *   `list.deinit()` -> **REMOVED** (for Unmanaged). Use `list.deinit(allocator)`.
     *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
     *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()`.
         *   **Note**: `Instant.timestamp` is a `posix.timespec` struct on POSIX systems (macOS/Linux).
-        *   **Accessing sec/nsec**: On macOS (Darwin), `timespec` fields are often `sec` and `nsec`. On Linux, they are `tv_sec` and `tv_nsec`. ALWAYS use `@hasField`.
+        *   **Accessing sec/nsec**: On macOS (Darwin), `timespec` fields are `sec` and `nsec`. On Linux (io_uring/epoll), they are `tv_sec` and `tv_nsec`. ALWAYS use `@hasField`.
         *   **Safe Milliseconds**: 
             ```zig
             const now = try std.time.Instant.now();
@@ -64,7 +66,16 @@ alwaysApply: false
     *   **Executable Configuration**: `addExecutable` options now require an explicit `root_module` (created via `b.createModule`) instead of flat `root_source_file`/`target`/`optimize` fields.
     *   **Naming Alignment**: `std.mem.trimRight` -> `std.mem.trimEnd`, `std.mem.trimLeft` -> `std.mem.trimStart`.
 
-## 8. High-Performance Debugging & Feedback
+## 8. Event Loop & Connection Management
+*   **Loop Ownership**: Use a shared `xev.Loop` across related requests (e.g., in a `Source` or `Client`). Avoid creating a loop-per-request unless isolation is strictly required.
+*   **The Ghost Watcher**: `loop.active` count must be perfectly balanced.
+    *   **Rule**: Never call `loop.stop()` inside a connection's `onClose` or `onError` callback if the loop is shared or if other completions are pending.
+    *   **Pattern**: Use `pending_read` and `pending_write` flags to prevent double-arming a connection's callbacks.
+*   **Connection Pooling**:
+    *   **Strategy**: Use LIFO (Last-In-First-Out) for idle connection retrieval to prioritize "warm" connections.
+    *   **Health Check**: Connections retrieved from a pool MUST be checked for expiration (e.g., 10s idle timeout) before reuse.
+
+## 9. High-Performance Debugging & Feedback
 *   **Fix the Loop First**: If a bug takes >60s to reproduce, your priority is NOT the bug; it is **shortening the feedback loop**.
 *   **5-Second Timeout Policy**: All network and I/O experiments MUST be wrapped in `python3 tools/no_output_timeout.py --idle-seconds 5`.
     *   *Rationale*: If a network operation doesn't produce a log entry in 5s, it is deadlocked or mis-segmented. Do not wait for 60s "jitter".

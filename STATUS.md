@@ -139,7 +139,8 @@
 *   [x] **SigV4 Signing**: Integrated SigV4 logic into `XevS3Source` for authenticated AWS S3.
 *   [x] **Multi-System Benchmarking**: Proved ~3x speedup over Polars and parity with PyArrow on cold starts.
 *   [x] **Connection Pooling**: Reuses TLS connections across requests, eliminating handshake overhead for metadata & page reads.
-*   [ ] **Linear Scaling**: Verify linear performance scaling when scanning 50+ columns in parallel.
+*   [x] **CI Type Safety**: Resolved type ambiguity between legacy and new connection pools to ensure co-existence.
+*   [x] **Linear Scaling**: Verify linear performance scaling when scanning 50+ columns in parallel.
 
 ### Milestone 13: Massively Parallel Column Scans [IN PROGRESS]
 *   [ ] **Vectorized Reads**: Increase read buffer size (1MB+) to saturate link bandwidth.

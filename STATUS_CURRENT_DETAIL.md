@@ -116,3 +116,17 @@ Implementation of high-concurrency fetching and optimization of the new I/O stac
 2.  **Scheduler Port**: Migrate the `scheduler.zig` range-coalescing logic to the new `XevS3Source` stack.
 3.  **Linear Scaling**: Verify linear performance scaling when scanning 50+ columns in parallel.
 4.  **Beat Polars**: Optimize throughput to surpass the Polars baseline (~162ms) for large file scans.
+5.  **CI Co-existence**: Resolved a critical type ambiguity where the legacy `AsyncS3Source` and the new `XevS3Source` both tried to use a `Connection` type; fixed by creating a dedicated `XevConnectionPool`.
+
+## Lessons Learned: I/O Evolution & Cleanup Roadmap
+
+### 1. The "Two-Stack" Problem
+*   **Conflict**: Having two asynchronous stacks (`s3_legacy` and the new `Xev`) in one codebase is dangerous for CI (naming collisions) and maintenance.
+*   **Cleanup Strategy**: Once Milestone 13 (Parallel Scans + Range Scheduler) is complete, the legacy stack will be deleted. It currently serves only as a regression baseline.
+
+### 2. Connection Pooling Nuances
+*   **LIFO is Key**: Using a Last-In-First-Out (LIFO) stack for idle connections ensures we pick the "warmest" connection, reducing the chance of server-side timeouts.
+*   **Timestamp Precision**: On POSIX systems, `std.time.Instant.now().timestamp` is a `posix.timespec`. Correctly extracting milliseconds requires `(sec * 1000) + (nsec / 1_000_000)`.
+
+### 3. Loop Reusability
+*   **Ghost Watchers**: The most common source of event loop hangs in `libxev` is an unbalanced `active` count. Never `loop.stop()` a shared loop inside a connection's `onClose` callback if other requests are still inflight.

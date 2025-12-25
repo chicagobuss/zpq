@@ -15,7 +15,7 @@ pub const SigV4 = struct {
         allocator: std.mem.Allocator,
         method: []const u8,
         uri: std.Uri,
-        headers: *std.ArrayList(std.http.Header),
+        headers: *std.ArrayListUnmanaged(std.http.Header),
         payload: []const u8,
     ) !void {
         // 1. Create Date (ISO8601 Basic Format: YYYYMMDDTHHMMSSZ)
@@ -49,9 +49,9 @@ pub const SigV4 = struct {
             try headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
         }
 
-        // 3. Create Canonical Request
-        var canonical_req = std.ArrayList(u8){};
-        defer canonical_req.deinit(allocator);
+    // 3. Create Canonical Request
+    var canonical_req = std.ArrayList(u8){};
+    defer canonical_req.deinit(allocator);
 
         // Custom Writer for Unmanaged ArrayList with Error Propagation
         const WriterContext = struct {
@@ -202,6 +202,46 @@ pub const SigV4 = struct {
     }
 };
 
+/// Percent-encode a path for S3/SigV4 signing.
+/// Encodes all characters except unreserved chars (A-Z, a-z, 0-9, -, _, ., ~) and '/'.
+/// Returns the original slice if no encoding needed (zero allocation fast path).
+pub fn encodeS3Path(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    // Fast path: check if encoding is needed
+    var needs_encoding = false;
+    for (path) |c| {
+        if (!isUnreservedOrSlash(c)) {
+            needs_encoding = true;
+            break;
+        }
+    }
+    if (!needs_encoding) return path;
+
+    // Slow path: allocate and encode
+    var result = std.ArrayList(u8){};
+    errdefer result.deinit(allocator);
+
+    for (path) |c| {
+        if (isUnreservedOrSlash(c)) {
+            try result.append(allocator, c);
+        } else {
+            // Percent-encode: %XX
+            const hex_chars = "0123456789ABCDEF";
+            try result.append(allocator, '%');
+            try result.append(allocator, hex_chars[c >> 4]);
+            try result.append(allocator, hex_chars[c & 0x0F]);
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+fn isUnreservedOrSlash(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '/' => true,
+        else => false,
+    };
+}
+
 const HeaderRef = struct {
     name: []const u8,
     value: []const u8,
@@ -253,7 +293,7 @@ test "sigv4 produces valid Authorization header" {
         .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     };
 
-    var headers: std.ArrayList(std.http.Header) = .empty;
+    var headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer {
         for (headers.items) |h| {
             allocator.free(h.value);

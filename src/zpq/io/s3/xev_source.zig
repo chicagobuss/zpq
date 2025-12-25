@@ -74,6 +74,18 @@ pub const XevS3Source = struct {
         self.secret_key = null;
         self.session_token = null;
 
+        // Try to load credentials from environment
+        if (std.posix.getenv("AWS_ACCESS_KEY_ID")) |ak| {
+            if (std.posix.getenv("AWS_SECRET_ACCESS_KEY")) |sk| {
+                self.access_key = try allocator.dupe(u8, ak);
+                self.secret_key = try allocator.dupe(u8, sk);
+                if (std.posix.getenv("AWS_SESSION_TOKEN")) |st| {
+                    self.session_token = try allocator.dupe(u8, st);
+                }
+                log.debug("XevS3Source: loaded credentials from environment", .{});
+            }
+        }
+
         return self;
     }
 
@@ -121,73 +133,73 @@ pub const XevS3Source = struct {
         const self: *XevS3Source = @ptrCast(@alignCast(ptr));
         if (ranges.len == 0) return;
         
-        // Use parallel implementation for all range counts >= 1
-        log.debug("readRangesImpl: fetching {d} ranges in parallel", .{ranges.len});
         const addr = try self.resolve();
 
-        const contexts = try self.allocator.alloc(*ReqContext, ranges.len);
-        defer self.allocator.free(contexts);
-        
-        const conns = try self.allocator.alloc(*tls.Connection, ranges.len);
-        defer self.allocator.free(conns);
+        const max_concurrency = 16;
+        var i: usize = 0;
+        while (i < ranges.len) {
+            const batch_size = @min(max_concurrency, ranges.len - i);
+            const batch_ranges = ranges[i .. i + batch_size];
+            const batch_buffers = buffers[i .. i + batch_size];
 
-        var cleanup_idx: usize = 0;
-        errdefer {
-            for (0..cleanup_idx) |i| {
-                conns[i].deinit();
-                self.allocator.destroy(conns[i]);
-                self.allocator.destroy(contexts[i]);
-            }
-        }
+            var local_loop = try xev.Loop.init(.{});
+            defer local_loop.deinit();
 
-        for (ranges, 0..) |range, i| {
-            const conn = try self.allocator.create(tls.Connection);
-            conns[i] = conn;
-            conn.* = try tls.Connection.init(self.loop, self.allocator, self.host);
-            cleanup_idx += 1;
+            const contexts = try self.allocator.alloc(*ReqContext, batch_size);
+            defer self.allocator.free(contexts);
+            
+            const conns = try self.allocator.alloc(*tls.Connection, batch_size);
+            defer self.allocator.free(conns);
 
-            const ctx = try self.allocator.create(ReqContext);
-            contexts[i] = ctx;
-            ctx.* = .{
-                .source = self,
-                .conn = conn,
-                .buf = buffers[i][0 .. range.end - range.start],
-                .offset = range.start,
-                .allocator = self.allocator,
-                .parser = .{},
-            };
-
-            conn.user_ctx = ctx;
-            conn.on_connect = onConnect;
-            conn.on_data = onData;
-            conn.on_error = onError;
-
-            try conn.connect(addr);
-        }
-
-        // Run loop until ALL requests are finished or one has a fatal error
-        try self.loop.run(.until_done);
-
-        // Check for fatal errors
-        var first_err: ?anyerror = null;
-        for (contexts) |ctx| {
-            if (ctx.err) |err| {
-                if (err != error.EOF and err != error.TlsConnectionClosed) {
-                    if (first_err == null) first_err = err;
-                } else if (!ctx.finished) {
-                    if (first_err == null) first_err = err;
+            var cleanup_idx: usize = 0;
+            defer {
+                for (0..cleanup_idx) |j| {
+                    conns[j].deinit();
+                    self.allocator.destroy(conns[j]);
+                    self.allocator.destroy(contexts[j]);
                 }
             }
-        }
 
-        // Cleanup
-        for (0..ranges.len) |i| {
-            conns[i].deinit();
-            self.allocator.destroy(conns[i]);
-            self.allocator.destroy(contexts[i]);
+            for (batch_ranges, 0..) |range, j| {
+                const conn = try self.allocator.create(tls.Connection);
+                conns[j] = conn;
+                conn.* = try tls.Connection.init(&local_loop, self.allocator, self.host);
+                cleanup_idx += 1;
+
+                const ctx = try self.allocator.create(ReqContext);
+                contexts[j] = ctx;
+                ctx.* = .{
+                    .source = self,
+                    .conn = conn,
+                    .buf = batch_buffers[j][0 .. range.end - range.start],
+                    .offset = range.start,
+                    .allocator = self.allocator,
+                    .parser = .{},
+                };
+
+                conn.user_ctx = ctx;
+                conn.on_connect = onConnect;
+                conn.on_data = onData;
+                conn.on_error = onError;
+
+                try conn.connect(addr);
+            }
+
+            try local_loop.run(.until_done);
+
+            // Check for errors in batch
+            for (contexts) |ctx| {
+                if (ctx.err) |err| {
+                    if (err != error.EOF and err != error.TlsConnectionClosed) {
+                         return err;
+                    } else if (!ctx.finished) {
+                         return err;
+                    }
+                }
+            }
+
+            i += batch_size;
         }
-        
-        if (first_err) |err| return err;
     }
 
     fn sizeImpl(ptr: *anyopaque) u64 {
@@ -373,47 +385,137 @@ const ReqContext = struct {
 fn onConnect(ctx_void: ?*anyopaque) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
     
-    const path = std.fmt.allocPrint(ctx.allocator, "/{s}/{s}", .{ctx.source.bucket, ctx.source.key}) catch |err| {
+    // Use an arena for building the request (headers, signature, etc.)
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const path = std.fmt.allocPrint(aa, "/{s}/{s}", .{ctx.source.bucket, ctx.source.key}) catch |err| {
         ctx.err = err;
         ctx.conn.close();
         return;
     };
-    defer ctx.allocator.free(path);
 
-    var req: []u8 = undefined;
-    if (ctx.is_head) {
-        const req_fmt =
-            "HEAD {s} HTTP/1.1\r\n" ++
-            "Host: {s}\r\n" ++
-            "User-Agent: zpq-xev\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n";
-        req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ path, ctx.source.host }) catch |err| {
+    const method = if (ctx.is_head) "HEAD" else "GET";
+    
+    // Build Headers
+    var headers = std.ArrayListUnmanaged(std.http.Header){};
+    headers.append(aa, .{ .name = "User-Agent", .value = "zpq-xev" }) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    headers.append(aa, .{ .name = "Connection", .value = "close" }) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+
+    if (!ctx.is_head) {
+        const end_inclusive = ctx.offset + ctx.buf.len - 1;
+        const range_val = std.fmt.allocPrint(aa, "bytes={d}-{d}", .{ ctx.offset, end_inclusive }) catch |err| {
             ctx.err = err;
             ctx.conn.close();
             return;
         };
-    } else {
-        const end_inclusive = ctx.offset + ctx.buf.len - 1;
-        const req_fmt =
-            "GET {s} HTTP/1.1\r\n" ++
-            "Host: {s}\r\n" ++
-            "User-Agent: zpq-xev\r\n" ++
-            "Range: bytes={d}-{d}\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n";
-
-        req = std.fmt.allocPrint(ctx.allocator, req_fmt, .{ path, ctx.source.host, ctx.offset, end_inclusive }) catch |err| {
+        headers.append(aa, .{ .name = "Range", .value = range_val }) catch |err| {
             ctx.err = err;
             ctx.conn.close();
             return;
         };
     }
-    defer ctx.allocator.free(req);
 
-    log.debug("Sending Request: {s}", .{req});
+    // Sign if credentials provided
+    if (ctx.source.access_key) |ak| {
+        if (ctx.source.secret_key) |sk| {
+            const signer = SigV4{
+                .region = ctx.source.region,
+                .access_key = ak,
+                .secret_key = sk,
+                .session_token = ctx.source.session_token,
+            };
 
-    ctx.conn.write(req) catch |err| {
+            const scheme = if (ctx.source.use_tls) "https" else "http";
+            const url = std.fmt.allocPrint(aa, "{s}://{s}{s}", .{ scheme, ctx.source.host, path }) catch unreachable;
+            const uri = std.Uri.parse(url) catch unreachable;
+
+            signer.sign(aa, method, uri, &headers, "") catch |err| {
+                ctx.err = err;
+                ctx.conn.close();
+                return;
+            };
+        }
+    } else {
+        // Must add Host manually for anonymous requests (SigV4 adds it automatically)
+        headers.append(aa, .{ .name = "Host", .value = ctx.source.host }) catch |err| {
+            ctx.err = err;
+            ctx.conn.close();
+            return;
+        };
+    }
+
+    // Serialize Request
+    const encoded_path = @import("sigv4.zig").encodeS3Path(aa, path) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    
+    var head_list = std.ArrayListUnmanaged(u8){};
+    defer head_list.deinit(aa);
+    
+    head_list.appendSlice(aa, method) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    head_list.appendSlice(aa, " ") catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    head_list.appendSlice(aa, encoded_path) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    head_list.appendSlice(aa, " HTTP/1.1\r\n") catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+
+    for (headers.items) |h| {
+        head_list.appendSlice(aa, h.name) catch |err| {
+            ctx.err = err;
+            ctx.conn.close();
+            return;
+        };
+        head_list.appendSlice(aa, ": ") catch |err| {
+            ctx.err = err;
+            ctx.conn.close();
+            return;
+        };
+        head_list.appendSlice(aa, h.value) catch |err| {
+            ctx.err = err;
+            ctx.conn.close();
+            return;
+        };
+        head_list.appendSlice(aa, "\r\n") catch |err| {
+            ctx.err = err;
+            ctx.conn.close();
+            return;
+        };
+    }
+    head_list.appendSlice(aa, "\r\n") catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+
+    log.debug("Sending Request:\n{s}", .{head_list.items});
+
+    ctx.conn.write(head_list.items) catch |err| {
         ctx.err = err;
         ctx.conn.close();
     };

@@ -120,11 +120,22 @@ bench_e2e() {
     [[ -n "$mode_arg" ]] && info "Mode: $mode_arg"
     echo ""
 
-    # Load .env if present (for AWS creds)
+    # Load .env if present (but don't overwrite existing env vars)
     if [[ -f "$PROJECT_ROOT/.env" ]]; then
-        set -a
-        source "$PROJECT_ROOT/.env"
-        set +a
+        while read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^#.*$ ]] || [[ -z "$line" ]] && continue
+            
+            # Strip 'export ' prefix if present
+            clean_line="${line#export }"
+            key=$(echo "$clean_line" | cut -d'=' -f1)
+            value=$(echo "$clean_line" | cut -d'=' -f2-)
+            
+            # Only export if not already set in environment (Bash 3.2 compatible)
+            if ! env | grep -q "^$key="; then
+                export "$key=$value"
+            fi
+        done < "$PROJECT_ROOT/.env"
     fi
 
     "$PROJECT_ROOT/zig-out/bin/bench-e2e" "$path" ${iterations:-1} $mode_arg
@@ -200,11 +211,22 @@ compare_e2e() {
     echo -e "Iterations: ${BOLD}$iterations${NC}"
     echo ""
 
-    # Load .env if present
+    # Load .env if present (but don't overwrite existing env vars)
     if [[ -f "$PROJECT_ROOT/.env" ]]; then
-        set -a
-        source "$PROJECT_ROOT/.env"
-        set +a
+        while read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^#.*$ ]] || [[ -z "$line" ]] && continue
+            
+            # Strip 'export ' prefix if present
+            clean_line="${line#export }"
+            key=$(echo "$clean_line" | cut -d'=' -f1)
+            value=$(echo "$clean_line" | cut -d'=' -f2-)
+            
+            # Only export if not already set in environment (Bash 3.2 compatible)
+            if ! env | grep -q "^$key="; then
+                export "$key=$value"
+            fi
+        done < "$PROJECT_ROOT/.env"
     fi
 
     # Simple variables (bash 3 compatible)
@@ -221,13 +243,23 @@ compare_e2e() {
     fi
 
     echo -e "${BOLD}--- ZPQ Async ---${NC}"
+    set +e
     output=$("$PROJECT_ROOT/zig-out/bin/bench-e2e" "$path" "$iterations" --async 2>&1)
-    echo "$output" | tail -5
-    zpq_async_avg=$(echo "$output" | extract_avg)
+    zpq_exit_code=$?
+    set -e
+    if [ $zpq_exit_code -eq 0 ]; then
+        echo "$output" | tail -5
+        zpq_async_avg=$(echo "$output" | extract_avg)
+    else
+        echo -e "${RED}ZPQ Async FAILED (exit $zpq_exit_code)${NC}"
+        echo "$output" | tail -10
+    fi
     echo ""
 
     if [[ "$path" == s3://* ]]; then
         echo -e "${BOLD}--- PyArrow (boto3) ---${NC}"
+        # Inject endpoint if present
+        export AWS_ENDPOINT_URL_S3="${S3_ENDPOINT:-}"
         output=$(uv run --with pyarrow --with boto3 python3 "$PROJECT_ROOT/benchmarks/competitor.py" "$path" "$iterations" 2>&1)
         echo "$output" | tail -5
         pyarrow_avg=$(echo "$output" | extract_avg)
@@ -241,24 +273,36 @@ import polars as pl
 s3_path = '$path'
 iterations = $iterations
 
-storage_options = {'aws_region': os.environ.get('AWS_REGION', 'us-west-2')}
-for key in ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN']:
-    val = os.environ.get(key)
-    if val:
-        storage_options[key.lower()] = val
+endpoint = os.environ.get('S3_ENDPOINT')
+storage_options = {
+    'aws_region': os.environ.get('AWS_REGION', 'us-west-2'),
+    'aws_access_key_id': os.environ.get('AWS_ACCESS_KEY_ID', 'minioadmin'),
+    'aws_secret_access_key': os.environ.get('AWS_SECRET_ACCESS_KEY', 'minioadmin'),
+}
+
+if endpoint:
+    storage_options['endpoint_url'] = endpoint
+    if endpoint.startswith('http://'):
+        storage_options['allow_http'] = 'true'
+    # For self-signed certs in MinIO TLS
+    storage_options['aws_allow_invalid_certificates'] = 'true'
 
 durations = []
 for i in range(iterations):
     start = time.time()
-    df = pl.scan_parquet(s3_path, storage_options=storage_options)
-    result = df.select(df.columns[0]).collect()
-    duration_ms = (time.time() - start) * 1000
-    durations.append(duration_ms)
-    print(f'  Run {i+1}: {result.height} rows in {duration_ms:.2f}ms')
+    try:
+        df = pl.scan_parquet(s3_path, storage_options=storage_options)
+        result = df.select(df.columns[0]).collect()
+        duration_ms = (time.time() - start) * 1000
+        durations.append(duration_ms)
+        print(f'  Run {i+1}: {result.height} rows in {duration_ms:.2f}ms')
+    except Exception as e:
+        print(f'  Run {i+1}: FAILED ({e})')
 
-print(f'Min: {min(durations):.2f}ms')
-print(f'Max: {max(durations):.2f}ms')
-print(f'Avg: {sum(durations)/len(durations):.2f}ms')
+if durations:
+    print(f'Min: {min(durations):.2f}ms')
+    print(f'Max: {max(durations):.2f}ms')
+    print(f'Avg: {sum(durations)/len(durations):.2f}ms')
 " 2>&1)
         echo "$output" | tail -5
         polars_avg=$(echo "$output" | extract_avg)

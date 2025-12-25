@@ -25,6 +25,20 @@ pub fn main() !void {
 
     var file = try ParquetFile.openS3(allocator, host, bucket, key, region, true, port);
     defer file.deinit();
+
+    // Set credentials if available
+    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |ak| {
+        defer allocator.free(ak);
+        if (std.process.getEnvVarOwned(allocator, "AWS_SECRET_ACCESS_KEY")) |sk| {
+            defer allocator.free(sk);
+            const st = std.process.getEnvVarOwned(allocator, "AWS_SESSION_TOKEN") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
+            defer if (st) |token| allocator.free(token);
+            
+            const s3_src: *zpq.s3.XevS3Source = @ptrCast(@alignCast(file.cleanup_context.?));
+            try s3_src.setCredentials(ak, sk, st);
+            std.debug.print("Using SigV4 credentials from environment\n", .{});
+        } else |_| {}
+    } else |_| {}
     
     const open_time = timer.read();
     

@@ -181,7 +181,10 @@ pub const ParquetFile = struct {
     pub fn openS3(allocator: std.mem.Allocator, host: []const u8, bucket: []const u8, key: []const u8, region: []const u8, use_tls: bool, port: u16) !ParquetFile {
         const zpq = @import("../../zpq.zig");
         const s3_source = try zpq.s3.XevS3Source.init(allocator, host, bucket, key, region, use_tls, port);
-        errdefer s3_source.deinit();
+        errdefer {
+            s3_source.deinit();
+            allocator.destroy(s3_source);
+        }
 
         const source = s3_source.source();
         const size = source.size();

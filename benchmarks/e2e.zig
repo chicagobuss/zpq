@@ -46,7 +46,7 @@ fn cleanupManualAsyncS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     s.allocator.destroy(s);
 }
 
-fn openAsyncBasic(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
+fn openAsyncXev(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
     if (!std.mem.startsWith(u8, path, "s3://")) return error.NotS3Path;
 
     const s3_path = path[5..];
@@ -54,48 +54,30 @@ fn openAsyncBasic(allocator: std.mem.Allocator, path: []const u8) !zpq.file.Parq
     const bucket = s3_path[0..slash_idx];
     const key = s3_path[slash_idx + 1 ..];
 
-    const ctx = try allocator.create(ManualContext);
-    errdefer allocator.destroy(ctx);
-
-    ctx.allocator = allocator;
-    ctx.pool = s3.ConnectionPool.init(allocator);
-    ctx.thread_pool = xev.ThreadPool.init(.{});
-    ctx.tp_resolver = dns.ThreadPoolResolver.init(&ctx.thread_pool, allocator);
-
-    const resolver = ctx.tp_resolver.resolver();
-
-    const region_env = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
-    defer if (region_env) |s| allocator.free(s);
+    const endpoint_env = std.process.getEnvVarOwned(allocator, "S3_ENDPOINT") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
+    defer if (endpoint_env) |ep| allocator.free(ep);
 
     var host: []const u8 = "s3.amazonaws.com";
-    var host_allocated = false;
-    if (region_env) |region| {
-        if (!std.mem.eql(u8, region, "us-east-1")) {
-            host = try std.fmt.allocPrint(allocator, "s3.{s}.amazonaws.com", .{region});
-            host_allocated = true;
+    var port: u16 = 443;
+    var use_tls: bool = true;
+
+    if (endpoint_env) |ep| {
+        const uri = try std.Uri.parse(ep);
+        if (uri.host) |h| {
+            switch (h) {
+                .raw => |s| host = s,
+                .percent_encoded => |s| host = s,
+            }
         }
+        port = uri.port orelse (if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80);
+        use_tls = std.mem.eql(u8, uri.scheme, "https");
     }
-    defer if (host_allocated) allocator.free(host);
 
-    ctx.host_owned = try allocator.dupe(u8, host);
-    errdefer allocator.free(ctx.host_owned.?);
+    const region_res = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
+    const region = region_res orelse "us-east-1";
+    defer if (region_res) |r| allocator.free(r);
 
-    const access_key = std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
-    defer if (access_key) |s| allocator.free(s);
-    const secret_key = std.process.getEnvVarOwned(allocator, "AWS_SECRET_ACCESS_KEY") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
-    defer if (secret_key) |s| allocator.free(s);
-
-    const config = s3.S3Config{
-        .credentials = if (access_key != null and secret_key != null) .{
-            .access_key = try allocator.dupe(u8, access_key.?),
-            .secret_key = try allocator.dupe(u8, secret_key.?),
-        } else null,
-        .region = try allocator.dupe(u8, region_env orelse "us-east-1"),
-    };
-
-    ctx.source = try s3.AsyncS3Source.init(allocator, &ctx.pool, resolver, ctx.host_owned.?, 443, bucket, key, true, null, config);
-
-    return zpq.file.ParquetFile.initOwned(allocator, ctx.source.source(), ctx, cleanupManualAsyncS3);
+    return zpq.file.ParquetFile.openS3(allocator, host, bucket, key, region, use_tls, port);
 }
 
 pub fn main() !void {
@@ -144,8 +126,8 @@ pub fn main() !void {
         var file = if (std.mem.startsWith(u8, target_path, "s3://"))
             switch (mode) {
                 .Sync => try factory.openFile(allocator, target_path, false),
-                .AsyncFancy => try factory.openFile(allocator, target_path, true),
-                .AsyncBasic => try openAsyncBasic(allocator, target_path),
+                .AsyncFancy => try openAsyncXev(allocator, target_path),
+                .AsyncBasic => try openAsyncXev(allocator, target_path),
             }
         else
             try zpq.file.ParquetFile.open(allocator, target_path);

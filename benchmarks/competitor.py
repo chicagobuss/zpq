@@ -26,13 +26,17 @@ def main():
     print(f"Target: {s3_path}")
     print(f"Iterations: {iterations}")
 
-    s3 = boto3.client('s3')
-
+    endpoint = os.environ.get('S3_ENDPOINT') or os.environ.get('AWS_ENDPOINT_URL_S3')
     durations = []
 
     for i in range(iterations):
         print(f"\nRun {i+1}/{iterations}...")
         start_time = time.time()
+        
+        if endpoint:
+            s3 = boto3.client('s3', endpoint_url=endpoint, verify=False)
+        else:
+            s3 = boto3.client('s3')
         
         # 1. Open File (We use boto3 to get the object as a file-like object 
         # because PyArrow's S3FileSystem is complex to configure identically 

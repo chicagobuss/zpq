@@ -241,6 +241,23 @@ pub fn build(b: *std.Build) void {
         const step_probe_loop_active = b.step("probe-loop-active", "Run Loop active count probe");
         step_probe_loop_active.dependOn(&run_probe_loop_active.step);
 
+        // 11. probe-multi-conn
+        const probe_multi_conn = b.addExecutable(.{
+            .name = "probe-multi-conn",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_multi_conn.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_multi_conn.root_module.addImport("xev", libxev_mod);
+        probe_multi_conn.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_multi_conn);
+
+        const run_probe_multi_conn = b.addRunArtifact(probe_multi_conn);
+        const step_probe_multi_conn = b.step("probe-multi-conn", "Run multi-connection probe");
+        step_probe_multi_conn.dependOn(&run_probe_multi_conn.step);
+
         // Probe for DNS
         const probe_dns_xev = b.addExecutable(.{
             .name = "probe-dns-xev",

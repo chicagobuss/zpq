@@ -7,46 +7,6 @@ const zpq_log = @import("../../../zpq.zig").log;
 
 const log = zpq_log.s3;
 
-/// Percent-encode a path for S3/SigV4 signing.
-/// Encodes all characters except unreserved chars (A-Z, a-z, 0-9, -, _, ., ~) and '/'.
-/// Returns the original slice if no encoding needed (zero allocation fast path).
-fn encodeS3Path(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    // Fast path: check if encoding is needed
-    var needs_encoding = false;
-    for (path) |c| {
-        if (!isUnreservedOrSlash(c)) {
-            needs_encoding = true;
-            break;
-        }
-    }
-    if (!needs_encoding) return path;
-
-    // Slow path: allocate and encode
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-
-    for (path) |c| {
-        if (isUnreservedOrSlash(c)) {
-            try result.append(allocator, c);
-        } else {
-            // Percent-encode: %XX
-            const hex_chars = "0123456789ABCDEF";
-            try result.append(allocator, '%');
-            try result.append(allocator, hex_chars[c >> 4]);
-            try result.append(allocator, hex_chars[c & 0x0F]);
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-fn isUnreservedOrSlash(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '/' => true,
-        else => false,
-    };
-}
-
 /// States for the HTTP Request Lifecycle
 pub const State = enum {
     Idle,
@@ -165,7 +125,7 @@ pub const AsyncRequest = struct {
         const aa = arena.allocator();
 
         // 1. Build Base Headers
-        var headers = std.ArrayList(std.http.Header).empty;
+        var headers = std.ArrayListUnmanaged(std.http.Header).empty;
 
         // Host Header Value
         const host_header_val = if (port == 80 or port == 443)
@@ -190,7 +150,7 @@ pub const AsyncRequest = struct {
                 };
 
                 const scheme = if (use_tls) "https" else "http";
-                const encoded_path = try encodeS3Path(aa, path);
+                const encoded_path = try sigv4.encodeS3Path(aa, path);
                 const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{ scheme, host_header_val, encoded_path });
                 const uri = try std.Uri.parse(url);
 
@@ -205,7 +165,7 @@ pub const AsyncRequest = struct {
         }
 
         // 3. Serialize Request (use encoded path in HTTP request line too)
-        const request_path = try encodeS3Path(aa, path);
+        const request_path = try sigv4.encodeS3Path(aa, path);
         try self.write_buf.appendSlice(self.allocator, "GET ");
         try self.write_buf.appendSlice(self.allocator, request_path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
@@ -236,7 +196,7 @@ pub const AsyncRequest = struct {
         const aa = arena.allocator();
 
         // 1. Build Base Headers
-        var headers = std.ArrayList(std.http.Header).empty;
+        var headers = std.ArrayListUnmanaged(std.http.Header).empty;
 
         const host_header_val = if (port == 80 or port == 443)
             try std.fmt.allocPrint(aa, "{s}", .{host})
@@ -256,7 +216,7 @@ pub const AsyncRequest = struct {
                 };
 
                 const scheme = if (use_tls) "https" else "http";
-                const encoded_path = try encodeS3Path(aa, path);
+                const encoded_path = try sigv4.encodeS3Path(aa, path);
                 const url = try std.fmt.allocPrint(aa, "{s}://{s}{s}", .{ scheme, host_header_val, encoded_path });
                 const uri = try std.Uri.parse(url);
 
@@ -270,7 +230,7 @@ pub const AsyncRequest = struct {
         }
 
         // 3. Serialize Request (use encoded path in HTTP request line too)
-        const request_path = try encodeS3Path(aa, path);
+        const request_path = try sigv4.encodeS3Path(aa, path);
         try self.write_buf.appendSlice(self.allocator, "HEAD ");
         try self.write_buf.appendSlice(self.allocator, request_path);
         try self.write_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");

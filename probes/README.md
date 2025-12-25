@@ -22,6 +22,7 @@ Probes are **point-in-time learning experiments** - one-off code written to unde
 | `probe_tls_pump.zig` | Low-level boring_tls integration without zpq abstractions | Dec 2024 |
 | `probe_xev_tcp_lifecycle.zig` | Learning xev TCP socket lifecycle and completion handling | Dec 2024 |
 | `verify_minish_context.zig` | Verifying minish fuzzer context/allocator patterns | Dec 2024 |
+| `probe_encoding.zig` | Verifying S3 path percent-encoding with special characters | Dec 2024 |
 
 ## Running a Probe
 

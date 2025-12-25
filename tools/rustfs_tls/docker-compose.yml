@@ -1,0 +1,16 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs-zpq
+    ports:
+      - "9999:9000"
+      - "9991:9001"
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_ACCESS_KEY=rustfsadmin
+      - RUSTFS_REGION=us-east-1
+      - RUSTFS_TLS_PATH=/certs/
+    volumes:
+      - ./data:/data
+      - ./certs:/certs:ro
+    command: /data

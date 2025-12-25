@@ -79,18 +79,6 @@ pub const XevS3Source = struct {
         self.secret_key = null;
         self.session_token = null;
 
-        // Try to load credentials from environment
-        if (std.posix.getenv("AWS_ACCESS_KEY_ID")) |ak| {
-            if (std.posix.getenv("AWS_SECRET_ACCESS_KEY")) |sk| {
-                self.access_key = try allocator.dupe(u8, ak);
-                self.secret_key = try allocator.dupe(u8, sk);
-                if (std.posix.getenv("AWS_SESSION_TOKEN")) |st| {
-                    self.session_token = try allocator.dupe(u8, st);
-                }
-                log.debug("XevS3Source: loaded credentials from environment", .{});
-            }
-        }
-
         return self;
     }
 
@@ -141,27 +129,33 @@ pub const XevS3Source = struct {
         
         const addr = try self.resolve();
 
-        const max_concurrency = 16;
+        // 1. Merge ranges using scheduler
+        var merged_list = try @import("scheduler.zig").mergeRanges(self.allocator, ranges);
+        defer {
+            for (merged_list.items) |*m| m.original_indices.deinit(self.allocator);
+            merged_list.deinit(self.allocator);
+        }
+
+        const max_concurrency = 64; // Bumped for high-throughput S3
         var i: usize = 0;
-        while (i < ranges.len) {
-            const batch_size = @min(max_concurrency, ranges.len - i);
-            const batch_ranges = ranges[i .. i + batch_size];
-            const batch_buffers = buffers[i .. i + batch_size];
+        while (i < merged_list.items.len) {
+            const batch_size = @min(max_concurrency, merged_list.items.len - i);
+            const batch_merged = merged_list.items[i .. i + batch_size];
 
             const contexts = try self.allocator.alloc(*ReqContext, batch_size);
             defer self.allocator.free(contexts);
             
-            const conns = try self.allocator.alloc(*tls.Connection, batch_size);
-            defer self.allocator.free(conns);
-
             var cleanup_idx: usize = 0;
             errdefer {
                 for (0..cleanup_idx) |j| {
+                    // Free the sub-range/buffer slices we allocated
+                    self.allocator.free(contexts[j].sub_ranges);
+                    self.allocator.free(contexts[j].dest_buffers);
                     self.allocator.destroy(contexts[j]);
                 }
             }
 
-            for (batch_ranges, 0..) |range, j| {
+            for (batch_merged, 0..) |merged, j| {
                 const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
                 const conn = if (self.pool.acquire(key)) |c| blk: {
                     c.idling = false;
@@ -171,19 +165,28 @@ pub const XevS3Source = struct {
                     c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
                     break :blk c;
                 };
-                conns[j] = conn;
-                cleanup_idx += 1;
+
+                // Prepare sub-ranges and buffers for this merged request
+                const sub_ranges = try self.allocator.alloc(io.Range, merged.original_indices.items.len);
+                const dest_buffers = try self.allocator.alloc([]u8, merged.original_indices.items.len);
+                for (merged.original_indices.items, 0..) |orig_idx, k| {
+                    sub_ranges[k] = ranges[orig_idx];
+                    dest_buffers[k] = buffers[orig_idx];
+                }
 
                 const ctx = try self.allocator.create(ReqContext);
                 contexts[j] = ctx;
                 ctx.* = .{
                     .source = self,
                     .conn = conn,
-                    .buf = batch_buffers[j][0 .. range.end - range.start],
-                    .offset = range.start,
+                    .request_offset = merged.request_range.start,
+                    .request_end = merged.request_range.end,
+                    .sub_ranges = sub_ranges,
+                    .dest_buffers = dest_buffers,
                     .allocator = self.allocator,
                     .parser = .{},
                 };
+                cleanup_idx += 1;
 
                 conn.user_ctx = ctx;
                 conn.on_connect = onConnect;
@@ -205,12 +208,16 @@ pub const XevS3Source = struct {
                 if (ctx.err) |err| {
                     if (err == error.EOF or err == error.TlsConnectionClosed) {
                         if (ctx.finished) {
+                            self.allocator.free(ctx.sub_ranges);
+                            self.allocator.free(ctx.dest_buffers);
                             self.allocator.destroy(ctx);
                             continue;
                         }
                     }
                     if (first_err == null) first_err = err;
                 }
+                self.allocator.free(ctx.sub_ranges);
+                self.allocator.free(ctx.dest_buffers);
                 self.allocator.destroy(ctx);
             }
 
@@ -268,8 +275,10 @@ pub const XevS3Source = struct {
         ctx.* = .{
             .source = self,
             .conn = conn,
-            .buf = &[_]u8{}, // No body expected for HEAD
-            .offset = 0,
+            .request_offset = 0,
+            .request_end = 0,
+            .sub_ranges = &.{},
+            .dest_buffers = &.{},
             .allocator = self.allocator,
             .parser = .{},
             .is_head = true,
@@ -314,15 +323,28 @@ pub const XevS3Source = struct {
         };
         
         const ctx = try self.allocator.create(ReqContext);
+        
+        // Single range setup
+        const range = try self.allocator.alloc(io.Range, 1);
+        range[0] = .{ .start = offset, .end = offset + buf.len };
+        const dest = try self.allocator.alloc([]u8, 1);
+        dest[0] = buf;
+
         ctx.* = .{
             .source = self,
             .conn = conn,
-            .buf = buf,
-            .offset = offset,
+            .request_offset = offset,
+            .request_end = offset + buf.len,
+            .sub_ranges = range,
+            .dest_buffers = dest,
             .allocator = self.allocator,
             .parser = .{},
         };
-        defer self.allocator.destroy(ctx);
+        defer {
+            self.allocator.free(range);
+            self.allocator.free(dest);
+            self.allocator.destroy(ctx);
+        }
 
         conn.user_ctx = ctx;
         conn.on_connect = onConnect;
@@ -339,17 +361,17 @@ pub const XevS3Source = struct {
 
         log.debug("readAt: running loop...", .{});
         try self.loop.run(.until_done);
-        log.debug("readAt: loop finished bytes_read={d} finished={}", .{ctx.bytes_read, ctx.finished});
+        log.debug("readAt: loop finished total_body_read={d} finished={}", .{ctx.total_body_read, ctx.finished});
 
         if (ctx.err) |err| {
             if (err == error.EOF or err == error.TlsConnectionClosed) {
-                if (ctx.finished) return ctx.bytes_read;
+                if (ctx.finished) return ctx.total_body_read;
             }
             log.debug("readAt: error return {}", .{err});
             return err;
         }
         
-        return ctx.bytes_read;
+        return ctx.total_body_read;
     }
     
     pub fn resolve(self: *XevS3Source) !xev.shim_net.Address {
@@ -404,17 +426,29 @@ pub const XevS3Source = struct {
 const ReqContext = struct {
     source: *XevS3Source,
     conn: *tls.Connection,
-    buf: []u8,
-    offset: u64,
-    allocator: std.mem.Allocator,
     
+    // For coalesced reads:
+    // request_offset is where the S3 GET starts (e.g. 0)
+    request_offset: u64,
+    request_end: u64, // The full end of the S3 request
+    
+    // sub_ranges are the parts we actually want (e.g. 0..100, 110..200)
+    sub_ranges: []const io.Range,
+    dest_buffers: []const []u8,
+    
+    allocator: std.mem.Allocator,
     parser: ResponseParser,
     
-    bytes_read: usize = 0,
+    // Progress tracking
+    total_body_read: usize = 0,
     finished: bool = false,
     err: ?anyerror = null,
     http_status: u16 = 0,
     is_head: bool = false,
+    
+    pub fn deinit(self: *ReqContext) void {
+        self.allocator.destroy(self);
+    }
 };
 
 fn onConnect(ctx_void: ?*anyopaque) void {
@@ -447,8 +481,8 @@ fn onConnect(ctx_void: ?*anyopaque) void {
     };
 
     if (!ctx.is_head) {
-        const end_inclusive = ctx.offset + ctx.buf.len - 1;
-        const range_val = std.fmt.allocPrint(aa, "bytes={d}-{d}", .{ ctx.offset, end_inclusive }) catch |err| {
+        const end_inclusive = ctx.request_end - 1;
+        const range_val = std.fmt.allocPrint(aa, "bytes={d}-{d}", .{ ctx.request_offset, end_inclusive }) catch |err| {
             ctx.err = err;
             ctx.conn.close();
             return;
@@ -595,25 +629,37 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
 
 fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
-    log.debug("onBody: status={d} chunk={d} remaining={d}", .{ ctx.parser.status_code, chunk.len, ctx.buf.len - ctx.bytes_read });
     
     if (ctx.parser.status_code != 0) ctx.http_status = ctx.parser.status_code;
     
-    const remaining = ctx.buf.len - ctx.bytes_read;
-    const take = @min(remaining, chunk.len);
-    
-    if (take > 0) {
-        @memcpy(ctx.buf[ctx.bytes_read .. ctx.bytes_read + take], chunk[0..take]);
-        ctx.bytes_read += take;
+    const chunk_start_abs = ctx.request_offset + ctx.total_body_read;
+    const chunk_end_abs = chunk_start_abs + chunk.len;
+
+    // Dispatch bytes to all overlapping sub-ranges
+    for (ctx.sub_ranges, 0..) |range, i| {
+        // Find intersection of current chunk and this sub-range
+        const intersect_start = @max(chunk_start_abs, range.start);
+        const intersect_end = @min(chunk_end_abs, range.end);
+
+        if (intersect_start < intersect_end) {
+            const chunk_offset = intersect_start - chunk_start_abs;
+            const dest_offset = intersect_start - range.start;
+            const len = intersect_end - intersect_start;
+            
+            @memcpy(ctx.dest_buffers[i][dest_offset .. dest_offset + len], chunk[chunk_offset .. chunk_offset + len]);
+        }
     }
+
+    ctx.total_body_read += chunk.len;
     
-    // Finish if we've filled our buffer OR if we've read the full content length
-    const body_done = if (ctx.parser.content_length) |cl| ctx.bytes_read >= cl else false;
-    
-    if (ctx.bytes_read == ctx.buf.len or body_done) {
-        log.debug("[s3] Request finished. read={d} buf_len={d} content_len={?d}", .{ctx.bytes_read, ctx.buf.len, ctx.parser.content_length});
+    // Check for completion based on Content-Length or total body size
+    const body_len = if (ctx.parser.content_length) |cl| cl else 0;
+    const is_last_byte = if (body_len > 0) ctx.total_body_read >= body_len else false;
+
+    if (is_last_byte) {
+        log.debug("[s3] Coalesced request finished. total_read={d}", .{ctx.total_body_read});
         ctx.finished = true;
-        // Don't close, pool instead!
+        // Release to pool
         ctx.conn.user_ctx = null;
         ctx.conn.idling = true;
         ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {

@@ -47,37 +47,8 @@ fn cleanupManualAsyncS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 }
 
 fn openAsyncXev(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
-    if (!std.mem.startsWith(u8, path, "s3://")) return error.NotS3Path;
-
-    const s3_path = path[5..];
-    const slash_idx = std.mem.indexOf(u8, s3_path, "/") orelse return error.InvalidS3Path;
-    const bucket = s3_path[0..slash_idx];
-    const key = s3_path[slash_idx + 1 ..];
-
-    const endpoint_env = std.process.getEnvVarOwned(allocator, "S3_ENDPOINT") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
-    defer if (endpoint_env) |ep| allocator.free(ep);
-
-    var host: []const u8 = "s3.amazonaws.com";
-    var port: u16 = 443;
-    var use_tls: bool = true;
-
-    if (endpoint_env) |ep| {
-        const uri = try std.Uri.parse(ep);
-        if (uri.host) |h| {
-            switch (h) {
-                .raw => |s| host = s,
-                .percent_encoded => |s| host = s,
-            }
-        }
-        port = uri.port orelse (if (std.mem.eql(u8, uri.scheme, "https")) 443 else 80);
-        use_tls = std.mem.eql(u8, uri.scheme, "https");
-    }
-
-    const region_res = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch |err| if (err == error.EnvironmentVariableNotFound) null else return err;
-    const region = region_res orelse "us-east-1";
-    defer if (region_res) |r| allocator.free(r);
-
-    return zpq.file.ParquetFile.openS3(allocator, host, bucket, key, region, use_tls, port);
+    // force_async = true triggers the Xev stack
+    return factory.openFile(allocator, path, true);
 }
 
 pub fn main() !void {

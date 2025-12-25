@@ -186,20 +186,21 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, resol
     var total_bytes: u64 = 0;
 
     if (pf.metadata) |meta| {
-        for (meta.row_groups.items) |rg| {
-            for (rg.columns.items) |col| {
-                if (col.meta_data) |md| {
-                    _ = md; // unused
-                    var reader = try zpq.column.ColumnReader.init(pf.source, col);
-                    while (try reader.next(allocator)) |page| {
-                        var p = page;
-                        defer p.deinit(allocator);
-                        total_bytes += p.data.len;
-                        if (p.header.data_page_header) |dph| {
-                            total_values += @intCast(dph.num_values);
-                            // Force decompression by accessing data
-                            // (already done by next() if snappy)
-                        }
+        for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
+            var rg = try pf.rowGroup(rg_idx);
+            defer rg.deinit();
+            
+            // Trigger Massive Parallel Prefetch!
+            try rg.prefetch(null); // Prefetch all columns
+
+            for (rg_meta.columns.items, 0..) |_, col_idx| {
+                var reader = try rg.columnReader(col_idx);
+                while (try reader.next(allocator)) |page| {
+                    var p = page;
+                    defer p.deinit(allocator);
+                    total_bytes += p.data.len;
+                    if (p.header.data_page_header) |dph| {
+                        total_values += @intCast(dph.num_values);
                     }
                 }
             }

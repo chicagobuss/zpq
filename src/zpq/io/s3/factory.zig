@@ -135,11 +135,7 @@ fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, force_async: b
     // Note: ParquetFile.openS3 takes ownership of s3_src and will call its deinit.
     
     if (config.credentials) |creds| {
-        s3_src.access_key = try allocator.dupe(u8, creds.access_key);
-        s3_src.secret_key = try allocator.dupe(u8, creds.secret_key);
-        if (creds.session_token) |st| {
-            s3_src.session_token = try allocator.dupe(u8, st);
-        }
+        try s3_src.setCredentials(creds.access_key, creds.secret_key, creds.session_token);
     }
 
     return zpq.file.ParquetFile.openS3(allocator, s3_src);

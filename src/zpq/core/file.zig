@@ -177,19 +177,14 @@ pub const ParquetFile = struct {
         };
     }
 
-    /// Open an S3 object using the new xev-based stack. ParquetFile owns the XevS3Source.
-    pub fn openS3(allocator: std.mem.Allocator, host: []const u8, bucket: []const u8, key: []const u8, region: []const u8, use_tls: bool, port: u16) !ParquetFile {
-        const zpq = @import("../../zpq.zig");
-        const s3_source = try zpq.s3.XevS3Source.init(allocator, host, bucket, key, region, use_tls, port);
-        errdefer {
-            s3_source.deinit();
-            allocator.destroy(s3_source);
-        }
-
+    /// Open an S3 object using the new xev-based stack. ParquetFile takes ownership of the provided XevS3Source.
+    pub fn openS3(allocator: std.mem.Allocator, s3_source: *@import("../io/s3/xev_source.zig").XevS3Source) !ParquetFile {
         const source = s3_source.source();
         const size = source.size();
 
         if (size < 8) {
+            s3_source.deinit();
+            allocator.destroy(s3_source);
             return error.InvalidParquetFile;
         }
 

@@ -22,3 +22,5 @@ __pycache__/
 # Env
 .env*
 !.env.example
+mock_s3_server
+nc_output.txt

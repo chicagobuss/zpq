@@ -26,6 +26,10 @@ pub const ResponseParser = struct {
 
     body_read: usize = 0,
 
+    pub fn headersComplete(self: Self) bool {
+        return self.state != .reading_headers;
+    }
+
     pub fn reset(self: *Self) void {
         self.* = .{};
     }

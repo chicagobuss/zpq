@@ -145,6 +145,13 @@ pub const ParquetFile = struct {
         allocator.destroy(s);
     }
 
+    fn cleanupXevS3(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const zpq = @import("../../zpq.zig");
+        const s: *zpq.s3.XevS3Source = @ptrCast(@alignCast(ctx));
+        s.deinit();
+        allocator.destroy(s);
+    }
+
     /// Open a local file path. ParquetFile owns the file source.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !ParquetFile {
         const local_source = try allocator.create(io.LocalFileSource);
@@ -164,6 +171,29 @@ pub const ParquetFile = struct {
             .source = source,
             .cleanup_context = local_source,
             .cleanup_fn = cleanupLocal,
+            .footer_len = 0,
+            .file_size = size,
+            .allocator = allocator,
+        };
+    }
+
+    /// Open an S3 object using the new xev-based stack. ParquetFile owns the XevS3Source.
+    pub fn openS3(allocator: std.mem.Allocator, host: []const u8, bucket: []const u8, key: []const u8, region: []const u8, use_tls: bool, port: u16) !ParquetFile {
+        const zpq = @import("../../zpq.zig");
+        const s3_source = try zpq.s3.XevS3Source.init(allocator, host, bucket, key, region, use_tls, port);
+        errdefer s3_source.deinit();
+
+        const source = s3_source.source();
+        const size = source.size();
+
+        if (size < 8) {
+            return error.InvalidParquetFile;
+        }
+
+        return ParquetFile{
+            .source = source,
+            .cleanup_context = s3_source,
+            .cleanup_fn = cleanupXevS3,
             .footer_len = 0,
             .file_size = size,
             .allocator = allocator,

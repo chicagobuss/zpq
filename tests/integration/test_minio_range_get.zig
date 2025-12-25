@@ -2,7 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const zpq = @import("zpq");
 
-const ResponseParser = @import("response_parser").ResponseParser;
+const ResponseParser = zpq.io.response_parser.ResponseParser;
 const fixtures = @import("minio_fixtures");
 
 pub const std_options = std.Options{

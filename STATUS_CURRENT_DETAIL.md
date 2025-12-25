@@ -85,8 +85,18 @@ Local copies persist at `/mnt/d/work/zpq-scratch/test_data/` (WSL2).
 
 ---
 
-## Future Technical Objectives (Milestone 11):
-1.  **[DONE] Lambda Example & Architecture**: Restructured Lambda bootstrap as a first-class Example (`examples/lambda`), cross-compiled via `zig build -Dexamples`. Verified local execution via Docker/RIE.
+## Milestone 11: New cross-platform I/O Stack Integration (Completed)
+Integration of the new `libxev` + `boring_tls` stack with `ParquetFile` for robust, cross-platform S3 access.
+
+### Key Achievements:
+*   **XevS3Source Implementation**: Created a new `io.RandomAccessSource` implementation that uses `libxev` for asynchronous transport and `boring_tls` for TLS 1.3 encryption.
+*   **TLS Record Pumping**: Fixed a critical bug where multiple TLS records in a single TCP packet were being ignored. The stack now correctly pumps the TLS engine in a loop.
+*   **Isolated Loop Lifecycle**: Implemented a "fresh loop per request" pattern in `XevS3Source` to prevent resource leaks and completion corruption across serial requests.
+*   **Parquet Wiring**: Verified that `ParquetFile.openS3` correctly fetches file size via HEAD and parses footer metadata via ranged GETs against MinIO over TLS.
+*   **CI Robustness**: Integrated `tools/no_output_timeout.py` and watchdog timers into integration tests to ensure deterministic failure modes.
+
+## Future Technical Objectives (Milestone 12):
+1.  **SigV4 Signing**: Integrate SigV4 logic into `XevS3Source` to support authenticated AWS S3 requests.
 2.  **Milestone 8: Persistent Pool & Timeouts**: Addressing the cleanup hang in `AsyncFancy` by implementing formal keep-alive timeouts and idle connection harvesting.
-3.  **Milestone 12: Repetition Levels**: Implementing Dremel-style shredding for nested Parquet structures (Lists and Maps).
+3.  **Milestone 13: Repetition Levels**: Implementing Dremel-style shredding for nested Parquet structures (Lists and Maps).
 4.  **Plan 11: Massively Parallel Column Scans**: Stress-testing the `AsyncS3Source` with 50+ concurrent column readers to find the next bottleneck in the `libxev` completion queue.

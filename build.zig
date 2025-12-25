@@ -82,6 +82,114 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&exe.step);
     check_step.dependOn(&lib_unit_tests.step);
 
+    // Experimental I/O Stack Tests (libxev + boring_tls)
+    const enable_experimental = b.option(bool, "experimental", "Enable experimental tests/benchmarks") orelse false;
+
+    if (enable_experimental) {
+        // MinIO Fixtures
+        const minio_fixtures = b.addModule("minio_fixtures", .{
+            .root_source_file = b.path("ci/fixtures/minio/fixtures.zig"),
+        });
+
+        // 2. test-http-client
+        const test_http_client = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_http_client.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_http_client.root_module.addImport("xev", libxev_mod);
+        test_http_client.root_module.addImport("zpq", zpq_mod);
+        
+        const run_test_http_client = b.addRunArtifact(test_http_client);
+        test_step.dependOn(&run_test_http_client.step);
+        
+        // 3. test-minio-https
+        const test_minio_https = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/io/test_minio_https.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_minio_https.root_module.addImport("xev", libxev_mod);
+        test_minio_https.root_module.addImport("zpq", zpq_mod);
+        const run_test_minio_https = b.addRunArtifact(test_minio_https);
+        test_step.dependOn(&run_test_minio_https.step);
+
+        // 4. test-minio-range-get
+        const test_minio_range_get = b.addExecutable(.{
+            .name = "test-minio-range-get",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/integration/test_minio_range_get.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_minio_range_get.root_module.addImport("xev", libxev_mod);
+        test_minio_range_get.root_module.addImport("zpq", zpq_mod);
+        test_minio_range_get.root_module.addImport("minio_fixtures", minio_fixtures);
+        
+        const run_test_minio_range_get = b.addRunArtifact(test_minio_range_get);
+        test_step.dependOn(&run_test_minio_range_get.step);
+
+        // 5. test-xev-s3-source
+        const test_xev_s3_source = b.addExecutable(.{
+            .name = "test-xev-s3-source",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/integration/test_xev_s3_source.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_xev_s3_source.root_module.addImport("xev", libxev_mod);
+        test_xev_s3_source.root_module.addImport("zpq", zpq_mod);
+        test_xev_s3_source.root_module.addImport("minio_fixtures", minio_fixtures);
+        test_xev_s3_source.root_module.addImport("boring_tls", boring_tls_mod);
+
+        const run_test_xev_s3_source = b.addRunArtifact(test_xev_s3_source);
+        test_step.dependOn(&run_test_xev_s3_source.step);
+        b.installArtifact(test_xev_s3_source);
+
+        // Create a dedicated step for this test
+        const step_xev_s3_source = b.step("test-xev-s3-source", "Run XevS3Source integration test");
+        step_xev_s3_source.dependOn(&run_test_xev_s3_source.step);
+
+        // 6. test-parquet-s3
+        const test_parquet_s3 = b.addExecutable(.{
+            .name = "test-parquet-s3",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/integration/test_parquet_s3.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_parquet_s3.root_module.addImport("xev", libxev_mod);
+        test_parquet_s3.root_module.addImport("zpq", zpq_mod);
+        test_parquet_s3.root_module.addImport("boring_tls", boring_tls_mod);
+
+        const run_test_parquet_s3 = b.addRunArtifact(test_parquet_s3);
+        test_step.dependOn(&run_test_parquet_s3.step);
+        b.installArtifact(test_parquet_s3);
+
+        const step_parquet_s3 = b.step("test-parquet-s3", "Run Parquet S3 integration test");
+        step_parquet_s3.dependOn(&run_test_parquet_s3.step);
+
+        // Probe for DNS
+        const probe_dns_xev = b.addExecutable(.{
+            .name = "probe-dns-xev",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_dns_xev.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_dns_xev.root_module.addImport("xev", libxev_mod);
+        probe_dns_xev.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_dns_xev);
+    }
+
     // Auxiliary Tools (Probes, Benchmarks, Fuzzers)
     const build_tests = @import("build_tests.zig");
     build_tests.addAuxiliaryTools(

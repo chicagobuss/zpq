@@ -20,14 +20,7 @@ services:
   # MinIO Client (mc) for setup/tracing
   mc:
     image: minio/mc
-    depends_on:
-      - minio
     volumes:
       - ../../ci/fixtures/minio:/fixtures:ro
-    entrypoint: >
-      /bin/sh -c "
-      until curl -k -s https://minio:9000/minio/health/live; do echo 'Waiting for MinIO...'; sleep 1; done;
-      mc alias set local https://minio:9000 minioadmin minioadmin --insecure;
-      tail -f /dev/null
-      "
+    # No entrypoint, we'll use 'run' or 'exec'
 

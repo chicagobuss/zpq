@@ -78,6 +78,13 @@ pub const Connection = struct {
     pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
          log.debug("Connection.connect called", .{});
          self.tcp = try xev.TCP.init(addr);
+
+         // Disable SIGPIPE on this socket for macOS
+         if (@import("builtin").os.tag == .macos) {
+             const one: i32 = 1;
+             try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
+         }
+
          self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
     }
     
@@ -93,6 +100,8 @@ pub const Connection = struct {
     // --- Internals (The Pump) ---
 
     fn pump(self: *Self) void {
+        if (self.closed) return;
+
         // 1. Process Outgoing (TLS -> TCP)
         const out_slice_res = self.tls.processOutgoing(null);
         if (out_slice_res) |out_slice_opt| {
@@ -119,35 +128,46 @@ pub const Connection = struct {
     fn internalOnClose(
         self: ?*Self,
         loop: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        r: xev.CloseError!void,
+        completion: *xev.Completion,
+        watcher: xev.TCP,
+        result: xev.CloseError!void,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s; 
-        _ = self;
-        _ = r catch {};
-        log.debug("Connection closed.", .{});
+        _ = loop;
+        _ = completion;
+        _ = watcher;
+        _ = result catch {};
+        if (self) |me| {
+            log.debug("Connection closed.", .{});
+            me.closed = true;
+            me.loop.stop(); // Force loop to exit for this request
+        }
         return .disarm;
     }
 
     fn internalOnConnect(
         self: ?*Self,
         loop: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        r: xev.ConnectError!void,
+        completion: *xev.Completion,
+        watcher: xev.TCP,
+        result: xev.ConnectError!void,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s;
+        _ = loop;
+        _ = completion;
+        _ = watcher;
         const me = self.?;
-        if (r) |_| {
-            log.debug("TCP Connected", .{});
+        if (result) |_| {
+            std.debug.print("[tls] TCP Connected, starting handshake...\n", .{});
             me.connected = true;
             // Start Handshake
              const out_slice_res = me.tls.startHandshake();
+             std.debug.print("[tls] Handshake started\n", .{});
              if (out_slice_res) |out_slice_opt| {
                  if (out_slice_opt) |data| {
+                    std.debug.print("[tls] Handshake wants to write {d} bytes\n", .{data.len});
                     const buf = me.allocator.dupe(u8, data) catch unreachable;
+                    std.debug.print("[tls] Calling tcp.write...\n", .{});
                     me.tcp.write(me.loop, &me.c_write, .{ .slice = buf }, Self, me, internalOnTcpWrite);
+                    std.debug.print("[tls] tcp.write called\n", .{});
                     return .disarm;
                  }
              } else |err| {
@@ -164,15 +184,17 @@ pub const Connection = struct {
     fn internalOnTcpWrite(
         self: ?*Self,
         loop: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        buf: xev.WriteBuffer,
-        r: xev.WriteError!usize,
+        completion: *xev.Completion,
+        watcher: xev.TCP,
+        buffer: xev.WriteBuffer,
+        result: xev.WriteError!usize,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s;
+        _ = loop;
+        _ = completion;
+        _ = watcher;
         const me = self.?;
-        me.allocator.free(buf.slice); // Free the dupe
-        if (r) |_| {
+        me.allocator.free(buffer.slice); // Free the dupe
+        if (result) |_| {
             me.pump();
         } else |err| {
              if (me.on_error) |cb| cb(me.user_ctx, err);
@@ -183,14 +205,18 @@ pub const Connection = struct {
     fn internalOnTcpRead(
         self: ?*Self,
         loop: *xev.Loop,
-        c: *xev.Completion,
-        s: xev.TCP,
-        buf: xev.ReadBuffer,
-        r: xev.ReadError!usize,
+        completion: *xev.Completion,
+        watcher: xev.TCP,
+        buffer: xev.ReadBuffer,
+        result: xev.ReadError!usize,
     ) xev.CallbackAction {
-        _ = loop; _ = c; _ = s; _ = buf;
+        _ = loop;
+        _ = completion;
+        _ = watcher;
+        _ = buffer;
         const me = self.?;
-        if (r) |n| {
+        if (result) |n| {
+            log.debug("TCP Read complete: {d} bytes", .{n});
             if (n == 0) {
                  // EOF
                  log.debug("TCP EOF. Closing...", .{});
@@ -200,21 +226,36 @@ pub const Connection = struct {
                  return .disarm;
             }
             
-            // Feed to TLS
-            const dec_res = me.tls.processIncoming(me.read_buf[0..n]);
-            if (dec_res) |dec_opt| {
-                 // Check if handshake just finished
-                 if (!me.handshake_complete and me.tls.handshake_complete) {
-                     me.handshake_complete = true;
-                     if (me.on_connect) |cb| cb(me.user_ctx);
-                 }
-                 
-                 if (dec_opt) |pt| {
-                     if (me.on_data) |cb| cb(me.user_ctx, pt);
-                 }
-            } else |err| {
-                 if (me.on_error) |cb| cb(me.user_ctx, err);
-                 return .disarm;
+            // 1. Feed the new encrypted data into the TLS state machine
+            log.debug("TLS processIncoming: {d} bytes", .{n});
+            var data_to_feed: ?[]const u8 = me.read_buf[0..n];
+            
+            while (true) {
+                const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}) catch |err| {
+                    log.debug("TLS processIncoming error: {}", .{err});
+                    if (me.on_error) |cb| cb(me.user_ctx, err);
+                    return .disarm;
+                };
+                
+                // After the first call, we don't have new data to feed, 
+                // we just want to drain any remaining records from the BIO.
+                data_to_feed = null;
+
+                // Check if handshake just finished
+                if (!me.handshake_complete and me.tls.handshake_complete) {
+                    log.debug("Handshake complete!", .{});
+                    me.handshake_complete = true;
+                    if (me.on_connect) |cb| cb(me.user_ctx);
+                }
+                
+                if (dec_res) |pt| {
+                    log.debug("Decrypted {d} bytes", .{pt.len});
+                    if (me.on_data) |cb| cb(me.user_ctx, pt);
+                    // Continue looping to see if there are more records in the BIO
+                } else {
+                    // No more decrypted data available at this time
+                    break;
+                }
             }
             me.pump();
         } else |err| {

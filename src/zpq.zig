@@ -49,6 +49,7 @@ pub const s3 = struct {
     pub const dns = @import("zpq/io/s3/dns.zig");
     pub const sigv4 = @import("zpq/io/s3/sigv4.zig");
     pub const factory = @import("zpq/io/s3/factory.zig");
+    pub const XevS3Source = @import("zpq/io/s3/xev_source.zig").XevS3Source;
 };
 
 test {

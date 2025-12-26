@@ -1,125 +1,100 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
 
-      - name: Set up Zig (via zvm)
-        run: |
-          curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
-          export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
-          echo "$HOME/.zvm/bin" >> $GITHUB_PATH
-          echo "$HOME/.zvm/self" >> $GITHUB_PATH
-          # Install and use Zig master (dev)
-          zvm install master
-          zvm use master
+            - name: Set up Zig (via zvm)
+              run: |
+                  curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
+                  export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
+                  echo "$HOME/.zvm/bin" >> $GITHUB_PATH
+                  echo "$HOME/.zvm/self" >> $GITHUB_PATH
+                  # Install and use Zig master (dev)
+                  zvm install master
+                  zvm use master
 
-      - name: Install Just
-        uses: extractions/setup-just@v2
+            - name: Install Just
+              uses: extractions/setup-just@v2
 
-      - name: Cache Zig Global Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            zig-cache
-          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
+            - name: Cache Zig Global Cache
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/zig
+                      zig-cache
+                  key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
+                  restore-keys: |
+                      ${{ runner.os }}-zig-
 
-      - name: Fetch Pre-built Dependencies
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "::group::Fetching pre-built BoringSSL libraries"
-          # Determine target triple for this runner
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ]; then
-            TARGET="x86_64-linux"
-          elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-            TARGET="aarch64-linux"
-          else
-            echo "Unknown architecture: $ARCH, will build from source"
-            echo "::endgroup::"
-            exit 0
-          fi
-          echo "Detected target: $TARGET"
+            - name: Fetch Pre-built Dependencies from R2
+              run: |
+                  echo "::group::Fetching pre-built BoringSSL libraries from Cloudflare R2"
+                  # Determine target triple for this runner
+                  ARCH=$(uname -m)
+                  if [ "$ARCH" = "x86_64" ]; then
+                    TARGET="x86_64-linux"
+                  elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+                    TARGET="aarch64-linux"
+                  else
+                    echo "Unknown architecture: $ARCH, will build from source"
+                    echo "::endgroup::"
+                    exit 0
+                  fi
+                  echo "Detected target: $TARGET"
 
-          mkdir -p vendor/boring_tls/prebuilt/$TARGET
-          DEPS_TAG="deps-v0.2"
+                  # Fetch from Cloudflare R2 (public, no auth needed)
+                  R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${TARGET}"
+                  mkdir -p vendor/boring_tls/prebuilt/$TARGET
 
-          # Try fetching with gh CLI (works for private repos with token)
-          if command -v gh &> /dev/null && [ -n "$GH_TOKEN" ]; then
-            echo "Using gh CLI for authenticated download..."
-            gh release download "$DEPS_TAG" \
-              --repo chicagobuss/zpq \
-              --pattern "libcrypto-${TARGET}.a" \
-              --pattern "libssl-${TARGET}.a" \
-              --dir "vendor/boring_tls/prebuilt/${TARGET}/" \
-              --clobber 2>/dev/null || echo "gh download failed, trying curl..."
+                  echo "Fetching libcrypto.a..."
+                  curl -fsSL "${R2_URL}/libcrypto.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" || true
+                  echo "Fetching libssl.a..."
+                  curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" || true
 
-            # Rename files (gh downloads with original names like libcrypto-x86_64-linux.a)
-            if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" ]; then
-              mv "vendor/boring_tls/prebuilt/${TARGET}/libcrypto-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a"
-              echo "Renamed libcrypto-${TARGET}.a -> libcrypto.a"
-            fi
-            if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" ]; then
-              mv "vendor/boring_tls/prebuilt/${TARGET}/libssl-${TARGET}.a" "vendor/boring_tls/prebuilt/${TARGET}/libssl.a"
-              echo "Renamed libssl-${TARGET}.a -> libssl.a"
-            fi
-          fi
+                  # Verify downloads
+                  if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ]; then
+                    echo "Successfully fetched pre-built dependencies from R2"
+                    ls -la vendor/boring_tls/prebuilt/${TARGET}/
+                  else
+                    echo "Pre-built deps not available on R2, will build from source (~5-10 min)"
+                  fi
+                  echo "::endgroup::"
 
-          # Fallback to curl (for when repo becomes public)
-          if [ ! -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ]; then
-            BASE_URL="https://github.com/chicagobuss/zpq/releases/download/${DEPS_TAG}"
-            echo "Fetching from: $BASE_URL"
-            curl -fsSL "${BASE_URL}/libcrypto-${TARGET}.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || true
-            curl -fsSL "${BASE_URL}/libssl-${TARGET}.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" 2>/dev/null || true
-          fi
+            - name: Build
+              run: |
+                  echo "::group::Zig Build"
+                  zig build --summary all 2>&1
+                  echo "::endgroup::"
+                  echo "::group::Build Examples (Lambda)"
+                  zig build -Dexamples --summary all 2>&1
+                  echo "::endgroup::"
+                  echo "Build artifacts:"
+                  ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
+                  ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
 
-          # Verify downloads
-          if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ]; then
-            echo "Successfully fetched pre-built dependencies"
-            ls -la vendor/boring_tls/prebuilt/${TARGET}/
-          else
-            echo "Pre-built deps not available, will build from source (~5-10 min)"
-          fi
-          echo "::endgroup::"
+            - name: Run Tests
+              run: |
+                  echo "::group::Running Tests"
+                  zig build test --summary all 2>&1
+                  echo "::endgroup::"
 
-      - name: Build
-        run: |
-          echo "::group::Zig Build"
-          zig build --summary all 2>&1
-          echo "::endgroup::"
-          echo "::group::Build Examples (Lambda)"
-          zig build -Dexamples --summary all 2>&1
-          echo "::endgroup::"
-          echo "Build artifacts:"
-          ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
-          ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
-
-      - name: Run Tests
-        run: |
-          echo "::group::Running Tests"
-          zig build test --summary all 2>&1
-          echo "::endgroup::"
-
-      - name: Run Inspector Verification
-        run: |
-          echo "::group::Inspector Verification"
-          echo "Testing simple.parquet..."
-          ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
-          echo "Testing required.parquet..."
-          ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
-          echo "::endgroup::"
-          echo "All verifications passed!"
+            - name: Run Inspector Verification
+              run: |
+                  echo "::group::Inspector Verification"
+                  echo "Testing simple.parquet..."
+                  ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
+                  echo "Testing required.parquet..."
+                  ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
+                  echo "::endgroup::"
+                  echo "All verifications passed!"

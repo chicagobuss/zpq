@@ -34,3 +34,4 @@ tools/rustfs_tls/certs/
 !data/large_bitpacked.parquet
 !data/large_rle.parquet
 tmp/
+vendor/boring_tls/prebuilt/

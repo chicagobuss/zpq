@@ -25,7 +25,7 @@ pub const Connection = struct {
 
     // Buffers
     // TODO: Make this configurable or dynamic
-    read_buf: [4096]u8 = undefined,
+    read_buf: [1024 * 1024]u8 = undefined,
 
     // State
     connected: bool = false,
@@ -34,7 +34,12 @@ pub const Connection = struct {
     idling: bool = false,
     pending_read: bool = false,
     pending_write: bool = false,
-    
+
+    // Zero-Copy support
+    target_buffer: ?[]u8 = null,
+    tcp_read_buf_size: usize = 4096,
+    use_direct: bool = true,
+
     // User callbacks
     // We use a simplified callback interface for now:
     // When data is available (decrypted), we call on_data.
@@ -49,14 +54,14 @@ pub const Connection = struct {
     const Self = @This();
 
     pub fn init(loop: *xev.Loop, allocator: std.mem.Allocator, host: []const u8) !Self {
-        // Use verify_certificate = false for now (as per microtest success). 
+        // Use verify_certificate = false for now (as per microtest success).
         // TODO: Enable verification with embedded CA bundle.
         const tls_client = try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = false });
-        // tcp is init'd later or we can init it empty? 
+        // tcp is init'd later or we can init it empty?
         // xev.TCP.init requires an address. We'll init it in connect().
-        // For now, return a partial struct or init with dummy addr? 
+        // For now, return a partial struct or init with dummy addr?
         // xev.TCP structure is just an fd holder.
-        
+
         return Self{
             .loop = loop,
             .tcp = undefined, // Set in connect
@@ -66,29 +71,40 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.tls.deinit(); 
+        self.tls.deinit();
+        if (!self.closed) {
+            log.warn("Connection deinitialized without being closed! This will leak completions.", .{});
+        }
     }
 
     pub fn close(self: *Self) void {
          if (self.closed) return;
          self.closed = true;
-         // We don't cancel pending reads/writes explicitly here, 
+         // We don't cancel pending reads/writes explicitly here,
          // but internalOnClose will disarm its completion.
          self.tcp.close(self.loop, &self.c_close, Self, self, internalOnClose);
     }
-    
+
     pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
          self.tcp = try xev.TCP.init(addr);
 
-         // Disable SIGPIPE on this socket for macOS
-         if (@import("builtin").os.tag == .macos) {
-             const one: i32 = 1;
-             try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
-         }
+        const one: i32 = 1;
+
+        // Disable SIGPIPE on this socket for macOS
+        if (@import("builtin").os.tag == .macos) {
+            try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
+        }
+
+        // Increase TCP receive buffer to 4MB for high throughput
+        const size: i32 = 4 * 1024 * 1024;
+        std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+
+        // Enable TCP_NODELAY (Disable Nagle's algorithm) for lower latency
+        std.posix.setsockopt(self.tcp.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 
          self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
     }
-    
+
     pub fn write(self: *Self, data: []const u8) !void {
         if (self.closed) {
             log.debug("write: connection closed, ignoring", .{});
@@ -143,7 +159,7 @@ pub const Connection = struct {
         if (!self.pending_read and !self.idling) {
             log.debug("pump: scheduling TCP read", .{});
             self.pending_read = true;
-            self.tcp.read(self.loop, &self.c_read, .{ .slice = &self.read_buf }, Self, self, internalOnTcpRead);
+            self.tcp.read(self.loop, &self.c_read, .{ .slice = self.read_buf[0..self.tcp_read_buf_size] }, Self, self, internalOnTcpRead);
         }
     }
 
@@ -236,32 +252,43 @@ pub const Connection = struct {
         const me = self.?;
         me.pending_read = false;
         if (result) |n| {
-            log.debug("internalOnTcpRead: read {d} bytes", .{n});
+            log.info("wire: read {d} bytes (target {d}KB)", .{ n, me.tcp_read_buf_size / 1024 });
             if (n == 0) {
                  // EOF
                  me.close();
                  if (me.on_error) |cb| cb(me.user_ctx, error.EOF);
                  return .disarm;
             }
-            
+
             // 1. Feed the new encrypted data into the TLS state machine
             var data_to_feed: ?[]const u8 = me.read_buf[0..n];
-            
+
             while (true) {
-                const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}) catch |err| {
+                const start_proc = std.time.Instant.now() catch unreachable;
+                const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}, if (me.use_direct) me.target_buffer else null) catch |err| {
                     if (me.on_error) |cb| cb(me.user_ctx, err);
                     return .disarm;
                 };
-                
+                const end_proc = std.time.Instant.now() catch unreachable;
+                log.info("perf: processIncoming took {d}ns", .{end_proc.since(start_proc)});
+
                 data_to_feed = null;
 
                 if (!me.handshake_complete and me.tls.handshake_complete) {
                     me.handshake_complete = true;
                     if (me.on_connect) |cb| cb(me.user_ctx);
                 }
-                
+
                 if (dec_res) |pt| {
+                    if (me.use_direct and me.target_buffer != null) {
+                        // Direct decryption happened. Update target_buffer to skip what we read.
+                        me.target_buffer = me.target_buffer.?[pt.len..];
+                        if (me.target_buffer.?.len == 0) me.target_buffer = null;
+                    }
+                    const start_cb = std.time.Instant.now() catch unreachable;
                     if (me.on_data) |cb| cb(me.user_ctx, pt);
+                    const end_cb = std.time.Instant.now() catch unreachable;
+                    log.info("perf: on_data callback took {d}ns", .{end_cb.since(start_cb)});
                 } else {
                     break;
                 }
@@ -274,4 +301,3 @@ pub const Connection = struct {
         return .disarm;
     }
 };
-

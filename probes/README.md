@@ -27,6 +27,8 @@ Probes are **point-in-time learning experiments** - one-off code written to unde
 | `probe_timespec_fields.zig` | Investigating `posix.timespec` field naming (Darwin vs Linux) | Dec 2025 |
 | `probe_arraylist_unmanaged.zig` | Documenting the move to `ArrayListUnmanaged` in Zig 0.16.x | Dec 2025 |
 | `probe_rustfs_raw.zig` | Proving raw TCP connectivity to RustFS without TLS | Dec 2025 |
+| `shootout_tls_throughput.zig` | Micro-shootout comparing TLS decryption strategies (Baseline vs Direct vs Monster) | Dec 2025 |
+| `remote_latency_shootout.bt` | eBPF script to diagnose 100Mbps bottleneck by tracking kernel-to-user scheduling lag and app processing gaps on Linux ARM64 | Dec 2025 |
 
 ## Running a Probe
 

@@ -1,72 +1,65 @@
-name: Release Dependencies
+name: Build and Upload Dependencies
 
 on:
-  workflow_dispatch:
-  push:
-    tags:
-      - 'deps-*'
-
-permissions:
-  contents: write
+    workflow_dispatch:
+    push:
+        tags:
+            - "deps-*"
 
 jobs:
-  build-boring-ssl:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-linux
-          - os: ubuntu-latest
-            target: aarch64-linux
-          - os: macos-latest
-            target: x86_64-macos
-          - os: macos-latest
-            target: aarch64-macos
-    steps:
-      - uses: actions/checkout@v4
+    build-boring-ssl:
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      target: x86_64-linux
+                    - os: ubuntu-latest
+                      target: aarch64-linux
+                    - os: macos-latest
+                      target: x86_64-macos
+                    - os: macos-latest
+                      target: aarch64-macos
+        steps:
+            - uses: actions/checkout@v4
 
-      - name: Set up Zig (via zvm)
-        run: |
-          curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
-          export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
-          echo "$HOME/.zvm/bin" >> $GITHUB_PATH
-          echo "$HOME/.zvm/self" >> $GITHUB_PATH
-          zvm install master
-          zvm use master
+            - name: Set up Zig (via zvm)
+              run: |
+                  curl -L https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
+                  export PATH=$HOME/.zvm/bin:$HOME/.zvm/self:$PATH
+                  echo "$HOME/.zvm/bin" >> $GITHUB_PATH
+                  echo "$HOME/.zvm/self" >> $GITHUB_PATH
+                  zvm install master
+                  zvm use master
 
-      - name: Build BoringSSL
-        run: |
-          cd vendor/boring_tls
-          zig build -Dtarget=${{ matrix.target }} -Duse-prebuilt=false --summary all
-          
-          # Create the bundle with unique names
-          mkdir -p ../../bundle
-          cp zig-out/lib/libcrypto.a ../../bundle/libcrypto-${{ matrix.target }}.a
-          cp zig-out/lib/libssl.a ../../bundle/libssl-${{ matrix.target }}.a
-          
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: boring-ssl-${{ matrix.target }}
-          path: bundle/
+            - name: Build BoringSSL
+              run: |
+                  cd vendor/boring_tls
+                  zig build -Dtarget=${{ matrix.target }} -Duse-prebuilt=false -Dfetch-prebuilt=false --summary all
 
-  release:
-    needs: build-boring-ssl
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/deps-')
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-          merge-multiple: true
+                  # Prepare for upload
+                  mkdir -p prebuilt/${{ matrix.target }}
+                  cp zig-out/lib/libcrypto.a prebuilt/${{ matrix.target }}/
+                  cp zig-out/lib/libssl.a prebuilt/${{ matrix.target }}/
+                  ls -la prebuilt/${{ matrix.target }}/
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: release-artifacts/*
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
+            - name: Upload to Cloudflare R2
+              env:
+                  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+                  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+                  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+              run: |
+                  cd vendor/boring_tls
+                  R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+                  echo "Uploading libcrypto.a for ${{ matrix.target }}..."
+                  aws s3 cp prebuilt/${{ matrix.target }}/libcrypto.a \
+                    s3://zpq/boring_tls/${{ matrix.target }}/libcrypto.a \
+                    --endpoint-url "$R2_ENDPOINT"
+
+                  echo "Uploading libssl.a for ${{ matrix.target }}..."
+                  aws s3 cp prebuilt/${{ matrix.target }}/libssl.a \
+                    s3://zpq/boring_tls/${{ matrix.target }}/libssl.a \
+                    --endpoint-url "$R2_ENDPOINT"
+
+                  echo "Done uploading ${{ matrix.target }}"

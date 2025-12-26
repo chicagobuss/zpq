@@ -33,9 +33,6 @@ pub const XevConnectionPool = struct {
 
     pub fn deinit(self: *XevConnectionPool) void {
         for (self.idle_connections.items) |entry| {
-            // Note: Connection.deinit() is synchronous but close() is async.
-            // For a clean shutdown, the source should have closed these.
-            // But if they are idle, we just destroy them.
             entry.conn.deinit();
             self.allocator.destroy(entry.conn);
             self.allocator.free(entry.key.host);
@@ -43,14 +40,24 @@ pub const XevConnectionPool = struct {
         self.idle_connections.deinit(self.allocator);
     }
 
+    /// Asynchronously closes all idle connections. The caller must run the loop.
+    pub fn closeAll(self: *XevConnectionPool) void {
+        var i: usize = 0;
+        while (i < self.idle_connections.items.len) : (i += 1) {
+            const entry = self.idle_connections.items[i];
+            entry.conn.close();
+        }
+    }
+
     /// Finds a warm connection from the pool. Returns null if none available or all are dead.
     pub fn acquire(self: *XevConnectionPool, key: ConnectionKey) ?*Connection {
+        std.debug.print("[POOL] acquire: pool has {d} idle connections\n", .{self.idle_connections.items.len});
         const now = std.time.Instant.now() catch return null;
-        const now_ms = if (@hasField(@TypeOf(now.timestamp), "sec")) 
+        const now_ms = if (@hasField(@TypeOf(now.timestamp), "sec"))
             (now.timestamp.sec * 1000) + @divFloor(now.timestamp.nsec, 1_000_000)
         else if (@hasField(@TypeOf(now.timestamp), "tv_sec"))
             (now.timestamp.tv_sec * 1000) + @divFloor(now.timestamp.tv_nsec, 1_000_000)
-        else 
+        else
             @divFloor(@as(i64, @intCast(now.timestamp)), 1_000_000);
 
         var i: usize = self.idle_connections.items.len;
@@ -59,7 +66,7 @@ pub const XevConnectionPool = struct {
             const entry = self.idle_connections.items[i];
             if (entry.key.eql(key)) {
                 _ = self.idle_connections.orderedRemove(i);
-                
+
                 // 1. Check for expiration (e.g. 10 seconds)
                 if (now_ms - entry.last_used_ms > 10000) {
                     entry.conn.deinit();
@@ -77,6 +84,7 @@ pub const XevConnectionPool = struct {
 
     /// Releases a connection back into the pool. If the pool is full, it's destroyed.
     pub fn release(self: *XevConnectionPool, key: ConnectionKey, conn: *Connection) !void {
+        std.debug.print("[POOL] release: adding connection to pool (now {d})\n", .{self.idle_connections.items.len + 1});
         if (self.idle_connections.items.len >= self.max_idle) {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -92,11 +100,11 @@ pub const XevConnectionPool = struct {
             self.allocator.free(host_dupe);
             return;
         };
-        const now_ms = if (@hasField(@TypeOf(now.timestamp), "sec")) 
+        const now_ms = if (@hasField(@TypeOf(now.timestamp), "sec"))
             (now.timestamp.sec * 1000) + @divFloor(now.timestamp.nsec, 1_000_000)
         else if (@hasField(@TypeOf(now.timestamp), "tv_sec"))
             (now.timestamp.tv_sec * 1000) + @divFloor(now.timestamp.tv_nsec, 1_000_000)
-        else 
+        else
             @divFloor(@as(i64, @intCast(now.timestamp)), 1_000_000);
 
         try self.idle_connections.append(self.allocator, .{
@@ -110,4 +118,3 @@ pub const XevConnectionPool = struct {
         });
     }
 };
-

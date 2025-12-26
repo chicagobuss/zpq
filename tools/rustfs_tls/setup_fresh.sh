@@ -64,6 +64,12 @@ except Exception as e:
 fixture_path = os.path.abspath(os.path.join('$DIR', '../../ci/fixtures/parquet/simple.parquet'))
 s3.upload_file(fixture_path, bucket, 'simple.parquet')
 print(f"Uploaded simple.parquet to {bucket}")
+
+# Real Parquet Shootout File
+shootout_path = os.path.abspath(os.path.join('$DIR', '../../tmp/million-line-120-col-00001.snappy.parquet'))
+if os.path.exists(shootout_path):
+    s3.upload_file(shootout_path, bucket, 'bench.parquet')
+    print(f"Uploaded bench.parquet to {bucket}")
 EOF
 
 echo "SUCCESS: RustFS is ready for ZPQ benchmarking."

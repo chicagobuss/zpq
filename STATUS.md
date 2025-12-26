@@ -7,13 +7,25 @@
 *   **Portability**: Run as a standalone CLI, AWS Lambda (Zig's cross-compilation), or library.
 
 ## Philosophy & Architecture
-*   **Lambda-First**: The ultimate goal is high-performance AWS Lambdas with minimal cold starts.
-    *   **No Runtime SDKs**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
-    *   **Minimal Footprint**: Reduction of binary size and memory utilization.
-*   **The Spirit of Zig 0.16**: We align with upcoming 0.16 patterns today:
-    *   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
-    *   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
-    *   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
+
+### The Laziness Principle (Foundational)
+> **ZPQ preserves data in its most compact/encoded form as long as possible. Decoding, decompression, and re-encoding happen only at the boundaries where transformation is required.**
+
+This principle drives every architectural decision:
+*   **Late Materialization**: Data stays in Parquet's native encoding (RLE, dictionary, delta) until a consumer needs decoded values.
+*   **Metadata-First**: Leverage row group stats and column indexes to skip work before touching data bytes.
+*   **Copy-Through Optimization**: Unchanged columns pass through as compressed bytes - only the footer is rewritten.
+*   **Selective Decoding**: For filtered reads, decode only predicate columns to build selection vectors.
+
+### Lambda-First Design
+*   **No Runtime SDKs**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
+*   **Minimal Footprint**: ~2MB binary size for the full S3+TLS+Parquet stack.
+*   **Cold Start Optimized**: Binary size and initialization overhead are first-class concerns.
+
+### The Spirit of Zig 0.16
+*   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
+*   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
+*   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
 *   **Pragmatic Library Usage**:
     *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level    @echo "\n=== Python (PyArrow) ==="
     uv run python tools/bench/pyarrow_bench.py data/sample-data.parquet
@@ -151,11 +163,99 @@
 *   [x] **Correctness**: Verified against **RustFS** over HTTPS with zero memory leaks.
 *   [x] **Performance**: Achieved **28.3ms** cold starts—matching/surpassing established baselines.
 
-### Milestone 14: Radical Optimizations
-*   [ ] **Zero-Copy TLS**: Decrypt S3 data directly into column buffers to eliminate the final memcpy.
-*   [ ] **SIMD Bit-Unpacking**: Comptime-generated SIMD decoders for specialized integer widths.
+### Milestone 14: Cleanup & Consolidation
 *   [ ] **Delete Legacy**: Remove `async_source.zig`, `event_loop.zig`, and `tls_adapter.zig`.
 *   [ ] **Factory Flip**: Make `XevS3Source` the definitive default for all `s3://` paths.
+
+### Milestone 15: Real-World Benchmarking & Performance Baseline [IN PROGRESS]
+**Goal**: Establish baseline performance against competitors on real S3/R2 with production-sized files.
+
+*   [ ] **Re-benchmark with TLS fix**: Validate hardware crypto acceleration impact on real workloads.
+*   [ ] **Large file testing**: 10MB+, 100MB+ Parquet files on real S3 (us-west-2).
+*   [ ] **R2 testing**: Public-friendly benchmark target on Cloudflare R2.
+*   [ ] **Competitor comparison**: PyArrow, DuckDB, Polars on identical files/queries.
+*   [ ] **Decoder profiling**: Identify which decoders (PLAIN, RLE, Dictionary) are bottlenecks.
+*   [ ] **Document baseline**: Record numbers before SIMD work begins.
+
+### Milestone 16: SIMD Decoders
+**Goal**: Maximize decode throughput for cases where we must decode.
+
+*   [ ] **Comptime bit-unpacking**: Generated SIMD for common bit widths (1-32).
+*   [ ] **Vectorized RLE decoder**: Batch decode runs instead of one-at-a-time.
+*   [ ] **SIMD null bitmap operations**: Fast null expansion/checking.
+*   [ ] **Benchmark suite**: Isolated decoder benchmarks to measure improvements.
+*   [ ] **Target**: 2x+ decode throughput vs current implementation.
+
+### Milestone 17: Predicate Pushdown (Read-Side)
+**Goal**: Skip work on reads - Laziness Principle for filtering.
+
+*   [ ] **Row group statistics evaluation**: Skip row groups via min/max metadata.
+*   [ ] **Page index support**: Finer-grained skipping (if present in file).
+*   [ ] **Selection vector generation**: Decode filter column, build bitmap.
+*   [ ] **Selective column decode**: Only decode rows matching selection vector.
+*   [ ] **Benchmark**: "1% selectivity" should be ~100x faster than full scan.
+
+### Milestone 18: Parquet Writer Foundation
+**Goal**: Basic write capability for "slice and dice" operations.
+
+*   [ ] **PLAIN encoder** for primitives (INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY).
+*   [ ] **Definition level writer** (RLE encoded) for nullable columns.
+*   [ ] **Page/row group assembly**: Data pages with headers, column chunks.
+*   [ ] **Footer generation**: FileMetaData Thrift serialization.
+*   [ ] **CLI**: `zpq slice input.parquet -o output.parquet --columns a,b,c`
+*   [ ] **Round-trip verification**: Read → write → read, compare results.
+
+### Milestone 19: Copy-Through Optimization
+**Goal**: The "cheat path" - copy unchanged columns without decode/encode.
+
+*   [ ] **Passthrough detection**: Identify columns not touched by filter/projection.
+*   [ ] **Compressed chunk copying**: Byte-copy column chunks directly.
+*   [ ] **Metadata-only rewrite**: Update offsets in footer without touching data.
+*   [ ] **Partial row group handling**: Fall back to decode when only some rows match.
+*   [ ] **Benchmark**: Prove 10x+ speedup for "1% filter, 25 columns" vs naive.
+
+### Milestone 20: Compression & Dictionary Encoding
+**Goal**: Production-quality output files.
+
+*   [ ] **Snappy compressor**: Reuse decompressor knowledge, add compression.
+*   [ ] **Dictionary encoder**: Build dictionary for string columns, encode indices.
+*   [ ] **Dictionary passthrough**: Preserve input dictionary when possible.
+*   [ ] **Compression selection**: Match input compression or specify via CLI.
+
+### Milestone 21: Streaming S3 Output
+**Goal**: Write directly to S3 without local temp files.
+
+*   [ ] **S3 multipart upload**: Initiate, upload parts, complete.
+*   [ ] **Streaming writer interface**: Write pages as they're ready.
+*   [ ] **Full pipeline**: S3 input → filter → S3 output (no local disk).
+*   [ ] **Memory-bounded**: Limit buffering, flush parts incrementally.
+*   [ ] **CLI**: `zpq slice s3://in/file.parquet -o s3://out/file.parquet`
+
+### Milestone 22: Lambda-Ready Package
+**Goal**: Production deployment for serverless lakehouse.
+
+*   [ ] **Lambda handler**: Event-driven entry point.
+*   [ ] **Configuration via environment**: Input/output paths, filter expressions.
+*   [ ] **Error handling**: Graceful failures, structured logging.
+*   [ ] **Metrics**: Execution time, bytes read/written, rows processed.
+*   [ ] **Binary size audit**: Target <3MB for fast cold starts.
+*   [ ] **Benchmark vs DuckDB Lambda**: Prove the cost/performance advantage.
+
+### Milestone 23: Zero-Copy TLS (Research)
+**Goal**: Eliminate final memcpy in TLS decryption path.
+
+*   [ ] **Direct decryption into column buffers**: Decrypt S3 data directly into destination.
+*   [ ] **Vendor boring_tls modifications**: Requires changes to SSL_read path.
+*   [ ] **Benchmark**: Measure throughput improvement on large file scans.
+
+### Milestone 24: Query Engine Foundation (Future)
+**Goal**: Lay groundwork for operators beyond scan.
+
+*   [ ] **Batch/morsel abstraction**: Fixed-size column chunks (1024/2048 rows).
+*   [ ] **Operator interface**: `open()`, `next() -> Batch`, `close()`.
+*   [ ] **Filter operator**: Evaluate predicates on batches.
+*   [ ] **Project operator**: Compute expressions, select columns.
+*   [ ] **Pipeline builder**: Compose operators into execution plan.
 
 ---
 

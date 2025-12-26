@@ -11,6 +11,18 @@ const ConnectionKey = pool_mod.ConnectionKey;
 
 const log = @import("std").log.scoped(.s3_source);
 
+const BatchContext = struct {
+    remaining: usize,
+    loop: *xev.Loop,
+
+    pub fn signalDone(self: *@This()) void {
+        self.remaining -= 1;
+        // NOTE: We do NOT call loop.stop() here because that permanently stops the loop
+        // and breaks subsequent iterations. The loop will naturally exit when all
+        // active completions are done (active == 0).
+    }
+};
+
 /// A cross-platform S3 Source that uses libxev + boring_tls.
 /// Implements io.RandomAccessSource for ParquetFile.
 /// This source owns its own EventLoop and blocks on read calls (spinning the loop).
@@ -28,6 +40,12 @@ pub const XevS3Source = struct {
     use_tls: bool,
     port: u16,
 
+    // Throughput Options
+    tcp_read_buf_size: usize = 4096,
+    use_direct: bool = true,
+
+    owns_loop: bool = false,
+
     // Auth (optional)
     access_key: ?[]const u8 = null,
     secret_key: ?[]const u8 = null,
@@ -35,7 +53,7 @@ pub const XevS3Source = struct {
 
     // Cached DNS result
     cached_addr: ?xev.shim_net.Address = null,
-    
+
     // File size (fetched on init or on demand)
     file_size: u64 = 0,
 
@@ -48,55 +66,88 @@ pub const XevS3Source = struct {
         use_tls: bool,
         port: u16,
     ) !*XevS3Source {
-        const self = try allocator.create(XevS3Source);
-        errdefer allocator.destroy(self);
-
-        self.allocator = allocator;
-        self.loop = try allocator.create(xev.Loop);
-        errdefer allocator.destroy(self.loop);
-        self.loop.* = try xev.Loop.init(.{});
-        
-        self.thread_pool = try allocator.create(xev.ThreadPool);
+        const loop = try allocator.create(xev.Loop);
+        loop.* = try xev.Loop.init(.{});
         errdefer {
-            self.loop.deinit();
-            allocator.destroy(self.loop);
-            allocator.destroy(self.thread_pool);
+            loop.deinit();
+            allocator.destroy(loop);
         }
-        self.thread_pool.* = xev.ThreadPool.init(.{});
-        
-        self.resolver = dns.ThreadPoolResolver.init(self.thread_pool, allocator);
-        self.pool = XevConnectionPool.init(allocator);
-        
-        self.host = try allocator.dupe(u8, host);
-        self.bucket = try allocator.dupe(u8, bucket);
-        self.key = try allocator.dupe(u8, key);
-        self.region = try allocator.dupe(u8, region);
-        self.use_tls = use_tls;
-        self.port = port;
-        self.cached_addr = null;
-        self.file_size = 0;
-        self.access_key = null;
-        self.secret_key = null;
-        self.session_token = null;
+
+        const thread_pool = try allocator.create(xev.ThreadPool);
+        thread_pool.* = xev.ThreadPool.init(.{});
+        errdefer {
+            thread_pool.shutdown();
+            thread_pool.deinit();
+            allocator.destroy(thread_pool);
+        }
+
+        var self = try initWithLoop(allocator, loop, thread_pool, host, bucket, key, region, use_tls, port, 4096, true);
+        self.owns_loop = true;
+        return self;
+    }
+
+    pub fn initWithLoop(
+        allocator: std.mem.Allocator,
+        loop: *xev.Loop,
+        thread_pool: *xev.ThreadPool,
+        host: []const u8,
+        bucket: []const u8,
+        key: []const u8,
+        region: []const u8,
+        use_tls: bool,
+        port: u16,
+        tcp_read_buf_size: usize,
+        use_direct: bool,
+    ) !*XevS3Source {
+        const self = try allocator.create(XevS3Source);
+        self.* = .{
+            .allocator = allocator,
+            .loop = loop,
+            .thread_pool = thread_pool,
+            .resolver = dns.ThreadPoolResolver.init(thread_pool, allocator),
+            .pool = XevConnectionPool.init(allocator),
+            .host = try allocator.dupe(u8, host),
+            .bucket = try allocator.dupe(u8, bucket),
+            .key = try allocator.dupe(u8, key),
+            .region = try allocator.dupe(u8, region),
+            .use_tls = use_tls,
+            .port = port,
+            .tcp_read_buf_size = tcp_read_buf_size,
+            .use_direct = use_direct,
+            .owns_loop = false,
+        };
 
         return self;
     }
 
     pub fn deinit(self: *XevS3Source) void {
+        // 1. Close all idle connections in the pool
+        self.pool.closeAll();
+
+        // 2. Pump the loop one last time to process the close completions
+        // We use .once in a loop because .until_done might wait for
+        // connections that are still in a "connect" state if something went wrong.
+        // Actually, until_done is fine here if we trust our close() logic.
+        self.loop.run(.until_done) catch {};
+
+        // 3. Cleanup the rest
         self.pool.deinit();
         self.resolver.deinit();
-        self.thread_pool.shutdown(); // Ensure threads stop
-        self.thread_pool.deinit();
-        self.loop.deinit();
-        
-        self.allocator.destroy(self.thread_pool);
-        self.allocator.destroy(self.loop);
-        
+
+        if (self.owns_loop) {
+            self.thread_pool.shutdown(); // Ensure threads stop
+            self.thread_pool.deinit();
+            self.loop.deinit();
+
+            self.allocator.destroy(self.thread_pool);
+            self.allocator.destroy(self.loop);
+        }
+
         self.allocator.free(self.host);
         self.allocator.free(self.bucket);
         self.allocator.free(self.key);
         self.allocator.free(self.region);
-        
+
         if (self.access_key) |k| self.allocator.free(k);
         if (self.secret_key) |k| self.allocator.free(k);
         if (self.session_token) |t| self.allocator.free(t);
@@ -126,7 +177,8 @@ pub const XevS3Source = struct {
     fn readRangesImpl(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8) anyerror!void {
         const self: *XevS3Source = @ptrCast(@alignCast(ptr));
         if (ranges.len == 0) return;
-        
+
+        log.debug("readRangesImpl: called with {d} ranges", .{ranges.len});
         const addr = try self.resolve();
 
         // 1. Merge ranges using scheduler
@@ -144,7 +196,7 @@ pub const XevS3Source = struct {
 
             const contexts = try self.allocator.alloc(*ReqContext, batch_size);
             defer self.allocator.free(contexts);
-            
+
             var cleanup_idx: usize = 0;
             errdefer {
                 for (0..cleanup_idx) |j| {
@@ -155,14 +207,26 @@ pub const XevS3Source = struct {
                 }
             }
 
+            var batch_ctx = BatchContext{ .remaining = batch_size, .loop = self.loop };
+
+            log.debug("readRangesImpl: processing batch of {d} merged ranges", .{batch_size});
             for (batch_merged, 0..) |merged, j| {
                 const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
                 const conn = if (self.pool.acquire(key)) |c| blk: {
+                    log.debug("readRangesImpl: reusing pooled connection (handshake_complete={}, closed={}, pending_read={}, pending_write={})", .{c.handshake_complete, c.closed, c.pending_read, c.pending_write});
                     c.idling = false;
+                    // Reset pending flags for reuse - previous request may have left these set
+                    c.pending_read = false;
+                    c.pending_write = false;
+                    c.tcp_read_buf_size = self.tcp_read_buf_size;
+                    c.use_direct = self.use_direct;
                     break :blk c;
                 } else blk: {
+                    log.debug("readRangesImpl: creating new connection", .{});
                     const c = try self.allocator.create(tls.Connection);
                     c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+                    c.tcp_read_buf_size = self.tcp_read_buf_size;
+                    c.use_direct = self.use_direct;
                     break :blk c;
                 };
 
@@ -185,6 +249,7 @@ pub const XevS3Source = struct {
                     .dest_buffers = dest_buffers,
                     .allocator = self.allocator,
                     .parser = .{},
+                    .batch_ctx = &batch_ctx,
                 };
                 cleanup_idx += 1;
 
@@ -200,7 +265,9 @@ pub const XevS3Source = struct {
                 }
             }
 
+            log.debug("readRangesImpl: running loop", .{});
             try self.loop.run(.until_done);
+            log.debug("readRangesImpl: loop finished", .{});
 
             // Check for errors and cleanup contexts
             var first_err: ?anyerror = null;
@@ -208,17 +275,13 @@ pub const XevS3Source = struct {
                 if (ctx.err) |err| {
                     if (err == error.EOF or err == error.TlsConnectionClosed) {
                         if (ctx.finished) {
-                            self.allocator.free(ctx.sub_ranges);
-                            self.allocator.free(ctx.dest_buffers);
-                            self.allocator.destroy(ctx);
+                            ctx.deinit();
                             continue;
                         }
                     }
                     if (first_err == null) first_err = err;
                 }
-                self.allocator.free(ctx.sub_ranges);
-                self.allocator.free(ctx.dest_buffers);
-                self.allocator.destroy(ctx);
+                ctx.deinit();
             }
 
             if (first_err) |e| return e;
@@ -260,17 +323,24 @@ pub const XevS3Source = struct {
     pub fn fetchSize(self: *XevS3Source) !void {
         log.debug("fetchSize: starting HEAD request", .{});
         const addr = try self.resolve();
-        
+
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
         const conn = if (self.pool.acquire(key)) |c| blk: {
             c.idling = false;
+            // Reset pending flags for reuse
+            c.pending_read = false;
+            c.pending_write = false;
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         } else blk: {
             const c = try self.allocator.create(tls.Connection);
             c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         };
-        
+
         const ctx = try self.allocator.create(ReqContext);
         ctx.* = .{
             .source = self,
@@ -296,7 +366,7 @@ pub const XevS3Source = struct {
             // Already connected, trigger onConnect manually
             onConnect(ctx);
         }
-        
+
         try self.loop.run(.until_done);
 
         if (ctx.err) |err| {
@@ -315,15 +385,22 @@ pub const XevS3Source = struct {
         const key = ConnectionKey{ .host = self.host, .port = self.port, .use_tls = self.use_tls };
         const conn = if (self.pool.acquire(key)) |c| blk: {
             c.idling = false;
+            // Reset pending flags for reuse
+            c.pending_read = false;
+            c.pending_write = false;
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         } else blk: {
             const c = try self.allocator.create(tls.Connection);
             c.* = try tls.Connection.init(self.loop, self.allocator, self.host);
+            c.tcp_read_buf_size = self.tcp_read_buf_size;
+            c.use_direct = self.use_direct;
             break :blk c;
         };
-        
+
         const ctx = try self.allocator.create(ReqContext);
-        
+
         // Single range setup
         const range = try self.allocator.alloc(io.Range, 1);
         range[0] = .{ .start = offset, .end = offset + buf.len };
@@ -370,21 +447,21 @@ pub const XevS3Source = struct {
             log.debug("readAt: error return {}", .{err});
             return err;
         }
-        
+
         return ctx.total_body_read;
     }
-    
+
     pub fn resolve(self: *XevS3Source) !xev.shim_net.Address {
         if (self.cached_addr) |a| return a;
-        
+
         var comp = dns.Resolver.Completion.init();
         defer comp.deinit(self.allocator);
-        
+
         const DnsCtx = struct {
             addr: ?xev.shim_net.Address = null,
             err: ?anyerror = null,
             done: bool = false,
-            
+
             fn callback(ud: ?*anyopaque, results: []const dns.Address, err: anyerror!void) void {
                 const c: *@This() = @ptrCast(@alignCast(ud));
                 err catch |e| {
@@ -400,9 +477,9 @@ pub const XevS3Source = struct {
                 c.done = true;
             }
         };
-        
+
         var dctx = DnsCtx{};
-        
+
         var resolver_iface = self.resolver.resolver();
         log.debug("resolve: starting resolution for {s}:{d}", .{self.host, self.port});
         resolver_iface.resolve(self.loop, self.host, self.port, &comp, DnsCtx.callback, &dctx);
@@ -411,7 +488,7 @@ pub const XevS3Source = struct {
         while (!dctx.done) {
             try self.loop.run(.once);
         }
-        
+
         log.debug("resolve: done err={?}", .{dctx.err});
         if (dctx.err) |err| return err;
         if (dctx.addr) |a| {
@@ -426,34 +503,37 @@ pub const XevS3Source = struct {
 const ReqContext = struct {
     source: *XevS3Source,
     conn: *tls.Connection,
-    
+
     // For coalesced reads:
     // request_offset is where the S3 GET starts (e.g. 0)
     request_offset: u64,
     request_end: u64, // The full end of the S3 request
-    
+
     // sub_ranges are the parts we actually want (e.g. 0..100, 110..200)
     sub_ranges: []const io.Range,
     dest_buffers: []const []u8,
-    
+
     allocator: std.mem.Allocator,
     parser: ResponseParser,
-    
+
     // Progress tracking
     total_body_read: usize = 0,
     finished: bool = false,
     err: ?anyerror = null,
     http_status: u16 = 0,
     is_head: bool = false,
-    
+    batch_ctx: ?*anyopaque = null,
+
     pub fn deinit(self: *ReqContext) void {
+        self.allocator.free(self.sub_ranges);
+        self.allocator.free(self.dest_buffers);
         self.allocator.destroy(self);
     }
 };
 
 fn onConnect(ctx_void: ?*anyopaque) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
-    
+
     // Use an arena for building the request (headers, signature, etc.)
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
@@ -466,7 +546,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
     };
 
     const method = if (ctx.is_head) "HEAD" else "GET";
-    
+
     // Build Headers
     var headers = std.ArrayListUnmanaged(std.http.Header){};
     headers.append(aa, .{ .name = "User-Agent", .value = "zpq-xev" }) catch |err| {
@@ -524,7 +604,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
                 ctx.conn.close();
                 return;
             };
-            
+
         headers.append(aa, .{ .name = "Host", .value = host_header }) catch |err| {
             ctx.err = err;
             ctx.conn.close();
@@ -538,10 +618,10 @@ fn onConnect(ctx_void: ?*anyopaque) void {
         ctx.conn.close();
         return;
     };
-    
+
     var head_list = std.ArrayListUnmanaged(u8){};
     defer head_list.deinit(aa);
-    
+
     head_list.appendSlice(aa, method) catch |err| {
         ctx.err = err;
         ctx.conn.close();
@@ -602,7 +682,7 @@ fn onConnect(ctx_void: ?*anyopaque) void {
 fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
     log.debug("onData: received {d} bytes", .{data.len});
-    
+
     ctx.parser.feed(data, ctx, onBody) catch |err| {
         ctx.err = err;
         ctx.conn.close();
@@ -624,14 +704,18 @@ fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
         ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
             ctx.conn.close();
         };
+        if (ctx.batch_ctx) |bc| {
+            const batch: *BatchContext = @ptrCast(@alignCast(bc));
+            batch.signalDone();
+        }
     }
 }
 
 fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
-    
+
     if (ctx.parser.status_code != 0) ctx.http_status = ctx.parser.status_code;
-    
+
     const chunk_start_abs = ctx.request_offset + ctx.total_body_read;
     const chunk_end_abs = chunk_start_abs + chunk.len;
 
@@ -645,13 +729,13 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
             const chunk_offset = intersect_start - chunk_start_abs;
             const dest_offset = intersect_start - range.start;
             const len = intersect_end - intersect_start;
-            
+
             @memcpy(ctx.dest_buffers[i][dest_offset .. dest_offset + len], chunk[chunk_offset .. chunk_offset + len]);
         }
     }
 
     ctx.total_body_read += chunk.len;
-    
+
     // Check for completion based on Content-Length or total body size
     const body_len = if (ctx.parser.content_length) |cl| cl else 0;
     const is_last_byte = if (body_len > 0) ctx.total_body_read >= body_len else false;
@@ -665,6 +749,10 @@ fn onBody(ctx_void: *anyopaque, chunk: []const u8) void {
         ctx.source.pool.release(.{ .host = ctx.source.host, .port = ctx.source.port, .use_tls = ctx.source.use_tls }, ctx.conn) catch {
             ctx.conn.close();
         };
+        if (ctx.batch_ctx) |bc| {
+            const batch: *BatchContext = @ptrCast(@alignCast(bc));
+            batch.signalDone();
+        }
     }
 }
 
@@ -672,4 +760,8 @@ fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
     const ctx: *ReqContext = @ptrCast(@alignCast(ctx_void));
     ctx.err = err;
     ctx.conn.close();
+    if (ctx.batch_ctx) |bc| {
+        const batch: *BatchContext = @ptrCast(@alignCast(bc));
+        batch.signalDone();
+    }
 }

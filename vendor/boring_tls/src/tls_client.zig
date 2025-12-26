@@ -83,18 +83,40 @@ pub const TlsClient = struct {
         return try self.processOutgoing(null);
     }
 
-    pub fn processIncoming(self: *Self, encrypted_data: []const u8) !?[]const u8 {
+    pub fn processIncoming(self: *Self, encrypted_data: []const u8, user_buf: ?[]u8) !?[]const u8 {
+        const t0 = std.time.Instant.now() catch unreachable;
+
         if (encrypted_data.len > 0) {
             try tls.writeToBio(self.bio_read, encrypted_data);
         }
+
+        const t1 = std.time.Instant.now() catch unreachable;
 
         if (!self.handshake_complete) {
             try self.performHandshake();
         }
 
+        const t2 = std.time.Instant.now() catch unreachable;
+
         if (!self.handshake_complete) return null;
 
-        return try self.readDecryptedData();
+        const result = try self.readDecryptedData(user_buf);
+
+        const t3 = std.time.Instant.now() catch unreachable;
+
+        const bio_ns = t1.since(t0);
+        const hs_ns = t2.since(t1);
+        const read_ns = t3.since(t2);
+        const total_ns = t3.since(t0);
+
+        // Only log if total > 1ms
+        if (total_ns > 1_000_000) {
+            std.log.info("processIncoming breakdown: bio={d}us hs={d}us read={d}us total={d}us", .{
+                bio_ns / 1000, hs_ns / 1000, read_ns / 1000, total_ns / 1000
+            });
+        }
+
+        return result;
     }
 
     pub fn processOutgoing(self: *Self, plaintext: ?[]const u8) !?[]const u8 {
@@ -172,10 +194,18 @@ pub const TlsClient = struct {
         }
     }
 
-    fn readDecryptedData(self: *Self) !?[]const u8 {
+    fn readDecryptedData(self: *Self, user_buf: ?[]u8) !?[]const u8 {
         self.buffers.resetDecrypted();
-        var temp_buf: [BUFFER_SIZE]u8 = undefined;
 
+        if (user_buf) |buf| {
+            const bytes_read = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
+            if (bytes_read > 0) {
+                return buf[0..@as(usize, @intCast(bytes_read))];
+            }
+            return try tls.handleSslReadError(self.ssl, bytes_read);
+        }
+
+        var temp_buf: [BUFFER_SIZE]u8 = undefined;
         const bytes_read = c.SSL_read(self.ssl, &temp_buf, temp_buf.len);
         if (bytes_read > 0) {
             const read_size = @as(usize, @intCast(bytes_read));

@@ -245,7 +245,7 @@ fn buildBoringCrypto(
             .flags = &[_][]const u8{},
         });
     } else if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux) {
-        // BCM (FIPS module) assembly - AES-NI, SHA, GCM, AVX, etc.
+        // BCM (FIPS module) assembly - AES-NI, SHA, GCM, AVX, Montgomery, RSA, P-256, etc.
         crypto.root_module.addCSourceFiles(.{
             .root = boringssl_dep.path("gen/bcm"),
             .files = &[_][]const u8{
@@ -256,11 +256,15 @@ fn buildBoringCrypto(
                 "ghash-ssse3-x86_64-linux.S",
                 "ghash-x86_64-linux.S",
                 "p256-x86_64-asm-linux.S",
+                "p256_beeu-x86_64-asm-linux.S",
                 "rdrand-x86_64-linux.S",
+                "rsaz-avx2-linux.S",
                 "sha1-x86_64-linux.S",
                 "sha256-x86_64-linux.S",
                 "sha512-x86_64-linux.S",
                 "vpaes-x86_64-linux.S",
+                "x86_64-mont-linux.S",
+                "x86_64-mont5-linux.S",
             },
             .flags = &[_][]const u8{},
         });
@@ -272,6 +276,17 @@ fn buildBoringCrypto(
                 "chacha20_poly1305_x86_64-linux.S",
                 "md5-x86_64-linux.S",
                 "aes128gcmsiv-x86_64-linux.S",
+            },
+            .flags = &[_][]const u8{},
+        });
+        // Fiat-crypto assembly - P-256 and Curve25519 ADX optimizations
+        crypto.root_module.addCSourceFiles(.{
+            .root = boringssl_dep.path("third_party/fiat/asm"),
+            .files = &[_][]const u8{
+                "fiat_curve25519_adx_mul.S",
+                "fiat_curve25519_adx_square.S",
+                "fiat_p256_adx_mul.S",
+                "fiat_p256_adx_sqr.S",
             },
             .flags = &[_][]const u8{},
         });

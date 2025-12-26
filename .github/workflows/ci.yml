@@ -38,6 +38,7 @@ jobs:
                       ${{ runner.os }}-zig-
 
             - name: Fetch Pre-built Dependencies from R2
+              id: fetch-deps
               run: |
                   echo "::group::Fetching pre-built BoringSSL libraries from Cloudflare R2"
                   # Determine target triple for this runner
@@ -48,9 +49,12 @@ jobs:
                     TARGET="aarch64-linux"
                   else
                     echo "Unknown architecture: $ARCH, will build from source"
+                    echo "TARGET=$ARCH-unknown" >> $GITHUB_OUTPUT
+                    echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
                     echo "::endgroup::"
                     exit 0
                   fi
+                  echo "TARGET=$TARGET" >> $GITHUB_OUTPUT
                   echo "Detected target: $TARGET"
 
                   # Fetch from Cloudflare R2 (public, no auth needed)
@@ -62,12 +66,17 @@ jobs:
                   echo "Fetching libssl.a..."
                   curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" || true
 
-                  # Verify downloads
-                  if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ]; then
+                  # Verify downloads (check file size > 1KB to ensure not error page)
+                  if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && \
+                     [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ] && \
+                     [ $(stat -c%s "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || echo 0) -gt 1000 ]; then
                     echo "Successfully fetched pre-built dependencies from R2"
+                    echo "CACHE_HIT=true" >> $GITHUB_OUTPUT
                     ls -la vendor/boring_tls/prebuilt/${TARGET}/
                   else
-                    echo "Pre-built deps not available on R2, will build from source (~5-10 min)"
+                    echo "Pre-built deps not available on R2, will build from source (~3 min)"
+                    echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
+                    rm -f vendor/boring_tls/prebuilt/${TARGET}/*.a 2>/dev/null || true
                   fi
                   echo "::endgroup::"
 
@@ -82,6 +91,39 @@ jobs:
                   echo "Build artifacts:"
                   ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
                   ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
+
+            # Laziness Principle: if we built from source, upload to R2 so next run is faster
+            - name: Upload Built Dependencies to R2
+              if: steps.fetch-deps.outputs.CACHE_HIT == 'false' && steps.fetch-deps.outputs.TARGET != ''
+              env:
+                  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+                  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+                  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+              run: |
+                  TARGET="${{ steps.fetch-deps.outputs.TARGET }}"
+                  echo "::group::Uploading built BoringSSL to R2 for $TARGET"
+
+                  # Check if we have built libraries to upload
+                  if [ ! -f "vendor/boring_tls/zig-out/lib/libcrypto.a" ]; then
+                    echo "No built libraries found, skipping upload"
+                    echo "::endgroup::"
+                    exit 0
+                  fi
+
+                  R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+                  echo "Uploading libcrypto.a..."
+                  aws s3 cp vendor/boring_tls/zig-out/lib/libcrypto.a \
+                    "s3://zpq/boring_tls/${TARGET}/libcrypto.a" \
+                    --endpoint-url "$R2_ENDPOINT"
+
+                  echo "Uploading libssl.a..."
+                  aws s3 cp vendor/boring_tls/zig-out/lib/libssl.a \
+                    "s3://zpq/boring_tls/${TARGET}/libssl.a" \
+                    --endpoint-url "$R2_ENDPOINT"
+
+                  echo "Successfully uploaded to R2 - next CI run will be faster!"
+                  echo "::endgroup::"
 
             - name: Run Tests
               run: |

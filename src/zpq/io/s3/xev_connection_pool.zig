@@ -32,21 +32,23 @@ pub const XevConnectionPool = struct {
     }
 
     pub fn deinit(self: *XevConnectionPool) void {
+        // Close any remaining connections (if closeAll wasn't called)
+        self.closeAll();
+        self.idle_connections.deinit(self.allocator);
+    }
+
+    /// Closes all idle connections and clears the pool.
+    /// This is a synchronous cleanup - connections are destroyed immediately.
+    /// Note: We set closed=true directly instead of calling close() to avoid
+    /// queuing async operations that would require the event loop.
+    pub fn closeAll(self: *XevConnectionPool) void {
         for (self.idle_connections.items) |entry| {
+            entry.conn.closed = true; // Mark closed without async ops
             entry.conn.deinit();
             self.allocator.destroy(entry.conn);
             self.allocator.free(entry.key.host);
         }
-        self.idle_connections.deinit(self.allocator);
-    }
-
-    /// Asynchronously closes all idle connections. The caller must run the loop.
-    pub fn closeAll(self: *XevConnectionPool) void {
-        var i: usize = 0;
-        while (i < self.idle_connections.items.len) : (i += 1) {
-            const entry = self.idle_connections.items[i];
-            entry.conn.close();
-        }
+        self.idle_connections.clearRetainingCapacity();
     }
 
     /// Finds a warm connection from the pool. Returns null if none available or all are dead.

@@ -148,9 +148,22 @@ fn runBenchmark(
     const s3_source = try zpq.s3.XevS3Source.init(allocator, host, bucket, key, region, true, 443);
 
     // Set credentials if available (before passing ownership)
-    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |ak| {
+    // Try S3_ACCESS_KEY first, fall back to AWS_ACCESS_KEY_ID
+    const ak_result = std.process.getEnvVarOwned(allocator, "S3_ACCESS_KEY") catch |err| blk: {
+        if (err == error.EnvironmentVariableNotFound) {
+            break :blk std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID") catch null;
+        }
+        return err;
+    };
+    if (ak_result) |ak| {
         defer allocator.free(ak);
-        if (std.process.getEnvVarOwned(allocator, "AWS_SECRET_ACCESS_KEY")) |sk| {
+        const sk_result = std.process.getEnvVarOwned(allocator, "S3_SECRET_KEY") catch |err| blk: {
+            if (err == error.EnvironmentVariableNotFound) {
+                break :blk std.process.getEnvVarOwned(allocator, "AWS_SECRET_ACCESS_KEY") catch null;
+            }
+            return err;
+        };
+        if (sk_result) |sk| {
             defer allocator.free(sk);
             const st = std.process.getEnvVarOwned(allocator, "AWS_SESSION_TOKEN") catch |err| blk: {
                 if (err == error.EnvironmentVariableNotFound) break :blk null else return err;
@@ -162,8 +175,8 @@ fn runBenchmark(
                 allocator.destroy(s3_source);
                 return err;
             };
-        } else |_| {}
-    } else |_| {}
+        }
+    }
 
     // Open S3 file (HEAD request for size) - takes ownership of s3_source
     var file = ParquetFile.openS3(allocator, s3_source) catch |err| {

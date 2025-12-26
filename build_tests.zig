@@ -165,7 +165,8 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/e2e.zig"),
             .target = target,
-            .optimize = optimize,
+            // Always use ReleaseFast for benchmarks
+            .optimize = .ReleaseFast,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addImport("xev", libxev_mod);
@@ -177,16 +178,20 @@ pub fn addAuxiliaryTools(
         });
         exe.root_module.linkSystemLibrary("c", .{});
 
-        // Always install benchmark binaries
         b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("run-bench-e2e", "Run end-to-end S3 benchmark");
+        step.dependOn(&run.step);
     }
 
-    // bench-projection (column projection benchmark)
+    // bench-projection (column projection benchmark - local files)
     {
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/projection.zig"),
             .target = target,
-            .optimize = optimize,
+            // Always use ReleaseFast for benchmarks
+            .optimize = .ReleaseFast,
         });
         mod.addImport("zpq", zpq_mod);
 
@@ -197,6 +202,10 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("run-bench-projection", "Run local file projection benchmark");
+        step.dependOn(&run.step);
     }
 
     // bench-decode-full (apples-to-apples benchmark with full value decoding)
@@ -204,7 +213,8 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/decode_full.zig"),
             .target = target,
-            .optimize = optimize,
+            // Always use ReleaseFast for benchmarks
+            .optimize = .ReleaseFast,
         });
         mod.addImport("zpq", zpq_mod);
 
@@ -215,6 +225,10 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("run-bench-decode", "Run full decode benchmark (apples-to-apples)");
+        step.dependOn(&run.step);
     }
 
     // bench-s3-projection (S3/R2 column projection benchmark)
@@ -222,7 +236,8 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/s3_projection.zig"),
             .target = target,
-            .optimize = optimize,
+            // Always use ReleaseFast for S3 benchmarks (consistent with competitors)
+            .optimize = .ReleaseFast,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addImport("xev", libxev_mod);
@@ -235,6 +250,10 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("run-bench-s3", "Run S3/R2 column projection benchmark");
+        step.dependOn(&run.step);
     }
 
     // test-sf (SingleFlightResolver isolation test)
@@ -440,6 +459,49 @@ pub fn addAuxiliaryTools(
 
             const run = b.addRunArtifact(exe);
         const step = b.step("probe-s3-head-hang", "Run S3 HEAD request hang probe");
+        step.dependOn(&run.step);
+    }
+
+    // probe_xev_s3_head - Minimal XevS3Source HEAD probe
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/probe_xev_s3_head.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+        mod.addImport("xev", libxev_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "probe-xev-s3-head",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+        if (install_all) b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("probe-xev-s3-head", "Run XevS3Source HEAD probe");
+        step.dependOn(&run.step);
+    }
+
+    // probe-pool-cleanup - Test connection pool cleanup
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/probe_pool_cleanup.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "probe-pool-cleanup",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+        if (install_all) b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("probe-pool-cleanup", "Test connection pool cleanup");
         step.dependOn(&run.step);
     }
 

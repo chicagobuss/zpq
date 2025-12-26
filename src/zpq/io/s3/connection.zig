@@ -244,7 +244,7 @@ pub const Connection = struct {
             if (self.use_tls) {
                 var dec_ptr = self.read_buf[0..n];
                 while (dec_ptr.len > 0) {
-                    const dec_res = self.tls.?.processIncoming(dec_ptr) catch |err| {
+                    const dec_res = self.tls.?.processIncoming(dec_ptr, null) catch |err| {
                         if (self.on_error) |cb| cb(self, self.user_ctx, err);
                         return .disarm;
                     };
@@ -262,7 +262,7 @@ pub const Connection = struct {
 
                         // Check for more data in BIO
                         while (true) {
-                            const remaining = self.tls.?.processIncoming(&[_]u8{}) catch break;
+                            const remaining = self.tls.?.processIncoming(&[_]u8{}, null) catch break;
                             if (remaining) |pt| {
                                 if (pt.len > 0) {
                                     if (self.on_data) |cb| cb(self, self.user_ctx, pt);

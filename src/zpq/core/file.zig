@@ -254,9 +254,16 @@ pub const ParquetFile = struct {
     }
 
     pub fn readFooter(self: *ParquetFile) !void {
-        // Optimization: Speculatively read the last 64KB (or file size if smaller)
-        const PREFETCH_SIZE = 65536; // 64KB
-        const fetch_len = @min(self.file_size, PREFETCH_SIZE);
+        // Optimization: Adaptive footer prefetch (DuckDB-style)
+        // Use file_size / 256 clamped to [16KB, 256KB]
+        // - Small files (1MB): prefetch ~4KB, clamped to 16KB
+        // - Medium files (10MB): prefetch ~40KB
+        // - Large files (100MB+): prefetch 256KB (max)
+        const MIN_PREFETCH = 16 * 1024; // 16KB minimum
+        const MAX_PREFETCH = 256 * 1024; // 256KB maximum
+        const adaptive_size = self.file_size / 256;
+        const clamped_size = @max(MIN_PREFETCH, @min(adaptive_size, MAX_PREFETCH));
+        const fetch_len = @min(self.file_size, clamped_size);
         const fetch_start = self.file_size - fetch_len;
 
         var prefetch_buf = try self.allocator.alloc(u8, fetch_len);

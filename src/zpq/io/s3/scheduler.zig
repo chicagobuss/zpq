@@ -12,10 +12,16 @@ pub const MergedRequest = struct {
     original_indices: std.ArrayListUnmanaged(usize),
 };
 
+/// Minimum gap threshold for aggressive coalescing (DuckDB-style).
+/// Always merge if gap is under this threshold, regardless of request size.
+pub const MIN_GAP_THRESHOLD = 16 * 1024; // 16KB
+
 /// Merges adjacent/overlapping ranges based on a gap heuristic.
 /// Ported from Polars/Arrow logic with ZPQ's Zero-Alloc optimization in mind.
 ///
-/// Heuristic: Merge if gap < 12.5% of total request size, clamped to [1MB, 8MB].
+/// Heuristic:
+/// 1. Always merge if gap < 16KB (DuckDB-style, reduces request count)
+/// 2. Otherwise merge if gap < 12.5% of total request size, clamped to [1MB, 8MB]
 pub fn mergeRanges(
     allocator: std.mem.Allocator,
     ranges: []const Range,
@@ -56,15 +62,19 @@ pub fn mergeRanges(
 
         const gap = next.start - current_end;
 
-        // Polars Heuristic:
+        // DuckDB-style optimization: Always merge small gaps (reduces request count)
+        // This is critical for Parquet column chunks which are often close together
+        if (gap <= MIN_GAP_THRESHOLD) {
+            current_req.request_range.end = next.end;
+            try current_req.original_indices.append(allocator, i);
+            continue;
+        }
+
+        // Polars Heuristic for larger gaps:
         // gap_tolerance = (current_len.max(next_len) / 8).clamp(1MB, 8MB)
         const size_base = @max(current_req.request_range.len(), next.len());
         const MB = 1024 * 1024;
         const gap_tolerance = std.math.clamp(size_base / 8, 1 * MB, 8 * MB);
-
-        // ZPQ Optimization: We can be MORE aggressive because we don't allocate the gap.
-        // Let's stick to Polars for now as a baseline, but maybe double the max tolerance?
-        // Let's use Polars exact logic first to pass the "Reference" check.
 
         if (gap <= gap_tolerance) {
             // Merge
@@ -168,6 +178,46 @@ test "mergeRanges - dynamic tolerance" {
 
     try std.testing.expectEqual(@as(usize, 1), merged.items.len);
     try std.testing.expectEqual(@as(u64, 90 * MB), merged.items[0].request_range.end);
+}
+
+test "mergeRanges - 16KB gap threshold (DuckDB-style)" {
+    const allocator = std.testing.allocator;
+
+    // Gap = 10KB (under 16KB threshold), should merge even for tiny requests
+    const ranges = &[_]Range{
+        .{ .start = 0, .end = 100 },
+        .{ .start = 10340, .end = 10440 }, // 10KB gap
+    };
+
+    var merged = try mergeRanges(allocator, ranges);
+    defer {
+        for (merged.items) |*m| m.original_indices.deinit(allocator);
+        merged.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), merged.items.len);
+    try std.testing.expectEqual(@as(u64, 0), merged.items[0].request_range.start);
+    try std.testing.expectEqual(@as(u64, 10440), merged.items[0].request_range.end);
+}
+
+test "mergeRanges - gap just over 16KB (no merge for tiny requests)" {
+    const allocator = std.testing.allocator;
+
+    // Gap = 20KB (over 16KB threshold), tiny requests won't hit the Polars heuristic
+    const ranges = &[_]Range{
+        .{ .start = 0, .end = 100 },
+        .{ .start = 20580, .end = 20680 }, // 20KB gap
+    };
+
+    var merged = try mergeRanges(allocator, ranges);
+    defer {
+        for (merged.items) |*m| m.original_indices.deinit(allocator);
+        merged.deinit(allocator);
+    }
+
+    // 20KB gap > 16KB threshold, and 100 bytes / 8 = 12 bytes (way under 1MB min)
+    // So these should NOT merge
+    try std.testing.expectEqual(@as(usize, 2), merged.items.len);
 }
 
 test "RangeSplitter - splits large range" {

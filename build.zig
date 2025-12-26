@@ -12,9 +12,12 @@ pub fn build(b: *std.Build) void {
     });
     const libxev_mod = libxev_dep.module("xev");
 
+    // Always build boring_tls with ReleaseFast:
+    // 1. Crypto libraries need optimization for performance
+    // 2. Debug builds enable UBSAN which requires runtime support not available in CI
     const boring_tls_dep = b.dependency("boring_tls", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
         .@"use-prebuilt" = use_prebuilt,
     });
     const boring_tls_mod = boring_tls_dep.module("boring_tls");
@@ -101,10 +104,10 @@ pub fn build(b: *std.Build) void {
         });
         test_http_client.root_module.addImport("xev", libxev_mod);
         test_http_client.root_module.addImport("zpq", zpq_mod);
-        
+
         const run_test_http_client = b.addRunArtifact(test_http_client);
         test_step.dependOn(&run_test_http_client.step);
-        
+
         // 3. test-minio-https
         const test_minio_https = b.addTest(.{
             .root_module = b.createModule(.{
@@ -130,7 +133,7 @@ pub fn build(b: *std.Build) void {
         test_minio_range_get.root_module.addImport("xev", libxev_mod);
         test_minio_range_get.root_module.addImport("zpq", zpq_mod);
         test_minio_range_get.root_module.addImport("minio_fixtures", minio_fixtures);
-        
+
         const run_test_minio_range_get = b.addRunArtifact(test_minio_range_get);
         test_step.dependOn(&run_test_minio_range_get.step);
 

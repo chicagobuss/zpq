@@ -103,22 +103,28 @@ jobs:
                   TARGET="${{ steps.fetch-deps.outputs.TARGET }}"
                   echo "::group::Uploading built BoringSSL to R2 for $TARGET"
 
-                  # Check if we have built libraries to upload
-                  if [ ! -f "vendor/boring_tls/zig-out/lib/libcrypto.a" ]; then
-                    echo "No built libraries found, skipping upload"
+                  # Find built libraries in zig-cache (hash varies per build)
+                  LIBCRYPTO=$(find .zig-cache -name "libcrypto.a" -type f 2>/dev/null | head -1)
+                  LIBSSL=$(find .zig-cache -name "libssl.a" -type f 2>/dev/null | head -1)
+
+                  if [ -z "$LIBCRYPTO" ] || [ -z "$LIBSSL" ]; then
+                    echo "No built libraries found in .zig-cache, skipping upload"
                     echo "::endgroup::"
                     exit 0
                   fi
 
+                  echo "Found libcrypto.a: $LIBCRYPTO"
+                  echo "Found libssl.a: $LIBSSL"
+
                   R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
                   echo "Uploading libcrypto.a..."
-                  aws s3 cp vendor/boring_tls/zig-out/lib/libcrypto.a \
+                  aws s3 cp "$LIBCRYPTO" \
                     "s3://zpq/boring_tls/${TARGET}/libcrypto.a" \
                     --endpoint-url "$R2_ENDPOINT"
 
                   echo "Uploading libssl.a..."
-                  aws s3 cp vendor/boring_tls/zig-out/lib/libssl.a \
+                  aws s3 cp "$LIBSSL" \
                     "s3://zpq/boring_tls/${TARGET}/libssl.a" \
                     --endpoint-url "$R2_ENDPOINT"
 

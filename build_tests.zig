@@ -402,11 +402,16 @@ pub fn addAuxiliaryTools(
             .root_module = mod,
         });
         exe.root_module.linkSystemLibrary("c", .{});
-        if (install_all) b.installArtifact(exe);
+        const install = b.addInstallArtifact(exe, .{});
 
+        // Build-only step (no run) - depends on install so binary goes to zig-out
+        const build_step = b.step("shootout-tls", "Build TLS throughput micro-shootout");
+        build_step.dependOn(&install.step);
+
+        // Separate run step
         const run = b.addRunArtifact(exe);
-        const step = b.step("shootout-tls", "Run TLS throughput micro-shootout");
-        step.dependOn(&run.step);
+        const run_step = b.step("run-shootout-tls", "Run TLS throughput micro-shootout");
+        run_step.dependOn(&run.step);
     }
 }
 

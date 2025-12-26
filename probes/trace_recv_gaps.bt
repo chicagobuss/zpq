@@ -1,0 +1,88 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_recv_gaps.bt - Test serial pumping hypothesis
+ *
+ * Purpose: Measure time BETWEEN recv calls to determine if we're:
+ *   a) CPU-bound in userspace (large gaps, small kernel time)
+ *   b) Serial pumping (tiny gaps, tiny kernel time, tiny reads)
+ *   c) Network-bound (large kernel time)
+ */
+
+BEGIN {
+    printf("Testing serial pumping hypothesis for shootout-tls...\n");
+    printf("Ctrl+C to stop\n\n");
+}
+
+kprobe:tcp_recvmsg
+/comm == "shootout-tls"/
+{
+    @recv_entry[tid] = nsecs;
+
+    // Measure gap since last recv completed (userspace processing time)
+    if (@last_recv_exit[tid]) {
+        $gap_us = (nsecs - @last_recv_exit[tid]) / 1000;
+        @userspace_gap_us = hist($gap_us);
+        @total_userspace_ns = @total_userspace_ns + (nsecs - @last_recv_exit[tid]);
+    }
+}
+
+kretprobe:tcp_recvmsg
+/comm == "shootout-tls" && @recv_entry[tid]/
+{
+    $kernel_ns = nsecs - @recv_entry[tid];
+    $kernel_us = $kernel_ns / 1000;
+    $bytes = retval;
+
+    @last_recv_exit[tid] = nsecs;
+
+    if ($bytes > 0) {
+        @kernel_time_us = hist($kernel_us);
+        @total_kernel_ns = @total_kernel_ns + $kernel_ns;
+        @bytes_hist = hist($bytes);
+        @total_bytes = @total_bytes + $bytes;
+        @recv_count = @recv_count + 1;
+    }
+
+    delete(@recv_entry[tid]);
+}
+
+END {
+    printf("\n");
+    printf("========================================\n");
+    printf("SERIAL PUMPING HYPOTHESIS TEST RESULTS\n");
+    printf("========================================\n\n");
+
+    printf("Total recvs: %lld\n", @recv_count);
+    printf("Total bytes: %lld\n", @total_bytes);
+    printf("Avg bytes/recv: %lld\n", @recv_count > 0 ? @total_bytes / @recv_count : 0);
+    printf("\n");
+
+    printf("Total time in kernel (recv): %lld ms\n", @total_kernel_ns / 1000000);
+    printf("Total time in userspace (between recvs): %lld ms\n", @total_userspace_ns / 1000000);
+    printf("\n");
+
+    printf("=== Kernel time per recv (us) ===\n");
+    printf("(Low values + low bytes = serial pumping)\n");
+    print(@kernel_time_us);
+
+    printf("\n=== Userspace gap between recvs (us) ===\n");
+    printf("(High values = CPU-bound in TLS/app processing)\n");
+    print(@userspace_gap_us);
+
+    printf("\n=== Bytes per recv ===\n");
+    printf("(Should be close to buffer size if waiting properly)\n");
+    print(@bytes_hist);
+
+    printf("\n=== DIAGNOSIS ===\n");
+    // Can't do complex conditionals in bpftrace END, but the histograms tell the story
+
+    clear(@recv_entry);
+    clear(@last_recv_exit);
+    clear(@kernel_time_us);
+    clear(@userspace_gap_us);
+    clear(@bytes_hist);
+    clear(@total_kernel_ns);
+    clear(@total_userspace_ns);
+    clear(@total_bytes);
+    clear(@recv_count);
+}

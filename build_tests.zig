@@ -181,6 +181,24 @@ pub fn addAuxiliaryTools(
         b.installArtifact(exe);
     }
 
+    // bench-projection (column projection benchmark)
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("benchmarks/projection.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "bench-projection",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+
+        b.installArtifact(exe);
+    }
+
     // test-sf (SingleFlightResolver isolation test)
     {
         const mod = b.createModule(.{

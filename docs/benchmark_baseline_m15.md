@@ -83,9 +83,32 @@ arrow_table = duckdb.query(f"SELECT * FROM read_parquet('{path}')").fetch_arrow_
 _ = arrow_table.num_rows
 ```
 
+## Column Projection Benchmark (100MB file, 3 of 129 columns)
+
+This is where the Laziness Principle shines - only read what you need.
+
+| Tool | 3 Columns | All Columns | Speedup |
+|------|-----------|-------------|---------|
+| **ZPQ** | **0.38ms** | 358ms | 942x |
+| Polars | 10.9ms | 303ms | 28x |
+| DuckDB | 33.4ms | 3388ms | 101x |
+| PyArrow | 35.7ms | 774ms | 22x |
+
+### ZPQ vs Competitors (3 columns)
+
+| vs Tool | ZPQ Speedup |
+|---------|-------------|
+| Polars | **29x faster** |
+| DuckDB | **88x faster** |
+| PyArrow | **94x faster** |
+
+ZPQ achieves this by:
+1. **Seeking directly** to column offsets (no scanning)
+2. **Reading only needed bytes** from disk
+3. **Zero-copy where possible** - data stays compressed until needed
+
 ## Next Steps
 
 1. **M16 - SIMD Decoders**: Target 2x decode throughput
 2. **Parallel column decoding**: Match Polars on large files
 3. **R2/S3 benchmarks**: Test network performance with TLS fix
-4. **Column projection**: Test reading subset of columns (ZPQ advantage)

@@ -80,7 +80,8 @@ pub fn build(b: *std.Build) !void {
     // This provides ~100x speedup for TLS operations
 
     if (target.result.cpu.arch == .x86_64) {
-        boring_tls_mod.addCMacro("__x86_64__", "1");
+        // BoringSSL's target.h checks for __x86_64 (no trailing underscore) to define OPENSSL_X86_64
+        boring_tls_mod.addCMacro("__x86_64", "1");
     } else if (target.result.cpu.arch == .aarch64) {
         // BoringSSL expects __AARCH64EL__ for little-endian ARM64 detection
         boring_tls_mod.addCMacro("__AARCH64EL__", "1");
@@ -196,7 +197,8 @@ fn buildBoringCrypto(
     };
 
     // Add arch-specific defines for hardware crypto
-    const crypto_flags_x86_64 = base_crypto_flags ++ [_][]const u8{"-D__x86_64__"};
+    // BoringSSL's target.h checks for __x86_64 (no trailing underscore) to define OPENSSL_X86_64
+    const crypto_flags_x86_64 = base_crypto_flags ++ [_][]const u8{"-D__x86_64"};
     const crypto_flags_aarch64 = base_crypto_flags ++ [_][]const u8{"-D__AARCH64EL__"};
 
     const crypto_flags: []const []const u8 = if (target.result.cpu.arch == .x86_64)
@@ -239,6 +241,37 @@ fn buildBoringCrypto(
             .files = &[_][]const u8{
                 "chacha-armv8-linux.S",
                 "chacha20_poly1305_armv8-linux.S",
+            },
+            .flags = &[_][]const u8{},
+        });
+    } else if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux) {
+        // BCM (FIPS module) assembly - AES-NI, SHA, GCM, AVX, etc.
+        crypto.root_module.addCSourceFiles(.{
+            .root = boringssl_dep.path("gen/bcm"),
+            .files = &[_][]const u8{
+                "aes-gcm-avx2-x86_64-linux.S",
+                "aes-gcm-avx512-x86_64-linux.S",
+                "aesni-gcm-x86_64-linux.S",
+                "aesni-x86_64-linux.S",
+                "ghash-ssse3-x86_64-linux.S",
+                "ghash-x86_64-linux.S",
+                "p256-x86_64-asm-linux.S",
+                "rdrand-x86_64-linux.S",
+                "sha1-x86_64-linux.S",
+                "sha256-x86_64-linux.S",
+                "sha512-x86_64-linux.S",
+                "vpaes-x86_64-linux.S",
+            },
+            .flags = &[_][]const u8{},
+        });
+        // Crypto assembly - ChaCha20, MD5
+        crypto.root_module.addCSourceFiles(.{
+            .root = boringssl_dep.path("gen/crypto"),
+            .files = &[_][]const u8{
+                "chacha-x86_64-linux.S",
+                "chacha20_poly1305_x86_64-linux.S",
+                "md5-x86_64-linux.S",
+                "aes128gcmsiv-x86_64-linux.S",
             },
             .flags = &[_][]const u8{},
         });
@@ -313,7 +346,7 @@ fn buildBoringSSLSSL(
 
     // Build flags for ssl - target-specific arch defines
     const base_ssl_flags = [_][]const u8{"-Wall"};
-    const ssl_flags_x86_64 = base_ssl_flags ++ [_][]const u8{"-D__x86_64__"};
+    const ssl_flags_x86_64 = base_ssl_flags ++ [_][]const u8{"-D__x86_64"};
     const ssl_flags_aarch64 = base_ssl_flags ++ [_][]const u8{"-D__AARCH64EL__"};
 
     const ssl_flags: []const []const u8 = if (target.result.cpu.arch == .x86_64)

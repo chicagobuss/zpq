@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// Public R2 URL for pre-built BoringSSL artifacts
+const R2_PUBLIC_URL = "https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev";
+
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
 
@@ -8,6 +11,7 @@ pub fn build(b: *std.Build) !void {
     const boringssl_dep = b.dependency("boringssl", .{});
 
     const use_prebuilt = b.option(bool, "use-prebuilt", "Use pre-built static libraries if available") orelse true;
+    const fetch_prebuilt = b.option(bool, "fetch-prebuilt", "Fetch pre-built libraries from R2 if not found locally") orelse true;
     const target_info = target.result;
     const triple = try std.fmt.allocPrint(b.allocator, "{s}-{s}", .{ @tagName(target_info.cpu.arch), @tagName(target_info.os.tag) });
     const prebuilt_path = b.path(b.fmt("prebuilt/{s}", .{triple}));
@@ -26,6 +30,15 @@ pub fn build(b: *std.Build) !void {
             build_root.access(ssl_path, .{}) catch null != null)
         {
             found_prebuilt = true;
+        } else if (fetch_prebuilt) {
+            // Try to fetch from R2
+            std.log.info("Pre-built artifacts not found locally, fetching from R2 for {s}...", .{triple});
+            if (fetchFromR2(b, triple)) {
+                found_prebuilt = true;
+                std.log.info("Successfully fetched pre-built artifacts from R2", .{});
+            } else |err| {
+                std.log.warn("Failed to fetch from R2: {}, will build from source", .{err});
+            }
         }
     }
 
@@ -385,4 +398,48 @@ fn shouldSkipFile(file_path: []const u8) bool {
     }
 
     return false;
+}
+
+/// Fetch pre-built BoringSSL artifacts from Cloudflare R2
+fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
+    const prebuilt_dir = b.fmt("prebuilt/{s}", .{triple});
+
+    // Create the prebuilt directory
+    const build_root = b.build_root.handle;
+    build_root.makePath(prebuilt_dir) catch |err| {
+        std.log.err("Failed to create prebuilt directory: {}", .{err});
+        return err;
+    };
+
+    // Get absolute path to build root for curl
+    const abs_root = build_root.realpathAlloc(b.allocator, ".") catch {
+        std.log.err("Failed to get absolute path", .{});
+        return error.PathError;
+    };
+
+    // Files to fetch
+    const files = [_][]const u8{ "libcrypto.a", "libssl.a" };
+
+    for (files) |filename| {
+        const url = b.fmt("{s}/boring_tls/{s}/{s}", .{ R2_PUBLIC_URL, triple, filename });
+        const full_dest = b.fmt("{s}/{s}/{s}", .{ abs_root, prebuilt_dir, filename });
+
+        std.log.info("Fetching {s}...", .{filename});
+
+        // Use curl to download (available on all platforms)
+        var child = std.process.Child.init(
+            &[_][]const u8{ "curl", "-fSL", "--create-dirs", "-o", full_dest, url },
+            b.allocator,
+        );
+
+        const term = child.spawnAndWait() catch |err| {
+            std.log.err("Failed to spawn curl: {}", .{err});
+            return err;
+        };
+
+        if (term.Exited != 0) {
+            std.log.err("curl failed with exit code {}", .{term.Exited});
+            return error.FetchFailed;
+        }
+    }
 }

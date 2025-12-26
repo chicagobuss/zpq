@@ -547,18 +547,8 @@ fn onConnect(ctx_void: ?*anyopaque) void {
 
     const method = if (ctx.is_head) "HEAD" else "GET";
 
-    // Build Headers
+    // Build Headers - only include headers that should be signed
     var headers = std.ArrayListUnmanaged(std.http.Header){};
-    headers.append(aa, .{ .name = "User-Agent", .value = "zpq-xev" }) catch |err| {
-        ctx.err = err;
-        ctx.conn.close();
-        return;
-    };
-    headers.append(aa, .{ .name = "Connection", .value = "keep-alive" }) catch |err| {
-        ctx.err = err;
-        ctx.conn.close();
-        return;
-    };
 
     if (!ctx.is_head) {
         const end_inclusive = ctx.request_end - 1;
@@ -611,6 +601,18 @@ fn onConnect(ctx_void: ?*anyopaque) void {
             return;
         };
     }
+
+    // Add non-signed headers after signing
+    headers.append(aa, .{ .name = "User-Agent", .value = "zpq-xev" }) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
+    headers.append(aa, .{ .name = "Connection", .value = "keep-alive" }) catch |err| {
+        ctx.err = err;
+        ctx.conn.close();
+        return;
+    };
 
     // Serialize Request
     const encoded_path = @import("sigv4.zig").encodeS3Path(aa, path) catch |err| {

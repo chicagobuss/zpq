@@ -217,6 +217,26 @@ pub fn addAuxiliaryTools(
         b.installArtifact(exe);
     }
 
+    // bench-s3-projection (S3/R2 column projection benchmark)
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("benchmarks/s3_projection.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+        mod.addImport("xev", libxev_mod);
+        mod.addImport("boring_tls", boring_tls_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "bench-s3-projection",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+
+        b.installArtifact(exe);
+    }
+
     // test-sf (SingleFlightResolver isolation test)
     {
         const mod = b.createModule(.{

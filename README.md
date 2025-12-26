@@ -6,6 +6,21 @@ ZPQ is a Parquet utility designed for fast data access across both local filesys
 
 ZPQ is built for scenarios where resource utilization and execution time are primary constraints.
 
+### The Laziness Principle
+
+> **ZPQ preserves data in its most compact/encoded form as long as possible. Decoding, decompression, and re-encoding happen only at the boundaries where transformation is required.**
+
+This is ZPQ's foundational philosophy. Where conventional engines follow "decode everything → process → encode everything," ZPQ asks at every step: *"Can we avoid doing this work?"*
+
+| Operation | Conventional | ZPQ |
+|-----------|--------------|-----|
+| Column projection | Decode all, select some | Never read unselected columns |
+| Row filtering | Decode all, discard | Skip row groups via stats |
+| Pass-through columns | Decode → re-encode | Copy compressed bytes |
+| Dictionary data | Decode to strings | Keep encoded through pipeline |
+
+This principle enables ZPQ to be *dramatically* faster for common operations like "select 25 columns from 120" or "filter 1% of rows" - the exact workloads that dominate serverless data processing.
+
 ### Characteristics:
 - **Asynchronous I/O**: Utilizes a completion-based state machine for interleaved request execution on a single thread.
 - **Minimal Dependencies**: The S3, SigV4, and HTTP/1.1 protocols are implemented directly in Zig to eliminate dependencies on large, general-purpose SDKs.

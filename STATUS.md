@@ -7,13 +7,25 @@
 *   **Portability**: Run as a standalone CLI, AWS Lambda (Zig's cross-compilation), or library.
 
 ## Philosophy & Architecture
-*   **Lambda-First**: The ultimate goal is high-performance AWS Lambdas with minimal cold starts.
-    *   **No Runtime SDKs**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
-    *   **Minimal Footprint**: Reduction of binary size and memory utilization.
-*   **The Spirit of Zig 0.16**: We align with upcoming 0.16 patterns today:
-    *   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
-    *   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
-    *   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
+
+### The Laziness Principle (Foundational)
+> **ZPQ preserves data in its most compact/encoded form as long as possible. Decoding, decompression, and re-encoding happen only at the boundaries where transformation is required.**
+
+This principle drives every architectural decision:
+*   **Late Materialization**: Data stays in Parquet's native encoding (RLE, dictionary, delta) until a consumer needs decoded values.
+*   **Metadata-First**: Leverage row group stats and column indexes to skip work before touching data bytes.
+*   **Copy-Through Optimization**: Unchanged columns pass through as compressed bytes - only the footer is rewritten.
+*   **Selective Decoding**: For filtered reads, decode only predicate columns to build selection vectors.
+
+### Lambda-First Design
+*   **No Runtime SDKs**: We re-write S3, SigV4, and HTTP/1.1 natively to eliminate SDK bloat and maintain a zero-copy, zero-allocation path.
+*   **Minimal Footprint**: ~2MB binary size for the full S3+TLS+Parquet stack.
+*   **Cold Start Optimized**: Binary size and initialization overhead are first-class concerns.
+
+### The Spirit of Zig 0.16
+*   **Unmanaged-Only**: No internal allocators in core structs (`AsyncRequest`, `ColumnReader`).
+*   **Interface-Driven**: Business logic sees only `std.Io` interfaces, never `libxev` directly.
+*   **Reproducible Build**: The project pins to a specific Zig nightly commit (see `.zig-version`).
 *   **Pragmatic Library Usage**:
     *   **`libxev` & `boring_tls`**: These are viewed as high-performance "bridging" technologies. They provide the necessary OS-level    @echo "\n=== Python (PyArrow) ==="
     uv run python tools/bench/pyarrow_bench.py data/sample-data.parquet

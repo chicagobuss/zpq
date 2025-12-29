@@ -83,7 +83,7 @@ jobs:
       - name: Build
         run: |
           echo "::group::Zig Build"
-          zig build -Doptimize=ReleaseFast --summary all 2>&1
+          zig build -Doptimize=ReleaseFast -Dall=true --summary all 2>&1
           echo "::endgroup::"
           echo "::group::Build Examples (Lambda)"
           zig build -Doptimize=ReleaseFast -Dexamples --summary all 2>&1

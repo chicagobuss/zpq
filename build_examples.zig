@@ -11,18 +11,27 @@ pub fn addExamples(
 ) void {
     if (!install_examples) return;
 
-    // Lambda Bootstrap Example
-    {
-        const lambda_target = target;
-        
+    const examples = [_]struct {
+        name: []const u8,
+        path: []const u8,
+        needs_zpq: bool,
+    }{
+        .{ .name = "lambda-01-minimal", .path = "examples/lambda/01-minimal/main.zig", .needs_zpq = false },
+        .{ .name = "lambda-02-scan-benchmark", .path = "examples/lambda/02-scan-benchmark/main.zig", .needs_zpq = true },
+    };
+
+    for (examples) |example| {
         const mod = b.createModule(.{
-            .root_source_file = b.path("examples/lambda/main.zig"),
-            .target = lambda_target,
+            .root_source_file = b.path(example.path),
+            .target = target,
             .optimize = optimize,
         });
-        mod.addImport("zpq", zpq_mod);
-        mod.addImport("xev", libxev_mod);
-        mod.addImport("boring_tls", boring_tls_mod);
+
+        if (example.needs_zpq) {
+            mod.addImport("zpq", zpq_mod);
+            mod.addImport("xev", libxev_mod);
+            mod.addImport("boring_tls", boring_tls_mod);
+        }
 
         const exe = b.addExecutable(.{
             .name = "bootstrap",
@@ -30,13 +39,13 @@ pub fn addExamples(
         });
         exe.root_module.linkSystemLibrary("c", .{});
 
-        // Install to zig-out/lambda/bootstrap
+        // Install to zig-out/lambda/{example_name}/bootstrap
         const install = b.addInstallArtifact(exe, .{
-            .dest_dir = .{ .override = .{ .custom = "lambda" } },
+            .dest_dir = .{ .override = .{ .custom = b.fmt("lambda/{s}", .{example.name}) } },
         });
 
-        const step = b.step("example-lambda", "Build AWS Lambda bootstrap example");
+        const step_name = b.fmt("example-{s}", .{example.name});
+        const step = b.step(step_name, b.fmt("Build {s} example", .{example.name}));
         step.dependOn(&install.step);
     }
 }
-

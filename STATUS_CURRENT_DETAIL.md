@@ -159,15 +159,26 @@ First-class support for serverless execution via a custom Zig Lambda runtime.
 *   **Libxev 0.16 Alignment**: Patched the `io_uring` and `epoll` backends in vendored `libxev` to align with Zig's strict `std.posix` vs `std.os.linux` type decoupling.
 *   **CI Production Artifacts**: Optimized CI to produce optimized `ReleaseFast` binaries for the Lambda runtime (`bootstrap`) and the E2E benchmark suite.
 
-### The "Steering Wheel" Problem (Design Insight):
-*   **Loop/Pool Coupling**: Realized that the `GlobalConnectionPool` is currently underutilized because each `openFile` call creates a fresh `xev.Loop`. Connections are tied to their loop.
-*   **Solution**: Refactor to allow sharing a long-lived `Loop` and `ThreadPool` across multiple S3 source instances, enabling true connection warming across Lambda invocations.
+### The "SQL Layer" Roadmap (Research Synthesis):
+Exhaustive research into "Headless OLAP" frontends has yielded a two-track roadmap for ZPQ's query intelligence:
+
+1.  **Track A: The Pragmatic SQL (SQLite VTable)**:
+    *   **Frontend**: SQLite (~1MB).
+    *   **Integration**: Custom Virtual Table in Zig (using the `Stanchion` project as a pattern).
+    *   **Optimization**: Use `xBestIndex` for row group pruning and "Pointer-as-BLOB" for vectorized SIMD aggregations (bypassing SQLite's row-at-a-time bottleneck).
+    *   **Status**: Ready for prototyping.
+
+2.  **Track B: The Holy Grail (Frankenstein Engine)**:
+    *   **Parser**: `libpg_query` (Postgres parser as a standalone C lib, ~3MB).
+    *   **Planner**: Lightweight rule-based optimizer in Zig.
+    *   **Executor**: ZPQ's native SIMD kernels operating directly on Arrow buffers.
+    *   **Outcome**: Bare-metal performance with 100% Postgres-compatible SQL syntax, fitting comfortably under the 5MB Lambda budget.
+
+### Common Requirement: Arrow C Data Interface
+Both tracks require ZPQ to export data via the **Apache Arrow C Data Interface** (two ABI-stable C structs). This is our next high-level technical objective.
 
 ## Future Technical Objectives:
-1.  **SIMD Decoders**: Moving from scalar decoding to vectorized bit-unpacking for PLAIN and RLE encodings.
-2.  **Predicate Pushdown**: Implementing row group and page skipping based on metadata statistics to avoid reading unnecessary data.
-3.  **Lambda "Instant-On" Optimizations**:
-    *   **Speculative Footer Fetch**: Merge HEAD and first GET into a single 128KB speculative read of the file tail.
-    *   **Connection Warming**: Persist TCP/TLS connections across Lambda invocations using the `GlobalConnectionPool` and shared `Loop` context.
-    *   **Zero-Copy Metadata**: Parse Thrift/Parquet footers directly from the network buffer.
-4.  **Parquet Writing**: Adding the capability to write or "slice" parquet files using the Laziness Principle.
+1.  **Arrow C Data Interface**: Implement zero-copy column exposure using stable C ABI structs.
+2.  **SIMD Decoders**: Vectorized bit-unpacking for PLAIN and RLE encodings.
+3.  **Speculative Footer Fetch**: Merge HEAD and first GET into a single 128KB speculative read of the file tail.
+4.  **Connection Warming**: Persist TCP/TLS connections across Lambda invocations using the `GlobalConnectionPool`.

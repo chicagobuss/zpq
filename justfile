@@ -9,10 +9,6 @@ default:
     @just --list
 
 # === Development Setup ===
-# Install git hooks
-install-hooks:
-    @ln -sf ../../tools/pre-commit.sh .git/hooks/pre-commit
-    @echo "Git hooks installed."
 
 # === Testing ===
 # Run all checks (tests + build + verify)
@@ -114,15 +110,22 @@ comprehensive: build gen-fixtures
 
 # === Lambda ===
 
-# Build and run the Lambda bootstrap locally using the Runtime Interface Emulator (RIE)
-lambda-local:
-    @echo "Building Lambda bootstrap (native)..."
-    zig build example-lambda -Dexamples -Dtarget=native
+# Build and run the minimal Hello World Lambda locally
+lambda-01:
+    @echo "Building Lambda 01-minimal..."
+    zig build example-lambda-01-minimal -Dexamples -Dtarget=native
     @echo "Starting Lambda RIE..."
     @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{}'"
-    # Note: This expects the 'aws-lambda-rie' binary to be in your path
-    # If not, you can run via Docker: docker run -v $(pwd)/zig-out/lambda:/var/task public.ecr.aws/lambda/provided:al2 /var/task/bootstrap
-    ./zig-out/lambda/bootstrap
+    # Mocking AWS_LAMBDA_RUNTIME_API for local RIE (using 8080)
+    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-01-minimal/bootstrap
+
+# Build and run the Parquet scan benchmark Lambda locally
+lambda-02:
+    @echo "Building Lambda 02-scan-benchmark..."
+    zig build example-lambda-02-scan-benchmark -Dexamples -Dtarget=native
+    @echo "Starting Lambda RIE..."
+    @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{\"file\": \"s3://bucket/path.parquet\"}'"
+    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-02-scan-benchmark/bootstrap
 
 # Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
 bench +args:

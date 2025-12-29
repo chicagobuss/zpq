@@ -40,15 +40,12 @@ jobs:
             exit 1
           fi
           
-          # Extract and ensure the binary is in the current directory
-          # anyzig releases usually have a top-level directory in the tarball
-          mkdir -p anyzig_tmp
-          curl -fsSL "$URL" | tar -xz -C anyzig_tmp --strip-components=1
+          # Install to workspace to avoid polluting self-hosted runner
+          mkdir -p $GITHUB_WORKSPACE/zig-bin
+          curl -fsSL "$URL" | tar -xz -C $GITHUB_WORKSPACE/zig-bin
           
-          mkdir -p $HOME/.local/bin
-          mv anyzig_tmp/anyzig $HOME/.local/bin/zig
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          rm -rf anyzig_tmp
+          # anyzig releases contain a binary named 'zig' (verified)
+          echo "$GITHUB_WORKSPACE/zig-bin" >> $GITHUB_PATH
           echo "::endgroup::"
 
       - name: Verify Zig Version

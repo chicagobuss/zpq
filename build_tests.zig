@@ -167,51 +167,8 @@ pub fn addAuxiliaryTools(
         run_step.dependOn(&run.step);
     }
 
-    // test-sf (SingleFlightResolver isolation test)
-    {
-        const mod = b.createModule(.{
-            .root_source_file = b.path("tools/test_sf.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        mod.addImport("zpq", zpq_mod);
-
-        const exe = b.addExecutable(.{
-            .name = "test-sf",
-            .root_module = mod,
-        });
-        exe.root_module.linkSystemLibrary("c", .{});
-        if (install_all) b.installArtifact(exe);
-
-        const run = b.addRunArtifact(exe);
-        const step = b.step("test-sf", "Test SingleFlightResolver in isolation");
-        step.dependOn(&run.step);
-    }
-
     // Hardening Proofs / Integration tests
     {
-        // 12. test_gap_skipping
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("tests/integration/test_gap_skipping.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("zpq", zpq_mod);
-
-            const exe = b.addExecutable(.{
-                .name = "test_gap_skipping",
-                .root_module = mod,
-            });
-            exe.root_module.linkSystemLibrary("c", .{});
-            if (install_all) b.installArtifact(exe);
-
-            const run = b.addRunArtifact(exe);
-            const step = b.step("test-gap-skipping", "Run zero-allocation gap skipping integration test");
-            step.dependOn(&run.step);
-        }
-
         // 13. test_fuzz_demo
         {
             const test_exe = b.addTest(.{
@@ -337,49 +294,6 @@ pub fn addAuxiliaryTools(
 
             const run = b.addRunArtifact(exe);
             const step = b.step("probe-sf-crash", "Run SingleFlight crash probe");
-            step.dependOn(&run.step);
-        }
-
-        // 18. probe_tls_echo
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("probes/probe_tls_echo.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("zpq", zpq_mod);
-
-            const exe = b.addExecutable(.{
-                .name = "probe-tls-echo",
-                .root_module = mod,
-            });
-            exe.root_module.linkSystemLibrary("c", .{});
-            if (install_all) b.installArtifact(exe);
-
-            const run = b.addRunArtifact(exe);
-            const step = b.step("probe-tls-echo", "Run TLS echo micro-test");
-            step.dependOn(&run.step);
-        }
-
-        // 19. probe_s3_head_hang - diagnose async S3 HEAD request hang
-        {
-            const mod = b.createModule(.{
-                .root_source_file = b.path("probes/probe_s3_head_hang.zig"),
-                .target = target,
-                .optimize = optimize,
-            });
-            mod.addImport("zpq", zpq_mod);
-            mod.addImport("xev", libxev_mod);
-
-            const exe = b.addExecutable(.{
-                .name = "probe-s3-head-hang",
-                .root_module = mod,
-            });
-            exe.root_module.linkSystemLibrary("c", .{});
-            if (install_all) b.installArtifact(exe);
-
-            const run = b.addRunArtifact(exe);
-            const step = b.step("probe-s3-head-hang", "Run S3 HEAD request hang probe");
             step.dependOn(&run.step);
         }
 

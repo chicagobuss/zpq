@@ -196,6 +196,14 @@ This principle drives every architectural decision:
 *   [x] **Factory robustness**: `S3_ENDPOINT` now accepts bare hostnames or full URLs.
 *   [x] **Verification**: Confirmed stable performance after massive I/O refactor.
 
+### Milestone 17: Loop-Agnostic Refactor & Lambda Foundation [COMPLETE]
+**Goal**: Decouple I/O stack from specific loops and enable high-performance DNS in Lambda.
+
+*   [x] **Factory Polish**: Consolidated S3 path parsing, environment discovery, and endpoint discovery.
+*   [x] **Resolver Injection**: Correctly pass `dns.ResolverGen(XevApi)` down to the I/O stack.
+*   [x] **Lambda Verification**: Proved ~16ms cold starts for minimal loop and ~260ms for full scan on Lambda.
+*   [x] **CI Confirmation**: Verified multi-arch builds and benchmarks pass on `main`.
+
 ## ⏭️ Roadmap & Future Technical Objectives
 
 ### Technical Debt & Standards (Zig 0.16 Alignment)
@@ -204,7 +212,7 @@ This principle drives every architectural decision:
 *   **TLS Abstraction**: Wrap `boring_tls` in a `std.Io.Reader/Writer` interface to prepare for future native TLS support or offloading.
 *   **Upstream Contributions**: Port `std.http.Client` to the new `std.Io` interface to allow native async HTTP without custom "Bare Metal" clients.
 
-### Milestone 17: SIMD Decoders
+### Milestone 18: SIMD Decoders
 **Goal**: Maximize decode throughput for cases where we must decode.
 
 *   [ ] **Comptime bit-unpacking**: Generated SIMD for common bit widths (1-32).
@@ -213,7 +221,7 @@ This principle drives every architectural decision:
 *   [ ] **Benchmark suite**: Isolated decoder benchmarks to measure improvements.
 *   [ ] **Target**: 2x+ decode throughput vs current implementation.
 
-### Milestone 18: Predicate Pushdown (Read-Side)
+### Milestone 19: Predicate Pushdown (Read-Side)
 **Goal**: Skip work on reads - Laziness Principle for filtering.
 
 *   [ ] **Row group statistics evaluation**: Skip row groups via min/max metadata.
@@ -222,7 +230,7 @@ This principle drives every architectural decision:
 *   [ ] **Selective column decode**: Only decode rows matching selection vector.
 *   [ ] **Benchmark**: "1% selectivity" should be ~100x faster than full scan.
 
-### Milestone 19: Parquet Writer Foundation
+### Milestone 20: Parquet Writer Foundation
 **Goal**: Basic write capability for "slice and dice" operations.
 
 *   [ ] **PLAIN encoder** for primitives (INT32, INT64, FLOAT, DOUBLE, BYTE_ARRAY).
@@ -232,7 +240,7 @@ This principle drives every architectural decision:
 *   [ ] **CLI**: `zpq slice input.parquet -o output.parquet --columns a,b,c`
 *   [ ] **Round-trip verification**: Read → write → read, compare results.
 
-### Milestone 20: Copy-Through Optimization
+### Milestone 21: Copy-Through Optimization
 **Goal**: The "cheat path" - copy unchanged columns without decode/encode.
 
 *   [ ] **Passthrough detection**: Identify columns not touched by filter/projection.
@@ -241,7 +249,7 @@ This principle drives every architectural decision:
 *   [ ] **Partial row group handling**: Fall back to decode when only some rows match.
 *   [ ] **Benchmark**: Prove 10x+ speedup for "1% filter, 25 columns" vs naive.
 
-### Milestone 21: Compression & Dictionary Encoding
+### Milestone 22: Compression & Dictionary Encoding
 **Goal**: Production-quality output files.
 
 *   [ ] **Snappy compressor**: Reuse decompressor knowledge, add compression.
@@ -249,7 +257,7 @@ This principle drives every architectural decision:
 *   [ ] **Dictionary passthrough**: Preserve input dictionary when possible.
 *   [ ] **Compression selection**: Match input compression or specify via CLI.
 
-### Milestone 22: Streaming S3 Output
+### Milestone 23: Streaming S3 Output
 **Goal**: Write directly to S3 without local temp files.
 
 *   [ ] **S3 multipart upload**: Initiate, upload parts, complete.
@@ -258,7 +266,7 @@ This principle drives every architectural decision:
 *   [ ] **Memory-bounded**: Limit buffering, flush parts incrementally.
 *   [ ] **CLI**: `zpq slice s3://in/file.parquet -o s3://out/file.parquet`
 
-### Milestone 23: Lambda-Ready Package
+### Milestone 24: Lambda-Ready Package
 **Goal**: Production deployment for serverless lakehouse.
 
 *   [ ] **Lambda handler**: Event-driven entry point.
@@ -268,14 +276,14 @@ This principle drives every architectural decision:
 *   [ ] **Binary size audit**: Target <3MB for fast cold starts.
 *   [ ] **Benchmark vs DuckDB Lambda**: Prove the cost/performance advantage.
 
-### Milestone 24: Zero-Copy TLS (Research)
+### Milestone 25: Zero-Copy TLS (Research)
 **Goal**: Eliminate final memcpy in TLS decryption path.
 
 *   [ ] **Direct decryption into column buffers**: Decrypt S3 data directly into destination.
 *   [ ] **Vendor boring_tls modifications**: Requires changes to SSL_read path.
 *   [ ] **Benchmark**: Measure throughput improvement on large file scans.
 
-### Milestone 25: Query Engine Foundation (Future)
+### Milestone 26: Query Engine Foundation (Future)
 **Goal**: Lay groundwork for operators beyond scan.
 
 *   [ ] **Batch/morsel abstraction**: Fixed-size column chunks (1024/2048 rows).

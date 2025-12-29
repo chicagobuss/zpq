@@ -1,7 +1,7 @@
 # ZPQ Technical Context and Detail
 
-**Last Updated**: Dec 23, 2025
-**Current State**: Milestone 0 (CI & Build Hardening) Completed. Project is stable on Zig master with optimized pre-built dependency workflows. Milestone 10 (Empirical Proof) verified on ARM64 hardware. Batched column prefetch optimization delivers 1.7x speedup over PyArrow on cold starts.
+**Last Updated**: Dec 29, 2025
+**Current State**: Milestone 17 (Lambda & Loop-Agnostic I/O) in progress. Polished `factory.zig` and fixed DNS resolver injection, verified with CI. Milestone 10 (Empirical Proof) verified on ARM64 hardware. Batched column prefetch optimization delivers 1.7x speedup over PyArrow on cold starts.
 
 ## Milestone 9: Hardening & Transport Stability (Completed)
 Extensive debugging and refactoring to ensure production-grade stability and memory safety.

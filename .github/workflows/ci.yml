@@ -9,20 +9,38 @@ on:
 
 jobs:
   test:
-    # Use self-hosted runner on zpq-arm with pinned Zig version
-    # ARM runners not available for private repos on GitHub-hosted
-    runs-on: [self-hosted, Linux, ARM64, zpq-arm]
+    name: ${{ matrix.name }}
+    # High-Performance Parallel CI:
+    # 1. ARM64: Runs on your high-performance self-hosted box (for benchmarks).
+    # 2. x86_64: Runs on GitHub's free infrastructure (for Intel/AMD compatibility).
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false # Let one arch fail without killing the other
+      matrix:
+        include:
+          - name: linux-arm64
+            runs-on: [self-hosted, Linux, ARM64, zpq-arm]
+            zig-setup: "custom"
+          - name: linux-x86_64
+            runs-on: ubuntu-latest
+            zig-setup: "standard"
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Zig
+      - name: Set up Zig (Custom/Self-Hosted)
+        if: matrix.zig-setup == 'custom'
         run: |
           # Use Zig from zvm on the self-hosted runner
-          # Version: 0.16.0-dev.1657+985a3565c (pinned for vendor compat)
-          # TODO: Update vendored deps (libxev, boring_tls) for latest Zig master
           echo "$HOME/.zvm/bin" >> $GITHUB_PATH
           ~/.zvm/master/zig version
+
+      - name: Set up Zig (Standard/GitHub-Hosted)
+        if: matrix.zig-setup == 'standard'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.16.0-dev.1657+985a3565c"
 
       - name: Install Just
         uses: extractions/setup-just@v2
@@ -33,9 +51,9 @@ jobs:
           path: |
             ~/.cache/zig
             zig-cache
-          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
+          key: ${{ runner.os }}-${{ matrix.name }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
           restore-keys: |
-            ${{ runner.os }}-zig-
+            ${{ runner.os }}-${{ matrix.name }}-zig-
 
       - name: Fetch Pre-built Dependencies from R2
         id: fetch-deps

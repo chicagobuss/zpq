@@ -183,7 +183,7 @@ This principle drives every architectural decision:
 *   [x] **Delete Legacy**: Removed `async_source.zig`, `event_loop.zig`, `tls_adapter.zig`, `connection.zig`, `connection_pool.zig`, `request.zig`, `raw_s3_source.zig`, and related test files (~2,180 lines deleted).
 *   [x] **I/O Consolidation**: Moved `LocalFileSource` and `MemorySource` into `src/zpq/io/local/` and introduced `io.local` namespace.
 *   [x] **Factory Flip**: Made `XevS3Source` the definitive default for all `s3://` paths via `factory.openFile`.
-*   [x] **CI Optimization**: Implemented a "Lean CI" strategy using `zig build check` to reduce runtimes by 50% while maintaining 100% compilation coverage.
+*   [x] **CI Optimization**: Implemented a "Lean CI" strategy using `zig build check` and parallel multi-arch runners (ARM64 + x86_64), reducing feedback loops while maintaining 100% platform coverage.
 
 ### Milestone 16: Real-World Benchmarking & Performance Baseline [COMPLETE]
 **Goal**: Establish baseline performance against competitors on real S3/R2 with production-sized files.

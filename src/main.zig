@@ -244,9 +244,13 @@ fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loo
         std.debug.print("Schema for {s}:\n", .{path});
         for (meta.schema.items, 0..) |elem, i| {
             const indent = if (elem.num_children == null) "  " else "";
-            std.debug.print("{s}[{d}] {s} ({any})", .{ indent, i, elem.name, elem.repetition_type orelse .REQUIRED });
+            const rt = elem.repetition_type orelse .REQUIRED;
+            std.debug.print("{s}[{d}] {s} ({any}/{d})", .{ indent, i, elem.name, rt, @intFromEnum(rt) });
             if (elem.type) |t| {
                 std.debug.print(" type={any}", .{t});
+            }
+            if (elem.type_length) |tl| {
+                std.debug.print(" len={d}", .{tl});
             }
             if (elem.field_id) |fid| {
                 std.debug.print(" id={d}", .{fid});

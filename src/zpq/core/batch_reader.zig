@@ -80,12 +80,16 @@ pub fn BatchReader(comptime T: type) type {
 
                 // 2. Non-nullable PLAIN-encoded (primitives)
                 if (self.max_def_level == 0 and self.plain_decoder != null and T != []const u8) {
-                    // TODO: SIMD load for PLAIN primitives
-                    for (0..count) |i| {
-                        buffer[out_pos + i] = try self.decodePlainScalar();
+                    var values_buf: [1024]T = undefined;
+                    const to_read = @min(count, values_buf.len);
+                    const n = try self.plain_decoder.?.readBatch(values_buf[0..to_read]);
+                    if (n == 0) break;
+                    
+                    for (0..n) |i| {
+                        buffer[out_pos + i] = values_buf[i];
                     }
-                    out_pos += count;
-                    self.values_remaining_in_page -= count;
+                    out_pos += n;
+                    self.values_remaining_in_page -= n;
                     continue;
                 }
 

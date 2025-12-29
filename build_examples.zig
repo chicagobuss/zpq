@@ -19,7 +19,7 @@ pub fn addExamples(
         const mod = b.createModule(.{
             .root_source_file = b.path("examples/lambda/main.zig"),
             .target = lambda_target,
-            .optimize = .ReleaseFast, // Always release for lambda to be realistic
+            .optimize = optimize,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addImport("xev", libxev_mod);

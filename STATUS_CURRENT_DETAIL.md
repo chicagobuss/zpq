@@ -138,7 +138,7 @@ Successfully transitioned to the `Xev` stack as the definitive engine and cleane
 *   **Massive Deletion**: Removed ~2,180 lines of legacy asynchronous code (the old `AsyncS3Source`, `Connection`, `TlsAdapter`, and `ConnectionPool`). The codebase is now 100% focused on the modern `libxev` + `boring_tls` stack.
 *   **I/O Re-homing**: Moved `LocalFileSource` and `MemorySource` from the generic `interface.zig` into a dedicated `src/zpq/io/local/` directory. This improves modularity and organization.
 *   **Namespace Refactor**: Introduced `zpq.io.local` and `zpq.io.s3` namespaces to clearly separate local vs remote storage implementations.
-*   **CI Build Optimization**: Refactored the CI workflow into a parallel matrix (ARM64 + x86_64). Differentiates between critical binaries (fully built with `ReleaseFast`) and auxiliary tools/probes (verified via `zig build check`). This reduced feedback loops significantly while ensuring multi-architecture compatibility.
+*   **CI Build Optimization**: Refactored the CI workflow into a parallel matrix (ARM64 + x86_64). Differentiates between critical binaries (fully built with `ReleaseFast`) and auxiliary tools/probes (verified via `zig build check` in Debug mode). This significantly reduced build times by avoiding redundant heavy optimization passes.
 *   **Factory Consolidation**: Simplified `src/zpq/io/s3/factory.zig` to treat `XevS3Source` as the first-class, default implementation for all S3 access.
 
 ## Milestone 16: Real-World Benchmarking & Baseline (Completed)

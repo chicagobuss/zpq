@@ -87,8 +87,7 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/e2e.zig"),
             .target = target,
-            // Always use ReleaseFast for benchmarks
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addImport("xev", libxev_mod);
@@ -120,8 +119,7 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/projection.zig"),
             .target = target,
-            // Always use ReleaseFast for benchmarks
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addOptions("build_options", build_options);
@@ -151,8 +149,7 @@ pub fn addAuxiliaryTools(
         const mod = b.createModule(.{
             .root_source_file = b.path("benchmarks/decode_full.zig"),
             .target = target,
-            // Always use ReleaseFast for benchmarks
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         });
         mod.addImport("zpq", zpq_mod);
         mod.addOptions("build_options", build_options);

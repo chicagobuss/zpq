@@ -115,8 +115,8 @@ jobs:
           echo "::group::Zig Build (Necessities)"
           # Build only the binaries needed for CI verification and benchmarks.
           # We build 'zpq', 'bench-e2e', and 'example-lambda' in ReleaseFast.
-          # We explicitly build the 'bench-e2e' step to ensure it is installed.
-          zig build -Doptimize=ReleaseFast -Dexamples=true install bench-e2e --summary all 2>&1
+          # We do NOT use -Dall here to avoid the heavy cost of optimizing 20+ probes.
+          zig build -Doptimize=ReleaseFast -Dexamples=true install bench-e2e example-lambda --summary all 2>&1
           echo "::endgroup::"
 
           echo "::group::Quick Compilation Check (Auxiliary Tools)"

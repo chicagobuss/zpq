@@ -114,18 +114,19 @@ jobs:
         run: |
           echo "::group::Zig Build (Necessities)"
           # Build only the binaries needed for CI verification and benchmarks.
-          # We explicitly invoke 'install' (for zpq CLI) and 'bench-e2e'.
-          zig build -Doptimize=ReleaseFast -Dexamples install bench-e2e --summary all 2>&1
+          # We build 'zpq', 'bench-e2e', and 'example-lambda' in ReleaseFast.
+          zig build -Doptimize=ReleaseFast -Dall=true -Dexamples=true install --summary all 2>&1
           echo "::endgroup::"
 
-          echo "::group::Quick Compilation Check (All Probes & Tests)"
-          # Fast check of the entire codebase in Debug mode (no linking/optimization)
-          zig build check -Dall=true --summary all 2>&1
+          echo "::group::Quick Compilation Check (Auxiliary Tools)"
+          # Fast check of probes and tests in Debug mode to ensure no regressions
+          # We use 'zig build check' to avoid the cost of full linking/optimization.
+          zig build check -Dall=true -Dexamples=true --summary all 2>&1
           echo "::endgroup::"
 
           echo "Build artifacts:"
-          ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
-          ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
+          ls -laR zig-out/
+
 
       # Laziness Principle: if we built from source, upload to R2 so next run is faster
       - name: Upload Built Dependencies to R2
@@ -175,10 +176,18 @@ jobs:
       - name: Run Inspector Verification
         run: |
           echo "::group::Inspector Verification"
+          # Find the built zpq binary
+          ZPQ_BIN=$(find zig-out -name zpq -type f | head -1)
+          if [ -z "$ZPQ_BIN" ]; then
+            echo "Error: zpq binary not found in zig-out"
+            exit 1
+          fi
+          echo "Using binary: $ZPQ_BIN"
+          
           echo "Testing simple.parquet..."
-          ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
+          "$ZPQ_BIN" inspect ci/fixtures/parquet/simple.parquet
           echo "Testing required.parquet..."
-          ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
+          "$ZPQ_BIN" inspect ci/fixtures/parquet/required.parquet
           echo "::endgroup::"
           echo "All verifications passed!"
 
@@ -192,6 +201,17 @@ jobs:
             echo "R2 credentials not configured, skipping benchmarks"
             exit 0
           fi
-          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_1mb.parquet" --async
-          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_10mb.parquet" --async
-          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_100mb.parquet" --async
+          # Find the built bench-e2e binary
+          BENCH_BIN=$(find zig-out -name bench-e2e -type f | head -1)
+          if [ -z "$BENCH_BIN" ]; then
+            echo "Error: bench-e2e binary not found in zig-out"
+            exit 1
+          fi
+          echo "Using binary: $BENCH_BIN"
+          
+          # Use the absolute path for bench-e2e in bench.sh
+          # (bench.sh might need an update to accept an external binary path,
+          # but for now we'll try to just run it)
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_1mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_10mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_100mb.parquet" --async

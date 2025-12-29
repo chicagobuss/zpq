@@ -82,12 +82,21 @@ jobs:
 
       - name: Build
         run: |
-          echo "::group::Zig Build"
-          zig build -Doptimize=ReleaseFast -Dall=true --summary all 2>&1
+          echo "::group::Zig Build (Necessities)"
+          # Combined build: 
+          # - zpq (the main CLI)
+          # - bench-e2e (the performance watchdog)
+          # - examples (the cloud deployment target)
+          # We omit -Dall=true here to save ~3 mins of linking/optimizing 30+ non-critical binaries
+          zig build -Doptimize=ReleaseFast -Dexamples bench-e2e --summary all 2>&1
           echo "::endgroup::"
-          echo "::group::Build Examples (Lambda)"
-          zig build -Doptimize=ReleaseFast -Dexamples --summary all 2>&1
+
+          echo "::group::Full Compilation Check (All Probes & Tests)"
+          # Verify that the entire codebase (including all 36+ probes/tests) compiles.
+          # The 'check' step skips the expensive linking/binary emission phase.
+          zig build check -Doptimize=ReleaseFast -Dall=true --summary all 2>&1
           echo "::endgroup::"
+
           echo "Build artifacts:"
           ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
           ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"

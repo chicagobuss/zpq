@@ -10,6 +10,7 @@ pub fn addAuxiliaryTools(
     minish_mod: *std.Build.Module,
     install_all: bool,
     build_options: *std.Build.Step.Options,
+    check_step: ?*std.Build.Step,
 ) void {
     // Fast Feedback Probe
     {
@@ -27,6 +28,7 @@ pub fn addAuxiliaryTools(
         pff_exe.root_module.linkSystemLibrary("c", .{});
 
         if (install_all) b.installArtifact(pff_exe);
+        if (check_step) |s| s.dependOn(&pff_exe.step);
 
         const run = b.addRunArtifact(pff_exe);
         const step = b.step("probe-fast-feedback", "Run fast feedback probe");
@@ -47,6 +49,7 @@ pub fn addAuxiliaryTools(
             .root_module = mod,
         });
         if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
         const run = b.addRunArtifact(exe);
 
         const step = b.step("test-xev-tcp", "Run basic xev TCP test");
@@ -69,6 +72,7 @@ pub fn addAuxiliaryTools(
         });
         exe.root_module.linkSystemLibrary("c", .{});
         if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
         const run = b.addRunArtifact(exe);
 
         const step = b.step("test-s3-range-get", "Run S3 HTTPS range GET test (presigned URL; opt-in via env)");
@@ -98,6 +102,7 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-e2e", "Build end-to-end S3 benchmark");
@@ -128,6 +133,7 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-projection", "Build local file projection benchmark");
@@ -158,6 +164,7 @@ pub fn addAuxiliaryTools(
         exe.root_module.linkSystemLibrary("c", .{});
 
         if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-decode", "Build full decode benchmark (apples-to-apples)");
@@ -240,6 +247,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             // Build-only step - just builds and installs the binary
             const build_step = b.step("bench-dns", "Build DNS benchmark");
@@ -268,6 +276,7 @@ pub fn addAuxiliaryTools(
             });
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             // Build-only step - just builds and installs the binary
             const build_step = b.step("ping-pongs", "Build TCP ping-pong benchmark");
@@ -296,6 +305,7 @@ pub fn addAuxiliaryTools(
             });
             exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const run = b.addRunArtifact(exe);
             const step = b.step("probe-sf-crash", "Run SingleFlight crash probe");
@@ -318,6 +328,7 @@ pub fn addAuxiliaryTools(
             });
             exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const run = b.addRunArtifact(exe);
             const step = b.step("probe-xev-s3-head", "Run XevS3Source HEAD probe");
@@ -339,6 +350,7 @@ pub fn addAuxiliaryTools(
             });
             exe.root_module.linkSystemLibrary("c", .{});
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const run = b.addRunArtifact(exe);
             const step = b.step("probe-pool-cleanup", "Test connection pool cleanup");
@@ -363,6 +375,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             // Build-only step (no run) - depends on install so binary goes to zig-out
             const build_step = b.step("shootout-tls", "Build TLS throughput micro-shootout");
@@ -391,6 +404,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const build_step = b.step("test-dict-decode", "Build dict decode micro-test");
             const install = b.addInstallArtifact(exe, .{});
@@ -417,6 +431,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             // Build-only step
             const build_step = b.step("test-passthrough", "Build passthrough integration test");
@@ -445,6 +460,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const build_step = b.step("test-partitioned", "Build partitioned passthrough demo");
             const install = b.addInstallArtifact(exe, .{});
@@ -471,6 +487,7 @@ pub fn addAuxiliaryTools(
             exe.root_module.linkSystemLibrary("c", .{});
 
             if (install_all) b.installArtifact(exe);
+            if (check_step) |s| s.dependOn(&exe.step);
 
             const build_step = b.step("test-roundtrip", "Build roundtrip integration test");
             const install = b.addInstallArtifact(exe, .{});

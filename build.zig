@@ -329,6 +329,7 @@ pub fn build(b: *std.Build) void {
         minish,
         install_all,
         build_options,
+        check_step,
     );
 
     // Examples

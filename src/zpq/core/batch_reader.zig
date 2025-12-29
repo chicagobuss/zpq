@@ -27,14 +27,16 @@ pub fn BatchReader(comptime T: type) type {
         
         // Metadata
         max_def_level: u16 = 0,
+        max_rep_level: u16 = 0,
         column_type: schema.Type,
 
-        pub fn init(allocator: std.mem.Allocator, column_reader: ColumnReader, column_type: schema.Type, max_def_level: u16) Self {
+        pub fn init(allocator: std.mem.Allocator, column_reader: ColumnReader, column_type: schema.Type, max_def_level: u16, max_rep_level: u16) Self {
             return Self{
                 .allocator = allocator,
                 .column_reader = column_reader,
                 .column_type = column_type,
                 .max_def_level = max_def_level,
+                .max_rep_level = max_rep_level,
             };
         }
 
@@ -201,6 +203,15 @@ pub fn BatchReader(comptime T: type) type {
         fn initPageDecoders(self: *Self, page: zpq.column.Page) !void {
             const dph = page.header.data_page_header.?;
             var data_slice = page.data;
+
+            // Repetition levels
+            if (self.max_rep_level > 0) {
+                if (data_slice.len < 4) return error.MalformedPage;
+                const len = std.mem.readInt(u32, data_slice[0..4], .little);
+                if (data_slice.len < 4 + len) return error.MalformedPage;
+                // Skipping repetition levels for now as ZPQ doesn't support nested arrays
+                data_slice = data_slice[4 + len ..];
+            }
 
             // Definition levels
             if (self.max_def_level > 0) {

@@ -115,12 +115,13 @@ jobs:
           echo "::group::Zig Build (Necessities)"
           # Build only the binaries needed for CI verification and benchmarks.
           # We build 'zpq', 'bench-e2e', and 'example-lambda' in ReleaseFast.
-          zig build -Doptimize=ReleaseFast -Dall=true -Dexamples=true install --summary all 2>&1
+          # We do NOT use -Dall here to avoid building every probe in Release mode.
+          zig build -Doptimize=ReleaseFast -Dexamples=true install --summary all 2>&1
           echo "::endgroup::"
 
           echo "::group::Quick Compilation Check (Auxiliary Tools)"
           # Fast check of probes and tests in Debug mode to ensure no regressions
-          # We use 'zig build check' to avoid the cost of full linking/optimization.
+          # We use 'zig build check' and -Dall=true to verify the whole codebase.
           zig build check -Dall=true -Dexamples=true --summary all 2>&1
           echo "::endgroup::"
 

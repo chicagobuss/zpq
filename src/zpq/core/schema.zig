@@ -545,6 +545,11 @@ pub const FileMetaData = struct {
         var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
         return iter.find(path) catch .{ .max_def = 0, .max_rep = 0 };
     }
+
+    pub fn getColumnSchema(self: *const FileMetaData, path: []const []const u8) ?SchemaElement {
+        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
+        return iter.findSchema(path) catch null;
+    }
 };
 
 const SchemaIterator = struct {
@@ -564,6 +569,47 @@ const SchemaIterator = struct {
             if (try self.visit(path, 0, 0, 0)) |res| return res;
         }
         return error.NotFound;
+    }
+
+    fn findSchema(self: *SchemaIterator, path: []const []const u8) !SchemaElement {
+        if (self.pos >= self.items.len) return error.NotFound;
+
+        // Consume root
+        const root = self.items[self.pos];
+        self.pos += 1;
+
+        const num_children = root.num_children orelse 0;
+        var i: i32 = 0;
+        while (i < num_children) : (i += 1) {
+            if (try self.visitSchema(path, 0)) |res| return res;
+        }
+        return error.NotFound;
+    }
+
+    fn visitSchema(self: *SchemaIterator, target_path: []const []const u8, depth: usize) !?SchemaElement {
+        if (self.pos >= self.items.len) return null;
+        const elem = self.items[self.pos];
+        self.pos += 1;
+
+        if (std.mem.eql(u8, elem.name, target_path[depth])) {
+            if (depth == target_path.len - 1) {
+                return elem;
+            } else {
+                const num_children = elem.num_children orelse 0;
+                var i: i32 = 0;
+                while (i < num_children) : (i += 1) {
+                    if (try self.visitSchema(target_path, depth + 1)) |res| return res;
+                }
+            }
+        } else {
+            // Not the node we're looking for, skip its children
+            const num_children = elem.num_children orelse 0;
+            var i: i32 = 0;
+            while (i < num_children) : (i += 1) {
+                _ = try self.skip();
+            }
+        }
+        return null;
     }
 
     fn visit(self: *SchemaIterator, target_path: []const []const u8, depth: usize, current_def: i32, current_rep: i32) !?Levels {

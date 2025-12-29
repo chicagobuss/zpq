@@ -183,15 +183,18 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             for (rg_meta.columns.items, 0..) |col, col_idx| {
                 if (col.meta_data) |md| {
                     const levels = meta.getColumnLevels(md.path_in_schema.items);
+                    const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
+                    const type_length = if (schema_elem) |se| se.type_length else null;
                     const reader = try rg.columnReader(col_idx);
 
                     // Type dispatch for full-materialization scan
                     const n = switch (md.type) {
-                        .BYTE_ARRAY => try scanColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep)),
-                        .INT32 => try scanColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep)),
-                        .INT64 => try scanColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep)),
-                        .FLOAT => try scanColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep)),
-                        .DOUBLE => try scanColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep)),
+                        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try scanColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                        .INT32 => try scanColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                        .INT64 => try scanColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                        .INT96 => try scanColumnBatch(allocator, [12]u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                        .FLOAT => try scanColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                        .DOUBLE => try scanColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
                         else => blk: {
                             // Fallback for unsupported types (just count pages)
                             var reader_inner = try rg.columnReader(col_idx);
@@ -217,8 +220,8 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     std.debug.print("Scanned {d} values in {d:.2}ms ({d:.2} MVal/s)\n", .{ total_values, @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0, mvals_per_s });
 }
 
-fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16) !u64 {
-    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep);
+fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32) !u64 {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep, type_length);
     defer batch_reader.deinit();
 
     var total: u64 = 0;
@@ -311,15 +314,18 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
                     std.debug.print("):\n", .{});
 
                     const levels = meta.getColumnLevels(md.path_in_schema.items);
+                    const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
+                    const type_length = if (schema_elem) |se| se.type_length else null;
                     const reader = try rg_reader.columnReader(col_idx);
 
                     // Type dispatch for BatchReader
                     switch (md.type) {
-                        .BYTE_ARRAY => try dumpColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), limit),
-                        .INT32 => try dumpColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), limit),
-                        .INT64 => try dumpColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), limit),
-                        .FLOAT => try dumpColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), limit),
-                        .DOUBLE => try dumpColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), limit),
+                        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try dumpColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
+                        .INT32 => try dumpColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
+                        .INT64 => try dumpColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
+                        .INT96 => try dumpColumnBatch(allocator, [12]u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
+                        .FLOAT => try dumpColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
+                        .DOUBLE => try dumpColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, limit),
                         else => std.debug.print("        (Type {any} not yet supported by BatchReader)\n", .{md.type}),
                     }
                 }
@@ -328,8 +334,8 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
     }
 }
 
-fn dumpColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, limit: usize) !void {
-    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep);
+fn dumpColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32, limit: usize) !void {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep, type_length);
     defer batch_reader.deinit();
 
     var values_printed: usize = 0;

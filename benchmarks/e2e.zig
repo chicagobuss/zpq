@@ -128,13 +128,16 @@ pub fn main() !void {
             for (rg_meta.columns.items, 0..) |col_meta, col_idx| {
                 if (col_meta.meta_data) |md| {
                     const levels = file.metadata.?.getColumnLevels(md.path_in_schema.items);
+                    const schema_elem = file.metadata.?.getColumnSchema(md.path_in_schema.items);
+                    const type_length = if (schema_elem) |se| se.type_length else null;
                     
                     switch (md.type) {
-                        .INT32 => try scanColumnBatch(aa, i32, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), &values_count),
-                        .INT64 => try scanColumnBatch(aa, i64, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), &values_count),
-                        .FLOAT => try scanColumnBatch(aa, f32, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), &values_count),
-                        .DOUBLE => try scanColumnBatch(aa, f64, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), &values_count),
-                        .BYTE_ARRAY => try scanColumnBatch(aa, []const u8, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), &values_count),
+                        .INT32 => try scanColumnBatch(aa, i32, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
+                        .INT64 => try scanColumnBatch(aa, i64, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
+                        .INT96 => try scanColumnBatch(aa, [12]u8, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
+                        .FLOAT => try scanColumnBatch(aa, f32, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
+                        .DOUBLE => try scanColumnBatch(aa, f64, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
+                        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try scanColumnBatch(aa, []const u8, try rg_reader.columnReader(col_idx), md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, &values_count),
                         else => {
                             var reader = try rg_reader.columnReader(col_idx);
                             while (try reader.next(aa)) |page_val| {
@@ -168,8 +171,8 @@ pub fn main() !void {
     std.debug.print("Avg: {d:.2}ms\n", .{@as(f64, @floatFromInt(avg_ns)) / 1_000_000.0});
 }
 
-fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, total_count: *usize) !void {
-    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep);
+fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32, total_count: *usize) !void {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep, type_length);
     defer batch_reader.deinit();
 
     var batch: [1024]?T = undefined;

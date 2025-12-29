@@ -29,14 +29,16 @@ pub fn BatchReader(comptime T: type) type {
         max_def_level: u16 = 0,
         max_rep_level: u16 = 0,
         column_type: schema.Type,
+        type_length: ?i32 = null,
 
-        pub fn init(allocator: std.mem.Allocator, column_reader: ColumnReader, column_type: schema.Type, max_def_level: u16, max_rep_level: u16) Self {
+        pub fn init(allocator: std.mem.Allocator, column_reader: ColumnReader, column_type: schema.Type, max_def_level: u16, max_rep_level: u16, type_length: ?i32) Self {
             return Self{
                 .allocator = allocator,
                 .column_reader = column_reader,
                 .column_type = column_type,
                 .max_def_level = max_def_level,
                 .max_rep_level = max_rep_level,
+                .type_length = type_length,
             };
         }
 
@@ -178,9 +180,14 @@ pub fn BatchReader(comptime T: type) type {
 
             while (decoder.hasMore()) {
                 if (T == []const u8) {
-                    const val = try decoder.readByteArray();
+                    const val = if (self.column_type == .FIXED_LEN_BYTE_ARRAY)
+                        try decoder.readFixedLenByteArray(@intCast(self.type_length.?))
+                    else
+                        try decoder.readByteArray();
                     const owned = try self.allocator.dupe(u8, val);
                     try items.append(self.allocator, owned);
+                } else if (T == [12]u8) {
+                    try items.append(self.allocator, try decoder.readInt96());
                 } else if (T == i32) {
                     try items.append(self.allocator, @intCast(try decoder.readInt32()));
                 } else if (T == i64 or T == u64) {
@@ -245,7 +252,12 @@ pub fn BatchReader(comptime T: type) type {
         fn decodePlainScalar(self: *Self) !T {
             const dec = &self.plain_decoder.?;
             if (T == []const u8) {
+                if (self.column_type == .FIXED_LEN_BYTE_ARRAY) {
+                    return try dec.readFixedLenByteArray(@intCast(self.type_length.?));
+                }
                 return try dec.readByteArray();
+            } else if (T == [12]u8) {
+                return try dec.readInt96();
             } else if (T == i32) {
                 return @intCast(try dec.readInt32());
             } else if (T == i64 or T == u64) {

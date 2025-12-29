@@ -12,7 +12,8 @@ ZPQ's decode performance now leverages Zig 0.16's native `@Vector` support for e
 1.  **`BatchReader` Parity**:
     *   [x] **PLAIN Encoding**: Implemented.
     *   [x] **Vectorized Nulls**: Integrated via `expandNullsBatch8`.
-    *   [x] **Repetition Levels**: Added skipping logic for nested types to maintain data alignment. Verified on `zpq-sample.snappy.parquet` (**265 MVal/s**).
+    *   [x] **Repetition Levels**: Added skipping logic for nested types.
+    *   [x] **Full Type Coverage**: Added `INT96` (timestamps) and `FIXED_LEN_BYTE_ARRAY` (Decimals/UUIDs) support. Verified on various test files.
 2.  **CLI Refactor**:
     *   [x] **`cat` command**: Refactored to use `BatchReader` for unified materialization.
     *   [x] **`scan` command**: Replaced the dummy page-skipping loop with a full-materialization benchmark using `BatchReader`. Verified **~710 MVal/s** on local `many_rows.parquet`.

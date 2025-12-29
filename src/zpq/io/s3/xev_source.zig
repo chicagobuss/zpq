@@ -30,7 +30,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
         allocator: std.mem.Allocator,
         loop: *LoopType,
         thread_pool: *xev.ThreadPool,
-        resolver: ThreadPoolResolver,
+        resolver: dns.ResolverGen(XevApi),
         pool: *GlobalConnectionPool,
 
         host: []const u8,
@@ -61,6 +61,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
 
         pub const Options = struct {
             verify_certificate: bool = false,
+            resolver: ?dns.ResolverGen(XevApi) = null,
         };
 
         pub fn init(
@@ -130,11 +131,14 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
         ) !*Self {
             const self = try allocator.create(Self);
             const typed_loop: *LoopType = @ptrCast(@alignCast(loop));
+
+            var default_tp_resolver = ThreadPoolResolver.init(thread_pool, allocator);
+
             self.* = .{
                 .allocator = allocator,
                 .loop = typed_loop,
                 .thread_pool = thread_pool,
-                .resolver = ThreadPoolResolver.init(thread_pool, allocator),
+                .resolver = options.resolver orelse default_tp_resolver.resolver(),
                 .pool = external_pool orelse @as(*GlobalConnectionPool, @ptrCast(@alignCast(global_pool_mod.getGlobalPool(allocator)))),
                 .host = try allocator.dupe(u8, host),
                 .bucket = try allocator.dupe(u8, bucket),
@@ -152,8 +156,6 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.resolver.deinit();
-
             if (self.owns_pool) {
                 self.pool.deinit();
                 self.allocator.destroy(self.pool);
@@ -416,7 +418,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
 
             var dctx = DnsCtx{};
 
-            var resolver_iface = self.resolver.resolver();
+            var resolver_iface = self.resolver;
             log.debug("resolve: starting resolution for {s}:{d}", .{ self.host, self.port });
             resolver_iface.resolve(self.loop, self.host, self.port, &comp, DnsCtx.callback, &dctx);
 

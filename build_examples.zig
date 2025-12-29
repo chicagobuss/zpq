@@ -9,7 +9,6 @@ pub fn addExamples(
     boring_tls_mod: *std.Build.Module,
     install_examples: bool,
 ) void {
-    _ = optimize;
     if (!install_examples) return;
 
     // Lambda Bootstrap Example

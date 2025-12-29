@@ -16,17 +16,7 @@ pub fn main() !void {
     };
     defer allocator.free(runtime_api);
 
-    // 1. Initialize Async DNS Stack for S3
-    var thread_pool = xev.ThreadPool.init(.{});
-    defer thread_pool.deinit();
-
-    var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
-    var sf_resolver = zpq.s3.dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
-    defer sf_resolver.deinit();
-    var speculative = zpq.s3.dns.SpeculativeResolver.init(allocator, sf_resolver.resolver());
-    const resolver = speculative.resolver();
-
-    // 2. Create HTTP Client for Lambda Runtime API
+    // 1. Create HTTP Client for Lambda Runtime API
     // We use standard threaded IO for the runtime API as it's sequential/blocking anyway
     var threaded = std.Io.Threaded.init(allocator);
     defer threaded.deinit();
@@ -89,7 +79,7 @@ pub fn main() !void {
                     const val = body[start .. start + q2];
                     std.debug.print("Processing file: {s}\n", .{val});
 
-                    scan_benchmark(allocator, resolver, val) catch |err| {
+                    scan_benchmark(allocator, val) catch |err| {
                         std.debug.print("Scan error: {any}\n", .{err});
                         result_msg = "Error";
                     };
@@ -115,10 +105,10 @@ pub fn main() !void {
     }
 }
 
-fn scan_benchmark(allocator: std.mem.Allocator, resolver: zpq.s3.dns.Resolver, path: []const u8) !void {
+fn scan_benchmark(allocator: std.mem.Allocator, path: []const u8) !void {
     var timer = try std.time.Timer.start();
 
-    var pf = try openFile(allocator, path, resolver);
+    var pf = try openFile(allocator, path);
     defer pf.deinit();
     try pf.readFooter();
 
@@ -146,7 +136,7 @@ fn scan_benchmark(allocator: std.mem.Allocator, resolver: zpq.s3.dns.Resolver, p
     std.debug.print("Scanned {d} values in {d:.4}s\n", .{ total_values, elapsed_s });
 }
 
-fn openFile(allocator: std.mem.Allocator, path: []const u8, _: zpq.s3.dns.Resolver) !zpq.file.ParquetFile {
+fn openFile(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
     return zpq.s3.factory.openFileWithOptions(allocator, path, .{
         .force_async = true,
         .verify_tls = true,

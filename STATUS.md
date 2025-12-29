@@ -181,6 +181,7 @@ This principle drives every architectural decision:
 
 ### Milestone 15: Cleanup & Consolidation [COMPLETE]
 *   [x] **Delete Legacy**: Removed `async_source.zig`, `event_loop.zig`, `tls_adapter.zig`, `connection.zig`, `connection_pool.zig`, `request.zig`, `raw_s3_source.zig`, and related test files (~2,180 lines deleted).
+*   [x] **I/O Consolidation**: Moved `LocalFileSource` and `MemorySource` into `src/zpq/io/local/` and introduced `io.local` namespace.
 *   [x] **Factory Flip**: Made `XevS3Source` the definitive default for all `s3://` paths via `factory.openFile`.
 
 ### Milestone 16: Real-World Benchmarking & Performance Baseline [IN PROGRESS]

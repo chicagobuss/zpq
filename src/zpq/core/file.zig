@@ -11,14 +11,14 @@ pub const RowGroupReader = struct {
 
     // Sparse array of memory sources (indexed by column index)
     // If null, the column is not pre-fetched.
-    memory_sources: []?io.MemorySource,
+    memory_sources: []?io.local.MemorySource,
 
     // Buffers backing the memory sources.
     // We own these and must free them.
     buffers: std.ArrayListUnmanaged([]u8),
 
     pub fn init(file: *ParquetFile, meta: schema.RowGroup, allocator: std.mem.Allocator) !RowGroupReader {
-        const sources = try allocator.alloc(?io.MemorySource, meta.columns.items.len);
+        const sources = try allocator.alloc(?io.local.MemorySource, meta.columns.items.len);
         @memset(sources, null);
 
         return RowGroupReader{
@@ -107,7 +107,7 @@ pub const RowGroupReader = struct {
                 if (dpo < start) start = @intCast(dpo);
             }
 
-            self.memory_sources[col_idx] = io.MemorySource.initWithOffset(buf, start);
+            self.memory_sources[col_idx] = io.local.MemorySource.initWithOffset(buf, start);
             try self.buffers.append(self.allocator, buf);
         }
     }
@@ -140,7 +140,7 @@ pub const ParquetFile = struct {
     allocator: std.mem.Allocator,
 
     fn cleanupLocal(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-        const s: *io.LocalFileSource = @ptrCast(@alignCast(ctx));
+        const s: *io.local.FileSource = @ptrCast(@alignCast(ctx));
         s.deinit();
         allocator.destroy(s);
     }
@@ -154,10 +154,10 @@ pub const ParquetFile = struct {
 
     /// Open a local file path. ParquetFile owns the file source.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !ParquetFile {
-        const local_source = try allocator.create(io.LocalFileSource);
+        const local_source = try allocator.create(io.local.FileSource);
         errdefer allocator.destroy(local_source);
 
-        local_source.* = try io.LocalFileSource.init(path);
+        local_source.* = try io.local.FileSource.init(path);
         errdefer local_source.deinit();
 
         const source = local_source.source();

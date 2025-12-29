@@ -17,7 +17,9 @@ pub fn addExamples(
         needs_zpq: bool,
     }{
         .{ .name = "lambda-01-minimal", .path = "examples/lambda/01-minimal/main.zig", .needs_zpq = false },
-        .{ .name = "lambda-02-scan-benchmark", .path = "examples/lambda/02-scan-benchmark/main.zig", .needs_zpq = true },
+        .{ .name = "lambda-02-dns-warming", .path = "examples/lambda/02-dns-warming/main.zig", .needs_zpq = true },
+        .{ .name = "lambda-03-warm-s3", .path = "examples/lambda/03-warm-s3/main.zig", .needs_zpq = true },
+        .{ .name = "lambda-04-scan-benchmark", .path = "examples/lambda/04-scan-benchmark/main.zig", .needs_zpq = true },
     };
 
     for (examples) |example| {

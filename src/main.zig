@@ -171,7 +171,6 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     try pf.readFooter();
 
     var total_values: u64 = 0;
-    var total_bytes: u64 = 0;
 
     if (pf.metadata) |meta| {
         for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
@@ -181,15 +180,31 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             // Trigger Massive Parallel Prefetch!
             try rg.prefetch(null); // Prefetch all columns
 
-            for (rg_meta.columns.items, 0..) |_, col_idx| {
-                var reader = try rg.columnReader(col_idx);
-                while (try reader.next(allocator)) |page| {
-                    var p = page;
-                    defer p.deinit(allocator);
-                    total_bytes += p.data.len;
-                    if (p.header.data_page_header) |dph| {
-                        total_values += @intCast(dph.num_values);
-                    }
+            for (rg_meta.columns.items, 0..) |col, col_idx| {
+                if (col.meta_data) |md| {
+                    const levels = meta.getColumnLevels(md.path_in_schema.items);
+                    const reader = try rg.columnReader(col_idx);
+
+                    // Type dispatch for full-materialization scan
+                    const n = switch (md.type) {
+                        .BYTE_ARRAY => try scanColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def)),
+                        .INT32 => try scanColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def)),
+                        .INT64 => try scanColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def)),
+                        .FLOAT => try scanColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def)),
+                        .DOUBLE => try scanColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def)),
+                        else => blk: {
+                            // Fallback for unsupported types (just count pages)
+                            var reader_inner = try rg.columnReader(col_idx);
+                            var count: u64 = 0;
+                            while (try reader_inner.next(allocator)) |page| {
+                                var p = page;
+                                defer p.deinit(allocator);
+                                if (p.header.data_page_header) |dph| count += @intCast(dph.num_values);
+                            }
+                            break :blk count;
+                        },
+                    };
+                    total_values += n;
                 }
             }
         }
@@ -197,10 +212,24 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
 
     const elapsed_ns = timer.read();
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
-    const mb = @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0);
+    const mvals_per_s = if (elapsed_s > 0) @as(f64, @floatFromInt(total_values)) / elapsed_s / 1_000_000.0 else 0.0;
 
-    std.debug.print("Scanned {d} values ({d:.2} MB uncompressed page data) in {d:.4}s\n", .{ total_values, mb, elapsed_s });
-    std.debug.print("Throughput: {d:.2} MB/s (pages), {d:.2} MVal/s\n", .{ mb / elapsed_s, @as(f64, @floatFromInt(total_values)) / elapsed_s / 1_000_000.0 });
+    std.debug.print("Scanned {d} values in {d:.2}ms ({d:.2} MVal/s)\n", .{ total_values, @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0, mvals_per_s });
+}
+
+fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16) !u64 {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def);
+    defer batch_reader.deinit();
+
+    var total: u64 = 0;
+    var buffer: [1024]?T = undefined;
+
+    while (true) {
+        const n = try batch_reader.nextBatch(&buffer);
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
 }
 
 fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool) !void {

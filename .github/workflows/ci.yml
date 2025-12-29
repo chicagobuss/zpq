@@ -30,8 +30,6 @@ jobs:
       - name: Set up anyzig
         run: |
           echo "::group::Installing anyzig"
-          # Use anyzig to manage Zig versioning based on build.zig.zon
-          # This matches the local development workflow.
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then
             URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz"
@@ -42,13 +40,15 @@ jobs:
             exit 1
           fi
           
-          curl -fsSL "$URL" | tar -xz
+          # Extract and ensure the binary is in the current directory
+          # anyzig releases usually have a top-level directory in the tarball
+          mkdir -p anyzig_tmp
+          curl -fsSL "$URL" | tar -xz -C anyzig_tmp --strip-components=1
           
-          # Create a local bin directory and add it to PATH
-          # On self-hosted runners, we avoid modifying system /usr/local/bin
           mkdir -p $HOME/.local/bin
-          mv anyzig $HOME/.local/bin/zig
+          mv anyzig_tmp/anyzig $HOME/.local/bin/zig
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+          rm -rf anyzig_tmp
           echo "::endgroup::"
 
       - name: Verify Zig Version

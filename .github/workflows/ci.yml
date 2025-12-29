@@ -83,18 +83,14 @@ jobs:
       - name: Build
         run: |
           echo "::group::Zig Build (Necessities)"
-          # Combined build: 
-          # - zpq (the main CLI)
-          # - bench-e2e (the performance watchdog)
-          # - examples (the cloud deployment target)
-          # We omit -Dall=true here to save ~3 mins of linking/optimizing 30+ non-critical binaries
-          zig build -Doptimize=ReleaseFast -Dexamples bench-e2e --summary all 2>&1
+          # Build only the binaries needed for CI verification and benchmarks.
+          # Including 'zpq' explicitly ensures it's installed to zig-out/bin/
+          zig build -Doptimize=ReleaseFast -Dexamples bench-e2e zpq --summary all 2>&1
           echo "::endgroup::"
 
-          echo "::group::Full Compilation Check (All Probes & Tests)"
-          # Verify that the entire codebase (including all 36+ probes/tests) compiles.
-          # The 'check' step skips the expensive linking/binary emission phase.
-          zig build check -Doptimize=ReleaseFast -Dall=true --summary all 2>&1
+          echo "::group::Quick Compilation Check (All Probes & Tests)"
+          # Fast check of the entire codebase in Debug mode (no linking/optimization)
+          zig build check -Dall=true --summary all 2>&1
           echo "::endgroup::"
 
           echo "Build artifacts:"

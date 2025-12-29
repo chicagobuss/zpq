@@ -3,6 +3,7 @@ const zpq = @import("../../zpq.zig");
 const schema = zpq.schema;
 const ColumnReader = zpq.column.ColumnReader;
 const RleDecoder = zpq.rle.RleDecoder;
+const Decoder = zpq.decoder.Decoder;
 const simd = @import("simd.zig");
 
 pub fn BatchReader(comptime T: type) type {
@@ -18,6 +19,7 @@ pub fn BatchReader(comptime T: type) type {
         
         // Page decoders
         rle_decoder: ?RleDecoder = null,
+        plain_decoder: ?Decoder = null,
         def_levels_decoder: ?RleDecoder = null,
         
         // Dictionary (if any)
@@ -55,7 +57,9 @@ pub fn BatchReader(comptime T: type) type {
 
                 const count = @min(buffer.len - out_pos, self.values_remaining_in_page);
                 
-                // Vectorized path for non-nullable dictionary-encoded columns
+                // --- VECTORIZED PATHS ---
+                
+                // 1. Non-nullable Dictionary-encoded
                 if (self.max_def_level == 0 and self.rle_decoder != null and self.dictionary != null) {
                     var indices: [1024]u64 = undefined;
                     const to_read = @min(count, indices.len);
@@ -70,7 +74,65 @@ pub fn BatchReader(comptime T: type) type {
                     continue;
                 }
 
-                // Fallback to scalar
+                // 2. Non-nullable PLAIN-encoded (primitives)
+                if (self.max_def_level == 0 and self.plain_decoder != null and T != []const u8) {
+                    // TODO: SIMD load for PLAIN primitives
+                    for (0..count) |i| {
+                        buffer[out_pos + i] = try self.decodePlainScalar();
+                    }
+                    out_pos += count;
+                    self.values_remaining_in_page -= count;
+                    continue;
+                }
+
+                // 3. Nullable Dictionary-encoded
+                if (self.max_def_level > 0 and self.def_levels_decoder != null and self.rle_decoder != null and self.dictionary != null) {
+                    // Use expandNullsBatch8 logic
+                    var batch_size: usize = 0;
+                    while (batch_size < count) {
+                        const batch_rem = @min(8, count - batch_size);
+                        var def_levels: [8]u64 = undefined;
+                        const n_def = try self.def_levels_decoder.?.nextBatch(def_levels[0..batch_rem]);
+                        if (n_def == 0) break;
+
+                        // Identify how many values we actually need to pull from data stream
+                        var mask: u8 = 0;
+                        var values_needed: u8 = 0;
+                        for (0..n_def) |i| {
+                            if (def_levels[i] == self.max_def_level) {
+                                mask |= (@as(u8, 1) << @intCast(i));
+                                values_needed += 1;
+                            }
+                        }
+
+                        if (values_needed > 0) {
+                            var indices: [8]u64 = undefined;
+                            const n_idx = try self.rle_decoder.?.nextBatch(indices[0..values_needed]);
+                            if (n_idx < values_needed) return error.EndOfStream;
+
+                            // Map indices to dictionary values
+                            var compact_vals: [8]T = undefined;
+                            const dict = self.dictionary.?;
+                            for (0..n_idx) |i| {
+                                compact_vals[i] = dict[indices[i]];
+                            }
+
+                            // Expand into the output buffer
+                            var tmp_out: [8]?T = undefined;
+                            _ = simd.expandNullsBatch8(T, compact_vals[0..n_idx], mask, &tmp_out);
+                            @memcpy(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], tmp_out[0..n_def]);
+                        } else {
+                            @memset(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], null);
+                        }
+                        
+                        batch_size += n_def;
+                        self.values_remaining_in_page -= n_def;
+                    }
+                    out_pos += batch_size;
+                    continue;
+                }
+
+                // --- SCALAR FALLBACK ---
                 for (0..count) |_| {
                     buffer[out_pos] = try self.nextValue();
                     out_pos += 1;
@@ -129,16 +191,16 @@ pub fn BatchReader(comptime T: type) type {
                     return error.UnsupportedTypeForDictionary;
                 }
             }
-            if (self.dictionary) |d| self.allocator.free(d);
+            if (self.dictionary) |d| {
+                if (T == []const u8) for (d) |s| self.allocator.free(s);
+                self.allocator.free(d);
+            }
             self.dictionary = try items.toOwnedSlice(self.allocator);
         }
 
         fn initPageDecoders(self: *Self, page: zpq.column.Page) !void {
             const dph = page.header.data_page_header.?;
             var data_slice = page.data;
-
-            // Skip repetition levels (not supported yet)
-            // if (max_rep > 0) ...
 
             // Definition levels
             if (self.max_def_level > 0) {
@@ -154,14 +216,35 @@ pub fn BatchReader(comptime T: type) type {
                 self.def_levels_decoder = null;
             }
 
-            // Data
+            // Data Encodings
             if (dph.encoding == .RLE_DICTIONARY or dph.encoding == .PLAIN_DICTIONARY) {
                 if (data_slice.len > 0) {
                     const bit_width = data_slice[0];
                     self.rle_decoder = RleDecoder.init(data_slice[1..], bit_width);
+                    self.plain_decoder = null;
                 }
+            } else if (dph.encoding == .PLAIN) {
+                self.plain_decoder = Decoder.init(data_slice);
+                self.rle_decoder = null;
             } else {
-                self.rle_decoder = null; // PLAIN or other
+                return error.UnsupportedEncoding;
+            }
+        }
+
+        fn decodePlainScalar(self: *Self) !T {
+            const dec = &self.plain_decoder.?;
+            if (T == []const u8) {
+                return try dec.readByteArray();
+            } else if (T == i32) {
+                return @intCast(try dec.readInt32());
+            } else if (T == i64 or T == u64) {
+                return @intCast(try dec.readInt64());
+            } else if (T == f32) {
+                return try dec.readFloat();
+            } else if (T == f64) {
+                return try dec.readDouble();
+            } else {
+                return error.UnsupportedTypeForPlain;
             }
         }
 
@@ -180,8 +263,10 @@ pub fn BatchReader(comptime T: type) type {
                 return error.MissingDictionary;
             }
 
-            // PLAIN fallback
-            // TODO: implement PLAIN decoding from current_page.data
+            if (self.plain_decoder != null) {
+                return try self.decodePlainScalar();
+            }
+
             return error.UnsupportedEncoding;
         }
     };

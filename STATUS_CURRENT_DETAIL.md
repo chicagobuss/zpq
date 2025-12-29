@@ -6,6 +6,20 @@
 ## Milestone 18: SIMD Decoders (In Progress)
 ZPQ's decode performance now leverages Zig 0.16's native `@Vector` support for extreme throughput.
 
+### Plan: Core Engine Batch Integration
+**Goal**: Transition from row-at-a-time decoding in `main.zig` to 1024-wide vectorized batches via `BatchReader`.
+
+1.  **`BatchReader` Parity**:
+    *   [ ] **PLAIN Encoding**: Implement `PLAIN` decoder support for all primitive types.
+    *   [ ] **Vectorized Nulls**: Integrate `expandNullsBatch8` to handle nullable columns without branchy scalar loops.
+    *   [ ] **Repetition Levels**: Add skipping logic for nested types to maintain data alignment.
+2.  **CLI Refactor**:
+    *   [ ] **`scan` command**: Replace 150+ lines of manual decoding logic with a clean `BatchReader` loop.
+    *   [ ] **`cat` command**: Update to use `BatchReader` for unified materialization.
+3.  **Performance Verification**:
+    *   [ ] Compare `just bench` results before/after integration to ensure no overhead on I/O-bound tasks.
+    *   [ ] Run `bench-decode-full` to verify 3x+ speedup on CPU-bound local scans.
+
 ### Key Achievements:
 *   **Vector-Vector Shifts**: Utilized Zig's first-class support for `v1 >> v2` where both are vectors to implement parallel bit-unpacking for widths 1-32.
 *   **Large-Integer Load**: Used `u128` and `u256` as SIMD containers to load 8 values in a single unaligned read, minimizing memory instructions.

@@ -268,7 +268,10 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
 
     // Simple Columnar Dump
     if (pf.metadata) |meta| {
-        for (meta.row_groups.items) |rg| {
+        for (meta.row_groups.items, 0..) |rg, rg_idx| {
+            var rg_reader = try pf.rowGroup(rg_idx);
+            defer rg_reader.deinit();
+
             for (rg.columns.items, 0..) |col, col_idx| {
                 if (col.meta_data) |md| {
                     std.debug.print("Column {d} (", .{col_idx});
@@ -278,135 +281,47 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
                     }
                     std.debug.print("):\n", .{});
 
-                    var dict_strings = std.ArrayListUnmanaged([]const u8){};
-                    defer dict_strings.deinit(allocator);
-                    var dict_int32 = std.ArrayListUnmanaged(i32){};
-                    defer dict_int32.deinit(allocator);
-                    var dict_int64 = std.ArrayListUnmanaged(i64){};
-                    defer dict_int64.deinit(allocator);
-                    var dict_double = std.ArrayListUnmanaged(f64){};
-                    defer dict_double.deinit(allocator);
-                    var dict_float = std.ArrayListUnmanaged(f32){};
-                    defer dict_float.deinit(allocator);
-
                     const levels = meta.getColumnLevels(md.path_in_schema.items);
-                    var reader = try zpq.column.ColumnReader.init(pf.source, col);
+                    const reader = try rg_reader.columnReader(col_idx);
 
-                    var values_printed: usize = 0;
-
-                    while (try reader.next(allocator)) |page| {
-                        if (values_printed >= limit) break;
-
-                        var p = page;
-                        defer p.deinit(allocator);
-
-                        if (p.header.type == .DICTIONARY_PAGE) {
-                            var decoder = zpq.decoder.Decoder.init(p.data);
-                            if (md.type == .BYTE_ARRAY) {
-                                while (decoder.hasMore()) {
-                                    const val = try decoder.readByteArray();
-                                    const val_copy = try allocator.dupe(u8, val);
-                                    try dict_strings.append(allocator, val_copy);
-                                }
-                            } else if (md.type == .INT32) {
-                                while (decoder.hasMore()) try dict_int32.append(allocator, try decoder.readInt32());
-                            } else if (md.type == .INT64) {
-                                while (decoder.hasMore()) try dict_int64.append(allocator, try decoder.readInt64());
-                            } else if (md.type == .DOUBLE) {
-                                while (decoder.hasMore()) try dict_double.append(allocator, try decoder.readDouble());
-                            } else if (md.type == .FLOAT) {
-                                while (decoder.hasMore()) try dict_float.append(allocator, try decoder.readFloat());
-                            }
-                        } else if (p.header.type == .DATA_PAGE) {
-                            if (p.header.data_page_header) |dph| {
-                                if (dph.encoding == .RLE_DICTIONARY or dph.encoding == .PLAIN_DICTIONARY) {
-                                    var data_slice = p.data;
-
-                                    // Skip Repetition Levels
-                                    if (levels.max_rep > 0) {
-                                        if (data_slice.len < 4) break;
-                                        const len = std.mem.readInt(u32, data_slice[0..4], .little);
-                                        if (data_slice.len < 4 + len) break;
-                                        data_slice = data_slice[4 + len ..];
-                                    }
-
-                                    // Decode Definition Levels
-                                    var def_levels = std.ArrayListUnmanaged(i32){};
-                                    defer def_levels.deinit(allocator);
-
-                                    if (levels.max_def > 0) {
-                                        if (data_slice.len < 4) break;
-                                        const len = std.mem.readInt(u32, data_slice[0..4], .little);
-                                        if (data_slice.len < 4 + len) break;
-                                        const def_level_data = data_slice[4 .. 4 + len];
-                                        data_slice = data_slice[4 + len ..];
-
-                                        const max_val = @as(u32, @intCast(levels.max_def)) + 1;
-                                        const next_pow2 = try std.math.ceilPowerOfTwo(u32, max_val);
-                                        const bit_width = std.math.log2_int(u32, next_pow2);
-                                        var rle_dec = zpq.rle.RleDecoder.init(def_level_data, @intCast(bit_width));
-
-                                        var count: usize = 0;
-                                        while (count < dph.num_values) : (count += 1) {
-                                            if (rle_dec.next()) |res| {
-                                                if (res) |val| try def_levels.append(allocator, @intCast(val));
-                                            } else |_| break;
-                                        }
-                                    }
-
-                                    if (data_slice.len > 0) {
-                                        const bit_width = data_slice[0];
-                                        var rle_dec = zpq.rle.RleDecoder.init(data_slice[1..], bit_width);
-
-                                        if (levels.max_def > 0) {
-                                            for (def_levels.items) |dl| {
-                                                if (values_printed >= limit) break;
-
-                                                if (dl == levels.max_def) {
-                                                    if (try rle_dec.next()) |idx| {
-                                                        if (md.type == .BYTE_ARRAY) {
-                                                            if (idx < dict_strings.items.len) std.debug.print("  {s}\n", .{dict_strings.items[idx]});
-                                                        } else if (md.type == .INT64) {
-                                                            if (idx < dict_int64.items.len) std.debug.print("  {d}\n", .{dict_int64.items[idx]});
-                                                        } else if (md.type == .INT32) {
-                                                            if (idx < dict_int32.items.len) std.debug.print("  {d}\n", .{dict_int32.items[idx]});
-                                                        } else if (md.type == .DOUBLE) {
-                                                            if (idx < dict_double.items.len) std.debug.print("  {d}\n", .{dict_double.items[idx]});
-                                                        } else {
-                                                            std.debug.print("  <val>\n", .{});
-                                                        }
-                                                        values_printed += 1;
-                                                    }
-                                                } else {
-                                                    std.debug.print("  null\n", .{});
-                                                    values_printed += 1;
-                                                }
-                                            }
-                                        } else {
-                                            var k: i32 = 0;
-                                            while (k < dph.num_values) : (k += 1) {
-                                                if (values_printed >= limit) break;
-                                                if (try rle_dec.next()) |idx| {
-                                                    if (md.type == .BYTE_ARRAY) {
-                                                        if (idx < dict_strings.items.len) std.debug.print("  {s}\n", .{dict_strings.items[idx]});
-                                                    } else if (md.type == .INT64) {
-                                                        if (idx < dict_int64.items.len) std.debug.print("  {d}\n", .{dict_int64.items[idx]});
-                                                    } else {
-                                                        std.debug.print("  <val>\n", .{});
-                                                    }
-                                                    values_printed += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Type dispatch for BatchReader
+                    switch (md.type) {
+                        .BYTE_ARRAY => try dumpColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), limit),
+                        .INT32 => try dumpColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), limit),
+                        .INT64 => try dumpColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), limit),
+                        .FLOAT => try dumpColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), limit),
+                        .DOUBLE => try dumpColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), limit),
+                        else => std.debug.print("        (Type {any} not yet supported by BatchReader)\n", .{md.type}),
                     }
-
-                    for (dict_strings.items) |s| allocator.free(s);
                 }
             }
+        }
+    }
+}
+
+fn dumpColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, limit: usize) !void {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def);
+    defer batch_reader.deinit();
+
+    var values_printed: usize = 0;
+    var buffer: [1024]?T = undefined;
+
+    while (values_printed < limit) {
+        const batch_size = @min(buffer.len, limit - values_printed);
+        const n = try batch_reader.nextBatch(buffer[0..batch_size]);
+        if (n == 0) break;
+
+        for (buffer[0..n]) |maybe_val| {
+            if (maybe_val) |val| {
+                if (T == []const u8) {
+                    std.debug.print("  {s}\n", .{val});
+                } else {
+                    std.debug.print("  {any}\n", .{val});
+                }
+            } else {
+                std.debug.print("  null\n", .{});
+            }
+            values_printed += 1;
         }
     }
 }

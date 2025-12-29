@@ -24,21 +24,34 @@ pub fn main() !void {
         var rg_reader = try file.rowGroup(rg_idx);
         defer rg_reader.deinit();
         
-        // Let's try to read the "name" column (index 1) using BatchReader
-        const col_idx = 1;
+        // Let's try to read the first column using BatchReader
+        const col_idx = 0;
         const col = rg.columns.items[col_idx];
         const md = col.meta_data.?;
         const levels = meta.getColumnLevels(md.path_in_schema.items);
         
         const reader = try rg_reader.columnReader(col_idx);
-        var batch_reader = BatchReader([]const u8).init(allocator, reader, md.type, @intCast(levels.max_def));
-        defer batch_reader.deinit();
+        
+        if (md.type == .INT32) {
+            var batch_reader = BatchReader(i32).init(allocator, reader, md.type, @intCast(levels.max_def));
+            defer batch_reader.deinit();
 
-        var batch: [1024]?[]const u8 = undefined;
-        while (true) {
-            const n = try batch_reader.nextBatch(&batch);
-            if (n == 0) break;
-            std.debug.print("Read batch of {d} values\n", .{n});
+            var batch: [1024]?i32 = undefined;
+            while (true) {
+                const n = try batch_reader.nextBatch(&batch);
+                if (n == 0) break;
+                std.debug.print("Read batch of {d} values (i32)\n", .{n});
+            }
+        } else {
+            var batch_reader = BatchReader([]const u8).init(allocator, reader, md.type, @intCast(levels.max_def));
+            defer batch_reader.deinit();
+
+            var batch: [1024]?[]const u8 = undefined;
+            while (true) {
+                const n = try batch_reader.nextBatch(&batch);
+                if (n == 0) break;
+                std.debug.print("Read batch of {d} values (string)\n", .{n});
+            }
         }
     }
 }

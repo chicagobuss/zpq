@@ -170,8 +170,61 @@ pub fn addAuxiliaryTools(
 
         // Separate run step
         const run = b.addRunArtifact(exe);
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
         const run_step = b.step("run-bench-decode", "Run full decode benchmark (apples-to-apples)");
         run_step.dependOn(&run.step);
+    }
+
+    // bench-simd (SIMD bit-unpacking and RLE benchmark)
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("benchmarks/simd_bitunpack.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "bench-simd",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+
+        if (install_all) b.installArtifact(exe);
+        if (check_step) |s| s.dependOn(&exe.step);
+
+        const build_step = b.step("bench-simd", "Build SIMD bit-unpacking benchmark");
+        const install = b.addInstallArtifact(exe, .{});
+        build_step.dependOn(&install.step);
+
+        const run = b.addRunArtifact(exe);
+        const run_step = b.step("run-bench-simd", "Run SIMD bit-unpacking benchmark");
+        run_step.dependOn(&run.step);
+    }
+
+    // test-batch-reader
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/test_batch_reader.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "test-batch-reader",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+
+        const run = b.addRunArtifact(exe);
+        if (b.args) |args| {
+            run.addArgs(args);
+        }
+        const step = b.step("test-batch-reader", "Run BatchReader test probe");
+        step.dependOn(&run.step);
     }
 
     // Hardening Proofs / Integration tests

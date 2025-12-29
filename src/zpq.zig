@@ -16,6 +16,8 @@ pub const core = struct {
     pub const thrift = @import("zpq/core/thrift.zig");
     pub const writer = @import("zpq/core/writer.zig");
     pub const page_writer = @import("zpq/core/page_writer.zig");
+    pub const simd = @import("zpq/core/simd.zig");
+    pub const batch_reader = @import("zpq/core/batch_reader.zig");
 };
 
 pub const io = struct {

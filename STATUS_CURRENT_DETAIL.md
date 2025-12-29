@@ -1,7 +1,22 @@
 # ZPQ Technical Context and Detail
 
 **Last Updated**: Dec 29, 2025
-**Current State**: Milestone 17 (Lambda & Loop-Agnostic I/O) in progress. Polished `factory.zig` and fixed DNS resolver injection, verified with CI. Milestone 10 (Empirical Proof) verified on ARM64 hardware. Batched column prefetch optimization delivers 1.7x speedup over PyArrow on cold starts.
+**Current State**: Milestone 18 (SIMD Decoders) in progress. Achieved **3.1 GVal/s** bit-unpacking throughput using comptime-generated vector kernels. Milestone 17 (Lambda & Loop-Agnostic I/O) completed. Milestone 10 (Empirical Proof) verified on ARM64 hardware.
+
+## Milestone 18: SIMD Decoders (In Progress)
+ZPQ's decode performance now leverages Zig 0.16's native `@Vector` support for extreme throughput.
+
+### Key Achievements:
+*   **Vector-Vector Shifts**: Utilized Zig's first-class support for `v1 >> v2` where both are vectors to implement parallel bit-unpacking for widths 1-32.
+*   **Large-Integer Load**: Used `u128` and `u256` as SIMD containers to load 8 values in a single unaligned read, minimizing memory instructions.
+*   **Batch Decoding**: Implemented `RleDecoder.nextBatch(buffer)` to expose SIMD speed to the rest of the engine.
+*   **Micro-benchmarks**:
+    *   **Bit-Unpacking**: ~3,100 MVal/s (ARM64/M3 Max).
+    *   **Null Expansion**: ~1,800 MVal/s using branchless SIMD expansion.
+*   **E2E Integration**: Refactored `bench-decode-full` to use batch reading, verifying the path in real-world scenarios.
+
+## Milestone 17: Lambda & Loop-Agnostic I/O (Completed)
+Polished `factory.zig` and fixed DNS resolver injection, verified with CI. Milestone 10 (Empirical Proof) verified on ARM64 hardware. Batched column prefetch optimization delivers 1.7x speedup over PyArrow on cold starts.
 
 ## Milestone 9: Hardening & Transport Stability (Completed)
 Extensive debugging and refactoring to ensure production-grade stability and memory safety.

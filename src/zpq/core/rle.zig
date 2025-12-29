@@ -61,6 +61,113 @@ pub const RleDecoder = struct {
         return null;
     }
 
+    /// Read multiple values into a buffer. Returns number of values actually read.
+    pub fn nextBatch(self: *RleDecoder, buffer: []u64) !usize {
+        var out_pos: usize = 0;
+        while (out_pos < buffer.len) {
+            // Check if we have repeat values
+            if (self.repeat_count > 0) {
+                const count = @min(buffer.len - out_pos, self.repeat_count);
+                @memset(buffer[out_pos .. out_pos + count], self.current_value);
+                self.repeat_count -= @intCast(count);
+                out_pos += count;
+                continue;
+            }
+
+            // Check if we have literal values
+            if (self.literal_count > 0) {
+                // Try to use vectorized unpacking for groups of 8
+                if (self.bitpack_pos == 0 and self.literal_count >= 8 and (buffer.len - out_pos) >= 8) {
+                    const count = @min(self.literal_count, (buffer.len - out_pos)) / 8 * 8;
+                    for (0..count / 8) |_| {
+                        self.readBitPackedBatch8(buffer[out_pos .. out_pos + 8]);
+                        out_pos += 8;
+                        self.literal_count -= 8;
+                    }
+                    continue;
+                }
+
+                // Fallback to scalar
+                buffer[out_pos] = try self.readBitPackedValue();
+                out_pos += 1;
+                continue;
+            }
+
+            // Need new counts
+            if (!self.nextCounts()) break;
+        }
+        return out_pos;
+    }
+
+    /// Optimized unpacking for 8 values. Requires bitpack_pos == 0.
+    fn readBitPackedBatch8(self: *RleDecoder, out: []u64) void {
+        std.debug.assert(self.bitpack_pos == 0);
+        std.debug.assert(out.len >= 8);
+
+        const bw = self.bit_width;
+        if (bw == 0) {
+            @memset(out[0..8], 0);
+            return;
+        }
+
+        // Use inline switch for specialized bit-unpacking kernels
+        switch (bw) {
+            inline 1...32 => |width| {
+                const total_bits: u16 = @as(u16, width) * 8;
+                const total_bytes = (total_bits + 7) / 8;
+                
+                // Choose smallest container that fits all 8 values
+                const Container = comptime switch (width) {
+                    1...8 => u64,
+                    9...16 => u128,
+                    17...32 => u256,
+                    else => unreachable,
+                };
+
+                var bits: Container = 0;
+                const remaining = self.data.len - self.pos;
+                if (remaining >= total_bytes) {
+                    if (remaining >= @sizeOf(Container)) {
+                        // Fast path: direct unaligned load
+                        bits = std.mem.readInt(Container, self.data[self.pos..][0..@sizeOf(Container)], .little);
+                    } else {
+                        // Middle path: enough for group but not full Container load
+                        var buf: [@sizeOf(Container)]u8 = @splat(0);
+                        @memcpy(buf[0..total_bytes], self.data[self.pos .. self.pos + total_bytes]);
+                        bits = std.mem.readInt(Container, &buf, .little);
+                    }
+                    self.pos += total_bytes;
+                } else {
+                    // Slow path: bounded load (not even enough for full group)
+                    const limit = remaining;
+                    var buf: [@sizeOf(Container)]u8 = @splat(0);
+                    @memcpy(buf[0..limit], self.data[self.pos .. self.pos + limit]);
+                    bits = std.mem.readInt(Container, &buf, .little);
+                    self.pos += limit;
+                }
+
+                const v_bits: @Vector(8, Container) = @splat(bits);
+                comptime var shifts: [8]std.math.Log2Int(Container) = undefined;
+                inline for (0..8) |i| {
+                    shifts[i] = @intCast(i * width);
+                }
+                const v_shifts: @Vector(8, std.math.Log2Int(Container)) = shifts;
+                const mask: Container = (@as(Container, 1) << width) - 1;
+                const v_res = (v_bits >> v_shifts) & @as(@Vector(8, Container), @splat(mask));
+                
+                inline for (0..8) |i| {
+                    out[i] = @intCast(v_res[i]);
+                }
+            },
+            else => {
+                // Fallback to scalar for very large widths
+                for (0..8) |i| {
+                    out[i] = self.readBitPackedValue() catch unreachable;
+                }
+            },
+        }
+    }
+
     /// Read next RLE/literal header and set up state
     fn nextCounts(self: *RleDecoder) bool {
         // If we're mid-byte in bit-packed mode, advance to next byte

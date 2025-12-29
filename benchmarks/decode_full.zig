@@ -153,9 +153,15 @@ pub fn main() !void {
                                 const bit_width = data_slice[0];
                                 var rle_dec = zpq.rle.RleDecoder.init(data_slice[1..], bit_width);
 
+                                var batch_buf: [1024]u64 = undefined;
                                 var count: usize = 0;
-                                while (count < dph.num_values) : (count += 1) {
-                                    if (try rle_dec.next()) |idx| {
+                                const num_values = @as(usize, @intCast(dph.num_values));
+                                while (count < num_values) {
+                                    const batch_size = @min(batch_buf.len, num_values - count);
+                                    const n = try rle_dec.nextBatch(batch_buf[0..batch_size]);
+                                    if (n == 0) break;
+
+                                    for (batch_buf[0..n]) |idx| {
                                         // Actually look up dictionary value (simulates materialization)
                                         if (md.type == .BYTE_ARRAY and idx < dict_strings.items.len) {
                                             _ = dict_strings.items[idx];
@@ -169,9 +175,8 @@ pub fn main() !void {
                                             _ = dict_float.items[idx];
                                         }
                                         values_decoded += 1;
-                                    } else {
-                                        break;
                                     }
+                                    count += n;
                                 }
                             }
                         } else if (dph.encoding == .PLAIN) {

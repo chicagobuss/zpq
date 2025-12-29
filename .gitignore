@@ -1,0 +1,38 @@
+# Local-only artifacts / scratch
+certs/
+data/
+references/
+
+# Zig / Build
+zig-cache/
+.zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Python / Venv
+.venv/
+__pycache__/
+*.pyc
+
+
+# Env
+.env*
+!.env.example
+mock_s3_server
+nc_output.txt
+
+# RustFS / Local Testing
+rustfs_data/
+tools/rustfs_tls/certs/
+*.parquet
+!ci/fixtures/parquet/*.parquet
+ci/fixtures/parquet/sales_large.parquet
+!data/simple.parquet
+!data/large_bitpacked.parquet
+!data/large_rle.parquet
+tmp/
+vendor/boring_tls/prebuilt/

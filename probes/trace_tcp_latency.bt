@@ -1,0 +1,50 @@
+#!/usr/bin/env bpftrace
+/*
+ * trace_tcp_latency.bt - Trace TCP read latency for shootout analysis
+ */
+
+BEGIN {
+    printf("Tracing TCP read latency for shootout-tls... Ctrl+C to stop\n");
+}
+
+/* Track when read starts */
+tracepoint:syscalls:sys_enter_read
+/comm == "shootout-tls"/
+{
+    @start[tid] = nsecs;
+}
+
+/* Measure read completion */
+tracepoint:syscalls:sys_exit_read
+/comm == "shootout-tls" && @start[tid]/
+{
+    $latency_us = (nsecs - @start[tid]) / 1000;
+    $bytes = args->ret;
+    
+    if ($bytes > 0) {
+        @bytes_hist = lhist($bytes, 0, 65536, 4096);
+        @latency_us_hist = lhist($latency_us, 0, 50000, 1000);
+        @total_bytes = @total_bytes + $bytes;
+        @total_reads = @total_reads + 1;
+    }
+    
+    delete(@start[tid]);
+}
+
+END {
+    printf("\n=== Summary ===\n");
+    printf("Total bytes: %lld\n", @total_bytes);
+    printf("Total reads: %lld\n", @total_reads);
+    
+    printf("\n=== Bytes per read ===\n");
+    print(@bytes_hist);
+    
+    printf("\n=== Read latency (us) ===\n");
+    print(@latency_us_hist);
+    
+    clear(@start);
+    clear(@bytes_hist);
+    clear(@latency_us_hist);
+    clear(@total_bytes);
+    clear(@total_reads);
+}

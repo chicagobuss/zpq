@@ -1,0 +1,12 @@
+.{
+    .name = .zpq_probes,
+    .version = "0.0.1",
+    .fingerprint = 0x36854fb30de9f4ec,
+    .dependencies = .{
+        // Reference parent project for zpq module and its transitive deps
+        .zpq_parent = .{
+            .path = "..",
+        },
+    },
+    .paths = .{""},
+}

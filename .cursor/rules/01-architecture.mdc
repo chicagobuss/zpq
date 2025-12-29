@@ -1,0 +1,124 @@
+---
+description: Architectural Guardrails & Patterns for ZPQ
+alwaysApply: false
+---
+# ZPQ Architecture & Guardrails regarding working with bleeding-edge 0.16.x zig
+
+## 0. The Laziness Principle (Foundational)
+
+> **ZPQ preserves data in its most compact/encoded form as long as possible. Decoding, decompression, and re-encoding happen only at the boundaries where transformation is required.**
+
+This is ZPQ's core architectural philosophy. Every design decision should ask: "Can we avoid doing this work?"
+
+### What This Means in Practice
+
+| Operation | Conventional Approach | ZPQ Approach |
+|-----------|----------------------|--------------|
+| Column projection | Decode all, select some | Never read unselected columns from storage |
+| Row filtering | Decode all rows, discard non-matching | Skip row groups via stats, decode only filter column |
+| Pass-through columns | Decode → re-encode | Copy compressed bytes verbatim |
+| Dictionary columns | Decode to strings | Keep dictionary-encoded through pipeline |
+| Type casting | Decode → cast → encode | Only decode/encode if actually transforming |
+
+### Architectural Implications
+
+*   **Late Materialization**: Keep data in Parquet's native encoding (RLE, dictionary, delta) until a consumer actually needs decoded values.
+*   **Metadata-First**: Parse and leverage Parquet metadata (row group stats, column indexes) to skip work before touching data.
+*   **Copy-Through Optimization**: When columns pass through unchanged, copy the compressed bytes and rewrite only the footer/metadata.
+*   **Selective Decoding**: For filtered reads, decode only the predicate columns to build a selection vector, then selectively process other columns.
+
+### Guardrail
+
+Before implementing any data transformation:
+1. Ask: "Does this column actually change?"
+2. If no: pass through encoded bytes
+3. If yes: decode only the affected rows/pages
+
+## 1. The Golden Rule: `std.Io` Only
+*   **Business Logic Constraint**: `ParquetFile` and `S3Source` logic MUST NOT import `xev`, `epoll`, or `kqueue`.
+*   **Interface**: All I/O must go through `std.Io` interfaces (`Reader`, `Writer`, `SeekableStream`) or the `RandomAccessSource` abstraction.
+*   **Pattern**: Inject `io: std.Io` (or the source abstraction) into structs. Use adapters (e.g., `XevIo`) to bridge `libxev` to `std.Io`.
+
+## 2. Protocol Design: "Sans-I/O"
+*   **Decouple**: Separate protocol logic (S3 request formatting, SigV4, XML parsing) from socket operations.
+*   **Guardrail**: Prefer `Serializer.writeTo(writer)` over `socket.write(bytes)`.
+*   **Benefit**: Allows testing protocol logic with `ArrayList` writers without network mocks.
+
+## 3. High-Performance S3 / Object Store Patterns
+*   **Stateless Random-Access**: Treat S3 files as stateless blobs. Do not attempt to emulate stateful file handles (open, seek, read, close). Use the "Read At Offset" pattern.
+*   **Range Coalescing**: S3 latency (Time to First Byte) is high (50-100ms). If the reader asks for multiple small, nearby ranges, merge them into one larger HTTP request to save round-trips, even if some bandwidth is "wasted" on gaps.
+*   **Footer Optimization**: Always prefetch the last 64KB (or similar) of the file first to obtain the Parquet footer and metadata in a single request.
+*   **Parallel Range Fetches**: S3 throughput scales with concurrent connections. Use multiple connections to read different row groups or columns simultaneously.
+*   **Lazy Connection**: Don't open the physical connection/TLS handshake until the first `read()` is actually called.
+
+## 4. Cancellation & Context
+*   **Explicit Context**: Long-running functions (e.g., `fetchRowGroup`) MUST accept a context or `Io` object.
+*   **Check**: Call `io.checkCancellation()` (or equivalent) between large chunks/iterations. Do not rely on implicit timeouts.
+
+## 4. Network Primitives (`shim_net`)
+*   **Compliance**: `shim_net.zig` types (`Stream`, `Address`) MUST strictly match `std.Io.net` signatures.
+*   **Swap-ability**: Ensure `shim_net` can be replaced by `std.Io.net` in blocking builds without code changes.
+
+## 5. TLS Abstraction
+*   **Wrapper**: Do not leak `boring_tls` types into core logic. Wrap implementation in `std.Io.Reader/Writer`.
+
+## 6. Testing Philosophy: Property-Based Verification
+*   **Tools**: Use `minish` (vendored in `vendor/minish`) for fuzzing and property-based testing.
+*   **Pattern**: Prefer **properties** (invariants) over **examples** (unit tests) for complex parsers and state machines.
+    *   *Example-based*: `expect(parse("123") == 123)`
+    *   *Property-based*: `expect(parse(toString(n)) == n)` for all integers `n`.
+*   **Shrinking**: Leverage Minish's shrinking capability to find minimal reproduction cases for crashes.
+*   **Context**: Inject `allocator` into properties using the Context Wrapper pattern to support memory-managed fuzzing.
+
+## 7. Zig 0.16.dev "Source-First" Mandate
+*   **Volatility**: Assume all `std` signatures are "Broken" until verified against the local source in `/Users/joshua/.zvm/master/lib/std/`.
+*   **Verification Path**: Before using or debugging `std.X`, you MUST run:
+    `grep -r "pub fn [function_name]" /Users/joshua/.zvm/master/lib/std/[module].zig`
+*   **No Guessing**: If a build fails with "no member named X", stop immediately and read the `std` source file. Do not attempt a second guess based on training data.
+*   **Common 0.16.x Breaking Examples**:
+    *   **ArrayList**: `std.ArrayList(T)` (managed) is generally DISCOURAGED in core logic. Use `std.ArrayListUnmanaged(T)`.
+        *   `list.init(allocator)` -> **REMOVED** (for both Managed and Unmanaged in 0.16.x).
+            *   Managed: Use `var list = std.ArrayList(T).init(allocator);`.
+            *   Unmanaged: Use `var list = std.ArrayListUnmanaged(T){};`.
+        *   `list.append(item)` -> **REMOVED** (for Unmanaged). Use `list.append(allocator, item)`.
+        *   `list.deinit()` -> **REMOVED** (for Unmanaged). Use `list.deinit(allocator)`.
+    *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
+    *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()`.
+        *   **Note**: `Instant.timestamp` is a `posix.timespec` struct on POSIX systems (macOS/Linux).
+        *   **Accessing sec/nsec**: On macOS (Darwin), `timespec` fields are `sec` and `nsec`. On Linux (io_uring/epoll), they are `tv_sec` and `tv_nsec`. ALWAYS use `@hasField`.
+        *   **Safe Milliseconds**:
+            ```zig
+            const now = try std.time.Instant.now();
+            const ms = if (@hasField(@TypeOf(now.timestamp), "sec"))
+                (now.timestamp.sec * 1000) + @divFloor(now.timestamp.nsec, 1_000_000)
+            else if (@hasField(@TypeOf(now.timestamp), "tv_sec"))
+                (now.timestamp.tv_sec * 1000) + @divFloor(now.timestamp.tv_nsec, 1_000_000)
+            else
+                @divFloor(@as(i64, @intCast(now.timestamp)), 1_000_000);
+            ```
+    *   **Build API**: Methods like `linkLibC`, `linkLibCpp`, `addCSourceFiles`, and `addObjectFile` moved from `Step.Compile` to `Build.Module`.
+        *   Access them via `exe.root_module`.
+        *   `linkLibC()` -> `root_module.linkSystemLibrary("c", .{})`.
+        *   `linkLibCpp()` -> `root_module.linkSystemLibrary("c++", .{})`.
+    *   **Executable Configuration**: `addExecutable` options now require an explicit `root_module` (created via `b.createModule`) instead of flat `root_source_file`/`target`/`optimize` fields.
+    *   **Naming Alignment**: `std.mem.trimRight` -> `std.mem.trimEnd`, `std.mem.trimLeft` -> `std.mem.trimStart`.
+
+## 8. Event Loop & Connection Management
+*   **Loop Ownership**: Use a shared `xev.Loop` across related requests (e.g., in a `Source` or `Client`). Avoid creating a loop-per-request unless isolation is strictly required.
+*   **The Ghost Watcher**: `loop.active` count must be perfectly balanced.
+    *   **Rule**: Never call `loop.stop()` inside a connection's `onClose` or `onError` callback if the loop is shared or if other completions are pending.
+    *   **Pattern**: Use `pending_read` and `pending_write` flags to prevent double-arming a connection's callbacks.
+*   **Connection Pooling**:
+    *   **Strategy**: Use LIFO (Last-In-First-Out) for idle connection retrieval to prioritize "warm" connections.
+    *   **Health Check**: Connections retrieved from a pool MUST be checked for expiration (e.g., 10s idle timeout) before reuse.
+
+## 9. High-Performance Debugging & Feedback
+*   **Fix the Loop First**: If a bug takes >60s to reproduce, your priority is NOT the bug; it is **shortening the feedback loop**.
+*   **5-Second Timeout Policy**: All network and I/O experiments MUST be wrapped in `python3 tools/no_output_timeout.py --idle-seconds 5`.
+    *   *Rationale*: If a network operation doesn't produce a log entry in 5s, it is deadlocked or mis-segmented. Do not wait for 60s "jitter".
+*   **Isolation (Probes)**: Never debug complex I/O (TLS, S3, DNS) inside the main application.
+    *   **Action**: Create a `probes/probe_X.zig` that isolates the single failing component (e.g., `probe_tls_echo.zig`).
+    *   **Persistence**: Maintain `probes/README.md` as a living index. Every new probe MUST be added to the index with its purpose and date to preserve institutional memory.
+*   **Radical Logging**: Use `std.debug.print` to verify **flow**, not just errors.
+    *   **Required Logs**: Entry/exit of every async callback; number of bytes decrypted from BIO; state transitions (e.g., `handshake_complete=true`).
+*   **The "Halving" Strategy**: Use probes to divide the problem space (e.g., "If Google works but S3 fails, the transport layer is fine, check the AWS config").

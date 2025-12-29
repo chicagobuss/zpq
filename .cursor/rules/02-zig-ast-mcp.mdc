@@ -1,0 +1,82 @@
+---
+alwaysApply: true
+---
+# Zig AST MCP Integration (Zed-specific)
+
+> **Note**: This capability is currently only available in **Zed** editor via MCP server integration.
+> It is NOT available in Cursor, VS Code, or other editors at this time.
+
+## Overview
+
+The `zig-ast` MCP server provides AST-aware code analysis for Zig projects. It offers ground-truth symbol tracing rather than LLM inference/guessing.
+
+## Available Tools
+
+### 1. Text Search (Fast, Reliable)
+```
+find_text(project, pattern, max_results)
+```
+- Best for finding all usages of a symbol across the codebase
+- Returns file, line number, and context
+- No timeout issues - works on any codebase size
+
+### 2. Single-File Symbol Extraction
+```
+get_symbols(project, file_path)
+```
+- Extracts functions, structs, enums, imports from one file
+- Fast and reliable
+- Good for understanding file structure
+
+### 3. Single-File AST
+```
+get_ast(project, path, max_depth)
+```
+- Full AST for one file
+- Use when you need node-level detail
+
+### 4. Dependency Analysis
+```
+get_dependencies(project, file_path)
+```
+- Shows imports/includes for a file
+
+## Practical Workflow
+
+1. **Find all usages**: Use `find_text` with symbol name (fast, accurate)
+2. **Understand a file**: Use `get_symbols` to see its structure
+3. **Deep dive**: Use `get_ast` for node-level analysis
+
+## Performance Notes
+
+- **Project-wide tree-sitter queries** (`run_query`, `find_usage`) may timeout on large codebases
+- **Text search** (`find_text`) is always fast
+- **Per-file tools** (`get_symbols`, `get_ast`) are always fast
+
+## Use Cases
+
+- **Refactoring**: Find all call sites before changing a function signature
+- **Dead code detection**: Find symbols with no references outside definition
+- **Dependency mapping**: Understand import chains
+- **Code review**: Verify symbol usage claims with ground truth
+
+## Example: Tracing XevS3Source
+
+```
+find_text(project="zpq", pattern="XevS3Source", max_results=50)
+```
+
+Returns actual locations:
+- `src/zpq.zig:43` - export
+- `src/zpq/io/s3/xev_source.zig:28` - definition
+- `benchmarks/e2e.zig` - usage (via factory)
+- `probes/probe_conn_reuse.zig:52` - usage
+
+This is **ground truth**, not inference. No hallucination risk.
+
+## Project Registration
+
+The zpq project should be registered as:
+```
+register_project(path="/Users/joshua/code/zpq", name="zpq")
+```

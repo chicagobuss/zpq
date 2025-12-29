@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Use self-hosted runner on zpq-arm with pinned Zig version
+    # ARM runners not available for private repos on GitHub-hosted
+    runs-on: [self-hosted, Linux, ARM64, zpq-arm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        run: |
+          # Use Zig from zvm on the self-hosted runner
+          # Version: 0.16.0-dev.1657+985a3565c (pinned for vendor compat)
+          # TODO: Update vendored deps (libxev, boring_tls) for latest Zig master
+          echo "$HOME/.zvm/bin" >> $GITHUB_PATH
+          ~/.zvm/master/zig version
+
+      - name: Install Just
+        uses: extractions/setup-just@v2
+
+      - name: Cache Zig Global Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig', 'vendor/*/build.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Fetch Pre-built Dependencies from R2
+        id: fetch-deps
+        run: |
+          echo "::group::Fetching pre-built BoringSSL libraries from Cloudflare R2"
+          # Determine target triple for this runner
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            TARGET="x86_64-linux"
+          elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            TARGET="aarch64-linux"
+          else
+            echo "Unknown architecture: $ARCH, will build from source"
+            echo "TARGET=$ARCH-unknown" >> $GITHUB_OUTPUT
+            echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "TARGET=$TARGET" >> $GITHUB_OUTPUT
+          echo "Detected target: $TARGET"
+
+          # Fetch from Cloudflare R2 (public, no auth needed)
+          R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${TARGET}"
+          mkdir -p vendor/boring_tls/prebuilt/$TARGET
+
+          echo "Fetching libcrypto.a..."
+          curl -fsSL "${R2_URL}/libcrypto.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" || true
+          echo "Fetching libssl.a..."
+          curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" || true
+
+          # Verify downloads (check file size > 1KB to ensure not error page)
+          if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && \
+             [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ] && \
+             [ $(stat -c%s "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || echo 0) -gt 1000 ]; then
+            echo "Successfully fetched pre-built dependencies from R2"
+            echo "CACHE_HIT=true" >> $GITHUB_OUTPUT
+            ls -la vendor/boring_tls/prebuilt/${TARGET}/
+          else
+            echo "Pre-built deps not available on R2, will build from source (~3 min)"
+            echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
+            rm -f vendor/boring_tls/prebuilt/${TARGET}/*.a 2>/dev/null || true
+          fi
+          echo "::endgroup::"
+
+      - name: Build
+        run: |
+          echo "::group::Zig Build"
+          zig build -Doptimize=ReleaseFast --summary all 2>&1
+          echo "::endgroup::"
+          echo "::group::Build Examples (Lambda)"
+          zig build -Doptimize=ReleaseFast -Dexamples --summary all 2>&1
+          echo "::endgroup::"
+          echo "Build artifacts:"
+          ls -la zig-out/bin/ 2>/dev/null || echo "No bin directory yet"
+          ls -la zig-out/lambda/ 2>/dev/null || echo "No lambda directory yet"
+
+      # Laziness Principle: if we built from source, upload to R2 so next run is faster
+      - name: Upload Built Dependencies to R2
+        if: steps.fetch-deps.outputs.CACHE_HIT == 'false' && steps.fetch-deps.outputs.TARGET != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          TARGET="${{ steps.fetch-deps.outputs.TARGET }}"
+          echo "::group::Uploading built BoringSSL to R2 for $TARGET"
+
+          # Find built libraries in zig-cache (hash varies per build)
+          LIBCRYPTO=$(find .zig-cache -name "libcrypto.a" -type f 2>/dev/null | head -1)
+          LIBSSL=$(find .zig-cache -name "libssl.a" -type f 2>/dev/null | head -1)
+
+          if [ -z "$LIBCRYPTO" ] || [ -z "$LIBSSL" ]; then
+            echo "No built libraries found in .zig-cache, skipping upload"
+            echo "::endgroup::"
+            exit 0
+          fi
+
+          echo "Found libcrypto.a: $LIBCRYPTO"
+          echo "Found libssl.a: $LIBSSL"
+
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          echo "Uploading libcrypto.a..."
+          aws s3 cp "$LIBCRYPTO" \
+            "s3://zpq/boring_tls/${TARGET}/libcrypto.a" \
+            --endpoint-url "$R2_ENDPOINT"
+
+          echo "Uploading libssl.a..."
+          aws s3 cp "$LIBSSL" \
+            "s3://zpq/boring_tls/${TARGET}/libssl.a" \
+            --endpoint-url "$R2_ENDPOINT"
+
+          echo "Successfully uploaded to R2 - next CI run will be faster!"
+          echo "::endgroup::"
+
+      - name: Run Tests
+        run: |
+          echo "::group::Running Tests"
+          zig build test --summary all 2>&1
+          echo "::endgroup::"
+
+      - name: Run Inspector Verification
+        run: |
+          echo "::group::Inspector Verification"
+          echo "Testing simple.parquet..."
+          ./zig-out/bin/zpq inspect ci/fixtures/parquet/simple.parquet
+          echo "Testing required.parquet..."
+          ./zig-out/bin/zpq inspect ci/fixtures/parquet/required.parquet
+          echo "::endgroup::"
+          echo "All verifications passed!"
+
+      - name: Run R2 Benchmarks
+        env:
+          S3_ENDPOINT: ${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "R2 credentials not configured, skipping benchmarks"
+            exit 0
+          fi
+          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_1mb.parquet" --async
+          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_10mb.parquet" --async
+          ./benchmarks/bench.sh e2e "s3://zpq/benchmark_100mb.parquet" --async

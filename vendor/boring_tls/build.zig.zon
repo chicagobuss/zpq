@@ -1,0 +1,17 @@
+.{
+    .name = .boring_tls,
+    .version = "0.0.1",
+    .fingerprint = 0x9c2773b7b6fdcf40,
+    .minimum_zig_version = "0.15.0-dev.483+837e0f9c3",
+    .dependencies = .{
+        .boringssl = .{
+            .url = "https://github.com/Thomvanoorschot/boringssl/archive/main.tar.gz",
+            .hash = "boringssl-0.20250514.0-zK0prLy1xAfRpqIBYbl48gYSlA95NLt3WrmR06bVT57a",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

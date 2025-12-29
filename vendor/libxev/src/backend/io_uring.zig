@@ -491,7 +491,7 @@ pub const Loop = struct {
 
                 sqe.prep_sendmsg(
                     v.fd,
-                    v.msghdr,
+                    @ptrCast(v.msghdr),
                     0,
                 );
             },
@@ -960,7 +960,7 @@ pub const Operation = union(OperationType) {
 
     sendmsg: struct {
         fd: posix.fd_t,
-        msghdr: *posix.msghdr_const,
+        msghdr: *const linux.msghdr_const,
 
         /// Optionally, a write buffer can be specified and the given
         /// msghdr will be populated with information about this buffer.
@@ -972,7 +972,7 @@ pub const Operation = union(OperationType) {
 
     recvmsg: struct {
         fd: posix.fd_t,
-        msghdr: *posix.msghdr,
+        msghdr: *linux.msghdr,
     },
 
     shutdown: struct {

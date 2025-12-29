@@ -6,16 +6,15 @@ pub fn addExamples(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     libxev_mod: *std.Build.Module,
+    boring_tls_mod: *std.Build.Module,
     install_examples: bool,
 ) void {
-    _ = target;
     _ = optimize;
     if (!install_examples) return;
 
     // Lambda Bootstrap Example
     {
-        // Always build for Linux/ARM64 as that's the target runtime
-        const lambda_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux });
+        const lambda_target = target;
         
         const mod = b.createModule(.{
             .root_source_file = b.path("examples/lambda/main.zig"),
@@ -24,6 +23,7 @@ pub fn addExamples(
         });
         mod.addImport("zpq", zpq_mod);
         mod.addImport("xev", libxev_mod);
+        mod.addImport("boring_tls", boring_tls_mod);
 
         const exe = b.addExecutable(.{
             .name = "bootstrap",

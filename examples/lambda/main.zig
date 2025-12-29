@@ -146,9 +146,9 @@ fn scan_benchmark(allocator: std.mem.Allocator, resolver: zpq.s3.dns.Resolver, p
     std.debug.print("Scanned {d} values in {d:.4}s\n", .{ total_values, elapsed_s });
 }
 
-fn openFile(allocator: std.mem.Allocator, path: []const u8, resolver: zpq.s3.dns.Resolver) !zpq.file.ParquetFile {
-    if (std.mem.startsWith(u8, path, "s3://")) {
-        return zpq.s3.factory.openS3Source(allocator, resolver, path, true);
-    }
-    return zpq.file.ParquetFile.open(allocator, path);
+fn openFile(allocator: std.mem.Allocator, path: []const u8, _: zpq.s3.dns.Resolver) !zpq.file.ParquetFile {
+    return zpq.s3.factory.openFileWithOptions(allocator, path, .{
+        .force_async = true,
+        .verify_tls = true,
+    });
 }

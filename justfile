@@ -112,12 +112,17 @@ comprehensive: build gen-fixtures
 
     @echo "Comprehensive suite finished."
 
-# === Benchmarks ===
-# All benchmarks are run via ./benchmarks/bench.sh for consistency
+# === Lambda ===
 
-# List available benchmarks
-bench-list:
-    ./benchmarks/bench.sh list
+# Build and run the Lambda bootstrap locally using the Runtime Interface Emulator (RIE)
+lambda-local:
+    @echo "Building Lambda bootstrap (native)..."
+    zig build example-lambda -Dexamples -Dtarget=native
+    @echo "Starting Lambda RIE..."
+    @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{}'"
+    # Note: This expects the 'aws-lambda-rie' binary to be in your path
+    # If not, you can run via Docker: docker run -v $(pwd)/zig-out/lambda:/var/task public.ecr.aws/lambda/provided:al2 /var/task/bootstrap
+    ./zig-out/lambda/bootstrap
 
 # Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
 bench +args:

@@ -341,6 +341,7 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         libxev_mod,
+        boring_tls_mod,
         install_examples,
     );
 }

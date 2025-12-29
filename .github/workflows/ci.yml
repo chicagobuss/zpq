@@ -34,9 +34,9 @@ jobs:
           # This matches the local development workflow.
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then
-            URL="https://github.com/mitchellh/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz"
+            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz"
           elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-            URL="https://github.com/mitchellh/anyzig/releases/latest/download/anyzig-aarch64-linux.tar.gz"
+            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-aarch64-linux.tar.gz"
           else
             echo "Unsupported architecture: $ARCH"
             exit 1

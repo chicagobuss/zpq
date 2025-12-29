@@ -6,6 +6,7 @@ const xev = @import("xev");
 const ENV_RUNTIME_API = "AWS_LAMBDA_RUNTIME_API";
 
 pub fn main() !void {
+    std.debug.print("LEVEL 04: Starting SUV Lambda...\n", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55,18 +56,15 @@ pub fn main() !void {
         }
         defer allocator.free(request_id);
 
-        var body_list = std.ArrayList(u8).empty;
-        defer body_list.deinit(allocator);
+        var body: []u8 = &[_]u8{};
+        defer if (body.len > 0) allocator.free(body);
 
-        var transfer_buf: [4096]u8 = undefined;
-        var rdr = res.reader(&transfer_buf);
-        while (true) {
-            var buf: [1024]u8 = undefined;
-            const n = try rdr.readSliceShort(&buf);
-            if (n == 0) break;
-            try body_list.appendSlice(allocator, buf[0..n]);
+        if (res.head.content_length) |cl| {
+            body = try allocator.alloc(u8, cl);
+            var transfer_buf: [4096]u8 = undefined;
+            const rdr = res.reader(&transfer_buf);
+            try rdr.*.readSliceAll(body);
         }
-        const body = body_list.items;
 
         std.debug.print("Received invocation: {s}\n", .{request_id});
 
@@ -106,9 +104,30 @@ pub fn main() !void {
 }
 
 fn scan_benchmark(allocator: std.mem.Allocator, path: []const u8) !void {
+    std.debug.print("LEVEL 04: scan_benchmark started for {s}\n", .{path});
     var timer = try std.time.Timer.start();
 
-    var pf = try openFile(allocator, path);
+    // SUV Lambda: Use Epoll to avoid io_uring blocks in Lambda
+    std.debug.print("LEVEL 04: Initializing Epoll loop...\n", .{});
+    var loop = try xev.Epoll.Loop.init(.{});
+    defer loop.deinit();
+
+    std.debug.print("LEVEL 04: Initializing ThreadPool...\n", .{});
+    var thread_pool = xev.ThreadPool.init(.{});
+    defer {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    }
+
+    std.debug.print("LEVEL 04: Opening S3 file with Loop...\n", .{});
+    var pf = try zpq.s3.factory.openS3WithLoop(allocator, &loop, &thread_pool, path, .{
+        .force_async = true,
+        .verify_tls = true,
+    });
+    defer pf.deinit();
+
+    const row_count = pf.metadata.?.num_rows;
+    std.debug.print("LEVEL 04: Successfully opened Parquet file. Rows: {d}\n", .{row_count});
     defer pf.deinit();
     try pf.readFooter();
 
@@ -136,9 +155,3 @@ fn scan_benchmark(allocator: std.mem.Allocator, path: []const u8) !void {
     std.debug.print("Scanned {d} values in {d:.4}s\n", .{ total_values, elapsed_s });
 }
 
-fn openFile(allocator: std.mem.Allocator, path: []const u8) !zpq.file.ParquetFile {
-    return zpq.s3.factory.openFileWithOptions(allocator, path, .{
-        .force_async = true,
-        .verify_tls = true,
-    });
-}

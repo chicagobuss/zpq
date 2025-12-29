@@ -1,6 +1,5 @@
 const std = @import("std");
 const tls = @import("../tls/connection.zig");
-const Connection = tls.Connection;
 const xev = @import("xev");
 
 /// Global S3 Connection Pool
@@ -44,201 +43,197 @@ pub const ConnectionKey = struct {
     }
 };
 
-const PoolEntry = struct {
-    conn: *Connection,
-    last_used_ms: i64,
-    host_owned: []const u8, // We own this memory
-};
-
-pub const GlobalConnectionPool = struct {
-    allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    idle_connections: std.ArrayListUnmanaged(PoolEntry) = .{},
-
-    // Configuration
-    max_idle_per_host: usize = 16,
-    max_idle_total: usize = 64,
-    idle_timeout_ms: i64 = 30_000, // 30 seconds
-
-    // Stats (for observability)
-    stats: Stats = .{},
-
-    pub const Stats = struct {
-        acquires: u64 = 0,
-        hits: u64 = 0,
-        misses: u64 = 0,
-        releases: u64 = 0,
-        expirations: u64 = 0,
-        evictions: u64 = 0,
+pub fn GlobalConnectionPool(comptime XevApi: type) type {
+    const Connection = tls.ConnectionGen(XevApi);
+    const PoolEntry = struct {
+        conn: *Connection,
+        last_used_ms: i64,
+        host_owned: []const u8, // We own this memory
     };
 
-    pub fn init(allocator: std.mem.Allocator) GlobalConnectionPool {
-        return .{ .allocator = allocator };
-    }
+    return struct {
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        mutex: std.Thread.Mutex = .{},
+        idle_connections: std.ArrayListUnmanaged(PoolEntry) = .{},
 
-    pub fn deinit(self: *GlobalConnectionPool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Configuration
+        max_idle_per_host: usize = 16,
+        max_idle_total: usize = 64,
+        idle_timeout_ms: i64 = 30_000, // 30 seconds
 
-        for (self.idle_connections.items) |entry| {
-            entry.conn.closed = true;
-            entry.conn.deinit();
-            self.allocator.destroy(entry.conn);
-            self.allocator.free(entry.host_owned);
+        // Stats (for observability)
+        stats: Stats = .{},
+
+        pub const Stats = struct {
+            acquires: u64 = 0,
+            hits: u64 = 0,
+            misses: u64 = 0,
+            releases: u64 = 0,
+            expirations: u64 = 0,
+            evictions: u64 = 0,
+        };
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{ .allocator = allocator };
         }
-        self.idle_connections.deinit(self.allocator);
-    }
 
-    /// Acquire a connection from the pool, or return null if none available.
-    /// Caller is responsible for creating a new connection if null is returned.
-    pub fn acquire(self: *GlobalConnectionPool, key: ConnectionKey) ?*Connection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        self.stats.acquires += 1;
-
-        const now_ms = getNowMs() orelse return null;
-
-        // Search backwards for matching connection (LIFO = most recently used)
-        var i: usize = self.idle_connections.items.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.idle_connections.items[i];
-
-            if (key.eql(.{ .host = entry.host_owned, .port = key.port, .use_tls = key.use_tls })) {
-                _ = self.idle_connections.orderedRemove(i);
-
-                // Check expiration
-                if (now_ms - entry.last_used_ms > self.idle_timeout_ms) {
-                    self.stats.expirations += 1;
-                    entry.conn.closed = true;
-                    entry.conn.deinit();
-                    self.allocator.destroy(entry.conn);
-                    self.allocator.free(entry.host_owned);
-                    continue; // Keep looking
-                }
-
-                self.stats.hits += 1;
-                self.allocator.free(entry.host_owned); // Caller provides key, we free our copy
-                return entry.conn;
+        pub fn deinit(self: *Self) void {
+            self.mutex.lock();
+            for (self.idle_connections.items) |entry| {
+                entry.conn.closed = true;
+                entry.conn.deinit();
+                self.allocator.destroy(entry.conn);
+                self.allocator.free(entry.host_owned);
             }
+            self.idle_connections.deinit(self.allocator);
+            self.mutex.unlock();
         }
 
-        self.stats.misses += 1;
-        return null;
-    }
+        pub fn acquire(self: *Self, key: ConnectionKey) ?*Connection {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-    /// Release a connection back to the pool.
-    /// If pool is full, the connection is closed.
-    pub fn release(self: *GlobalConnectionPool, key: ConnectionKey, conn: *Connection) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+            self.stats.acquires += 1;
 
-        self.stats.releases += 1;
+            const now_ms = getNowMs() orelse return null;
 
-        // Check if connection is still usable
-        if (conn.closed) {
-            conn.deinit();
-            self.allocator.destroy(conn);
-            return;
+            // Search backwards for matching connection (LIFO = most recently used)
+            var i: usize = self.idle_connections.items.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = self.idle_connections.items[i];
+
+                if (key.eql(.{ .host = entry.host_owned, .port = key.port, .use_tls = key.use_tls })) {
+                    _ = self.idle_connections.orderedRemove(i);
+
+                    // Check expiration
+                    if (now_ms - entry.last_used_ms > self.idle_timeout_ms) {
+                        self.stats.expirations += 1;
+                        entry.conn.closed = true;
+                        entry.conn.deinit();
+                        self.allocator.destroy(entry.conn);
+                        self.allocator.free(entry.host_owned);
+                        continue; // Keep looking
+                    }
+
+                    self.stats.hits += 1;
+                    self.allocator.free(entry.host_owned); // Caller provides key, we free our copy
+                    return entry.conn;
+                }
+            }
+
+            self.stats.misses += 1;
+            return null;
         }
 
-        // Evict if at capacity
-        if (self.idle_connections.items.len >= self.max_idle_total) {
-            self.stats.evictions += 1;
-            // Evict oldest (front of list)
-            const evicted = self.idle_connections.orderedRemove(0);
-            evicted.conn.closed = true;
-            evicted.conn.deinit();
-            self.allocator.destroy(evicted.conn);
-            self.allocator.free(evicted.host_owned);
+        pub fn release(self: *Self, key: ConnectionKey, conn: *Connection) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.stats.releases += 1;
+
+            // Check if connection is still usable
+            if (conn.closed) {
+                conn.deinit();
+                self.allocator.destroy(conn);
+                return;
+            }
+
+            // Evict if at capacity
+            if (self.idle_connections.items.len >= self.max_idle_total) {
+                self.stats.evictions += 1;
+                // Evict oldest (front of list)
+                const evicted = self.idle_connections.orderedRemove(0);
+                evicted.conn.closed = true;
+                evicted.conn.deinit();
+                self.allocator.destroy(evicted.conn);
+                self.allocator.free(evicted.host_owned);
+            }
+
+            const now_ms = getNowMs() orelse {
+                conn.deinit();
+                self.allocator.destroy(conn);
+                return;
+            };
+
+            const host_copy = self.allocator.dupe(u8, key.host) catch {
+                conn.deinit();
+                self.allocator.destroy(conn);
+                return;
+            };
+
+            conn.idling = true;
+            self.idle_connections.append(self.allocator, .{
+                .conn = conn,
+                .last_used_ms = now_ms,
+                .host_owned = host_copy,
+            }) catch {
+                self.allocator.free(host_copy);
+                conn.deinit();
+                self.allocator.destroy(conn);
+            };
         }
 
-        const now_ms = getNowMs() orelse {
-            conn.deinit();
-            self.allocator.destroy(conn);
-            return;
-        };
-
-        const host_copy = self.allocator.dupe(u8, key.host) catch {
-            conn.deinit();
-            self.allocator.destroy(conn);
-            return;
-        };
-
-        conn.idling = true;
-        self.idle_connections.append(self.allocator, .{
-            .conn = conn,
-            .last_used_ms = now_ms,
-            .host_owned = host_copy,
-        }) catch {
-            self.allocator.free(host_copy);
-            conn.deinit();
-            self.allocator.destroy(conn);
-        };
-    }
-
-    /// Get pool statistics for monitoring/debugging
-    pub fn getStats(self: *GlobalConnectionPool) Stats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.stats;
-    }
-
-    /// Current number of idle connections
-    pub fn idleCount(self: *GlobalConnectionPool) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.idle_connections.items.len;
-    }
-
-    fn getNowMs() ?i64 {
-        const now = std.time.Instant.now() catch return null;
-        const ts = now.timestamp;
-        // Handle different timestamp struct layouts across platforms
-        if (@hasField(@TypeOf(ts), "tv_sec")) {
-            return ts.tv_sec * 1000 + @divFloor(ts.tv_nsec, 1_000_000);
-        } else if (@hasField(@TypeOf(ts), "sec")) {
-            return ts.sec * 1000 + @divFloor(ts.nsec, 1_000_000);
-        } else {
-            // Fallback: treat as nanoseconds
-            return @divFloor(@as(i64, @intCast(ts)), 1_000_000);
+        pub fn getStats(self: *Self) Stats {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.stats;
         }
+
+        pub fn idleCount(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.idle_connections.items.len;
+        }
+    };
+}
+
+fn getNowMs() ?i64 {
+    const now = std.time.Instant.now() catch return null;
+    const ts = now.timestamp;
+    // Handle different timestamp struct layouts across platforms
+    if (@hasField(@TypeOf(ts), "tv_sec")) {
+        return ts.tv_sec * 1000 + @divFloor(ts.tv_nsec, 1_000_000);
+    } else if (@hasField(@TypeOf(ts), "sec")) {
+        return ts.sec * 1000 + @divFloor(ts.nsec, 1_000_000);
+    } else {
+        // Fallback: treat as nanoseconds
+        return @divFloor(@as(i64, @intCast(ts)), 1_000_000);
     }
-};
+}
 
 // ============================================================================
-// Global Singleton
+// Global Singleton (for xev.Loop)
 // ============================================================================
 
-var global_pool_instance: ?*GlobalConnectionPool = null;
+var global_pool_instance: ?*anyopaque = null; // Erased pointer to GlobalConnectionPool(xev)
 var global_pool_mutex: std.Thread.Mutex = .{};
 var global_allocator: ?std.mem.Allocator = null;
 
-/// Get or create the global connection pool.
-/// Uses the provided allocator on first call; subsequent calls ignore it.
-pub fn getGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool {
+pub fn getGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool(xev) {
     global_pool_mutex.lock();
     defer global_pool_mutex.unlock();
 
-    if (global_pool_instance) |pool| {
-        return pool;
+    if (global_pool_instance) |pool_ptr| {
+        return @ptrCast(@alignCast(pool_ptr));
     }
 
-    const pool = allocator.create(GlobalConnectionPool) catch @panic("OOM creating global pool");
-    pool.* = GlobalConnectionPool.init(allocator);
+    const Pool = GlobalConnectionPool(xev);
+    const pool = allocator.create(Pool) catch @panic("OOM creating global pool");
+    pool.* = Pool.init(allocator);
     global_pool_instance = pool;
     global_allocator = allocator;
     return pool;
 }
 
-/// Shutdown the global pool. Call at process exit if you want clean cleanup.
-/// Safe to call multiple times or if pool was never initialized.
 pub fn shutdownGlobalPool() void {
     global_pool_mutex.lock();
     defer global_pool_mutex.unlock();
 
-    if (global_pool_instance) |pool| {
+    if (global_pool_instance) |pool_ptr| {
+        const Pool = GlobalConnectionPool(xev);
+        const pool: *Pool = @ptrCast(@alignCast(pool_ptr));
         pool.deinit();
         if (global_allocator) |alloc| {
             alloc.destroy(pool);
@@ -253,8 +248,9 @@ pub fn shutdownGlobalPool() void {
 // ============================================================================
 
 test "GlobalConnectionPool basic lifecycle" {
+    const Pool = GlobalConnectionPool(xev);
     const allocator = std.testing.allocator;
-    var pool = GlobalConnectionPool.init(allocator);
+    var pool = Pool.init(allocator);
     defer pool.deinit();
 
     // Acquire from empty pool
@@ -297,8 +293,9 @@ test "ConnectionKey hash distribution" {
 }
 
 test "GlobalConnectionPool stats tracking" {
+    const Pool = GlobalConnectionPool(xev);
     const allocator = std.testing.allocator;
-    var pool = GlobalConnectionPool.init(allocator);
+    var pool = Pool.init(allocator);
     defer pool.deinit();
 
     const key = ConnectionKey{ .host = "test.com", .port = 443, .use_tls = true };
@@ -314,8 +311,9 @@ test "GlobalConnectionPool stats tracking" {
 }
 
 test "GlobalConnectionPool idle count" {
+    const Pool = GlobalConnectionPool(xev);
     const allocator = std.testing.allocator;
-    var pool = GlobalConnectionPool.init(allocator);
+    var pool = Pool.init(allocator);
     defer pool.deinit();
 
     // Empty pool should have 0 idle connections

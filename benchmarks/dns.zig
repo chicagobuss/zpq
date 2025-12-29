@@ -56,9 +56,9 @@ const Context = struct {
     id: usize,
     done: bool = false,
     results_len: usize = 0,
-    completion: dns.Resolver.Completion = .{},
+    completion: dns.ResolverGen(xev).Completion = .{},
 
-    pub fn onResolve(ud: ?*anyopaque, results: []const dns.Address, err: anyerror!void) void {
+    pub fn onResolve(ud: ?*anyopaque, results: []const xev.shim_net.Address, err: anyerror!void) void {
         const self = @as(*Context, @ptrCast(@alignCast(ud)));
         err catch |e| {
             std.debug.print("   [{d}] Resolution error: {}\n", .{ self.id, e });
@@ -71,7 +71,7 @@ const Context = struct {
 fn benchAsync(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.ThreadPool) !void {
     std.debug.print("2. Async ThreadPool (No Deduplication)...\n", .{});
 
-    var tp_resolver = dns.ThreadPoolResolver.init(thread_pool, allocator);
+    var tp_resolver = dns.ThreadPoolResolverGen(xev).init(thread_pool, allocator);
     const resolver = tp_resolver.resolver();
 
     const ctxs = try allocator.alloc(Context, NUM_REQUESTS);
@@ -103,8 +103,8 @@ fn benchAsync(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.T
 fn benchSingleFlight(allocator: std.mem.Allocator, loop: *xev.Loop, thread_pool: *xev.ThreadPool) !void {
     std.debug.print("3. Async + Single-Flight (Deduplication)...\n", .{});
 
-    var tp_resolver = dns.ThreadPoolResolver.init(thread_pool, allocator);
-    var sf_resolver = dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+    var tp_resolver = dns.ThreadPoolResolverGen(xev).init(thread_pool, allocator);
+    var sf_resolver = dns.SingleFlightResolverGen(xev).init(allocator, tp_resolver.resolver());
     defer sf_resolver.deinit();
 
     const resolver = sf_resolver.resolver();

@@ -158,6 +158,7 @@ First-class support for serverless execution via a custom Zig Lambda runtime.
 *   **Architecture Parity**: Verified that the Lambda bootstrap builds and links correctly on both ARM64 (native) and macOS (cross-compilation verified for logic).
 *   **Libxev 0.16 Alignment**: Patched the `io_uring` and `epoll` backends in vendored `libxev` to align with Zig's strict `std.posix` vs `std.os.linux` type decoupling.
 *   **CI Production Artifacts**: Optimized CI to produce optimized `ReleaseFast` binaries for the Lambda runtime (`bootstrap`) and the E2E benchmark suite.
+*   **Loop-Agnostic Refactor**: Polished `src/zpq/io/s3/factory.zig` with higher abstraction, consolidating S3 path parsing, environment discovery, and correctly passing sophisticated DNS resolvers down to the I/O stack.
 
 ### The "SQL Layer" Roadmap (Research Synthesis):
 Exhaustive research into "Headless OLAP" frontends has yielded a two-track roadmap for ZPQ's query intelligence:

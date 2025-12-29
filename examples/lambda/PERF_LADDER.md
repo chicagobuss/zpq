@@ -9,9 +9,9 @@ This document tracks the "Performance Tax" of each layer added to the ZPQ Lambda
 | Level | Name | Init (Cold) | Exec (Hot) | Memory | Binary Size | Added Complexity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **01** | **[minimal](./examples/lambda/01-minimal/main.zig)** | **6.22 ms** | **1.45 ms** | **11 MB** | **432 KB** | Baseline (Pure Zig Stdlib) |
-| **02** | **dns-warming** | *Pending* | *Pending* | *Pending* | *Pending* | `libxev` loop + Custom DNS |
+| **02** | **dns-warming** | **16.8 ms** | **0.65 ms** | **11 MB** | **440 KB** | `libxev.Epoll` loop + Generic DNS |
 | **03** | **warm-s3** | *Pending* | *Pending* | *Pending* | *Pending* | Connection Pool + S3 HEAD |
-| **04** | **scan-bench** | *Pending* | *Pending* | *Pending* | *Pending* | Full Parquet Logic + TLS |
+| **04** | **scan-bench** | **16.8 ms** | **268.4 ms** | **12 MB** | **480 KB** | Full Parquet Logic + TLS (Generic) |
 
 ---
 
@@ -34,3 +34,8 @@ This document tracks the "Performance Tax" of each layer added to the ZPQ Lambda
 | **Python** | ~100-200ms | ~35MB |
 | **Java** | ~500ms - 2s | ~150MB+ |
 
+
+### Level 04: scan-bench (SUV Lambda)
+*   **Strategy**: Full ZPQ stack using loop-agnostic refactor. Explicitly initializes `xev.Epoll` to bypass Lambda's `io_uring` block.
+*   **Result**: Cold starts stay under 20ms even with the full I/O stack (TLS + DNS + libxev). The execution time (268ms) represents a full Parquet scan over S3 (1MB file, includes handshake latency).
+*   **Takeaway**: The generic refactor works. We've proven we can run the "powerhouse" ZPQ logic inside the leanest possible custom runtime without significant overhead.

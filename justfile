@@ -119,13 +119,27 @@ lambda-01:
     # Mocking AWS_LAMBDA_RUNTIME_API for local RIE (using 8080)
     AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-01-minimal/bootstrap
 
-# Build and run the Parquet scan benchmark Lambda locally
+# Build and run the DNS warming Lambda locally
 lambda-02:
-    @echo "Building Lambda 02-scan-benchmark..."
-    zig build example-lambda-02-scan-benchmark -Dexamples -Dtarget=native
+    @echo "Building Lambda 02-dns-warming..."
+    zig build example-lambda-02-dns-warming -Dexamples -Dtarget=native
+    @echo "Starting Lambda RIE..."
+    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-02-dns-warming/bootstrap
+
+# Build and run the S3 warming Lambda locally
+lambda-03:
+    @echo "Building Lambda 03-warm-s3..."
+    zig build example-lambda-03-warm-s3 -Dexamples -Dtarget=native
+    @echo "Starting Lambda RIE..."
+    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-03-warm-s3/bootstrap
+
+# Build and run the Parquet scan benchmark Lambda locally
+lambda-04:
+    @echo "Building Lambda 04-scan-benchmark..."
+    zig build example-lambda-04-scan-benchmark -Dexamples -Dtarget=native
     @echo "Starting Lambda RIE..."
     @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{\"file\": \"s3://bucket/path.parquet\"}'"
-    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-02-scan-benchmark/bootstrap
+    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-04-scan-benchmark/bootstrap
 
 # Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
 bench +args:

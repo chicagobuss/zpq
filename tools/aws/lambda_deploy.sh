@@ -77,6 +77,10 @@ echo "--- CloudWatch Statistics ---"
 cat result.json | jq -r '.LogResult' | base64 --decode | grep "REPORT"
 echo "----------------------------"
 
+echo "--- Tail Logs ---"
+cat result.json | jq -r '.LogResult' | base64 --decode
+echo "-----------------"
+
 # 5. Clean up
 rm response.json result.json
 echo "Done."

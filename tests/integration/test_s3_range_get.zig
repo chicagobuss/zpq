@@ -48,10 +48,13 @@ pub fn main() !void {
     defer loop.deinit();
 
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
-    defer thread_pool.deinit();
+    defer {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    }
 
-    var tp_resolver = zpq.s3.dns.ThreadPoolResolver.init(&thread_pool, allocator);
-    var dns_completion = zpq.s3.dns.Resolver.Completion.init();
+    var tp_resolver = zpq.s3.dns.ThreadPoolResolverGen(xev).init(&thread_pool, allocator);
+    var dns_completion = zpq.s3.dns.ResolverGen(xev).Completion.init();
     defer dns_completion.deinit(allocator);
 
     var ctx = try allocator.create(Ctx);
@@ -167,6 +170,8 @@ fn parseEnvUsize(allocator: std.mem.Allocator, name: []const u8) ?usize {
     return std.fmt.parseInt(usize, v, 10) catch null;
 }
 
+const Connection = zpq.io.tls.Connection;
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
     result: zpq.io.http.Client.FetchResult,
@@ -175,7 +180,7 @@ const Ctx = struct {
     dst_written: usize,
     want_len: usize,
     req: ?*ReqCtx,
-    conn: ?*zpq.io.tls.Connection,
+    conn: ?*zpq.io.tls.ConnectionGen(xev),
     loop: *xev.Loop,
 
     // DNS resolution result
@@ -188,7 +193,7 @@ const Ctx = struct {
     sha256: std.crypto.hash.sha2.Sha256,
 };
 
-fn onResolved(ud: ?*anyopaque, results: []const zpq.s3.dns.Address, err: anyerror!void) void {
+fn onResolved(ud: ?*anyopaque, results: []const xev.shim_net.Address, err: anyerror!void) void {
     const ctx: *Ctx = @ptrCast(@alignCast(ud));
     if (err) |_| {} else |e| {
         ctx.resolve_err = e;
@@ -225,8 +230,9 @@ fn fetchRange(
     len: usize,
     ctx: *Ctx,
 ) !void {
-    const conn = try allocator.create(zpq.io.tls.Connection);
-    conn.* = try zpq.io.tls.Connection.init(loop, allocator, host);
+    const ConnectionGen = zpq.io.tls.ConnectionGen(xev);
+    const conn = try allocator.create(ConnectionGen);
+    conn.* = try ConnectionGen.init(loop, allocator, host);
     ctx.conn = conn;
 
     const req = try allocator.create(ReqCtx);
@@ -249,7 +255,7 @@ fn fetchRange(
 }
 
 const ReqCtx = struct {
-    conn: *zpq.io.tls.Connection,
+    conn: *Connection,
     ctx: *Ctx,
     host: []const u8,
     request_target: []const u8,
@@ -328,5 +334,3 @@ fn cleanup(allocator: std.mem.Allocator, ctx: *Ctx) void {
         ctx.conn = null;
     }
 }
-
-

@@ -44,6 +44,7 @@ pub const s3 = struct {
 
     // Primary async S3 implementation (libxev + boring_tls)
     pub const XevS3Source = @import("zpq/io/s3/xev_source.zig").XevS3Source;
+    pub const XevS3SourceGen = @import("zpq/io/s3/xev_source.zig").XevS3SourceGen;
     pub const XevConnectionPool = @import("zpq/io/s3/xev_connection_pool.zig").XevConnectionPool;
     pub const global_pool = @import("zpq/io/s3/global_pool.zig");
     pub const GlobalConnectionPool = global_pool.GlobalConnectionPool;

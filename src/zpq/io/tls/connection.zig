@@ -11,302 +11,280 @@ const log = std.log.scoped(.tls);
 /// It does NOT implement `std.io.Reader/Writer` directly because it is
 /// primarily callback/event-driven via `libxev`.
 /// To use it with blocking interfaces, one would need to buffer the output.
-pub const Connection = struct {
-    loop: *xev.Loop,
-    tcp: xev.TCP,
-    tls: boring.tls_client.TlsClient,
-    allocator: std.mem.Allocator,
+pub const Connection = ConnectionGen(xev);
 
-    // Completions
-    c_connect: xev.Completion = .{},
-    c_read: xev.Completion = .{},
-    c_write: xev.Completion = .{},
-    c_close: xev.Completion = .{},
+pub fn ConnectionGen(comptime XevApi: type) type {
+    const LoopType = if (@hasDecl(XevApi, "Loop")) XevApi.Loop else XevApi;
+    const TCP = XevApi.TCP;
+    return struct {
+        const Self = @This();
 
-    // Buffers
-    // TODO: Make this configurable or dynamic
-    read_buf: [1024 * 1024]u8 = undefined,
+        loop: *LoopType,
+        tcp: TCP,
+        tls: boring.tls_client.TlsClient,
+        allocator: std.mem.Allocator,
 
-    // State
-    connected: bool = false,
-    handshake_complete: bool = false,
-    closed: bool = false,
-    idling: bool = false,
-    pending_read: bool = false,
-    pending_write: bool = false,
+        // Completions
+        c_connect: XevApi.Completion = .{},
+        c_read: XevApi.Completion = .{},
+        c_write: XevApi.Completion = .{},
+        c_close: XevApi.Completion = .{},
 
-    // Zero-Copy support
-    target_buffer: ?[]u8 = null,
-    tcp_read_buf_size: usize = 4096,
-    use_direct: bool = true,
+        // Buffers
+        read_buf: [1024 * 1024]u8 = undefined,
 
-    // User callbacks
-    // We use a simplified callback interface for now:
-    // When data is available (decrypted), we call on_data.
-    // When connection is ready (handshake done), we call on_connect.
-    // When error occurs, we call on_error.
-    // Context is erased to ?*anyopaque.
-    user_ctx: ?*anyopaque = null,
-    on_connect: ?*const fn (ctx: ?*anyopaque) void = null,
-    on_data: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
-    on_error: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
+        // State
+        connected: bool = false,
+        handshake_complete: bool = false,
+        closed: bool = false,
+        idling: bool = false,
+        pending_read: bool = false,
+        pending_write: bool = false,
 
-    const Self = @This();
+        // Zero-Copy support
+        target_buffer: ?[]u8 = null,
+        tcp_read_buf_size: usize = 4096,
+        use_direct: bool = true,
 
-    pub const Options = struct {
-        verify_certificate: bool = false,
-    };
+        user_ctx: ?*anyopaque = null,
+        on_connect: ?*const fn (ctx: ?*anyopaque) void = null,
+        on_data: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
+        on_error: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
 
-    pub fn init(loop: *xev.Loop, allocator: std.mem.Allocator, host: []const u8) !Self {
-        return initWithOptions(loop, allocator, host, .{});
-    }
-
-    pub fn initWithOptions(loop: *xev.Loop, allocator: std.mem.Allocator, host: []const u8, options: Options) !Self {
-        const tls_client = try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = options.verify_certificate });
-        // tcp is init'd later or we can init it empty?
-        // xev.TCP.init requires an address. We'll init it in connect().
-        // For now, return a partial struct or init with dummy addr?
-        // xev.TCP structure is just an fd holder.
-
-        return Self{
-            .loop = loop,
-            .tcp = undefined, // Set in connect
-            .tls = tls_client, // We own this pointer now? No, init returns pointer.
-            .allocator = allocator,
+        pub const Options = struct {
+            verify_certificate: bool = false,
         };
-    }
 
-    pub fn deinit(self: *Self) void {
-        self.tls.deinit();
-        if (!self.closed) {
-            // Auto-close the socket synchronously to prevent fd leak.
-            // This bypasses the async close path but is safe during cleanup.
-            std.posix.close(self.tcp.fd);
-            self.closed = true;
-        }
-    }
-
-    pub fn close(self: *Self) void {
-        if (self.closed) return;
-        self.closed = true;
-        // We don't cancel pending reads/writes explicitly here,
-        // but internalOnClose will disarm its completion.
-        self.tcp.close(self.loop, &self.c_close, Self, self, internalOnClose);
-    }
-
-    pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
-        self.tcp = try xev.TCP.init(addr);
-
-        const one: i32 = 1;
-
-        // Disable SIGPIPE on this socket for macOS
-        if (@import("builtin").os.tag == .macos) {
-            try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
+        pub fn init(loop: *LoopType, allocator: std.mem.Allocator, host: []const u8) !Self {
+            return initWithOptions(loop, allocator, host, .{});
         }
 
-        // Increase TCP receive buffer to 4MB for high throughput
-        const size: i32 = 4 * 1024 * 1024;
-        std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
-
-        // Enable TCP_NODELAY (Disable Nagle's algorithm) for lower latency
-        std.posix.setsockopt(self.tcp.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
-
-        self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
-    }
-
-    pub fn write(self: *Self, data: []const u8) !void {
-        if (self.closed) {
-            log.debug("write: connection closed, ignoring", .{});
-            return;
+        pub fn initWithOptions(loop: *LoopType, allocator: std.mem.Allocator, host: []const u8, options: Options) !Self {
+            const tls_client = try boring.tls_client.TlsClient.init(host, .{ .verify_certificate = options.verify_certificate });
+            return Self{
+                .loop = loop,
+                .tcp = undefined,
+                .tls = tls_client,
+                .allocator = allocator,
+            };
         }
-        // Encrypt and send
-        const enc_data = try self.tls.processOutgoing(data);
-        if (enc_data) |bytes| {
-            if (self.pending_write) {
-                log.debug("write: write already in progress", .{});
-                return error.WriteInProgress;
+
+        pub fn deinit(self: *Self) void {
+            self.tls.deinit();
+            if (!self.closed) {
+                std.posix.close(self.tcp.fd);
+                self.closed = true;
             }
-            const buf = try self.allocator.dupe(u8, bytes);
-            self.pending_write = true;
-            log.debug("write: scheduling TCP write {d} bytes", .{buf.len});
-            self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
-        } else {
-            log.debug("write: no encrypted data produced by TLS", .{});
         }
-    }
 
-    // --- Internals (The Pump) ---
+        pub fn close(self: *Self) void {
+            if (self.closed) return;
+            self.closed = true;
+            self.tcp.close(self.loop, &self.c_close, Self, self, internalOnClose);
+        }
 
-    fn pump(self: *Self) void {
-        if (self.closed) return;
+        pub fn connect(self: *Self, addr: xev.shim_net.Address) !void {
+            self.tcp = try TCP.init(addr);
 
-        // 1. Process Outgoing (TLS -> TCP)
-        const out_slice_res = self.tls.processOutgoing(null);
-        if (out_slice_res) |out_slice_opt| {
-            if (out_slice_opt) |data| {
-                if (self.pending_write) {
-                    log.debug("pump: write in progress, buffering", .{});
-                    return; // Wait for current write to finish
-                }
-                const buf = self.allocator.dupe(u8, data) catch |err| {
-                    log.debug("pump: alloc failed: {}", .{err});
-                    if (self.on_error) |cb| cb(self.user_ctx, err);
-                    return;
-                };
-                self.pending_write = true;
-                log.debug("pump: scheduling TCP write {d} bytes", .{buf.len});
-                self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+            const one: i32 = 1;
+
+            if (@import("builtin").os.tag == .macos) {
+                try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
+            }
+
+            const size: i32 = 4 * 1024 * 1024;
+            std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+
+            std.posix.setsockopt(self.tcp.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+
+            self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
+        }
+
+        pub fn write(self: *Self, data: []const u8) !void {
+            if (self.closed) {
+                log.debug("write: connection closed, ignoring", .{});
                 return;
             }
-        } else |err| {
-            log.debug("pump: TLS processOutgoing failed: {}", .{err});
-            if (self.on_error) |cb| cb(self.user_ctx, err);
-            return;
+            const enc_data = try self.tls.processOutgoing(data);
+            if (enc_data) |bytes| {
+                if (self.pending_write) {
+                    log.debug("write: write already in progress", .{});
+                    return error.WriteInProgress;
+                }
+                const buf = try self.allocator.dupe(u8, bytes);
+                self.pending_write = true;
+                log.debug("write: scheduling TCP write {d} bytes", .{buf.len});
+                self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+            } else {
+                log.debug("write: no encrypted data produced by TLS", .{});
+            }
         }
 
-        // 2. Need Input? (TCP -> TLS)
-        if (!self.pending_read and !self.idling) {
-            log.debug("pump: scheduling TCP read", .{});
-            self.pending_read = true;
-            self.tcp.read(self.loop, &self.c_read, .{ .slice = self.read_buf[0..self.tcp_read_buf_size] }, Self, self, internalOnTcpRead);
-        }
-    }
+        fn pump(self: *Self) void {
+            if (self.closed) return;
 
-    fn internalOnClose(
-        self: ?*Self,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        watcher: xev.TCP,
-        result: xev.CloseError!void,
-    ) xev.CallbackAction {
-        _ = loop;
-        _ = completion;
-        _ = watcher;
-        _ = result catch {};
-        if (self) |me| {
-            me.closed = true;
-        }
-        return .disarm;
-    }
-
-    fn internalOnConnect(
-        self: ?*Self,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        watcher: xev.TCP,
-        result: xev.ConnectError!void,
-    ) xev.CallbackAction {
-        _ = loop;
-        _ = completion;
-        _ = watcher;
-        const me = self.?;
-        if (result) |_| {
-            me.connected = true;
-            // Start Handshake
-            const out_slice_res = me.tls.startHandshake();
+            const out_slice_res = self.tls.processOutgoing(null);
             if (out_slice_res) |out_slice_opt| {
                 if (out_slice_opt) |data| {
-                    const buf = me.allocator.dupe(u8, data) catch unreachable;
-                    me.pending_write = true;
-                    me.tcp.write(me.loop, &me.c_write, .{ .slice = buf }, Self, me, internalOnTcpWrite);
-                    return .disarm;
+                    if (self.pending_write) {
+                        log.debug("pump: write in progress, buffering", .{});
+                        return;
+                    }
+                    const buf = self.allocator.dupe(u8, data) catch |err| {
+                        log.debug("pump: alloc failed: {}", .{err});
+                        if (self.on_error) |cb| cb(self.user_ctx, err);
+                        return;
+                    };
+                    self.pending_write = true;
+                    log.debug("pump: scheduling TCP write {d} bytes", .{buf.len});
+                    self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
+                    return;
                 }
             } else |err| {
-                if (me.on_error) |cb| cb(me.user_ctx, err);
-                return .disarm;
-            }
-            me.pump();
-        } else |err| {
-            if (me.on_error) |cb| cb(me.user_ctx, err);
-        }
-        return .disarm;
-    }
-
-    fn internalOnTcpWrite(
-        self: ?*Self,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        watcher: xev.TCP,
-        buffer: xev.WriteBuffer,
-        result: xev.WriteError!usize,
-    ) xev.CallbackAction {
-        _ = loop;
-        _ = completion;
-        _ = watcher;
-        const me = self.?;
-        me.pending_write = false;
-        me.allocator.free(buffer.slice); // Free the dupe
-        if (result) |n| {
-            log.debug("internalOnTcpWrite: wrote {d} bytes", .{n});
-            me.pump();
-        } else |err| {
-            log.debug("internalOnTcpWrite: write failed: {}", .{err});
-            if (me.on_error) |cb| cb(me.user_ctx, err);
-        }
-        return .disarm;
-    }
-
-    fn internalOnTcpRead(
-        self: ?*Self,
-        loop: *xev.Loop,
-        completion: *xev.Completion,
-        watcher: xev.TCP,
-        buffer: xev.ReadBuffer,
-        result: xev.ReadError!usize,
-    ) xev.CallbackAction {
-        _ = loop;
-        _ = completion;
-        _ = watcher;
-        _ = buffer;
-        const me = self.?;
-        me.pending_read = false;
-        if (result) |n| {
-            log.info("wire: read {d} bytes (target {d}KB)", .{ n, me.tcp_read_buf_size / 1024 });
-            if (n == 0) {
-                // EOF
-                me.close();
-                if (me.on_error) |cb| cb(me.user_ctx, error.EOF);
-                return .disarm;
+                log.debug("pump: TLS processOutgoing failed: {}", .{err});
+                if (self.on_error) |cb| cb(self.user_ctx, err);
+                return;
             }
 
-            // 1. Feed the new encrypted data into the TLS state machine
-            var data_to_feed: ?[]const u8 = me.read_buf[0..n];
+            if (!self.pending_read and !self.idling) {
+                log.debug("pump: scheduling TCP read", .{});
+                self.pending_read = true;
+                self.tcp.read(self.loop, &self.c_read, .{ .slice = self.read_buf[0..self.tcp_read_buf_size] }, Self, self, internalOnTcpRead);
+            }
+        }
 
-            while (true) {
-                const start_proc = std.time.Instant.now() catch unreachable;
-                const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}, if (me.use_direct) me.target_buffer else null) catch |err| {
+        fn internalOnClose(
+            self: ?*Self,
+            loop: *LoopType,
+            completion: *XevApi.Completion,
+            watcher: TCP,
+            result: XevApi.CloseError!void,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = completion;
+            _ = watcher;
+            _ = result catch {};
+            if (self) |me| {
+                me.closed = true;
+            }
+            return .disarm;
+        }
+
+        fn internalOnConnect(
+            self: ?*Self,
+            loop: *LoopType,
+            completion: *XevApi.Completion,
+            watcher: TCP,
+            result: XevApi.ConnectError!void,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = completion;
+            _ = watcher;
+            const me = self.?;
+            if (result) |_| {
+                me.connected = true;
+                const out_slice_res = me.tls.startHandshake();
+                if (out_slice_res) |out_slice_opt| {
+                    if (out_slice_opt) |data| {
+                        const buf = me.allocator.dupe(u8, data) catch unreachable;
+                        me.pending_write = true;
+                        me.tcp.write(me.loop, &me.c_write, .{ .slice = buf }, Self, me, internalOnTcpWrite);
+                        return .disarm;
+                    }
+                } else |err| {
                     if (me.on_error) |cb| cb(me.user_ctx, err);
                     return .disarm;
-                };
-                const end_proc = std.time.Instant.now() catch unreachable;
-                log.info("perf: processIncoming took {d}ns", .{end_proc.since(start_proc)});
-
-                data_to_feed = null;
-
-                if (!me.handshake_complete and me.tls.handshake_complete) {
-                    me.handshake_complete = true;
-                    if (me.on_connect) |cb| cb(me.user_ctx);
                 }
-
-                if (dec_res) |pt| {
-                    if (me.use_direct and me.target_buffer != null) {
-                        // Direct decryption happened. Update target_buffer to skip what we read.
-                        me.target_buffer = me.target_buffer.?[pt.len..];
-                        if (me.target_buffer.?.len == 0) me.target_buffer = null;
-                    }
-                    const start_cb = std.time.Instant.now() catch unreachable;
-                    if (me.on_data) |cb| cb(me.user_ctx, pt);
-                    const end_cb = std.time.Instant.now() catch unreachable;
-                    log.info("perf: on_data callback took {d}ns", .{end_cb.since(start_cb)});
-                } else {
-                    break;
-                }
+                me.pump();
+            } else |err| {
+                if (me.on_error) |cb| cb(me.user_ctx, err);
             }
-            me.pump();
-        } else |err| {
-            me.close();
-            if (me.on_error) |cb| cb(me.user_ctx, err);
+            return .disarm;
         }
-        return .disarm;
-    }
-};
+
+        fn internalOnTcpWrite(
+            self: ?*Self,
+            loop: *LoopType,
+            completion: *XevApi.Completion,
+            watcher: TCP,
+            buffer: XevApi.WriteBuffer,
+            result: XevApi.WriteError!usize,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = completion;
+            _ = watcher;
+            const me = self.?;
+            me.pending_write = false;
+            me.allocator.free(buffer.slice);
+            if (result) |n| {
+                log.debug("internalOnTcpWrite: wrote {d} bytes", .{n});
+                me.pump();
+            } else |err| {
+                log.debug("internalOnTcpWrite: write failed: {}", .{err});
+                if (me.on_error) |cb| cb(me.user_ctx, err);
+            }
+            return .disarm;
+        }
+
+        fn internalOnTcpRead(
+            self: ?*Self,
+            loop: *LoopType,
+            completion: *XevApi.Completion,
+            watcher: TCP,
+            buffer: XevApi.ReadBuffer,
+            result: XevApi.ReadError!usize,
+        ) xev.CallbackAction {
+            _ = loop;
+            _ = completion;
+            _ = watcher;
+            _ = buffer;
+            const me = self.?;
+            me.pending_read = false;
+            if (result) |n| {
+                log.info("wire: read {d} bytes (target {d}KB)", .{ n, me.tcp_read_buf_size / 1024 });
+                if (n == 0) {
+                    me.close();
+                    if (me.on_error) |cb| cb(me.user_ctx, error.EOF);
+                    return .disarm;
+                }
+
+                var data_to_feed: ?[]const u8 = me.read_buf[0..n];
+
+                while (true) {
+                    const start_proc = std.time.Instant.now() catch unreachable;
+                    const dec_res = me.tls.processIncoming(data_to_feed orelse &.{}, if (me.use_direct) me.target_buffer else null) catch |err| {
+                        if (me.on_error) |cb| cb(me.user_ctx, err);
+                        return .disarm;
+                    };
+                    const end_proc = std.time.Instant.now() catch unreachable;
+                    log.info("perf: processIncoming took {d}ns", .{end_proc.since(start_proc)});
+
+                    data_to_feed = null;
+
+                    if (!me.handshake_complete and me.tls.handshake_complete) {
+                        me.handshake_complete = true;
+                        if (me.on_connect) |cb| cb(me.user_ctx);
+                    }
+
+                    if (dec_res) |pt| {
+                        if (me.use_direct and me.target_buffer != null) {
+                            me.target_buffer = me.target_buffer.?[pt.len..];
+                            if (me.target_buffer.?.len == 0) me.target_buffer = null;
+                        }
+                        const start_cb = std.time.Instant.now() catch unreachable;
+                        if (me.on_data) |cb| cb(me.user_ctx, pt);
+                        const end_cb = std.time.Instant.now() catch unreachable;
+                        log.info("perf: on_data callback took {d}ns", .{end_cb.since(start_cb)});
+                    } else {
+                        break;
+                    }
+                }
+                me.pump();
+            } else |err| {
+                me.close();
+                if (me.on_error) |cb| cb(me.user_ctx, err);
+            }
+            return .disarm;
+        }
+    };
+}

@@ -9,20 +9,23 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     var thread_pool = xev.ThreadPool.init(.{});
-    defer thread_pool.deinit();
+    defer {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    }
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var tp_resolver = dns.ThreadPoolResolver.init(&thread_pool, allocator);
-    var sf_resolver = dns.SingleFlightResolver.init(allocator, tp_resolver.resolver());
+    var tp_resolver = dns.ThreadPoolResolverGen(xev).init(&thread_pool, allocator);
+    var sf_resolver = dns.SingleFlightResolverGen(xev).init(allocator, tp_resolver.resolver());
     defer sf_resolver.deinit();
     const resolver = sf_resolver.resolver();
 
     const Context = struct {
         done: bool = false,
-        completion: dns.Resolver.Completion = .{},
-        pub fn onResolve(ud: ?*anyopaque, results: []const dns.Address, err: anyerror!void) void {
+        completion: dns.ResolverGen(xev).Completion = .{},
+        pub fn onResolve(ud: ?*anyopaque, results: []const xev.shim_net.Address, err: anyerror!void) void {
             const self = @as(*@This(), @ptrCast(@alignCast(ud)));
             _ = results;
             err catch |e| std.debug.print("Error: {}\n", .{e});

@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addImport("zpq", zpq_mod);
+    exe_mod.addImport("xev", libxev_mod);
     exe_mod.linkSystemLibrary("c", .{});
 
     const install_all = b.option(bool, "all", "Build all auxiliary tests, probes, and benchmarks") orelse false;

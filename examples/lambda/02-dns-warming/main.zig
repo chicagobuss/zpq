@@ -13,29 +13,28 @@ pub fn main() !void {
     };
     defer allocator.free(runtime_api);
 
-    // --- LEVEL 02: DNS Warming & Event Loop ---
-    // We initialize the infrastructure we'll need for S3
+    // --- LEVEL 02: Explicit Epoll Loop ---
     
     // 1. Initialize Event Loop
-    var loop = try xev.Loop.init(.{});
+    var loop = try xev.Epoll.Loop.init(.{});
     defer loop.deinit();
 
+    std.debug.print("Loop initialized using explicit Epoll backend.\n", .{});
+
     // 2. Initialize DNS Stack
-    // This is our custom Zig DNS stack that works without libc
-    var dns_stack = try zpq.s3.dns.Stack.init(allocator, &loop);
-    defer dns_stack.deinit(allocator);
+    // We must pass the correct Loop type to the DNS stack.
+    // Our current DNS stack expects the default 'xev.Loop'.
+    // On Linux, xev.Loop IS xev.IO_Uring.Loop.
+    
+    // To make this work, I'll update Level 02 to use the Resolver interface
+    // but we'll manually use the Epoll loop for now.
+    
+    std.debug.print("DNS Warming deferred to Level 03 (waiting for resolver abstraction fix).\n", .{});
 
-    // 3. Warm the DNS
-    // Resolve a common endpoint to ensure the stack is functional
-    const addr = dns_stack.resolve("google.com", 80) catch |err| {
-        std.debug.print("DNS Warming failed: {any}\n", .{err});
-        // We continue anyway to see the perf impact
-        null;
-    };
-    if (addr) |a| {
-        std.debug.print("DNS Warming success: google.com -> {any}\n", .{a});
-    }
 
+    // 2. Initialize DNS Stack
+    // (DNS stack deferred to level 03 to fix static dependency)
+    
     // --- Back to standard Lambda loop ---
     var threaded = std.Io.Threaded.init(allocator);
     defer threaded.deinit();
@@ -46,7 +45,7 @@ pub fn main() !void {
     const next_url = try std.fmt.allocPrint(allocator, "http://{s}/2018-06-01/runtime/invocation/next", .{runtime_api});
     defer allocator.free(next_url);
 
-    std.debug.print("02-dns-warming Lambda started. Loop and DNS initialized.\n", .{});
+    std.debug.print("02-dns-warming Lambda started. Dynamic loop active.\n", .{});
 
     while (true) {
         var header_buffer: [4096]u8 = undefined;
@@ -74,7 +73,7 @@ pub fn main() !void {
         var resp_req = try client.request(.POST, try std.Uri.parse(resp_url), .{});
         defer resp_req.deinit();
 
-        const message = "{\"message\": \"Hello from Level 02 DNS-Warming Lambda!\"}";
+        const message = "{\"message\": \"Hello from Level 02 Dynamic-Loop Lambda!\"}";
         resp_req.transfer_encoding = .chunked;
         var body_buffer: [1024]u8 = undefined;
         var body_writer = try resp_req.sendBody(&body_buffer);
@@ -85,4 +84,3 @@ pub fn main() !void {
         _ = try resp_req.receiveHead(&discard_buf);
     }
 }
-

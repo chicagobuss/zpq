@@ -453,12 +453,22 @@ pub const Loop = struct {
                         // We can't use self.stop because we can't trust
                         // that c is still a valid pointer.
                         if (fd) |v| {
-                            posix.epoll_ctl(
-                                self.fd,
+                            const rc = linux.syscall4(
+                                .epoll_ctl,
+                                @bitCast(@as(isize, self.fd)),
                                 linux.EPOLL.CTL_DEL,
-                                v,
-                                null,
-                            ) catch unreachable;
+                                @bitCast(@as(isize, v)),
+                                0,
+                            );
+                            if (rc >= @as(usize, @bitCast(@as(isize, -4095)))) {
+                                const err_code: i32 = @intCast(@as(isize, @bitCast(rc)) * -1);
+                                const err: posix.E = @enumFromInt(err_code);
+                                // If the FD is already gone, that's fine.
+                                // This can happen with high-frequency DNS/TLS swaps.
+                                if (err != .NOENT and err != .BADF) {
+                                    return posix.unexpectedErrno(err);
+                                }
+                            }
 
                             if (close_dup) {
                                 posix.close(v);
@@ -1050,7 +1060,7 @@ pub const Completion = struct {
             },
 
             .sendmsg => |*op| .{
-                .sendmsg = if (posix.sendmsg(op.fd, op.msghdr, 0)) |v|
+                .sendmsg = if (std.posix.sendmsg(op.fd, @ptrCast(@alignCast(op.msghdr)), 0)) |v|
                     v
                 else |err|
                     err,

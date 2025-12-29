@@ -84,8 +84,8 @@ jobs:
         run: |
           echo "::group::Zig Build (Necessities)"
           # Build only the binaries needed for CI verification and benchmarks.
-          # Including 'zpq' explicitly ensures it's installed to zig-out/bin/
-          zig build -Doptimize=ReleaseFast -Dexamples bench-e2e zpq --summary all 2>&1
+          # We explicitly invoke 'install' (for zpq CLI) and 'bench-e2e'.
+          zig build -Doptimize=ReleaseFast -Dexamples install bench-e2e --summary all 2>&1
           echo "::endgroup::"
 
           echo "::group::Quick Compilation Check (All Probes & Tests)"

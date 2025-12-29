@@ -97,10 +97,11 @@ pub fn addAuxiliaryTools(
         });
         exe.root_module.linkSystemLibrary("c", .{});
 
-        const install = b.addInstallArtifact(exe, .{});
+        if (install_all) b.installArtifact(exe);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-e2e", "Build end-to-end S3 benchmark");
+        const install = b.addInstallArtifact(exe, .{});
         build_step.dependOn(&install.step);
 
         // Separate run step
@@ -126,10 +127,11 @@ pub fn addAuxiliaryTools(
         });
         exe.root_module.linkSystemLibrary("c", .{});
 
-        const install = b.addInstallArtifact(exe, .{});
+        if (install_all) b.installArtifact(exe);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-projection", "Build local file projection benchmark");
+        const install = b.addInstallArtifact(exe, .{});
         build_step.dependOn(&install.step);
 
         // Separate run step
@@ -155,10 +157,11 @@ pub fn addAuxiliaryTools(
         });
         exe.root_module.linkSystemLibrary("c", .{});
 
-        const install = b.addInstallArtifact(exe, .{});
+        if (install_all) b.installArtifact(exe);
 
         // Build-only step - just builds and installs the binary
         const build_step = b.step("bench-decode", "Build full decode benchmark (apples-to-apples)");
+        const install = b.addInstallArtifact(exe, .{});
         build_step.dependOn(&install.step);
 
         // Separate run step
@@ -236,10 +239,11 @@ pub fn addAuxiliaryTools(
             });
             exe.root_module.linkSystemLibrary("c", .{});
 
-            const install = b.addInstallArtifact(exe, .{});
+            if (install_all) b.installArtifact(exe);
 
             // Build-only step - just builds and installs the binary
             const build_step = b.step("bench-dns", "Build DNS benchmark");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             // Separate run step
@@ -263,10 +267,11 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
 
-            const install = b.addInstallArtifact(exe, .{});
+            if (install_all) b.installArtifact(exe);
 
             // Build-only step - just builds and installs the binary
             const build_step = b.step("ping-pongs", "Build TCP ping-pong benchmark");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             // Separate run step
@@ -356,10 +361,12 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
             exe.root_module.linkSystemLibrary("c", .{});
-            const install = b.addInstallArtifact(exe, .{});
+
+            if (install_all) b.installArtifact(exe);
 
             // Build-only step (no run) - depends on install so binary goes to zig-out
             const build_step = b.step("shootout-tls", "Build TLS throughput micro-shootout");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             // Separate run step
@@ -382,9 +389,11 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
             exe.root_module.linkSystemLibrary("c", .{});
-            const install = b.addInstallArtifact(exe, .{});
+
+            if (install_all) b.installArtifact(exe);
 
             const build_step = b.step("test-dict-decode", "Build dict decode micro-test");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             const run = b.addRunArtifact(exe);
@@ -406,10 +415,12 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
             exe.root_module.linkSystemLibrary("c", .{});
-            const install = b.addInstallArtifact(exe, .{});
+
+            if (install_all) b.installArtifact(exe);
 
             // Build-only step
             const build_step = b.step("test-passthrough", "Build passthrough integration test");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             // Separate run step
@@ -432,9 +443,11 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
             exe.root_module.linkSystemLibrary("c", .{});
-            const install = b.addInstallArtifact(exe, .{});
+
+            if (install_all) b.installArtifact(exe);
 
             const build_step = b.step("test-partitioned", "Build partitioned passthrough demo");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             const run = b.addRunArtifact(exe);
@@ -456,9 +469,11 @@ pub fn addAuxiliaryTools(
                 .root_module = mod,
             });
             exe.root_module.linkSystemLibrary("c", .{});
-            const install = b.addInstallArtifact(exe, .{});
+
+            if (install_all) b.installArtifact(exe);
 
             const build_step = b.step("test-roundtrip", "Build roundtrip integration test");
+            const install = b.addInstallArtifact(exe, .{});
             build_step.dependOn(&install.step);
 
             const run = b.addRunArtifact(exe);

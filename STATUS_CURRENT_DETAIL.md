@@ -150,7 +150,24 @@ Established the performance baseline for ZPQ on production-sized workloads.
 *   **Scale**: Verified that the parallel scheduler correctly handles 100MB+ files with dozens of columns, efficiently coalescing requests to maximize bandwidth.
 *   **Reliability**: The stack successfully handles high-latency remote storage with robust connection pooling and DNS racing.
 
-## Next High-Level Objectives:
+## Milestone 17: AWS Lambda Integration & Minimal Runtime (In Progress)
+First-class support for serverless execution via a custom Zig Lambda runtime.
+
+### Key Achievements:
+*   **Minimal Runtime Loop**: Implemented a native Lambda Runtime API loop in `examples/lambda/main.zig` that avoids heavyweight dependencies.
+*   **Architecture Parity**: Verified that the Lambda bootstrap builds and links correctly on both ARM64 (native) and macOS (cross-compilation verified for logic).
+*   **Libxev 0.16 Alignment**: Patched the `io_uring` and `epoll` backends in vendored `libxev` to align with Zig's strict `std.posix` vs `std.os.linux` type decoupling.
+*   **CI Production Artifacts**: Optimized CI to produce optimized `ReleaseFast` binaries for the Lambda runtime (`bootstrap`) and the E2E benchmark suite.
+
+### The "Steering Wheel" Problem (Design Insight):
+*   **Loop/Pool Coupling**: Realized that the `GlobalConnectionPool` is currently underutilized because each `openFile` call creates a fresh `xev.Loop`. Connections are tied to their loop.
+*   **Solution**: Refactor to allow sharing a long-lived `Loop` and `ThreadPool` across multiple S3 source instances, enabling true connection warming across Lambda invocations.
+
+## Future Technical Objectives:
 1.  **SIMD Decoders**: Moving from scalar decoding to vectorized bit-unpacking for PLAIN and RLE encodings.
 2.  **Predicate Pushdown**: Implementing row group and page skipping based on metadata statistics to avoid reading unnecessary data.
-3.  **Parquet Writing**: Adding the capability to write or "slice" parquet files using the Laziness Principle.
+3.  **Lambda "Instant-On" Optimizations**:
+    *   **Speculative Footer Fetch**: Merge HEAD and first GET into a single 128KB speculative read of the file tail.
+    *   **Connection Warming**: Persist TCP/TLS connections across Lambda invocations using the `GlobalConnectionPool` and shared `Loop` context.
+    *   **Zero-Copy Metadata**: Parse Thrift/Parquet footers directly from the network buffer.
+4.  **Parquet Writing**: Adding the capability to write or "slice" parquet files using the Laziness Principle.

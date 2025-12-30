@@ -54,6 +54,50 @@ pub fn BatchReader(comptime T: type) type {
             }
         }
 
+        /// Find an index in the dictionary for a given value.
+        /// Find an index in the dictionary for a given value.
+        pub fn findInDictionary(self: *Self, value: T) ?u64 {
+            const dict = self.dictionary orelse return null;
+            for (dict, 0..) |item, i| {
+                if (T == []const u8) {
+                    if (std.mem.eql(u8, item, value)) return i;
+                } else {
+                    if (item == value) return i;
+                }
+            }
+            return null;
+        }
+
+        pub fn skip(self: *Self, count: usize) !void {
+            var remaining = count;
+            while (remaining > 0) {
+                if (self.values_remaining_in_page == 0) {
+                    if (!try self.loadNextPage()) return;
+                }
+
+                const to_skip = @min(remaining, self.values_remaining_in_page);
+                
+                // Use optimized skip in RleDecoder if available
+                if (self.def_levels_decoder) |*d| try d.skip(@intCast(to_skip));
+                
+                if (self.rle_decoder) |*r| {
+                    try r.skip(@intCast(to_skip));
+                } else if (self.plain_decoder != null) {
+                    // Decoder.skip is easy for fixed-width
+                    // For BYTE_ARRAY it's hard, but we can just read and discard
+                    if (T == []const u8 and self.column_type != .FIXED_LEN_BYTE_ARRAY) {
+                        for (0..to_skip) |_| _ = try self.plain_decoder.?.readByteArray();
+                    } else {
+                        const width: usize = if (T == [12]u8) 12 else @sizeOf(T);
+                        try self.plain_decoder.?.skip(to_skip * width);
+                    }
+                }
+
+                self.values_remaining_in_page -= to_skip;
+                remaining -= to_skip;
+            }
+        }
+
         pub fn nextBatch(self: *Self, buffer: []?T) !usize {
             // Free pages from PREVIOUS batch, except the one we are currently reading from
             var page_idx: usize = 0;
@@ -110,7 +154,6 @@ pub fn BatchReader(comptime T: type) type {
 
                 // 3. Nullable Dictionary-encoded
                 if (self.max_def_level > 0 and self.def_levels_decoder != null and self.rle_decoder != null and self.dictionary != null) {
-                    // Use expandNullsBatch8 logic
                     var batch_size: usize = 0;
                     while (batch_size < count) {
                         const batch_rem = @min(8, count - batch_size);
@@ -118,31 +161,75 @@ pub fn BatchReader(comptime T: type) type {
                         const n_def = try self.def_levels_decoder.?.nextBatch(def_levels[0..batch_rem]);
                         if (n_def == 0) break;
 
-                        // Identify how many values we actually need to pull from data stream
-                        var mask: u8 = 0;
-                        var values_needed: u8 = 0;
-                        for (0..n_def) |i| {
-                            if (def_levels[i] == self.max_def_level) {
-                                mask |= (@as(u8, 1) << @intCast(i));
-                                values_needed += 1;
+                        const mask = if (n_def == 8) 
+                            simd.defLevelsToMask8(def_levels, self.max_def_level)
+                        else blk: {
+                            var m: u8 = 0;
+                            for (0..n_def) |i| {
+                                if (def_levels[i] == self.max_def_level) {
+                                    m |= (@as(u8, 1) << @intCast(i));
+                                }
                             }
-                        }
+                            break :blk m;
+                        };
+
+                        const values_needed = @popCount(mask);
 
                         if (values_needed > 0) {
                             var indices: [8]u64 = undefined;
                             const n_idx = try self.rle_decoder.?.nextBatch(indices[0..values_needed]);
                             if (n_idx < values_needed) return error.EndOfStream;
 
-                            // Map indices to dictionary values
                             var compact_vals: [8]T = undefined;
                             const dict = self.dictionary.?;
                             for (0..n_idx) |i| {
                                 compact_vals[i] = dict[indices[i]];
                             }
 
-                            // Expand into the output buffer
                             var tmp_out: [8]?T = undefined;
                             _ = simd.expandNullsBatch8(T, compact_vals[0..n_idx], mask, &tmp_out);
+                            @memcpy(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], tmp_out[0..n_def]);
+                        } else {
+                            @memset(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], null);
+                        }
+                        
+                        batch_size += n_def;
+                        self.values_remaining_in_page -= n_def;
+                    }
+                    out_pos += batch_size;
+                    continue;
+                }
+
+                // 4. Nullable PLAIN-encoded (primitives)
+                if (self.max_def_level > 0 and self.def_levels_decoder != null and self.plain_decoder != null and T != []const u8 and T != [12]u8) {
+                    var batch_size: usize = 0;
+                    while (batch_size < count) {
+                        const batch_rem = @min(8, count - batch_size);
+                        var def_levels: [8]u64 = undefined;
+                        const n_def = try self.def_levels_decoder.?.nextBatch(def_levels[0..batch_rem]);
+                        if (n_def == 0) break;
+
+                        const mask = if (n_def == 8) 
+                            simd.defLevelsToMask8(def_levels, self.max_def_level)
+                        else blk: {
+                            var m: u8 = 0;
+                            for (0..n_def) |i| {
+                                if (def_levels[i] == self.max_def_level) {
+                                    m |= (@as(u8, 1) << @intCast(i));
+                                }
+                            }
+                            break :blk m;
+                        };
+
+                        const values_needed = @popCount(mask);
+
+                        if (values_needed > 0) {
+                            var compact_vals: [8]T = undefined;
+                            const n_plain = try self.plain_decoder.?.readBatch(compact_vals[0..values_needed]);
+                            if (n_plain < values_needed) return error.EndOfStream;
+
+                            var tmp_out: [8]?T = undefined;
+                            _ = simd.expandNullsBatch8(T, compact_vals[0..n_plain], mask, &tmp_out);
                             @memcpy(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], tmp_out[0..n_def]);
                         } else {
                             @memset(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], null);
@@ -163,6 +250,44 @@ pub fn BatchReader(comptime T: type) type {
                 }
             }
             return out_pos;
+        }
+
+        /// Read a batch of values, but only materializing rows set in the selection vector.
+        /// Unselected rows are skipped in the underlying data stream.
+        /// buffer should be large enough to hold all selected values (sel.count).
+        /// returns number of selected values materialized.
+        pub fn nextBatchSelected(self: *Self, buffer: []?T, selection: *const zpq.core.simd.SelectionVector, n: usize) !usize {
+            var selected_pos: usize = 0;
+            var i: usize = 0;
+            while (i < n) {
+                if (self.values_remaining_in_page == 0) {
+                    if (!try self.loadNextPage()) break;
+                }
+
+                const batch_rem = @min(n - i, self.values_remaining_in_page);
+                
+                // Identify runs of selected/unselected rows
+                var j: usize = 0;
+                while (j < batch_rem) {
+                    const is_selected = selection.isSet(i + j);
+                    var run_len: usize = 1;
+                    while (j + run_len < batch_rem and selection.isSet(i + j + run_len) == is_selected) {
+                        run_len += 1;
+                    }
+
+                    if (is_selected) {
+                        // Materialize run
+                        const materialized = try self.nextBatch(buffer[selected_pos .. selected_pos + run_len]);
+                        selected_pos += materialized;
+                    } else {
+                        // Skip run
+                        try self.skip(run_len);
+                    }
+                    j += run_len;
+                }
+                i += batch_rem;
+            }
+            return selected_pos;
         }
 
         fn loadNextPage(self: *Self) !bool {

@@ -314,4 +314,36 @@ pub const ParquetFile = struct {
         }
         return error.MetadataNotLoaded;
     }
+
+    /// Check if a row group should be skipped based on a simple equality filter on a column.
+    pub fn shouldSkipRowGroup(self: *const ParquetFile, rg_idx: usize, column_name: []const u8, filter_val: []const u8) bool {
+        const meta = self.metadata orelse return false;
+        if (rg_idx >= meta.row_groups.items.len) return false;
+        const rg = meta.row_groups.items[rg_idx];
+
+        for (rg.columns.items) |col| {
+            if (col.meta_data) |md| {
+                // Check if this column matches the name (simple leaf-name check for now)
+                // In production, we'd want full path matching.
+                const path = md.path_in_schema.items;
+                const leaf_name = path[path.len - 1];
+                if (!std.mem.eql(u8, leaf_name, column_name)) continue;
+
+                // Found the column, check statistics
+                if (md.statistics) |stats| {
+                    if (md.type == .BYTE_ARRAY) {
+                        if (stats.min_value) |min| {
+                            if (std.mem.lessThan(u8, filter_val, min)) return true;
+                        }
+                        if (stats.max_value) |max| {
+                            if (std.mem.lessThan(u8, max, filter_val)) return true;
+                        }
+                    }
+                    // TODO: Add support for other types (INT32, INT64, etc.)
+                }
+                break;
+            }
+        }
+        return false;
+    }
 };

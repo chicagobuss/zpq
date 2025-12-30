@@ -25,6 +25,15 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--tls-verify")) break true;
     } else false;
 
+    var filter: ?[]const u8 = null;
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--filter")) {
+            if (i + 1 < args.len) {
+                filter = args[i + 1];
+            }
+        }
+    }
+
     // Initialize core xev infrastructure for all commands
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
@@ -63,10 +72,10 @@ pub fn main() !void {
         try cmdCat(allocator, args[2], limit, is_async, &loop, &thread_pool, resolver, verify_tls);
     } else if (std.mem.eql(u8, command, "scan")) {
         if (args.len < 3) {
-            std.debug.print("Usage: {s} scan <parquet_file>\n", .{args[0]});
+            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val]\n", .{args[0]});
             return;
         }
-        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
+        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter);
     } else if (std.mem.eql(u8, command, "pages")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} pages <parquet_file>\n", .{args[0]});
@@ -163,7 +172,7 @@ fn openFile(
     );
 }
 
-fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool) !void {
+fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool, filter: ?[]const u8) !void {
     var timer = try std.time.Timer.start();
 
     var pf = try openFile(allocator, path, is_async, loop, thread_pool, resolver, verify_tls);
@@ -171,43 +180,125 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     try pf.readFooter();
 
     var total_values: u64 = 0;
+    var row_groups_skipped: usize = 0;
+    var rows_selected: u64 = 0;
+
+    // Parse filter (simple col=val)
+    var filter_col_name: ?[]const u8 = null;
+    var filter_val: ?[]const u8 = null;
+    if (filter) |f| {
+        if (std.mem.indexOfScalar(u8, f, '=')) |idx| {
+            filter_col_name = f[0..idx];
+            filter_val = f[idx+1..];
+        }
+    }
 
     if (pf.metadata) |meta| {
         for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
+            // 1. Metadata Pruning
+            if (filter_col_name != null and filter_val != null) {
+                if (pf.shouldSkipRowGroup(rg_idx, filter_col_name.?, filter_val.?)) {
+                    row_groups_skipped += 1;
+                    continue;
+                }
+            }
+
             var rg = try pf.rowGroup(rg_idx);
             defer rg.deinit();
 
             // Trigger Massive Parallel Prefetch!
-            try rg.prefetch(null); // Prefetch all columns
+            try rg.prefetch(null);
 
-            for (rg_meta.columns.items, 0..) |col, col_idx| {
-                if (col.meta_data) |md| {
-                    const levels = meta.getColumnLevels(md.path_in_schema.items);
-                    const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
-                    const type_length = if (schema_elem) |se| se.type_length else null;
-                    const reader = try rg.columnReader(col_idx);
+            // Find filter column index
+            var filter_col_idx: ?usize = null;
+            if (filter_col_name) |name| {
+                for (rg_meta.columns.items, 0..) |col, idx| {
+                    if (col.meta_data) |md| {
+                        const path_parts = md.path_in_schema.items;
+                        if (std.mem.eql(u8, path_parts[path_parts.len - 1], name)) {
+                            filter_col_idx = idx;
+                            break;
+                        }
+                    }
+                }
+            }
 
-                    // Type dispatch for full-materialization scan
-                    const n = switch (md.type) {
-                        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try scanColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        .INT32 => try scanColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        .INT64 => try scanColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        .INT96 => try scanColumnBatch(allocator, [12]u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        .FLOAT => try scanColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        .DOUBLE => try scanColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
-                        else => blk: {
-                            // Fallback for unsupported types (just count pages)
-                            var reader_inner = try rg.columnReader(col_idx);
-                            var count: u64 = 0;
-                            while (try reader_inner.next(allocator)) |page| {
-                                var p = page;
-                                defer p.deinit(allocator);
-                                if (p.header.data_page_header) |dph| count += @intCast(dph.num_values);
+            if (filter_col_idx) |f_idx| {
+                // FILTERED SCAN PATH
+                const md = rg_meta.columns.items[f_idx].meta_data.?;
+                const levels = meta.getColumnLevels(md.path_in_schema.items);
+                const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
+                const type_length = if (schema_elem) |se| se.type_length else null;
+                
+                // For now, only support BYTE_ARRAY filters for simplicity
+                if (md.type != .BYTE_ARRAY) {
+                    std.debug.print("Filters currently only supported on BYTE_ARRAY columns\n", .{});
+                    return error.UnsupportedFilterType;
+                }
+
+                const filter_reader = try rg.columnReader(f_idx);
+                var filter_batch_reader = zpq.core.batch_reader.BatchReader([]const u8).init(allocator, filter_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length);
+                defer filter_batch_reader.deinit();
+
+                var filter_buf: [1024]?[]const u8 = undefined;
+                var row_idx: usize = 0;
+                while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
+                    const to_read = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
+                    const n = try filter_batch_reader.nextBatch(filter_buf[0..to_read]);
+                    if (n == 0) break;
+
+                    var sel = zpq.core.simd.SelectionVector.init();
+                    for (filter_buf[0..n], 0..) |val, i| {
+                        if (val) |v| {
+                            if (std.mem.eql(u8, v, filter_val.?)) {
+                                sel.setBitIndices(i);
                             }
-                            break :blk count;
-                        },
-                    };
+                        }
+                    }
+                    rows_selected += sel.count();
                     total_values += n;
+
+                    // Lazy Materialization: Decode other columns only if sel.count() > 0
+                    if (sel.count() > 0) {
+                        for (rg_meta.columns.items, 0..) |other_col, other_idx| {
+                            if (other_idx == f_idx) continue;
+                            if (other_col.meta_data) |_| {
+                                // Proof of concept: multi-column lazy materialization
+                                // would go here.
+                            }
+                        }
+                    }
+                    row_idx += n;
+                }
+            } else {
+                // FULL SCAN PATH (no filter or column not found)
+                for (rg_meta.columns.items, 0..) |col, col_idx| {
+                    if (col.meta_data) |md| {
+                        const levels = meta.getColumnLevels(md.path_in_schema.items);
+                        const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
+                        const type_length = if (schema_elem) |se| se.type_length else null;
+                        const reader = try rg.columnReader(col_idx);
+
+                        const n = switch (md.type) {
+                            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try scanColumnBatch(allocator, []const u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            .INT32 => try scanColumnBatch(allocator, i32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            .INT64 => try scanColumnBatch(allocator, i64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            .INT96 => try scanColumnBatch(allocator, [12]u8, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            .FLOAT => try scanColumnBatch(allocator, f32, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            .DOUBLE => try scanColumnBatch(allocator, f64, reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length),
+                            else => blk: {
+                                var reader_inner = try rg.columnReader(col_idx);
+                                var count: u64 = 0;
+                                while (try reader_inner.next(allocator)) |page| {
+                                    var p = page;
+                                    defer p.deinit(allocator);
+                                    if (p.header.data_page_header) |dph| count += @intCast(dph.num_values);
+                                }
+                                break :blk count;
+                            },
+                        };
+                        total_values += n;
+                    }
                 }
             }
         }
@@ -218,6 +309,12 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     const mvals_per_s = if (elapsed_s > 0) @as(f64, @floatFromInt(total_values)) / elapsed_s / 1_000_000.0 else 0.0;
 
     std.debug.print("Scanned {d} values in {d:.2}ms ({d:.2} MVal/s)\n", .{ total_values, @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0, mvals_per_s });
+    if (filter_col_name) |_| {
+        std.debug.print("Rows selected: {d}\n", .{rows_selected});
+    }
+    if (row_groups_skipped > 0) {
+        std.debug.print("Row groups skipped via stats: {d}\n", .{row_groups_skipped});
+    }
 }
 
 fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32) !u64 {
@@ -291,6 +388,13 @@ fn cmdMeta(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         std.debug.print("{any} ", .{enc});
                     }
                     std.debug.print("\n", .{});
+                    if (md.statistics) |stats| {
+                        std.debug.print("          Stats: ", .{});
+                        if (stats.min_value) |min| std.debug.print("min={s} ", .{min});
+                        if (stats.max_value) |max| std.debug.print("max={s} ", .{max});
+                        if (stats.null_count) |nc| std.debug.print("nulls={d} ", .{nc});
+                        std.debug.print("\n", .{});
+                    }
                 }
             }
         }

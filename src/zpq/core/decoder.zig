@@ -92,5 +92,10 @@ pub const Decoder = struct {
     pub fn hasMore(self: *Decoder) bool {
         return self.pos < self.data.len;
     }
+
+    pub fn skip(self: *Decoder, len: usize) !void {
+        if (self.pos + len > self.data.len) return error.EndOfStream;
+        self.pos += len;
+    }
 };
 

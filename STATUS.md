@@ -36,15 +36,15 @@ ZPQ's objective is to become the fastest, leanest Parquet engine for serverless 
 ### Phase 1: Read Dominance (Skip Everything)
 **Goal**: Minimize I/O and maximize decode throughput.
 
-#### Milestone 18: SIMD Decoders [IN PROGRESS]
+#### Milestone 18: SIMD Decoders [COMPLETE]
 *   [x] **SIMD Bit-Unpacking**: Achieved **3.1 GVal/s** using comptime kernels.
 *   [x] **BatchReader Integration**: Unified 1024-wide vectorized paths for all types.
 *   [x] **Deranged Data Proof**: Verified correctness against industrial edge cases.
-*   [ ] **Vectorized RLE runs**: SIMD splat/memset for repetition runs.
-*   [ ] **SIMD null bitmap expansion**: Branchless expansion of nullable batches.
+*   [x] **Vectorized RLE runs**: SIMD splat/memset for repetition runs.
+*   [x] **SIMD null bitmap expansion**: Branchless expansion using shuffle tables.
 
-#### Milestone 19: Predicate Pushdown (Read-Side)
-*   [ ] **Metadata Pruning**: Skip row groups using min/max statistics.
+#### Milestone 19: Predicate Pushdown (Read-Side) [IN PROGRESS]
+*   [x] **Metadata Pruning**: Skip row groups using min/max statistics.
 *   [ ] **Selection Vector Generation**: Decode filter columns first to build bitmaps.
 *   [ ] **Lazy Materialization**: Only decode rows matching the selection vector.
 

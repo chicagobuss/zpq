@@ -121,6 +121,7 @@ pub const DataPageHeader = struct {
 
     pub fn read(reader: *thrift.Reader) !DataPageHeader {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var header = DataPageHeader{
@@ -163,6 +164,7 @@ pub const DictionaryPageHeader = struct {
 
     pub fn read(reader: *thrift.Reader) !DictionaryPageHeader {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var header = DictionaryPageHeader{
@@ -206,6 +208,7 @@ pub const PageHeader = struct {
 
     pub fn read(reader: *thrift.Reader) !PageHeader {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var header = PageHeader{
@@ -253,6 +256,50 @@ pub const PageHeader = struct {
     }
 };
 
+pub const Statistics = struct {
+    max: ?[]const u8 = null,
+    min: ?[]const u8 = null,
+    null_count: ?i64 = null,
+    distinct_count: ?i64 = null,
+    max_value: ?[]const u8 = null,
+    min_value: ?[]const u8 = null,
+
+    pub fn read(reader: *thrift.Reader) !Statistics {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+
+        var stats = Statistics{};
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+
+            switch (field.id) {
+                1 => stats.max = try reader.readString(),
+                2 => stats.min = try reader.readString(),
+                3 => stats.null_count = try reader.readZigZag(i64),
+                4 => stats.distinct_count = try reader.readZigZag(i64),
+                5 => stats.max_value = try reader.readString(),
+                6 => stats.min_value = try reader.readString(),
+                else => try reader.skip(field.type),
+            }
+        }
+        return stats;
+    }
+
+    pub fn write(self: *const Statistics, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        if (self.max) |v| try writer.writeFieldString(1, v);
+        if (self.min) |v| try writer.writeFieldString(2, v);
+        if (self.null_count) |v| try writer.writeFieldI64(3, v);
+        if (self.distinct_count) |v| try writer.writeFieldI64(4, v);
+        if (self.max_value) |v| try writer.writeFieldString(5, v);
+        if (self.min_value) |v| try writer.writeFieldString(6, v);
+        try writer.writeStructEnd();
+    }
+};
+
 pub const ColumnMetaData = struct {
     type: Type,
     encodings: EncodingList,
@@ -264,9 +311,11 @@ pub const ColumnMetaData = struct {
     data_page_offset: i64,
     index_page_offset: ?i64,
     dictionary_page_offset: ?i64,
+    statistics: ?Statistics = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnMetaData {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var meta = ColumnMetaData{
@@ -280,6 +329,7 @@ pub const ColumnMetaData = struct {
             .data_page_offset = 0,
             .index_page_offset = null,
             .dictionary_page_offset = null,
+            .statistics = null,
         };
         errdefer meta.encodings.deinit(allocator);
         errdefer meta.path_in_schema.deinit(allocator);
@@ -313,9 +363,11 @@ pub const ColumnMetaData = struct {
                 5 => meta.num_values = try reader.readZigZag(i64),
                 6 => meta.total_uncompressed_size = try reader.readZigZag(i64),
                 7 => meta.total_compressed_size = try reader.readZigZag(i64),
+                8 => try reader.skip(field.type), // key_value_metadata skipped for now
                 9 => meta.data_page_offset = try reader.readZigZag(i64),
                 10 => meta.index_page_offset = try reader.readZigZag(i64),
                 11 => meta.dictionary_page_offset = try reader.readZigZag(i64),
+                12 => meta.statistics = try Statistics.read(reader),
                 else => try reader.skip(field.type),
             }
         }
@@ -345,6 +397,10 @@ pub const ColumnMetaData = struct {
         try writer.writeFieldI64(5, self.num_values);
         try writer.writeFieldI64(6, self.total_uncompressed_size);
         try writer.writeFieldI64(7, self.total_compressed_size);
+        if (self.statistics) |*s| {
+            try writer.writeFieldBegin(.Struct, 8);
+            try s.write(writer);
+        }
         try writer.writeFieldI64(9, self.data_page_offset);
         if (self.index_page_offset) |v| try writer.writeFieldI64(10, v);
         if (self.dictionary_page_offset) |v| try writer.writeFieldI64(11, v);
@@ -359,6 +415,7 @@ pub const ColumnChunk = struct {
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var chunk = ColumnChunk{
@@ -407,6 +464,7 @@ pub const RowGroup = struct {
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !RowGroup {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var rg = RowGroup{
@@ -469,6 +527,7 @@ pub const FileMetaData = struct {
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
         var meta = FileMetaData{

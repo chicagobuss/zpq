@@ -7,14 +7,14 @@
 
 ## Phase 1: Read Dominance (Skip Everything)
 
-### Milestone 18: SIMD Decoders (In Progress)
+### Milestone 18: SIMD Decoders [COMPLETE]
 ZPQ's decode performance leverages Zig 0.16's native `@Vector` support for extreme throughput.
 
 *   [x] **Vector-Vector Shifts**: Parallel bit-unpacking for widths 1-32.
 *   [x] **Large-Integer Load**: Use `u128/u256` containers for single-read 8-value loads.
-*   [x] **BatchReader Integration**: Unified `nextBatch` path for dictionary and plain encodings.
-*   [ ] **Vectorized RLE runs**: Vectorize repetition runs using splat/memset.
-*   [ ] **SIMD null bitmap expansion**: Branchless expansion of nullable batches.
+*   [x] **BatchReader Integration**: Unified 1024-wide vectorized paths for all types.
+*   [x] **SIMD Null Expansion**: Achieved branchless expansion using shuffle tables and vectorized mask generation from definition levels.
+*   [x] **Vectorized RLE Runs**: Leveraged `@memset` for high-speed repetition decoding.
 
 ### Milestone 18.5: The Deranged Data Verification Gauntlet [COMPLETE]
 **Goal**: Stress-test correctness and SIMD alignment using non-standard data.
@@ -24,8 +24,14 @@ ZPQ's decode performance leverages Zig 0.16's native `@Vector` support for extre
 *   [x] **Alignment**: FIXED_LEN_BYTE_ARRAY with non-standard lengths (7 bytes). Correct.
 *   [x] **Transitions**: Dictionary -> PLAIN encoding transitions mid-column. Correct.
 
-### Milestone 19: Predicate Pushdown (Up Next)
-**Goal**: Skip I/O and processing for non-matching rows.
+### Milestone 19: Predicate Pushdown (Read-Side) [IN PROGRESS]
+**Goal**: Skip work on reads - Laziness Principle for filtering.
+
+*   [x] **Metadata Pruning**: Implemented basic row group skipping using min/max statistics.
+*   [x] **Selection Vector Generation**: Implemented `SelectionVector` and integrated it into `zpq scan` filter path.
+*   [x] **Lazy Materialization (Primitive)**: Added `BatchReader.skip(n)` and `BatchReader.nextBatchSelected(...)` to support vectorized skipping/filtering.
+*   [ ] **Full Lazy Materialization**: Refactor `scan` to persist readers across batches for multi-column lazy materialization.
+*   [ ] **Benchmark**: Demonstrate speedup on highly selective filters.
 
 ---
 

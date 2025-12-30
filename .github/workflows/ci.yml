@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -112,17 +112,13 @@ jobs:
 
       - name: Build
         run: |
-          echo "::group::Zig Build (Necessities)"
           # Build only the binaries needed for CI verification and benchmarks.
           # We build 'zpq' and 'bench-e2e' in ReleaseFast.
           zig build -Doptimize=ReleaseFast install bench-e2e --summary all 2>&1
-          echo "::endgroup::"
 
-          echo "::group::Quick Compilation Check (Auxiliary Tools)"
           # Fast check of probes and tests in Debug mode to ensure no regressions
           # We use 'zig build check' and -Dall=true to verify the whole codebase.
           zig build check -Dall=true -Dexamples=true --summary all 2>&1
-          echo "::endgroup::"
 
           echo "Build artifacts:"
           ls -laR zig-out/
@@ -169,13 +165,14 @@ jobs:
 
       - name: Run Tests
         run: |
-          echo "::group::Running Tests"
+          echo "Running Tests (ZSTD Enabled)"
           zig build test --summary all 2>&1
-          echo "::endgroup::"
+
+          echo "Running Tests (ZSTD Disabled)"
+          zig build test -Dzstd-compression=false --summary all 2>&1
 
       - name: Run Inspector Verification
         run: |
-          echo "::group::Inspector Verification"
           # Find the built zpq binary
           ZPQ_BIN=$(find zig-out -name zpq -type f | head -1)
           if [ -z "$ZPQ_BIN" ]; then
@@ -188,7 +185,6 @@ jobs:
           "$ZPQ_BIN" inspect ci/fixtures/parquet/simple.parquet
           echo "Testing required.parquet..."
           "$ZPQ_BIN" inspect ci/fixtures/parquet/required.parquet
-          echo "::endgroup::"
           echo "All verifications passed!"
 
       - name: Run R2 Benchmarks

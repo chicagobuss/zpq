@@ -35,12 +35,19 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const use_prebuilt = b.option(bool, "use-prebuilt", "Use pre-built static libraries if available") orelse true;
 
+    // Optional features requiring external libraries
+    const enable_zstd_compression = b.option(bool, "zstd-compression", "Enable ZSTD compression (requires libzstd)") orelse true;
+
     // Get git hash for build info
     const git_hash = getGitHash(b);
 
     // Create build_options module with git hash for benchmarks
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "git_hash", git_hash);
+
+    // Create zpq_options module for feature flags
+    const zpq_options = b.addOptions();
+    zpq_options.addOption(bool, "enable_zstd_compression", enable_zstd_compression);
 
     // Dependencies
     const libxev_dep = b.dependency("libxev", .{
@@ -67,8 +74,18 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "xev", .module = libxev_mod },
             .{ .name = "boring_tls", .module = boring_tls_mod },
+            .{ .name = "zpq_options", .module = zpq_options.createModule() },
         },
     });
+
+    // Conditionally link libzstd for compression support
+    if (enable_zstd_compression) {
+        const zstd_dep = b.dependency("zstd", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        zpq_mod.linkLibrary(zstd_dep.artifact("zstd"));
+    }
 
     // Also expose xev for probes that need direct access
     // Re-export the dependency's module rather than creating a new one

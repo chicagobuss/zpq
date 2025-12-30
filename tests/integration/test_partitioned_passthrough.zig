@@ -180,7 +180,7 @@ fn runPassthrough(allocator: std.mem.Allocator, input_path: []const u8, output_p
     var bytes_written: usize = 0;
     for (rg.columns.items, 0..) |col_chunk, col_idx| {
         const col_meta = col_chunk.meta_data orelse continue;
-        try writer.writePassthroughColumn(rg_writer, col_meta, column_data[col_idx]);
+        try rg_writer.writePassthroughColumn(col_meta, column_data[col_idx]);
         bytes_written += column_data[col_idx].len;
     }
 

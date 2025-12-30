@@ -30,6 +30,26 @@ pub fn main() !void {
     try testDictStringRoundtrip(allocator, "/tmp/zpq_test_dict.parquet");
     std.debug.print("  ✓ Dictionary string roundtrip passed\n\n", .{});
 
+    // Test 4: GZIP compressed INT32 column
+    std.debug.print("Test 4: GZIP compressed INT32 column\n", .{});
+    try testGzipInt32Roundtrip(allocator, "/tmp/zpq_test_gzip.parquet");
+    std.debug.print("  ✓ GZIP compressed roundtrip passed\n\n", .{});
+
+    // Test 5: SNAPPY compressed INT32 column
+    std.debug.print("Test 5: SNAPPY compressed INT32 column\n", .{});
+    try testSnappyInt32Roundtrip(allocator, "/tmp/zpq_test_snappy.parquet");
+    std.debug.print("  ✓ SNAPPY compressed roundtrip passed\n\n", .{});
+
+    // Test 6: ZSTD compressed INT32 column (only if ZSTD compression enabled)
+    const zstd = zpq.core.zstd;
+    if (comptime zstd.compression_enabled) {
+        std.debug.print("Test 6: ZSTD compressed INT32 column\n", .{});
+        try testZstdInt32Roundtrip(allocator, "/tmp/zpq_test_zstd.parquet");
+        std.debug.print("  ✓ ZSTD compressed roundtrip passed\n\n", .{});
+    } else {
+        std.debug.print("Test 6: ZSTD compressed INT32 column (SKIPPED - not enabled)\n\n", .{});
+    }
+
     std.debug.print("=== All Round-Trip Tests Passed ===\n", .{});
 }
 
@@ -198,6 +218,318 @@ fn writeInt32File(allocator: std.mem.Allocator, path: []const u8, values: []cons
         .precision = null,
         .field_id = null,
     });
+
+    // Write footer
+    const metadata = schema.FileMetaData{
+        .version = 2,
+        .schema = schema_elements,
+        .num_rows = @intCast(values.len),
+        .created_by = "zpq",
+        .row_groups = row_groups,
+    };
+
+    var writer = thrift.Writer.init(allocator);
+    defer writer.deinit();
+    try metadata.write(&writer);
+
+    const footer_bytes = writer.bytes();
+    try file.writeAll(footer_bytes);
+    try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(footer_bytes.len))));
+    try file.writeAll("PAR1");
+}
+
+fn testGzipInt32Roundtrip(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Write with GZIP compression
+    const values = [_]i32{ 1, 2, 3, 4, 5, 100, -50, 999, 12345, -99999 };
+    try writeGzipInt32File(allocator, path, &values);
+
+    // Read back and verify
+    var file = try ParquetFile.open(allocator, path);
+    defer file.deinit();
+    try file.readFooter();
+
+    const meta = file.metadata orelse return error.NoMetadata;
+    try std.testing.expectEqual(@as(i64, 10), meta.num_rows);
+
+    // Verify compression codec in metadata
+    const rg = meta.row_groups.items[0];
+    const col_meta = rg.columns.items[0].meta_data orelse return error.NoColumnMetadata;
+    try std.testing.expectEqual(schema.CompressionCodec.GZIP, col_meta.codec);
+
+    // Read and decode - ParquetFile should handle decompression
+    var rg_reader = try file.rowGroup(0);
+    defer rg_reader.deinit();
+
+    var col_reader = try rg_reader.columnReader(0);
+
+    var decoded = std.ArrayListUnmanaged(i32){};
+    defer decoded.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    while (try col_reader.next(arena.allocator())) |page| {
+        if (page.header.type == .DATA_PAGE) {
+            var decoder_inst = zpq.decoder.Decoder.init(page.data);
+            while (decoder_inst.hasMore()) {
+                const val = try decoder_inst.readInt32();
+                try decoded.append(allocator, val);
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), decoded.items.len);
+    for (decoded.items, 0..) |val, i| {
+        try std.testing.expectEqual(values[i], val);
+    }
+}
+
+fn writeGzipInt32File(allocator: std.mem.Allocator, path: []const u8, values: []const i32) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    try file.writeAll("PAR1");
+    var offset: u64 = 4;
+
+    // Create column writer with GZIP compression
+    var col_writer = page_writer.ColumnWriter.init(allocator, .INT32, .GZIP);
+    defer col_writer.deinit();
+
+    try col_writer.writeInt32Plain(values);
+
+    const chunk = try col_writer.writeToFile(file, &[_][]const u8{"value"}, offset);
+    offset = @intCast(try file.getPos());
+
+    // Build metadata
+    var row_groups = std.ArrayListUnmanaged(schema.RowGroup){};
+    defer {
+        for (row_groups.items) |*rg| rg.deinit(allocator);
+        row_groups.deinit(allocator);
+    }
+
+    var columns = std.ArrayListUnmanaged(schema.ColumnChunk){};
+    try columns.append(allocator, chunk);
+
+    try row_groups.append(allocator, schema.RowGroup{
+        .columns = columns,
+        .total_byte_size = col_writer.total_compressed_size,
+        .num_rows = @intCast(values.len),
+    });
+
+    // Build schema
+    var schema_elements = std.ArrayListUnmanaged(schema.SchemaElement){};
+    defer schema_elements.deinit(allocator);
+
+    try schema_elements.append(allocator, .{ .type = null, .type_length = null, .repetition_type = null, .name = "schema", .num_children = 1, .scale = null, .precision = null, .field_id = null });
+    try schema_elements.append(allocator, .{ .type = .INT32, .type_length = null, .repetition_type = .REQUIRED, .name = "value", .num_children = null, .scale = null, .precision = null, .field_id = null });
+
+    // Write footer
+    const metadata = schema.FileMetaData{
+        .version = 2,
+        .schema = schema_elements,
+        .num_rows = @intCast(values.len),
+        .created_by = "zpq",
+        .row_groups = row_groups,
+    };
+
+    var writer = thrift.Writer.init(allocator);
+    defer writer.deinit();
+    try metadata.write(&writer);
+
+    const footer_bytes = writer.bytes();
+    try file.writeAll(footer_bytes);
+    try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(footer_bytes.len))));
+    try file.writeAll("PAR1");
+}
+
+fn testSnappyInt32Roundtrip(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Write with SNAPPY compression
+    const values = [_]i32{ 1, 2, 3, 4, 5, 100, -50, 999, 12345, -99999 };
+    try writeSnappyInt32File(allocator, path, &values);
+
+    // Read back and verify
+    var file = try ParquetFile.open(allocator, path);
+    defer file.deinit();
+    try file.readFooter();
+
+    const meta = file.metadata orelse return error.NoMetadata;
+    try std.testing.expectEqual(@as(i64, 10), meta.num_rows);
+
+    // Verify compression codec in metadata
+    const rg = meta.row_groups.items[0];
+    const col_meta = rg.columns.items[0].meta_data orelse return error.NoColumnMetadata;
+    try std.testing.expectEqual(schema.CompressionCodec.SNAPPY, col_meta.codec);
+
+    // Read and decode - ParquetFile should handle decompression
+    var rg_reader = try file.rowGroup(0);
+    defer rg_reader.deinit();
+
+    var col_reader = try rg_reader.columnReader(0);
+
+    var decoded = std.ArrayListUnmanaged(i32){};
+    defer decoded.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    while (try col_reader.next(arena.allocator())) |page| {
+        if (page.header.type == .DATA_PAGE) {
+            var decoder_inst = zpq.decoder.Decoder.init(page.data);
+            while (decoder_inst.hasMore()) {
+                const val = try decoder_inst.readInt32();
+                try decoded.append(allocator, val);
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), decoded.items.len);
+    for (decoded.items, 0..) |val, i| {
+        try std.testing.expectEqual(values[i], val);
+    }
+}
+
+fn writeSnappyInt32File(allocator: std.mem.Allocator, path: []const u8, values: []const i32) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    try file.writeAll("PAR1");
+    var offset: u64 = 4;
+
+    // Create column writer with SNAPPY compression
+    var col_writer = page_writer.ColumnWriter.init(allocator, .INT32, .SNAPPY);
+    defer col_writer.deinit();
+
+    try col_writer.writeInt32Plain(values);
+
+    const chunk = try col_writer.writeToFile(file, &[_][]const u8{"value"}, offset);
+    offset = @intCast(try file.getPos());
+
+    // Build metadata
+    var row_groups = std.ArrayListUnmanaged(schema.RowGroup){};
+    defer {
+        for (row_groups.items) |*rg| rg.deinit(allocator);
+        row_groups.deinit(allocator);
+    }
+
+    var columns = std.ArrayListUnmanaged(schema.ColumnChunk){};
+    try columns.append(allocator, chunk);
+
+    try row_groups.append(allocator, schema.RowGroup{
+        .columns = columns,
+        .total_byte_size = col_writer.total_compressed_size,
+        .num_rows = @intCast(values.len),
+    });
+
+    // Build schema
+    var schema_elements = std.ArrayListUnmanaged(schema.SchemaElement){};
+    defer schema_elements.deinit(allocator);
+
+    try schema_elements.append(allocator, .{ .type = null, .type_length = null, .repetition_type = null, .name = "schema", .num_children = 1, .scale = null, .precision = null, .field_id = null });
+    try schema_elements.append(allocator, .{ .type = .INT32, .type_length = null, .repetition_type = .REQUIRED, .name = "value", .num_children = null, .scale = null, .precision = null, .field_id = null });
+
+    // Write footer
+    const metadata = schema.FileMetaData{
+        .version = 2,
+        .schema = schema_elements,
+        .num_rows = @intCast(values.len),
+        .created_by = "zpq",
+        .row_groups = row_groups,
+    };
+
+    var writer = thrift.Writer.init(allocator);
+    defer writer.deinit();
+    try metadata.write(&writer);
+
+    const footer_bytes = writer.bytes();
+    try file.writeAll(footer_bytes);
+    try file.writeAll(&std.mem.toBytes(@as(u32, @intCast(footer_bytes.len))));
+    try file.writeAll("PAR1");
+}
+
+fn testZstdInt32Roundtrip(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Write with ZSTD compression
+    const values = [_]i32{ 1, 2, 3, 4, 5, 100, -50, 999, 12345, -99999 };
+    try writeZstdInt32File(allocator, path, &values);
+
+    // Read back and verify
+    var file = try ParquetFile.open(allocator, path);
+    defer file.deinit();
+    try file.readFooter();
+
+    const meta = file.metadata orelse return error.NoMetadata;
+    try std.testing.expectEqual(@as(i64, 10), meta.num_rows);
+
+    // Verify compression codec in metadata
+    const rg = meta.row_groups.items[0];
+    const col_meta = rg.columns.items[0].meta_data orelse return error.NoColumnMetadata;
+    try std.testing.expectEqual(schema.CompressionCodec.ZSTD, col_meta.codec);
+
+    // Read and decode - ParquetFile should handle decompression
+    var rg_reader = try file.rowGroup(0);
+    defer rg_reader.deinit();
+
+    var col_reader = try rg_reader.columnReader(0);
+
+    var decoded = std.ArrayListUnmanaged(i32){};
+    defer decoded.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    while (try col_reader.next(arena.allocator())) |page| {
+        if (page.header.type == .DATA_PAGE) {
+            var decoder_inst = zpq.decoder.Decoder.init(page.data);
+            while (decoder_inst.hasMore()) {
+                const val = try decoder_inst.readInt32();
+                try decoded.append(allocator, val);
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), decoded.items.len);
+    for (decoded.items, 0..) |val, i| {
+        try std.testing.expectEqual(values[i], val);
+    }
+}
+
+fn writeZstdInt32File(allocator: std.mem.Allocator, path: []const u8, values: []const i32) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+
+    try file.writeAll("PAR1");
+    var offset: u64 = 4;
+
+    // Create column writer with ZSTD compression
+    var col_writer = page_writer.ColumnWriter.init(allocator, .INT32, .ZSTD);
+    defer col_writer.deinit();
+
+    try col_writer.writeInt32Plain(values);
+
+    const chunk = try col_writer.writeToFile(file, &[_][]const u8{"value"}, offset);
+    offset = @intCast(try file.getPos());
+
+    // Build metadata
+    var row_groups = std.ArrayListUnmanaged(schema.RowGroup){};
+    defer {
+        for (row_groups.items) |*rg| rg.deinit(allocator);
+        row_groups.deinit(allocator);
+    }
+
+    var columns = std.ArrayListUnmanaged(schema.ColumnChunk){};
+    try columns.append(allocator, chunk);
+
+    try row_groups.append(allocator, schema.RowGroup{
+        .columns = columns,
+        .total_byte_size = col_writer.total_compressed_size,
+        .num_rows = @intCast(values.len),
+    });
+
+    // Build schema
+    var schema_elements = std.ArrayListUnmanaged(schema.SchemaElement){};
+    defer schema_elements.deinit(allocator);
+
+    try schema_elements.append(allocator, .{ .type = null, .type_length = null, .repetition_type = null, .name = "schema", .num_children = 1, .scale = null, .precision = null, .field_id = null });
+    try schema_elements.append(allocator, .{ .type = .INT32, .type_length = null, .repetition_type = .REQUIRED, .name = "value", .num_children = null, .scale = null, .precision = null, .field_id = null });
 
     // Write footer
     const metadata = schema.FileMetaData{

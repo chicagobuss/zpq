@@ -114,6 +114,9 @@ pub fn main() !void {
             return;
         }
         try cmdDebugS3(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
+    } else if (std.mem.eql(u8, command, "write-test")) {
+        const output_path = if (args.len > 2) args[2] else "/tmp/zpq_test.parquet";
+        try cmdWriteTest(allocator, output_path);
     } else {
         printUsage(args[0]);
     }
@@ -158,6 +161,7 @@ fn printUsage(exe_name: []const u8) void {
         \\  cat    <file>       Dump row data (JSON-like)
         \\  scan   <file>       Benchmark scan speed (no output)
         \\  pages  <file>       Inspect page headers and encodings (deep dive)
+        \\  write-test [file]   Write a test parquet file (default: /tmp/zpq_test.parquet)
         \\
         \\Options:
         \\  --tls-verify        Enable TLS certificate verification for S3/HTTPS
@@ -1377,4 +1381,50 @@ fn cmdPages(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop
             }
         }
     }
+}
+
+fn cmdWriteTest(allocator: std.mem.Allocator, output_path: []const u8) !void {
+    const writer = zpq.core.writer;
+
+    std.debug.print("=== ZPQ Write Test ===\n\n", .{});
+    std.debug.print("Writing to: {s}\n\n", .{output_path});
+
+    // Create writer
+    var pw = try writer.ParquetWriter.init(allocator, output_path);
+    defer pw.deinit();
+
+    // Define schema
+    try pw.setColumns(&[_]writer.ColumnDef{
+        .{ .name = "id", .type = .INT32 },
+        .{ .name = "value", .type = .DOUBLE },
+        .{ .name = "name", .type = .BYTE_ARRAY },
+        .{ .name = "active", .type = .BOOLEAN },
+    });
+
+    // Write row group with test data
+    var rg = try pw.beginRowGroup();
+
+    const ids = [_]i32{ 1, 2, 3, 4, 5 };
+    const values = [_]f64{ 1.1, 2.2, 3.3, 4.4, 5.5 };
+    const names = [_][]const u8{ "alice", "bob", "charlie", "diana", "eve" };
+    const active = [_]bool{ true, false, true, true, false };
+
+    try rg.writeInt32Column(&ids);
+    try rg.writeDoubleColumn(&values);
+    try rg.writeByteArrayColumn(&names);
+    try rg.writeBooleanColumn(&active);
+
+    try pw.finishRowGroup(rg, 5);
+    try pw.finish();
+
+    std.debug.print("Written 5 rows with 4 columns:\n", .{});
+    std.debug.print("  - id: INT32 [1, 2, 3, 4, 5]\n", .{});
+    std.debug.print("  - value: DOUBLE [1.1, 2.2, 3.3, 4.4, 5.5]\n", .{});
+    std.debug.print("  - name: BYTE_ARRAY [alice, bob, charlie, diana, eve]\n", .{});
+    std.debug.print("  - active: BOOLEAN [true, false, true, true, false]\n", .{});
+    std.debug.print("\n=== SUCCESS ===\n", .{});
+    std.debug.print("\nVerify with:\n", .{});
+    std.debug.print("  zpq schema {s}\n", .{output_path});
+    std.debug.print("  zpq cat {s}\n", .{output_path});
+    std.debug.print("  duckdb -c \"SELECT * FROM '{s}'\"\n", .{output_path});
 }

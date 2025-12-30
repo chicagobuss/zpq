@@ -12,6 +12,10 @@
         .libxev = .{
             .path = "vendor/libxev",
         },
+        .zstd = .{
+            .url = "https://github.com/allyourcodebase/zstd/archive/refs/heads/zig-0.16.tar.gz",
+            .hash = "zstd-1.5.7-KEItkBA0AADSGJseZTqmYVPMGCerT1VevdZFlPKz2DNI",
+        },
     },
     .paths = .{""},
 }

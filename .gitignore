@@ -18,6 +18,11 @@ zig-out/
 __pycache__/
 *.pyc
 
+# Compiled libraries
+*.dylib
+*.so
+*.dll
+
 
 # Env
 .env*

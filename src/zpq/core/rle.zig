@@ -61,39 +61,122 @@ pub const RleDecoder = struct {
         return null;
     }
 
-    /// Read multiple values into a buffer. Returns number of values actually read.
     pub fn nextBatch(self: *RleDecoder, buffer: []u64) !usize {
+        return self.nextBatchT(u64, buffer, null);
+    }
+
+    /// Optimized batch read with optional dictionary lookup.
+    /// If dictionary is provided, T is the type stored in the dictionary.
+    /// Otherwise, T must be u64 and it reads raw indices.
+    pub fn nextBatchT(self: *RleDecoder, comptime T: type, buffer: []T, dictionary: ?[]const T) !usize {
         var out_pos: usize = 0;
         while (out_pos < buffer.len) {
-            // Check if we have repeat values
             if (self.repeat_count > 0) {
                 const count = @min(buffer.len - out_pos, self.repeat_count);
-                @memset(buffer[out_pos .. out_pos + count], self.current_value);
+                const val = if (dictionary) |dict| dict[self.current_value] else blk: {
+                    switch (@typeInfo(T)) {
+                        .int => break :blk @as(T, @intCast(self.current_value)),
+                        .float => break :blk @as(T, @floatFromInt(self.current_value)),
+                        else => if (T == u64) {
+                            break :blk self.current_value;
+                        } else {
+                            @compileError("Unsupported type for RLE decoding without dictionary");
+                        },
+                    }
+                };
+                @memset(buffer[out_pos .. out_pos + count], val);
                 self.repeat_count -= @intCast(count);
                 out_pos += count;
                 continue;
             }
 
-            // Check if we have literal values
             if (self.literal_count > 0) {
-                // Try to use vectorized unpacking for groups of 8
                 if (self.bitpack_pos == 0 and self.literal_count >= 8 and (buffer.len - out_pos) >= 8) {
                     const count = @min(self.literal_count, (buffer.len - out_pos)) / 8 * 8;
                     for (0..count / 8) |_| {
-                        self.readBitPackedBatch8(buffer[out_pos .. out_pos + 8]);
+                        var indices: [8]u64 = undefined;
+                        self.readBitPackedBatch8(&indices);
+                        if (dictionary) |dict| {
+                            inline for (0..8) |i| {
+                                buffer[out_pos + i] = dict[indices[i]];
+                            }
+                        } else {
+                            switch (@typeInfo(T)) {
+                                .int => inline for (0..8) |i| {
+                                    buffer[out_pos + i] = @as(T, @intCast(indices[i]));
+                                },
+                                .float => inline for (0..8) |i| {
+                                    buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
+                                },
+                                else => if (T == u64) {
+                                    inline for (0..8) |i| {
+                                        buffer[out_pos + i] = indices[i];
+                                    }
+                                } else {
+                                    @compileError("Unsupported type for RLE decoding without dictionary");
+                                },
+                            }
+                        }
                         out_pos += 8;
                         self.literal_count -= 8;
                     }
                     continue;
                 }
 
-                // Fallback to scalar
-                buffer[out_pos] = try self.readBitPackedValue();
+                const idx = try self.readBitPackedValue();
+                buffer[out_pos] = if (dictionary) |dict| dict[idx] else blk: {
+                    switch (@typeInfo(T)) {
+                        .int => break :blk @as(T, @intCast(idx)),
+                        .float => break :blk @as(T, @floatFromInt(idx)),
+                        else => if (T == u64) {
+                            break :blk idx;
+                        } else {
+                            @compileError("Unsupported type for RLE decoding without dictionary");
+                        },
+                    }
+                };
                 out_pos += 1;
                 continue;
             }
 
-            // Need new counts
+            if (!self.nextCounts()) break;
+        }
+        return out_pos;
+    }
+
+    pub fn nextBatchOptT(self: *RleDecoder, comptime T: type, buffer: []?T, dictionary: []const T) !usize {
+        var out_pos: usize = 0;
+        while (out_pos < buffer.len) {
+            if (self.repeat_count > 0) {
+                const count = @min(buffer.len - out_pos, self.repeat_count);
+                const val = dictionary[self.current_value];
+                @memset(buffer[out_pos .. out_pos + count], val);
+                self.repeat_count -= @intCast(count);
+                out_pos += count;
+                continue;
+            }
+
+            if (self.literal_count > 0) {
+                if (self.bitpack_pos == 0 and self.literal_count >= 8 and (buffer.len - out_pos) >= 8) {
+                    const count = @min(self.literal_count, (buffer.len - out_pos)) / 8 * 8;
+                    for (0..count / 8) |_| {
+                        var indices: [8]u64 = undefined;
+                        self.readBitPackedBatch8(&indices);
+                        inline for (0..8) |i| {
+                            buffer[out_pos + i] = dictionary[indices[i]];
+                        }
+                        out_pos += 8;
+                        self.literal_count -= 8;
+                    }
+                    continue;
+                }
+
+                const idx = try self.readBitPackedValue();
+                buffer[out_pos] = dictionary[idx];
+                out_pos += 1;
+                continue;
+            }
+
             if (!self.nextCounts()) break;
         }
         return out_pos;
@@ -115,7 +198,7 @@ pub const RleDecoder = struct {
             inline 1...32 => |width| {
                 const total_bits: u16 = @as(u16, width) * 8;
                 const total_bytes = (total_bits + 7) / 8;
-                
+
                 // Choose smallest container that fits all 8 values
                 const Container = comptime switch (width) {
                     1...8 => u64,
@@ -154,7 +237,7 @@ pub const RleDecoder = struct {
                 const v_shifts: @Vector(8, std.math.Log2Int(Container)) = shifts;
                 const mask: Container = (@as(Container, 1) << width) - 1;
                 const v_res = (v_bits >> v_shifts) & @as(@Vector(8, Container), @splat(mask));
-                
+
                 inline for (0..8) |i| {
                     out[i] = @intCast(v_res[i]);
                 }
@@ -291,6 +374,40 @@ pub const RleDecoder = struct {
                 if (!self.nextCounts()) return error.EndOfStream;
             }
         }
+    }
+
+    /// Skip n values and count how many match the target value.
+    /// This is optimized for RLE runs: if a run's value matches, we count
+    /// the entire run without decoding individual values.
+    /// Returns the count of matching values.
+    pub fn skipAndCountMatching(self: *RleDecoder, count: u32, target: u64) !u32 {
+        var remaining = count;
+        var match_count: u32 = 0;
+
+        while (remaining > 0) {
+            if (self.repeat_count > 0) {
+                const skip_amt = @min(remaining, self.repeat_count);
+                // RLE run: check once if the repeated value matches
+                if (self.current_value == target) {
+                    match_count += skip_amt;
+                }
+                self.repeat_count -= skip_amt;
+                remaining -= skip_amt;
+            } else if (self.literal_count > 0) {
+                // Literal run: must decode each value to check
+                const skip_amt = @min(remaining, self.literal_count);
+                var i: u32 = 0;
+                while (i < skip_amt) : (i += 1) {
+                    const val = self.readBitPackedValue() catch break;
+                    if (val == target) match_count += 1;
+                    self.literal_count -= 1;
+                }
+                remaining -= i;
+            } else {
+                if (!self.nextCounts()) return error.EndOfStream;
+            }
+        }
+        return match_count;
     }
 };
 

@@ -211,28 +211,40 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
         // 4. Process each row group using pre-fetched data
 
         var filter_col_idx: ?usize = null;
+        var filter_col_type: ?zpq.core.schema.Type = null;
         var rg_skip_mask = try allocator.alloc(bool, meta.row_groups.items.len);
         defer allocator.free(rg_skip_mask);
         @memset(rg_skip_mask, false);
 
-        // Find filter column index and determine which row groups to skip
+        // Find filter column index and type
         if (filter_col_name) |name| {
-            // Find filter column index from first row group
             if (meta.row_groups.items.len > 0) {
                 for (meta.row_groups.items[0].columns.items, 0..) |col, idx| {
                     if (col.meta_data) |md| {
                         const path_parts = md.path_in_schema.items;
                         if (std.mem.eql(u8, path_parts[path_parts.len - 1], name)) {
                             filter_col_idx = idx;
+                            filter_col_type = md.type;
                             break;
                         }
                     }
                 }
             }
+        }
+
+        // Create EncodedFilter for unified type handling (lives through entire scan)
+        var encoded_filter: ?zpq.core.filter.EncodedFilter = null;
+        defer if (encoded_filter) |*ef| ef.deinit();
+
+        if (filter_col_type) |col_type| {
+            encoded_filter = zpq.core.filter.EncodedFilter.parse(allocator, filter_val.?, col_type) catch |err| {
+                std.debug.print("Failed to parse filter value '{s}' for type {}: {}\n", .{ filter_val.?, col_type, err });
+                return error.InvalidFilterValue;
+            };
 
             // Mark row groups to skip via metadata pruning
             for (meta.row_groups.items, 0..) |_, rg_idx| {
-                if (pf.shouldSkipRowGroup(rg_idx, name, filter_val.?)) {
+                if (pf.shouldSkipRowGroup(rg_idx, filter_col_name.?, &encoded_filter.?)) {
                     rg_skip_mask[rg_idx] = true;
                     row_groups_skipped += 1;
                 }
@@ -359,16 +371,6 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                     defer filter_reader.deinit();
 
                     var row_idx: usize = 0;
-                    // Pre-compute which pages to skip using ColumnIndex
-                    var page_skip_mask: u64 = 0; // Bitmap: bit i = skip page i
-                    if (column_index) |ci| {
-                        for (0..@min(64, ci.numPages())) |i| {
-                            if (!ci.mightContainString(i, filter_val.?)) {
-                                page_skip_mask |= (@as(u64, 1) << @intCast(i));
-                                pages_skipped += 1;
-                            }
-                        }
-                    }
 
                     // Try to use fast dictionary index path
                     // First, we need to load the first page to get the dictionary
@@ -379,9 +381,14 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         // Only check skip logic at page boundaries
                         if (filter_reader.isAtPageBoundary()) {
                             const next_page = filter_reader.getPageIndex();
-                            const should_skip = next_page < 64 and (page_skip_mask & (@as(u64, 1) << @intCast(next_page))) != 0;
+                            // Check ColumnIndex using EncodedFilter (handles all types)
+                            const should_skip = if (column_index) |*ci|
+                                if (encoded_filter) |*ef| !ef.mightContainInPage(ci, next_page) else false
+                            else
+                                false;
                             if (should_skip) {
                                 // Skip this entire page
+                                pages_skipped += 1;
                                 if (try filter_reader.skipNextPage()) |skipped_rows| {
                                     var remaining = skipped_rows;
                                     while (remaining > 0) {
@@ -433,8 +440,75 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         row_idx += n_read;
                     }
                     phase1_decode_ns = t0.read();
+                } else if (filter_md.type == .INT64) {
+                    // Parse filter value as i64
+                    const filter_i64 = std.fmt.parseInt(i64, filter_val.?, 10) catch {
+                        std.debug.print("Invalid INT64 filter value: {s}\n", .{filter_val.?});
+                        return error.InvalidFilterValue;
+                    };
+
+                    var filter_reader = zpq.core.batch_reader.BatchReader(i64).init(
+                        allocator,
+                        filter_col_reader,
+                        filter_md.type,
+                        @intCast(filter_levels.max_def),
+                        @intCast(filter_levels.max_rep),
+                        filter_type_len,
+                    );
+                    defer filter_reader.deinit();
+
+                    var row_idx: usize = 0;
+
+                    while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
+                        // Page-level skip using EncodedFilter
+                        if (filter_reader.isAtPageBoundary()) {
+                            const next_page = filter_reader.getPageIndex();
+                            const should_skip = if (column_index) |*ci|
+                                if (encoded_filter) |*ef| !ef.mightContainInPage(ci, next_page) else false
+                            else
+                                false;
+                            if (should_skip) {
+                                pages_skipped += 1;
+                                if (try filter_reader.skipNextPage()) |skipped_rows| {
+                                    var remaining = skipped_rows;
+                                    while (remaining > 0) {
+                                        const batch_size = @min(1024, remaining);
+                                        const sel = zpq.core.simd.SelectionVector.init();
+                                        try batch_selections.append(allocator, sel);
+                                        try batch_sizes.append(allocator, batch_size);
+                                        total_values += batch_size;
+                                        remaining -= batch_size;
+                                    }
+                                    row_idx += skipped_rows;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
+
+                        var sel = zpq.core.simd.SelectionVector.init();
+                        var buf: [1024]?i64 = undefined;
+                        const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
+
+                        for (buf[0..n_read], 0..) |val, i| {
+                            if (val) |v| {
+                                if (v == filter_i64) sel.setBitIndices(i);
+                            }
+                        }
+
+                        if (n_read == 0) break;
+
+                        rows_selected += sel.count();
+                        total_values += n_read;
+                        if (sel.count() > 0) rg_has_matches = true;
+                        try batch_selections.append(allocator, sel);
+                        try batch_sizes.append(allocator, n_read);
+                        row_idx += n_read;
+                    }
+                    phase1_decode_ns = t0.read();
                 } else {
-                    std.debug.print("Filters currently only supported on BYTE_ARRAY columns\n", .{});
+                    std.debug.print("Filters currently only supported on BYTE_ARRAY and INT64 columns\n", .{});
                     return error.UnsupportedFilterType;
                 }
 

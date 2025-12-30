@@ -1,10 +1,11 @@
 const std = @import("std");
-const zpq = @import("../../zpq.zig");
-const schema = zpq.schema;
-const ColumnReader = zpq.column.ColumnReader;
-const RleDecoder = zpq.rle.RleDecoder;
-const Decoder = zpq.decoder.Decoder;
+const schema = @import("schema.zig");
+const column = @import("column.zig");
+const ColumnReader = column.ColumnReader;
+const RleDecoder = @import("rle.zig").RleDecoder;
+const Decoder = @import("decoder.zig").Decoder;
 const simd = @import("simd.zig");
+const file = @import("file.zig");
 
 pub fn BatchReader(comptime T: type) type {
     return struct {
@@ -14,8 +15,8 @@ pub fn BatchReader(comptime T: type) type {
         column_reader: ColumnReader,
 
         // Current state
-        current_page: ?zpq.column.Page = null,
-        active_pages: std.ArrayListUnmanaged(zpq.column.Page) = .{},
+        current_page: ?column.Page = null,
+        active_pages: std.ArrayListUnmanaged(column.Page) = .{},
         values_remaining_in_page: usize = 0,
         current_page_index: usize = 0, // Track which page we're on (0-based, data pages only)
 
@@ -53,6 +54,8 @@ pub fn BatchReader(comptime T: type) type {
                 }
                 self.allocator.free(d);
             }
+            // Free ColumnReader's reusable decompression buffer
+            self.column_reader.deinit();
         }
 
         /// Find an index in the dictionary for a given value.
@@ -61,9 +64,12 @@ pub fn BatchReader(comptime T: type) type {
             const dict = self.dictionary orelse return null;
             for (dict, 0..) |item, i| {
                 if (T == []const u8) {
-                    if (std.mem.eql(u8, item, value)) return i;
+                    if (std.mem.eql(u8, item, value)) return @intCast(i);
+                } else if (T == f32 or T == f64) {
+                    // Primitive equality is fine for benches, but NaN handling would be needed for prod
+                    if (item == value) return @intCast(i);
                 } else {
-                    if (item == value) return i;
+                    if (item == value) return @intCast(i);
                 }
             }
             return null;
@@ -78,7 +84,7 @@ pub fn BatchReader(comptime T: type) type {
         /// This is MUCH faster than decoding strings for dictionary-encoded columns.
         /// Must call after loading at least one page (to initialize dictionary).
         /// Returns number of values read.
-        pub fn scanDictIndicesIntoBatch(self: *Self, target_idx: u64, selection: *zpq.core.simd.SelectionVector, batch_size: usize) !usize {
+        pub fn scanDictIndicesIntoBatch(self: *Self, target_idx: u64, selection: *simd.SelectionVector, batch_size: usize) !usize {
             if (self.values_remaining_in_page == 0) {
                 if (!try self.loadNextPage()) return 0;
             }
@@ -145,20 +151,11 @@ pub fn BatchReader(comptime T: type) type {
                 const to_skip = @min(remaining, self.values_remaining_in_page);
 
                 // 1. Skip Definition Levels and count present values
+                // Optimized: use skipAndCountMatching for RLE-encoded def levels
                 var values_to_skip_in_data = to_skip;
                 if (self.def_levels_decoder) |*d| {
-                    values_to_skip_in_data = 0;
-                    var i: usize = 0;
-                    while (i < to_skip) {
-                        const batch_rem = @min(8, to_skip - i);
-                        var def_levels: [8]u64 = undefined;
-                        const n = try d.nextBatch(def_levels[0..batch_rem]);
-                        if (n == 0) break;
-                        for (def_levels[0..n]) |dl| {
-                            if (dl == self.max_def_level) values_to_skip_in_data += 1;
-                        }
-                        i += n;
-                    }
+                    // Use optimized RLE skip that counts matching values in O(runs) not O(values)
+                    values_to_skip_in_data = try d.skipAndCountMatching(@intCast(to_skip), self.max_def_level);
                 }
 
                 // 2. Skip Data Values
@@ -182,12 +179,54 @@ pub fn BatchReader(comptime T: type) type {
             }
         }
 
-        pub fn nextBatch(self: *Self, buffer: []?T) !usize {
-            // Free pages from PREVIOUS batch, except the one we are currently reading from
+        pub fn nextBatchRaw(self: *Self, buffer: []T) !usize {
+            if (self.max_def_level > 0) return error.CannotUseRawBatchOnNullableColumn;
+
+            // Free pages from PREVIOUS batch
+            self.freeInactivePages();
+
+            var out_pos: usize = 0;
+            while (out_pos < buffer.len) {
+                if (self.values_remaining_in_page == 0) {
+                    if (!try self.loadNextPage()) break;
+                }
+
+                const count = @min(buffer.len - out_pos, self.values_remaining_in_page);
+
+                if (self.max_def_level == 0) {
+                    if (self.dictionary) |dict| {
+                        if (self.rle_decoder) |*rle| {
+                            const n = try rle.nextBatchT(T, buffer[out_pos .. out_pos + count], dict);
+                            out_pos += n;
+                            self.values_remaining_in_page -= n;
+                            continue;
+                        }
+                    }
+                }
+
+                // Plain fast-path
+                if (self.plain_decoder) |*plain| {
+                    if (T != []const u8) {
+                        const n = try plain.readBatch(buffer[out_pos .. out_pos + count]);
+                        if (n == 0) break;
+                        out_pos += n;
+                        self.values_remaining_in_page -= n;
+                        continue;
+                    }
+                }
+
+                // Fallback (scalar)
+                buffer[out_pos] = (try self.nextValue()).?;
+                out_pos += 1;
+                self.values_remaining_in_page -= 1;
+            }
+            return out_pos;
+        }
+
+        fn freeInactivePages(self: *Self) void {
             var page_idx: usize = 0;
             while (page_idx < self.active_pages.items.len) {
                 var p = &self.active_pages.items[page_idx];
-                // If this is the current page, keep it
                 if (self.current_page != null and p.data.ptr == self.current_page.?.data.ptr) {
                     page_idx += 1;
                     continue;
@@ -195,6 +234,11 @@ pub fn BatchReader(comptime T: type) type {
                 p.deinit(self.allocator);
                 _ = self.active_pages.swapRemove(page_idx);
             }
+        }
+
+        pub fn nextBatch(self: *Self, buffer: []?T) !usize {
+            // Free pages from PREVIOUS batch
+            self.freeInactivePages();
 
             var out_pos: usize = 0;
             while (out_pos < buffer.len) {
@@ -207,33 +251,34 @@ pub fn BatchReader(comptime T: type) type {
                 // --- VECTORIZED PATHS ---
 
                 // 1. Non-nullable Dictionary-encoded
-                if (self.max_def_level == 0 and self.rle_decoder != null and self.dictionary != null) {
-                    var indices: [1024]u64 = undefined;
-                    const to_read = @min(count, indices.len);
-                    const n = try self.rle_decoder.?.nextBatch(indices[0..to_read]);
-
-                    const dict = self.dictionary.?;
-                    for (0..n) |i| {
-                        buffer[out_pos + i] = dict[indices[i]];
+                if (self.max_def_level == 0) {
+                    if (self.dictionary) |dict| {
+                        if (self.rle_decoder) |*rle| {
+                            const n = try rle.nextBatchOptT(T, buffer[out_pos .. out_pos + count], dict);
+                            out_pos += n;
+                            self.values_remaining_in_page -= n;
+                            continue;
+                        }
                     }
-                    out_pos += n;
-                    self.values_remaining_in_page -= n;
-                    continue;
                 }
 
                 // 2. Non-nullable PLAIN-encoded (primitives)
-                if (self.max_def_level == 0 and self.plain_decoder != null and T != []const u8) {
-                    var values_buf: [1024]T = undefined;
-                    const to_read = @min(count, values_buf.len);
-                    const n = try self.plain_decoder.?.readBatch(values_buf[0..to_read]);
-                    if (n == 0) break;
+                if (self.max_def_level == 0) {
+                    if (self.plain_decoder) |*plain| {
+                        if (T != []const u8) {
+                            const to_read = @min(count, 1024); // Limited for internal buffer
+                            var values_buf: [1024]T = undefined;
+                            const n = try plain.readBatch(values_buf[0..to_read]);
+                            if (n == 0) break;
 
-                    for (0..n) |i| {
-                        buffer[out_pos + i] = values_buf[i];
+                            for (0..n) |i| {
+                                buffer[out_pos + i] = values_buf[i];
+                            }
+                            out_pos += n;
+                            self.values_remaining_in_page -= n;
+                            continue;
+                        }
                     }
-                    out_pos += n;
-                    self.values_remaining_in_page -= n;
-                    continue;
                 }
 
                 // 3. Nullable Dictionary-encoded
@@ -340,7 +385,7 @@ pub fn BatchReader(comptime T: type) type {
         /// Unselected rows are skipped in the underlying data stream.
         /// buffer should be large enough to hold all selected values (sel.count).
         /// returns number of selected values materialized.
-        pub fn nextBatchSelected(self: *Self, buffer: []?T, selection: *const zpq.core.simd.SelectionVector, n: usize) !usize {
+        pub fn nextBatchSelected(self: *Self, buffer: []?T, selection: *const simd.SelectionVector, n: usize) !usize {
             // Fast path: if all rows are selected, just use nextBatch directly
             if (selection.count() == n) {
                 return try self.nextBatch(buffer[0..n]);
@@ -399,10 +444,10 @@ pub fn BatchReader(comptime T: type) type {
 
                 if (page.header.type == .DATA_PAGE) {
                     try self.active_pages.append(self.allocator, page);
-                    self.current_page = page;
-                    const dph = page.header.data_page_header.?;
+                    self.current_page = self.active_pages.items[self.active_pages.items.len - 1];
+                    const dph = self.current_page.?.header.data_page_header.?;
                     self.values_remaining_in_page = @intCast(dph.num_values);
-                    try self.initPageDecoders(page);
+                    try self.initPageDecoders(self.current_page.?);
                     self.current_page_index += 1;
                     return true;
                 }
@@ -452,8 +497,8 @@ pub fn BatchReader(comptime T: type) type {
             return self.values_remaining_in_page == 0;
         }
 
-        fn loadDictionary(self: *Self, page: zpq.column.Page) !void {
-            var decoder = zpq.decoder.Decoder.init(page.data);
+        fn loadDictionary(self: *Self, page: column.Page) !void {
+            var decoder = Decoder.init(page.data);
             var items = std.ArrayListUnmanaged(T){};
             errdefer items.deinit(self.allocator);
 
@@ -526,7 +571,7 @@ pub fn BatchReader(comptime T: type) type {
             self.dictionary = try items.toOwnedSlice(self.allocator);
         }
 
-        fn initPageDecoders(self: *Self, page: zpq.column.Page) !void {
+        fn initPageDecoders(self: *Self, page: column.Page) !void {
             const dph = page.header.data_page_header.?;
             var data_slice = page.data;
 
@@ -572,9 +617,11 @@ pub fn BatchReader(comptime T: type) type {
             const dec = &self.plain_decoder.?;
             if (T == []const u8) {
                 if (self.column_type == .FIXED_LEN_BYTE_ARRAY) {
-                    return try dec.readFixedLenByteArray(@intCast(self.type_length.?));
+                    const bytes = try dec.readFixedLenByteArray(@intCast(self.type_length.?));
+                    return @ptrCast(bytes);
                 }
-                return try dec.readByteArray();
+                const bytes = try dec.readByteArray();
+                return @ptrCast(bytes);
             } else if (T == [12]u8) {
                 return try dec.readInt96();
             } else if (T == i32) {

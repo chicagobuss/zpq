@@ -24,7 +24,7 @@ pub const MemorySource = struct {
 
         const end = @min(relative + buf.len, self.data.len);
         const available = end - relative;
-        @memcpy(buf[0..available], self.data[relative..relative+available]);
+        @memcpy(buf[0..available], self.data[relative .. relative + available]);
         return available;
     }
 
@@ -37,6 +37,17 @@ pub const MemorySource = struct {
         _ = ptr;
     }
 
+    fn getSliceImpl(ptr: *anyopaque, offset: u64, len: u64) ?[]const u8 {
+        const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        if (offset < self.base_offset) return null;
+        const relative = offset - self.base_offset;
+
+        if (relative >= self.data.len) return null;
+        if (relative + len > self.data.len) return null;
+
+        return self.data[relative..][0..len];
+    }
+
     pub fn source(self: *MemorySource) io.RandomAccessSource {
         return .{
             .ptr = self,
@@ -45,6 +56,7 @@ pub const MemorySource = struct {
                 .readRanges = null,
                 .size = sizeImpl,
                 .close = closeImpl,
+                .getSlice = getSliceImpl,
             },
         };
     }
@@ -84,3 +96,36 @@ test "MemorySource Offset" {
     try testing.expectEqual(@as(usize, 0), n2);
 }
 
+test "MemorySource getSlice" {
+    const testing = std.testing;
+    const data = "Hello, Memory World!";
+    var mem_source = MemorySource.init(data);
+    const source = mem_source.source();
+
+    // Zero-copy slice at offset 7, length 6 = "Memory"
+    const slice = source.getSlice(7, 6);
+    try testing.expect(slice != null);
+    try testing.expectEqualStrings("Memory", slice.?);
+
+    // Verify it's actually a slice into the original data (zero-copy)
+    try testing.expectEqual(@intFromPtr(data.ptr + 7), @intFromPtr(slice.?.ptr));
+
+    // Out of bounds should return null
+    try testing.expect(source.getSlice(100, 5) == null);
+    try testing.expect(source.getSlice(15, 10) == null); // Would exceed end
+}
+
+test "MemorySource getSlice with offset" {
+    const testing = std.testing;
+    const data = "Offset World";
+    var mem_source = MemorySource.initWithOffset(data, 100);
+    const source = mem_source.source();
+
+    // Slice at absolute offset 100 = "Offset"
+    const slice = source.getSlice(100, 6);
+    try testing.expect(slice != null);
+    try testing.expectEqualStrings("Offset", slice.?);
+
+    // Before base offset should return null
+    try testing.expect(source.getSlice(50, 5) == null);
+}

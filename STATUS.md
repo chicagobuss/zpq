@@ -43,16 +43,31 @@ ZPQ's objective is to become the fastest, leanest Parquet engine for serverless 
 *   [x] **Vectorized RLE runs**: SIMD splat/memset for repetition runs.
 *   [x] **SIMD null bitmap expansion**: Branchless expansion using shuffle tables.
 
-#### Milestone 19: Predicate Pushdown & Lazy I/O [IN PROGRESS - CRITICAL]
+#### Milestone 19: Predicate Pushdown & Lazy I/O [COMPLETE]
 
 **December 2024 Discovery**: Filtered scans take the same time as full scans over network storage because we prefetch ALL columns before evaluating filters. This is the critical bottleneck.
 
 *   [x] **Metadata Pruning**: Skip row groups using min/max statistics.
 *   [x] **Selection Vector Primitives**: `SelectionVector`, `BatchReader.skip()`, `nextBatchSelected()`.
 *   [x] **Observability**: Tracing infrastructure for benchmark analysis (`bench/`, `src/zpq/trace.zig`).
-*   [x] **Two-Phase Column Fetching** (P0): Fetch filter column first, then remaining columns only if needed. *(Implemented Dec 30, 2024)*
-*   [ ] **Page-Level ColumnIndex** (P1): Skip pages within row groups using per-page min/max stats.
-*   [ ] **BatchReader.skip() Optimization** (P2): Use `RleDecoder.skip()` for def levels.
+*   [x] **Two-Phase Column Fetching** (P0): Fetch filter column first, then remaining columns only if needed. *(Dec 30, 2024)*
+*   [x] **Page-Level ColumnIndex** (P1): Skip pages within row groups using per-page min/max stats. *(Dec 29, 2024)*
+*   [x] **BatchReader.skip() Optimization** (P2): `RleDecoder.skipAndCountMatching()` for O(runs) def level skipping. *(Dec 29, 2024)*
+
+#### Milestone 19.5: Zero-Copy Page Reading [COMPLETE]
+
+**Problem**: Local file reads via Python Arrow bridge are 2-3x slower than PyArrow due to per-page allocation overhead (~8 allocations of ~1MB each per column).
+
+**Solution Implemented** (Dec 29, 2024):
+*   Added `getSlice(offset, len)` method to `RandomAccessSource` vtable
+*   Implemented zero-copy `getSlice` in `MemorySource` (returns slice into buffer)
+*   Modified `ColumnReader.next()` to use `getSlice` for uncompressed pages
+*   Added reusable `decompression_buffer` to `ColumnReader` for compressed pages
+*   Updated `Page` struct with `borrowed` field to track ownership
+
+**Verification**: `probes/test_zerocopy.zig` shows 9/9 pages borrowed (zero-copy) with prefetch vs 0/9 without.
+
+**Result**: Zero-copy working for uncompressed pages. PyArrow still faster - mmap tested separately with no benefit, bottleneck is in decode path.
 
 **Target**: 10-50x speedup for low-selectivity queries over network storage.
 **See**: `plans/two_phase_column_fetching.md`, `plans/milestone_19_lazy_materialization.md`

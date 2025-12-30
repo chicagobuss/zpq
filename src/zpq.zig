@@ -22,6 +22,7 @@ pub const core = struct {
     pub const simd = @import("zpq/core/simd.zig");
     pub const batch_reader = @import("zpq/core/batch_reader.zig");
     pub const page_index = @import("zpq/core/page_index.zig");
+    pub const filter = @import("zpq/core/filter.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection

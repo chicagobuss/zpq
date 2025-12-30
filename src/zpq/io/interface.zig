@@ -23,10 +23,10 @@ pub const RandomAccessSource = struct {
 
     pub const VTable = struct {
         /// Read exactly `len` bytes from `offset` into `buf`.
-        /// Returns the number of bytes read. 
+        /// Returns the number of bytes read.
         /// Should return error.EndOfStream if fewer bytes are available than requested.
         readAt: *const fn (ptr: *anyopaque, offset: u64, buf: []u8) anyerror!usize,
-        
+
         /// Read multiple ranges into provided buffers.
         /// ranges[i] corresponds to buffers[i].
         /// Default implementation (if null) loops readAt.
@@ -34,10 +34,16 @@ pub const RandomAccessSource = struct {
 
         /// Returns the total size of the source in bytes.
         size: *const fn (ptr: *anyopaque) u64,
-        
+
         /// Closes the source and releases resources.
         /// Note: Some sources (like memory buffers) might be no-ops.
         close: *const fn (ptr: *anyopaque) void,
+
+        /// Zero-copy slice access (optional).
+        /// Returns a slice into the source's internal buffer if supported.
+        /// Returns null if zero-copy is not supported (e.g., for file/network sources).
+        /// This enables avoiding allocations for in-memory sources like MemorySource.
+        getSlice: ?*const fn (ptr: *anyopaque, offset: u64, len: u64) ?[]const u8 = null,
     };
 
     /// Read bytes from the specified offset into the buffer.
@@ -71,6 +77,15 @@ pub const RandomAccessSource = struct {
     pub fn close(self: RandomAccessSource) void {
         self.vtable.close(self.ptr);
     }
+
+    /// Get a zero-copy slice if supported by the underlying source.
+    /// Returns null if zero-copy is not available.
+    pub fn getSlice(self: RandomAccessSource, offset: u64, len: u64) ?[]const u8 {
+        if (self.vtable.getSlice) |func| {
+            return func(self.ptr, offset, len);
+        }
+        return null;
+    }
 };
 
 pub const local = struct {
@@ -82,4 +97,3 @@ test {
     _ = @import("local/file_source.zig");
     _ = @import("local/memory_source.zig");
 }
-

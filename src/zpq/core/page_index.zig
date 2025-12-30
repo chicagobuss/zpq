@@ -238,6 +238,28 @@ pub const ColumnIndex = struct {
         return true; // Might contain matching values
     }
 
+    /// Check if page might contain values matching an INT64 equality filter.
+    /// Returns false if we can definitively skip this page.
+    pub fn mightContainInt64(self: *const ColumnIndex, page_idx: usize, filter_val: i64) bool {
+        if (page_idx >= self.null_pages.len) return true; // No stats, can't skip
+        if (self.null_pages[page_idx]) return false; // All nulls, no match possible
+
+        const min_bytes = self.min_values[page_idx];
+        const max_bytes = self.max_values[page_idx];
+
+        // INT64 stats are 8-byte little-endian
+        if (min_bytes.len != 8 or max_bytes.len != 8) return true; // Invalid stats, can't skip
+
+        const min_i64 = std.mem.readInt(i64, min_bytes[0..8], .little);
+        const max_i64 = std.mem.readInt(i64, max_bytes[0..8], .little);
+
+        // filter_val < min or filter_val > max means no match possible
+        if (filter_val < min_i64) return false;
+        if (filter_val > max_i64) return false;
+
+        return true; // Might contain matching values
+    }
+
     /// Get number of pages in this index
     pub fn numPages(self: *const ColumnIndex) usize {
         return self.null_pages.len;

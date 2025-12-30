@@ -5,6 +5,9 @@ const std = @import("std");
 /// Example: `pub const std_options: std.Options = .{ .log_level = .warn };`
 pub const log = @import("zpq/log.zig");
 
+/// Arrow C Data Interface for zero-copy interop with external engines
+pub const arrow = @import("zpq/arrow.zig");
+
 pub const core = struct {
     pub const file = @import("zpq/core/file.zig");
     pub const schema = @import("zpq/core/schema.zig");
@@ -67,4 +70,5 @@ test {
     _ = core.rle;
     _ = io.interface;
     _ = s3.XevS3Source;
+    _ = arrow;
 }

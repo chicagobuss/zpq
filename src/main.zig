@@ -26,11 +26,15 @@ pub fn main() !void {
     } else false;
 
     var filter: ?[]const u8 = null;
+    var count_only = false;
     for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--filter")) {
             if (i + 1 < args.len) {
                 filter = args[i + 1];
             }
+        }
+        if (std.mem.eql(u8, arg, "--count")) {
+            count_only = true;
         }
     }
 
@@ -72,10 +76,10 @@ pub fn main() !void {
         try cmdCat(allocator, args[2], limit, is_async, &loop, &thread_pool, resolver, verify_tls);
     } else if (std.mem.eql(u8, command, "scan")) {
         if (args.len < 3) {
-            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val]\n", .{args[0]});
+            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val] [--count]\n", .{args[0]});
             return;
         }
-        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter);
+        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter, count_only);
     } else if (std.mem.eql(u8, command, "pages")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} pages <parquet_file>\n", .{args[0]});
@@ -172,7 +176,7 @@ fn openFile(
     );
 }
 
-fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool, filter: ?[]const u8) !void {
+fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool, filter: ?[]const u8, count_only: bool) !void {
     var timer = try std.time.Timer.start();
 
     var pf = try openFile(allocator, path, is_async, loop, thread_pool, resolver, verify_tls);
@@ -283,6 +287,11 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         }
                     }
 
+                    // Try to use fast dictionary index path
+                    // First, we need to load the first page to get the dictionary
+                    var target_dict_idx: ?u64 = null;
+                    var use_dict_fast_path = false;
+
                     while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
                         // Only check skip logic at page boundaries
                         if (filter_reader.isAtPageBoundary()) {
@@ -307,16 +316,31 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         }
 
                         const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
-                        var buf: [1024]?[]const u8 = undefined;
-                        const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
-                        if (n_read == 0) break;
+
+                        // Check if we can use dictionary fast path (after first page load)
+                        if (target_dict_idx == null and filter_reader.hasDictionary()) {
+                            target_dict_idx = filter_reader.findInDictionary(filter_val.?);
+                            use_dict_fast_path = target_dict_idx != null;
+                        }
 
                         var sel = zpq.core.simd.SelectionVector.init();
-                        for (buf[0..n_read], 0..) |val, i| {
-                            if (val) |v| {
-                                if (std.mem.eql(u8, v, filter_val.?)) sel.setBitIndices(i);
+                        var n_read: usize = 0;
+
+                        if (use_dict_fast_path) {
+                            // Fast path: compare dictionary indices (integers)
+                            n_read = try filter_reader.scanDictIndicesIntoBatch(target_dict_idx.?, &sel, batch_size);
+                        } else {
+                            // Slow path: decode strings and compare
+                            var buf: [1024]?[]const u8 = undefined;
+                            n_read = try filter_reader.nextBatch(buf[0..batch_size]);
+                            for (buf[0..n_read], 0..) |val, i| {
+                                if (val) |v| {
+                                    if (std.mem.eql(u8, v, filter_val.?)) sel.setBitIndices(i);
+                                }
                             }
                         }
+
+                        if (n_read == 0) break;
 
                         rows_selected += sel.count();
                         total_values += n_read;
@@ -331,8 +355,8 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                     return error.UnsupportedFilterType;
                 }
 
-                // Phase 2: Only fetch remaining columns if we have matches
-                if (rg_has_matches) {
+                // Phase 2: Only fetch remaining columns if we have matches (skip if --count)
+                if (rg_has_matches and !count_only) {
                     t0.reset();
                     try rg.prefetchExcluding(&[_]usize{f_idx});
                     phase2_fetch_ns = t0.read();

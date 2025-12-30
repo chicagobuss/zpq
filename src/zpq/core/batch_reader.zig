@@ -69,6 +69,72 @@ pub fn BatchReader(comptime T: type) type {
             return null;
         }
 
+        /// Check if this column uses dictionary encoding.
+        pub fn hasDictionary(self: *const Self) bool {
+            return self.dictionary != null;
+        }
+
+        /// Scan dictionary indices directly and build selection vector.
+        /// This is MUCH faster than decoding strings for dictionary-encoded columns.
+        /// Must call after loading at least one page (to initialize dictionary).
+        /// Returns number of values read.
+        pub fn scanDictIndicesIntoBatch(self: *Self, target_idx: u64, selection: *zpq.core.simd.SelectionVector, batch_size: usize) !usize {
+            if (self.values_remaining_in_page == 0) {
+                if (!try self.loadNextPage()) return 0;
+            }
+
+            const count = @min(batch_size, self.values_remaining_in_page);
+            if (count == 0) return 0;
+
+            // Non-nullable path: no def levels, just compare indices
+            if (self.max_def_level == 0) {
+                if (self.rle_decoder) |*rle_dec| {
+                    var indices: [1024]u64 = undefined;
+                    const n = try rle_dec.nextBatch(indices[0..count]);
+                    for (indices[0..n], 0..) |idx, i| {
+                        if (idx == target_idx) selection.setBitIndices(i);
+                    }
+                    self.values_remaining_in_page -= n;
+                    return n;
+                }
+            }
+
+            // Nullable path: read indices upfront, then single pass over def levels
+            if (self.def_levels_decoder) |*def_dec| {
+                var def_levels: [1024]u64 = undefined;
+                const n_def = try def_dec.nextBatch(def_levels[0..count]);
+                if (n_def == 0) return 0;
+
+                // Count present values first (compiler will vectorize this)
+                var num_present: usize = 0;
+                const max_def = self.max_def_level;
+                for (def_levels[0..n_def]) |dl| {
+                    num_present += @intFromBool(dl == max_def);
+                }
+
+                if (num_present > 0 and self.rle_decoder != null) {
+                    var indices: [1024]u64 = undefined;
+                    const n_idx = try self.rle_decoder.?.nextBatch(indices[0..num_present]);
+
+                    // Single pass: scan def_levels, consume indices as we find present values
+                    var idx_pos: usize = 0;
+                    for (def_levels[0..n_def], 0..) |dl, row| {
+                        if (dl == max_def and idx_pos < n_idx) {
+                            if (indices[idx_pos] == target_idx) {
+                                selection.setBitIndices(row);
+                            }
+                            idx_pos += 1;
+                        }
+                    }
+                }
+
+                self.values_remaining_in_page -= n_def;
+                return n_def;
+            }
+
+            return 0;
+        }
+
         pub fn skip(self: *Self, count: usize) !void {
             var remaining = count;
             while (remaining > 0) {
@@ -275,6 +341,18 @@ pub fn BatchReader(comptime T: type) type {
         /// buffer should be large enough to hold all selected values (sel.count).
         /// returns number of selected values materialized.
         pub fn nextBatchSelected(self: *Self, buffer: []?T, selection: *const zpq.core.simd.SelectionVector, n: usize) !usize {
+            // Fast path: if all rows are selected, just use nextBatch directly
+            if (selection.count() == n) {
+                return try self.nextBatch(buffer[0..n]);
+            }
+
+            // Fast path: if no rows are selected, just skip
+            if (selection.count() == 0) {
+                try self.skip(n);
+                return 0;
+            }
+
+            // Slow path: selective materialization
             var selected_pos: usize = 0;
             var i: usize = 0;
             while (i < n) {

@@ -1,6 +1,13 @@
 const std = @import("std");
 const zpq = @import("zpq");
 const xev = @import("xev");
+const builtin = @import("builtin");
+
+/// Control log level based on build mode.
+/// Debug builds show all logs, release builds show only warnings and errors.
+pub const std_options: std.Options = .{
+    .log_level = if (builtin.mode == .Debug) .debug else .warn,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

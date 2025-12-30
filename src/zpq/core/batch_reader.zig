@@ -12,20 +12,21 @@ pub fn BatchReader(comptime T: type) type {
 
         allocator: std.mem.Allocator,
         column_reader: ColumnReader,
-        
+
         // Current state
         current_page: ?zpq.column.Page = null,
         active_pages: std.ArrayListUnmanaged(zpq.column.Page) = .{},
         values_remaining_in_page: usize = 0,
-        
+        current_page_index: usize = 0, // Track which page we're on (0-based, data pages only)
+
         // Page decoders
         rle_decoder: ?RleDecoder = null,
         plain_decoder: ?Decoder = null,
         def_levels_decoder: ?RleDecoder = null,
-        
+
         // Dictionary (if any)
         dictionary: ?[]const T = null,
-        
+
         // Metadata
         max_def_level: u16 = 0,
         max_rep_level: u16 = 0,
@@ -76,7 +77,7 @@ pub fn BatchReader(comptime T: type) type {
                 }
 
                 const to_skip = @min(remaining, self.values_remaining_in_page);
-                
+
                 // 1. Skip Definition Levels and count present values
                 var values_to_skip_in_data = to_skip;
                 if (self.def_levels_decoder) |*d| {
@@ -93,7 +94,7 @@ pub fn BatchReader(comptime T: type) type {
                         i += n;
                     }
                 }
-                
+
                 // 2. Skip Data Values
                 if (values_to_skip_in_data > 0) {
                     if (self.rle_decoder) |*r| {
@@ -136,15 +137,15 @@ pub fn BatchReader(comptime T: type) type {
                 }
 
                 const count = @min(buffer.len - out_pos, self.values_remaining_in_page);
-                
+
                 // --- VECTORIZED PATHS ---
-                
+
                 // 1. Non-nullable Dictionary-encoded
                 if (self.max_def_level == 0 and self.rle_decoder != null and self.dictionary != null) {
                     var indices: [1024]u64 = undefined;
                     const to_read = @min(count, indices.len);
                     const n = try self.rle_decoder.?.nextBatch(indices[0..to_read]);
-                    
+
                     const dict = self.dictionary.?;
                     for (0..n) |i| {
                         buffer[out_pos + i] = dict[indices[i]];
@@ -160,7 +161,7 @@ pub fn BatchReader(comptime T: type) type {
                     const to_read = @min(count, values_buf.len);
                     const n = try self.plain_decoder.?.readBatch(values_buf[0..to_read]);
                     if (n == 0) break;
-                    
+
                     for (0..n) |i| {
                         buffer[out_pos + i] = values_buf[i];
                     }
@@ -178,7 +179,7 @@ pub fn BatchReader(comptime T: type) type {
                         const n_def = try self.def_levels_decoder.?.nextBatch(def_levels[0..batch_rem]);
                         if (n_def == 0) break;
 
-                        const mask = if (n_def == 8) 
+                        const mask = if (n_def == 8)
                             simd.defLevelsToMask8(def_levels, self.max_def_level)
                         else blk: {
                             var m: u8 = 0;
@@ -209,7 +210,7 @@ pub fn BatchReader(comptime T: type) type {
                         } else {
                             @memset(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], null);
                         }
-                        
+
                         batch_size += n_def;
                         self.values_remaining_in_page -= n_def;
                     }
@@ -226,7 +227,7 @@ pub fn BatchReader(comptime T: type) type {
                         const n_def = try self.def_levels_decoder.?.nextBatch(def_levels[0..batch_rem]);
                         if (n_def == 0) break;
 
-                        const mask = if (n_def == 8) 
+                        const mask = if (n_def == 8)
                             simd.defLevelsToMask8(def_levels, self.max_def_level)
                         else blk: {
                             var m: u8 = 0;
@@ -251,7 +252,7 @@ pub fn BatchReader(comptime T: type) type {
                         } else {
                             @memset(buffer[out_pos + batch_size .. out_pos + batch_size + n_def], null);
                         }
-                        
+
                         batch_size += n_def;
                         self.values_remaining_in_page -= n_def;
                     }
@@ -282,7 +283,7 @@ pub fn BatchReader(comptime T: type) type {
                 }
 
                 const batch_rem = @min(n - i, self.values_remaining_in_page);
-                
+
                 // Identify runs of selected/unselected rows
                 var j: usize = 0;
                 while (j < batch_rem) {
@@ -324,12 +325,53 @@ pub fn BatchReader(comptime T: type) type {
                     const dph = page.header.data_page_header.?;
                     self.values_remaining_in_page = @intCast(dph.num_values);
                     try self.initPageDecoders(page);
+                    self.current_page_index += 1;
                     return true;
                 }
-                
+
                 page.deinit(self.allocator);
             }
             return false;
+        }
+
+        /// Skip to the next data page without decoding it.
+        /// Returns the number of rows in the skipped page, or null if no more pages.
+        pub fn skipNextPage(self: *Self) !?usize {
+            self.current_page = null;
+            self.values_remaining_in_page = 0;
+
+            while (try self.column_reader.next(self.allocator)) |const_page| {
+                var page = const_page;
+                if (page.header.type == .DICTIONARY_PAGE) {
+                    // Still need to load dictionary for future pages
+                    try self.loadDictionary(page);
+                    page.deinit(self.allocator);
+                    continue;
+                }
+
+                if (page.header.type == .DATA_PAGE) {
+                    const dph = page.header.data_page_header.?;
+                    const num_values: usize = @intCast(dph.num_values);
+                    self.current_page_index += 1;
+                    page.deinit(self.allocator); // Don't keep the page
+                    return num_values;
+                }
+
+                page.deinit(self.allocator);
+            }
+            return null;
+        }
+
+        /// Get the current page index (0-based, data pages only).
+        /// Returns the number of data pages loaded so far.
+        pub fn getPageIndex(self: *const Self) usize {
+            return self.current_page_index;
+        }
+
+        /// Check if we're at a page boundary (about to load a new page).
+        /// Returns true if the next read will trigger loading a new page.
+        pub fn isAtPageBoundary(self: *const Self) bool {
+            return self.values_remaining_in_page == 0;
         }
 
         fn loadDictionary(self: *Self, page: zpq.column.Page) !void {

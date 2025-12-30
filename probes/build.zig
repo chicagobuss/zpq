@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_lazy_materialization");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_skip_performance");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "bench_skip_breakdown");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "test_page_index");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "test_page_skip_debug");
 }
 
 fn addProbe(

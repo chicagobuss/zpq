@@ -3,6 +3,7 @@ const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const io = @import("../io/interface.zig");
 const ColumnReader = @import("column.zig").ColumnReader;
+const page_index = @import("page_index.zig");
 
 pub const RowGroupReader = struct {
     file: *ParquetFile,
@@ -160,6 +161,64 @@ pub const RowGroupReader = struct {
         }
 
         return ColumnReader.init(self.file.source, chunk);
+    }
+
+    /// Fetch and parse the ColumnIndex for a column (page-level min/max stats).
+    /// Returns null if the column doesn't have a ColumnIndex.
+    pub fn getColumnIndex(self: *RowGroupReader, col_idx: usize) !?page_index.ColumnIndex {
+        if (col_idx >= self.meta.columns.items.len) return error.InvalidColumnIndex;
+
+        const chunk = self.meta.columns.items[col_idx];
+        const offset = chunk.column_index_offset orelse return null;
+        const length = chunk.column_index_length orelse return null;
+
+        // Fetch the ColumnIndex data
+        var buf = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(buf);
+
+        const n = try self.file.source.readAt(@intCast(offset), buf);
+        if (n != buf.len) {
+            self.allocator.free(buf);
+            return error.UnexpectedEndOfFile;
+        }
+
+        // Parse it
+        var reader = thrift.Reader.init(buf);
+        const idx = try page_index.ColumnIndex.read(self.allocator, &reader);
+
+        // Free the buffer (ColumnIndex has its own copies)
+        self.allocator.free(buf);
+
+        return idx;
+    }
+
+    /// Fetch and parse the OffsetIndex for a column (page locations).
+    /// Returns null if the column doesn't have an OffsetIndex.
+    pub fn getOffsetIndex(self: *RowGroupReader, col_idx: usize) !?page_index.OffsetIndex {
+        if (col_idx >= self.meta.columns.items.len) return error.InvalidColumnIndex;
+
+        const chunk = self.meta.columns.items[col_idx];
+        const offset = chunk.offset_index_offset orelse return null;
+        const length = chunk.offset_index_length orelse return null;
+
+        // Fetch the OffsetIndex data
+        var buf = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(buf);
+
+        const n = try self.file.source.readAt(@intCast(offset), buf);
+        if (n != buf.len) {
+            self.allocator.free(buf);
+            return error.UnexpectedEndOfFile;
+        }
+
+        // Parse it
+        var reader = thrift.Reader.init(buf);
+        const idx = try page_index.OffsetIndex.read(self.allocator, &reader);
+
+        // Free the buffer (OffsetIndex has its own copies)
+        self.allocator.free(buf);
+
+        return idx;
     }
 };
 

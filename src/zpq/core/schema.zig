@@ -412,6 +412,11 @@ pub const ColumnChunk = struct {
     file_path: ?[]const u8,
     file_offset: i64,
     meta_data: ?ColumnMetaData,
+    // Page index locations (for page-level filtering)
+    offset_index_offset: ?i64 = null,
+    offset_index_length: ?i32 = null,
+    column_index_offset: ?i64 = null,
+    column_index_length: ?i32 = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
         const saved_id = reader.last_field_id;
@@ -433,6 +438,10 @@ pub const ColumnChunk = struct {
                 1 => chunk.file_path = try reader.readString(),
                 2 => chunk.file_offset = try reader.readZigZag(i64),
                 3 => chunk.meta_data = try ColumnMetaData.read(allocator, reader),
+                4 => chunk.offset_index_offset = try reader.readZigZag(i64),
+                5 => chunk.offset_index_length = try reader.readZigZag(i32),
+                6 => chunk.column_index_offset = try reader.readZigZag(i64),
+                7 => chunk.column_index_length = try reader.readZigZag(i32),
                 else => try reader.skip(field.type),
             }
         }

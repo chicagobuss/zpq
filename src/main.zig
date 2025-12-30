@@ -245,6 +245,12 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                 const filter_type_len = if (filter_schema) |se| se.type_length else null;
                 const filter_col_reader = try rg.columnReader(f_idx);
 
+                // Try to get page-level statistics for smarter skipping
+                var column_index: ?zpq.core.page_index.ColumnIndex = null;
+                defer if (column_index) |*ci| ci.deinit(allocator);
+                column_index = try rg.getColumnIndex(f_idx);
+                var pages_skipped: usize = 0;
+
                 // Storage for batch selections (used in Phase 2)
                 var batch_selections = std.ArrayListUnmanaged(zpq.core.simd.SelectionVector){};
                 defer batch_selections.deinit(allocator);
@@ -266,7 +272,40 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                     defer filter_reader.deinit();
 
                     var row_idx: usize = 0;
+                    // Pre-compute which pages to skip using ColumnIndex
+                    var page_skip_mask: u64 = 0; // Bitmap: bit i = skip page i
+                    if (column_index) |ci| {
+                        for (0..@min(64, ci.numPages())) |i| {
+                            if (!ci.mightContainString(i, filter_val.?)) {
+                                page_skip_mask |= (@as(u64, 1) << @intCast(i));
+                                pages_skipped += 1;
+                            }
+                        }
+                    }
+
                     while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
+                        // Only check skip logic at page boundaries
+                        if (filter_reader.isAtPageBoundary()) {
+                            const next_page = filter_reader.getPageIndex();
+                            const should_skip = next_page < 64 and (page_skip_mask & (@as(u64, 1) << @intCast(next_page))) != 0;
+                            if (should_skip) {
+                                // Skip this entire page
+                                if (try filter_reader.skipNextPage()) |skipped_rows| {
+                                    var remaining = skipped_rows;
+                                    while (remaining > 0) {
+                                        const batch_size = @min(1024, remaining);
+                                        const sel = zpq.core.simd.SelectionVector.init();
+                                        try batch_selections.append(allocator, sel);
+                                        try batch_sizes.append(allocator, batch_size);
+                                        total_values += batch_size;
+                                        remaining -= batch_size;
+                                    }
+                                    row_idx += skipped_rows;
+                                    continue;
+                                }
+                            }
+                        }
+
                         const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
                         var buf: [1024]?[]const u8 = undefined;
                         const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
@@ -324,13 +363,16 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                 }
 
                 // Print timing breakdown for this row group
-                std.debug.print("  RG[{d}]: P1-fetch={d:.1}ms P1-decode={d:.1}ms P2-fetch={d:.1}ms P2-decode={d:.1}ms matches={}\n", .{
+                const total_pages = if (column_index) |ci| ci.numPages() else 0;
+                std.debug.print("  RG[{d}]: P1-fetch={d:.1}ms P1-decode={d:.1}ms P2-fetch={d:.1}ms P2-decode={d:.1}ms matches={} pages_skipped={d}/{d}\n", .{
                     rg_idx,
                     @as(f64, @floatFromInt(phase1_fetch_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase1_decode_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase2_fetch_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase2_decode_ns)) / 1_000_000.0,
                     rg_has_matches,
+                    pages_skipped,
+                    total_pages,
                 });
                 // If no matches in this row group, we skip fetching all other columns entirely!
             } else {

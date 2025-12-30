@@ -18,6 +18,7 @@ pub const core = struct {
     pub const page_writer = @import("zpq/core/page_writer.zig");
     pub const simd = @import("zpq/core/simd.zig");
     pub const batch_reader = @import("zpq/core/batch_reader.zig");
+    pub const page_index = @import("zpq/core/page_index.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection

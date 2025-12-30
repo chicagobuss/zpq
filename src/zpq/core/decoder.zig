@@ -40,7 +40,7 @@ pub const Decoder = struct {
         if (self.pos + 4 > self.data.len) return error.EndOfStream;
         const len = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
         self.pos += 4;
-        
+
         if (self.pos + len > self.data.len) return error.EndOfStream;
         const str = self.data[self.pos..][0..len];
         self.pos += len;
@@ -63,6 +63,12 @@ pub const Decoder = struct {
 
     pub fn readBatch(self: *Decoder, buffer: anytype) !usize {
         const T = @TypeOf(buffer[0]);
+
+        // Booleans are bit-packed in Parquet
+        if (T == bool) {
+            return self.readBoolBatch(buffer);
+        }
+
         const size = switch (T) {
             i32, f32 => 4,
             i64, f64 => 8,
@@ -88,7 +94,23 @@ pub const Decoder = struct {
         self.pos += num_to_read * size;
         return num_to_read;
     }
-    
+
+    /// Read bit-packed booleans (1 bit per value, LSB first within each byte)
+    fn readBoolBatch(self: *Decoder, buffer: []bool) usize {
+        var count: usize = 0;
+        while (count < buffer.len and self.pos < self.data.len) {
+            const byte = self.data[self.pos];
+            // Each byte contains up to 8 booleans, LSB first
+            for (0..8) |bit| {
+                if (count >= buffer.len) break;
+                buffer[count] = ((byte >> @intCast(bit)) & 1) == 1;
+                count += 1;
+            }
+            self.pos += 1;
+        }
+        return count;
+    }
+
     pub fn skipByteArray(self: *Decoder) !void {
         if (self.pos + 4 > self.data.len) return error.EndOfStream;
         const len = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
@@ -111,4 +133,3 @@ pub const Decoder = struct {
         self.pos += len;
     }
 };
-

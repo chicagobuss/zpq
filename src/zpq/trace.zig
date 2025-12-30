@@ -142,9 +142,13 @@ pub const Tracer = struct {
         const m = &self.metrics;
         const r = &self.run;
 
-        const git_commit_str = if (r.git_commit) |c| c else "null";
-        const filter_col_str = if (r.filter_column) |c| c else "null";
-        const filter_val_str = if (r.filter_value) |v| v else "null";
+        // Pre-allocate optional strings (will be freed after formatting)
+        const git_str = try jsonStr(allocator, r.git_commit);
+        defer allocator.free(git_str);
+        const filter_col_str = try jsonStr(allocator, r.filter_column);
+        defer allocator.free(filter_col_str);
+        const filter_val_str = try jsonStr(allocator, r.filter_value);
+        defer allocator.free(filter_val_str);
 
         return std.fmt.allocPrint(allocator,
             \\{{
@@ -179,14 +183,14 @@ pub const Tracer = struct {
             \\
         , .{
             r.timestamp_ms,
-            if (r.git_commit != null) try std.fmt.allocPrint(allocator, "\"{s}\"", .{git_commit_str}) else @as([]const u8, "null"),
+            git_str,
             r.file_path,
             r.file_size_bytes,
             r.num_columns,
             r.num_row_groups,
             r.total_rows,
-            if (r.filter_column != null) try std.fmt.allocPrint(allocator, "\"{s}\"", .{filter_col_str}) else @as([]const u8, "null"),
-            if (r.filter_value != null) try std.fmt.allocPrint(allocator, "\"{s}\"", .{filter_val_str}) else @as([]const u8, "null"),
+            filter_col_str,
+            filter_val_str,
             nsToMs(m.totalNs()),
             nsToMs(m.filter_decode_ns),
             nsToMs(m.skip_ns),
@@ -217,6 +221,15 @@ pub const Tracer = struct {
 
 fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+/// Format an optional string as JSON (with quotes) or "null"
+fn jsonStr(allocator: std.mem.Allocator, value: ?[]const u8) ![]const u8 {
+    if (value) |v| {
+        return std.fmt.allocPrint(allocator, "\"{s}\"", .{v});
+    } else {
+        return allocator.dupe(u8, "null");
+    }
 }
 
 /// Get current timestamp in milliseconds (for run metadata)

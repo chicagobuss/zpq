@@ -2,6 +2,9 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const encoder = @import("encoder.zig");
 const thrift = @import("thrift.zig");
+const compress = @import("compress.zig");
+const snappy = @import("snappy.zig");
+const zstd = @import("zstd.zig");
 
 /// Page writer for encoding and writing Parquet data pages
 pub const PageWriter = struct {
@@ -160,12 +163,27 @@ pub const PageWriter = struct {
         const uncompressed_size: i32 = @intCast(uncompressed_data.len);
 
         // Compress if needed
-        // For now, only UNCOMPRESSED is supported
-        if (self.compression != .UNCOMPRESSED) {
-            return error.UnsupportedCompression;
-        }
+        const compressed_data: []u8 = switch (self.compression) {
+            .UNCOMPRESSED => try self.allocator.dupe(u8, uncompressed_data),
+            .GZIP => compress.compressGzip(self.allocator, uncompressed_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CompressionFailed => return error.CompressionFailed,
+            },
+            .SNAPPY => snappy.compressAlloc(self.allocator, uncompressed_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OutputTooSmall => return error.CompressionFailed,
+            },
+            .ZSTD => if (comptime zstd.compression_enabled)
+                zstd.compressAlloc(self.allocator, uncompressed_data) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionFailed => return error.CompressionFailed,
+                }
+            else
+                return error.UnsupportedCompression,
+            .LZO, .BROTLI, .LZ4, .LZ4_RAW => return error.UnsupportedCompression,
+        };
 
-        const compressed_size = uncompressed_size;
+        const compressed_size: i32 = @intCast(compressed_data.len);
 
         // Build page header
         const header = schema.PageHeader{
@@ -182,12 +200,9 @@ pub const PageWriter = struct {
             .dictionary_page_header = null,
         };
 
-        // Copy data to owned buffer (so caller can safely reset the encoder)
-        const owned_data = try self.allocator.dupe(u8, uncompressed_data);
-
         return DataPageResult{
             .header = header,
-            .data = owned_data,
+            .data = compressed_data,
             .owns_data = true,
             .allocator = self.allocator,
         };
@@ -198,12 +213,28 @@ pub const PageWriter = struct {
         const encoded_data = self.plain_encoder.getData();
         const uncompressed_size: i32 = @intCast(encoded_data.len);
 
-        // For now, only UNCOMPRESSED is supported
-        if (self.compression != .UNCOMPRESSED) {
-            return error.UnsupportedCompression;
-        }
+        // Compress if needed
+        const compressed_data: []u8 = switch (self.compression) {
+            .UNCOMPRESSED => try self.allocator.dupe(u8, encoded_data),
+            .GZIP => compress.compressGzip(self.allocator, encoded_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CompressionFailed => return error.CompressionFailed,
+            },
+            .SNAPPY => snappy.compressAlloc(self.allocator, encoded_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OutputTooSmall => return error.CompressionFailed,
+            },
+            .ZSTD => if (comptime zstd.compression_enabled)
+                zstd.compressAlloc(self.allocator, encoded_data) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CompressionFailed => return error.CompressionFailed,
+                }
+            else
+                return error.UnsupportedCompression,
+            .LZO, .BROTLI, .LZ4, .LZ4_RAW => return error.UnsupportedCompression,
+        };
 
-        const compressed_size = uncompressed_size;
+        const compressed_size: i32 = @intCast(compressed_data.len);
 
         const header = schema.PageHeader{
             .type = .DICTIONARY_PAGE,
@@ -218,12 +249,9 @@ pub const PageWriter = struct {
             },
         };
 
-        // Copy data to owned buffer (so caller can safely reset the encoder)
-        const owned_data = try self.allocator.dupe(u8, encoded_data);
-
         return DataPageResult{
             .header = header,
-            .data = owned_data,
+            .data = compressed_data,
             .owns_data = true,
             .allocator = self.allocator,
         };

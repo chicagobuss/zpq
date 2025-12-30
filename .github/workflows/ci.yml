@@ -169,8 +169,12 @@ jobs:
 
       - name: Run Tests
         run: |
-          echo "::group::Running Tests"
+          echo "::group::Running Tests (ZSTD Enabled)"
           zig build test --summary all 2>&1
+          echo "::endgroup::"
+
+          echo "::group::Running Tests (ZSTD Disabled)"
+          zig build test -Dzstd-compression=false --summary all 2>&1
           echo "::endgroup::"
 
       - name: Run Inspector Verification

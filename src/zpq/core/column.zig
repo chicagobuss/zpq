@@ -3,6 +3,7 @@ const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
 const zstd = @import("zstd.zig");
+const flate = std.compress.flate;
 const io = @import("../io/interface.zig");
 const log = @import("../log.zig").core;
 
@@ -172,6 +173,30 @@ pub const ColumnReader = struct {
 
             const decompressed_len = try zstd.decompress(payload, result);
             _ = decompressed_len;
+
+            // Free the compressed payload
+            allocator.free(payload);
+
+            return Page{
+                .header = header,
+                .data = result,
+                .borrowed = false,
+            };
+        }
+
+        if (self.codec == .GZIP) {
+            const uncompressed_size = @as(usize, @intCast(header.uncompressed_page_size));
+
+            const result = try allocator.alloc(u8, uncompressed_size);
+            errdefer allocator.free(result);
+
+            // Use flate.Decompress for GZIP
+            var input_reader: std.Io.Reader = .fixed(payload);
+            var output_writer: std.Io.Writer = .fixed(result);
+
+            // Decompress.init takes (input, container, buffer) - use empty buffer for direct mode
+            var decompressor = flate.Decompress.init(&input_reader, .gzip, &.{});
+            _ = decompressor.reader.streamRemaining(&output_writer) catch return error.DecompressionFailed;
 
             // Free the compressed payload
             allocator.free(payload);

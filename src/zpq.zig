@@ -16,6 +16,7 @@ pub const core = struct {
     pub const encoder = @import("zpq/core/encoder.zig");
     pub const rle = @import("zpq/core/rle.zig");
     pub const snappy = @import("zpq/core/snappy.zig");
+    pub const zstd = @import("zpq/core/zstd.zig");
     pub const thrift = @import("zpq/core/thrift.zig");
     pub const writer = @import("zpq/core/writer.zig");
     pub const page_writer = @import("zpq/core/page_writer.zig");
@@ -23,6 +24,7 @@ pub const core = struct {
     pub const batch_reader = @import("zpq/core/batch_reader.zig");
     pub const page_index = @import("zpq/core/page_index.zig");
     pub const filter = @import("zpq/core/filter.zig");
+    pub const compress = @import("zpq/core/compress.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection

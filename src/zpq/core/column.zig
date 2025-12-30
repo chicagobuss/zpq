@@ -2,6 +2,7 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
+const zstd = @import("zstd.zig");
 const io = @import("../io/interface.zig");
 const log = @import("../log.zig").core;
 
@@ -155,6 +156,25 @@ pub const ColumnReader = struct {
             // because the buffer will be reused for the next page
             const result = try allocator.alloc(u8, uncompressed_size);
             @memcpy(result, uncompressed);
+
+            return Page{
+                .header = header,
+                .data = result,
+                .borrowed = false,
+            };
+        }
+
+        if (self.codec == .ZSTD) {
+            const uncompressed_size = @as(usize, @intCast(header.uncompressed_page_size));
+
+            const result = try allocator.alloc(u8, uncompressed_size);
+            errdefer allocator.free(result);
+
+            const decompressed_len = try zstd.decompress(payload, result);
+            _ = decompressed_len;
+
+            // Free the compressed payload
+            allocator.free(payload);
 
             return Page{
                 .header = header,

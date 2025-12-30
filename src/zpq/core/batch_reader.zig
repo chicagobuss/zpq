@@ -7,6 +7,55 @@ const Decoder = @import("decoder.zig").Decoder;
 const simd = @import("simd.zig");
 const file = @import("file.zig");
 
+/// Decoder for BYTE_STREAM_SPLIT encoding.
+/// Data is split into N streams (one per byte of the type width).
+/// To reconstruct value i: take byte 0 from stream[0][i], byte 1 from stream[1][i], etc.
+/// Only valid for fixed-width numeric types (f32, f64, i32, i64, etc.)
+pub fn ByteStreamSplitDecoder(comptime T: type) type {
+    // BYTE_STREAM_SPLIT only makes sense for fixed-width types
+    const width = comptime blk: {
+        if (T == f32 or T == i32 or T == u32) break :blk 4;
+        if (T == f64 or T == i64 or T == u64) break :blk 8;
+        if (T == [12]u8) break :blk 12; // INT96
+        // For unsupported types, use 0 to signal incompatibility
+        break :blk 0;
+    };
+
+    return struct {
+        data: []const u8,
+        num_values: usize,
+        pos: usize = 0,
+
+        pub fn init(data: []const u8, num_values: usize) @This() {
+            return .{ .data = data, .num_values = num_values };
+        }
+
+        pub fn next(self: *@This()) ?T {
+            if (width == 0) return null; // Unsupported type
+            if (self.pos >= self.num_values) return null;
+
+            const stride = self.num_values;
+            var bytes: [if (width > 0) width else 1]u8 = undefined;
+
+            // Reconstruct value by gathering one byte from each stream
+            inline for (0..width) |b| {
+                const offset = b * stride + self.pos;
+                if (offset >= self.data.len) return null;
+                bytes[b] = self.data[offset];
+            }
+
+            self.pos += 1;
+
+            // Return the reconstructed value
+            if (T == [12]u8) {
+                return bytes;
+            } else {
+                return @bitCast(bytes);
+            }
+        }
+    };
+}
+
 pub fn BatchReader(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -24,6 +73,7 @@ pub fn BatchReader(comptime T: type) type {
         rle_decoder: ?RleDecoder = null,
         plain_decoder: ?Decoder = null,
         def_levels_decoder: ?RleDecoder = null,
+        byte_stream_split_decoder: ?ByteStreamSplitDecoder(T) = null,
 
         // Dictionary (if any)
         dictionary: ?[]const T = null,
@@ -604,9 +654,15 @@ pub fn BatchReader(comptime T: type) type {
                     const bit_width = data_slice[0];
                     self.rle_decoder = RleDecoder.init(data_slice[1..], bit_width);
                     self.plain_decoder = null;
+                    self.byte_stream_split_decoder = null;
                 }
             } else if (dph.encoding == .PLAIN) {
                 self.plain_decoder = Decoder.init(data_slice);
+                self.rle_decoder = null;
+                self.byte_stream_split_decoder = null;
+            } else if (dph.encoding == .BYTE_STREAM_SPLIT) {
+                self.byte_stream_split_decoder = ByteStreamSplitDecoder(T).init(data_slice, @intCast(dph.num_values));
+                self.plain_decoder = null;
                 self.rle_decoder = null;
             } else {
                 return error.UnsupportedEncoding;
@@ -654,6 +710,10 @@ pub fn BatchReader(comptime T: type) type {
 
             if (self.plain_decoder != null) {
                 return try self.decodePlainScalar();
+            }
+
+            if (self.byte_stream_split_decoder) |*bss| {
+                return bss.next() orelse error.EndOfStream;
             }
 
             return error.UnsupportedEncoding;

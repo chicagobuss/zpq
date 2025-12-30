@@ -71,6 +71,40 @@ ZPQ is tested for stability across several environments:
 - **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
 - **Property-Based Verification**: We utilize `minish` for fuzzing and property-based testing. This allows us to verify invariants (e.g., "re-serializing a struct matches the original") and automatically shrink complex crash cases into minimal reproductions. This is particularly critical for the Thrift metadata parser and HTTP header handling.
 
+### Parquet Validation Suite
+
+ZPQ includes a multi-backend validation tool that compares output against reference implementations (DuckDB, PyArrow). This enables 3-way comparisons to catch correctness issues:
+
+```bash
+# Validate against default backend (DuckDB)
+just validate data/myfile.parquet
+
+# Validate all apache/parquet-testing files
+just validate-all
+
+# 3-way comparison: zpq vs duckdb vs pyarrow side-by-side
+just validate-compare data/myfile.parquet
+```
+
+Example 3-way comparison output:
+```
+Column: float_col (FLOAT)
+--------------------------------------------------------------------------------
+  Row   zpq                           duckdb                        pyarrow
+  ----  ----------------------------  ----------------------------  ----------------------------
+  0     0                             0.0                           0.0
+  1     1.1                           1.100000023841858             1.100000023841858            !!!
+  2     0                             0.0                           0.0
+
+Column: timestamp_col (TIMESTAMP)
+--------------------------------------------------------------------------------
+  Row   zpq                           duckdb                        pyarrow
+  ----  ----------------------------  ----------------------------  ----------------------------
+  0     1235865600 (JD=2454892...     2009-03-01 00:00:00           2009-03-01 00:00:00          !!!
+```
+
+The `!!!` markers highlight mismatches, making it easy to identify where zpq differs from reference implementations. This is invaluable for ensuring correctness across the 64+ test files in the Apache parquet-testing suite.
+
 ## Performance
 
 ZPQ is designed to outperform general-purpose Parquet readers in cloud-native environments.

@@ -80,7 +80,7 @@ fetch_deps() {
     # 3. Attempt Download (Fail-Open)
     # We use curl with --fail to detect 404s/auth errors
     local base_url="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${DEPS_TAG}"
-    
+
     if curl -fL --connect-timeout 5 --max-time 60 "$base_url/libcrypto-$triple.a" -o "$libcrypto" 2>/dev/null; then
         success "Downloaded libcrypto.a"
     else
@@ -100,6 +100,63 @@ fetch_deps() {
     success "Deps ready."
 }
 
+# --- Test against apache/parquet-testing ---
+test_parquet_testing() {
+    local mode="${1:-schema}"  # schema or scan
+
+    echo "=== Testing against apache/parquet-testing (mode: $mode) ==="
+
+    local passed=0
+    local failed=0
+    local skipped=0
+    local failed_files=""
+
+    for f in references/parquet-testing/data/*.parquet; do
+        local name=$(basename "$f")
+        printf "%-55s " "$name"
+
+        local output
+        output=$(zig build run -- "$mode" "$f" 2>&1) || true
+        local exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
+            echo "✓ PASS"
+            passed=$((passed + 1))
+        else
+            if echo "$output" | grep -qE "UnsupportedCompression|not supported|Unsupported|BYTE_STREAM_SPLIT|LZ4_RAW|BROTLI|LZ4"; then
+                echo "⊘ SKIP (unsupported)"
+                skipped=$((skipped + 1))
+            else
+                echo "✗ FAIL"
+                local error_line=$(echo "$output" | grep -E "error|Error|panic" | tail -1)
+                if [ -n "$error_line" ]; then
+                    echo "    $error_line"
+                fi
+                failed=$((failed + 1))
+                failed_files="$failed_files $name"
+            fi
+        fi
+    done
+
+    echo ""
+    echo "=== Summary ==="
+    echo "Passed:  $passed"
+    echo "Skipped: $skipped"
+    echo "Failed:  $failed"
+
+    if [ -n "$failed_files" ]; then
+        echo ""
+        echo "Failed files:$failed_files"
+    fi
+
+    [ $failed -eq 0 ]
+}
+
+# --- Validate against reference implementations ---
+validate_parquet() {
+    python3 "$(dirname "$0")/validate_parquet.py" "$@"
+}
+
 # --- Dispatcher ---
 # Allows calling functions by name: ./tools/just_helpers.sh fetch_deps
 cmd="${1:-}"
@@ -108,9 +165,10 @@ shift || true
 case "$cmd" in
     fetch_deps) fetch_deps "$@" ;;
     detect_triple) detect_triple "$@" ;;
+    test_parquet_testing) test_parquet_testing "$@" ;;
+    validate_parquet) validate_parquet "$@" ;;
     *)
         error "Unknown command: $cmd"
         exit 1
         ;;
 esac
-

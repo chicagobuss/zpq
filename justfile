@@ -264,6 +264,35 @@ cross-check-experimental:
 watch-ci:
     act --watch
 
+# === Apache Parquet Testing Suite ===
+
+# Test against apache/parquet-testing files (schema parsing)
+test-parquet-testing:
+    @./tools/just_helpers.sh test_parquet_testing schema
+
+# Test parquet-testing with full scan (slower, more thorough)
+test-parquet-testing-scan:
+    @./tools/just_helpers.sh test_parquet_testing scan
+
+# Validate zpq output against reference impl (duckdb or pyarrow)
+validate *args:
+    @./tools/just_helpers.sh validate_parquet {{args}}
+
+# Validate all parquet-testing files (default: duckdb)
+validate-all:
+    @./tools/just_helpers.sh validate_parquet --all
+
+# Validate with specific backend
+validate-duckdb *args:
+    @./tools/just_helpers.sh validate_parquet --backend duckdb {{args}}
+
+validate-pyarrow *args:
+    @./tools/just_helpers.sh validate_parquet --backend pyarrow {{args}}
+
+# 3-way comparison: zpq vs duckdb vs pyarrow
+validate-compare *args:
+    @./tools/just_helpers.sh validate_parquet --compare {{args}}
+
 # Run benchmarks on remote ARM64 host
 remote-bench:
     ./tools/remote_bench.sh

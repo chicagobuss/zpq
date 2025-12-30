@@ -27,6 +27,8 @@ pub fn main() !void {
 
     var filter: ?[]const u8 = null;
     var count_only = false;
+    var unified_filter = false;
+    var trace_output: ?[]const u8 = null;
     for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--filter")) {
             if (i + 1 < args.len) {
@@ -35,6 +37,17 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, arg, "--count")) {
             count_only = true;
+        }
+        if (std.mem.eql(u8, arg, "--unified-filter")) {
+            unified_filter = true;
+        }
+        if (std.mem.eql(u8, arg, "--trace")) {
+            // Optional: --trace output.json or just --trace for stdout
+            if (i + 1 < args.len and args[i + 1][0] != '-') {
+                trace_output = args[i + 1];
+            } else {
+                trace_output = "-"; // stdout marker
+            }
         }
     }
 
@@ -78,10 +91,10 @@ pub fn main() !void {
         try cmdCat(allocator, args[2], limit, is_async, &loop, &thread_pool, resolver, verify_tls);
     } else if (std.mem.eql(u8, command, "scan")) {
         if (args.len < 3) {
-            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val] [--count]\n", .{args[0]});
+            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val] [--count] [--unified-filter] [--trace [file]]\n", .{args[0]});
             return;
         }
-        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter, count_only);
+        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter, count_only, unified_filter, trace_output);
     } else if (std.mem.eql(u8, command, "pages")) {
         if (args.len < 3) {
             std.debug.print("Usage: {s} pages <parquet_file>\n", .{args[0]});
@@ -149,6 +162,10 @@ fn printUsage(exe_name: []const u8) void {
         \\Options:
         \\  --tls-verify        Enable TLS certificate verification for S3/HTTPS
         \\  --async             Force async I/O path
+        \\  --filter col=val    Filter rows where column equals value
+        \\  --count             Only count matching rows (skip Phase 2)
+        \\  --unified-filter    Use unified byte-level filter matching (experimental)
+        \\  --trace [file]      Output performance trace (JSON to file or stdout if no file)
         \\
         \\Environment Variables:
         \\  S3_ENDPOINT         Custom S3 endpoint (e.g. http://localhost:9000 for MinIO)
@@ -178,7 +195,7 @@ fn openFile(
     );
 }
 
-fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool, filter: ?[]const u8, count_only: bool) !void {
+fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool, filter: ?[]const u8, count_only: bool, unified_filter: bool, trace_output: ?[]const u8) !void {
     var timer = try std.time.Timer.start();
 
     var pf = try openFile(allocator, path, is_async, loop, thread_pool, resolver, verify_tls);
@@ -197,6 +214,22 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             filter_col_name = f[0..idx];
             filter_val = f[idx + 1 ..];
         }
+    }
+
+    // Initialize tracer if requested
+    var tracer: ?zpq.trace.Tracer = if (trace_output != null) zpq.trace.Tracer.init(.{
+        .timestamp_ms = zpq.trace.nowMs(),
+        .file_path = path,
+        .filter_column = filter_col_name,
+        .filter_value = filter_val,
+        .total_rows = if (pf.metadata) |m| @intCast(m.num_rows) else 0,
+        .num_row_groups = if (pf.metadata) |m| @intCast(m.row_groups.items.len) else 0,
+        .num_columns = if (pf.metadata) |m| @intCast(m.schema.items.len) else 0,
+    }) else null;
+
+    // Log unified filter mode
+    if (unified_filter) {
+        std.debug.print("Using unified filter path (EncodedFilter.matchesBytes)\n", .{});
     }
 
     if (pf.metadata) |meta| {
@@ -243,10 +276,15 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             };
 
             // Mark row groups to skip via metadata pruning
-            for (meta.row_groups.items, 0..) |_, rg_idx| {
+            for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
                 if (pf.shouldSkipRowGroup(rg_idx, filter_col_name.?, &encoded_filter.?)) {
                     rg_skip_mask[rg_idx] = true;
                     row_groups_skipped += 1;
+                    // Record skipped row group in tracer
+                    if (tracer) |*t| {
+                        t.recordRowGroup(false);
+                        t.metrics.rows_skipped += @intCast(rg_meta.num_rows);
+                    }
                 }
             }
         }
@@ -420,12 +458,12 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                             // Fast path: compare dictionary indices (integers)
                             n_read = try filter_reader.scanDictIndicesIntoBatch(target_dict_idx.?, &sel, batch_size);
                         } else {
-                            // Slow path: decode strings and compare
+                            // Slow path: decode strings and compare using EncodedFilter
                             var buf: [1024]?[]const u8 = undefined;
                             n_read = try filter_reader.nextBatch(buf[0..batch_size]);
                             for (buf[0..n_read], 0..) |val, i| {
                                 if (val) |v| {
-                                    if (std.mem.eql(u8, v, filter_val.?)) sel.setBitIndices(i);
+                                    if (encoded_filter.?.matchesBytes(v)) sel.setBitIndices(i);
                                 }
                             }
                         }
@@ -440,75 +478,249 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                         row_idx += n_read;
                     }
                     phase1_decode_ns = t0.read();
-                } else if (filter_md.type == .INT64) {
-                    // Parse filter value as i64
-                    const filter_i64 = std.fmt.parseInt(i64, filter_val.?, 10) catch {
-                        std.debug.print("Invalid INT64 filter value: {s}\n", .{filter_val.?});
-                        return error.InvalidFilterValue;
-                    };
+                } else if (filter_md.type == .INT64 or filter_md.type == .INT32 or
+                    filter_md.type == .FLOAT or filter_md.type == .DOUBLE or
+                    filter_md.type == .BOOLEAN or filter_md.type == .INT96)
+                {
+                    // Fixed-width numeric types - use unified or legacy path
+                    if (unified_filter) {
+                        // === UNIFIED PATH: byte-level comparison via EncodedFilter ===
+                        const ci_ptr: ?*const zpq.core.page_index.ColumnIndex = if (column_index) |*ci| ci else null;
 
-                    var filter_reader = zpq.core.batch_reader.BatchReader(i64).init(
-                        allocator,
-                        filter_col_reader,
-                        filter_md.type,
-                        @intCast(filter_levels.max_def),
-                        @intCast(filter_levels.max_rep),
-                        filter_type_len,
-                    );
-                    defer filter_reader.deinit();
+                        switch (filter_md.type) {
+                            .INT64 => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader(i64).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
 
-                    var row_idx: usize = 0;
+                                const result = try scanFixedWidthFilterColumn(
+                                    i64,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            .INT32 => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader(i32).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
 
-                    while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
-                        // Page-level skip using EncodedFilter
-                        if (filter_reader.isAtPageBoundary()) {
-                            const next_page = filter_reader.getPageIndex();
-                            const should_skip = if (column_index) |*ci|
-                                if (encoded_filter) |*ef| !ef.mightContainInPage(ci, next_page) else false
-                            else
-                                false;
-                            if (should_skip) {
-                                pages_skipped += 1;
-                                if (try filter_reader.skipNextPage()) |skipped_rows| {
-                                    var remaining = skipped_rows;
-                                    while (remaining > 0) {
-                                        const batch_size = @min(1024, remaining);
-                                        const sel = zpq.core.simd.SelectionVector.init();
-                                        try batch_selections.append(allocator, sel);
-                                        try batch_sizes.append(allocator, batch_size);
-                                        total_values += batch_size;
-                                        remaining -= batch_size;
+                                const result = try scanFixedWidthFilterColumn(
+                                    i32,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            .FLOAT => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader(f32).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
+
+                                const result = try scanFixedWidthFilterColumn(
+                                    f32,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            .DOUBLE => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader(f64).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
+
+                                const result = try scanFixedWidthFilterColumn(
+                                    f64,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            .BOOLEAN => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader(bool).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
+
+                                const result = try scanFixedWidthFilterColumn(
+                                    bool,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            .INT96 => {
+                                var filter_reader = zpq.core.batch_reader.BatchReader([12]u8).init(
+                                    allocator,
+                                    filter_col_reader,
+                                    filter_md.type,
+                                    @intCast(filter_levels.max_def),
+                                    @intCast(filter_levels.max_rep),
+                                    filter_type_len,
+                                );
+                                defer filter_reader.deinit();
+
+                                const result = try scanFixedWidthFilterColumn(
+                                    [12]u8,
+                                    allocator,
+                                    &filter_reader,
+                                    &encoded_filter.?,
+                                    ci_ptr,
+                                    @intCast(rg_meta.num_rows),
+                                    &batch_selections,
+                                    &batch_sizes,
+                                );
+                                total_values += result.total_values;
+                                rows_selected += result.rows_selected;
+                                pages_skipped = result.pages_skipped;
+                                rg_has_matches = result.has_matches;
+                            },
+                            else => unreachable,
+                        }
+                        phase1_decode_ns = t0.read();
+                    } else {
+                        // === LEGACY PATH: type-specific comparison (INT64 only) ===
+                        if (filter_md.type != .INT64) {
+                            std.debug.print("Legacy path only supports INT64. Use --unified-filter for {any}\n", .{filter_md.type});
+                            return error.UnsupportedFilterType;
+                        }
+
+                        const filter_i64 = std.fmt.parseInt(i64, filter_val.?, 10) catch {
+                            std.debug.print("Invalid INT64 filter value: {s}\n", .{filter_val.?});
+                            return error.InvalidFilterValue;
+                        };
+
+                        var filter_reader = zpq.core.batch_reader.BatchReader(i64).init(
+                            allocator,
+                            filter_col_reader,
+                            filter_md.type,
+                            @intCast(filter_levels.max_def),
+                            @intCast(filter_levels.max_rep),
+                            filter_type_len,
+                        );
+                        defer filter_reader.deinit();
+
+                        var row_idx: usize = 0;
+
+                        while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
+                            if (filter_reader.isAtPageBoundary()) {
+                                const next_page = filter_reader.getPageIndex();
+                                const should_skip = if (column_index) |*ci|
+                                    if (encoded_filter) |*ef| !ef.mightContainInPage(ci, next_page) else false
+                                else
+                                    false;
+                                if (should_skip) {
+                                    pages_skipped += 1;
+                                    if (try filter_reader.skipNextPage()) |skipped_rows| {
+                                        var remaining = skipped_rows;
+                                        while (remaining > 0) {
+                                            const batch_size = @min(1024, remaining);
+                                            const sel = zpq.core.simd.SelectionVector.init();
+                                            try batch_selections.append(allocator, sel);
+                                            try batch_sizes.append(allocator, batch_size);
+                                            total_values += batch_size;
+                                            remaining -= batch_size;
+                                        }
+                                        row_idx += skipped_rows;
+                                        continue;
                                     }
-                                    row_idx += skipped_rows;
-                                    continue;
                                 }
                             }
-                        }
 
-                        const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
+                            const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
 
-                        var sel = zpq.core.simd.SelectionVector.init();
-                        var buf: [1024]?i64 = undefined;
-                        const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
+                            var sel = zpq.core.simd.SelectionVector.init();
+                            var buf: [1024]?i64 = undefined;
+                            const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
 
-                        for (buf[0..n_read], 0..) |val, i| {
-                            if (val) |v| {
-                                if (v == filter_i64) sel.setBitIndices(i);
+                            for (buf[0..n_read], 0..) |val, i| {
+                                if (val) |v| {
+                                    if (v == filter_i64) sel.setBitIndices(i);
+                                }
                             }
+
+                            if (n_read == 0) break;
+
+                            rows_selected += sel.count();
+                            total_values += n_read;
+                            if (sel.count() > 0) rg_has_matches = true;
+                            try batch_selections.append(allocator, sel);
+                            try batch_sizes.append(allocator, n_read);
+                            row_idx += n_read;
                         }
-
-                        if (n_read == 0) break;
-
-                        rows_selected += sel.count();
-                        total_values += n_read;
-                        if (sel.count() > 0) rg_has_matches = true;
-                        try batch_selections.append(allocator, sel);
-                        try batch_sizes.append(allocator, n_read);
-                        row_idx += n_read;
+                        phase1_decode_ns = t0.read();
                     }
-                    phase1_decode_ns = t0.read();
                 } else {
-                    std.debug.print("Filters currently only supported on BYTE_ARRAY and INT64 columns\n", .{});
+                    std.debug.print("Unsupported filter column type: {any}\n", .{filter_md.type});
                     return error.UnsupportedFilterType;
                 }
 
@@ -555,6 +767,14 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                     pages_skipped,
                     total_pages,
                 });
+
+                // Record tracer metrics for this row group
+                if (tracer) |*t| {
+                    t.recordFilterDecode(phase1_decode_ns, batch_selections.items.len * 1024); // Approximate rows
+                    t.recordMaterialize(phase2_decode_ns, rows_selected);
+                    t.metrics.pages_decoded += total_pages - pages_skipped;
+                    t.recordRowGroup(true);
+                }
                 // If no matches in this row group, we skip fetching all other columns entirely!
             } else {
                 // FULL SCAN PATH (no filter or column not found)
@@ -601,6 +821,32 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     if (row_groups_skipped > 0) {
         std.debug.print("Row groups skipped via stats: {d}\n", .{row_groups_skipped});
     }
+
+    // Output tracer results if enabled
+    if (tracer) |*t| {
+        // Populate final metrics
+        t.metrics.rows_scanned = total_values;
+        t.metrics.rows_selected = rows_selected;
+        t.metrics.row_groups_skipped = row_groups_skipped;
+
+        if (trace_output) |output| {
+            if (std.mem.eql(u8, output, "-")) {
+                // Write to stdout
+                const json = t.toJson(allocator) catch |err| {
+                    std.debug.print("Failed to generate trace JSON: {}\n", .{err});
+                    return;
+                };
+                defer allocator.free(json);
+                std.debug.print("\n--- Trace Output ---\n{s}\n", .{json});
+            } else {
+                // Write to file
+                t.writeToFile(output) catch |err| {
+                    std.debug.print("Failed to write trace to {s}: {}\n", .{ output, err });
+                };
+                std.debug.print("Trace written to: {s}\n", .{output});
+            }
+        }
+    }
 }
 
 fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32) !u64 {
@@ -616,6 +862,94 @@ fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.c
         total += n;
     }
     return total;
+}
+
+/// Unified filter scanning for fixed-width types (INT32, INT64, FLOAT, DOUBLE).
+/// Uses EncodedFilter.matchesBytes() for byte-level comparison - single code path for all types.
+///
+/// Key insight: For equality predicates, we can compare raw encoded bytes instead of
+/// decoding to native types. This enables a single code path AND opens the door for
+/// SIMD-accelerated comparison (compare 32 bytes at a time across multiple values).
+const ScanFilterResult = struct {
+    total_values: u64,
+    rows_selected: u64,
+    pages_skipped: usize,
+    has_matches: bool,
+};
+
+fn scanFixedWidthFilterColumn(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    filter_reader_ptr: *zpq.core.batch_reader.BatchReader(T),
+    encoded_filter: *const zpq.core.filter.EncodedFilter,
+    column_index: ?*const zpq.core.page_index.ColumnIndex,
+    num_rows: usize,
+    batch_selections: *std.ArrayListUnmanaged(zpq.core.simd.SelectionVector),
+    batch_sizes: *std.ArrayListUnmanaged(usize),
+) !ScanFilterResult {
+    var result = ScanFilterResult{
+        .total_values = 0,
+        .rows_selected = 0,
+        .pages_skipped = 0,
+        .has_matches = false,
+    };
+    var row_idx: usize = 0;
+
+    while (row_idx < num_rows) {
+        // Page-level skip using EncodedFilter
+        if (filter_reader_ptr.isAtPageBoundary()) {
+            const next_page = filter_reader_ptr.getPageIndex();
+            const should_skip = if (column_index) |ci|
+                !encoded_filter.mightContainInPage(ci, next_page)
+            else
+                false;
+            if (should_skip) {
+                result.pages_skipped += 1;
+                if (try filter_reader_ptr.skipNextPage()) |skipped_rows| {
+                    var remaining = skipped_rows;
+                    while (remaining > 0) {
+                        const batch_size = @min(1024, remaining);
+                        const sel = zpq.core.simd.SelectionVector.init();
+                        try batch_selections.append(allocator, sel);
+                        try batch_sizes.append(allocator, batch_size);
+                        result.total_values += batch_size;
+                        remaining -= batch_size;
+                    }
+                    row_idx += skipped_rows;
+                    continue;
+                }
+            }
+        }
+
+        const batch_size = @min(1024, num_rows - row_idx);
+
+        var sel = zpq.core.simd.SelectionVector.init();
+        var buf: [1024]?T = undefined;
+        const n_read = try filter_reader_ptr.nextBatch(buf[0..batch_size]);
+
+        // Unified byte-level comparison using EncodedFilter
+        for (buf[0..n_read], 0..) |val, i| {
+            if (val) |v| {
+                // Convert decoded value to bytes and compare
+                // For fixed-width types, this is just a pointer cast (zero cost)
+                const value_bytes = std.mem.asBytes(&v);
+                if (encoded_filter.matchesBytes(value_bytes)) {
+                    sel.setBitIndices(i);
+                }
+            }
+        }
+
+        if (n_read == 0) break;
+
+        result.rows_selected += sel.count();
+        result.total_values += n_read;
+        if (sel.count() > 0) result.has_matches = true;
+        try batch_selections.append(allocator, sel);
+        try batch_sizes.append(allocator, n_read);
+        row_idx += n_read;
+    }
+
+    return result;
 }
 
 /// Process a column using pre-computed selection vectors from Phase 1.

@@ -227,6 +227,26 @@ pub fn addAuxiliaryTools(
         step.dependOn(&run.step);
     }
 
+    // test-deranged-bloat
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("probes/test_deranged_bloat.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        mod.addImport("zpq", zpq_mod);
+
+        const exe = b.addExecutable(.{
+            .name = "test-deranged-bloat",
+            .root_module = mod,
+        });
+        exe.root_module.linkSystemLibrary("c", .{});
+
+        const run = b.addRunArtifact(exe);
+        const step = b.step("test-deranged-bloat", "Run deranged bloat test probe");
+        step.dependOn(&run.step);
+    }
+
     // Hardening Proofs / Integration tests
     {
         // 13. test_fuzz_demo

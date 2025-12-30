@@ -60,6 +60,12 @@ cross-check:
 gen-fixtures:
     python3 tools/fixtures/gen.py
 
+# Generate deranged test fixtures
+gen-deranged:
+    python3 tools/fixtures/deranged_gen.py
+    duckdb -c "COPY (SELECT * FROM read_csv('data/deranged.csv')) TO 'data/deranged.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 1000);"
+    @echo "Generated data/deranged.parquet using DuckDB"
+
 # Run the CLI tools against verified fixtures (Moderate)
 verify: build check-tls
     @echo "Verifying CLI commands..."

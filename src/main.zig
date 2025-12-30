@@ -338,6 +338,17 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
     }
 }
 
+fn formatInt96(val: [12]u8) !void {
+    const nanos = std.mem.readInt(u64, val[0..8], .little);
+    const days = std.mem.readInt(u32, val[8..12], .little);
+    
+    // Julian Day 2440588 is 1970-01-01
+    const julian_epoch = 2440588;
+    const unix_seconds = (@as(i64, days) - julian_epoch) * 86400 + @as(i64, @intCast(nanos / 1_000_000_000));
+    
+    std.debug.print("{d} (JD={d}, NS={d})", .{ unix_seconds, days, nanos });
+}
+
 fn dumpColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.column.ColumnReader, col_type: zpq.schema.Type, max_def: u16, max_rep: u16, type_length: ?i32, limit: usize) !void {
     var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep, type_length);
     defer batch_reader.deinit();
@@ -354,6 +365,10 @@ fn dumpColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.c
             if (maybe_val) |val| {
                 if (T == []const u8) {
                     std.debug.print("  {s}\n", .{val});
+                } else if (T == [12]u8) {
+                    std.debug.print("  ", .{});
+                    try formatInt96(val);
+                    std.debug.print("\n", .{});
                 } else {
                     std.debug.print("  {any}\n", .{val});
                 }

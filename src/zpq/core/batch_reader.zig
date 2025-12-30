@@ -15,6 +15,7 @@ pub fn BatchReader(comptime T: type) type {
         
         // Current state
         current_page: ?zpq.column.Page = null,
+        active_pages: std.ArrayListUnmanaged(zpq.column.Page) = .{},
         values_remaining_in_page: usize = 0,
         
         // Page decoders
@@ -43,7 +44,8 @@ pub fn BatchReader(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.current_page) |*p| p.deinit(self.allocator);
+            for (self.active_pages.items) |*p| p.deinit(self.allocator);
+            self.active_pages.deinit(self.allocator);
             if (self.dictionary) |d| {
                 if (T == []const u8) {
                     for (d) |s| self.allocator.free(s);
@@ -53,6 +55,19 @@ pub fn BatchReader(comptime T: type) type {
         }
 
         pub fn nextBatch(self: *Self, buffer: []?T) !usize {
+            // Free pages from PREVIOUS batch, except the one we are currently reading from
+            var page_idx: usize = 0;
+            while (page_idx < self.active_pages.items.len) {
+                var p = &self.active_pages.items[page_idx];
+                // If this is the current page, keep it
+                if (self.current_page != null and p.data.ptr == self.current_page.?.data.ptr) {
+                    page_idx += 1;
+                    continue;
+                }
+                p.deinit(self.allocator);
+                _ = self.active_pages.swapRemove(page_idx);
+            }
+
             var out_pos: usize = 0;
             while (out_pos < buffer.len) {
                 if (self.values_remaining_in_page == 0) {
@@ -151,10 +166,7 @@ pub fn BatchReader(comptime T: type) type {
         }
 
         fn loadNextPage(self: *Self) !bool {
-            if (self.current_page) |*p| {
-                p.deinit(self.allocator);
-                self.current_page = null;
-            }
+            self.current_page = null;
 
             while (try self.column_reader.next(self.allocator)) |const_page| {
                 var page = const_page;
@@ -165,6 +177,7 @@ pub fn BatchReader(comptime T: type) type {
                 }
 
                 if (page.header.type == .DATA_PAGE) {
+                    try self.active_pages.append(self.allocator, page);
                     self.current_page = page;
                     const dph = page.header.data_page_header.?;
                     self.values_remaining_in_page = @intCast(dph.num_values);

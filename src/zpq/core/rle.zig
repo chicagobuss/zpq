@@ -234,7 +234,7 @@ pub const RleDecoder = struct {
             // Extract bits from current byte
             const byte_val = self.data[self.pos];
             const shifted = byte_val >> self.bitpack_pos;
-            const extracted_mask: u8 = (@as(u8, 1) << @intCast(bits_to_read)) -% 1;
+            const extracted_mask: u8 = @intCast((@as(u16, 1) << @intCast(bits_to_read)) - 1);
             const extracted = shifted & extracted_mask;
 
             val |= @as(u64, extracted) << @intCast(bits_read);

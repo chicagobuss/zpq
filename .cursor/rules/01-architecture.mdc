@@ -77,11 +77,15 @@ Before implementing any data transformation:
 *   **No Guessing**: If a build fails with "no member named X", stop immediately and read the `std` source file. Do not attempt a second guess based on training data.
 *   **Common 0.16.x Breaking Examples**:
     *   **ArrayList**: `std.ArrayList(T)` (managed) is generally DISCOURAGED in core logic. Use `std.ArrayListUnmanaged(T)`.
-        *   `list.init(allocator)` -> **REMOVED** (for both Managed and Unmanaged in 0.16.x).
-            *   Managed: Use `var list = std.ArrayList(T).init(allocator);`.
-            *   Unmanaged: Use `var list = std.ArrayListUnmanaged(T){};`.
-        *   `list.append(item)` -> **REMOVED** (for Unmanaged). Use `list.append(allocator, item)`.
-        *   `list.deinit()` -> **REMOVED** (for Unmanaged). Use `list.deinit(allocator)`.
+        *   **Initialization**:
+            *   Managed: `var list = std.ArrayList(T).init(allocator);`
+            *   Unmanaged: `var list = std.ArrayListUnmanaged(T){};` (empty struct literal, NO .init())
+        *   **All Unmanaged methods require allocator as first arg**:
+            *   `list.append(allocator, item)` - NOT `list.append(item)`
+            *   `list.appendSlice(allocator, items)` - NOT `list.appendSlice(items)`
+            *   `list.deinit(allocator)` - NOT `list.deinit()`
+            *   `list.ensureTotalCapacity(allocator, n)` - NOT `list.ensureTotalCapacity(n)`
+        *   **Managed ArrayList keeps allocator internally**, so methods don't need it passed.
     *   `std.fmt.format(writer, ...)` -> **PREFER** `writer.print(...)`.
     *   `std.time.milliTimestamp()` -> **REMOVED**. Use `std.time.Instant.now()`.
         *   **Note**: `Instant.timestamp` is a `posix.timespec` struct on POSIX systems (macOS/Linux).
@@ -111,6 +115,11 @@ Before implementing any data transformation:
 *   **Connection Pooling**:
     *   **Strategy**: Use LIFO (Last-In-First-Out) for idle connection retrieval to prioritize "warm" connections.
     *   **Health Check**: Connections retrieved from a pool MUST be checked for expiration (e.g., 10s idle timeout) before reuse.
+    *   **Lifecycle (Polars Pattern)**: Global pool uses reference counting - no explicit shutdown required.
+        *   `acquireGlobalPool()` increments refcount, returns pool pointer
+        *   `releaseGlobalPool()` decrements refcount, auto-cleans when count hits 0
+        *   `XevS3Source` acquires on init, releases on deinit
+        *   Why: Zero cognitive load (can't forget shutdown), correct by construction, Lambda-friendly
 
 ## 9. High-Performance Debugging & Feedback
 *   **Fix the Loop First**: If a bug takes >60s to reproduce, your priority is NOT the bug; it is **shortening the feedback loop**.

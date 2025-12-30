@@ -235,6 +235,9 @@ pub const ParquetFile = struct {
     footer_buffer: []u8 = &[_]u8{},
     allocator: std.mem.Allocator,
 
+    // Arena for metadata allocations (much faster than GPA for many small allocs)
+    metadata_arena: std.heap.ArenaAllocator,
+
     fn cleanupLocal(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const s: *io.local.FileSource = @ptrCast(@alignCast(ctx));
         s.deinit();
@@ -263,6 +266,7 @@ pub const ParquetFile = struct {
             .footer_len = 0,
             .file_size = size,
             .allocator = allocator,
+            .metadata_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
     }
 
@@ -294,6 +298,7 @@ pub const ParquetFile = struct {
             .footer_len = 0,
             .file_size = size,
             .allocator = allocator,
+            .metadata_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
     }
 
@@ -309,6 +314,7 @@ pub const ParquetFile = struct {
             .footer_len = 0,
             .file_size = size,
             .allocator = allocator,
+            .metadata_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
     }
 
@@ -326,14 +332,15 @@ pub const ParquetFile = struct {
             .footer_len = 0,
             .file_size = size,
             .allocator = allocator,
+            .metadata_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         };
     }
 
     pub fn deinit(self: *ParquetFile) void {
-        if (self.metadata) |*m| {
-            m.deinit(self.allocator);
-            self.metadata = null;
-        }
+        // Arena handles all metadata allocations - no need to call m.deinit()
+        self.metadata_arena.deinit();
+        self.metadata = null;
+
         if (self.footer_buffer.len > 0) {
             self.allocator.free(self.footer_buffer);
             self.footer_buffer = &[_]u8{};
@@ -400,7 +407,9 @@ pub const ParquetFile = struct {
         }
 
         var reader = thrift.Reader.init(self.footer_buffer);
-        self.metadata = try schema.FileMetaData.read(self.allocator, &reader);
+
+        // Use arena allocator for metadata - much faster for many small allocations
+        self.metadata = try schema.FileMetaData.read(self.metadata_arena.allocator(), &reader);
     }
 
     pub fn rowGroup(self: *ParquetFile, index: usize) !RowGroupReader {

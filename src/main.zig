@@ -47,6 +47,8 @@ pub fn main() !void {
         thread_pool.shutdown();
         thread_pool.deinit();
     }
+    // Note: Global connection pool uses reference counting (Polars-style).
+    // No explicit shutdown needed - pool auto-cleans when last ParquetFile closes.
 
     var tp_resolver = zpq.s3.dns.ThreadPoolResolverGen(xev).init(&thread_pool, allocator);
     var sf_resolver = zpq.s3.dns.SingleFlightResolverGen(xev).init(allocator, tp_resolver.resolver());

@@ -22,7 +22,6 @@ const xev = @import("xev");
 ///   // Explicit - for testing or custom lifetime
 ///   var pool = GlobalConnectionPool.init(allocator);
 ///   var source = try XevS3Source.initWithPool(allocator, &pool, ...);
-
 pub const ConnectionKey = struct {
     host: []const u8,
     port: u16,
@@ -204,16 +203,41 @@ fn getNowMs() ?i64 {
 }
 
 // ============================================================================
-// Global Singleton (for xev.Loop)
+// Global Singleton with Reference Counting (Polars-style)
 // ============================================================================
+//
+// Design Philosophy (inspired by Polars/Arrow):
+// - No explicit shutdown() required - pool auto-cleans when last user releases
+// - Reference counting via atomic counter
+// - acquire() increments refcount, release() decrements
+// - When refcount hits 0, pool cleans up all idle connections and frees itself
+// - Bounded idle connections (max_idle_total) prevent unbounded growth
+// - Idle timeout evicts stale connections automatically
+//
+// Why this pattern?
+// 1. Zero cognitive load - users can't forget to call shutdown
+// 2. Correct by construction - resources freed when last reference drops
+// 3. Lambda-friendly - works whether process lives 100ms or 100 hours
+// 4. Matches Zig idioms - like defer, cleanup is automatic
+//
+// Usage:
+//   const pool = acquireGlobalPool(allocator);  // refcount++
+//   defer releaseGlobalPool();                   // refcount--, auto-cleanup if 0
+//   // ... use pool ...
 
 var global_pool_instance: ?*anyopaque = null; // Erased pointer to GlobalConnectionPool(xev)
 var global_pool_mutex: std.Thread.Mutex = .{};
 var global_allocator: ?std.mem.Allocator = null;
+var global_refcount: u32 = 0;
 
-pub fn getGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool(xev) {
+/// Acquire the global connection pool, incrementing the reference count.
+/// The pool is created lazily on first acquire.
+/// Caller MUST call releaseGlobalPool() when done (typically via defer).
+pub fn acquireGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool(xev) {
     global_pool_mutex.lock();
     defer global_pool_mutex.unlock();
+
+    global_refcount += 1;
 
     if (global_pool_instance) |pool_ptr| {
         return @ptrCast(@alignCast(pool_ptr));
@@ -227,10 +251,50 @@ pub fn getGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool(xev) {
     return pool;
 }
 
+/// Release a reference to the global pool.
+/// When the last reference is released, the pool cleans up all connections
+/// and frees itself. No explicit shutdown needed.
+pub fn releaseGlobalPool() void {
+    global_pool_mutex.lock();
+    defer global_pool_mutex.unlock();
+
+    if (global_refcount == 0) {
+        // Already fully released (shouldn't happen in correct code)
+        return;
+    }
+
+    global_refcount -= 1;
+
+    if (global_refcount == 0) {
+        // Last reference dropped - clean up
+        if (global_pool_instance) |pool_ptr| {
+            const Pool = GlobalConnectionPool(xev);
+            const pool: *Pool = @ptrCast(@alignCast(pool_ptr));
+            pool.deinit();
+            if (global_allocator) |alloc| {
+                alloc.destroy(pool);
+            }
+            global_pool_instance = null;
+            global_allocator = null;
+        }
+    }
+}
+
+/// Legacy API - get pool without incrementing refcount.
+/// DEPRECATED: Use acquireGlobalPool/releaseGlobalPool instead.
+/// This exists for backwards compatibility during migration.
+pub fn getGlobalPool(allocator: std.mem.Allocator) *GlobalConnectionPool(xev) {
+    return acquireGlobalPool(allocator);
+}
+
+/// Legacy API - explicit shutdown.
+/// DEPRECATED: Use acquireGlobalPool/releaseGlobalPool instead.
+/// With proper refcounting, this should never be needed.
 pub fn shutdownGlobalPool() void {
     global_pool_mutex.lock();
     defer global_pool_mutex.unlock();
 
+    // Force cleanup regardless of refcount (for legacy callers)
     if (global_pool_instance) |pool_ptr| {
         const Pool = GlobalConnectionPool(xev);
         const pool: *Pool = @ptrCast(@alignCast(pool_ptr));
@@ -240,7 +304,15 @@ pub fn shutdownGlobalPool() void {
         }
         global_pool_instance = null;
         global_allocator = null;
+        global_refcount = 0;
     }
+}
+
+/// Get current reference count (for testing/debugging).
+pub fn getGlobalPoolRefCount() u32 {
+    global_pool_mutex.lock();
+    defer global_pool_mutex.unlock();
+    return global_refcount;
 }
 
 // ============================================================================

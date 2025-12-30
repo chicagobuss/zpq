@@ -47,6 +47,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
 
         owns_loop: bool = false,
         owns_pool: bool = false, // If true, we created and own the pool (must deinit)
+        uses_global_pool: bool = false, // If true, we acquired from global pool (must release)
 
         // Auth (optional)
         access_key: ?[]const u8 = null,
@@ -139,7 +140,8 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
                 .loop = typed_loop,
                 .thread_pool = thread_pool,
                 .resolver = options.resolver orelse default_tp_resolver.resolver(),
-                .pool = external_pool orelse @as(*GlobalConnectionPool, @ptrCast(@alignCast(global_pool_mod.getGlobalPool(allocator)))),
+                .pool = external_pool orelse @as(*GlobalConnectionPool, @ptrCast(@alignCast(global_pool_mod.acquireGlobalPool(allocator)))),
+                .uses_global_pool = (external_pool == null),
                 .host = try allocator.dupe(u8, host),
                 .bucket = try allocator.dupe(u8, bucket),
                 .key = try allocator.dupe(u8, key),
@@ -159,6 +161,10 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
             if (self.owns_pool) {
                 self.pool.deinit();
                 self.allocator.destroy(self.pool);
+            } else if (self.uses_global_pool) {
+                // Release our reference to the global pool
+                // When refcount hits 0, pool auto-cleans
+                global_pool_mod.releaseGlobalPool();
             }
 
             if (self.owns_loop) {

@@ -200,22 +200,26 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     }
 
     if (pf.metadata) |meta| {
-        for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
-            // 1. Metadata Pruning
-            if (filter_col_name != null and filter_val != null) {
-                if (pf.shouldSkipRowGroup(rg_idx, filter_col_name.?, filter_val.?)) {
-                    row_groups_skipped += 1;
-                    continue;
-                }
-            }
+        // ========== BATCHED FILTER COLUMN FETCH ==========
+        // Optimization: Fetch filter columns for ALL row groups in one parallel request.
+        // This gives ~2.24x speedup over sequential per-RG fetches (verified in test_coalesced_fetch.zig).
+        //
+        // Steps:
+        // 1. Identify which row groups to scan (skip via stats)
+        // 2. Collect filter column ranges for all non-skipped row groups
+        // 3. Fetch all filter columns in one batched readRanges call
+        // 4. Process each row group using pre-fetched data
 
-            var rg = try pf.rowGroup(rg_idx);
-            defer rg.deinit();
+        var filter_col_idx: ?usize = null;
+        var rg_skip_mask = try allocator.alloc(bool, meta.row_groups.items.len);
+        defer allocator.free(rg_skip_mask);
+        @memset(rg_skip_mask, false);
 
-            // Find filter column index BEFORE prefetching
-            var filter_col_idx: ?usize = null;
-            if (filter_col_name) |name| {
-                for (rg_meta.columns.items, 0..) |col, idx| {
+        // Find filter column index and determine which row groups to skip
+        if (filter_col_name) |name| {
+            // Find filter column index from first row group
+            if (meta.row_groups.items.len > 0) {
+                for (meta.row_groups.items[0].columns.items, 0..) |col, idx| {
                     if (col.meta_data) |md| {
                         const path_parts = md.path_in_schema.items;
                         if (std.mem.eql(u8, path_parts[path_parts.len - 1], name)) {
@@ -226,30 +230,107 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                 }
             }
 
+            // Mark row groups to skip via metadata pruning
+            for (meta.row_groups.items, 0..) |_, rg_idx| {
+                if (pf.shouldSkipRowGroup(rg_idx, name, filter_val.?)) {
+                    rg_skip_mask[rg_idx] = true;
+                    row_groups_skipped += 1;
+                }
+            }
+        }
+
+        // Batched fetch of filter columns (if we have a filter)
+        var filter_col_buffers: ?[][]u8 = null;
+        var filter_col_offsets: ?[]u64 = null; // Base offset for each buffer
+        var batched_fetch_ns: u64 = 0;
+        defer {
+            if (filter_col_buffers) |bufs| {
+                for (bufs) |buf| allocator.free(buf);
+                allocator.free(bufs);
+            }
+            if (filter_col_offsets) |offs| allocator.free(offs);
+        }
+
+        if (filter_col_idx) |f_idx| {
+            // Count non-skipped row groups
+            var active_count: usize = 0;
+            for (rg_skip_mask) |skip| {
+                if (!skip) active_count += 1;
+            }
+
+            if (active_count > 0) {
+                // Collect ranges for filter column across all active row groups
+                var ranges = try allocator.alloc(zpq.io.interface.Range, active_count);
+                defer allocator.free(ranges);
+                filter_col_buffers = try allocator.alloc([]u8, active_count);
+                filter_col_offsets = try allocator.alloc(u64, active_count);
+
+                var buf_idx: usize = 0;
+                for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
+                    if (rg_skip_mask[rg_idx]) continue;
+
+                    const chunk = rg_meta.columns.items[f_idx];
+                    const md = chunk.meta_data orelse continue;
+
+                    var start: u64 = @intCast(md.data_page_offset);
+                    if (md.dictionary_page_offset) |dpo| {
+                        if (dpo < start) start = @intCast(dpo);
+                    }
+                    const len: u64 = @intCast(md.total_compressed_size);
+
+                    ranges[buf_idx] = .{ .start = start, .end = start + len };
+                    filter_col_buffers.?[buf_idx] = try allocator.alloc(u8, @intCast(len));
+                    filter_col_offsets.?[buf_idx] = start;
+                    buf_idx += 1;
+                }
+
+                // Single batched fetch for ALL filter columns
+                var t0 = try std.time.Timer.start();
+                try pf.source.readRanges(ranges, filter_col_buffers.?);
+                batched_fetch_ns = t0.read();
+
+                std.debug.print("  Batched filter fetch: {d} ranges in {d:.1}ms\n", .{
+                    active_count,
+                    @as(f64, @floatFromInt(batched_fetch_ns)) / 1_000_000.0,
+                });
+            }
+        }
+
+        // Process each row group
+        var filter_buf_idx: usize = 0;
+        for (meta.row_groups.items, 0..) |rg_meta, rg_idx| {
+            // Skip row groups pruned by metadata
+            if (rg_skip_mask[rg_idx]) continue;
+
+            var rg = try pf.rowGroup(rg_idx);
+            defer rg.deinit();
+
             if (filter_col_idx) |f_idx| {
                 // ========== TWO-PHASE COLUMN FETCHING ==========
-                // This is the critical I/O optimization discovered in Dec 2024:
-                // Fetch filter column first, then only fetch remaining columns if matches exist.
-                // DuckDB does the same: parquet_reader.cpp:1316-1338
+                // Phase 1 data was pre-fetched in the batched call above.
+                // Now we just need to decode and build selection vectors.
                 //
                 // Timing instrumentation
-                var phase1_fetch_ns: u64 = 0;
                 var phase1_decode_ns: u64 = 0;
                 var phase2_fetch_ns: u64 = 0;
                 var phase2_decode_ns: u64 = 0;
 
-                // Phase 1: Fetch ONLY the filter column
-                var t0 = try std.time.Timer.start();
-                try rg.prefetchColumns(&[_]usize{f_idx});
-                phase1_fetch_ns = t0.read();
+                // Inject the pre-fetched buffer as a memory source
+                const prefetched_buf = filter_col_buffers.?[filter_buf_idx];
+                const prefetched_offset = filter_col_offsets.?[filter_buf_idx];
+                filter_buf_idx += 1;
 
-                // Get filter column metadata and create reader
+                // Create a memory source from the pre-fetched buffer
+                var mem_source = zpq.io.interface.local.MemorySource.initWithOffset(prefetched_buf, prefetched_offset);
+
+                // Get filter column metadata and create reader using pre-fetched memory
                 const filter_col = rg_meta.columns.items[f_idx];
                 const filter_md = filter_col.meta_data.?;
                 const filter_levels = meta.getColumnLevels(filter_md.path_in_schema.items);
                 const filter_schema = meta.getColumnSchema(filter_md.path_in_schema.items);
                 const filter_type_len = if (filter_schema) |se| se.type_length else null;
-                const filter_col_reader = try rg.columnReader(f_idx);
+                // Use pre-fetched memory source instead of remote source
+                const filter_col_reader = try zpq.column.ColumnReader.init(mem_source.source(), filter_col);
 
                 // Try to get page-level statistics for smarter skipping
                 var column_index: ?zpq.core.page_index.ColumnIndex = null;
@@ -264,8 +345,8 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                 defer batch_sizes.deinit(allocator);
                 var rg_has_matches = false;
 
-                // Phase 1: Scan filter column only and build selection vectors
-                t0.reset();
+                // Phase 1: Decode filter column (already fetched in batch) and build selection vectors
+                var t0 = try std.time.Timer.start();
                 if (filter_md.type == .BYTE_ARRAY or filter_md.type == .FIXED_LEN_BYTE_ARRAY) {
                     var filter_reader = zpq.core.batch_reader.BatchReader([]const u8).init(
                         allocator,
@@ -389,10 +470,10 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
                 }
 
                 // Print timing breakdown for this row group
+                // Note: P1-fetch is batched across all row groups (shown once above)
                 const total_pages = if (column_index) |ci| ci.numPages() else 0;
-                std.debug.print("  RG[{d}]: P1-fetch={d:.1}ms P1-decode={d:.1}ms P2-fetch={d:.1}ms P2-decode={d:.1}ms matches={} pages_skipped={d}/{d}\n", .{
+                std.debug.print("  RG[{d}]: P1-decode={d:.1}ms P2-fetch={d:.1}ms P2-decode={d:.1}ms matches={} pages_skipped={d}/{d}\n", .{
                     rg_idx,
-                    @as(f64, @floatFromInt(phase1_fetch_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase1_decode_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase2_fetch_ns)) / 1_000_000.0,
                     @as(f64, @floatFromInt(phase2_decode_ns)) / 1_000_000.0,

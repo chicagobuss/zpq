@@ -37,6 +37,9 @@ pub fn build(b: *std.Build) void {
     addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_batch_reuse");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_simd_null_bug");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_stats");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "test_lazy_materialization");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "test_skip_performance");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "bench_skip_breakdown");
 }
 
 fn addProbe(

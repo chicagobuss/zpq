@@ -89,6 +89,19 @@ pub const Decoder = struct {
         return num_to_read;
     }
     
+    pub fn skipByteArray(self: *Decoder) !void {
+        if (self.pos + 4 > self.data.len) return error.EndOfStream;
+        const len = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
+        self.pos += 4;
+        if (self.pos + len > self.data.len) return error.EndOfStream;
+        self.pos += len;
+    }
+
+    pub fn skipFixedLenByteArray(self: *Decoder, len: usize) !void {
+        if (self.pos + len > self.data.len) return error.EndOfStream;
+        self.pos += len;
+    }
+
     pub fn hasMore(self: *Decoder) bool {
         return self.pos < self.data.len;
     }

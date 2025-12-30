@@ -189,7 +189,7 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
     if (filter) |f| {
         if (std.mem.indexOfScalar(u8, f, '=')) |idx| {
             filter_col_name = f[0..idx];
-            filter_val = f[idx+1..];
+            filter_val = f[idx + 1 ..];
         }
     }
 
@@ -206,10 +206,7 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             var rg = try pf.rowGroup(rg_idx);
             defer rg.deinit();
 
-            // Trigger Massive Parallel Prefetch!
-            try rg.prefetch(null);
-
-            // Find filter column index
+            // Find filter column index BEFORE prefetching
             var filter_col_idx: ?usize = null;
             if (filter_col_name) |name| {
                 for (rg_meta.columns.items, 0..) |col, idx| {
@@ -224,52 +221,118 @@ fn cmdScan(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop:
             }
 
             if (filter_col_idx) |f_idx| {
-                // FILTERED SCAN PATH
-                const md = rg_meta.columns.items[f_idx].meta_data.?;
-                const levels = meta.getColumnLevels(md.path_in_schema.items);
-                const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
-                const type_length = if (schema_elem) |se| se.type_length else null;
-                
-                // For now, only support BYTE_ARRAY filters for simplicity
-                if (md.type != .BYTE_ARRAY) {
+                // ========== TWO-PHASE COLUMN FETCHING ==========
+                // This is the critical I/O optimization discovered in Dec 2024:
+                // Fetch filter column first, then only fetch remaining columns if matches exist.
+                // DuckDB does the same: parquet_reader.cpp:1316-1338
+                //
+                // Timing instrumentation
+                var phase1_fetch_ns: u64 = 0;
+                var phase1_decode_ns: u64 = 0;
+                var phase2_fetch_ns: u64 = 0;
+                var phase2_decode_ns: u64 = 0;
+
+                // Phase 1: Fetch ONLY the filter column
+                var t0 = try std.time.Timer.start();
+                try rg.prefetchColumns(&[_]usize{f_idx});
+                phase1_fetch_ns = t0.read();
+
+                // Get filter column metadata and create reader
+                const filter_col = rg_meta.columns.items[f_idx];
+                const filter_md = filter_col.meta_data.?;
+                const filter_levels = meta.getColumnLevels(filter_md.path_in_schema.items);
+                const filter_schema = meta.getColumnSchema(filter_md.path_in_schema.items);
+                const filter_type_len = if (filter_schema) |se| se.type_length else null;
+                const filter_col_reader = try rg.columnReader(f_idx);
+
+                // Storage for batch selections (used in Phase 2)
+                var batch_selections = std.ArrayListUnmanaged(zpq.core.simd.SelectionVector){};
+                defer batch_selections.deinit(allocator);
+                var batch_sizes = std.ArrayListUnmanaged(usize){};
+                defer batch_sizes.deinit(allocator);
+                var rg_has_matches = false;
+
+                // Phase 1: Scan filter column only and build selection vectors
+                t0.reset();
+                if (filter_md.type == .BYTE_ARRAY or filter_md.type == .FIXED_LEN_BYTE_ARRAY) {
+                    var filter_reader = zpq.core.batch_reader.BatchReader([]const u8).init(
+                        allocator,
+                        filter_col_reader,
+                        filter_md.type,
+                        @intCast(filter_levels.max_def),
+                        @intCast(filter_levels.max_rep),
+                        filter_type_len,
+                    );
+                    defer filter_reader.deinit();
+
+                    var row_idx: usize = 0;
+                    while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
+                        const batch_size = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
+                        var buf: [1024]?[]const u8 = undefined;
+                        const n_read = try filter_reader.nextBatch(buf[0..batch_size]);
+                        if (n_read == 0) break;
+
+                        var sel = zpq.core.simd.SelectionVector.init();
+                        for (buf[0..n_read], 0..) |val, i| {
+                            if (val) |v| {
+                                if (std.mem.eql(u8, v, filter_val.?)) sel.setBitIndices(i);
+                            }
+                        }
+
+                        rows_selected += sel.count();
+                        total_values += n_read;
+                        if (sel.count() > 0) rg_has_matches = true;
+                        try batch_selections.append(allocator, sel);
+                        try batch_sizes.append(allocator, n_read);
+                        row_idx += n_read;
+                    }
+                    phase1_decode_ns = t0.read();
+                } else {
                     std.debug.print("Filters currently only supported on BYTE_ARRAY columns\n", .{});
                     return error.UnsupportedFilterType;
                 }
 
-                const filter_reader = try rg.columnReader(f_idx);
-                var filter_batch_reader = zpq.core.batch_reader.BatchReader([]const u8).init(allocator, filter_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length);
-                defer filter_batch_reader.deinit();
+                // Phase 2: Only fetch remaining columns if we have matches
+                if (rg_has_matches) {
+                    t0.reset();
+                    try rg.prefetchExcluding(&[_]usize{f_idx});
+                    phase2_fetch_ns = t0.read();
 
-                var filter_buf: [1024]?[]const u8 = undefined;
-                var row_idx: usize = 0;
-                while (row_idx < @as(usize, @intCast(rg_meta.num_rows))) {
-                    const to_read = @min(1024, @as(usize, @intCast(rg_meta.num_rows)) - row_idx);
-                    const n = try filter_batch_reader.nextBatch(filter_buf[0..to_read]);
-                    if (n == 0) break;
+                    t0.reset();
 
-                    var sel = zpq.core.simd.SelectionVector.init();
-                    for (filter_buf[0..n], 0..) |val, i| {
-                        if (val) |v| {
-                            if (std.mem.eql(u8, v, filter_val.?)) {
-                                sel.setBitIndices(i);
-                            }
+                    // Process each non-filter column with stored selections
+                    for (rg_meta.columns.items, 0..) |col, col_idx| {
+                        if (col_idx == f_idx) continue;
+
+                        const md = col.meta_data orelse continue;
+                        const levels = meta.getColumnLevels(md.path_in_schema.items);
+                        const schema_elem = meta.getColumnSchema(md.path_in_schema.items);
+                        const type_length = if (schema_elem) |se| se.type_length else null;
+                        const col_reader = try rg.columnReader(col_idx);
+
+                        switch (md.type) {
+                            .INT32 => try processColumnWithSelection(i32, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            .INT64 => try processColumnWithSelection(i64, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            .FLOAT => try processColumnWithSelection(f32, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            .DOUBLE => try processColumnWithSelection(f64, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => try processColumnWithSelection([]const u8, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            .INT96 => try processColumnWithSelection([12]u8, allocator, col_reader, md.type, @intCast(levels.max_def), @intCast(levels.max_rep), type_length, batch_selections.items, batch_sizes.items),
+                            else => {},
                         }
                     }
-                    rows_selected += sel.count();
-                    total_values += n;
-
-                    // Lazy Materialization: Decode other columns only if sel.count() > 0
-                    if (sel.count() > 0) {
-                        for (rg_meta.columns.items, 0..) |other_col, other_idx| {
-                            if (other_idx == f_idx) continue;
-                            if (other_col.meta_data) |_| {
-                                // Proof of concept: multi-column lazy materialization
-                                // would go here.
-                            }
-                        }
-                    }
-                    row_idx += n;
+                    phase2_decode_ns = t0.read();
                 }
+
+                // Print timing breakdown for this row group
+                std.debug.print("  RG[{d}]: P1-fetch={d:.1}ms P1-decode={d:.1}ms P2-fetch={d:.1}ms P2-decode={d:.1}ms matches={}\n", .{
+                    rg_idx,
+                    @as(f64, @floatFromInt(phase1_fetch_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(phase1_decode_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(phase2_fetch_ns)) / 1_000_000.0,
+                    @as(f64, @floatFromInt(phase2_decode_ns)) / 1_000_000.0,
+                    rg_has_matches,
+                });
+                // If no matches in this row group, we skip fetching all other columns entirely!
             } else {
                 // FULL SCAN PATH (no filter or column not found)
                 for (rg_meta.columns.items, 0..) |col, col_idx| {
@@ -330,6 +393,37 @@ fn scanColumnBatch(allocator: std.mem.Allocator, comptime T: type, reader: zpq.c
         total += n;
     }
     return total;
+}
+
+/// Process a column using pre-computed selection vectors from Phase 1.
+/// This is used in two-phase column fetching: we already know which rows match
+/// from scanning the filter column, so we can skip/select accordingly.
+fn processColumnWithSelection(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    reader: zpq.column.ColumnReader,
+    col_type: zpq.schema.Type,
+    max_def: u16,
+    max_rep: u16,
+    type_length: ?i32,
+    batch_selections: []const zpq.core.simd.SelectionVector,
+    batch_sizes: []const usize,
+) !void {
+    var batch_reader = zpq.core.batch_reader.BatchReader(T).init(allocator, reader, col_type, max_def, max_rep, type_length);
+    defer batch_reader.deinit();
+
+    var buffer: [1024]?T = undefined;
+
+    for (batch_selections, batch_sizes) |sel, batch_size| {
+        if (sel.count() > 0) {
+            // Materialize only selected rows
+            var sel_copy = sel; // nextBatchSelected needs mutable pointer
+            _ = try batch_reader.nextBatchSelected(buffer[0..sel.count()], &sel_copy, batch_size);
+        } else {
+            // Skip the entire batch
+            try batch_reader.skip(batch_size);
+        }
+    }
 }
 
 fn cmdSchema(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop: *xev.Loop, thread_pool: *xev.ThreadPool, resolver: Resolver, verify_tls: bool) !void {
@@ -445,11 +539,11 @@ fn cmdCat(allocator: std.mem.Allocator, path: []const u8, limit: usize, is_async
 fn formatInt96(val: [12]u8) !void {
     const nanos = std.mem.readInt(u64, val[0..8], .little);
     const days = std.mem.readInt(u32, val[8..12], .little);
-    
+
     // Julian Day 2440588 is 1970-01-01
     const julian_epoch = 2440588;
     const unix_seconds = (@as(i64, days) - julian_epoch) * 86400 + @as(i64, @intCast(nanos / 1_000_000_000));
-    
+
     std.debug.print("{d} (JD={d}, NS={d})", .{ unix_seconds, days, nanos });
 }
 

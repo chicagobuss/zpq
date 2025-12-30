@@ -43,10 +43,19 @@ ZPQ's objective is to become the fastest, leanest Parquet engine for serverless 
 *   [x] **Vectorized RLE runs**: SIMD splat/memset for repetition runs.
 *   [x] **SIMD null bitmap expansion**: Branchless expansion using shuffle tables.
 
-#### Milestone 19: Predicate Pushdown (Read-Side) [IN PROGRESS]
+#### Milestone 19: Predicate Pushdown & Lazy I/O [IN PROGRESS - CRITICAL]
+
+**December 2024 Discovery**: Filtered scans take the same time as full scans over network storage because we prefetch ALL columns before evaluating filters. This is the critical bottleneck.
+
 *   [x] **Metadata Pruning**: Skip row groups using min/max statistics.
-*   [ ] **Selection Vector Generation**: Decode filter columns first to build bitmaps.
-*   [ ] **Lazy Materialization**: Only decode rows matching the selection vector.
+*   [x] **Selection Vector Primitives**: `SelectionVector`, `BatchReader.skip()`, `nextBatchSelected()`.
+*   [x] **Observability**: Tracing infrastructure for benchmark analysis (`bench/`, `src/zpq/trace.zig`).
+*   [x] **Two-Phase Column Fetching** (P0): Fetch filter column first, then remaining columns only if needed. *(Implemented Dec 30, 2024)*
+*   [ ] **Page-Level ColumnIndex** (P1): Skip pages within row groups using per-page min/max stats.
+*   [ ] **BatchReader.skip() Optimization** (P2): Use `RleDecoder.skip()` for def levels.
+
+**Target**: 10-50x speedup for low-selectivity queries over network storage.
+**See**: `plans/two_phase_column_fetching.md`, `plans/milestone_19_lazy_materialization.md`
 
 ### Phase 2: Transformation Dominance (The Cheat Path)
 **Goal**: High-speed filtering and projection for data lake ETL.

@@ -64,6 +64,7 @@ This builds only the probe and its dependencies, not the entire zpq CLI.
 | `probe_xev_s3_head` | XevS3Source HEAD request verification | Dec 2024 |
 | `verify_minish_context` | Verifying minish fuzzer context/allocator patterns | Dec 2024 |
 | `shootout_tls_throughput` | Micro-shootout comparing TLS decryption strategies | Dec 2024 |
+| `bench_skip_breakdown` | Time breakdown for filtered scans (outputs JSON trace) | Dec 2024 |
 
 ## eBPF Probes
 

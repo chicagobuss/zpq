@@ -20,6 +20,9 @@ pub const core = struct {
     pub const batch_reader = @import("zpq/core/batch_reader.zig");
 };
 
+/// Performance tracing - minimal overhead metrics collection
+pub const trace = @import("zpq/trace.zig");
+
 pub const io = struct {
     pub const interface = @import("zpq/io/interface.zig");
     pub const http = @import("zpq/io/http/client.zig");

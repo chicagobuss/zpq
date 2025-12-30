@@ -1,0 +1,29 @@
+{
+  "run": {
+    "timestamp_ms": 1379998791,
+    "git_commit": null,
+    "file_path": "../data/benchmark_100mb.parquet",
+    "file_size_bytes": 121821881,
+    "num_columns": 138,
+    "num_row_groups": 5,
+    "total_rows": 602348,
+    "filter_column": "line_item_product_code",
+    "filter_value": "AWSLambda"
+  },
+  "metrics": {
+    "total_ms": 304.542,
+    "filter_decode_ms": 4.825,
+    "skip_ms": 0.000,
+    "materialize_ms": 295.395,
+    "loop_overhead_ms": 4.321,
+    "rows_scanned": 602348,
+    "rows_selected": 4020,
+    "rows_skipped": 598328,
+    "selectivity": 0.006674,
+    "throughput_mval_s": 1.98,
+    "batches_processed": 46531,
+    "batches_skipped": 0,
+    "row_groups_scanned": 5,
+    "row_groups_skipped": 0
+  }
+}

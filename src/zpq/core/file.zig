@@ -38,6 +38,43 @@ pub const RowGroupReader = struct {
         self.allocator.free(self.memory_sources);
     }
 
+    /// Check if a column has been prefetched
+    pub fn isPrefetched(self: *const RowGroupReader, col_idx: usize) bool {
+        if (col_idx >= self.memory_sources.len) return false;
+        return self.memory_sources[col_idx] != null;
+    }
+
+    /// Pre-fetch only the specified columns (convenience wrapper)
+    pub fn prefetchColumns(self: *RowGroupReader, indices: []const usize) !void {
+        return self.prefetch(indices);
+    }
+
+    /// Pre-fetch all columns EXCEPT the specified ones
+    pub fn prefetchExcluding(self: *RowGroupReader, exclude: []const usize) !void {
+        // Build list of columns to fetch (all except excluded)
+        var to_fetch = try self.allocator.alloc(usize, self.meta.columns.items.len);
+        defer self.allocator.free(to_fetch);
+
+        var count: usize = 0;
+        for (0..self.meta.columns.items.len) |col_idx| {
+            var excluded = false;
+            for (exclude) |ex| {
+                if (ex == col_idx) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (!excluded) {
+                to_fetch[count] = col_idx;
+                count += 1;
+            }
+        }
+
+        if (count > 0) {
+            try self.prefetch(to_fetch[0..count]);
+        }
+    }
+
     /// Pre-fetch specific columns (or all if indices is null)
     pub fn prefetch(self: *RowGroupReader, indices: ?[]const usize) !void {
         // If indices is null, we need to generate all column indices

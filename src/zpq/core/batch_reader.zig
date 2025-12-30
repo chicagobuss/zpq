@@ -77,19 +77,36 @@ pub fn BatchReader(comptime T: type) type {
 
                 const to_skip = @min(remaining, self.values_remaining_in_page);
                 
-                // Use optimized skip in RleDecoder if available
-                if (self.def_levels_decoder) |*d| try d.skip(@intCast(to_skip));
+                // 1. Skip Definition Levels and count present values
+                var values_to_skip_in_data = to_skip;
+                if (self.def_levels_decoder) |*d| {
+                    values_to_skip_in_data = 0;
+                    var i: usize = 0;
+                    while (i < to_skip) {
+                        const batch_rem = @min(8, to_skip - i);
+                        var def_levels: [8]u64 = undefined;
+                        const n = try d.nextBatch(def_levels[0..batch_rem]);
+                        if (n == 0) break;
+                        for (def_levels[0..n]) |dl| {
+                            if (dl == self.max_def_level) values_to_skip_in_data += 1;
+                        }
+                        i += n;
+                    }
+                }
                 
-                if (self.rle_decoder) |*r| {
-                    try r.skip(@intCast(to_skip));
-                } else if (self.plain_decoder != null) {
-                    // Decoder.skip is easy for fixed-width
-                    // For BYTE_ARRAY it's hard, but we can just read and discard
-                    if (T == []const u8 and self.column_type != .FIXED_LEN_BYTE_ARRAY) {
-                        for (0..to_skip) |_| _ = try self.plain_decoder.?.readByteArray();
-                    } else {
-                        const width: usize = if (T == [12]u8) 12 else @sizeOf(T);
-                        try self.plain_decoder.?.skip(to_skip * width);
+                // 2. Skip Data Values
+                if (values_to_skip_in_data > 0) {
+                    if (self.rle_decoder) |*r| {
+                        try r.skip(@intCast(values_to_skip_in_data));
+                    } else if (self.plain_decoder) |*p| {
+                        if (self.column_type == .BYTE_ARRAY) {
+                            for (0..values_to_skip_in_data) |_| try p.skipByteArray();
+                        } else if (self.column_type == .FIXED_LEN_BYTE_ARRAY) {
+                            try p.skipFixedLenByteArray(values_to_skip_in_data * @as(usize, @intCast(self.type_length.?)));
+                        } else {
+                            const width: usize = if (T == [12]u8) 12 else @sizeOf(T);
+                            try p.skip(values_to_skip_in_data * width);
+                        }
                     }
                 }
 
@@ -321,25 +338,65 @@ pub fn BatchReader(comptime T: type) type {
             errdefer items.deinit(self.allocator);
 
             while (decoder.hasMore()) {
-                if (T == []const u8) {
-                    const val = if (self.column_type == .FIXED_LEN_BYTE_ARRAY)
-                        try decoder.readFixedLenByteArray(@intCast(self.type_length.?))
-                    else
-                        try decoder.readByteArray();
-                    const owned = try self.allocator.dupe(u8, val);
-                    try items.append(self.allocator, owned);
-                } else if (T == [12]u8) {
-                    try items.append(self.allocator, try decoder.readInt96());
-                } else if (T == i32) {
-                    try items.append(self.allocator, @intCast(try decoder.readInt32()));
-                } else if (T == i64 or T == u64) {
-                    try items.append(self.allocator, @intCast(try decoder.readInt64()));
-                } else if (T == f32) {
-                    try items.append(self.allocator, try decoder.readFloat());
-                } else if (T == f64) {
-                    try items.append(self.allocator, try decoder.readDouble());
-                } else {
-                    return error.UnsupportedTypeForDictionary;
+                switch (self.column_type) {
+                    .BYTE_ARRAY => {
+                        const val = try decoder.readByteArray();
+                        const owned = try self.allocator.dupe(u8, val);
+                        if (T == []const u8) {
+                            try items.append(self.allocator, owned);
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .FIXED_LEN_BYTE_ARRAY => {
+                        const val = try decoder.readFixedLenByteArray(@intCast(self.type_length.?));
+                        const owned = try self.allocator.dupe(u8, val);
+                        if (T == []const u8) {
+                            try items.append(self.allocator, owned);
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .INT32 => {
+                        const val = try decoder.readInt32();
+                        if (T == i64 or T == u64) {
+                            try items.append(self.allocator, @intCast(val));
+                        } else if (T == i32) {
+                            try items.append(self.allocator, val);
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .INT64 => {
+                        const val = try decoder.readInt64();
+                        if (T == i64 or T == u64) {
+                            try items.append(self.allocator, val);
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .INT96 => {
+                        if (T == [12]u8) {
+                            try items.append(self.allocator, try decoder.readInt96());
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .FLOAT => {
+                        if (T == f32) {
+                            try items.append(self.allocator, try decoder.readFloat());
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    .DOUBLE => {
+                        if (T == f64) {
+                            try items.append(self.allocator, try decoder.readDouble());
+                        } else {
+                            return error.IncompatibleTypeForDictionary;
+                        }
+                    },
+                    else => return error.UnsupportedTypeForDictionary,
                 }
             }
             if (self.dictionary) |d| {

@@ -502,3 +502,316 @@ fn readSelectedRows(
 For the benchmark file (602K rows, 129K matches = 21% selectivity):
 - Current: Read filter col 2x, read all 602K rows for output
 - Optimized: Read filter col 1x, skip 79% of non-filter column decodes
+
+---
+
+# PHASE 2: Parallel Row Group Processing with xev
+
+## Current State (Sequential)
+
+```
+RG0: fetch → scan → fetch_other → write ─┐
+RG1: ─────────────────────────────────────┼─ fetch → scan → fetch_other → write ─┐
+RG2: ────────────────────────────────────────────────────────────────────────────┼─ fetch → scan → ...
+                                                                                  │
+Total time = sum of all RG times
+```
+
+## Target State (Parallel with xev)
+
+```
+                    ┌─ RG0: scan → write ─┐
+Batch Fetch All ───►├─ RG1: scan → write ─├───► Merge/Finalize
+Filter Cols         └─ RG2: scan → write ─┘
+
+Total time ≈ max(RG times) + overhead
+```
+
+## Architecture: Row Group Workers
+
+```zig
+const RowGroupWorker = struct {
+    allocator: std.mem.Allocator,
+    rg_idx: usize,
+    rg_meta: *const RowGroup,
+    
+    // Pre-fetched filter column data (owned by parent)
+    filter_buf: []const u8,
+    filter_offset: u64,
+    
+    // Shared immutable context
+    filter_col_idx: usize,
+    filter_col_type: Type,
+    encoded_filter: *const EncodedFilter,
+    output_cols: []const OutputColumn,
+    filter_col_in_output: bool,
+    
+    // Results (owned by worker)
+    selection: SelectionVector,
+    filter_cache: ?FilterColumnCache,
+    output_buffers: [][]u8,  // Serialized column data ready for writing
+    row_count: usize,
+    
+    // State
+    status: enum { pending, scanning, fetching, writing, done, failed },
+    err: ?anyerror,
+    
+    pub fn init(allocator: Allocator, ctx: *const FilterContext, rg_idx: usize) !*RowGroupWorker { ... }
+    pub fn deinit(self: *RowGroupWorker) void { ... }
+};
+```
+
+## Parallel Filter with xev Event Loop
+
+```zig
+const ParallelFilter = struct {
+    allocator: std.mem.Allocator,
+    loop: *xev.Loop,
+    pf: *ParquetFile,
+    
+    // Shared context
+    ctx: FilterContext,
+    
+    // Workers
+    workers: []*RowGroupWorker,
+    pending_count: std.atomic.Value(usize),
+    
+    // Results
+    output_writer: *ParquetWriter,
+    
+    pub fn init(
+        allocator: Allocator,
+        loop: *xev.Loop,
+        pf: *ParquetFile,
+        filter_str: []const u8,
+        select_columns: ?[]const u8,
+        output_path: []const u8,
+    ) !*ParallelFilter { ... }
+    
+    pub fn run(self: *ParallelFilter) !void {
+        // =====================================================================
+        // PHASE 1: Batch fetch ALL filter columns (single async I/O)
+        // =====================================================================
+        
+        var ranges = try self.buildFilterColumnRanges();
+        defer self.allocator.free(ranges);
+        
+        // Async batch read - xev will parallelize across connections for S3
+        var completion = xev.Completion{};
+        self.pf.source.readRangesAsync(ranges, self.filter_buffers, &completion);
+        
+        // Wait for batch fetch to complete
+        try self.loop.run(.until_done);
+        
+        // =====================================================================
+        // PHASE 2: Spawn parallel workers for each row group
+        // =====================================================================
+        
+        for (self.workers, 0..) |worker, i| {
+            // Each worker gets its pre-fetched filter buffer
+            worker.filter_buf = self.filter_buffers[i];
+            worker.filter_offset = self.filter_offsets[i];
+            
+            // Schedule worker on event loop
+            self.loop.spawn(workerTask, worker, .{ .priority = .normal });
+        }
+        
+        // =====================================================================
+        // PHASE 3: Run event loop until all workers complete
+        // =====================================================================
+        
+        try self.loop.run(.until_done);
+        
+        // =====================================================================
+        // PHASE 4: Merge results and finalize output
+        // =====================================================================
+        
+        // Workers have produced serialized column buffers
+        // Write them in order to output
+        for (self.workers) |worker| {
+            if (worker.status == .failed) {
+                return worker.err.?;
+            }
+            if (worker.row_count > 0) {
+                try self.writeWorkerOutput(worker);
+            }
+        }
+        
+        try self.output_writer.finish();
+    }
+};
+
+fn workerTask(worker: *RowGroupWorker) void {
+    worker.status = .scanning;
+    
+    // PHASE 2a: Scan filter column from pre-fetched buffer
+    var mem_source = MemorySource.initWithOffset(worker.filter_buf, worker.filter_offset);
+    const filter_reader = ColumnReader.init(mem_source.source(), worker.filter_chunk) catch |e| {
+        worker.status = .failed;
+        worker.err = e;
+        return;
+    };
+    
+    // Build selection vector (CPU-bound, can run in parallel)
+    worker.scanFilterColumn(filter_reader) catch |e| {
+        worker.status = .failed;
+        worker.err = e;
+        return;
+    };
+    
+    if (worker.selection.count() == 0) {
+        worker.status = .done;
+        worker.row_count = 0;
+        return;
+    }
+    
+    // PHASE 2b: Fetch other columns (async I/O)
+    worker.status = .fetching;
+    worker.fetchOtherColumnsAsync() catch |e| {
+        worker.status = .failed;
+        worker.err = e;
+        return;
+    };
+    
+    // PHASE 2c: Materialize to output buffers
+    worker.status = .writing;
+    worker.materializeOutput() catch |e| {
+        worker.status = .failed;
+        worker.err = e;
+        return;
+    };
+    
+    worker.status = .done;
+    worker.row_count = worker.selection.count();
+}
+```
+
+## Key Design Decisions
+
+### 1. Pre-fetch Filter Columns Together
+```
+Before: RG0 fetch → RG1 fetch → RG2 fetch (sequential)
+After:  [RG0, RG1, RG2] fetch (batched, single round-trip for S3)
+```
+
+For S3, this is critical: one HTTP request with Range header vs N requests.
+
+### 2. Workers Own Their Output Buffers
+
+Each worker produces serialized column data in memory. The main thread
+writes these buffers in order. This avoids:
+- Lock contention on the output file
+- Out-of-order writes requiring seeking
+- Complex coordination for interleaved writes
+
+### 3. CPU-bound Scan Phase is Naturally Parallel
+
+The filter scan (comparing values, building selection vector) is CPU-bound.
+xev's thread pool can execute these in parallel across cores.
+
+### 4. Async I/O for Other Columns
+
+Each worker can issue async reads for its non-filter columns:
+```zig
+fn fetchOtherColumnsAsync(self: *RowGroupWorker) !void {
+    var ranges = try self.buildOtherColumnRanges();
+    
+    // This returns immediately, completion happens via event loop
+    self.pf.source.readRangesAsync(ranges, self.other_buffers, &self.fetch_completion);
+    
+    // The event loop will call our callback when done
+    self.fetch_completion.callback = onOtherColumnsFetched;
+    self.fetch_completion.userdata = self;
+}
+
+fn onOtherColumnsFetched(completion: *xev.Completion) void {
+    const self = @fieldParentPtr(RowGroupWorker, "fetch_completion", completion);
+    
+    // Now materialize output
+    self.materializeOutput() catch |e| {
+        self.status = .failed;
+        self.err = e;
+        return;
+    };
+    
+    self.status = .done;
+}
+```
+
+## Memory Layout for Parallel Execution
+
+```
+ParallelFilter
+├── filter_buffers[]     ─── Owned, freed after all workers done
+├── filter_offsets[]     ─── Owned
+├── workers[]
+│   ├── Worker[0]
+│   │   ├── selection        ─── Owned by worker
+│   │   ├── filter_cache     ─── Owned by worker (if filter in output)
+│   │   ├── other_buffers[]  ─── Owned by worker
+│   │   └── output_buffers[] ─── Owned by worker, moved to writer
+│   ├── Worker[1]
+│   │   └── ...
+│   └── Worker[N]
+└── output_writer        ─── Receives buffers from workers
+```
+
+## Synchronization Points
+
+1. **After batch filter fetch**: All workers can start scanning
+2. **After all workers complete**: Main thread writes output in order
+3. **No locks during worker execution**: Each worker operates on its own data
+
+## Expected Performance
+
+For 5M rows (50 row groups) on 8-core machine:
+
+| Phase | Sequential | Parallel (8 workers) |
+|-------|------------|---------------------|
+| Filter fetch | 50 * 2ms = 100ms | 1 batch = 10ms |
+| Scan (CPU) | 50 * 0.4ms = 20ms | 50/8 * 0.4ms = 2.5ms |
+| Other fetch | 50 * 1ms = 50ms | Overlapped with scan |
+| Write | 50 * 0.5ms = 25ms | 50 * 0.5ms = 25ms |
+| **Total** | **~195ms** | **~40ms** |
+
+This would make ZPQ competitive with DuckDB even at 5M+ rows.
+
+## Implementation Phases
+
+### Phase 2.1: Batch Filter Fetch (Low Risk)
+- Already have `readRanges()` 
+- Just need to collect all filter column ranges upfront
+- **Estimated: Done in current implementation**
+
+### Phase 2.2: Worker Struct (Medium Risk)
+- Factor out per-RG state into `RowGroupWorker`
+- Keep sequential execution initially
+- Verify correctness with existing tests
+
+### Phase 2.3: xev Thread Pool Integration (Medium Risk)
+- Use `loop.spawn()` for CPU-bound scan phase
+- Each worker scans independently
+- Main thread waits for all completions
+
+### Phase 2.4: Async Other-Column Fetch (Higher Risk)
+- Each worker issues async reads
+- Requires careful completion tracking
+- Test with local files first, then S3
+
+### Phase 2.5: Output Merge (Low Risk)
+- Workers produce serialized buffers
+- Main thread writes in RG order
+- Simple concatenation
+
+## API Requirements from xev
+
+| API | Purpose | Status |
+|-----|---------|--------|
+| `loop.spawn(fn, ctx, opts)` | Schedule CPU work | Available |
+| `ThreadPool.schedule()` | Parallel task execution | Available |
+| `Completion` callbacks | Async I/O notification | Available |
+| `source.readRangesAsync()` | Non-blocking batch read | **Needs wrapper** |
+
+The main gap is `readRangesAsync()` - need to wrap the sync `readRanges()` to:
+1. Submit to thread pool for local files
+2. Use xev async I/O for S3 (already async internally)

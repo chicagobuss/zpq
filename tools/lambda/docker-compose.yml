@@ -1,0 +1,56 @@
+# Local Lambda testing with RIE
+#
+# Usage:
+#   # Test with R2 (default) - run from repo root
+#   cd tools/lambda && source ../../.env && docker-compose up --build
+#
+#   # Test with local rustfs
+#   cd tools/lambda && docker-compose --profile local up --build
+#
+#   # Invoke the function
+#   curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+#     -d '{"file": "s3://zpq/testdata/benchmark/benchmark_1mb.parquet"}'
+
+services:
+  # Lambda configured for R2 (default)
+  lambda:
+    build:
+      context: ../..
+      dockerfile: tools/lambda/Dockerfile
+    ports:
+      - "9000:8080"
+    environment:
+      - S3_ENDPOINT
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+
+  # Local rustfs for offline testing
+  rustfs:
+    image: rustfs/rustfs:latest
+    profiles: ["local"]
+    ports:
+      - "9999:9000"
+    environment:
+      - RUSTFS_ACCESS_KEY=rustfsadmin
+      - RUSTFS_SECRET_ACCESS_KEY=rustfsadmin
+      - RUSTFS_REGION=us-east-1
+    volumes:
+      - ../rustfs_tls/data:/data
+    command: /data
+
+  # Lambda configured for local rustfs
+  lambda-local:
+    build:
+      context: ../..
+      dockerfile: tools/lambda/Dockerfile
+    profiles: ["local"]
+    ports:
+      - "9000:8080"
+    environment:
+      - S3_ENDPOINT=http://rustfs:9000
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=rustfsadmin
+      - AWS_SECRET_ACCESS_KEY=rustfsadmin
+    depends_on:
+      - rustfs

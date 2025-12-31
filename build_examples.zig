@@ -23,6 +23,7 @@ pub fn addExamples(
         .{ .name = "lambda-02-dns-warming", .path = "examples/lambda/02-dns-warming/main.zig", .needs_zpq = true },
         .{ .name = "lambda-03-warm-s3", .path = "examples/lambda/03-warm-s3/main.zig", .needs_zpq = true },
         .{ .name = "lambda-04-scan-benchmark", .path = "examples/lambda/04-scan-benchmark/main.zig", .needs_zpq = true },
+        .{ .name = "lambda-05-filter-s3", .path = "examples/lambda/05-filter-s3/main.zig", .needs_zpq = true },
     };
 
     for (examples) |example| {

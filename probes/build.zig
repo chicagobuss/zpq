@@ -45,6 +45,10 @@ pub fn build(b: *std.Build) void {
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_coalesced_fetch");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_column_index");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "test_zerocopy");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_s3_writer");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_parallel_write");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_parallel_upload");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_traced_upload");
 }
 
 fn addProbe(

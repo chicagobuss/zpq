@@ -31,6 +31,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
         loop: *LoopType,
         thread_pool: *xev.ThreadPool,
         resolver: dns.ResolverGen(XevApi),
+        tp_resolver: ?*ThreadPoolResolver = null, // Heap-allocated resolver storage
         pool: *GlobalConnectionPool,
 
         host: []const u8,
@@ -133,13 +134,21 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
             const self = try allocator.create(Self);
             const typed_loop: *LoopType = @ptrCast(@alignCast(loop));
 
-            var default_tp_resolver = ThreadPoolResolver.init(thread_pool, allocator);
+            // If no resolver provided, heap-allocate a ThreadPoolResolver
+            // to avoid use-after-free (stack variable going out of scope)
+            var tp_resolver_ptr: ?*ThreadPoolResolver = null;
+            const resolver_iface = if (options.resolver) |r| r else blk: {
+                tp_resolver_ptr = try allocator.create(ThreadPoolResolver);
+                tp_resolver_ptr.?.* = ThreadPoolResolver.init(thread_pool, allocator);
+                break :blk tp_resolver_ptr.?.resolver();
+            };
 
             self.* = .{
                 .allocator = allocator,
                 .loop = typed_loop,
                 .thread_pool = thread_pool,
-                .resolver = options.resolver orelse default_tp_resolver.resolver(),
+                .resolver = resolver_iface,
+                .tp_resolver = tp_resolver_ptr,
                 .pool = external_pool orelse @as(*GlobalConnectionPool, @ptrCast(@alignCast(global_pool_mod.acquireGlobalPool(allocator)))),
                 .uses_global_pool = (external_pool == null),
                 .host = try allocator.dupe(u8, host),
@@ -174,6 +183,11 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
 
                 self.allocator.destroy(self.thread_pool);
                 self.allocator.destroy(self.loop);
+            }
+
+            // Free heap-allocated resolver if we created one
+            if (self.tp_resolver) |r| {
+                self.allocator.destroy(r);
             }
 
             self.allocator.free(self.host);

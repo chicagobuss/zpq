@@ -120,10 +120,17 @@ fn scan_benchmark(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 
     std.debug.print("LEVEL 04: Opening S3 file with Loop...\n", .{});
-    var pf = try zpq.s3.factory.openS3WithLoop(allocator, &loop, &thread_pool, path, .{
+    var pf = zpq.s3.factory.openS3WithLoop(allocator, &loop, &thread_pool, path, .{
         .force_async = true,
         .verify_tls = true,
-    });
+    }) catch |err| {
+        std.debug.print("LEVEL 04: openS3WithLoop failed: {}\n", .{err});
+        // Print env vars for debugging
+        const endpoint = std.process.getEnvVarOwned(allocator, "S3_ENDPOINT") catch "NOT_SET";
+        const region = std.process.getEnvVarOwned(allocator, "AWS_REGION") catch "NOT_SET";
+        std.debug.print("LEVEL 04: S3_ENDPOINT={s}, AWS_REGION={s}\n", .{ endpoint, region });
+        return err;
+    };
     defer pf.deinit();
 
     const row_count = pf.metadata.?.num_rows;
@@ -154,4 +161,3 @@ fn scan_benchmark(allocator: std.mem.Allocator, path: []const u8) !void {
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
     std.debug.print("Scanned {d} values in {d:.4}s\n", .{ total_values, elapsed_s });
 }
-

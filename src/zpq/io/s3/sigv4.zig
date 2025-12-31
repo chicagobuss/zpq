@@ -8,6 +8,10 @@ pub const SigV4 = struct {
     access_key: []const u8,
     secret_key: []const u8,
     session_token: ?[]const u8 = null,
+    /// Use UNSIGNED-PAYLOAD for uploads. Skips expensive SHA-256 hash of body.
+    /// Safe for Lambda-to-S3 in same region, VPC endpoints, or when using HTTPS.
+    /// AWS CLI doesn't do this by default - gives us a CPU advantage.
+    use_unsigned_payload: bool = false,
 
     /// Signs an HTTP request by adding the necessary headers.
     pub fn sign(
@@ -29,7 +33,7 @@ pub const SigV4 = struct {
         // Add Host Header (Required for SigV4)
         if (uri.host) |h| {
             const host_val = if (uri.port) |p|
-                try std.fmt.allocPrint(allocator, "{s}:{d}", .{h.percent_encoded, p})
+                try std.fmt.allocPrint(allocator, "{s}:{d}", .{ h.percent_encoded, p })
             else
                 try allocator.dupe(u8, h.percent_encoded);
             try headers.append(allocator, .{ .name = "Host", .value = host_val });
@@ -37,8 +41,12 @@ pub const SigV4 = struct {
 
         try headers.append(allocator, .{ .name = "X-Amz-Date", .value = try allocator.dupe(u8, iso_date) });
 
+        // Payload hash: UNSIGNED-PAYLOAD skips the expensive SHA-256 computation
+        // This is the "secret sauce" that can make us faster than AWS CLI
         var payload_hash_buf: [64]u8 = undefined;
-        const payload_hash = if (payload.len == 0)
+        const payload_hash = if (self.use_unsigned_payload)
+            "UNSIGNED-PAYLOAD"
+        else if (payload.len == 0)
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         else
             try hashSha256Hex(payload, &payload_hash_buf);
@@ -49,9 +57,9 @@ pub const SigV4 = struct {
             try headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
         }
 
-    // 3. Create Canonical Request
-    var canonical_req = std.ArrayList(u8){};
-    defer canonical_req.deinit(allocator);
+        // 3. Create Canonical Request
+        var canonical_req = std.ArrayList(u8){};
+        defer canonical_req.deinit(allocator);
 
         // Custom Writer for Unmanaged ArrayList with Error Propagation
         const WriterContext = struct {
@@ -71,34 +79,34 @@ pub const SigV4 = struct {
             }
 
             fn drainImpl(ctx: *@This(), data: []const []const u8, splat: usize) !usize {
-                 if (data.len == 0) return 0;
-                 var total: usize = 0;
-                 // Write all but last
-                 for (data[0 .. data.len - 1]) |chunk| {
-                     try ctx.list.appendSlice(ctx.allocator, chunk);
-                     total += chunk.len;
-                 }
-                 // Write last element splat times
-                 const last = data[data.len - 1];
-                 for (0..splat) |_| {
-                     try ctx.list.appendSlice(ctx.allocator, last);
-                     total += last.len;
-                 }
-                 return total;
+                if (data.len == 0) return 0;
+                var total: usize = 0;
+                // Write all but last
+                for (data[0 .. data.len - 1]) |chunk| {
+                    try ctx.list.appendSlice(ctx.allocator, chunk);
+                    total += chunk.len;
+                }
+                // Write last element splat times
+                const last = data[data.len - 1];
+                for (0..splat) |_| {
+                    try ctx.list.appendSlice(ctx.allocator, last);
+                    total += last.len;
+                }
+                return total;
             }
 
             pub fn print(ctx: *@This(), comptime fmt: []const u8, args: anytype) !void {
-                 ctx.writer.print(fmt, args) catch |err| {
-                     if (err == error.WriteFailed and ctx.last_error != null) return ctx.last_error.?;
-                     return err;
-                 };
+                ctx.writer.print(fmt, args) catch |err| {
+                    if (err == error.WriteFailed and ctx.last_error != null) return ctx.last_error.?;
+                    return err;
+                };
             }
 
             pub fn writeAll(ctx: *@This(), bytes: []const u8) !void {
                 ctx.writer.writeAll(bytes) catch |err| {
-                     if (err == error.WriteFailed and ctx.last_error != null) return ctx.last_error.?;
-                     return err;
-                 };
+                    if (err == error.WriteFailed and ctx.last_error != null) return ctx.last_error.?;
+                    return err;
+                };
             }
         };
 
@@ -121,8 +129,38 @@ pub const SigV4 = struct {
 
         if (path.len == 0) try ctx.writeAll("/\n") else try ctx.print("{s}\n", .{path});
 
-        // Canonical Query String
-        try ctx.writeAll("\n");
+        // Canonical Query String (must be sorted by param name)
+        if (uri.query) |q| {
+            const QueryParam = struct { key: []const u8, val: []const u8 };
+            // Parse query params and sort them
+            var params = std.ArrayListUnmanaged(QueryParam){};
+            defer params.deinit(allocator);
+
+            var iter = std.mem.splitScalar(u8, q.percent_encoded, '&');
+            while (iter.next()) |param| {
+                if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
+                    try params.append(allocator, .{ .key = param[0..eq_pos], .val = param[eq_pos + 1 ..] });
+                } else {
+                    try params.append(allocator, .{ .key = param, .val = "" });
+                }
+            }
+
+            // Sort by key
+            std.sort.pdq(QueryParam, params.items, {}, struct {
+                fn lessThan(_: void, a: QueryParam, b: QueryParam) bool {
+                    return std.mem.lessThan(u8, a.key, b.key);
+                }
+            }.lessThan);
+
+            // Write sorted query string
+            for (params.items, 0..) |p, i| {
+                if (i > 0) try ctx.writeAll("&");
+                try ctx.print("{s}={s}", .{ p.key, p.val });
+            }
+            try ctx.writeAll("\n");
+        } else {
+            try ctx.writeAll("\n");
+        }
 
         // Canonical Headers
         var canonical_headers_list = try std.ArrayList(HeaderRef).initCapacity(allocator, headers.items.len);
@@ -142,7 +180,7 @@ pub const SigV4 = struct {
             var lower_name_buf: [128]u8 = undefined;
             const lower_name = std.ascii.lowerString(&lower_name_buf, h.name);
 
-            try ctx.print("{s}:{s}\n", .{lower_name, h.value});
+            try ctx.print("{s}:{s}\n", .{ lower_name, h.value });
 
             if (signed_headers.items.len > 0) try signed_headers.append(allocator, ';');
             try signed_headers.appendSlice(allocator, lower_name);
@@ -154,7 +192,7 @@ pub const SigV4 = struct {
 
         // 4. Create String to Sign
         const algorithm = "AWS4-HMAC-SHA256";
-        const credential_scope = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/aws4_request", .{date_short, self.region, self.service});
+        const credential_scope = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/aws4_request", .{ date_short, self.region, self.service });
         defer allocator.free(credential_scope);
 
         var canonical_req_hash_buf: [64]u8 = undefined;
@@ -193,10 +231,7 @@ pub const SigV4 = struct {
         signature_hex = std.fmt.bytesToHex(signature, .lower);
 
         // 6. Add Authorization Header
-        const auth_header = try std.fmt.allocPrint(allocator,
-            "{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}",
-            .{algorithm, self.access_key, credential_scope, signed_headers.items, &signature_hex}
-        );
+        const auth_header = try std.fmt.allocPrint(allocator, "{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{ algorithm, self.access_key, credential_scope, signed_headers.items, &signature_hex });
 
         try headers.append(allocator, .{ .name = "Authorization", .value = auth_header });
     }
@@ -267,9 +302,7 @@ fn fmtIso8601(ts: i64, buf: *[16]u8) ![]const u8 {
     const minute = day_seconds.getMinutesIntoHour();
     const second = day_seconds.getSecondsIntoMinute();
 
-    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        year_val, month_val, day_val, hour, minute, second
-    });
+    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{ year_val, month_val, day_val, hour, minute, second });
 }
 
 fn hashSha256Hex(data: []const u8, out_hex: *[64]u8) ![]const u8 {

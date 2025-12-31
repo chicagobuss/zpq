@@ -113,30 +113,37 @@ pub fn ThreadPoolResolverGen(comptime XevApi: type) type {
             _ = hostname;
             _ = port;
 
+            log.debug("ThreadPoolResolver.resolve: setting up async for {s}:{d}", .{ completion.hostname, completion.port });
+
             // Setup completion
             completion.internal.callback = cb;
             completion.internal.userdata = userdata;
             completion.internal.resolver_ptr = self;
             completion.internal.xev_async = XevApi.Async.init() catch |err| {
+                log.err("ThreadPoolResolver.resolve: Async.init failed: {}", .{err});
                 cb(userdata, &.{}, err);
                 return;
             };
 
             completion.internal.task = .{ .callback = threadCallback };
 
+            log.debug("ThreadPoolResolver.resolve: arming async.wait on loop", .{});
             // Wait on the loop
             completion.internal.xev_async.?.wait(@as(*LoopType, @ptrCast(@alignCast(loop))), &completion.internal.xev_completion, Res.Completion, completion, asyncCallback);
 
+            log.debug("ThreadPoolResolver.resolve: scheduling task on thread pool", .{});
             // Schedule on thread pool
             self.pool.schedule(@import("xev").ThreadPool.Batch.from(&completion.internal.task));
+            log.debug("ThreadPoolResolver.resolve: task scheduled", .{});
         }
 
         fn threadCallback(task: *@import("xev").ThreadPool.Task) void {
+            log.debug("threadCallback: entered", .{});
             const internal: *Res.Internal = @fieldParentPtr("task", task);
             const completion: *Res.Completion = @fieldParentPtr("internal", internal);
             const self: *Self = @ptrCast(@alignCast(completion.internal.resolver_ptr.?));
 
-            log.debug("resolving {s}:{d}", .{ completion.hostname, completion.port });
+            log.debug("threadCallback: resolving {s}:{d}", .{ completion.hostname, completion.port });
             const hostname_z = self.allocator.dupeZ(u8, completion.hostname) catch {
                 completion.internal.err = error.OutOfMemory;
                 if (completion.internal.xev_async) |*a| a.notify() catch {};

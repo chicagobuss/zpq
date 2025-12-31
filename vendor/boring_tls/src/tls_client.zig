@@ -124,7 +124,7 @@ pub const TlsClient = struct {
             try self.writeEncryptedData(data);
         }
 
-        return self.readFromWriteBio();
+        return try self.readFromWriteBio();
     }
 
     pub fn isHandshakeComplete(self: *Self) bool {

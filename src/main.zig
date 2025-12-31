@@ -2,12 +2,235 @@ const std = @import("std");
 const zpq = @import("zpq");
 const xev = @import("xev");
 const builtin = @import("builtin");
+const cli = @import("cli.zig");
 
 /// Control log level based on build mode.
 /// Debug builds show all logs, release builds show only warnings and errors.
 pub const std_options: std.Options = .{
     .log_level = if (builtin.mode == .Debug) .debug else .warn,
 };
+
+// ============================================================================
+// Argument Parsing
+// ============================================================================
+
+const Command = enum {
+    schema,
+    meta,
+    cat,
+    scan,
+    filter,
+    pages,
+    inspect,
+    debug_s3,
+    write_test,
+};
+
+const Flag = enum {
+    @"--async",
+    @"--tls-verify",
+    @"--filter",
+    @"--count",
+    @"--unified-filter",
+    @"--trace",
+    @"--select",
+    @"--output",
+    @"-o",
+};
+
+/// Flags that are valid for each command
+fn validFlagsForCommand(cmd: Command) []const Flag {
+    return switch (cmd) {
+        .schema => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .meta => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .cat => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .scan => &[_]Flag{ .@"--async", .@"--tls-verify", .@"--filter", .@"--count", .@"--unified-filter", .@"--trace" },
+        .filter => &[_]Flag{ .@"--async", .@"--tls-verify", .@"--filter", .@"--select", .@"--output", .@"-o", .@"--trace" },
+        .pages => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .inspect => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .debug_s3 => &[_]Flag{ .@"--async", .@"--tls-verify" },
+        .write_test => &[_]Flag{},
+    };
+}
+
+fn commandUsage(cmd: Command) []const u8 {
+    return switch (cmd) {
+        .schema => "schema <file> [--async] [--tls-verify]",
+        .meta => "meta <file> [--async] [--tls-verify]",
+        .cat => "cat <file> [limit] [--async] [--tls-verify]",
+        .scan => "scan <file> [--filter col=val] [--count] [--unified-filter] [--trace [file]] [--async] [--tls-verify]",
+        .filter => "filter <input> --filter col=val [--select col1,col2,...] -o <output>",
+        .pages => "pages <file> [--async] [--tls-verify]",
+        .inspect => "inspect <file> [--async] [--tls-verify]",
+        .debug_s3 => "debug-s3 <file> [--async] [--tls-verify]",
+        .write_test => "write-test [file]",
+    };
+}
+
+const ParsedArgs = struct {
+    command: Command,
+    file_path: ?[]const u8 = null,
+    limit: usize = 10,
+    is_async: bool = false,
+    verify_tls: bool = false,
+    filter: ?[]const u8 = null,
+    count_only: bool = false,
+    unified_filter: bool = false,
+    trace_output: ?[]const u8 = null,
+    // Filter command specific
+    select_columns: ?[]const u8 = null, // comma-separated column names
+    output_path: ?[]const u8 = null,
+};
+
+const ParseError = error{
+    NoCommand,
+    UnknownCommand,
+    MissingFile,
+    UnknownFlag,
+    InvalidLimit,
+    MissingFilterValue,
+};
+
+fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
+    if (args.len < 2) return ParseError.NoCommand;
+
+    const cmd_str = args[1];
+    const command: Command = if (std.mem.eql(u8, cmd_str, "schema"))
+        .schema
+    else if (std.mem.eql(u8, cmd_str, "meta"))
+        .meta
+    else if (std.mem.eql(u8, cmd_str, "cat"))
+        .cat
+    else if (std.mem.eql(u8, cmd_str, "scan"))
+        .scan
+    else if (std.mem.eql(u8, cmd_str, "filter"))
+        .filter
+    else if (std.mem.eql(u8, cmd_str, "pages"))
+        .pages
+    else if (std.mem.eql(u8, cmd_str, "inspect"))
+        .inspect
+    else if (std.mem.eql(u8, cmd_str, "debug-s3"))
+        .debug_s3
+    else if (std.mem.eql(u8, cmd_str, "write-test"))
+        .write_test
+    else
+        return ParseError.UnknownCommand;
+
+    var result = ParsedArgs{ .command = command };
+    const valid_flags = validFlagsForCommand(command);
+
+    // Parse remaining arguments
+    var i: usize = 2;
+    var positional_idx: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (std.mem.startsWith(u8, arg, "--") or std.mem.eql(u8, arg, "-o")) {
+            // It's a flag
+            const flag: ?Flag = if (std.mem.eql(u8, arg, "-o"))
+                .@"-o"
+            else if (std.mem.eql(u8, arg, "--async"))
+                .@"--async"
+            else if (std.mem.eql(u8, arg, "--tls-verify"))
+                .@"--tls-verify"
+            else if (std.mem.eql(u8, arg, "--filter"))
+                .@"--filter"
+            else if (std.mem.eql(u8, arg, "--count"))
+                .@"--count"
+            else if (std.mem.eql(u8, arg, "--unified-filter"))
+                .@"--unified-filter"
+            else if (std.mem.eql(u8, arg, "--trace"))
+                .@"--trace"
+            else if (std.mem.eql(u8, arg, "--select"))
+                .@"--select"
+            else if (std.mem.eql(u8, arg, "--output"))
+                .@"--output"
+            else
+                null;
+
+            if (flag == null) {
+                std.debug.print("Error: Unknown flag '{s}'\n", .{arg});
+                return ParseError.UnknownFlag;
+            }
+
+            // Check if this flag is valid for this command
+            var is_valid = false;
+            for (valid_flags) |vf| {
+                if (vf == flag.?) {
+                    is_valid = true;
+                    break;
+                }
+            }
+            if (!is_valid) {
+                std.debug.print("Error: Flag '{s}' is not valid for '{s}' command\n", .{ arg, cmd_str });
+                std.debug.print("Usage: {s}\n", .{commandUsage(command)});
+                return ParseError.UnknownFlag;
+            }
+
+            // Handle the flag
+            switch (flag.?) {
+                .@"--async" => result.is_async = true,
+                .@"--tls-verify" => result.verify_tls = true,
+                .@"--count" => result.count_only = true,
+                .@"--unified-filter" => result.unified_filter = true,
+                .@"--filter" => {
+                    if (i + 1 >= args.len) {
+                        std.debug.print("Error: --filter requires a value (e.g., --filter col=val)\n", .{});
+                        return ParseError.MissingFilterValue;
+                    }
+                    i += 1;
+                    result.filter = args[i];
+                },
+                .@"--trace" => {
+                    // Optional value: --trace output.json or just --trace for stdout
+                    if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                        i += 1;
+                        result.trace_output = args[i];
+                    } else {
+                        result.trace_output = "-"; // stdout marker
+                    }
+                },
+                .@"--select" => {
+                    if (i + 1 >= args.len) {
+                        std.debug.print("Error: --select requires a value (e.g., --select col1,col2,col3)\n", .{});
+                        return ParseError.MissingFilterValue;
+                    }
+                    i += 1;
+                    result.select_columns = args[i];
+                },
+                .@"--output", .@"-o" => {
+                    if (i + 1 >= args.len) {
+                        std.debug.print("Error: -o/--output requires a value (e.g., -o output.parquet)\n", .{});
+                        return ParseError.MissingFilterValue;
+                    }
+                    i += 1;
+                    result.output_path = args[i];
+                },
+            }
+        } else {
+            // Positional argument
+            if (positional_idx == 0) {
+                result.file_path = arg;
+            } else if (positional_idx == 1 and command == .cat) {
+                // cat command has optional [limit] as second positional
+                result.limit = std.fmt.parseInt(usize, arg, 10) catch {
+                    std.debug.print("Error: Invalid limit '{s}' - must be a number\n", .{arg});
+                    return ParseError.InvalidLimit;
+                };
+            }
+            positional_idx += 1;
+        }
+    }
+
+    // Validate required arguments
+    if (command != .write_test and result.file_path == null) {
+        std.debug.print("Error: Missing file argument\n", .{});
+        std.debug.print("Usage: {s}\n", .{commandUsage(command)});
+        return ParseError.MissingFile;
+    }
+
+    return result;
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -17,46 +240,13 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 2) {
-        printUsage(args[0]);
+    const parsed = parseArgs(args) catch |err| {
+        switch (err) {
+            ParseError.NoCommand, ParseError.UnknownCommand => printUsage(args[0]),
+            else => {}, // Error already printed
+        }
         return;
-    }
-
-    const command = args[1];
-
-    const is_async = for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--async")) break true;
-    } else false;
-
-    const verify_tls = for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--tls-verify")) break true;
-    } else false;
-
-    var filter: ?[]const u8 = null;
-    var count_only = false;
-    var unified_filter = false;
-    var trace_output: ?[]const u8 = null;
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--filter")) {
-            if (i + 1 < args.len) {
-                filter = args[i + 1];
-            }
-        }
-        if (std.mem.eql(u8, arg, "--count")) {
-            count_only = true;
-        }
-        if (std.mem.eql(u8, arg, "--unified-filter")) {
-            unified_filter = true;
-        }
-        if (std.mem.eql(u8, arg, "--trace")) {
-            // Optional: --trace output.json or just --trace for stdout
-            if (i + 1 < args.len and args[i + 1][0] != '-') {
-                trace_output = args[i + 1];
-            } else {
-                trace_output = "-"; // stdout marker
-            }
-        }
-    }
+    };
 
     // Initialize core xev infrastructure for all commands
     var loop = try xev.Loop.init(.{});
@@ -77,55 +267,31 @@ pub fn main() !void {
 
     const resolver = spec_resolver.resolver();
 
-    if (std.mem.eql(u8, command, "schema")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} schema <parquet_file>\n", .{args[0]});
-            return;
-        }
-        try cmdSchema(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "meta")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} meta <parquet_file>\n", .{args[0]});
-            return;
-        }
-        try cmdMeta(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "cat")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} cat <parquet_file> [limit]\n", .{args[0]});
-            return;
-        }
-        const limit = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 10;
-        try cmdCat(allocator, args[2], limit, is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "scan")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} scan <parquet_file> [--filter col=val] [--count] [--unified-filter] [--trace [file]]\n", .{args[0]});
-            return;
-        }
-        try cmdScan(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls, filter, count_only, unified_filter, trace_output);
-    } else if (std.mem.eql(u8, command, "pages")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} pages <parquet_file>\n", .{args[0]});
-            return;
-        }
-        try cmdPages(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "inspect")) {
-        // Legacy support
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} inspect <parquet_file> [--async]\n", .{args[0]});
-            return;
-        }
-        try cmdPages(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "debug-s3")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: {s} debug-s3 <parquet_file> [--async]\n", .{args[0]});
-            return;
-        }
-        try cmdDebugS3(allocator, args[2], is_async, &loop, &thread_pool, resolver, verify_tls);
-    } else if (std.mem.eql(u8, command, "write-test")) {
-        const output_path = if (args.len > 2) args[2] else "/tmp/zpq_test.parquet";
-        try cmdWriteTest(allocator, output_path);
-    } else {
-        printUsage(args[0]);
+    switch (parsed.command) {
+        .schema => try cmdSchema(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .meta => try cmdMeta(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .cat => try cmdCat(allocator, parsed.file_path.?, parsed.limit, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .scan => try cmdScan(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls, parsed.filter, parsed.count_only, parsed.unified_filter, parsed.trace_output),
+        .filter => {
+            const ctx = cli.Context{
+                .allocator = allocator,
+                .loop = &loop,
+                .thread_pool = &thread_pool,
+                .resolver = resolver,
+                .is_async = parsed.is_async,
+                .verify_tls = parsed.verify_tls,
+            };
+            try cli.filter.run(&ctx, .{
+                .input_path = parsed.file_path.?,
+                .output_path = parsed.output_path,
+                .filter = parsed.filter,
+                .select_columns = parsed.select_columns,
+            });
+        },
+        .pages => try cmdPages(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .inspect => try cmdPages(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .debug_s3 => try cmdDebugS3(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),
+        .write_test => try cmdWriteTest(allocator, parsed.file_path orelse "/tmp/zpq_test.parquet"),
     }
 }
 
@@ -167,16 +333,24 @@ fn printUsage(exe_name: []const u8) void {
         \\  meta   <file>       Show file and row group metadata
         \\  cat    <file>       Dump row data (JSON-like)
         \\  scan   <file>       Benchmark scan speed (no output)
+        \\  filter <file>       Filter rows and write to output parquet
         \\  pages  <file>       Inspect page headers and encodings (deep dive)
         \\  write-test [file]   Write a test parquet file (default: /tmp/zpq_test.parquet)
         \\
-        \\Options:
-        \\  --tls-verify        Enable TLS certificate verification for S3/HTTPS
-        \\  --async             Force async I/O path
+        \\Filter Options:
+        \\  --filter col=val    Filter rows where column equals value (required)
+        \\  --select col1,col2  Columns to include in output (default: all)
+        \\  -o, --output file   Output file path (required)
+        \\
+        \\Scan Options:
         \\  --filter col=val    Filter rows where column equals value
         \\  --count             Only count matching rows (skip Phase 2)
         \\  --unified-filter    Use unified byte-level filter matching (experimental)
         \\  --trace [file]      Output performance trace (JSON to file or stdout if no file)
+        \\
+        \\General Options:
+        \\  --tls-verify        Enable TLS certificate verification for S3/HTTPS
+        \\  --async             Force async I/O path
         \\
         \\Environment Variables:
         \\  S3_ENDPOINT         Custom S3 endpoint (e.g. http://localhost:9000 for MinIO)
@@ -1389,7 +1563,6 @@ fn cmdPages(allocator: std.mem.Allocator, path: []const u8, is_async: bool, loop
         }
     }
 }
-
 fn cmdWriteTest(allocator: std.mem.Allocator, output_path: []const u8) !void {
     const writer = zpq.core.writer;
 

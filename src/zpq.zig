@@ -25,6 +25,10 @@ pub const core = struct {
     pub const page_index = @import("zpq/core/page_index.zig");
     pub const filter = @import("zpq/core/filter.zig");
     pub const compress = @import("zpq/core/compress.zig");
+    pub const selection = @import("zpq/core/selection.zig");
+    pub const filter_cache = @import("zpq/core/filter_cache.zig");
+    pub const filter_scan = @import("zpq/core/filter_scan.zig");
+    pub const selected_reader = @import("zpq/core/selected_reader.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection
@@ -60,6 +64,13 @@ pub const s3 = struct {
     pub const XevConnectionPool = @import("zpq/io/s3/xev_connection_pool.zig").XevConnectionPool;
     pub const global_pool = @import("zpq/io/s3/global_pool.zig");
     pub const GlobalConnectionPool = global_pool.GlobalConnectionPool;
+
+    // S3 Writer - streaming multipart uploads
+    // Performance: UNSIGNED-PAYLOAD + event-driven concurrency beats AWS CLI
+    pub const writer = @import("zpq/io/s3/writer.zig");
+    pub const S3Writer = writer.S3Writer;
+    pub const S3WriterGen = writer.S3WriterGen;
+    pub const EpollS3Writer = writer.EpollS3Writer;
 
     // Internal Components
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");

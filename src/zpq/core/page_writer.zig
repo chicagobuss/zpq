@@ -526,6 +526,24 @@ pub const ColumnWriter = struct {
             },
         };
     }
+
+    /// Write all pages to a buffer (for slot-based parallel writes).
+    /// Unmanaged version that takes allocator explicitly.
+    pub fn writePagesToBufferUnmanaged(self: *ColumnWriter, buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
+        var thrift_writer = thrift.Writer.init(self.allocator);
+        defer thrift_writer.deinit();
+
+        for (self.pages.items) |page| {
+            // Write page header
+            thrift_writer.reset();
+            try page.header.write(&thrift_writer);
+            const header_bytes = thrift_writer.bytes();
+            try buffer.appendSlice(allocator, header_bytes);
+
+            // Write page data
+            try buffer.appendSlice(allocator, page.data);
+        }
+    }
 };
 
 // ============================================================================
@@ -567,6 +585,6 @@ test "ColumnWriter - dict strings" {
 
     // Should have 2 pages: dictionary + data
     try std.testing.expectEqual(@as(usize, 2), cw.pages.items.len);
-    try std.testing.expectEqual(schema.PageHeader.PageType.DICTIONARY_PAGE, cw.pages.items[0].header.type);
-    try std.testing.expectEqual(schema.PageHeader.PageType.DATA_PAGE, cw.pages.items[1].header.type);
+    try std.testing.expectEqual(schema.PageType.DICTIONARY_PAGE, cw.pages.items[0].header.type);
+    try std.testing.expectEqual(schema.PageType.DATA_PAGE, cw.pages.items[1].header.type);
 }

@@ -36,6 +36,9 @@ const Flag = enum {
     @"--select",
     @"--output",
     @"-o",
+    @"--workers",
+    @"--parallel",
+    @"--slot-parallel",
 };
 
 /// Flags that are valid for each command
@@ -45,7 +48,7 @@ fn validFlagsForCommand(cmd: Command) []const Flag {
         .meta => &[_]Flag{ .@"--async", .@"--tls-verify" },
         .cat => &[_]Flag{ .@"--async", .@"--tls-verify" },
         .scan => &[_]Flag{ .@"--async", .@"--tls-verify", .@"--filter", .@"--count", .@"--unified-filter", .@"--trace" },
-        .filter => &[_]Flag{ .@"--async", .@"--tls-verify", .@"--filter", .@"--select", .@"--output", .@"-o", .@"--trace" },
+        .filter => &[_]Flag{ .@"--async", .@"--tls-verify", .@"--filter", .@"--select", .@"--output", .@"-o", .@"--trace", .@"--workers", .@"--parallel", .@"--slot-parallel" },
         .pages => &[_]Flag{ .@"--async", .@"--tls-verify" },
         .inspect => &[_]Flag{ .@"--async", .@"--tls-verify" },
         .debug_s3 => &[_]Flag{ .@"--async", .@"--tls-verify" },
@@ -80,6 +83,9 @@ const ParsedArgs = struct {
     // Filter command specific
     select_columns: ?[]const u8 = null, // comma-separated column names
     output_path: ?[]const u8 = null,
+    use_workers: bool = false, // Use RowGroupWorker-based implementation (--workers)
+    use_parallel: bool = false, // Use parallel thread pool execution (--parallel)
+    use_slot_parallel: bool = false, // Use slot-based parallel writes (--slot-parallel)
 };
 
 const ParseError = error{
@@ -145,6 +151,12 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
                 .@"--select"
             else if (std.mem.eql(u8, arg, "--output"))
                 .@"--output"
+            else if (std.mem.eql(u8, arg, "--workers"))
+                .@"--workers"
+            else if (std.mem.eql(u8, arg, "--parallel"))
+                .@"--parallel"
+            else if (std.mem.eql(u8, arg, "--slot-parallel"))
+                .@"--slot-parallel"
             else
                 null;
 
@@ -205,6 +217,15 @@ fn parseArgs(args: []const []const u8) ParseError!ParsedArgs {
                     }
                     i += 1;
                     result.output_path = args[i];
+                },
+                .@"--workers" => {
+                    result.use_workers = true;
+                },
+                .@"--parallel" => {
+                    result.use_parallel = true;
+                },
+                .@"--slot-parallel" => {
+                    result.use_slot_parallel = true;
                 },
             }
         } else {
@@ -286,6 +307,9 @@ pub fn main() !void {
                 .output_path = parsed.output_path,
                 .filter = parsed.filter,
                 .select_columns = parsed.select_columns,
+                .use_workers = parsed.use_workers,
+                .use_parallel = parsed.use_parallel,
+                .use_slot_parallel = parsed.use_slot_parallel,
             });
         },
         .pages => try cmdPages(allocator, parsed.file_path.?, parsed.is_async, &loop, &thread_pool, resolver, parsed.verify_tls),

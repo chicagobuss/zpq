@@ -29,6 +29,8 @@ pub const core = struct {
     pub const filter_cache = @import("zpq/core/filter_cache.zig");
     pub const filter_scan = @import("zpq/core/filter_scan.zig");
     pub const selected_reader = @import("zpq/core/selected_reader.zig");
+    pub const row_group_worker = @import("zpq/core/row_group_worker.zig");
+    pub const slot_writer = @import("zpq/core/slot_writer.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection
@@ -82,6 +84,7 @@ pub const s3 = struct {
 test {
     _ = @import("zpq/core/thrift_test.zig");
     _ = core.rle;
+    _ = core.slot_writer;
     _ = io.interface;
     _ = s3.XevS3Source;
     _ = arrow;

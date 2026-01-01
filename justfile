@@ -116,6 +116,54 @@ comprehensive: build gen-fixtures
 
 # === Lambda ===
 
+# Build Lambda for AWS (arch: arm64 or x86_64)
+lambda-build name="lambda-05-filter-s3" arch="arm64":
+    @./tools/lambda.sh build {{name}} {{arch}}
+
+# Deploy Lambda to AWS
+lambda-deploy fn zip arch="arm64" memory="512":
+    @./tools/lambda.sh deploy {{fn}} {{zip}} {{arch}} {{memory}}
+
+# Build and deploy Lambda in one step
+lambda-ship name="lambda-05-filter-s3" fn="zpq-filter-s3" arch="arm64" memory="1769":
+    #!/usr/bin/env bash
+    zip=$(./tools/lambda.sh build {{name}} {{arch}})
+    ./tools/lambda.sh deploy {{fn}} "$zip" {{arch}} {{memory}}
+
+# Invoke Lambda with JSON payload
+lambda-invoke fn payload:
+    @./tools/lambda.sh invoke {{fn}} '{{payload}}'
+
+# Get Lambda logs
+lambda-logs fn:
+    @./tools/lambda.sh logs {{fn}}
+
+# Get Lambda metrics (duration, memory, throughput)
+lambda-metrics fn:
+    @./tools/lambda.sh metrics {{fn}}
+
+# Run benchmark matrix (arm64/x86_64 x 512MB/1769MB)
+lambda-bench-matrix payload:
+    @./tools/lambda.sh bench-matrix lambda-05-filter-s3 '{{payload}}'
+
+# List ZPQ Lambda functions
+lambda-list:
+    @./tools/lambda.sh list zpq
+
+# Quick benchmark: build ARM64, deploy at 1769MB, invoke, show metrics
+lambda-quick fn="zpq-filter-s3" payload='{"input_path": "s3://skyway-staging-perf-test/zpq_test_data/benchmark_100mb.parquet", "output_path": "s3://skyway-staging-perf-test/zpq_test_data/output/quick_test.parquet", "filter_column": "line_item_product_code", "filter_value": "AmazonEC2"}':
+    #!/usr/bin/env bash
+    set -e
+    zip=$(./tools/lambda.sh build lambda-05-filter-s3 arm64)
+    ./tools/lambda.sh deploy {{fn}} "$zip" arm64 1769
+    echo ""
+    echo "Invoking..."
+    ./tools/lambda.sh invoke {{fn}} '{{payload}}'
+    echo ""
+    sleep 2
+    echo "Metrics:"
+    ./tools/lambda.sh metrics {{fn}}
+
 # Build and run the minimal Hello World Lambda locally
 lambda-01:
     @echo "Building Lambda 01-minimal..."

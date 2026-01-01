@@ -232,6 +232,8 @@ pub fn Orchestrator(comptime XevApi: type) type {
 
             try self.loop.run(.until_done);
 
+            log.debug("fetchSize loop done: finished={}, err={?}, file_size={d}", .{ ctx.finished, ctx.err, ctx.file_size });
+
             if (ctx.err) |err| {
                 if (err == error.EOF or err == error.TlsConnectionClosed) {
                     if (ctx.finished) return ctx.file_size;
@@ -397,14 +399,22 @@ fn onDataGeneric(comptime XevApi: type) fn (?*anyopaque, []const u8) void {
         fn func(ctx_void: ?*anyopaque, data: []const u8) void {
             const ctx: *RequestContext = @ptrCast(@alignCast(ctx_void));
             const orch: *Orchestrator(XevApi) = @ptrCast(@alignCast(ctx.orchestrator_ptr));
+
+            if (ctx.is_head) {
+                log.debug("HEAD response data ({d} bytes): {s}", .{ data.len, data[0..@min(data.len, 512)] });
+            }
+
             ctx.parser.feed(data, ctx, onBody) catch |err| {
+                log.err("parser.feed error: {}", .{err});
                 ctx.err = err;
                 ctx.closeConn();
                 return;
             };
 
             if (ctx.is_head and ctx.parser.headersComplete()) {
+                log.debug("HEAD complete: status={d}, content_length={?}", .{ ctx.parser.status_code, ctx.parser.content_length });
                 ctx.file_size = orch.provider.onHeadComplete(ctx.parser.status_code, ctx.parser.content_length);
+                log.debug("file_size set to: {d}", .{ctx.file_size});
                 ctx.finished = true;
                 const Connection = tls.ConnectionGen(XevApi);
                 const typed_conn: *Connection = @ptrCast(@alignCast(ctx.conn_ptr));

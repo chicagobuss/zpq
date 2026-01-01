@@ -39,11 +39,11 @@ jobs:
             echo "Unsupported architecture: $ARCH"
             exit 1
           fi
-          
+
           # Install to workspace to avoid polluting self-hosted runner
           mkdir -p $GITHUB_WORKSPACE/zig-bin
           curl -fsSL "$URL" | tar -xz -C $GITHUB_WORKSPACE/zig-bin
-          
+
           # anyzig releases contain a binary named 'zig' (verified)
           echo "$GITHUB_WORKSPACE/zig-bin" >> $GITHUB_PATH
           echo "::endgroup::"
@@ -123,7 +123,6 @@ jobs:
           echo "Build artifacts:"
           ls -laR zig-out/
 
-
       # Laziness Principle: if we built from source, upload to R2 so next run is faster
       - name: Upload Built Dependencies to R2
         if: steps.fetch-deps.outputs.CACHE_HIT == 'false' && steps.fetch-deps.outputs.TARGET != ''
@@ -171,7 +170,7 @@ jobs:
           echo "Running Tests (ZSTD Disabled)"
           zig build test -Dzstd-compression=false --summary all 2>&1
 
-      - name: Run Inspector Verification
+      - name: Run CLI Verification
         run: |
           # Find the built zpq binary
           ZPQ_BIN=$(find zig-out -name zpq -type f | head -1)
@@ -180,11 +179,11 @@ jobs:
             exit 1
           fi
           echo "Using binary: $ZPQ_BIN"
-          
-          echo "Testing simple.parquet..."
-          "$ZPQ_BIN" inspect ci/fixtures/parquet/simple.parquet
-          echo "Testing required.parquet..."
-          "$ZPQ_BIN" inspect ci/fixtures/parquet/required.parquet
+
+          echo "Testing --schema on simple.parquet..."
+          "$ZPQ_BIN" ci/fixtures/parquet/simple.parquet --schema
+          echo "Testing --meta on required.parquet..."
+          "$ZPQ_BIN" ci/fixtures/parquet/required.parquet --meta
           echo "All verifications passed!"
 
       - name: Run R2 Benchmarks
@@ -204,10 +203,10 @@ jobs:
             exit 1
           fi
           echo "Using binary: $BENCH_BIN"
-          
+
           # Use the absolute path for bench-e2e in bench.sh
           # (bench.sh might need an update to accept an external binary path,
           # but for now we'll try to just run it)
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_1mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_10mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_100mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_1mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_10mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_100mb.parquet" --async

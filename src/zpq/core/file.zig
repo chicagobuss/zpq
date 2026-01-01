@@ -19,6 +19,12 @@ pub const RowGroupReader = struct {
     // We own these and must free them.
     buffers: std.ArrayListUnmanaged([]u8),
 
+    // Column name to index mapping (built lazily on first use)
+    column_name_map: ?std.StringHashMapUnmanaged(usize) = null,
+
+    // Projection indices if projection was specified
+    projection_indices: ?[]const usize = null,
+
     pub fn init(file: *ParquetFile, meta: schema.RowGroup, allocator: std.mem.Allocator) !RowGroupReader {
         const sources = try allocator.alloc(?io.local.MemorySource, meta.columns.items.len);
         @memset(sources, null);
@@ -29,7 +35,38 @@ pub const RowGroupReader = struct {
             .allocator = allocator,
             .memory_sources = sources,
             .buffers = .{},
+            .column_name_map = null,
+            .projection_indices = null,
         };
+    }
+
+    /// Initialize with projection - only specified columns will be prefetched
+    pub fn initWithProjection(file: *ParquetFile, meta: schema.RowGroup, allocator: std.mem.Allocator, column_names: []const []const u8) !RowGroupReader {
+        var self = try init(file, meta, allocator);
+        errdefer self.deinit();
+
+        // Build name map and resolve projection indices
+        try self.buildColumnNameMap();
+
+        var indices = try allocator.alloc(usize, column_names.len);
+        var valid_count: usize = 0;
+
+        for (column_names) |name| {
+            if (self.column_name_map.?.get(name)) |idx| {
+                indices[valid_count] = idx;
+                valid_count += 1;
+            }
+            // Silently skip columns not found (they might not exist in this row group)
+        }
+
+        if (valid_count > 0) {
+            self.projection_indices = indices[0..valid_count];
+            try self.prefetch(self.projection_indices);
+        } else {
+            allocator.free(indices);
+        }
+
+        return self;
     }
 
     pub fn deinit(self: *RowGroupReader) void {
@@ -38,6 +75,69 @@ pub const RowGroupReader = struct {
         }
         self.buffers.deinit(self.allocator);
         self.allocator.free(self.memory_sources);
+
+        // Clean up projection indices if we allocated them
+        if (self.projection_indices) |indices| {
+            // We need to get the original allocation size
+            // The indices were allocated with column_names.len capacity
+            self.allocator.free(@constCast(indices.ptr)[0..indices.len]);
+        }
+
+        // Clean up column name map
+        if (self.column_name_map) |*map| {
+            map.deinit(self.allocator);
+        }
+    }
+
+    /// Build the column name to index mapping (lazy initialization)
+    fn buildColumnNameMap(self: *RowGroupReader) !void {
+        if (self.column_name_map != null) return;
+
+        var map = std.StringHashMapUnmanaged(usize){};
+        errdefer map.deinit(self.allocator);
+
+        for (self.meta.columns.items, 0..) |col, idx| {
+            if (col.meta_data) |md| {
+                const path_parts = md.path_in_schema.items;
+                if (path_parts.len > 0) {
+                    // Use leaf name as key (last component of path)
+                    const leaf_name = path_parts[path_parts.len - 1];
+                    try map.put(self.allocator, leaf_name, idx);
+                }
+            }
+        }
+
+        self.column_name_map = map;
+    }
+
+    /// Get column index by name
+    pub fn getColumnIndexByName(self: *RowGroupReader, name: []const u8) !?usize {
+        try self.buildColumnNameMap();
+        return self.column_name_map.?.get(name);
+    }
+
+    /// Get a ColumnReader by column name
+    pub fn columnReaderByName(self: *RowGroupReader, name: []const u8) !ColumnReader {
+        const idx = try self.getColumnIndexByName(name) orelse return error.ColumnNotFound;
+        return self.columnReader(idx);
+    }
+
+    /// Check if a column is in the projection (if projection was specified)
+    pub fn isProjected(self: *const RowGroupReader, col_idx: usize) bool {
+        if (self.projection_indices) |indices| {
+            for (indices) |idx| {
+                if (idx == col_idx) return true;
+            }
+            return false;
+        }
+        return true; // No projection = all columns are "projected"
+    }
+
+    /// Get column metadata by name
+    pub fn getColumnMetadata(self: *RowGroupReader, name: []const u8) !?schema.ColumnMetaData {
+        const idx = try self.getColumnIndexByName(name) orelse return null;
+        if (idx >= self.meta.columns.items.len) return null;
+        return self.meta.columns.items[idx].meta_data;
     }
 
     /// Check if a column has been prefetched
@@ -419,6 +519,57 @@ pub const ParquetFile = struct {
             return RowGroupReader.init(self, meta.row_groups.items[index], self.allocator);
         }
         return error.MetadataNotLoaded;
+    }
+
+    /// Create a RowGroupReader with column projection.
+    /// Only the specified columns will be prefetched (in a single coalesced read).
+    /// This is more efficient than reading all columns when you only need a subset.
+    pub fn rowGroupWithProjection(self: *ParquetFile, index: usize, column_names: []const []const u8) !RowGroupReader {
+        if (self.metadata) |*meta| {
+            if (index >= meta.row_groups.items.len) return error.InvalidRowGroupIndex;
+            return RowGroupReader.initWithProjection(self, meta.row_groups.items[index], self.allocator, column_names);
+        }
+        return error.MetadataNotLoaded;
+    }
+
+    /// Get column index by name from file metadata
+    pub fn getColumnIndexByName(self: *const ParquetFile, name: []const u8) ?usize {
+        const meta = self.metadata orelse return null;
+        if (meta.row_groups.items.len == 0) return null;
+
+        const rg0 = meta.row_groups.items[0];
+        for (rg0.columns.items, 0..) |col, idx| {
+            if (col.meta_data) |md| {
+                const path_parts = md.path_in_schema.items;
+                if (path_parts.len > 0) {
+                    const leaf_name = path_parts[path_parts.len - 1];
+                    if (std.mem.eql(u8, leaf_name, name)) {
+                        return idx;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Get column type by name from file metadata
+    pub fn getColumnType(self: *const ParquetFile, name: []const u8) ?schema.Type {
+        const meta = self.metadata orelse return null;
+        if (meta.row_groups.items.len == 0) return null;
+
+        const rg0 = meta.row_groups.items[0];
+        for (rg0.columns.items) |col| {
+            if (col.meta_data) |md| {
+                const path_parts = md.path_in_schema.items;
+                if (path_parts.len > 0) {
+                    const leaf_name = path_parts[path_parts.len - 1];
+                    if (std.mem.eql(u8, leaf_name, name)) {
+                        return md.type;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /// Check if a row group should be skipped based on a simple equality filter on a column.

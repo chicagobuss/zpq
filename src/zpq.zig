@@ -25,6 +25,13 @@ pub const core = struct {
     pub const page_index = @import("zpq/core/page_index.zig");
     pub const filter = @import("zpq/core/filter.zig");
     pub const compress = @import("zpq/core/compress.zig");
+    pub const selection = @import("zpq/core/selection.zig");
+    pub const filter_cache = @import("zpq/core/filter_cache.zig");
+    pub const filter_scan = @import("zpq/core/filter_scan.zig");
+    pub const selected_reader = @import("zpq/core/selected_reader.zig");
+    pub const row_group_worker = @import("zpq/core/row_group_worker.zig");
+    pub const slot_writer = @import("zpq/core/slot_writer.zig");
+    pub const pipeline = @import("zpq/core/pipeline.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection
@@ -61,6 +68,13 @@ pub const s3 = struct {
     pub const global_pool = @import("zpq/io/s3/global_pool.zig");
     pub const GlobalConnectionPool = global_pool.GlobalConnectionPool;
 
+    // S3 Writer - streaming multipart uploads
+    // Performance: UNSIGNED-PAYLOAD + event-driven concurrency beats AWS CLI
+    pub const writer = @import("zpq/io/s3/writer.zig");
+    pub const S3Writer = writer.S3Writer;
+    pub const S3WriterGen = writer.S3WriterGen;
+    pub const EpollS3Writer = writer.EpollS3Writer;
+
     // Internal Components
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");
     pub const dns = @import("zpq/io/s3/dns.zig");
@@ -71,6 +85,7 @@ pub const s3 = struct {
 test {
     _ = @import("zpq/core/thrift_test.zig");
     _ = core.rle;
+    _ = core.slot_writer;
     _ = io.interface;
     _ = s3.XevS3Source;
     _ = arrow;

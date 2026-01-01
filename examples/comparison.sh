@@ -18,7 +18,7 @@ echo ""
 
 # zpq
 echo "--- zpq ---"
-time ./zig-out/bin/zpq scan "$FILE"
+time ./zig-out/bin/zpq "$FILE" --schema
 echo ""
 
 # PyArrow

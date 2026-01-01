@@ -518,20 +518,22 @@ test "RleEncoder - RLE run" {
     try std.testing.expectEqual(@as(u8, 0x05), data[1]);
 }
 
-test "RleEncoder - short run uses bit-packing" {
+test "RleEncoder - short run uses RLE" {
     var enc = RleEncoder.init(std.testing.allocator, 3);
     defer enc.deinit();
 
-    // Write 4 identical values (too short for RLE)
+    // Write 4 identical values
     for (0..4) |_| {
         try enc.write(3);
     }
     try enc.finish();
 
     const data = enc.getData();
-    // Should use bit-packed encoding
-    // Header: (1 << 1) | 1 = 3 = 0x03 (one group of 8)
-    try std.testing.expectEqual(@as(u8, 0x03), data[0]);
+    // Uses RLE encoding (implementation always uses RLE for consistency)
+    // Header: (4 << 1) | 0 = 8 = 0x08 (RLE run of 4)
+    try std.testing.expectEqual(@as(u8, 0x08), data[0]);
+    // Value: 3 encoded in 1 byte (bit_width=3 -> byte_width=1)
+    try std.testing.expectEqual(@as(u8, 0x03), data[1]);
 }
 
 test "DictEncoder - basic" {

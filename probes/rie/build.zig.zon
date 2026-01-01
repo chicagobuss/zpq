@@ -1,0 +1,16 @@
+.{
+    .name = .probe_rie,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0-dev.1657+985a3565c",
+    .fingerprint = 0xdc33cd055599556e,
+    .dependencies = .{
+        .libxev = .{
+            .path = "../../vendor/libxev",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

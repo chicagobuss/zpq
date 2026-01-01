@@ -105,6 +105,7 @@ pub fn ConnectionGen(comptime XevApi: type) type {
                 log.debug("write: connection closed, ignoring", .{});
                 return;
             }
+            log.debug("write: encrypting {d} bytes of plaintext", .{data.len});
             const enc_data = try self.tls.processOutgoing(data);
             if (enc_data) |bytes| {
                 if (self.pending_write) {
@@ -113,23 +114,38 @@ pub fn ConnectionGen(comptime XevApi: type) type {
                 }
                 const buf = try self.allocator.dupe(u8, bytes);
                 self.pending_write = true;
-                log.debug("write: scheduling TCP write {d} bytes", .{buf.len});
+                log.debug("write: scheduling TCP write {d} bytes (encrypted from {d} plaintext)", .{ buf.len, data.len });
                 self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
             } else {
-                log.debug("write: no encrypted data produced by TLS", .{});
+                log.debug("write: no encrypted data produced by TLS (input was {d} bytes)", .{data.len});
             }
         }
 
         fn pump(self: *Self) void {
             if (self.closed) return;
 
+            // FULL-DUPLEX: Always try to schedule a read first.
+            // TCP is full-duplex, so we can read and write simultaneously.
+            // This is critical for large uploads where the server might send
+            // an early response (e.g., error) while we're still sending data.
+            if (!self.pending_read and !self.idling) {
+                log.debug("pump: scheduling TCP read", .{});
+                self.pending_read = true;
+                self.tcp.read(self.loop, &self.c_read, .{ .slice = self.read_buf[0..self.tcp_read_buf_size] }, Self, self, internalOnTcpRead);
+            }
+
+            // IMPORTANT: Check pending_write BEFORE calling processOutgoing!
+            // processOutgoing consumes data from the BIO - if we can't write it,
+            // that data would be lost forever.
+            if (self.pending_write) {
+                log.debug("pump: write in progress, deferring drain", .{});
+                return;
+            }
+
+            // Now handle outgoing TLS data
             const out_slice_res = self.tls.processOutgoing(null);
             if (out_slice_res) |out_slice_opt| {
                 if (out_slice_opt) |data| {
-                    if (self.pending_write) {
-                        log.debug("pump: write in progress, buffering", .{});
-                        return;
-                    }
                     const buf = self.allocator.dupe(u8, data) catch |err| {
                         log.debug("pump: alloc failed: {}", .{err});
                         if (self.on_error) |cb| cb(self.user_ctx, err);
@@ -138,18 +154,10 @@ pub fn ConnectionGen(comptime XevApi: type) type {
                     self.pending_write = true;
                     log.debug("pump: scheduling TCP write {d} bytes", .{buf.len});
                     self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, internalOnTcpWrite);
-                    return;
                 }
             } else |err| {
                 log.debug("pump: TLS processOutgoing failed: {}", .{err});
                 if (self.on_error) |cb| cb(self.user_ctx, err);
-                return;
-            }
-
-            if (!self.pending_read and !self.idling) {
-                log.debug("pump: scheduling TCP read", .{});
-                self.pending_read = true;
-                self.tcp.read(self.loop, &self.c_read, .{ .slice = self.read_buf[0..self.tcp_read_buf_size] }, Self, self, internalOnTcpRead);
             }
         }
 

@@ -259,13 +259,13 @@ pub const Pipeline = struct {
 
     fn executeSequential(self: *Self) !ExecutionResult {
         _ = self;
-        // TODO: Port from cli/filter.zig run()
+        // Sequential mode not implemented - use slot_parallel (default)
         return error.NotImplemented;
     }
 
     fn executeParallel(self: *Self) !ExecutionResult {
         _ = self;
-        // TODO: Port from cli/filter.zig runWithWorkersParallel()
+        // Parallel mode not implemented - use slot_parallel (default)
         return error.NotImplemented;
     }
 

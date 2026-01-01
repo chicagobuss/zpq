@@ -207,6 +207,6 @@ jobs:
           # Use the absolute path for bench-e2e in bench.sh
           # (bench.sh might need an update to accept an external binary path,
           # but for now we'll try to just run it)
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_1mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_10mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/benchmark_100mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_1mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_10mb.parquet" --async
+          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_100mb.parquet" --async

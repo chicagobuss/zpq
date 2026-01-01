@@ -7,11 +7,11 @@ ZPQ works as a serverless function by using the same binary you'd run locally. N
 ### Quick Start (from release)
 
 ```bash
-# Download latest Lambda zip
-just lambda-deploy-release zpq-filter arm64 512
+# Download from R2 (public), rename to bootstrap, and zip
+curl -fsSL https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/zpq-linux-arm64.tar.gz | tar -xz
+mv zpq bootstrap && zip lambda.zip bootstrap
 
-# Or manually:
-curl -fsSLO https://github.com/chicagobuss/zpq/releases/latest/download/zpq-lambda-arm64.zip
+# Deploy to AWS Lambda
 aws lambda create-function \
   --function-name zpq-filter \
   --runtime provided.al2023 \
@@ -19,7 +19,7 @@ aws lambda create-function \
   --architectures arm64 \
   --memory-size 512 \
   --timeout 120 \
-  --zip-file fileb://zpq-lambda-arm64.zip \
+  --zip-file fileb://lambda.zip \
   --role arn:aws:iam::YOUR_ACCOUNT:role/YOUR_LAMBDA_ROLE
 ```
 

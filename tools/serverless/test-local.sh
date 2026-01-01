@@ -32,14 +32,12 @@ if [ "$INVOKE_ONLY" = false ]; then
         ./tools/serverless/aws.sh build arm64
     else
         echo "=== Downloading latest zpq release (aarch64-linux) ==="
-        LATEST=$(curl -fsSL "https://api.github.com/repos/chicagobuss/zpq/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
-        if [ -z "$LATEST" ]; then
-            echo "Failed to get latest release, falling back to build from source"
-            ./tools/serverless/aws.sh build arm64
+        R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/zpq-linux-arm64.tar.gz"
+        if curl -fsSL "$R2_URL" | tar -xz -C zig-out/bin/; then
+            echo "Downloaded zpq from R2"
         else
-            echo "Downloading $LATEST..."
-            curl -fsSL "https://github.com/chicagobuss/zpq/releases/download/$LATEST/zpq-linux-arm64.tar.gz" | tar -xz -C zig-out/bin/
-            echo "Downloaded zpq $LATEST"
+            echo "Failed to download from R2, falling back to build from source"
+            ./tools/serverless/aws.sh build arm64
         fi
     fi
 

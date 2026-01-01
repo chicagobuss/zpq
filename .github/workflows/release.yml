@@ -143,6 +143,25 @@ jobs:
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} release/ \;
           ls -la release/
 
+      - name: Upload to R2 (public access)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          echo "Uploading release binaries to R2..."
+          for file in release/*.tar.gz; do
+            name=$(basename "$file")
+            echo "Uploading $name..."
+            aws s3 cp "$file" "s3://zpq/releases/${TAG}/${name}" --endpoint-url "$R2_ENDPOINT"
+            # Also upload as "latest" for easy access
+            aws s3 cp "$file" "s3://zpq/releases/latest/${name}" --endpoint-url "$R2_ENDPOINT"
+          done
+          echo "Done uploading to R2"
+
       - name: Determine tag
         id: tag
         run: |
@@ -167,16 +186,16 @@ jobs:
 
             | Platform | Download |
             |----------|----------|
-            | Linux x86_64 | [zpq-linux-x86_64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-linux-x86_64.tar.gz) |
-            | Linux ARM64 | [zpq-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz) |
-            | macOS x86_64 | [zpq-macos-x86_64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-macos-x86_64.tar.gz) |
-            | macOS ARM64 | [zpq-macos-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-macos-arm64.tar.gz) |
+            | Linux x86_64 | [zpq-linux-x86_64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-x86_64.tar.gz) |
+            | Linux ARM64 | [zpq-linux-arm64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz) |
+            | macOS x86_64 | [zpq-macos-x86_64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-macos-x86_64.tar.gz) |
+            | macOS ARM64 | [zpq-macos-arm64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-macos-arm64.tar.gz) |
 
             ### Quick Start
 
             ```bash
             # Download and extract (Linux ARM64 example)
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz | tar -xz
+            curl -fsSL https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz | tar -xz
 
             # View schema
             ./zpq myfile.parquet --schema

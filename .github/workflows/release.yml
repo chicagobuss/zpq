@@ -22,23 +22,18 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-linux
             artifact: zpq-linux-x86_64
-            lambda_arch: x86_64
             ci_artifact: zpq-linux-x86_64
           - os: [self-hosted, Linux, ARM64, zpq-arm]
             target: aarch64-linux
             artifact: zpq-linux-arm64
-            lambda_arch: arm64
             ci_artifact: zpq-linux-arm64
-          # macOS builds (no CI artifacts available)
           - os: macos-latest
             target: x86_64-macos
             artifact: zpq-macos-x86_64
-            lambda_arch: ""
             ci_artifact: ""
           - os: macos-latest
             target: aarch64-macos
             artifact: zpq-macos-arm64
-            lambda_arch: ""
             ci_artifact: ""
 
     steps:
@@ -119,28 +114,11 @@ jobs:
           tar -czvf ${{ matrix.artifact }}.tar.gz zpq
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - name: Package Lambda
-        if: matrix.lambda_arch != ''
-        run: |
-          # Rename zpq to bootstrap and zip for Lambda
-          cp zig-out/bin/zpq dist/bootstrap
-          cd dist
-          zip zpq-lambda-${{ matrix.lambda_arch }}.zip bootstrap
-          shasum -a 256 zpq-lambda-${{ matrix.lambda_arch }}.zip > zpq-lambda-${{ matrix.lambda_arch }}.zip.sha256
-          rm bootstrap
-
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}.tar.gz*
-
-      - name: Upload Lambda artifact
-        if: matrix.lambda_arch != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: zpq-lambda-${{ matrix.lambda_arch }}
-          path: dist/zpq-lambda-${{ matrix.lambda_arch }}.zip*
 
   release:
     name: Create Release
@@ -185,19 +163,12 @@ jobs:
 
             ### Downloads
 
-            **CLI Binary:**
             | Platform | Download |
             |----------|----------|
             | Linux x86_64 | [zpq-linux-x86_64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-linux-x86_64.tar.gz) |
             | Linux ARM64 | [zpq-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz) |
             | macOS x86_64 | [zpq-macos-x86_64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-macos-x86_64.tar.gz) |
             | macOS ARM64 | [zpq-macos-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-macos-arm64.tar.gz) |
-
-            **AWS Lambda:**
-            | Architecture | Download |
-            |--------------|----------|
-            | ARM64 (Graviton) | [zpq-lambda-arm64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-lambda-arm64.zip) |
-            | x86_64 | [zpq-lambda-x86_64.zip](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-lambda-x86_64.zip) |
 
             ### Quick Start
 
@@ -212,18 +183,6 @@ jobs:
             ./zpq input.parquet output.parquet --filter "status=active" --select "id,name,email"
             ```
 
-            ### Lambda Deployment
+            ### Serverless Deployment
 
-            ```bash
-            # Download Lambda zip
-            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/zpq-lambda-arm64.zip
-
-            # Deploy to AWS
-            aws lambda create-function \
-              --function-name zpq-filter \
-              --runtime provided.al2023 \
-              --handler bootstrap \
-              --architectures arm64 \
-              --zip-file fileb://zpq-lambda-arm64.zip \
-              --role arn:aws:iam::YOUR_ACCOUNT:role/YOUR_LAMBDA_ROLE
-            ```
+            See [examples/serverless/README.md](https://github.com/${{ github.repository }}/blob/main/examples/serverless/README.md) for AWS Lambda, Cloud Run, and other serverless deployments.

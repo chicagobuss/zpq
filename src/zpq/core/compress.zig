@@ -84,7 +84,7 @@ test "gzip roundtrip" {
     var output_writer: std.Io.Writer.Allocating = .init(allocator);
     defer output_writer.deinit();
 
-    var decompressor = flate.Decompress.init(&input_reader, &.{}, .gzip);
+    var decompressor = flate.Decompress.init(&input_reader, .gzip, &.{});
     _ = decompressor.reader.streamRemaining(&output_writer.writer) catch |err| {
         std.debug.print("Decompression error: {}\n", .{err});
         return err;

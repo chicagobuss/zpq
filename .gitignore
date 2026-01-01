@@ -41,3 +41,9 @@ ci/fixtures/parquet/sales_large.parquet
 !data/large_rle.parquet
 tmp/
 vendor/boring_tls/prebuilt/
+
+# Comparison project build artifacts
+examples/lambda/comparison/rust-arrow/target/
+examples/lambda/comparison/**/*.zip
+CURRENT_CONTEXT.md
+.claude/

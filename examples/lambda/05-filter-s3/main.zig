@@ -15,8 +15,11 @@ pub fn main() !void {
     };
     defer allocator.free(runtime_api);
 
-    // Lambda runtime loop
-    var http_client = std.http.Client{ .allocator = allocator };
+    // Lambda runtime loop - need std.Io for HTTP client
+    var threaded = try std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+
+    var http_client = std.http.Client{ .allocator = allocator, .io = threaded.io() };
     defer http_client.deinit();
 
     const next_url = try std.fmt.allocPrint(allocator, "http://{s}/2018-06-01/runtime/invocation/next", .{runtime_api});

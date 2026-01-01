@@ -1,148 +1,162 @@
-# ZPQ: A Zig Parquet Tool
+# ZPQ: Fast Parquet for Cloud & Lambda
 
-ZPQ is a Parquet utility designed for fast data access across both local filesystems and cloud object storage, with a specific focus on AWS S3 and Lambda. It is built to support multiple storage providers through an abstract I/O interface.
+ZPQ is a high-performance Parquet CLI and Lambda runtime. Filter, project, and transform Parquet files locally or in S3 with minimal latency and memory.
+
+## Quick Start
+
+### Download Binary
+
+```bash
+# Linux x86_64
+curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-linux-x86_64.tar.gz | tar -xz
+
+# Linux ARM64 (Graviton)
+curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-linux-arm64.tar.gz | tar -xz
+
+# macOS ARM64 (Apple Silicon)
+curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-macos-arm64.tar.gz | tar -xz
+
+# macOS x86_64
+curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-macos-x86_64.tar.gz | tar -xz
+```
+
+### CLI Usage
+
+```bash
+# View schema
+./zpq data.parquet --schema
+
+# View metadata (row groups, compression, etc.)
+./zpq data.parquet --meta
+
+# Filter rows and output to new file
+./zpq input.parquet output.parquet --filter "status=active"
+
+# Filter with column projection
+./zpq input.parquet output.parquet --filter "country=US" --select "id,name,email"
+
+# Works with S3 (requires AWS credentials in env)
+./zpq s3://bucket/input.parquet output.parquet --filter "year=2024"
+```
+
+### Environment Variables
+
+For S3 access:
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-west-2"
+
+# For non-AWS S3 (R2, MinIO, etc.)
+export S3_ENDPOINT="https://your-endpoint.com"
+```
+
+## AWS Lambda
+
+Deploy ZPQ as a Lambda function for serverless Parquet filtering.
+
+### Quick Deploy
+
+```bash
+# Download Lambda zip (ARM64 recommended for cost/performance)
+curl -fsSLO https://github.com/chicagobuss/zpq/releases/latest/download/zpq-lambda-arm64.zip
+
+# Create function
+aws lambda create-function \
+  --function-name zpq-filter \
+  --runtime provided.al2023 \
+  --handler bootstrap \
+  --architectures arm64 \
+  --memory-size 512 \
+  --timeout 120 \
+  --zip-file fileb://zpq-lambda-arm64.zip \
+  --role arn:aws:iam::YOUR_ACCOUNT:role/YOUR_ROLE
+```
+
+### Invoke
+
+```bash
+aws lambda invoke \
+  --function-name zpq-filter \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "input_path": "s3://source-bucket/data.parquet",
+    "output_path": "s3://dest-bucket/filtered.parquet",
+    "filter": "status=active",
+    "select": "id,name,created_at"
+  }' \
+  response.json
+```
+
+### Lambda Payload Schema
+
+```json
+{
+  "input_path": "s3://bucket/input.parquet",
+  "output_path": "s3://bucket/output.parquet",
+  "filter": "column=value",
+  "select": "col1,col2,col3"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `input_path` | Yes | S3 path to source Parquet file |
+| `output_path` | Yes | S3 path for filtered output |
+| `filter` | Yes | Filter expression (e.g., `status=active`, `year>=2020`) |
+| `select` | No | Comma-separated columns to include (default: all) |
+
+## Performance
+
+ZPQ is built for serverless - minimal cold start, low memory, fast execution.
+
+| Metric | ZPQ | PyArrow | Polars |
+|--------|-----|---------|--------|
+| S3 Cold Start | ~42ms | ~35ms | ~121ms |
+| Local Scan | 842 MB/s | 372 MB/s | 160 MB/s |
+| Lambda Binary | ~4 MB | ~50 MB | ~30 MB |
+
+## Build from Source
+
+Requires [Zig 0.16.x](https://ziglang.org/download/) (master branch).
+
+```bash
+git clone https://github.com/chicagobuss/zpq
+cd zpq
+
+# Fetch pre-built BoringSSL
+just fetch-deps
+
+# Build
+just build
+
+# Test
+just test
+
+# Binary at zig-out/bin/zpq
+```
 
 ## Design Philosophy
 
-ZPQ is built for scenarios where resource utilization and execution time are primary constraints.
-
 ### The Laziness Principle
 
-> **ZPQ preserves data in its most compact/encoded form as long as possible. Decoding, decompression, and re-encoding happen only at the boundaries where transformation is required.**
-
-This is ZPQ's foundational philosophy. Where conventional engines follow "decode everything → process → encode everything," ZPQ asks at every step: *"Can we avoid doing this work?"*
+> ZPQ preserves data in its most compact/encoded form as long as possible.
 
 | Operation | Conventional | ZPQ |
 |-----------|--------------|-----|
 | Column projection | Decode all, select some | Never read unselected columns |
 | Row filtering | Decode all, discard | Skip row groups via stats |
-| Pass-through columns | Decode → re-encode | Copy compressed bytes |
-| Dictionary data | Decode to strings | Keep encoded through pipeline |
+| Pass-through columns | Decode → re-encode | Copy compressed bytes verbatim |
 
-This principle enables ZPQ to be *dramatically* faster for common operations like "select 25 columns from 120" or "filter 1% of rows" - the exact workloads that dominate serverless data processing.
+This makes ZPQ dramatically faster for selective operations - the exact workloads that dominate serverless data processing.
 
-### Characteristics:
-- **Asynchronous I/O**: Utilizes a completion-based state machine for interleaved request execution on a single thread.
-- **Minimal Dependencies**: The S3, SigV4, and HTTP/1.1 protocols are implemented directly in Zig to eliminate dependencies on large, general-purpose SDKs.
-- **Resource Constraints**: Optimized for low memory overhead and minimal binary size to improve AWS Lambda cold-start times.
+### Architecture Highlights
 
-### Scope:
-- **Analytical Workloads**: Focuses on performance for common analytical query patterns rather than exhaustive Parquet feature parity.
-- **Read-Oriented**: Designed for scanning and extracting data; it is not a query engine or storage manager.
-- **Direct Implementation**: Does not wrap the AWS C++ or Rust SDKs; all protocol logic is implemented natively to ensure zero-copy performance.
+- **Native S3/SigV4**: No SDK dependencies, zero-copy where possible
+- **Async I/O**: Single-threaded completion-based state machine
+- **Static Binary**: ~4MB with TLS, no runtime dependencies
+- **Cross-Platform**: Linux (io_uring), macOS (kqueue), x86_64 & ARM64
 
-## Architectural Implementation
+## License
 
-The codebase does its best to adhere to the following internal standards:
-
-- **Protocol/Transport Separation**: Protocol logic (e.g., S3 request formatting) is decoupled from socket operations. This allows protocol verification against memory buffers without requiring network connectivity.
-- **Abstract I/O**: Business logic interacts with a `RandomAccessSource` interface. Platform-specific primitives (such as `io_uring` or `kqueue`) are isolated within transport implementations.
-- **Explicit Memory Management**: Performance-critical paths utilize unmanaged containers. All allocations are explicit, requiring the caller to manage resource lifecycles.
-- **Memory Pinning**: Resources with strict identity requirements, such as event loops and network buffers, are heap-allocated to ensure validity across asynchronous transitions.
-
-## Technical Philosophy
-
-ZPQ tries to balance emerging Zig 0.16.dev features with stable development practices to ensure performance without incurring excessive technical debt.
-
-### Supporting the Spirit of Zig 0.16
-While targeting the latest master branch, ZPQ prioritizes the architectural "spirit" of the upcoming standard library:
-- **Interface-First I/O**: Business logic is restricted to `std.Io` style interfaces. This ensures that the core engine remains decoupled from the specific event loop implementation.
-- **Unmanaged Containers**: We adopt the 0.16 pattern of unmanaged containers (`ArrayListUnmanaged`, etc.) to make memory allocation explicit and visible throughout the hot path.
-- **Composition over Inheritance**: Transport implementations are composed of independent parts (DNS, TCP, TLS) rather than hidden behind a monolithic client object.
-
-### Library Selection and the "Re-write" Rationale
-ZPQ is selective about external dependencies, favoring native re-writes for the core protocol stack to maintain performance and small binary sizes.
-
-**Curated Dependencies:**
-- **`libxev`**: A high-performance, cross-platform event loop abstraction. We use it to bridge the gap while Zig's `std.Io` event loop matures. It is isolated behind our internal abstractions for a future transition to native Zig async.
-- **`boring_tls`**: Provides secure transport via statically-linked BoringSSL. This is required for secure communication with S3.
-- **`libc`**: Required for system-level networking primitives and DNS resolution (via `getaddrinfo`).
-
-**Protocol Re-writes (S3, HTTP/1.1, SigV4):**
-These are implemented natively in ZPQ to avoid the significant overhead of general-purpose SDKs. This allows for specialized optimizations like zero-allocation gap skipping.
-
-## Testing and Verification
-
-ZPQ is tested for stability across several environments:
-
-- **Platform Support**: Verified on Linux (`io_uring`), macOS (`kqueue`).
-- **Architecture Support**: Native testing for x86_64 and ARM64.
-- **Component Isolation**: Critical components (DNS stack, TLS integration, HTTP state machine) are verified through independent micro-tests prior to integration.
-- **Memory Safety**: Validated with the Zig `GeneralPurposeAllocator` to confirm the absence of leaks and correct alignment during concurrent operations.
-- **Property-Based Verification**: We utilize `minish` for fuzzing and property-based testing. This allows us to verify invariants (e.g., "re-serializing a struct matches the original") and automatically shrink complex crash cases into minimal reproductions. This is particularly critical for the Thrift metadata parser and HTTP header handling.
-
-### Parquet Validation Suite
-
-ZPQ includes a multi-backend validation tool that compares output against reference implementations (DuckDB, PyArrow). This enables 3-way comparisons to catch correctness issues:
-
-```bash
-# Validate against default backend (DuckDB)
-just validate data/myfile.parquet
-
-# Validate all apache/parquet-testing files
-just validate-all
-
-# 3-way comparison: zpq vs duckdb vs pyarrow side-by-side
-just validate-compare data/myfile.parquet
-```
-
-Example 3-way comparison output:
-```
-Column: float_col (FLOAT)
---------------------------------------------------------------------------------
-  Row   zpq                           duckdb                        pyarrow
-  ----  ----------------------------  ----------------------------  ----------------------------
-  0     0                             0.0                           0.0
-  1     1.1                           1.100000023841858             1.100000023841858            !!!
-  2     0                             0.0                           0.0
-
-Column: timestamp_col (TIMESTAMP)
---------------------------------------------------------------------------------
-  Row   zpq                           duckdb                        pyarrow
-  ----  ----------------------------  ----------------------------  ----------------------------
-  0     1235865600 (JD=2454892...     2009-03-01 00:00:00           2009-03-01 00:00:00          !!!
-```
-
-The `!!!` markers highlight mismatches, making it easy to identify where zpq differs from reference implementations. This is invaluable for ensuring correctness across the 64+ test files in the Apache parquet-testing suite.
-
-## Performance
-
-ZPQ is designed to outperform general-purpose Parquet readers in cloud-native environments.
-
-### S3 Cold Start (MinIO TLS, Local)
-*Cold start comparison: fresh process, fresh TLS connection per run.*
-| Implementation | Avg Time (ms) | Speedup (vs Polars) | Notes |
-| :--- | :--- | :--- | :--- |
-| **ZPQ Async (Xev)** | **~42.3ms** | **~2.8x** | Achieving parity with PyArrow/boto3 without connection pooling. |
-| Python (PyArrow/boto3) | ~35.1ms | ~3.4x | Standard production baseline. |
-| Rust (Polars) | ~121.2ms | 1.0x | Rust Polars S3 path. |
-
-### Local File Scan (M3 Max)
-| Implementation | Throughput (File) | Throughput (Values) |
-| :--- | :--- | :--- |
-| **ZPQ (Zig)** | **~842 MB/s** | **~857 MVal/s** |
-| PyArrow (Python) | ~372 MB/s | N/A |
-| Rust (Arrow) | ~160 MB/s | N/A |
-
-## Getting Started
-### Environment Configuration
-ZPQ uses environment variables for AWS credentials and benchmarking configuration. To get started:
-1. Copy the example environment file: `cp .env.example .env`
-2. Edit `.env` with your specific details (AWS keys, test S3 paths, etc.).
-3. The `.env` file is ignored by git to keep your credentials safe.
-
-### Installation & Build
-```bash
-# Fetch pre-built dependencies
-just fetch-deps
-# Build the project
-just build
-# Run unit tests
-just test
-```
-
-## Documentation
-Additional technical detail is available in the following files:
-- `STATUS.md`: Project roadmap and milestone tracking.
-- `STATUS_CURRENT_DETAIL.md`: Technical implementation notes and lessons learned.
-- `docs/high_performance_io_plan.md`: Architectural design for the asynchronous I/O engine.
+MIT

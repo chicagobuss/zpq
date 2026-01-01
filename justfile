@@ -116,6 +116,39 @@ comprehensive: build gen-fixtures
 
 # === Lambda ===
 
+# Deploy Lambda from latest release (no build required)
+lambda-deploy-release fn="zpq-filter" arch="arm64" memory="512":
+    #!/usr/bin/env bash
+    set -e
+    echo "Downloading latest zpq-lambda-{{arch}}.zip..."
+    curl -fsSLO https://github.com/chicagobuss/zpq/releases/latest/download/zpq-lambda-{{arch}}.zip
+
+    if aws lambda get-function --function-name {{fn}} &>/dev/null; then
+        echo "Updating existing function {{fn}}..."
+        aws lambda update-function-code --function-name {{fn}} --zip-file fileb://zpq-lambda-{{arch}}.zip
+        aws lambda update-function-configuration --function-name {{fn}} --memory-size {{memory}}
+    else
+        echo "Creating new function {{fn}}..."
+        echo "Note: You need to set LAMBDA_ROLE env var or create the function manually"
+        if [ -z "$LAMBDA_ROLE" ]; then
+            echo "Error: LAMBDA_ROLE environment variable not set"
+            echo "Set it to your Lambda execution role ARN, e.g.:"
+            echo "  export LAMBDA_ROLE=arn:aws:iam::123456789:role/lambda-execution-role"
+            exit 1
+        fi
+        aws lambda create-function \
+            --function-name {{fn}} \
+            --runtime provided.al2023 \
+            --handler bootstrap \
+            --architectures {{arch}} \
+            --memory-size {{memory}} \
+            --timeout 120 \
+            --zip-file fileb://zpq-lambda-{{arch}}.zip \
+            --role "$LAMBDA_ROLE"
+    fi
+    rm zpq-lambda-{{arch}}.zip
+    echo "Done! Invoke with: just lambda-invoke {{fn}} '{...}'"
+
 # Build Lambda for AWS (arch: arm64 or x86_64)
 lambda-build name="lambda-05-filter-s3" arch="arm64":
     @./tools/lambda.sh build {{name}} {{arch}}

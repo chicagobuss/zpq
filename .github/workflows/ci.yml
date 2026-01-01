@@ -210,3 +210,10 @@ jobs:
           ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_1mb.parquet" --async
           ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_10mb.parquet" --async
           ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_100mb.parquet" --async
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zpq-${{ matrix.name }}
+          path: zig-out/bin/zpq
+          retention-days: 7

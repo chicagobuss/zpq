@@ -50,21 +50,36 @@ This builds only the probe and its dependencies, not the entire zpq CLI.
 
 | Probe | Purpose | Created |
 |-------|---------|---------|
-| `probe_conn_reuse` | Verify connection pool reuse within XevS3Source lifetime | Dec 2024 |
-| `probe_conn_cost` | Measure TLS handshake vs transfer time tradeoffs | Dec 2024 |
-| `probe_pool_cleanup` | Test XevConnectionPool cleanup sequence | Dec 2024 |
 | `probe_async_dns` | Understanding xev ThreadPool + async DNS resolution pattern | Dec 2024 |
+| `probe_batch_reuse` | Testing batch connection reuse patterns | Dec 2024 |
+| `probe_conn_cost` | Measure TLS handshake vs transfer time tradeoffs | Dec 2024 |
+| `probe_conn_reuse` | Verify connection pool reuse within XevS3Source lifetime | Dec 2024 |
+| `probe_dns_xev` | xev-based DNS resolution testing | Dec 2024 |
 | `probe_fast_feedback` | Quick zpq DNS integration sanity check | Dec 2024 |
 | `probe_multi_conn` | Debugging S3 connection concurrency - isolating hang in connection vs dispatch | Dec 2024 |
-| `probe_s3_head_hang` | Diagnosing async S3 HEAD request hangs on large files | Dec 2024 |
+| `probe_parallel_upload` | Testing parallel PUT uploads for S3 multipart | Dec 2024 |
+| `probe_parallel_write` | Understanding parallel TLS writes with xev | Dec 2024 |
+| `probe_pool_cleanup` | Test XevConnectionPool cleanup sequence | Dec 2024 |
+| `probe_s3_writer` | S3Writer integration with local rustfs | Dec 2024 |
 | `probe_sf_crash` | Investigating SingleFlightResolver crash scenarios | Dec 2024 |
-| `probe_tls_echo` | Understanding zpq Connection + TLS handshake pattern | Dec 2024 |
 | `probe_tls_pump` | Low-level boring_tls integration without zpq abstractions | Dec 2024 |
-| `probe_xev_tcp_lifecycle` | Learning xev TCP socket lifecycle and completion handling | Dec 2024 |
+| `probe_traced_upload` | Heavily instrumented TLS upload tracing | Dec 2024 |
+| `probe_write_roundtrip` | Write → read roundtrip verification | Dec 2024 |
 | `probe_xev_s3_head` | XevS3Source HEAD request verification | Dec 2024 |
-| `verify_minish_context` | Verifying minish fuzzer context/allocator patterns | Dec 2024 |
-| `shootout_tls_throughput` | Micro-shootout comparing TLS decryption strategies | Dec 2024 |
+| `probe_xev_tcp_lifecycle` | Learning xev TCP socket lifecycle and completion handling | Dec 2024 |
 | `bench_skip_breakdown` | Time breakdown for filtered scans (outputs JSON trace) | Dec 2024 |
+| `shootout_tls_throughput` | Micro-shootout comparing TLS decryption strategies | Dec 2024 |
+| `verify_minish_context` | Verifying minish fuzzer context/allocator patterns | Dec 2024 |
+
+## RIE (Runtime Interface Emulator)
+
+The `rie/` subdirectory contains a minimal Lambda Runtime Interface Emulator for local testing:
+
+```bash
+cd probes/rie
+zig build
+./zig-out/bin/rie
+```
 
 ## Python Probes
 

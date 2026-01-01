@@ -2,8 +2,9 @@
 # Test Lambda locally with RIE
 #
 # Usage:
-#   ./tools/serverless/test-local.sh              # Test with R2
+#   ./tools/serverless/test-local.sh              # Use latest release, test with R2
 #   ./tools/serverless/test-local.sh --local      # Test with local rustfs
+#   ./tools/serverless/test-local.sh --build      # Build from source instead of downloading
 #   ./tools/serverless/test-local.sh --invoke     # Just invoke (container already running)
 
 set -e
@@ -12,18 +13,35 @@ cd "$(dirname "$0")/../.."
 
 MODE="r2"
 INVOKE_ONLY=false
+BUILD_FROM_SOURCE=false
 
 for arg in "$@"; do
     case $arg in
         --local) MODE="local" ;;
         --invoke) INVOKE_ONLY=true ;;
+        --build) BUILD_FROM_SOURCE=true ;;
     esac
 done
 
-# Build the Lambda binary
+# Get the Lambda binary
 if [ "$INVOKE_ONLY" = false ]; then
-    echo "=== Building zpq for Lambda (aarch64-linux) ==="
-    ./tools/serverless/aws.sh build arm64
+    mkdir -p zig-out/bin
+
+    if [ "$BUILD_FROM_SOURCE" = true ]; then
+        echo "=== Building zpq for Lambda (aarch64-linux) ==="
+        ./tools/serverless/aws.sh build arm64
+    else
+        echo "=== Downloading latest zpq release (aarch64-linux) ==="
+        LATEST=$(curl -fsSL "https://api.github.com/repos/chicagobuss/zpq/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+        if [ -z "$LATEST" ]; then
+            echo "Failed to get latest release, falling back to build from source"
+            ./tools/serverless/aws.sh build arm64
+        else
+            echo "Downloading $LATEST..."
+            curl -fsSL "https://github.com/chicagobuss/zpq/releases/download/$LATEST/zpq-linux-arm64.tar.gz" | tar -xz -C zig-out/bin/
+            echo "Downloaded zpq $LATEST"
+        fi
+    fi
 
     echo ""
     echo "=== Starting container ($MODE mode) ==="

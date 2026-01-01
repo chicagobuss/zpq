@@ -66,6 +66,23 @@ This builds only the probe and its dependencies, not the entire zpq CLI.
 | `shootout_tls_throughput` | Micro-shootout comparing TLS decryption strategies | Dec 2024 |
 | `bench_skip_breakdown` | Time breakdown for filtered scans (outputs JSON trace) | Dec 2024 |
 
+## Python Probes
+
+Rapid prototyping probes for testing theories before implementing in Zig:
+
+| Probe | Purpose | Created |
+|-------|---------|---------|
+| `python/test_slot_padding.py` | Proves padding between row groups is tolerated by Parquet readers | Dec 2024 |
+| `python/test_footer_reconstruction.py` | Tests footer offset requirements and manipulation | Dec 2024 |
+| `python/test_full_slot_assembly.py` | Full proof of slot-based parallel write approach | Dec 2024 |
+| `python/test_slot_writer_e2e.py` | End-to-end SlotWriter verification with pyarrow | Dec 2024 |
+
+Key findings from Python probes:
+- **Padding tolerance CONFIRMED**: PyArrow reads files with zeros between row groups
+- **Footer offsets MUST be accurate**: Can't guess, but CAN pre-compute with slots
+- **pwrite() parallelism works**: File integrity maintained with concurrent slot writes
+- **S3 ETags are predictable**: `MD5(MD5(part1)||MD5(part2)||...)-N` formula confirmed
+
 ## eBPF Probes
 
 For kernel-level tracing (requires root):

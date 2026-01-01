@@ -31,6 +31,7 @@ pub const core = struct {
     pub const selected_reader = @import("zpq/core/selected_reader.zig");
     pub const row_group_worker = @import("zpq/core/row_group_worker.zig");
     pub const slot_writer = @import("zpq/core/slot_writer.zig");
+    pub const pipeline = @import("zpq/core/pipeline.zig");
 };
 
 /// Performance tracing - minimal overhead metrics collection

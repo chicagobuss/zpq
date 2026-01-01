@@ -21,8 +21,16 @@ jobs:
         include:
           - name: linux-arm64
             runs-on: [self-hosted, Linux, ARM64, zpq-arm]
+            target: aarch64-linux
           - name: linux-x86_64
             runs-on: ubuntu-latest
+            target: x86_64-linux
+          - name: macos-arm64
+            runs-on: macos-latest
+            target: aarch64-macos
+          - name: macos-x86_64
+            runs-on: macos-latest
+            target: x86_64-macos
 
     steps:
       - uses: actions/checkout@v4
@@ -31,13 +39,13 @@ jobs:
         run: |
           echo "::group::Installing anyzig"
           ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ]; then
-            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz"
-          elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-aarch64-linux.tar.gz"
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
+
+          if [ "$OS" = "darwin" ]; then
+            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ARCH}-macos.tar.gz"
           else
-            echo "Unsupported architecture: $ARCH"
-            exit 1
+            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ARCH}-linux.tar.gz"
           fi
 
           # Install to workspace to avoid polluting self-hosted runner
@@ -71,21 +79,9 @@ jobs:
         id: fetch-deps
         run: |
           echo "::group::Fetching pre-built BoringSSL libraries from Cloudflare R2"
-          # Determine target triple for this runner
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ]; then
-            TARGET="x86_64-linux"
-          elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-            TARGET="aarch64-linux"
-          else
-            echo "Unknown architecture: $ARCH, will build from source"
-            echo "TARGET=$ARCH-unknown" >> $GITHUB_OUTPUT
-            echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
-            echo "::endgroup::"
-            exit 0
-          fi
+          TARGET="${{ matrix.target }}"
           echo "TARGET=$TARGET" >> $GITHUB_OUTPUT
-          echo "Detected target: $TARGET"
+          echo "Target: $TARGET"
 
           # Fetch from Cloudflare R2 (public, no auth needed)
           R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${TARGET}"
@@ -97,16 +93,23 @@ jobs:
           curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" || true
 
           # Verify downloads (check file size > 1KB to ensure not error page)
+          # Use stat -f%z on macOS, stat -c%s on Linux
           if [ -f "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" ] && \
-             [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ] && \
-             [ $(stat -c%s "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || echo 0) -gt 1000 ]; then
-            echo "Successfully fetched pre-built dependencies from R2"
-            echo "CACHE_HIT=true" >> $GITHUB_OUTPUT
-            ls -la vendor/boring_tls/prebuilt/${TARGET}/
+             [ -f "vendor/boring_tls/prebuilt/${TARGET}/libssl.a" ]; then
+            SIZE=$(stat -f%z "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || \
+                   stat -c%s "vendor/boring_tls/prebuilt/${TARGET}/libcrypto.a" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 1000 ]; then
+              echo "Successfully fetched pre-built dependencies from R2"
+              echo "CACHE_HIT=true" >> $GITHUB_OUTPUT
+              ls -la vendor/boring_tls/prebuilt/${TARGET}/
+            else
+              echo "Pre-built deps not available on R2, will build from source (~3 min)"
+              echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
+              rm -f vendor/boring_tls/prebuilt/${TARGET}/*.a 2>/dev/null || true
+            fi
           else
             echo "Pre-built deps not available on R2, will build from source (~3 min)"
             echo "CACHE_HIT=false" >> $GITHUB_OUTPUT
-            rm -f vendor/boring_tls/prebuilt/${TARGET}/*.a 2>/dev/null || true
           fi
           echo "::endgroup::"
 
@@ -125,13 +128,13 @@ jobs:
 
       # Laziness Principle: if we built from source, upload to R2 so next run is faster
       - name: Upload Built Dependencies to R2
-        if: steps.fetch-deps.outputs.CACHE_HIT == 'false' && steps.fetch-deps.outputs.TARGET != ''
+        if: steps.fetch-deps.outputs.CACHE_HIT == 'false'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
-          TARGET="${{ steps.fetch-deps.outputs.TARGET }}"
+          TARGET="${{ matrix.target }}"
           echo "::group::Uploading built BoringSSL to R2 for $TARGET"
 
           # Find built libraries in zig-cache (hash varies per build)
@@ -187,6 +190,7 @@ jobs:
           echo "All verifications passed!"
 
       - name: Run R2 Benchmarks
+        if: startsWith(matrix.target, 'aarch64-linux') || startsWith(matrix.target, 'x86_64-linux')
         env:
           S3_ENDPOINT: ${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -214,6 +218,6 @@ jobs:
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zpq-${{ matrix.name }}
+          name: zpq-${{ matrix.target }}
           path: zig-out/bin/zpq
           retention-days: 7

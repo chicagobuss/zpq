@@ -25,19 +25,19 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-linux
             artifact: zpq-linux-x86_64
-            ci_artifact: zpq-linux-x86_64
+            ci_artifact: zpq-x86_64-linux
           - os: [self-hosted, Linux, ARM64, zpq-arm]
             target: aarch64-linux
             artifact: zpq-linux-arm64
-            ci_artifact: zpq-linux-arm64
+            ci_artifact: zpq-aarch64-linux
           - os: macos-latest
             target: x86_64-macos
             artifact: zpq-macos-x86_64
-            ci_artifact: ""
+            ci_artifact: zpq-x86_64-macos
           - os: macos-latest
             target: aarch64-macos
             artifact: zpq-macos-arm64
-            ci_artifact: ""
+            ci_artifact: zpq-aarch64-macos
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +45,6 @@ jobs:
       # Try to download pre-built binary from CI (faster path)
       - name: Try CI Artifact
         id: ci-artifact
-        if: matrix.ci_artifact != ''
         uses: dawidd6/action-download-artifact@v3
         continue-on-error: true
         with:

@@ -23,6 +23,6 @@ BUCKET=$(echo "$PREFIX" | sed 's|s3://||' | cut -d/ -f1)
 for KEY in $FILES; do
     S3_PATH="s3://$BUCKET/$KEY"
     echo "--- $S3_PATH ---"
-    ./zig-out/bin/zpq scan "$S3_PATH"
+    ./zig-out/bin/zpq "$S3_PATH" --schema
     echo ""
 done

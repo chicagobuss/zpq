@@ -2,9 +2,9 @@
 # Query Parquet files in Cloudflare R2 with zpq
 #
 # Usage:
-#   ./examples/r2-query.sh schema s3://zpq/testdata/benchmark/benchmark_1mb.parquet
-#   ./examples/r2-query.sh cat s3://zpq/testdata/benchmark/benchmark_1mb.parquet
-#   ./examples/r2-query.sh inspect s3://zpq/testdata/benchmark/benchmark_1mb.parquet
+#   ./examples/r2-query.sh s3://zpq/testdata/benchmark/benchmark_1mb.parquet --schema
+#   ./examples/r2-query.sh s3://zpq/testdata/benchmark/benchmark_1mb.parquet --meta
+#   ./examples/r2-query.sh s3://zpq/testdata/benchmark/benchmark_1mb.parquet output.parquet --filter "category=A"
 #
 # Environment:
 #   Requires .env file with R2 credentials:
@@ -38,10 +38,6 @@ export AWS_REGION="auto"
 export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
 export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 
-# Default command and path
-CMD="${1:-schema}"
-PATH_ARG="${2:-s3://zpq/testdata/benchmark/benchmark_1mb.parquet}"
-
 # Find zpq binary
 ZPQ="zig-out/bin/zpq"
 if [ ! -x "$ZPQ" ]; then
@@ -49,8 +45,17 @@ if [ ! -x "$ZPQ" ]; then
     zig build -Doptimize=ReleaseFast
 fi
 
-echo "Querying: $PATH_ARG"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <s3-path> [output] [options]"
+    echo ""
+    echo "Examples:"
+    echo "  $0 s3://zpq/testdata/benchmark/benchmark_1mb.parquet --schema"
+    echo "  $0 s3://zpq/testdata/benchmark/benchmark_1mb.parquet --meta"
+    echo "  $0 s3://zpq/testdata/benchmark/benchmark_1mb.parquet out.parquet --filter 'category=A'"
+    exit 1
+fi
+
 echo "Endpoint: $S3_ENDPOINT"
 echo ""
 
-exec "$ZPQ" "$CMD" "$PATH_ARG"
+exec "$ZPQ" "$@"

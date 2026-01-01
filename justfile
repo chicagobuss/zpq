@@ -149,84 +149,47 @@ lambda-deploy-release fn="zpq-filter" arch="arm64" memory="512":
     rm zpq-lambda-{{arch}}.zip
     echo "Done! Invoke with: just lambda-invoke {{fn}} '{...}'"
 
-# Build Lambda for AWS (arch: arm64 or x86_64)
-lambda-build name="lambda-05-filter-s3" arch="arm64":
-    @./tools/lambda.sh build {{name}} {{arch}}
+# Build Lambda zip (arch: arm64 or x86_64)
+lambda-build arch="arm64":
+    @./tools/serverless/aws.sh build {{arch}}
 
 # Deploy Lambda to AWS
 lambda-deploy fn zip arch="arm64" memory="512":
-    @./tools/lambda.sh deploy {{fn}} {{zip}} {{arch}} {{memory}}
+    @./tools/serverless/aws.sh deploy {{fn}} {{zip}} {{arch}} {{memory}}
 
 # Build and deploy Lambda in one step
-lambda-ship name="lambda-05-filter-s3" fn="zpq-filter-s3" arch="arm64" memory="1769":
+lambda-ship fn="zpq-filter" arch="arm64" memory="1769":
     #!/usr/bin/env bash
-    zip=$(./tools/lambda.sh build {{name}} {{arch}})
-    ./tools/lambda.sh deploy {{fn}} "$zip" {{arch}} {{memory}}
+    zip=$(./tools/serverless/aws.sh build {{arch}})
+    ./tools/serverless/aws.sh deploy {{fn}} "$zip" {{arch}} {{memory}}
 
 # Invoke Lambda with JSON payload
 lambda-invoke fn payload:
-    @./tools/lambda.sh invoke {{fn}} '{{payload}}'
+    @./tools/serverless/aws.sh invoke {{fn}} '{{payload}}'
 
 # Get Lambda logs
 lambda-logs fn:
-    @./tools/lambda.sh logs {{fn}}
+    @./tools/serverless/aws.sh logs {{fn}}
 
 # Get Lambda metrics (duration, memory, throughput)
 lambda-metrics fn:
-    @./tools/lambda.sh metrics {{fn}}
+    @./tools/serverless/aws.sh metrics {{fn}}
 
 # Run benchmark matrix (arm64/x86_64 x 512MB/1769MB)
 lambda-bench-matrix payload:
-    @./tools/lambda.sh bench-matrix lambda-05-filter-s3 '{{payload}}'
+    @./tools/serverless/aws.sh bench-matrix '{{payload}}'
 
 # List ZPQ Lambda functions
 lambda-list:
-    @./tools/lambda.sh list zpq
+    @./tools/serverless/aws.sh list zpq
 
-# Quick benchmark: build ARM64, deploy at 1769MB, invoke, show metrics
-lambda-quick fn="zpq-filter-s3" payload='{"input_path": "s3://skyway-staging-perf-test/zpq_test_data/benchmark_100mb.parquet", "output_path": "s3://skyway-staging-perf-test/zpq_test_data/output/quick_test.parquet", "filter_column": "line_item_product_code", "filter_value": "AmazonEC2"}':
-    #!/usr/bin/env bash
-    set -e
-    zip=$(./tools/lambda.sh build lambda-05-filter-s3 arm64)
-    ./tools/lambda.sh deploy {{fn}} "$zip" arm64 1769
-    echo ""
-    echo "Invoking..."
-    ./tools/lambda.sh invoke {{fn}} '{{payload}}'
-    echo ""
-    sleep 2
-    echo "Metrics:"
-    ./tools/lambda.sh metrics {{fn}}
+# Test Lambda locally with RIE
+lambda-local:
+    @./tools/serverless/test-local.sh
 
-# Build and run the minimal Hello World Lambda locally
-lambda-01:
-    @echo "Building Lambda 01-minimal..."
-    zig build example-lambda-01-minimal -Dexamples -Dtarget=native
-    @echo "Starting Lambda RIE..."
-    @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{}'"
-    # Mocking AWS_LAMBDA_RUNTIME_API for local RIE (using 8080)
-    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-01-minimal/bootstrap
-
-# Build and run the DNS warming Lambda locally
-lambda-02:
-    @echo "Building Lambda 02-dns-warming..."
-    zig build example-lambda-02-dns-warming -Dexamples -Dtarget=native
-    @echo "Starting Lambda RIE..."
-    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-02-dns-warming/bootstrap
-
-# Build and run the S3 warming Lambda locally
-lambda-03:
-    @echo "Building Lambda 03-warm-s3..."
-    zig build example-lambda-03-warm-s3 -Dexamples -Dtarget=native
-    @echo "Starting Lambda RIE..."
-    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-03-warm-s3/bootstrap
-
-# Build and run the Parquet scan benchmark Lambda locally
-lambda-04:
-    @echo "Building Lambda 04-scan-benchmark..."
-    zig build example-lambda-04-scan-benchmark -Dexamples -Dtarget=native
-    @echo "Starting Lambda RIE..."
-    @echo "To test: curl -XPOST \"http://localhost:8080/2015-03-31/functions/function/invocations\" -d '{\"file\": \"s3://bucket/path.parquet\"}'"
-    AWS_LAMBDA_RUNTIME_API=localhost:8080 ./zig-out/lambda/lambda-04-scan-benchmark/bootstrap
+# Test Lambda locally with RIE (invoke only, container already running)
+lambda-local-invoke:
+    @./tools/serverless/test-local.sh --invoke
 
 # Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
 bench +args:
@@ -378,14 +341,5 @@ validate-compare *args:
 remote-bench:
     ./tools/remote_bench.sh
 
-# Build AWS Lambda Zip
-build-lambda:
-    zig build build-lambda
-    cd zig-out/lambda && zip lambda_function.zip bootstrap
-
-build-lambda-bench:
-    zig build build-lambda-bench
-
 bench-sweep:
     ./tools/bench_memory_sweep.sh
-    @echo "Created zig-out/lambda/lambda_function.zip"

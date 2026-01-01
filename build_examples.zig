@@ -9,51 +9,16 @@ pub fn addExamples(
     boring_tls_mod: *std.Build.Module,
     install_examples: bool,
 ) void {
+    _ = libxev_mod;
+    _ = boring_tls_mod;
+    _ = install_examples;
+
     // Always add the Arrow shared library (for Python integration)
     addArrowLib(b, zpq_mod, target, optimize);
 
-    if (!install_examples) return;
-
-    const examples = [_]struct {
-        name: []const u8,
-        path: []const u8,
-        needs_zpq: bool,
-    }{
-        .{ .name = "lambda-01-minimal", .path = "examples/lambda/01-minimal/main.zig", .needs_zpq = false },
-        .{ .name = "lambda-02-dns-warming", .path = "examples/lambda/02-dns-warming/main.zig", .needs_zpq = true },
-        .{ .name = "lambda-03-warm-s3", .path = "examples/lambda/03-warm-s3/main.zig", .needs_zpq = true },
-        .{ .name = "lambda-04-scan-benchmark", .path = "examples/lambda/04-scan-benchmark/main.zig", .needs_zpq = true },
-        .{ .name = "lambda-05-filter-s3", .path = "examples/lambda/05-filter-s3/main.zig", .needs_zpq = true },
-    };
-
-    for (examples) |example| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(example.path),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        if (example.needs_zpq) {
-            mod.addImport("zpq", zpq_mod);
-            mod.addImport("xev", libxev_mod);
-            mod.addImport("boring_tls", boring_tls_mod);
-        }
-
-        const exe = b.addExecutable(.{
-            .name = "bootstrap",
-            .root_module = mod,
-        });
-        exe.root_module.linkSystemLibrary("c", .{});
-
-        // Install to zig-out/lambda/{example_name}/bootstrap
-        const install = b.addInstallArtifact(exe, .{
-            .dest_dir = .{ .override = .{ .custom = b.fmt("lambda/{s}", .{example.name}) } },
-        });
-
-        const step_name = b.fmt("example-{s}", .{example.name});
-        const step = b.step(step_name, b.fmt("Build {s} example", .{example.name}));
-        step.dependOn(&install.step);
-    }
+    // Note: Lambda examples have been removed. The zpq binary itself
+    // can be used directly as a Lambda bootstrap - just rename to 'bootstrap'
+    // and zip. See examples/serverless/README.md for details.
 }
 
 /// Build libzpq_arrow shared library for Python/ctypes integration

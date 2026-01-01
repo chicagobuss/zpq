@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/lambda.sh
+# tools/serverless/aws.sh
 # Helper script for AWS Lambda operations with ZPQ.
 # Requires: AWS CLI configured, .env with credentials (optional)
 
@@ -26,11 +26,10 @@ load_env() {
 }
 
 # --- Build Lambda ---
-# Usage: build <example-name> <arch>
-# Example: build lambda-05-filter-s3 arm64
+# Usage: build <arch>
+# Builds zpq for the target arch and packages as Lambda zip
 build() {
-    local name="${1:-lambda-05-filter-s3}"
-    local arch="${2:-arm64}"
+    local arch="${1:-arm64}"
 
     local target
     case "$arch" in
@@ -39,23 +38,26 @@ build() {
         *) error "Unknown arch: $arch (use arm64 or x86_64)"; exit 1 ;;
     esac
 
-    info "Building $name for $target..."
-    zig build "example-$name" -Dexamples=true -Dtarget="$target" -Doptimize=ReleaseFast
+    info "Building zpq for $target..."
+    zig build -Dtarget="$target" -Doptimize=ReleaseFast
 
-    local bootstrap="zig-out/lambda/$name/bootstrap"
-    if [[ ! -f "$bootstrap" ]]; then
-        error "Build failed - no bootstrap at $bootstrap"
+    local zpq_bin="zig-out/bin/zpq"
+    if [[ ! -f "$zpq_bin" ]]; then
+        error "Build failed - no zpq at $zpq_bin"
         exit 1
     fi
 
     # Verify architecture
     local file_arch
-    file_arch=$(file "$bootstrap" | grep -oE "x86-64|aarch64|ARM")
-    info "Built: $file_arch binary ($(du -h "$bootstrap" | cut -f1))"
+    file_arch=$(file "$zpq_bin" 2>/dev/null | grep -oE "x86-64|aarch64|ARM" || echo "unknown")
+    info "Built: $file_arch binary ($(du -h "$zpq_bin" | cut -f1))"
 
-    # Create zip
-    local zip_path="zig-out/lambda/$name-$arch.zip"
-    (cd "zig-out/lambda/$name" && zip -j "../$name-$arch.zip" bootstrap)
+    # Create Lambda zip (zpq renamed to bootstrap)
+    local zip_dir="zig-out/lambda"
+    local zip_path="$zip_dir/zpq-lambda-$arch.zip"
+    mkdir -p "$zip_dir"
+    cp "$zpq_bin" "$zip_dir/bootstrap"
+    (cd "$zip_dir" && zip -j "zpq-lambda-$arch.zip" bootstrap && rm bootstrap)
     success "Created $zip_path ($(du -h "$zip_path" | cut -f1))"
 
     echo "$zip_path"
@@ -192,19 +194,18 @@ metrics() {
 }
 
 # --- Benchmark Matrix ---
-# Usage: bench-matrix <example-name> <payload-json>
+# Usage: bench-matrix <payload-json>
 # Runs all 4 combinations: arm64/x86_64 x 512MB/1769MB
 bench_matrix() {
-    local name="${1:-lambda-05-filter-s3}"
-    local payload="$2"
-    local region="${3:-$DEFAULT_REGION}"
+    local payload="$1"
+    local region="${2:-$DEFAULT_REGION}"
 
     load_env
 
     info "Building both architectures..."
     local arm_zip x86_zip
-    arm_zip=$(build "$name" arm64)
-    x86_zip=$(build "$name" x86_64)
+    arm_zip=$(build arm64)
+    x86_zip=$(build x86_64)
 
     local configs=(
         "arm-512:arm64:512:$arm_zip"
@@ -279,26 +280,26 @@ delete() {
 # --- Help ---
 usage() {
     cat <<EOF
-ZPQ Lambda Helper
+ZPQ AWS Lambda Helper
 
 Usage: $0 <command> [args...]
 
 Commands:
-  build <name> <arch>           Build Lambda zip (arch: arm64|x86_64)
+  build <arch>                  Build zpq and package as Lambda zip (arch: arm64|x86_64)
   deploy <fn> <zip> <arch> [mem] [region]  Deploy/update Lambda
   invoke <fn> <payload> [region]  Invoke Lambda with JSON payload
   logs <fn> [region]            Get latest logs for Lambda
   metrics <fn> [region]         Get key metrics (duration, memory, etc.)
-  bench-matrix <name> <payload>  Run benchmark across all arch/memory combos
+  bench-matrix <payload>        Run benchmark across all arch/memory combos
   list [prefix] [region]        List Lambda functions
   delete <fn> [region]          Delete Lambda function
 
 Examples:
-  $0 build lambda-05-filter-s3 arm64
-  $0 deploy zpq-test zig-out/lambda/lambda-05-filter-s3-arm64.zip arm64 1769
-  $0 invoke zpq-test '{"input_path": "s3://bucket/file.parquet", ...}'
-  $0 metrics zpq-test
-  $0 bench-matrix lambda-05-filter-s3 '{"input_path": "s3://...", "output_path": "s3://...", "filter_column": "col", "filter_value": "val"}'
+  $0 build arm64
+  $0 deploy zpq-filter zig-out/lambda/zpq-lambda-arm64.zip arm64 1769
+  $0 invoke zpq-filter '{"file": "s3://bucket/file.parquet"}'
+  $0 metrics zpq-filter
+  $0 bench-matrix '{"file": "s3://bucket/file.parquet"}'
 
 Environment:
   AWS_REGION          Default region (default: us-west-2)

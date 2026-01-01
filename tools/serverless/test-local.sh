@@ -2,9 +2,9 @@
 # Test Lambda locally with RIE
 #
 # Usage:
-#   ./tools/lambda/test-local.sh              # Test with R2
-#   ./tools/lambda/test-local.sh --local      # Test with local rustfs
-#   ./tools/lambda/test-local.sh --invoke     # Just invoke (container already running)
+#   ./tools/serverless/test-local.sh              # Test with R2
+#   ./tools/serverless/test-local.sh --local      # Test with local rustfs
+#   ./tools/serverless/test-local.sh --invoke     # Just invoke (container already running)
 
 set -e
 
@@ -22,14 +22,14 @@ done
 
 # Build the Lambda binary
 if [ "$INVOKE_ONLY" = false ]; then
-    echo "=== Building Lambda binary (aarch64-linux) ==="
-    zig build example-lambda-04-scan-benchmark -Dexamples -Dtarget=aarch64-linux -Doptimize=ReleaseFast
+    echo "=== Building zpq for Lambda (aarch64-linux) ==="
+    ./tools/serverless/aws.sh build arm64
 
     echo ""
     echo "=== Starting container ($MODE mode) ==="
 
     if [ "$MODE" = "local" ]; then
-        cd tools/lambda
+        cd tools/serverless
         docker-compose --profile local up --build -d
     else
         # Source .env and export R2 vars for docker-compose
@@ -39,7 +39,7 @@ if [ "$INVOKE_ONLY" = false ]; then
         export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
         export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
 
-        cd tools/lambda
+        cd tools/serverless
         docker-compose up --build -d
     fi
 
@@ -68,5 +68,5 @@ curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations"
 echo ""
 echo "=== Done ==="
 echo ""
-echo "To stop: cd tools/lambda && docker-compose down"
-echo "To view logs: cd tools/lambda && docker-compose logs -f"
+echo "To stop: cd tools/serverless && docker-compose down"
+echo "To view logs: cd tools/serverless && docker-compose logs -f"

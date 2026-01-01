@@ -8,9 +8,9 @@
 
 FROM public.ecr.aws/lambda/provided:al2023-arm64
 
-# Copy pre-built bootstrap binary
-# Build with: zig build example-lambda-04-scan-benchmark -Dexamples -Dtarget=aarch64-linux -Doptimize=ReleaseFast
-COPY zig-out/lambda/lambda-04-scan-benchmark/bootstrap ${LAMBDA_RUNTIME_DIR}/bootstrap
+# Copy pre-built zpq binary as bootstrap
+# Build with: ./tools/serverless/aws.sh build arm64
+COPY zig-out/bin/zpq ${LAMBDA_RUNTIME_DIR}/bootstrap
 
 RUN chmod +x ${LAMBDA_RUNTIME_DIR}/bootstrap
 

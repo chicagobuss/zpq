@@ -22,16 +22,20 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-linux
             artifact: zpq-linux-x86_64
+            lambda_arch: x86_64
           - os: [self-hosted, Linux, ARM64, zpq-arm]
             target: aarch64-linux
             artifact: zpq-linux-arm64
+            lambda_arch: arm64
           # macOS builds (for local dev)
           - os: macos-latest
             target: x86_64-macos
             artifact: zpq-macos-x86_64
+            lambda_arch: ""
           - os: macos-latest
             target: aarch64-macos
             artifact: zpq-macos-arm64
+            lambda_arch: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +74,7 @@ jobs:
           ls -la zig-out/bin/
           file zig-out/bin/zpq || true
 
-      - name: Package
+      - name: Package CLI
         run: |
           mkdir -p dist
           cp zig-out/bin/zpq dist/
@@ -78,71 +82,32 @@ jobs:
           tar -czvf ${{ matrix.artifact }}.tar.gz zpq
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - name: Upload artifact
+      - name: Package Lambda
+        if: matrix.lambda_arch != ''
+        run: |
+          # Rename zpq to bootstrap and zip for Lambda
+          cp zig-out/bin/zpq dist/bootstrap
+          cd dist
+          zip zpq-lambda-${{ matrix.lambda_arch }}.zip bootstrap
+          shasum -a 256 zpq-lambda-${{ matrix.lambda_arch }}.zip > zpq-lambda-${{ matrix.lambda_arch }}.zip.sha256
+          rm bootstrap
+
+      - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}.tar.gz*
 
-  build-lambda:
-    name: Build Lambda ${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: [self-hosted, Linux, ARM64, zpq-arm]
-            arch: arm64
-            target: aarch64-linux
-          - os: ubuntu-latest
-            arch: x86_64
-            target: x86_64-linux
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up anyzig
-        run: |
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
-          URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ARCH}-linux.tar.gz"
-
-          mkdir -p $HOME/zig-bin
-          curl -fsSL "$URL" | tar -xz -C $HOME/zig-bin
-          echo "$HOME/zig-bin" >> $GITHUB_PATH
-
-      - name: Fetch Pre-built BoringSSL
-        run: |
-          R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${{ matrix.target }}"
-          mkdir -p vendor/boring_tls/prebuilt/${{ matrix.target }}
-
-          curl -fsSL "${R2_URL}/libcrypto.a" -o "vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a"
-          curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a"
-
-      - name: Build Lambda
-        run: |
-          zig build example-lambda-05-filter-s3 -Dexamples=true -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
-
-          ls -la zig-out/lambda/lambda-05-filter-s3/
-          file zig-out/lambda/lambda-05-filter-s3/bootstrap || true
-
-      - name: Package Lambda
-        run: |
-          mkdir -p dist
-          cd zig-out/lambda/lambda-05-filter-s3
-          zip -j ../../../dist/zpq-lambda-${{ matrix.arch }}.zip bootstrap
-          cd ../../../dist
-          shasum -a 256 zpq-lambda-${{ matrix.arch }}.zip > zpq-lambda-${{ matrix.arch }}.zip.sha256
-
-      - name: Upload artifact
+      - name: Upload Lambda artifact
+        if: matrix.lambda_arch != ''
         uses: actions/upload-artifact@v4
         with:
-          name: zpq-lambda-${{ matrix.arch }}
-          path: dist/zpq-lambda-${{ matrix.arch }}.zip*
+          name: zpq-lambda-${{ matrix.lambda_arch }}
+          path: dist/zpq-lambda-${{ matrix.lambda_arch }}.zip*
 
   release:
     name: Create Release
-    needs: [build, build-lambda]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

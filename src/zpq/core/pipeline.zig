@@ -8,6 +8,7 @@ const writer_mod = @import("writer.zig");
 const slot_writer_mod = @import("slot_writer.zig");
 const row_group_worker_mod = @import("row_group_worker.zig");
 const interface = @import("../io/interface.zig");
+const factory = @import("../io/s3/factory.zig");
 
 const ParquetFile = file_mod.ParquetFile;
 const EncodedFilter = filter_mod.EncodedFilter;
@@ -164,9 +165,15 @@ pub const Pipeline = struct {
     pub fn open(self: *Self) !void {
         const path = self.input_path orelse return error.NoInputPath;
 
-        // TODO: Detect s3:// and use appropriate source
+        // Use factory to handle both local and s3:// paths
         const pf = try self.allocator.create(ParquetFile);
-        pf.* = try ParquetFile.open(self.allocator, path);
+        errdefer self.allocator.destroy(pf);
+
+        pf.* = try factory.openFileWithOptions(self.allocator, path, .{
+            .force_async = false,
+            .loop = self.loop,
+            .thread_pool = self.thread_pool,
+        });
         try pf.readFooter();
 
         self.input_file = pf;
@@ -215,6 +222,61 @@ pub const Pipeline = struct {
         if (meta.created_by) |cb| {
             std.debug.print("  Created by: {s}\n", .{cb});
         }
+    }
+
+    /// Schema field info for programmatic access
+    pub const SchemaFieldInfo = struct {
+        index: usize,
+        name: []const u8,
+        type_name: []const u8,
+    };
+
+    /// File metadata for programmatic access
+    pub const FileMetaInfo = struct {
+        path: []const u8,
+        row_count: u64,
+        row_group_count: usize,
+        column_count: usize,
+        created_by: ?[]const u8,
+    };
+
+    /// Get schema as struct array (for Lambda/HTTP responses)
+    pub fn getSchema(self: *Self, allocator: std.mem.Allocator) ![]SchemaFieldInfo {
+        if (self.input_file == null) {
+            try self.open();
+        }
+        const pf = self.input_file.?;
+        const meta = pf.metadata orelse return error.NoMetadata;
+
+        const col_count = meta.schema.items.len - 1;
+        var fields = try allocator.alloc(SchemaFieldInfo, col_count);
+
+        for (meta.schema.items[1..], 0..) |elem, i| {
+            fields[i] = .{
+                .index = i,
+                .name = elem.name,
+                .type_name = @tagName(elem.type orelse .BOOLEAN),
+            };
+        }
+
+        return fields;
+    }
+
+    /// Get file metadata as struct (for Lambda/HTTP responses)
+    pub fn getMeta(self: *Self) !FileMetaInfo {
+        if (self.input_file == null) {
+            try self.open();
+        }
+        const pf = self.input_file.?;
+        const meta = pf.metadata orelse return error.NoMetadata;
+
+        return .{
+            .path = self.input_path.?,
+            .row_count = @intCast(meta.num_rows),
+            .row_group_count = meta.row_groups.items.len,
+            .column_count = meta.schema.items.len - 1,
+            .created_by = meta.created_by,
+        };
     }
 
     /// Print summary (row count with filter applied if set)

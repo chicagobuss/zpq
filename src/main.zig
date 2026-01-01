@@ -3,14 +3,69 @@ const zpq = @import("zpq");
 const xev = @import("xev");
 const builtin = @import("builtin");
 
+const query = @import("query.zig");
+const lambda = @import("lambda.zig");
+
 const Pipeline = zpq.core.pipeline.Pipeline;
 const ExecutionMode = zpq.core.pipeline.ExecutionMode;
+const QueryParams = query.QueryParams;
 
 pub const std_options: std.Options = .{
     .log_level = if (builtin.mode == .Debug) .debug else .warn,
 };
 
-const Args = struct {
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Priority 1: Lambda mode (hot path - check first)
+    // Debug: print if we see the Lambda env var
+    if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API")) |runtime_api| {
+        std.debug.print("zpq: detected AWS_LAMBDA_RUNTIME_API={s}\n", .{runtime_api});
+        return lambda.run(allocator, runtime_api);
+    } else {
+        // Check if we're in Lambda context (LAMBDA_TASK_ROOT exists) but missing runtime API
+        if (std.posix.getenv("LAMBDA_TASK_ROOT")) |_| {
+            std.debug.print("zpq: LAMBDA_TASK_ROOT set but AWS_LAMBDA_RUNTIME_API missing\n", .{});
+        }
+    }
+
+    // Priority 2: HTTP server mode (check for --serve flag)
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (getServePort(args)) |port| {
+        _ = port;
+        // TODO: Implement HTTP server mode
+        std.debug.print("HTTP server mode not yet implemented\n", .{});
+        return;
+    }
+
+    // Priority 3: CLI mode (convenience/dev)
+    return cliMain(allocator, args);
+}
+
+/// Check for --serve flag and return port if present
+fn getServePort(args: []const []const u8) ?u16 {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--serve")) {
+            i += 1;
+            if (i < args.len) {
+                return std.fmt.parseInt(u16, args[i], 10) catch 8080;
+            }
+            return 8080; // Default port
+        }
+    }
+    return null;
+}
+
+// =============================================================================
+// CLI Mode
+// =============================================================================
+
+const CliArgs = struct {
     input: ?[]const u8 = null,
     output: ?[]const u8 = null,
     filter: ?[]const u8 = null,
@@ -20,10 +75,10 @@ const Args = struct {
     mode: ExecutionMode = .slot_parallel,
 };
 
-fn parseArgs(args: []const []const u8) ?Args {
+fn parseCliArgs(args: []const []const u8) ?CliArgs {
     if (args.len < 2) return null;
 
-    var result = Args{};
+    var result = CliArgs{};
     var i: usize = 1;
 
     while (i < args.len) : (i += 1) {
@@ -39,6 +94,9 @@ fn parseArgs(args: []const []const u8) ?Args {
             result.mode = .sequential;
         } else if (std.mem.eql(u8, arg, "--parallel")) {
             result.mode = .parallel;
+        } else if (std.mem.eql(u8, arg, "--serve")) {
+            // Skip --serve and its argument (handled above)
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
             i += 1;
             if (i >= args.len) {
@@ -96,6 +154,9 @@ fn printUsage(exe: []const u8) void {
         \\  --sequential       Process row groups sequentially
         \\  --parallel         Parallel processing (default: slot-parallel)
         \\
+        \\Server Mode:
+        \\  --serve [PORT]     Run as HTTP server (default port: 8080)
+        \\
         \\Output:
         \\  -o, --output FILE  Output file (alternative to positional)
         \\
@@ -105,19 +166,16 @@ fn printUsage(exe: []const u8) void {
         \\  {s} input.parquet output.parquet --filter category=A
         \\  {s} input.parquet -o out.parquet --filter id>100 --select id,name
         \\  {s} s3://bucket/data.parquet --schema
+        \\  {s} --serve 8080
         \\
-    , .{ exe, exe, exe, exe, exe, exe });
+        \\Environment:
+        \\  AWS_LAMBDA_RUNTIME_API  Auto-detected for Lambda mode
+        \\
+    , .{ exe, exe, exe, exe, exe, exe, exe });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    const parsed = parseArgs(args) orelse {
+fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const parsed = parseCliArgs(args) orelse {
         printUsage(args[0]);
         return;
     };
@@ -138,37 +196,49 @@ pub fn main() !void {
         thread_pool.deinit();
     }
 
-    // Create pipeline
-    var pipeline = Pipeline.init(allocator);
-    defer pipeline.deinit();
+    // Convert CLI args to QueryParams
+    const params = QueryParams{
+        .input = input,
+        .output = parsed.output,
+        .filter = parsed.filter,
+        .select = parsed.select,
+        .mode = parsed.mode,
+        .show_schema = parsed.show_schema,
+        .show_meta = parsed.show_meta,
+    };
 
-    pipeline.setInput(input);
-    pipeline.setRuntime(&loop, &thread_pool);
-
-    if (parsed.output) |out| pipeline.setOutput(out);
-    if (parsed.filter) |f| try pipeline.setFilter(f);
-    if (parsed.select) |s| try pipeline.setProjection(s);
-
-    // Schema-only mode
+    // For schema/meta, use the print methods (CLI-friendly output)
     if (parsed.show_schema) {
+        var pipeline = Pipeline.init(allocator);
+        defer pipeline.deinit();
+        pipeline.setInput(input);
+        pipeline.setRuntime(&loop, &thread_pool);
         try pipeline.printSchema();
         return;
     }
 
-    // Meta-only mode
     if (parsed.show_meta) {
+        var pipeline = Pipeline.init(allocator);
+        defer pipeline.deinit();
+        pipeline.setInput(input);
+        pipeline.setRuntime(&loop, &thread_pool);
         try pipeline.printMeta();
         return;
     }
 
-    // Filter/transform mode requires output
+    // For filter/transform, use executeQuery
     if (parsed.filter != null) {
         if (parsed.output == null) {
             std.debug.print("Error: --filter requires an output file\n", .{});
             return;
         }
 
-        const result = try pipeline.execute(parsed.mode);
+        const result = try query.executeQuery(allocator, &loop, &thread_pool, params);
+
+        if (result.error_message) |err| {
+            std.debug.print("Error: {s}\n", .{err});
+            return;
+        }
 
         std.debug.print("\nComplete:\n", .{});
         std.debug.print("  Input:  {d} rows\n", .{result.input_rows});
@@ -178,5 +248,9 @@ pub fn main() !void {
     }
 
     // Default: print summary
+    var pipeline = Pipeline.init(allocator);
+    defer pipeline.deinit();
+    pipeline.setInput(input);
+    pipeline.setRuntime(&loop, &thread_pool);
     try pipeline.printSummary();
 }

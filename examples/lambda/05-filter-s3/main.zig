@@ -16,7 +16,7 @@ pub fn main() !void {
     defer allocator.free(runtime_api);
 
     // Lambda runtime loop - need std.Io for HTTP client
-    var threaded = try std.Io.Threaded.init(allocator, .{});
+    var threaded = std.Io.Threaded.init(allocator);
     defer threaded.deinit();
 
     var http_client = std.http.Client{ .allocator = allocator, .io = threaded.io() };

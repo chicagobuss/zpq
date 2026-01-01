@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g., v0.1.0)'
+        description: "Tag to release (e.g., v0.1.0)"
         required: true
         type: string
 
@@ -68,7 +68,7 @@ jobs:
 
           # Show binary info
           ls -la zig-out/bin/
-          file zig-out/bin/zpq
+          file zig-out/bin/zpq || true
 
       - name: Package
         run: |
@@ -124,7 +124,7 @@ jobs:
           zig build example-lambda-05-filter-s3 -Dexamples=true -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
 
           ls -la zig-out/lambda/lambda-05-filter-s3/
-          file zig-out/lambda/lambda-05-filter-s3/bootstrap
+          file zig-out/lambda/lambda-05-filter-s3/bootstrap || true
 
       - name: Package Lambda
         run: |

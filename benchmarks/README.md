@@ -1,246 +1,151 @@
-# ZPQ Benchmarks
+# ZPQ Lambda Benchmarks
 
-This directory contains benchmarks for comparing ZPQ against other Parquet implementations (PyArrow, Polars, DuckDB).
+Benchmark zpq filter performance across deployment environments.
 
 ## Quick Start
 
 ```bash
-# 1. Build ZPQ in release mode
-zig build -Doptimize=ReleaseFast
+# 1. Source AWS credentials (from project root)
+cd /path/to/zpq
+source .env
 
-# 2. Run a benchmark
-./benchmarks/bench.sh e2e data/many_rows.parquet
+# 2. Build for Lambda (aarch64-linux)
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
+cp zig-out/bin/zpq benchmarks/zpq
 
-# 3. Compare against competitors
-./benchmarks/bench.sh compare e2e s3://your-bucket/file.parquet
+# 3. Start Lambda RIE
+cd benchmarks
+docker-compose up -d
+
+# 4. Run a benchmark
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "/data/benchmark_10mb.parquet", "output": "/tmp/out.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
 ```
 
-## Prerequisites
+## Example Commands
 
-### Build
+### Local File Read
 ```bash
-zig build -Doptimize=ReleaseFast
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "/data/benchmark_10mb.parquet", "output": "/tmp/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
 ```
 
-### Python Dependencies (for competitor benchmarks)
-The benchmark scripts use `uv` to manage Python dependencies automatically:
+### S3 Read + Local Output
 ```bash
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Dependencies are installed on-demand by bench.sh
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "s3://{BUCKET}/benchmark/benchmark_10mb.parquet", "output": "/tmp/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
 ```
 
-## Environment Setup
-
-Copy `.env.example` to `.env` in the project root and configure:
-
+### S3 Read + S3 Output
 ```bash
-cp .env.example .env
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "s3://{BUCKET}/benchmark/benchmark_10mb.parquet", "output": "s3://{BUCKET}/output/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
 ```
 
-### Required Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `AWS_ACCESS_KEY_ID` | AWS access key for S3 | `AKIA...` |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key | `...` |
-| `AWS_REGION` | AWS region | `us-west-2` |
-
-### Optional Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `S3_ENDPOINT` | Custom S3 endpoint (MinIO, R2) | `http://localhost:9000` |
-| `ZPQ_TEST_S3_PATH` | Default S3 test file | `s3://bucket/file.parquet` |
-| `ZPQ_BENCH_FILE` | Default local test file | `data/large.parquet` |
-
-### Cloudflare R2 Setup
-
-For R2 benchmarks, add these to your `.env`:
-```bash
-R2_ACCESS_KEY_ID=your_r2_key
-R2_SECRET_ACCESS_KEY=your_r2_secret
-R2_ACCOUNT_ID=your_account_id
-R2_ENDPOINT=https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
-R2_BUCKET=zpq
-
-# Pre-configured benchmark files (create these yourself)
-R2_BENCH_FILE_1MB=benchmark_1mb.parquet
-R2_BENCH_FILE_10MB=benchmark_10mb.parquet
-R2_BENCH_FILE_100MB=benchmark_100mb.parquet
-```
-
-## Benchmark Files
-
-### Local Files
-
-The `data/` directory is gitignored. You need to provide your own test files:
-
-| File | Purpose | How to Create |
-|------|---------|---------------|
-| `data/many_rows.parquet` | Row scan benchmark | Included (88KB, ~10K rows) |
-| `data/simple.parquet` | Basic functionality | Included (small) |
-| `data/large.parquet` | Large file benchmark | Download or generate |
-
-To generate test files:
-```bash
-# Using DuckDB
-duckdb -c "COPY (SELECT * FROM range(1000000)) TO 'data/million_rows.parquet'"
-
-# Using Python
-python3 -c "
-import pyarrow as pa
-import pyarrow.parquet as pq
-import numpy as np
-
-n = 1_000_000
-table = pa.table({
-    'id': np.arange(n),
-    'value': np.random.randn(n),
-    'category': np.random.choice(['A', 'B', 'C'], n)
-})
-pq.write_table(table, 'data/million_rows.parquet')
-"
-```
-
-### S3 Files
-
-Upload your benchmark files to S3:
-```bash
-aws s3 cp data/million_rows.parquet s3://your-bucket/benchmarks/
-```
-
-## Available Benchmarks
-
-### List All Benchmarks
-```bash
-./benchmarks/bench.sh list
-```
-
-### Individual Benchmarks
-
-| Command | Description |
-|---------|-------------|
-| `bench.sh dns` | DNS resolver performance |
-| `bench.sh ping` | TCP ping-pong throughput |
-| `bench.sh e2e <path>` | Full parquet scan (local or S3) |
-| `bench.sh scan <path>` | Quick scan via zpq CLI |
-| `bench.sh pyarrow <path>` | PyArrow baseline |
-
-### Comparison Mode
-
-Compare ZPQ against PyArrow and Polars:
+### Force epoll Backend (Simulate Lambda)
+Lambda's older kernel doesn't support io_uring. To test epoll locally:
 
 ```bash
-# Local file
-./benchmarks/bench.sh compare e2e data/large.parquet
-
-# S3 file (tests network + parsing)
-./benchmarks/bench.sh compare e2e s3://bucket/file.parquet -n 5
+docker-compose -f docker-compose.no-io-uring.yml up -d
 ```
 
-Output includes:
-- ZPQ Sync timing
-- ZPQ Async timing  
-- PyArrow timing
-- Polars timing
-- Speedup calculations
+This uses a seccomp profile (`no-io-uring.json`) to block io_uring syscalls.
 
-### E2E Options
+## Test Data
+
+**Local**: `/tmp/zpq_r2_bucket/benchmark/` (mounted as `/data` in container)
+**S3**: `s3://{BUCKET}/benchmark/` (us-west-2)
+
+### Files
+
+| File | Size | Rows |
+|------|------|------|
+| benchmark_10mb.parquet | 16MB | ~52K |
+| benchmark_100mb.parquet | 156MB | ~524K |
+
+Compression variants: `_snappy` (default), `_gzip`, `_zstd`, `_none`
+
+### Schema (27 columns)
+
+Key columns for filtering:
+- `string_dict_low` - 10 categories (~10% each): `category_0000` through `category_0009`
+- `bool` - ~51% true
+- `bool_sparse` - ~1% true
+- `int32_sorted` - sequential integers
+
+## Filter Scenarios
+
+| Scenario | Filter | Selectivity | Use Case |
+|----------|--------|-------------|----------|
+| **High selectivity** | `bool_sparse=true` | ~1% | Needle in haystack |
+| **Medium selectivity** | `string_dict_low=category_0001` | ~10% | Category filter |
+| **Low selectivity** | `bool=true` | ~50% | Broad filter |
+
+## Deployment Environments
+
+| Environment | Description |
+|-------------|-------------|
+| **RIE + local** | Lambda RIE, local parquet file |
+| **RIE + S3** | Lambda RIE, real S3 (us-west-2) |
+| **Lambda + S3** | Real Lambda (arm64/1769MB, us-west-2) |
+
+---
+
+## Results
+
+### Phase 1: zpq Baseline
+
+**Filter**: `string_dict_low=category_0001` (~10% selectivity)
+
+#### 10mb (3 runs, times in ms)
+
+| Environment | Run 1 | Run 2 | Run 3 | Median | Rows Out |
+|-------------|-------|-------|-------|--------|----------|
+| RIE + local | 80.0 | 65.6 | 64.1 | 65.6 | 5,142 |
+| RIE + S3 | 1779.3 | 2615.6 | 1637.4 | 1779.3 | 5,142 |
+| Lambda + S3 | 68.0 | 64.4 | 64.4 | **64.4** | 5,142 |
+
+#### 100mb (1 run)
+
+| Environment | Time (ms) | Rows Out |
+|-------------|-----------|----------|
+| RIE + local | 553.8 | 52,526 |
+| RIE + S3 | 1860.2 | 52,526 |
+| Lambda + S3 | **245.7** | 52,526 |
+
+#### S3 Output (RIE + epoll)
+
+| Scenario | Time | Notes |
+|----------|------|-------|
+| S3 read + S3 write (10mb) | 13.4s | Includes multipart upload |
+
+### Verification
 
 ```bash
-./benchmarks/bench.sh e2e <path> [options]
-
-Options:
-  --sync          Synchronous I/O (blocking)
-  --async         Async I/O with speculative DNS (default)
-  --dns=basic     Async I/O with basic thread-pool DNS
-  -n, --iterations N   Number of iterations (default: 1)
+# Verify output with DuckDB
+duckdb -c "SELECT COUNT(*), COUNT(DISTINCT string_dict_low) FROM 's3://{BUCKET}/output/zpq_bench_output.parquet'"
+# Result: 5142 rows, 1 distinct value (category_0001)
 ```
 
-## Benchmark Files (Zig)
+---
 
-| File | Description |
-|------|-------------|
-| `e2e.zig` | End-to-end benchmark (local or S3) |
-| `decode_full.zig` | Full decode benchmark |
-| `projection.zig` | Local column projection benchmark |
-| `s3_cold_start.zig` | S3 cold start latency |
-| `dns.zig` | DNS resolver benchmark |
-| `ping_pongs.zig` | TCP throughput benchmark |
+## Benchmark Methodology
 
-## Competitor Implementations
+### Iterations
+- 10mb files: **3 runs** each
+- 100mb files: **1 run** each
 
-| File | Description |
-|------|-------------|
-| `competitor.py` | PyArrow S3 benchmark |
-| `pyarrow_bench.py` | PyArrow local file benchmark |
-| `competitors/s3_bench.py` | Python S3 benchmark |
-| `competitors/rust_bench/` | Rust arrow-rs benchmark |
-| `competitors/node_ping_pong.js` | Node.js baseline |
+### Phases
+1. **Phase 1**: zpq baseline across all environments [COMPLETE]
+2. **Phase 2**: Add DuckDB, verify apples-to-apples
+3. **Phase 3**: Add PyArrow, Polars
+4. **Phase 4**: Full matrix (all filters x all sizes)
 
-## Example Benchmark Session
+---
 
-```bash
-# Build
-zig build -Doptimize=ReleaseFast
+## Status
 
-# Local file benchmarks
-./benchmarks/bench.sh e2e data/many_rows.parquet -n 10
-./benchmarks/bench.sh compare e2e data/many_rows.parquet
-
-# S3 benchmarks (requires .env setup)
-./benchmarks/bench.sh e2e s3://my-bucket/large.parquet --async -n 5
-./benchmarks/bench.sh compare e2e s3://my-bucket/large.parquet -n 3
-
-# DNS benchmark
-./benchmarks/bench.sh dns
-
-# TCP throughput
-./benchmarks/bench.sh ping
-```
-
-## Interpreting Results
-
-### E2E Output
-```
-=== E2E Benchmark Results ===
-Platform:   aarch64-darwin
-Target:     s3://bucket/file.parquet
-Iterations: 5
-
-  Run 1: 1000000 rows in 45.23ms
-  Run 2: 1000000 rows in 42.18ms
-  ...
-
-Min: 42.18ms
-Max: 48.92ms
-Avg: 44.56ms
-```
-
-### Comparison Output
-```
-=== Summary ===
-
-  ZPQ Async:          44.56 ms
-  PyArrow:            98.23 ms
-  Polars:             67.45 ms
-
-  ZPQ Async vs PyArrow: 2.20x
-  ZPQ Async vs Polars:  1.51x
-```
-
-## Troubleshooting
-
-### "Binary not found"
-Build first: `zig build -Doptimize=ReleaseFast`
-
-### S3 authentication errors
-Check your `.env` file has correct AWS credentials.
-
-### TLS errors with custom endpoints
-For self-signed certs (MinIO), the benchmark scripts handle this automatically.
-
-### Missing Python dependencies
-Install `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- [x] Phase 1: zpq baseline (RIE local -> RIE S3 -> Lambda S3)
+- [ ] Phase 2: DuckDB comparison
+- [ ] Phase 3: PyArrow/Polars comparison
+- [ ] Phase 4: Full matrix

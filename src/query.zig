@@ -32,9 +32,10 @@ pub const QueryResult = struct {
 
 /// Execute a query with the given parameters.
 /// This is the universal entry point used by Lambda, HTTP server, and CLI modes.
+/// Uses xev.Dynamic for runtime backend selection (io_uring -> epoll fallback).
 pub fn executeQuery(
     allocator: std.mem.Allocator,
-    loop: *xev.Loop,
+    loop: *xev.Dynamic.Loop,
     thread_pool: *xev.ThreadPool,
     params: QueryParams,
 ) !QueryResult {
@@ -67,6 +68,52 @@ pub fn executeQuery(
 
     // Execute pipeline
     const result = try pipeline.execute(params.mode);
+    return .{
+        .input_rows = result.input_rows,
+        .output_rows = result.output_rows,
+        .elapsed_ms = result.elapsed_ms,
+    };
+}
+
+/// Execute a query with a generic xev backend (for unibin Lambda/Epoll support).
+/// This allows the same binary to work with io_uring, epoll, or kqueue.
+pub fn executeQueryWithLoop(
+    comptime XevApi: type,
+    allocator: std.mem.Allocator,
+    loop: *XevApi.Loop,
+    thread_pool: *xev.ThreadPool,
+    params: QueryParams,
+) !QueryResult {
+    var pipeline = Pipeline.init(allocator);
+    defer pipeline.deinit();
+
+    pipeline.setInput(params.input);
+
+    if (params.output) |out| pipeline.setOutput(out);
+    if (params.filter) |f| try pipeline.setFilter(f);
+    if (params.select) |s| try pipeline.setProjection(s);
+
+    // Schema-only mode - doesn't need loop
+    if (params.show_schema) {
+        try pipeline.openWithLoop(loop, thread_pool);
+        const schema = try pipeline.getSchema(allocator);
+        return .{ .schema = schema };
+    }
+
+    // Meta-only mode - doesn't need loop
+    if (params.show_meta) {
+        try pipeline.openWithLoop(loop, thread_pool);
+        const meta = try pipeline.getMeta(allocator);
+        return .{ .meta = meta };
+    }
+
+    // Filter/transform mode requires output
+    if (params.filter != null and params.output == null) {
+        return .{ .error_message = "--filter requires an output file" };
+    }
+
+    // Execute pipeline with generic loop
+    const result = try pipeline.executeWithLoop(XevApi, loop, thread_pool, params.mode);
     return .{
         .input_rows = result.input_rows,
         .output_rows = result.output_rows,

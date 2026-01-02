@@ -186,8 +186,12 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     };
 
-    // Initialize xev runtime
-    var loop = try xev.Loop.init(.{});
+    // Initialize xev runtime with dynamic backend detection (io_uring -> epoll fallback)
+    // On single-backend systems (macOS/kqueue), detect() doesn't exist - that's fine.
+    if (@hasDecl(xev.Dynamic, "detect")) {
+        try xev.Dynamic.detect();
+    }
+    var loop = try xev.Dynamic.Loop.init(.{});
     defer loop.deinit();
 
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });

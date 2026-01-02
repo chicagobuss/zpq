@@ -427,20 +427,29 @@ fn DynamicPollEvent(comptime xev: type) type {
 /// Preserves the same backing type and integer values for the
 /// subset making it easy to convert between the two.
 fn EnumSubset(comptime T: type, comptime values: []const T) type {
-    const fields = comptime fields: {
-    var fields: [values.len]std.builtin.Type.EnumField = undefined;
-    for (values, 0..) |value, i| fields[i] = .{
-        .name = @tagName(value),
-        .value = @intFromEnum(value),
+    const TagInt = @typeInfo(T).@"enum".tag_type;
+
+    const field_names = comptime blk: {
+        var names: [values.len][]const u8 = undefined;
+        for (values, 0..) |value, i| {
+            names[i] = @tagName(value);
+        }
+        break :blk names;
     };
-        break :fields fields;
+
+    const field_values = comptime blk: {
+        var vals: [values.len]TagInt = undefined;
+        for (values, 0..) |value, i| {
+            vals[i] = @intFromEnum(value);
+        }
+        break :blk vals;
     };
 
     return @Enum(
-        @typeInfo(T).@"enum".tag_type,
-        &fields,
-        &.{},
-        true
+        TagInt,
+        .exhaustive,
+        &field_names,
+        &field_values,
     );
 }
 
@@ -462,40 +471,41 @@ fn Union(
     comptime tagged: bool,
 ) type {
     const info = comptime blk: {
-    var largest: usize = 0;
-    var fields: [bes.len + 1]std.builtin.Type.UnionField = undefined;
-        var attrs: [bes.len + 1]std.builtin.Type.UnionField.Attributes = undefined;
-    for (bes, 0..) |be, i| {
-        var T: type = be.Api();
-        for (field) |f| T = @field(T, f);
-        largest = @max(largest, @sizeOf(T));
-        fields[i] = .{
-            .name = @tagName(be),
-            .type = T,
-            .alignment = @alignOf(T),
-        };
-            attrs[i] = .{};
+        var largest: usize = 0;
+        var field_names: [bes.len + 1][]const u8 = undefined;
+        var field_types: [bes.len + 1]type = undefined;
+        var field_attrs: [bes.len + 1]std.builtin.Type.UnionField.Attributes = undefined;
+
+        for (bes, 0..) |be, i| {
+            var T: type = be.Api();
+            for (field) |f| T = @field(T, f);
+            largest = @max(largest, @sizeOf(T));
+            field_names[i] = @tagName(be);
+            field_types[i] = T;
+            field_attrs[i] = .{};
         }
 
-    var count: usize = bes.len;
-    if (largest == 0) {
-        fields[count] = .{
-            .name = "_zig_bug_padding",
-            .type = u8,
-            .alignment = @alignOf(u8),
+        var count: usize = bes.len;
+        if (largest == 0) {
+            field_names[count] = "_zig_bug_padding";
+            field_types[count] = u8;
+            field_attrs[count] = .{};
+            count += 1;
+        }
+        break :blk .{
+            .names = field_names,
+            .types = field_types,
+            .attrs = field_attrs,
+            .count = count,
         };
-            attrs[count] = .{};
-        count += 1;
-    }
-        break :blk .{ .fields = fields, .attrs = attrs, .count = count };
     };
 
     return @Union(
         .auto,
         if (tagged) EnumSubset(AllBackend, bes) else null,
-        info.fields[0..info.count],
-        &.{},
-        info.attrs[0..info.count]
+        info.names[0..info.count],
+        info.types[0..info.count],
+        info.attrs[0..info.count],
     );
 }
 

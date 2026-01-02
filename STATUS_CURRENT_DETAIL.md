@@ -1,7 +1,126 @@
 # ZPQ Technical Context and Detail
 
-**Last Updated**: Dec 30, 2024
-**Current State**: Phase 1 (Read Dominance) - Milestone 19 complete! Predicate pushdown with unified `EncodedFilter` abstraction supporting all types. Page-level skip achieving 230x speedup on low-selectivity queries.
+**Last Updated**: Jan 2, 2025
+**Current State**: Phase 1 (Read Dominance) - Milestone 20 complete. Unibin Lambda deployment with runtime io_uring → epoll fallback complete. S3 output working with epoll backend.
+
+---
+
+## Current Work: Lambda Benchmarking Matrix
+
+### Context
+Benchmarking zpq performance across different environments to establish baselines before Phase 2 (Write Path).
+
+### Benchmark Matrix Status
+
+| Environment | File Size | Storage | Status | Notes |
+|-------------|-----------|---------|--------|-------|
+| RIE + Local | 10mb × 3 | Local | **COMPLETE** | Baseline established |
+| RIE + Local | 100mb × 1 | Local | **COMPLETE** | |
+| RIE + S3 | 10mb × 3 | S3 | **COMPLETE** | |
+| RIE + S3 | 100mb × 1 | S3 | **COMPLETE** | |
+| Lambda + S3 | 10mb × 3 | S3 | **COMPLETE** | 64.4ms median |
+| Lambda + S3 | 100mb × 1 | S3 | **COMPLETE** | 245.7ms |
+| RIE + S3 Output | 10mb | S3→S3 | **COMPLETE** | 13.4s (epoll) |
+
+### Milestone 20: Unibin Lambda Deployment [COMPLETE - Jan 1, 2025]
+
+**Problem**: Lambda deployment failed with `SystemOutdated` error because libxev defaults to io_uring on Linux, but Lambda's older kernel doesn't support io_uring.
+
+**Solution**: Use libxev's built-in `xev.Dynamic` API for runtime backend detection.
+
+#### Key Changes
+
+1. **Runtime Backend Detection** (`src/main.zig`, `src/lambda.zig`)
+   - Added `xev.Dynamic.detect()` call at startup (when available)
+   - On Linux: probes for io_uring, falls back to epoll if unavailable
+   - On macOS: single kqueue backend, no detection needed
+   - Uses `@hasDecl(xev.Dynamic, "detect")` for cross-platform compatibility
+
+2. **Unified Loop Type** (all execution paths)
+   - Changed `xev.Loop` → `xev.Dynamic.Loop` throughout codebase
+   - `src/query.zig`: `executeQuery` accepts `*xev.Dynamic.Loop`
+   - `src/zpq/core/pipeline.zig`: `setRuntime` accepts `*xev.Dynamic.Loop`
+   - `src/zpq/io/s3/factory.zig`: `OpenOptions.loop` is `*xev.Dynamic.Loop`
+
+3. **Generic Completions Use Dynamic** (`src/zpq/core/row_group_worker.zig`)
+   - `WorkerCompletion = WorkerCompletionGen(xev.Dynamic)`
+   - `SlotWriteCompletion = SlotWriteCompletionGen(xev.Dynamic)`
+
+4. **S3 Sources Use Dynamic** (`src/zpq/io/s3/factory.zig`)
+   - `XevS3SourceGen(xev.Dynamic)` for internal S3 stack
+   - `ResolverGen(xev.Dynamic)` for DNS resolution
+
+#### How It Works
+
+```
+Single Binary → Startup → xev.Dynamic.detect()
+                              ↓
+              ┌───────────────┴───────────────┐
+              ↓                               ↓
+        io_uring available?             Only one backend?
+              ↓                               ↓
+         Use io_uring                   Use that backend
+              ↓                          (kqueue/epoll)
+         Lambda Kernel?
+              ↓
+         Use epoll (fallback)
+```
+
+**Key insight**: `xev.Dynamic` is a valid XevApi type that works with all the generic types (`XevS3SourceGen`, `S3WriterGen`, `SlotWriteCompletionGen`). On single-backend systems (macOS), `xev.Dynamic` resolves to the static API with zero overhead.
+
+#### Files Modified
+- `src/main.zig` - Dynamic detect + loop type
+- `src/lambda.zig` - Dynamic detect + loop type + backend name handling
+- `src/query.zig` - Accept `*xev.Dynamic.Loop`
+- `src/zpq/core/pipeline.zig` - Loop field and setRuntime type
+- `src/zpq/core/row_group_worker.zig` - Default completion types
+- `src/zpq/io/s3/factory.zig` - OpenOptions and internal S3 source
+
+### Milestone 20.5: S3 Writer with xev.Dynamic [COMPLETE - Jan 2, 2025]
+
+**Problem**: S3 multipart uploads failed with `MissingContentLength` error when using epoll backend.
+
+**Root Cause**: 
+1. S3 multipart upload responses use `Transfer-Encoding: chunked`, but our HTTP response parser only supported `Content-Length`
+2. Bucket host was being incorrectly overwritten with path-style endpoint for standard AWS S3
+
+**Solution**:
+
+1. **Chunked Transfer-Encoding Support** (`src/zpq/io/http/response_parser.zig`)
+   - Added `is_chunked` field and chunked state machine
+   - New states: `reading_chunk_size`, `reading_chunk_data`, `reading_chunk_trailer`
+   - Added `consumeChunked()` function to parse chunked response bodies
+   - Updated `parseHeaders()` to detect `Transfer-Encoding: chunked`
+
+2. **Fixed S3 Bucket Host Generation** (`src/zpq/core/pipeline.zig`)
+   - Only override host/port/tls for custom endpoints (MinIO, R2, LocalStack)
+   - For standard AWS S3, use virtual-hosted style: `{bucket}.s3.{region}.amazonaws.com`
+
+#### Working Example Commands
+
+```bash
+# Source AWS credentials
+source .env
+
+# Start Lambda RIE with epoll (io_uring blocked via seccomp)
+cd benchmarks && docker-compose -f docker-compose.no-io-uring.yml up -d
+
+# S3 read + local output (2.5s)
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "s3://{BUCKET}/benchmark/benchmark_10mb.parquet", "output": "/tmp/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
+
+# S3 read + S3 output (13.4s with multipart upload)
+curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d '{"file": "s3://{BUCKET}/benchmark/benchmark_10mb.parquet", "output": "s3://{BUCKET}/output/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
+
+# Verify output with DuckDB
+duckdb -c "SELECT COUNT(*), COUNT(DISTINCT string_dict_low) FROM 's3://{BUCKET}/output/zpq_bench_output.parquet'"
+# Result: 5142 rows, 1 distinct value (category_0001)
+```
+
+#### Files Modified
+- `src/zpq/io/http/response_parser.zig` - Chunked encoding support
+- `src/zpq/core/pipeline.zig` - Fixed S3 bucket host for standard AWS
 
 ---
 
@@ -103,7 +222,7 @@ Unified predicate handling across all types using byte-level comparison:
 
 ---
 
-## 🛠️ Key Technical Achievements (Recent)
+## Key Technical Achievements (Recent)
 
 ### 1. The `active_pages` Lifecycle
 The `BatchReader` now manages an `active_pages` list. A page is only freed when `nextBatch` is called and the current read position has moved entirely past that page. This allows for zero-copy string slices to remain valid throughout the user's processing loop.
@@ -124,7 +243,12 @@ Zig 0.16 is strict about variable shadowing. Refactoring loops into `nextBatch` 
 ### 2. Memory Safety in Vectorized Reads
 Zero-copy is a double-edged sword. When batch reading across page boundaries, the previous page *must* stay alive until the batch is consumed. The `active_pages` pattern is the standard for ZPQ to prevent UAF (Use-After-Free) on string columns.
 
----
+### 3. libxev Dynamic Backend Selection (Jan 2025)
+When using libxev for cross-platform async I/O:
+- `xev.Dynamic` provides runtime backend detection (io_uring vs epoll)
+- On single-backend systems (macOS/kqueue), `xev.Dynamic` equals the static API
+- Use `@hasDecl(xev.Dynamic, "detect")` to check if detection is needed
+- All generic types (`XevS3SourceGen`, etc.) work with `xev.Dynamic` as the XevApi parameter
 
 ---
 
@@ -195,3 +319,17 @@ Pages: 9, Borrowed (zero-copy): 9
 
 ### Streaming Writer
 **Status**: Planned for Phase 2. Currently, ZPQ is optimized for Read/Scan.
+
+---
+
+## Bugs Fixed (Recent)
+
+### BOOLEAN Bit-Packed + RLE Double-Decrement (Dec 31, 2024)
+- **Symptom**: Boolean columns with RLE encoding produced incorrect values
+- **Root Cause**: Double-decrement of `remaining_values` in RLE decoder
+- **Fix**: Removed duplicate decrement in `RleDecoder.readBitPacked()`
+
+### S3 Range Request Sorting (Dec 31, 2024)
+- **Symptom**: S3 reads returned corrupted data when ranges were coalesced
+- **Root Cause**: Range coalescing sorted by start offset but didn't preserve original buffer mapping
+- **Fix**: Track original indices through sort and map back correctly

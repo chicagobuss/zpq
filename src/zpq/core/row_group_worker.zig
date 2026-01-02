@@ -20,79 +20,85 @@ const MemorySource = interface.local.MemorySource;
 // Parallel Execution Support (Phase 2.3)
 // ============================================================================
 
-/// Completion tracker for parallel worker execution via xev ThreadPool.
-/// Each WorkerCompletion manages one RowGroupWorker's lifecycle through the thread pool.
-pub const WorkerCompletion = struct {
-    const Self = @This();
+/// Default WorkerCompletion using xev.Dynamic for runtime backend selection.
+/// This enables io_uring -> epoll fallback for unibin Lambda support.
+pub const WorkerCompletion = WorkerCompletionGen(xev.Dynamic);
 
-    /// The worker being executed
-    worker: *RowGroupWorker,
+/// Generic completion tracker parameterized by xev API type.
+/// Supports io_uring, epoll, kqueue backends via compile-time selection.
+pub fn WorkerCompletionGen(comptime XevApi: type) type {
+    return struct {
+        const Self = @This();
 
-    /// Thread pool task (embedded for zero-allocation scheduling)
-    task: xev.ThreadPool.Task,
+        /// The worker being executed
+        worker: *RowGroupWorker,
 
-    /// Async signal to notify main loop when worker completes
-    async_signal: xev.Async,
+        /// Thread pool task (embedded for zero-allocation scheduling)
+        task: xev.ThreadPool.Task,
 
-    /// xev completion for async wait
-    xev_completion: xev.Completion,
+        /// Async signal to notify main loop when worker completes
+        async_signal: XevApi.Async,
 
-    /// Pointer to shared pending counter (atomic)
-    pending: *std.atomic.Value(usize),
+        /// xev completion for async wait
+        xev_completion: XevApi.Completion,
 
-    /// Initialize a WorkerCompletion for a given worker
-    pub fn init(worker: *RowGroupWorker, pending: *std.atomic.Value(usize)) !Self {
-        return Self{
-            .worker = worker,
-            .task = .{ .callback = taskCallback },
-            .async_signal = try xev.Async.init(),
-            .xev_completion = .{},
-            .pending = pending,
-        };
-    }
+        /// Pointer to shared pending counter (atomic)
+        pending: *std.atomic.Value(usize),
 
-    /// Clean up resources
-    pub fn deinit(self: *Self) void {
-        self.async_signal.deinit();
-    }
+        /// Initialize a WorkerCompletion for a given worker
+        pub fn init(worker: *RowGroupWorker, pending: *std.atomic.Value(usize)) !Self {
+            return Self{
+                .worker = worker,
+                .task = .{ .callback = taskCallback },
+                .async_signal = try XevApi.Async.init(),
+                .xev_completion = .{},
+                .pending = pending,
+            };
+        }
 
-    /// Arm the async wait on the loop and schedule the task on the thread pool
-    pub fn scheduleOn(self: *Self, loop: *xev.Loop, pool: *xev.ThreadPool) void {
-        // First, arm the async wait so we get notified when worker completes
-        self.async_signal.wait(loop, &self.xev_completion, Self, self, asyncCallback);
+        /// Clean up resources
+        pub fn deinit(self: *Self) void {
+            self.async_signal.deinit();
+        }
 
-        // Then schedule the task on the thread pool
-        pool.schedule(xev.ThreadPool.Batch.from(&self.task));
-    }
+        /// Arm the async wait on the loop and schedule the task on the thread pool
+        pub fn scheduleOn(self: *Self, loop: *XevApi.Loop, pool: *xev.ThreadPool) void {
+            // First, arm the async wait so we get notified when worker completes
+            self.async_signal.wait(loop, &self.xev_completion, Self, self, asyncCallback);
 
-    /// Thread pool task callback - runs on worker thread
-    fn taskCallback(task: *xev.ThreadPool.Task) void {
-        // Recover the WorkerCompletion from the task pointer
-        const self: *Self = @fieldParentPtr("task", task);
+            // Then schedule the task on the thread pool
+            pool.schedule(xev.ThreadPool.Batch.from(&self.task));
+        }
 
-        // Execute the worker (pure CPU work, no I/O)
-        self.worker.execute();
+        /// Thread pool task callback - runs on worker thread
+        fn taskCallback(task: *xev.ThreadPool.Task) void {
+            // Recover the WorkerCompletion from the task pointer
+            const self: *Self = @fieldParentPtr("task", task);
 
-        // Signal the main loop that we're done
-        self.async_signal.notify() catch {};
-    }
+            // Execute the worker (pure CPU work, no I/O)
+            self.worker.execute();
 
-    /// Async callback - runs on main loop when worker signals completion
-    fn asyncCallback(
-        ud: ?*Self,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.Async.WaitError!void,
-    ) xev.CallbackAction {
-        const self = ud.?;
+            // Signal the main loop that we're done
+            self.async_signal.notify() catch {};
+        }
 
-        // Decrement the pending counter (atomic)
-        _ = self.pending.fetchSub(1, .release);
+        /// Async callback - runs on main loop when worker signals completion
+        fn asyncCallback(
+            ud: ?*Self,
+            _: *XevApi.Loop,
+            _: *XevApi.Completion,
+            _: XevApi.Async.WaitError!void,
+        ) XevApi.CallbackAction {
+            const self = ud.?;
 
-        // Disarm - we only need one notification per worker
-        return .disarm;
-    }
-};
+            // Decrement the pending counter (atomic)
+            _ = self.pending.fetchSub(1, .release);
+
+            // Disarm - we only need one notification per worker
+            return .disarm;
+        }
+    };
+}
 
 /// Pre-fetched column data for a single row group.
 /// All I/O happens BEFORE the worker starts - worker does only CPU work.
@@ -767,144 +773,150 @@ pub const RowGroupWorker = struct {
 // Slot-based Parallel Execution (Phase 2)
 // ============================================================================
 
-/// Completion tracker for slot-based parallel worker execution.
-/// Extends WorkerCompletion to encode and write output to a slot.
-pub const SlotWriteCompletion = struct {
-    const Self = @This();
+/// Default SlotWriteCompletion using xev.Dynamic for runtime backend selection.
+/// This enables io_uring -> epoll fallback for unibin Lambda support.
+pub const SlotWriteCompletion = SlotWriteCompletionGen(xev.Dynamic);
 
-    /// The worker being executed
-    worker: *RowGroupWorker,
+/// Generic slot write completion parameterized by xev API type.
+/// Supports io_uring, epoll, kqueue backends via compile-time selection.
+pub fn SlotWriteCompletionGen(comptime XevApi: type) type {
+    return struct {
+        const Self = @This();
 
-    /// Slot writer for output
-    slot_writer_ptr: *slot_writer.SlotWriter,
-
-    /// Which slot this worker writes to
-    slot_index: usize,
-
-    /// Compression codec for output
-    compression: schema.CompressionCodec,
-
-    /// Thread pool task
-    task: xev.ThreadPool.Task,
-
-    /// Async signal to notify main loop
-    async_signal: xev.Async,
-
-    /// xev completion for async wait
-    xev_completion: xev.Completion,
-
-    /// Pointer to shared pending counter
-    pending: *std.atomic.Value(usize),
-
-    /// Output buffer (filled during task execution)
-    output_buffer: std.ArrayListUnmanaged(u8),
-
-    /// Column metadata (filled during task execution)
-    column_metas: ?[]slot_writer.ColumnMeta,
-
-    /// Error from task execution (if any)
-    task_error: ?anyerror,
-
-    pub fn init(
+        /// The worker being executed
         worker: *RowGroupWorker,
-        sw: *slot_writer.SlotWriter,
-        slot_idx: usize,
+
+        /// Slot writer for output
+        slot_writer_ptr: *slot_writer.SlotWriter,
+
+        /// Which slot this worker writes to
+        slot_index: usize,
+
+        /// Compression codec for output
         compression: schema.CompressionCodec,
+
+        /// Thread pool task
+        task: xev.ThreadPool.Task,
+
+        /// Async signal to notify main loop
+        async_signal: XevApi.Async,
+
+        /// xev completion for async wait
+        xev_completion: XevApi.Completion,
+
+        /// Pointer to shared pending counter
         pending: *std.atomic.Value(usize),
-    ) !Self {
-        return Self{
-            .worker = worker,
-            .slot_writer_ptr = sw,
-            .slot_index = slot_idx,
-            .compression = compression,
-            .task = .{ .callback = taskCallback },
-            .async_signal = try xev.Async.init(),
-            .xev_completion = .{},
-            .pending = pending,
-            .output_buffer = .{},
-            .column_metas = null,
-            .task_error = null,
-        };
-    }
 
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-        self.async_signal.deinit();
-        self.output_buffer.deinit(allocator);
-        if (self.column_metas) |metas| {
-            for (metas) |*m| {
-                m.encodings.deinit(allocator);
-                m.path_in_schema.deinit(allocator);
+        /// Output buffer (filled during task execution)
+        output_buffer: std.ArrayListUnmanaged(u8),
+
+        /// Column metadata (filled during task execution)
+        column_metas: ?[]slot_writer.ColumnMeta,
+
+        /// Error from task execution (if any)
+        task_error: ?anyerror,
+
+        pub fn init(
+            worker: *RowGroupWorker,
+            sw: *slot_writer.SlotWriter,
+            slot_idx: usize,
+            compression: schema.CompressionCodec,
+            pending: *std.atomic.Value(usize),
+        ) !Self {
+            return Self{
+                .worker = worker,
+                .slot_writer_ptr = sw,
+                .slot_index = slot_idx,
+                .compression = compression,
+                .task = .{ .callback = taskCallback },
+                .async_signal = try XevApi.Async.init(),
+                .xev_completion = .{},
+                .pending = pending,
+                .output_buffer = .{},
+                .column_metas = null,
+                .task_error = null,
+            };
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.async_signal.deinit();
+            self.output_buffer.deinit(allocator);
+            if (self.column_metas) |metas| {
+                for (metas) |*m| {
+                    m.encodings.deinit(allocator);
+                    m.path_in_schema.deinit(allocator);
+                }
+                allocator.free(metas);
             }
-            allocator.free(metas);
         }
-    }
 
-    /// Schedule this completion on the thread pool
-    pub fn scheduleOn(self: *Self, loop: *xev.Loop, pool: *xev.ThreadPool) void {
-        // Arm async wait first
-        self.async_signal.wait(loop, &self.xev_completion, Self, self, asyncCallback);
+        /// Schedule this completion on the thread pool
+        pub fn scheduleOn(self: *Self, loop: *XevApi.Loop, pool: *xev.ThreadPool) void {
+            // Arm async wait first
+            self.async_signal.wait(loop, &self.xev_completion, Self, self, asyncCallback);
 
-        // Schedule task on thread pool
-        pool.schedule(xev.ThreadPool.Batch.from(&self.task));
-    }
+            // Schedule task on thread pool
+            pool.schedule(xev.ThreadPool.Batch.from(&self.task));
+        }
 
-    /// Thread pool callback - runs filter, encode, and slot write
-    fn taskCallback(task: *xev.ThreadPool.Task) void {
-        const self: *Self = @fieldParentPtr("task", task);
-        const allocator = self.worker.allocator;
+        /// Thread pool callback - runs filter, encode, and slot write
+        fn taskCallback(task: *xev.ThreadPool.Task) void {
+            const self: *Self = @fieldParentPtr("task", task);
+            const allocator = self.worker.allocator;
 
-        // Step 1: Execute filter (CPU work)
-        self.worker.execute();
+            // Step 1: Execute filter (CPU work)
+            self.worker.execute();
 
-        if (self.worker.status == .failed) {
-            self.task_error = self.worker.err;
+            if (self.worker.status == .failed) {
+                self.task_error = self.worker.err;
+                self.async_signal.notify() catch {};
+                return;
+            }
+
+            // Step 2: Encode to buffer (if we have output)
+            if (self.worker.row_count > 0) {
+                self.column_metas = self.worker.encodeToBuffer(&self.output_buffer, self.compression) catch |err| {
+                    self.task_error = err;
+                    self.async_signal.notify() catch {};
+                    return;
+                };
+
+                // Step 3: Write to slot via pwrite (thread-safe)
+                self.slot_writer_ptr.writeSlot(self.slot_index, self.output_buffer.items) catch |err| {
+                    self.task_error = err;
+                    self.async_signal.notify() catch {};
+                    return;
+                };
+            } else {
+                // Empty result - write nothing but still need metadata
+                self.column_metas = allocator.alloc(slot_writer.ColumnMeta, 0) catch null;
+            }
+
+            // Signal completion
             self.async_signal.notify() catch {};
-            return;
         }
 
-        // Step 2: Encode to buffer (if we have output)
-        if (self.worker.row_count > 0) {
-            self.column_metas = self.worker.encodeToBuffer(&self.output_buffer, self.compression) catch |err| {
-                self.task_error = err;
-                self.async_signal.notify() catch {};
-                return;
-            };
-
-            // Step 3: Write to slot via pwrite (thread-safe)
-            self.slot_writer_ptr.writeSlot(self.slot_index, self.output_buffer.items) catch |err| {
-                self.task_error = err;
-                self.async_signal.notify() catch {};
-                return;
-            };
-        } else {
-            // Empty result - write nothing but still need metadata
-            self.column_metas = allocator.alloc(slot_writer.ColumnMeta, 0) catch null;
+        /// Async callback - runs on main loop when task completes
+        fn asyncCallback(
+            ud: ?*Self,
+            _: *XevApi.Loop,
+            _: *XevApi.Completion,
+            _: XevApi.Async.WaitError!void,
+        ) XevApi.CallbackAction {
+            const self = ud.?;
+            _ = self.pending.fetchSub(1, .release);
+            return .disarm;
         }
 
-        // Signal completion
-        self.async_signal.notify() catch {};
-    }
-
-    /// Async callback - runs on main loop when task completes
-    fn asyncCallback(
-        ud: ?*Self,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.Async.WaitError!void,
-    ) xev.CallbackAction {
-        const self = ud.?;
-        _ = self.pending.fetchSub(1, .release);
-        return .disarm;
-    }
-
-    /// Get the row group metadata after completion
-    pub fn getRowGroupMeta(self: *const Self) slot_writer.RowGroupMeta {
-        return self.worker.getRowGroupMeta(
-            self.column_metas orelse &[_]slot_writer.ColumnMeta{},
-            self.output_buffer.items.len,
-        );
-    }
-};
+        /// Get the row group metadata after completion
+        pub fn getRowGroupMeta(self: *const Self) slot_writer.RowGroupMeta {
+            return self.worker.getRowGroupMeta(
+                self.column_metas orelse &[_]slot_writer.ColumnMeta{},
+                self.output_buffer.items.len,
+            );
+        }
+    };
+}
 
 // Basic compile-time verification tests
 test "RowGroupWorker struct has expected fields" {

@@ -69,6 +69,9 @@ pub fn BatchReader(comptime T: type) type {
         values_remaining_in_page: usize = 0,
         current_page_index: usize = 0, // Track which page we're on (0-based, data pages only)
 
+        // Bit offset for BOOLEAN columns (bit-packed: 8 values per byte)
+        bool_bit_offset: u3 = 0,
+
         // Page decoders
         rle_decoder: ?RleDecoder = null,
         plain_decoder: ?Decoder = null,
@@ -217,6 +220,9 @@ pub fn BatchReader(comptime T: type) type {
                             for (0..values_to_skip_in_data) |_| try p.skipByteArray();
                         } else if (self.column_type == .FIXED_LEN_BYTE_ARRAY) {
                             try p.skipFixedLenByteArray(values_to_skip_in_data * @as(usize, @intCast(self.type_length.?)));
+                        } else if (self.column_type == .BOOLEAN) {
+                            // BOOLEAN is bit-packed (1 bit per value), must track bit offset
+                            p.skipBoolsWithOffset(values_to_skip_in_data, &self.bool_bit_offset);
                         } else {
                             const width: usize = if (T == [12]u8) 12 else @sizeOf(T);
                             try p.skip(values_to_skip_in_data * width);
@@ -315,7 +321,20 @@ pub fn BatchReader(comptime T: type) type {
                 // 2. Non-nullable PLAIN-encoded (primitives)
                 if (self.max_def_level == 0) {
                     if (self.plain_decoder) |*plain| {
-                        if (T != []const u8) {
+                        if (T == bool) {
+                            // BOOLEAN is bit-packed, need offset-aware read
+                            const to_read = @min(count, 1024);
+                            var values_buf: [1024]bool = undefined;
+                            const n = plain.readBoolBatchWithOffset(values_buf[0..to_read], &self.bool_bit_offset);
+                            if (n == 0) break;
+
+                            for (0..n) |i| {
+                                buffer[out_pos + i] = values_buf[i];
+                            }
+                            out_pos += n;
+                            self.values_remaining_in_page -= n;
+                            continue;
+                        } else if (T != []const u8) {
                             const to_read = @min(count, 1024); // Limited for internal buffer
                             var values_buf: [1024]T = undefined;
                             const n = try plain.readBatch(values_buf[0..to_read]);
@@ -404,7 +423,10 @@ pub fn BatchReader(comptime T: type) type {
 
                         if (values_needed > 0) {
                             var compact_vals: [8]T = undefined;
-                            const n_plain = try self.plain_decoder.?.readBatch(compact_vals[0..values_needed]);
+                            const n_plain = if (T == bool)
+                                self.plain_decoder.?.readBoolBatchWithOffset(compact_vals[0..values_needed], &self.bool_bit_offset)
+                            else
+                                try self.plain_decoder.?.readBatch(compact_vals[0..values_needed]);
                             if (n_plain < values_needed) return error.EndOfStream;
 
                             var tmp_out: [8]?T = undefined;
@@ -499,6 +521,8 @@ pub fn BatchReader(comptime T: type) type {
                     self.values_remaining_in_page = @intCast(dph.num_values);
                     try self.initPageDecoders(self.current_page.?);
                     self.current_page_index += 1;
+                    // Reset bit offset for new page (BOOLEAN is bit-packed)
+                    self.bool_bit_offset = 0;
                     return true;
                 }
 

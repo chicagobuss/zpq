@@ -6,12 +6,13 @@ const xev = @import("xev");
 const log = zpq.log.s3;
 
 /// Options for opening a Parquet file from S3 or Local storage.
+/// Uses xev.Dynamic for runtime backend selection (io_uring -> epoll fallback).
 pub const OpenOptions = struct {
     force_async: bool = false,
     verify_tls: bool = false,
-    loop: ?*xev.Loop = null,
+    loop: ?*xev.Dynamic.Loop = null,
     thread_pool: ?*xev.ThreadPool = null,
-    resolver: ?s3.dns.ResolverGen(xev) = null,
+    resolver: ?s3.dns.ResolverGen(xev.Dynamic) = null,
 };
 
 /// Cleanup helper for S3 sources owned by ParquetFile.
@@ -56,6 +57,7 @@ pub fn openS3WithLoop(
 
     // Discover the specific Xev API type based on the Loop type
     const XevApi = switch (LoopType) {
+        xev.Dynamic.Loop => xev.Dynamic,
         xev.Epoll.Loop => xev.Epoll,
         xev.IO_Uring.Loop => xev.IO_Uring,
         else => blk: {
@@ -132,7 +134,8 @@ pub fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, options: O
     defer discovery.deinit(allocator);
 
     // New high-performance Xev stack (creates its own loop)
-    const XevS3Source = @import("xev_source.zig").XevS3SourceGen(xev);
+    // Use xev.Dynamic for runtime backend selection (io_uring -> epoll fallback)
+    const XevS3Source = @import("xev_source.zig").XevS3SourceGen(xev.Dynamic);
     const s3_src = try XevS3Source.initWithOptions(
         allocator,
         discovery.host,

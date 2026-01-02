@@ -134,6 +134,13 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             key: []const u8,
             region: []const u8,
         ) !*Self {
+            // Detect best available backend at runtime for xev.Dynamic
+            if (@hasDecl(XevApi, "Dynamic") or @hasDecl(XevApi, "detect")) {
+                if (@hasDecl(XevApi, "detect")) {
+                    try XevApi.detect();
+                }
+            }
+
             const loop = try allocator.create(LoopType);
             loop.* = try LoopType.init(.{});
             errdefer {
@@ -177,6 +184,49 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                 .port = 443,
                 .use_tls = true,
                 .owns_loop = true,
+                .owns_pool = true,
+            };
+            return self;
+        }
+
+        /// Initialize with an existing event loop and thread pool (for Lambda/unibin).
+        /// The caller retains ownership of loop and pool - they won't be freed on deinit.
+        pub fn initWithLoop(
+            allocator: std.mem.Allocator,
+            loop: *LoopType,
+            thread_pool: *xev.ThreadPool,
+            bucket: []const u8,
+            key: []const u8,
+            region: []const u8,
+        ) !*Self {
+            const local_pool = try allocator.create(GlobalConnectionPool);
+            local_pool.* = GlobalConnectionPool.init(allocator);
+            errdefer {
+                local_pool.deinit();
+                allocator.destroy(local_pool);
+            }
+
+            const host = try std.fmt.allocPrint(allocator, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
+            errdefer allocator.free(host);
+
+            var tp_resolver = try allocator.create(ThreadPoolResolver);
+            tp_resolver.* = ThreadPoolResolver.init(thread_pool, allocator);
+
+            const self = try allocator.create(Self);
+            self.* = .{
+                .allocator = allocator,
+                .loop = loop,
+                .thread_pool = thread_pool,
+                .resolver = tp_resolver.resolver(),
+                .tp_resolver = tp_resolver,
+                .pool = local_pool,
+                .bucket = try allocator.dupe(u8, bucket),
+                .key = try allocator.dupe(u8, key),
+                .region = try allocator.dupe(u8, region),
+                .host = host,
+                .port = 443,
+                .use_tls = true,
+                .owns_loop = false, // Caller owns loop
                 .owns_pool = true,
             };
             return self;
@@ -839,14 +889,12 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                 try req_buf.appendSlice(self.allocator, "\r\n");
             }
 
-            // Add Content-Length
-            if (body.len > 0) {
-                try req_buf.appendSlice(self.allocator, "Content-Length: ");
-                var len_buf: [20]u8 = undefined;
-                const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
-                try req_buf.appendSlice(self.allocator, len_str);
-                try req_buf.appendSlice(self.allocator, "\r\n");
-            }
+            // Add Content-Length (always required by S3, even for 0-byte bodies)
+            try req_buf.appendSlice(self.allocator, "Content-Length: ");
+            var len_buf: [20]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
+            try req_buf.appendSlice(self.allocator, len_str);
+            try req_buf.appendSlice(self.allocator, "\r\n");
 
             try req_buf.appendSlice(self.allocator, "\r\n");
 

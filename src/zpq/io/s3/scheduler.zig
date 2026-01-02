@@ -28,10 +28,17 @@ pub fn mergeRanges(
 ) !std.ArrayListUnmanaged(MergedRequest) {
     if (ranges.len == 0) return std.ArrayListUnmanaged(MergedRequest){};
 
-    // 1. Sort ranges by start offset (assumed sorted for now, or caller must sort)
-    // We'll assume caller sorts for this low-level function to avoid allocs if possible,
-    // but for safety/correctness let's just create an index list and sort that if needed.
-    // For now, let's assume input IS sorted by start.
+    // 1. Sort ranges by start offset - critical for correct merging!
+    // Create sorted indices to preserve original buffer mapping.
+    var sorted_indices = try allocator.alloc(usize, ranges.len);
+    defer allocator.free(sorted_indices);
+    for (0..ranges.len) |i| sorted_indices[i] = i;
+
+    std.mem.sort(usize, sorted_indices, ranges, struct {
+        fn lessThan(ctx: []const Range, a: usize, b: usize) bool {
+            return ctx[a].start < ctx[b].start;
+        }
+    }.lessThan);
 
     var merged = std.ArrayListUnmanaged(MergedRequest){};
     errdefer {
@@ -39,16 +46,18 @@ pub fn mergeRanges(
         merged.deinit(allocator);
     }
 
-    // Start with the first range
+    // Start with the first range (in sorted order)
+    const first_idx = sorted_indices[0];
     var current_req = MergedRequest{
-        .request_range = ranges[0],
+        .request_range = ranges[first_idx],
         .original_indices = std.ArrayListUnmanaged(usize){},
     };
-    try current_req.original_indices.append(allocator, 0);
+    try current_req.original_indices.append(allocator, first_idx);
 
     var i: usize = 1;
     while (i < ranges.len) : (i += 1) {
-        const next = ranges[i];
+        const orig_idx = sorted_indices[i];
+        const next = ranges[orig_idx];
 
         // Calculate gap
         const current_end = current_req.request_range.end;
@@ -56,7 +65,7 @@ pub fn mergeRanges(
         // Handle overlap (should be merged)
         if (next.start < current_end) {
             current_req.request_range.end = @max(current_end, next.end);
-            try current_req.original_indices.append(allocator, i);
+            try current_req.original_indices.append(allocator, orig_idx);
             continue;
         }
 
@@ -66,7 +75,7 @@ pub fn mergeRanges(
         // This is critical for Parquet column chunks which are often close together
         if (gap <= MIN_GAP_THRESHOLD) {
             current_req.request_range.end = next.end;
-            try current_req.original_indices.append(allocator, i);
+            try current_req.original_indices.append(allocator, orig_idx);
             continue;
         }
 
@@ -79,7 +88,7 @@ pub fn mergeRanges(
         if (gap <= gap_tolerance) {
             // Merge
             current_req.request_range.end = next.end;
-            try current_req.original_indices.append(allocator, i);
+            try current_req.original_indices.append(allocator, orig_idx);
         } else {
             // Push current and start new
             try merged.append(allocator, current_req);
@@ -87,7 +96,7 @@ pub fn mergeRanges(
                 .request_range = next,
                 .original_indices = std.ArrayListUnmanaged(usize){},
             };
-            try current_req.original_indices.append(allocator, i);
+            try current_req.original_indices.append(allocator, orig_idx);
         }
     }
 

@@ -1,0 +1,33 @@
+# Benchmark Lambda RIE setup
+#
+# Usage:
+#   cd benchmarks && docker-compose up --build -d
+#
+#   # Local file benchmark
+#   curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+#     -d '{"file": "/data/benchmark_10mb.parquet", "output": "/tmp/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
+#
+#   # S3 benchmark (us-west-2) - replace {BUCKET} with your bucket name
+#   curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+#     -d '{"file": "s3://{BUCKET}/benchmark/benchmark_10mb.parquet", "output": "s3://{BUCKET}/output/zpq_bench_output.parquet", "filter": "string_dict_low=category_0001", "select": "int32_sorted,string_dict_low,float64"}'
+#
+# To force epoll (block io_uring), set NO_IO_URING=1:
+#   NO_IO_URING=1 docker-compose up --build -d
+
+services:
+  lambda-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:8080"
+    environment:
+      - AWS_REGION=us-west-2
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+    volumes:
+      - /tmp/zpq_r2_bucket/benchmark:/data:ro
+      - /tmp:/tmp
+    # Uncomment to force epoll (block io_uring):
+    # security_opt:
+    #   - seccomp=./no-io-uring.json

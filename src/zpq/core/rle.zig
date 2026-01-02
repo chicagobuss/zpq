@@ -398,9 +398,9 @@ pub const RleDecoder = struct {
                 const skip_amt = @min(remaining, self.literal_count);
                 var i: u32 = 0;
                 while (i < skip_amt) : (i += 1) {
+                    // readBitPackedValue() already decrements literal_count
                     const val = self.readBitPackedValue() catch break;
                     if (val == target) match_count += 1;
-                    self.literal_count -= 1;
                 }
                 remaining -= i;
             } else {

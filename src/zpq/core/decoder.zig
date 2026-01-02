@@ -132,4 +132,41 @@ pub const Decoder = struct {
         if (self.pos + len > self.data.len) return error.EndOfStream;
         self.pos += len;
     }
+
+    /// Read bit-packed booleans with bit offset tracking.
+    /// bit_offset tracks position within current byte (0-7).
+    /// Returns number of values read.
+    pub fn readBoolBatchWithOffset(self: *Decoder, buffer: []bool, bit_offset: *u3) usize {
+        var count: usize = 0;
+        var bit: u3 = bit_offset.*;
+
+        while (count < buffer.len and self.pos < self.data.len) {
+            const byte = self.data[self.pos];
+            buffer[count] = ((byte >> bit) & 1) == 1;
+            count += 1;
+
+            // Advance bit position
+            if (bit == 7) {
+                bit = 0;
+                self.pos += 1;
+            } else {
+                bit += 1;
+            }
+        }
+
+        bit_offset.* = bit;
+        return count;
+    }
+
+    /// Skip bit-packed booleans with bit offset tracking.
+    /// bit_offset tracks position within current byte (0-7).
+    pub fn skipBoolsWithOffset(self: *Decoder, count: usize, bit_offset: *u3) void {
+        // Calculate total bits from current offset
+        const total_bits = @as(usize, bit_offset.*) + count;
+        const bytes_to_skip = total_bits / 8;
+        const remaining_bits: u3 = @intCast(total_bits % 8);
+
+        self.pos += bytes_to_skip;
+        bit_offset.* = remaining_bits;
+    }
 };

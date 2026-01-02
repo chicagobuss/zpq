@@ -47,3 +47,8 @@ examples/lambda/comparison/rust-arrow/target/
 examples/lambda/comparison/**/*.zip
 CURRENT_CONTEXT.md
 .claude/
+-e 
+# Benchmark binaries
+benchmarks/bootstrap
+benchmarks/zpq
+benchmarks/*.zip

@@ -7,13 +7,24 @@ const QueryResult = query.QueryResult;
 
 /// Lambda Runtime API handler.
 /// Polls for events and executes queries in a loop until the container is killed.
+/// Uses xev.Dynamic for runtime backend detection (io_uring -> epoll fallback).
 pub fn run(allocator: std.mem.Allocator, runtime_api: [*:0]const u8) !void {
     const api_str = std.mem.span(runtime_api);
 
-    std.debug.print("zpq: Lambda mode (runtime: {s})\n", .{api_str});
+    // Detect best available backend at runtime (io_uring if available, else epoll)
+    // On single-backend systems (macOS/kqueue), detect() doesn't exist - that's fine.
+    if (@hasDecl(xev.Dynamic, "detect")) {
+        try xev.Dynamic.detect();
+    }
 
-    // Setup once (warm container reuse)
-    var loop = try xev.Loop.init(.{});
+    const backend_name = if (@hasDecl(xev.Dynamic, "backend"))
+        @tagName(xev.Dynamic.backend)
+    else
+        @tagName(xev.backend); // Single-backend system uses static xev.backend
+    std.debug.print("zpq: Lambda mode (runtime: {s}, backend: {s})\n", .{ api_str, backend_name });
+
+    // Setup event loop with detected backend
+    var loop = try xev.Dynamic.Loop.init(.{});
     defer loop.deinit();
 
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });

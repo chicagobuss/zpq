@@ -19,6 +19,18 @@ pub fn ConnectionGen(comptime XevApi: type) type {
     return struct {
         const Self = @This();
 
+        /// Get the file descriptor from TCP socket, handling both static (.fd field)
+        /// and dynamic (.fd() method) APIs.
+        fn getFd(tcp: TCP) std.posix.socket_t {
+            if (@hasDecl(TCP, "fd")) {
+                // Dynamic API: fd is a method
+                return tcp.fd();
+            } else {
+                // Static API: fd is a field
+                return tcp.fd;
+            }
+        }
+
         loop: *LoopType,
         tcp: TCP,
         tls: boring.tls_client.TlsClient,
@@ -73,7 +85,7 @@ pub fn ConnectionGen(comptime XevApi: type) type {
         pub fn deinit(self: *Self) void {
             self.tls.deinit();
             if (!self.closed) {
-                std.posix.close(self.tcp.fd);
+                std.posix.close(getFd(self.tcp));
                 self.closed = true;
             }
         }
@@ -90,13 +102,13 @@ pub fn ConnectionGen(comptime XevApi: type) type {
             const one: i32 = 1;
 
             if (@import("builtin").os.tag == .macos) {
-                try std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
+                try std.posix.setsockopt(getFd(self.tcp), std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one));
             }
 
             const size: i32 = 4 * 1024 * 1024;
-            std.posix.setsockopt(self.tcp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+            std.posix.setsockopt(getFd(self.tcp), std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
 
-            std.posix.setsockopt(self.tcp.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+            std.posix.setsockopt(getFd(self.tcp), std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 
             self.tcp.connect(self.loop, &self.c_connect, addr, Self, self, internalOnConnect);
         }

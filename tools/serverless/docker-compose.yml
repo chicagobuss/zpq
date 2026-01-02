@@ -2,10 +2,10 @@
 #
 # Usage:
 #   # Test with R2 (default) - run from repo root
-#   cd tools/lambda && source ../../.env && docker-compose up --build
+#   cd tools/serverless && source ../../.env && docker-compose up --build
 #
 #   # Test with local rustfs
-#   cd tools/lambda && docker-compose --profile local up --build
+#   cd tools/serverless && docker-compose --profile local up --build
 #
 #   # Invoke the function
 #   curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
@@ -16,7 +16,7 @@ services:
   lambda:
     build:
       context: ../..
-      dockerfile: tools/lambda/Dockerfile
+      dockerfile: tools/serverless/Dockerfile
     ports:
       - "9000:8080"
     environment:
@@ -43,7 +43,7 @@ services:
   lambda-local:
     build:
       context: ../..
-      dockerfile: tools/lambda/Dockerfile
+      dockerfile: tools/serverless/Dockerfile
     profiles: ["local"]
     ports:
       - "9000:8080"

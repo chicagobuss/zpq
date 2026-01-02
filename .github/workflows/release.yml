@@ -12,8 +12,25 @@ on:
         type: string
 
 jobs:
+  # Wait for CI to complete on the same commit (only for tag pushes)
+  wait-for-ci:
+    name: Wait for CI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Wait for CI workflow
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 10
+          running-workflow-name: "Wait for CI"
+          check-regexp: "(linux|macos)-" # Match CI job names
+
   build:
     name: Build ${{ matrix.target }}
+    needs: [wait-for-ci]
+    if: always() && (needs.wait-for-ci.result == 'success' || needs.wait-for-ci.result == 'skipped')
     runs-on: ${{ matrix.os }}
     permissions:
       actions: read # Required for dawidd6/action-download-artifact to list CI runs
@@ -42,31 +59,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Try to download pre-built binary from CI (faster path)
+      # Try to download pre-built binary from CI for this specific commit
       - name: Try CI Artifact
         id: ci-artifact
         uses: dawidd6/action-download-artifact@v3
         continue-on-error: true
         with:
           workflow: ci.yml
-          branch: main
+          commit: ${{ github.sha }}
           name: ${{ matrix.ci_artifact }}
           path: ci-bin/
-          search_artifacts: true
           if_no_artifact_found: ignore
 
       - name: Check CI Artifact
         id: check-ci
         run: |
           if [ -f "ci-bin/zpq" ]; then
-            echo "Found CI artifact, using pre-built binary"
+            echo "Found CI artifact for commit ${{ github.sha }}, using pre-built binary"
             echo "found=true" >> $GITHUB_OUTPUT
             chmod +x ci-bin/zpq
             mkdir -p zig-out/bin
             mv ci-bin/zpq zig-out/bin/zpq
             ls -la zig-out/bin/
           else
-            echo "No CI artifact found, will build from source"
+            echo "No CI artifact found for commit ${{ github.sha }}, will build from source"
             echo "found=false" >> $GITHUB_OUTPUT
           fi
 

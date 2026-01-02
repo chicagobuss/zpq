@@ -180,12 +180,12 @@ fn parseS3Path(path: []const u8) !S3PathInfo {
     };
 }
 
-const ManagedS3Config = struct {
+pub const ManagedS3Config = struct {
     credentials: ?s3.Credentials = null,
     region: []const u8,
     endpoint: ?[]const u8 = null,
 
-    fn deinit(self: *const ManagedS3Config, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const ManagedS3Config, allocator: std.mem.Allocator) void {
         if (self.credentials) |creds| {
             allocator.free(creds.access_key);
             allocator.free(creds.secret_key);
@@ -195,7 +195,7 @@ const ManagedS3Config = struct {
         if (self.endpoint) |ep| allocator.free(ep);
     }
 
-    fn toLegacy(self: ManagedS3Config) s3.S3Config {
+    pub fn toLegacy(self: ManagedS3Config) s3.S3Config {
         return .{
             .credentials = self.credentials,
             .region = self.region,
@@ -204,7 +204,7 @@ const ManagedS3Config = struct {
     }
 };
 
-fn loadS3ConfigFromEnv(allocator: std.mem.Allocator) !ManagedS3Config {
+pub fn loadS3ConfigFromEnv(allocator: std.mem.Allocator) !ManagedS3Config {
     const access_key = try getEnvOrNull(allocator, "AWS_ACCESS_KEY_ID");
     errdefer if (access_key) |s| allocator.free(s);
     const secret_key = try getEnvOrNull(allocator, "AWS_SECRET_ACCESS_KEY");
@@ -230,18 +230,18 @@ fn loadS3ConfigFromEnv(allocator: std.mem.Allocator) !ManagedS3Config {
     };
 }
 
-const EndpointDiscovery = struct {
+pub const EndpointDiscovery = struct {
     host: []const u8,
     port: u16,
     use_tls: bool,
     allocated_host: bool = false,
 
-    fn deinit(self: EndpointDiscovery, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: EndpointDiscovery, allocator: std.mem.Allocator) void {
         if (self.allocated_host) allocator.free(self.host);
     }
 };
 
-fn discoverS3Endpoint(allocator: std.mem.Allocator, endpoint_env: ?[]const u8, region: []const u8) !EndpointDiscovery {
+pub fn discoverS3Endpoint(allocator: std.mem.Allocator, endpoint_env: ?[]const u8, region: []const u8) !EndpointDiscovery {
     var disc = EndpointDiscovery{
         .host = "s3.amazonaws.com",
         .port = 443,
@@ -275,8 +275,14 @@ fn discoverS3Endpoint(allocator: std.mem.Allocator, endpoint_env: ?[]const u8, r
 }
 
 fn getEnvOrNull(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
+    const val = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
         else => |e| return e,
     };
+    // Treat empty string as null (e.g., Lambda RIE sets AWS_SESSION_TOKEN="")
+    if (val.len == 0) {
+        allocator.free(val);
+        return null;
+    }
+    return val;
 }

@@ -50,6 +50,7 @@ pub fn ConnectionGen(comptime XevApi: type) type {
         on_connect: ?*const fn (ctx: ?*anyopaque) void = null,
         on_data: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
         on_error: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
+        on_write_complete: ?*const fn (ctx: ?*anyopaque, bytes_written: usize) void = null,
 
         pub const Options = struct {
             verify_certificate: bool = false,
@@ -226,6 +227,9 @@ pub fn ConnectionGen(comptime XevApi: type) type {
             me.allocator.free(buffer.slice);
             if (result) |n| {
                 log.debug("internalOnTcpWrite: wrote {d} bytes", .{n});
+                // Notify application that write completed BEFORE pump()
+                // This allows chunked uploads to queue the next chunk
+                if (me.on_write_complete) |cb| cb(me.user_ctx, n);
                 me.pump();
             } else |err| {
                 log.debug("internalOnTcpWrite: write failed: {}", .{err});

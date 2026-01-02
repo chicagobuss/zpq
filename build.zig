@@ -333,6 +333,40 @@ pub fn build(b: *std.Build) void {
         probe_dns_xev.root_module.addImport("xev", libxev_mod);
         probe_dns_xev.root_module.addImport("zpq", zpq_mod);
         b.installArtifact(probe_dns_xev);
+
+        // Probe for parallel uploads
+        const probe_parallel_upload = b.addExecutable(.{
+            .name = "probe-parallel-upload",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_parallel_upload.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_parallel_upload.root_module.addImport("xev", libxev_mod);
+        probe_parallel_upload.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_parallel_upload);
+
+        const run_probe_parallel_upload = b.addRunArtifact(probe_parallel_upload);
+        const step_probe_parallel_upload = b.step("probe-parallel-upload", "Run parallel upload probe");
+        step_probe_parallel_upload.dependOn(&run_probe_parallel_upload.step);
+
+        // Probe for R2 writer (using existing S3Writer)
+        const probe_r2_writer = b.addExecutable(.{
+            .name = "probe-r2-writer",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probes/probe_r2_writer.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        probe_r2_writer.root_module.addImport("xev", libxev_mod);
+        probe_r2_writer.root_module.addImport("zpq", zpq_mod);
+        b.installArtifact(probe_r2_writer);
+
+        const run_probe_r2_writer = b.addRunArtifact(probe_r2_writer);
+        const step_probe_r2_writer = b.step("probe-r2-writer", "Run R2 writer probe");
+        step_probe_r2_writer.dependOn(&run_probe_r2_writer.step);
     }
 
     // Auxiliary Tools (Probes, Benchmarks, Fuzzers)

@@ -40,13 +40,13 @@ pub fn run(allocator: std.mem.Allocator, runtime_api: [*:0]const u8) !void {
     while (true) {
         // GET /runtime/invocation/next (blocks until event arrives)
         const event_result = httpGet(allocator, &client, base_url, "/invocation/next") catch |err| {
-            std.debug.print("zpq: Failed to get next invocation: {s}\n", .{@errorName(err)});
+            std.debug.print("zpq: error polling for invocation: {s}\n", .{@errorName(err)});
             continue;
         };
         defer allocator.free(event_result.body);
         defer allocator.free(event_result.request_id);
 
-        std.debug.print("zpq: Received invocation {s}\n", .{event_result.request_id});
+        std.debug.print("zpq: invocation {s}\n", .{event_result.request_id});
 
         // Parse JSON event → QueryParams
         const params = query.parseQueryJson(allocator, event_result.body) catch |err| {
@@ -90,7 +90,7 @@ pub fn run(allocator: std.mem.Allocator, runtime_api: [*:0]const u8) !void {
             std.debug.print("zpq: Failed to post response: {s}\n", .{@errorName(err)});
         };
 
-        std.debug.print("zpq: Completed invocation {s}\n", .{event_result.request_id});
+        std.debug.print("zpq: completed {s}\n", .{event_result.request_id});
     }
 }
 
@@ -118,7 +118,7 @@ fn httpGet(allocator: std.mem.Allocator, client: *std.http.Client, base_url: []c
     var redirect_buf: [1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
 
-    // Extract request ID from headers BEFORE getting the reader
+    // Extract request ID from headers
     var request_id: []u8 = undefined;
     var found_id = false;
 
@@ -135,20 +135,38 @@ fn httpGet(allocator: std.mem.Allocator, client: *std.http.Client, base_url: []c
         request_id = try allocator.dupe(u8, "unknown");
     }
 
-    // Read body - get reader AFTER processing headers
+    // Read body directly from underlying reader
+    // NOTE: response.reader() has a bug in Zig 0.16 with @fieldParentPtr,
+    // so we read directly from req.reader.in instead
     var body_list = std.ArrayListUnmanaged(u8){};
-    defer body_list.deinit(allocator);
+    errdefer body_list.deinit(allocator);
 
-    var transfer_buf: [4096]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
+    const content_len = response.head.content_length orelse 0;
+    if (content_len > 0) {
+        const underlying_reader = req.reader.in;
 
-    // Read all body content
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = reader.readSliceShort(&buf) catch break;
-        if (n == 0) break;
-        try body_list.appendSlice(allocator, buf[0..n]);
+        // Check for already-buffered data first
+        const buffered = underlying_reader.buffered();
+        if (buffered.len > 0) {
+            const to_read = @min(buffered.len, content_len);
+            try body_list.appendSlice(allocator, buffered[0..to_read]);
+            underlying_reader.toss(to_read);
+        }
+
+        // Read remaining if needed
+        if (body_list.items.len < content_len) {
+            var buf: [4096]u8 = undefined;
+            while (body_list.items.len < content_len) {
+                const to_read = @min(buf.len, content_len - body_list.items.len);
+                underlying_reader.readSliceAll(buf[0..to_read]) catch break;
+                try body_list.appendSlice(allocator, buf[0..to_read]);
+            }
+        }
     }
+
+    // Mark reader state as ready so deinit doesn't try to drain body
+    // (we already read it directly from the underlying reader)
+    req.reader.state = .ready;
 
     return .{
         .body = try body_list.toOwnedSlice(allocator),

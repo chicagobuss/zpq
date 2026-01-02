@@ -18,6 +18,11 @@ const log = std.log.scoped(.probe_upload);
 /// 2. Kick them all off (connect) - non-blocking
 /// 3. Run loop.run(.until_done) - processes all in parallel
 /// 4. Check results after loop completes
+/// Maximum chunk size for writes to avoid TLS buffer issues.
+/// Testing shows uploads fail above ~130KB due to TLS not interleaving reads.
+/// Set to 0 to disable chunking (send entire request in one write).
+const WRITE_CHUNK_SIZE = 0; // Disabled - test single write
+
 const UploadContext = struct {
     allocator: std.mem.Allocator,
     id: usize,
@@ -25,6 +30,8 @@ const UploadContext = struct {
     pool: *GlobalConnectionPool,
     key: ConnectionKey,
     request_data: []const u8, // Owned - headers + body combined
+    write_offset: usize = 0, // Track chunked write progress
+    write_started: bool = false, // Guard against callbacks during handshake
     response_buf: std.ArrayListUnmanaged(u8) = .{},
     done: bool = false,
     err: ?anyerror = null,
@@ -37,22 +44,86 @@ const UploadContext = struct {
         self.response_buf.deinit(self.allocator);
         if (self.etag) |e| self.allocator.free(e);
     }
+
+    /// Write the next chunk of data. Returns true if more data to write.
+    /// Returns false if done, nothing to write, or write not possible yet.
+    fn writeNextChunk(self: *UploadContext) bool {
+        if (self.done) return false;
+        if (self.write_offset >= self.request_data.len) return false;
+
+        // KEY: Check if a write is already in progress
+        // This handles the case where on_connect fires while handshake write is pending
+        if (self.conn.pending_write) {
+            log.debug("[{d}] Write pending, deferring chunk", .{self.id});
+            return true; // Still have data to write, will retry on next callback
+        }
+
+        const remaining = self.request_data.len - self.write_offset;
+        const chunk_size = @min(remaining, WRITE_CHUNK_SIZE);
+        const chunk = self.request_data[self.write_offset .. self.write_offset + chunk_size];
+
+        log.debug("[{d}] Writing chunk: offset={d}, size={d}, remaining={d}", .{
+            self.id,
+            self.write_offset,
+            chunk_size,
+            remaining - chunk_size,
+        });
+
+        self.conn.write(chunk) catch |err| {
+            log.err("[{d}] Chunk write failed: {}", .{ self.id, err });
+            self.err = err;
+            self.done = true;
+            return false;
+        };
+
+        self.write_offset += chunk_size;
+        return self.write_offset < self.request_data.len;
+    }
 };
 
 fn onConnect(ctx_void: ?*anyopaque) void {
     const ctx: *UploadContext = @ptrCast(@alignCast(ctx_void));
-    log.info("[{d}] Connected, sending {d} bytes ({d} body)", .{
+    log.info("[{d}] Connected, sending {d} bytes ({d} body) in {d}KB chunks, pending_write={}", .{
         ctx.id,
         ctx.request_data.len,
         ctx.body_size,
+        WRITE_CHUNK_SIZE / 1024,
+        ctx.conn.pending_write,
     });
 
-    ctx.conn.write(ctx.request_data) catch |err| {
-        log.err("[{d}] Write failed: {}", .{ ctx.id, err });
-        ctx.err = err;
-        ctx.done = true;
+    // Mark that we're starting application data writes
+    ctx.write_started = true;
+
+    // Start chunked write - first chunk (may defer if pending_write=true)
+    const has_more = ctx.writeNextChunk();
+    log.info("[{d}] After first writeNextChunk: has_more={}, offset={}, pending_write={}", .{
+        ctx.id,
+        has_more,
+        ctx.write_offset,
+        ctx.conn.pending_write,
+    });
+}
+
+fn onWriteComplete(ctx_void: ?*anyopaque, bytes_written: usize) void {
+    const ctx: *UploadContext = @ptrCast(@alignCast(ctx_void));
+
+    // Ignore callbacks during TLS handshake (before onConnect is called)
+    if (!ctx.write_started) {
+        log.debug("[{d}] onWriteComplete (handshake): {d} bytes", .{ ctx.id, bytes_written });
         return;
-    };
+    }
+
+    log.info("[{d}] onWriteComplete: {d} bytes, offset={d}/{d}, pending_write={}", .{
+        ctx.id,
+        bytes_written,
+        ctx.write_offset,
+        ctx.request_data.len,
+        ctx.conn.pending_write,
+    });
+
+    // Continue with next chunk if there's more data
+    const has_more = ctx.writeNextChunk();
+    log.debug("[{d}] After writeNextChunk: has_more={}", .{ ctx.id, has_more });
 }
 
 fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
@@ -204,7 +275,30 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("=== Parallel Upload Probe ===\n", .{});
-    std.debug.print("Testing N parallel PUT uploads to rustfs\n\n", .{});
+    std.debug.print("Testing N parallel PUT uploads to R2\n\n", .{});
+
+    // Load R2 credentials from environment
+    const access_key = std.posix.getenv("R2_ACCESS_KEY_ID") orelse {
+        std.debug.print("ERROR: R2_ACCESS_KEY_ID not set\n", .{});
+        return error.MissingCredentials;
+    };
+    const secret_key = std.posix.getenv("R2_SECRET_ACCESS_KEY") orelse {
+        std.debug.print("ERROR: R2_SECRET_ACCESS_KEY not set\n", .{});
+        return error.MissingCredentials;
+    };
+    const account_id = std.posix.getenv("R2_ACCOUNT_ID") orelse {
+        std.debug.print("ERROR: R2_ACCOUNT_ID not set\n", .{});
+        return error.MissingCredentials;
+    };
+    const bucket = std.posix.getenv("R2_BUCKET") orelse "zpq";
+    const region = "auto"; // R2 uses "auto"
+
+    // Build R2 host from account ID
+    const host = try std.fmt.allocPrint(allocator, "{s}.r2.cloudflarestorage.com", .{account_id});
+    defer allocator.free(host);
+
+    std.debug.print("R2 endpoint: {s}\n", .{host});
+    std.debug.print("Bucket: {s}\n\n", .{bucket});
 
     // Setup
     var loop = try xev.Loop.init(.{});
@@ -213,19 +307,30 @@ pub fn main() !void {
     var pool = GlobalConnectionPool.init(allocator);
     defer pool.deinit();
 
-    const host = "localhost";
-    const port: u16 = 9999;
+    const port: u16 = 443;
     const key = ConnectionKey{ .host = host, .port = port, .use_tls = true };
-    const xev_addr = try xev.shim_net.Address.parseIp4("127.0.0.1", port);
 
-    // rustfs credentials
-    const access_key = "rustfsadmin";
-    const secret_key = "rustfsadmin";
-    const region = "us-east-1";
+    // DNS resolution for R2 using std.c.getaddrinfo
+    const host_z = try allocator.dupeZ(u8, host);
+    defer allocator.free(host_z);
+
+    var hints: std.c.addrinfo = std.mem.zeroInit(std.c.addrinfo, .{
+        .family = std.c.AF.UNSPEC,
+        .socktype = std.c.SOCK.STREAM,
+    });
+    var res: ?*std.c.addrinfo = null;
+    const rc = std.c.getaddrinfo(host_z.ptr, "443", &hints, &res);
+    if (@intFromEnum(rc) != 0) {
+        std.debug.print("DNS resolution failed: {s}\n", .{std.mem.span(std.c.gai_strerror(rc))});
+        return error.DnsResolutionFailed;
+    }
+    defer std.c.freeaddrinfo(res.?);
+
+    const xev_addr = xev.shim_net.Address.initPosix(res.?.addr.?);
 
     // Number of parallel uploads and body size
-    const N = 5; // Test parallel uploads (like AWS CLI's default)
-    const BODY_SIZE = 8 * 1024 * 1024; // 8MB per upload (AWS CLI default chunk size)
+    const N = 1; // Single upload to isolate the issue
+    const BODY_SIZE = 1 * 1024 * 1024; // 1MB - should need 16 chunks
 
     std.debug.print("Starting {d} parallel uploads ({d} KB each)...\n\n", .{ N, BODY_SIZE / 1024 });
 
@@ -240,7 +345,7 @@ pub fn main() !void {
 
     for (0..N) |i| {
         // Each upload goes to a different key
-        const path = try std.fmt.allocPrint(allocator, "/test-bucket/parallel_upload_{d}.bin", .{i});
+        const path = try std.fmt.allocPrint(allocator, "/{s}/testdata/probe_parallel_upload_{d}.bin", .{ bucket, i });
         defer allocator.free(path);
 
         const request = try buildPutRequest(
@@ -277,6 +382,7 @@ pub fn main() !void {
         conn.on_connect = onConnect;
         conn.on_data = onData;
         conn.on_error = onError;
+        conn.on_write_complete = onWriteComplete;
 
         // Kick off connection (non-blocking)
         log.info("[{d}] Starting connection...", .{i});

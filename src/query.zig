@@ -56,7 +56,7 @@ pub fn executeQuery(
 
     // Meta-only mode
     if (params.show_meta) {
-        const meta = try pipeline.getMeta();
+        const meta = try pipeline.getMeta(allocator);
         return .{ .meta = meta };
     }
 

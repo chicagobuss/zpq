@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
     addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_parallel_write");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_parallel_upload");
     addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_traced_upload");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_r2_writer");
+    addProbe(b, target, optimize, zpq_mod, xev_mod, "probe_s3_parquet_write");
 }
 
 fn addProbe(

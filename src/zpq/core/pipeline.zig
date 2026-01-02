@@ -9,6 +9,7 @@ const slot_writer_mod = @import("slot_writer.zig");
 const row_group_worker_mod = @import("row_group_worker.zig");
 const interface = @import("../io/interface.zig");
 const factory = @import("../io/s3/factory.zig");
+const s3_writer_mod = @import("../io/s3/writer.zig");
 
 const ParquetFile = file_mod.ParquetFile;
 const EncodedFilter = filter_mod.EncodedFilter;
@@ -241,6 +242,7 @@ pub const Pipeline = struct {
     };
 
     /// Get schema as struct array (for Lambda/HTTP responses)
+    /// Caller owns the returned slice and all strings within it.
     pub fn getSchema(self: *Self, allocator: std.mem.Allocator) ![]SchemaFieldInfo {
         if (self.input_file == null) {
             try self.open();
@@ -250,11 +252,12 @@ pub const Pipeline = struct {
 
         const col_count = meta.schema.items.len - 1;
         var fields = try allocator.alloc(SchemaFieldInfo, col_count);
+        errdefer allocator.free(fields);
 
         for (meta.schema.items[1..], 0..) |elem, i| {
             fields[i] = .{
                 .index = i,
-                .name = elem.name,
+                .name = try allocator.dupe(u8, elem.name),
                 .type_name = @tagName(elem.type orelse .BOOLEAN),
             };
         }
@@ -263,7 +266,8 @@ pub const Pipeline = struct {
     }
 
     /// Get file metadata as struct (for Lambda/HTTP responses)
-    pub fn getMeta(self: *Self) !FileMetaInfo {
+    /// Caller owns the returned strings (path, created_by).
+    pub fn getMeta(self: *Self, allocator: std.mem.Allocator) !FileMetaInfo {
         if (self.input_file == null) {
             try self.open();
         }
@@ -271,11 +275,11 @@ pub const Pipeline = struct {
         const meta = pf.metadata orelse return error.NoMetadata;
 
         return .{
-            .path = self.input_path.?,
+            .path = try allocator.dupe(u8, self.input_path.?),
             .row_count = @intCast(meta.num_rows),
             .row_group_count = meta.row_groups.items.len,
             .column_count = meta.schema.items.len - 1,
-            .created_by = meta.created_by,
+            .created_by = if (meta.created_by) |cb| try allocator.dupe(u8, cb) else null,
         };
     }
 
@@ -570,9 +574,27 @@ pub const Pipeline = struct {
             });
         }
 
+        // Detect S3 output and use temp file if needed
+        const is_s3_output = std.mem.startsWith(u8, output_path, "s3://");
+        var temp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const effective_output_path = if (is_s3_output) blk: {
+            // Generate temp file path for S3 staging using current time
+            const now = std.time.Instant.now() catch return error.ClockUnavailable;
+            const ts_value = if (@hasField(@TypeOf(now.timestamp), "sec"))
+                @as(i128, now.timestamp.sec) * 1_000_000_000 + now.timestamp.nsec
+            else if (@hasField(@TypeOf(now.timestamp), "tv_sec"))
+                @as(i128, now.timestamp.tv_sec) * 1_000_000_000 + now.timestamp.tv_nsec
+            else
+                @as(i128, now.timestamp);
+            const temp_path = std.fmt.bufPrint(&temp_path_buf, "/tmp/zpq_s3_stage_{d}.parquet", .{
+                ts_value,
+            }) catch return error.TempPathTooLong;
+            break :blk temp_path;
+        } else output_path;
+
         var sw = try SlotWriter.init(
             self.allocator,
-            output_path,
+            effective_output_path,
             rg_count,
             max_input_rg_size,
             output_schema.items,
@@ -639,6 +661,15 @@ pub const Pipeline = struct {
 
         try sw.finish(rg_metas);
 
+        // Upload to S3 if needed
+        if (is_s3_output) {
+            try self.uploadToS3(effective_output_path, output_path);
+            // Clean up temp file
+            std.fs.cwd().deleteFile(effective_output_path) catch |err| {
+                std.debug.print("Warning: could not delete temp file {s}: {}\n", .{ effective_output_path, err });
+            };
+        }
+
         const elapsed_ns = timer.read();
         const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
 
@@ -647,5 +678,64 @@ pub const Pipeline = struct {
             .output_rows = total_output_rows,
             .elapsed_ms = elapsed_ms,
         };
+    }
+
+    /// Upload a local file to S3.
+    fn uploadToS3(self: *Self, local_path: []const u8, s3_path: []const u8) !void {
+        const S3Writer = s3_writer_mod.S3WriterGen(xev);
+
+        // Parse S3 path
+        if (!std.mem.startsWith(u8, s3_path, "s3://")) return error.InvalidS3Path;
+        const path_without_prefix = s3_path[5..];
+        const slash_idx = std.mem.indexOf(u8, path_without_prefix, "/") orelse return error.InvalidS3Path;
+        const bucket = path_without_prefix[0..slash_idx];
+        const key = path_without_prefix[slash_idx + 1 ..];
+
+        // Load S3 config from environment
+        const config = try factory.loadS3ConfigFromEnv(self.allocator);
+        defer config.deinit(self.allocator);
+
+        // Discover endpoint (handles S3_ENDPOINT for rustfs/MinIO/R2)
+        const discovery = try factory.discoverS3Endpoint(self.allocator, config.endpoint, config.region);
+        defer discovery.deinit(self.allocator);
+
+        // Create S3Writer
+        var s3w = try S3Writer.init(self.allocator, bucket, key, config.region);
+        defer s3w.deinit();
+
+        // Configure endpoint
+        self.allocator.free(s3w.host);
+        s3w.host = try self.allocator.dupe(u8, discovery.host);
+        s3w.port = discovery.port;
+        s3w.use_tls = discovery.use_tls;
+
+        // Use path-style for custom endpoints (rustfs, MinIO, R2)
+        if (config.endpoint != null) {
+            s3w.use_path_style = true;
+        }
+
+        // Set credentials
+        if (config.credentials) |creds| {
+            try s3w.setCredentials(creds.access_key, creds.secret_key, creds.session_token);
+        }
+
+        // Read local file and upload
+        const file = try std.fs.cwd().openFile(local_path, .{});
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const chunk_size: usize = 8 * 1024 * 1024; // 8MB chunks
+        var buf = try self.allocator.alloc(u8, chunk_size);
+        defer self.allocator.free(buf);
+
+        var uploaded: u64 = 0;
+        while (uploaded < file_size) {
+            const bytes_read = try file.read(buf);
+            if (bytes_read == 0) break;
+            try s3w.writeAll(buf[0..bytes_read]);
+            uploaded += bytes_read;
+        }
+
+        try s3w.finish();
     }
 };

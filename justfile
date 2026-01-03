@@ -183,18 +183,6 @@ lambda-bench-matrix payload:
 lambda-list:
     @./tools/serverless/aws.sh list zpq
 
-# Test Lambda locally with RIE (legacy)
-lambda-local:
-    @./tools/serverless/test-local.sh
-
-# Test Lambda locally with RIE (invoke only, container already running)
-lambda-local-invoke:
-    @./tools/serverless/test-local.sh --invoke
-
-# Run Lambda RIE benchmark: just lambda-local-bench aws 100mb 3
-lambda-local-bench backend="aws" size="10mb" runs="1":
-    @./tools/serverless/aws.sh local-bench {{backend}} {{size}} {{runs}}
-
 # === Unified Benchmarking ===
 # Usage: just bench <what> <input> <where> <output> [size] [runs]
 #   what:   native | serverless
@@ -213,25 +201,22 @@ lambda-local-bench backend="aws" size="10mb" runs="1":
 bench what input where output size="10mb" runs="1":
     @./tools/bench.sh {{what}} {{input}} {{where}} {{output}} {{size}} {{runs}}
 
-# Run a specific legacy benchmark (dns, ping, e2e, scan, pyarrow)
-bench-legacy +args:
+# Run Zig native benchmarks (dns, ping, e2e, scan)
+# Examples:
+#   just zig-bench dns                    # DNS resolver benchmark
+#   just zig-bench ping                   # TCP ping-pong benchmark
+#   just zig-bench e2e s3://bucket/key    # E2E parquet scan
+#   just zig-bench compare e2e <path>     # Compare ZPQ vs PyArrow
+zig-bench +args:
     ./benchmarks/bench.sh {{args}}
 
-# Run DNS resolver benchmark
-bench-dns:
-    ./benchmarks/bench.sh dns
-
-# Run TCP ping-pong benchmark
-bench-ping:
-    ./benchmarks/bench.sh ping
-
-# Run E2E parquet scan benchmark
-bench-e2e path *args:
-    ./benchmarks/bench.sh e2e {{path}} {{args}}
-
-# Compare ZPQ vs PyArrow on a file
-bench-compare path *args:
-    ./benchmarks/bench.sh compare e2e {{path}} {{args}}
+# Engine comparison benchmarks (pyarrow, polars, duckdb)
+# Examples:
+#   just engine pyarrow local 10mb 3      # PyArrow local file
+#   just engine duckdb s3 100mb           # DuckDB S3
+#   just engine compare local 10mb 3      # Compare all engines
+engine +args:
+    ./tools/bench.sh engine {{args}}
 
 # Generate malformed fixtures
 gen-malformed:

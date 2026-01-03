@@ -2,6 +2,32 @@ const std = @import("std");
 const xev = @import("xev");
 
 const schema_mod = @import("schema.zig");
+
+/// Simple trace helper - prints timing when ZPQ_TRACE=1
+const Trace = struct {
+    start: std.time.Instant,
+    last: std.time.Instant,
+    enabled: bool,
+
+    fn init() Trace {
+        const enabled = if (std.posix.getenv("ZPQ_TRACE")) |v| std.mem.eql(u8, v, "1") else false;
+        const now = std.time.Instant.now() catch unreachable;
+        return .{ .start = now, .last = now, .enabled = enabled };
+    }
+
+    fn mark(self: *Trace, comptime label: []const u8) void {
+        if (!self.enabled) return;
+        const now = std.time.Instant.now() catch return;
+        const since_last = now.since(self.last);
+        const since_start = now.since(self.start);
+        std.debug.print("[TRACE] {s}: +{d:.2}ms (total {d:.2}ms)\n", .{
+            label,
+            @as(f64, @floatFromInt(since_last)) / 1_000_000.0,
+            @as(f64, @floatFromInt(since_start)) / 1_000_000.0,
+        });
+        self.last = now;
+    }
+};
 const file_mod = @import("file.zig");
 const filter_mod = @import("filter.zig");
 const writer_mod = @import("writer.zig");
@@ -110,6 +136,7 @@ pub const Pipeline = struct {
 
     // Output
     output_path: ?[]const u8 = null,
+    output_compression: schema_mod.CompressionCodec = .SNAPPY,
 
     // Runtime context (required for parallel execution)
     // Uses xev.Dynamic for runtime backend selection (io_uring -> epoll fallback)
@@ -138,6 +165,11 @@ pub const Pipeline = struct {
     /// Set output path (local file or s3://)
     pub fn setOutput(self: *Self, path: []const u8) void {
         self.output_path = path;
+    }
+
+    /// Set output compression codec
+    pub fn setCompression(self: *Self, codec: schema_mod.CompressionCodec) void {
+        self.output_compression = codec;
     }
 
     /// Set filter predicate from expression string
@@ -385,6 +417,7 @@ pub const Pipeline = struct {
 
     /// Slot-parallel execution: parallel filter + encode + pwrite per row group.
     fn executeSlotParallel(self: *Self) !ExecutionResult {
+        var trace = Trace.init();
         var timer = try std.time.Timer.start();
 
         // Validate requirements
@@ -585,7 +618,9 @@ pub const Pipeline = struct {
             }
         }
 
+        trace.mark("setup_ranges");
         try pf.source.readRanges(ranges, buffers);
+        trace.mark("read_data");
 
         // =====================================================================
         // PHASE 2: Create RowGroupData and FilterContext
@@ -709,6 +744,8 @@ pub const Pipeline = struct {
 
         var pending = std.atomic.Value(usize).init(rg_count);
 
+        trace.mark("setup_workers");
+
         for (all_rg_data, 0..) |*rg_data, i| {
             total_input_rows += rg_data.num_rows;
             workers[i] = try RowGroupWorker.init(self.allocator, &filter_ctx, rg_data);
@@ -716,7 +753,7 @@ pub const Pipeline = struct {
                 workers[i],
                 &sw,
                 i,
-                .SNAPPY,
+                self.output_compression,
                 &pending,
             );
         }
@@ -725,12 +762,16 @@ pub const Pipeline = struct {
             c.scheduleOn(loop, thread_pool);
         }
 
+        trace.mark("scheduled");
+
         while (pending.load(.acquire) > 0) {
             loop.run(.once) catch |err| {
                 std.debug.print("Loop error: {}\n", .{err});
                 break;
             };
         }
+
+        trace.mark("workers_done");
 
         // =====================================================================
         // PHASE 5: Collect metadata and finish (write footer)
@@ -751,7 +792,11 @@ pub const Pipeline = struct {
             rg_metas[i] = c.getRowGroupMeta();
         }
 
+        trace.mark("collected");
+
         try sw.finish(rg_metas);
+
+        trace.mark("finished");
 
         const elapsed_ns = timer.read();
         const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -768,6 +813,7 @@ pub const Pipeline = struct {
     fn executeSlotParallelWithLoop(self: *Self, comptime XevApi: type, loop: *XevApi.Loop, thread_pool: *xev.ThreadPool) !ExecutionResult {
         const Completion = SlotWriteCompletionGen(XevApi);
 
+        var trace = Trace.init();
         var timer = try std.time.Timer.start();
 
         // Validate requirements
@@ -1053,15 +1099,19 @@ pub const Pipeline = struct {
 
         var pending = std.atomic.Value(usize).init(rg_count);
 
+        trace.mark("setup_workers");
+
         for (all_rg_data, 0..) |*rg_data, i| {
             total_input_rows += rg_data.num_rows;
             workers[i] = try RowGroupWorker.init(self.allocator, &filter_ctx, rg_data);
-            completions[i] = try Completion.init(workers[i], &sw, i, .SNAPPY, &pending);
+            completions[i] = try Completion.init(workers[i], &sw, i, self.output_compression, &pending);
         }
 
         for (completions) |*c| {
             c.scheduleOn(loop, thread_pool);
         }
+
+        trace.mark("scheduled");
 
         while (pending.load(.acquire) > 0) {
             loop.run(.once) catch |err| {
@@ -1069,6 +1119,8 @@ pub const Pipeline = struct {
                 break;
             };
         }
+
+        trace.mark("workers_done");
 
         // Collect results
         var total_output_rows: u64 = 0;
@@ -1082,7 +1134,11 @@ pub const Pipeline = struct {
             rg_metas[i] = c.getRowGroupMeta();
         }
 
+        trace.mark("collected");
+
         try sw.finish(rg_metas);
+
+        trace.mark("finished");
 
         const elapsed_ns = timer.read();
         const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -1433,7 +1489,7 @@ pub const Pipeline = struct {
             var encode_buffer = std.ArrayListUnmanaged(u8){};
             defer encode_buffer.deinit(self.allocator);
 
-            const col_metas_slot = try worker.encodeToBuffer(&encode_buffer, .SNAPPY);
+            const col_metas_slot = try worker.encodeToBuffer(&encode_buffer, self.output_compression);
             defer {
                 for (col_metas_slot) |*cm| {
                     cm.path_in_schema.deinit(self.allocator);

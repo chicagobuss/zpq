@@ -376,6 +376,61 @@ pub const RleDecoder = struct {
         }
     }
 
+    /// Scan up to `count` values and append matching positions to selection.
+    /// Optimized for RLE: matching runs bulk-append positions, non-matching runs skip entirely.
+    /// Returns the number of values scanned.
+    pub fn scanMatchingPositions(self: *RleDecoder, count: u32, target: u64, base_pos: usize, selection: anytype) !u32 {
+        var remaining = count;
+        var pos = base_pos;
+
+        while (remaining > 0) {
+            if (self.repeat_count > 0) {
+                const scan_amt = @min(remaining, self.repeat_count);
+                // RLE run: if value matches, all positions in run match
+                if (self.current_value == target) {
+                    // Bulk append consecutive positions
+                    try selection.appendRange(pos, scan_amt);
+                }
+                self.repeat_count -= scan_amt;
+                remaining -= scan_amt;
+                pos += scan_amt;
+            } else if (self.literal_count > 0) {
+                // Literal run: decode and check each value
+                // Use SIMD for batches of 8
+                while (self.literal_count >= 8 and remaining >= 8) {
+                    var indices: [8]u64 = undefined;
+                    self.readBitPackedBatch8(&indices);
+
+                    // SIMD comparison
+                    const v_indices: @Vector(8, u64) = indices;
+                    const v_target: @Vector(8, u64) = @splat(target);
+                    const matches: u8 = @bitCast(v_indices == v_target);
+
+                    if (matches != 0) {
+                        try selection.appendFromMask(matches, pos);
+                    }
+
+                    self.literal_count -= 8;
+                    remaining -= 8;
+                    pos += 8;
+                }
+
+                // Scalar tail for remaining literals
+                while (self.literal_count > 0 and remaining > 0) {
+                    const val = self.readBitPackedValue() catch break;
+                    if (val == target) {
+                        try selection.append(pos);
+                    }
+                    remaining -= 1;
+                    pos += 1;
+                }
+            } else {
+                if (!self.nextCounts()) break;
+            }
+        }
+        return count - remaining;
+    }
+
     /// Skip n values and count how many match the target value.
     /// This is optimized for RLE runs: if a run's value matches, we count
     /// the entire run without decoding individual values.

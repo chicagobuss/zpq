@@ -1,12 +1,12 @@
-//! Slot-based parallel Parquet writer.
+//! Sequential Parquet writer with parallel preparation.
 //!
-//! Enables embarrassingly parallel row group writes by:
-//! 1. Pre-allocating fixed-size "slots" for each row group
-//! 2. Using pwrite() for thread-safe writes to any slot
-//! 3. Building footer with pre-computed slot offsets
+//! Design (like DuckDB/Polars):
+//! 1. Workers prepare row groups in parallel (encode to memory buffers)
+//! 2. Mutex-protected sequential writes to file
+//! 3. Offsets computed at write time (contiguous layout, no gaps)
 //!
-//! The key insight: padding between row groups is ignored by readers
-//! because Parquet page headers are self-describing.
+//! This avoids the "sparse slot" problem where filtered output creates
+//! huge files with gaps between row groups.
 
 const std = @import("std");
 const schema = @import("schema.zig");
@@ -29,38 +29,44 @@ pub const ColumnMeta = struct {
 pub const RowGroupMeta = struct {
     num_rows: i64,
     columns: []const ColumnMeta,
-    actual_size: u64, // Actual bytes written (may be less than slot size)
+    actual_size: u64, // Actual bytes written
 };
 
-/// Slot-based parallel Parquet writer.
+/// Sequential Parquet writer.
 ///
-/// Pre-computes all offsets at init time, enabling workers to write
-/// to their assigned slots via pwrite() with zero coordination.
+/// Workers call writeSlot() which is mutex-protected for sequential writes.
+/// Offsets are computed at write time, resulting in a compact file.
 pub const SlotWriter = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
 
-    // Slot layout (computed at init, immutable)
-    slot_size: u64,
+    // Slot tracking
     num_slots: usize,
+    /// Actual file offsets where each slot was written (computed at write time)
     slot_offsets: []u64,
-    footer_offset: u64,
-
-    // Track actual sizes written (updated by workers atomically)
+    /// Track actual sizes written
     actual_sizes: []std.atomic.Value(u64),
+    /// Current write position in file
+    write_pos: std.atomic.Value(u64),
+    /// Mutex for sequential writes
+    write_mutex: std.Thread.Mutex,
+
+    // Legacy fields (kept for API compatibility, unused)
+    slot_size: u64,
+    footer_offset: u64,
 
     // Schema info (immutable after init)
     schema_elements: std.ArrayListUnmanaged(schema.SchemaElement),
 
     const Self = @This();
 
-    /// Initialize a slot-based writer.
+    /// Initialize a sequential writer.
     ///
     /// Args:
     ///   - allocator: Memory allocator
     ///   - path: Output file path
-    ///   - num_row_groups: Number of row groups (slots) to allocate
-    ///   - max_rg_size: Maximum expected size of any row group (bytes)
+    ///   - num_row_groups: Number of row groups to write
+    ///   - max_rg_size: Unused (kept for API compatibility)
     ///   - schema_elements: Schema for the output file
     pub fn init(
         allocator: std.mem.Allocator,
@@ -69,19 +75,14 @@ pub const SlotWriter = struct {
         max_rg_size: u64,
         input_schema: []const schema.SchemaElement,
     ) !Self {
-        // Compute slot size with 20% margin for safety
-        const slot_size = max_rg_size + (max_rg_size / 5);
-
-        // Pre-compute all offsets
+        // Allocate offset trackers (filled in at write time)
         const slot_offsets = try allocator.alloc(u64, num_row_groups);
         errdefer allocator.free(slot_offsets);
-
-        for (slot_offsets, 0..) |*offset, i| {
-            offset.* = 4 + (i * slot_size); // 4 = PAR1 header
+        for (slot_offsets) |*offset| {
+            offset.* = 0; // Will be set when slot is written
         }
-        const footer_offset = 4 + (num_row_groups * slot_size);
 
-        // Allocate atomic size trackers
+        // Allocate size trackers
         const actual_sizes = try allocator.alloc(std.atomic.Value(u64), num_row_groups);
         errdefer allocator.free(actual_sizes);
         for (actual_sizes) |*s| {
@@ -100,19 +101,16 @@ pub const SlotWriter = struct {
         // Write PAR1 header
         try file.writeAll("PAR1");
 
-        // Pre-extend file to full size (sparse allocation on most filesystems)
-        const total_size = footer_offset + 65536; // Footer space
-        try file.seekTo(total_size - 1);
-        try file.writeAll(&[_]u8{0});
-
         return Self{
             .allocator = allocator,
             .file = file,
-            .slot_size = slot_size,
             .num_slots = num_row_groups,
             .slot_offsets = slot_offsets,
-            .footer_offset = footer_offset,
             .actual_sizes = actual_sizes,
+            .write_pos = std.atomic.Value(u64).init(4), // After PAR1 header
+            .write_mutex = .{},
+            .slot_size = max_rg_size, // Unused, kept for compatibility
+            .footer_offset = 0, // Unused, computed at finish time
             .schema_elements = schema_copy,
         };
     }
@@ -124,42 +122,44 @@ pub const SlotWriter = struct {
         self.schema_elements.deinit(self.allocator);
     }
 
-    /// Get the file offset for a slot.
-    /// Thread-safe (slot_offsets is immutable).
+    /// Get the file offset for a slot (only valid after writeSlot called).
     pub fn slotOffset(self: *const Self, slot_index: usize) u64 {
         return self.slot_offsets[slot_index];
     }
 
-    /// Write row group data to a slot.
-    /// Thread-safe via pwrite - multiple threads can call concurrently.
+    /// Write row group data sequentially.
+    /// Thread-safe via mutex - writes are serialized but preparation is parallel.
     pub fn writeSlot(self: *Self, slot_index: usize, data: []const u8) !void {
         if (slot_index >= self.num_slots) {
             return error.InvalidSlotIndex;
         }
-        if (data.len > self.slot_size) {
-            return error.DataExceedsSlotSize;
-        }
 
-        const offset = self.slot_offsets[slot_index];
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
 
-        // Use pwrite for atomic, position-independent write
-        const written = try pwrite(self.file.handle, data, @intCast(offset));
-        if (written != data.len) {
-            return error.PartialWrite;
-        }
+        // Record the offset where this slot starts
+        const offset = self.write_pos.load(.acquire);
+        self.slot_offsets[slot_index] = offset;
 
-        // Track actual size atomically
+        // Write data sequentially
+        try self.file.writeAll(data);
+
+        // Update position and size
+        self.write_pos.store(offset + data.len, .release);
         self.actual_sizes[slot_index].store(@intCast(data.len), .release);
     }
 
-    /// Finish the file - build and write footer with slot-based offsets.
+    /// Finish the file - write footer with recorded offsets.
     /// Must be called after all workers complete.
     pub fn finish(self: *Self, row_groups_meta: []const RowGroupMeta) !void {
         if (row_groups_meta.len != self.num_slots) {
             return error.RowGroupCountMismatch;
         }
 
-        // Build row groups with slot-adjusted offsets
+        // Get current write position (where footer will start)
+        const footer_start = self.write_pos.load(.acquire);
+
+        // Build row groups with recorded offsets (already contiguous)
         var row_groups = std.ArrayListUnmanaged(schema.RowGroup){};
         defer {
             for (row_groups.items) |*rg| {
@@ -252,15 +252,11 @@ pub const SlotWriter = struct {
         const footer_bytes = writer.bytes();
         const footer_len: u32 = @intCast(footer_bytes.len);
 
-        // Write footer at pre-computed offset
-        try self.file.seekTo(self.footer_offset);
+        // Write footer right after data (already contiguous, no seek needed)
+        try self.file.seekTo(footer_start);
         try self.file.writeAll(footer_bytes);
         try self.file.writeAll(&std.mem.toBytes(footer_len));
         try self.file.writeAll("PAR1");
-
-        // Truncate file to actual size (remove pre-allocated padding)
-        const actual_end = self.footer_offset + footer_bytes.len + 8;
-        try self.file.setEndPos(actual_end);
     }
 };
 
@@ -290,7 +286,7 @@ fn pwrite(handle: std.fs.File.Handle, data: []const u8, offset: i64) !usize {
 // Tests
 // ============================================================================
 
-test "SlotWriter - basic slot allocation" {
+test "SlotWriter - sequential write behavior" {
     const allocator = std.testing.allocator;
 
     // Create schema
@@ -321,21 +317,24 @@ test "SlotWriter - basic slot allocation" {
         allocator,
         "/tmp/test_slot_writer.parquet",
         3, // 3 row groups
-        10000, // max 10KB per row group
+        10000, // max 10KB per row group (unused in sequential mode)
         &schema_elements,
     );
     defer writer.deinit();
 
-    // Verify slot offsets
-    try std.testing.expectEqual(@as(u64, 4), writer.slotOffset(0)); // After PAR1
-    try std.testing.expectEqual(@as(u64, 4 + 12000), writer.slotOffset(1)); // slot_size = 10000 * 1.2
-    try std.testing.expectEqual(@as(u64, 4 + 24000), writer.slotOffset(2));
+    // Initially all offsets are 0 (will be set at write time)
+    try std.testing.expectEqual(@as(u64, 0), writer.slot_offsets[0]);
+    try std.testing.expectEqual(@as(u64, 0), writer.slot_offsets[1]);
+    try std.testing.expectEqual(@as(u64, 0), writer.slot_offsets[2]);
+
+    // Write position starts after PAR1 header
+    try std.testing.expectEqual(@as(u64, 4), writer.write_pos.load(.acquire));
 
     // Clean up test file
     std.fs.cwd().deleteFile("/tmp/test_slot_writer.parquet") catch {};
 }
 
-test "SlotWriter - parallel writes to different slots" {
+test "SlotWriter - sequential writes (out of order)" {
     const allocator = std.testing.allocator;
 
     const schema_elements = [_]schema.SchemaElement{
@@ -370,7 +369,7 @@ test "SlotWriter - parallel writes to different slots" {
     );
     defer writer.deinit();
 
-    // Write to slots out of order (simulating parallel workers)
+    // Write to slots out of order (simulating parallel workers completing at different times)
     const data2 = "slot 2 data here";
     const data0 = "slot 0 data";
     const data1 = "slot 1 longer data";
@@ -384,29 +383,37 @@ test "SlotWriter - parallel writes to different slots" {
     try std.testing.expectEqual(@as(u64, data1.len), writer.actual_sizes[1].load(.acquire));
     try std.testing.expectEqual(@as(u64, data2.len), writer.actual_sizes[2].load(.acquire));
 
-    // Verify data was written to correct offsets
+    // With sequential writes, data is written in arrival order, not slot order
+    // Slot 2 arrived first, so it's at offset 4 (after PAR1)
+    // Slot 0 arrived second, at offset 4 + len(data2)
+    // Slot 1 arrived third, at offset 4 + len(data2) + len(data0)
+    try std.testing.expectEqual(@as(u64, 4), writer.slot_offsets[2]);
+    try std.testing.expectEqual(@as(u64, 4 + data2.len), writer.slot_offsets[0]);
+    try std.testing.expectEqual(@as(u64, 4 + data2.len + data0.len), writer.slot_offsets[1]);
+
+    // Verify data was written correctly by reading back
     var read_buf: [100]u8 = undefined;
 
-    // Read slot 0
+    // Read slot 2 (first in file)
+    try writer.file.seekTo(writer.slotOffset(2));
+    const n2 = try writer.file.read(read_buf[0..data2.len]);
+    try std.testing.expectEqualStrings(data2, read_buf[0..n2]);
+
+    // Read slot 0 (second in file)
     try writer.file.seekTo(writer.slotOffset(0));
     const n0 = try writer.file.read(read_buf[0..data0.len]);
     try std.testing.expectEqualStrings(data0, read_buf[0..n0]);
 
-    // Read slot 1
+    // Read slot 1 (third in file)
     try writer.file.seekTo(writer.slotOffset(1));
     const n1 = try writer.file.read(read_buf[0..data1.len]);
     try std.testing.expectEqualStrings(data1, read_buf[0..n1]);
-
-    // Read slot 2
-    try writer.file.seekTo(writer.slotOffset(2));
-    const n2 = try writer.file.read(read_buf[0..data2.len]);
-    try std.testing.expectEqualStrings(data2, read_buf[0..n2]);
 
     // Clean up
     std.fs.cwd().deleteFile("/tmp/test_slot_parallel.parquet") catch {};
 }
 
-test "SlotWriter - data exceeds slot size" {
+test "SlotWriter - no size limit with sequential writes" {
     const allocator = std.testing.allocator;
 
     const schema_elements = [_]schema.SchemaElement{
@@ -436,14 +443,17 @@ test "SlotWriter - data exceeds slot size" {
         allocator,
         "/tmp/test_slot_overflow.parquet",
         1,
-        100, // Very small slot
+        100, // This hint is now unused - no size limit
         &schema_elements,
     );
     defer writer.deinit();
 
-    // Try to write data larger than slot (100 * 1.2 = 120 bytes max)
+    // With sequential writes, there's no slot size limit
     const big_data = "x" ** 200;
-    try std.testing.expectError(error.DataExceedsSlotSize, writer.writeSlot(0, big_data));
+    try writer.writeSlot(0, big_data);
+
+    // Verify it was written
+    try std.testing.expectEqual(@as(u64, 200), writer.actual_sizes[0].load(.acquire));
 
     // Clean up
     std.fs.cwd().deleteFile("/tmp/test_slot_overflow.parquet") catch {};
@@ -601,13 +611,12 @@ test "SlotWriter - end-to-end with real row group data" {
     try std.testing.expectEqual(@as(usize, 4), n2);
     try std.testing.expectEqualStrings("PAR1", &footer_magic);
 
-    // Verify file size is correct for slot-based layout:
-    // 4 (PAR1) + 2 * slot_size (12000 each = 24000) + footer + 8 (footer_len + PAR1)
-    // The file includes padding between slots - this is expected behavior!
+    // Verify file size is compact (no sparse gaps)
+    // 4 (PAR1) + data + footer + 4 (footer_len) + 4 (PAR1)
     const file_stat = try file.stat();
-    // Should be roughly: 4 + 24000 + ~500 (footer) + 8 = ~24512
-    try std.testing.expect(file_stat.size > 24000); // Must include slots
-    try std.testing.expect(file_stat.size < 30000); // But not excessively large
+    // With sequential writes, file should be small - just data + overhead
+    // Two row groups of ~400 bytes each + footer (~500 bytes) + 8 = ~1300 bytes
+    try std.testing.expect(file_stat.size < 3000); // Must be compact!
 
     // Clean up
     std.fs.cwd().deleteFile(output_path) catch {};

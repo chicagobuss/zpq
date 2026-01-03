@@ -6,6 +6,7 @@ const RleDecoder = @import("rle.zig").RleDecoder;
 const Decoder = @import("decoder.zig").Decoder;
 const simd = @import("simd.zig");
 const file = @import("file.zig");
+const SelectionVector = @import("selection.zig").SelectionVector;
 
 /// Decoder for BYTE_STREAM_SPLIT encoding.
 /// Data is split into N streams (one per byte of the type width).
@@ -137,6 +138,88 @@ pub fn BatchReader(comptime T: type) type {
         /// This is MUCH faster than decoding strings for dictionary-encoded columns.
         /// Must call after loading at least one page (to initialize dictionary).
         /// Returns number of values read.
+        /// Scan dictionary indices and directly append matching row positions to selection.
+        /// Uses RLE-aware scanning: matching runs bulk-append, non-matching runs skip.
+        /// Returns number of values scanned.
+        pub fn scanDictMatchesToSelection(self: *Self, target_idx: u64, base_row: usize, max_rows: usize, selection: *SelectionVector) !usize {
+            var rows_scanned: usize = 0;
+
+            while (rows_scanned < max_rows) {
+                if (self.values_remaining_in_page == 0) {
+                    if (!try self.loadNextPage()) break;
+                }
+
+                const count = @min(max_rows - rows_scanned, self.values_remaining_in_page);
+                if (count == 0) break;
+
+                // Non-nullable path: use RLE-aware scan
+                if (self.max_def_level == 0) {
+                    if (self.rle_decoder) |*rle_dec| {
+                        const n = try rle_dec.scanMatchingPositions(
+                            @intCast(count),
+                            target_idx,
+                            base_row + rows_scanned,
+                            selection,
+                        );
+                        self.values_remaining_in_page -= n;
+                        rows_scanned += n;
+                        continue;
+                    }
+                }
+
+                // Nullable path: must handle def levels
+                if (self.def_levels_decoder) |*def_dec| {
+                    var def_levels: [1024]u64 = undefined;
+                    const n_def = try def_dec.nextBatch(def_levels[0..count]);
+                    if (n_def == 0) break;
+
+                    // Count present values (SIMD-friendly loop - compiler vectorizes)
+                    var num_present: usize = 0;
+                    const max_def = self.max_def_level;
+                    for (def_levels[0..n_def]) |dl| {
+                        num_present += @intFromBool(dl == max_def);
+                    }
+
+                    // Fast path: if ALL values are present (no nulls), use RLE-aware scan
+                    if (num_present == n_def and self.rle_decoder != null) {
+                        const n = try self.rle_decoder.?.scanMatchingPositions(
+                            @intCast(n_def),
+                            target_idx,
+                            base_row + rows_scanned,
+                            selection,
+                        );
+                        self.values_remaining_in_page -= n;
+                        rows_scanned += n;
+                        continue;
+                    }
+
+                    // Slow path: some nulls, must check each def level
+                    if (num_present > 0 and self.rle_decoder != null) {
+                        var indices: [1024]u64 = undefined;
+                        const n_idx = try self.rle_decoder.?.nextBatch(indices[0..num_present]);
+
+                        var idx_pos: usize = 0;
+                        for (def_levels[0..n_def], 0..) |dl, row| {
+                            if (dl == max_def and idx_pos < n_idx) {
+                                if (indices[idx_pos] == target_idx) {
+                                    try selection.append(base_row + rows_scanned + row);
+                                }
+                                idx_pos += 1;
+                            }
+                        }
+                    }
+
+                    self.values_remaining_in_page -= n_def;
+                    rows_scanned += n_def;
+                    continue;
+                }
+
+                break;
+            }
+
+            return rows_scanned;
+        }
+
         pub fn scanDictIndicesIntoBatch(self: *Self, target_idx: u64, selection: *simd.SelectionVector, batch_size: usize) !usize {
             if (self.values_remaining_in_page == 0) {
                 if (!try self.loadNextPage()) return 0;
@@ -150,9 +233,26 @@ pub fn BatchReader(comptime T: type) type {
                 if (self.rle_decoder) |*rle_dec| {
                     var indices: [1024]u64 = undefined;
                     const n = try rle_dec.nextBatch(indices[0..count]);
-                    for (indices[0..n], 0..) |idx, i| {
-                        if (idx == target_idx) selection.setBitIndices(i);
+
+                    // SIMD path: process 8 indices at a time
+                    var i: usize = 0;
+                    const simd_limit = n & ~@as(usize, 7); // Round down to multiple of 8
+                    while (i < simd_limit) : (i += 8) {
+                        const v_indices: @Vector(8, u64) = indices[i..][0..8].*;
+                        const v_target: @Vector(8, u64) = @splat(target_idx);
+                        const matches: u8 = @bitCast(v_indices == v_target);
+                        if (matches != 0) {
+                            // Set matching bits in selection vector
+                            const byte_idx = i / 8;
+                            selection.mask[byte_idx] |= matches;
+                            selection.set_count += @popCount(matches);
+                        }
                     }
+                    // Scalar tail
+                    while (i < n) : (i += 1) {
+                        if (indices[i] == target_idx) selection.setBitIndices(i);
+                    }
+
                     self.values_remaining_in_page -= n;
                     return n;
                 }

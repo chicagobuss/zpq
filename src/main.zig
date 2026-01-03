@@ -73,6 +73,7 @@ const CliArgs = struct {
     show_schema: bool = false,
     show_meta: bool = false,
     mode: ExecutionMode = .slot_parallel,
+    compression: zpq.core.schema.CompressionCodec = .SNAPPY,
 };
 
 fn parseCliArgs(args: []const []const u8) ?CliArgs {
@@ -118,6 +119,25 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
                 return null;
             }
             result.output = args[i];
+        } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "-c")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --compression requires a value (none, snappy, zstd, gzip)\n", .{});
+                return null;
+            }
+            const comp_str = args[i];
+            if (std.mem.eql(u8, comp_str, "none") or std.mem.eql(u8, comp_str, "uncompressed")) {
+                result.compression = .UNCOMPRESSED;
+            } else if (std.mem.eql(u8, comp_str, "snappy")) {
+                result.compression = .SNAPPY;
+            } else if (std.mem.eql(u8, comp_str, "zstd")) {
+                result.compression = .ZSTD;
+            } else if (std.mem.eql(u8, comp_str, "gzip")) {
+                result.compression = .GZIP;
+            } else {
+                std.debug.print("Error: Unknown compression '{s}'. Use: none, snappy, zstd, gzip\n", .{comp_str});
+                return null;
+            }
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             // Positional argument
             if (result.input == null) {
@@ -154,11 +174,12 @@ fn printUsage(exe: []const u8) void {
         \\  --sequential       Process row groups sequentially
         \\  --parallel         Parallel processing (default: slot-parallel)
         \\
-        \\Server Mode:
-        \\  --serve [PORT]     Run as HTTP server (default port: 8080)
-        \\
         \\Output:
         \\  -o, --output FILE  Output file (alternative to positional)
+        \\  -c, --compression  Compression: none, snappy (default), zstd, gzip
+        \\
+        \\Server Mode:
+        \\  --serve [PORT]     Run as HTTP server (default port: 8080)
         \\
         \\Examples:
         \\  {s} data.parquet --schema
@@ -207,6 +228,7 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .filter = parsed.filter,
         .select = parsed.select,
         .mode = parsed.mode,
+        .compression = parsed.compression,
         .show_schema = parsed.show_schema,
         .show_meta = parsed.show_meta,
     };

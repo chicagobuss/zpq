@@ -397,6 +397,110 @@ pub const ColumnWriter = struct {
         try dict.putMany(values);
     }
 
+    /// Write a constant BYTE_ARRAY value repeated `count` times.
+    /// Optimized for filter columns where all values match the filter.
+    /// Uses dictionary encoding with a single entry + RLE indices (all zeros).
+    pub fn writeConstantByteArray(self: *ColumnWriter, value: []const u8, count: usize) !void {
+        if (count == 0) return;
+
+        // Dictionary page: just the single value
+        self.page_writer.reset();
+        try self.page_writer.plain_encoder.writeByteArray(value);
+        var dict_result = try self.page_writer.finalizeDictPage(1);
+        try self.pages.append(self.allocator, .{
+            .header = dict_result.header,
+            .data = dict_result.data,
+            .owns_data = dict_result.owns_data,
+        });
+        self.total_uncompressed_size += dict_result.header.uncompressed_page_size;
+        self.total_compressed_size += dict_result.header.compressed_page_size;
+
+        // Data page: RLE-encoded indices (all zeros)
+        // With bit_width=1 and all same values, RLE compresses to ~10 bytes
+        self.page_writer.reset();
+        const bit_width: u8 = 1; // Only need 1 bit for index 0
+        try self.page_writer.page_buffer.append(self.allocator, bit_width);
+
+        // RLE encode: for N identical values, format is:
+        // - varint header: (count << 1) | 0  (run length)
+        // - single byte: the repeated value (0)
+        var rle = encoder.RleEncoder.init(self.allocator, bit_width);
+        defer rle.deinit();
+
+        // Write `count` zeros
+        const zeros = try self.allocator.alloc(u32, count);
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0);
+        try rle.writeMany(zeros);
+        try rle.finish();
+
+        try self.page_writer.page_buffer.appendSlice(self.allocator, rle.getData());
+        self.page_writer.num_values = @intCast(count);
+
+        var data_result = try self.page_writer.finalizeDataPage(.RLE_DICTIONARY);
+        try self.pages.append(self.allocator, .{
+            .header = data_result.header,
+            .data = data_result.data,
+            .owns_data = data_result.owns_data,
+        });
+        self.total_uncompressed_size += data_result.header.uncompressed_page_size;
+        self.total_compressed_size += data_result.header.compressed_page_size;
+        self.num_values += @intCast(count);
+    }
+
+    /// Write dictionary passthrough - re-encodes dictionary page and writes new RLE indices.
+    /// The dict_data is already decompressed by ColumnReader, so we need to recompress it.
+    pub fn writeDictPassthrough(
+        self: *ColumnWriter,
+        dict_header: schema.PageHeader,
+        dict_data: []const u8,
+        indices: []const u32,
+        bit_width: u8,
+    ) !void {
+        if (indices.len == 0) return;
+
+        // Step 1: Write dictionary page (dict_data is decompressed, need to recompress)
+        self.page_writer.reset();
+        try self.page_writer.plain_encoder.writeRaw(dict_data);
+
+        // Get number of dict entries from original header
+        const num_dict_values = if (dict_header.dictionary_page_header) |dph| dph.num_values else 0;
+        var dict_result = try self.page_writer.finalizeDictPage(num_dict_values);
+        try self.pages.append(self.allocator, .{
+            .header = dict_result.header,
+            .data = dict_result.data,
+            .owns_data = dict_result.owns_data,
+        });
+        self.total_uncompressed_size += dict_result.header.uncompressed_page_size;
+        self.total_compressed_size += dict_result.header.compressed_page_size;
+
+        // Step 2: Create new data page with RLE-encoded indices
+        self.page_writer.reset();
+
+        // Write bit width as first byte
+        try self.page_writer.page_buffer.append(self.allocator, bit_width);
+
+        // RLE encode the gathered indices
+        var rle = encoder.RleEncoder.init(self.allocator, bit_width);
+        defer rle.deinit();
+
+        try rle.writeMany(indices);
+        try rle.finish();
+
+        try self.page_writer.page_buffer.appendSlice(self.allocator, rle.getData());
+        self.page_writer.num_values = @intCast(indices.len);
+
+        var data_result = try self.page_writer.finalizeDataPage(.RLE_DICTIONARY);
+        try self.pages.append(self.allocator, .{
+            .header = data_result.header,
+            .data = data_result.data,
+            .owns_data = data_result.owns_data,
+        });
+        self.total_uncompressed_size += data_result.header.uncompressed_page_size;
+        self.total_compressed_size += data_result.header.compressed_page_size;
+        self.num_values += @intCast(indices.len);
+    }
+
     /// Flush dictionary-encoded column (call after all values added)
     pub fn flushDict(self: *ColumnWriter) !void {
         if (self.string_dict) |*dict| {

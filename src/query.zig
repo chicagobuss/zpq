@@ -14,6 +14,7 @@ pub const QueryParams = struct {
     filter: ?[]const u8 = null, // "status=active"
     select: ?[]const u8 = null, // "id,name,created_at"
     mode: ExecutionMode = .slot_parallel,
+    compression: zpq.core.schema.CompressionCodec = .SNAPPY,
 
     // Operations (mutually exclusive with filter/output)
     show_schema: bool = false,
@@ -44,6 +45,7 @@ pub fn executeQuery(
 
     pipeline.setInput(params.input);
     pipeline.setRuntime(loop, thread_pool);
+    pipeline.setCompression(params.compression);
 
     if (params.output) |out| pipeline.setOutput(out);
     if (params.filter) |f| try pipeline.setFilter(f);

@@ -1,6 +1,30 @@
 const std = @import("std");
 const xev = @import("xev");
 
+/// Simple trace helper - prints timing when ZPQ_TRACE=1
+const Trace = struct {
+    start: std.time.Instant,
+    last: std.time.Instant,
+    enabled: bool,
+
+    fn init() Trace {
+        const enabled = if (std.posix.getenv("ZPQ_TRACE")) |v| std.mem.eql(u8, v, "1") else false;
+        const now = std.time.Instant.now() catch unreachable;
+        return .{ .start = now, .last = now, .enabled = enabled };
+    }
+
+    fn mark(self: *Trace, comptime label: []const u8) void {
+        if (!self.enabled) return;
+        const now = std.time.Instant.now() catch return;
+        const since_last = now.since(self.last);
+        std.debug.print("[WORKER] {s}: +{d:.2}ms\n", .{
+            label,
+            @as(f64, @floatFromInt(since_last)) / 1_000_000.0,
+        });
+        self.last = now;
+    }
+};
+
 const SelectionVector = @import("selection.zig").SelectionVector;
 const FilterColumnCache = @import("filter_cache.zig").FilterColumnCache;
 const EncodedFilter = @import("filter.zig").EncodedFilter;
@@ -13,6 +37,7 @@ const thrift = @import("thrift.zig");
 const schema = @import("schema.zig");
 const column_mod = @import("column.zig");
 const ColumnReader = column_mod.ColumnReader;
+const RleDecoder = @import("rle.zig").RleDecoder;
 const interface = @import("../io/interface.zig");
 const MemorySource = interface.local.MemorySource;
 
@@ -142,6 +167,27 @@ pub const FilterContext = struct {
     meta: *const schema.FileMetaData,
 };
 
+/// Dictionary passthrough data - avoids decoding strings entirely
+pub const DictPassthroughData = struct {
+    /// Raw dictionary page bytes (may be compressed)
+    dict_page_data: []const u8,
+    /// Dictionary page header for writing
+    dict_header: schema.PageHeader,
+    /// Selected indices (gathered from RLE stream)
+    indices: []u32,
+    /// Bit width for RLE encoding
+    bit_width: u8,
+    /// Whether dict_page_data is borrowed (from input) or owned
+    dict_borrowed: bool,
+
+    pub fn deinit(self: *DictPassthroughData, allocator: std.mem.Allocator) void {
+        if (!self.dict_borrowed) {
+            allocator.free(self.dict_page_data);
+        }
+        allocator.free(self.indices);
+    }
+};
+
 /// Output data for a single column, ready for writing
 pub const OutputColumnData = struct {
     col_type: schema.Type,
@@ -154,6 +200,9 @@ pub const OutputColumnData = struct {
     bool_values: ?[]bool = null,
     byte_array_values: ?[][]const u8 = null,
 
+    // Dictionary passthrough (for BYTE_ARRAY columns with dict encoding)
+    dict_passthrough: ?DictPassthroughData = null,
+
     pub fn deinit(self: *OutputColumnData, allocator: std.mem.Allocator) void {
         if (self.int32_values) |v| allocator.free(v);
         if (self.int64_values) |v| allocator.free(v);
@@ -164,6 +213,7 @@ pub const OutputColumnData = struct {
             for (values) |v| allocator.free(v);
             allocator.free(values);
         }
+        if (self.dict_passthrough) |*dp| dp.deinit(allocator);
         self.* = .{ .col_type = self.col_type };
     }
 };
@@ -230,6 +280,7 @@ pub const RowGroupWorker = struct {
     /// or from a thread pool callback for parallel execution).
     /// This is pure CPU work - no I/O.
     pub fn execute(self: *Self) void {
+        var trace = Trace.init();
         self.status = .scanning;
 
         // Phase 1: Scan filter column to build selection vector
@@ -238,6 +289,7 @@ pub const RowGroupWorker = struct {
             self.err = e;
             return;
         };
+        trace.mark("scan_filter");
 
         // Early exit if no matches
         if (self.selection.count() == 0) {
@@ -253,6 +305,7 @@ pub const RowGroupWorker = struct {
             self.err = e;
             return;
         };
+        trace.mark("decode_cols");
 
         // Phase 3: Materialize filter column values (if needed)
         self.status = .materializing;
@@ -261,6 +314,7 @@ pub const RowGroupWorker = struct {
             self.err = e;
             return;
         };
+        trace.mark("materialize");
 
         self.status = .done;
         self.row_count = self.selection.count();
@@ -339,17 +393,10 @@ pub const RowGroupWorker = struct {
             }
 
             if (use_dict_fast_path) {
-                // Fast path: compare dictionary indices
-                var sel_batch = simd.SelectionVector.init();
-                const n_read = try reader.scanDictIndicesIntoBatch(target_dict_idx.?, &sel_batch, batch_size);
+                // Fast path: RLE-aware scan directly to selection vector
+                const n_read = try reader.scanDictMatchesToSelection(target_dict_idx.?, row_idx, batch_size, &self.selection);
                 if (n_read == 0) break;
 
-                for (0..n_read) |i| {
-                    if (sel_batch.isSet(i)) {
-                        try self.selection.append(row_idx + i);
-                    }
-                }
-                // Don't cache values for dict path - we'll use filter_val directly
                 row_idx += n_read;
                 self.used_dict_fast_path = true;
             } else {
@@ -455,6 +502,13 @@ pub const RowGroupWorker = struct {
         type_len: ?i32,
         out_idx: usize,
     ) !void {
+        // Try dictionary passthrough for all column types first
+        // This avoids decoding values entirely - just gather indices
+        if (try self.tryReadSelectedWithDictPassthrough(col_reader, col_type, levels, out_idx)) {
+            return; // Successfully used passthrough
+        }
+
+        // Fall back to full decode
         switch (col_type) {
             .INT32 => {
                 const values = try self.readSelectedTyped(i32, col_reader, col_type, levels, type_len);
@@ -503,30 +557,38 @@ pub const RowGroupWorker = struct {
         defer reader.deinit();
 
         const indices = self.selection.items();
+        const total_rows = self.data.num_rows;
+
+        // Batch decode + gather approach:
+        // 1. Decode entire column into a buffer
+        // 2. Gather selected values using indices
+        // This is O(n) decode + O(k) gather vs O(n*k) skip-per-row
+
+        // Allocate decode buffer for entire column
+        var decode_buf = try self.allocator.alloc(?T, total_rows);
+        defer self.allocator.free(decode_buf);
+
+        // Decode all rows in batches
+        var decoded: usize = 0;
+        while (decoded < total_rows) {
+            const n = try reader.nextBatch(decode_buf[decoded..]);
+            if (n == 0) break;
+            decoded += n;
+        }
+
+        // Gather selected values
         var values = try self.allocator.alloc(T, indices.len);
         errdefer self.allocator.free(values);
 
-        var current_row: usize = 0;
-        var out_idx: usize = 0;
-        var batch_buf: [1024]?T = undefined;
-
-        for (indices) |target_row| {
-            // Skip to target row
-            if (target_row > current_row) {
-                try reader.skip(target_row - current_row);
-                current_row = target_row;
+        for (indices, 0..) |row_idx, out_idx| {
+            if (row_idx < decoded) {
+                values[out_idx] = decode_buf[row_idx] orelse std.mem.zeroes(T);
+            } else {
+                values[out_idx] = std.mem.zeroes(T);
             }
-
-            // Read one value
-            const n = try reader.nextBatch(batch_buf[0..1]);
-            if (n == 1) {
-                values[out_idx] = batch_buf[0] orelse std.mem.zeroes(T);
-                out_idx += 1;
-            }
-            current_row += 1;
         }
 
-        return values[0..out_idx];
+        return values;
     }
 
     fn readSelectedByteArray(
@@ -547,35 +609,240 @@ pub const RowGroupWorker = struct {
         defer reader.deinit();
 
         const indices = self.selection.items();
+        const total_rows = self.data.num_rows;
+
+        // Batch decode + gather approach (same as typed version)
+        // Decode entire column, then gather selected values
+
+        // Allocate decode buffer for entire column
+        var decode_buf = try self.allocator.alloc(?[]const u8, total_rows);
+        defer self.allocator.free(decode_buf);
+
+        // Decode all rows in batches
+        var decoded: usize = 0;
+        while (decoded < total_rows) {
+            const n = try reader.nextBatch(decode_buf[decoded..]);
+            if (n == 0) break;
+            decoded += n;
+        }
+
+        // Gather selected values
         var values = try self.allocator.alloc([]const u8, indices.len);
         errdefer {
             for (values) |v| self.allocator.free(v);
             self.allocator.free(values);
         }
 
-        var current_row: usize = 0;
-        var out_idx: usize = 0;
-        var batch_buf: [1]?[]const u8 = undefined;
-
-        for (indices) |target_row| {
-            if (target_row > current_row) {
-                try reader.skip(target_row - current_row);
-                current_row = target_row;
-            }
-
-            const n = try reader.nextBatch(&batch_buf);
-            if (n == 1) {
-                if (batch_buf[0]) |v| {
+        for (indices, 0..) |row_idx, out_idx| {
+            if (row_idx < decoded) {
+                if (decode_buf[row_idx]) |v| {
                     values[out_idx] = try self.allocator.dupe(u8, v);
                 } else {
                     values[out_idx] = try self.allocator.dupe(u8, "");
                 }
-                out_idx += 1;
+            } else {
+                values[out_idx] = try self.allocator.dupe(u8, "");
             }
-            current_row += 1;
         }
 
-        return values[0..out_idx];
+        return values;
+    }
+
+    /// Try to read a column using dictionary passthrough.
+    /// This avoids decoding values entirely - we keep the raw dictionary page
+    /// and just gather the RLE indices for selected rows.
+    /// Returns true if passthrough was used, false if caller should fall back to full decode.
+    fn tryReadSelectedWithDictPassthrough(
+        self: *Self,
+        col_reader: ColumnReader,
+        col_type: schema.Type,
+        levels: schema.Levels,
+        out_idx: usize,
+    ) !bool {
+        // Don't support nested/repeated columns yet
+        if (levels.max_rep > 0) {
+            return false;
+        }
+
+        var reader = col_reader;
+        defer reader.deinit(); // Clean up decompression buffer
+
+        const selection_indices = self.selection.items();
+        const max_def: u16 = @intCast(levels.max_def);
+
+        // Sentinel value for nulls (use max u32)
+        const null_sentinel: u64 = std.math.maxInt(u32);
+
+        // Step 1: Read pages and collect ALL indices + dictionary
+        var dict_page_data: ?[]const u8 = null;
+        var dict_header: ?schema.PageHeader = null;
+        var rle_bit_width: u8 = 0;
+
+        // Collect indices for selected rows only (skip-based)
+        var all_indices = std.ArrayListUnmanaged(u64){};
+        defer all_indices.deinit(self.allocator);
+        try all_indices.ensureTotalCapacity(self.allocator, selection_indices.len);
+
+        var current_row: usize = 0;
+
+        while (try reader.next(self.allocator)) |page| {
+            var mutable_page = page;
+            defer mutable_page.deinit(self.allocator);
+
+            if (mutable_page.header.type == .DICTIONARY_PAGE) {
+                // Capture dictionary page - we need to keep it for output
+                dict_header = mutable_page.header;
+                dict_page_data = try self.allocator.dupe(u8, mutable_page.data);
+                continue;
+            }
+
+            if (mutable_page.header.type == .DATA_PAGE) {
+                const dph = mutable_page.header.data_page_header orelse continue;
+
+                // Only support RLE_DICTIONARY encoding
+                if (dph.encoding != .RLE_DICTIONARY and dph.encoding != .PLAIN_DICTIONARY) {
+                    // Not dictionary encoded - abort passthrough
+                    if (dict_page_data) |d| self.allocator.free(d);
+                    return false;
+                }
+
+                var data_slice = mutable_page.data;
+
+                // Parse definition levels if present
+                var def_decoder: ?RleDecoder = null;
+                if (max_def > 0) {
+                    if (data_slice.len < 4) continue;
+                    const def_len = std.mem.readInt(u32, data_slice[0..4], .little);
+                    if (data_slice.len < 4 + def_len) continue;
+                    const def_data = data_slice[4 .. 4 + def_len];
+                    data_slice = data_slice[4 + def_len ..];
+
+                    const def_bit_width = std.math.log2_int(u32, std.math.ceilPowerOfTwo(u32, @as(u32, max_def) + 1) catch 1);
+                    def_decoder = RleDecoder.init(def_data, @intCast(def_bit_width));
+                }
+
+                // Parse RLE data: first byte is bit width
+                if (data_slice.len < 1) continue;
+                rle_bit_width = data_slice[0];
+                const rle_data = data_slice[1..];
+
+                var rle = RleDecoder.init(rle_data, rle_bit_width);
+                const num_values: usize = @intCast(dph.num_values);
+                const page_start_row = current_row;
+                const page_end_row = current_row + num_values;
+
+                // Find which selected rows fall in this page
+                // Selection is sorted, so we can binary search
+                const first_sel_idx = blk: {
+                    var low: usize = 0;
+                    var high: usize = selection_indices.len;
+                    while (low < high) {
+                        const mid = low + (high - low) / 2;
+                        if (selection_indices[mid] < page_start_row) {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    break :blk low;
+                };
+
+                // Skip pages with no selected rows
+                if (first_sel_idx >= selection_indices.len or selection_indices[first_sel_idx] >= page_end_row) {
+                    current_row = page_end_row;
+                    continue;
+                }
+
+                if (def_decoder != null) {
+                    // Nullable columns: use efficient batch skip for def levels
+                    var def_dec = def_decoder.?;
+                    var rle_pos: usize = 0;
+                    var sel_idx = first_sel_idx;
+
+                    while (sel_idx < selection_indices.len) {
+                        const target_row = selection_indices[sel_idx];
+                        if (target_row >= page_end_row) break;
+
+                        const target_pos = target_row - page_start_row;
+
+                        // Skip def levels to target position using batch skip
+                        if (target_pos > rle_pos) {
+                            const to_skip = target_pos - rle_pos;
+                            // skipAndCountMatching returns number of values that matched max_def
+                            const values_to_skip = try def_dec.skipAndCountMatching(@intCast(to_skip), max_def);
+                            // Skip the corresponding RLE values
+                            if (values_to_skip > 0) {
+                                try rle.skip(@intCast(values_to_skip));
+                            }
+                            rle_pos = target_pos;
+                        }
+
+                        // Read the value at target position
+                        const def_level = (try def_dec.next()) orelse break;
+                        if (def_level == max_def) {
+                            const idx = (try rle.next()) orelse break;
+                            all_indices.appendAssumeCapacity(idx);
+                        } else {
+                            all_indices.appendAssumeCapacity(null_sentinel);
+                        }
+                        rle_pos += 1;
+                        sel_idx += 1;
+                    }
+                    current_row = page_end_row;
+                } else {
+                    // Non-nullable: use skip-based gathering
+                    // Only decode indices we actually need
+                    var rle_pos: usize = 0; // Position in RLE stream (relative to page)
+                    var sel_idx = first_sel_idx;
+
+                    while (sel_idx < selection_indices.len) {
+                        const target_row = selection_indices[sel_idx];
+                        if (target_row >= page_end_row) break;
+
+                        const target_pos = target_row - page_start_row;
+
+                        // Skip to target position
+                        if (target_pos > rle_pos) {
+                            try rle.skip(@intCast(target_pos - rle_pos));
+                            rle_pos = target_pos;
+                        }
+
+                        // Read the index we need
+                        const idx = (try rle.next()) orelse break;
+                        all_indices.appendAssumeCapacity(idx);
+                        rle_pos += 1;
+                        sel_idx += 1;
+                    }
+                    current_row = page_end_row;
+                }
+            }
+        }
+
+        // Must have dictionary for passthrough
+        if (dict_page_data == null or dict_header == null) {
+            return false;
+        }
+
+        // For skip-based path, all_indices already contains only selected indices in order
+        // Just convert to u32
+        var selected_indices = try self.allocator.alloc(u32, all_indices.items.len);
+        errdefer self.allocator.free(selected_indices);
+
+        for (all_indices.items, 0..) |idx, i| {
+            selected_indices[i] = if (idx == null_sentinel) 0 else @intCast(idx);
+        }
+
+        // Store passthrough data
+        self.output_columns[out_idx].dict_passthrough = DictPassthroughData{
+            .dict_page_data = dict_page_data.?,
+            .dict_header = dict_header.?,
+            .indices = selected_indices,
+            .bit_width = rle_bit_width,
+            .dict_borrowed = false,
+        };
+        self.output_columns[out_idx].col_type = col_type;
+
+        return true;
     }
 
     fn materializeFilterColumn(self: *Self) !void {
@@ -588,17 +855,17 @@ pub const RowGroupWorker = struct {
         // If dictionary fast path was used at all, regenerate ALL values from filter_val.
         // This handles the mixed case where first page is PLAIN but rest are dictionary.
         if (self.used_dict_fast_path) {
+            // For BYTE_ARRAY with dict fast path, skip materialization entirely.
+            // encodeToBuffer will use writeConstantByteArray which doesn't need the values.
+            if (self.ctx.filter_col_type == .BYTE_ARRAY or self.ctx.filter_col_type == .FIXED_LEN_BYTE_ARRAY) {
+                // Don't materialize - encodeToBuffer handles this with constant encoding
+                return;
+            }
+
             // Generate values from filter_val (all matching rows have same value)
             const count = self.selection.count();
             switch (self.ctx.filter_col_type) {
-                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
-                    const values = try self.allocator.alloc([]const u8, count);
-                    // Dupe filter_val for each entry since deinit will free them individually
-                    for (values) |*v| {
-                        v.* = try self.allocator.dupe(u8, self.ctx.filter_val);
-                    }
-                    self.output_columns[out_idx].byte_array_values = values;
-                },
+                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => unreachable, // Handled above
                 .INT32 => {
                     const parsed = try std.fmt.parseInt(i32, self.ctx.filter_val, 10);
                     const values = try self.allocator.alloc(i32, count);
@@ -693,39 +960,58 @@ pub const RowGroupWorker = struct {
             var cw = page_writer.ColumnWriter.init(self.allocator, col_type, compression);
             defer cw.deinit();
 
-            // Encode values based on type
-            switch (col_type) {
-                .INT32 => {
-                    if (col_data.int32_values) |values| {
-                        try cw.writeInt32Plain(values);
-                    }
-                },
-                .INT64 => {
-                    if (col_data.int64_values) |values| {
-                        try cw.writeInt64Plain(values);
-                    }
-                },
-                .FLOAT => {
-                    if (col_data.float_values) |values| {
-                        try cw.writeFloatPlain(values);
-                    }
-                },
-                .DOUBLE => {
-                    if (col_data.double_values) |values| {
-                        try cw.writeDoublePlain(values);
-                    }
-                },
-                .BOOLEAN => {
-                    if (col_data.bool_values) |values| {
-                        try cw.writeBooleanPlain(values);
-                    }
-                },
-                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
-                    if (col_data.byte_array_values) |values| {
-                        try cw.writeByteArrayPlain(values);
-                    }
-                },
-                else => {},
+            // Check if this is the filter column with dict fast path
+            // If so, use constant encoding (single-value dict + RLE)
+            const is_filter_col = self.ctx.filter_col_in_output and
+                self.ctx.filter_col_output_idx != null and
+                self.ctx.filter_col_output_idx.? == i;
+            const use_constant_encoding = is_filter_col and self.used_dict_fast_path;
+
+            var used_dict_encoding = false;
+
+            if (use_constant_encoding and (col_type == .BYTE_ARRAY or col_type == .FIXED_LEN_BYTE_ARRAY)) {
+                // Optimized path: single-value dictionary + RLE indices
+                try cw.writeConstantByteArray(self.ctx.filter_val, self.row_count);
+                used_dict_encoding = true;
+            } else if (col_data.dict_passthrough) |dp| {
+                // Dictionary passthrough: write original dict page + new RLE indices
+                try cw.writeDictPassthrough(dp.dict_header, dp.dict_page_data, dp.indices, dp.bit_width);
+                used_dict_encoding = true;
+            } else {
+                // Standard encoding path
+                switch (col_type) {
+                    .INT32 => {
+                        if (col_data.int32_values) |values| {
+                            try cw.writeInt32Plain(values);
+                        }
+                    },
+                    .INT64 => {
+                        if (col_data.int64_values) |values| {
+                            try cw.writeInt64Plain(values);
+                        }
+                    },
+                    .FLOAT => {
+                        if (col_data.float_values) |values| {
+                            try cw.writeFloatPlain(values);
+                        }
+                    },
+                    .DOUBLE => {
+                        if (col_data.double_values) |values| {
+                            try cw.writeDoublePlain(values);
+                        }
+                    },
+                    .BOOLEAN => {
+                        if (col_data.bool_values) |values| {
+                            try cw.writeBooleanPlain(values);
+                        }
+                    },
+                    .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
+                        if (col_data.byte_array_values) |values| {
+                            try cw.writeByteArrayPlain(values);
+                        }
+                    },
+                    else => {},
+                }
             }
 
             // Record buffer position before writing this column
@@ -742,7 +1028,12 @@ pub const RowGroupWorker = struct {
 
             // Build encodings list
             var encodings = std.ArrayListUnmanaged(schema.Encoding){};
-            try encodings.append(self.allocator, .PLAIN);
+            if (used_dict_encoding) {
+                try encodings.append(self.allocator, .PLAIN); // For dictionary page
+                try encodings.append(self.allocator, .RLE_DICTIONARY);
+            } else {
+                try encodings.append(self.allocator, .PLAIN);
+            }
 
             column_metas[i] = slot_writer.ColumnMeta{
                 .type = col_type,
@@ -752,6 +1043,7 @@ pub const RowGroupWorker = struct {
                 .num_values = @intCast(self.row_count),
                 .uncompressed_size = cw.total_uncompressed_size,
                 .compressed_size = @intCast(col_size),
+                .has_dictionary = used_dict_encoding,
             };
         }
 
@@ -864,8 +1156,11 @@ pub fn SlotWriteCompletionGen(comptime XevApi: type) type {
             const self: *Self = @fieldParentPtr("task", task);
             const allocator = self.worker.allocator;
 
+            var trace = Trace.init();
+
             // Step 1: Execute filter (CPU work)
             self.worker.execute();
+            trace.mark("execute");
 
             if (self.worker.status == .failed) {
                 self.task_error = self.worker.err;
@@ -880,6 +1175,7 @@ pub fn SlotWriteCompletionGen(comptime XevApi: type) type {
                     self.async_signal.notify() catch {};
                     return;
                 };
+                trace.mark("encode");
 
                 // Step 3: Write to slot via pwrite (thread-safe)
                 self.slot_writer_ptr.writeSlot(self.slot_index, self.output_buffer.items) catch |err| {
@@ -887,6 +1183,7 @@ pub fn SlotWriteCompletionGen(comptime XevApi: type) type {
                     self.async_signal.notify() catch {};
                     return;
                 };
+                trace.mark("write_slot");
             } else {
                 // Empty result - write nothing but still need metadata
                 self.column_metas = allocator.alloc(slot_writer.ColumnMeta, 0) catch null;

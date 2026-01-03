@@ -195,8 +195,26 @@ lambda-local-invoke:
 lambda-local-bench backend="aws" size="10mb" runs="1":
     @./tools/serverless/aws.sh local-bench {{backend}} {{size}} {{runs}}
 
-# Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
-bench +args:
+# === Unified Benchmarking ===
+# Usage: just bench <what> <input> <where> <output> [size] [runs]
+#   what:   native | serverless
+#   input:  local | s3
+#   where:  local | lambda
+#   output: local | s3
+#   size:   1mb | 10mb | 100mb
+#   runs:   number of iterations
+#
+# Examples:
+#   just bench native local local local           # zpq local→local
+#   just bench native s3 local s3 100mb 3         # zpq S3→S3
+#   just bench serverless local local local       # RIE file→file
+#   just bench serverless s3 local s3             # RIE S3→S3
+#   just bench serverless s3 lambda s3 100mb      # Real Lambda
+bench what input where output size="10mb" runs="1":
+    @./tools/bench.sh {{what}} {{input}} {{where}} {{output}} {{size}} {{runs}}
+
+# Run a specific legacy benchmark (dns, ping, e2e, scan, pyarrow)
+bench-legacy +args:
     ./benchmarks/bench.sh {{args}}
 
 # Run DNS resolver benchmark

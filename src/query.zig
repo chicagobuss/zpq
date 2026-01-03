@@ -175,6 +175,7 @@ pub fn parseQueryJson(allocator: std.mem.Allocator, json: []const u8) !QueryPara
         select: ?[]const u8 = null,
         schema: ?bool = null,
         meta: ?bool = null,
+        mode: ?[]const u8 = null, // "slot_parallel" or "morsel_parallel"
     };
 
     const parsed = try std.json.parseFromSlice(EventSchema, allocator, json, .{
@@ -185,6 +186,17 @@ pub fn parseQueryJson(allocator: std.mem.Allocator, json: []const u8) !QueryPara
     const input = parsed.value.file orelse parsed.value.input orelse
         return error.MissingInputField;
 
+    // Parse execution mode (default to slot_parallel)
+    var mode: ExecutionMode = .slot_parallel;
+    if (parsed.value.mode) |mode_str| {
+        if (std.mem.eql(u8, mode_str, "morsel_parallel") or std.mem.eql(u8, mode_str, "morsel")) {
+            mode = .morsel_parallel;
+        } else if (std.mem.eql(u8, mode_str, "slot_parallel") or std.mem.eql(u8, mode_str, "slot")) {
+            mode = .slot_parallel;
+        }
+        // else keep default
+    }
+
     return .{
         .input = try allocator.dupe(u8, input),
         .output = if (parsed.value.output) |o| try allocator.dupe(u8, o) else null,
@@ -192,5 +204,6 @@ pub fn parseQueryJson(allocator: std.mem.Allocator, json: []const u8) !QueryPara
         .select = if (parsed.value.select) |s| try allocator.dupe(u8, s) else null,
         .show_schema = parsed.value.schema orelse false,
         .show_meta = parsed.value.meta orelse false,
+        .mode = mode,
     };
 }

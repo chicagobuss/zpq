@@ -277,6 +277,55 @@ delete() {
     success "Deleted $fn_name"
 }
 
+# --- Local RIE Benchmark ---
+# Usage: local-bench <backend> <size> [runs]
+# backend: aws|rustfs|file
+# size: 1mb|10mb|100mb
+local_bench() {
+    local backend="${1:-aws}"
+    local size="${2:-10mb}"
+    local runs="${3:-1}"
+
+    load_env
+
+    local input output
+    case "$backend" in
+        aws)
+            local bucket="${AWS_S3_BUCKET:?AWS_S3_BUCKET not set in .env}"
+            input="s3://$bucket/zpq_test_data/benchmark/benchmark_$size.parquet"
+            output="s3://$bucket/zpq_test_data/output/bench_${size}_out.parquet"
+            ;;
+        rustfs)
+            input="s3://zpq-r2-bucket/benchmark/benchmark_$size.parquet"
+            output="s3://zpq-r2-bucket/output/bench_${size}_out.parquet"
+            export S3_ENDPOINT="${S3_ENDPOINT:-http://host.docker.internal:3000}"
+            ;;
+        file)
+            input="/data/benchmark_$size.parquet"
+            output="/tmp/bench_${size}_out.parquet"
+            ;;
+        *) error "Unknown backend: $backend (use aws|rustfs|file)"; exit 1 ;;
+    esac
+
+    local payload="{\"file\": \"$input\", \"output\": \"$output\", \"filter\": \"string_dict_low=category_0001\", \"select\": \"int32_sorted,string_dict_low,float64\"}"
+
+    info "Backend: $backend | Size: $size | Runs: $runs"
+    info "Input:  $input"
+    info "Output: $output"
+
+    # Ensure RIE container is running
+    if ! docker ps --format '{{.Names}}' | grep -q 'lambda-bench'; then
+        info "Starting RIE container..."
+        (cd "$(dirname "$0")/../../benchmarks" && docker-compose up -d)
+        sleep 2
+    fi
+
+    for i in $(seq 1 "$runs"); do
+        [[ "$runs" -gt 1 ]] && info "Run $i/$runs"
+        curl -s -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" -d "$payload" | jq .
+    done
+}
+
 # --- Help ---
 usage() {
     cat <<EOF
@@ -293,6 +342,7 @@ Commands:
   bench-matrix <payload>        Run benchmark across all arch/memory combos
   list [prefix] [region]        List Lambda functions
   delete <fn> [region]          Delete Lambda function
+  local-bench <backend> <size> [runs]  Run benchmark on local RIE (backend: aws|rustfs|file)
 
 Examples:
   $0 build arm64
@@ -300,9 +350,11 @@ Examples:
   $0 invoke zpq-filter '{"file": "s3://bucket/file.parquet"}'
   $0 metrics zpq-filter
   $0 bench-matrix '{"file": "s3://bucket/file.parquet"}'
+  $0 local-bench aws 100mb 3
 
 Environment:
   AWS_REGION          Default region (default: us-west-2)
+  AWS_S3_BUCKET       S3 bucket for benchmark files (required for aws backend)
   ZPQ_LAMBDA_ROLE     IAM role ARN for new functions
   .env                Loaded automatically if present
 EOF
@@ -317,6 +369,7 @@ case "$cmd" in
     deploy) deploy "$@" ;;
     invoke) invoke "$@" ;;
     logs) logs "$@" ;;
+    local-bench) local_bench "$@" ;;
     metrics) metrics "$@" ;;
     bench-matrix|bench_matrix) bench_matrix "$@" ;;
     list) list "$@" ;;

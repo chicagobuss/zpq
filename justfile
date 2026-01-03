@@ -183,13 +183,17 @@ lambda-bench-matrix payload:
 lambda-list:
     @./tools/serverless/aws.sh list zpq
 
-# Test Lambda locally with RIE
+# Test Lambda locally with RIE (legacy)
 lambda-local:
     @./tools/serverless/test-local.sh
 
 # Test Lambda locally with RIE (invoke only, container already running)
 lambda-local-invoke:
     @./tools/serverless/test-local.sh --invoke
+
+# Run Lambda RIE benchmark: just lambda-local-bench aws 100mb 3
+lambda-local-bench backend="aws" size="10mb" runs="1":
+    @./tools/serverless/aws.sh local-bench {{backend}} {{size}} {{runs}}
 
 # Run a specific benchmark (dns, ping, e2e, scan, pyarrow)
 bench +args:

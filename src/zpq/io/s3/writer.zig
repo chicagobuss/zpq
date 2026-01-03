@@ -802,7 +802,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         }
 
         fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
-            const ctx: *RequestContext = @ptrCast(@alignCast(ctx_void));
+            // Context can be null if connection was already released or error during setup
+            const ctx: *RequestContext = @ptrCast(@alignCast(ctx_void orelse return));
             // EOF after headers complete is ok
             if ((err == error.EOF or err == error.TlsConnectionClosed) and ctx.parser.headersComplete()) {
                 ctx.done = true;
@@ -999,10 +1000,11 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                     };
 
                     // Include port in URL if non-standard
-                    const url = if (self.port == 443 or self.port == 80)
-                        try std.fmt.allocPrint(self.allocator, "https://{s}{s}", .{ self.host, path })
+                    const scheme = if (self.use_tls) "https" else "http";
+                    const url = if ((self.use_tls and self.port == 443) or (!self.use_tls and self.port == 80))
+                        try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, self.host, path })
                     else
-                        try std.fmt.allocPrint(self.allocator, "https://{s}:{d}{s}", .{ self.host, self.port, path });
+                        try std.fmt.allocPrint(self.allocator, "{s}://{s}:{d}{s}", .{ scheme, self.host, self.port, path });
                     defer self.allocator.free(url);
 
                     log.debug("Signing: {s} {s}", .{ method, url });
@@ -1059,6 +1061,99 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         // =====================================================================
         // Public API
         // =====================================================================
+
+        /// Part info for multipart upload completion.
+        /// Used by MorselCoordinator to track uploaded parts.
+        pub const UploadedPart = struct {
+            part_number: u32,
+            etag: []const u8,
+        };
+
+        /// Initialize a multipart upload and return the upload ID.
+        /// This is the public entry point for MorselCoordinator.
+        pub fn initMultipartUpload(self: *Self) ![]const u8 {
+            try self.createMultipartUpload();
+            return self.upload_id orelse error.NoUploadId;
+        }
+
+        /// Upload a single part with the given part number.
+        /// Returns the ETag for use in completeMultipartUpload.
+        /// Caller owns the returned ETag and must free it.
+        pub fn uploadPartDirect(self: *Self, upload_id: []const u8, part_number: u32, data: []const u8) ![]const u8 {
+            // Temporarily set upload_id if not already set
+            const had_upload_id = self.upload_id != null;
+            if (!had_upload_id) {
+                self.upload_id = try self.allocator.dupe(u8, upload_id);
+            }
+            defer {
+                if (!had_upload_id) {
+                    if (self.upload_id) |id| self.allocator.free(id);
+                    self.upload_id = null;
+                }
+            }
+
+            return try self.uploadPart(part_number, data);
+        }
+
+        /// Complete a multipart upload with the given parts.
+        /// Parts must be sorted by part_number.
+        pub fn completeMultipartUploadDirect(self: *Self, upload_id: []const u8, parts: []const UploadedPart) !void {
+            log.debug("Completing multipart upload with {d} parts", .{parts.len});
+
+            // Build XML body
+            var xml = std.ArrayListUnmanaged(u8){};
+            defer xml.deinit(self.allocator);
+
+            try xml.appendSlice(self.allocator, "<CompleteMultipartUpload>");
+
+            for (parts) |part| {
+                try xml.appendSlice(self.allocator, "<Part><PartNumber>");
+                var num_buf: [10]u8 = undefined;
+                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{part.part_number}) catch unreachable;
+                try xml.appendSlice(self.allocator, num_str);
+                try xml.appendSlice(self.allocator, "</PartNumber><ETag>");
+                try xml.appendSlice(self.allocator, part.etag);
+                try xml.appendSlice(self.allocator, "</ETag></Part>");
+            }
+            try xml.appendSlice(self.allocator, "</CompleteMultipartUpload>");
+
+            const path = try self.buildPath("/{s}?uploadId={s}", .{ self.key, upload_id });
+            defer self.allocator.free(path);
+
+            var extra_headers = [_]std.http.Header{
+                .{ .name = "Content-Type", .value = "application/xml" },
+            };
+
+            const response = try self.doRequest("POST", path, xml.items, &extra_headers);
+            defer self.allocator.free(response.body);
+            defer self.allocator.free(response.headers);
+
+            if (response.status >= 400) {
+                log.err("CompleteMultipartUpload failed: {d} - {s}", .{ response.status, response.body });
+                return error.CompleteMultipartFailed;
+            }
+
+            log.info("Multipart upload completed: {s}/{s}", .{ self.bucket, self.key });
+        }
+
+        /// Abort a multipart upload.
+        pub fn abortMultipartUpload(self: *Self, upload_id: []const u8) !void {
+            log.debug("Aborting multipart upload: {s}", .{upload_id});
+
+            const path = try self.buildPath("/{s}?uploadId={s}", .{ self.key, upload_id });
+            defer self.allocator.free(path);
+
+            const response = try self.doRequest("DELETE", path, "", null);
+            defer self.allocator.free(response.body);
+            defer self.allocator.free(response.headers);
+
+            if (response.status >= 400 and response.status != 404) {
+                log.err("AbortMultipartUpload failed: {d} - {s}", .{ response.status, response.body });
+                return error.AbortMultipartFailed;
+            }
+
+            log.info("Multipart upload aborted: {s}/{s}", .{ self.bucket, self.key });
+        }
 
         /// Finish the upload. Must be called after all writes.
         /// - If using multipart: completes the multipart upload

@@ -594,6 +594,12 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             var row_groups = std.ArrayListUnmanaged(RowGroup){};
             defer {
                 for (row_groups.items) |*rg| {
+                    for (rg.columns.items) |*col| {
+                        if (col.meta_data) |*md| {
+                            md.path_in_schema.deinit(self.allocator);
+                            md.encodings.deinit(self.allocator);
+                        }
+                    }
                     rg.columns.deinit(self.allocator);
                 }
                 row_groups.deinit(self.allocator);

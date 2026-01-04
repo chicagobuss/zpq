@@ -485,9 +485,18 @@ pub const RleDecoder = struct {
                     var indices: [32]u64 = undefined;
                     self.readBitPackedBatch32(&indices);
 
-                    const v_target: @Vector(32, u64) = @splat(target);
-                    const v_indices: @Vector(32, u64) = indices;
-                    const matches: u32 = @bitCast(v_indices == v_target);
+                    // Split 32-value batch into smaller simd chunks (4 x 8)
+                    // @Vector(32, u64) is too large (2048 bits) for efficient register allocation
+                    // standard AVX2 is 256 bits (4 x u64), AVX-512 is 512 bits (8 x u64)
+                    var matches: u32 = 0;
+                    
+                    inline for (0..4) |chunk_idx| {
+                        const offset = chunk_idx * 8;
+                        const v_target: @Vector(8, u64) = @splat(target);
+                        const v_indices: @Vector(8, u64) = indices[offset..][0..8].*;
+                        const mask_8: u8 = @bitCast(v_indices == v_target);
+                        matches |= @as(u32, mask_8) << @intCast(offset);
+                    }
 
                     if (matches != 0) {
                         try selection.appendFromMask32(matches, pos);

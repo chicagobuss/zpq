@@ -61,6 +61,11 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             request_buf: []const u8 = &[_]u8{},
             body_data: []const u8 = &[_]u8{},
             headers_sent: bool = false,
+            
+            // Chunked write state
+            body_offset: usize = 0,
+            current_chunk_len: usize = 0,
+            writing_headers: bool = false,
 
             fn onBody(ctx_ptr: *anyopaque, chunk: []const u8) void {
                 const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_ptr));
@@ -429,6 +434,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             conn.on_connect = onPartConnect;
             conn.on_data = onPartData;
             conn.on_error = onPartError;
+            conn.on_write_complete = onPartWriteComplete;
 
             // Build and sign request
             const path = try self.buildPath("/{s}?partNumber={d}&uploadId={s}", .{
@@ -466,12 +472,12 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             try req_buf.appendSlice(self.allocator, len_str);
             try req_buf.appendSlice(self.allocator, "\r\n\r\n");
 
-            // Append body directly to request buffer (single write)
-            try req_buf.appendSlice(self.allocator, part.data);
-
-            // Store complete request (headers + body)
+            // Store request (headers ONLY)
             ctx.request_buf = try req_buf.toOwnedSlice(self.allocator);
-            ctx.body_data = part.data; // Keep reference for data_len tracking
+            ctx.body_data = part.data; // Keep reference for body
+            ctx.body_offset = 0;
+            ctx.current_chunk_len = 0;
+            ctx.writing_headers = false;
 
             // Connect (or use existing connection)
             if (!conn.handshake_complete) {
@@ -484,8 +490,42 @@ pub fn S3WriterGen(comptime XevApi: type) type {
 
         fn onPartConnect(ctx_void: ?*anyopaque) void {
             const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
-            // Send complete request (headers + body) in single write
+            // Send headers
+            ctx.writing_headers = true;
             ctx.conn.write(ctx.request_buf) catch |err| {
+                ctx.err = err;
+                ctx.done = true;
+                return;
+            };
+        }
+
+        fn onPartWriteComplete(ctx_void: ?*anyopaque, _: usize) void {
+            const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
+            
+            if (ctx.writing_headers) {
+                // Headers done, start body
+                ctx.writing_headers = false;
+                writeNextChunk(ctx);
+            } else {
+                // Chunk done, advance and write next
+                ctx.body_offset += ctx.current_chunk_len;
+                writeNextChunk(ctx);
+            }
+        }
+
+        fn writeNextChunk(ctx: *PartUploadContext) void {
+            if (ctx.body_offset >= ctx.body_data.len) {
+                // Done writing body
+                return;
+            }
+
+            const chunk_size = 64 * 1024;
+            const end = @min(ctx.body_offset + chunk_size, ctx.body_data.len);
+            const chunk = ctx.body_data[ctx.body_offset..end];
+            
+            ctx.current_chunk_len = chunk.len;
+            
+            ctx.conn.write(chunk) catch |err| {
                 ctx.err = err;
                 ctx.done = true;
                 return;
@@ -728,7 +768,10 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             const path = try self.buildPath("/{s}", .{self.key});
             defer self.allocator.free(path);
 
-            const response = try self.doRequest("PUT", path, data, null);
+            var extra_headers = [_]std.http.Header{
+                .{ .name = "x-amz-server-side-encryption", .value = "AES256" },
+            };
+            const response = try self.doRequest("PUT", path, data, &extra_headers);
             defer self.allocator.free(response.body);
             defer self.allocator.free(response.headers);
 
@@ -940,7 +983,22 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                     try self.loop.run(.once);
                 }
                 if (ctx.err) |err| return err;
-                try conn.write(body);
+
+                // Write body in chunks to avoid transport buffer limits (128KB issue)
+                const chunk_size = 8 * 1024;
+                var offset: usize = 0;
+                while (offset < body.len) {
+                    const end = @min(offset + chunk_size, body.len);
+                    try conn.write(body[offset..end]);
+                    
+                    // Wait for chunk to be written
+                    while (conn.pending_write and !ctx.done and ctx.err == null) {
+                        try self.loop.run(.once);
+                    }
+                    if (ctx.err) |err| return err;
+                    
+                    offset = end;
+                }
             }
 
             // Run loop until response complete

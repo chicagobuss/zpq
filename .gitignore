@@ -7,6 +7,7 @@ references/
 zig-cache/
 .zig-cache/
 zig-out/
+.bin/
 
 # IDE
 .vscode/
@@ -22,7 +23,6 @@ __pycache__/
 *.dylib
 *.so
 *.dll
-
 
 # Env
 .env*
@@ -47,7 +47,7 @@ examples/lambda/comparison/rust-arrow/target/
 examples/lambda/comparison/**/*.zip
 CURRENT_CONTEXT.md
 .claude/
--e 
+
 # Benchmark binaries
 benchmarks/bootstrap
 benchmarks/zpq

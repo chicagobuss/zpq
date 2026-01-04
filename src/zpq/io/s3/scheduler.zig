@@ -71,9 +71,17 @@ pub fn mergeRanges(
 
         const gap = next.start - current_end;
 
+        // Limit max request size to ensuring parallelism
+        // S3 single-stream throughput is limited; we want parallel requests for large data.
+        const MAX_MERGED_SIZE = 16 * 1024 * 1024; // 16MB
+        
+        const new_len_if_merged = @max(current_end, next.end) - current_req.request_range.start;
+        const would_exceed_size = new_len_if_merged > MAX_MERGED_SIZE;
+
         // DuckDB-style optimization: Always merge small gaps (reduces request count)
         // This is critical for Parquet column chunks which are often close together
-        if (gap <= MIN_GAP_THRESHOLD) {
+        // BUT: Do not merge if it exceeds our max size target for parallelism
+        if (gap <= MIN_GAP_THRESHOLD and !would_exceed_size) {
             current_req.request_range.end = next.end;
             try current_req.original_indices.append(allocator, orig_idx);
             continue;
@@ -85,7 +93,7 @@ pub fn mergeRanges(
         const MB = 1024 * 1024;
         const gap_tolerance = std.math.clamp(size_base / 8, 1 * MB, 8 * MB);
 
-        if (gap <= gap_tolerance) {
+        if (gap <= gap_tolerance and !would_exceed_size) {
             // Merge
             current_req.request_range.end = next.end;
             try current_req.original_indices.append(allocator, orig_idx);

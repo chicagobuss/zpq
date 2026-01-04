@@ -384,6 +384,20 @@ pub fn build(b: *std.Build) void {
         check_step,
     );
 
+    // Tool: echo-s3
+    const echo_s3 = b.addExecutable(.{
+        .name = "echo-s3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/echo_s3.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    echo_s3.root_module.addImport("zpq", zpq_mod);
+    echo_s3.root_module.addImport("xev", libxev_mod);
+    echo_s3.root_module.addImport("boring_tls", boring_tls_mod);
+    b.installArtifact(echo_s3);
+
     // Examples
     const install_examples = b.option(bool, "examples", "Build examples (including Lambda bootstrap)") orelse false;
     const build_examples = @import("build_examples.zig");

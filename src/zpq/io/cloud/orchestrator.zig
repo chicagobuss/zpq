@@ -140,6 +140,9 @@ pub fn Orchestrator(comptime XevApi: type) type {
 
                 try self.loop.run(.until_done);
 
+                // Disable errdefer cleanup since we will handle it manually below
+                cleanup_idx = 0;
+
                 var first_err: ?anyerror = null;
                 for (contexts) |ctx| {
                     if (ctx.err) |err| {

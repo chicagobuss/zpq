@@ -8,6 +8,8 @@ pub const log = @import("zpq/log.zig");
 /// Arrow C Data Interface for zero-copy interop with external engines
 pub const arrow = @import("zpq/arrow.zig");
 
+pub const vector = @import("zpq/vector/batch.zig");
+
 pub const core = struct {
     pub const file = @import("zpq/core/file.zig");
     pub const schema = @import("zpq/core/schema.zig");
@@ -89,4 +91,5 @@ test {
     _ = io.interface;
     _ = s3.XevS3Source;
     _ = arrow;
+    _ = vector;
 }

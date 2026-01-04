@@ -13,8 +13,8 @@
             .path = "vendor/libxev",
         },
         .zstd = .{
-            .url = "https://github.com/allyourcodebase/zstd/archive/refs/heads/zig-0.16.tar.gz",
-            .hash = "zstd-1.5.7-KEItkBA0AADSGJseZTqmYVPMGCerT1VevdZFlPKz2DNI",
+            .url = "https://github.com/allyourcodebase/zstd/archive/e1a501be57f42c541e8a5597e4b59a074dfd09a3.tar.gz",
+            .hash = "zstd-1.5.7-1-KEItkAMwAAD6OKY3m0OOmXG7aL-aLUfrDqbP5J5oYapU",
         },
     },
     .paths = .{""},

@@ -424,10 +424,9 @@ pub const ParquetFile = struct {
         const SourceType = @TypeOf(s3_source.*);
         const Cleanup = struct {
             fn func(ctx: *anyopaque, alloc: std.mem.Allocator) void {
-                _ = alloc;
                 const s: *SourceType = @ptrCast(@alignCast(ctx));
                 s.deinit();
-                allocator.destroy(s);
+                alloc.destroy(s);
             }
         }.func;
 
@@ -549,6 +548,7 @@ pub const ParquetFile = struct {
             if (self.footer_buffer.len > 0) self.allocator.free(self.footer_buffer);
             self.footer_buffer = try self.allocator.alloc(u8, self.footer_len);
             @memcpy(self.footer_buffer, footer_slice);
+            self.footer_buffer_owned = true;
         } else {
             const footer_start = self.file_size - 8 - self.footer_len;
             if (self.footer_buffer.len > 0) self.allocator.free(self.footer_buffer);

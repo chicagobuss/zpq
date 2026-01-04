@@ -235,15 +235,39 @@ pub fn ConnectionGen(comptime XevApi: type) type {
             _ = completion;
             _ = watcher;
             const me = self.?;
-            me.pending_write = false;
-            me.allocator.free(buffer.slice);
+            
             if (result) |n| {
                 log.debug("internalOnTcpWrite: wrote {d} bytes", .{n});
+                
+                // Handle partial write
+                if (n < buffer.slice.len) {
+                    log.debug("internalOnTcpWrite: partial write ({d}/{d}), rescheduling remainder", .{n, buffer.slice.len});
+                    const remainder = buffer.slice[n..];
+                    const new_buf = me.allocator.dupe(u8, remainder) catch |err| {
+                        me.allocator.free(buffer.slice);
+                        me.pending_write = false;
+                        if (me.on_error) |cb| cb(me.user_ctx, err);
+                        return .disarm;
+                    };
+                    me.allocator.free(buffer.slice);
+                    
+                    // Re-schedule write for remainder
+                    // Keep pending_write = true
+                    me.tcp.write(me.loop, &me.c_write, .{ .slice = new_buf }, Self, me, internalOnTcpWrite);
+                    return .disarm;
+                }
+                
+                // Full write complete
+                me.allocator.free(buffer.slice);
+                me.pending_write = false;
+                
                 // Notify application that write completed BEFORE pump()
                 // This allows chunked uploads to queue the next chunk
-                if (me.on_write_complete) |cb| cb(me.user_ctx, n);
+                if (me.on_write_complete) |cb| cb(me.user_ctx, n); // Note: n here is just the last chunk length, but we assume app treats this as "done"
                 me.pump();
             } else |err| {
+                me.allocator.free(buffer.slice);
+                me.pending_write = false;
                 log.debug("internalOnTcpWrite: write failed: {}", .{err});
                 if (me.on_error) |cb| cb(me.user_ctx, err);
             }

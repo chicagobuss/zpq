@@ -70,13 +70,11 @@ gen-deranged:
 verify: build check-tls
     @echo "Verifying CLI commands..."
     # Schema check
-    zig build run -- schema data/simple.parquet
+    zig build run -- data/simple.parquet --schema
     # Metadata check
-    zig build run -- meta data/required.parquet
-    # Pages check (deep dive)
-    zig build run -- pages data/simple.parquet > /dev/null
-    # Cat check (data dump)
-    zig build run -- cat data/simple.parquet 5
+    zig build run -- data/required.parquet --meta
+    # Summary check (default action)
+    zig build run -- data/simple.parquet
     @echo "Verification passed."
 
 # Verify TLS Transport and S3 Factory (Requires Network)
@@ -92,24 +90,24 @@ comprehensive: build gen-fixtures
 
     # 1. Correctness on Edge Cases
     @echo "[Check] Large RLE Decoding..."
-    zig build run -- cat data/large_rle.parquet 10 > /dev/null
+    zig build run -- data/large_rle.parquet --schema
 
     @echo "[Check] Bit-Packed Handling..."
-    zig build run -- cat data/large_bitpacked.parquet 10 > /dev/null
+    zig build run -- data/large_bitpacked.parquet --schema
 
     @echo "[Check] High Bit Widths..."
-    zig build run -- cat data/high_width.parquet 10 > /dev/null
+    zig build run -- data/high_width.parquet --schema
 
     # 2. Performance / Throughput
     @echo "[Bench] Scanning Many Rows (Throughput)..."
-    zig build run -- scan data/many_rows.parquet
+    zig build run -- data/many_rows.parquet
 
     # 3. Complex/Real-world Data (if available)
     # If zpq-subset exists, test it
     @if [ -f data/zpq-subset.parquet ]; then \
         echo "[Check] Real-world Subset (Snappy + Dict + Nulls)..."; \
-        zig build run -- cat data/zpq-subset.parquet 5 > /dev/null; \
-        zig build run -- meta data/zpq-subset.parquet; \
+        zig build run -- data/zpq-subset.parquet --schema; \
+        zig build run -- data/zpq-subset.parquet --meta; \
     fi
 
     @echo "Comprehensive suite finished."
@@ -227,16 +225,16 @@ verify-malformed: build gen-malformed
     @echo "Testing corrupt file handling..."
 
     @echo "[Check] Bad Magic Bytes (Should fail)..."
-    @! zig build run -- inspect data/malformed/bad_magic.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
+    @! zig build run -- data/malformed/bad_magic.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
     @echo "[Check] Truncated Footer (Should fail)..."
-    @! zig build run -- inspect data/malformed/truncated.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
+    @! zig build run -- data/malformed/truncated.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
     @echo "[Check] Garbage Footer Length (Should fail)..."
-    @! zig build run -- inspect data/malformed/garbage_footer_len.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
+    @! zig build run -- data/malformed/garbage_footer_len.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
     @echo "[Check] Random Garbage with Valid Magic (Should fail)..."
-    @! zig build run -- inspect data/malformed/random_garbage.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
+    @! zig build run -- data/malformed/random_garbage.parquet > /dev/null 2>&1 && echo "  -> Failed as expected" || (echo "  -> UNEXPECTED SUCCESS" && exit 1)
 
     @echo "Malformed tests passed (all files rejected)."
 

@@ -46,3 +46,40 @@ The zig-docs MCP and local std source reflect actual 0.16 APIs. Training data is
 - Fix feedback loop first (if >60s to reproduce, shorten it)
 - Isolate in `probes/probe_X.zig`, not main app
 - 5-second timeout policy for network ops
+
+## Benchmarking (CRITICAL)
+**ALWAYS use `just bench` or `just engine` commands for performance testing.**
+
+Standard benchmark files in `/tmp/zpq_r2_bucket/benchmark/`:
+
+| Size | Compression | Rows | MD5 |
+|------|-------------|------|-----|
+| 1mb | snappy (default) | 5,242 | `8b326789c1434479eaa25bf720c19f54` |
+| 1mb | none | 5,242 | `e0141be99ed431179d38087b3e5935af` |
+| 1mb | gzip | 5,242 | `d647806413ad62ba6dac7898afce6feb` |
+| 1mb | zstd | 5,242 | `e04fe816b61a6be3dd003974a4f27f3c` |
+| 10mb | snappy (default) | 52,428 | `f325f829234f678a8a247a69753d6324` |
+| 10mb | none | 52,428 | `0822ebd6ca461003b5b3be020eca6af0` |
+| 10mb | gzip | 52,428 | `ae5bc20e5d0aa1addecbe2b8b67260d8` |
+| 10mb | zstd | 52,428 | `cbf12db407601349a6b2b0f4d7f4c0c6` |
+| 100mb | snappy (default) | 524,288 | `9e80e049d5db8cb8ba63bee5eb5213fa` |
+| 100mb | none | 524,288 | `808a2b9f9d3bceef1de765396ab64439` |
+| 100mb | gzip | 524,288 | `7f21f6926b508f56aab6d6caead5d499` |
+| 100mb | zstd | 524,288 | `eb30115f306b82eb402c2134c11f8e1c` |
+
+**NEVER create ad-hoc test files** like `/tmp/bench_*.parquet` for performance comparisons.
+
+Commands:
+```bash
+# ZPQ benchmark (uses standard files automatically)
+just bench native local local local 10mb 3
+
+# Compare with other engines
+just engine polars local 100mb 3
+just engine duckdb local 100mb 3
+
+# Full comparison
+just compare local local 100mb 3
+```
+
+Build for benchmarks: `zig build -Doptimize=ReleaseFast`

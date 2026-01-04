@@ -177,6 +177,8 @@ pub const SlotWriter = struct {
         var total_rows: i64 = 0;
 
         for (row_groups_meta, 0..) |rg_meta, i| {
+            if (rg_meta.num_rows == 0) continue;
+            
             const slot_start = self.slot_offsets[i];
 
             // Build column chunks with adjusted offsets

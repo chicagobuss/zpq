@@ -91,36 +91,75 @@ pub const RleDecoder = struct {
             }
 
             if (self.literal_count > 0) {
-                if (self.bitpack_pos == 0 and self.literal_count >= 8 and (buffer.len - out_pos) >= 8) {
-                    const count = @min(self.literal_count, (buffer.len - out_pos)) / 8 * 8;
-                    for (0..count / 8) |_| {
-                        var indices: [8]u64 = undefined;
-                        self.readBitPackedBatch8(&indices);
-                        if (dictionary) |dict| {
-                            inline for (0..8) |i| {
-                                buffer[out_pos + i] = dict[indices[i]];
+                if (self.bitpack_pos == 0) {
+                    const avail = buffer.len - out_pos;
+                    const can_do = @min(self.literal_count, avail);
+
+                    // 32-value fast path
+                    if (can_do >= 32) {
+                        const groups = can_do / 32;
+                        for (0..groups) |_| {
+                            var indices: [32]u64 = undefined;
+                            self.readBitPackedBatch32(&indices);
+                            if (dictionary) |dict| {
+                                inline for (0..32) |i| {
+                                    buffer[out_pos + i] = dict[indices[i]];
+                                }
+                            } else {
+                                switch (@typeInfo(T)) {
+                                    .int => inline for (0..32) |i| {
+                                        buffer[out_pos + i] = @as(T, @intCast(indices[i]));
+                                    },
+                                    .float => inline for (0..32) |i| {
+                                        buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
+                                    },
+                                    else => if (T == u64) {
+                                        inline for (0..32) |i| {
+                                            buffer[out_pos + i] = indices[i];
+                                        }
+                                    } else {
+                                        @compileError("Unsupported type for RLE decoding without dictionary");
+                                    },
+                                }
                             }
-                        } else {
-                            switch (@typeInfo(T)) {
-                                .int => inline for (0..8) |i| {
-                                    buffer[out_pos + i] = @as(T, @intCast(indices[i]));
-                                },
-                                .float => inline for (0..8) |i| {
-                                    buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
-                                },
-                                else => if (T == u64) {
-                                    inline for (0..8) |i| {
-                                        buffer[out_pos + i] = indices[i];
-                                    }
-                                } else {
-                                    @compileError("Unsupported type for RLE decoding without dictionary");
-                                },
-                            }
+                            out_pos += 32;
+                            self.literal_count -= 32;
                         }
-                        out_pos += 8;
-                        self.literal_count -= 8;
+                        continue;
                     }
-                    continue;
+
+                    // 8-value path
+                    if (can_do >= 8) {
+                        const groups = can_do / 8;
+                        for (0..groups) |_| {
+                            var indices: [8]u64 = undefined;
+                            self.readBitPackedBatch8(&indices);
+                            if (dictionary) |dict| {
+                                inline for (0..8) |i| {
+                                    buffer[out_pos + i] = dict[indices[i]];
+                                }
+                            } else {
+                                switch (@typeInfo(T)) {
+                                    .int => inline for (0..8) |i| {
+                                        buffer[out_pos + i] = @as(T, @intCast(indices[i]));
+                                    },
+                                    .float => inline for (0..8) |i| {
+                                        buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
+                                    },
+                                    else => if (T == u64) {
+                                        inline for (0..8) |i| {
+                                            buffer[out_pos + i] = indices[i];
+                                        }
+                                    } else {
+                                        @compileError("Unsupported type for RLE decoding without dictionary");
+                                    },
+                                }
+                            }
+                            out_pos += 8;
+                            self.literal_count -= 8;
+                        }
+                        continue;
+                    }
                 }
 
                 const idx = try self.readBitPackedValue();
@@ -157,18 +196,39 @@ pub const RleDecoder = struct {
             }
 
             if (self.literal_count > 0) {
-                if (self.bitpack_pos == 0 and self.literal_count >= 8 and (buffer.len - out_pos) >= 8) {
-                    const count = @min(self.literal_count, (buffer.len - out_pos)) / 8 * 8;
-                    for (0..count / 8) |_| {
-                        var indices: [8]u64 = undefined;
-                        self.readBitPackedBatch8(&indices);
-                        inline for (0..8) |i| {
-                            buffer[out_pos + i] = dictionary[indices[i]];
+                if (self.bitpack_pos == 0) {
+                    const avail = buffer.len - out_pos;
+                    const can_do = @min(self.literal_count, avail);
+
+                    // 32-value fast path
+                    if (can_do >= 32) {
+                        const groups = can_do / 32;
+                        for (0..groups) |_| {
+                            var indices: [32]u64 = undefined;
+                            self.readBitPackedBatch32(&indices);
+                            inline for (0..32) |i| {
+                                buffer[out_pos + i] = dictionary[indices[i]];
+                            }
+                            out_pos += 32;
+                            self.literal_count -= 32;
                         }
-                        out_pos += 8;
-                        self.literal_count -= 8;
+                        continue;
                     }
-                    continue;
+
+                    // 8-value path
+                    if (can_do >= 8) {
+                        const groups = can_do / 8;
+                        for (0..groups) |_| {
+                            var indices: [8]u64 = undefined;
+                            self.readBitPackedBatch8(&indices);
+                            inline for (0..8) |i| {
+                                buffer[out_pos + i] = dictionary[indices[i]];
+                            }
+                            out_pos += 8;
+                            self.literal_count -= 8;
+                        }
+                        continue;
+                    }
                 }
 
                 const idx = try self.readBitPackedValue();
@@ -182,70 +242,94 @@ pub const RleDecoder = struct {
         return out_pos;
     }
 
-    /// Optimized unpacking for 8 values. Requires bitpack_pos == 0.
-    fn readBitPackedBatch8(self: *RleDecoder, out: []u64) void {
+    /// Optimized unpacking for 32 values. Requires bitpack_pos == 0.
+    fn readBitPackedBatch32(self: *RleDecoder, out: *[32]u64) void {
+        @setEvalBranchQuota(10000);
         std.debug.assert(self.bitpack_pos == 0);
-        std.debug.assert(out.len >= 8);
 
         const bw = self.bit_width;
         if (bw == 0) {
-            @memset(out[0..8], 0);
+            @memset(out, 0);
+            return;
+        }
+
+        switch (bw) {
+            inline 1...32 => |width| {
+                // Scalar unrolled fast-path (as proven by probe_simd_32.zig)
+                // Compiler generates excellent SIMD instructions from this pattern on ARM/x86.
+                inline for (0..32) |i| {
+                    const bit_idx = i * width;
+                    const byte_idx = bit_idx / 8;
+                    const bit_off: u3 = @intCast(bit_idx % 8);
+
+                    // Load u64 if we have space, otherwise scalar fallback
+                    if (self.pos + byte_idx + 8 <= self.data.len) {
+                        const raw = std.mem.readInt(u64, self.data[self.pos + byte_idx ..][0..8], .little);
+                        out[i] = (raw >> bit_off) & self.mask;
+                    } else {
+                        // Very slow case: end of stream
+                        out[i] = (self.readBitAt(bit_idx, width) catch 0);
+                    }
+                }
+                const total_bits = 32 * @as(u32, width);
+                self.pos += total_bits / 8;
+            },
+            else => {
+                // Fallback to scalar for large widths
+                for (0..32) |i| {
+                    out[i] = self.readBitPackedValue() catch 0;
+                }
+            },
+        }
+    }
+
+    /// Helper for end-of-stream bit-packed reads
+    fn readBitAt(self: *RleDecoder, start_bit: u32, width: u8) !u64 {
+        var val: u64 = 0;
+        var i: u8 = 0;
+        while (i < width) : (i += 1) {
+            const bit_idx = start_bit + i;
+            const byte_idx = self.pos + (bit_idx / 8);
+            if (byte_idx >= self.data.len) return val;
+            const bit_off: u3 = @intCast(bit_idx % 8);
+            if ((self.data[byte_idx] >> bit_off) & 1 == 1) {
+                val |= (@as(u64, 1) << @as(u6, @intCast(i)));
+            }
+        }
+        return val & self.mask;
+    }
+
+    /// Optimized unpacking for 8 values. Requires bitpack_pos == 0.
+    fn readBitPackedBatch8(self: *RleDecoder, out: *[8]u64) void {
+        std.debug.assert(self.bitpack_pos == 0);
+
+        const bw = self.bit_width;
+        if (bw == 0) {
+            @memset(out, 0);
             return;
         }
 
         // Use inline switch for specialized bit-unpacking kernels
         switch (bw) {
             inline 1...32 => |width| {
-                const total_bits: u16 = @as(u16, width) * 8;
-                const total_bytes = (total_bits + 7) / 8;
+                inline for (0..8) |i| {
+                    const bit_idx = i * width;
+                    const byte_idx = bit_idx / 8;
+                    const bit_off: u3 = @intCast(bit_idx % 8);
 
-                // Choose smallest container that fits all 8 values
-                const Container = comptime switch (width) {
-                    1...8 => u64,
-                    9...16 => u128,
-                    17...32 => u256,
-                    else => unreachable,
-                };
-
-                var bits: Container = 0;
-                const remaining = self.data.len - self.pos;
-                if (remaining >= total_bytes) {
-                    if (remaining >= @sizeOf(Container)) {
-                        // Fast path: direct unaligned load
-                        bits = std.mem.readInt(Container, self.data[self.pos..][0..@sizeOf(Container)], .little);
+                    if (self.pos + byte_idx + 8 <= self.data.len) {
+                        const raw = std.mem.readInt(u64, self.data[self.pos + byte_idx ..][0..8], .little);
+                        out[i] = (raw >> bit_off) & self.mask;
                     } else {
-                        // Middle path: enough for group but not full Container load
-                        var buf: [@sizeOf(Container)]u8 = @splat(0);
-                        @memcpy(buf[0..total_bytes], self.data[self.pos .. self.pos + total_bytes]);
-                        bits = std.mem.readInt(Container, &buf, .little);
+                        out[i] = (self.readBitAt(bit_idx, width) catch 0);
                     }
-                    self.pos += total_bytes;
-                } else {
-                    // Slow path: bounded load (not even enough for full group)
-                    const limit = remaining;
-                    var buf: [@sizeOf(Container)]u8 = @splat(0);
-                    @memcpy(buf[0..limit], self.data[self.pos .. self.pos + limit]);
-                    bits = std.mem.readInt(Container, &buf, .little);
-                    self.pos += limit;
                 }
-
-                const v_bits: @Vector(8, Container) = @splat(bits);
-                comptime var shifts: [8]std.math.Log2Int(Container) = undefined;
-                inline for (0..8) |i| {
-                    shifts[i] = @intCast(i * width);
-                }
-                const v_shifts: @Vector(8, std.math.Log2Int(Container)) = shifts;
-                const mask: Container = (@as(Container, 1) << width) - 1;
-                const v_res = (v_bits >> v_shifts) & @as(@Vector(8, Container), @splat(mask));
-
-                inline for (0..8) |i| {
-                    out[i] = @intCast(v_res[i]);
-                }
+                const total_bits = 8 * @as(u32, width);
+                self.pos += total_bits / 8;
             },
             else => {
-                // Fallback to scalar for very large widths
                 for (0..8) |i| {
-                    out[i] = self.readBitPackedValue() catch unreachable;
+                    out[i] = self.readBitPackedValue() catch 0;
                 }
             },
         }
@@ -396,7 +480,25 @@ pub const RleDecoder = struct {
                 pos += scan_amt;
             } else if (self.literal_count > 0) {
                 // Literal run: decode and check each value
-                // Use SIMD for batches of 8
+                // Use SIMD for batches of 32
+                while (self.literal_count >= 32 and remaining >= 32) {
+                    var indices: [32]u64 = undefined;
+                    self.readBitPackedBatch32(&indices);
+
+                    const v_target: @Vector(32, u64) = @splat(target);
+                    const v_indices: @Vector(32, u64) = indices;
+                    const matches: u32 = @bitCast(v_indices == v_target);
+
+                    if (matches != 0) {
+                        try selection.appendFromMask32(matches, pos);
+                    }
+
+                    self.literal_count -= 32;
+                    remaining -= 32;
+                    pos += 32;
+                }
+
+                // SIMD for batches of 8
                 while (self.literal_count >= 8 and remaining >= 8) {
                     var indices: [8]u64 = undefined;
                     self.readBitPackedBatch8(&indices);

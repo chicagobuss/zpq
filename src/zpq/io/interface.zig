@@ -91,9 +91,11 @@ pub const RandomAccessSource = struct {
 pub const local = struct {
     pub const FileSource = @import("local/file_source.zig").LocalFileSource;
     pub const MemorySource = @import("local/memory_source.zig").MemorySource;
+    pub const MmapSource = @import("local/mmap_source.zig").MmapSource;
 };
 
 test {
     _ = @import("local/file_source.zig");
     _ = @import("local/memory_source.zig");
+    _ = @import("local/mmap_source.zig");
 }

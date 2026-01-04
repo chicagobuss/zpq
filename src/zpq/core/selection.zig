@@ -56,6 +56,21 @@ pub const SelectionVector = struct {
         }
     }
 
+    /// Bulk append from a 32-bit bitmask. Each set bit at position i adds (base_idx + i) to selection.
+    pub fn appendFromMask32(self: *SelectionVector, mask: u32, base_idx: usize) !void {
+        if (mask == 0) return;
+
+        const num_bits = @popCount(mask);
+        try self.indices.ensureUnusedCapacity(self.allocator, num_bits);
+
+        var remaining = mask;
+        while (remaining != 0) {
+            const bit_pos = @ctz(remaining);
+            self.indices.appendAssumeCapacity(base_idx + bit_pos);
+            remaining &= remaining - 1;
+        }
+    }
+
     /// Bulk append from a bitmask. Each set bit at position i adds (base_idx + i) to selection.
     /// Uses popcount and ctz for efficient bit scanning.
     pub fn appendFromMask(self: *SelectionVector, mask: u8, base_idx: usize) !void {

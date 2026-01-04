@@ -195,7 +195,7 @@ pub const RowGroupReader = struct {
         var buffers = try std.ArrayList([]u8).initCapacity(self.allocator, targets.len);
         defer buffers.deinit(self.allocator); // We only free the list, not the contents (which move to self.buffers)
 
-        // Identify ranges and allocate buffers
+        // Identify ranges and allocate buffers (or get zero-copy slices)
         for (targets) |idx| {
             if (idx >= self.meta.columns.items.len) return error.InvalidColumnIndex;
             if (self.memory_sources[idx] != null) continue; // Already fetched
@@ -209,6 +209,12 @@ pub const RowGroupReader = struct {
                 if (dpo < start) start = @intCast(dpo);
             }
             const len: u64 = @intCast(meta.total_compressed_size);
+
+            // Try zero-copy first
+            if (self.file.source.getSlice(start, len)) |slice| {
+                self.memory_sources[idx] = io.local.MemorySource.initWithOffset(@constCast(slice), start);
+                continue;
+            }
 
             try ranges.append(self.allocator, .{ .start = start, .end = start + len });
 
@@ -334,6 +340,7 @@ pub const ParquetFile = struct {
     file_size: u64,
     metadata: ?schema.FileMetaData = null,
     footer_buffer: []u8 = &[_]u8{},
+    footer_buffer_owned: bool = false,
     allocator: std.mem.Allocator,
 
     // Arena for metadata allocations (much faster than GPA for many small allocs)
@@ -343,6 +350,38 @@ pub const ParquetFile = struct {
         const s: *io.local.FileSource = @ptrCast(@alignCast(ctx));
         s.deinit();
         allocator.destroy(s);
+    }
+
+    fn cleanupMmap(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const s: *io.local.MmapSource = @ptrCast(@alignCast(ctx));
+        s.deinit();
+        allocator.destroy(s);
+    }
+
+    /// Open a local file path using mmap for zero-copy.
+    pub fn openMmap(allocator: std.mem.Allocator, path: []const u8) !ParquetFile {
+        const local_source = try allocator.create(io.local.MmapSource);
+        errdefer allocator.destroy(local_source);
+
+        local_source.* = try io.local.MmapSource.init(path);
+        errdefer local_source.deinit();
+
+        const source = local_source.source();
+        const size = source.size();
+
+        if (size < 8) {
+            return error.InvalidParquetFile;
+        }
+
+        return ParquetFile{
+            .source = source,
+            .cleanup_context = local_source,
+            .cleanup_fn = cleanupMmap,
+            .footer_len = 0,
+            .file_size = size,
+            .allocator = allocator,
+            .metadata_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        };
     }
 
     /// Open a local file path. ParquetFile owns the file source.
@@ -442,10 +481,11 @@ pub const ParquetFile = struct {
         self.metadata_arena.deinit();
         self.metadata = null;
 
-        if (self.footer_buffer.len > 0) {
+        if (self.footer_buffer_owned and self.footer_buffer.len > 0) {
             self.allocator.free(self.footer_buffer);
-            self.footer_buffer = &[_]u8{};
         }
+        self.footer_buffer = &[_]u8{};
+        self.footer_buffer_owned = false;
 
         if (self.cleanup_fn) |clean| {
             if (self.cleanup_context) |ctx| {
@@ -458,6 +498,16 @@ pub const ParquetFile = struct {
 
     pub fn close(self: *ParquetFile) void {
         self.deinit();
+    }
+
+    /// Explicitly provide an access hint to the OS (only if source is MmapSource).
+    pub fn advise(self: *const ParquetFile, offset: u64, len: u64, advice: std.posix.MADV) void {
+        // Try to downcast to MmapSource if possible
+        // This is a bit hacky since we use anyopaque, but we can check the cleanup_fn
+        if (self.cleanup_fn == cleanupMmap) {
+            const mmap_src: *io.local.MmapSource = @ptrCast(@alignCast(self.cleanup_context.?));
+            mmap_src.advise(offset, len, advice) catch {};
+        }
     }
 
     pub fn readFooter(self: *ParquetFile) !void {
@@ -502,9 +552,20 @@ pub const ParquetFile = struct {
         } else {
             const footer_start = self.file_size - 8 - self.footer_len;
             if (self.footer_buffer.len > 0) self.allocator.free(self.footer_buffer);
-            self.footer_buffer = try self.allocator.alloc(u8, self.footer_len);
-            const bytes_read = try self.source.readAt(footer_start, self.footer_buffer);
-            if (bytes_read != self.footer_len) return error.UnexpectedEndOfFile;
+
+            // Try zero-copy for footer
+            if (self.source.getSlice(footer_start, self.footer_len)) |slice| {
+                self.footer_buffer = @constCast(slice);
+                // We mark it as empty so deinit doesn't try to free it
+                // Actually, we need to distinguish between owned and shared footer_buffer.
+                // Let's add a flag or use an empty slice for ownership.
+                self.footer_buffer_owned = false;
+            } else {
+                self.footer_buffer = try self.allocator.alloc(u8, self.footer_len);
+                const bytes_read = try self.source.readAt(footer_start, self.footer_buffer);
+                if (bytes_read != self.footer_len) return error.UnexpectedEndOfFile;
+                self.footer_buffer_owned = true;
+            }
         }
 
         var reader = thrift.Reader.init(self.footer_buffer);

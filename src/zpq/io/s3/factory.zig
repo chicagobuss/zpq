@@ -40,7 +40,7 @@ pub fn openFileWithOptions(
         }
         return openS3Internal(allocator, path, options);
     }
-    return zpq.file.ParquetFile.open(allocator, path);
+    return zpq.file.ParquetFile.openMmap(allocator, path);
 }
 
 /// Low-level S3 opener that accepts an existing xev Loop.

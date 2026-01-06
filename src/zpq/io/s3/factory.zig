@@ -34,13 +34,16 @@ pub fn openFileWithOptions(
     path: []const u8,
     options: OpenOptions,
 ) !zpq.file.ParquetFile {
-    if (std.mem.startsWith(u8, path, "s3://")) {
+    var pf = if (std.mem.startsWith(u8, path, "s3://")) blk: {
         if (options.loop) |loop| {
-            return openS3WithLoop(allocator, loop, options.thread_pool.?, path, options);
+            break :blk try openS3WithLoop(allocator, loop, options.thread_pool.?, path, options);
         }
-        return openS3Internal(allocator, path, options);
-    }
-    return zpq.file.ParquetFile.openMmap(allocator, path);
+        break :blk try openS3Internal(allocator, path, options);
+    } else try zpq.file.ParquetFile.openMmap(allocator, path);
+
+    errdefer pf.deinit();
+    try pf.readFooter();
+    return pf;
 }
 
 /// Low-level S3 opener that accepts an existing xev Loop.

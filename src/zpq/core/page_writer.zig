@@ -388,6 +388,31 @@ pub const ColumnWriter = struct {
         try self.flushPage(.PLAIN);
     }
 
+    /// Write an all-nulls column with `count` null values.
+    /// Creates a data page with only definition levels (all zeros = null).
+    pub fn writeAllNulls(self: *ColumnWriter, count: usize) !void {
+        if (count == 0) return;
+
+        self.page_writer.reset();
+
+        // Write definition levels: all zeros means all nulls
+        // max_def_level = 1 for OPTIONAL columns (0 = null, 1 = present)
+        const max_def: u8 = 1;
+
+        // Allocate def levels (all zeros)
+        const def_levels = try self.allocator.alloc(u8, count);
+        defer self.allocator.free(def_levels);
+        @memset(def_levels, 0);
+
+        try self.page_writer.writeDefinitionLevels(max_def, def_levels);
+
+        // No actual values to write - the page only has definition levels
+        self.page_writer.num_values = @intCast(count);
+        self.page_writer.num_nulls = @intCast(count);
+
+        try self.flushPage(.PLAIN);
+    }
+
     /// Write BYTE_ARRAY values with dictionary encoding
     pub fn writeByteArrayDict(self: *ColumnWriter, values: []const []const u8) !void {
         self.enableStringDict();

@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
 
     // Optional features requiring external libraries
     const enable_zstd_compression = b.option(bool, "zstd-compression", "Enable ZSTD compression (requires libzstd)") orelse true;
+    const enable_tracy = b.option(bool, "tracy", "Enable Tracy Profiler") orelse false;
 
     // Get git hash for build info
     const git_hash = getGitHash(b);
@@ -48,6 +49,7 @@ pub fn build(b: *std.Build) void {
     // Create zpq_options module for feature flags
     const zpq_options = b.addOptions();
     zpq_options.addOption(bool, "enable_zstd_compression", enable_zstd_compression);
+    zpq_options.addOption(bool, "enable_tracy", enable_tracy);
 
     // Dependencies
     const libxev_dep = b.dependency("libxev", .{
@@ -105,6 +107,9 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("zpq", zpq_mod);
     exe_mod.addImport("xev", libxev_mod);
     exe_mod.linkSystemLibrary("c", .{});
+    if (enable_tracy) {
+        exe_mod.linkSystemLibrary("c++", .{});
+    }
 
     const install_all = b.option(bool, "all", "Build all auxiliary tests, probes, and benchmarks") orelse false;
 
@@ -384,19 +389,19 @@ pub fn build(b: *std.Build) void {
         check_step,
     );
 
-    // Tool: echo-s3
-    const echo_s3 = b.addExecutable(.{
-        .name = "echo-s3",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/echo_s3.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    echo_s3.root_module.addImport("zpq", zpq_mod);
-    echo_s3.root_module.addImport("xev", libxev_mod);
-    echo_s3.root_module.addImport("boring_tls", boring_tls_mod);
-    b.installArtifact(echo_s3);
+    // Tool: echo-s3 (disabled - file doesn't exist yet)
+    // const echo_s3 = b.addExecutable(.{
+    //     .name = "echo-s3",
+    //     .root_module = b.createModule(.{
+    //         .root_source_file = b.path("tools/echo_s3.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //     }),
+    // });
+    // echo_s3.root_module.addImport("zpq", zpq_mod);
+    // echo_s3.root_module.addImport("xev", libxev_mod);
+    // echo_s3.root_module.addImport("boring_tls", boring_tls_mod);
+    // b.installArtifact(echo_s3);
 
     // Examples
     const install_examples = b.option(bool, "examples", "Build examples (including Lambda bootstrap)") orelse false;

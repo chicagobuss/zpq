@@ -31,6 +31,7 @@ pub const core = struct {
     pub const filter_cache = @import("zpq/core/filter_cache.zig");
     pub const filter_scan = @import("zpq/core/filter_scan.zig");
     pub const selected_reader = @import("zpq/core/selected_reader.zig");
+    pub const filters = @import("zpq/core/filters/mod.zig");
     pub const row_group_worker = @import("zpq/core/row_group_worker.zig");
     pub const slot_writer = @import("zpq/core/slot_writer.zig");
     pub const pipeline = @import("zpq/core/pipeline.zig");
@@ -44,6 +45,8 @@ pub const io = struct {
     pub const http = @import("zpq/io/http/client.zig");
     pub const response_parser = @import("zpq/io/http/response_parser.zig");
     pub const tls = @import("zpq/io/tls/connection.zig");
+    pub const dns = @import("zpq/io/dns.zig");
+    pub const pool = @import("zpq/io/pool.zig");
 };
 
 // Aliases for compatibility
@@ -67,7 +70,7 @@ pub const s3 = struct {
     pub const XevS3Source = @import("zpq/io/s3/xev_source.zig").XevS3Source;
     pub const XevS3SourceGen = @import("zpq/io/s3/xev_source.zig").XevS3SourceGen;
     pub const XevConnectionPool = @import("zpq/io/s3/xev_connection_pool.zig").XevConnectionPool;
-    pub const global_pool = @import("zpq/io/s3/global_pool.zig");
+    pub const global_pool = @import("zpq/io/pool.zig");
     pub const GlobalConnectionPool = global_pool.GlobalConnectionPool;
 
     // S3 Writer - streaming multipart uploads
@@ -79,7 +82,7 @@ pub const s3 = struct {
 
     // Internal Components
     pub const scheduler = @import("zpq/io/s3/scheduler.zig");
-    pub const dns = @import("zpq/io/s3/dns.zig");
+    pub const dns = @import("zpq/io/dns.zig");
     pub const sigv4 = @import("zpq/io/s3/sigv4.zig");
     pub const factory = @import("zpq/io/s3/factory.zig");
 };
@@ -88,6 +91,7 @@ test {
     _ = @import("zpq/core/thrift_test.zig");
     _ = core.rle;
     _ = core.slot_writer;
+    _ = core.filters;
     _ = io.interface;
     _ = s3.XevS3Source;
     _ = arrow;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls = @import("../tls/connection.zig");
+const tls = @import("tls/connection.zig");
 const xev = @import("xev");
 
 /// Global S3 Connection Pool

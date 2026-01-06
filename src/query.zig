@@ -4,8 +4,8 @@ const xev = @import("xev");
 
 const Pipeline = zpq.core.pipeline.Pipeline;
 const ExecutionMode = zpq.core.pipeline.ExecutionMode;
-const SchemaFieldInfo = Pipeline.SchemaFieldInfo;
-const FileMetaInfo = Pipeline.FileMetaInfo;
+const SchemaFieldInfo = zpq.core.pipeline.SchemaFieldInfo;
+const FileMetaInfo = zpq.core.pipeline.FileMetaInfo;
 
 /// Common query parameters used by all execution modes (Lambda, HTTP, CLI).
 pub const QueryParams = struct {
@@ -59,7 +59,7 @@ pub fn executeQuery(
 
     // Meta-only mode
     if (params.show_meta) {
-        const meta = try pipeline.getMeta(allocator);
+        const meta = try pipeline.getFileMeta(allocator);
         return .{ .meta = meta };
     }
 
@@ -68,8 +68,14 @@ pub fn executeQuery(
         return .{ .error_message = "--filter requires an output file" };
     }
 
+    // Handle surgical mode: enable page-level pruning and use slot_parallel for output
+    const effective_mode = if (params.mode == .surgical) blk: {
+        pipeline.setSurgical(true);
+        break :blk ExecutionMode.slot_parallel;
+    } else params.mode;
+
     // Execute pipeline
-    const result = try pipeline.execute(params.mode);
+    const result = try pipeline.execute(effective_mode);
     return .{
         .input_rows = result.input_rows,
         .output_rows = result.output_rows,
@@ -105,7 +111,7 @@ pub fn executeQueryWithLoop(
     // Meta-only mode - doesn't need loop
     if (params.show_meta) {
         try pipeline.openWithLoop(loop, thread_pool);
-        const meta = try pipeline.getMeta(allocator);
+        const meta = try pipeline.getFileMeta(allocator);
         return .{ .meta = meta };
     }
 

@@ -91,10 +91,8 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
             result.show_schema = true;
         } else if (std.mem.eql(u8, arg, "--meta")) {
             result.show_meta = true;
-        } else if (std.mem.eql(u8, arg, "--sequential")) {
-            result.mode = .sequential;
-        } else if (std.mem.eql(u8, arg, "--parallel")) {
-            result.mode = .parallel;
+        } else if (std.mem.eql(u8, arg, "--surgical")) {
+            result.mode = .surgical;
         } else if (std.mem.eql(u8, arg, "--serve")) {
             // Skip --serve and its argument (handled above)
             i += 1;
@@ -171,8 +169,7 @@ fn printUsage(exe: []const u8) void {
         \\  -s, --select COLS  Select columns (comma-separated)
         \\
         \\Execution Mode:
-        \\  --sequential       Process row groups sequentially
-        \\  --parallel         Parallel processing (default: slot-parallel)
+        \\  --surgical         Page-level pruning (minimizes I/O for selective queries)
         \\
         \\Output:
         \\  -o, --output FILE  Output file (alternative to positional)
@@ -258,6 +255,16 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.debug.print("Error: --filter requires an output file\n", .{});
             return;
         }
+
+        // Initialize tracing if requested
+        if (std.posix.getenv("ZPQ_TRACE_FILE")) |path| {
+            try zpq.trace.initGlobal(allocator, path);
+        }
+        defer zpq.trace.deinitGlobal();
+
+        // Trace execution
+        const zone = zpq.trace.zone("CLI/Execution");
+        defer zone.end();
 
         const result = try query.executeQuery(allocator, &loop, &thread_pool, params);
 

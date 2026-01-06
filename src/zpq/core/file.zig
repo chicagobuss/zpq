@@ -5,6 +5,8 @@ const io = @import("../io/interface.zig");
 const ColumnReader = @import("column.zig").ColumnReader;
 const page_index = @import("page_index.zig");
 const filter = @import("filter.zig");
+const filters_mod = @import("filters/mod.zig");
+const Filter = filters_mod.Filter;
 
 pub const RowGroupReader = struct {
     file: *ParquetFile,
@@ -635,7 +637,7 @@ pub const ParquetFile = struct {
 
     /// Check if a row group should be skipped based on a simple equality filter on a column.
     /// Uses EncodedFilter for unified type handling.
-    pub fn shouldSkipRowGroup(self: *const ParquetFile, rg_idx: usize, column_name: []const u8, encoded_filter: *const filter.EncodedFilter) bool {
+    pub fn shouldSkipRowGroup(self: *const ParquetFile, rg_idx: usize, column_name: []const u8, f: *const Filter) bool {
         const meta = self.metadata orelse return false;
         if (rg_idx >= meta.row_groups.items.len) return false;
         const rg = meta.row_groups.items[rg_idx];
@@ -648,9 +650,9 @@ pub const ParquetFile = struct {
                 const leaf_name = path[path.len - 1];
                 if (!std.mem.eql(u8, leaf_name, column_name)) continue;
 
-                // Found the column, check statistics using EncodedFilter
+                // Found the column, check statistics using Filter
                 if (md.statistics) |*stats| {
-                    return !encoded_filter.mightContainInRowGroup(stats);
+                    return !f.mightMatchRowGroup(stats);
                 }
                 break;
             }

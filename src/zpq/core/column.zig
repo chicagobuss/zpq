@@ -78,6 +78,44 @@ pub const ColumnReader = struct {
         return new_buf[0..size];
     }
 
+    /// Skip a page without decompressing - just read header and advance offset.
+    /// Returns the page header (with num_values) and the offset where this page started.
+    /// This is O(1) - no decompression, no payload read.
+    pub fn skipPage(self: *ColumnReader) !?schema.PageHeader {
+        if (self.current_offset >= self.total_size) return null;
+
+        const abs_pos = self.start_offset + self.current_offset;
+
+        // Read just enough for the header (usually < 100 bytes)
+        var header_buf: [1024]u8 = undefined;
+        const bytes_to_read = @min(header_buf.len, self.total_size - self.current_offset);
+
+        const bytes_read = try self.source.readAt(abs_pos, header_buf[0..bytes_to_read]);
+        if (bytes_read == 0) return null;
+
+        var reader = thrift.Reader.init(header_buf[0..bytes_read]);
+        const header = try schema.PageHeader.read(&reader);
+
+        const header_size = reader.pos;
+        const payload_size: u64 = @intCast(header.compressed_page_size);
+
+        // Advance past this page WITHOUT reading payload
+        self.current_offset += header_size + payload_size;
+
+        return header;
+    }
+
+    /// Seek to a specific offset within the column.
+    /// This allows re-reading pages after skipPage().
+    pub fn seekTo(self: *ColumnReader, offset: u64) void {
+        self.current_offset = offset;
+    }
+
+    /// Get current offset within the column.
+    pub fn getOffset(self: *const ColumnReader) u64 {
+        return self.current_offset;
+    }
+
     pub fn next(self: *ColumnReader, allocator: std.mem.Allocator) !?Page {
         if (self.current_offset >= self.total_size) return null;
 

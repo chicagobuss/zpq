@@ -2,8 +2,9 @@ const std = @import("std");
 const xev = @import("xev");
 const tls = @import("../tls/connection.zig");
 const SigV4 = @import("sigv4.zig").SigV4;
-const dns = @import("dns.zig");
-const global_pool_mod = @import("global_pool.zig");
+const dns = @import("../dns.zig");
+const global_pool_mod = @import("../pool.zig");
+const http_client = @import("../http/client.zig");
 const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
 
 const log = std.log.scoped(.s3_writer);
@@ -33,6 +34,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
     const ThreadPoolResolver = dns.ThreadPoolResolverGen(XevApi);
     const Connection = tls.ConnectionGen(XevApi);
     const ConnectionKey = global_pool_mod.ConnectionKey;
+    const Client = http_client.ClientGen(XevApi);
 
     return struct {
         const Self = @This();
@@ -61,7 +63,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             request_buf: []const u8 = &[_]u8{},
             body_data: []const u8 = &[_]u8{},
             headers_sent: bool = false,
-            
+
             // Chunked write state
             body_offset: usize = 0,
             current_chunk_len: usize = 0,
@@ -93,6 +95,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         resolver: dns.ResolverGen(XevApi),
         tp_resolver: ?*ThreadPoolResolver = null,
         pool: *GlobalConnectionPool,
+        client: *Client,
 
         bucket: []const u8,
         key: []const u8,
@@ -191,6 +194,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                 .owns_loop = true,
                 .owns_pool = true,
             };
+            self.client = try Client.init(allocator, loop, local_pool, thread_pool, host, 443, true);
             return self;
         }
 
@@ -233,7 +237,9 @@ pub fn S3WriterGen(comptime XevApi: type) type {
                 .use_tls = true,
                 .owns_loop = false, // Caller owns loop
                 .owns_pool = true,
+                .client = undefined,
             };
+            self.client = try Client.init(allocator, loop, local_pool, thread_pool, host, 443, true);
             return self;
         }
 
@@ -273,6 +279,9 @@ pub fn S3WriterGen(comptime XevApi: type) type {
 
             // Free resolver
             if (self.tp_resolver) |r| self.allocator.destroy(r);
+
+            // Free client
+            self.client.deinit();
 
             // Free owned resources
             if (self.owns_pool) {
@@ -501,7 +510,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
 
         fn onPartWriteComplete(ctx_void: ?*anyopaque, _: usize) void {
             const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
-            
+
             if (ctx.writing_headers) {
                 // Headers done, start body
                 ctx.writing_headers = false;
@@ -522,9 +531,9 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             const chunk_size = 64 * 1024;
             const end = @min(ctx.body_offset + chunk_size, ctx.body_data.len);
             const chunk = ctx.body_data[ctx.body_offset..end];
-            
+
             ctx.current_chunk_len = chunk.len;
-            
+
             ctx.conn.write(chunk) catch |err| {
                 ctx.err = err;
                 ctx.done = true;
@@ -700,6 +709,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
 
             const response = try self.doRequest("PUT", path, data, null);
             defer self.allocator.free(response.body);
+            defer self.allocator.free(response.headers);
 
             // Extract ETag from response headers
             for (response.headers) |h| {
@@ -787,78 +797,9 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         // HTTP Request (callback-based xev pattern)
         // =====================================================================
 
-        const RequestResult = struct {
-            body: []const u8,
-            headers: []ResponseHeader,
-            status: u16,
-        };
+        const RequestResult = Client.RequestResult;
 
-        const ResponseHeader = struct {
-            name: []const u8,
-            value: []const u8,
-        };
-
-        /// Context for tracking an in-flight HTTP request
-        const RequestContext = struct {
-            allocator: std.mem.Allocator,
-            parser: ResponseParser = .{},
-            body_buf: std.ArrayListUnmanaged(u8) = .{},
-            done: bool = false,
-            err: ?anyerror = null,
-            conn: *Connection = undefined,
-            pool: *GlobalConnectionPool = undefined,
-            key: ConnectionKey = undefined,
-
-            fn onBody(ctx_ptr: *anyopaque, chunk: []const u8) void {
-                const ctx: *RequestContext = @ptrCast(@alignCast(ctx_ptr));
-                ctx.body_buf.appendSlice(ctx.allocator, chunk) catch |e| {
-                    ctx.err = e;
-                };
-            }
-
-            fn deinit(ctx: *RequestContext) void {
-                ctx.body_buf.deinit(ctx.allocator);
-            }
-        };
-
-        fn onConnect(ctx_void: ?*anyopaque) void {
-            // Connection established - request already sent after handshake
-            _ = ctx_void;
-        }
-
-        fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
-            const ctx: *RequestContext = @ptrCast(@alignCast(ctx_void));
-
-            ctx.parser.feed(data, ctx, RequestContext.onBody) catch |e| {
-                ctx.err = e;
-                ctx.done = true;
-                return;
-            };
-
-            if (ctx.parser.state == .done) {
-                ctx.done = true;
-                // Return connection to pool
-                ctx.conn.user_ctx = null;
-                ctx.conn.idling = true;
-                ctx.pool.release(ctx.key, ctx.conn);
-            }
-        }
-
-        fn onError(ctx_void: ?*anyopaque, err: anyerror) void {
-            // Context can be null if connection was already released or error during setup
-            const ctx: *RequestContext = @ptrCast(@alignCast(ctx_void orelse return));
-            // EOF after headers complete is ok
-            if ((err == error.EOF or err == error.TlsConnectionClosed) and ctx.parser.headersComplete()) {
-                ctx.done = true;
-                ctx.conn.user_ctx = null;
-                ctx.conn.idling = true;
-                ctx.pool.release(ctx.key, ctx.conn);
-                return;
-            }
-            ctx.err = err;
-            ctx.done = true;
-            ctx.conn.close();
-        }
+        const ResponseHeader = Client.ResponseHeader;
 
         fn doRequest(
             self: *Self,
@@ -866,35 +807,7 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             path: []const u8,
             body: []const u8,
             extra_headers: ?[]const std.http.Header,
-        ) !RequestResult {
-            // Resolve DNS if needed
-            if (self.cached_addr == null) {
-                self.cached_addr = try self.resolve();
-            }
-            const addr = self.cached_addr.?;
-
-            // Get or create connection
-            const key = ConnectionKey{
-                .host = self.host,
-                .port = self.port,
-                .use_tls = self.use_tls,
-            };
-
-            const conn = if (self.pool.acquire(key)) |c| blk: {
-                c.idling = false;
-                c.pending_read = false;
-                c.pending_write = false;
-                break :blk c;
-            } else blk: {
-                const c = try self.allocator.create(Connection);
-                c.* = try Connection.initWithOptions(self.loop, self.allocator, self.host, .{});
-                break :blk c;
-            };
-            errdefer {
-                conn.close();
-                self.allocator.destroy(conn);
-            }
-
+        ) !Client.RequestResult {
             // Build request with signing
             var headers = std.ArrayListUnmanaged(std.http.Header){};
             defer {
@@ -917,125 +830,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             // Sign request (adds Host, X-Amz-Date, Authorization, etc.)
             try self.signRequest(method, path, &headers, body);
 
-            // Build HTTP request bytes
-            var req_buf = std.ArrayListUnmanaged(u8){};
-            defer req_buf.deinit(self.allocator);
-
-            try req_buf.appendSlice(self.allocator, method);
-            try req_buf.appendSlice(self.allocator, " ");
-            try req_buf.appendSlice(self.allocator, path);
-            try req_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
-
-            for (headers.items) |h| {
-                try req_buf.appendSlice(self.allocator, h.name);
-                try req_buf.appendSlice(self.allocator, ": ");
-                try req_buf.appendSlice(self.allocator, h.value);
-                try req_buf.appendSlice(self.allocator, "\r\n");
-            }
-
-            // Add Content-Length (always required by S3, even for 0-byte bodies)
-            try req_buf.appendSlice(self.allocator, "Content-Length: ");
-            var len_buf: [20]u8 = undefined;
-            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
-            try req_buf.appendSlice(self.allocator, len_str);
-            try req_buf.appendSlice(self.allocator, "\r\n");
-
-            try req_buf.appendSlice(self.allocator, "\r\n");
-
-            // Set up request context
-            var ctx = RequestContext{
-                .allocator = self.allocator,
-                .conn = conn,
-                .pool = self.pool,
-                .key = key,
-            };
-            defer ctx.deinit();
-
-            conn.user_ctx = &ctx;
-            conn.on_connect = onConnect;
-            conn.on_data = onData;
-            conn.on_error = onError;
-
-            // Connect if needed, then send request
-            if (!conn.handshake_complete) {
-                try conn.connect(addr);
-                // Run loop until handshake completes
-                while (!conn.handshake_complete and !ctx.done and ctx.err == null) {
-                    try self.loop.run(.once);
-                }
-                if (ctx.err) |err| return err;
-            }
-
-            // Wait for any pending writes to complete (e.g., from TLS handshake)
-            while (conn.pending_write and !ctx.done and ctx.err == null) {
-                try self.loop.run(.once);
-            }
-            if (ctx.err) |err| return err;
-
-            // Send request headers
-            log.debug("Sending {s} {s} ({d} body bytes)", .{ method, path, body.len });
-            try conn.write(req_buf.items);
-
-            // Send body if present
-            if (body.len > 0) {
-                // Wait for headers to be sent
-                while (conn.pending_write and !ctx.done and ctx.err == null) {
-                    try self.loop.run(.once);
-                }
-                if (ctx.err) |err| return err;
-
-                // Write body in chunks to avoid transport buffer limits (128KB issue)
-                const chunk_size = 8 * 1024;
-                var offset: usize = 0;
-                while (offset < body.len) {
-                    const end = @min(offset + chunk_size, body.len);
-                    try conn.write(body[offset..end]);
-                    
-                    // Wait for chunk to be written
-                    while (conn.pending_write and !ctx.done and ctx.err == null) {
-                        try self.loop.run(.once);
-                    }
-                    if (ctx.err) |err| return err;
-                    
-                    offset = end;
-                }
-            }
-
-            // Run loop until response complete
-            while (!ctx.done and ctx.err == null) {
-                try self.loop.run(.once);
-            }
-
-            if (ctx.err) |err| return err;
-
-            // Check status
-            if (ctx.parser.status_code >= 400) {
-                log.err("S3 request failed: {d} - {s}", .{ ctx.parser.status_code, ctx.body_buf.items });
-            }
-
-            // Parse response headers
-            var result_headers = std.ArrayListUnmanaged(ResponseHeader){};
-            defer result_headers.deinit(self.allocator);
-
-            const header_str = ctx.parser.header_buf[0..ctx.parser.header_len];
-            var lines = std.mem.splitSequence(u8, header_str, "\r\n");
-            _ = lines.first(); // Skip status line
-
-            while (lines.next()) |line| {
-                if (line.len == 0) break;
-                if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
-                    try result_headers.append(self.allocator, .{
-                        .name = line[0..colon_pos],
-                        .value = line[colon_pos + 2 ..],
-                    });
-                }
-            }
-
-            return .{
-                .body = try self.allocator.dupe(u8, ctx.body_buf.items),
-                .headers = try result_headers.toOwnedSlice(self.allocator),
-                .status = ctx.parser.status_code,
-            };
+            // Use Generic Client
+            return self.client.request(method, path, headers.items, body);
         }
 
         fn signRequest(

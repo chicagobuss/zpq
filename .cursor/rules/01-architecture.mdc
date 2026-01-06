@@ -47,6 +47,18 @@ The zig-docs MCP and local std source reflect actual 0.16 APIs. Training data is
 - Isolate in `probes/probe_X.zig`, not main app
 - 5-second timeout policy for network ops
 
+## Standard Benchmark Files
+**Location**: `data/benchmark/` (local) or `/tmp/zpq_r2_bucket/benchmark/` (R2 mirror)
+
+**Default benchmark file**: `data/benchmark/benchmark_100mb.parquet` (155MB, 524,288 rows, snappy)
+
+Available sizes: 1mb, 10mb, 100mb
+Available compressions: snappy (default), none, gzip, zstd
+
+Pattern: `benchmark_{size}_{compression}.parquet` or `benchmark_{size}.parquet` (snappy default)
+
+**For ad-hoc testing**, use these files - NEVER create temporary test files.
+
 ## Benchmarking (CRITICAL)
 **ALWAYS use `just bench` or `just engine` commands for performance testing.**
 

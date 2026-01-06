@@ -298,7 +298,6 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             }
 
             self.submitted_count += 1;
-            const is_last = self.submitted_count >= self.total_row_groups;
 
             // Add to pending buffer
             try self.pending_buffer.appendSlice(self.allocator, encoded_bytes);
@@ -316,18 +315,30 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
                 try self.flushPendingBuffer();
             }
 
-            // Check if this was the last morsel
-            if (is_last) {
-                // If we have remaining data < 5MB and already started multipart,
-                // flush it as the last part (which can be any size)
-                if (self.pending_buffer.items.len > 0 and self.upload_id != null) {
-                    try self.flushPendingBuffer();
-                }
-                self.state = .draining;
-            }
-
             // Return current part number (may not be uploaded yet if buffered)
             return self.next_part_number;
+        }
+
+        /// Signal that all morsels have been submitted.
+        /// Must be called after processing all row groups, even if some were filtered out.
+        /// This triggers the transition to draining/finalizing state.
+        pub fn finishSubmissions(self: *Self) !void {
+            if (self.state != .uploading) {
+                return error.InvalidState;
+            }
+
+            log.debug("finishSubmissions: {d} morsels submitted, pending_buffer={d} bytes", .{
+                self.submitted_count,
+                self.pending_buffer.items.len,
+            });
+
+            // If we have remaining data < 5MB and already started multipart,
+            // flush it as the last part (which can be any size)
+            if (self.pending_buffer.items.len > 0 and self.upload_id != null) {
+                try self.flushPendingBuffer();
+            }
+
+            self.state = .draining;
         }
 
         /// Flush the pending buffer as a single S3 part.
@@ -350,7 +361,12 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             const part_number = self.next_part_number;
             self.next_part_number += 1;
 
+            // For the first part, we need to prepend "PAR1" magic header
+            const is_first_part = part_number == 1;
+            const header_size: usize = if (is_first_part) 4 else 0;
+
             // Calculate relative offsets within the combined buffer for each row group
+            // Account for PAR1 header in first part
             var offset: u64 = 0;
             for (self.pending_metadata.items) |*meta| {
                 meta.file_offset = offset; // Offset within this part - will be adjusted in finalize
@@ -360,9 +376,14 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
                 offset += meta.total_byte_size;
             }
 
-            // Take ownership of the buffer
-            const bytes_copy = try self.allocator.dupe(u8, self.pending_buffer.items);
+            // Take ownership of the buffer, prepending PAR1 header for first part
+            const bytes_copy = try self.allocator.alloc(u8, header_size + self.pending_buffer.items.len);
             errdefer self.allocator.free(bytes_copy);
+
+            if (is_first_part) {
+                @memcpy(bytes_copy[0..4], "PAR1");
+            }
+            @memcpy(bytes_copy[header_size..], self.pending_buffer.items);
 
             // Take ownership of the row groups metadata slice
             const row_groups = try self.allocator.dupe(RowGroupMeta, self.pending_metadata.items);
@@ -481,27 +502,35 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
 
             // Calculate cumulative byte offsets for footer
             // Each part can contain multiple row groups
-            var offset: u64 = 4; // Start after "PAR1" magic
+            // Part 1 contains "PAR1" header (4 bytes) prepended during flushPendingBuffer
+            // So row group data in part 1 starts at offset 4, subsequent parts at their cumulative offset
+            var file_offset: u64 = 0;
             for (self.completed.items) |*part| {
-                // Each row group's file_offset is its offset within the part
-                // We need to add the part's base offset
+                // For part 1, the PAR1 header is already included in part.size
+                // Row group data starts at offset 4 within part 1
+                const rg_start_in_part: u64 = if (part.part_number == 1) 4 else 0;
+
                 for (part.row_groups) |*rg| {
-                    const rg_base = offset + rg.file_offset;
+                    const rg_base = file_offset + rg_start_in_part + rg.file_offset;
                     rg.file_offset = rg_base;
                     for (rg.columns) |*col| {
                         col.file_offset = rg_base + col.relative_offset;
                     }
                 }
-                offset += part.size;
+                file_offset += part.size;
             }
 
-            // Build and upload Parquet footer as final part
-            const footer_bytes = try self.buildFooter();
-            defer self.allocator.free(footer_bytes);
+            // Build Parquet footer
+            const footer_metadata = try self.buildFooter();
+            defer self.allocator.free(footer_metadata);
+
+            // Build complete footer with trailing magic: [metadata][4-byte length][PAR1]
+            // The buildFooter already includes length and trailing PAR1
+            // So footer_metadata is the complete footer
 
             // Upload footer as the next part
             const footer_part_number = self.next_part_number;
-            const footer_etag = try s3w.uploadPartDirect(upload_id, footer_part_number, footer_bytes);
+            const footer_etag = try s3w.uploadPartDirect(upload_id, footer_part_number, footer_metadata);
             defer self.allocator.free(footer_etag);
 
             self.state = .completing;
@@ -545,6 +574,7 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
 
             // Move pending metadata to completed for buildFooter to use
             // Create a fake "completed part" with part_number 0 (unused for single PUT)
+            // We transfer ownership of the row_groups slice (and their columns) to completed
             const row_groups = try self.allocator.dupe(RowGroupMeta, self.pending_metadata.items);
             try self.completed.append(self.allocator, .{
                 .part_number = 0,
@@ -552,6 +582,9 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
                 .size = self.pending_buffer.items.len,
                 .row_groups = row_groups,
             });
+
+            // Clear pending_metadata WITHOUT freeing columns - ownership transferred to completed
+            self.pending_metadata.clearRetainingCapacity();
 
             // Build the footer
             const footer_bytes = try self.buildFooter();

@@ -172,9 +172,15 @@ fn parseEnvUsize(allocator: std.mem.Allocator, name: []const u8) ?usize {
 
 const Connection = zpq.io.tls.Connection;
 
+const FetchResult = struct {
+    got_any_data: bool = false,
+    bytes: usize = 0,
+    err: ?anyerror = null,
+};
+
 const Ctx = struct {
     allocator: std.mem.Allocator,
-    result: zpq.io.http.Client.FetchResult,
+    result: FetchResult,
     parser: ResponseParser,
     http_status: u16 = 0,
     dst_written: usize,

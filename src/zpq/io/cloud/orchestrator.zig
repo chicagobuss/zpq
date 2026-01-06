@@ -4,8 +4,8 @@ const tls = @import("../tls/connection.zig");
 const io = @import("../interface.zig");
 const scheduler = @import("../s3/scheduler.zig");
 const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
-const GlobalConnectionPool = @import("../s3/global_pool.zig").GlobalConnectionPool;
-const ConnectionKey = @import("../s3/global_pool.zig").ConnectionKey;
+const GlobalConnectionPool = @import("../pool.zig").GlobalConnectionPool;
+const ConnectionKey = @import("../pool.zig").ConnectionKey;
 
 const log = std.log.scoped(.cloud_orchestrator);
 

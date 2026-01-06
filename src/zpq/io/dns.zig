@@ -1,5 +1,5 @@
 const std = @import("std");
-const zpq_log = @import("../../../zpq.zig").log;
+const zpq_log = @import("../log.zig");
 
 const log = zpq_log.dns;
 

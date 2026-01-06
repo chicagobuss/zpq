@@ -4,11 +4,11 @@ const tls = @import("../tls/connection.zig");
 const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
 const SigV4 = @import("sigv4.zig").SigV4;
 const io = @import("../interface.zig");
-const dns = @import("dns.zig");
+const dns = @import("../dns.zig");
 const orchestrator = @import("../cloud/orchestrator.zig");
 const CloudProvider = orchestrator.CloudProvider;
 const RequestContext = orchestrator.RequestContext;
-const global_pool_mod = @import("global_pool.zig");
+const global_pool_mod = @import("../pool.zig");
 const ConnectionKey = global_pool_mod.ConnectionKey;
 
 const log = @import("std").log.scoped(.s3_source);

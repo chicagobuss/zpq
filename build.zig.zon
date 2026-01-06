@@ -16,6 +16,10 @@
             .url = "https://github.com/allyourcodebase/zstd/archive/e1a501be57f42c541e8a5597e4b59a074dfd09a3.tar.gz",
             .hash = "zstd-1.5.7-1-KEItkAMwAAD6OKY3m0OOmXG7aL-aLUfrDqbP5J5oYapU",
         },
+        .tracy = .{
+            .url = "https://github.com/wolfpld/tracy/archive/refs/tags/v0.11.1.tar.gz",
+            .hash = "N-V-__8AAMeOlQEipHjcyu0TCftdAi9AQe7EXUDJOoVe0k-t",
+        },
     },
     .paths = .{""},
 }

@@ -1,19 +1,57 @@
 const std = @import("std");
 
 /// Compile-time flag to enable/disable tracing.
-/// When false, all tracer methods compile to no-ops.
 pub const enabled = true;
 
-/// Aggregated performance metrics for a benchmark run.
-/// Designed for minimal overhead: just increment counters in the hot path.
+/// Global trace writer instance
+var global_tracer: ?*Tracer = null;
+
+/// Initialize the global tracer writing to the specified path.
+pub fn initGlobal(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (!enabled) return;
+    const t = try allocator.create(Tracer);
+    t.* = try Tracer.init(allocator, path);
+    global_tracer = t;
+}
+
+pub fn deinitGlobal() void {
+    if (global_tracer) |t| {
+        t.deinit();
+        global_tracer = null;
+    }
+}
+
+pub fn zone(comptime name: []const u8) Zone {
+    if (!enabled) return .{ .tracer = null };
+    if (global_tracer) |t| {
+        t.writeEvent("B", name, null);
+        return .{ .tracer = t, .name = name };
+    }
+    return .{ .tracer = null };
+}
+
+pub const Zone = struct {
+    tracer: ?*Tracer,
+    name: []const u8 = "",
+
+    pub fn end(self: Zone) void {
+        if (self.tracer) |t| {
+            t.writeEvent("E", self.name, null);
+        }
+    }
+
+    pub fn addText(self: Zone, text: []const u8) void {
+        if (self.tracer) |t| {
+            t.writeEvent("I", "log", text);
+        }
+    }
+};
+
 pub const Metrics = struct {
-    // Timing buckets (nanoseconds)
     filter_decode_ns: u64 = 0,
     skip_ns: u64 = 0,
     materialize_ns: u64 = 0,
     loop_overhead_ns: u64 = 0,
-
-    // Counters
     rows_scanned: u64 = 0,
     rows_selected: u64 = 0,
     rows_skipped: u64 = 0,
@@ -24,7 +62,6 @@ pub const Metrics = struct {
     pages_decoded: u64 = 0,
     bytes_decompressed: u64 = 0,
 
-    /// Add another Metrics struct to this one (for aggregating across row groups)
     pub fn add(self: *Metrics, other: Metrics) void {
         self.filter_decode_ns += other.filter_decode_ns;
         self.skip_ns += other.skip_ns;
@@ -44,24 +81,12 @@ pub const Metrics = struct {
     pub fn totalNs(self: Metrics) u64 {
         return self.filter_decode_ns + self.skip_ns + self.materialize_ns + self.loop_overhead_ns;
     }
-
-    pub fn selectivity(self: Metrics) f64 {
-        if (self.rows_scanned == 0) return 0;
-        return @as(f64, @floatFromInt(self.rows_selected)) / @as(f64, @floatFromInt(self.rows_scanned));
-    }
-
-    pub fn throughputMValPerSec(self: Metrics) f64 {
-        const total_s = @as(f64, @floatFromInt(self.totalNs())) / 1_000_000_000.0;
-        if (total_s == 0) return 0;
-        return @as(f64, @floatFromInt(self.rows_scanned)) / total_s / 1_000_000.0;
-    }
 };
 
-/// Run metadata captured at benchmark start
 pub const RunMetadata = struct {
-    timestamp_ms: i64,
+    timestamp_ms: i64 = 0,
     git_commit: ?[]const u8 = null,
-    file_path: []const u8,
+    file_path: []const u8 = "",
     file_size_bytes: u64 = 0,
     num_columns: u32 = 0,
     num_row_groups: u32 = 0,
@@ -70,24 +95,62 @@ pub const RunMetadata = struct {
     filter_value: ?[]const u8 = null,
 };
 
-/// Main tracer - holds metrics and run metadata.
-/// Zero-allocation after init. All operations are O(1).
 pub const Tracer = struct {
     metrics: Metrics = .{},
-    run: RunMetadata,
+    run: RunMetadata = .{},
     timer: ?std.time.Timer = null,
 
-    pub fn init(run: RunMetadata) Tracer {
-        return .{ .run = run };
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    start_time: std.time.Instant,
+    first_event: bool = true,
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8) !Tracer {
+        const file = try std.fs.cwd().createFile(path, .{});
+        try file.writeAll("[\n");
+
+        return Tracer{
+            .file = file,
+            .allocator = allocator,
+            .start_time = try std.time.Instant.now(),
+        };
     }
 
-    /// Start a scoped timer. Returns elapsed ns when stopped.
+    pub fn deinit(self: *Tracer) void {
+        self.file.writeAll("\n]") catch {};
+        self.file.close();
+        self.allocator.destroy(self);
+    }
+
+    pub fn writeEvent(self: *Tracer, ph: []const u8, name: []const u8, args: ?[]const u8) void {
+        const now = std.time.Instant.now() catch return;
+        const elapsed_ns = now.since(self.start_time);
+        const ts_us = elapsed_ns / 1000;
+
+        // Use allocPrint and writeAll to avoid std.fs.File.writer() API issues
+        const json = if (args) |arg_val|
+            std.fmt.allocPrint(self.allocator,
+                \\{{"name":"{s}","cat":"zpq","ph":"{s}","ts":{d},"pid":0,"tid":0,"args":{{"info":"{s}"}}}}
+            , .{ name, ph, ts_us, arg_val }) catch return
+        else
+            std.fmt.allocPrint(self.allocator,
+                \\{{"name":"{s}","cat":"zpq","ph":"{s}","ts":{d},"pid":0,"tid":0}}
+            , .{ name, ph, ts_us }) catch return;
+
+        defer self.allocator.free(json);
+
+        if (!self.first_event) {
+            self.file.writeAll(",\n") catch {};
+        }
+        self.first_event = false;
+        self.file.writeAll(json) catch {};
+    }
+
     pub fn startTimer(self: *Tracer) void {
         if (!enabled) return;
         self.timer = std.time.Timer.start() catch null;
     }
 
-    /// Stop timer and return elapsed nanoseconds
     pub fn stopTimer(self: *Tracer) u64 {
         if (!enabled) return 0;
         if (self.timer) |*t| {
@@ -97,194 +160,4 @@ pub const Tracer = struct {
         }
         return 0;
     }
-
-    /// Record filter column decode time
-    pub fn recordFilterDecode(self: *Tracer, elapsed_ns: u64, rows: u64) void {
-        if (!enabled) return;
-        self.metrics.filter_decode_ns += elapsed_ns;
-        self.metrics.rows_scanned += rows;
-    }
-
-    /// Record skip operation
-    pub fn recordSkip(self: *Tracer, elapsed_ns: u64, rows: u64) void {
-        if (!enabled) return;
-        self.metrics.skip_ns += elapsed_ns;
-        self.metrics.rows_skipped += rows;
-        self.metrics.batches_skipped += 1;
-    }
-
-    /// Record materialization of selected rows
-    pub fn recordMaterialize(self: *Tracer, elapsed_ns: u64, rows: u64) void {
-        if (!enabled) return;
-        self.metrics.materialize_ns += elapsed_ns;
-        self.metrics.rows_selected += rows;
-        self.metrics.batches_processed += 1;
-    }
-
-    /// Record loop/dispatch overhead
-    pub fn recordOverhead(self: *Tracer, elapsed_ns: u64) void {
-        if (!enabled) return;
-        self.metrics.loop_overhead_ns += elapsed_ns;
-    }
-
-    /// Record row group level stats
-    pub fn recordRowGroup(self: *Tracer, scanned: bool) void {
-        if (!enabled) return;
-        if (scanned) {
-            self.metrics.row_groups_scanned += 1;
-        } else {
-            self.metrics.row_groups_skipped += 1;
-        }
-    }
-
-    /// Write JSON output to a buffer
-    pub fn toJson(self: *const Tracer, allocator: std.mem.Allocator) ![]u8 {
-        const m = &self.metrics;
-        const r = &self.run;
-
-        // Pre-allocate optional strings (will be freed after formatting)
-        const git_str = try jsonStr(allocator, r.git_commit);
-        defer allocator.free(git_str);
-        const filter_col_str = try jsonStr(allocator, r.filter_column);
-        defer allocator.free(filter_col_str);
-        const filter_val_str = try jsonStr(allocator, r.filter_value);
-        defer allocator.free(filter_val_str);
-
-        return std.fmt.allocPrint(allocator,
-            \\{{
-            \\  "run": {{
-            \\    "timestamp_ms": {d},
-            \\    "git_commit": {s},
-            \\    "file_path": "{s}",
-            \\    "file_size_bytes": {d},
-            \\    "num_columns": {d},
-            \\    "num_row_groups": {d},
-            \\    "total_rows": {d},
-            \\    "filter_column": {s},
-            \\    "filter_value": {s}
-            \\  }},
-            \\  "metrics": {{
-            \\    "total_ms": {d:.3},
-            \\    "filter_decode_ms": {d:.3},
-            \\    "skip_ms": {d:.3},
-            \\    "materialize_ms": {d:.3},
-            \\    "loop_overhead_ms": {d:.3},
-            \\    "rows_scanned": {d},
-            \\    "rows_selected": {d},
-            \\    "rows_skipped": {d},
-            \\    "selectivity": {d:.6},
-            \\    "throughput_mval_s": {d:.2},
-            \\    "batches_processed": {d},
-            \\    "batches_skipped": {d},
-            \\    "row_groups_scanned": {d},
-            \\    "row_groups_skipped": {d}
-            \\  }}
-            \\}}
-            \\
-        , .{
-            r.timestamp_ms,
-            git_str,
-            r.file_path,
-            r.file_size_bytes,
-            r.num_columns,
-            r.num_row_groups,
-            r.total_rows,
-            filter_col_str,
-            filter_val_str,
-            nsToMs(m.totalNs()),
-            nsToMs(m.filter_decode_ns),
-            nsToMs(m.skip_ns),
-            nsToMs(m.materialize_ns),
-            nsToMs(m.loop_overhead_ns),
-            m.rows_scanned,
-            m.rows_selected,
-            m.rows_skipped,
-            m.selectivity(),
-            m.throughputMValPerSec(),
-            m.batches_processed,
-            m.batches_skipped,
-            m.row_groups_scanned,
-            m.row_groups_skipped,
-        });
-    }
-
-    /// Write to file
-    pub fn writeToFile(self: *const Tracer, path: []const u8) !void {
-        const json = try self.toJson(std.heap.page_allocator);
-        defer std.heap.page_allocator.free(json);
-
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(json);
-    }
 };
-
-fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-}
-
-/// Format an optional string as JSON (with quotes) or "null"
-fn jsonStr(allocator: std.mem.Allocator, value: ?[]const u8) ![]const u8 {
-    if (value) |v| {
-        return std.fmt.allocPrint(allocator, "\"{s}\"", .{v});
-    } else {
-        return allocator.dupe(u8, "null");
-    }
-}
-
-/// Get current timestamp in milliseconds (for run metadata)
-pub fn nowMs() i64 {
-    const now = std.time.Instant.now() catch return 0;
-    if (@hasField(@TypeOf(now.timestamp), "sec")) {
-        return now.timestamp.sec * 1000 + @divFloor(now.timestamp.nsec, 1_000_000);
-    } else if (@hasField(@TypeOf(now.timestamp), "tv_sec")) {
-        return now.timestamp.tv_sec * 1000 + @divFloor(now.timestamp.tv_nsec, 1_000_000);
-    } else {
-        return 0;
-    }
-}
-
-/// Scoped timer helper - automatically records elapsed time on scope exit
-pub fn ScopedTimer(comptime record_fn: anytype) type {
-    return struct {
-        tracer: *Tracer,
-        timer: std.time.Timer,
-        count: u64,
-
-        pub fn start(tracer: *Tracer) @This() {
-            return .{
-                .tracer = tracer,
-                .timer = std.time.Timer.start() catch std.time.Timer{ .started = .{ .sec = 0, .nsec = 0 } },
-                .count = 0,
-            };
-        }
-
-        pub fn setCount(self: *@This(), count: u64) void {
-            self.count = count;
-        }
-
-        pub fn stop(self: *@This()) void {
-            const elapsed = self.timer.read();
-            record_fn(self.tracer, elapsed, self.count);
-        }
-    };
-}
-
-// Test
-test "Tracer basic usage" {
-    var tracer = Tracer.init(.{
-        .timestamp_ms = 1735470000000,
-        .file_path = "test.parquet",
-        .total_rows = 1000,
-    });
-
-    tracer.recordFilterDecode(1_000_000, 1000); // 1ms, 1000 rows
-    tracer.recordSkip(500_000, 900); // 0.5ms, 900 rows
-    tracer.recordMaterialize(200_000, 100); // 0.2ms, 100 rows
-    tracer.recordRowGroup(true);
-
-    try std.testing.expectEqual(@as(u64, 1000), tracer.metrics.rows_scanned);
-    try std.testing.expectEqual(@as(u64, 100), tracer.metrics.rows_selected);
-    try std.testing.expectEqual(@as(u64, 900), tracer.metrics.rows_skipped);
-    try std.testing.expectApproxEqRel(@as(f64, 0.1), tracer.metrics.selectivity(), 0.001);
-}

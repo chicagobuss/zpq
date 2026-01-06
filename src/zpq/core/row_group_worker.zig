@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const tracer = @import("../trace.zig");
 
 /// Simple trace helper - prints timing when ZPQ_TRACE=1
 const Trace = struct {
@@ -28,6 +29,8 @@ const Trace = struct {
 const SelectionVector = @import("selection.zig").SelectionVector;
 const FilterColumnCache = @import("filter_cache.zig").FilterColumnCache;
 const EncodedFilter = @import("filter.zig").EncodedFilter;
+const filters_mod = @import("filters/mod.zig");
+const Filter = filters_mod.Filter;
 const BatchReader = @import("batch_reader.zig").BatchReader;
 const simd = @import("simd.zig");
 const page_writer = @import("page_writer.zig");
@@ -131,10 +134,10 @@ pub const RowGroupData = struct {
     rg_idx: usize,
     num_rows: usize,
 
-    // Filter column data
-    filter_buf: []const u8,
-    filter_offset: u64,
-    filter_chunk: schema.ColumnChunk,
+    // Filter column data (one per predicate)
+    filter_bufs: []const []const u8,
+    filter_offsets: []const u64,
+    filter_chunks: []const schema.ColumnChunk,
 
     // Output column data (in same order as output_col_indices)
     // For the filter column, we reuse filter_buf
@@ -149,22 +152,27 @@ pub const RowGroupData = struct {
 pub const FilterContext = struct {
     allocator: std.mem.Allocator,
 
-    // Filter specification
-    filter_col_name: []const u8,
-    filter_val: []const u8,
-    filter_col_idx: usize,
-    filter_col_type: schema.Type,
-    encoded_filter: *const EncodedFilter,
+    // Filter specification (multiple predicates)
+    filter_col_names: []const []const u8,
+    filter_vals: []const []const u8,
+    filter_col_indices: []const usize,
+    filter_col_types: []const schema.Type,
+    filters: []const Filter,
 
     // Output column specification
     output_col_indices: []const usize,
     output_col_types: []const schema.Type,
     output_col_names: []const []const u8,
-    filter_col_in_output: bool,
-    filter_col_output_idx: ?usize,
+    filter_cols_in_output: []const bool,
+    filter_col_output_indices: []const ?usize,
 
     // File metadata (read-only)
     meta: *const schema.FileMetaData,
+
+    // Legacy accessor for backwards compatibility
+    pub fn getEncodedFilter(self: *const FilterContext) ?*const EncodedFilter {
+        return self.filter.asEncodedFilter();
+    }
 };
 
 /// Dictionary passthrough data - avoids decoding strings entirely
@@ -280,6 +288,8 @@ pub const RowGroupWorker = struct {
     /// or from a thread pool callback for parallel execution).
     /// This is pure CPU work - no I/O.
     pub fn execute(self: *Self) void {
+        const zone = tracer.zone("RowGroupWorker/execute");
+        defer zone.end();
         var trace = Trace.init();
         self.status = .scanning;
 
@@ -320,46 +330,123 @@ pub const RowGroupWorker = struct {
         self.row_count = self.selection.count();
     }
 
+    /// Parse the filter value bytes as type T for dictionary lookup.
+    fn parseFilterValueFor(self: *const Self, filter_idx: usize, comptime T: type) ?T {
+        const val = self.ctx.filter_vals[filter_idx];
+        if (T == i32) {
+            if (val.len != 4) {
+                // Try parsing as string if it's not raw bytes
+                const i = std.fmt.parseInt(i32, val, 10) catch return null;
+                return i;
+            }
+            return std.mem.readInt(i32, val[0..4], .little);
+        } else if (T == i64) {
+            if (val.len != 8) {
+                const i = std.fmt.parseInt(i64, val, 10) catch return null;
+                return i;
+            }
+            return std.mem.readInt(i64, val[0..8], .little);
+        } else if (T == f32) {
+            if (val.len != 4) {
+                const f = std.fmt.parseFloat(f32, val) catch return null;
+                return f;
+            }
+            return @bitCast(std.mem.readInt(u32, val[0..4], .little));
+        } else if (T == f64) {
+            if (val.len != 8) {
+                const f = std.fmt.parseFloat(f64, val) catch return null;
+                return f;
+            }
+            return @bitCast(std.mem.readInt(u64, val[0..8], .little));
+        } else if (T == bool) {
+            if (std.mem.eql(u8, val, "true") or std.mem.eql(u8, val, "1")) return true;
+            if (std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "0")) return false;
+            return null;
+        } else {
+            return null;
+        }
+    }
+
     fn scanFilterColumn(self: *Self) !void {
         const num_rows = self.data.num_rows;
+        const num_filters = self.ctx.filters.len;
 
-        // Create memory source from pre-fetched buffer
-        var mem_source = MemorySource.initWithOffset(self.data.filter_buf, self.data.filter_offset);
+        for (0..num_filters) |i| {
+            try self.scanSingleFilter(i, num_rows);
+            // Early exit if no matches (AND conjunction)
+            if (self.selection.count() == 0) return;
+        }
+    }
+
+    fn scanSingleFilter(self: *Self, filter_idx: usize, num_rows: usize) !void {
+        const zone = tracer.zone("scanSingleFilter");
+        defer zone.end();
+        if (num_rows > 0) {
+            var buf: [64]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "flt={d}", .{filter_idx});
+            zone.addText(msg);
+        }
+        // Create memory source from pre-fetched buffer for THIS filter
+        var mem_source = MemorySource.initWithOffset(self.data.filter_bufs[filter_idx], self.data.filter_offsets[filter_idx]);
 
         // Get filter column metadata
-        const filter_md = self.data.filter_chunk.meta_data.?;
+        const filter_chunk = self.data.filter_chunks[filter_idx];
+        const filter_md = filter_chunk.meta_data.?;
         const filter_levels = self.ctx.meta.getColumnLevels(filter_md.path_in_schema.items);
         const filter_schema_elem = self.ctx.meta.getColumnSchema(filter_md.path_in_schema.items);
         const filter_type_len = if (filter_schema_elem) |se| se.type_length else null;
+        const filter_type = self.ctx.filter_col_types[filter_idx];
 
         // Create column reader
-        const filter_col_reader = try ColumnReader.init(mem_source.source(), self.data.filter_chunk);
+        const filter_col_reader = try ColumnReader.init(mem_source.source(), filter_chunk);
 
-        // Pre-allocate for expected matches (~20% selectivity)
-        try self.selection.ensureCapacity(num_rows / 4);
+        // If this is NOT the first filter, we filter the EXISTING selection
+        // If this is NOT the first filter, we filter the EXISTING selection
+        if (filter_idx > 0) {
+            var intersected_selection = SelectionVector.init(self.allocator);
+            errdefer intersected_selection.deinit();
 
-        // Initialize filter cache if filter column is in output
-        if (self.ctx.filter_col_in_output) {
-            self.filter_cache = FilterColumnCache.init(self.allocator, self.ctx.filter_col_type);
-            try self.filter_cache.?.ensureCapacity(num_rows / 4);
-        }
+            // Re-allocate based on current selection size
+            try intersected_selection.ensureCapacity(self.selection.count());
 
-        // Scan based on type
-        switch (self.ctx.filter_col_type) {
-            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
-                try self.scanByteArrayColumn(filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows);
-            },
-            .INT32 => try self.scanTypedColumn(i32, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
-            .INT64 => try self.scanTypedColumn(i64, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
-            .FLOAT => try self.scanTypedColumn(f32, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
-            .DOUBLE => try self.scanTypedColumn(f64, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
-            .BOOLEAN => try self.scanTypedColumn(bool, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
-            else => return error.UnsupportedFilterType,
+            // Scan using skipToRow for efficiency
+            switch (filter_type) {
+                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
+                    try self.scanByteArrayColumnSelected(filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection);
+                },
+                .INT32 => try self.scanTypedColumnSelected(i32, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection),
+                .INT64 => try self.scanTypedColumnSelected(i64, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection),
+                .FLOAT => try self.scanTypedColumnSelected(f32, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection),
+                .DOUBLE => try self.scanTypedColumnSelected(f64, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection),
+                .BOOLEAN => try self.scanTypedColumnSelected(bool, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows, &intersected_selection),
+                else => return error.UnsupportedFilterType,
+            }
+
+            // Swap selections
+            self.selection.deinit();
+            self.selection = intersected_selection;
+        } else {
+            // First filter: standard scan (populates selection)
+            // Pre-allocate for expected matches (~25% selectivity)
+            try self.selection.ensureCapacity(num_rows / 4);
+
+            switch (filter_type) {
+                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
+                    try self.scanByteArrayColumn(filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows);
+                },
+                .INT32 => try self.scanTypedColumn(i32, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
+                .INT64 => try self.scanTypedColumn(i64, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
+                .FLOAT => try self.scanTypedColumn(f32, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
+                .DOUBLE => try self.scanTypedColumn(f64, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
+                .BOOLEAN => try self.scanTypedColumn(bool, filter_idx, filter_col_reader, filter_md, filter_levels, filter_type_len, num_rows),
+                else => return error.UnsupportedFilterType,
+            }
         }
     }
 
     fn scanByteArrayColumn(
         self: *Self,
+        filter_idx: usize,
         col_reader: ColumnReader,
         md: schema.ColumnMetaData,
         levels: schema.Levels,
@@ -376,20 +463,32 @@ pub const RowGroupWorker = struct {
         );
         defer reader.deinit();
 
+        const filter = &self.ctx.filters[filter_idx];
+        const filter_val = self.ctx.filter_vals[filter_idx];
+
         var row_idx: usize = 0;
         var buf: [1024]?[]const u8 = undefined;
 
         // Try dictionary fast path
         var target_dict_idx: ?u64 = null;
         var use_dict_fast_path = false;
+        var dict_checked = false;
 
         while (row_idx < num_rows) {
             const batch_size = @min(1024, num_rows - row_idx);
 
-            // Check for dictionary fast path
-            if (target_dict_idx == null and reader.hasDictionary()) {
-                target_dict_idx = reader.findInDictionary(self.ctx.filter_val);
+            // Check for dictionary fast path (only once after dictionary is loaded)
+            if (!dict_checked and reader.hasDictionary()) {
+                dict_checked = true;
+                target_dict_idx = reader.findInDictionary(filter_val);
                 use_dict_fast_path = target_dict_idx != null;
+
+                // Dictionary pre-filter: for equality filters, if value not in dictionary,
+                // there can be zero matches - early exit
+                if (!use_dict_fast_path and filter.isEquality()) {
+                    // Value not in dictionary and this is an equality filter - no matches possible
+                    return;
+                }
             }
 
             if (use_dict_fast_path) {
@@ -405,12 +504,18 @@ pub const RowGroupWorker = struct {
                 if (n_read == 0) break;
 
                 for (buf[0..n_read], 0..) |maybe_val, i| {
-                    if (maybe_val) |v| {
-                        if (self.ctx.encoded_filter.matchesBytes(v)) {
-                            try self.selection.append(row_idx + i);
-                            if (self.filter_cache) |*fc| {
+                    const matches = if (maybe_val) |v|
+                        filter.matchesBytes(v)
+                    else
+                        filter.matchesNull();
+
+                    if (matches) {
+                        try self.selection.append(row_idx + i);
+                        if (self.filter_cache) |*fc| {
+                            if (maybe_val) |v| {
                                 try fc.appendByteArray(v);
                             }
+                            // Note: For IS NULL matches, we don't cache the value
                         }
                     }
                 }
@@ -422,12 +527,16 @@ pub const RowGroupWorker = struct {
     fn scanTypedColumn(
         self: *Self,
         comptime T: type,
+        filter_idx: usize,
         col_reader: ColumnReader,
         md: schema.ColumnMetaData,
         levels: schema.Levels,
         type_len: ?i32,
         num_rows: usize,
     ) !void {
+        const zone = tracer.zone("scanTypedColumn");
+        defer zone.end();
+
         var reader = BatchReader(T).init(
             self.allocator,
             col_reader,
@@ -438,26 +547,71 @@ pub const RowGroupWorker = struct {
         );
         defer reader.deinit();
 
+        const filter = &self.ctx.filters[filter_idx];
+
         var row_idx: usize = 0;
         var buf: [1024]?T = undefined;
+        var dict_checked = false;
 
         while (row_idx < num_rows) {
             const batch_size = @min(1024, num_rows - row_idx);
             const n_read = try reader.nextBatch(buf[0..batch_size]);
             if (n_read == 0) break;
 
+            // Dictionary pre-filter: for equality filters on dict-encoded columns,
+            // if value not in dictionary, there can be zero matches - early exit
+            if (!dict_checked and reader.hasDictionary()) {
+                dict_checked = true;
+                if (filter.isEquality()) {
+                    // Parse filter value as this type
+                    const filter_val = self.parseFilterValueFor(filter_idx, T) orelse {
+                        // Could not parse filter value for this type - skip optimization
+                        continue;
+                    };
+                    if (reader.findInDictionary(filter_val) == null) {
+                        // Value not in dictionary - no matches possible
+                        return;
+                    }
+                }
+            }
+
             for (buf[0..n_read], 0..) |maybe_val, i| {
-                if (maybe_val) |v| {
-                    const value_bytes = std.mem.asBytes(&v);
-                    if (self.ctx.encoded_filter.matchesBytes(value_bytes)) {
-                        try self.selection.append(row_idx + i);
-                        if (self.filter_cache) |*fc| {
+                const matches = if (maybe_val) |v| blk: {
+                    // Non-null value - check against filter
+                    break :blk if (T == i32)
+                        filter.matchesInt32(v)
+                    else if (T == i64)
+                        filter.matchesInt64(v)
+                    else if (T == f32)
+                        filter.matchesFloat(v)
+                    else if (T == f64)
+                        filter.matchesDouble(v)
+                    else if (T == bool)
+                        filter.matchesBool(v)
+                    else
+                        @compileError("Unsupported type for filter matching");
+                } else blk: {
+                    // Null value - check if this is a null filter
+                    break :blk filter.matchesNull();
+                };
+
+                if (matches) {
+                    try self.selection.append(row_idx + i);
+                    if (self.filter_cache) |*fc| {
+                        if (maybe_val) |v| {
                             if (T == i32) try fc.appendInt32(v) else if (T == i64) try fc.appendInt64(v) else if (T == f32) try fc.appendFloat(v) else if (T == f64) try fc.appendDouble(v) else if (T == bool) try fc.appendBool(v);
                         }
+                        // Note: For IS NULL matches, we don't cache the value (it's null)
                     }
                 }
             }
             row_idx += n_read;
+        }
+
+        if (self.selection.count() > 0) {
+            var out_buf: [64]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&out_buf, "in={d} out={d}", .{ num_rows, self.selection.count() });
+            zone.addText(msg);
         }
     }
 
@@ -472,10 +626,10 @@ pub const RowGroupWorker = struct {
         for (self.ctx.output_col_indices, self.ctx.output_col_types, 0..) |col_idx, col_type, out_idx| {
             self.output_columns[out_idx].col_type = col_type;
 
-            // Skip filter column - it will be materialized separately
-            if (col_idx == self.ctx.filter_col_idx) {
-                continue;
-            }
+            // Check if this is a filter column that we want to skip (because it's cached)
+            // For now, let's just decode all output columns normally to avoid complexity
+            // with multiple filter caches.
+            _ = col_idx;
 
             // Get the pre-fetched data for this column
             const buf = self.data.output_bufs[out_idx];
@@ -490,7 +644,120 @@ pub const RowGroupWorker = struct {
             var mem_source = MemorySource.initWithOffset(buf, offset);
             const col_reader = try ColumnReader.init(mem_source.source(), chunk);
 
-            try self.readSelectedColumn(col_reader, col_type, levels, type_len, out_idx);
+            // Check if column uses dictionary encoding (from metadata)
+            const is_dict_encoded = blk: {
+                for (md.encodings.items) |enc| {
+                    if (enc == .RLE_DICTIONARY or enc == .PLAIN_DICTIONARY) break :blk true;
+                }
+                break :blk false;
+            };
+
+            try self.readSelectedColumn(col_reader, col_type, levels, type_len, out_idx, is_dict_encoded);
+        }
+    }
+
+    fn scanTypedColumnSelected(
+        self: *Self,
+        comptime T: type,
+        filter_idx: usize,
+        col_reader: ColumnReader,
+        md: schema.ColumnMetaData,
+        levels: schema.Levels,
+        type_len: ?i32,
+        num_rows: usize,
+        new_selection: *SelectionVector,
+    ) !void {
+        const zone = tracer.zone("scanTypedColumnSelected");
+        defer zone.end();
+        var reader = BatchReader(T).init(
+            self.allocator,
+            col_reader,
+            md.type,
+            @intCast(levels.max_def),
+            @intCast(levels.max_rep),
+            type_len,
+        );
+        defer reader.deinit();
+
+        const filter = &self.ctx.filters[filter_idx];
+        var row_idx: usize = 0;
+
+        for (self.selection.items()) |target_row| {
+            // Efficient skip using page-skipping
+            row_idx = try reader.skipToRow(target_row, row_idx);
+
+            const maybe_val = try reader.nextValue();
+            row_idx += 1;
+
+            const matches = if (maybe_val) |v| blk: {
+                break :blk if (T == i32)
+                    filter.matchesInt32(v)
+                else if (T == i64)
+                    filter.matchesInt64(v)
+                else if (T == f32)
+                    filter.matchesFloat(v)
+                else if (T == f64)
+                    filter.matchesDouble(v)
+                else if (T == bool)
+                    filter.matchesBool(v)
+                else
+                    @compileError("Unsupported type for filter matching");
+            } else blk: {
+                // Null value - check if this is a null filter
+                break :blk filter.matchesNull();
+            };
+
+            if (matches) {
+                try new_selection.append(target_row);
+            }
+        }
+
+        if (new_selection.count() > 0) {
+            var buf: [64]u8 = undefined;
+            const msg = try std.fmt.bufPrint(&buf, "in={d} out={d}", .{ num_rows, new_selection.count() });
+            zone.addText(msg);
+        }
+    }
+
+    fn scanByteArrayColumnSelected(
+        self: *Self,
+        filter_idx: usize,
+        col_reader: ColumnReader,
+        md: schema.ColumnMetaData,
+        levels: schema.Levels,
+        type_len: ?i32,
+        num_rows: usize,
+        new_selection: *SelectionVector,
+    ) !void {
+        _ = num_rows;
+        var reader = BatchReader([]const u8).init(
+            self.allocator,
+            col_reader,
+            md.type,
+            @intCast(levels.max_def),
+            @intCast(levels.max_rep),
+            type_len,
+        );
+        defer reader.deinit();
+
+        const filter = &self.ctx.filters[filter_idx];
+        var row_idx: usize = 0;
+
+        for (self.selection.items()) |target_row| {
+            // Efficient skip using page-skipping
+            row_idx = try reader.skipToRow(target_row, row_idx);
+
+            const maybe_val = try reader.nextValue();
+            row_idx += 1;
+
+            const matches = if (maybe_val) |v|
+                filter.matchesBytes(v)
+            else
+                filter.matchesNull();
+
+            if (matches) {
+                try new_selection.append(target_row);
+            }
         }
     }
 
@@ -501,14 +768,17 @@ pub const RowGroupWorker = struct {
         levels: schema.Levels,
         type_len: ?i32,
         out_idx: usize,
+        is_dict_encoded: bool,
     ) !void {
-        // Try dictionary passthrough for all column types first
-        // This avoids decoding values entirely - just gather indices
-        if (try self.tryReadSelectedWithDictPassthrough(col_reader, col_type, levels, out_idx)) {
-            return; // Successfully used passthrough
+        // Only try dictionary passthrough for dictionary-encoded BYTE_ARRAY types
+        // This avoids reading pages just to check encoding (which corrupts the reader)
+        if (is_dict_encoded and (col_type == .BYTE_ARRAY or col_type == .FIXED_LEN_BYTE_ARRAY)) {
+            if (try self.tryReadSelectedWithDictPassthrough(col_reader, col_type, levels, out_idx)) {
+                return; // Successfully used passthrough
+            }
         }
 
-        // Fall back to full decode
+        // Skip-based decode for selected rows
         switch (col_type) {
             .INT32 => {
                 const values = try self.readSelectedTyped(i32, col_reader, col_type, levels, type_len);
@@ -557,35 +827,32 @@ pub const RowGroupWorker = struct {
         defer reader.deinit();
 
         const indices = self.selection.items();
-        const total_rows = self.data.num_rows;
-
-        // Batch decode + gather approach:
-        // 1. Decode entire column into a buffer
-        // 2. Gather selected values using indices
-        // This is O(n) decode + O(k) gather vs O(n*k) skip-per-row
-
-        // Allocate decode buffer for entire column
-        var decode_buf = try self.allocator.alloc(?T, total_rows);
-        defer self.allocator.free(decode_buf);
-
-        // Decode all rows in batches
-        var decoded: usize = 0;
-        while (decoded < total_rows) {
-            const n = try reader.nextBatch(decode_buf[decoded..]);
-            if (n == 0) break;
-            decoded += n;
+        if (indices.len == 0) {
+            return try self.allocator.alloc(T, 0);
         }
 
-        // Gather selected values
+        // Page-level skip optimization:
+        // If we need to skip more than a page worth of rows, skip entire pages
+        // without decompressing them. This is the key to matching Polars' speed.
         var values = try self.allocator.alloc(T, indices.len);
         errdefer self.allocator.free(values);
 
-        for (indices, 0..) |row_idx, out_idx| {
-            if (row_idx < decoded) {
-                values[out_idx] = decode_buf[row_idx] orelse std.mem.zeroes(T);
-            } else {
-                values[out_idx] = std.mem.zeroes(T);
+        var current_row: usize = 0;
+        for (indices, 0..) |target_row, out_idx| {
+            // Skip to the target row using page-level skipping
+            if (target_row > current_row) {
+                current_row = try reader.skipToRow(target_row, current_row);
             }
+
+            // Read the value at target position
+            var buf: [1]?T = undefined;
+            const n = try reader.nextBatch(&buf);
+            if (n == 0) {
+                values[out_idx] = std.mem.zeroes(T);
+            } else {
+                values[out_idx] = buf[0] orelse std.mem.zeroes(T);
+            }
+            current_row += 1;
         }
 
         return values;
@@ -609,40 +876,33 @@ pub const RowGroupWorker = struct {
         defer reader.deinit();
 
         const indices = self.selection.items();
-        const total_rows = self.data.num_rows;
-
-        // Batch decode + gather approach (same as typed version)
-        // Decode entire column, then gather selected values
-
-        // Allocate decode buffer for entire column
-        var decode_buf = try self.allocator.alloc(?[]const u8, total_rows);
-        defer self.allocator.free(decode_buf);
-
-        // Decode all rows in batches
-        var decoded: usize = 0;
-        while (decoded < total_rows) {
-            const n = try reader.nextBatch(decode_buf[decoded..]);
-            if (n == 0) break;
-            decoded += n;
+        if (indices.len == 0) {
+            return try self.allocator.alloc([]const u8, 0);
         }
 
-        // Gather selected values
+        // Page-level skip optimization (same as readSelectedTyped)
         var values = try self.allocator.alloc([]const u8, indices.len);
         errdefer {
             for (values) |v| self.allocator.free(v);
             self.allocator.free(values);
         }
 
-        for (indices, 0..) |row_idx, out_idx| {
-            if (row_idx < decoded) {
-                if (decode_buf[row_idx]) |v| {
-                    values[out_idx] = try self.allocator.dupe(u8, v);
-                } else {
-                    values[out_idx] = try self.allocator.dupe(u8, "");
-                }
-            } else {
-                values[out_idx] = try self.allocator.dupe(u8, "");
+        var current_row: usize = 0;
+        for (indices, 0..) |target_row, out_idx| {
+            // Skip to the target row using page-level skipping
+            if (target_row > current_row) {
+                current_row = try reader.skipToRow(target_row, current_row);
             }
+
+            // Read the value at target position
+            var buf: [1]?[]const u8 = undefined;
+            const n = try reader.nextBatch(&buf);
+            if (n == 0 or buf[0] == null) {
+                values[out_idx] = try self.allocator.dupe(u8, "");
+            } else {
+                values[out_idx] = try self.allocator.dupe(u8, buf[0].?);
+            }
+            current_row += 1;
         }
 
         return values;
@@ -846,52 +1106,70 @@ pub const RowGroupWorker = struct {
     }
 
     fn materializeFilterColumn(self: *Self) !void {
-        // Handle filter column if it's in output
-        if (!self.ctx.filter_col_in_output) return;
+        // Find if any filter column is also in the output
+        var cached_filter_idx: ?usize = null;
+        for (self.ctx.filter_cols_in_output, 0..) |in_output, i| {
+            if (in_output) {
+                // If there's a cache, it's for the FIRST filter column
+                if (i == 0 and self.filter_cache != null) {
+                    cached_filter_idx = i;
+                    break;
+                }
+            }
+        }
 
-        const out_idx = self.ctx.filter_col_output_idx.?;
-        self.output_columns[out_idx].col_type = self.ctx.filter_col_type;
+        const f_idx = cached_filter_idx orelse return;
+        const out_idx = self.ctx.filter_col_output_indices[f_idx].?;
+        const f_type = self.ctx.filter_col_types[f_idx];
+        const filter = &self.ctx.filters[f_idx];
+        const filter_val = self.ctx.filter_vals[f_idx];
+
+        self.output_columns[out_idx].col_type = f_type;
+
+        if (filter.isNullCheck() and filter.matchesNull()) {
+            return;
+        }
 
         // If dictionary fast path was used at all, regenerate ALL values from filter_val.
         // This handles the mixed case where first page is PLAIN but rest are dictionary.
         if (self.used_dict_fast_path) {
             // For BYTE_ARRAY with dict fast path, skip materialization entirely.
             // encodeToBuffer will use writeConstantByteArray which doesn't need the values.
-            if (self.ctx.filter_col_type == .BYTE_ARRAY or self.ctx.filter_col_type == .FIXED_LEN_BYTE_ARRAY) {
+            if (f_type == .BYTE_ARRAY or f_type == .FIXED_LEN_BYTE_ARRAY) {
                 // Don't materialize - encodeToBuffer handles this with constant encoding
                 return;
             }
 
             // Generate values from filter_val (all matching rows have same value)
             const count = self.selection.count();
-            switch (self.ctx.filter_col_type) {
+            switch (f_type) {
                 .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => unreachable, // Handled above
                 .INT32 => {
-                    const parsed = try std.fmt.parseInt(i32, self.ctx.filter_val, 10);
+                    const parsed = try std.fmt.parseInt(i32, filter_val, 10);
                     const values = try self.allocator.alloc(i32, count);
                     @memset(values, parsed);
                     self.output_columns[out_idx].int32_values = values;
                 },
                 .INT64 => {
-                    const parsed = try std.fmt.parseInt(i64, self.ctx.filter_val, 10);
+                    const parsed = try std.fmt.parseInt(i64, filter_val, 10);
                     const values = try self.allocator.alloc(i64, count);
                     @memset(values, parsed);
                     self.output_columns[out_idx].int64_values = values;
                 },
                 .FLOAT => {
-                    const parsed = try std.fmt.parseFloat(f32, self.ctx.filter_val);
+                    const parsed = try std.fmt.parseFloat(f32, filter_val);
                     const values = try self.allocator.alloc(f32, count);
                     @memset(values, parsed);
                     self.output_columns[out_idx].float_values = values;
                 },
                 .DOUBLE => {
-                    const parsed = try std.fmt.parseFloat(f64, self.ctx.filter_val);
+                    const parsed = try std.fmt.parseFloat(f64, filter_val);
                     const values = try self.allocator.alloc(f64, count);
                     @memset(values, parsed);
                     self.output_columns[out_idx].double_values = values;
                 },
                 .BOOLEAN => {
-                    const parsed = std.mem.eql(u8, self.ctx.filter_val, "true");
+                    const parsed = std.mem.eql(u8, filter_val, "true");
                     const values = try self.allocator.alloc(bool, count);
                     @memset(values, parsed);
                     self.output_columns[out_idx].bool_values = values;
@@ -901,7 +1179,7 @@ pub const RowGroupWorker = struct {
         } else {
             // Use cached values from filter scan
             // NOTE: For byte arrays, we transfer ownership from filter_cache to output_columns
-            switch (self.ctx.filter_col_type) {
+            switch (f_type) {
                 .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
                     const cache_values = self.filter_cache.?.getByteArrayValues();
                     const values = try self.allocator.alloc([]const u8, cache_values.len);
@@ -960,18 +1238,26 @@ pub const RowGroupWorker = struct {
             var cw = page_writer.ColumnWriter.init(self.allocator, col_type, compression);
             defer cw.deinit();
 
-            // Check if this is the filter column with dict fast path
-            // If so, use constant encoding (single-value dict + RLE)
-            const is_filter_col = self.ctx.filter_col_in_output and
-                self.ctx.filter_col_output_idx != null and
-                self.ctx.filter_col_output_idx.? == i;
-            const use_constant_encoding = is_filter_col and self.used_dict_fast_path;
+            // Check if this is a filter column with dict fast path
+            // For multi-filter, we only apply this to the first filter column for now
+            const is_first_filter_col = self.ctx.filter_cols_in_output.len > 0 and
+                self.ctx.filter_cols_in_output[0] and
+                self.ctx.filter_col_output_indices[0] != null and
+                self.ctx.filter_col_output_indices[0].? == i;
+
+            const use_constant_encoding = is_first_filter_col and self.used_dict_fast_path;
+
+            // Check if this is a null filter (IS NULL)
+            const is_null_filter_col = is_first_filter_col and self.ctx.filters[0].isNullCheck();
 
             var used_dict_encoding = false;
 
-            if (use_constant_encoding and (col_type == .BYTE_ARRAY or col_type == .FIXED_LEN_BYTE_ARRAY)) {
+            if (is_null_filter_col and self.ctx.filters[0].matchesNull()) {
+                // IS NULL filter: write all-null column
+                try cw.writeAllNulls(self.row_count);
+            } else if (use_constant_encoding and (col_type == .BYTE_ARRAY or col_type == .FIXED_LEN_BYTE_ARRAY)) {
                 // Optimized path: single-value dictionary + RLE indices
-                try cw.writeConstantByteArray(self.ctx.filter_val, self.row_count);
+                try cw.writeConstantByteArray(self.ctx.filter_vals[0], self.row_count);
                 used_dict_encoding = true;
             } else if (col_data.dict_passthrough) |dp| {
                 // Dictionary passthrough: write original dict page + new RLE indices

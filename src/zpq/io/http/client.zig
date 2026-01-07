@@ -4,6 +4,7 @@ const tls = @import("../tls/connection.zig");
 const global_pool_mod = @import("../pool.zig");
 const ResponseParser = @import("response_parser.zig").ResponseParser;
 const dns = @import("../dns.zig");
+const tracer = @import("../../trace.zig");
 
 const log = @import("../../../zpq.zig").log.http;
 
@@ -137,8 +138,190 @@ pub fn ClientGen(comptime XevApi: type) type {
             }
         };
 
+        /// Async request context - heap allocated, persists until completion callback is invoked.
+        /// Used when caller wants to drive the event loop themselves (avoiding nested loop.run()).
+        pub const AsyncRequestContext = struct {
+            allocator: std.mem.Allocator,
+            client: *Self,
+            parser: ResponseParser = .{},
+            body_buf: std.ArrayListUnmanaged(u8) = .{},
+            conn: *Connection = undefined,
+            pool: *GlobalConnectionPool = undefined,
+            key: ConnectionKey = undefined,
+
+            // Request data (owned by this context)
+            request_buf: []u8 = &[_]u8{},
+            body_data: []const u8 = &[_]u8{},
+
+            // State machine
+            phase: Phase = .connecting,
+            body_offset: usize = 0,
+            done: bool = false,
+            err: ?anyerror = null,
+
+            // Completion callback
+            on_complete: ?*const fn (*AsyncRequestContext, anyerror!RequestResult) void = null,
+            user_data: ?*anyopaque = null,
+
+            pub const Phase = enum {
+                connecting,
+                sending_headers,
+                sending_body,
+                waiting_response,
+                done,
+            };
+
+            fn onBodyChunk(ctx_ptr: *anyopaque, chunk: []const u8) void {
+                const self: *AsyncRequestContext = @ptrCast(@alignCast(ctx_ptr));
+                self.body_buf.appendSlice(self.allocator, chunk) catch |e| {
+                    self.err = e;
+                };
+            }
+
+            pub fn deinit(self: *AsyncRequestContext) void {
+                self.body_buf.deinit(self.allocator);
+                if (self.request_buf.len > 0) {
+                    self.allocator.free(self.request_buf);
+                }
+            }
+
+            /// Check if request is complete (success or error)
+            pub fn isComplete(self: *const AsyncRequestContext) bool {
+                return self.done or self.err != null;
+            }
+
+            /// Get result if complete, null otherwise
+            pub fn getResult(self: *AsyncRequestContext) ?anyerror!RequestResult {
+                if (!self.isComplete()) return null;
+
+                if (self.err) |e| return e;
+
+                // Extract headers
+                var result_headers = std.ArrayListUnmanaged(ResponseHeader){};
+                errdefer result_headers.deinit(self.allocator);
+
+                const header_str = self.parser.header_buf[0..self.parser.header_len];
+                var lines = std.mem.splitSequence(u8, header_str, "\r\n");
+                _ = lines.first(); // Skip status
+
+                while (lines.next()) |line| {
+                    if (line.len == 0) break;
+                    if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
+                        result_headers.append(self.allocator, .{
+                            .name = self.allocator.dupe(u8, line[0..colon_pos]) catch |e| return e,
+                            .value = self.allocator.dupe(u8, line[colon_pos + 2 ..]) catch |e| return e,
+                        }) catch |e| return e;
+                    }
+                }
+
+                return RequestResult{
+                    .body = self.allocator.dupe(u8, self.body_buf.items) catch |e| return e,
+                    .headers = result_headers.toOwnedSlice(self.allocator) catch |e| return e,
+                    .status = self.parser.status_code,
+                };
+            }
+        };
+
         fn onConnect(ctx_void: ?*anyopaque) void {
             _ = ctx_void;
+        }
+
+        // =====================================================================
+        // Async request callbacks (for requestAsync() - no loop.run() inside)
+        // =====================================================================
+
+        fn onAsyncConnect(ctx_void: ?*anyopaque) void {
+            const ctx: *AsyncRequestContext = @ptrCast(@alignCast(ctx_void orelse return));
+            ctx.phase = .sending_headers;
+            // Write headers (will trigger onAsyncWriteComplete when done)
+            ctx.conn.write(ctx.request_buf) catch |e| {
+                ctx.err = e;
+                ctx.done = true;
+            };
+        }
+
+        fn onAsyncWriteComplete(ctx_void: ?*anyopaque, _: usize) void {
+            const ctx: *AsyncRequestContext = @ptrCast(@alignCast(ctx_void orelse return));
+
+            switch (ctx.phase) {
+                .sending_headers => {
+                    if (ctx.body_data.len > 0) {
+                        ctx.phase = .sending_body;
+                        ctx.body_offset = 0;
+                        writeNextAsyncChunk(ctx);
+                    } else {
+                        ctx.phase = .waiting_response;
+                    }
+                },
+                .sending_body => {
+                    const chunk_size = 8 * 1024;
+                    ctx.body_offset += chunk_size;
+                    if (ctx.body_offset >= ctx.body_data.len) {
+                        ctx.phase = .waiting_response;
+                    } else {
+                        writeNextAsyncChunk(ctx);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn writeNextAsyncChunk(ctx: *AsyncRequestContext) void {
+            const chunk_size = 8 * 1024;
+            const end = @min(ctx.body_offset + chunk_size, ctx.body_data.len);
+            const chunk = ctx.body_data[ctx.body_offset..end];
+            ctx.conn.write(chunk) catch |e| {
+                ctx.err = e;
+                ctx.done = true;
+            };
+        }
+
+        fn onAsyncData(ctx_void: ?*anyopaque, data: []const u8) void {
+            const ctx: *AsyncRequestContext = @ptrCast(@alignCast(ctx_void orelse return));
+
+            ctx.parser.feed(data, ctx, AsyncRequestContext.onBodyChunk) catch |e| {
+                ctx.err = e;
+                ctx.done = true;
+                return;
+            };
+
+            if (ctx.parser.state == .done) {
+                ctx.done = true;
+                ctx.phase = .done;
+                ctx.conn.user_ctx = null;
+                ctx.conn.idling = true;
+                ctx.pool.release(ctx.key, ctx.conn);
+
+                // Call completion callback if set
+                if (ctx.on_complete) |cb| {
+                    const result = ctx.getResult() orelse unreachable;
+                    cb(ctx, result);
+                }
+            }
+        }
+
+        fn onAsyncError(ctx_void: ?*anyopaque, err: anyerror) void {
+            const ctx: *AsyncRequestContext = @ptrCast(@alignCast(ctx_void orelse return));
+            if ((err == error.EOF or err == error.TlsConnectionClosed) and ctx.parser.headersComplete()) {
+                ctx.done = true;
+                ctx.phase = .done;
+                ctx.conn.user_ctx = null;
+                ctx.conn.idling = true;
+                ctx.pool.release(ctx.key, ctx.conn);
+
+                if (ctx.on_complete) |cb| {
+                    const result = ctx.getResult() orelse unreachable;
+                    cb(ctx, result);
+                }
+                return;
+            }
+            ctx.err = err;
+            ctx.done = true;
+            ctx.conn.close();
+
+            if (ctx.on_complete) |cb| {
+                cb(ctx, err);
+            }
         }
 
         fn onData(ctx_void: ?*anyopaque, data: []const u8) void {
@@ -248,6 +431,8 @@ pub fn ClientGen(comptime XevApi: type) type {
 
             // Connect
             if (!conn.handshake_complete) {
+                const tls_zone = tracer.zone("HTTP/tlsHandshake");
+                defer tls_zone.end();
                 try conn.connect(addr);
                 while (!conn.handshake_complete and !ctx.done and ctx.err == null) {
                     try self.loop.run(.once);
@@ -267,6 +452,8 @@ pub fn ClientGen(comptime XevApi: type) type {
 
             // Send body
             if (body.len > 0) {
+                const upload_zone = tracer.zone("HTTP/uploadBody");
+                defer upload_zone.end();
                 while (conn.pending_write and !ctx.done and ctx.err == null) {
                     try self.loop.run(.once);
                 }
@@ -287,8 +474,12 @@ pub fn ClientGen(comptime XevApi: type) type {
             }
 
             // Wait for response
-            while (!ctx.done and ctx.err == null) {
-                try self.loop.run(.once);
+            {
+                const resp_zone = tracer.zone("HTTP/waitResponse");
+                defer resp_zone.end();
+                while (!ctx.done and ctx.err == null) {
+                    try self.loop.run(.once);
+                }
             }
             if (ctx.err) |err| return err;
 
@@ -319,6 +510,108 @@ pub fn ClientGen(comptime XevApi: type) type {
                 .headers = try result_headers.toOwnedSlice(self.allocator),
                 .status = ctx.parser.status_code,
             };
+        }
+
+        /// Perform an HTTP request asynchronously.
+        /// Returns a heap-allocated context that tracks the request state.
+        /// The caller must drive the event loop (loop.run()) until ctx.isComplete() returns true.
+        /// Then call ctx.getResult() to get the result, and ctx.deinit() + allocator.destroy(ctx).
+        ///
+        /// NOTE: The caller must ensure `body` remains valid until the request completes.
+        pub fn requestAsync(
+            self: *Self,
+            method: []const u8,
+            path: []const u8,
+            headers: []const std.http.Header,
+            body: []const u8,
+            addr: xev.shim_net.Address,
+        ) !*AsyncRequestContext {
+            const key = ConnectionKey{
+                .host = self.host,
+                .port = self.port,
+                .use_tls = self.use_tls,
+            };
+
+            // Acquire connection
+            const conn = if (self.pool.acquire(key)) |c| blk: {
+                c.idling = false;
+                c.pending_read = false;
+                c.pending_write = false;
+                break :blk c;
+            } else blk: {
+                const c = try self.allocator.create(Connection);
+                c.* = try Connection.initWithOptions(self.loop, self.allocator, self.host, .{});
+                break :blk c;
+            };
+            errdefer {
+                conn.close();
+                self.allocator.destroy(conn);
+            }
+
+            // Build request bytes (owned by context)
+            var req_buf = std.ArrayListUnmanaged(u8){};
+            errdefer req_buf.deinit(self.allocator);
+
+            try req_buf.appendSlice(self.allocator, method);
+            try req_buf.appendSlice(self.allocator, " ");
+            try req_buf.appendSlice(self.allocator, path);
+            try req_buf.appendSlice(self.allocator, " HTTP/1.1\r\n");
+
+            for (headers) |h| {
+                try req_buf.appendSlice(self.allocator, h.name);
+                try req_buf.appendSlice(self.allocator, ": ");
+                try req_buf.appendSlice(self.allocator, h.value);
+                try req_buf.appendSlice(self.allocator, "\r\n");
+            }
+
+            // Content-Length
+            try req_buf.appendSlice(self.allocator, "Content-Length: ");
+            var len_buf: [20]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch unreachable;
+            try req_buf.appendSlice(self.allocator, len_str);
+            try req_buf.appendSlice(self.allocator, "\r\n\r\n");
+
+            // Create heap-allocated async context
+            const ctx = try self.allocator.create(AsyncRequestContext);
+            errdefer self.allocator.destroy(ctx);
+
+            ctx.* = .{
+                .allocator = self.allocator,
+                .client = self,
+                .conn = conn,
+                .pool = self.pool,
+                .key = key,
+                .request_buf = try req_buf.toOwnedSlice(self.allocator),
+                .body_data = body,
+            };
+
+            // Setup async callbacks
+            conn.user_ctx = ctx;
+            conn.on_connect = onAsyncConnect;
+            conn.on_data = onAsyncData;
+            conn.on_error = onAsyncError;
+            conn.on_write_complete = onAsyncWriteComplete;
+
+            // Initiate connection (non-blocking)
+            if (!conn.handshake_complete) {
+                try conn.connect(addr);
+            } else {
+                // Already connected, immediately send headers
+                ctx.phase = .sending_headers;
+                try conn.write(ctx.request_buf);
+            }
+
+            return ctx;
+        }
+
+        /// Helper to get cached address or resolve DNS.
+        /// This still calls loop.run() internally for DNS resolution.
+        /// For fully async flow, caller should resolve DNS separately.
+        pub fn getOrResolveAddr(self: *Self) !xev.shim_net.Address {
+            if (self.cached_addr == null) {
+                self.cached_addr = try self.resolve();
+            }
+            return self.cached_addr.?;
         }
 
         fn resolve(self: *Self) !xev.shim_net.Address {

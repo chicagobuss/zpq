@@ -23,6 +23,7 @@ const ColumnChunk = schema_mod.ColumnChunk;
 const Trace = pipeline_types.Trace;
 
 pub fn execute(self: *Pipeline) !ExecutionResult {
+    std.debug.print("\n[TRACE] slot_parallel.execute() ENTRY - multi-predicate path\n", .{});
     const loop = self.loop orelse return error.NoRuntime;
     const pool = self.thread_pool orelse return error.NoRuntime;
 
@@ -296,6 +297,14 @@ pub fn execute(self: *Pipeline) !ExecutionResult {
     }
 
     trace.mark("setup_ranges");
+
+    // Debug: calculate total bytes being fetched
+    var total_bytes: u64 = 0;
+    for (ranges) |r| {
+        total_bytes += r.end - r.start;
+    }
+    std.debug.print("[DEBUG] Fetching {d} ranges, total {d} bytes ({d:.2} MB)\n", .{ ranges.len, total_bytes, @as(f64, @floatFromInt(total_bytes)) / (1024 * 1024) });
+
     try pf.source.readRanges(ranges, buffers);
     trace.mark("read_data");
 
@@ -468,6 +477,7 @@ pub fn execute(self: *Pipeline) !ExecutionResult {
 }
 
 pub fn executeWithLoop(self: *Pipeline, comptime XevApi: type, loop: *XevApi.Loop, thread_pool: *xev.ThreadPool) !ExecutionResult {
+    std.debug.print("\n[TRACE] slot_parallel.executeWithLoop() ENTRY\n", .{});
     const Completion = row_group_worker_mod.SlotWriteCompletionGen(XevApi);
 
     var trace = Trace.init();
@@ -651,6 +661,13 @@ pub fn executeWithLoop(self: *Pipeline, comptime XevApi: type, loop: *XevApi.Loo
             range_idx += 1;
         }
     }
+
+    // Debug: calculate total bytes being fetched
+    var total_bytes: u64 = 0;
+    for (ranges) |r| {
+        total_bytes += r.end - r.start;
+    }
+    std.debug.print("[TRACE] executeWithLoop: Fetching {d} ranges, total {d} bytes ({d:.2} MB)\n", .{ ranges.len, total_bytes, @as(f64, @floatFromInt(total_bytes)) / (1024 * 1024) });
 
     try pf.source.readRanges(ranges, buffers);
 

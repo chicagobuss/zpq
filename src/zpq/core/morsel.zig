@@ -148,6 +148,9 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
         /// Error tracking
         last_error: ?anyerror = null,
 
+        /// Flag for deferred S3 operations (set in callbacks, processed in main loop)
+        needs_multipart_init: bool = false,
+
         /// Statistics
         stats: Stats = .{},
 
@@ -262,18 +265,41 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             // NOTE: We do NOT call initMultipartUpload() here.
             // We defer it until we have >= MIN_PART_SIZE of data,
             // allowing us to use single PUT for small outputs (<5MB).
+            // The actual init is triggered via the needs_multipart_init flag,
+            // which is processed by the main loop (outside callback context).
 
             self.state = .uploading;
         }
 
-        /// Ensure multipart upload is initialized. Called when we have enough data to upload.
-        fn ensureMultipartStarted(self: *Self) !void {
+        /// Process deferred S3 operations. Call this from the main loop, NOT from callbacks.
+        /// Returns true if any operations were processed.
+        pub fn processFlags(self: *Self) !bool {
+            if (self.needs_multipart_init) {
+                self.needs_multipart_init = false;
+                try self.doMultipartInit();
+                return true;
+            }
+            return false;
+        }
+
+        /// Actually perform the multipart init (must be called outside callback context).
+        fn doMultipartInit(self: *Self) !void {
             if (self.upload_id != null) return; // Already started
 
             const s3w = self.s3_writer orelse return error.NoS3Writer;
             const upload_id = try s3w.initMultipartUpload();
             self.upload_id = try self.allocator.dupe(u8, upload_id);
             log.debug("Started multipart upload: {s}", .{upload_id});
+        }
+
+        /// Ensure multipart upload is initialized. Called when we have enough data to upload.
+        fn ensureMultipartStarted(self: *Self) !void {
+            if (self.upload_id != null) return; // Already started
+
+            // Set flag for main loop to process (avoid nested loop.run in callbacks)
+            self.needs_multipart_init = true;
+            // Return error to indicate we need to defer
+            return error.MultipartInitNeeded;
         }
 
         /// Get current in-flight count.
@@ -349,7 +375,22 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             }
 
             // Ensure multipart upload is started (deferred from start())
-            try self.ensureMultipartStarted();
+            // If multipart init is needed but can't be done here (in callback context),
+            // ensureMultipartStarted sets a flag and returns error.MultipartInitNeeded.
+            // The main loop will process the flag and we'll flush on the next iteration.
+            self.ensureMultipartStarted() catch |err| {
+                if (err == error.MultipartInitNeeded) {
+                    // Just return - the main loop will call processFlags(), then
+                    // the next submitMorsel will trigger flush again
+                    return;
+                }
+                return err;
+            };
+
+            // If we still don't have an upload_id, the main loop needs to process the flag first
+            if (self.upload_id == null) {
+                return;
+            }
 
             // Backpressure: wait if too many in flight
             while (self.inFlightCount() >= self.config.max_in_flight) {

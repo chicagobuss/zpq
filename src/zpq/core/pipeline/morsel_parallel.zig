@@ -445,6 +445,12 @@ pub fn executeWithLoop(self: *Pipeline, comptime XevApi: type, loop: *XevApi.Loo
     }
 
     while (pending.load(.acquire) > 0) {
+        // Process any deferred S3 operations (set in callbacks)
+        _ = coordinator.processFlags() catch |err| {
+            std.debug.print("processFlags error: {}\n", .{err});
+            break;
+        };
+
         loop.run(.once) catch |err| {
             std.debug.print("Loop error: {}\n", .{err});
             break;

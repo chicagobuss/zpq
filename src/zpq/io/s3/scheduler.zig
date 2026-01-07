@@ -74,7 +74,7 @@ pub fn mergeRanges(
         // Limit max request size to ensuring parallelism
         // S3 single-stream throughput is limited; we want parallel requests for large data.
         const MAX_MERGED_SIZE = 16 * 1024 * 1024; // 16MB
-        
+
         const new_len_if_merged = @max(current_end, next.end) - current_req.request_range.start;
         const would_exceed_size = new_len_if_merged > MAX_MERGED_SIZE;
 

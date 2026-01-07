@@ -14,8 +14,13 @@ default:
 # Run all checks (tests + build + verify)
 all: test build verify
 
-# Build the project (Core only)
+# Build the project (ReleaseFast)
 build:
+    @./tools/just_helpers.sh fetch_deps
+    zig build -Doptimize=ReleaseFast
+
+# Build the project (Debug)
+build-debug:
     @./tools/just_helpers.sh fetch_deps
     zig build
 
@@ -198,6 +203,9 @@ lambda-list:
 #   just bench serverless s3 lambda s3 100mb      # Real Lambda
 bench what input where output size="10mb" runs="1":
     @./tools/bench.sh {{what}} {{input}} {{where}} {{output}} {{size}} {{runs}}
+
+bench-trace-macos what input where output size="10mb" runs="1":
+    xcrun xctrace record --template 'Time Profiler' --launch -- ./tools/bench.sh {{what}} {{input}} {{where}} {{output}} {{size}} {{runs}}
 
 # Run Zig native benchmarks (dns, ping, e2e, scan)
 # Examples:

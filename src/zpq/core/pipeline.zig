@@ -165,6 +165,11 @@ pub const Pipeline = struct {
             actual_mode = .morsel_parallel;
         }
 
+        std.debug.print("\n[TRACE] pipeline.executeWithLoop: mode={}, actual_mode={}, predicates.len={}\n", .{ mode, actual_mode, self.predicates.len });
+        if (self.predicates.len > 0) {
+            std.debug.print("[TRACE]   predicate[0].op={}\n", .{self.predicates[0].op});
+        }
+
         return switch (actual_mode) {
             .slot_parallel => if (self.predicates.len == 1 and self.predicates[0].op == .between)
                 try surgical.executeSlotParallelWithLoop(self, XevApi, loop, pool)

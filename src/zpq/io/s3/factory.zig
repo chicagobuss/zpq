@@ -124,14 +124,12 @@ pub fn openS3Internal(allocator: std.mem.Allocator, path: []const u8, options: O
     const config = try loadS3ConfigFromEnv(allocator);
     defer config.deinit(allocator);
 
-    // Fallback to legacy sync stack ONLY if requested and not forced to async.
-    // In production, we prefer the Xev stack for its superior performance and pooling.
-    if (!options.force_async and config.credentials != null and !(std.process.hasEnvVar(allocator, "ZPQ_FORCE_XEV") catch false)) {
-        const s3_src = try allocator.create(s3.S3Source);
-        errdefer allocator.destroy(s3_src);
-        s3_src.* = try s3.S3Source.init(allocator, s3_info.bucket, s3_info.key, config.toLegacy());
-        return zpq.file.ParquetFile.initOwned(allocator, s3_src.source(), s3_src, cleanupS3);
-    }
+    // Always use XevS3Source - the legacy sync stack has been deprecated for performance reasons.
+    // Previously, we fell back to legacy S3Source when credentials were present, but XevS3Source
+    // is 2.5x+ faster with parallel range requests and connection pooling.
+    _ = options.force_async; // No longer used - always async
+
+    std.debug.print("[TRACE] factory.openS3Internal: Using XevS3Source (async stack)\n", .{});
 
     const discovery = try discoverS3Endpoint(allocator, config.endpoint, config.region);
     defer discovery.deinit(allocator);

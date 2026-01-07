@@ -6,6 +6,7 @@ const dns = @import("../dns.zig");
 const global_pool_mod = @import("../pool.zig");
 const http_client = @import("../http/client.zig");
 const ResponseParser = @import("../http/response_parser.zig").ResponseParser;
+const tracer = @import("../../trace.zig");
 
 const log = std.log.scoped(.s3_writer);
 
@@ -672,6 +673,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         }
 
         fn createMultipartUpload(self: *Self) !void {
+            const zone = tracer.zone("S3/createMultipartUpload");
+            defer zone.end();
             log.debug("Creating multipart upload for {s}/{s}", .{ self.bucket, self.key });
 
             const path = try self.buildPath("/{s}?uploads", .{self.key});
@@ -728,6 +731,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         }
 
         fn completeMultipartUpload(self: *Self) !void {
+            const zone = tracer.zone("S3/completeMultipartUpload");
+            defer zone.end();
             log.debug("Completing multipart upload with {d} parts", .{self.parts.items.len});
 
             // Build XML body
@@ -773,6 +778,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         }
 
         fn singlePut(self: *Self, data: []const u8) !void {
+            const zone = tracer.zone("S3/singlePut");
+            defer zone.end();
             log.debug("Single PUT for {s}/{s} ({d} bytes)", .{ self.bucket, self.key, data.len });
 
             const path = try self.buildPath("/{s}", .{self.key});
@@ -808,6 +815,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
             body: []const u8,
             extra_headers: ?[]const std.http.Header,
         ) !Client.RequestResult {
+            const zone = tracer.zone("S3/doRequest");
+            defer zone.end();
             // Build request with signing
             var headers = std.ArrayListUnmanaged(std.http.Header){};
             defer {
@@ -876,6 +885,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         }
 
         fn resolve(self: *Self) !xev.shim_net.Address {
+            const zone = tracer.zone("S3/resolve");
+            defer zone.end();
             var comp = dns.ResolverGen(XevApi).Completion.init();
             defer comp.deinit(self.allocator);
 
@@ -1013,6 +1024,8 @@ pub fn S3WriterGen(comptime XevApi: type) type {
         /// - If using multipart: completes the multipart upload
         /// - If small file: does a single PUT
         pub fn finish(self: *Self) !void {
+            const zone = tracer.zone("S3/finish");
+            defer zone.end();
             if (self.upload_id != null) {
                 // Multipart mode: upload final part if buffer has data
                 if (self.buffer.items.len > 0) {

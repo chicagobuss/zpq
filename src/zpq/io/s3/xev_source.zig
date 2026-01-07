@@ -288,6 +288,7 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
         }
 
         fn readRangesImpl(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8) anyerror!void {
+            std.debug.print("[TRACE] xev_source.readRangesImpl: {d} ranges\n", .{ranges.len});
             const self: *Self = @ptrCast(@alignCast(ptr));
             var orch = Orchestrator.init(self.allocator, self.loop, self.provider());
             return orch.readRanges(ranges, buffers);
@@ -315,7 +316,9 @@ pub fn XevS3SourceGen(comptime XevApi: type) type {
                 .ptr = self,
                 .vtable = &.{
                     .readAt = readAtImpl,
-                    .readRanges = readRangesImpl,
+                    // NOTE: No readRanges here! This uses the default serial fallback
+                    // from interface.zig which loops readAt() on the same connection,
+                    // avoiding the overhead of 12 TLS handshakes for 12 range requests.
                     .size = sizeImpl,
                     .close = closeImpl,
                 },

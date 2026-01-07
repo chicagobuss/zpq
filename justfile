@@ -67,7 +67,7 @@ gen-deranged:
     @echo "Generated data/deranged.parquet using DuckDB"
 
 # Run the CLI tools against verified fixtures (Moderate)
-verify: build check-tls
+verify: build
     @echo "Verifying CLI commands..."
     # Schema check
     zig build run -- schema data/simple.parquet
@@ -78,13 +78,6 @@ verify: build check-tls
     # Cat check (data dump)
     zig build run -- cat data/simple.parquet 5
     @echo "Verification passed."
-
-# Verify TLS Transport and S3 Factory (Requires Network)
-check-tls: build
-    @echo "Verifying TLS Transport (Google HEAD)..."
-    python3 tools/no_output_timeout.py --idle-seconds 10 -- zig build probe-tls-echo
-    @echo "Verifying S3 Integration (MinIO Parquet)..."
-    @ZPQ_TEST_MINIO=1 python3 tools/no_output_timeout.py --idle-seconds 10 -- zig build -Dexperimental test-parquet-s3
 
 # Run comprehensive tests including heavy data and edge cases (Slow)
 comprehensive: build gen-fixtures

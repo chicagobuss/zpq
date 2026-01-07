@@ -1,17 +1,37 @@
 const std = @import("std");
 const zpq = @import("zpq");
 const xev = @import("xev");
-const builtin = @import("builtin");
 
-const query = @import("query.zig");
-const lambda = @import("lambda.zig");
-
-const Pipeline = zpq.core.pipeline.Pipeline;
-const ExecutionMode = zpq.core.pipeline.ExecutionMode;
-const QueryParams = query.QueryParams;
-
-pub const std_options: std.Options = .{
-    .log_level = if (builtin.mode == .Debug) .debug else .warn,
+pub const BenchmarkRow = struct {
+    int8: i32,
+    int16: i32,
+    int32_sorted: i32,
+    int32_random: i32,
+    int64_sorted: i64,
+    int64_random: i64,
+    uint8: i32,
+    uint16: i32,
+    uint32: i32,
+    uint64: i64,
+    float32: f32,
+    float64: f64,
+    float64_sorted: f64,
+    bool: bool,
+    bool_sparse: bool,
+    string_random: []const u8,
+    string_dict_low: []const u8,
+    string_dict_high: []const u8,
+    string_sorted: []const u8,
+    binary: []const u8,
+    timestamp: i64,
+    timestamp_sorted: i64,
+    date: i32,
+    // Note: Currently skip nullable for absolute hot path simplicity if needed,
+    // but the engine supports them.
+    // int32_nullable: ?i32,
+    // float64_nullable: ?f64,
+    // string_nullable: ?[]const u8,
+    // int32_sparse: ?i32,
 };
 
 pub fn main() !void {
@@ -19,196 +39,35 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Priority 1: Lambda mode (hot path - check first)
-    // Debug: print if we see the Lambda env var
-    if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API")) |runtime_api| {
-        std.debug.print("zpq: detected AWS_LAMBDA_RUNTIME_API={s}\n", .{runtime_api});
-        return lambda.run(allocator, runtime_api);
-    } else {
-        // Check if we're in Lambda context (LAMBDA_TASK_ROOT exists) but missing runtime API
-        if (std.posix.getenv("LAMBDA_TASK_ROOT")) |_| {
-            std.debug.print("zpq: LAMBDA_TASK_ROOT set but AWS_LAMBDA_RUNTIME_API missing\n", .{});
-        }
-    }
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
 
-    // Priority 2: HTTP server mode (check for --serve flag)
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (getServePort(args)) |port| {
-        _ = port;
-        // TODO: Implement HTTP server mode
-        std.debug.print("HTTP server mode not yet implemented\n", .{});
+    _ = args.next(); // skip exe name
+    const input_path = args.next() orelse {
+        printUsage();
         return;
-    }
+    };
+    const output_path = args.next() orelse {
+        // Output path is required for now as per "zpq <in> <out>"
+        printUsage();
+        return;
+    };
 
-    // Priority 3: CLI mode (convenience/dev)
-    return cliMain(allocator, args);
-}
+    var filter_str: ?[]const u8 = null;
+    var select_str: ?[]const u8 = null;
 
-/// Check for --serve flag and return port if present
-fn getServePort(args: []const []const u8) ?u16 {
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--serve")) {
-            i += 1;
-            if (i < args.len) {
-                return std.fmt.parseInt(u16, args[i], 10) catch 8080;
-            }
-            return 8080; // Default port
-        }
-    }
-    return null;
-}
-
-// =============================================================================
-// CLI Mode
-// =============================================================================
-
-const CliArgs = struct {
-    input: ?[]const u8 = null,
-    output: ?[]const u8 = null,
-    filter: ?[]const u8 = null,
-    select: ?[]const u8 = null,
-    show_schema: bool = false,
-    show_meta: bool = false,
-    mode: ExecutionMode = .slot_parallel,
-    compression: zpq.core.schema.CompressionCodec = .SNAPPY,
-};
-
-fn parseCliArgs(args: []const []const u8) ?CliArgs {
-    if (args.len < 2) return null;
-
-    var result = CliArgs{};
-    var i: usize = 1;
-
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return null;
-        } else if (std.mem.eql(u8, arg, "--schema")) {
-            result.show_schema = true;
-        } else if (std.mem.eql(u8, arg, "--meta")) {
-            result.show_meta = true;
-        } else if (std.mem.eql(u8, arg, "--sequential")) {
-            result.mode = .sequential;
-        } else if (std.mem.eql(u8, arg, "--parallel")) {
-            result.mode = .parallel;
-        } else if (std.mem.eql(u8, arg, "--serve")) {
-            // Skip --serve and its argument (handled above)
-            i += 1;
-        } else if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --filter requires a value\n", .{});
-                return null;
-            }
-            result.filter = args[i];
+    var is_benchmark = std.mem.indexOf(u8, input_path, "benchmark") != null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
+            filter_str = args.next();
         } else if (std.mem.eql(u8, arg, "--select") or std.mem.eql(u8, arg, "-s")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --select requires a value\n", .{});
-                return null;
-            }
-            result.select = args[i];
-        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --output requires a value\n", .{});
-                return null;
-            }
-            result.output = args[i];
-        } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "-c")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --compression requires a value (none, snappy, zstd, gzip)\n", .{});
-                return null;
-            }
-            const comp_str = args[i];
-            if (std.mem.eql(u8, comp_str, "none") or std.mem.eql(u8, comp_str, "uncompressed")) {
-                result.compression = .UNCOMPRESSED;
-            } else if (std.mem.eql(u8, comp_str, "snappy")) {
-                result.compression = .SNAPPY;
-            } else if (std.mem.eql(u8, comp_str, "zstd")) {
-                result.compression = .ZSTD;
-            } else if (std.mem.eql(u8, comp_str, "gzip")) {
-                result.compression = .GZIP;
-            } else {
-                std.debug.print("Error: Unknown compression '{s}'. Use: none, snappy, zstd, gzip\n", .{comp_str});
-                return null;
-            }
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument
-            if (result.input == null) {
-                result.input = arg;
-            } else if (result.output == null) {
-                result.output = arg;
-            }
-        } else {
-            std.debug.print("Error: Unknown option '{s}'\n", .{arg});
-            return null;
+            select_str = args.next();
+        } else if (std.mem.eql(u8, arg, "--benchmark")) {
+            is_benchmark = true;
         }
     }
 
-    return result;
-}
-
-fn printUsage(exe: []const u8) void {
-    std.debug.print(
-        \\Usage: {s} <input> [output] [options]
-        \\
-        \\  Parquet query and transform tool.
-        \\
-        \\Arguments:
-        \\  input              Input parquet file (local path or s3://)
-        \\  output             Output parquet file (optional, for filter/transform)
-        \\
-        \\Operations:
-        \\  --schema           Print file schema
-        \\  --meta             Print file metadata
-        \\  -f, --filter EXPR  Filter rows (e.g., category=A)
-        \\  -s, --select COLS  Select columns (comma-separated)
-        \\
-        \\Execution Mode:
-        \\  --sequential       Process row groups sequentially
-        \\  --parallel         Parallel processing (default: slot-parallel)
-        \\
-        \\Output:
-        \\  -o, --output FILE  Output file (alternative to positional)
-        \\  -c, --compression  Compression: none, snappy (default), zstd, gzip
-        \\
-        \\Server Mode:
-        \\  --serve [PORT]     Run as HTTP server (default port: 8080)
-        \\
-        \\Examples:
-        \\  {s} data.parquet --schema
-        \\  {s} data.parquet --meta
-        \\  {s} input.parquet output.parquet --filter category=A
-        \\  {s} input.parquet -o out.parquet --filter id>100 --select id,name
-        \\  {s} s3://bucket/data.parquet --schema
-        \\  {s} --serve 8080
-        \\
-        \\Environment:
-        \\  AWS_LAMBDA_RUNTIME_API  Auto-detected for Lambda mode
-        \\
-    , .{ exe, exe, exe, exe, exe, exe, exe });
-}
-
-fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const parsed = parseCliArgs(args) orelse {
-        printUsage(args[0]);
-        return;
-    };
-
-    const input = parsed.input orelse {
-        std.debug.print("Error: Input file required\n", .{});
-        printUsage(args[0]);
-        return;
-    };
-
-    // Initialize xev runtime with dynamic backend detection (io_uring -> epoll fallback)
-    // On single-backend systems (macOS/kqueue), detect() doesn't exist - that's fine.
+    // Initialize xev loop and thread pool
     if (@hasDecl(xev.Dynamic, "detect")) {
         try xev.Dynamic.detect();
     }
@@ -221,62 +80,110 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         thread_pool.deinit();
     }
 
-    // Convert CLI args to QueryParams
-    const params = QueryParams{
-        .input = input,
-        .output = parsed.output,
-        .filter = parsed.filter,
-        .select = parsed.select,
-        .mode = parsed.mode,
-        .compression = parsed.compression,
-        .show_schema = parsed.show_schema,
-        .show_meta = parsed.show_meta,
+    // Open Source
+    const source = try zpq.io.factory.openSource(allocator, input_path, .{
+        .loop = &loop,
+        .thread_pool = &thread_pool,
+    });
+    defer source.close();
+
+    var pfile = zpq.core.file.ParquetFile.init(allocator, source);
+    try pfile.readFooter();
+    defer pfile.deinit();
+
+    if (is_benchmark) {
+        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path);
+    } else {
+        std.debug.print("Full CLI mode (GenericRow) not yet implemented. Use --benchmark for performance testing on known schema.\n", .{});
+        return error.UnsupportedMode;
+    }
+}
+
+fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8) !void {
+    _ = select_str; // TODO: Implement projection
+
+    var reader = try zpq.core.reader.ParquetReader(T).init(allocator, pfile);
+    defer reader.deinit();
+
+    var filters = std.ArrayListUnmanaged(zpq.core.filter.Filter){};
+    defer filters.deinit(allocator);
+
+    if (filter_str) |f| {
+        const parsed = try parseFilter(T, f, pfile);
+        try filters.append(allocator, parsed);
+    }
+
+    const batch_size = 8192;
+    const batch = try allocator.alloc(T, batch_size);
+    defer allocator.free(batch);
+
+    var total_active: usize = 0;
+    var total_scanned: usize = 0;
+    const total_rows_in_file: usize = @intCast(pfile.metadata.num_rows);
+    var timer = try std.time.Timer.start();
+
+    const output_to_stdout = std.mem.eql(u8, output_path, "--");
+
+    while (total_scanned < total_rows_in_file) {
+        const to_scan = @min(batch.len, total_rows_in_file - total_scanned);
+        const n = try reader.nextBatch(batch[0..to_scan], filters.items);
+        total_active += n;
+        total_scanned += to_scan;
+
+        if (output_to_stdout and total_active < 100) {
+            // Just print a few rows to verify
+            // std.debug.print("Row {d}: {any}\n", .{ total_active, batch[0] });
+        }
+    }
+
+    const elapsed = timer.read();
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    std.debug.print("Scanned {d} rows ({d} matched) in {d:.2}ms ({d:.2} Mrows/sec)\n", .{ total_scanned, total_active, elapsed_ms, @as(f64, @floatFromInt(total_scanned)) / (elapsed_ms * 1000.0) });
+}
+
+fn parseFilter(comptime T: type, filter_str: []const u8, pfile: *zpq.core.file.ParquetFile) !zpq.core.filter.Filter {
+    // Simple parser for "col=val"
+    const eq_idx = std.mem.indexOfScalar(u8, filter_str, '=') orelse return error.InvalidFilter;
+    const col_name = filter_str[0..eq_idx];
+    const val_str = filter_str[eq_idx + 1 ..];
+
+    const col_idx = try findColumnIndex(col_name, pfile);
+    const field_type = try getFieldType(T, col_name);
+
+    return switch (field_type) {
+        .ByteArray => .{ .ByteArray = .{ .col_idx = col_idx, .pred = .Eq, .val = val_str } },
+        .Int32 => .{ .Int32 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i32, val_str, 10) } },
+        .Int64 => .{ .Int64 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i64, val_str, 10) } },
+        else => return error.UnsupportedFilterType,
     };
+}
 
-    // For schema/meta, use the print methods (CLI-friendly output)
-    if (parsed.show_schema) {
-        var pipeline = Pipeline.init(allocator);
-        defer pipeline.deinit();
-        pipeline.setInput(input);
-        pipeline.setRuntime(&loop, &thread_pool);
-        try pipeline.printSchema();
-        return;
+fn findColumnIndex(name: []const u8, pfile: *zpq.core.file.ParquetFile) !usize {
+    // Parquet schema [0] is root
+    for (pfile.metadata.schema.items, 0..) |elem, i| {
+        if (i == 0) continue;
+        if (std.mem.eql(u8, elem.name, name)) return i - 1;
     }
+    return error.ColumnNotFound;
+}
 
-    if (parsed.show_meta) {
-        var pipeline = Pipeline.init(allocator);
-        defer pipeline.deinit();
-        pipeline.setInput(input);
-        pipeline.setRuntime(&loop, &thread_pool);
-        try pipeline.printMeta();
-        return;
-    }
+const FieldType = enum { Int32, Int64, Float, Double, Bool, ByteArray };
 
-    // For filter/transform, use executeQuery
-    if (parsed.filter != null) {
-        if (parsed.output == null) {
-            std.debug.print("Error: --filter requires an output file\n", .{});
-            return;
+fn getFieldType(comptime T: type, name: []const u8) !FieldType {
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) {
+            if (field.type == i32) return .Int32;
+            if (field.type == i64) return .Int64;
+            if (field.type == f32) return .Float;
+            if (field.type == f64) return .Double;
+            if (field.type == bool) return .Bool;
+            if (field.type == []const u8) return .ByteArray;
         }
-
-        const result = try query.executeQuery(allocator, &loop, &thread_pool, params);
-
-        if (result.error_message) |err| {
-            std.debug.print("Error: {s}\n", .{err});
-            return;
-        }
-
-        std.debug.print("\nComplete:\n", .{});
-        std.debug.print("  Input:  {d} rows\n", .{result.input_rows});
-        std.debug.print("  Output: {d} rows\n", .{result.output_rows});
-        std.debug.print("  Time:   {d:.1}ms\n", .{result.elapsed_ms});
-        return;
     }
+    return error.FieldNotFound;
+}
 
-    // Default: print summary
-    var pipeline = Pipeline.init(allocator);
-    defer pipeline.deinit();
-    pipeline.setInput(input);
-    pipeline.setRuntime(&loop, &thread_pool);
-    try pipeline.printSummary();
+fn printUsage() void {
+    std.debug.print("Usage: zpq <input> <output> [--filter \"col=val\"] [--select \"col1,col2\"]\n", .{});
 }

@@ -80,6 +80,8 @@ pub const InFlightPart = struct {
     start_time: std.time.Instant,
     /// Upload context (set when upload starts)
     upload_ctx: ?*anyopaque = null,
+    /// Whether the upload has been started (to avoid double-starting)
+    upload_started: bool = false,
     /// Whether upload is complete
     done: bool = false,
     /// Error if upload failed
@@ -282,6 +284,21 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             return false;
         }
 
+        /// Process pending part uploads. Call this from the main loop, NOT from callbacks.
+        /// This starts uploads for any parts that have been queued but not yet started.
+        /// Returns true if any uploads were started.
+        pub fn processPendingUploads(self: *Self) !bool {
+            var started_any = false;
+            for (self.in_flight.items) |*part| {
+                if (!part.upload_started and !part.done) {
+                    part.upload_started = true;
+                    try self.startPartUpload(part);
+                    started_any = true;
+                }
+            }
+            return started_any;
+        }
+
         /// Actually perform the multipart init (must be called outside callback context).
         fn doMultipartInit(self: *Self) !void {
             if (self.upload_id != null) return; // Already started
@@ -392,10 +409,11 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
                 return;
             }
 
-            // Backpressure: wait if too many in flight
-            while (self.inFlightCount() >= self.config.max_in_flight) {
-                try self.drainCompleted(false);
-                try self.loop.run(.once);
+            // Backpressure: if too many in flight, defer this flush to the main loop.
+            // The main loop will naturally drain completions before next iteration.
+            // IMPORTANT: Do NOT call loop.run() here - this may be called from a callback!
+            if (self.inFlightCount() >= self.config.max_in_flight) {
+                return; // Defer - main loop will call submitMorsel again after draining
             }
 
             // Assign part number
@@ -442,15 +460,15 @@ pub fn MorselCoordinatorGen(comptime XevApi: type) type {
             self.pending_metadata.clearRetainingCapacity();
             self.pending_buffer.clearRetainingCapacity();
 
-            // Start upload for this part
-            try self.startPartUpload(self.in_flight.items.len - 1);
+            // NOTE: Do NOT call startPartUpload here! The main loop will call
+            // processPendingUploads() to start uploads outside of callback context.
+            // This avoids nested loop.run() which breaks TLS handshake.
         }
 
         /// Start upload for a specific in-flight part.
         /// Currently synchronous - will block until upload completes.
-        /// TODO: Make this truly async with parallel uploads.
-        fn startPartUpload(self: *Self, idx: usize) !void {
-            const part = &self.in_flight.items[idx];
+        /// Must be called from the main loop, NOT from callbacks.
+        fn startPartUpload(self: *Self, part: *InFlightPart) !void {
             const s3w = self.s3_writer orelse return error.NoS3Writer;
             const upload_id = self.upload_id orelse return error.NoUploadId;
 

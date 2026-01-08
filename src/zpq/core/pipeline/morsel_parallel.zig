@@ -446,22 +446,21 @@ pub fn executeWithLoop(self: *Pipeline, comptime XevApi: type, loop: *XevApi.Loo
 
     while (pending.load(.acquire) > 0) {
         // Process any deferred S3 operations (set in callbacks)
-        _ = coordinator.processFlags() catch |err| {
-            std.debug.print("processFlags error: {}\n", .{err});
-            break;
-        };
+        _ = coordinator.processFlags() catch break;
 
-        loop.run(.once) catch |err| {
-            std.debug.print("Loop error: {}\n", .{err});
-            break;
-        };
+        // Start any pending part uploads (deferred from callbacks to avoid nested loop.run)
+        _ = coordinator.processPendingUploads() catch break;
+
+        loop.run(.once) catch break;
     }
 
     // Check for errors and calculate total rows
     var total_output_rows: u64 = 0;
     for (completions, workers) |*c, worker| {
         defer worker.deinit(); // Always cleanup workers
-        if (c.task_error) |err| return err;
+        if (c.task_error) |err| {
+            return err;
+        }
         total_output_rows += worker.row_count;
     }
 

@@ -1,0 +1,51 @@
+# Investigation: S3 Writer TLS Race Condition
+
+## Root Cause: Nested `loop.run()` in xev Callbacks
+
+### Summary
+Writing to S3 fails with `error: TlsNotReady` because the HTTP client's synchronous `request()` method calls `loop.run(.once)` from within an **xev callback**, creating a nested event loop execution. This corrupts TLS handshake state.
+
+### Call Stack
+```
+morsel_parallel.zig:454  loop.run(.once)         <- OUTER loop runs
+  morsel_parallel.zig:538  asyncCallback()       <- xev invokes callback
+    morsel_parallel.zig:597  coordinator.submitMorsel()
+      morsel.zig:341  flushPendingBuffer()
+        morsel.zig:446  startPartUpload()
+          morsel.zig:458  s3w.uploadPartDirect()
+            writer.zig:960  uploadPart()
+              writer.zig:713  doRequest()
+                writer.zig:843  self.client.request()
+                  client.zig:437  loop.run(.once)   <- NESTED loop.run()!
+```
+
+### Why This Breaks TLS
+1. The outer `loop.run(.once)` is processing events.
+2. Inside the `asyncCallback`, we call `submitMorsel()` which synchronously waits for S3.
+3. `client.request()` calls `loop.run(.once)` **again** to wait for TLS handshake.
+4. This nested run can:
+   - Process unrelated events out of order.
+   - Return before the TLS handshake actually completes.
+   - Corrupt internal xev/TLS state.
+5. When the outer callback continues, the connection appears ready but the TLS layer is in an inconsistent state → `TlsNotReady`.
+
+### Evidence
+- The warning "Attempt to encrypt data before handshake complete" comes from `vendor/boring_tls/src/tls_client.zig:244`.
+- The check `if (!self.handshake_complete)` in `writeEncryptedData()` fires because `handshake_complete` is `false` despite `conn.handshake_complete` being `true` (state desync).
+
+## Recommended Fix
+
+### Option 1: Defer S3 Operations (Preferred)
+In [morsel.zig](file:///Users/joshua/code/zpq/src/zpq/core/morsel.zig), `submitMorsel()` should **not** trigger synchronous uploads from within callbacks. Instead:
+- Buffer the morsel and set a flag (`needs_part_upload`).
+- Return immediately from `submitMorsel()`.
+- In [morsel_parallel.zig](file:///Users/joshua/code/zpq/src/zpq/core/pipeline/morsel_parallel.zig)'s main loop (line 448-458), call `coordinator.processPendingUploads()` which does the actual sync upload OUTSIDE the callback context.
+
+This matches the existing `needs_multipart_init` / `processFlags()` pattern already in [morsel.zig](file:///Users/joshua/code/zpq/src/zpq/core/morsel.zig).
+
+### Option 2: Use Async Uploads
+Replace `uploadPartDirect()` with `uploadPartAsync()` that uses `client.requestAsync()`. The callback would set a completion flag rather than blocking.
+
+### Files to Modify
+1. [src/zpq/core/morsel.zig](file:///Users/joshua/code/zpq/src/zpq/core/morsel.zig) - Defer `startPartUpload()` to main loop.
+2. [src/zpq/core/pipeline/morsel_parallel.zig](file:///Users/joshua/code/zpq/src/zpq/core/pipeline/morsel_parallel.zig) - Call `coordinator.processPendingUploads()` in main loop.

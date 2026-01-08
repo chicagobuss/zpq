@@ -15,6 +15,8 @@ pub const QueryParams = struct {
     select: ?[]const u8 = null, // "id,name,created_at"
     mode: ExecutionMode = .slot_parallel,
     compression: zpq.core.schema.CompressionCodec = .SNAPPY,
+    input_format: ?[]const u8 = null,
+    output_format: ?[]const u8 = null,
 
     // Operations (mutually exclusive with filter/output)
     show_schema: bool = false,
@@ -64,8 +66,9 @@ pub fn executeQuery(
     }
 
     // Filter/transform mode requires output
-    if (params.filter != null and params.output == null) {
-        return .{ .error_message = "--filter requires an output file" };
+    // TODO: Support pure transform/copy without filter (requires engine updates)
+    if (params.output != null and params.filter == null) {
+        return .{ .error_message = "--filter is currently required for transformation" };
     }
 
     // Handle surgical mode: enable page-level pruning and use slot_parallel for output

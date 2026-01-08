@@ -52,3 +52,4 @@ CURRENT_CONTEXT.md
 benchmarks/bootstrap
 benchmarks/zpq
 benchmarks/*.zip
+trace.json

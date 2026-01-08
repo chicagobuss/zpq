@@ -74,14 +74,19 @@ const CliArgs = struct {
     show_meta: bool = false,
     mode: ExecutionMode = .slot_parallel,
     compression: zpq.core.schema.CompressionCodec = .SNAPPY,
+    input_format: ?[]const u8 = null,
+    output_format: ?[]const u8 = null,
 };
 
 fn parseCliArgs(args: []const []const u8) ?CliArgs {
-    if (args.len < 2) return null;
-
     var result = CliArgs{};
+    var positionals = std.ArrayList([]const u8){}; // Unmanaged init
+    const allocator = std.heap.page_allocator;
+    defer positionals.deinit(allocator);
+
     var i: usize = 1;
 
+    // Scan for flags and build positional list
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
@@ -94,8 +99,8 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
         } else if (std.mem.eql(u8, arg, "--surgical")) {
             result.mode = .surgical;
         } else if (std.mem.eql(u8, arg, "--serve")) {
-            // Skip --serve and its argument (handled above)
-            i += 1;
+            // Handled in main() - skip
+            continue;
         } else if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
             i += 1;
             if (i >= args.len) {
@@ -110,13 +115,20 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
                 return null;
             }
             result.select = args[i];
-        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+        } else if (std.mem.eql(u8, arg, "--infmt")) {
             i += 1;
             if (i >= args.len) {
-                std.debug.print("Error: --output requires a value\n", .{});
+                std.debug.print("Error: --infmt requires a value (parquet, csv, json)\n", .{});
                 return null;
             }
-            result.output = args[i];
+            result.input_format = args[i];
+        } else if (std.mem.eql(u8, arg, "--outfmt")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --outfmt requires a value (parquet, csv, json)\n", .{});
+                return null;
+            }
+            result.output_format = args[i];
         } else if (std.mem.eql(u8, arg, "--compression") or std.mem.eql(u8, arg, "-c")) {
             i += 1;
             if (i >= args.len) {
@@ -136,17 +148,35 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
                 std.debug.print("Error: Unknown compression '{s}'. Use: none, snappy, zstd, gzip\n", .{comp_str});
                 return null;
             }
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument
-            if (result.input == null) {
-                result.input = arg;
-            } else if (result.output == null) {
-                result.output = arg;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            // Treat as flag unless exactly "--" is handled as positional special case?
+            // But "--" is standard end-of-options?
+            // Use case: zpq input -- -> "--" is output
+            if (std.mem.eql(u8, arg, "--")) {
+                positionals.append(allocator, arg) catch return null;
+            } else {
+                std.debug.print("Error: Unknown option '{s}'\n", .{arg});
+                return null;
             }
         } else {
-            std.debug.print("Error: Unknown option '{s}'\n", .{arg});
-            return null;
+            // Positional argument
+            positionals.append(allocator, arg) catch return null;
         }
+    }
+
+    if (positionals.items.len == 1) {
+        // Inspect Mode: <input>
+        result.input = positionals.items[0];
+        // Default to summary if neither schema/meta specified
+    } else if (positionals.items.len == 2) {
+        // Transform Mode: <input> <output>
+        result.input = positionals.items[0];
+        result.output = positionals.items[1];
+    } else {
+        // 0 or >2 args -> invalid (unless handled by --serve which we checked for help but main handles priority)
+        // Actually main() handles --serve priority *before* calling cliMain.
+        // So here we strictly enforce 1 or 2 positionals.
+        return null;
     }
 
     return result;
@@ -154,42 +184,35 @@ fn parseCliArgs(args: []const []const u8) ?CliArgs {
 
 fn printUsage(exe: []const u8) void {
     std.debug.print(
-        \\Usage: {s} <input> [output] [options]
-        \\
-        \\  Parquet query and transform tool.
+        \\Usage:
+        \\  {s} <input>                   (Inspect/Summary)
+        \\  {s} <input> <output>          (Transform/Query)
         \\
         \\Arguments:
-        \\  input              Input parquet file (local path or s3://)
-        \\  output             Output parquet file (optional, for filter/transform)
+        \\  input              Input file (local/s3) or '--' for stdin
+        \\  output             Output file (local/s3) or '--' for stdout
         \\
         \\Operations:
-        \\  --schema           Print file schema
-        \\  --meta             Print file metadata
+        \\  --schema           Print file schema (Inspect Mode)
+        \\  --meta             Print file metadata (Inspect Mode)
         \\  -f, --filter EXPR  Filter rows (e.g., category=A)
         \\  -s, --select COLS  Select columns (comma-separated)
         \\
-        \\Execution Mode:
-        \\  --surgical         Page-level pruning (minimizes I/O for selective queries)
+        \\Formats:
+        \\  --infmt FMT        Input format: parquet (default), csv, json
+        \\  --outfmt FMT       Output format: parquet (default), csv, json
+        \\                     (If output is '--', default is csv)
         \\
-        \\Output:
-        \\  -o, --output FILE  Output file (alternative to positional)
+        \\Output Options:
         \\  -c, --compression  Compression: none, snappy (default), zstd, gzip
         \\
+        \\Execution:
+        \\  --surgical         Page-level pruning
+        \\
         \\Server Mode:
-        \\  --serve [PORT]     Run as HTTP server (default port: 8080)
+        \\  {s} --serve [PORT]     Run HTTP server
         \\
-        \\Examples:
-        \\  {s} data.parquet --schema
-        \\  {s} data.parquet --meta
-        \\  {s} input.parquet output.parquet --filter category=A
-        \\  {s} input.parquet -o out.parquet --filter id>100 --select id,name
-        \\  {s} s3://bucket/data.parquet --schema
-        \\  {s} --serve 8080
-        \\
-        \\Environment:
-        \\  AWS_LAMBDA_RUNTIME_API  Auto-detected for Lambda mode
-        \\
-    , .{ exe, exe, exe, exe, exe, exe, exe });
+    , .{ exe, exe, exe });
 }
 
 fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -204,7 +227,21 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     };
 
-    // Initialize xev runtime with dynamic backend detection (io_uring -> epoll fallback)
+    // Stdin/Stdout TODOs
+    if (std.mem.eql(u8, input, "--")) {
+        std.debug.print("TODO: Stdin summary not implemented\n", .{});
+        return;
+    }
+
+    if (parsed.output) |out| {
+        if (std.mem.eql(u8, out, "--")) {
+            const fmt = parsed.output_format orelse "csv";
+            std.debug.print("TODO: Stdout support (fmt: {s}) not implemented\n", .{fmt});
+            return;
+        }
+    }
+
+    // Initialize xev runtime (dynamic backend)
     // On single-backend systems (macOS/kqueue), detect() doesn't exist - that's fine.
     if (@hasDecl(xev.Dynamic, "detect")) {
         try xev.Dynamic.detect();
@@ -228,6 +265,8 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .compression = parsed.compression,
         .show_schema = parsed.show_schema,
         .show_meta = parsed.show_meta,
+        .input_format = parsed.input_format,
+        .output_format = parsed.output_format,
     };
 
     // For schema/meta, use the print methods (CLI-friendly output)
@@ -249,20 +288,18 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    // For filter/transform, use executeQuery
-    if (parsed.filter != null) {
-        if (parsed.output == null) {
-            std.debug.print("Error: --filter requires an output file\n", .{});
-            return;
-        }
+    // Mode Dispatch:
+    // If output is present -> Transform/Filter Mode
+    // If output is missing -> Inspect/Summary Mode (unless filter is present which is error)
 
+    if (parsed.output != null) {
+        // Transform Mode (2 positonals)
         // Initialize tracing if requested
         if (std.posix.getenv("ZPQ_TRACE_FILE")) |path| {
             try zpq.trace.initGlobal(allocator, path);
         }
         defer zpq.trace.deinitGlobal();
 
-        // Trace execution
         const zone = zpq.trace.zone("CLI/Execution");
         defer zone.end();
 
@@ -278,12 +315,17 @@ fn cliMain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("  Output: {d} rows\n", .{result.output_rows});
         std.debug.print("  Time:   {d:.1}ms\n", .{result.elapsed_ms});
         return;
-    }
+    } else {
+        // Inspect Mode (1 positional) -> Print Summary
+        if (parsed.filter != null) {
+            std.debug.print("Error: --filter requires an output file (or use '--' for stdout stub)\n", .{});
+            return;
+        }
 
-    // Default: print summary
-    var pipeline = Pipeline.init(allocator);
-    defer pipeline.deinit();
-    pipeline.setInput(input);
-    pipeline.setRuntime(&loop, &thread_pool);
-    try pipeline.printSummary();
+        var pipeline = Pipeline.init(allocator);
+        defer pipeline.deinit();
+        pipeline.setInput(input);
+        pipeline.setRuntime(&loop, &thread_pool);
+        try pipeline.printSummary();
+    }
 }

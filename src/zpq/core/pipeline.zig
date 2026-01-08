@@ -274,7 +274,21 @@ pub const Pipeline = struct {
 
         std.debug.print("Query Summary:\n", .{});
         std.debug.print("  Input: {s}\n", .{self.input_path.?});
-        std.debug.print("  Rows: {d}, Row Groups: {d}\n", .{ meta.num_rows, meta.row_groups.items.len });
+
+        // Determine compression from first column of first row group (heuristic)
+        var compression_str: []const u8 = "unknown";
+        if (meta.row_groups.items.len > 0 and meta.row_groups.items[0].columns.items.len > 0) {
+            if (meta.row_groups.items[0].columns.items[0].meta_data) |md| {
+                compression_str = @tagName(md.codec);
+            }
+        }
+
+        std.debug.print("  Rows: {d}, Row Groups: {d}, Columns: {d}, Compression: {s}\n", .{
+            meta.num_rows,
+            meta.row_groups.items.len,
+            meta.schema.items.len - 1, // Subtract root
+            compression_str,
+        });
         if (self.predicates.len > 0) {
             for (self.predicates) |pred| {
                 const op_str = switch (pred.op) {

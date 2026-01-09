@@ -140,6 +140,32 @@ The goal is to issue N concurrent S3 range requests from a single event loop, ma
 
 Connection reuse provides **6.4x speedup** by eliminating DNS+TLS handshake per request.
 
+### Current State (Jan 9, 2026 - End of Session)
+
+**What's implemented in `src/io/s3.zig`:**
+- ✅ `ConnectionPool` with 4 `PooledConnection` instances
+- ✅ HTTP keep-alive connection reuse (skip DNS/TLS on subsequent requests)
+- ✅ DNS address caching (resolve once, reuse for all connections)
+- ✅ Automatic retry on stale connections (EOF triggers fresh connection)
+- ✅ `readRanges()` API for parallel multi-range fetching
+
+**What's implemented in `src/io/transport.zig`:**
+- ✅ `stopped` flag for caller to signal response complete
+- ✅ Read scheduling after write completes (for keep-alive reuse)
+- ✅ TLS record drain loop (multiple records per TCP read)
+- ✅ Explicit FD close in `deinit()`
+
+**Performance Status:**
+- zpq 100MB S3 benchmark: **~8.3 seconds** (sequential with connection reuse)
+- No improvement yet vs baseline because `ParquetReader` still calls `readAt` sequentially
+
+**What's NOT done (next steps):**
+1. `ParquetReader` needs to use `readRanges()` to prefetch column chunks in parallel
+2. Currently reader does: read page header → read page data → decompress → decode → repeat
+3. Need to batch column chunk reads across row groups and issue them via `readRanges()`
+
+**The bottleneck:** `ColumnReader.loadNextPage()` calls `source.readAt()` synchronously for each page. Even though `readRanges()` is now available, nothing calls it yet. The reader architecture needs to prefetch upcoming pages while processing current ones.
+
 ### Reference: DuckDB Pattern
 
 From `thrift_tools.hpp`:

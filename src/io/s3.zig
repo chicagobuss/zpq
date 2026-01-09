@@ -67,10 +67,105 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 .ptr = self,
                 .vtable = &.{
                     .readAt = readAt,
+                    .readRanges = readRanges,
                     .size = size,
                     .close = close,
                 },
             };
+        }
+
+        /// Read multiple ranges in parallel using the connection pool
+        fn readRanges(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (ranges.len != buffers.len) return error.InvalidArgs;
+            if (ranges.len == 0) return;
+
+            // Fix pool pointers
+            self.pool.source = self;
+            self.pool.fixPointers();
+
+            // Create contexts for all requests
+            var contexts = try self.allocator.alloc(RequestContext, ranges.len);
+            defer self.allocator.free(contexts);
+
+            for (ranges, buffers, 0..) |range, buf, i| {
+                if (buf.len != range.len()) return error.InvalidArgs;
+                contexts[i] = RequestContext{
+                    .source = self,
+                    .method = .GET,
+                    .allocator = self.allocator,
+                    .range_start = range.start,
+                    .range_end = range.end - 1,
+                    .output_buf = buf,
+                    .parser = .{},
+                };
+            }
+
+            // Start up to NUM_CONNECTIONS requests
+            var next_to_start: usize = 0;
+            var completed: usize = 0;
+
+            // Start initial batch
+            for (0..@min(NUM_CONNECTIONS, ranges.len)) |_| {
+                const ctx = &contexts[next_to_start];
+                const pc = self.pool.acquire();
+                ctx.pooled_conn = pc;
+                pc.state = .sending;
+                pc.ensureConnected(ctx) catch |err| {
+                    ctx.err = err;
+                    ctx.done = true;
+                };
+                if (pc.connection_ready) {
+                    ctx.sendRequest() catch |err| {
+                        ctx.err = err;
+                        ctx.done = true;
+                    };
+                }
+                next_to_start += 1;
+            }
+
+            // Run event loop until all complete
+            while (completed < ranges.len) {
+                try self.loop.run(.once);
+
+                // Check for completed requests
+                for (contexts) |*ctx| {
+                    if (ctx.done and ctx.pooled_conn != null) {
+                        const pc = ctx.pooled_conn.?;
+                        if (ctx.err == null) {
+                            pc.markReady();
+                        } else {
+                            pc.markFailed();
+                        }
+                        ctx.pooled_conn = null;
+                        completed += 1;
+
+                        // Start next request if any pending
+                        if (next_to_start < ranges.len) {
+                            const next_ctx = &contexts[next_to_start];
+                            next_ctx.pooled_conn = pc;
+                            pc.state = .sending;
+                            pc.ensureConnected(next_ctx) catch |err| {
+                                next_ctx.err = err;
+                                next_ctx.done = true;
+                            };
+                            if (pc.connection_ready) {
+                                next_ctx.sendRequest() catch |err| {
+                                    next_ctx.err = err;
+                                    next_ctx.done = true;
+                                };
+                            }
+                            next_to_start += 1;
+                        }
+                    }
+                }
+            }
+
+            // Check for errors
+            for (contexts) |ctx| {
+                if (ctx.err) |e| return e;
+                if (ctx.status_code != 200 and ctx.status_code != 206) return error.S3GetFailed;
+            }
         }
 
         fn fetchSize(self: *Self) !void {

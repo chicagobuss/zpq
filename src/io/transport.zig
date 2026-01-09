@@ -3,6 +3,7 @@ const xev_mod = @import("xev");
 const tls_mod = @import("tls.zig");
 
 pub const Address = xev_mod.shim_net.Address;
+pub var global_logger: ?*@import("../zpq/log.zig").AsyncLogger = null;
 
 const log = std.log.scoped(.transport);
 
@@ -20,6 +21,9 @@ pub const Resolver = struct {
 
     pub fn resolve(self: Resolver, loop: anytype, hostname: []const u8, port: u16, context: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, addr: ?Address) void) !void {
         const LoopType = @TypeOf(loop);
+        const is_dynamic = @hasDecl(xev_mod, "Dynamic") and LoopType == *xev_mod.Dynamic.Loop;
+        const AsyncType = if (is_dynamic) xev_mod.Dynamic.Async else xev_mod.Async;
+        const CompletionType = if (is_dynamic) xev_mod.Dynamic.Completion else xev_mod.Completion;
 
         const Task = struct {
             resolver: Resolver,
@@ -28,8 +32,8 @@ pub const Resolver = struct {
             ctx: ?*anyopaque,
             cb: *const fn (ctx: ?*anyopaque, addr: ?Address) void,
             result: ?Address = null,
-            completion: xev_mod.Completion = .{},
-            async_node: xev_mod.Async,
+            completion: CompletionType = .{},
+            async_node: AsyncType,
             tp_task: xev_mod.ThreadPool.Task = undefined,
 
             fn run(t: *xev_mod.ThreadPool.Task) void {
@@ -39,7 +43,9 @@ pub const Resolver = struct {
                 task.async_node.notify() catch {};
             }
 
-            fn onDone(t: ?*@This(), _: LoopType, _: *xev_mod.Completion, res: xev_mod.Async.WaitError!void) xev_mod.CallbackAction {
+            fn onDone(t: ?*@This(), l: LoopType, c: *CompletionType, res: anyerror!void) xev_mod.CallbackAction {
+                _ = l;
+                _ = c;
                 _ = res catch {};
                 const task = t.?;
                 task.cb(task.ctx, task.result);
@@ -56,11 +62,11 @@ pub const Resolver = struct {
             .port = port,
             .ctx = context,
             .cb = callback,
-            .async_node = try xev_mod.Async.init(),
+            .async_node = try AsyncType.init(),
             .tp_task = .{ .callback = Task.run },
         };
 
-        if (comptime @hasDecl(@typeInfo(LoopType).pointer.child, "wait")) {
+        if (@hasDecl(@typeInfo(LoopType).pointer.child, "wait")) {
             try loop.wait(&task.completion, task.async_node, Task, task, Task.onDone);
         } else {
             task.async_node.wait(loop, &task.completion, Task, task, Task.onDone);
@@ -121,8 +127,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
         // State
         closed: bool = false,
         handshake_done: bool = false,
+        stopped: bool = false, // Set by caller to stop reading (e.g., HTTP response complete)
         write_buffer: std.ArrayListUnmanaged(u8) = .{},
         write_in_flight: bool = false,
+        read_in_flight: bool = false,
 
         // Callbacks
         callback_ctx: ?*anyopaque = null,
@@ -144,6 +152,14 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.tls) |*t| t.deinit();
+            // Ensure we close the socket FD to prevent leaks.
+            // libxev wrappers do NOT close the FD on deinit.
+            if (!self.closed) {
+                // Dynamic wrappers use fd() method, static use .fd field
+                const fd = if (@hasDecl(TCP, "fd")) self.tcp.fd() else self.tcp.fd;
+                std.posix.close(fd);
+                self.closed = true;
+            }
             self.write_buffer.deinit(self.allocator);
             self.allocator.destroy(self);
         }
@@ -164,7 +180,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 const encrypted = try t.encrypt(data);
                 if (encrypted) |bytes| {
                     try self.writeRaw(bytes);
-                }
+                } else {}
             } else {
                 try self.writeRaw(data);
             }
@@ -212,18 +228,16 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 } else {
                     self.tcp.write(self.loop, &self.c_write, .{ .slice = bytes }, Self, self, onHandshakeWrite);
                 }
-            } else {
-                // Should not happen as startHandshake returns ClientHello
-            }
+            } else {}
         }
 
         fn onHandshakeWrite(t: ?*Self, _: Loop, _: *Completion, _: TCP, _: Xev.WriteBuffer, res: Xev.WriteError!usize) xev_mod.CallbackAction {
             const self = t.?;
-            self.write_in_flight = false;
             _ = res catch |err| {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 return .disarm;
             };
+            self.write_in_flight = false;
             self.doHandshakeLoop() catch |err| {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
             };
@@ -231,19 +245,16 @@ pub fn ConnectionGen(comptime Xev: type) type {
         }
 
         fn doHandshakeLoop(self: *Self) !void {
-            // After ClientHello or other handshake writes, we usually wait for read.
-            // But BoringSSL might have more data to send without reading.
-            // In our simple state machine, we just call read().
             self.read();
         }
 
         fn onWrite(t: ?*Self, _: Loop, _: *Completion, _: TCP, _: Xev.WriteBuffer, res: Xev.WriteError!usize) xev_mod.CallbackAction {
             const self = t.?;
-            self.write_in_flight = false;
             _ = res catch |err| {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 return .disarm;
             };
+            self.write_in_flight = false;
 
             if (self.write_buffer.items.len > 0) {
                 const data = self.write_buffer.toOwnedSlice(self.allocator) catch |err| {
@@ -259,6 +270,13 @@ pub fn ConnectionGen(comptime Xev: type) type {
         }
 
         pub fn read(self: *Self) void {
+            if (self.stopped or self.closed) {
+                return;
+            }
+            if (self.read_in_flight) {
+                return;
+            }
+            self.read_in_flight = true;
             const buf = self.allocator.alloc(u8, 4096) catch return;
             if (comptime @hasDecl(Xev.Loop, "read")) {
                 self.loop.read(&self.c_read, self.tcp, .{ .slice = buf }, Self, self, onRead) catch {};
@@ -269,6 +287,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
         fn onRead(t: ?*Self, _: Loop, _: *Completion, _: TCP, buf: Xev.ReadBuffer, res: Xev.ReadError!usize) xev_mod.CallbackAction {
             const self = t.?;
+            self.read_in_flight = false;
             const n = res catch |err| {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 self.allocator.free(buf.slice);
@@ -304,19 +323,38 @@ pub fn ConnectionGen(comptime Xev: type) type {
                     };
                     if (out) |to_send| {
                         self.writeRaw(to_send) catch {};
-                    } else if (!self.handshake_done) {
-                        self.read();
                     }
+                    // Schedule next read: either for more handshake data or for response
+                    if (!self.stopped) self.read();
                 } else {
-                    const decrypted = t_client.decrypt(data) catch |err| {
+                    // First decrypt with the new data
+                    const first_decrypted = t_client.decrypt(data) catch |err| {
                         if (self.on_error) |cb| cb(self.callback_ctx, err);
                         self.allocator.free(buf.slice);
                         return .disarm;
                     };
-                    if (decrypted) |plain| {
+                    if (first_decrypted) |plain| {
                         if (self.on_data) |cb| cb(self.callback_ctx, plain) catch {};
                     }
-                    self.read();
+                    // Loop to drain any additional buffered TLS records
+                    while (!self.stopped) {
+                        const more = t_client.decrypt(&[_]u8{}) catch |err| {
+                            // TlsConnectionClosed is expected when server sends close_notify
+                            if (err == error.TlsConnectionClosed) {
+                                self.closed = true;
+                                break;
+                            }
+                            if (self.on_error) |cb| cb(self.callback_ctx, err);
+                            self.allocator.free(buf.slice);
+                            return .disarm;
+                        };
+                        if (more) |plain| {
+                            if (self.on_data) |cb| cb(self.callback_ctx, plain) catch {};
+                        } else {
+                            break; // No more buffered data
+                        }
+                    }
+                    if (!self.stopped and !self.closed) self.read();
                 }
             } else {
                 if (self.on_data) |cb| cb(self.callback_ctx, data) catch {};

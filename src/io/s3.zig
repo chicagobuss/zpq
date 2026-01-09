@@ -238,13 +238,18 @@ fn RequestContext(comptime Xev: type) type {
                 if (self.parser.content_length) |cl| {
                     self.content_length = @intCast(cl);
                 }
+                // Stop the connection from scheduling more reads
+                if (self.source.conn) |conn| {
+                    conn.stopped = true;
+                }
                 self.done = true;
             }
         }
 
         fn onError(ptr: ?*anyopaque, err: anyerror) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            if (self.done) return;
+            // If we already have a complete response, ignore connection close errors
+            if (self.done or self.parser.state == .done) return;
             self.err = err;
             self.done = true;
         }

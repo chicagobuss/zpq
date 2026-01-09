@@ -43,20 +43,14 @@ pub fn main() !void {
     defer args.deinit();
 
     _ = args.next(); // skip exe name
-    const input_path = args.next() orelse {
-        printUsage();
-        return;
-    };
-    const output_path = args.next() orelse {
-        // Output path is required for now as per "zpq <in> <out>"
-        printUsage();
-        return;
-    };
-
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
     var filter_str: ?[]const u8 = null;
     var select_str: ?[]const u8 = null;
+    var log_level: zpq.log.Level = .info;
+    var is_benchmark = false;
 
-    var is_benchmark = std.mem.indexOf(u8, input_path, "benchmark") != null;
+    // First pass: extract all flags and positional arguments
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
             filter_str = args.next();
@@ -64,7 +58,43 @@ pub fn main() !void {
             select_str = args.next();
         } else if (std.mem.eql(u8, arg, "--benchmark")) {
             is_benchmark = true;
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            const level_str = args.next() orelse "info";
+            if (std.mem.eql(u8, level_str, "trace")) {
+                log_level = .trace;
+            } else if (std.mem.eql(u8, level_str, "debug")) {
+                log_level = .debug;
+            } else if (std.mem.eql(u8, level_str, "info")) {
+                log_level = .info;
+            } else if (std.mem.eql(u8, level_str, "warn")) {
+                log_level = .warn;
+            } else if (std.mem.eql(u8, level_str, "err")) {
+                log_level = .err;
+            }
+        } else if (std.mem.eql(u8, arg, "--cid")) {
+            if (args.next()) |cid_str| {
+                zpq.log.correlation_id = std.fmt.parseInt(u64, cid_str, 0) catch 0;
+            }
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            // Unknown flag, ignore or warn?
+            std.debug.print("Warning: Unknown flag '{s}'\n", .{arg});
+        } else {
+            // Positional argument
+            if (input_path == null) {
+                input_path = arg;
+            } else if (output_path == null) {
+                output_path = arg;
+            }
         }
+    }
+
+    if (input_path == null or output_path == null) {
+        printUsage();
+        return;
+    }
+
+    if (!is_benchmark and std.mem.indexOf(u8, input_path.?, "benchmark") != null) {
+        is_benchmark = true;
     }
 
     // Initialize xev loop and thread pool
@@ -74,6 +104,14 @@ pub fn main() !void {
     var loop = try xev.Dynamic.Loop.init(.{});
     defer loop.deinit();
 
+    // Initialize Logger
+    const logger = try zpq.log.AsyncLogger.init(allocator, log_level);
+    defer logger.deinit();
+    try logger.start(&loop);
+
+    // Set global logger for other modules to use
+    zpq.io.transport.global_logger = logger;
+
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
     defer {
         thread_pool.shutdown();
@@ -81,7 +119,7 @@ pub fn main() !void {
     }
 
     // Open Source
-    const source = try zpq.io.factory.openSource(allocator, input_path, .{
+    const source = try zpq.io.factory.openSource(allocator, input_path.?, .{
         .loop = &loop,
         .thread_pool = &thread_pool,
     });
@@ -92,7 +130,7 @@ pub fn main() !void {
     defer pfile.deinit();
 
     if (is_benchmark) {
-        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path);
+        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path.?);
     } else {
         std.debug.print("Full CLI mode (GenericRow) not yet implemented. Use --benchmark for performance testing on known schema.\n", .{});
         return error.UnsupportedMode;
@@ -123,10 +161,36 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
     var timer = try std.time.Timer.start();
 
     const output_to_stdout = std.mem.eql(u8, output_path, "--");
+    const output_to_null = std.mem.eql(u8, output_path, "/dev/null");
+
+    var writer: ?*zpq.core.writer.ParquetWriter = null;
+    var sink_ptr: ?*zpq.io.local_sink.AsyncFileSink = null;
+    if (!output_to_stdout and !output_to_null) {
+        const out_file = try std.fs.cwd().createFile(output_path, .{});
+        sink_ptr = try allocator.create(zpq.io.local_sink.AsyncFileSink);
+        sink_ptr.?.* = zpq.io.local_sink.AsyncFileSink.init(out_file);
+        writer = try zpq.core.writer.ParquetWriter.init(allocator, sink_ptr.?.sink(), pfile.metadata.schema.items);
+    }
+    defer {
+        if (writer) |w| {
+            w.close() catch {};
+            w.deinit();
+        }
+        if (sink_ptr) |s| {
+            allocator.destroy(s);
+        }
+    }
 
     while (total_scanned < total_rows_in_file) {
         const to_scan = @min(batch.len, total_rows_in_file - total_scanned);
         const n = try reader.nextBatch(batch[0..to_scan], filters.items);
+
+        if (writer) |w| {
+            for (batch[0..n]) |row| {
+                try w.appendRow(row);
+            }
+        }
+
         total_active += n;
         total_scanned += to_scan;
 
@@ -134,6 +198,10 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
             // Just print a few rows to verify
             // std.debug.print("Row {d}: {any}\n", .{ total_active, batch[0] });
         }
+    }
+
+    if (writer) |w| {
+        try w.flushRowGroup();
     }
 
     const elapsed = timer.read();

@@ -158,4 +158,98 @@ pub fn build(b: *std.Build) void {
         }),
     });
     check.dependOn(&probe_filter_scan.step);
+
+    const probe_async_log = b.addExecutable(.{
+        .name = "probe-async-log",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_async_log.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+                .{ .name = "xev", .module = libxev_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_async_log);
+    const run_probe_log = b.addRunArtifact(probe_async_log);
+    const probe_log_step = b.step("probe-async-log", "Run the async logger probe");
+    probe_log_step.dependOn(&run_probe_log.step);
+
+    const check_probe_async_log = b.addExecutable(.{
+        .name = "probe-async-log",
+        .root_module = probe_async_log.root_module,
+    });
+    check.dependOn(&check_probe_async_log.step);
+
+    // Probe: Xev Lifecycle
+    const probe_lifecycle = b.addExecutable(.{
+        .name = "probe-xev-lifecycle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_xev_lifecycle.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "xev", .module = libxev_mod },
+            },
+        }),
+    });
+    probe_lifecycle.root_module.omit_frame_pointer = !no_omit_frame_pointer;
+    b.installArtifact(probe_lifecycle);
+
+    const run_cmd_lifecycle = b.addRunArtifact(probe_lifecycle);
+    run_cmd_lifecycle.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd_lifecycle.addArgs(args);
+    }
+    const run_step_lifecycle = b.step("probe-xev-lifecycle", "Run the xev lifecycle probe");
+    run_step_lifecycle.dependOn(&run_cmd_lifecycle.step);
+
+    // Probe: S3 Retry/Leak
+    const probe_retry = b.addExecutable(.{
+        .name = "probe-s3-retry-leak",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_s3_retry_leak.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+                .{ .name = "xev", .module = libxev_mod },
+            },
+        }),
+    });
+    probe_retry.root_module.omit_frame_pointer = !no_omit_frame_pointer;
+    b.installArtifact(probe_retry);
+
+    const run_cmd_retry = b.addRunArtifact(probe_retry);
+    run_cmd_retry.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd_retry.addArgs(args);
+    }
+    const run_step_retry = b.step("probe-s3-retry-leak", "Run the S3 retry/leak probe");
+    run_step_retry.dependOn(&run_cmd_retry.step);
+
+    // Probe: S3 Prefetch (parallel connection pool)
+    const probe_prefetch = b.addExecutable(.{
+        .name = "probe-s3-prefetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_s3_prefetch.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+                .{ .name = "xev", .module = libxev_mod },
+            },
+        }),
+    });
+    probe_prefetch.root_module.omit_frame_pointer = !no_omit_frame_pointer;
+    b.installArtifact(probe_prefetch);
+
+    const run_cmd_prefetch = b.addRunArtifact(probe_prefetch);
+    run_cmd_prefetch.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd_prefetch.addArgs(args);
+    }
+    const run_step_prefetch = b.step("probe-s3-prefetch", "Run the S3 prefetch probe");
+    run_step_prefetch.dependOn(&run_cmd_prefetch.step);
 }

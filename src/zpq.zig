@@ -40,6 +40,8 @@ pub const core = struct {
     pub const writer = @import("core/writer.zig");
 };
 
+pub const log = @import("zpq/log.zig");
+
 /// High-level schema reflection and specialized reader generation.
 pub const schema = struct {
     // The "Polars Killer" comptime implementation lives here,

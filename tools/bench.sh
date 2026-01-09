@@ -249,38 +249,55 @@ if durations:
 
 # --- Commands ---
 cmd_bench() {
-    local what="${1:-}" input="${2:-}" where="${3:-}" output="${4:-}" size="${5:-10mb}" runs="${6:-1}"
+    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}"
 
-    [[ -z "$what" || -z "$input" || -z "$where" || -z "$output" ]] && {
-        echo "Usage: $0 <what> <input> <where> <output> [size] [runs]"
-        echo "  what:   native | serverless"
-        echo "  input:  local | s3"
-        echo "  where:  local | lambda"
-        echo "  output: local | s3"
+    [[ -z "$backend" || -z "$input" || -z "$output" ]] && {
+        echo "Usage: $0 <backend> <input> <output> [size] [runs]"
+        echo "  backend: native | serverless-rie | serverless-lambda"
+        echo "  input:   local | s3"
+        echo "  output:  local | s3"
         exit 1
     }
+
+    # Map backend to context
+    local context="native"
+    local where="local"
+    
+    case "$backend" in
+        native)
+            context="native"
+            where="local"
+            ;;
+        serverless-rie)
+            context="serverless"
+            where="local"
+            ;;
+        serverless-lambda)
+            context="serverless"
+            where="lambda"
+            ;;
+        *)
+            echo "Error: Unknown backend: $backend"
+            exit 1
+            ;;
+    esac
 
     # Validation
     [[ "$where" == "lambda" && "$output" == "local" ]] && { echo "Error: Lambda cannot write to local"; exit 1; }
     [[ "$where" == "lambda" && "$input" == "local" ]] && { echo "Error: Lambda cannot read from local"; exit 1; }
-    [[ "$what" == "native" && "$where" == "lambda" ]] && { echo "Error: Native cannot run in Lambda"; exit 1; }
-
-    local context="$what"
-    [[ "$what" == "serverless" ]] && context="serverless"
 
     local input_path=$(get_input_path "$input" "$size" "$context")
     local output_path=$(get_output_path "$output" "$size")
 
-    info "$what | $input -> $output | $where | $size | $runs runs"
+    info "$backend | $input -> $output | $size | $runs runs"
     info "Input:  $input_path"
     info "Output: $output_path"
     echo ""
 
-    case "$what:$where" in
-        native:local)       run_native "$input_path" "$output_path" "$runs" ;;
-        serverless:local)   run_serverless_local "$input_path" "$output_path" "$runs" ;;
-        serverless:lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" ;;
-        *) echo "Error: Unsupported: $what + $where"; exit 1 ;;
+    case "$backend" in
+        native)             run_native "$input_path" "$output_path" "$runs" ;;
+        serverless-rie)     run_serverless_local "$input_path" "$output_path" "$runs" ;;
+        serverless-lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" ;;
     esac
 }
 

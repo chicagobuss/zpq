@@ -668,6 +668,9 @@ pub fn ParquetReader(comptime T: type) type {
             const limit = @min(out_buf.len, remaining);
             const out = out_buf[0..limit];
 
+            const transport = @import("../io/transport.zig");
+            if (transport.global_logger) |l| l.log(.trace, "reader: nextBatch current_row={d} limit={d}", .{ self.current_row, limit });
+
             // 1. Initialize Selection Vector
             var selection = try selection_mod.SelectionVector.init(self.allocator, out.len);
             defer selection.deinit();
@@ -687,13 +690,16 @@ pub fn ParquetReader(comptime T: type) type {
                 }
 
                 // Early exit if everything filtered
-                if (selection.count() == 0) return 0;
+                if (selection.count() == 0) {
+                    self.current_row += limit;
+                    return 0;
+                }
             }
 
             // 3. Project Phase (Row-Oriented with Run-Skipping)
             var out_idx: usize = 0;
             var scan_idx: usize = 0;
-            var current_run_start: usize = 0; // Fixed: init to 0
+            var current_run_start: usize = 0;
             var looking_for_active = selection.isActive(0);
 
             // Iterate to find runs
@@ -709,15 +715,11 @@ pub fn ParquetReader(comptime T: type) type {
                             if (out_idx >= out.len) break;
 
                             // Read all columns for this row
-                            var any_val = false;
                             inline for (fields, 0..) |field, i| {
                                 if (try self.column_readers[i].next()) |val| {
                                     @field(out[out_idx], field.name) = val;
-                                    any_val = true;
                                 }
                             }
-                            // We assume if one col has value, row exists?
-                            // Parquet requires definition levels sync.
                             out_idx += 1;
                         }
                     } else {
@@ -752,7 +754,7 @@ pub fn ParquetReader(comptime T: type) type {
                 }
             }
 
-            self.current_row += out_idx;
+            self.current_row += limit;
             return out_idx;
         }
     };

@@ -45,15 +45,22 @@ pub const S3 = struct {
         defer allocator.free(path);
 
         var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
-        defer extra_headers.deinit(allocator);
+        defer extra_headers.deinit(allocator); // shallow deinit
+
+        var range_val: ?[]u8 = null;
+        defer if (range_val) |v| allocator.free(v);
 
         if (range) |r| {
-            const range_val = try std.fmt.allocPrint(allocator, "bytes={d}-{d}", .{ r.start, r.end - 1 });
-            try extra_headers.append(allocator, .{ .name = "Range", .value = range_val });
+            range_val = try std.fmt.allocPrint(allocator, "bytes={d}-{d}", .{ r.start, r.end - 1 });
+            try extra_headers.append(allocator, .{ .name = "Range", .value = range_val.? });
         }
 
+        var token_val: ?[]u8 = null;
+        defer if (token_val) |v| allocator.free(v);
+
         if (self.signer.session_token) |token| {
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
+            token_val = try allocator.dupe(u8, token);
+            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
         }
 
         return self.signer.sign(
@@ -84,8 +91,12 @@ pub const S3 = struct {
         var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
+        var token_val: ?[]u8 = null;
+        defer if (token_val) |v| allocator.free(v);
+
         if (self.signer.session_token) |token| {
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
+            token_val = try allocator.dupe(u8, token);
+            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
         }
 
         return self.signer.sign(
@@ -110,8 +121,12 @@ pub const S3 = struct {
         var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
+        var token_val: ?[]u8 = null;
+        defer if (token_val) |v| allocator.free(v);
+
         if (self.signer.session_token) |token| {
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
+            token_val = try allocator.dupe(u8, token);
+            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
         }
 
         return self.signer.sign(
@@ -136,8 +151,12 @@ pub const S3 = struct {
         var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
+        var token_val: ?[]u8 = null;
+        defer if (token_val) |v| allocator.free(v);
+
         if (self.signer.session_token) |token| {
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = try allocator.dupe(u8, token) });
+            token_val = try allocator.dupe(u8, token);
+            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
         }
 
         return self.signer.sign(

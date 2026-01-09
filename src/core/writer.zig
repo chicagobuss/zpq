@@ -170,9 +170,19 @@ pub const ParquetWriter = struct {
     }
 
     pub fn appendRow(self: *ParquetWriter, values: anytype) !void {
-        inline for (values, 0..) |v, i| {
-            if (i < self.columns.len) {
-                try self.columns[i].append(v);
+        const T = @TypeOf(values);
+        const info = @typeInfo(T);
+        if (info == .@"struct") {
+            inline for (info.@"struct".fields, 0..) |field, i| {
+                if (i < self.columns.len) {
+                    try self.columns[i].append(@field(values, field.name));
+                }
+            }
+        } else {
+            inline for (values, 0..) |v, i| {
+                if (i < self.columns.len) {
+                    try self.columns[i].append(v);
+                }
             }
         }
         self.total_rows += 1;

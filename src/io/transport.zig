@@ -265,6 +265,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
                     if (self.on_error) |cb| cb(self.callback_ctx, err);
                 };
                 self.allocator.free(data);
+            } else if (self.handshake_done) {
+                // After writing application data, schedule a read for the response
+                // This is essential for HTTP keep-alive connection reuse
+                self.read();
             }
             return .disarm;
         }

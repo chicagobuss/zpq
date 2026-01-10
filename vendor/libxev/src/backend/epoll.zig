@@ -1026,8 +1026,8 @@ pub const Completion = struct {
 
             .pread => |*op| res: {
                 const n_ = switch (op.buffer) {
-                    .slice => |v| posix.pread(op.fd, v, op.offset),
-                    .array => |*v| posix.pread(op.fd, v, op.offset),
+                    .slice => |v| std.os.linux.pread(op.fd, v, op.offset),
+                    .array => |*v| std.os.linux.pread(op.fd, v, op.offset),
                 };
 
                 break :res .{
@@ -1047,8 +1047,8 @@ pub const Completion = struct {
 
             .pwrite => |*op| .{
                 .pwrite = switch (op.buffer) {
-                    .slice => |v| posix.pwrite(op.fd, v, op.offset),
-                    .array => |*v| posix.pwrite(op.fd, v.array[0..v.len], op.offset),
+                    .slice => |v| std.os.linux.pwrite(op.fd, v, op.offset),
+                    .array => |*v| std.os.linux.pwrite(op.fd, v.array[0..v.len], op.offset),
                 },
             },
 
@@ -1383,7 +1383,6 @@ pub const ConnectError = posix.EpollCtlError || posix.ConnectError || error{
 
 pub const ReadError = ThreadPoolError || posix.EpollCtlError ||
     posix.ReadError ||
-    posix.PReadError ||
     posix.RecvFromError ||
     error{
         DupFailed,
@@ -1393,7 +1392,7 @@ pub const ReadError = ThreadPoolError || posix.EpollCtlError ||
 
 pub const WriteError = ThreadPoolError || posix.EpollCtlError ||
     posix.WriteError ||
-    posix.PWriteError ||
+
     posix.SendError ||
     posix.SendMsgError ||
     error{

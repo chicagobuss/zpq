@@ -97,12 +97,30 @@ pub fn ColumnReader(comptime T: type) type {
 
             if (header.type == .DICTIONARY_PAGE) {
                 const num_values: usize = @intCast(header.dictionary_page_header.?.num_values);
-                const bytes_needed = num_values * @sizeOf(T);
-                if (uncompressed_data.len < bytes_needed) return error.DictionaryTooSmall;
+                
+                if (T == []const u8) {
+                     // Alloc array of slices
+                     const dict_array = try self.arena.allocator().alloc([]const u8, num_values);
+                     var pos: usize = 0;
+                     for (0..num_values) |i| {
+                         if (pos + 4 > uncompressed_data.len) return error.DictionaryTruncated;
+                         const len = std.mem.readInt(u32, uncompressed_data[pos..][0..4], .little);
+                         pos += 4;
+                         
+                         if (pos + len > uncompressed_data.len) return error.DictionaryTruncated;
+                         dict_array[i] = uncompressed_data[pos..][0..len];
+                         pos += len;
+                     }
+                     self.dictionary = dict_array;
+                } else {
+                    // Fixed width types (Int/Float)
+                    const bytes_needed = num_values * @sizeOf(T);
+                    if (uncompressed_data.len < bytes_needed) return error.DictionaryTooSmall;
 
-                // Align and cast dictionary data
-                const dict_slice = std.mem.bytesAsSlice(T, uncompressed_data[0..bytes_needed]);
-                self.dictionary = dict_slice;
+                    // Align and cast dictionary data
+                    const dict_slice = std.mem.bytesAsSlice(T, uncompressed_data[0..bytes_needed]);
+                    self.dictionary = dict_slice;
+                }
 
                 return try self.loadNextPage();
             }
@@ -150,6 +168,8 @@ pub fn ColumnReader(comptime T: type) type {
                 // Read bit width (1 byte)
                 const bit_width = page.data[page.pos];
                 page.pos += 1;
+                // std.debug.print("initDecoders: Page {d} - Encoding {s}, bit_width={d}, data_len={d}, pos={d}\n", 
+                //    .{self.current_page.?.values_read, @tagName(enc), bit_width, page.data.len, page.pos});
 
                 // Initialize RLE decoder for indices
                 if (page.pos < page.data.len) {
@@ -276,6 +296,13 @@ pub fn ColumnReader(comptime T: type) type {
                                 const total_bits = @as(usize, self.bit_offset) + non_null_count;
                                 page.pos += total_bits / 8;
                                 self.bit_offset = @intCast(total_bits % 8);
+                            } else if (T == []const u8) {
+                                // PLAIN strings are length-prefixed
+                                for (0..non_null_count) |_| {
+                                    if (page.pos + 4 > page.data.len) return error.UnexpectedEOF;
+                                    const len = std.mem.readInt(u32, page.data[page.pos..][0..4], .little);
+                                    page.pos += 4 + len;
+                                }
                             } else {
                                 const size = @sizeOf(T);
                                 page.pos += non_null_count * size;
@@ -587,6 +614,7 @@ pub fn ParquetReader(comptime T: type) type {
 
         // Tuple of ColumnReaders, one for each field in T
         column_readers: ColumnReaderTuple(T),
+        selection_mask: [fields.len]bool,
 
         current_row: usize = 0,
         total_rows: usize,
@@ -598,6 +626,7 @@ pub fn ParquetReader(comptime T: type) type {
                 .allocator = allocator,
                 .row_group_arena = std.heap.ArenaAllocator.init(allocator),
                 .column_readers = undefined,
+                .selection_mask = [_]bool{true} ** fields.len,
                 .current_row = 0,
                 .total_rows = @intCast(file.metadata.num_rows),
             };
@@ -609,6 +638,10 @@ pub fn ParquetReader(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             self.row_group_arena.deinit();
             self.allocator.destroy(self);
+        }
+
+        pub fn setProjection(self: *Self, mask: [fields.len]bool) void {
+            self.selection_mask = mask;
         }
 
         fn initColumnReaders(self: *Self) !void {
@@ -716,8 +749,10 @@ pub fn ParquetReader(comptime T: type) type {
 
                             // Read all columns for this row
                             inline for (fields, 0..) |field, i| {
-                                if (try self.column_readers[i].next()) |val| {
-                                    @field(out[out_idx], field.name) = val;
+                                if (self.selection_mask[i]) {
+                                    if (try self.column_readers[i].next()) |val| {
+                                        @field(out[out_idx], field.name) = val;
+                                    }
                                 }
                             }
                             out_idx += 1;
@@ -725,7 +760,9 @@ pub fn ParquetReader(comptime T: type) type {
                     } else {
                         // Inactive: Skip rows
                         inline for (fields, 0..) |_, i| {
-                            _ = try self.column_readers[i].skip(run_len);
+                            if (self.selection_mask[i]) {
+                                _ = try self.column_readers[i].skip(run_len);
+                            }
                         }
                     }
                     current_run_start = scan_idx;
@@ -741,15 +778,19 @@ pub fn ParquetReader(comptime T: type) type {
                     for (0..run_len) |_| {
                         if (out_idx >= out.len) break;
                         inline for (fields, 0..) |field, i| {
-                            if (try self.column_readers[i].next()) |val| {
-                                @field(out[out_idx], field.name) = val;
+                            if (self.selection_mask[i]) {
+                                if (try self.column_readers[i].next()) |val| {
+                                    @field(out[out_idx], field.name) = val;
+                                }
                             }
                         }
                         out_idx += 1;
                     }
                 } else {
                     inline for (fields, 0..) |_, i| {
-                        _ = try self.column_readers[i].skip(run_len);
+                        if (self.selection_mask[i]) {
+                            _ = try self.column_readers[i].skip(run_len);
+                        }
                     }
                 }
             }

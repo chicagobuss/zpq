@@ -138,10 +138,22 @@ pub fn main() !void {
 }
 
 fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8) !void {
-    _ = select_str; // TODO: Implement projection
-
     var reader = try zpq.core.reader.ParquetReader(T).init(allocator, pfile);
     defer reader.deinit();
+
+    if (select_str) |s| {
+        var mask = [_]bool{false} ** @typeInfo(T).@"struct".fields.len;
+        var it = std.mem.tokenizeScalar(u8, s, ',');
+        while (it.next()) |col_name_raw| {
+            const col_name = std.mem.trim(u8, col_name_raw, " ");
+            inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+                if (std.mem.eql(u8, field.name, col_name)) {
+                    mask[i] = true;
+                }
+            }
+        }
+        reader.setProjection(mask);
+    }
 
     var filters = std.ArrayListUnmanaged(zpq.core.filter.Filter){};
     defer filters.deinit(allocator);
@@ -166,9 +178,12 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
     var writer: ?*zpq.core.writer.ParquetWriter = null;
     var sink_ptr: ?*zpq.io.local_sink.AsyncFileSink = null;
     if (!output_to_stdout and !output_to_null) {
-        const out_file = try std.fs.cwd().createFile(output_path, .{});
+        const out_path_z = try allocator.dupeZ(u8, output_path);
+        defer allocator.free(out_path_z);
+        const out_fd = try std.posix.open(out_path_z, std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+        
         sink_ptr = try allocator.create(zpq.io.local_sink.AsyncFileSink);
-        sink_ptr.?.* = zpq.io.local_sink.AsyncFileSink.init(out_file);
+        sink_ptr.?.* = zpq.io.local_sink.AsyncFileSink.init(out_fd);
         writer = try zpq.core.writer.ParquetWriter.init(allocator, sink_ptr.?.sink(), pfile.metadata.schema.items);
     }
     defer {
@@ -222,7 +237,9 @@ fn parseFilter(comptime T: type, filter_str: []const u8, pfile: *zpq.core.file.P
         .ByteArray => .{ .ByteArray = .{ .col_idx = col_idx, .pred = .Eq, .val = val_str } },
         .Int32 => .{ .Int32 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i32, val_str, 10) } },
         .Int64 => .{ .Int64 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i64, val_str, 10) } },
-        else => return error.UnsupportedFilterType,
+        .Float => .{ .Float = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseFloat(f32, val_str) } },
+        .Double => .{ .Double = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseFloat(f64, val_str) } },
+        .Bool => .{ .Bool = .{ .col_idx = col_idx, .pred = .Eq, .val = std.mem.eql(u8, val_str, "true") } },
     };
 }
 

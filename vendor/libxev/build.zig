@@ -176,15 +176,15 @@ fn buildBenchmarks(
     var steps: std.ArrayList(*Step.Compile) = .empty;
     defer steps.deinit(alloc);
 
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
+    var dir = try std.Io.Dir.cwd().openDir(b.graph.io, try b.build_root.join(
         b.allocator,
         &.{ "src", "bench" },
     ), .{ .iterate = true });
-    defer dir.close();
+    defer dir.close(b.graph.io);
 
     // Go through and add each as a step
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(b.graph.io)) |entry| {
         // Get the index of the last '.' so we can strip the extension.
         const index = std.mem.lastIndexOfScalar(
             u8,
@@ -227,15 +227,15 @@ fn buildExamples(
     var steps: std.ArrayList(*Step.Compile) = .empty;
     defer steps.deinit(alloc);
 
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
+    var dir = try std.Io.Dir.cwd().openDir(b.graph.io, try b.build_root.join(
         b.allocator,
         &.{"examples"},
     ), .{ .iterate = true });
-    defer dir.close();
+    defer dir.close(b.graph.io);
 
     // Go through and add each as a step
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(b.graph.io)) |entry| {
         // Get the index of the last '.' so we can strip the extension.
         const index = std.mem.lastIndexOfScalar(
             u8,
@@ -302,14 +302,14 @@ fn manPages(b: *std.Build) ![]const *Step {
     var steps: std.ArrayList(*Step) = .empty;
     defer steps.deinit(alloc);
 
-    var dir = try std.fs.cwd().openDir(try b.build_root.join(
+    var dir = try std.Io.Dir.cwd().openDir(b.graph.io, try b.build_root.join(
         b.allocator,
         &.{"docs"},
     ), .{ .iterate = true });
-    defer dir.close();
+    defer dir.close(b.graph.io);
 
     var it = dir.iterate();
-    while (try it.next()) |*entry| {
+    while (try it.next(b.graph.io)) |*entry| {
         // Filenames must end in "{section}.scd" and sections are
         // single numerals.
         const base = entry.name[0 .. entry.name.len - 4];

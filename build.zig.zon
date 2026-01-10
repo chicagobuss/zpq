@@ -4,7 +4,7 @@
     .fingerprint = 0xae1a0cc8c4cc362f,
     // Pin Zig version for vendor compat (libxev, boring_tls, minish)
     // TODO: Update vendored deps for latest Zig master
-    .minimum_zig_version = "0.16.0-dev.1657+985a3565c",
+    .minimum_zig_version = "0.16.0-dev.1912+0cbaaa5eb",
     .dependencies = .{
         .boring_tls = .{
             .path = "vendor/boring_tls",

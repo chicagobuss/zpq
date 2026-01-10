@@ -340,5 +340,8 @@ validate-compare *args:
 remote-bench:
     ./tools/remote_bench.sh
 
-bench-sweep:
+lambda-memory-sweep:
     ./tools/bench_memory_sweep.sh
+
+bench-sweep:
+    ./tools/bench_sweep.py

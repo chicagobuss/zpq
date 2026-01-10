@@ -24,10 +24,12 @@ pub fn build(b: *std.Build) !void {
         const crypto_path = b.fmt("prebuilt/{s}/libcrypto.a", .{triple});
         const ssl_path = b.fmt("prebuilt/{s}/libssl.a", .{triple});
 
-        // Check if files exist via std.fs (relative to build.zig)
-        const build_root = b.build_root.handle;
-        if (build_root.access(crypto_path, .{}) catch null != null and
-            build_root.access(ssl_path, .{}) catch null != null)
+        // Check if files exist
+        const crypto_file_path = b.path(crypto_path).getPath(b);
+        const ssl_file_path = b.path(ssl_path).getPath(b);
+
+        if (std.Io.Dir.accessAbsolute(b.graph.io, crypto_file_path, .{}) catch null != null and
+            std.Io.Dir.accessAbsolute(b.graph.io, ssl_file_path, .{}) catch null != null)
         {
             found_prebuilt = true;
         } else if (fetch_prebuilt) {
@@ -51,7 +53,7 @@ pub fn build(b: *std.Build) !void {
         crypto_sources.ensureTotalCapacity(arena.allocator(), 200) catch @panic("OOM");
 
         const full_path = boringssl_dep.path("crypto/aes").getPath(b);
-        try glob_sources(arena.allocator(), full_path, ".cc", &crypto_sources);
+        try glob_sources(b.graph.io, arena.allocator(), full_path, ".cc", &crypto_sources);
 
         crypto = try buildBoringCrypto(
             b,
@@ -182,8 +184,8 @@ fn buildBoringCrypto(
 
     for (crypto_dirs) |dir| {
         const full_dir_path = boringssl_dep.path(dir).getPath(b);
-        glob_sources_relative(arena.allocator(), full_dir_path, boringssl_root, ".cc", &crypto_sources) catch continue;
-        glob_sources_relative(arena.allocator(), full_dir_path, boringssl_root, ".c", &crypto_sources) catch continue;
+        glob_sources_relative(b.graph.io, arena.allocator(), full_dir_path, boringssl_root, ".cc", &crypto_sources) catch continue;
+        glob_sources_relative(b.graph.io, arena.allocator(), full_dir_path, boringssl_root, ".c", &crypto_sources) catch continue;
     }
 
     // Build flags for crypto - target-specific arch defines for hardware acceleration
@@ -457,20 +459,25 @@ fn buildBoringSSLSSL(
 }
 
 pub fn glob_sources(
+    io: std.Io,
     allocator: std.mem.Allocator,
     base: []const u8,
     ext: []const u8,
     paths: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = try std.fs.cwd().openDir(base, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, base, .{ .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         const path_ext = std.fs.path.extension(entry.path);
         if (std.mem.eql(u8, path_ext, ext)) {
+            // Need relative path from module root, but here we are gathering absolute paths?
+            // Actually addCSourceFiles expects paths relative to root, OR absolute paths if using .files (which we are).
+            // However, the original code joined base + entry.path.
+            // Let's stick to that but keep in mind addCSourceFiles behavior.
             const path = try std.fs.path.join(allocator, &.{ base, entry.path });
             try paths.append(allocator, path);
         }
@@ -478,19 +485,20 @@ pub fn glob_sources(
 }
 
 pub fn glob_sources_relative(
+    io: std.Io,
     allocator: std.mem.Allocator,
     search_dir: []const u8,
     root_dir: []const u8,
     ext: []const u8,
     paths: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = try std.fs.cwd().openDir(search_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, search_dir, .{ .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         const path_ext = std.fs.path.extension(entry.path);
         if (std.mem.eql(u8, path_ext, ext)) {
             if (shouldSkipFile(entry.path)) {
@@ -525,27 +533,30 @@ fn shouldSkipFile(file_path: []const u8) bool {
 
 /// Fetch pre-built BoringSSL artifacts from Cloudflare R2
 fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
-    const prebuilt_dir = b.fmt("prebuilt/{s}", .{triple});
+    const prebuilt_rel = b.fmt("prebuilt/{s}", .{triple});
+    const prebuilt_abs = b.path(prebuilt_rel).getPath(b);
 
     // Create the prebuilt directory
-    const build_root = b.build_root.handle;
-    build_root.makePath(prebuilt_dir) catch |err| {
-        std.log.err("Failed to create prebuilt directory: {}", .{err});
-        return err;
+    std.Io.Dir.createDirAbsolute(b.graph.io, prebuilt_abs, @enumFromInt(0o755)) catch |err| {
+        // Ignore if exists (error.PathAlreadyExists)
+        if (err != error.PathAlreadyExists) {
+             std.log.err("Failed to create prebuilt directory {s}: {}", .{ prebuilt_abs, err });
+             return err;
+        }
     };
 
     // Get absolute path to build root for curl
-    const abs_root = build_root.realpathAlloc(b.allocator, ".") catch {
-        std.log.err("Failed to get absolute path", .{});
-        return error.PathError;
-    };
+    // We already have prebuilt_abs which is where we want to put files.
+    // The original code calculated abs_root then joined. 
+    // We can just use prebuilt_abs directly in full_dest.
 
     // Files to fetch
     const files = [_][]const u8{ "libcrypto.a", "libssl.a" };
 
     for (files) |filename| {
         const url = b.fmt("{s}/boring_tls/{s}/{s}", .{ R2_PUBLIC_URL, triple, filename });
-        const full_dest = b.fmt("{s}/{s}/{s}", .{ abs_root, prebuilt_dir, filename });
+        // Use prebuilt_abs directly
+        const full_dest = b.fmt("{s}/{s}", .{ prebuilt_abs, filename });
 
         std.log.info("Fetching {s}...", .{filename});
 
@@ -555,7 +566,7 @@ fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
             b.allocator,
         );
 
-        const term = child.spawnAndWait() catch |err| {
+        const term = child.spawnAndWait(b.graph.io) catch |err| {
             std.log.err("Failed to spawn curl: {}", .{err});
             return err;
         };

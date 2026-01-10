@@ -35,14 +35,18 @@ pub fn openSource(allocator: std.mem.Allocator, path: []const u8, options: Facto
         s3_source.* = try S3Source.init(allocator, @ptrCast(options.loop.?), options.thread_pool.?, s3_config, bucket, key);
         return s3_source.randomAccessSource();
     } else {
-        var file = try std.fs.cwd().openFile(path, .{});
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        const fd = try std.posix.open(path_z, std.posix.O{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        
         var local_source = try allocator.create(local.AsyncFileSource);
         errdefer {
             allocator.destroy(local_source);
-            file.close();
+            std.posix.close(fd);
         }
 
-        local_source.* = try local.AsyncFileSource.init(allocator, file);
+        local_source.* = try local.AsyncFileSource.init(allocator, fd);
         return local_source.randomAccessSource();
     }
 }

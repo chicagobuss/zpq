@@ -21,10 +21,13 @@ pub fn main() !void {
 
     // 1. Open local file
     const path = "data/parquet-testing/data/alltypes_plain.parquet";
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    // Use O_RDONLY (0) usually, but with proper struct
+    const fd = try std.posix.open(path_z, std.posix.O{ .ACCMODE = .RDONLY }, 0);
+    defer std.posix.close(fd);
 
-    var source = try zpq.io.local.AsyncFileSource.init(allocator, file);
+    var source = try zpq.io.local.AsyncFileSource.init(allocator, fd);
     var pfile = zpq.core.file.ParquetFile.init(allocator, source.randomAccessSource());
     try pfile.readFooter();
     defer pfile.deinit();

@@ -9,12 +9,13 @@ trigger: always_on
 - **Python**: Use `.venv` and manage deps with `uv`. Scripts in `tools/`.
 
 ## Testing and Benchmarking
-- **Standard Benchmark File**: [data/benchmark/benchmark_100mb.parquet](cci:7://file:///home/joshua/code/zpq/data/benchmark/benchmark_100mb.parquet:0:0-0:0).
+- **Standard Benchmark File**: [data/benchmark/benchmark_100mb.parquet]
 - **S3 Benchmark Path**: `s3://$AWS_S3_BUCKET/zpq_test_data/benchmark/benchmark_100mb.parquet`.
 - **Environment**: Always source `.env` for cloud benchmarks (contains `AWS_S3_BUCKET` and credentials).
 - **Core Benchmarks**:
   - `just bench native local local local`: Local-to-local scan.
   - `just bench native s3 local s3 100mb 3`: S3-to-S3 scan (3 runs).
+  - `just bench-sweep` for all types
   - `just bench serverless s3 lambda s3`: Real AWS Lambda test.
   - `just engine duckdb s3 100mb`: Compare against DuckDB on S3 data.
   - `just zig-bench e2e <path>`: Direct native scan without `bench.sh` wrapper.

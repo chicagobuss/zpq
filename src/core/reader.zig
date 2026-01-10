@@ -593,19 +593,58 @@ pub fn ColumnReader(comptime T: type) type {
     };
 }
 
+pub const MemorySource = struct {
+    buffer: []const u8,
+
+    pub fn init(buffer: []const u8) MemorySource {
+        return .{ .buffer = buffer };
+    }
+
+    pub fn randomAccessSource(self: *MemorySource) io.RandomAccessSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .readAt = readAt,
+                .size = size,
+                .close = close,
+                .getSlice = getSlice,
+            },
+        };
+    }
+
+    fn readAt(ptr: *anyopaque, offset: u64, buf: []u8) anyerror!usize {
+        const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        if (offset >= self.buffer.len) return 0;
+        const available = self.buffer.len - offset;
+        const to_read = @min(@as(usize, @intCast(buf.len)), @as(usize, @intCast(available)));
+        @memcpy(buf[0..to_read], self.buffer[offset .. offset + to_read]);
+        return to_read;
+    }
+
+    fn size(ptr: *anyopaque) u64 {
+        const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        return self.buffer.len;
+    }
+
+    fn close(ptr: *anyopaque) void {
+        _ = ptr;
+    }
+
+    fn getSlice(ptr: *anyopaque, offset: u64, len: u64) ?[]const u8 {
+        const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        if (offset + len > self.buffer.len) return null;
+        return self.buffer[offset .. offset + len];
+    }
+};
+
 /// ParquetReader(T) analyzes a user-defined struct at COMPTIME.
 /// It creates a specialized, branchless reader for exactly the fields in T.
 pub fn ParquetReader(comptime T: type) type {
     const type_info = @typeInfo(T);
-    if (type_info != .@"struct") {
-        @compileError("ParquetReader requires a struct type, found " ++ @typeName(T));
-    }
-
     const fields = type_info.@"struct".fields;
-
+    
     return struct {
         const Self = @This();
-
         file: *file_mod.ParquetFile,
         allocator: std.mem.Allocator,
 
@@ -615,6 +654,7 @@ pub fn ParquetReader(comptime T: type) type {
         // Tuple of ColumnReaders, one for each field in T
         column_readers: ColumnReaderTuple(T),
         selection_mask: [fields.len]bool,
+        column_buffers: ?[]const []u8 = null,
 
         current_row: usize = 0,
         total_rows: usize,
@@ -629,6 +669,7 @@ pub fn ParquetReader(comptime T: type) type {
                 .selection_mask = [_]bool{true} ** fields.len,
                 .current_row = 0,
                 .total_rows = @intCast(file.metadata.num_rows),
+                .column_buffers = null,
             };
 
             try self.initColumnReaders();
@@ -636,12 +677,63 @@ pub fn ParquetReader(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.column_buffers) |bufs| {
+                for (bufs) |buf| self.allocator.free(buf);
+                self.allocator.free(bufs);
+            }
             self.row_group_arena.deinit();
             self.allocator.destroy(self);
         }
 
         pub fn setProjection(self: *Self, mask: [fields.len]bool) void {
             self.selection_mask = mask;
+        }
+
+        fn prefetchRowGroup(self: *Self) !void {
+            if (self.file.metadata.row_groups.items.len == 0) return;
+            const row_group = self.file.metadata.row_groups.items[0]; 
+            
+            var ranges = std.ArrayListUnmanaged(io.Range){};
+            defer ranges.deinit(self.allocator);
+            var buffers = std.ArrayListUnmanaged([]u8){};
+            defer buffers.deinit(self.allocator);
+            
+            // Collect ranges for all selected columns
+            inline for (fields, 0..) |field, i| {
+                if (self.selection_mask[i]) {
+                    const col_idx = try self.findColumnIndex(field.name);
+                    const col_meta = row_group.columns.items[col_idx].meta_data.?;
+                    const offset = if (col_meta.dictionary_page_offset) |o| o else col_meta.data_page_offset;
+                    const len = col_meta.total_compressed_size;
+                    
+                    try ranges.append(self.allocator, .{ .start = @intCast(offset), .end = @intCast(offset + len) });
+                    const buf = try self.allocator.alloc(u8, @intCast(len));
+                    try buffers.append(self.allocator, buf);
+                }
+            }
+            
+            if (ranges.items.len > 0) {
+                try self.file.source.readRanges(ranges.items, buffers.items);
+            }
+            
+            // Wrap each buffer in a MemorySource and update ColumnReaders
+            var bufs = try self.allocator.alloc([]u8, ranges.items.len);
+            @memcpy(bufs, buffers.items);
+            self.column_buffers = bufs;
+            
+            var buf_idx: usize = 0;
+            inline for (fields, 0..) |_, i| {
+                if (self.selection_mask[i]) {
+                    const buf = bufs[buf_idx];
+                    buf_idx += 1;
+                    
+                    const mem_source_ptr = try self.row_group_arena.allocator().create(MemorySource);
+                    mem_source_ptr.* = MemorySource.init(buf);
+                    
+                    self.column_readers[i].source = mem_source_ptr.randomAccessSource();
+                    self.column_readers[i].chunk_offset = 0;
+                }
+            }
         }
 
         fn initColumnReaders(self: *Self) !void {
@@ -697,6 +789,11 @@ pub fn ParquetReader(comptime T: type) type {
         pub fn nextBatch(self: *Self, out_buf: []T, filters: []const filter_mod.Filter) !usize {
             const remaining = self.total_rows - self.current_row;
             if (remaining == 0) return 0;
+
+            // Ensure we have prefetched the row group
+            if (self.column_buffers == null) {
+                try self.prefetchRowGroup();
+            }
 
             const limit = @min(out_buf.len, remaining);
             const out = out_buf[0..limit];

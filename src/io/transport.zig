@@ -129,6 +129,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
         handshake_done: bool = false,
         stopped: bool = false, // Set by caller to stop reading (e.g., HTTP response complete)
         write_buffer: std.ArrayListUnmanaged(u8) = .{},
+        current_write_buf: ?[]const u8 = null,
         write_in_flight: bool = false,
         read_in_flight: bool = false,
 
@@ -152,6 +153,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.tls) |*t| t.deinit();
+            if (self.current_write_buf) |buf| {
+                self.allocator.free(buf);
+                self.current_write_buf = null;
+            }
             // Ensure we close the socket FD to prevent leaks.
             // libxev wrappers do NOT close the FD on deinit.
             if (!self.closed) {
@@ -193,10 +198,14 @@ pub fn ConnectionGen(comptime Xev: type) type {
             }
 
             self.write_in_flight = true;
+            // Always copy data to ensure validity during async operation
+            const buf = try self.allocator.dupe(u8, data);
+            self.current_write_buf = buf;
+            
             if (comptime @hasDecl(Xev.Loop, "write")) {
-                try self.loop.write(&self.c_write, self.tcp, .{ .slice = data }, Self, self, onWrite);
+                try self.loop.write(&self.c_write, self.tcp, .{ .slice = buf }, Self, self, onWrite);
             } else {
-                self.tcp.write(self.loop, &self.c_write, .{ .slice = data }, Self, self, onWrite);
+                self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, onWrite);
             }
         }
 
@@ -255,12 +264,22 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 return .disarm;
             };
             self.write_in_flight = false;
+            
+            // Clean up the buffer from the write that just completed
+            if (self.current_write_buf) |buf| {
+                self.allocator.free(buf);
+                self.current_write_buf = null;
+            }
 
             if (self.write_buffer.items.len > 0) {
                 const data = self.write_buffer.toOwnedSlice(self.allocator) catch |err| {
                     if (self.on_error) |cb| cb(self.callback_ctx, err);
                     return .disarm;
                 };
+                // writeRaw will dupe this again, so we can free our copy immediately? 
+                // No, we must free `data` AFTER writeRaw returns because writeRaw dupes it.
+                // Yes, checking writeRaw impl above: it calls dupe(data). 
+                // So `data` (owned slice) can be freed after writeRaw returns.
                 self.writeRaw(data) catch |err| {
                     if (self.on_error) |cb| cb(self.callback_ctx, err);
                 };
@@ -297,7 +316,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 self.allocator.free(buf.slice);
                 return .disarm;
             };
-
+            
             if (n == 0) {
                 self.closed = true;
                 self.allocator.free(buf.slice);

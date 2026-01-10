@@ -7,7 +7,8 @@ const sigv4 = @import("../protocol/sigv4.zig");
 const xev_mod = @import("xev");
 
 /// Number of parallel connections in the pool
-const NUM_CONNECTIONS = 4;
+const NUM_CONNECTIONS = 16;
+const COALESCE_THRESHOLD = 64 * 1024; // 64KB
 
 pub fn AsyncS3SourceGen(comptime Xev: type) type {
     const Loop = *Xev.Loop;
@@ -51,6 +52,12 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
 
             // Initialize pool with back-pointer
             self.pool = ConnectionPool.init(&self);
+            
+            // Ensure we clean up if fetchSize fails
+            errdefer {
+                self.pool.deinit();
+                allocator.free(host);
+            }
 
             // Fetch size via HEAD
             try self.fetchSize();
@@ -84,29 +91,82 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             self.pool.source = self;
             self.pool.fixPointers();
 
-            // Create contexts for all requests
-            var contexts = try self.allocator.alloc(RequestContext, ranges.len);
-            defer self.allocator.free(contexts);
+            // 1. Coalescing Pass
+            // We want to merge ranges that are "close" to each other to reduce HTTP overhead.
+            var sorted_indices = try self.allocator.alloc(usize, ranges.len);
+            defer self.allocator.free(sorted_indices);
+            for (sorted_indices, 0..) |*idx, i| idx.* = i;
 
-            for (ranges, buffers, 0..) |range, buf, i| {
-                if (buf.len != range.len()) return error.InvalidArgs;
-                contexts[i] = RequestContext{
-                    .source = self,
-                    .method = .GET,
-                    .allocator = self.allocator,
-                    .range_start = range.start,
-                    .range_end = range.end - 1,
-                    .output_buf = buf,
-                    .parser = .{},
-                };
+            // Sort indices by range start
+            const SortCtx = struct {
+                r: []const io.Range,
+                fn lessThan(ctx: @This(), lo: usize, hi: usize) bool {
+                    return ctx.r[lo].start < ctx.r[hi].start;
+                }
+            };
+            std.sort.pdq(usize, sorted_indices, SortCtx{ .r = ranges }, SortCtx.lessThan);
+
+            var coalesced_ranges = std.ArrayListUnmanaged(RequestContext){};
+            defer {
+                for (coalesced_ranges.items) |*ctx| {
+                    ctx.sub_ranges.deinit(self.allocator);
+                }
+                coalesced_ranges.deinit(self.allocator);
             }
 
-            // Start up to NUM_CONNECTIONS requests
+            if (ranges.len > 0) {
+                var i: usize = 0;
+                while (i < sorted_indices.len) {
+                    const first_idx = sorted_indices[i];
+                    const start = ranges[first_idx].start;
+                    var end = ranges[first_idx].end;
+                    
+                    var sub_ranges = std.ArrayListUnmanaged(SubRange){};
+                    try sub_ranges.append(self.allocator, .{
+                        .offset_in_coalesced = 0,
+                        .len = ranges[first_idx].len(),
+                        .dest = buffers[first_idx],
+                    });
+
+                    i += 1;
+                    while (i < sorted_indices.len) {
+                        const next_idx = sorted_indices[i];
+                        const next_start = ranges[next_idx].start;
+                        const next_end = ranges[next_idx].end;
+
+                        // If gap is small enough, merge
+                        if (next_start >= end and next_start - end <= COALESCE_THRESHOLD) {
+                            try sub_ranges.append(self.allocator, .{
+                                .offset_in_coalesced = next_start - start,
+                                .len = ranges[next_idx].len(),
+                                .dest = buffers[next_idx],
+                            });
+                            end = @max(end, next_end);
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    try coalesced_ranges.append(self.allocator, RequestContext{
+                        .source = self,
+                        .method = .GET,
+                        .allocator = self.allocator,
+                        .range_start = start,
+                        .range_end = end - 1,
+                        .sub_ranges = sub_ranges,
+                        .parser = .{},
+                    });
+                }
+            }
+
+            // 2. Dispatch Coalesced Requests
+            const contexts = coalesced_ranges.items;
             var next_to_start: usize = 0;
             var completed: usize = 0;
 
             // Start initial batch
-            for (0..@min(NUM_CONNECTIONS, ranges.len)) |_| {
+            for (0..@min(NUM_CONNECTIONS, contexts.len)) |_| {
                 const ctx = &contexts[next_to_start];
                 const pc = self.pool.acquire();
                 ctx.pooled_conn = pc;
@@ -125,7 +185,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             }
 
             // Run event loop until all complete
-            while (completed < ranges.len) {
+            while (completed < contexts.len) {
                 try self.loop.run(.once);
 
                 // Check for completed requests
@@ -141,7 +201,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                         completed += 1;
 
                         // Start next request if any pending
-                        if (next_to_start < ranges.len) {
+                        if (next_to_start < contexts.len) {
                             const next_ctx = &contexts[next_to_start];
                             next_ctx.pooled_conn = pc;
                             pc.state = .sending;
@@ -356,12 +416,21 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             }
         };
 
+        const SubRange = struct {
+            offset_in_coalesced: u64,
+            len: u64,
+            dest: []u8,
+        };
+
         const RequestContext = struct {
             source: *Self,
             method: enum { HEAD, GET },
             allocator: std.mem.Allocator,
             range_start: u64 = 0,
             range_end: u64 = 0,
+            
+            /// Sub-ranges within the coalesced response that need copying to user buffers.
+            sub_ranges: std.ArrayListUnmanaged(SubRange) = .{},
             output_buf: []u8 = &[_]u8{},
 
             // Which pooled connection we're using
@@ -376,8 +445,10 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
 
             // Internal parser state
             parser: protocol_http.ResponseParser = .{},
+            parser_pos: usize = 0,
 
             fn run(self: *RequestContext) !void {
+                self.sub_ranges = .{};
                 return self.runWithRetry(true);
             }
 
@@ -427,7 +498,21 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                     pc.markFailed();
                 }
 
-                if (self.err) |e| return e;
+                if (self.err) |e| {
+                    const is_retryable = switch (e) {
+                        error.ConnectionReset,
+                        error.BrokenPipe,
+                        error.EndOfStream,
+                        error.TlsConnectionClosed, // Retry on TLS closure
+                        => true,
+                        else => false,
+                    };
+
+                    if (allow_retry and is_retryable) {
+                        return self.runWithRetry(false);
+                    }
+                    return e;
+                }
             }
 
             fn onHandshake(ptr: ?*anyopaque) void {
@@ -476,7 +561,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                     try req_buf.appendSlice(self.allocator, "\r\n");
                 }
                 try req_buf.appendSlice(self.allocator, "Connection: keep-alive\r\n\r\n");
-
+                
                 if (self.pooled_conn) |pc| {
                     pc.state = .reading;
                     if (pc.conn) |conn| {
@@ -495,11 +580,36 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
 
                         if (me.method == .HEAD) return;
 
-                        if (me.bytes_read + chunk.len > me.output_buf.len) {
-                            return error.BufferOverflow;
+                        // Map chunk back to original user buffers
+                        for (me.sub_ranges.items) |sr| {
+                            const chunk_start = me.parser_pos;
+                            const chunk_end = me.parser_pos + chunk.len;
+                            const sr_end = sr.offset_in_coalesced + sr.len;
+
+                            // Intersection of [chunk_start, chunk_end) and [sr.offset, sr_end)
+                            const intersect_start = @max(chunk_start, sr.offset_in_coalesced);
+                            const intersect_end = @min(chunk_end, sr_end);
+
+                            if (intersect_start < intersect_end) {
+                                const dest_offset = intersect_start - sr.offset_in_coalesced;
+                                const src_offset = intersect_start - chunk_start;
+                                const intersect_len = intersect_end - intersect_start;
+                                @memcpy(sr.dest[dest_offset .. dest_offset + intersect_len], chunk[src_offset .. src_offset + intersect_len]);
+                            }
                         }
-                        @memcpy(me.output_buf[me.bytes_read .. me.bytes_read + chunk.len], chunk);
-                        me.bytes_read += chunk.len;
+
+                        // Also handle single output_buf for readAt/fetchSize
+                        if (me.output_buf.len > 0) {
+                            const clen = chunk.len;
+                            const remaining = me.output_buf.len - me.bytes_read;
+                            const to_copy = @min(clen, remaining);
+                            if (to_copy > 0) {
+                                @memcpy(me.output_buf[me.bytes_read .. me.bytes_read + to_copy], chunk[0..to_copy]);
+                                me.bytes_read += to_copy;
+                            }
+                        }
+                        
+                        me.parser_pos += chunk.len;
                     }
                 };
                 var bctx = BodyCtx{ .ctx = self };
@@ -529,5 +639,6 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 self.done = true;
             }
         };
+
     };
 }

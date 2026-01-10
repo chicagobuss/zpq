@@ -17,6 +17,8 @@ const ColumnWriter = struct {
     values_buffer: std.ArrayListUnmanaged(u8),
     count: usize,
     path: []const []const u8,
+    bool_buffer: u8 = 0,
+    bool_bit_pos: u3 = 0,
 
     pub fn init(allocator: std.mem.Allocator, col_type: schema.Type, path: []const []const u8) ColumnWriter {
         return .{
@@ -55,13 +57,58 @@ const ColumnWriter = struct {
                 try self.values_buffer.appendSlice(self.allocator, &len_buf);
                 try self.values_buffer.appendSlice(self.allocator, s);
             },
-            else => return error.NotImplemented,
+            f32 => {
+                if (self.type != .FLOAT) return error.EncodingError;
+                var buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &buf, @bitCast(value), .little);
+                try self.values_buffer.appendSlice(self.allocator, &buf);
+            },
+            f64 => {
+                if (self.type != .DOUBLE) return error.EncodingError;
+                var buf: [8]u8 = undefined;
+                std.mem.writeInt(u64, &buf, @bitCast(value), .little);
+                try self.values_buffer.appendSlice(self.allocator, &buf);
+            },
+            bool => {
+                if (self.type != .BOOLEAN) return error.EncodingError;
+                if (value) {
+                    self.bool_buffer |= (@as(u8, 1) << self.bool_bit_pos);
+                }
+                if (self.bool_bit_pos == 7) {
+                    try self.values_buffer.append(self.allocator, self.bool_buffer);
+                    self.bool_buffer = 0;
+                    self.bool_bit_pos = 0;
+                } else {
+                    self.bool_bit_pos += 1;
+                }
+            },
+            else => {
+                // Handle various int sizes that might be passed (e.g. i8, i16 via i32)
+                const info = @typeInfo(T);
+                if (info == .int) {
+                    if (self.type == .INT32) {
+                        var buf: [4]u8 = undefined;
+                        std.mem.writeInt(i32, &buf, @intCast(value), .little);
+                        try self.values_buffer.appendSlice(self.allocator, &buf);
+                    } else if (self.type == .INT64) {
+                        var buf: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &buf, @intCast(value), .little);
+                        try self.values_buffer.appendSlice(self.allocator, &buf);
+                    } else return error.NotImplemented;
+                } else return error.NotImplemented;
+            },
         }
         self.count += 1;
     }
 
     pub fn flushPage(self: *ColumnWriter, writer: *ParquetWriter) !PageResult {
         if (self.count == 0) return PageResult{};
+
+        if (self.type == .BOOLEAN and self.bool_bit_pos > 0) {
+            try self.values_buffer.append(self.allocator, self.bool_buffer);
+            self.bool_buffer = 0;
+            self.bool_bit_pos = 0;
+        }
 
         const uncompressed_data = self.values_buffer.items;
         const compressed_data = try snappy.compressAlloc(self.allocator, uncompressed_data);

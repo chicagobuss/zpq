@@ -166,6 +166,7 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
     const batch_size = 8192;
     const batch = try allocator.alloc(T, batch_size);
     defer allocator.free(batch);
+    @memset(std.mem.sliceAsBytes(batch), 0);
 
     var total_active: usize = 0;
     var total_scanned: usize = 0;

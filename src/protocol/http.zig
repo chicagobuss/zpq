@@ -64,13 +64,14 @@ pub const ResponseParser = struct {
                         const headers_slice = self.header_buf[0 .. pos + 4];
                         try self.parseHeaders(headers_slice);
 
+                        if (self.is_head) {
+                            self.state = .done;
+                            return;
+                        }
+
                         if (self.is_chunked) {
                             self.state = .reading_chunk_size;
                         } else {
-                            if (self.is_head) {
-                                self.state = .done;
-                                return;
-                            }
                             self.state = .reading_body;
                             if (self.content_length) |len| {
                                 if (len == 0) {

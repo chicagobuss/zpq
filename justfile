@@ -343,5 +343,5 @@ remote-bench:
 lambda-memory-sweep:
     ./tools/bench_memory_sweep.sh
 
-bench-sweep:
-    ./tools/bench_sweep.py
+bench-sweep *args:
+    ./tools/bench_sweep.py {{args}}

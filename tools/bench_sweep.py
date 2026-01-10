@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import os
+import argparse
 
 COLUMNS = [
     "int8", "int16", "int32_sorted", "int32_random", "int64_sorted", "int64_random",
@@ -12,21 +13,18 @@ COLUMNS = [
     "string_sorted", "binary", "timestamp", "timestamp_sorted", "date"
 ]
 
-PARQUET_PATH = "/tmp/zpq_r2_bucket/benchmark/benchmark_100mb.parquet"
-
-def run_bench(filter_str=None, select_str=None):
-    cmd = ["./zig-out/bin/zpq", PARQUET_PATH, "/dev/null", "--benchmark"]
+def run_bench(parquet_path, output_path, filter_str=None, select_str=None):
+    env = os.environ.copy()
+    cmd = ["./zig-out/bin/zpq", parquet_path, output_path, "--benchmark"]
     if filter_str:
         cmd += ["--filter", filter_str]
     if select_str:
         cmd += ["--select", select_str]
     
     try:
-        # We use a timeout to prevent hanging on bad filters
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60, env=env)
         output = result.stderr if "Mrows/sec" in result.stderr else result.stdout
         
-        # Parse: Scanned 2500000 rows (23503 matched) in 31.99ms (78.15 Mrows/sec)
         match = re.search(r"\(([\d\.]+) Mrows/sec\)", output)
         if match:
             return float(match.group(1))
@@ -39,30 +37,39 @@ def run_bench(filter_str=None, select_str=None):
         return -2.0
 
 def main():
+    parser = argparse.ArgumentParser(description="ZPQ Benchmark Sweep")
+    parser.add_argument("--s3", action="store_true", help="Use S3 benchmark file")
+    parser.add_argument("--output", default="/dev/null", help="Output path for scan results")
+    args = parser.parse_args()
+
     if not os.path.exists("./zig-out/bin/zpq"):
         print("Error: zpq binary not found at ./zig-out/bin/zpq. Run 'just build' first.", file=sys.stderr)
         sys.exit(1)
         
-    if not os.path.exists(PARQUET_PATH):
-        print(f"Error: Benchmark file not found at {PARQUET_PATH}.", file=sys.stderr)
-        print("Run 'just build gen-benchmark' (if it exists) or 'python3 tools/fixtures/gen_benchmark.py /tmp/zpq_r2_bucket/benchmark/benchmark_100mb.parquet 2500000'", file=sys.stderr)
+    if args.s3:
+        bucket = os.environ.get("AWS_S3_BUCKET", "skyway-staging-perf-test")
+        parquet_path = f"s3://{bucket}/zpq_test_data/benchmark/benchmark_100mb.parquet"
+    else:
+        parquet_path = "/tmp/zpq_r2_bucket/benchmark/benchmark_100mb.parquet"
+        if not os.path.exists(parquet_path):
+             # Fallback to current project root if /tmp not setup
+             parquet_path = "data/benchmark/benchmark_100mb.parquet"
+
+    if not args.s3 and not os.path.exists(parquet_path):
+        print(f"Error: Benchmark file not found at {parquet_path}.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Starting Benchmark Sweep against {PARQUET_PATH}...")
-    print(f"{'Column':<20} | {'Full Scan':<12} | {'Filtered':<12} | {'Selected':<12}")
-    print(f"{' ':<20} | {'(Mrows/s)':<12} | {'(Mrows/s)':<12} | {'(Mrows/s)':<12}")
-    print("-" * 65)
+    print(f"Starting Benchmark Sweep against {parquet_path} -> {args.output}...")
+    print(f"{'Column':<20} | {'Filtered':<12} | {'Selected':<12}")
+    print(f"{' ':<20} | {'(Mrows/s)':<12} | {'(Mrows/s)':<12}")
+    print("-" * 55)
     
-    # establish baseline full scan
-    baseline = run_bench()
-    print(f"{'OVERALL (Baseline)':<20} | {baseline:>12.2f} | {'-':>12} | {'-':>12}")
-
     for col in COLUMNS:
         # 1. Selective read (just this col)
-        scan_rate = run_bench(select_str=col)
+        scan_rate = run_bench(parquet_path, args.output, select_str=col)
         
         # 2. Filter rate (specific to col type)
-        filter_val = "100" # Arbitrary numeric default
+        filter_val = "100" 
         if "bool" in col:
             filter_val = "true"
         elif "string" in col or "binary" in col:
@@ -71,14 +78,13 @@ def main():
             elif col == "string_sorted": filter_val = "sort_00000001"
             else: filter_val = "val_0"
         
-        filter_rate = run_bench(filter_str=f"{col}={filter_val}", select_str=col)
+        filter_rate = run_bench(parquet_path, args.output, filter_str=f"{col}={filter_val}", select_str=col)
         
-        # Format the numbers nicely
-        f_scan = f"{baseline:.2f}"
+        # Format the numbers
         f_filter = f"{filter_rate:.2f}" if filter_rate >= 0 else ("ERR" if filter_rate == -1 else "TO")
         f_select = f"{scan_rate:.2f}" if scan_rate >= 0 else ("ERR" if scan_rate == -1 else "TO")
         
-        print(f"{col:<20} | {f_scan:>12} | {f_filter:>12} | {f_select:>12}")
+        print(f"{col:<20} | {f_filter:>12} | {f_select:>12}")
 
 if __name__ == "__main__":
     main()

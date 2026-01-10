@@ -38,28 +38,37 @@ def run_bench(parquet_path, output_path, filter_str=None, select_str=None):
 
 def main():
     parser = argparse.ArgumentParser(description="ZPQ Benchmark Sweep")
-    parser.add_argument("--s3", action="store_true", help="Use S3 benchmark file")
-    parser.add_argument("--output", default="/dev/null", help="Output path for scan results")
+    parser.add_argument("what", nargs="?", default="native", help="Benchmarking backend (native)")
+    parser.add_argument("input", nargs="?", default="local", help="Input source (local or s3)")
+    parser.add_argument("output", nargs="?", default="null", help="Output destination (local or null)")
     args = parser.parse_args()
+
+    if not os.environ.get("AWS_REGION"):
+        os.environ["AWS_REGION"] = "us-west-2"
 
     if not os.path.exists("./zig-out/bin/zpq"):
         print("Error: zpq binary not found at ./zig-out/bin/zpq. Run 'just build' first.", file=sys.stderr)
         sys.exit(1)
         
-    if args.s3:
+    if args.input == "s3":
         bucket = os.environ.get("AWS_S3_BUCKET", "skyway-staging-perf-test")
         parquet_path = f"s3://{bucket}/zpq_test_data/benchmark/benchmark_100mb.parquet"
     else:
         parquet_path = "/tmp/zpq_r2_bucket/benchmark/benchmark_100mb.parquet"
         if not os.path.exists(parquet_path):
-             # Fallback to current project root if /tmp not setup
              parquet_path = "data/benchmark/benchmark_100mb.parquet"
 
-    if not args.s3 and not os.path.exists(parquet_path):
+    output_path = "/dev/null"
+    if args.output == "local":
+        output_path = "/tmp/bench_zpq_sweep.parquet"
+    elif args.output != "null":
+        output_path = args.output
+
+    if args.input != "s3" and not os.path.exists(parquet_path):
         print(f"Error: Benchmark file not found at {parquet_path}.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Starting Benchmark Sweep against {parquet_path} -> {args.output}...")
+    print(f"Starting Benchmark Sweep: {args.input} ({parquet_path}) -> {args.output} ({output_path})...")
     print(f"{'Column':<20} | {'Filtered':<12} | {'Selected':<12}")
     print(f"{' ':<20} | {'(Mrows/s)':<12} | {'(Mrows/s)':<12}")
     print("-" * 55)

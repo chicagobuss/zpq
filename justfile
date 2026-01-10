@@ -193,14 +193,6 @@ lambda-list:
 bench what input output size="10mb" runs="1":
     @./tools/bench.sh {{what}} {{input}} {{output}} {{size}} {{runs}}
 
-# Run Zig native benchmarks (dns, ping, e2e, scan)
-# Examples:
-#   just zig-bench dns                    # DNS resolver benchmark
-#   just zig-bench ping                   # TCP ping-pong benchmark
-#   just zig-bench e2e s3://bucket/key    # E2E parquet scan
-#   just zig-bench compare e2e <path>     # Compare ZPQ vs PyArrow
-zig-bench +args:
-    ./benchmarks/bench.sh {{args}}
 
 # Engine comparison benchmarks (pyarrow, polars, duckdb)
 # Examples:
@@ -232,14 +224,13 @@ verify-malformed: build gen-malformed
 
     @echo "Malformed tests passed (all files rejected)."
 
-# Fetch pre-built dependencies to speed up build
+# Fetch pre-built BoringSSL static libraries (Fast)
 fetch-deps:
-    @echo "Fetching pre-built BoringSSL static libraries ({{DEPS_TAG}})..."
-    @TRIPLE=$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]') && \
-        mkdir -p vendor/boring_tls/prebuilt/$$TRIPLE && \
-        echo "Detected triple: $$TRIPLE" && \
-        curl -fL https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libcrypto-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libcrypto.a || echo "Warning: Could not fetch libcrypto.a" && \
-        curl -fL https://github.com/{{GH_OWNER}}/{{GH_REPO}}/releases/download/{{DEPS_TAG}}/libssl-$$TRIPLE.a -o vendor/boring_tls/prebuilt/$$TRIPLE/libssl.a || echo "Warning: Could not fetch libssl.a"
+    @./tools/r2-fetch-artifacts.sh
+
+# Upload current pre-built artifacts to R2 (Requires R2 credentials)
+upload-deps target="":
+    @./tools/r2-upload-artifacts.sh {{target}}
 
 # Clean build artifacts
 clean:
@@ -340,8 +331,8 @@ validate-compare *args:
 remote-bench:
     ./tools/remote_bench.sh
 
-lambda-memory-sweep:
-    ./tools/bench_memory_sweep.sh
+lambda-memory-sweep fn:
+    @./tools/serverless/aws.sh memory-sweep {{fn}}
 
 bench-sweep what="native" input="local" output="null":
-    ./tools/bench_sweep.py {{what}} {{input}} {{output}}
+    ./tools/bench.sh sweep {{input}} {{output}}

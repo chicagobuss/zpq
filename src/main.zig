@@ -2,6 +2,35 @@ const std = @import("std");
 const zpq = @import("zpq");
 const xev = @import("xev");
 
+var global_async_logger: ?*zpq.log.AsyncLogger = null;
+
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = logFn,
+};
+
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    if (global_async_logger) |logger| {
+        const zpq_level: zpq.log.Level = switch (level) {
+            .err => .err,
+            .warn => .warn,
+            .info => .info,
+            .debug => .debug,
+        };
+        logger.log(zpq_level, format, args);
+    } else {
+        // Fallback for logs before logger is initialized
+        const prefix = "[" ++ @tagName(level) ++ "] ";
+        std.debug.print(prefix ++ format ++ "\n", args);
+    }
+}
+
 pub const BenchmarkRow = struct {
     int8: i32,
     int16: i32,
@@ -107,10 +136,9 @@ pub fn main() !void {
     // Initialize Logger
     const logger = try zpq.log.AsyncLogger.init(allocator, log_level);
     defer logger.deinit();
+    global_async_logger = logger;
+    defer global_async_logger = null;
     try logger.start(&loop);
-
-    // Set global logger for other modules to use
-    zpq.io.transport.global_logger = logger;
 
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
     defer {

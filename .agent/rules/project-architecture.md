@@ -20,5 +20,9 @@ trigger: always_on
 ## Memory
 - **Arenas**: Use `ArenaAllocator` for request lifecycles to simplify cleanup.
 
+## Logging
+- **Standard Library**: ALWAYS use `std.log` (scoped or default). Do NOT use `std.debug.print` for runtime telemetry.
+- **Async Execution**: Logging is handled by the `zpq.log.AsyncLogger` via `std.Options`. This ensures zero impact on hot paths by offloading I/O to the event loop.
+
 ## Legacy Code
 - **src_legacy**: Treat as read-only reference. Do not modify unless strictly necessary for migration.

@@ -3,7 +3,6 @@ const xev_mod = @import("xev");
 const tls_mod = @import("tls.zig");
 
 pub const Address = xev_mod.shim_net.Address;
-pub var global_logger: ?*@import("../zpq/log.zig").AsyncLogger = null;
 
 const log = std.log.scoped(.transport);
 

@@ -210,20 +210,11 @@ jobs:
             echo "R2 credentials not configured, skipping benchmarks"
             exit 0
           fi
-          # Find the built bench-e2e binary
-          BENCH_BIN=$(find zig-out -name bench-e2e -type f | head -1)
-          if [ -z "$BENCH_BIN" ]; then
-            echo "Error: bench-e2e binary not found in zig-out"
-            exit 1
-          fi
-          echo "Using binary: $BENCH_BIN"
-
-          # Use the absolute path for bench-e2e in bench.sh
-          # (bench.sh might need an update to accept an external binary path,
-          # but for now we'll try to just run it)
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_1mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_10mb.parquet" --async
-          ZPQ_BENCH_EXE="$BENCH_BIN" ./benchmarks/bench.sh e2e "s3://zpq/testdata/benchmark/benchmark_100mb.parquet" --async
+          # Unified benchmark dispatcher
+          export AWS_S3_BUCKET="zpq"
+          ./tools/bench.sh native s3 null 1mb 1
+          ./tools/bench.sh native s3 null 10mb 1
+          ./tools/bench.sh native s3 null 100mb 1
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4

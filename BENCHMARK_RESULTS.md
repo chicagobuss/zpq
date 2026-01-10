@@ -9,16 +9,17 @@ This ensures consistent, reproducible results regardless of how the benchmark is
 ### Available Benchmark Commands
 
 ```bash
-# Local file benchmarks
-zig build run-bench-projection    # Column projection (local files)
-zig build run-bench-decode        # Full decode (apples-to-apples with competitors)
+# Unified benchmark dispatcher (Handles Local, S3, RIE, and Lambda)
+# Usage: just bench <what> <input> <output> [size] [runs]
+just bench native local local      # Local file scan
+just bench native s3 null 100mb    # S3 scan to /dev/null
 
-# S3/R2 benchmarks (requires credentials)
-zig build run-bench-s3            # S3/R2 column projection
-zig build run-bench-e2e           # End-to-end S3 benchmark
+# Comprehensive per-column sweep
+# Usage: just bench-sweep <what> <input> <output>
+just bench-sweep native s3 null    # Scan every column from S3
 
-# DNS benchmark
-zig build run-bench-dns           # DNS resolution benchmark
+# Direct binary use with log-level control
+./zig-out/bin/zpq <input> <output> --benchmark --log-level err
 ```
 
 ### Environment Variables for S3 Benchmarks

@@ -193,6 +193,50 @@ metrics() {
     logs "$fn_name" "$region" | grep -E "(REPORT|Filter completed|Upload complete|Duration|Memory)"
 }
 
+# --- Memory Sweep ---
+# Usage: memory-sweep <function-name> [payload] [region]
+memory_sweep() {
+    local fn_name="$1"
+    local payload="${2:-'{"event": "bench"}'}"
+    local region="${3:-$DEFAULT_REGION}"
+    local sizes=(128 512 1024 2048 4096)
+
+    load_env
+    info "Starting Memory Sweep for: $fn_name"
+    printf "%-8s | %-20s\n" "Memory" "Throughput (RPS)"
+    echo "------------------------------------------"
+
+    for mem in "${sizes[@]}"; do
+        # 1. Update config
+        aws lambda update-function-configuration \
+            --function-name "$fn_name" \
+            --memory-size "$mem" \
+            --region "$region" > /dev/null
+        
+        aws lambda wait function-updated --function-name "$fn_name" --region "$region"
+
+        # 2. Invoke
+        local tmp_out="/tmp/zpq-mem-$$.json"
+        aws lambda invoke \
+            --function-name "$fn_name" \
+            --log-type Tail \
+            --payload "$(echo "$payload" | base64)" \
+            --region "$region" \
+            "$tmp_out" > /tmp/invoke_res.json
+        
+        # 3. Parse result from tail logs (last 4KB)
+        local logs
+        logs=$(jq -r '.LogResult' /tmp/invoke_res.json | base64 -d)
+        
+        # ping-pong result format: "Ping-pong result: 15881.25 roundtrips/s"
+        local rps
+        rps=$(echo "$logs" | grep -oP "Ping-pong result: \K[0-9.]+" || echo "N/A")
+
+        printf "%-8s | %-20s\n" "${mem}MB" "$rps"
+        rm -f "$tmp_out"
+    done
+}
+
 # --- Benchmark Matrix ---
 # Usage: bench-matrix <payload-json>
 # Runs all 4 combinations: arm64/x86_64 x 512MB/1769MB
@@ -276,6 +320,7 @@ delete() {
     aws lambda delete-function --function-name "$fn_name" --region "$region"
     success "Deleted $fn_name"
 }
+
 # --- Help ---
 usage() {
     cat <<EOF
@@ -290,6 +335,7 @@ Commands:
   logs <fn> [region]            Get latest logs for Lambda
   metrics <fn> [region]         Get key metrics (duration, memory, etc.)
   bench-matrix <payload>        Run benchmark across all arch/memory combos
+  memory-sweep <fn> [payload]   Sweep memory sizes for a specific function
   list [prefix] [region]        List Lambda functions
   delete <fn> [region]          Delete Lambda function
 
@@ -299,6 +345,31 @@ Examples:
   $0 invoke zpq-filter '{"file": "s3://bucket/file.parquet"}'
   $0 metrics zpq-filter
   $0 bench-matrix '{"file": "s3://bucket/file.parquet"}'
+  $0 memory-sweep zpq-bench-arm
+EOF
+}
+
+# --- Dispatcher ---
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    build) build "$@" ;;
+    deploy) deploy "$@" ;;
+    invoke) invoke "$@" ;;
+    logs) logs "$@" ;;
+    metrics) metrics "$@" ;;
+    bench-matrix|bench_matrix) bench_matrix "$@" ;;
+    memory-sweep|memory_sweep) memory_sweep "$@" ;;
+    list) list "$@" ;;
+    delete) delete "$@" ;;
+    help|--help|-h) usage ;;
+    *)
+        error "Unknown command: $cmd"
+        usage
+        exit 1
+        ;;
+esac
 
 Environment:
   AWS_REGION          Default region (default: us-west-2)

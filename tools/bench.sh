@@ -57,6 +57,56 @@ get_output_path() {
     esac
 }
 
+COLUMNS=(
+    "int8" "int16" "int32_sorted" "int32_random" "int64_sorted" "int64_random"
+    "uint8" "uint16" "uint32" "uint64" "float32" "float64" "float64_sorted"
+    "bool" "bool_sparse" "string_random" "string_dict_low" "string_dict_high"
+    "string_sorted" "binary" "timestamp" "timestamp_sorted" "date"
+)
+
+cmd_sweep() {
+    local input="${1:-local}" output="${2:-null}" size="${3:-100mb}"
+    local input_path=$(get_input_path "$input" "$size" "native")
+    local out_target
+    
+    if [[ "$output" == "null" ]]; then
+        out_target="/dev/null"
+    elif [[ "$output" == "local" ]]; then
+        out_target="/tmp/bench_sweep_out.parquet"
+    else
+        out_target="$output"
+    fi
+
+    info "Starting Benchmark Sweep: $input ($input_path) -> $output ($out_target)..."
+    printf "%-20s | %-12s | %-12s\n" "Column" "Filtered" "Selected"
+    printf "%-20s | %-12s | %-12s\n" "" "(Mrows/s)" "(Mrows/s)"
+    echo "-------------------------------------------------------"
+
+    for col in "${COLUMNS[@]}"; do
+        # 1. Selected
+        local select_out=$(./zig-out/bin/zpq "$input_path" "$out_target" --benchmark --select "$col" --log-level err 2>&1)
+        local select_rate=$(echo "$select_out" | awk -F '(' '{print $NF}' | awk -F ' ' '{print $1}' || echo "ERR")
+
+        # 2. Filter
+        local filter_val="100"
+        if [[ "$col" == *"bool"* ]]; then
+            filter_val="true"
+        elif [[ "$col" == *"string"* || "$col" == *"binary"* ]]; then
+            case "$col" in
+                string_dict_low)  filter_val="category_0001" ;;
+                string_dict_high) filter_val="unique_00001" ;;
+                string_sorted)    filter_val="sort_00000001" ;;
+                *)                filter_val="val_0" ;;
+            esac
+        fi
+
+        local filter_out=$(./zig-out/bin/zpq "$input_path" "$out_target" --benchmark --select "$col" --filter "$col=$filter_val" --log-level err 2>&1)
+        local filter_rate=$(echo "$filter_out" | awk -F '(' '{print $NF}' | awk -F ' ' '{print $1}' || echo "ERR")
+
+        printf "%-20s | %10s | %10s\n" "$col" "$filter_rate" "$select_rate"
+    done
+}
+
 # --- ZPQ Runners ---
 run_native() {
     local input_path="$1" output_path="$2" runs="$3"
@@ -368,6 +418,7 @@ case "$cmd" in
     native|serverless) cmd_bench "$cmd" "$@" ;;
     engine)  cmd_engine "$@" ;;
     compare) cmd_compare "$@" ;;
+    sweep)   cmd_sweep "$@" ;;
     help|--help|-h|"")
         cat <<EOF
 Usage: $0 <command> [args...]
@@ -385,6 +436,7 @@ Commands:
       engine: pyarrow | polars | duckdb
 
   compare [input] [size] [runs]  - Compare all engines
+  sweep [input] [output] [size]  - Sweep through all types
 
 Examples:
   $0 native local local local 10mb

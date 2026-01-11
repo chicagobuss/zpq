@@ -119,24 +119,24 @@ pub fn logDetailedSslError(ssl: *c.SSL) void {
 }
 
 pub const TlsBuffers = struct {
-    encrypted_buffer: [BUFFER_SIZE * 2]u8 = undefined,
-    encrypted_len: usize = 0,
-    decrypted_buffer: [BUFFER_SIZE * 2]u8 = undefined,
-    decrypted_len: usize = 0,
+    encrypted_out: std.ArrayListUnmanaged(u8) = .{},
+    decrypted_out: std.ArrayListUnmanaged(u8) = .{},
 
-    pub fn resetEncrypted(self: *TlsBuffers) void {
-        self.encrypted_len = 0;
-    }
-
-    pub fn resetDecrypted(self: *TlsBuffers) void {
-        self.decrypted_len = 0;
+    pub fn deinit(self: *TlsBuffers, allocator: std.mem.Allocator) void {
+        self.encrypted_out.deinit(allocator);
+        self.decrypted_out.deinit(allocator);
     }
 
     pub fn getEncryptedSlice(self: *TlsBuffers) []const u8 {
-        return self.encrypted_buffer[0..self.encrypted_len];
+        return self.encrypted_out.items;
     }
 
     pub fn getDecryptedSlice(self: *TlsBuffers) []const u8 {
-        return self.decrypted_buffer[0..self.decrypted_len];
+        return self.decrypted_out.items;
     }
+};
+
+pub const ProcessResult = struct {
+    encrypted: ?[]const u8,
+    consumed: usize,
 };

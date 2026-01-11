@@ -44,7 +44,7 @@ pub const S3 = struct {
         const path = try self.getPath(allocator, key, options);
         defer allocator.free(path);
 
-        var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator); // shallow deinit
 
         var range_val: ?[]u8 = null;
@@ -55,13 +55,6 @@ pub const S3 = struct {
             try extra_headers.append(allocator, .{ .name = "Range", .value = range_val.? });
         }
 
-        var token_val: ?[]u8 = null;
-        defer if (token_val) |v| allocator.free(v);
-
-        if (self.signer.session_token) |token| {
-            token_val = try allocator.dupe(u8, token);
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
-        }
 
         return self.signer.sign(
             allocator,
@@ -88,16 +81,9 @@ pub const S3 = struct {
         const path = try self.getPath(allocator, key, options);
         defer allocator.free(path);
 
-        var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
-        var token_val: ?[]u8 = null;
-        defer if (token_val) |v| allocator.free(v);
-
-        if (self.signer.session_token) |token| {
-            token_val = try allocator.dupe(u8, token);
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
-        }
 
         return self.signer.sign(
             allocator,
@@ -118,16 +104,9 @@ pub const S3 = struct {
         const host = try self.getHost(allocator, options);
         defer allocator.free(host);
 
-        var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
-        var token_val: ?[]u8 = null;
-        defer if (token_val) |v| allocator.free(v);
-
-        if (self.signer.session_token) |token| {
-            token_val = try allocator.dupe(u8, token);
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
-        }
 
         return self.signer.sign(
             allocator,
@@ -148,16 +127,9 @@ pub const S3 = struct {
         const host = try self.getHost(allocator, options);
         defer allocator.free(host);
 
-        var extra_headers = std.ArrayList(sigv4.SigV4.Header){};
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
         defer extra_headers.deinit(allocator);
 
-        var token_val: ?[]u8 = null;
-        defer if (token_val) |v| allocator.free(v);
-
-        if (self.signer.session_token) |token| {
-            token_val = try allocator.dupe(u8, token);
-            try extra_headers.append(allocator, .{ .name = "X-Amz-Security-Token", .value = token_val.? });
-        }
 
         return self.signer.sign(
             allocator,
@@ -193,5 +165,135 @@ pub const S3 = struct {
                 return try std.fmt.allocPrint(allocator, "/{s}", .{key});
             }
         }
+    }
+
+    pub fn formatInitiateMultipartRequest(
+        self: S3,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        options: Options,
+    ) ![]sigv4.SigV4.Header {
+        const path = try self.getPath(allocator, key, options);
+        defer allocator.free(path);
+
+        const host = try self.getHost(allocator, options);
+        defer allocator.free(host);
+
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
+        defer extra_headers.deinit(allocator);
+
+
+        try extra_headers.append(allocator, .{ .name = "Content-Type", .value = "application/octet-stream" });
+
+        return self.signer.sign(
+            allocator,
+            "POST",
+            host,
+            path,
+            "uploads=", // Query string
+            extra_headers.items,
+            "", // No payload
+            .{ .clock_offset = options.clock_offset, .use_unsigned_payload = options.use_unsigned_payload },
+        );
+    }
+
+    pub fn formatUploadPartRequest(
+        self: S3,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        upload_id: []const u8,
+        part_number: u32,
+        payload: []const u8,
+        options: Options,
+    ) ![]sigv4.SigV4.Header {
+        const path = try self.getPath(allocator, key, options);
+        defer allocator.free(path);
+
+        const query = try std.fmt.allocPrint(allocator, "partNumber={d}&uploadId={s}", .{ part_number, upload_id });
+        defer allocator.free(query);
+
+        const host = try self.getHost(allocator, options);
+        defer allocator.free(host);
+
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
+        defer extra_headers.deinit(allocator);
+
+        return self.signer.sign(
+            allocator,
+            "PUT",
+            host,
+            path,
+            query,
+            extra_headers.items,
+            payload,
+            .{ .clock_offset = options.clock_offset, .use_unsigned_payload = options.use_unsigned_payload },
+        );
+    }
+
+    pub fn formatCompleteMultipartRequest(
+        self: S3,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        upload_id: []const u8,
+        parts: []const Part, // Expected to be already sorted
+        options: Options,
+    ) !struct { headers: []sigv4.SigV4.Header, body: []const u8 } {
+        const path = try self.getPath(allocator, key, options);
+        defer allocator.free(path);
+
+        const query = try std.fmt.allocPrint(allocator, "uploadId={s}", .{upload_id});
+        defer allocator.free(query);
+
+        const host = try self.getHost(allocator, options);
+        defer allocator.free(host);
+
+        // Generate XML body
+        var xml = std.ArrayListUnmanaged(u8){};
+        defer xml.deinit(allocator);
+
+        try xml.appendSlice(allocator, "<CompleteMultipartUpload>");
+        for (parts) |p| {
+            var buf: [256]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>", .{ p.part_number, p.etag });
+            try xml.appendSlice(allocator, s);
+        }
+        try xml.appendSlice(allocator, "</CompleteMultipartUpload>");
+
+        const body = try xml.toOwnedSlice(allocator);
+        errdefer allocator.free(body);
+
+        var extra_headers = std.ArrayListUnmanaged(sigv4.SigV4.Header){};
+        defer extra_headers.deinit(allocator);
+
+        
+        try extra_headers.append(allocator, .{ .name = "Content-Type", .value = "application/xml" });
+
+        const headers = try self.signer.sign(
+            allocator,
+            "POST",
+            host,
+            path,
+            query,
+            extra_headers.items,
+            body,
+            .{ .clock_offset = options.clock_offset, .use_unsigned_payload = options.use_unsigned_payload },
+        );
+
+        return .{ .headers = headers, .body = body };
+    }
+
+    pub const Part = struct {
+        part_number: u32,
+        etag: []const u8,
+    };
+
+    pub fn parseUploadId(allocator: std.mem.Allocator, xml: []const u8) ![]const u8 {
+        if (std.mem.indexOf(u8, xml, "<UploadId>")) |start| {
+            const id_start = start + "<UploadId>".len;
+            if (std.mem.indexOf(u8, xml[id_start..], "</UploadId>")) |end| {
+                return allocator.dupe(u8, xml[id_start .. id_start + end]);
+            }
+        }
+        return error.UploadIdNotFound;
     }
 };

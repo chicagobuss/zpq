@@ -26,6 +26,7 @@ pub const ResponseParser = struct {
     status_code: u16 = 0,
     content_length: ?usize = null,
     is_chunked: bool = false,
+    etag: ?[]const u8 = null,
 
     body_read: usize = 0,
 
@@ -204,6 +205,9 @@ pub const ResponseParser = struct {
             if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
                 const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
                 if (std.ascii.eqlIgnoreCase(v, "chunked")) self.is_chunked = true;
+            }
+            if (std.ascii.startsWithIgnoreCase(line, "etag:")) {
+                self.etag = std.mem.trim(u8, line["etag:".len..], " \t\"");
             }
         }
     }

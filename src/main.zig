@@ -158,14 +158,14 @@ pub fn main() !void {
     defer pfile.deinit();
 
     if (is_benchmark) {
-        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path.?);
+        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path.?, &loop, &thread_pool);
     } else {
         std.debug.print("Full CLI mode (GenericRow) not yet implemented. Use --benchmark for performance testing on known schema.\n", .{});
         return error.UnsupportedMode;
     }
 }
 
-fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8) !void {
+fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8, loop: *xev.Dynamic.Loop, thread_pool: *xev.ThreadPool) !void {
     var reader = try zpq.core.reader.ParquetReader(T).init(allocator, pfile);
     defer reader.deinit();
 
@@ -205,23 +205,17 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
     const output_to_null = std.mem.eql(u8, output_path, "/dev/null");
 
     var writer: ?*zpq.core.writer.ParquetWriter = null;
-    var sink_ptr: ?*zpq.io.local_sink.AsyncFileSink = null;
     if (!output_to_stdout and !output_to_null) {
-        const out_path_z = try allocator.dupeZ(u8, output_path);
-        defer allocator.free(out_path_z);
-        const out_fd = try std.posix.open(out_path_z, std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
-        
-        sink_ptr = try allocator.create(zpq.io.local_sink.AsyncFileSink);
-        sink_ptr.?.* = zpq.io.local_sink.AsyncFileSink.init(out_fd);
-        writer = try zpq.core.writer.ParquetWriter.init(allocator, sink_ptr.?.sink(), pfile.metadata.schema.items);
+        const out_sink = try zpq.io.factory.openSink(allocator, output_path, .{
+            .loop = loop,
+            .thread_pool = thread_pool,
+        });
+        writer = try zpq.core.writer.ParquetWriter.init(allocator, out_sink, pfile.metadata.schema.items);
     }
     defer {
         if (writer) |w| {
             w.close() catch {};
             w.deinit();
-        }
-        if (sink_ptr) |s| {
-            allocator.destroy(s);
         }
     }
 

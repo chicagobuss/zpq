@@ -129,6 +129,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
         stopped: bool = false, // Set by caller to stop reading (e.g., HTTP response complete)
         write_buffer: std.ArrayListUnmanaged(u8) = .{},
         current_write_buf: ?[]const u8 = null,
+        current_write_offset: usize = 0,
         write_in_flight: bool = false,
         read_in_flight: bool = false,
 
@@ -144,8 +145,9 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 .allocator = allocator,
                 .loop = loop,
                 .tcp = undefined,
-                .tls = if (use_tls) try tls_mod.Client.init(host, .{}) else null,
+                .tls = if (use_tls) try tls_mod.Client.init(allocator, host, .{}) else null,
                 .write_buffer = .{},
+                .current_write_offset = 0,
             };
             return self;
         }
@@ -181,10 +183,15 @@ pub fn ConnectionGen(comptime Xev: type) type {
             if (self.closed) return error.ConnectionClosed;
 
             if (self.tls) |*t| {
-                const encrypted = try t.encrypt(data);
-                if (encrypted) |bytes| {
-                    try self.writeRaw(bytes);
-                } else {}
+                var total_consumed: usize = 0;
+                while (total_consumed < data.len) {
+                    const result = try t.encrypt(data[total_consumed..]);
+                    if (result.encrypted) |bytes| {
+                        try self.writeRaw(bytes);
+                    }
+                    if (result.consumed == 0) break;
+                    total_consumed += result.consumed;
+                }
             } else {
                 try self.writeRaw(data);
             }
@@ -202,8 +209,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
             self.current_write_buf = buf;
             
             if (comptime @hasDecl(Xev.Loop, "write")) {
+                std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
                 try self.loop.write(&self.c_write, self.tcp, .{ .slice = buf }, Self, self, onWrite);
             } else {
+                std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
                 self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, onWrite);
             }
         }
@@ -229,14 +238,14 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
         fn doHandshake(self: *Self) !void {
             const handshake = try self.tls.?.startHandshake();
-            if (handshake) |bytes| {
+            if (handshake.encrypted) |bytes| {
                 self.write_in_flight = true;
                 if (comptime @hasDecl(Xev.Loop, "write")) {
                     try self.loop.write(&self.c_write, self.tcp, .{ .slice = bytes }, Self, self, onHandshakeWrite);
                 } else {
                     self.tcp.write(self.loop, &self.c_write, .{ .slice = bytes }, Self, self, onHandshakeWrite);
                 }
-            } else {}
+            }
         }
 
         fn onHandshakeWrite(t: ?*Self, _: Loop, _: *Completion, _: TCP, _: Xev.WriteBuffer, res: Xev.WriteError!usize) xev_mod.CallbackAction {
@@ -258,16 +267,48 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
         fn onWrite(t: ?*Self, _: Loop, _: *Completion, _: TCP, _: Xev.WriteBuffer, res: Xev.WriteError!usize) xev_mod.CallbackAction {
             const self = t.?;
-            _ = res catch |err| {
+            const n = res catch |err| {
+                std.debug.print("[Transport] onWrite error: {any}\n", .{err});
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 return .disarm;
             };
+            std.debug.print("[Transport] onWrite finished: {d} bytes\n", .{n});
             self.write_in_flight = false;
             
-            // Clean up the buffer from the write that just completed
             if (self.current_write_buf) |buf| {
+                const total_len = buf.len;
+                // We must account for the fact that we might have already written some of this buffer
+                // if we are in a partial write loop.
+                // However, current implementation dupes a NEW buffer for each writeRaw call
+                // and expects it to be cleared.
+                // Let's assume writeRaw is "header of the line".
+                
+                // If we are here, we just finished a write of `n` bytes.
+                // We need to know if that covered the whole buffer.
+                // But wait, `buf` is the WHOLE buffer.
+                // We need to track our offset into it.
+                self.current_write_offset += n;
+                
+                if (self.current_write_offset < total_len) {
+                    // Partial write! We must loop.
+                    std.debug.print("[Transport] Partial write: {d}/{d} bytes. Re-queuing remainder.\n", .{self.current_write_offset, total_len});
+                    const slice = buf[self.current_write_offset..];
+                    if (comptime @hasDecl(Xev.Loop, "write")) {
+                         // We must NOT call writeRaw because it dupes! We just call loop.write again with the slice.
+                        self.loop.write(&self.c_write, self.tcp, .{ .slice = slice }, Self, self, onWrite) catch |err| {
+                             if (self.on_error) |cb| cb(self.callback_ctx, err);
+                        };
+                    } else {
+                        self.tcp.write(self.loop, &self.c_write, .{ .slice = slice }, Self, self, onWrite);
+                    }
+                    // Stay in flight
+                    return .disarm;
+                }
+
+                // Full write complete
                 self.allocator.free(buf);
                 self.current_write_buf = null;
+                self.current_write_offset = 0;
             }
 
             if (self.write_buffer.items.len > 0) {
@@ -343,7 +384,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
                         self.allocator.free(buf.slice);
                         return .disarm;
                     };
-                    if (out) |to_send| {
+                    if (out.encrypted) |to_send| {
                         self.writeRaw(to_send) catch {};
                     }
                     // Schedule next read: either for more handshake data or for response

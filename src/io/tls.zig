@@ -19,9 +19,9 @@ pub const Client = struct {
     };
 
     /// Initialize a new TLS client for the given host.
-    pub fn init(host: []const u8, options: Options) !Client {
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, options: Options) !Client {
         return .{
-            .inner = try boring.tls_client.TlsClient.init(host, .{
+            .inner = try boring.tls_client.TlsClient.init(allocator, host, .{
                 .verify_certificate = options.verify_certificate,
             }),
         };
@@ -32,22 +32,17 @@ pub const Client = struct {
     }
 
     /// Returns the initial handshake data (ClientHello) to be sent to the server.
-    pub fn startHandshake(self: *Client) !?[]const u8 {
-        return self.inner.startHandshake();
+    pub fn startHandshake(self: *Client) !boring.tls.ProcessResult {
+        return try self.inner.startHandshake();
     }
 
     /// Decrypts data received from the wire.
-    /// Returns a slice of plaintext data if available. The slice is valid until
-    /// the next call to any decryption/encryption method on this client.
     pub fn decrypt(self: *Client, encrypted: []const u8) !?[]const u8 {
         return self.inner.processIncoming(encrypted, null);
     }
 
     /// Encrypts plaintext data for transmission over the wire.
-    /// If `plaintext` is null, it continues any pending handshake or administrative operations.
-    /// Returns a slice of encrypted data to be written to the socket.
-    /// The slice is valid until the next call to any decryption/encryption method.
-    pub fn encrypt(self: *Client, plaintext: ?[]const u8) !?[]const u8 {
+    pub fn encrypt(self: *Client, plaintext: ?[]const u8) !boring.tls.ProcessResult {
         return self.inner.processOutgoing(plaintext);
     }
 

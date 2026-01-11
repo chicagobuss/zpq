@@ -1,152 +1,58 @@
 const std = @import("std");
-const sink_mod = @import("sink.zig");
+const sink_interface = @import("sink.zig");
+const channel = @import("sink/channel.zig");
+const writer_mod = @import("s3/sink_writer.zig");
+const protocol_s3 = @import("../protocol/s3.zig");
 const transport = @import("transport.zig");
-const s3_protocol = @import("../protocol/s3.zig");
-const http_protocol = @import("../protocol/http.zig");
 const xev = @import("xev");
 
+const PART_SIZE = 8 * 1024 * 1024; // 8MB parts
+
 pub fn AsyncS3SinkGen(comptime Xev: type) type {
-    const Loop = Xev.Loop;
-    const Connection = transport.ConnectionGen(Xev);
-    const S3 = s3_protocol.S3;
+    const Writer = writer_mod.AsyncS3SinkWriterGen(Xev);
+    const ByteChannel = channel.SinkChannel([]const u8);
 
     return struct {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        loop: *Loop,
+        writer: Writer,
+        chan: ByteChannel,
         thread_pool: *xev.ThreadPool,
-        resolver: transport.Resolver,
+        
+        // Final results
+        err: ?anyerror = null,
+        thread: std.Thread,
+        notifier: xev.Async,
+        notifier_c: xev.Completion,
 
-        s3: S3,
-        bucket: []const u8,
-        key: []const u8,
-        host: []const u8,
+        pub fn init(allocator: std.mem.Allocator, loop: *Xev.Loop, thread_pool: *xev.ThreadPool, s3_config: protocol_s3.S3, bucket: []const u8, key: []const u8) !*Self {
+            var self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
 
-        // Ownership
-        owns_loop: bool = false,
+            self.allocator = allocator;
+            self.writer = try Writer.init(allocator, loop, s3_config, bucket, key);
+            
+            // Note: We use the provided loop, but we MUST ensure only one thread 
+            // drives it. If the reader is also driving it, we need a separate loop.
+            // Let's create a private loop for the Sink to be 100% safe from concurrency.
+            self.writer.loop = try allocator.create(Xev.Loop);
+            self.writer.loop.* = try Xev.Loop.init(.{});
+            
+            self.chan = ByteChannel.init(allocator, 32);
+            self.thread_pool = thread_pool;
+            self.err = null;
+            
+            self.notifier = try xev.Async.init();
+            self.notifier_c = .{};
 
-        // Connection pool
-        idle_connections: std.ArrayListUnmanaged(*Connection) = .{},
+            // Start the consumer thread
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
 
-        // Upload state
-        upload_id: ?[]const u8 = null,
-        parts: std.ArrayListUnmanaged(PartInfo) = .{},
-        current_part_number: u32 = 1,
-
-        // Buffering
-        buffer: std.ArrayListUnmanaged(u8) = .{},
-        part_size: usize = 8 * 1024 * 1024,
-
-        // In-flight uploads
-        in_flight: std.ArrayListUnmanaged(InFlightPart) = .{},
-        max_concurrent_uploads: usize = 4,
-
-        cached_addr: ?transport.Address = null,
-
-        const PartInfo = struct {
-            part_number: u32,
-            etag: []const u8,
-        };
-
-        const InFlightPart = struct {
-            part_number: u32,
-            data: []const u8, // Owned slice
-            ctx: ?*PartUploadContext = null,
-        };
-
-        const PartUploadContext = struct {
-            allocator: std.mem.Allocator,
-            sink: *Self,
-            conn: *Connection,
-            part_number: u32,
-            data: []const u8,
-
-            parser: http_protocol.ResponseParser = .{},
-            request_buf: []const u8 = "",
-
-            done: bool = false,
-            err: ?anyerror = null,
-            etag: ?[]const u8 = null,
-
-            // Chunked write state for body
-            body_offset: usize = 0,
-            current_chunk_len: usize = 0,
-
-            pub fn deinit(self: *PartUploadContext) void {
-                if (self.request_buf.len > 0) self.allocator.free(self.request_buf);
-            }
-        };
-
-        pub fn init(
-            allocator: std.mem.Allocator,
-            loop: *Loop,
-            thread_pool: *xev.ThreadPool,
-            bucket: []const u8,
-            region: []const u8,
-            key: []const u8,
-            access_key: []const u8,
-            secret_key: []const u8,
-            session_token: ?[]const u8,
-        ) !*Self {
-            const self = try allocator.create(Self);
-
-            const r = transport.Resolver.init(allocator, thread_pool);
-            const host = try std.fmt.allocPrint(allocator, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
-            errdefer allocator.free(host);
-
-            self.* = .{
-                .allocator = allocator,
-                .loop = loop,
-                .thread_pool = thread_pool,
-                .resolver = r,
-                .s3 = S3.init(bucket, region, access_key, secret_key, session_token),
-                .bucket = try allocator.dupe(u8, bucket),
-                .key = try allocator.dupe(u8, key),
-                .host = host,
-            };
             return self;
         }
 
-        pub fn deinit(self: *Self) void {
-            // Free in-flight (force clean)
-            for (self.in_flight.items) |part| {
-                self.allocator.free(part.data);
-                if (part.ctx) |ctx| {
-                    ctx.deinit();
-                    self.allocator.destroy(ctx);
-                }
-            }
-            self.in_flight.deinit(self.allocator);
-
-            // Free idle connections
-            for (self.idle_connections.items) |conn| {
-                conn.deinit();
-            }
-            self.idle_connections.deinit(self.allocator);
-
-            // Free parts metadata
-            for (self.parts.items) |p| self.allocator.free(p.etag);
-            self.parts.deinit(self.allocator);
-
-            self.buffer.deinit(self.allocator);
-            if (self.upload_id) |id| self.allocator.free(id);
-
-            self.allocator.free(self.bucket);
-            self.allocator.free(self.key);
-            self.allocator.free(self.host);
-            // S3 config copies (hack: s3 struct doesn't own strings but copies were passed? No, S3 struct just holds slices.
-            // Wait, S3.init takes slices. The key/secret need to be owned somewhere if they came from env.
-            // For now, assume caller manages lifetime or we should dupe them.
-            // S3 struct in protocol/s3.zig doesn't own strings.
-            // We should ideally dupe them if we want to be safe, but S3 struct fields are const.
-            // We can store owned copies in Self and point S3 to them.
-            // For now, let's assume they are static or owned by caller (Env map).
-
-            self.allocator.destroy(self);
-        }
-
-        pub fn sink(self: *Self) sink_mod.Sink {
+        pub fn sink(self: *Self) sink_interface.Sink {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -158,312 +64,201 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
 
         fn write(ptr: *anyopaque, data: []const u8) anyerror!usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            try self.buffer.appendSlice(self.allocator, data);
+            if (self.err) |e| return e;
 
-            while (self.buffer.items.len >= self.part_size) {
-                try self.flushPart();
-            }
+            std.debug.print("[S3Sink] Receiving {d} bytes\n", .{data.len});
+            // Copy data into channel (Sink takes ownership)
+            const copy = try self.allocator.dupe(u8, data);
+            try self.chan.send(copy);
+            
+            // Wake up the consumer loop
+            self.notifier.notify() catch {};
+            
             return data.len;
         }
 
         fn close(ptr: *anyopaque) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            try self.flushPart(); // Flush remaining
-
-            // If we started a multipart upload, finish it
-            if (self.upload_id != null) {
-                try self.drainUploads(true);
-                try self.completeMultipartUpload();
-            } else {
-                // Single PUT if buffer has content and no multipart started
-                // But flushPart already consumes buffer.
-                // If buffer was < part_size, flushPart does nothing unless we force it?
-                // Logic check: flushPart checks `items.len == 0` return.
-                // If items.len > 0 (but < part_size), flushPart creates a part.
-                // Wait, S3 limits multipart parts to 5MB except last part.
-                // If we have < 5MB total, we should do Single PUT.
-                // My flushPart logic blindly creates a part.
-                // Let's refine flushPart to only flush if >= part_size OR if explicit flush?
-                // Actually, if we haven't started Multipart, and we are closing:
-                // If parts.len == 0, we do Single PUT of buffer.
-                // If parts.len > 0, we flush remaining buffer as last part.
-
-                if (self.parts.items.len == 0 and self.upload_id == null) {
-                    // Single PUT
-                    try self.singlePut(self.buffer.items);
-                    self.buffer.clearRetainingCapacity();
-                } else {
-                    // Flush remainder as a part
-                    if (self.buffer.items.len > 0) {
-                        try self.flushPartForce();
-                    }
-                    try self.drainUploads(true);
-                    try self.completeMultipartUpload();
-                }
+            self.chan.close();
+            self.notifier.notify() catch {};
+            self.thread.join();
+            
+            // Drain remaining chunks in channel
+            while (try self.chan.recv()) |chunk| {
+                self.allocator.free(chunk);
             }
+            
+            self.writer.loop.deinit();
+            self.allocator.destroy(self.writer.loop);
+            
+            self.notifier.deinit();
+            self.writer.deinit();
+            self.chan.deinit();
+            const err = self.err;
+            self.allocator.destroy(self);
+            
+            if (err) |e| return e;
         }
 
-        fn flushPart(self: *Self) !void {
-            if (self.buffer.items.len < self.part_size) return;
-            try self.flushPartForce();
-        }
-
-        fn flushPartForce(self: *Self) !void {
-            if (self.buffer.items.len == 0) return;
-
-            if (self.upload_id == null) {
-                try self.createMultipartUpload();
-            }
-
-            const part_len = @min(self.buffer.items.len, self.part_size);
-            const part_data = try self.allocator.dupe(u8, self.buffer.items[0..part_len]);
-
-            // Shift buffer
-            const remaining = self.buffer.items.len - part_len;
-            if (remaining > 0) {
-                std.mem.copyForwards(u8, self.buffer.items[0..remaining], self.buffer.items[part_len..]);
-            }
-            self.buffer.shrinkRetainingCapacity(remaining);
-
-            const part_number = self.current_part_number;
-            self.current_part_number += 1;
-
-            try self.in_flight.append(self.allocator, .{
-                .part_number = part_number,
-                .data = part_data,
-            });
-
-            try self.startPendingUploads();
-
-            if (self.in_flight.items.len >= self.max_concurrent_uploads) {
-                try self.drainUploads(false);
-            }
-        }
-
-        fn startPendingUploads(self: *Self) !void {
-            var active: usize = 0;
-            for (self.in_flight.items) |part| {
-                if (part.ctx != null and !part.ctx.?.done) active += 1;
-            }
-
-            for (self.in_flight.items) |*part| {
-                if (active >= self.max_concurrent_uploads) break;
-                if (part.ctx == null) {
-                    try self.startPartUpload(part);
-                    active += 1;
-                }
-            }
-        }
-
-        fn acquireConnection(self: *Self) !*Connection {
-            if (self.idle_connections.popOrNull()) |conn| {
-                return conn;
-            }
-            if (self.cached_addr == null) {
-                // Resolve
-                var result: ?transport.Address = null;
-                const Ctx = struct { res: *?transport.Address };
-                const cb = struct {
-                    fn call(ctx: ?*anyopaque, addr: ?transport.Address) void {
-                        const c: *Ctx = @ptrCast(@alignCast(ctx));
-                        c.res.* = addr;
-                    }
-                }.call;
-                var ctx = Ctx{ .res = &result };
-
-                // Synchronous resolve for now (using thread pool)
-                // We could make this async if we change state machine, but block here is okay for now on init
-                try self.resolver.resolve(self.loop, self.host, 443, &ctx, cb);
-                while (result == null) {
-                    try self.loop.run(.once);
-                }
-                self.cached_addr = result;
-            }
-
-            const conn = try Connection.init(self.allocator, self.loop, true, self.host);
-            errdefer conn.deinit();
-            try conn.connect(self.cached_addr.?);
-            return conn;
-        }
-
-        fn releaseConnection(self: *Self, conn: *Connection) !void {
-            try self.idle_connections.append(self.allocator, conn);
-        }
-
-        fn startPartUpload(self: *Self, part: *InFlightPart) !void {
-            const conn = try self.acquireConnection();
-
-            const ctx = try self.allocator.create(PartUploadContext);
-            ctx.* = .{
-                .allocator = self.allocator,
-                .sink = self,
-                .conn = conn,
-                .part_number = part.part_number,
-                .data = part.data,
+        fn run(self: *Self) void {
+            self.runInternal() catch |e| {
+                self.err = e;
             };
-            part.ctx = ctx;
-
-            conn.callback_ctx = ctx;
-            conn.on_handshake = onPartHandshake;
-            conn.on_error = onPartError;
-
-            // If connection is already ready (from pool), on_handshake won't fire automatically?
-            // ConnectionGen doesn't track "ready" state perfectly re: callbacks.
-            // If we just created it, it's connecting.
-            // If we popped it, it's connected.
-            // We need to check conn.handshake_done.
-            if (conn.handshake_done) {
-                onPartHandshake(ctx);
-            }
         }
 
-        fn onPartHandshake(ctx_void: ?*anyopaque) void {
-            const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
-            const self = ctx.sink;
-
-            // Build Request
-            const path_fmt = "/{s}?partNumber={d}&uploadId={s}";
-            const path = std.fmt.allocPrint(self.allocator, path_fmt, .{ self.key, ctx.part_number, self.upload_id.? }) catch {
-                ctx.err = error.OutOfMemory;
-                ctx.done = true;
-                return;
-            };
-            defer self.allocator.free(path);
-
-            // Headers
-            // Note: We need to sign this.
-            // Using S3 protocol helper (which handles signing)
-            // But we need to format it into raw HTTP request for ConnectionGen.write.
-
-            // Simplify: Assume we can construct headers here.
-            // ... (Signing Logic) ...
-
-            const req_headers = self.s3.formatPutRequest(self.allocator, self.key, ctx.data, .{ .use_unsigned_payload = true }) catch |err| {
-                ctx.err = err;
-                ctx.done = true;
-                return;
-            };
-            // Note: formatPutRequest returns headers. We need to serialize them + Method/Path.
-            // Wait, formatPutRequest expects "key" but signs it.
-            // But for Part Upload, the path includes query params?
-            // S3.zig might need adjustment to support query params in signing.
-            // ...
-            // Let's assume for now we use a simpler approach or modify S3.zig later.
-            // Actually, legacy s3/writer.zig implemented its own `signRequest`.
-
-            // Construct request buffer
-            var buf = std.ArrayList(u8).init(self.allocator);
-            // ... append method, path, headers ...
-
-            // Add query params to path for signing?
-            // If implementation detail is complex, maybe just Stub it for now.
-            // ...
-
-            // Let's just create valid HTTP for now
-            http_protocol.formatRequest(buf.writer(), "PUT", path, req_headers) catch {};
-            // Add Content-Length
-            buf.writer().print("Content-Length: {d}\r\n\r\n", .{ctx.data.len}) catch {};
-
-            ctx.request_buf = buf.toOwnedSlice() catch return;
-
-            ctx.conn.on_data = onPartData;
-            ctx.conn.write(ctx.request_buf) catch {};
-
-            // We write body in chunks? Or all at once?
-            // Write all at once for simplicity in this pass, ConnectionGen queues it.
-            ctx.conn.write(ctx.data) catch {};
-        }
-
-        fn onPartData(ctx_void: ?*anyopaque, data: []const u8) !void {
-            const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
-
-            // Feed parser
-            ctx.parser.feed(data, ctx, onBodyRef) catch |err| {
-                ctx.err = err;
-                ctx.done = true;
-                return;
-            };
-
-            if (ctx.parser.state == .done) {
-                // Extract ETag
-                // ...
-                ctx.done = true;
-                // Release connection
-                ctx.sink.releaseConnection(ctx.conn) catch {};
-            }
-        }
-
-        fn onBodyRef(ctx: *anyopaque, chunk: []const u8) anyerror!void {
-            // We don't expect body for PUT response (usually empty XML)
-            _ = ctx;
-            _ = chunk;
-        }
-
-        fn onPartError(ctx_void: ?*anyopaque, err: anyerror) void {
-            const ctx: *PartUploadContext = @ptrCast(@alignCast(ctx_void));
-            ctx.err = err;
-            ctx.done = true;
-        }
-
-        fn drainUploads(self: *Self, wait_all: bool) !void {
-            while (true) {
-                if (self.countPending() > 0) {
-                    try self.loop.run(.once);
+        fn runInternal(self: *Self) !void {
+            // 0. Register notifier in loop to wake us on channel data
+            self.notifier.wait(self.writer.loop, &self.notifier_c, Self, self, struct {
+                fn cb(ptr: ?*Self, _: *xev.Loop, _: *xev.Completion, res: xev.Async.WaitError!void) xev.CallbackAction {
+                    _ = res catch {};
+                    _ = ptr;
+                    return .rearm;
                 }
+            }.cb);
 
+            // 1. Resolve DNS
+            const resolver = transport.Resolver.init(self.allocator, self.thread_pool);
+            
+            const ResolveResult = struct {
+                addr: ?transport.Address = null,
+                done: bool = false,
+            };
+            var res = ResolveResult{};
+            
+            try resolver.resolve(self.writer.loop, self.writer.host, 443, &res, struct {
+                fn cb(ctx: ?*anyopaque, addr: ?transport.Address) void {
+                    const r: *ResolveResult = @ptrCast(@alignCast(ctx));
+                    r.addr = addr;
+                    r.done = true;
+                }
+            }.cb);
+
+            while (!res.done) {
+                try self.writer.loop.run(.once);
+            }
+
+            const addr = res.addr orelse return error.DnsExpansionFailed;
+            self.writer.setAddress(addr);
+
+            // 2. Parallel Upload Logic
+            var buffer = std.ArrayListUnmanaged(u8){};
+            defer buffer.deinit(self.allocator);
+
+            var upload_id: ?[]const u8 = null;
+            var completed_parts = std.ArrayListUnmanaged(protocol_s3.S3.Part){};
+            defer {
+                for (completed_parts.items) |p| self.allocator.free(p.etag);
+                completed_parts.deinit(self.allocator);
+                if (upload_id) |id| self.allocator.free(id);
+            }
+
+            // In-flight request management (Mirroring Go semaphore/waitgroup)
+            const CONCURRENCY = 8;
+            var in_flight = std.ArrayListUnmanaged(*Writer.RequestContext){};
+            defer {
+                for (in_flight.items) |ctx| {
+                    ctx.deinit();
+                    self.allocator.destroy(ctx);
+                }
+                in_flight.deinit(self.allocator);
+            }
+
+            var next_part_number: u32 = 1;
+            var channel_closed = false;
+
+            while (!channel_closed or in_flight.items.len > 0 or buffer.items.len > 0) {
+                // A. Progress the loop
+                try self.writer.loop.run(.once);
+
+                // B. Reap finished requests
                 var i: usize = 0;
-                while (i < self.in_flight.items.len) {
-                    const part = &self.in_flight.items[i];
-                    if (part.ctx) |ctx| {
-                        if (ctx.done) {
-                            if (ctx.err) |err| return err;
+                while (i < in_flight.items.len) {
+                    const ctx = in_flight.items[i];
+                    if (ctx.done) {
+                        if (ctx.err) |err| return err;
+                        if (ctx.status_code != 200) return error.S3UploadPartFailed;
+                        
+                        const etag = try self.allocator.dupe(u8, ctx.etag orelse return error.MissingETag);
+                        try completed_parts.append(self.allocator, .{ .part_number = ctx.part_number, .etag = etag });
+                        
+                        _ = in_flight.orderedRemove(i);
+                        std.debug.print("[S3Sink] Part {d} finished. In-flight: {d}\n", .{ctx.part_number, in_flight.items.len});
+                        ctx.deinit();
+                        self.allocator.destroy(ctx);
+                    } else {
+                        i += 1;
+                    }
+                }
 
-                            // Success
-                            try self.parts.append(self.allocator, .{
-                                .part_number = ctx.part_number,
-                                .etag = ctx.etag orelse "", // TODO parse
-                            });
-
-                            // Cleanup
-                            ctx.deinit();
-                            self.allocator.destroy(ctx);
-                            self.allocator.free(part.data);
-                            _ = self.in_flight.swapRemove(i);
-                            continue;
+                // C. Try to fill buffer and launch new parts if room
+                if (!channel_closed and in_flight.items.len < CONCURRENCY) {
+                    while (try self.chan.tryRecv()) |chunk| {
+                        defer self.allocator.free(chunk);
+                        try buffer.appendSlice(self.allocator, chunk);
+                        
+                        if (buffer.items.len >= PART_SIZE) {
+                            if (upload_id == null) {
+                                std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
+                                upload_id = try self.writer.initiateMultipartUpload();
+                            }
+                            
+                            std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
+                            const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items);
+                            try in_flight.append(self.allocator, ctx);
+                            
+                            next_part_number += 1;
+                            buffer.clearRetainingCapacity();
+                            break; // Back to driving the loop
+                        }
+                    } else {
+                        // Channel empty, if we have nothing in-flight and not closed, block
+                        if (in_flight.items.len == 0 and buffer.items.len < PART_SIZE) {
+                            if (try self.chan.recv()) |chunk| {
+                                defer self.allocator.free(chunk);
+                                try buffer.appendSlice(self.allocator, chunk);
+                            } else {
+                                channel_closed = true;
+                            }
                         }
                     }
-                    i += 1;
+                } else if (in_flight.items.len >= CONCURRENCY or channel_closed) {
+                    // We are at capacity or done receiving, just drive the loop
                 }
 
-                try self.startPendingUploads();
-                if (!wait_all or self.in_flight.items.len == 0) break;
+                // D. Handle end of stream
+                if (channel_closed and buffer.items.len > 0 and in_flight.items.len < CONCURRENCY) {
+                    if (upload_id == null) {
+                         // Small file, will handle after the loop with single PUT
+                         break;
+                    } else {
+                        std.debug.print("[S3Sink] Launching final part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
+                        const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items);
+                        try in_flight.append(self.allocator, ctx);
+                        next_part_number += 1;
+                        buffer.clearRetainingCapacity();
+                    }
+                }
+                
+                if (channel_closed and buffer.items.len == 0 and in_flight.items.len == 0) break;
             }
-        }
 
-        fn countPending(self: *Self) usize {
-            var c: usize = 0;
-            for (self.in_flight.items) |p| if (p.ctx != null and !p.ctx.?.done) {
-                c += 1;
-            };
-            return c;
-        }
-
-        fn createMultipartUpload(self: *Self) !void {
-            _ = self;
-            // self.upload_id = try self.allocator.dupe(u8, "dummy_upload_id");
-            return error.NotImplemented;
-        }
-
-        fn completeMultipartUpload(self: *Self) !void {
-            _ = self;
-            // Blocking
-            // ...
-        }
-
-        fn singlePut(self: *Self, data: []const u8) !void {
-            _ = self;
-            _ = data;
-            // Blocking
+            // 3. Finalize
+            if (upload_id == null) {
+                if (buffer.items.len > 0) {
+                     std.debug.print("[S3Sink] Performing single PUT ({d} bytes)...\n", .{buffer.items.len});
+                     try self.writer.putObject(buffer.items);
+                }
+            } else {
+                std.debug.print("[S3Sink] Completing multipart upload {s} ({d} parts)...\n", .{upload_id.?, completed_parts.items.len});
+                // AWS requires parts to be sorted by PartNumber
+                const PartSort = struct {
+                    fn lessThan(_: void, a: protocol_s3.S3.Part, b: protocol_s3.S3.Part) bool {
+                        return a.part_number < b.part_number;
+                    }
+                };
+                std.mem.sort(protocol_s3.S3.Part, completed_parts.items, {}, PartSort.lessThan);
+                try self.writer.completeMultipartUpload(upload_id.?, completed_parts.items);
+            }
         }
     };
 }

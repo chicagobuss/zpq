@@ -12,6 +12,7 @@ const TlsClientOptions = struct {
 };
 
 pub const TlsClient = struct {
+    allocator: std.mem.Allocator,
     ssl_ctx: *c.SSL_CTX,
     ssl: *c.SSL,
     bio_read: *c.BIO,
@@ -23,7 +24,7 @@ pub const TlsClient = struct {
 
     const Self = @This();
 
-    pub fn init(hostname: []const u8, options: TlsClientOptions) !Self {
+    pub fn init(allocator: std.mem.Allocator, hostname: []const u8, options: TlsClientOptions) !Self {
         tls.initOpenSsl();
 
         const ctx = try createSslContext(options.verify_certificate);
@@ -54,6 +55,7 @@ pub const TlsClient = struct {
         c.SSL_set_bio(ssl, bio_read, bio_write);
 
         return .{
+            .allocator = allocator,
             .ssl_ctx = ctx,
             .ssl = ssl,
             .bio_read = bio_read,
@@ -64,11 +66,12 @@ pub const TlsClient = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.buffers.deinit(self.allocator);
         c.SSL_free(self.ssl);
         c.SSL_CTX_free(self.ssl_ctx);
     }
 
-    pub fn startHandshake(self: *Self) !?[]const u8 {
+    pub fn startHandshake(self: *Self) !tls.ProcessResult {
         c.SSL_set_connect_state(self.ssl);
         const handshake_result = c.SSL_do_handshake(self.ssl);
 
@@ -119,12 +122,17 @@ pub const TlsClient = struct {
         return result;
     }
 
-    pub fn processOutgoing(self: *Self, plaintext: ?[]const u8) !?[]const u8 {
+    pub fn processOutgoing(self: *Self, plaintext: ?[]const u8) !tls.ProcessResult {
+        var consumed: usize = 0;
         if (plaintext) |data| {
-            try self.writeEncryptedData(data);
+            consumed = try self.writeEncryptedData(data);
         }
 
-        return try self.readFromWriteBio();
+        try self.readFromWriteBio();
+        return .{
+            .encrypted = if (self.buffers.encrypted_out.items.len > 0) self.buffers.getEncryptedSlice() else null,
+            .consumed = consumed,
+        };
     }
 
     pub fn isHandshakeComplete(self: *Self) bool {
@@ -213,52 +221,43 @@ pub const TlsClient = struct {
         }
     }
 
-    fn readDecryptedData(self: *Self, user_buf: ?[]u8) !?[]const u8 {
-        self.buffers.resetDecrypted();
-
-        if (user_buf) |buf| {
-            const bytes_read = c.SSL_read(self.ssl, buf.ptr, @intCast(buf.len));
-            if (bytes_read > 0) {
-                return buf[0..@as(usize, @intCast(bytes_read))];
-            }
-            return try tls.handleSslReadError(self.ssl, bytes_read);
-        }
+    fn readDecryptedData(self: *Self, _: ?[]u8) !?[]const u8 {
+        self.buffers.decrypted_out.clearRetainingCapacity();
 
         var temp_buf: [BUFFER_SIZE]u8 = undefined;
-        const bytes_read = c.SSL_read(self.ssl, &temp_buf, temp_buf.len);
-        if (bytes_read > 0) {
-            const read_size = @as(usize, @intCast(bytes_read));
-            if (read_size > self.buffers.decrypted_buffer.len) {
-                return TlsError.TlsReadFailed;
+        while (true) {
+            const bytes_read = c.SSL_read(self.ssl, &temp_buf, temp_buf.len);
+            if (bytes_read > 0) {
+                try self.buffers.decrypted_out.appendSlice(self.allocator, temp_buf[0..@intCast(bytes_read)]);
+            } else {
+                if (self.buffers.decrypted_out.items.len > 0) return self.buffers.getDecryptedSlice();
+                return try tls.handleSslReadError(self.ssl, bytes_read);
             }
-            @memcpy(self.buffers.decrypted_buffer[0..read_size], temp_buf[0..read_size]);
-            self.buffers.decrypted_len = read_size;
-            return self.buffers.getDecryptedSlice();
         }
-
-        return try tls.handleSslReadError(self.ssl, bytes_read);
     }
 
-    fn writeEncryptedData(self: *Self, data: []const u8) !void {
+    fn writeEncryptedData(self: *Self, data: []const u8) !usize {
         if (!self.handshake_complete) {
             std.log.warn("Attempt to encrypt data before handshake complete", .{});
             return TlsError.TlsNotReady;
         }
 
         const bytes_written = c.SSL_write(self.ssl, data.ptr, @intCast(data.len));
-        if (bytes_written > 0) return;
+        if (bytes_written > 0) return @as(usize, @intCast(bytes_written));
 
-        if (tls.sslWantsMoreData(self.ssl, bytes_written)) return;
+        if (tls.sslWantsMoreData(self.ssl, bytes_written)) return 0;
 
         std.log.err("SSL_write failed with error: {}", .{c.SSL_get_error(self.ssl, bytes_written)});
         return TlsError.TlsWriteFailed;
     }
 
-    fn readFromWriteBio(self: *Self) !?[]const u8 {
-        self.buffers.resetEncrypted();
-        const encrypted_len = try tls.readFromBio(self.bio_write, &self.buffers.encrypted_buffer);
-        self.buffers.encrypted_len = encrypted_len;
-
-        return if (self.buffers.encrypted_len > 0) self.buffers.getEncryptedSlice() else null;
+    fn readFromWriteBio(self: *Self) !void {
+        self.buffers.encrypted_out.clearRetainingCapacity();
+        var temp_buf: [BUFFER_SIZE]u8 = undefined;
+        while (true) {
+            const encrypted_len = try tls.readFromBio(self.bio_write, &temp_buf);
+            if (encrypted_len == 0) break;
+            try self.buffers.encrypted_out.appendSlice(self.allocator, temp_buf[0..encrypted_len]);
+        }
     }
 };

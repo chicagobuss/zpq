@@ -798,7 +798,6 @@ pub fn ParquetReader(comptime T: type) type {
             const limit = @min(out_buf.len, remaining);
             const out = out_buf[0..limit];
 
-            const transport = @import("../io/transport.zig");
             std.log.scoped(.reader).debug("reader: nextBatch current_row={d} limit={d}", .{ self.current_row, limit });
 
             // 1. Initialize Selection Vector

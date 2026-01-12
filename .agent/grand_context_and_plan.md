@@ -4,13 +4,13 @@
 Radically simplify project documentation into a cohesive, tiered knowledge base. eliminate the sprawl of `.txt`, `.md`, and random `PLAN_*.md` files. Establish a clear "Base Camp" for future architectural expeditions.
 
 ## Checkpoint (Fork Point)
-**Commit**: `d62bf7c` (branch: `clean-slate-review`)
+**Commit**: `716c001` (branch: `clean-slate-review`)
 **Date**: 2026-01-11
-**State**: S3 Multipart Upload working, memory leak fixed, benchmarks captured, `just build` defaults to ReleaseFast.
+**State**: S3/Local benchmarking verified, `just bpftrace-bench` added, flamegraph methodology (wrapper scripts) established, Polars comparison baseline set.
 
 To revert to this checkpoint:
 ```bash
-git checkout 64bba48
+git checkout 716c001
 ```
 
 ## 1. The New Structure (`.agent/rules/`)
@@ -33,6 +33,12 @@ We will enforce a 3-Tier Rule System.
     -   *Always* source `.env`.
     -   *Always* use `just build` (defaults to ReleaseFast) and `just` commands.
     -   Use `just build-debug` only when debugging with symbols needed.
+-   **Performance Profiling (Flamegraphs)**:
+    -   **When**: Use before major architectural changes (to find bottlenecks) and after (to verify fixes).
+    -   **How**: Use the "Wrapper Script" pattern to preserve `.env` and `venv` under `sudo`.
+    -   **Command**: `just bpftrace-bench <input> <output> <args>` for aggregate syscall stats.
+    -   **Manual Perf**: `sudo perf record -F 997 -g -- /bin/bash /tmp/perf_wrapper.sh`.
+    -   **What to expect**: Current `zpq` is CPU-bound by encoding (35%) and Memcpy (20%). Polars is bottlenecked by productive work (ZSTD compression).
 -   **DNS/Networking**: Result of the DNS wars (The 3-tier resolver approach).
 -   **Memory Management**: Track in-flight buffers (read_buf_ptr pattern). Always call `stop()` before connection teardown.
 
@@ -54,11 +60,13 @@ We will enforce a 3-Tier Rule System.
 
 ## 2. Benchmark Results (100MB Parquet, ReleaseFast, 2026-01-11)
 
-| Scenario | ZPQ | AWS CLI | Ratio | Notes |
-|----------|-----|---------|-------|-------|
-| Local → S3 | 13.49s | 6.84s | 2.0x slower | Row decode/re-encode overhead |
-| S3 → S3 | 20.46s | N/A | - | S3 read + decode/re-encode + S3 write |
-| S3 → Local | 2.02s | N/A | - | Read-only path, very fast |
+| Scenario | ZPQ | Polars | AWS CLI | Ratio (vs Polars) | Notes |
+|----------|-----|--------|---------|-------------------|-------|
+| Local → S3 | 13.49s | 7.64s | 6.84s | 1.76x slower | Polars uses parallel async threads |
+| S3 → S3 | 20.46s | - | N/A | - | S3 read + decode/re-encode + S3 write |
+| S3 → Local | 2.02s | - | N/A | - | Read-only path, very fast |
+
+**Key Insight**: Polars achieves its speed via massive parallelism and optimized Arrow transformations. `zpq`'s Current bottleneck is row-by-row re-encoding and memory copies. The **Zero-Copy Fast Path** will allow `zpq` to **BEAT** Polars for `SELECT *` by streaming raw bits, which Polars cannot easily do.
 
 ### Methodology
 - **Build**: `just build` (uses -Doptimize=ReleaseFast by default)

@@ -61,7 +61,7 @@ We will enforce a 3-Tier Rule System.
 | S3 → Local | 2.02s | N/A | - | Read-only path, very fast |
 
 ### Methodology
-- **Build**: `zig build -Doptimize=ReleaseFast`
+- **Build**: `just build` (uses -Doptimize=ReleaseFast by default)
 - **Data**: 100MB Parquet file, 524,288 rows, ~20 columns
 - **ZPQ behavior**: Decodes ALL rows → `BenchmarkRow` struct (~18 columns) → re-encodes to Parquet → writes to sink
 - **No filtering applied** (no `--filter` flag), all rows written
@@ -77,7 +77,7 @@ A single, living document tracking:
 -   **Latest Benchmark Numbers** (See table above).
 
 ## 3. The Purge
-Once the above are created, we DELETE:
+Once the above are created, we deleted:
 -   `.cursor/`
 -   `.claude/`
 -   `hardening_plans/`
@@ -86,6 +86,8 @@ Once the above are created, we DELETE:
 -   `PLAN_SQL_LAYER.md`
 -   `step_back_architecture_01_05.md`
 -   `STATUS_CURRENT_DETAIL.md`
+
+## .cursor and .claude are now symlinks to .agent so rules stay in sync
 
 ## Execution Plan
 1.  Create `.agent/grand_context_and_plan.md` (This file).

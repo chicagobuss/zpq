@@ -49,14 +49,23 @@ We will enforce a 3-Tier Rule System.
 -   **Next Steps**:
     -   Implement the Zero-Copy Fast Path (bypass `ParquetReader` for `SELECT *`).
     -   Refactor `main.zig` to use a `Planner` (Decider) vs `Executor` (Doer).
-    -   Performance benchmarks vs AWS CLI baseline.
 
-## 2. The Status (`STATUS.md`)
+## 2. Benchmark Results (100MB Parquet, ReleaseFast, 2026-01-11)
+
+| Scenario | ZPQ | AWS CLI | Ratio | Notes |
+|----------|-----|---------|-------|-------|
+| Local → S3 | 13.49s | 6.84s | 2.0x slower | Row decode/re-encode overhead |
+| S3 → S3 | 20.46s | N/A | - | S3 read + filtering + S3 write |
+| S3 → Local | 2.02s | N/A | - | Read-only path, very fast |
+
+**Key Insight**: The ~2x overhead vs AWS CLI is due to row-by-row decoding and re-encoding. The **Zero-Copy Fast Path** should eliminate this for `SELECT *` queries, targeting AWS CLI parity.
+
+## 3. The Status (`STATUS.md`)
 A single, living document tracking:
 -   **Completed Milestones** (Read Dominance, Async Foundation, S3 Sink Stability).
 -   **Current Active Task** (Fast Path Optimization).
 -   **Future Roadmap** (SQL Layer, Arrow Interview).
--   **Latest Benchmark Numbers** (100MB multipart upload verified).
+-   **Latest Benchmark Numbers** (See table above).
 
 ## 3. The Purge
 Once the above are created, we DELETE:

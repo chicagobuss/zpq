@@ -31,8 +31,8 @@ We will enforce a 3-Tier Rule System.
 -   **Testing/Benchmarking**:
     -   *Never* compare `zpq` doing ETL vs `aws` doing Copy. Apples-to-Apples only.
     -   *Always* source `.env`.
-    -   *Always* use `just` commands.
-    -   *Always* build with `-Doptimize=ReleaseFast` for benchmarks.
+    -   *Always* use `just build` (defaults to ReleaseFast) and `just` commands.
+    -   Use `just build-debug` only when debugging with symbols needed.
 -   **DNS/Networking**: Result of the DNS wars (The 3-tier resolver approach).
 -   **Memory Management**: Track in-flight buffers (read_buf_ptr pattern). Always call `stop()` before connection teardown.
 

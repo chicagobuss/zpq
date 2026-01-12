@@ -4,13 +4,13 @@
 Radically simplify project documentation into a cohesive, tiered knowledge base. eliminate the sprawl of `.txt`, `.md`, and random `PLAN_*.md` files. Establish a clear "Base Camp" for future architectural expeditions.
 
 ## Checkpoint (Fork Point)
-**Commit**: `c1f08ba` (branch: `clean-slate-review`)
+**Commit**: `32dc576` (branch: `clean-slate-review`)
 **Date**: 2026-01-11
-**State**: S3 Multipart Upload working, memory leak fixed, stable baseline.
+**State**: S3 Multipart Upload working, memory leak fixed, benchmarks captured, stable baseline.
 
 To revert to this checkpoint:
 ```bash
-git checkout c1f08ba
+git checkout 32dc576
 ```
 
 ## 1. The New Structure (`.agent/rules/`)
@@ -32,6 +32,7 @@ We will enforce a 3-Tier Rule System.
     -   *Never* compare `zpq` doing ETL vs `aws` doing Copy. Apples-to-Apples only.
     -   *Always* source `.env`.
     -   *Always* use `just` commands.
+    -   *Always* build with `-Doptimize=ReleaseFast` for benchmarks.
 -   **DNS/Networking**: Result of the DNS wars (The 3-tier resolver approach).
 -   **Memory Management**: Track in-flight buffers (read_buf_ptr pattern). Always call `stop()` before connection teardown.
 
@@ -46,6 +47,7 @@ We will enforce a 3-Tier Rule System.
     -   ✅ S3 Multipart Upload working (14 parts, 100MB verified)
     -   ✅ Memory leak in transport layer fixed
     -   ✅ Stable checkpoint established
+    -   ✅ Baseline benchmarks captured (ReleaseFast)
 -   **Next Steps**:
     -   Implement the Zero-Copy Fast Path (bypass `ParquetReader` for `SELECT *`).
     -   Refactor `main.zig` to use a `Planner` (Decider) vs `Executor` (Doer).
@@ -55,10 +57,17 @@ We will enforce a 3-Tier Rule System.
 | Scenario | ZPQ | AWS CLI | Ratio | Notes |
 |----------|-----|---------|-------|-------|
 | Local → S3 | 13.49s | 6.84s | 2.0x slower | Row decode/re-encode overhead |
-| S3 → S3 | 20.46s | N/A | - | S3 read + filtering + S3 write |
+| S3 → S3 | 20.46s | N/A | - | S3 read + decode/re-encode + S3 write |
 | S3 → Local | 2.02s | N/A | - | Read-only path, very fast |
 
-**Key Insight**: The ~2x overhead vs AWS CLI is due to row-by-row decoding and re-encoding. The **Zero-Copy Fast Path** should eliminate this for `SELECT *` queries, targeting AWS CLI parity.
+### Methodology
+- **Build**: `zig build -Doptimize=ReleaseFast`
+- **Data**: 100MB Parquet file, 524,288 rows, ~20 columns
+- **ZPQ behavior**: Decodes ALL rows → `BenchmarkRow` struct (~18 columns) → re-encodes to Parquet → writes to sink
+- **No filtering applied** (no `--filter` flag), all rows written
+- **AWS CLI comparison**: Raw byte copy, no decoding (apples-to-oranges for ETL, but shows overhead)
+
+**Key Insight**: The ~2x overhead vs AWS CLI is the cost of row-by-row decoding and re-encoding. The **Zero-Copy Fast Path** should eliminate this for `SELECT *` queries by streaming raw Parquet pages directly, targeting AWS CLI parity.
 
 ## 3. The Status (`STATUS.md`)
 A single, living document tracking:

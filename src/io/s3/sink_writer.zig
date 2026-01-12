@@ -290,7 +290,7 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                 try self.parser.feed(data, &bctx, BodyCtx.onBody);
 
                 if (self.parser.state == .done) {
-                    if (self.conn) |c| c.stopped = true;
+                    if (self.conn) |c| c.stop();
                     self.status_code = self.parser.status_code;
                     // Extract ETag if present
                     if (self.parser.etag) |e| {

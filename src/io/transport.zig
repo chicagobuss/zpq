@@ -132,12 +132,17 @@ pub fn ConnectionGen(comptime Xev: type) type {
         current_write_offset: usize = 0,
         write_in_flight: bool = false,
         read_in_flight: bool = false,
+        read_buf_ptr: ?[]u8 = null, // Track in-flight read buffer for cleanup
 
         // Callbacks
         callback_ctx: ?*anyopaque = null,
         on_data: ?*const fn (ctx: ?*anyopaque, data: []const u8) anyerror!void = null,
         on_handshake: ?*const fn (ctx: ?*anyopaque) void = null,
         on_error: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
+
+        pub fn stop(self: *Self) void {
+            self.stopped = true;
+        }
 
         pub fn init(allocator: std.mem.Allocator, loop: Loop, use_tls: bool, host: []const u8) !*Self {
             const self = try allocator.create(Self);
@@ -153,6 +158,11 @@ pub fn ConnectionGen(comptime Xev: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Free any in-flight read buffer to prevent leaks
+            if (self.read_buf_ptr) |buf| {
+                self.allocator.free(buf);
+                self.read_buf_ptr = null;
+            }
             if (self.tls) |*t| t.deinit();
             if (self.current_write_buf) |buf| {
                 self.allocator.free(buf);
@@ -341,6 +351,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
             }
             self.read_in_flight = true;
             const buf = self.allocator.alloc(u8, 4096) catch return;
+            self.read_buf_ptr = buf; // Track for cleanup on deinit
             if (comptime @hasDecl(Xev.Loop, "read")) {
                 self.loop.read(&self.c_read, self.tcp, .{ .slice = buf }, Self, self, onRead) catch {};
             } else {
@@ -351,6 +362,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
         fn onRead(t: ?*Self, _: Loop, _: *Completion, _: TCP, buf: Xev.ReadBuffer, res: Xev.ReadError!usize) xev_mod.CallbackAction {
             const self = t.?;
             self.read_in_flight = false;
+            self.read_buf_ptr = null; // Buffer is now being handled, clear tracking
             const n = res catch |err| {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 self.allocator.free(buf.slice);

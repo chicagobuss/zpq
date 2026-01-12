@@ -3,6 +3,16 @@
 ## Objective
 Radically simplify project documentation into a cohesive, tiered knowledge base. eliminate the sprawl of `.txt`, `.md`, and random `PLAN_*.md` files. Establish a clear "Base Camp" for future architectural expeditions.
 
+## Checkpoint (Fork Point)
+**Commit**: `c1f08ba` (branch: `clean-slate-review`)
+**Date**: 2026-01-11
+**State**: S3 Multipart Upload working, memory leak fixed, stable baseline.
+
+To revert to this checkpoint:
+```bash
+git checkout c1f08ba
+```
+
 ## 1. The New Structure (`.agent/rules/`)
 
 We will enforce a 3-Tier Rule System.
@@ -23,6 +33,7 @@ We will enforce a 3-Tier Rule System.
     -   *Always* source `.env`.
     -   *Always* use `just` commands.
 -   **DNS/Networking**: Result of the DNS wars (The 3-tier resolver approach).
+-   **Memory Management**: Track in-flight buffers (read_buf_ptr pattern). Always call `stop()` before connection teardown.
 
 ### Tier 3: The Current Strategy (`tier3_strategy.md`)
 **The expedition we are on RIGHT NOW.**
@@ -31,16 +42,21 @@ We will enforce a 3-Tier Rule System.
     -   **Morsel-Driven parallel processing** (Go-style concurrency in Zig).
     -   **S3 Multipart Uploads** (8 concurrent parts).
     -   **Zero-Copy Pass-Through** (The "Fast Path" for `SELECT *`).
+-   **Completed**:
+    -   ✅ S3 Multipart Upload working (14 parts, 100MB verified)
+    -   ✅ Memory leak in transport layer fixed
+    -   ✅ Stable checkpoint established
 -   **Next Steps**:
-    -   Implement the logic to bypass the `ParquetReader` when filtering is null.
+    -   Implement the Zero-Copy Fast Path (bypass `ParquetReader` for `SELECT *`).
     -   Refactor `main.zig` to use a `Planner` (Decider) vs `Executor` (Doer).
+    -   Performance benchmarks vs AWS CLI baseline.
 
 ## 2. The Status (`STATUS.md`)
 A single, living document tracking:
--   **Completed Milestones** (Read Dominance, Async Foundation).
--   **Current Active Task** (Parallel Sink Verification, Fast Path Optimization).
+-   **Completed Milestones** (Read Dominance, Async Foundation, S3 Sink Stability).
+-   **Current Active Task** (Fast Path Optimization).
 -   **Future Roadmap** (SQL Layer, Arrow Interview).
--   **Latest Benchmark Numbers** (The 100MB Scan results).
+-   **Latest Benchmark Numbers** (100MB multipart upload verified).
 
 ## 3. The Purge
 Once the above are created, we DELETE:

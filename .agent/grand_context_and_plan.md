@@ -4,13 +4,13 @@
 Radically simplify project documentation into a cohesive, tiered knowledge base. eliminate the sprawl of `.txt`, `.md`, and random `PLAN_*.md` files. Establish a clear "Base Camp" for future architectural expeditions.
 
 ## Checkpoint (Fork Point)
-**Commit**: `32dc576` (branch: `clean-slate-review`)
+**Commit**: `64bba48` (branch: `clean-slate-review`)
 **Date**: 2026-01-11
-**State**: S3 Multipart Upload working, memory leak fixed, benchmarks captured, stable baseline.
+**State**: S3 Multipart Upload working, memory leak fixed, benchmarks captured, `just build` defaults to ReleaseFast.
 
 To revert to this checkpoint:
 ```bash
-git checkout 32dc576
+git checkout 64bba48
 ```
 
 ## 1. The New Structure (`.agent/rules/`)

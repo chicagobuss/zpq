@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # Tier 3: The Current Strategy
 
 **"Write Dominance" & The Fast Path**
@@ -19,3 +23,6 @@ Implement a high-performance S3 Sink that can saturate network bandwidth using p
 ## Next Tacticals
 1.  **Fast Path Logic**: Wire up `main.zig` to detect the identity case logic.
 2.  **Planner Separation**: Refactor `runQuery` into strict `Planner` (Decision) and `Executor` (Action) phases.
+
+## Much more detail here for how we're going to orchestrate s3 to s3:
+docs/tier_3_s3_pipeline_strategy.md

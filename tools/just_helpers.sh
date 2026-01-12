@@ -105,6 +105,71 @@ test_parquet_testing() {
     [ $failed -eq 0 ]
 }
 
+# --- Bpftrace Benchmark ---
+# Runs zpq with bpftrace syscall tracing. Requires sudo.
+# Usage: bpftrace_bench [input] [output] [extra_args...]
+# Example: bpftrace_bench s3://bucket/file.parquet /tmp/out.parquet --benchmark
+bpftrace_bench() {
+    local script_dir="$(dirname "$0")"
+    local project_root="$(cd "$script_dir/.." && pwd)"
+    
+    # Source environment for AWS credentials and export them
+    if [ -f "$project_root/.env" ]; then
+        set -a  # Automatically export all variables
+        source "$project_root/.env"
+        set +a
+    else
+        error ".env file not found at $project_root/.env"
+        exit 1
+    fi
+    
+    local input="${1:-}"
+    local output="${2:-/tmp/bpftrace_output.parquet}"
+    shift 2 || true
+    local extra_args="$*"
+    
+    if [ -z "$input" ]; then
+        error "Usage: bpftrace_bench <input> [output] [extra_args...]"
+        echo "  Examples:"
+        echo "    bpftrace_bench s3://bucket/file.parquet /tmp/out.parquet --benchmark"
+        echo "    bpftrace_bench /local/file.parquet /tmp/out.parquet --benchmark"
+        exit 1
+    fi
+    
+    info "Bpftrace benchmark: $input -> $output"
+    info "Extra args: $extra_args"
+    
+    # Create a wrapper script that sources .env and runs zpq
+    # This lets the root-run bpftrace subprocess source env vars properly
+    # Use project dir instead of /tmp to avoid namespace isolation issues
+    local wrapper="$project_root/.bpftrace_wrapper.sh"
+    cat > "$wrapper" << WRAPPER_EOF
+#!/bin/bash
+source $project_root/.env
+exec $project_root/zig-out/bin/zpq $input $output $extra_args
+WRAPPER_EOF
+    chmod 755 "$wrapper"
+    
+    if [ ! -x "$wrapper" ]; then
+        error "Failed to create wrapper script at $wrapper"
+        exit 1
+    fi
+    info "Created wrapper: $wrapper"
+    
+    # Run bpftrace with the wrapper script
+    # Note: bpftrace -c can't execute shell scripts directly, must use /bin/bash
+    # This traces: reads, writes, sends (TLS/S3), recvs
+    sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_read /comm == "zpq"/ { @reads = count(); @read_bytes = sum(args->count); }
+tracepoint:syscalls:sys_enter_write /comm == "zpq"/ { @writes = count(); @write_bytes = sum(args->count); }
+tracepoint:syscalls:sys_enter_sendto /comm == "zpq"/ { @sends = count(); @send_bytes = sum(args->len); }
+tracepoint:syscalls:sys_enter_recvfrom /comm == "zpq"/ { @recvs = count(); }
+tracepoint:syscalls:sys_enter_openat /comm == "zpq"/ { @opens = count(); }
+' -c "/bin/bash $wrapper"
+    
+    rm -f "$wrapper"
+}
+
 # --- Validate against reference implementations ---
 validate_parquet() {
     python3 "$(dirname "$0")/validate_parquet.py" "$@"
@@ -120,6 +185,7 @@ case "$cmd" in
     detect_triple) detect_triple "$@" ;;
     test_parquet_testing) test_parquet_testing "$@" ;;
     validate_parquet) validate_parquet "$@" ;;
+    bpftrace_bench) bpftrace_bench "$@" ;;
     *)
         error "Unknown command: $cmd"
         exit 1

@@ -51,6 +51,12 @@ test-verbose *args="":
 test-filter *filter:
     zig build test --summary all -- --test-filter "{{filter}}"
 
+# Run zpq with bpftrace syscall tracing (requires sudo bpftrace in sudoers)
+# Usage: just bpftrace-bench input output [extra_args]
+# Example: just bpftrace-bench 's3://bucket/file.parquet' '/tmp/out.parquet' '--benchmark'
+bpftrace-bench input output *args:
+    ./tools/just_helpers.sh bpftrace_bench {{input}} {{output}} {{args}}
+
 # Verify compilation for all major targets (Critical for Lambda)
 cross-check:
     @echo "Building for x86_64-linux (AWS Lambda)..."

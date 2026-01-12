@@ -14,8 +14,13 @@ default:
 # Run all checks (tests + build + verify)
 all: test build verify
 
-# Build the project (Core only)
+# Build the project (ReleaseFast by default)
 build:
+    @./tools/just_helpers.sh fetch_deps
+    zig build -Doptimize=ReleaseFast
+
+# Build with debug symbols (for debugging/profiling)
+build-debug:
     @./tools/just_helpers.sh fetch_deps
     zig build
 

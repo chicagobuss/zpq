@@ -26,10 +26,16 @@ trigger: always_on
     *   **Use `just`**: `just build` and `just bench` are the sources of truth.
 *   **Reproducibility**:
     *   Pin the Zig compiler version (see `.zig-version`).
-    *   Disable "Verify Certificate" only for local MinIO tests. Production **MUST** verify.
+    *   # Standard parquet testing and benchmark file (snappy compressed, lots of types):
+       ZPQ_BENCH_FILE=data/benchmark/benchmark_100mb.parquet
+       # Also in S3 in s3://${AWS_S3_BUCKET}zpq_test_data/zpq_test_data/benchmark/
 
 ## DNS & Networking
 *   **The Resolver Wars**: We use a 3-tier resolver stack:
     1.  **Fast Path**: In-memory LRU cache.
     2.  **deduplication**: SingleFlight (coalesce concurrent requests for same host).
     3.  **Transport**: `xev`-based async resolution (never block the loop).
+
+## Observability & Logging
+ - zpq shouldn't need fancy debug-mode compilation, just use releasefast builds and a normal debug/info/warn/error style logger in a consistent, unified fashion throughout the codebase, and set the log level appropriately with a cli arg when running the binary if you need/want more logging output.
+ - for more detailed observability, you can use ebpf tools on linux or xccode when developing on macos

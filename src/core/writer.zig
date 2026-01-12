@@ -3,6 +3,8 @@ const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const snappy = @import("snappy.zig");
 const sink_mod = @import("../io/sink.zig");
+const column_batch = @import("column_batch.zig");
+const selection = @import("selection.zig");
 
 pub const WriterError = error{
     IoError,
@@ -101,6 +103,99 @@ const ColumnWriter = struct {
         self.count += 1;
     }
 
+    pub fn appendColumn(self: *ColumnWriter, col: *const column_batch.Column, sel: *const selection.SelectionVector, count: usize) !void {
+        var added: usize = 0;
+        
+        switch (self.type) {
+            .INT32 => {
+                 if (col.data != .i32) return error.EncodingError;
+                 const src = col.data.i32;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         var buf: [4]u8 = undefined;
+                         std.mem.writeInt(i32, &buf, src[i], .little);
+                         try self.values_buffer.appendSlice(self.allocator, &buf);
+                         added += 1;
+                     }
+                 }
+            },
+            .INT64 => {
+                 if (col.data != .i64) return error.EncodingError;
+                 const src = col.data.i64;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         var buf: [8]u8 = undefined;
+                         std.mem.writeInt(i64, &buf, src[i], .little);
+                         try self.values_buffer.appendSlice(self.allocator, &buf);
+                         added += 1;
+                     }
+                 }
+            },
+            .FLOAT => {
+                 if (col.data != .f32) return error.EncodingError;
+                 const src = col.data.f32;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         var buf: [4]u8 = undefined;
+                         std.mem.writeInt(u32, &buf, @bitCast(src[i]), .little);
+                         try self.values_buffer.appendSlice(self.allocator, &buf);
+                         added += 1;
+                     }
+                 }
+            },
+            .DOUBLE => {
+                 if (col.data != .f64) return error.EncodingError;
+                 const src = col.data.f64;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         var buf: [8]u8 = undefined;
+                         std.mem.writeInt(u64, &buf, @bitCast(src[i]), .little);
+                         try self.values_buffer.appendSlice(self.allocator, &buf);
+                         added += 1;
+                     }
+                 }
+            },
+            .BOOLEAN => {
+                 // Note: ColumnData boolean is currently []bool, not bitpacked.
+                 if (col.data != .bool) return error.EncodingError;
+                 const src = col.data.bool;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         if (src[i]) {
+                            self.bool_buffer |= (@as(u8, 1) << self.bool_bit_pos);
+                         }
+                         if (self.bool_bit_pos == 7) {
+                            try self.values_buffer.append(self.allocator, self.bool_buffer);
+                            self.bool_buffer = 0;
+                            self.bool_bit_pos = 0;
+                         } else {
+                            self.bool_bit_pos += 1;
+                         }
+                         added += 1;
+                     }
+                 }
+            },
+            .BYTE_ARRAY => {
+                 // ColumnData byte_array is [][]const u8
+                 if (col.data != .byte_array) return error.EncodingError;
+                 const src = col.data.byte_array;
+                 for (0..count) |i| {
+                     if (sel.isActive(i)) {
+                         const s = src[i];
+                         var len_buf: [4]u8 = undefined;
+                         std.mem.writeInt(u32, &len_buf, @intCast(s.len), .little);
+                         try self.values_buffer.appendSlice(self.allocator, &len_buf);
+                         try self.values_buffer.appendSlice(self.allocator, s);
+                         added += 1;
+                     }
+                 }
+            },
+            else => return error.NotImplemented,
+        }
+        
+        self.count += added;
+    }
+
     pub fn flushPage(self: *ColumnWriter, writer: *ParquetWriter) !PageResult {
         if (self.count == 0) return PageResult{};
 
@@ -169,8 +264,17 @@ pub const ParquetWriter = struct {
     total_rows: i64 = 0,
     offset: i64 = 0,
     path_strings: std.ArrayListUnmanaged([]const u8),
+    is_detached: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, sink: sink_mod.Sink, schema_elems: []const schema.SchemaElement) !*ParquetWriter {
+        return try initInternal(allocator, sink, schema_elems, false);
+    }
+
+    pub fn initDetached(allocator: std.mem.Allocator, sink: sink_mod.Sink, schema_elems: []const schema.SchemaElement) !*ParquetWriter {
+        return try initInternal(allocator, sink, schema_elems, true);
+    }
+
+    fn initInternal(allocator: std.mem.Allocator, sink: sink_mod.Sink, schema_elems: []const schema.SchemaElement, detached: bool) !*ParquetWriter {
         const self = try allocator.create(ParquetWriter);
         var schema_list = std.ArrayListUnmanaged(schema.SchemaElement){};
         try schema_list.appendSlice(allocator, schema_elems);
@@ -196,9 +300,12 @@ pub const ParquetWriter = struct {
             .columns = cols,
             .row_groups = .{},
             .path_strings = path_strings,
+            .is_detached = detached,
         };
 
-        try self.writeSink("PAR1");
+        if (!detached) {
+            try self.writeSink("PAR1");
+        }
         return self;
     }
 
@@ -233,6 +340,31 @@ pub const ParquetWriter = struct {
             }
         }
         self.total_rows += 1;
+    }
+
+    pub fn appendBatch(self: *ParquetWriter, batch: *const column_batch.ColumnBatch) !void {
+        // Iterate over columns in the batch
+        // We assume the batch columns match the writer schema columns strictly in order.
+        // batch.columns[i] -> self.columns[i]
+        
+        // Count active rows first (we need to update total_rows)
+        var active_count: usize = 0;
+        for (0..batch.num_rows) |i| {
+            if (batch.selection.isActive(i)) active_count += 1;
+        }
+        if (active_count == 0) return;
+
+        for (self.columns, 0..) |*writer_col, i| {
+             if (i >= batch.columns.items.len) break;
+             const batch_col = &batch.columns.items[i];
+             
+             // Ensure type match (basic check, appendColumn does strict check)
+             if (writer_col.type != batch_col.parquet_type) return error.EncodingError;
+             
+             try writer_col.appendColumn(batch_col, &batch.selection, batch.num_rows);
+        }
+        
+        self.total_rows += @intCast(active_count);
     }
 
     pub fn flushRowGroup(self: *ParquetWriter) !void {
@@ -311,5 +443,53 @@ pub const ParquetWriter = struct {
     fn writeSink(self: *ParquetWriter, data: []const u8) !void {
         _ = try self.sink.write(data);
         self.offset += @intCast(data.len);
+    }
+
+    /// Merges results from a detached writer into this one.
+    /// This is used for parallel commit.
+    pub fn mergeDetached(self: *ParquetWriter, data: []const u8, row_groups: []const schema.RowGroup) !void {
+        const start_offset = self.offset;
+        
+        // 1. Write the raw bytes
+        try self.writeSink(data);
+        
+        // 2. Adjust and append row groups
+        for (row_groups) |rg| {
+            // Manual Deep Clone to global allocator
+            var rg_copy = schema.RowGroup{
+                .columns = .{},
+                .total_byte_size = rg.total_byte_size,
+                .num_rows = rg.num_rows,
+            };
+            try rg_copy.columns.ensureTotalCapacity(self.allocator, rg.columns.items.len);
+            
+            for (rg.columns.items) |col| {
+                var col_copy = col;
+                col_copy.file_offset += start_offset;
+                
+                if (col.meta_data) |meta| {
+                    var meta_copy = meta;
+                    meta_copy.data_page_offset += start_offset;
+                    if (meta_copy.index_page_offset) |*v| v.* += start_offset;
+                    if (meta_copy.dictionary_page_offset) |*v| v.* += start_offset;
+                    
+                    // Clone ArrayLists
+                    meta_copy.encodings = .{};
+                    try meta_copy.encodings.appendSlice(self.allocator, meta.encodings.items);
+                    
+                    meta_copy.path_in_schema = .{};
+                    try meta_copy.path_in_schema.ensureTotalCapacity(self.allocator, meta.path_in_schema.items.len);
+                    for (meta.path_in_schema.items) |p| {
+                         try meta_copy.path_in_schema.append(self.allocator, try self.allocator.dupe(u8, p));
+                    }
+                    
+                    col_copy.meta_data = meta_copy;
+                }
+                rg_copy.columns.appendAssumeCapacity(col_copy);
+            }
+            
+            try self.row_groups.append(self.allocator, rg_copy);
+            self.total_rows += rg.num_rows;
+        }
     }
 };

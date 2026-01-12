@@ -325,6 +325,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zpq", .module = zpq_mod },
+                .{ .name = "xev", .module = libxev_mod },
             },
         }),
     });

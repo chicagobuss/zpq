@@ -11,9 +11,11 @@ pub const io = struct {
     pub const BufferLender = interface.BufferLender;
     pub const local = @import("io/local.zig");
     pub const s3 = @import("io/s3.zig");
+    pub const prefetching_source = @import("io/prefetching_source.zig");
     pub const transport = @import("io/transport.zig");
     pub const factory = @import("io/factory.zig");
     pub const sink = @import("io/sink.zig");
+    pub const memory_sink = @import("io/memory_sink.zig");
     pub const s3_sink = @import("io/s3_sink.zig");
     pub const local_sink = @import("io/local_sink.zig");
 };
@@ -42,6 +44,7 @@ pub const core = struct {
     pub const column_reader = @import("core/column_reader.zig");
     pub const planner = @import("core/planner.zig");
     pub const rowgroup_pipeline = @import("core/rowgroup_pipeline.zig");
+    pub const executor = @import("core/executor.zig");
 };
 
 pub const log = @import("zpq/log.zig");

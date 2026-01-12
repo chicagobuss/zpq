@@ -78,15 +78,34 @@ pub fn main() !void {
     var select_str: ?[]const u8 = null;
     var log_level: zpq.log.Level = .info;
     var is_benchmark = false;
+    var num_threads: usize = 4;
+    var repeat_count: usize = 1;
+    var command: enum { query, schema, meta, cat, pages } = .query;
 
-    // First pass: extract all flags and positional arguments
+    // First pass: extract command and flags
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
+        if (std.mem.eql(u8, arg, "schema")) {
+            command = .schema;
+        } else if (std.mem.eql(u8, arg, "meta")) {
+            command = .meta;
+        } else if (std.mem.eql(u8, arg, "cat")) {
+            command = .cat;
+        } else if (std.mem.eql(u8, arg, "pages")) {
+            command = .pages;
+        } else if (std.mem.eql(u8, arg, "--filter") or std.mem.eql(u8, arg, "-f")) {
             filter_str = args.next();
         } else if (std.mem.eql(u8, arg, "--select") or std.mem.eql(u8, arg, "-s")) {
             select_str = args.next();
         } else if (std.mem.eql(u8, arg, "--benchmark")) {
             is_benchmark = true;
+        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-t")) {
+            if (args.next()) |t_str| {
+                num_threads = try std.fmt.parseInt(usize, t_str, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--repeat")) {
+            if (args.next()) |r_str| {
+                repeat_count = try std.fmt.parseInt(usize, r_str, 10);
+            }
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             const level_str = args.next() orelse "info";
             if (std.mem.eql(u8, level_str, "trace")) {
@@ -105,10 +124,8 @@ pub fn main() !void {
                 zpq.log.correlation_id = std.fmt.parseInt(u64, cid_str, 0) catch 0;
             }
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            // Unknown flag, ignore or warn?
             std.debug.print("Warning: Unknown flag '{s}'\n", .{arg});
         } else {
-            // Positional argument
             if (input_path == null) {
                 input_path = arg;
             } else if (output_path == null) {
@@ -117,7 +134,7 @@ pub fn main() !void {
         }
     }
 
-    if (input_path == null or output_path == null) {
+    if (input_path == null) {
         printUsage();
         return;
     }
@@ -140,7 +157,7 @@ pub fn main() !void {
     defer global_async_logger = null;
     try logger.start(&loop);
 
-    var thread_pool = xev.ThreadPool.init(.{ .max_threads = 4 });
+    var thread_pool = xev.ThreadPool.init(.{ .max_threads = @intCast(num_threads) });
     defer {
         thread_pool.shutdown();
         thread_pool.deinit();
@@ -158,49 +175,83 @@ pub fn main() !void {
     defer pfile.deinit();
 
     if (is_benchmark) {
-        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path.?, &loop, &thread_pool);
+        try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path orelse "/dev/null", &loop, &thread_pool, repeat_count);
     } else {
-        std.debug.print("Full CLI mode (GenericRow) not yet implemented. Use --benchmark for performance testing on known schema.\n", .{});
-        return error.UnsupportedMode;
+        switch (command) {
+            .query => try runQuery(BenchmarkRow, allocator, &pfile, filter_str, select_str, output_path orelse "/dev/null", &loop, &thread_pool, repeat_count),
+            .schema => {
+                std.debug.print("Schema for {s}:\n", .{input_path.?});
+                for (pfile.metadata.schema.items, 0..) |elem, i| {
+                    const type_str = if (elem.type) |t| @tagName(t) else "n/a";
+                    const rep_str = if (elem.repetition_type) |rt| @tagName(rt) else "n/a";
+                    std.debug.print("  [{d}] {s}: {s} ({s})\n", .{ i, elem.name, type_str, rep_str });
+                }
+            },
+            .meta => {
+                std.debug.print("Metadata for {s}:\n", .{input_path.?});
+                std.debug.print("  Rows: {d}\n", .{pfile.metadata.num_rows});
+                std.debug.print("  Row Groups: {d}\n", .{pfile.metadata.row_groups.items.len});
+            },
+            else => {
+                std.debug.print("Command {s} not yet fully implemented in refactor.\n", .{@tagName(command)});
+            },
+        }
     }
 }
 
-fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8, loop: *xev.Dynamic.Loop, thread_pool: *xev.ThreadPool) !void {
-    var reader = try zpq.core.reader.ParquetReader(T).init(allocator, pfile);
-    defer reader.deinit();
+fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8, loop: *xev.Dynamic.Loop, thread_pool: *xev.ThreadPool, repeat: usize) !void {
+    // 1. Setup Execution Plan
+    var plan = zpq.core.planner.ExecutionPlan.init(allocator);
+    defer plan.deinit();
+
+    // Map columns
+    // We need to know indices for generic T
+    // This is a bit hacked for T, ideally T shouldn't dictate it if we are generic,
+    // but for the benchmark we use strict indices.
+    
+    // For T=BenchmarkRow, we know the indices match the file schema indices usually.
+    // Let's assume schema based scan.
+    
+    var req_cols_list = std.ArrayListUnmanaged(usize){};
+    defer req_cols_list.deinit(allocator);
 
     if (select_str) |s| {
-        var mask = [_]bool{false} ** @typeInfo(T).@"struct".fields.len;
         var it = std.mem.tokenizeScalar(u8, s, ',');
         while (it.next()) |col_name_raw| {
             const col_name = std.mem.trim(u8, col_name_raw, " ");
-            inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
-                if (std.mem.eql(u8, field.name, col_name)) {
-                    mask[i] = true;
-                }
+            const idx = try findColumnIndex(col_name, pfile);
+            try req_cols_list.append(allocator, idx);
+        }
+    } else {
+        // Select all
+        // skip 0 (root)
+        for (0..pfile.metadata.schema.items.len - 1) |i| {
+            if (pfile.metadata.schema.items[i + 1].type != null) {
+                try req_cols_list.append(allocator, i);
             }
         }
-        reader.setProjection(mask);
     }
+    
+    plan.required_columns = try req_cols_list.toOwnedSlice(allocator);
+    plan.output_columns = try allocator.dupe(usize, plan.required_columns);
 
-    var filters = std.ArrayListUnmanaged(zpq.core.filter.Filter){};
-    defer filters.deinit(allocator);
-
+    // 2. Setup Filter
     if (filter_str) |f| {
-        const parsed = try parseFilter(T, f, pfile);
-        try filters.append(allocator, parsed);
+        plan.filter = try parseFilter(T, f, pfile);
+        
+        // Collect all filter columns (handles composite filters recursively)
+        var filter_cols_list = std.ArrayListUnmanaged(usize){};
+        try collectFilterColumns(plan.filter.?, &filter_cols_list, allocator);
+        plan.filter_columns = try filter_cols_list.toOwnedSlice(allocator);
+        
+        // Ensure filter columns are in required columns?
+        // RowGroupPipeline logic: it reads filter_cols separately. 
+        // If filter col is ALSO in output, it reads it again? 
+        // Current implementation: yes, naive read.
+
     }
 
-    const batch_size = 8192;
-    const batch = try allocator.alloc(T, batch_size);
-    defer allocator.free(batch);
-    @memset(std.mem.sliceAsBytes(batch), 0);
-
-    var total_active: usize = 0;
-    var total_scanned: usize = 0;
-    const total_rows_in_file: usize = @intCast(pfile.metadata.num_rows);
-    var timer = try std.time.Timer.start();
-
+    // 3. Setup Writer
     const output_to_stdout = std.mem.eql(u8, output_path, "--");
     const output_to_null = std.mem.eql(u8, output_path, "/dev/null");
 
@@ -210,7 +261,19 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
             .loop = loop,
             .thread_pool = thread_pool,
         });
-        writer = try zpq.core.writer.ParquetWriter.init(allocator, out_sink, pfile.metadata.schema.items);
+        
+        // Construct writing schema from output columns
+        var out_schema = std.ArrayListUnmanaged(zpq.core.schema.SchemaElement){};
+        defer out_schema.deinit(allocator);
+        
+        try out_schema.append(allocator, pfile.metadata.schema.items[0]); // Root
+        for (plan.output_columns) |idx| {
+            // idx is index in full schema? Yes.
+            // Writer expects a list of SchemaElements.
+            try out_schema.append(allocator, pfile.metadata.schema.items[idx]);
+        }
+        
+        writer = try zpq.core.writer.ParquetWriter.init(allocator, out_sink, out_schema.items);
     }
     defer {
         if (writer) |w| {
@@ -219,53 +282,122 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
         }
     }
 
-    while (total_scanned < total_rows_in_file) {
-        const to_scan = @min(batch.len, total_rows_in_file - total_scanned);
-        const n = try reader.nextBatch(batch[0..to_scan], filters.items);
-
-        if (writer) |w| {
-            for (batch[0..n]) |row| {
-                try w.appendRow(row);
-            }
-        }
-
-        total_active += n;
-        total_scanned += to_scan;
-
-        if (output_to_stdout and total_active < 100) {
-            // Just print a few rows to verify
-            // std.debug.print("Row {d}: {any}\n", .{ total_active, batch[0] });
-        }
+    // 4. Parallel Execution
+    var timer = try std.time.Timer.start();
+    var executor = zpq.core.executor.Executor.init(
+        allocator,
+        &plan,
+        &pfile.metadata,
+        pfile.source,
+        thread_pool,
+        writer,
+    );
+    for (0..repeat) |_| {
+        try executor.execute();
     }
-
-    if (writer) |w| {
-        try w.flushRowGroup();
-    }
+    
+    // Stats from executor
+    const total_active = executor.rows_matched.load(.monotonic);
+    const total_scanned = executor.rows_scanned.load(.monotonic);
 
     const elapsed = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
     std.debug.print("Scanned {d} rows ({d} matched) in {d:.2}ms ({d:.2} Mrows/sec)\n", .{ total_scanned, total_active, elapsed_ms, @as(f64, @floatFromInt(total_scanned)) / (elapsed_ms * 1000.0) });
 }
 
+fn collectFilterColumns(filter: zpq.core.filter.Filter, list: *std.ArrayListUnmanaged(usize), allocator: std.mem.Allocator) !void {
+    switch (filter) {
+        .int32 => |f| try list.append(allocator, f.col_idx),
+        .int64 => |f| try list.append(allocator, f.col_idx),
+        .float => |f| try list.append(allocator, f.col_idx),
+        .double => |f| try list.append(allocator, f.col_idx),
+        .string => |f| try list.append(allocator, f.col_idx),
+        .boolean => |f| try list.append(allocator, f.col_idx),
+        .and_filter => |f| {
+            try collectFilterColumns(f.left.*, list, allocator);
+            try collectFilterColumns(f.right.*, list, allocator);
+        },
+        .or_filter => |f| {
+            try collectFilterColumns(f.left.*, list, allocator);
+            try collectFilterColumns(f.right.*, list, allocator);
+        },
+    }
+}
+
 fn parseFilter(comptime T: type, filter_str: []const u8, pfile: *zpq.core.file.ParquetFile) !zpq.core.filter.Filter {
-    // Simple parser for "col=val"
-    const eq_idx = std.mem.indexOfScalar(u8, filter_str, '=') orelse return error.InvalidFilter;
-    const col_name = filter_str[0..eq_idx];
-    const val_str = filter_str[eq_idx + 1 ..];
+    return parseFilterWithAllocator(T, filter_str, pfile, pfile.allocator);
+}
+
+
+fn parseFilterWithAllocator(comptime T: type, filter_str: []const u8, pfile: *zpq.core.file.ParquetFile, allocator: std.mem.Allocator) !zpq.core.filter.Filter {
+    // Check for OR first (lower precedence)
+    if (std.mem.indexOf(u8, filter_str, " OR ")) |or_idx| {
+        const left_str = std.mem.trim(u8, filter_str[0..or_idx], " ");
+        const right_str = std.mem.trim(u8, filter_str[or_idx + 4 ..], " ");
+        
+        const left = try allocator.create(zpq.core.filter.Filter);
+        const right = try allocator.create(zpq.core.filter.Filter);
+        left.* = try parseFilterWithAllocator(T, left_str, pfile, allocator);
+        right.* = try parseFilterWithAllocator(T, right_str, pfile, allocator);
+        
+        return .{ .or_filter = .{ .left = left, .right = right } };
+    }
+    
+    // Check for AND (higher precedence)
+    if (std.mem.indexOf(u8, filter_str, " AND ")) |and_idx| {
+        const left_str = std.mem.trim(u8, filter_str[0..and_idx], " ");
+        const right_str = std.mem.trim(u8, filter_str[and_idx + 5 ..], " ");
+        
+        const left = try allocator.create(zpq.core.filter.Filter);
+        const right = try allocator.create(zpq.core.filter.Filter);
+        left.* = try parseFilterWithAllocator(T, left_str, pfile, allocator);
+        right.* = try parseFilterWithAllocator(T, right_str, pfile, allocator);
+        
+        return .{ .and_filter = .{ .left = left, .right = right } };
+    }
+    
+    // Leaf filter: "colOPval" where OP is =, !=, <, >, <=, >=
+    const operators = [_][]const u8{ "!=", "<=", ">=", "=", "<", ">" };
+    var op_str: []const u8 = "";
+    var op_type: zpq.core.filter.Operator = .Eq;
+    var op_idx: usize = 0;
+
+    for (operators) |op| {
+        if (std.mem.indexOf(u8, filter_str, op)) |idx| {
+            op_idx = idx;
+            op_str = op;
+            op_type = switch (op[0]) {
+                '=' => .Eq,
+                '!' => .NotEq,
+                '<' => if (op.len > 1) .LtEq else .Lt,
+                '>' => if (op.len > 1) .GtEq else .Gt,
+                else => unreachable,
+            };
+            break;
+        }
+    }
+
+    if (op_str.len == 0) return error.InvalidFilter;
+
+    const col_name = std.mem.trim(u8, filter_str[0..op_idx], " ");
+    const val_str = std.mem.trim(u8, filter_str[op_idx + op_str.len ..], " ");
 
     const col_idx = try findColumnIndex(col_name, pfile);
     const field_type = try getFieldType(T, col_name);
 
     return switch (field_type) {
-        .ByteArray => return error.InvalidFilter, // Not supported yet
-        .Int32 => .{ .int32 = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseInt(i32, val_str, 10) } },
-        .Int64 => .{ .int64 = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseInt(i64, val_str, 10) } },
-        .Float => .{ .float = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseFloat(f32, val_str) } },
-        .Double => .{ .double = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseFloat(f64, val_str) } },
-        // .Bool => .{ .bool = ... } // Filter doesn't have bool yet? 
-        .Bool => return error.InvalidFilter,
+        .ByteArray => .{ .string = .{ .col_idx = col_idx, .op = op_type, .value = val_str } },
+        .Int32 => .{ .int32 = .{ .col_idx = col_idx, .op = op_type, .value = try std.fmt.parseInt(i32, val_str, 10) } },
+        .Int64 => .{ .int64 = .{ .col_idx = col_idx, .op = op_type, .value = try std.fmt.parseInt(i64, val_str, 10) } },
+        .Float => .{ .float = .{ .col_idx = col_idx, .op = op_type, .value = try std.fmt.parseFloat(f32, val_str) } },
+        .Double => .{ .double = .{ .col_idx = col_idx, .op = op_type, .value = try std.fmt.parseFloat(f64, val_str) } },
+        .Bool => blk: {
+            const bool_val = std.mem.eql(u8, val_str, "true") or std.mem.eql(u8, val_str, "1");
+            break :blk .{ .boolean = .{ .col_idx = col_idx, .op = op_type, .value = bool_val } };
+        },
     };
 }
+
 
 fn findColumnIndex(name: []const u8, pfile: *zpq.core.file.ParquetFile) !usize {
     // Parquet schema [0] is root

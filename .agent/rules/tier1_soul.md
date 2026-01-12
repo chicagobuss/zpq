@@ -24,3 +24,4 @@ We trade "safety abstractions" for raw, hand-tuned architectural control.
 *   **Skepticism**: "Libraries are usually bloated and broken." We verify everything.
 *   **Honesty**: "If it's slow, say it's slow." We benchmark against `aws s3 cp` and `duckdb`. We do not hide behind "microbenchmarks."
 *   **Control**: "If we can't fix it, we don't use it." We own the vertical slice from the syscall to the bit written.
+*   **Inspired**: "Regularly see what other speed demons like duckdb and polars do" (Both are checked out in the references/ dir)

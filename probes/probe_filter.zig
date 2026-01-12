@@ -1,5 +1,6 @@
 const std = @import("std");
 const zpq = @import("zpq");
+const xev = @import("xev");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -68,82 +69,39 @@ pub fn main() !void {
         .int32 = .{ .col_idx = 2, .op = .Lt, .value = 250000 }
     };
 
-    // 3. Worker logic
-    const Context = struct {
-        allocator: std.mem.Allocator,
-        pfile: *zpq.core.file.ParquetFile,
-        plan: *zpq.core.planner.ExecutionPlan,
-        source: zpq.io.RandomAccessSource,
-        rg_start: usize,
-        rg_end: usize,
-        rows_processed: usize,
-    };
+    // 3. Thread Pool
+    const Xev = xev;
+    var thread_pool = Xev.ThreadPool.init(.{ .max_threads = @intCast(num_threads) });
+    defer {
+        thread_pool.shutdown();
+        thread_pool.deinit();
+    }
 
-    const worker_fn = struct {
-        fn run(ctx: *Context) void {
-            // Per-thread arena for batch allocations
-            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-            defer arena.deinit();
-            const arena_alloc = arena.allocator();
+    // 4. Output Writer (Optional, but let's use null or a MemorySink to test Parallel Commit)
+    // For this benchmark, we'll use a MemorySink to simulate writing overhead
+    var mem_sink = zpq.io.memory_sink.MemorySink.init(allocator);
+    defer mem_sink.deinit();
 
-            var dummy_queue = zpq.core.rowgroup_pipeline.BatchQueue{};
-
-            // Loop 100 times to simulate a larger file (50MB -> 5GB equivalent)
-            for (0..100) |_| {
-                for (ctx.rg_start..ctx.rg_end) |rg_idx| {
-                    const rg = &ctx.pfile.metadata.row_groups.items[rg_idx];
-                    var pipeline = zpq.core.rowgroup_pipeline.RowGroupPipeline.init(
-                        arena_alloc, // batch memory from arena
-                        &arena,
-                        ctx.plan,
-                        ctx.source,
-                        rg_idx,
-                        rg,
-                        &ctx.pfile.metadata
-                    ) catch @panic("Failed to init pipeline");
-                    defer pipeline.deinit();
-
-                    pipeline.execute(&dummy_queue) catch @panic("Pipeline failed");
-                    ctx.rows_processed += @intCast(rg.num_rows);
-                }
-            }
-        }
-    }.run;
-
-    var threads = try allocator.alloc(std.Thread, num_threads);
-    defer allocator.free(threads);
-    var contexts = try allocator.alloc(Context, num_threads);
-    defer allocator.free(contexts);
-
-    const total_rgs = pfile.metadata.row_groups.items.len;
-    const rgs_per_thread = total_rgs / num_threads;
-    const extra = total_rgs % num_threads;
-    var current_rg: usize = 0;
+    var writer = try zpq.core.writer.ParquetWriter.init(allocator, mem_sink.sink(), pfile.metadata.schema.items);
+    defer {
+        writer.close() catch {};
+        writer.deinit();
+    }
 
     var timer = try std.time.Timer.start();
 
-    // Spawn threads
-    for (0..num_threads) |i| {
-        const count = rgs_per_thread + if (i < extra) @as(usize, 1) else 0;
-        contexts[i] = Context{
-            .allocator = allocator, // allocator is thread safe (GPA with mutex by default? Yes in std)
-            .pfile = &pfile,
-            .plan = &plan,
-            .source = source.randomAccessSource(), // copy interface (fat pointer)
-            .rg_start = current_rg,
-            .rg_end = current_rg + count,
-            .rows_processed = 0,
-        };
-        current_rg += count;
-        threads[i] = try std.Thread.spawn(.{}, worker_fn, .{&contexts[i]});
-    }
+    // 5. Executor
+    var executor = zpq.core.executor.Executor.init(
+        allocator,
+        &plan,
+        &pfile.metadata,
+        pfile.source,
+        &thread_pool,
+        writer,
+    );
+    try executor.execute();
 
-    // Join threads
-    var total_rows: usize = 0;
-    for (0..num_threads) |i| {
-        threads[i].join();
-        total_rows += contexts[i].rows_processed;
-    }
+    const total_rows = executor.rows_scanned.load(.monotonic);
 
     const elapsed_ns = timer.read();
     const elapsed_ms = elapsed_ns / 1_000_000;

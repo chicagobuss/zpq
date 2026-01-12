@@ -106,56 +106,63 @@ pub const RowGroupPipeline = struct {
         unreachable; // Planner guarantees required columns are present
     }
 
-    pub fn execute(self: *RowGroupPipeline, output_queue: anytype) !void {
+    pub fn next(self: *RowGroupPipeline) !?*const column_batch.ColumnBatch {
         const BATCH_SIZE = 4096;
+        if (self.current_row >= self.total_rows) return null;
 
-        while (self.current_row < self.total_rows) {
-            // 1. Determine morsel size
-            const count = @min(BATCH_SIZE, self.total_rows - self.current_row);
+        // 1. Determine morsel size
+        const count = @min(BATCH_SIZE, self.total_rows - self.current_row);
+        
+        // Re-use pre-allocated batch
+        self.batch.reset();
+        self.batch.num_rows = count; // Inform batch of current valid rows
+        
+        // 2. Read FILTER columns first
+        for (self.plan.filter_columns) |col_idx| {
+            const idx = self.getReaderIndex(col_idx);
+            var reader = &self.readers[idx];
+            const col = &self.batch.columns.items[idx];
             
-            // Re-use pre-allocated batch
-            self.batch.reset();
-            self.batch.num_rows = count; // Inform batch of current valid rows
-            
-            // 2. Read FILTER columns first
-            for (self.plan.filter_columns) |col_idx| {
-                const idx = self.getReaderIndex(col_idx);
-                var reader = &self.readers[idx];
-                const col = &self.batch.columns.items[idx];
-                
-                // Read without selection initially
-                _ = try reader.readBatchInto(col, count, &self.batch.selection);
+            // Read without selection initially
+            _ = try reader.readBatchInto(col, count, &self.batch.selection);
+        }
+        
+        // 3. Evaluate Filter -> Updates batch.selection
+        if (self.plan.filter) |filter| {
+            filter.evaluate(&self.batch, &self.batch.selection, self.plan.required_columns); 
+            // If no rows selected, we still return the batch, but selection is empty.
+            // Optimization: if empty, we could skip reading projection columns?
+            // Yes, let's do that check.
+            if (!self.batch.selection.anySet(count)) {
+                 self.current_row += count;
+                 // But we must return *something* or recurse?
+                 // If we return a batch with 0 selected, consumer sees 0 rows. Correct.
+                 return &self.batch;
             }
-            
-            // 3. Evaluate Filter -> Updates batch.selection
-            if (self.plan.filter) |filter| {
-                filter.evaluate(&self.batch, &self.batch.selection); 
-                // If no rows selected, skip the rest!
-                if (!self.batch.selection.anySet(count)) {
-                     self.current_row += count;
-                     continue;
-                }
+        }
+        
+        // 4. Read PROJECTION columns (using selection)
+        for (self.plan.output_columns) |col_idx| {
+            if (!self.isFilterCol(col_idx)) {
+                 const idx = self.getReaderIndex(col_idx);
+                 var reader = &self.readers[idx];
+                 const col = &self.batch.columns.items[idx];
+                 
+                 // Decode WITH selection (bitmask pushdown!)
+                 _ = try reader.readBatchInto(col, count, &self.batch.selection);
             }
-            
-            // 4. Read PROJECTION columns (using selection)
-            for (self.plan.output_columns) |col_idx| {
-                if (!self.isFilterCol(col_idx)) {
-                     const idx = self.getReaderIndex(col_idx);
-                     var reader = &self.readers[idx];
-                     const col = &self.batch.columns.items[idx];
-                     
-                     // Decode WITH selection (bitmask pushdown!)
-                     _ = try reader.readBatchInto(col, count, &self.batch.selection);
-                }
-            }
-            
-            // 5. Submit batch to output queue (copy or move?)
-            // For now, we are reusing 'batch' so we can't push it directly if queue is async.
-            // But if queue processes immediately or copies, it's fine.
-            // 'BatchQueue' placeholder implies immediate processing or copy.
-            try output_queue.push(self.batch);
-            
-            self.current_row += count;
+        }
+        
+        self.current_row += count;
+        return &self.batch;
+    }
+
+    pub fn execute(self: *RowGroupPipeline, output_queue: anytype) !void {
+        while (try self.next()) |batch| {
+            // If completely filtered out (optimization), selection might be empty.
+            // Queue implementation should handle that or we check here.
+            // But we push anyway for now.
+             try output_queue.push(batch.*);
         }
     }
 };

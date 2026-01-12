@@ -64,4 +64,40 @@ pub const SelectionVector = struct {
             word.* &= other.mask[i];
         }
     }
+
+    pub fn allSet(self: SelectionVector, limit: usize) bool {
+        const full_words = limit / 64;
+        for (self.mask[0..full_words]) |word| {
+            if (word != ~@as(u64, 0)) return false;
+        }
+        const rem = limit % 64;
+        if (rem > 0) {
+            const word = self.mask[full_words];
+            const extra_mask = (@as(u64, 1) << @intCast(rem)) - 1;
+            if ((word & extra_mask) != extra_mask) return false;
+        }
+        return true;
+    }
+
+    pub fn allClear(self: SelectionVector, limit: usize) bool {
+        const full_words = limit / 64;
+        for (self.mask[0..full_words]) |word| {
+            if (word != 0) return false;
+        }
+        const rem = limit % 64;
+        if (rem > 0) {
+            const word = self.mask[full_words];
+            const extra_mask = (@as(u64, 1) << @intCast(rem)) - 1;
+            if ((word & extra_mask) != 0) return false;
+        }
+        return true;
+    }
+
+    pub fn anySet(self: SelectionVector, limit: usize) bool {
+        return !self.allClear(limit);
+    }
+
+    pub fn clearAll(self: *Self) void {
+        @memset(self.mask, 0);
+    }
 };

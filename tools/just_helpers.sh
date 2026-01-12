@@ -170,6 +170,112 @@ tracepoint:syscalls:sys_enter_openat /comm == "zpq"/ { @opens = count(); }
     rm -f "$wrapper"
 }
 
+# --- Flamegraph ---
+# Runs zpq with perf and generates a flamegraph.
+# Usage: flamegraph [input] [output] [extra_args...]
+flamegraph() {
+    local script_dir="$(dirname "$0")"
+    local project_root="$(cd "$script_dir/.." && pwd)"
+    local fg_dir="$project_root/vendor/FlameGraph"
+    
+    if [ ! -d "$fg_dir" ]; then
+        error "FlameGraph tools not found at $fg_dir. Run 'just fetch-flamegraph' first."
+        exit 1
+    fi
+
+    # Source environment
+    if [ -f "$project_root/.env" ]; then
+        set -a
+        source "$project_root/.env"
+        set +a
+    else
+        error ".env file not found"
+        exit 1
+    fi
+
+    local input="${1:-}"
+    local output="${2:-/tmp/flamegraph.svg}"
+    shift 2 || true
+    local extra_args="$*"
+
+    if [ -z "$input" ]; then
+        error "Usage: flamegraph <input> [output_svg] [extra_args...]"
+        exit 1
+    fi
+
+    info "Generating flamegraph: $input -> $output"
+
+    local wrapper="$project_root/.perf_wrapper.sh"
+    cat > "$wrapper" << 'WRAPPER_EOF'
+#!/bin/bash
+set -e
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$PROJECT_ROOT/.env"
+
+# If a venv exists, activate it (for polars/python benchmarks)
+if [ -d "$PROJECT_ROOT/.venv" ]; then
+    source "$PROJECT_ROOT/.venv/bin/activate"
+fi
+
+input="$1"
+shift
+extra_args="$*"
+
+# Determine if input is a python script, an executable, or a parquet file
+if [[ "$input" == *.py ]]; then
+    exec python3 "$input" $extra_args
+elif [ -x "$input" ]; then
+    # If it's an absolute or relative path to an executable, run it
+    exec "$input" $extra_args
+elif [[ "$input" == *.parquet ]]; then
+    # If it's a parquet file, run with zpq
+    zpq_bin="$PROJECT_ROOT/zig-out/bin/zpq"
+    if [ ! -f "$zpq_bin" ]; then
+        echo "zpq binary not found at $zpq_bin. Run 'just build' first." >&2
+        exit 1
+    fi
+    exec "$zpq_bin" "$input" /dev/null $extra_args
+else
+    # Fallback: check if it's a binary name in zig-out/bin
+    probe_bin="$PROJECT_ROOT/zig-out/bin/$input"
+    if [ -x "$probe_bin" ]; then
+        exec "$probe_bin" $extra_args
+    else
+        echo "Unknown input type: $input. Must be .py, .parquet, or an executable." >&2
+        exit 1
+    fi
+fi
+WRAPPER_EOF
+    chmod 755 "$wrapper"
+
+    # Use task-clock to be compatible with most environments (cloud VMs)
+    info "Recording with perf..."
+    sudo perf record -e task-clock -F 997 -g -o /tmp/perf.data -- /bin/bash "$wrapper" "$input" "$extra_args"
+    
+    info "Rendering flamegraph..."
+    sudo perf script -i /tmp/perf.data | "$fg_dir/stackcollapse-perf.pl" | "$fg_dir/flamegraph.pl" > "$output"
+    
+    success "Flamegraph generated at $output"
+    rm -f "$wrapper"
+}
+
+# --- Fetch FlameGraph ---
+fetch_flamegraph() {
+    local script_dir="$(dirname "$0")"
+    local project_root="$(cd "$script_dir/.." && pwd)"
+    local dest="$project_root/vendor/FlameGraph"
+    
+    if [ -d "$dest" ]; then
+        info "FlameGraph already exists at $dest"
+        return 0
+    fi
+    
+    info "Fetching FlameGraph tools..."
+    mkdir -p "$project_root/vendor"
+    git clone --depth 1 https://github.com/brendangregg/FlameGraph "$dest"
+    success "FlameGraph tools installed to $dest"
+}
+
 # --- Validate against reference implementations ---
 validate_parquet() {
     python3 "$(dirname "$0")/validate_parquet.py" "$@"
@@ -186,6 +292,8 @@ case "$cmd" in
     test_parquet_testing) test_parquet_testing "$@" ;;
     validate_parquet) validate_parquet "$@" ;;
     bpftrace_bench) bpftrace_bench "$@" ;;
+    flamegraph) flamegraph "$@" ;;
+    fetch_flamegraph) fetch_flamegraph "$@" ;;
     *)
         error "Unknown command: $cmd"
         exit 1

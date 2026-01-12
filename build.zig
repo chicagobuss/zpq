@@ -252,4 +252,84 @@ pub fn build(b: *std.Build) void {
     }
     const run_step_prefetch = b.step("probe-s3-prefetch", "Run the S3 prefetch probe");
     run_step_prefetch.dependOn(&run_cmd_prefetch.step);
+
+    const probe_columnar = b.addExecutable(.{
+        .name = "probe-columnar-verify",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_columnar_verify.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_columnar);
+    const run_probe_columnar = b.addRunArtifact(probe_columnar);
+    const probe_columnar_step = b.step("probe-columnar-verify", "Run the columnar verification probe");
+    probe_columnar_step.dependOn(&run_probe_columnar.step);
+
+    const probe_bench = b.addExecutable(.{
+        .name = "probe-benchmark-columnar",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_benchmark_columnar.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_bench);
+    const run_probe_bench = b.addRunArtifact(probe_bench);
+    const probe_bench_step = b.step("probe-benchmark-columnar", "Run the benchmark columnar probe");
+    probe_bench_step.dependOn(&run_probe_bench.step);
+
+    const probe_integrated = b.addExecutable(.{
+        .name = "probe-integrated-pipeline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_integrated_pipeline.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_integrated);
+    const run_probe_integrated = b.addRunArtifact(probe_integrated);
+    const probe_integrated_step = b.step("probe-integrated-pipeline", "Run the integrated pipeline probe");
+    probe_integrated_step.dependOn(&run_probe_integrated.step);
+
+    const probe_parallel = b.addExecutable(.{
+        .name = "probe-parallel-pipeline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_parallel_pipeline.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_parallel);
+    const run_probe_parallel = b.addRunArtifact(probe_parallel);
+    const probe_parallel_step = b.step("probe-parallel-pipeline", "Run the parallel pipeline probe");
+    probe_parallel_step.dependOn(&run_probe_parallel.step);
+
+    const probe_filter = b.addExecutable(.{
+        .name = "probe-filter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_filter.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = zpq_mod },
+            },
+        }),
+    });
+    b.installArtifact(probe_filter);
+    const run_probe_filter = b.addRunArtifact(probe_filter);
+    const probe_filter_step = b.step("probe-filter", "Run the filter benchmark probe");
+    probe_filter_step.dependOn(&run_probe_filter.step);
 }

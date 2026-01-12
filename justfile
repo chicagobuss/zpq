@@ -57,6 +57,13 @@ test-filter *filter:
 bpftrace-bench input output *args:
     ./tools/just_helpers.sh bpftrace_bench {{input}} {{output}} {{args}}
 
+# Generate a flamegraph for zpq or a python script
+# Usage: just flamegraph <input> [output_svg] [extra_args]
+# Example: just flamegraph 'benchmark_local.parquet' '/tmp/zpq.svg'
+# Example: just flamegraph 'tools/polars_bench.py' '/tmp/polars.svg'
+flamegraph input output="/tmp/flamegraph.svg" *args="":
+    ./tools/just_helpers.sh flamegraph {{input}} {{output}} {{args}}
+
 # Verify compilation for all major targets (Critical for Lambda)
 cross-check:
     @echo "Building for x86_64-linux (AWS Lambda)..."
@@ -238,6 +245,10 @@ verify-malformed: build gen-malformed
 # Fetch pre-built BoringSSL static libraries (Fast)
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
+
+# Fetch FlameGraph tools for profiling
+fetch-flamegraph:
+    @./tools/just_helpers.sh fetch_flamegraph
 
 # Upload current pre-built artifacts to R2 (Requires R2 credentials)
 upload-deps target="":

@@ -42,7 +42,7 @@ pub fn main() !void {
     // We want to find rows where id > 2
     // Field 0 is 'id' (i32)
     const filters = [_]zpq.core.filter.Filter{
-        .{ .Int32 = .{ .col_idx = 0, .pred = .Gt, .val = 2 } },
+        .{ .int32 = .{ .col_idx = 0, .op = .Gt, .value = 2 } },
     };
 
     var batch_buf: [1024]AllTypes = undefined;

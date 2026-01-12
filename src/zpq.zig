@@ -38,6 +38,10 @@ pub const core = struct {
     pub const selection = @import("core/selection.zig");
     pub const filter = @import("core/filter.zig");
     pub const writer = @import("core/writer.zig");
+    pub const column_batch = @import("core/column_batch.zig");
+    pub const column_reader = @import("core/column_reader.zig");
+    pub const planner = @import("core/planner.zig");
+    pub const rowgroup_pipeline = @import("core/rowgroup_pipeline.zig");
 };
 
 pub const log = @import("zpq/log.zig");
@@ -49,5 +53,7 @@ pub const schema = struct {
 };
 
 test {
+    _ = @import("core/column_batch.zig");
+    _ = @import("core/column_reader.zig");
     std.testing.refAllDecls(@This());
 }

@@ -257,12 +257,13 @@ fn parseFilter(comptime T: type, filter_str: []const u8, pfile: *zpq.core.file.P
     const field_type = try getFieldType(T, col_name);
 
     return switch (field_type) {
-        .ByteArray => .{ .ByteArray = .{ .col_idx = col_idx, .pred = .Eq, .val = val_str } },
-        .Int32 => .{ .Int32 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i32, val_str, 10) } },
-        .Int64 => .{ .Int64 = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseInt(i64, val_str, 10) } },
-        .Float => .{ .Float = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseFloat(f32, val_str) } },
-        .Double => .{ .Double = .{ .col_idx = col_idx, .pred = .Eq, .val = try std.fmt.parseFloat(f64, val_str) } },
-        .Bool => .{ .Bool = .{ .col_idx = col_idx, .pred = .Eq, .val = std.mem.eql(u8, val_str, "true") } },
+        .ByteArray => return error.InvalidFilter, // Not supported yet
+        .Int32 => .{ .int32 = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseInt(i32, val_str, 10) } },
+        .Int64 => .{ .int64 = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseInt(i64, val_str, 10) } },
+        .Float => .{ .float = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseFloat(f32, val_str) } },
+        .Double => .{ .double = .{ .col_idx = col_idx, .op = .Eq, .value = try std.fmt.parseFloat(f64, val_str) } },
+        // .Bool => .{ .bool = ... } // Filter doesn't have bool yet? 
+        .Bool => return error.InvalidFilter,
     };
 }
 

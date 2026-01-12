@@ -426,15 +426,18 @@ pub fn ColumnReader(comptime T: type) type {
         /// Evaluates a filter against the next batch of values, updating the selection vector.
         pub fn evaluate(self: *Self, filter: filter_mod.Filter, selection: *selection_mod.SelectionVector) !void {
             const pivot: T = switch (filter) {
-                .Int32 => |f| if (T == i32) f.val else return error.TypeMismatch,
-                .Int64 => |f| if (T == i64) f.val else return error.TypeMismatch,
-                .Float => |f| if (T == f32) f.val else return error.TypeMismatch,
-                .Double => |f| if (T == f64) f.val else return error.TypeMismatch,
-                .Bool => |f| if (T == bool) f.val else return error.TypeMismatch,
-                .ByteArray => |f| if (T == []const u8) f.val else return error.TypeMismatch,
+                .int32 => |f| if (T == i32) f.value else return error.TypeMismatch,
+                .int64 => |f| if (T == i64) f.value else return error.TypeMismatch,
+                .float => |f| if (T == f32) f.value else return error.TypeMismatch,
+                .double => |f| if (T == f64) f.value else return error.TypeMismatch,
+                else => @panic("Unsupported filter type"),
             };
-            const pred = switch (filter) {
-                inline else => |f| f.pred,
+            const op = switch (filter) {
+                .int32 => |f| f.op,
+                .int64 => |f| f.op,
+                .float => |f| f.op,
+                .double => |f| f.op,
+                else => unreachable,
             };
 
             var i: usize = 0;
@@ -462,7 +465,7 @@ pub fn ColumnReader(comptime T: type) type {
                         const def = try self.def_decoder.?.next() orelse break;
                         if (def == self.max_def) {
                             const val = try self.readValue();
-                            const match = checkPredicate(val, pred, pivot);
+                            const match = checkPredicate(val, op, pivot);
                             selection.set(i + k, match);
                         } else {
                             selection.set(i + k, false);
@@ -479,7 +482,7 @@ pub fn ColumnReader(comptime T: type) type {
                         var k: usize = 0;
                         while (k < count) : (k += 1) {
                             const val = try self.readValue();
-                            const match = checkPredicate(val, pred, pivot);
+                            const match = checkPredicate(val, op, pivot);
                             selection.set(i + k, match);
                         }
                         page.values_read += @intCast(count);
@@ -491,7 +494,7 @@ pub fn ColumnReader(comptime T: type) type {
                             const idx = try decoder.next() orelse return error.UnexpectedEOF;
                             if (idx >= self.dictionary.?.len) return error.InvalidDictionaryIndex;
                             const val = self.dictionary.?[idx];
-                            const match = checkPredicate(val, pred, pivot);
+                            const match = checkPredicate(val, op, pivot);
                             selection.set(i + k, match);
                         }
                         page.values_read += @intCast(count);
@@ -502,36 +505,36 @@ pub fn ColumnReader(comptime T: type) type {
             }
         }
 
-        inline fn checkPredicate(val: T, pred: filter_mod.Predicate, pivot: T) bool {
+        inline fn checkPredicate(val: T, op: filter_mod.Operator, pivot: T) bool {
             if (T == bool) {
                 const i_val = @intFromBool(val);
                 const i_pivot = @intFromBool(pivot);
-                return switch (pred) {
+                return switch (op) {
                     .Eq => val == pivot,
-                    .Neq => val != pivot,
+                    .NotEq => val != pivot,
                     .Gt => i_val > i_pivot,
                     .Lt => i_val < i_pivot,
-                    .Gte => i_val >= i_pivot,
-                    .Lte => i_val <= i_pivot,
+                    .GtEq => i_val >= i_pivot,
+                    .LtEq => i_val <= i_pivot,
                 };
             }
             if (T == []const u8) {
-                return switch (pred) {
+                return switch (op) {
                     .Eq => std.mem.eql(u8, val, pivot),
-                    .Neq => !std.mem.eql(u8, val, pivot),
+                    .NotEq => !std.mem.eql(u8, val, pivot),
                     .Gt => std.mem.order(u8, val, pivot) == .gt,
                     .Lt => std.mem.order(u8, val, pivot) == .lt,
-                    .Gte => std.mem.order(u8, val, pivot) != .lt,
-                    .Lte => std.mem.order(u8, val, pivot) != .gt,
+                    .GtEq => std.mem.order(u8, val, pivot) != .lt,
+                    .LtEq => std.mem.order(u8, val, pivot) != .gt,
                 };
             }
-            return switch (pred) {
+            return switch (op) {
                 .Eq => val == pivot,
-                .Neq => val != pivot,
+                .NotEq => val != pivot,
                 .Gt => val > pivot,
                 .Lt => val < pivot,
-                .Gte => val >= pivot,
-                .Lte => val <= pivot,
+                .GtEq => val >= pivot,
+                .LtEq => val <= pivot,
             };
         }
 
@@ -807,7 +810,11 @@ pub fn ParquetReader(comptime T: type) type {
             // 2. Filter Phase
             for (filters) |filter| {
                 const col_idx = switch (filter) {
-                    inline else => |f| f.col_idx,
+                    .int32 => |f| f.col_idx,
+                    .int64 => |f| f.col_idx,
+                    .float => |f| f.col_idx,
+                    .double => |f| f.col_idx,
+                    else => @panic("Complex filters not supported in legacy reader"),
                 };
 
                 // Find matching column reader

@@ -77,10 +77,12 @@ pub const RleDecoder = struct {
                     switch (@typeInfo(T)) {
                         .int => break :blk @as(T, @intCast(self.current_value)),
                         .float => break :blk @as(T, @floatFromInt(self.current_value)),
-                        else => if (T == u64) {
-                            break :blk self.current_value;
-                        } else {
-                            @compileError("Unsupported type for RLE decoding without dictionary");
+                        .bool => break :blk self.current_value != 0,
+                        else => {
+                            if (T == u64) {
+                                break :blk self.current_value;
+                            }
+                            @panic("Unsupported type for RLE decoding without dictionary");
                         },
                     }
                 };
@@ -113,12 +115,16 @@ pub const RleDecoder = struct {
                                     .float => inline for (0..32) |i| {
                                         buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
                                     },
-                                    else => if (T == u64) {
-                                        inline for (0..32) |i| {
-                                            buffer[out_pos + i] = indices[i];
+                                    .bool => inline for (0..32) |i| {
+                                        buffer[out_pos + i] = indices[i] != 0;
+                                    },
+                                    else => {
+                                        if (T == u64) {
+                                            inline for (0..32) |i| {
+                                                buffer[out_pos + i] = indices[i];
+                                            }
                                         }
-                                    } else {
-                                        @compileError("Unsupported type for RLE decoding without dictionary");
+                                        @panic("Unsupported type for RLE decoding without dictionary");
                                     },
                                 }
                             }
@@ -146,12 +152,16 @@ pub const RleDecoder = struct {
                                     .float => inline for (0..8) |i| {
                                         buffer[out_pos + i] = @as(T, @floatFromInt(indices[i]));
                                     },
-                                    else => if (T == u64) {
-                                        inline for (0..8) |i| {
-                                            buffer[out_pos + i] = indices[i];
+                                    .bool => inline for (0..8) |i| {
+                                        buffer[out_pos + i] = indices[i] != 0;
+                                    },
+                                    else => {
+                                        if (T == u64) {
+                                            inline for (0..8) |i| {
+                                                buffer[out_pos + i] = indices[i];
+                                            }
                                         }
-                                    } else {
-                                        @compileError("Unsupported type for RLE decoding without dictionary");
+                                        @panic("Unsupported type for RLE decoding without dictionary");
                                     },
                                 }
                             }
@@ -167,10 +177,12 @@ pub const RleDecoder = struct {
                     switch (@typeInfo(T)) {
                         .int => break :blk @as(T, @intCast(idx)),
                         .float => break :blk @as(T, @floatFromInt(idx)),
-                        else => if (T == u64) {
-                            break :blk idx;
-                        } else {
-                            @compileError("Unsupported type for RLE decoding without dictionary");
+                        .bool => break :blk idx != 0,
+                        else => {
+                            if (T == u64) {
+                                break :blk idx;
+                            }
+                            @panic("Unsupported type for RLE decoding without dictionary");
                         },
                     }
                 };

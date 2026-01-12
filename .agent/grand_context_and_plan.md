@@ -42,6 +42,13 @@ We will enforce a 3-Tier Rule System.
 -   **DNS/Networking**: Result of the DNS wars (The 3-tier resolver approach).
 -   **Memory Management**: Track in-flight buffers (read_buf_ptr pattern). Always call `stop()` before connection teardown.
 
+### The Meta-Process: Trace-Driven Development
+We treat performance as a correctness constraint. Implementation follows this cycle:
+1. **Predict**: Define expected thread, I/O, and memory traces *before* writing code.
+2. **Instrument**: Capture real syscall/perf traces using `just bpftrace-bench` and `perf`.
+3. **Validate**: Align the real execution with the prediction. Any divergence is a bug (even if output is correct).
+4. **Iterate**: Refine until "Bad Waste" (Memcpy/Faults) is replaced by "Good Waste" (Compression/Compute).
+
 ### Tier 3: The Current Strategy (`tier3_strategy.md`)
 **The expedition we are on RIGHT NOW.**
 -   **Current Goal**: "Write Dominance" (S3 Parallel Sink).

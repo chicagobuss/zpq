@@ -2,25 +2,26 @@
 
 **The Fastest Serverless Parquet Engine.**
 
-## 🟢 Current Focus: Parallel S3 Writer
-We are validating the robust parallel S3 sink and implementing the "Fast Path" for pass-through queries.
+## 🟢 Current Focus: Columnar Re-architecture
+We are rewriting the core engine to use columnar batches and vectorized decoding, targeting Polars-competitive performance.
 
-## 📊 Benchmarks (Latest)
-*   **100MB Scan (S3 -> Local)**: ~5ms column fetch (ZPQ) vs ~260ms (PyArrow).
-*   **100MB Upload (Local -> S3)**:
-    *   **AWS CLI**: 6.86s (~14.5 MB/s) - *Baseline*
-    *   **ZPQ (Parallel)**: 21.76s (~4.6 MB/s effective) - *Includes Parsing Overhead*
-    *   *Next Goal*: Zero-Copy Fast Path to match AWS CLI.
+## 📊 Benchmarks (Latest - 100MB Parquet)
+*   **Local -> S3**:
+    *   **AWS CLI**: 6.84s (Raw Copy)
+    *   **Polars**: 7.64s (Parallel Arrow)
+    *   **ZPQ**: 13.49s (Serial Row-based)
+*   **Bottleneck**: 35% Parquet encoding, 20% memcpy.
 
 ## 🗺️ Roadmap
 *   **[COMPLETE] Phase 1: Read Dominance**
-    *   Zero-Copy Page Reading
-    *   Async S3 Source
-    *   Simd Bit-Unpacking
-*   **[ACTIVE] Phase 2: Write Dominance**
-    *   Multipart S3 Sink
-    *   Parallel Part Uploads
-    *   **[NEXT]** Pass-Through "Fast Path" (Zero-Decode)
+    *   Zero-Copy Page Reading, Async S3 Source.
+*   **[COMPLETE] Phase 2: Write Dominance**
+    *   Multipart S3 Sink, Parallel Row Group buffering.
+*   **[ACTIVE] Phase 3: High Performance Architecture**
+    *   **[WEEK 1]** Columnar Batch Container & Vectorized Reader.
+    *   **[WEEK 2]** SIMD Filter Evaluation.
+    *   **[WEEK 3]** Parallel Row Group Pipeline.
+    *   **[WEEK 4]** Zero-Copy Fast Path (The Polars-Killer).
 *   **[PLANNED] Phase 3: SQL Layer**
     *   Arrow C Data Interface
     *   SQLite VTable Integration

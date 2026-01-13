@@ -31,6 +31,8 @@ pub const AsyncFileSource = struct {
             .ptr = self,
             .vtable = &.{
                 .readAt = readAt,
+                .readRanges = readRanges,
+                .readRangesAsync = readRangesAsync,
                 .size = size,
                 .close = close,
             },
@@ -45,6 +47,20 @@ pub const AsyncFileSource = struct {
             else => |err| return std.posix.unexpectedErrno(err),
         };
         return n;
+    }
+
+    fn readRanges(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8) anyerror!void {
+        for (ranges, 0..) |r, i| {
+            _ = try readAt(ptr, r.start, buffers[i]);
+        }
+    }
+
+    fn readRangesAsync(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8, cb: *const fn (ptr: ?*anyopaque, err: ?anyerror) void, ctx: ?*anyopaque) anyerror!void {
+        if (readRanges(ptr, ranges, buffers)) |_| {
+            cb(ctx, null);
+        } else |err| {
+            cb(ctx, err);
+        }
     }
 
     fn size(ptr: *anyopaque) u64 {

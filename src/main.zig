@@ -189,6 +189,7 @@ pub fn main() !void {
             },
             .meta => {
                 std.debug.print("Metadata for {s}:\n", .{input_path.?});
+                std.debug.print("  File Size: {d} bytes\n", .{pfile.source.size()});
                 std.debug.print("  Rows: {d}\n", .{pfile.metadata.num_rows});
                 std.debug.print("  Row Groups: {d}\n", .{pfile.metadata.row_groups.items.len});
             },
@@ -202,6 +203,7 @@ pub fn main() !void {
 fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.file.ParquetFile, filter_str: ?[]const u8, select_str: ?[]const u8, output_path: []const u8, loop: *xev.Dynamic.Loop, thread_pool: *xev.ThreadPool, repeat: usize) !void {
     // 1. Setup Execution Plan
     var plan = zpq.core.planner.ExecutionPlan.init(allocator);
+    plan.loop = @ptrCast(loop);
     defer plan.deinit();
 
     // Map columns
@@ -268,9 +270,9 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
         
         try out_schema.append(allocator, pfile.metadata.schema.items[0]); // Root
         for (plan.output_columns) |idx| {
-            // idx is index in full schema? Yes.
-            // Writer expects a list of SchemaElements.
-            try out_schema.append(allocator, pfile.metadata.schema.items[idx]);
+            // idx is logical column index (0-based)
+            // schema.items[0] is Root, so we need idx + 1
+            try out_schema.append(allocator, pfile.metadata.schema.items[idx + 1]);
         }
         
         writer = try zpq.core.writer.ParquetWriter.init(allocator, out_sink, out_schema.items);
@@ -284,6 +286,16 @@ fn runQuery(comptime T: type, allocator: std.mem.Allocator, pfile: *zpq.core.fil
 
     // 4. Parallel Execution
     var timer = try std.time.Timer.start();
+    
+    // Check for fast path optimizations
+    if (pfile.metadata.row_groups.items.len > 0) {
+        const total_cols = pfile.metadata.row_groups.items[0].columns.items.len;
+        plan.detectOptimization(total_cols);
+        if (plan.is_zero_copy) {
+            std.debug.print("⚡ Zero-Copy Fast Path Detected! (Pass-through)\n", .{});
+        }
+    }
+
     var executor = zpq.core.executor.Executor.init(
         allocator,
         &plan,

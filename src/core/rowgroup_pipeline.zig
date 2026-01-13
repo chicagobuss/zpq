@@ -5,6 +5,7 @@ const file = @import("file.zig");
 const column_batch = @import("column_batch.zig");
 const column_reader = @import("column_reader.zig");
 const planner = @import("planner.zig");
+const sink_mod = @import("../io/sink.zig");
 
 pub const BatchQueue = struct {
     // Placeholder for now
@@ -164,5 +165,97 @@ pub const RowGroupPipeline = struct {
             // But we push anyway for now.
              try output_queue.push(batch.*);
         }
+    }
+
+    /// Fast Path: Copy raw compressed column chunks directly from source to sink.
+    /// Returns the new RowGroup metadata (relative to the sink start).
+    pub fn executeFastPath(self: *RowGroupPipeline, sink: sink_mod.Sink) !schema.RowGroup {
+        var rg_cols = std.ArrayListUnmanaged(schema.ColumnChunk){};
+        errdefer {
+            for (rg_cols.items) |*c| {
+                if (c.meta_data) |*m| {
+                    m.encodings.deinit(self.allocator);
+                    for (m.path_in_schema.items) |p| self.allocator.free(p);
+                    m.path_in_schema.deinit(self.allocator);
+                }
+            }
+            rg_cols.deinit(self.allocator);
+        }
+
+        var current_offset: i64 = 0;
+        var total_rg_size: i64 = 0;
+
+        // Iterate over required columns (which should be ALL columns in fast path)
+        for (self.plan.required_columns) |col_idx| {
+            const org_chunk = self.row_group_metadata.columns.items[col_idx];
+            
+            // 1. Determine read range
+            if (org_chunk.meta_data) |meta| {
+                const data_offset: u64 = @intCast(meta.data_page_offset);
+                const col_len: u64 = @intCast(meta.total_compressed_size);
+                
+                // If dictionary page exists, it comes first
+                const col_start = if (meta.dictionary_page_offset) |d| @min(@as(u64, @intCast(d)), data_offset) else data_offset;
+                const io_len = col_len; // Assuming contiguous
+
+                // 2. Read raw bytes
+                // Optimization: getSlice could be zero-copy reference if MemorySource
+                var buffer: []const u8 = undefined;
+                var alloc_buf: []u8 = &[_]u8{};
+                defer if (alloc_buf.len > 0) self.allocator.free(alloc_buf);
+
+                if (self.source.getSlice(col_start, io_len)) |slice| {
+                    buffer = slice;
+                } else {
+                    alloc_buf = try self.allocator.alloc(u8, io_len);
+                    _ = try self.source.readAt(col_start, alloc_buf);
+                    buffer = alloc_buf;
+                }
+
+                // 3. Write to sink
+                var off: usize = 0;
+                while (off < buffer.len) {
+                    const n = try sink.write(buffer[off..]);
+                    if (n == 0) return error.SinkWriteFailed;
+                    off += n;
+                }
+                
+                // 4. Create new metadata
+                // Deep clone the metadata because we modify offsets and own lifecycle
+                var new_meta = meta;
+
+                // Adjust offsets to be relative to the start of this detached sink
+                const shift = @as(i64, @intCast(col_start)) * -1 + current_offset; 
+                new_meta.data_page_offset += shift;
+                if (new_meta.index_page_offset) |*v| v.* += shift;
+                if (new_meta.dictionary_page_offset) |*v| v.* += shift;
+
+                // Deep copy arrays
+                new_meta.encodings = .{};
+                try new_meta.encodings.appendSlice(self.allocator, meta.encodings.items);
+                
+                new_meta.path_in_schema = .{};
+                for (meta.path_in_schema.items) |p| {
+                     try new_meta.path_in_schema.append(self.allocator, try self.allocator.dupe(u8, p));
+                }
+
+                const new_chunk = schema.ColumnChunk{
+                    .file_path = null,
+                    .file_offset = current_offset,
+                    .meta_data = new_meta,
+                };
+                
+                try rg_cols.append(self.allocator, new_chunk);
+                
+                current_offset += @intCast(buffer.len);
+                total_rg_size += @intCast(buffer.len);
+            }
+        }
+
+        return schema.RowGroup{
+            .columns = rg_cols,
+            .total_byte_size = total_rg_size,
+            .num_rows = self.row_group_metadata.num_rows,
+        };
     }
 };

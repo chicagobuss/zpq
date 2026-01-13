@@ -45,7 +45,9 @@ pub const core = struct {
     pub const planner = @import("core/planner.zig");
     pub const rowgroup_pipeline = @import("core/rowgroup_pipeline.zig");
     pub const executor = @import("core/executor.zig");
+    pub const data_manager = @import("core/data_manager.zig");
 };
+
 
 pub const log = @import("zpq/log.zig");
 

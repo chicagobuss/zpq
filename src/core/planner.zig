@@ -1,4 +1,5 @@
 const std = @import("std");
+const xev = @import("xev");
 const schema = @import("schema.zig");
 
 pub const SinkType = enum {
@@ -37,6 +38,7 @@ pub const ExecutionPlan = struct {
     // Parallelism
     row_group_assignments: []const RowGroupAssignment,
     num_workers: u8,
+    loop: ?*xev.Loop = null,
 
     pub fn init(allocator: std.mem.Allocator) ExecutionPlan {
         return .{
@@ -57,5 +59,17 @@ pub const ExecutionPlan = struct {
         self.allocator.free(self.filter_columns);
         self.allocator.free(self.output_columns);
         self.allocator.free(self.row_group_assignments);
+    }
+
+    pub fn detectOptimization(self: *ExecutionPlan, total_columns: usize) void {
+        // Zero-copy Pass-through conditions:
+        // 1. No filter
+        // 2. All columns selected (output_columns.len == total_columns - 1)
+        //    (We subtract 1 for the root schema element)
+        if (self.filter == null and self.output_columns.len == total_columns) {
+            self.is_zero_copy = true;
+        } else {
+            self.is_zero_copy = false;
+        }
     }
 };

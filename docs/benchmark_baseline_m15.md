@@ -2,7 +2,18 @@
 
 **Date**: 2025-12-26  
 **Hardware**: ARM64 Linux (Oracle Cloud A1.Flex)  
-**Test Files**: 125 columns, Snappy compressed, Dictionary + PLAIN encoding
+**Test File**: 
+Size: 149 MB
+Rows: 524,288
+Columns: 27
+The file contains a variety of types:
+
+Integers: int8, int16, int32_sorted, int32_random, int64_sorted, int64_random, etc.
+Floats: float32, float64, float64_sorted.
+Booleans: bool, bool_sparse.
+Strings: string_random, string_dict_low, string_dict_high, string_sorted.
+Complex: binary, timestamp, timestamp_sorted, date.
+Nullable: int32_nullable, float64_nullable, string_nullable.
 
 ## Test Files
 

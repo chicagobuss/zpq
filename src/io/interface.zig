@@ -29,6 +29,7 @@ pub const RandomAccessSource = struct {
         /// Read multiple ranges into provided buffers.
         /// This is the primary hook for scatter-gather I/O (io_uring).
         readRanges: ?*const fn (ptr: *anyopaque, ranges: []const Range, buffers: []const []u8) anyerror!void = null,
+        readRangesAsync: ?*const fn (ptr: *anyopaque, ranges: []const Range, buffers: []const []u8, cb: *const fn (ptr: ?*anyopaque, err: ?anyerror) void, ctx: ?*anyopaque) anyerror!void = null,
 
         /// Returns the total size of the source in bytes.
         size: *const fn (ptr: *anyopaque) u64,

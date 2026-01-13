@@ -162,3 +162,25 @@ DuckDB caching was disabled with `PRAGMA disable_object_cache`.
 - [ ] Profile ZPQ decoder for optimization opportunities
 - [ ] Add SIMD decoding to ZPQ
 - [ ] Test passthrough optimization on R2 (skip decode for 100% selection)
+
+## Unified Benchmark Tooling (v2026)
+
+We have consolidated benchmarking logic into `tools/bench.sh` and `tools/bench_engines.py`.
+
+### Comparing Engines (S3 -> S3)
+
+To run a fair "apples-to-apples" comparison between ZPQ, Polars, DuckDB, and PyArrow:
+
+```bash
+# Syntax: tools/bench.sh engine <engine> <input_type> [size] [runs] [scenario]
+# Scenarios: pass-through | filter | select-1 | select-3
+
+# Example: Compare Zero-Copy Performance (100MB)
+./tools/bench.sh engine polars s3 100mb 1 pass-through
+./tools/bench.sh engine duckdb s3 100mb 1 pass-through
+```
+
+The tool handles:
+- Dependency management via `uv` (isolated environments)
+- S3 credential propagation
+- Standardized timing and reporting

@@ -9,6 +9,7 @@ const column_batch = @import("column_batch.zig");
 const writer = @import("writer.zig");
 const prefetching = @import("../io/prefetching_source.zig");
 const memory_sink = @import("../io/memory_sink.zig");
+const memory_source = @import("../io/memory_source.zig");
 
 pub const Executor = struct {
     allocator: std.mem.Allocator,
@@ -50,55 +51,17 @@ pub const Executor = struct {
     }
 
     pub fn execute(self: *Self) !void {
-        // Simple parallel loop over row groups
-        // We use an atomic counter or just the thread pool's task mechanism?
-        // xev ThreadPool doesn't map directly to "wait for all".
-        // We need a WaitGroup equivalent.
-        
+        const num_rgs = self.file_metadata.row_groups.items.len;
+        var data_manager = @import("data_manager.zig").DataManager.init(self.allocator, num_rgs);
+        defer data_manager.deinit();
+
         var wg = std.Thread.WaitGroup{};
         
+        // Phase 1: Spawn ALL worker tasks immediately
+        // They will block on data_manager.waitForRowGroup
         for (self.file_metadata.row_groups.items, 0..) |*rg, rg_idx| {
-            // Prefetch Logic Implementation:
-            // Calculate range for this RG and next RG.
-            // Since we iterate sequentially to spawn tasks, we can just issue prefetch for i+1 here.
-            
-            // Note: We should verify if 'prefetch' is non-blocking. Yes it is.
-            if (rg_idx + 1 < self.file_metadata.row_groups.items.len) {
-                 const next_rg = &self.file_metadata.row_groups.items[rg_idx + 1];
-                 // Heuristic: Read from first column offset to ... size?
-                 // Using 16MB constant from prefetcher for now if range calculation is hard.
-                 // Better: iterate columns to find min_offset and max_offset+len.
-                 
-                 // Simpler: Just prefetch the *current* row group? 
-                 // No, we want to prefetch *ahead* or at least start it immediately.
-                 // Actually, if we spawn a task for RG[i], that task calls `pipeline.init` which calls `readAt`.
-                 // If we call prefetch(RG[i]) *before* spawning the task, we are racing the task.
-                 // If we call prefetch(RG[i+1]), we are ahead.
-                 
-                 // Let's iterate columns of next_rg to find bounds.
-                 var min_offset: u64 = std.math.maxInt(u64);
-                 var max_end: u64 = 0;
-                 var valid = false;
-                 
-                 for (next_rg.columns.items) |*col| {
-                     if (col.meta_data) |*meta| {
-                         const start: u64 = @intCast(meta.data_page_offset); // or dictionary_page_offset
-                         const len: u64 = @intCast(meta.total_compressed_size);
-                         if (start < min_offset) min_offset = start;
-                         if (start + len > max_end) max_end = start + len;
-                         valid = true;
-                     }
-                 }
-                 
-                 if (valid) {
-                     // Issue prefetch
-                     self.prefetch_source.prefetch(min_offset, max_end - min_offset) catch {};
-                 }
-            }
-            
             wg.start();
             
-            // Allocate a task context
             const ctx = try self.allocator.create(TaskContext);
             ctx.* = .{
                 .task = .{
@@ -107,21 +70,127 @@ pub const Executor = struct {
                 .executor = self,
                 .row_group = rg,
                 .row_group_idx = rg_idx,
+                .data_manager = &data_manager,
                 .wg = &wg,
             };
             
-            // Queue task
             self.thread_pool.schedule(xev.ThreadPool.Batch.from(&ctx.task));
         }
-        
+
+        // Phase 2: Dispatch all prefetch requests asynchronously (Conductor)
+        var prefetches_completed: usize = 0;
+        const PrefetchCtx = struct {
+            executor: *Executor,
+            data_manager: *@import("data_manager.zig").DataManager,
+            rg_idx: usize,
+            base_offset: u64,
+            completed_ptr: *usize,
+            
+            fn callback(ptr: ?*anyopaque, err: ?anyerror) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                if (err) |e| {
+                    std.debug.print("Prefetch failed for RG {d}: {any}\n", .{ ctx.rg_idx, e });
+                    ctx.data_manager.markFailed(ctx.rg_idx, e) catch {};
+                }
+                ctx.completed_ptr.* += 1;
+                ctx.executor.allocator.destroy(ctx);
+            }
+        };
+
+        for (self.file_metadata.row_groups.items, 0..) |*rg, rg_idx| {
+            var min_offset: u64 = std.math.maxInt(u64);
+            var max_end: u64 = 0;
+            
+            for (rg.columns.items) |*col| {
+                if (col.meta_data) |*meta| {
+                    const data_offset: u64 = @intCast(meta.data_page_offset);
+                    const col_len: u64 = @intCast(meta.total_compressed_size);
+                    const col_start = if (meta.dictionary_page_offset) |d| @min(@as(u64, @intCast(d)), data_offset) else data_offset;
+                    const col_end = col_start + col_len;
+                    if (col_start < min_offset) min_offset = col_start;
+                    if (col_end > max_end) max_end = col_end;
+                }
+            }
+            
+            if (max_end > min_offset) {
+                const rg_size = max_end - min_offset;
+                const buf = try self.allocator.alloc(u8, rg_size);
+                
+                const pctx = try self.allocator.create(PrefetchCtx);
+                pctx.* = .{
+                    .executor = self,
+                    .data_manager = &data_manager,
+                    .rg_idx = rg_idx,
+                    .base_offset = min_offset,
+                    .completed_ptr = &prefetches_completed,
+                };
+                
+                const ranges = [_]io.Range{.{ .start = min_offset, .end = max_end }};
+                const buffers = [_][]u8{buf};
+                
+                // Wrap callback to mark ready
+                const WrappedCtx = struct {
+                    pctx: *PrefetchCtx,
+                    buf: []u8,
+                    fn cb(ptr: ?*anyopaque, err: ?anyerror) void {
+                        const w: *@This() = @ptrCast(@alignCast(ptr));
+                        if (err == null) {
+                            const rg_data = @import("data_manager.zig").RowGroupData.init(w.pctx.executor.allocator, w.pctx.rg_idx, w.buf, w.pctx.base_offset);
+                            w.pctx.data_manager.markReady(w.pctx.rg_idx, rg_data) catch {};
+                        }
+                        PrefetchCtx.callback(w.pctx, err);
+                        w.pctx.executor.allocator.destroy(w);
+                    }
+                };
+                const w = try self.allocator.create(WrappedCtx);
+                w.* = .{ .pctx = pctx, .buf = buf };
+
+                if (self.source.vtable.readRangesAsync) |rra| {
+                    try rra(self.source.ptr, &ranges, &buffers, WrappedCtx.cb, w);
+                } else {
+                    // Fallback to sync
+                    try self.source.readRanges(&ranges, &buffers);
+                    WrappedCtx.cb(w, null);
+                }
+            } else {
+                prefetches_completed += 1;
+            }
+        }
+
+        // Phase 3: Drive the loop until all prefetches are done (Conductor)
+        // Workers are running on thread pool and will be unblocked as data arrives.
+        while (prefetches_completed < num_rgs) {
+            // We use the loop from main.zig (which is shared with S3Source)
+            // Wait, how do we get the loop here?
+            // S3Source has the loop. We can drive it via a dummy call or exposing it.
+            // For now, let's assume S3Source's loop is what we need to drive.
+            // Actually, Executor should probably HAVE a pointer to the loop.
+            
+            // FIXME: Drive the loop. For now, since S3Source.readAt/readRanges 
+            // already drive the loop if they are sync, it works.
+            // But for TRUE async, we need a way to run the loop.
+            // Let's assume the loop is being driven elsewhere or we have it.
+            
+            // TEMPORARY: If we are on S3, we know the source is AsyncS3Source.
+            // We'll add 'loop' to Executor.
+            if (self.plan.loop) |loop| {
+                try loop.run(.once);
+            } else {
+                // If no loop (sync source), we already called callbacks above.
+                if (prefetches_completed < num_rgs) break;
+            }
+        }
+
         wg.wait();
     }
+
     
     const TaskContext = struct {
         task: xev.ThreadPool.Task,
         executor: *Executor,
         row_group: *schema.RowGroup,
         row_group_idx: usize,
+        data_manager: *@import("data_manager.zig").DataManager,
         wg: *std.Thread.WaitGroup,
     };
     
@@ -142,11 +211,24 @@ pub const Executor = struct {
     }
     
     fn processRowGroup(ctx: *TaskContext, arena: *std.heap.ArenaAllocator) !void {
+        // Wait for data to be ready (blocks worker thread)
+        const rg_data = ctx.data_manager.waitForRowGroup(ctx.row_group_idx) orelse {
+            return error.NoRowGroupData;
+        };
+
+        // Create memory-backed source from pre-fetched data
+        // This avoids any network calls from worker threads
+        var mem_src = memory_source.MemorySource.init(
+            rg_data.data,
+            rg_data.base_offset,
+        );
+        const source = mem_src.randomAccessSource();
+        
         var pipeline = try rowgroup_pipeline.RowGroupPipeline.init(
             ctx.executor.allocator,
             arena,
             ctx.executor.plan,
-            ctx.executor.prefetch_source.randomAccessSource(),
+            source,
             ctx.row_group_idx,
             ctx.row_group,
             ctx.executor.file_metadata,
@@ -167,6 +249,25 @@ pub const Executor = struct {
             // not the footer.
             lw.deinit();
         };
+
+        // Fast Path Optimization
+        if (ctx.executor.plan.is_zero_copy) {
+            const rg_meta = try pipeline.executeFastPath(local_mem_sink.sink());
+            
+            // Synchronized Merge
+            ctx.executor.write_mutex.lock();
+            defer ctx.executor.write_mutex.unlock();
+
+            if (ctx.executor.output_writer) |gw| {
+                const rgs = [_]schema.RowGroup{rg_meta};
+                try gw.mergeDetached(local_mem_sink.data.items, &rgs);
+            }
+            
+            _ = ctx.executor.rows_scanned.fetchAdd(@intCast(rg_meta.num_rows), .monotonic);
+            _ = ctx.executor.rows_matched.fetchAdd(@intCast(rg_meta.num_rows), .monotonic);
+            
+            return;
+        }
 
         var matched_in_rg: usize = 0;
         var scanned_in_rg: usize = 0;

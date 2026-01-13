@@ -75,6 +75,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 .vtable = &.{
                     .readAt = readAt,
                     .readRanges = readRanges,
+                    .readRangesAsync = readRangesAsync,
                     .size = size,
                     .close = close,
                 },
@@ -160,71 +161,106 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 }
             }
 
-            // 2. Dispatch Coalesced Requests
+            // 2. Dispatch all requests
             const contexts = coalesced_ranges.items;
-            var next_to_start: usize = 0;
-            var completed: usize = 0;
-
-            // Start initial batch
-            for (0..@min(NUM_CONNECTIONS, contexts.len)) |_| {
-                const ctx = &contexts[next_to_start];
-                const pc = self.pool.acquire();
-                ctx.pooled_conn = pc;
-                pc.state = .sending;
-                pc.ensureConnected(ctx) catch |err| {
-                    ctx.err = err;
-                    ctx.done = true;
-                };
-                if (pc.connection_ready) {
-                    ctx.sendRequest() catch |err| {
-                        ctx.err = err;
-                        ctx.done = true;
-                    };
-                }
-                next_to_start += 1;
+            for (contexts) |*ctx| {
+                try self.pool.dispatch(ctx);
             }
 
-            // Run event loop until all complete
-            while (completed < contexts.len) {
+            // 3. Drive loop until all completed
+            while (true) {
                 try self.loop.run(.once);
-
-                // Check for completed requests
+                
+                var done_count: usize = 0;
                 for (contexts) |*ctx| {
-                    if (ctx.done and ctx.pooled_conn != null) {
-                        const pc = ctx.pooled_conn.?;
-                        if (ctx.err == null) {
-                            pc.markReady();
-                        } else {
-                            pc.markFailed();
-                        }
-                        ctx.pooled_conn = null;
-                        completed += 1;
-
-                        // Start next request if any pending
-                        if (next_to_start < contexts.len) {
-                            const next_ctx = &contexts[next_to_start];
-                            next_ctx.pooled_conn = pc;
-                            pc.state = .sending;
-                            pc.ensureConnected(next_ctx) catch |err| {
-                                next_ctx.err = err;
-                                next_ctx.done = true;
-                            };
-                            if (pc.connection_ready) {
-                                next_ctx.sendRequest() catch |err| {
-                                    next_ctx.err = err;
-                                    next_ctx.done = true;
-                                };
-                            }
-                            next_to_start += 1;
-                        }
-                    }
+                    if (ctx.done) done_count += 1;
                 }
+                if (done_count == contexts.len) break;
             }
 
             // Check for errors
             for (contexts) |ctx| {
                 if (ctx.err) |e| return e;
-                if (ctx.status_code != 200 and ctx.status_code != 206) return error.S3GetFailed;
+                if (ctx.status_code != 200 and ctx.status_code != 206) {
+                    std.debug.print("[S3Source] readRanges failed with status {d} for range {d}-{d}\n", .{ctx.status_code, ctx.range_start, ctx.range_end});
+                    return error.S3GetFailed;
+                }
+            }
+        }
+
+        fn readRangesAsync(ptr: *anyopaque, ranges: []const io.Range, buffers: []const []u8, cb: *const fn (ptr: ?*anyopaque, err: ?anyerror) void, ctx_ptr: ?*anyopaque) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            // Fix pool pointers as this struct may have moved
+            self.pool.source = self;
+            self.pool.fixPointers();
+
+            if (ranges.len != buffers.len) return error.InvalidArgs;
+            if (ranges.len == 0) {
+                cb(ctx_ptr, null);
+                return;
+            }
+
+            // For now, we only support a single coalesced range for simplicity in async
+            // (Wait, S3Source already has coalescing logic for readRanges, I should reuse it!)
+            // Actually, for Phase 2 Conductor Model, we usually call readRangesAsync for ONE row group at a time.
+            
+            // IMPLEMENTATION:
+            // 1. Create a master callback context that waits for ALL coalesced requests to finish.
+            const MasterCtx = struct {
+                allocator: std.mem.Allocator,
+                cb: *const fn (ptr: ?*anyopaque, err: ?anyerror) void,
+                ctx_ptr: ?*anyopaque,
+                remaining: usize,
+                err: ?anyerror = null,
+                
+                fn checkDone(mctx: *@This()) void {
+                    mctx.remaining -= 1;
+                    if (mctx.remaining == 0) {
+                        mctx.cb(mctx.ctx_ptr, mctx.err);
+                        mctx.allocator.destroy(mctx);
+                    }
+                }
+            };
+            
+            // Reuse coalescing logic (simplified for heap-allocated contexts)
+            // ... (I'll implement a more direct async version for now)
+            
+            // To be robust, let's just use RequestContext.start() for each range separately 
+            // if they are many, but S3 likes coalescing.
+            
+            // FOR NOW: Treat it as a single request if length is 1, or error/coalesce if more.
+            // If ranges.len > 1, we should coalesce.
+            
+            // Actually, I'll just implement the parallel version since I added the queue.
+            const mctx = try self.allocator.create(MasterCtx);
+            mctx.* = .{
+                .allocator = self.allocator,
+                .cb = cb,
+                .ctx_ptr = ctx_ptr,
+                .remaining = ranges.len,
+            };
+
+            for (ranges, 0..) |r, i| {
+                const rctx = try self.allocator.create(RequestContext);
+                rctx.* = .{
+                    .source = self,
+                    .method = .GET,
+                    .allocator = self.allocator,
+                    .range_start = r.start,
+                    .range_end = r.end - 1,
+                    .output_buf = buffers[i],
+                    .callback = struct {
+                        fn call(done_ctx: *RequestContext) void {
+                            const master: *MasterCtx = @ptrCast(@alignCast(done_ctx.callback_ctx.?));
+                            if (done_ctx.err) |e| master.err = e;
+                            const allocator = done_ctx.allocator;
+                            master.checkDone();
+                            allocator.destroy(done_ctx);
+                        }
+                    }.call,
+                };
+                rctx.callback_ctx = mctx; // Need to add this field to RequestContext too!
+                try rctx.start();
             }
         }
 
@@ -237,10 +273,15 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             try ctx.run();
             if (ctx.status_code != 200) return error.S3HeadFailed;
             self.content_length = ctx.content_length;
+            std.debug.print("[S3Source] detected size: {d} bytes\n", .{self.content_length});
         }
 
         fn readAt(ptr: *anyopaque, offset: u64, buf: []u8) anyerror!usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            // Fix pool pointers as this struct may have moved
+            self.pool.source = self;
+            self.pool.fixPointers();
+
             const range_end = offset + buf.len - 1;
 
             var ctx = RequestContext{
@@ -253,7 +294,10 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             };
             try ctx.run();
 
-            if (ctx.status_code != 200 and ctx.status_code != 206) return error.S3GetFailed;
+            if (ctx.status_code != 200 and ctx.status_code != 206) {
+                std.debug.print("[S3Source] {s} readAt failed with status {d} for range {d}-{d} (len {d})\n", .{@tagName(ctx.method), ctx.status_code, offset, range_end, buf.len});
+                return error.S3GetFailed;
+            }
             return ctx.bytes_read;
         }
 
@@ -268,10 +312,10 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             self.allocator.destroy(self);
         }
 
-        /// Connection pool manages N connections with keep-alive reuse
         const ConnectionPool = struct {
             source: *Self,
             connections: [NUM_CONNECTIONS]PooledConnection = undefined,
+            queue: std.ArrayListUnmanaged(*RequestContext) = .{},
 
             fn init(source: *Self) ConnectionPool {
                 var pool = ConnectionPool{ .source = source };
@@ -288,24 +332,33 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 for (&self.connections) |*pc| {
                     if (pc.conn) |c| c.deinit();
                 }
+                self.queue.deinit(self.source.allocator);
             }
 
-            /// Get an idle connection, or the first one if none idle
-            fn acquire(self: *ConnectionPool) *PooledConnection {
-                // Find an idle connection that's ready
-                for (&self.connections) |*pc| {
-                    if (pc.state == .idle and pc.connection_ready) {
-                        return pc;
-                    }
-                }
-                // Find any idle connection
+            /// Dispatch a request context. Either uses an idle connection or queues it.
+            fn dispatch(self: *ConnectionPool, ctx: *RequestContext) !void {
+                // Find an idle connection
                 for (&self.connections) |*pc| {
                     if (pc.state == .idle) {
-                        return pc;
+                        try pc.startRequest(ctx);
+                        return;
                     }
                 }
-                // All busy - use first one (will wait)
-                return &self.connections[0];
+                
+                // All busy - queue it
+                try self.queue.append(self.source.allocator, ctx);
+            }
+
+            fn onConnectionIdle(self: *ConnectionPool, pc: *PooledConnection) void {
+                if (self.queue.items.len > 0) {
+                    const ctx = self.queue.orderedRemove(0);
+                    pc.startRequest(ctx) catch |err| {
+                        ctx.err = err;
+                        ctx.done = true;
+                        if (ctx.callback) |cb| cb(ctx);
+                        self.onConnectionIdle(pc); // Try next in queue
+                    };
+                }
             }
 
             fn fixPointers(self: *ConnectionPool) void {
@@ -330,6 +383,21 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             conn: ?*Conn = null,
             state: ConnectionState = .idle,
             connection_ready: bool = false,
+
+            fn startRequest(self: *PooledConnection, ctx: *RequestContext) !void {
+                self.state = .sending;
+                ctx.pooled_conn = self;
+                
+                ctx.parser = .{ .is_head = (ctx.method == .HEAD) };
+                ctx.done = false;
+                ctx.err = null;
+                ctx.bytes_read = 0;
+
+                try self.ensureConnected(ctx);
+                if (self.connection_ready) {
+                    try ctx.sendRequest();
+                }
+            }
 
             fn ensureConnected(self: *PooledConnection, ctx: *RequestContext) !void {
                 if (self.connection_ready and self.conn != null) {
@@ -408,11 +476,13 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             fn markReady(self: *PooledConnection) void {
                 self.connection_ready = true;
                 self.state = .idle;
+                self.pool.onConnectionIdle(self);
             }
 
             fn markFailed(self: *PooledConnection) void {
                 self.connection_ready = false;
                 self.state = .idle;
+                self.pool.onConnectionIdle(self);
             }
         };
 
@@ -442,6 +512,9 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             content_length: u64 = 0,
             bytes_read: usize = 0,
             err: ?anyerror = null,
+            
+            callback: ?*const fn(ctx: *RequestContext) void = null,
+            callback_ctx: ?*anyopaque = null,
 
             // Internal parser state
             parser: protocol_http.ResponseParser = .{},
@@ -449,70 +522,16 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
 
             fn run(self: *RequestContext) !void {
                 self.sub_ranges = .{};
-                return self.runWithRetry(true);
-            }
-
-            fn runWithRetry(self: *RequestContext, allow_retry: bool) !void {
-                self.parser = .{ .is_head = (self.method == .HEAD) };
-                self.done = false;
-                self.err = null;
-                self.bytes_read = 0;
-
-                // Fix pool pointers (in case source was moved)
-                self.source.pool.source = self.source;
-                self.source.pool.fixPointers();
-
-                // Acquire a connection from the pool
-                const pc = self.source.pool.acquire();
-                self.pooled_conn = pc;
-                const was_reused = pc.connection_ready;
-
-                // Ensure we're connected (reuses if possible)
-                try pc.ensureConnected(self);
-
-                // If already connected, send immediately
-                if (pc.connection_ready) {
-                    try self.sendRequest();
-                }
-                // Otherwise, onHandshake will call sendRequest
-
+                try self.source.pool.dispatch(self);
                 while (!self.done) {
                     try self.source.loop.run(.once);
                 }
+                if (self.err) |e| return e;
+            }
 
-                // Handle connection errors - retry once if we were reusing
-                if (self.err != null and was_reused and allow_retry) {
-                    // Connection was stale, force reconnect and retry
-                    pc.markFailed();
-                    if (pc.conn) |c| {
-                        c.deinit();
-                        pc.conn = null;
-                    }
-                    return self.runWithRetry(false);
-                }
-
-                // Mark connection as ready for reuse (unless error)
-                if (self.err == null) {
-                    pc.markReady();
-                } else {
-                    pc.markFailed();
-                }
-
-                if (self.err) |e| {
-                    const is_retryable = switch (e) {
-                        error.ConnectionReset,
-                        error.BrokenPipe,
-                        error.EndOfStream,
-                        error.TlsConnectionClosed, // Retry on TLS closure
-                        => true,
-                        else => false,
-                    };
-
-                    if (allow_retry and is_retryable) {
-                        return self.runWithRetry(false);
-                    }
-                    return e;
-                }
+            fn start(self: *RequestContext) !void {
+                self.sub_ranges = .{};
+                try self.source.pool.dispatch(self);
             }
 
             fn onHandshake(ptr: ?*anyopaque) void {
@@ -628,6 +647,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                         }
                     }
                     self.done = true;
+                    if (self.callback) |cb| cb(self);
                 }
             }
 
@@ -637,6 +657,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 if (self.done or self.parser.state == .done) return;
                 self.err = err;
                 self.done = true;
+                if (self.callback) |cb| cb(self);
             }
         };
 

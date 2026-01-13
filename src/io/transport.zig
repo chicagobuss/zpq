@@ -219,10 +219,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
             self.current_write_buf = buf;
             
             if (comptime @hasDecl(Xev.Loop, "write")) {
-                std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
+                // std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
                 try self.loop.write(&self.c_write, self.tcp, .{ .slice = buf }, Self, self, onWrite);
             } else {
-                std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
+                // std.debug.print("[Transport] Queuing write ({d} bytes)\n", .{buf.len});
                 self.tcp.write(self.loop, &self.c_write, .{ .slice = buf }, Self, self, onWrite);
             }
         }
@@ -282,7 +282,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 if (self.on_error) |cb| cb(self.callback_ctx, err);
                 return .disarm;
             };
-            std.debug.print("[Transport] onWrite finished: {d} bytes\n", .{n});
+            // std.debug.print("[Transport] onWrite finished: {d} bytes\n", .{n});
             self.write_in_flight = false;
             
             if (self.current_write_buf) |buf| {
@@ -301,7 +301,7 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 
                 if (self.current_write_offset < total_len) {
                     // Partial write! We must loop.
-                    std.debug.print("[Transport] Partial write: {d}/{d} bytes. Re-queuing remainder.\n", .{self.current_write_offset, total_len});
+                    // std.debug.print("[Transport] Partial write: {d}/{d} bytes. Re-queuing remainder.\n", .{self.current_write_offset, total_len});
                     const slice = buf[self.current_write_offset..];
                     if (comptime @hasDecl(Xev.Loop, "write")) {
                          // We must NOT call writeRaw because it dupes! We just call loop.write again with the slice.

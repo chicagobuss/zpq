@@ -418,10 +418,18 @@ test "S3 protocol" {
 - [ ] Vectorized RLE decoder
 - [ ] SIMD null bitmap operations
 
-### Phase 3: Zero-Copy (Future)
-- [ ] Direct TLS decryption into column buffers
+### Phase 3: Zero-Copy (Verified: Jan 2026)
+- [x] **Verified Zero-Copy Pass-Through**: 55.5 MB/s (1.4x speedup vs decode path).
+- [ ] Direct TLS decryption into column buffers (Next Step)
 - [ ] mmap for local file access
-- [ ] Buffer pool with arena recycling
+
+**Competitor Benchmarks (S3 -> S3 100MB):**
+| Engine | Zero-Copy | Filter | 1-Col |
+| :--- | :--- | :--- | :--- |
+| **ZPQ** | **2.8s** | **4.0s** | 6.3s |
+| Polars | 8.9s | 19.5s | 1.2s |
+| DuckDB | 24.1s | 9.0s | **0.6s** |
+*ZPQ wins on throughput, lags on sparse latency.*
 
 ### Phase 4: Schema Specialization (Research)
 - [ ] Runtime comptime (via cached compiled modules)

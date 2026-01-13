@@ -109,14 +109,14 @@ cmd_sweep() {
 
 # --- ZPQ Runners ---
 run_native() {
-    local input_path="$1" output_path="$2" runs="$3"
+    local input_path="$1" output_path="$2" runs="$3" threads="${4:-4}"
     local bin="$PROJECT_ROOT/zig-out/bin/zpq"
 
     [[ ! -x "$bin" ]] && { echo "Error: zpq not built. Run: zig build -Doptimize=ReleaseFast"; exit 1; }
 
     for i in $(seq 1 "$runs"); do
         [[ "$runs" -gt 1 ]] && info "Run $i/$runs"
-        "$bin" --filter "string_dict_low=category_0001" --select "int32_sorted,string_dict_low,float64" "$input_path" "$output_path"
+        "$bin" --threads "$threads" --filter "string_dict_low=category_0001" --select "int32_sorted,string_dict_low,float64" "$input_path" "$output_path"
     done
 }
 
@@ -160,146 +160,41 @@ run_serverless_lambda() {
 #   - Select: int32_sorted, string_dict_low, float64
 #   - Write: parquet output
 
-run_pyarrow() {
-    local input_path="$1" output_path="$2" runs="$3"
+run_engine_generic() {
+    local engine="$1"
+    local input_path="$2"
+    local output_path="$3"
+    local runs="$4"
+    local scenario="${5:-default}"
 
-    info "PyArrow | $input_path -> $output_path | $runs runs"
-    uv run --with pyarrow --with boto3 python3 -c "
-import time, os, io
-import pyarrow.parquet as pq
-import pyarrow.compute as pc
-import boto3
+    info "$engine | $input_path -> $output_path | Scenario: $scenario | $runs runs"
+    
+    local cmd=(uv run)
+    
+    # Add engine-specific dependencies
+    case "$engine" in
+        pyarrow) cmd+=("--with" "pyarrow" "--with" "boto3") ;;
+        polars)  cmd+=("--with" "polars" "--with" "s3fs" "--with" "boto3") ;;
+        duckdb)  cmd+=("--with" "duckdb" "--with" "httpfs") ;; # httpfs might be internal, duckdb pip is self-contained usually
+    esac
 
-input_path = '$input_path'
-output_path = '$output_path'
-iterations = $runs
-s3 = boto3.client('s3')
+    cmd+=("python3" "$PROJECT_ROOT/tools/bench_engines.py" \
+          "--engine" "$engine" \
+          "--input" "$input_path" \
+          "--output" "$output_path" \
+          "--runs" "$runs" \
+          "--scenario" "$scenario")
 
-durations = []
-for i in range(iterations):
-    start = time.time()
-
-    # Read
-    if input_path.startswith('s3://'):
-        parts = input_path[5:].split('/', 1)
-        obj = s3.get_object(Bucket=parts[0], Key=parts[1])
-        f = io.BytesIO(obj['Body'].read())
-        table = pq.read_table(f, columns=['int32_sorted', 'string_dict_low', 'float64'])
-    else:
-        table = pq.read_table(input_path, columns=['int32_sorted', 'string_dict_low', 'float64'])
-
-    # Filter
-    mask = pc.equal(table['string_dict_low'], 'category_0001')
-    filtered = table.filter(mask)
-
-    # Write
-    if output_path.startswith('s3://'):
-        parts = output_path[5:].split('/', 1)
-        buf = io.BytesIO()
-        pq.write_table(filtered, buf)
-        buf.seek(0)
-        s3.put_object(Bucket=parts[0], Key=parts[1], Body=buf.getvalue())
-    else:
-        pq.write_table(filtered, output_path)
-
-    duration_ms = (time.time() - start) * 1000
-    durations.append(duration_ms)
-    print(f'  Run {i+1}: {table.num_rows} -> {filtered.num_rows} rows in {duration_ms:.2f}ms')
-
-print(f'Min: {min(durations):.2f}ms')
-print(f'Max: {max(durations):.2f}ms')
-print(f'Avg: {sum(durations)/len(durations):.2f}ms')
-"
+    "${cmd[@]}"
 }
 
-run_polars() {
-    local input_path="$1" output_path="$2" runs="$3"
-
-    info "Polars | $input_path -> $output_path | $runs runs"
-    uv run --with polars python3 -c "
-import time, os
-import polars as pl
-
-input_path = '$input_path'
-output_path = '$output_path'
-iterations = $runs
-
-durations = []
-for i in range(iterations):
-    start = time.time()
-
-    # Read, filter, select, write
-    df = pl.scan_parquet(input_path)
-    result = (df
-        .filter(pl.col('string_dict_low') == 'category_0001')
-        .select(['int32_sorted', 'string_dict_low', 'float64'])
-        .collect())
-    result.write_parquet(output_path)
-
-    duration_ms = (time.time() - start) * 1000
-    durations.append(duration_ms)
-    # Get input row count for comparison
-    input_rows = pl.scan_parquet(input_path).select(pl.len()).collect().item()
-    print(f'  Run {i+1}: {input_rows} -> {result.height} rows in {duration_ms:.2f}ms')
-
-if durations:
-    print(f'Min: {min(durations):.2f}ms')
-    print(f'Max: {max(durations):.2f}ms')
-    print(f'Avg: {sum(durations)/len(durations):.2f}ms')
-"
-}
-
-run_duckdb() {
-    local input_path="$1" output_path="$2" runs="$3"
-
-    info "DuckDB | $input_path -> $output_path | $runs runs"
-    uv run --with duckdb python3 -c "
-import time, os
-import duckdb
-
-input_path = '$input_path'
-output_path = '$output_path'
-iterations = $runs
-
-durations = []
-for i in range(iterations):
-    start = time.time()
-    conn = duckdb.connect()
-
-    # S3 credentials
-    conn.execute(\"SET s3_region='\"+os.environ.get('AWS_REGION', 'us-west-2')+\"'\")
-    conn.execute(\"SET s3_access_key_id='\"+os.environ.get('AWS_ACCESS_KEY_ID', '')+\"'\")
-    conn.execute(\"SET s3_secret_access_key='\"+os.environ.get('AWS_SECRET_ACCESS_KEY', '')+\"'\")
-
-    # Read, filter, select, write
-    query = f\"\"\"
-        COPY (
-            SELECT int32_sorted, string_dict_low, float64
-            FROM '{input_path}'
-            WHERE string_dict_low = 'category_0001'
-        ) TO '{output_path}' (FORMAT PARQUET)
-    \"\"\"
-    conn.execute(query)
-
-    # Get row counts for reporting
-    input_rows = conn.execute(f\"SELECT COUNT(*) FROM '{input_path}'\").fetchone()[0]
-    output_rows = conn.execute(f\"SELECT COUNT(*) FROM '{output_path}'\").fetchone()[0]
-
-    duration_ms = (time.time() - start) * 1000
-    durations.append(duration_ms)
-    print(f'  Run {i+1}: {input_rows} -> {output_rows} rows in {duration_ms:.2f}ms')
-    conn.close()
-
-if durations:
-    print(f'Min: {min(durations):.2f}ms')
-    print(f'Max: {max(durations):.2f}ms')
-    print(f'Avg: {sum(durations)/len(durations):.2f}ms')
-"
-}
+run_pyarrow() { run_engine_generic "pyarrow" "$1" "$2" "$3" "${4:-default}"; }
+run_polars()  { run_engine_generic "polars"  "$1" "$2" "$3" "${4:-default}"; }
+run_duckdb()  { run_engine_generic "duckdb"  "$1" "$2" "$3" "${4:-default}"; }
 
 # --- Commands ---
 cmd_bench() {
-    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}"
+    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}" threads="${6:-4}"
 
     [[ -z "$backend" || -z "$input" || -z "$output" ]] && {
         echo "Usage: $0 <backend> <input> <output> [size] [runs]"
@@ -345,29 +240,35 @@ cmd_bench() {
     echo ""
 
     case "$backend" in
-        native)             run_native "$input_path" "$output_path" "$runs" ;;
+        native)             run_native "$input_path" "$output_path" "$runs" "$threads" ;;
         serverless-rie)     run_serverless_local "$input_path" "$output_path" "$runs" ;;
         serverless-lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" ;;
     esac
 }
 
 cmd_engine() {
-    local engine="${1:-}" input="${2:-local}" size="${3:-10mb}" runs="${4:-1}"
+    local engine="${1:-}" input="${2:-local}" size="${3:-10mb}" runs="${4:-1}" scenario="${5:-default}"
 
     [[ -z "$engine" ]] && {
-        echo "Usage: $0 engine <engine> [input] [size] [runs]"
-        echo "  engine: pyarrow | polars | duckdb"
-        echo "  input:  local | s3 (default: local)"
+        echo "Usage: $0 engine <engine> [input] [size] [runs] [scenario]"
+        echo "  engine:   pyarrow | polars | duckdb"
+        echo "  input:    local | s3 (default: local)"
+        echo "  scenario: default | pass-through | filter | select-1 | select-3"
         exit 1
     }
 
     local input_path=$(get_input_path "$input" "$size" "native")
     local output_path="/tmp/bench_${engine}_${size}_out.parquet"
+    if [[ "$input" == "s3" ]]; then
+         # If input is S3, let's make output S3 too for consistency in benchmarks
+         local bucket="${AWS_S3_BUCKET:?AWS_S3_BUCKET not set}"
+         output_path="s3://$bucket/zpq_test_data/output/bench_${engine}_${size}_out.parquet"
+    fi
 
     case "$engine" in
-        pyarrow) run_pyarrow "$input_path" "$output_path" "$runs" ;;
-        polars)  run_polars "$input_path" "$output_path" "$runs" ;;
-        duckdb)  run_duckdb "$input_path" "$output_path" "$runs" ;;
+        pyarrow) run_pyarrow "$input_path" "$output_path" "$runs" "$scenario" ;;
+        polars)  run_polars "$input_path" "$output_path" "$runs" "$scenario" ;;
+        duckdb)  run_duckdb "$input_path" "$output_path" "$runs" "$scenario" ;;
         *) echo "Error: Unknown engine: $engine"; exit 1 ;;
     esac
 }

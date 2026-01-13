@@ -208,8 +208,8 @@ lambda-list:
 #   just bench serverless-rie local local       # RIE file→file
 #   just bench serverless-rie s3 s3             # RIE S3→S3
 #   just bench serverless-lambda s3 s3 100mb    # Real Lambda
-bench what input output size="10mb" runs="1":
-    @./tools/bench.sh {{what}} {{input}} {{output}} {{size}} {{runs}}
+bench what input output size="10mb" runs="1" threads="4":
+    @./tools/bench.sh {{what}} {{input}} {{output}} {{size}} {{runs}} {{threads}}
 
 
 # Engine comparison benchmarks (pyarrow, polars, duckdb)

@@ -66,7 +66,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.err) |e| return e;
 
-            std.debug.print("[S3Sink] Receiving {d} bytes\n", .{data.len});
+            // std.debug.print("[S3Sink] Receiving {d} bytes\n", .{data.len});
             // Copy data into channel (Sink takes ownership)
             const copy = try self.allocator.dupe(u8, data);
             try self.chan.send(copy);
@@ -182,7 +182,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                         try completed_parts.append(self.allocator, .{ .part_number = ctx.part_number, .etag = etag });
                         
                         _ = in_flight.orderedRemove(i);
-                        std.debug.print("[S3Sink] Part {d} finished. In-flight: {d}\n", .{ctx.part_number, in_flight.items.len});
+                        // std.debug.print("[S3Sink] Part {d} finished. In-flight: {d}\n", .{ctx.part_number, in_flight.items.len});
                         ctx.deinit();
                         self.allocator.destroy(ctx);
                     } else {
@@ -192,33 +192,63 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
 
                 // C. Try to fill buffer and launch new parts if room
                 if (!channel_closed and in_flight.items.len < CONCURRENCY) {
-                    while (try self.chan.tryRecv()) |chunk| {
-                        defer self.allocator.free(chunk);
-                        try buffer.appendSlice(self.allocator, chunk);
-                        
-                        if (buffer.items.len >= PART_SIZE) {
-                            if (upload_id == null) {
-                                std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
-                                upload_id = try self.writer.initiateMultipartUpload();
-                            }
-                            
-                            std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
-                            const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items);
-                            try in_flight.append(self.allocator, ctx);
-                            
-                            next_part_number += 1;
-                            buffer.clearRetainingCapacity();
-                            break; // Back to driving the loop
+                    // 1. Process existing buffer
+                    while (buffer.items.len >= PART_SIZE and in_flight.items.len < CONCURRENCY) {
+                        if (upload_id == null) {
+                            // std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
+                            upload_id = try self.writer.initiateMultipartUpload();
                         }
-                    } else {
-                        // Channel empty, if we have nothing in-flight and not closed, block
-                        if (in_flight.items.len == 0 and buffer.items.len < PART_SIZE) {
-                            if (try self.chan.recv()) |chunk| {
-                                defer self.allocator.free(chunk);
-                                try buffer.appendSlice(self.allocator, chunk);
-                            } else {
-                                channel_closed = true;
+                        
+                        // std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
+                        const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items[0..PART_SIZE]);
+                        try in_flight.append(self.allocator, ctx);
+                        
+                        next_part_number += 1;
+                        
+                        const remaining = buffer.items.len - PART_SIZE;
+                        std.mem.copyForwards(u8, buffer.items[0..remaining], buffer.items[PART_SIZE..]);
+                        buffer.items.len = remaining;
+                    }
+
+                    // 2. Try to receive more data
+                    while (in_flight.items.len < CONCURRENCY) {
+                        if (try self.chan.tryRecv()) |chunk| {
+                            defer self.allocator.free(chunk);
+                            try buffer.appendSlice(self.allocator, chunk);
+                            
+                            // Check if we can launch parts now
+                             while (buffer.items.len >= PART_SIZE and in_flight.items.len < CONCURRENCY) {
+                                if (upload_id == null) {
+                                    std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
+                                    upload_id = try self.writer.initiateMultipartUpload();
+                                }
+                                
+                                std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
+                                const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items[0..PART_SIZE]);
+                                try in_flight.append(self.allocator, ctx);
+                                
+                                next_part_number += 1;
+                                
+                                const remaining = buffer.items.len - PART_SIZE;
+                                std.mem.copyForwards(u8, buffer.items[0..remaining], buffer.items[PART_SIZE..]);
+                                buffer.items.len = remaining;
                             }
+                        } else {
+                            // Channel empty, stop trying to recv
+                            break;
+                        }
+                    }
+
+                    // 3. Blocking wait if necessary
+                    if (in_flight.items.len == 0 and buffer.items.len < PART_SIZE) {
+                        if (try self.chan.recv()) |chunk| {
+                            defer self.allocator.free(chunk);
+                            try buffer.appendSlice(self.allocator, chunk);
+                            // We will process this data in the next outer loop iteration (Step A -> B -> C1)
+                            // or we can process here. But easier to just continue loop.
+                            continue;
+                        } else {
+                            channel_closed = true;
                         }
                     }
                 } else if (in_flight.items.len >= CONCURRENCY or channel_closed) {
@@ -245,11 +275,15 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
             // 3. Finalize
             if (upload_id == null) {
                 if (buffer.items.len > 0) {
-                     std.debug.print("[S3Sink] Performing single PUT ({d} bytes)...\n", .{buffer.items.len});
+                     // std.debug.print("[S3Sink] Performing single PUT ({d} bytes)...\n", .{buffer.items.len});
                      try self.writer.putObject(buffer.items);
                 }
             } else {
-                std.debug.print("[S3Sink] Completing multipart upload {s} ({d} parts)...\n", .{upload_id.?, completed_parts.items.len});
+                // std.debug.print("[S3Sink] Completing multipart upload {s} ({d} parts)...\n", .{upload_id.?, completed_parts.items.len});
+                if (false) { // Disabled sleep hack
+                    var ts = std.posix.timespec{ .tv_sec = 1, .tv_nsec = 0 };
+                    std.posix.nanosleep(&ts, null);
+                }
                 // AWS requires parts to be sorted by PartNumber
                 const PartSort = struct {
                     fn lessThan(_: void, a: protocol_s3.S3.Part, b: protocol_s3.S3.Part) bool {

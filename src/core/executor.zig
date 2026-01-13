@@ -10,6 +10,7 @@ const writer = @import("writer.zig");
 const prefetching = @import("../io/prefetching_source.zig");
 const memory_sink = @import("../io/memory_sink.zig");
 const memory_source = @import("../io/memory_source.zig");
+const coalescer = @import("../io/coalescer.zig");
 
 pub const Executor = struct {
     allocator: std.mem.Allocator,
@@ -97,59 +98,113 @@ pub const Executor = struct {
             }
         };
 
+
         for (self.file_metadata.row_groups.items, 0..) |*rg, rg_idx| {
-            var min_offset: u64 = std.math.maxInt(u64);
-            var max_end: u64 = 0;
-            
-            for (rg.columns.items) |*col| {
+            // Collect ranges for REQUIRED columns only
+            var range_list = std.ArrayListUnmanaged(coalescer.Range){};
+            defer range_list.deinit(self.allocator);
+
+            for (self.plan.required_columns) |col_idx| {
+                if (col_idx >= rg.columns.items.len) continue;
+                const col = &rg.columns.items[col_idx];
+                
                 if (col.meta_data) |*meta| {
                     const data_offset: u64 = @intCast(meta.data_page_offset);
                     const col_len: u64 = @intCast(meta.total_compressed_size);
                     const col_start = if (meta.dictionary_page_offset) |d| @min(@as(u64, @intCast(d)), data_offset) else data_offset;
                     const col_end = col_start + col_len;
-                    if (col_start < min_offset) min_offset = col_start;
-                    if (col_end > max_end) max_end = col_end;
+                    
+                    try range_list.append(self.allocator, .{ .start = col_start, .end = col_end });
                 }
             }
             
-            if (max_end > min_offset) {
-                const rg_size = max_end - min_offset;
-                const buf = try self.allocator.alloc(u8, rg_size);
-                
+            // Coalesce ranges (gap threshold 64KB)
+            const coalesced = try coalescer.Coalescer.coalesce(self.allocator, range_list.items, 64 * 1024);
+            // Note: coalesced is owned by us, need to free later (but we pass it to async call... wait.
+            // Actually, we process immediately below).
+            defer self.allocator.free(coalesced);
+
+            if (coalesced.len > 0) {
+                 // Prepare buffers for each coalesced range
+                 const buffers = try self.allocator.alloc([]u8, coalesced.len);
+                 // We rely on the callback/WrappedCtx to free this 'buffers' slice, 
+                 // BUT the individual buffers inside must be allocated now.
+                 
+                 var total_bytes: usize = 0;
+                 for (coalesced, 0..) |range, i| {
+                     const len = range.end - range.start;
+                     buffers[i] = try self.allocator.alloc(u8, len);
+                     total_bytes += len;
+                 }
+                 
+                 // Convert coalescer ranges to io.Range
+                 const io_ranges = try self.allocator.alloc(io.Range, coalesced.len);
+                 for (coalesced, 0..) |c, i| {
+                     io_ranges[i] = .{ .start = c.start, .end = c.end };
+                 }
+
                 const pctx = try self.allocator.create(PrefetchCtx);
                 pctx.* = .{
                     .executor = self,
                     .data_manager = &data_manager,
                     .rg_idx = rg_idx,
-                    .base_offset = min_offset,
+                    .base_offset = 0, // Not used for sparse
                     .completed_ptr = &prefetches_completed,
                 };
-                
-                const ranges = [_]io.Range{.{ .start = min_offset, .end = max_end }};
-                const buffers = [_][]u8{buf};
                 
                 // Wrap callback to mark ready
                 const WrappedCtx = struct {
                     pctx: *PrefetchCtx,
-                    buf: []u8,
+                    buffers: [][]u8, // We own the slice AND the buffers
+                    io_ranges: []io.Range, // We own this too
+                    
                     fn cb(ptr: ?*anyopaque, err: ?anyerror) void {
                         const w: *@This() = @ptrCast(@alignCast(ptr));
                         if (err == null) {
-                            const rg_data = @import("data_manager.zig").RowGroupData.init(w.pctx.executor.allocator, w.pctx.rg_idx, w.buf, w.pctx.base_offset);
+                            // Create chunks from buffers + ranges
+                            // We need to map back which buffer is which.
+                            // Luckily io_ranges[i] corresponds to buffers[i].
+                            
+                            const chunks = w.pctx.executor.allocator.alloc(@import("data_manager.zig").RowGroupData.Chunk, w.buffers.len) catch panic("OOM in cb");
+                            
+                            for (w.buffers, 0..) |buf, i| {
+                                chunks[i] = .{
+                                    .data = buf, // Transfer ownership to RowGroupData
+                                    .base_offset = w.io_ranges[i].start,
+                                };
+                            }
+                            
+                            const rg_data = @import("data_manager.zig").RowGroupData.init(w.pctx.executor.allocator, w.pctx.rg_idx, chunks);
+                            
+                            // Free the container slice, but NOT the buffer contents (transferred)
+                            w.pctx.executor.allocator.free(w.buffers);
+                            
                             w.pctx.data_manager.markReady(w.pctx.rg_idx, rg_data) catch {};
+                        } else {
+                            // On error, free everything
+                            for (w.buffers) |buf| w.pctx.executor.allocator.free(buf);
+                            w.pctx.executor.allocator.free(w.buffers);
                         }
+                        
+                        w.pctx.executor.allocator.free(w.io_ranges);
                         PrefetchCtx.callback(w.pctx, err);
                         w.pctx.executor.allocator.destroy(w);
                     }
+                    
+                    fn panic(msg: []const u8) noreturn {
+                        std.debug.print("PANIC: {s}\n", .{msg});
+                        std.process.exit(1);
+                    }
                 };
+                
                 const w = try self.allocator.create(WrappedCtx);
-                w.* = .{ .pctx = pctx, .buf = buf };
+                w.* = .{ .pctx = pctx, .buffers = buffers, .io_ranges = io_ranges };
 
                 if (self.source.vtable.readRangesAsync) |rra| {
-                    try rra(self.source.ptr, &ranges, &buffers, WrappedCtx.cb, w);
+                    try rra(self.source.ptr, io_ranges, buffers, WrappedCtx.cb, w);
                 } else {
                     // Fallback to sync
-                    try self.source.readRanges(&ranges, &buffers);
+                    try self.source.readRanges(io_ranges, buffers);
                     WrappedCtx.cb(w, null);
                 }
             } else {
@@ -219,8 +274,7 @@ pub const Executor = struct {
         // Create memory-backed source from pre-fetched data
         // This avoids any network calls from worker threads
         var mem_src = memory_source.MemorySource.init(
-            rg_data.data,
-            rg_data.base_offset,
+            rg_data.chunks
         );
         const source = mem_src.randomAccessSource();
         

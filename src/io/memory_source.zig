@@ -1,14 +1,14 @@
 const std = @import("std");
 const interface = @import("interface.zig");
+const DataManager = @import("../core/data_manager.zig");
 
-/// A RandomAccessSource backed by an in-memory buffer.
-/// Used for workers to read pre-fetched data without network calls.
+/// A RandomAccessSource backed by multiple in-memory chunks.
+/// Used for workers to read pre-fetched data (which may be sparse).
 pub const MemorySource = struct {
-    data: []const u8,
-    base_offset: u64,  // Offset in original file where this data starts
+    chunks: []const DataManager.RowGroupData.Chunk,
     
-    pub fn init(data: []const u8, base_offset: u64) MemorySource {
-        return .{ .data = data, .base_offset = base_offset };
+    pub fn init(chunks: []const DataManager.RowGroupData.Chunk) MemorySource {
+        return .{ .chunks = chunks };
     }
     
     pub fn randomAccessSource(self: *MemorySource) interface.RandomAccessSource {
@@ -27,37 +27,44 @@ pub const MemorySource = struct {
     
     fn readAt(ptr: *anyopaque, offset: u64, buffer: []u8) anyerror!usize {
         const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        const end = offset + buffer.len;
+
+        // Naive linear scan for relevant chunks (optimization: could sort/search, but usually few chunks)
+        // Note: A single read might span multiple chunks IF they are contiguous. 
+        // But for sparse coalescing, they are usually disjoint.
+        // Let's assume reads don't span gaps. If they do, we err or partial read.
         
-        // Translate absolute file offset to relative buffer offset
-        if (offset < self.base_offset) return error.InvalidOffset;
-        const rel_offset = offset - self.base_offset;
+        var bytes_read: usize = 0;
         
-        const start = @min(rel_offset, self.data.len);
-        const end = @min(start + buffer.len, self.data.len);
-        const bytes_to_read = end - start;
+        for (self.chunks) |chunk| {
+            const chunk_end = chunk.base_offset + chunk.data.len;
+            
+            // Check intersection [offset, end) with [chunk_start, chunk_end)
+            if (offset < chunk_end and end > chunk.base_offset) {
+                // Determine intersection range in absolute coords
+                const intersect_start = @max(offset, chunk.base_offset);
+                const intersect_end = @min(end, chunk_end);
+                
+                // Copy
+                const src_start = intersect_start - chunk.base_offset;
+                const src_end = intersect_end - chunk.base_offset;
+                const dst_start = intersect_start - offset;
+                const dst_end = intersect_end - offset;
+                
+                @memcpy(buffer[dst_start..dst_end], chunk.data[src_start..src_end]);
+                bytes_read += (dst_end - dst_start);
+            }
+        }
         
-        if (bytes_to_read == 0) return 0;
-        
-        @memcpy(buffer[0..bytes_to_read], self.data[start..end]);
-        return bytes_to_read;
+        return bytes_read;
     }
     
     fn readRanges(ptr: *anyopaque, ranges: []const interface.Range, buffers: []const []u8) anyerror!void {
-        const self: *MemorySource = @ptrCast(@alignCast(ptr));
+        // self cast not strictly needed since we pass ptr to readAt
+        // const self: *MemorySource = @ptrCast(@alignCast(ptr));
         
         for (ranges, buffers) |range, buf| {
-            // Translate absolute file offset to relative buffer offset
-            if (range.start < self.base_offset) return error.InvalidOffset;
-            const rel_start = range.start - self.base_offset;
-            
-            const start = @min(rel_start, self.data.len);
-            const len_u64 = range.len();
-            const end = @min(start + len_u64, self.data.len);
-            const bytes_to_read = end - start;
-            
-            if (bytes_to_read > 0) {
-                @memcpy(buf[0..bytes_to_read], self.data[start..end]);
-            }
+            _ = try readAt(ptr, range.start, buf);
         }
     }
 
@@ -70,8 +77,8 @@ pub const MemorySource = struct {
     }
     
     fn size(ptr: *anyopaque) u64 {
-        const self: *MemorySource = @ptrCast(@alignCast(ptr));
-        return self.base_offset + self.data.len;  // Return virtual size
+        _ = ptr;
+        return std.math.maxInt(u64); // Virtual size
     }
     
     fn close(ptr: *anyopaque) void {
@@ -81,36 +88,49 @@ pub const MemorySource = struct {
 
     fn getSlice(ptr: *anyopaque, offset: u64, len: u64) ?[]const u8 {
         const self: *MemorySource = @ptrCast(@alignCast(ptr));
-        if (offset < self.base_offset) return null;
-        const rel_offset = offset - self.base_offset;
+        const end = offset + len;
         
-        if (rel_offset + len > self.data.len) return null;
-        return self.data[rel_offset .. rel_offset + len];
+        for (self.chunks) |chunk| {
+            const chunk_end = chunk.base_offset + chunk.data.len;
+            if (offset >= chunk.base_offset and end <= chunk_end) {
+                const start_idx = offset - chunk.base_offset;
+                return chunk.data[start_idx..][0..len];
+            }
+        }
+        return null;
     }
 };
 
-test "MemorySource basic read" {
-    const data = "Hello, World!";
-    var src = MemorySource.init(data, 0);
+test "MemorySource sparse chunks" {
+    const allocator = std.testing.allocator;
+    const Chunk = DataManager.RowGroupData.Chunk;
+    
+    const buf1 = try allocator.dupe(u8, "Hello");
+    const buf2 = try allocator.dupe(u8, "World");
+    defer allocator.free(buf1);
+    defer allocator.free(buf2);
+    
+    var chunks = [_]Chunk{
+        .{ .data = buf1, .base_offset = 0 },
+        .{ .data = buf2, .base_offset = 100 },
+    };
+    
+    var src = MemorySource.init(&chunks);
     var ras = src.randomAccessSource();
     
     var buf: [5]u8 = undefined;
-    const n = try ras.readAt(0, &buf);
-    try std.testing.expectEqual(@as(usize, 5), n);
+    
+    // Read Chunk 1
+    _ = try ras.readAt(0, &buf);
     try std.testing.expectEqualStrings("Hello", &buf);
     
-    const n2 = try ras.readAt(7, &buf);
-    try std.testing.expectEqual(@as(usize, 5), n2);
+    // Read Chunk 2
+    _ = try ras.readAt(100, &buf);
     try std.testing.expectEqualStrings("World", &buf);
-}
-
-test "MemorySource with base_offset" {
-    const data = "Hello, World!";
-    var src = MemorySource.init(data, 1000);  // Data starts at file offset 1000
-    var ras = src.randomAccessSource();
     
-    var buf: [5]u8 = undefined;
-    const n = try ras.readAt(1000, &buf);  // Should read from start of buffer
-    try std.testing.expectEqual(@as(usize, 5), n);
-    try std.testing.expectEqualStrings("Hello", &buf);
+    // Read gap (should be empty/unchanged if initialized)
+    // Note: readAt doesn't zero buffer.
+    @memset(&buf, 0);
+    const n = try ras.readAt(50, &buf);
+    try std.testing.expectEqual(@as(usize, 0), n);
 }

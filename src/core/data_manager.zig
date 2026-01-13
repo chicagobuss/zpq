@@ -4,21 +4,43 @@ const std = @import("std");
 /// Owned by the DataManager, handed to workers for processing.
 pub const RowGroupData = struct {
     rg_idx: usize,
-    data: []const u8,
-    base_offset: u64,
+    /// The chunks of data fetched for this row group.
+    /// Can be a single chunk (contiguous) or multiple (sparse).
+    chunks: []const Chunk,
     allocator: std.mem.Allocator,
     
-    pub fn init(allocator: std.mem.Allocator, rg_idx: usize, data: []const u8, base_offset: u64) RowGroupData {
+    pub const Chunk = struct {
+        data: []u8,
+        base_offset: u64,
+    };
+    
+    pub fn init(allocator: std.mem.Allocator, rg_idx: usize, chunks: []const Chunk) RowGroupData {
         return .{
             .rg_idx = rg_idx,
-            .data = data,
-            .base_offset = base_offset,
+            .chunks = chunks,
             .allocator = allocator,
         };
     }
     
     pub fn deinit(self: *RowGroupData) void {
-        self.allocator.free(self.data);
+        for (self.chunks) |chunk| {
+            self.allocator.free(chunk.data);
+        }
+        self.allocator.free(self.chunks);
+    }
+
+    /// Find the chunk containing the given offset range.
+    /// Returns the slice within the chunk.
+    pub fn getSlice(self: *const RowGroupData, offset: u64, length: u64) ![]const u8 {
+        const end = offset + length;
+        for (self.chunks) |chunk| {
+            const chunk_end = chunk.base_offset + chunk.data.len;
+            if (offset >= chunk.base_offset and end <= chunk_end) {
+                const start_idx = offset - chunk.base_offset;
+                return chunk.data[start_idx..][0..length];
+            }
+        }
+        return error.OffsetOutofBounds;
     }
 };
 
@@ -182,8 +204,11 @@ test "DataManager basic flow" {
     try dm.requestRowGroup(0);
     
     // Mark RG0 ready
-    var data = RowGroupData.init(allocator, 0);
-    try data.addColumn(0, "test column data");
+    const buf = try allocator.dupe(u8, "test column data");
+    const chunks = try allocator.alloc(RowGroupData.Chunk, 1);
+    chunks[0] = .{ .data = buf, .base_offset = 0 };
+
+    const data = RowGroupData.init(allocator, 0, chunks);
     try dm.markReady(0, data);
     
     // Check it's ready
@@ -191,7 +216,8 @@ test "DataManager basic flow" {
     
     // Take ownership
     var taken = dm.takeRowGroup(0).?;
-    defer taken.deinit();
+    defer taken.deinit(); 
+    // Data is freed by deinit
     
     try std.testing.expect(!dm.isReady(0));
 }

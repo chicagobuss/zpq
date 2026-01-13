@@ -109,14 +109,37 @@ cmd_sweep() {
 
 # --- ZPQ Runners ---
 run_native() {
-    local input_path="$1" output_path="$2" runs="$3" threads="${4:-4}"
+    local input_path="$1" output_path="$2" runs="$3" threads="${4:-4}" scenario="${5:-default}"
     local bin="$PROJECT_ROOT/zig-out/bin/zpq"
 
     [[ ! -x "$bin" ]] && { echo "Error: zpq not built. Run: zig build -Doptimize=ReleaseFast"; exit 1; }
+    
+    local args=()
+    case "$scenario" in
+        pass-through) ;; # No args = SELECT *
+        filter)
+            args+=(--filter "string_dict_low=category_0001")
+            # Competitors usually select specific columns in filter benchmark, let's match default
+            args+=(--select "int32_sorted,string_dict_low,float64")
+            ;;
+        select-1)
+            args+=(--select "int64_random")
+            ;;
+        select-3)
+            args+=(--select "int64_random,int32_sorted,float64")
+            ;;
+        default)
+             args+=(--filter "string_dict_low=category_0001" --select "int32_sorted,string_dict_low,float64")
+             ;;
+        *)
+            echo "Unknown scenario: $scenario"
+            exit 1
+            ;;
+    esac
 
     for i in $(seq 1 "$runs"); do
         [[ "$runs" -gt 1 ]] && info "Run $i/$runs"
-        "$bin" --threads "$threads" --filter "string_dict_low=category_0001" --select "int32_sorted,string_dict_low,float64" "$input_path" "$output_path"
+        "$bin" --threads "$threads" "${args[@]}" "$input_path" "$output_path"
     done
 }
 
@@ -194,10 +217,10 @@ run_duckdb()  { run_engine_generic "duckdb"  "$1" "$2" "$3" "${4:-default}"; }
 
 # --- Commands ---
 cmd_bench() {
-    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}" threads="${6:-4}"
+    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}" threads="${6:-4}" scenario="${7:-default}"
 
     [[ -z "$backend" || -z "$input" || -z "$output" ]] && {
-        echo "Usage: $0 <backend> <input> <output> [size] [runs]"
+        echo "Usage: $0 <backend> <input> <output> [size] [runs] [threads] [scenario]"
         echo "  backend: native | serverless-rie | serverless-lambda"
         echo "  input:   local | s3"
         echo "  output:  local | s3"
@@ -234,13 +257,13 @@ cmd_bench() {
     local input_path=$(get_input_path "$input" "$size" "$context")
     local output_path=$(get_output_path "$output" "$size")
 
-    info "$backend | $input -> $output | $size | $runs runs"
+    info "$backend | $input -> $output | $size | Scenario: $scenario | $runs runs"
     info "Input:  $input_path"
     info "Output: $output_path"
     echo ""
 
     case "$backend" in
-        native)             run_native "$input_path" "$output_path" "$runs" "$threads" ;;
+        native)             run_native "$input_path" "$output_path" "$runs" "$threads" "$scenario" ;;
         serverless-rie)     run_serverless_local "$input_path" "$output_path" "$runs" ;;
         serverless-lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" ;;
     esac

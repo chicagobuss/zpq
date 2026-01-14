@@ -171,7 +171,12 @@ lambda-deploy fn zip arch="arm64" memory="512":
 # Build and deploy Lambda in one step
 lambda-ship fn="zpq-filter" arch="arm64" memory="1769":
     #!/usr/bin/env bash
-    zip=$(./tools/serverless/aws.sh build {{arch}})
+    # Run build and ignore stdout (logs), but we know the path
+    ./tools/serverless/aws.sh build {{arch}} > /dev/null
+    
+    # Path is deterministic based on arch
+    zip="zig-out/lambda/zpq-lambda-{{arch}}.zip"
+    
     ./tools/serverless/aws.sh deploy {{fn}} "$zip" {{arch}} {{memory}}
 
 # Invoke Lambda with JSON payload

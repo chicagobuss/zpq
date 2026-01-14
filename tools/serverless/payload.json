@@ -1,0 +1,6 @@
+{
+    "file": "s3://skyway-staging-perf-test/zpq_test_data/benchmark/benchmark_100mb.parquet",
+    "output": "/dev/null",
+    "threads": 4,
+    "log_level": "debug"
+}

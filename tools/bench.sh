@@ -217,32 +217,51 @@ run_duckdb()  { run_engine_generic "duckdb"  "$1" "$2" "$3" "${4:-default}"; }
 
 # --- Commands ---
 cmd_bench() {
-    local backend="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}" threads="${6:-4}" scenario="${7:-default}"
+    local backend_type="${1:-}" input="${2:-}" where_arg="${3:-}" output="${4:-}" size="${5:-10mb}" runs="${6:-1}" threads="${7:-4}" scenario="${8:-default}"
 
-    [[ -z "$backend" || -z "$input" || -z "$output" ]] && {
-        echo "Usage: $0 <backend> <input> <output> [size] [runs] [threads] [scenario]"
-        echo "  backend: native | serverless-rie | serverless-lambda"
+    [[ -z "$backend_type" || -z "$input" || -z "$where_arg" || -z "$output" ]] && {
+        echo "Usage: $0 <backend> <input> <where> <output> [size] [runs] [threads] [scenario]"
+        echo "  backend: native | serverless"
         echo "  input:   local | s3"
+        echo "  where:   local | lambda (only for serverless)"
         echo "  output:  local | s3"
         exit 1
     }
 
+    # Map to internal backend name
+    local backend="$backend_type"
+    local where="$where_arg"
+
+    if [[ "$backend_type" == "serverless" ]]; then
+        if [[ "$where_arg" == "lambda" ]]; then
+            backend="serverless-lambda"
+            where="lambda"
+        elif [[ "$where_arg" == "local" ]]; then
+            backend="serverless-rie"
+            where="local"
+        else
+            echo "Error: Unknown where: $where_arg for serverless"
+            exit 1
+        fi
+    elif [[ "$backend_type" == "native" ]]; then
+        if [[ "$where_arg" != "local" ]]; then
+             echo "Warning: native only supports where=local, ignoring $where_arg"
+        fi
+        where="local"
+        backend="native"
+    fi
+
     # Map backend to context
     local context="native"
-    local where="local"
-    
     case "$backend" in
         native)
             context="native"
-            where="local"
             ;;
         serverless-rie)
             context="serverless"
-            where="local"
             ;;
         serverless-lambda)
             context="serverless"
-            where="lambda"
             ;;
         *)
             echo "Error: Unknown backend: $backend"

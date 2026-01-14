@@ -68,6 +68,13 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Check for Lambda environment first (before CLI parsing)
+    if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API")) |runtime_api| {
+        const lambda = @import("lambda.zig");
+        try lambda.run(allocator, runtime_api);
+        return;
+    }
+
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
@@ -142,6 +149,8 @@ pub fn main() !void {
     if (!is_benchmark and std.mem.indexOf(u8, input_path.?, "benchmark") != null) {
         is_benchmark = true;
     }
+
+
 
     // Initialize xev loop and thread pool
     if (@hasDecl(xev.Dynamic, "detect")) {

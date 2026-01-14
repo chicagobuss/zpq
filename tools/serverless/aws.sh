@@ -91,6 +91,9 @@ deploy() {
             --query '{FunctionName: FunctionName, CodeSize: CodeSize}' \
             --output json
 
+        # Wait for update to complete
+        aws lambda wait function-updated --function-name "$fn_name" --region "$region"
+
         # Update config if memory changed
         aws lambda update-function-configuration \
             --function-name "$fn_name" \
@@ -140,6 +143,10 @@ invoke() {
     local tmp_out="/tmp/zpq-lambda-$$.json"
 
     info "Invoking $fn_name..."
+    if [[ -f "$payload" ]]; then
+        payload="fileb://$payload"
+    fi
+
     aws lambda invoke \
         --function-name "$fn_name" \
         --cli-binary-format raw-in-base64-out \
@@ -371,30 +378,4 @@ case "$cmd" in
         ;;
 esac
 
-Environment:
-  AWS_REGION          Default region (default: us-west-2)
-  ZPQ_LAMBDA_ROLE     IAM role ARN for new functions
-  .env                Loaded automatically if present
-EOF
-}
 
-# --- Dispatcher ---
-cmd="${1:-help}"
-shift || true
-
-case "$cmd" in
-    build) build "$@" ;;
-    deploy) deploy "$@" ;;
-    invoke) invoke "$@" ;;
-    logs) logs "$@" ;;
-    metrics) metrics "$@" ;;
-    bench-matrix|bench_matrix) bench_matrix "$@" ;;
-    list) list "$@" ;;
-    delete) delete "$@" ;;
-    help|--help|-h) usage ;;
-    *)
-        error "Unknown command: $cmd"
-        usage
-        exit 1
-        ;;
-esac

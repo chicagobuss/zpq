@@ -46,6 +46,7 @@ pub const core = struct {
     pub const rowgroup_pipeline = @import("core/rowgroup_pipeline.zig");
     pub const executor = @import("core/executor.zig");
     pub const data_manager = @import("core/data_manager.zig");
+    pub const engine = @import("core/engine.zig");
 };
 
 

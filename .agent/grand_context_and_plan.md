@@ -51,19 +51,25 @@ We treat performance as a correctness constraint. Implementation follows this cy
 
 ### Tier 3: The Current Strategy (`tier3_strategy.md`)
 **The expedition we are on RIGHT NOW.**
--   **Current Goal**: "Write Dominance" (S3 Parallel Sink).
+-   **Current Goal**: "Optimizer Dominance" (Unifying Fast & Slow Paths).
+-   **Philosophy**: **Optimization via Subtraction**.
+    -   We define a single pipeline (Executor -> RowGroupPipeline).
+    -   The **Planner** subtracts steps (Decode, Filter, Encode) based on query semantics.
+    -   **Identity Optimization**: For `SELECT *`, we detect that (Start, End) of columns are contiguous. We execute a single `CopyRange` op per RowGroup.
+    -   **Subtractive Logic**:
+        -   Start: "I must Decode RowGroup X".
+        -   Check: "Do I need to filter?" No -> "Skip Filter".
+        -   Check: "Do I need to modify?" No -> "Skip Decode".
+        -   Result: "Copy Compressed Bytes".
 -   **Architecture**:
-    -   **Morsel-Driven parallel processing** (Go-style concurrency in Zig).
-    -   **S3 Multipart Uploads** (8 concurrent parts).
-    -   **Zero-Copy Pass-Through** (The "Fast Path" for `SELECT *`).
--   **Completed**:
-    -   ✅ S3 Multipart Upload working (14 parts, 100MB verified)
-    -   ✅ Memory leak in transport layer fixed
-    -   ✅ Stable checkpoint established
-    -   ✅ Baseline benchmarks captured (ReleaseFast)
+    -   **Unified Executor**: Always used. Handles threading and S3 Prefetching (Main Thread) to avoid Event Loop conflicts.
+    -   **RowGroupPipeline**:
+        -   New `Config` struct determines mode (Scan vs Copy).
+        -   `Copy Mode`: Reads contiguous chunks from MemorySource (pre-fetched), writes to Sink.
 -   **Next Steps**:
-    -   Implement the Zero-Copy Fast Path (bypass `ParquetReader` for `SELECT *`).
-    -   Refactor `main.zig` to use a `Planner` (Decider) vs `Executor` (Doer).
+    -   Remove `runFastPath` bifurcation in `engine.zig`.
+    -   Enhance `RowGroupPipeline` to detect contiguous column chunks and perform bulk copy.
+    -   Ensure `Executor` prefetching logic handles the raw byte ranges correctly.
 
 ## 2. Benchmark Results (100MB Parquet, ReleaseFast, 2026-01-11)
 

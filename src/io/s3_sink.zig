@@ -23,8 +23,8 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
         // Final results
         err: ?anyerror = null,
         thread: std.Thread,
-        notifier: xev.Async,
-        notifier_c: xev.Completion,
+        notifier: Xev.Async,
+        notifier_c: Xev.Completion,
 
         pub fn init(allocator: std.mem.Allocator, loop: *Xev.Loop, thread_pool: *xev.ThreadPool, s3_config: protocol_s3.S3, bucket: []const u8, key: []const u8) !*Self {
             var self = try allocator.create(Self);
@@ -43,7 +43,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
             self.thread_pool = thread_pool;
             self.err = null;
             
-            self.notifier = try xev.Async.init();
+            self.notifier = try Xev.Async.init();
             self.notifier_c = .{};
 
             // Start the consumer thread
@@ -109,7 +109,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
         fn runInternal(self: *Self) !void {
             // 0. Register notifier in loop to wake us on channel data
             self.notifier.wait(self.writer.loop, &self.notifier_c, Self, self, struct {
-                fn cb(ptr: ?*Self, _: *xev.Loop, _: *xev.Completion, res: xev.Async.WaitError!void) xev.CallbackAction {
+                fn cb(ptr: ?*Self, _: *Xev.Loop, _: *Xev.Completion, res: Xev.Async.WaitError!void) Xev.CallbackAction {
                     _ = res catch {};
                     _ = ptr;
                     return .rearm;
@@ -185,6 +185,11 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                         // std.debug.print("[S3Sink] Part {d} finished. In-flight: {d}\n", .{ctx.part_number, in_flight.items.len});
                         ctx.deinit();
                         self.allocator.destroy(ctx);
+                    } else if (ctx.conn) |c| {
+                        if (c.closed and !ctx.done) {
+                             return error.ConnectionClosedUnexpectedly;
+                        }
+                        i += 1;
                     } else {
                         i += 1;
                     }
@@ -223,7 +228,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                                     upload_id = try self.writer.initiateMultipartUpload();
                                 }
                                 
-                                std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
+                                // std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
                                 const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items[0..PART_SIZE]);
                                 try in_flight.append(self.allocator, ctx);
                                 
@@ -261,7 +266,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                          // Small file, will handle after the loop with single PUT
                          break;
                     } else {
-                        std.debug.print("[S3Sink] Launching final part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
+                        // std.debug.print("[S3Sink] Launching final part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
                         const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items);
                         try in_flight.append(self.allocator, ctx);
                         next_part_number += 1;

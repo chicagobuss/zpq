@@ -105,6 +105,15 @@ pub const ParquetFile = struct {
     pub fn numRows(self: *const ParquetFile) i64 {
         return self.metadata.num_rows;
     }
+
+    pub fn findColumnIndex(self: *const ParquetFile, name: []const u8) !usize {
+        // Parquet schema [0] is root
+        for (self.metadata.schema.items, 0..) |elem, i| {
+            if (i == 0) continue;
+            if (std.mem.eql(u8, elem.name, name)) return i - 1;
+        }
+        return error.ColumnNotFound;
+    }
 };
 
 test "ParquetFile footer reading" {

@@ -75,21 +75,18 @@ We are rewriting the core engine to use columnar batches and vectorized decoding
     *   Zero-Copy Page Reading, Async S3 Source.
 *   **[COMPLETE] Phase 2: Write Dominance**
     *   Multipart S3 Sink, Parallel Row Group buffering.
-*   **[BLOCKED] Phase 3: High Performance Architecture**
-    *   ✅ Columnar Batch Container & Vectorized Reader
-    *   ✅ Filter Evaluation (all types + AND/OR)
-    *   ✅ Parallel Row Group Pipeline (local files)
-    *   ❌ **S3 Parallel Reads** (blocked by event loop issue above)
-    *   ⏳ Zero-Copy Fast Path
+*   **[IN PROGRESS] Phase 3: The Optimizer**
+    -   ✅ Columnar Batch Container & Vectorized Reader
+    -   ✅ Filter Evaluation
+    -   🔄 **Unified Executor**: Remove `runFastPath`. Use `Executor` for everything.
+    -   🔄 **S3 Safety**: `Executor` prefetching (Phase 2) runs on Main Thread, solving Loop Conflict.
+    -   ⏳ **Optimizer Logic**: `RowGroupPipeline` detects "Copy Opportunities" (contiguous columns) and bypasses decoding.
 *   **[PLANNED] Phase 4: SQL Layer**
-    *   Arrow C Data Interface
-    *   SQLite VTable Integration
+    -   Arrow C Data Interface.
 
 ## 🛠️ Known Issues
-*   **[CRITICAL]** S3 event loop conflict blocks parallel S3 reads (see above)
-*   **[HIGH]** EncodingError on S3 data with single-threaded mode
-*   Memory usage during massive parallel writes needs tuning (backpressure is working but aggressive).
-*   "Fast Path" logic is designed but not yet wired into `main.zig`.
+*   "Fast Path" currently exists as a hacks/fork in `engine.zig`. Must be deleted and merged into `Executor`.
+*   S3 multithreading is safe ONLY if used via `Executor` prefetching (Main Thread). Direct worker access is unsafe.
 
 ## 🧠 Knowledge Base
 See `.agent/rules/` for the Tier 1-3 operating manuals.

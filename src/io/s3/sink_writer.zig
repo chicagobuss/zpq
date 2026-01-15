@@ -228,7 +228,7 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
 
             fn onHandshake(ptr: ?*anyopaque) void {
                 const self: *RequestContext = @ptrCast(@alignCast(ptr));
-                std.debug.print("[S3Writer] Handshake/Connect done (Part {d})\n", .{self.part_number});
+                // std.debug.print("[S3Writer] Handshake/Connect done (Part {d})\n", .{self.part_number});
                 self.sendRequest() catch |e| {
                     self.err = e;
                     self.done = true;
@@ -271,7 +271,7 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                 try req.appendSlice(self.writer.allocator, len_s);
                 try req.appendSlice(self.writer.allocator, self.final_payload);
 
-                std.debug.print("[S3Writer] Sending request ({d} bytes, Part {d})\n", .{req.items.len, self.part_number});
+                // std.debug.print("[S3Writer] Sending request ({d} bytes, Part {d})\n", .{req.items.len, self.part_number});
                 try self.conn.?.write(req.items);
             }
 
@@ -300,7 +300,7 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                     if (self.status_code >= 400) {
                          std.debug.print("[S3Writer] Request failed: status={d} body={s}\n", .{self.status_code, self.body.items});
                     } else {
-                         std.debug.print("[S3Writer] Request completed: status={d}\n", .{self.status_code});
+                          // std.debug.print("[S3Writer] Request completed: status={d}\n", .{self.status_code});
                     }
                 }
             }

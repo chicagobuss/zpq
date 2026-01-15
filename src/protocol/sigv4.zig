@@ -160,9 +160,9 @@ pub const SigV4 = struct {
 
         const signature_hex = std.fmt.bytesToHex(signature, .lower);
 
-        std.log.debug("Canonical Request:\n{s}", .{canonical_req.items});
-        std.log.debug("String to Sign:\n{s}", .{string_to_sign});
-        std.log.debug("Signature: {s}", .{&signature_hex});
+        // std.log.debug("Canonical Request:\n{s}", .{canonical_req.items});
+        // std.log.debug("String to Sign:\n{s}", .{string_to_sign});
+        // std.log.debug("Signature: {s}", .{&signature_hex});
 
         // 5. Authorization Header
         const auth_header = try std.fmt.allocPrint(allocator, "{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{

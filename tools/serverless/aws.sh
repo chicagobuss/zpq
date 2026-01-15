@@ -98,8 +98,9 @@ deploy() {
         aws lambda update-function-configuration \
             --function-name "$fn_name" \
             --memory-size "$memory" \
+            --timeout "$DEFAULT_TIMEOUT" \
             --region "$region" \
-            --query '{MemorySize: MemorySize}' \
+            --query '{MemorySize: MemorySize, Timeout: Timeout}' \
             --output json
     else
         info "Creating new function $fn_name..."

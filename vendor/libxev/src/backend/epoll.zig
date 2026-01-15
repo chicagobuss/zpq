@@ -1026,15 +1026,12 @@ pub const Completion = struct {
 
             .pread => |*op| res: {
                 const n_ = switch (op.buffer) {
-                    .slice => |v| std.os.linux.pread(op.fd, v, op.offset),
-                    .array => |*v| std.os.linux.pread(op.fd, v, op.offset),
+                    .slice => |v| std.os.linux.pread(op.fd, v.ptr, v.len, @intCast(op.offset)),
+                    .array => |*v| std.os.linux.pread(op.fd, v, v.len, @intCast(op.offset)),
                 };
 
                 break :res .{
-                    .pread = if (n_) |n|
-                        if (n == 0) error.EOF else n
-                    else |err|
-                        err,
+                    .pread = if (n_ == 0) error.EOF else n_
                 };
             },
 
@@ -1047,8 +1044,8 @@ pub const Completion = struct {
 
             .pwrite => |*op| .{
                 .pwrite = switch (op.buffer) {
-                    .slice => |v| std.os.linux.pwrite(op.fd, v, op.offset),
-                    .array => |*v| std.os.linux.pwrite(op.fd, v.array[0..v.len], op.offset),
+                    .slice => |v| std.os.linux.pwrite(op.fd, v.ptr, v.len, @intCast(op.offset)),
+                    .array => |*v| std.os.linux.pwrite(op.fd, v.array[0..v.len].ptr, v.len, @intCast(op.offset)),
                 },
             },
 

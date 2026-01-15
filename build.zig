@@ -95,9 +95,23 @@ pub fn build(b: *std.Build) void {
     exe.root_module.omit_frame_pointer = !no_omit_frame_pointer;
     b.installArtifact(exe);
 
-    // Run Command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+
+    // Lambda Probe (Ephemeral)
+    const lambda_probe = b.addExecutable(.{
+        .name = "lambda-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/lambda_hello/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "xev", .module = libxev_mod },
+            },
+        }),
+    });
+    b.installArtifact(lambda_probe);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

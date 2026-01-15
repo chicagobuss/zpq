@@ -524,6 +524,13 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                 self.sub_ranges = .{};
                 try self.source.pool.dispatch(self);
                 while (!self.done) {
+                    if (self.pooled_conn) |pc| {
+                        if (pc.conn) |c| {
+                            if (c.closed) {
+                                return error.ConnectionClosedUnexpectedly;
+                            }
+                        }
+                    }
                     try self.source.loop.run(.once);
                 }
                 if (self.err) |e| return e;

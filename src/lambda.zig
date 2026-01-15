@@ -25,7 +25,12 @@ pub fn run(allocator: std.mem.Allocator, runtime_api: []const u8) !void {
         80;
 
     // Setup data plane (xev + thread pool) - reused across invocations
+    // Force Epoll backend to avoid io_uring detection issues on Lambda
+    if (@hasDecl(xev.Dynamic, "prefer")) _ = xev.Dynamic.prefer(.epoll);
+    
+    // Detect after setting preference (detects based on available + preference)
     if (@hasDecl(xev.Dynamic, "detect")) try xev.Dynamic.detect();
+    
     var loop = try xev.Dynamic.Loop.init(.{});
     defer loop.deinit();
 
@@ -75,34 +80,22 @@ fn processEvent(allocator: std.mem.Allocator, loop: *xev.Dynamic.Loop, pool: *xe
 
     std.debug.print("[lambda] Starting query: file={s} log_level={s}\n", .{ p.file, p.log_level orelse "info" });
 
-    // Open source
-    const source = try zpq.io.factory.openSource(allocator, p.file, .{ .loop = loop, .thread_pool = pool });
-    defer source.close();
+    // Call shared engine (unifies CLI and Lambda execution)
+    // We pass struct{} because Lambda mode doesn't currently rely on
+    // hardcoded row types for filter parsing in this path (generic scan).
+    const stats = try zpq.core.engine.runQuery(
+        struct {},
+        allocator,
+        p.file,
+        p.output,
+        p.filter,
+        p.select,
+        loop,
+        pool,
+        1
+    );
 
-    var pfile = zpq.core.file.ParquetFile.init(allocator, source);
-    try pfile.readFooter();
-    defer pfile.deinit();
-
-    // Build execution plan
-    var plan = zpq.core.planner.ExecutionPlan.init(allocator);
-    plan.loop = @ptrCast(loop);
-    defer plan.deinit();
-
-    // Select all columns
-    var cols = std.ArrayListUnmanaged(usize){};
-    defer cols.deinit(allocator);
-    for (0..pfile.metadata.schema.items.len - 1) |i| {
-        if (pfile.metadata.schema.items[i + 1].type != null)
-            try cols.append(allocator, i);
-    }
-    plan.required_columns = try cols.toOwnedSlice(allocator);
-    plan.output_columns = try allocator.dupe(usize, plan.required_columns);
-
-    // Execute
-    var executor = zpq.core.executor.Executor.init(allocator, &plan, &pfile.metadata, source, pool, null);
-    try executor.execute();
-
-    return std.fmt.allocPrint(allocator, "{{\"rows\":{d}}}", .{executor.rows_scanned.load(.acquire)});
+    return std.fmt.allocPrint(allocator, "{{\"rows\":{d}}}", .{stats.scanned});
 }
 
 // --- Socket Helpers ---

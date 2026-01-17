@@ -23,7 +23,7 @@ trigger: always_on
 *   **Fair Comparisons**:
     *   ** Make sure your benchmark is apples-to-apples.  If one tools is reading a file locally and writing to s3, the other tool needs to be doing the exact same task.
     *   **Always** source `.env` before running benchmarks.
-    *   **Use `just`**: `just build` and `just bench` are the sources of truth.
+    *   **Use `just`**: `just build` and `just native, and just lambda` are the sources of truth.
 *   **Reproducibility**:
     *   Pin the Zig compiler version (see `.zig-version`).
     *   # Standard parquet testing and benchmark file (snappy compressed, lots of types):

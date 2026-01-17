@@ -167,6 +167,8 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
             var channel_closed = false;
 
             while (!channel_closed or in_flight.items.len > 0 or buffer.items.len > 0) {
+                var activity = false;
+                
                 // A. Progress the loop
                 try self.writer.loop.run(.once);
 
@@ -175,6 +177,7 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                 while (i < in_flight.items.len) {
                     const ctx = in_flight.items[i];
                     if (ctx.done) {
+                        activity = true;
                         if (ctx.err) |err| return err;
                         if (ctx.status_code != 200) return error.S3UploadPartFailed;
                         
@@ -199,12 +202,11 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                 if (!channel_closed and in_flight.items.len < CONCURRENCY) {
                     // 1. Process existing buffer
                     while (buffer.items.len >= PART_SIZE and in_flight.items.len < CONCURRENCY) {
+                        activity = true;
                         if (upload_id == null) {
-                            // std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
                             upload_id = try self.writer.initiateMultipartUpload();
                         }
                         
-                        // std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
                         const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items[0..PART_SIZE]);
                         try in_flight.append(self.allocator, ctx);
                         
@@ -215,20 +217,19 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                         buffer.items.len = remaining;
                     }
 
-                    // 2. Try to receive more data
+                    // 2. Try to receive more data from channel
                     while (in_flight.items.len < CONCURRENCY) {
                         if (try self.chan.tryRecv()) |chunk| {
+                            activity = true;
                             defer self.allocator.free(chunk);
                             try buffer.appendSlice(self.allocator, chunk);
                             
                             // Check if we can launch parts now
                              while (buffer.items.len >= PART_SIZE and in_flight.items.len < CONCURRENCY) {
                                 if (upload_id == null) {
-                                    std.debug.print("[S3Sink] Initiating multipart upload...\n", .{});
                                     upload_id = try self.writer.initiateMultipartUpload();
                                 }
                                 
-                                // std.debug.print("[S3Sink] Launching part {d} ({d} bytes)...\n", .{next_part_number, PART_SIZE});
                                 const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items[0..PART_SIZE]);
                                 try in_flight.append(self.allocator, ctx);
                                 
@@ -239,57 +240,40 @@ pub fn AsyncS3SinkGen(comptime Xev: type) type {
                                 buffer.items.len = remaining;
                             }
                         } else {
-                            // Channel empty, stop trying to recv
+                            if (self.chan.closed) channel_closed = true;
                             break;
                         }
                     }
-
-                    // 3. Blocking wait if necessary
-                    if (in_flight.items.len == 0 and buffer.items.len < PART_SIZE) {
-                        if (try self.chan.recv()) |chunk| {
-                            defer self.allocator.free(chunk);
-                            try buffer.appendSlice(self.allocator, chunk);
-                            // We will process this data in the next outer loop iteration (Step A -> B -> C1)
-                            // or we can process here. But easier to just continue loop.
-                            continue;
-                        } else {
-                            channel_closed = true;
-                        }
-                    }
-                } else if (in_flight.items.len >= CONCURRENCY or channel_closed) {
-                    // We are at capacity or done receiving, just drive the loop
                 }
-
+                
                 // D. Handle end of stream
                 if (channel_closed and buffer.items.len > 0 and in_flight.items.len < CONCURRENCY) {
-                    if (upload_id == null) {
-                         // Small file, will handle after the loop with single PUT
-                         break;
-                    } else {
-                        // std.debug.print("[S3Sink] Launching final part {d} ({d} bytes)...\n", .{next_part_number, buffer.items.len});
+                    activity = true;
+                    if (upload_id != null) {
                         const ctx = try self.writer.uploadPartAsync(upload_id.?, next_part_number, buffer.items);
                         try in_flight.append(self.allocator, ctx);
                         next_part_number += 1;
                         buffer.clearRetainingCapacity();
+                    } else {
+                        // Very small file (<8MB)? We wait for everything else to clear then do a single PUT
+                        if (in_flight.items.len == 0) break;
                     }
                 }
                 
                 if (channel_closed and buffer.items.len == 0 and in_flight.items.len == 0) break;
+
+                // E. Yield only if idle to prevent 100% CPU spin on 1-vCPU systems
+                if (!activity) {
+                     std.posix.nanosleep(0, 100_000);
+                }
             }
 
             // 3. Finalize
             if (upload_id == null) {
                 if (buffer.items.len > 0) {
-                     // std.debug.print("[S3Sink] Performing single PUT ({d} bytes)...\n", .{buffer.items.len});
                      try self.writer.putObject(buffer.items);
                 }
             } else {
-                // std.debug.print("[S3Sink] Completing multipart upload {s} ({d} parts)...\n", .{upload_id.?, completed_parts.items.len});
-                if (false) { // Disabled sleep hack
-                    var ts = std.posix.timespec{ .tv_sec = 1, .tv_nsec = 0 };
-                    std.posix.nanosleep(&ts, null);
-                }
-                // AWS requires parts to be sorted by PartNumber
                 const PartSort = struct {
                     fn lessThan(_: void, a: protocol_s3.S3.Part, b: protocol_s3.S3.Part) bool {
                         return a.part_number < b.part_number;

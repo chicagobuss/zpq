@@ -32,6 +32,10 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
         /// Size of the object, fetched on init.
         content_length: u64,
 
+        /// Speculative tail cache (usually contains the Parquet footer)
+        tail_buffer: []u8 = &[_]u8{},
+        tail_offset: u64 = 0,
+
         /// Resolved address (cached after first DNS lookup)
         resolved_addr: ?transport.Address = null,
 
@@ -53,20 +57,22 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             // Initialize pool with back-pointer
             self.pool = ConnectionPool.init(&self);
             
-            // Ensure we clean up if fetchSize fails
+            // Ensure we clean up if fetch fails
             errdefer {
                 self.pool.deinit();
                 allocator.free(host);
+                if (self.tail_buffer.len > 0) allocator.free(self.tail_buffer);
             }
 
-            // Fetch size via HEAD
-            try self.fetchSize();
+            // Fetch tail (speculative footer + size) in one go
+            try self.fetchTail();
             return self;
         }
 
         pub fn deinit(self: *Self) void {
             self.pool.deinit();
             self.allocator.free(self.host);
+            if (self.tail_buffer.len > 0) self.allocator.free(self.tail_buffer);
         }
 
         pub fn randomAccessSource(self: *Self) io.RandomAccessSource {
@@ -264,20 +270,49 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             }
         }
 
-        fn fetchSize(self: *Self) !void {
+        fn fetchTail(self: *Self) !void {
+            const SPECULATIVE_SIZE = 256 * 1024; // Align with ParquetFile.MAX_PREFETCH
+            
+            // We don't know the exact size yet, so we request the end of the file.
+            // S3 Range: bytes=-131072 (last 128KB)
             var ctx = RequestContext{
                 .source = self,
-                .method = .HEAD,
+                .method = .GET,
                 .allocator = self.allocator,
+                .is_tail_fetch = true,
+                .output_buf = try self.allocator.alloc(u8, SPECULATIVE_SIZE),
             };
+            errdefer self.allocator.free(ctx.output_buf);
+
             try ctx.run();
-            if (ctx.status_code != 200) return error.S3HeadFailed;
-            self.content_length = ctx.content_length;
-            std.debug.print("[S3Source] detected size: {d} bytes\n", .{self.content_length});
+            
+            if (ctx.status_code != 200 and ctx.status_code != 206) return error.S3GetFailed;
+            if (ctx.total_size) |ts| {
+                self.content_length = ts;
+            } else return error.MissingContentRange;
+
+            // Store tail cache
+            self.tail_buffer = ctx.output_buf[0..ctx.bytes_read];
+            self.tail_offset = if (self.content_length > self.tail_buffer.len) 
+                self.content_length - self.tail_buffer.len 
+            else 
+                0;
+
+            std.debug.print("[S3Source] Collapsed Fetch: size={d} tail={d}kb\n", .{self.content_length, self.tail_buffer.len / 1024});
         }
 
         fn readAt(ptr: *anyopaque, offset: u64, buf: []u8) anyerror!usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            
+            // 1. Check Tail Cache
+            if (self.tail_buffer.len > 0 and offset >= self.tail_offset) {
+                const relative_offset = offset - self.tail_offset;
+                if (relative_offset + buf.len <= self.tail_buffer.len) {
+                    @memcpy(buf, self.tail_buffer[relative_offset .. relative_offset + buf.len]);
+                    return buf.len;
+                }
+            }
+
             // Fix pool pointers as this struct may have moved
             self.pool.source = self;
             self.pool.fixPointers();
@@ -498,6 +533,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             allocator: std.mem.Allocator,
             range_start: u64 = 0,
             range_end: u64 = 0,
+            is_tail_fetch: bool = false,
             
             /// Sub-ranges within the coalesced response that need copying to user buffers.
             sub_ranges: std.ArrayListUnmanaged(SubRange) = .{},
@@ -510,6 +546,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
             done: bool = false,
             status_code: u16 = 0,
             content_length: u64 = 0,
+            total_size: ?u64 = null,
             bytes_read: usize = 0,
             err: ?anyerror = null,
             
@@ -562,7 +599,10 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
 
                 const signed_headers = switch (self.method) {
                     .HEAD => try self.source.s3.formatHeadRequest(self.allocator, self.source.key, .{}),
-                    .GET => try self.source.s3.formatGetRequest(self.allocator, self.source.key, .{ .start = self.range_start, .end = self.range_end + 1 }, .{}),
+                    .GET => if (self.is_tail_fetch)
+                        try self.source.s3.formatGetRequest(self.allocator, self.source.key, .{ .suffix = self.output_buf.len }, .{})
+                    else
+                        try self.source.s3.formatGetRequest(self.allocator, self.source.key, .{ .bytes = .{ .start = self.range_start, .end = self.range_end + 1 } }, .{}),
                 };
                 defer {
                     for (signed_headers) |h| {
@@ -647,6 +687,7 @@ pub fn AsyncS3SourceGen(comptime Xev: type) type {
                     if (self.parser.content_length) |cl| {
                         self.content_length = @intCast(cl);
                     }
+                    self.total_size = self.parser.total_size;
                     // Stop the connection from scheduling more reads
                     if (self.pooled_conn) |pc| {
                         if (pc.conn) |conn| {

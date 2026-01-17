@@ -148,7 +148,7 @@ run_serverless_local() {
 
     if ! docker ps --format '{{.Names}}' | grep -q 'lambda-bench'; then
         info "Starting RIE container..."
-        (cd "$PROJECT_ROOT/benchmarks" && docker-compose up -d)
+        (cd "$PROJECT_ROOT/bench" && docker-compose up -d)
         sleep 2
     fi
 
@@ -161,10 +161,14 @@ run_serverless_local() {
 }
 
 run_serverless_lambda() {
-    local input_path="$1" output_path="$2" runs="$3"
-    local fn="${LAMBDA_FUNCTION_NAME:-zpq-lambda-bench}"
+    local input_path="$1" output_path="$2" runs="$3" scenario="${4:-default}"
+    local fn="${LAMBDA_FUNCTION_NAME:-zpq-perf-test}"
     local region="${AWS_REGION:-us-west-2}"
+    
     local payload="{\"file\": \"$input_path\", \"output\": \"$output_path\", \"filter\": \"string_dict_low=category_0001\", \"select\": \"int32_sorted,string_dict_low,float64\"}"
+    if [[ "$scenario" == "pass-through" ]]; then
+        payload="{\"file\": \"$input_path\", \"output\": \"$output_path\"}"
+    fi
 
     for i in $(seq 1 "$runs"); do
         [[ "$runs" -gt 1 ]] && info "Run $i/$runs"
@@ -217,54 +221,38 @@ run_duckdb()  { run_engine_generic "duckdb"  "$1" "$2" "$3" "${4:-default}"; }
 
 # --- Commands ---
 cmd_bench() {
-    local backend_type="${1:-}" input="${2:-}" where_arg="${3:-}" output="${4:-}" size="${5:-10mb}" runs="${6:-1}" threads="${7:-4}" scenario="${8:-default}"
+    local type="${1:-}" input="${2:-}" output="${3:-}" size="${4:-10mb}" runs="${5:-1}" threads="${6:-4}" scenario="${7:-default}"
 
-    [[ -z "$backend_type" || -z "$input" || -z "$where_arg" || -z "$output" ]] && {
-        echo "Usage: $0 <backend> <input> <where> <output> [size] [runs] [threads] [scenario]"
-        echo "  backend: native | serverless"
-        echo "  input:   local | s3"
-        echo "  where:   local | lambda (only for serverless)"
-        echo "  output:  local | s3"
+    [[ -z "$type" || -z "$input" || -z "$output" ]] && {
+        echo "Usage: $0 bench <type> <input> <output> [size] [runs] [threads] [scenario]"
+        echo "  type:   native | lambda | lambda-rie"
+        echo "  input:  local | s3"
+        echo "  output: local | s3"
         exit 1
     }
 
-    # Map to internal backend name
-    local backend="$backend_type"
-    local where="$where_arg"
+    local backend=""
+    local where=""
+    local context=""
 
-    if [[ "$backend_type" == "serverless" ]]; then
-        if [[ "$where_arg" == "lambda" ]]; then
-            backend="serverless-lambda"
-            where="lambda"
-        elif [[ "$where_arg" == "local" ]]; then
-            backend="serverless-rie"
-            where="local"
-        else
-            echo "Error: Unknown where: $where_arg for serverless"
-            exit 1
-        fi
-    elif [[ "$backend_type" == "native" ]]; then
-        if [[ "$where_arg" != "local" ]]; then
-             echo "Warning: native only supports where=local, ignoring $where_arg"
-        fi
-        where="local"
-        backend="native"
-    fi
-
-    # Map backend to context
-    local context="native"
-    case "$backend" in
+    case "$type" in
         native)
+            backend="native"
+            where="local"
             context="native"
             ;;
-        serverless-rie)
+        lambda)
+            backend="serverless-lambda"
+            where="lambda"
             context="serverless"
             ;;
-        serverless-lambda)
+        lambda-rie)
+            backend="serverless-rie"
+            where="local"
             context="serverless"
             ;;
         *)
-            echo "Error: Unknown backend: $backend"
+            echo "Error: Unknown type: $type"
             exit 1
             ;;
     esac
@@ -284,7 +272,7 @@ cmd_bench() {
     case "$backend" in
         native)             run_native "$input_path" "$output_path" "$runs" "$threads" "$scenario" ;;
         serverless-rie)     run_serverless_local "$input_path" "$output_path" "$runs" ;;
-        serverless-lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" ;;
+        serverless-lambda)  run_serverless_lambda "$input_path" "$output_path" "$runs" "$scenario" ;;
     esac
 }
 
@@ -358,7 +346,14 @@ cmd="${1:-}"
 shift || true
 
 case "$cmd" in
-    native|serverless) cmd_bench "$cmd" "$@" ;;
+    bench|native|lambda|lambda-rie)
+        if [[ "$cmd" == "bench" ]]; then
+            cmd_bench "$@"
+        else
+            # Support directly: ./tools/bench.sh native s3 s3 ...
+            cmd_bench "$cmd" "$@"
+        fi
+        ;;
     engine)  cmd_engine "$@" ;;
     compare) cmd_compare "$@" ;;
     sweep)   cmd_sweep "$@" ;;
@@ -367,13 +362,9 @@ case "$cmd" in
 Usage: $0 <command> [args...]
 
 Commands:
-  <what> <input> <where> <output> [size] [runs]  - Run zpq benchmark
-      what:   native | serverless
-      input:  local | s3
-      where:  local | lambda
-      output: local | s3
-      size:   1mb | 10mb | 100mb (default: 10mb)
-      runs:   iterations (default: 1)
+  native <input> <output> [size] [runs] [threads] [scenario]
+  lambda <input> <output> [size] [runs]
+  lambda-rie <input> <output> [size] [runs]
 
   engine <engine> [input] [size] [runs]  - Run competitor engine
       engine: pyarrow | polars | duckdb

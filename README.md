@@ -136,6 +136,24 @@ just test
 # Binary at zig-out/bin/zpq
 ```
 
+## Benchmarking
+
+ZPQ includes a unified benchmarking suite for comparing native, Lambda, and RIE performance.
+
+```bash
+# S3 -> S3 (Native): Estable baseline performance
+just bench native s3 s3 100mb
+
+# S3 -> S3 (AWS Lambda): Real remote execution
+just bench lambda s3 s3 100mb
+
+# S3 -> S3 (Local RIE): Test Lambda behavior locally
+just bench lambda-rie s3 s3 100mb
+
+# Engine Comparison: Compare against DuckDB, Polars, PyArrow
+just engine compare s3 100mb
+```
+
 ## Design Philosophy
 
 ### The Laziness Principle

@@ -1,6 +1,7 @@
 const std = @import("std");
 const zpq = @import("zpq");
 const xev = @import("xev");
+const posix = std.posix;
 
 var global_async_logger: ?*zpq.log.AsyncLogger = null;
 
@@ -70,8 +71,7 @@ pub fn main() !void {
 
     // Check for Lambda environment first (before CLI parsing)
     if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API")) |runtime_api| {
-        const lambda = @import("lambda.zig");
-        try lambda.run(allocator, runtime_api);
+        try runLambda(allocator, runtime_api);
         return;
     }
 
@@ -173,22 +173,15 @@ pub fn main() !void {
     }
 
 
-    if (is_benchmark) {
-        const stats = try zpq.core.engine.runQuery(
-            BenchmarkRow,
-            allocator,
-            input_path.?,
-            output_path orelse "/dev/null",
-            filter_str,
-            select_str,
-            &loop,
-            &thread_pool,
-            repeat_count,
-        );
-        std.debug.print("Scanned {d} rows ({d} matched) in {d:.2}ms\n", .{ stats.scanned, stats.matched, stats.elapsed_ms });
-    } else {
-        switch (command) {
-            .query => {
+    switch (command) {
+        .schema => {
+            try zpq.core.engine.printSchema(allocator, input_path.?, &loop, &thread_pool);
+        },
+        .meta => {
+            try zpq.core.engine.printMetadata(allocator, input_path.?, &loop, &thread_pool);
+        },
+        .query => {
+            if (is_benchmark) {
                 const stats = try zpq.core.engine.runQuery(
                     BenchmarkRow,
                     allocator,
@@ -201,21 +194,187 @@ pub fn main() !void {
                     repeat_count,
                 );
                 std.debug.print("Scanned {d} rows ({d} matched) in {d:.2}ms\n", .{ stats.scanned, stats.matched, stats.elapsed_ms });
-            },
-            .schema => {
-                try zpq.core.engine.printSchema(allocator, input_path.?, &loop, &thread_pool);
-            },
-            .meta => {
-                try zpq.core.engine.printMetadata(allocator, input_path.?, &loop, &thread_pool);
-            },
-            else => {
-                std.debug.print("Command {s} not yet fully implemented in refactor.\n", .{@tagName(command)});
-            },
-        }
+            } else {
+                const stats = try zpq.core.engine.runQuery(
+                    BenchmarkRow,
+                    allocator,
+                    input_path.?,
+                    output_path orelse "/dev/null",
+                    filter_str,
+                    select_str,
+                    &loop,
+                    &thread_pool,
+                    repeat_count,
+                );
+                std.debug.print("Scanned {d} rows ({d} matched) in {d:.2}ms\n", .{ stats.scanned, stats.matched, stats.elapsed_ms });
+            }
+        },
+        else => {
+            std.debug.print("Command {s} not yet fully implemented in refactor.\n", .{@tagName(command)});
+        },
     }
 }
 
 
 fn printUsage() void {
     std.debug.print("Usage: zpq <input> <output> [--filter \"col=val\"] [--select \"col1,col2\"]\n", .{});
+}
+
+// =============================================================================
+// Lambda Runtime (Self-Contained)
+// =============================================================================
+
+fn runLambda(allocator: std.mem.Allocator, runtime_api: []const u8) !void {
+    const colon = std.mem.indexOfScalar(u8, runtime_api, ':') orelse runtime_api.len;
+    const host = runtime_api[0..colon];
+    const port = if (colon < runtime_api.len)
+        std.fmt.parseInt(u16, runtime_api[colon + 1 ..], 10) catch 80
+    else
+        80;
+
+    // Force Epoll for Lambda
+    if (@hasDecl(xev.Dynamic, "prefer")) _ = xev.Dynamic.prefer(.epoll);
+    if (@hasDecl(xev.Dynamic, "detect")) try xev.Dynamic.detect();
+
+    var loop = try xev.Dynamic.Loop.init(.{});
+    defer loop.deinit();
+
+    // Initialize Global Async Logger
+    const logger = try zpq.log.AsyncLogger.init(allocator, .info);
+    defer logger.deinit();
+    global_async_logger = logger;
+    defer global_async_logger = null;
+    try logger.start(&loop);
+
+    var pool = xev.ThreadPool.init(.{ .max_threads = 4 });
+    defer {
+        pool.shutdown();
+        pool.deinit();
+    }
+
+    std.log.info("ZPQ Lambda Runtime started (epoll)", .{});
+
+    while (true) {
+        const event = getLambdaInvocation(allocator, host, port) catch continue;
+        defer allocator.free(event.body);
+        defer allocator.free(event.request_id);
+
+        const response = processLambdaEvent(allocator, &loop, &pool, event.body) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch continue;
+            defer allocator.free(msg);
+            postLambdaResult(allocator, host, port, event.request_id, msg, true) catch {};
+            continue;
+        };
+        defer allocator.free(response);
+
+        postLambdaResult(allocator, host, port, event.request_id, response, false) catch {};
+    }
+}
+
+const LambdaPayload = struct {
+    file: []const u8,
+    output: ?[]const u8 = null,
+    filter: ?[]const u8 = null,
+    select: ?[]const u8 = null,
+    threads: ?usize = null,
+    log_level: ?[]const u8 = null,
+};
+
+fn processLambdaEvent(allocator: std.mem.Allocator, loop: *xev.Dynamic.Loop, pool: *xev.ThreadPool, body: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(LambdaPayload, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const p = parsed.value;
+
+    if (global_async_logger) |logger| {
+        if (p.log_level) |lvl| {
+            if (std.ascii.eqlIgnoreCase(lvl, "debug")) logger.active_level.store(.debug, .release);
+            if (std.ascii.eqlIgnoreCase(lvl, "info")) logger.active_level.store(.info, .release);
+        }
+    }
+
+    std.log.info("Query: {s} -> {s} (filter: {s})", .{ p.file, p.output orelse "/dev/null", p.filter orelse "none" });
+
+    const stats = try zpq.core.engine.runQuery(
+        BenchmarkRow,
+        allocator,
+        p.file,
+        p.output,
+        p.filter,
+        p.select,
+        loop,
+        pool,
+        1
+    );
+
+    return std.fmt.allocPrint(allocator, "{{\"rows\":{d}, \"matched\":{d}, \"ms\":{d:.2}}}", .{ stats.scanned, stats.matched, stats.elapsed_ms });
+}
+
+fn getLambdaInvocation(allocator: std.mem.Allocator, host: []const u8, port: u16) !struct { body: []u8, request_id: []u8 } {
+    const sock = try connectLambda(host, port);
+    defer posix.close(sock);
+
+    _ = try posix.write(sock, "GET /2018-06-01/runtime/invocation/next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+    var buf: [65536]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = posix.read(sock, buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+    }
+
+    const sep = std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") orelse return error.Malformed;
+    const headers = buf[0..sep];
+    const body = buf[sep + 4 .. total];
+
+    var req_id: []const u8 = "unknown";
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "lambda-runtime-aws-request-id:")) {
+            req_id = std.mem.trim(u8, line["lambda-runtime-aws-request-id:".len..], " \t");
+            break;
+        }
+    }
+
+    return .{
+        .body = try allocator.dupe(u8, body),
+        .request_id = try allocator.dupe(u8, req_id),
+    };
+}
+
+fn postLambdaResult(allocator: std.mem.Allocator, host: []const u8, port: u16, id: []const u8, body: []const u8, is_error: bool) !void {
+    const sock = try connectLambda(host, port);
+    defer posix.close(sock);
+
+    const suffix = if (is_error) "/error" else "/response";
+    const req = try std.fmt.allocPrint(allocator,
+        "POST /2018-06-01/runtime/invocation/{s}{s} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ id, suffix, body.len, body },
+    );
+    defer allocator.free(req);
+    _ = try posix.write(sock, req);
+    var buf: [1024]u8 = undefined;
+    _ = posix.read(sock, &buf) catch {};
+}
+
+fn connectLambda(host: []const u8, port: u16) !posix.socket_t {
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(sock);
+
+    var parts: [4]u8 = undefined;
+    var i: usize = 0;
+    var iter = std.mem.splitScalar(u8, host, '.');
+    while (iter.next()) |p| : (i += 1) {
+        if (i >= 4) return error.InvalidIP;
+        parts[i] = std.fmt.parseInt(u8, p, 10) catch return error.InvalidIP;
+    }
+
+    var addr = std.mem.zeroes(posix.sockaddr.in);
+    addr.family = posix.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    addr.addr = std.mem.nativeToBig(u32, @as(u32, parts[0]) << 24 | @as(u32, parts[1]) << 16 | @as(u32, parts[2]) << 8 | parts[3]);
+
+    try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    return sock;
 }

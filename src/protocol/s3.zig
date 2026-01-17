@@ -29,13 +29,18 @@ pub const S3 = struct {
         };
     }
 
+    pub const Range = union(enum) {
+        bytes: struct { start: u64, end: u64 },
+        suffix: u64,
+    };
+
     /// Formats a GET request with an optional Range header.
     /// Returns the signed headers that should be sent.
     pub fn formatGetRequest(
         self: S3,
         allocator: std.mem.Allocator,
         key: []const u8,
-        range: ?struct { start: u64, end: u64 },
+        range: ?Range,
         options: Options,
     ) ![]sigv4.SigV4.Header {
         const host = try self.getHost(allocator, options);
@@ -51,7 +56,10 @@ pub const S3 = struct {
         defer if (range_val) |v| allocator.free(v);
 
         if (range) |r| {
-            range_val = try std.fmt.allocPrint(allocator, "bytes={d}-{d}", .{ r.start, r.end - 1 });
+            range_val = try switch (r) {
+                .bytes => |b| std.fmt.allocPrint(allocator, "bytes={d}-{d}", .{ b.start, b.end - 1 }),
+                .suffix => |s| std.fmt.allocPrint(allocator, "bytes=-{d}", .{s}),
+            };
             try extra_headers.append(allocator, .{ .name = "Range", .value = range_val.? });
         }
 

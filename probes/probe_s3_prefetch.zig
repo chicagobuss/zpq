@@ -140,7 +140,7 @@ const PooledConnection = struct {
         const signed_headers = try self.pool.s3.formatGetRequest(
             allocator,
             self.pool.key,
-            .{ .start = request.offset, .end = range_end + 1 },
+            .{ .bytes = .{ .start = request.offset, .end = range_end + 1 } },
             .{},
         );
         defer {

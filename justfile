@@ -200,21 +200,16 @@ lambda-list:
     @./tools/serverless/aws.sh list zpq
 
 # === Unified Benchmarking ===
-# Usage: just bench <what> <input> <where> <output> [size] [runs]
-#   what:   native | serverless-rie | serverless-lambda
-#   input:  local | s3
-#   output: local | s3
-#   size:   1mb | 10mb | 100mb
-#   runs:   number of iterations
-#
 # Examples:
-#   just bench native local local               # zpq local→local
-#   just bench native s3 s3 100mb 3             # zpq S3→S3
-#   just bench serverless-rie local local       # RIE file→file
-#   just bench serverless-rie s3 s3             # RIE S3→S3
-#   just bench serverless-lambda s3 s3 100mb    # Real Lambda
-bench what input output size="10mb" runs="1" threads="4":
-    @./tools/bench.sh {{what}} {{input}} {{output}} {{size}} {{runs}} {{threads}}
+#   just native local local               # zpq local→local
+#   just native s3 s3 100mb 3             # zpq S3→S3
+#   just lambda s3 s3 100mb               # Real Lambda
+#   just lambda-rie s3 s3 100mb           # Local RIE
+
+# Run zpq benchmarks
+# type: native | lambda | lambda-rie
+bench type input output size="10mb" runs="1" threads="4" scenario="default":
+    @./tools/bench.sh {{type}} {{input}} {{output}} {{size}} {{runs}} {{threads}} {{scenario}}
 
 
 # Engine comparison benchmarks (pyarrow, polars, duckdb)

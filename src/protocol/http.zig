@@ -25,6 +25,7 @@ pub const ResponseParser = struct {
 
     status_code: u16 = 0,
     content_length: ?usize = null,
+    total_size: ?u64 = null,
     is_chunked: bool = false,
     etag: ?[]const u8 = null,
 
@@ -208,6 +209,13 @@ pub const ResponseParser = struct {
             }
             if (std.ascii.startsWithIgnoreCase(line, "etag:")) {
                 self.etag = std.mem.trim(u8, line["etag:".len..], " \t\"");
+            }
+            if (std.ascii.startsWithIgnoreCase(line, "content-range:")) {
+                const v = std.mem.trim(u8, line["content-range:".len..], " \t");
+                // bytes 0-10/1234
+                if (std.mem.lastIndexOfScalar(u8, v, '/')) |slash| {
+                    self.total_size = std.fmt.parseInt(u64, v[slash + 1 ..], 10) catch null;
+                }
             }
         }
     }

@@ -1,0 +1,10 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install Polars and dependencies
+RUN pip install --no-cache-dir polars s3fs boto3
+
+# Copy the handler
+COPY polars_bench.py ${LAMBDA_TASK_ROOT}
+
+# Set the CMD to your handler
+CMD [ "polars_bench.lambda_handler" ]

@@ -15,6 +15,45 @@ This directory contains the implementations for filter evaluation. usage is disp
 The filter system uses a "backend" pattern where the main `evaluate` method chooses the best implementation available at compile time (or runtime).
 Currently, it defaults to `scalar` for all platforms.
 
+## Syntax Specification
+
+ZPQ supports a SQL-like DSL for row filtering and column projection.
+
+### 1. Filter Expressions (`--filter`)
+
+Filters are composed of **leaf predicates** combined with **boolean logic**.
+
+#### Supported Operators
+| Operator | Description |
+| :--- | :--- |
+| `=` | Equal to |
+| `!=` | Not equal to |
+| `<` | Less than |
+| `<=` | Less than or equal to |
+| `>` | Greater than |
+| `>=` | Greater than or equal to |
+
+#### Boolean Logic
+- **AND**: Higher precedence (evaluated first).
+- **OR**: Lower precedence.
+- *Note: Grouping via parentheses is currently not supported.*
+
+**Example**: `status=error AND id>=1000 OR priority=high`
+
+#### Supported Types
+- **Integers**: `Int32`, `Int64`
+- **Floats**: `Float`, `Double`
+- **Booleans**: `true`, `false`, `1`, `0`
+- **Strings**: `ByteArray` (Verbatim comparison)
+
+### 2. Column Selection (`--select`)
+
+Selection is a simple comma-separated list of column names.
+
+**Example**: `--select "id,timestamp,payload"`
+
+---
+
 ## Deployment Guide: AWS Lambda
 
 ZPQ is designed as a high-performance, zero-dependency Lambda runtime. The same binary used for CLI work functions as the Lambda `bootstrap` handler.

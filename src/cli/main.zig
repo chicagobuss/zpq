@@ -1,12 +1,12 @@
 //! ZPQ CLI binary entry point.
 //!
-//! Targets: native Linux (io_uring), macOS (kqueue). Hot paths assume the
-//! io_uring backend is available; the Lambda binary (src/lambda/main.zig)
-//! excludes io_uring code at compile time via build_options.lambda.
+//! Targets: native Linux (io_uring) and macOS (kqueue). The event loop
+//! is in-tree (`src/io/`), comptime-selected by target. The Lambda
+//! binary (src/lambda/main.zig) excludes io_uring code via
+//! `build_options.lambda`.
 //!
 //! No event loop is wired in yet — the CLI is a placeholder until the
-//! v2 pipeline lands. libxev will be added back as a build.zig.zon
-//! dependency at the same time the code that uses it lands.
+//! first hot-path code lands.
 
 const std = @import("std");
 const zpq = @import("zpq");

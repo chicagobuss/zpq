@@ -3,13 +3,14 @@ const std = @import("std");
 /// ZPQ build system.
 ///
 /// Produces two binaries from one source tree:
-///   - `zpq`        : CLI binary. Uses libxev with the native backend
+///   - `zpq`        : CLI binary. Native event-loop backend
 ///                    (io_uring on Linux, kqueue on macOS).
 ///   - `zpq-lambda` : Lambda bootstrap binary. Excludes io_uring code at
-///                    comptime. Linked against libxev's Epoll backend only.
+///                    comptime. Uses the in-tree epoll backend only.
 ///
 /// The split is enforced by the `build_options.lambda` flag visible to
-/// every translation unit in each binary.
+/// every translation unit in each binary. We don't depend on libxev or
+/// any other event-loop library — see .agent/rules/tier2_knowledge.md.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -28,10 +29,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // libxev is currently incompatible with Zig 0.16.0 (uses removed
-    // posix.clock_gettime, etc). The dep stays declared in build.zig.zon
-    // but no binary imports it yet — re-add the import once libxev catches
-    // up or once we patch the io_uring backend in vendor/libxev.
+    // No event-loop library dependency. The in-tree event loop will live
+    // under src/io/ (see tier3_strategy.md). It hasn't been built yet, so
+    // the CLI binary below is a placeholder.
 
     // ----- CLI binary -----
     const cli = b.addExecutable(.{

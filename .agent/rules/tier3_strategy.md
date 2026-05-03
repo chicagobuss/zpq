@@ -51,7 +51,7 @@ Saturate the network with **S3-to-S3** workloads. ZPQ wins by doing the absolute
     *   `io/source.zig` — S3 + local file source.
 3.  **Wire the planner.** Strict separation: `Planner` (decision — does this query need decoding? what columns? what predicates?) returns a plan. `Executor` (action) consumes the plan and runs it via the I/O strategy. Keep them in different files.
 4.  **Lambda binary excludes io_uring.** Already enforced by the build system; preserve as we add code.
-5.  **Add libxev when the CLI hot path needs it.** libxev was removed entirely from this branch — the vendored fork didn't compile against Zig 0.16.0. When ready, fetch a fresh upstream commit (or patch the fork) and re-add it as a `build.zig.zon` dependency. Don't pre-add it; only land it with the code that uses it.
+5.  **Build the in-tree event loop** in three phases (Phase A first, others on demand). See Tier-2 "Build order" — `src/io/epoll.zig` lands first because it unblocks Lambda. We are not adding libxev or any other event-loop library; that decision is durable, not a placeholder.
 
 ## What was deferred
 

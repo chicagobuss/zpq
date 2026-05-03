@@ -11,7 +11,7 @@ There is **one Conductor** (the main event loop) that owns all I/O. Workers neve
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        CONDUCTOR (Main Thread)                  │
-│  - Drives xev event loop                                        │
+│  - Drives the event loop (in-tree epoll/io_uring/kqueue)        │
 │  - Dispatches S3 reads/writes                                   │
 │  - Never does CPU-heavy work                                    │
 └─────────────────────────────────────────────────────────────────┘

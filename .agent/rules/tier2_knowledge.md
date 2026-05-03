@@ -27,20 +27,31 @@ For a worked-out example of these, read `probes/probe_lambda_caps/main.zig` — 
 
 **Comptime**: use it to generate specialized decoders (e.g., bit-unpacking). Avoid runtime `if` switches in hot loops.
 
-## The Async Stack (libxev + BoringSSL)
+## The Async Stack (in-tree event loop + BoringSSL)
+
+### Why we own the event loop
+We don't use libxev or any other event-loop library. Three reasons:
+1.  **Lambda is epoll-only**, and our epoll wrapper is ~150 lines we'd write regardless. The marginal cost of also owning io_uring + kqueue is small once the syscall-wrap layer exists.
+2.  **Tier-1 alignment**: *"if we can't fix it, we don't use it."* External event loops break on each Zig minor release, lag `std.Io` adoption, and bring code we never exercise (cross-platform IOCP, child-process supervision, signal forwarding).
+3.  **Workload narrowness**: ZPQ does S3 streaming with bounded fan-out (≤8 concurrent multipart uploads). General-purpose event-loop machinery is overkill — we want code shaped *exactly* for this access pattern.
 
 ### Backend selection per target
 Lambda's seccomp filter blocks `io_uring_setup` (returns ENOSYS), so we have **three backends with one abstraction**:
 
-| Target           | Backend  | Notes                                              |
-| ---------------- | -------- | -------------------------------------------------- |
-| Linux CLI        | io_uring | preferred; needed for SQE batching, fixed buffers |
-| Linux Lambda     | epoll    | mandatory, kernel-policy enforced                  |
-| macOS CLI        | kqueue   | the dev environment                                |
+| Target       | Backend  | Notes                                                 |
+| ------------ | -------- | ----------------------------------------------------- |
+| Linux CLI    | io_uring | hot-path perf; SQE batching, fixed buffers, multishot |
+| Linux Lambda | epoll    | mandatory, kernel-policy enforced                     |
+| macOS CLI    | kqueue   | the dev environment                                   |
 
-Hot-path designs reason in **epoll-readiness terms**, not io_uring-completion terms — that's the lowest common denominator. io_uring-only optimizations (`IORING_REGISTER_BUFFERS`, `IOSQE_IO_LINK`, multishot recv) live in `src/io/iouring.zig` and are excluded from the Lambda binary at compile time via `build_options.lambda`.
+Comptime-selected `Loop` type in `src/io/loop.zig` resolves to one of `epoll | iouring | kqueue` based on `(target, build_options.lambda)`. Hot-path designs reason in **epoll-readiness terms** — that's the lowest common denominator. io_uring-only optimizations (`IORING_REGISTER_BUFFERS`, `IOSQE_IO_LINK`, multishot recv) live in `src/io/iouring.zig` and are excluded from the Lambda binary at compile time.
 
-The previous Tier-2 framing — "We control the event loop explicitly (Submission/Completion Queue)" — is misleading because CQE/SQE semantics are an io_uring-only concept. Don't carry that mental model into Lambda code.
+### Build order (when we add the I/O layer)
+1.  **Phase A** — `src/io/epoll.zig` + the `Loop` selector. Unblocks Lambda entirely. ~200 LoC.
+2.  **Phase B** — `src/io/iouring.zig`. Lands with the first CLI hot-path code that needs it. Start with the simple version; tune (registered buffers, multishot) when benchmarks demand.
+3.  **Phase C** — `src/io/kqueue.zig`. macOS dev. Ships last.
+
+Don't pre-build phases. Each lands with the first piece of code that exercises it.
 
 ### Lambda capability ground truth
 From `docs/lambda_capabilities.md` (probed empirically, 2026-05-03 in `provided.al2023`):
@@ -60,12 +71,12 @@ Re-run `just probe-lambda` any time AWS announces runtime changes — seccomp po
 *   **Memory BIOs**: Use `BIO_s_mem` to decouple crypto from I/O.
     *   *Read Path*: Socket → Ring Buffer → `BIO_write` → `SSL_read` → Application.
     *   *Write Path*: Application → `SSL_write` → `BIO_read` → Ring Buffer → Socket.
-*   **Partial Writes**: `xev.write` may write fewer bytes than requested. **ALWAYS** loop until the entire buffer is drained.
+*   **Partial Writes**: A non-blocking socket `write` (or io_uring `IORING_OP_WRITE` completion) may write fewer bytes than requested. **ALWAYS** loop until the entire buffer is drained.
 *   **Backpressure**: Implement a bounded queue for outgoing writes. Don't blindly `write()` faster than the network can transmit.
 
 ### Vendor reality
 *   `vendor/boring_tls` ships **prebuilt-only** — `tools/r2-fetch-artifacts.sh` populates `vendor/boring_tls/prebuilt/<triple>/`. The vendor `build.zig` no longer carries source-build paths.
-*   `vendor/libxev` is a fork. As of 0.16.0 release the io_uring backend uses removed `posix.clock_gettime` — when wiring the CLI hot path back in, either patch the fork or bump to a newer libxev commit. The Lambda binary doesn't need this since it never imports the io_uring backend.
+*   No event-loop dependency. The previously-vendored libxev fork was removed when we decided to own the loop ourselves. If a future engineer is tempted to reach for libxev (or tokio-rs/Rust equivalents, or `std.Io.Net`), re-read the "Why we own the event loop" section above before writing the dep.
 
 ## Workflow & Benchmarking
 *   **Fair comparisons**: a benchmark must be apples-to-apples. If ZPQ reads from local + writes to S3, the comparator must do the exact same task. Native-vs-Lambda numbers are reported separately, never blended.
@@ -77,7 +88,7 @@ Re-run `just probe-lambda` any time AWS announces runtime changes — seccomp po
 The 3-tier resolver stack we want to maintain (when we re-introduce it):
 1.  **Fast path**: in-memory LRU cache.
 2.  **Deduplication**: SingleFlight — coalesce concurrent requests for the same host.
-3.  **Transport**: `xev`-based async resolution (never block the loop).
+3.  **Transport**: non-blocking DNS via the in-tree event loop (never block the loop). At rest, blocking `getaddrinfo` at startup is acceptable for the cold path.
 
 In Lambda, `/etc/resolv.conf` points at AWS's link-local resolver (`169.254.x.x`). Cold-resolve latency to a regional S3 endpoint is single-digit milliseconds — an LRU cache earns its keep more from request volume than from absolute miss cost.
 

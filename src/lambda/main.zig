@@ -6,8 +6,9 @@
 //!   - epoll/eventfd2/timerfd_create/signalfd4/mlock are allowed.
 //!   - SO_ZEROCOPY and TCP_FASTOPEN setsockopt allowed.
 //!
-//! This binary intentionally does NOT import io_uring code. The libxev
-//! Epoll backend is the only event loop driver we use here.
+//! This binary intentionally excludes io_uring code at compile time via
+//! `build_options.lambda`. The in-tree epoll backend is the only event
+//! loop driver linked here.
 
 const std = @import("std");
 const zpq = @import("zpq");

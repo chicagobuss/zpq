@@ -10,6 +10,7 @@ pub const core = struct {
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
         pub const snappy = @import("core/parquet/snappy.zig");
+        pub const lz4 = @import("core/parquet/lz4.zig");
         pub const compression = @import("core/parquet/compression.zig");
         pub const page = @import("core/parquet/page.zig");
         pub const column = @import("core/parquet/column.zig");
@@ -33,6 +34,7 @@ test {
     _ = core.thrift;
     _ = core.parquet.metadata;
     _ = core.parquet.snappy;
+    _ = core.parquet.lz4;
     _ = core.parquet.compression;
     _ = core.parquet.page;
     _ = core.parquet.column;

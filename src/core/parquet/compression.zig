@@ -8,6 +8,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const snappy = @import("snappy.zig");
+const lz4 = @import("lz4.zig");
 
 pub const Error = error{
     UnsupportedCodec,
@@ -48,6 +49,13 @@ pub fn decompress(
         },
         .GZIP => return decompressFlate(arena, src, uncompressed_size, .gzip),
         .ZSTD => return decompressZstd(arena, src, uncompressed_size),
+        .LZ4_RAW => {
+            const out = try arena.alloc(u8, uncompressed_size);
+            errdefer arena.free(out);
+            const n = lz4.uncompress(src, out) catch return error.DecompressionFailed;
+            if (n != uncompressed_size) return error.SizeMismatch;
+            return out[0..n];
+        },
         else => return error.UnsupportedCodec,
     }
 }
@@ -119,8 +127,8 @@ test "SNAPPY round-trip" {
 }
 
 test "unsupported codec" {
-    try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .LZ4_RAW, 1));
     try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .BROTLI, 1));
+    try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .LZ4, 1)); // legacy LZ4 (Hadoop framing) intentionally skipped
 }
 
 test "GZIP decompresses canned bytes" {

@@ -40,17 +40,30 @@ pub const Error = error{
 /// Choose the right decoder shape for T at comptime.
 ///   - i32/i64/f32/f64 → Plain.Decoder(T)
 ///   - []const u8      → Plain.ByteArrayDecoder
+///   - bool            → Plain.BooleanDecoder (note: takes num_values)
 fn PlainDecoderFor(comptime T: type) type {
     return switch (T) {
         i32, i64, f32, f64 => plain.Decoder(T),
         []const u8 => plain.ByteArrayDecoder,
+        bool => plain.BooleanDecoder,
         else => @compileError("unsupported column type: " ++ @typeName(T)),
+    };
+}
+
+/// BOOLEAN columns never use dictionary encoding in practice; the
+/// type's tiny cardinality makes it pointless. We still need a
+/// nominal RleDictDec type for the field, so we use Plain.Decoder(i32)
+/// as a placeholder — it's unreachable at runtime.
+fn RleDictDecFor(comptime T: type) type {
+    return switch (T) {
+        bool => rle_dict.Decoder(i32), // unused for bool
+        else => rle_dict.Decoder(T),
     };
 }
 
 pub fn ColumnChunkReader(comptime T: type) type {
     const PlainDec = PlainDecoderFor(T);
-    const RleDictDec = rle_dict.Decoder(T);
+    const RleDictDec = RleDictDecFor(T);
 
     return struct {
         const Self = @This();
@@ -104,8 +117,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (self.current_plain) |*d| {
                 return @as(*PlainDec, d).decode(dest) catch return error.UnexpectedPage;
             }
-            if (self.current_rle_dict) |*d| {
-                return @as(*RleDictDec, d).decode(dest) catch return error.UnexpectedPage;
+            if (T != bool) {
+                if (self.current_rle_dict) |*d| {
+                    return @as(*RleDictDec, d).decode(dest) catch return error.UnexpectedPage;
+                }
             }
             return 0;
         }
@@ -134,10 +149,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
         fn installDictionary(self: *Self, pg: page_mod.Page) Error!void {
             const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
             const num: usize = @intCast(dh.num_values);
+            // BOOLEAN never gets dictionary encoding in practice — the
+            // type's tiny cardinality makes it pointless. Reject early.
+            if (T == bool) return error.UnsupportedEncoding;
             const buf = try self.arena.alloc(T, num);
-            // Dictionary pages are PLAIN-encoded values back-to-back,
-            // regardless of the encoding tag (which is one of the
-            // PLAIN_DICTIONARY / PLAIN variants).
             switch (T) {
                 i32, i64, f32, f64 => {
                     var d = plain.Decoder(T).init(pg.bytes);
@@ -182,10 +197,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     self.current_plain = switch (T) {
                         i32, i64, f32, f64 => plain.Decoder(T).init(values_bytes),
                         []const u8 => plain.ByteArrayDecoder.init(values_bytes),
+                        bool => plain.BooleanDecoder.init(values_bytes, @intCast(dph.num_values)),
                         else => unreachable,
                     };
                 },
                 .PLAIN_DICTIONARY, .RLE_DICTIONARY => {
+                    if (T == bool) return error.UnsupportedEncoding;
                     const dict = self.dictionary orelse return error.DictionaryMissing;
                     self.current_rle_dict = rle_dict.Decoder(T).init(values_bytes, dict) catch return error.UnexpectedPage;
                 },
@@ -266,6 +283,56 @@ test "decode int8 column from the bench fixture" {
     std.debug.print(
         "[column] int8: {d} values decoded in {d} us; min={d} max={d} sum={d}; ~{d} MB/s (uncompressed)\n",
         .{ written, elapsed_us, min_v, max_v, sum, mb_per_s },
+    );
+}
+
+test "decode bool column from the bench fixture" {
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var meta = try metadata.open(testing.allocator, file_bytes);
+    defer meta.deinit(testing.allocator);
+
+    const rg0 = &meta.row_groups.items[0];
+    const col_idx = metadata.findColumnIndex(&meta, "bool") orelse return error.MissingColumn;
+    const col = rg0.columns.items[col_idx].meta_data.?;
+
+    const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
+    const chunk_len: usize = @intCast(col.total_compressed_size);
+    const chunk = file_bytes[chunk_start .. chunk_start + chunk_len];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const path: [1][]const u8 = .{"bool"};
+    const levels = meta.getColumnLevels(&path);
+    var reader = ColumnChunkReader(bool).init(chunk, col.codec, levels, arena.allocator());
+
+    const expected: usize = @intCast(col.num_values);
+    const out = try arena.allocator().alloc(bool, expected);
+
+    const t0 = nowNs();
+    var written: usize = 0;
+    while (written < expected) {
+        const n = try reader.decode(out[written..]);
+        if (n == 0) break;
+        written += n;
+    }
+    const elapsed_us = @divTrunc(nowNs() - t0, std.time.ns_per_us);
+
+    try testing.expectEqual(expected, written);
+
+    var trues: usize = 0;
+    for (out) |b| {
+        if (b) trues += 1;
+    }
+    std.debug.print(
+        "[column] bool: {d} values decoded in {d} us; {d} true / {d} false\n",
+        .{ written, elapsed_us, trues, written - trues },
     );
 }
 

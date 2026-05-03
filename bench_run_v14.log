@@ -1,0 +1,29 @@
+[engine] ⚡ Zero-Copy Fast Path Detected!
+[factory] Creating AsyncS3SinkGen for s3://skyway-staging-perf-test/zpq_test_data/output/bench_100mb_optimized_v14.parquet
+[S3Sink] background thread started
+DEBUG: logFn called with scope=pool level=debug
+[S3Sink] Initiating multipart upload
+[S3Writer] Request done: status=200 Part=0 ETag=none
+[S3Writer] initiateMultipartUpload body: <?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>skyway-staging-perf-test</Bucket><Key>zpq_test_data/output/bench_100mb_optimized_v14.parquet</Key><UploadId>oezVxMDVbVK7HDrj9SBxnIJsO13pKrJQZSLcDAukJNQXEE0iBQjaTIMSsVkGHNzuzsUwWTuF3p2jIrPXzdZOzbMeT6lF0wqA2Z2_zhfZFrYKJQVNvVLFukxcpMTD6Wgw</UploadId></InitiateMultipartUploadResult>
+[S3Sink] Upload ID: oezVxMDVbVK7HDrj9SBxnIJsO13pKrJQZSLcDAukJNQXEE0iBQjaTIMSsVkGHNzuzsUwWTuF3p2jIrPXzdZOzbMeT6lF0wqA2Z2_zhfZFrYKJQVNvVLFukxcpMTD6Wgw
+[S3Sink] Launching Part 1 (16777216 bytes)
+[S3Sink] Launching Part 2 (16777216 bytes)
+[S3Sink] Launching Part 3 (16777216 bytes)
+[engine] Copied 162 MB in 201.48ms (804.53 MB/s)
+[S3Sink] Launching Part 4 (16777216 bytes)
+[S3Sink] Launching Part 5 (16777216 bytes)
+[S3Sink] Launching Part 6 (16777216 bytes)
+[S3Sink] Launching Part 7 (16777216 bytes)
+[S3Sink] Launching Part 8 (16777216 bytes)
+[S3Sink] Launching Part 9 (16777216 bytes)
+[S3Sink] Launching Part 10 (16777216 bytes)
+[Transport] onWrite error: error.BrokenPipe
+[S3Sink] runInternal failed with error: error.BrokenPipe
+[S3Sink] thread exiting
+Scanned 0 rows (0 matched) in 201.48ms
+[1510057315] [DEBUG] [ID:0000000000000000] Hardware: CPU=24 RAM=18152MB (init_cap=8)
+DEBUG: logFn called with scope=DebugAllocator level=err
+[err] memory address 0x77ba2fa40200 leaked: 
+(empty stack trace)
+

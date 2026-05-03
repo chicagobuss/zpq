@@ -51,11 +51,27 @@ pub const core = struct {
 
 
 pub const log = @import("zpq/log.zig");
+pub var global_logger: ?*log.AsyncLogger = null;
 
-/// High-level schema reflection and specialized reader generation.
-pub const schema = struct {
-    // The "Polars Killer" comptime implementation lives here,
-    // utilizing the building blocks in core.reader.
+pub const std_options = struct {
+    pub const log_level = .debug;
+    pub fn logFn(
+        comptime level: std.log.Level,
+        comptime scope: @TypeOf(.EnumLiteral),
+        comptime format: []const u8,
+        args: anytype,
+    ) void {
+        _ = scope;
+        if (global_logger) |l| {
+            const zpq_level: log.Level = switch (level) {
+                .err => .err,
+                .warn => .warn,
+                .info => .info,
+                .debug => .debug,
+            };
+            l.log(zpq_level, format, args);
+        }
+    }
 };
 
 test {

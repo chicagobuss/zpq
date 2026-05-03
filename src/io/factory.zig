@@ -89,7 +89,6 @@ pub fn openSink(allocator: std.mem.Allocator, path: []const u8, options: anytype
                    else if (@hasDecl(xev, "Epoll") and LoopType == xev.Epoll.Loop) xev.Epoll
                    else xev;
         const S3Sink = @import("s3_sink.zig").AsyncS3SinkGen(Xev);
-        
         const sink_ptr = try S3Sink.init(allocator, @ptrCast(loop_ptr), pool_ptr, s3_config, bucket, key);
         return sink_ptr.sink();
     } else {

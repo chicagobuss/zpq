@@ -1,0 +1,36 @@
+[engine] ⚡ Zero-Copy Fast Path Detected!
+[factory] Creating AsyncS3SinkGen for s3://skyway-staging-perf-test/zpq_test_data/output/bench_100mb_optimized_v13.parquet
+[S3Sink] background thread started
+DEBUG: logFn called with scope=pool level=debug
+[S3Sink] Initiating multipart upload
+[S3Writer] Request done: status=200 Part=0 ETag=none
+General protection exception (no address available)
+/home/joshua/.zvm/master/lib/std/mem/Allocator.zig:142:26: 0x10d988e in rawAlloc (zpq)
+    return a.vtable.alloc(a.ptr, len, alignment, ret_addr);
+                         ^
+/home/joshua/code/zpq/src/io/transport.zig:683:51: 0x11703b9 in ensureConnected (zpq)
+                    try self.pool.resolver.resolve(self.pool.loop, self.pool.host, self.pool.port, ctx, struct {
+                                                  ^
+/home/joshua/code/zpq/src/io/transport.zig:753:32: 0x1180671 in onConnectionIdle (zpq)
+                pc.startRequest(req) catch |err| {
+                               ^
+/home/joshua/code/zpq/src/io/s3/sink_writer.zig:302:36: 0x11729b5 in onData (zpq)
+                        pc.markIdle();
+                                   ^
+/home/joshua/code/zpq/src/io/transport.zig:497:50: 0x1169a47 in onRead (zpq)
+                        if (self.on_data) |cb| cb(self.callback_ctx, plain) catch {};
+                                                 ^
+/home/joshua/code/zpq/vendor/libxev/src/watcher/stream.zig:478:38: 0x116ea6e in callback (zpq)
+                            return cb(
+                                     ^
+/home/joshua/code/zpq/vendor/libxev/src/backend/io_uring.zig:806:29: 0x10e56ea in invoke (zpq)
+        return self.callback(self.userdata, loop, self, result);
+                            ^
+/home/joshua/code/zpq/src/io/s3/sink_writer.zig:137:34: 0x11752d3 in drive (zpq)
+                try self.loop.run(.once);
+                                 ^
+/home/joshua/code/zpq/src/io/s3_sink.zig:118:29: 0x110c537 in run (zpq)
+            self.runInternal() catch |e| {
+                            ^
+./nptl/pthread_create.c:447:8: 0x7603dd69caa3 in start_thread (pthread_create.c)
+../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0: 0x7603dd729c6b in clone3 (../sysdeps/unix/sysv/linux/x86_64/clone3.S)

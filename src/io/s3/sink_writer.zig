@@ -14,15 +14,15 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
 
         allocator: std.mem.Allocator,
         loop: Loop,
+        host: []const u8,
         s3: protocol_s3.S3,
         bucket: []const u8,
         key: []const u8,
-        host: []const u8,
-        resolved_addr: ?transport.Address = null,
-        conn: ?*Conn = null,
+        pool: *transport.ConnectionPoolGen(Xev),
 
-        pub fn init(allocator: std.mem.Allocator, loop: Loop, s3_config: protocol_s3.S3, bucket: []const u8, key: []const u8) !Self {
+        pub fn init(allocator: std.mem.Allocator, loop: Loop, resolver: transport.Resolver, s3_config: protocol_s3.S3, bucket: []const u8, key: []const u8) !Self {
             const host = try std.fmt.allocPrint(allocator, "{s}.s3.{s}.amazonaws.com", .{ bucket, s3_config.region });
+            const pool = try transport.ConnectionPoolGen(Xev).init(allocator, loop, resolver, host, 443, true);
             return .{
                 .allocator = allocator,
                 .loop = loop,
@@ -30,16 +30,18 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                 .bucket = bucket,
                 .key = key,
                 .host = host,
+                .pool = pool,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.conn) |c| c.deinit();
+            self.pool.deinit();
             self.allocator.free(self.host);
         }
 
         pub fn setAddress(self: *Self, addr: transport.Address) void {
-            self.resolved_addr = addr;
+            _ = self;
+            _ = addr; // No-op, managed by pool now
         }
 
         pub fn initiateMultipartUpload(self: *Self) ![]const u8 {
@@ -131,9 +133,6 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
 
         fn drive(self: *Self, ctx: *RequestContext) !void {
             while (!ctx.done) {
-                if (ctx.conn) |c| {
-                    if (c.closed) return error.ConnectionClosedUnexpectedly;
-                }
                 try self.loop.run(.once);
             }
             if (ctx.err) |e| return e;
@@ -156,36 +155,36 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
             parser: protocol_http.ResponseParser = .{},
             
             conn: ?*Conn = null,
-            final_payload: []const u8 = undefined,
+            final_payload: []const u8 = "",
             owned_payload: ?[]const u8 = null,
-            signed_headers: []sigv4.SigV4.Header = undefined,
+            signed_headers: []sigv4.SigV4.Header = &.{},
     
             fn start(self: *RequestContext, payload: []const u8, options: protocol_s3.S3.Options) !void {
-                const addr = self.writer.resolved_addr orelse return error.AddressNotResolved;
-    
                 // If we have an owned_payload, use it. Otherwise use the passed payload.
                 const effective_payload = self.owned_payload orelse payload;
 
-                // Each request gets its own connection for true parallelism
-                self.conn = try Conn.init(self.writer.allocator, self.writer.loop, true, self.writer.host);
-                const conn = self.conn.?;
-                conn.callback_ctx = self;
-                conn.on_data = onData;
-                conn.on_error = onError;
-                conn.on_handshake = onHandshake;
-
                 // Sign headers
                 const signed = try self.sign(effective_payload, options);
-                // Note: signed headers and body memory must stay alive!
-                // We'll attach them to the context.
                 self.signed_headers = signed.headers;
                 self.final_payload = signed.body orelse effective_payload;
 
-                try conn.connect(addr);
+                try self.writer.pool.dispatch(.{
+                    .ptr = self,
+                    .on_data = onData,
+                    .on_error = onError,
+                    .on_handshake = onHandshake,
+                    .start_fn = startFn,
+                });
+            }
+
+            fn startFn(ptr: *anyopaque, conn: *transport.ConnectionGen(Xev)) anyerror!void {
+                const self: *RequestContext = @ptrCast(@alignCast(ptr));
+                self.conn = conn;
+                try self.sendRequest();
             }
 
             pub fn deinit(self: *RequestContext) void {
-                if (self.conn) |c| c.deinit();
+                // Pool manages connection, we don't deinit it here.
                 
                 // Clean up signed headers
                 for (self.signed_headers) |h| {
@@ -193,9 +192,6 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                     self.writer.allocator.free(h.value);
                 }
                 self.writer.allocator.free(self.signed_headers);
-                // Note: final_payload might be the original buffer, 
-                // but if it's signed.body, we should free it IF it was allocated.
-                // In CompleteMultipart case, formatCompleteMultipartRequest returns an owned body.
                 if (self.is_complete) {
                      self.writer.allocator.free(self.final_payload);
                 }
@@ -236,43 +232,45 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
             }
 
             fn sendRequest(self: *RequestContext) !void {
-                var req = std.ArrayListUnmanaged(u8){};
-                defer req.deinit(self.writer.allocator);
+                var header_buf = std.ArrayListUnmanaged(u8){};
+                defer header_buf.deinit(self.writer.allocator);
 
                 const m_str = @tagName(self.method);
-                try req.appendSlice(self.writer.allocator, m_str);
-                try req.appendSlice(self.writer.allocator, " /");
-                try req.appendSlice(self.writer.allocator, self.writer.key);
+                try header_buf.appendSlice(self.writer.allocator, m_str);
+                try header_buf.appendSlice(self.writer.allocator, " /");
+                try header_buf.appendSlice(self.writer.allocator, self.writer.key);
                 
                 if (self.method == .POST) {
                     if (self.is_complete) {
-                        var buf: [128]u8 = undefined;
+                        var buf: [512]u8 = undefined;
                         const s = try std.fmt.bufPrint(&buf, "?uploadId={s}", .{self.upload_id.?});
-                        try req.appendSlice(self.writer.allocator, s);
+                        try header_buf.appendSlice(self.writer.allocator, s);
                     } else if (std.mem.eql(u8, self.query orelse "", "uploads")) {
-                         try req.appendSlice(self.writer.allocator, "?uploads");
+                         try header_buf.appendSlice(self.writer.allocator, "?uploads");
                     }
                 } else if (self.method == .PUT and self.upload_id != null) {
-                    var buf: [256]u8 = undefined;
+                    var buf: [512]u8 = undefined;
                     const s = try std.fmt.bufPrint(&buf, "?partNumber={d}&uploadId={s}", .{ self.part_number, self.upload_id.? });
-                    try req.appendSlice(self.writer.allocator, s);
+                    try header_buf.appendSlice(self.writer.allocator, s);
                 }
 
-                try req.appendSlice(self.writer.allocator, " HTTP/1.1\r\n");
+                try header_buf.appendSlice(self.writer.allocator, " HTTP/1.1\r\n");
                 for (self.signed_headers) |h| {
-                    try req.appendSlice(self.writer.allocator, h.name);
-                    try req.appendSlice(self.writer.allocator, ": ");
-                    try req.appendSlice(self.writer.allocator, h.value);
-                    try req.appendSlice(self.writer.allocator, "\r\n");
+                    try header_buf.appendSlice(self.writer.allocator, h.name);
+                    try header_buf.appendSlice(self.writer.allocator, ": ");
+                    try header_buf.appendSlice(self.writer.allocator, h.value);
+                    try header_buf.appendSlice(self.writer.allocator, "\r\n");
                 }
                 
                 var len_buf: [64]u8 = undefined;
                 const len_s = try std.fmt.bufPrint(&len_buf, "Content-Length: {d}\r\n\r\n", .{self.final_payload.len});
-                try req.appendSlice(self.writer.allocator, len_s);
-                try req.appendSlice(self.writer.allocator, self.final_payload);
+                try header_buf.appendSlice(self.writer.allocator, len_s);
 
-                // std.debug.print("[S3Writer] Sending request ({d} bytes, Part {d})\n", .{req.items.len, self.part_number});
-                try self.conn.?.write(req.items);
+                const conn = self.conn.?;
+                try conn.write(header_buf.items);
+                if (self.final_payload.len > 0) {
+                    try conn.writeNoCopy(self.final_payload);
+                }
             }
 
             fn onData(ptr: ?*anyopaque, data: []const u8) anyerror!void {
@@ -292,15 +290,23 @@ pub fn AsyncS3SinkWriterGen(comptime Xev: type) type {
                 if (self.parser.state == .done) {
                     if (self.conn) |c| c.stop();
                     self.status_code = self.parser.status_code;
-                    // Extract ETag if present
                     if (self.parser.etag) |e| {
                         self.etag = try self.writer.allocator.dupe(u8, e);
                     }
+                    
+                    // Mark connection as idle for pool reuse
+                    if (self.conn) |c| {
+                        const pc: *transport.ConnectionPoolGen(Xev).PooledConnection = @ptrCast(@alignCast(c.callback_ctx));
+                        pc.markIdle();
+                    }
+                    
+                    if (self.method == .PUT and self.status_code == 200) {
+                        self.writer.pool.reportProgress(self.final_payload.len);
+                    }
+
                     self.done = true;
                     if (self.status_code >= 400) {
                          std.debug.print("[S3Writer] Request failed: status={d} body={s}\n", .{self.status_code, self.body.items});
-                    } else {
-                          // std.debug.print("[S3Writer] Request completed: status={d}\n", .{self.status_code});
                     }
                 }
             }

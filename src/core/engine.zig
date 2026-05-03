@@ -26,7 +26,12 @@ pub fn printSchema(
     for (pfile.metadata.schema.items, 0..) |elem, i| {
         const type_str = if (elem.type) |t| @tagName(t) else "n/a";
         const rep_str = if (elem.repetition_type) |rt| @tagName(rt) else "n/a";
-        std.debug.print("  [{d}] {s}: {s} ({s})\n", .{ i, elem.name, type_str, rep_str });
+        const logical_str = if (elem.logical_type) |lt| @tagName(lt) else if (elem.converted_type) |ct| @tagName(ct) else "";
+        if (logical_str.len > 0) {
+            std.debug.print("  [{d}] {s}: {s} ({s}) L:{s}\n", .{ i, elem.name, type_str, rep_str, logical_str });
+        } else {
+            std.debug.print("  [{d}] {s}: {s} ({s})\n", .{ i, elem.name, type_str, rep_str });
+        }
     }
 }
 
@@ -247,6 +252,8 @@ fn runFastPath(
     
     const elapsed = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const mb_per_s = (@as(f64, @floatFromInt(size)) / (elapsed_ms / 1000.0)) / (1024.0 * 1024.0);
+    std.debug.print("[engine] Copied {d} MB in {d:.2}ms ({d:.2} MB/s)\n", .{ size / 1024 / 1024, elapsed_ms, mb_per_s });
     
     return ExecutionStats{
         .scanned = 0, 

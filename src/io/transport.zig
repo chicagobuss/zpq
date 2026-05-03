@@ -103,6 +103,70 @@ pub const Resolver = struct {
     }
 };
 
+/// Resource information for adaptive scaling.
+pub const HardwareInfo = struct {
+    cpu_count: u32,
+    total_ram: u64,
+    available_ram: u64,
+
+    pub fn probe() HardwareInfo {
+        const cpu_count = @as(u32, @intCast(std.Thread.getCpuCount() catch 1));
+        var total_ram: u64 = 0;
+        var available_ram: u64 = 0;
+
+        const fd = std.posix.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0) catch -1;
+        if (fd != -1) {
+            defer std.posix.close(fd);
+            var buf: [4096]u8 = undefined;
+            const amt = std.posix.read(fd, &buf) catch 0;
+            var it = std.mem.splitScalar(u8, buf[0..amt], '\n');
+            while (it.next()) |line| {
+                if (std.ascii.startsWithIgnoreCase(line, "MemTotal:")) {
+                    total_ram = parseMemInfoLine(line);
+                } else if (std.ascii.startsWithIgnoreCase(line, "MemAvailable:")) {
+                    available_ram = parseMemInfoLine(line);
+                }
+            }
+        } else {
+            // Fallback for non-Linux or if /proc is missing.
+            // In Lambda, /proc/meminfo is available.
+        }
+
+        // If MemAvailable wasn't found, fallback to 1/2 of MemTotal as a guess
+        if (available_ram == 0) available_ram = total_ram / 2;
+        // If still 0, assume 512MB as a safe floor (Lambda base)
+        if (total_ram == 0) {
+            total_ram = 512 * 1024 * 1024;
+            available_ram = 256 * 1024 * 1024;
+        }
+
+        return .{
+            .cpu_count = cpu_count,
+            .total_ram = total_ram,
+            .available_ram = available_ram,
+        };
+    }
+
+    fn parseMemInfoLine(line: []const u8) u64 {
+        var it = std.mem.tokenizeAny(u8, line, " \t:");
+        _ = it.next(); // skip label
+        if (it.next()) |val_str| {
+            const val = std.fmt.parseInt(u64, val_str, 10) catch 0;
+            if (it.next()) |unit| {
+                if (std.ascii.eqlIgnoreCase(unit, "kB")) return val * 1024;
+                if (std.ascii.eqlIgnoreCase(unit, "mB")) return val * 1024 * 1024;
+            }
+            return val;
+        }
+        return 0;
+    }
+};
+
+fn getMilliTimestamp() i64 {
+    const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @as(i64, @intCast(@divTrunc(ts.nsec, 1000000)));
+}
+
 /// ConnectionGen(Xev) wraps a TCP socket and optionally TLS.
 pub fn ConnectionGen(comptime Xev: type) type {
     const Loop = *Xev.Loop;
@@ -204,6 +268,31 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 }
             } else {
                 try self.writeRaw(data);
+            }
+        }
+
+        pub fn writeNoCopy(self: *Self, data: []const u8) !void {
+            if (self.closed) return error.ConnectionClosed;
+            
+            if (self.tls != null) {
+                // For TLS, we MUST encrypt, which currently involves copies anyway.
+                // Fall back to normal write.
+                return self.write(data);
+            }
+
+            if (self.write_in_flight) {
+                try self.write_buffer.appendSlice(self.allocator, data);
+                return;
+            }
+
+            self.write_in_flight = true;
+            self.current_write_buf = null;
+            self.current_write_offset = 0;
+
+            if (comptime @hasDecl(Xev.Loop, "write")) {
+                try self.loop.write(&self.c_write, self.tcp, .{ .slice = data }, Self, self, onWrite);
+            } else {
+                self.tcp.write(self.loop, &self.c_write, .{ .slice = data }, Self, self, onWrite);
             }
         }
 
@@ -316,8 +405,10 @@ pub fn ConnectionGen(comptime Xev: type) type {
                 }
 
                 // Full write complete
-                self.allocator.free(buf);
-                self.current_write_buf = null;
+                if (self.current_write_buf) |owned_buf| {
+                    self.allocator.free(owned_buf);
+                    self.current_write_buf = null;
+                }
                 self.current_write_offset = 0;
             }
 
@@ -438,6 +529,232 @@ pub fn ConnectionGen(comptime Xev: type) type {
 
             self.allocator.free(buf.slice);
             return .disarm;
+        }
+    };
+}
+
+/// Dynamic connection pool for persistent HTTP/1.1 connections.
+pub fn ConnectionPoolGen(comptime Xev: type) type {
+    const Conn = ConnectionGen(Xev);
+    const log_pool = std.log.scoped(.pool);
+
+    return struct {
+        const Self = @This();
+
+        pub const Request = struct {
+            ptr: *anyopaque,
+            on_data: *const fn (ctx: ?*anyopaque, data: []const u8) anyerror!void,
+            on_error: *const fn (ctx: ?*anyopaque, err: anyerror) void,
+            on_handshake: ?*const fn (ctx: ?*anyopaque) void = null,
+            start_fn: *const fn (ptr: *anyopaque, conn: *Conn) anyerror!void,
+        };
+
+        allocator: std.mem.Allocator,
+        loop: *Xev.Loop,
+        host: []const u8,
+        port: u16,
+        use_tls: bool,
+        hw: HardwareInfo,
+        resolver: Resolver,
+
+        max_conns: usize,
+        connections: std.ArrayListUnmanaged(*PooledConnection) = .{},
+        queue: std.ArrayListUnmanaged(Request) = .{},
+
+        // Adaptive scaling
+        bytes_this_period: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        last_check_ms: i64 = 0,
+        last_throughput: f64 = 0.0,
+        count_completed: usize = 0,
+
+        pub fn init(allocator: std.mem.Allocator, loop: *Xev.Loop, resolver: Resolver, host: []const u8, port: u16, use_tls: bool) !*Self {
+            const self = try allocator.create(Self);
+            const hw = HardwareInfo.probe();
+            
+            var base = @as(usize, @intCast(hw.cpu_count));
+            if (base < 1) base = 1;
+            if (base > 8) base = 8;
+
+            self.* = .{
+                .allocator = allocator,
+                .loop = loop,
+                .host = try allocator.dupe(u8, host),
+                .port = port,
+                .use_tls = use_tls,
+                .hw = hw,
+                .resolver = resolver,
+                .max_conns = base,
+                .last_check_ms = getMilliTimestamp(),
+            };
+
+            if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API") != null) {
+                self.max_conns = @min(self.max_conns, 12);
+                log_pool.debug("Hardware: CPU={d} RAM={d}MB (Lambda detected, init_cap=12)", .{hw.cpu_count, hw.available_ram / 1024 / 1024});
+            } else {
+                log_pool.debug("Hardware: CPU={d} RAM={d}MB (init_cap={d})", .{hw.cpu_count, hw.available_ram / 1024 / 1024, self.max_conns});
+            }
+
+            return self;
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (self.connections.items) |pc| {
+                if (pc.conn) |c| c.deinit();
+                self.allocator.destroy(pc);
+            }
+            self.connections.deinit(self.allocator);
+            self.queue.deinit(self.allocator);
+            self.allocator.free(self.host);
+            self.allocator.destroy(self);
+        }
+
+        pub fn dispatch(self: *Self, req: Request) !void {
+            for (self.connections.items) |pc| {
+                if (pc.state == .idle) {
+                    try pc.startRequest(req);
+                    return;
+                }
+            }
+
+            if (self.connections.items.len < self.max_conns) {
+                const pc = try self.allocator.create(PooledConnection);
+                pc.* = .{ .pool = self, .index = self.connections.items.len };
+                try self.connections.append(self.allocator, pc);
+                try pc.startRequest(req);
+                return;
+            }
+
+            try self.queue.append(self.allocator, req);
+        }
+
+        pub fn reportProgress(self: *Self, bytes: usize) void {
+            _ = self.bytes_this_period.fetchAdd(bytes, .monotonic);
+            self.count_completed += 1;
+            if (self.count_completed % 4 == 0) self.considerScaling();
+        }
+
+        fn considerScaling(self: *Self) void {
+            const now = getMilliTimestamp();
+            const elapsed = now - self.last_check_ms;
+            if (elapsed < 300) return;
+
+            const bytes = self.bytes_this_period.swap(0, .monotonic);
+            const throughput = (@as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsed))) * 1000.0;
+            
+            if (throughput > self.last_throughput * 1.02) {
+                const RAM_SAFETY = 0.55;
+                const PART_EST = 16 * 1024 * 1024;
+                const ram_cap = @as(usize, @intFromFloat(@as(f64, @floatFromInt(self.hw.available_ram)) * RAM_SAFETY / @as(f64, @floatFromInt(PART_EST))));
+                const hard_limit = @min(@min(ram_cap, 64), @as(usize, if (std.posix.getenv("AWS_LAMBDA_RUNTIME_API") != null) 12 else 64));
+
+                if (self.max_conns < hard_limit) {
+                    self.max_conns += 1;
+                    log_pool.debug("Scaling up: {d}MB/s -> {d}MB/s (new limit: {d})", .{@as(u64, @intFromFloat(self.last_throughput / 1024 / 1024)), @as(u64, @intFromFloat(throughput / 1024 / 1024)), self.max_conns});
+                }
+            }
+            
+            self.last_throughput = throughput;
+            self.last_check_ms = now;
+        }
+
+        pub const PooledConnection = struct {
+            pool: *Self,
+            index: usize,
+            conn: ?*Conn = null,
+            state: enum { idle, busy } = .idle,
+            connection_ready: bool = false,
+            resolved_addr: ?Address = null,
+            current_req: ?Request = null,
+
+            fn startRequest(self: *PooledConnection, req: Request) !void {
+                self.state = .busy;
+                self.current_req = req;
+                try self.ensureConnected();
+                if (self.connection_ready) try self.runRequest();
+            }
+
+            fn ensureConnected(self: *PooledConnection) !void {
+                if (self.connection_ready and self.conn != null and !self.conn.?.closed) {
+                    self.conn.?.stopped = false;
+                    return;
+                }
+
+                if (self.resolved_addr) |addr| {
+                    try self.connectTo(addr);
+                } else {
+                    const Ctx = struct { pc: *PooledConnection };
+                    const ctx = try self.pool.allocator.create(Ctx);
+                    ctx.pc = self;
+                    try self.pool.resolver.resolve(self.pool.loop, self.pool.host, self.pool.port, ctx, struct {
+                        fn cb(ptr: ?*anyopaque, addr: ?Address) void {
+                            const c: *Ctx = @ptrCast(@alignCast(ptr));
+                            defer c.pc.pool.allocator.destroy(c);
+                            if (addr) |a| {
+                                c.pc.resolved_addr = a;
+                                c.pc.connectTo(a) catch |err| c.pc.handleError(err);
+                            } else {
+                                c.pc.handleError(error.ResolutionFailed);
+                            }
+                        }
+                    }.cb);
+                }
+            }
+
+            fn connectTo(self: *PooledConnection, addr: Address) !void {
+                if (self.conn) |c| c.deinit();
+                self.connection_ready = false;
+                self.conn = try Conn.init(self.pool.allocator, self.pool.loop, self.pool.use_tls, self.pool.host);
+                const conn = self.conn.?;
+                conn.callback_ctx = self;
+                conn.on_data = onData;
+                conn.on_error = onError;
+                conn.on_handshake = onHandshake;
+                try conn.connect(addr);
+            }
+
+            fn runRequest(self: *PooledConnection) !void {
+                if (self.current_req) |req| {
+                    try req.start_fn(req.ptr, self.conn.?);
+                }
+            }
+
+            pub fn markIdle(self: *PooledConnection) void {
+                self.state = .idle;
+                self.current_req = null;
+                self.pool.onConnectionIdle(self);
+            }
+
+            fn onHandshake(ptr: ?*anyopaque) void {
+                const self: *PooledConnection = @ptrCast(@alignCast(ptr));
+                self.connection_ready = true;
+                self.runRequest() catch |err| self.handleError(err);
+            }
+
+            fn onData(ptr: ?*anyopaque, data: []const u8) anyerror!void {
+                const self: *PooledConnection = @ptrCast(@alignCast(ptr));
+                if (self.current_req) |req| try req.on_data(req.ptr, data);
+            }
+
+            fn onError(ptr: ?*anyopaque, err: anyerror) void {
+                const self: *PooledConnection = @ptrCast(@alignCast(ptr));
+                self.handleError(err);
+            }
+
+            fn handleError(self: *PooledConnection, err: anyerror) void {
+                if (self.current_req) |req| req.on_error(req.ptr, err);
+                self.connection_ready = false;
+                self.markIdle();
+            }
+        };
+
+        fn onConnectionIdle(self: *Self, pc: *PooledConnection) void {
+            if (self.queue.items.len > 0) {
+                const req = self.queue.orderedRemove(0);
+                pc.startRequest(req) catch |err| {
+                    req.on_error(req.ptr, err);
+                    self.onConnectionIdle(pc);
+                };
+            }
         }
     };
 }

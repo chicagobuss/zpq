@@ -75,6 +75,15 @@ pub const AsyncLogger = struct {
 
     pub fn deinit(self: *AsyncLogger) void {
         self.notifier.deinit();
+        // Drain any remaining logs to stderr before destroying the pool
+        while (self.lock_free_queue.pop()) |entry| {
+            std.debug.print("[{d}] [{s}] [ID:{x:0>16}] {s}\n", .{
+                entry.timestamp,
+                entry.level.asText(),
+                entry.correlation_id,
+                entry.msg[0..entry.msg_len],
+            });
+        }
         self.allocator.free(self.pool);
         self.allocator.destroy(self);
     }
@@ -104,11 +113,10 @@ pub const AsyncLogger = struct {
         };
         entry.timestamp = @intCast(now.timestamp.sec * 1000 + @divFloor(now.timestamp.nsec, 1_000_000));
 
-        const msg = std.fmt.bufPrint(&entry.msg, fmt, args) catch |err| {
+        const msg = std.fmt.bufPrint(&entry.msg, fmt, args) catch |err| blk: {
             if (err == error.NoSpaceLeft) {
                 entry.msg_len = entry.msg.len;
-            } else {
-                return;
+                break :blk entry.msg[0..entry.msg.len];
             }
             return;
         };

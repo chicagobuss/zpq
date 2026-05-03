@@ -79,7 +79,7 @@ pub fn parseFilterWithAllocator(comptime T: type, filter_str: []const u8, pfile:
     const val_str = std.mem.trim(u8, filter_str[op_idx + op_str.len ..], " ");
 
     const col_idx = try pfile.findColumnIndex(col_name);
-    const field_type = try getFieldType(T, col_name);
+    const field_type = try getFieldTypeFromMetadata(pfile, col_idx);
 
     return switch (field_type) {
         .ByteArray => .{ .string = .{ .col_idx = col_idx, .op = op_type, .value = val_str } },
@@ -91,22 +91,87 @@ pub fn parseFilterWithAllocator(comptime T: type, filter_str: []const u8, pfile:
             const bool_val = std.mem.eql(u8, val_str, "true") or std.mem.eql(u8, val_str, "1");
             break :blk .{ .boolean = .{ .col_idx = col_idx, .op = op_type, .value = bool_val } };
         },
+        .Date => .{ .int32 = .{ .col_idx = col_idx, .op = op_type, .value = try parseDate(val_str) } },
+        .Timestamp => .{ .int64 = .{ .col_idx = col_idx, .op = op_type, .value = try parseTimestamp(val_str) } },
     };
 }
 
-const FieldType = enum { Int32, Int64, Float, Double, Bool, ByteArray };
+const FieldType = enum { Int32, Int64, Float, Double, Bool, ByteArray, Date, Timestamp };
 
 fn getFieldType(comptime T: type, name: []const u8) !FieldType {
-    const fields = @typeInfo(T).@"struct".fields;
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            if (field.type == i32) return .Int32;
-            if (field.type == i64) return .Int64;
-            if (field.type == f32) return .Float;
-            if (field.type == f64) return .Double;
-            if (field.type == bool) return .Bool;
-            if (field.type == []const u8) return .ByteArray;
+    _ = T;
+    _ = name;
+    return error.UseMetadataInstead;
+}
+
+fn getFieldTypeFromMetadata(pfile: *file.ParquetFile, col_idx: usize) !FieldType {
+    const elem = pfile.metadata.schema.items[col_idx + 1];
+    const physical = elem.type orelse .BYTE_ARRAY;
+
+    if (elem.converted_type) |ct| {
+        switch (ct) {
+            .UTF8 => return .ByteArray,
+            .DATE => return .Date,
+            .TIMESTAMP_MICROS, .TIMESTAMP_MILLIS => return .Timestamp,
+            else => {},
         }
     }
-    return error.FieldNotFound;
+
+    if (elem.logical_type) |lt| {
+        switch (lt) {
+            .STRING => return .ByteArray,
+            .DATE => return .Date,
+            .TIMESTAMP => return .Timestamp,
+            else => {},
+        }
+    }
+
+    return switch (physical) {
+        .BOOLEAN => .Bool,
+        .INT32 => .Int32,
+        .INT64 => .Int64,
+        .FLOAT => .Float,
+        .DOUBLE => .Double,
+        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => .ByteArray,
+        .INT96 => .Timestamp,
+    };
+}
+
+fn parseDate(s: []const u8) !i32 {
+    if (std.mem.startsWith(u8, s, "'") and std.mem.endsWith(u8, s, "'")) {
+        const trimmed = s[1 .. s.len - 1];
+        if (trimmed.len == 10 and trimmed[4] == '-' and trimmed[7] == '-') {
+            const year = try std.fmt.parseInt(i32, trimmed[0..4], 10);
+            const month = try std.fmt.parseInt(u4, trimmed[5..7], 10);
+            const day = try std.fmt.parseInt(u5, trimmed[8..10], 10);
+            return dateToDays(year, month, day);
+        }
+    }
+    return std.fmt.parseInt(i32, s, 10);
+}
+
+fn dateToDays(year: i32, month: u4, day: u5) i32 {
+    var y = year;
+    var m = @as(i32, month);
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    return 365 * y + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400) + @divFloor(306 * (m + 1), 10) - 428 + @as(i32, day) - 719163;
+}
+
+fn parseTimestamp(s: []const u8) !i64 {
+    // For now support raw integer or simple YYYY-MM-DD HH:MM:SS (stub)
+    return std.fmt.parseInt(i64, s, 10);
+}
+
+test "parse date" {
+    const d1 = try parseDate("'1970-01-01'");
+    try std.testing.expectEqual(@as(i32, 0), d1);
+
+    const d2 = try parseDate("'2024-01-01'");
+    try std.testing.expectEqual(@as(i32, 19723), d2);
+    
+    const d3 = try parseDate("123");
+    try std.testing.expectEqual(@as(i32, 123), d3);
 }

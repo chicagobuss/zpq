@@ -17,6 +17,7 @@ fn logFn(
     args: anytype,
 ) void {
     _ = scope;
+    // std.debug.print("DEBUG: logFn called with scope={s} level={s}\n", .{@tagName(scope), @tagName(level)});
     if (global_async_logger) |logger| {
         const zpq_level: zpq.log.Level = switch (level) {
             .err => .err,
@@ -165,6 +166,7 @@ pub fn main() !void {
     global_async_logger = logger;
     defer global_async_logger = null;
     try logger.start(&loop);
+    zpq.global_logger = logger;
 
     var thread_pool = xev.ThreadPool.init(.{ .max_threads = @intCast(num_threads) });
     defer {

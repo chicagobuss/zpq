@@ -1,0 +1,6 @@
+[engine] ⚡ Zero-Copy Fast Path Detected!
+[factory] Creating AsyncS3SinkGen for s3://skyway-staging-perf-test/zpq_test_data/output/bench_100mb_optimized_v11.parquet
+[S3Sink] background thread started
+DEBUG: logFn called with scope=pool level=debug
+[S3Sink] Initiating multipart upload
+[S3Writer] Request done: status=200 Part=0 ETag=none

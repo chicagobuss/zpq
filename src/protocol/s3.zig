@@ -261,7 +261,7 @@ pub const S3 = struct {
 
         try xml.appendSlice(allocator, "<CompleteMultipartUpload>");
         for (parts) |p| {
-            var buf: [256]u8 = undefined;
+            var buf: [512]u8 = undefined;
             const s = try std.fmt.bufPrint(&buf, "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>", .{ p.part_number, p.etag });
             try xml.appendSlice(allocator, s);
         }

@@ -12,6 +12,224 @@ pub const Type = enum(i32) {
     FIXED_LEN_BYTE_ARRAY = 7,
 };
 
+pub const ConvertedType = enum(i32) {
+    UTF8 = 0,
+    MAP = 1,
+    MAP_KEY_VALUE = 2,
+    LIST = 3,
+    ENUM = 4,
+    DECIMAL = 5,
+    DATE = 6,
+    TIME_MILLIS = 7,
+    TIME_MICROS = 8,
+    TIMESTAMP_MILLIS = 9,
+    TIMESTAMP_MICROS = 10,
+    UINT_8 = 11,
+    UINT_16 = 12,
+    UINT_32 = 13,
+    UINT_64 = 14,
+    INT_8 = 15,
+    INT_16 = 16,
+    INT_32 = 17,
+    INT_64 = 18,
+    JSON = 19,
+    BSON = 20,
+    INTERVAL = 21,
+};
+
+pub const TimeUnit = union(enum) {
+    MILLIS: struct {},
+    MICROS: struct {},
+    NANOS: struct {},
+
+    pub fn read(reader: *thrift.Reader) !TimeUnit {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+
+        var unit: TimeUnit = .{ .MILLIS = .{} };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => { try reader.skip(.Struct); unit = .{ .MILLIS = .{} }; },
+                2 => { try reader.skip(.Struct); unit = .{ .MICROS = .{} }; },
+                3 => { try reader.skip(.Struct); unit = .{ .NANOS = .{} }; },
+                else => try reader.skip(field.type),
+            }
+        }
+        return unit;
+    }
+
+    pub fn write(self: TimeUnit, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        switch (self) {
+            .MILLIS => { try writer.writeFieldBegin(.Struct, 1); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .MICROS => { try writer.writeFieldBegin(.Struct, 2); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .NANOS => { try writer.writeFieldBegin(.Struct, 3); writer.writeStructBegin(); try writer.writeStructEnd(); },
+        }
+        try writer.writeStructEnd();
+    }
+};
+
+pub const IntType = struct { bitWidth: i8, isSigned: bool };
+pub const DecimalType = struct { scale: i32, precision: i32 };
+pub const TimestampType = struct { isAdjustedToUTC: bool, unit: TimeUnit };
+pub const TimeType = struct { isAdjustedToUTC: bool, unit: TimeUnit };
+
+pub const LogicalType = union(enum) {
+    STRING: struct {},
+    MAP: struct {},
+    LIST: struct {},
+    ENUM: struct {},
+    DECIMAL: DecimalType,
+    DATE: struct {},
+    TIME: TimeType,
+    TIMESTAMP: TimestampType,
+    INTEGER: IntType,
+    UNKNOWN: struct {},
+    JSON: struct {},
+    BSON: struct {},
+    UUID: struct {},
+
+    pub fn read(reader: *thrift.Reader) !LogicalType {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+
+        var lt: LogicalType = .{ .UNKNOWN = .{} };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => { try reader.skip(.Struct); lt = .{ .STRING = .{} }; },
+                2 => { try reader.skip(.Struct); lt = .{ .MAP = .{} }; },
+                3 => { try reader.skip(.Struct); lt = .{ .LIST = .{} }; },
+                4 => { try reader.skip(.Struct); lt = .{ .ENUM = .{} }; },
+                5 => lt = .{ .DECIMAL = try readDecimal(reader) },
+                6 => { try reader.skip(.Struct); lt = .{ .DATE = .{} }; },
+                7 => lt = .{ .TIME = try readTime(reader) },
+                8 => lt = .{ .TIMESTAMP = try readTimestamp(reader) },
+                10 => lt = .{ .INTEGER = try readInteger(reader) },
+                11 => { try reader.skip(.Struct); lt = .{ .UNKNOWN = .{} }; },
+                12 => { try reader.skip(.Struct); lt = .{ .JSON = .{} }; },
+                13 => { try reader.skip(.Struct); lt = .{ .BSON = .{} }; },
+                14 => { try reader.skip(.Struct); lt = .{ .UUID = .{} }; },
+                else => try reader.skip(field.type),
+            }
+        }
+        return lt;
+    }
+
+    fn readDecimal(reader: *thrift.Reader) !DecimalType {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+        var res: DecimalType = .{ .scale = 0, .precision = 0 };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => res.scale = try reader.readZigZag(i32),
+                2 => res.precision = try reader.readZigZag(i32),
+                else => try reader.skip(field.type),
+            }
+        }
+        return res;
+    }
+
+    fn readTime(reader: *thrift.Reader) !TimeType {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+        var res: TimeType = .{ .isAdjustedToUTC = false, .unit = undefined };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => res.isAdjustedToUTC = (field.type == .True),
+                2 => res.unit = try TimeUnit.read(reader),
+                else => try reader.skip(field.type),
+            }
+        }
+        return res;
+    }
+
+    fn readTimestamp(reader: *thrift.Reader) !TimestampType {
+        const res = try readTime(reader);
+        return TimestampType{
+            .isAdjustedToUTC = res.isAdjustedToUTC,
+            .unit = res.unit,
+        };
+    }
+
+    fn readInteger(reader: *thrift.Reader) !IntType {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+        var res: IntType = .{ .bitWidth = 0, .isSigned = false };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => res.bitWidth = @as(i8, @intCast(try reader.readZigZag(i16))),
+                2 => res.isSigned = (field.type == .True),
+                else => try reader.skip(field.type),
+            }
+        }
+        return res;
+    }
+
+    pub fn write(self: LogicalType, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        switch (self) {
+            .STRING => { try writer.writeFieldBegin(.Struct, 1); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .MAP => { try writer.writeFieldBegin(.Struct, 2); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .LIST => { try writer.writeFieldBegin(.Struct, 3); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .ENUM => { try writer.writeFieldBegin(.Struct, 4); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .DECIMAL => |d| {
+                try writer.writeFieldBegin(.Struct, 5);
+                writer.writeStructBegin();
+                try writer.writeFieldI32(1, d.scale);
+                try writer.writeFieldI32(2, d.precision);
+                try writer.writeStructEnd();
+            },
+            .DATE => { try writer.writeFieldBegin(.Struct, 6); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .TIME => |t| {
+                try writer.writeFieldBegin(.Struct, 7);
+                writer.writeStructBegin();
+                try writer.writeFieldBool(1, t.isAdjustedToUTC);
+                try writer.writeFieldBegin(.Struct, 2); try t.unit.write(writer);
+                try writer.writeStructEnd();
+            },
+            .TIMESTAMP => |t| {
+                try writer.writeFieldBegin(.Struct, 8);
+                writer.writeStructBegin();
+                try writer.writeFieldBool(1, t.isAdjustedToUTC);
+                try writer.writeFieldBegin(.Struct, 2); try t.unit.write(writer);
+                try writer.writeStructEnd();
+            },
+            .INTEGER => |i| {
+                try writer.writeFieldBegin(.Struct, 10);
+                writer.writeStructBegin();
+                try writer.writeFieldI32(1, @as(i32, i.bitWidth));
+                try writer.writeFieldBool(2, i.isSigned);
+                try writer.writeStructEnd();
+            },
+            .UNKNOWN => { try writer.writeFieldBegin(.Struct, 11); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .JSON => { try writer.writeFieldBegin(.Struct, 12); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .BSON => { try writer.writeFieldBegin(.Struct, 13); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .UUID => { try writer.writeFieldBegin(.Struct, 14); writer.writeStructBegin(); try writer.writeStructEnd(); },
+        }
+        try writer.writeStructEnd();
+    }
+};
+
 pub const Encoding = enum(i32) {
     PLAIN = 0,
     PLAIN_DICTIONARY = 2,
@@ -58,6 +276,8 @@ pub const SchemaElement = struct {
     repetition_type: ?FieldRepetitionType,
     name: []const u8,
     num_children: ?i32,
+    converted_type: ?ConvertedType = null,
+    logical_type: ?LogicalType = null,
     scale: ?i32,
     precision: ?i32,
     field_id: ?i32,
@@ -72,6 +292,8 @@ pub const SchemaElement = struct {
             .repetition_type = null,
             .name = "",
             .num_children = null,
+            .converted_type = null,
+            .logical_type = null,
             .scale = null,
             .precision = null,
             .field_id = null,
@@ -88,10 +310,11 @@ pub const SchemaElement = struct {
                 3 => elem.repetition_type = @as(FieldRepetitionType, @enumFromInt(try reader.readZigZag(i32))),
                 4 => elem.name = try reader.readString(),
                 5 => elem.num_children = try reader.readZigZag(i32),
-                6 => try reader.skip(field.type), // converted_type
+                6 => elem.converted_type = @as(ConvertedType, @enumFromInt(try reader.readZigZag(i32))),
                 7 => elem.scale = try reader.readZigZag(i32),
                 8 => elem.precision = try reader.readZigZag(i32),
                 9 => elem.field_id = try reader.readZigZag(i32),
+                10 => elem.logical_type = try LogicalType.read(reader),
                 else => try reader.skip(field.type),
             }
         }
@@ -105,9 +328,14 @@ pub const SchemaElement = struct {
         if (self.repetition_type) |rt| try writer.writeFieldI32(3, @intFromEnum(rt));
         try writer.writeFieldString(4, self.name);
         if (self.num_children) |v| try writer.writeFieldI32(5, v);
+        if (self.converted_type) |ct| try writer.writeFieldI32(6, @intFromEnum(ct));
         if (self.scale) |v| try writer.writeFieldI32(7, v);
         if (self.precision) |v| try writer.writeFieldI32(8, v);
         if (self.field_id) |v| try writer.writeFieldI32(9, v);
+        if (self.logical_type) |*lt| {
+            try writer.writeFieldBegin(.Struct, 10);
+            try lt.write(writer);
+        }
         try writer.writeStructEnd();
     }
 };

@@ -46,19 +46,68 @@ pub fn build(b: *std.Build) void {
     test_opts.addOption(bool, "lambda", true);
     const test_opts_mod = test_opts.createModule();
 
+    const test_zpq_mod = b.createModule(.{
+        .root_source_file = b.path("src/zpq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = test_opts_mod },
+        },
+    });
+
+    // Sans-IO + io tests (live in src/zpq.zig and what it imports).
     const lib_tests = b.addTest(.{
+        .root_module = test_zpq_mod,
+    });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+
+    // Lambda binary tests (runtime.zig and anything else lambda-only).
+    // Reuses the same zpq module so import paths match the production build.
+    const lambda_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zpq.zig"),
+            .root_source_file = b.path("src/lambda/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "zpq", .module = test_zpq_mod },
                 .{ .name = "build_options", .module = test_opts_mod },
             },
         }),
     });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
+    const run_lambda_tests = b.addRunArtifact(lambda_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_lambda_tests.step);
+
+    // ----- Integration tests (Lambda fake runtime) -----
+    // Spawns the built zpq-lambda binary against an in-process fake
+    // runtime API. Doesn't run as part of `zig build test` because it
+    // requires the binary to be installed first; run with
+    // `zig build test-integration`.
+    const integration_opts = b.addOptions();
+    const lambda_install = b.addInstallArtifact(lambda, .{});
+    integration_opts.addOption(
+        []const u8,
+        "lambda_bin",
+        b.getInstallPath(.bin, "zpq-lambda"),
+    );
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/lambda_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "integration_opts", .module = integration_opts.createModule() },
+            },
+        }),
+    });
+    integration_tests.step.dependOn(&lambda_install.step);
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const integration_step = b.step("test-integration", "Run Lambda integration tests");
+    integration_step.dependOn(&run_integration_tests.step);
 }
 
 /// Bundle the per-binary modules. We give each binary its own zpq module

@@ -40,6 +40,10 @@ lambda-build:
 test *args="":
     zig build test --summary all -- {{args}}
 
+# Lambda integration tests — spawns the binary against an in-process fake.
+test-integration:
+    zig build test-integration --summary all
+
 # === Lambda lifecycle ===
 
 # Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.

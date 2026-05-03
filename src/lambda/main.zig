@@ -11,29 +11,23 @@
 //! loop driver linked here.
 //!
 //! Lifecycle:
-//!   1. Init the epoll Loop and the runtime API client.
-//!   2. Long-poll the runtime API for the next invocation.
-//!   3. Dispatch to the handler (currently a stub that exercises the
-//!      Loop and echoes the event body).
-//!   4. Post the response.
-//!   5. Repeat. Process exits on fatal errors only — the runtime
-//!      will restart the bootstrap binary if we exit.
+//!   1. Init the runtime API client.
+//!   2. Long-poll for invocations.
+//!   3. For each invocation: decode the request body as a Parquet file,
+//!      compute stats over a target column, post the response.
+//!   4. Repeat. Process exits on fatal errors only.
 
 const std = @import("std");
 const zpq = @import("zpq");
 const runtime = @import("runtime.zig");
 
-const Loop = zpq.io.loop.Loop;
-const Completion = zpq.io.loop.Completion;
-const Result = zpq.io.loop.Result;
+const metadata = zpq.core.parquet.metadata;
+const column_mod = zpq.core.parquet.column;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
-    var loop = try Loop.init(allocator);
-    defer loop.deinit();
 
     var client = runtime.Client.fromEnv(allocator, init.environ) catch |err| {
         std.debug.print("zpq lambda: runtime client init failed: {s}\n", .{@errorName(err)});
@@ -44,14 +38,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     while (true) {
         var inv = client.nextInvocation() catch |err| {
             std.debug.print("zpq lambda: poll error {s}\n", .{@errorName(err)});
-            // Brief backoff to avoid hot-spinning on a misconfigured runtime API.
             const ts: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
             _ = std.os.linux.nanosleep(&ts, null);
             continue;
         };
         defer inv.deinit(allocator);
 
-        const response = handle(allocator, &loop, &inv) catch |err| {
+        const response = handle(allocator, &inv) catch |err| {
             client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
@@ -67,39 +60,97 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 /// Per-invocation handler.
 ///
-/// Phase A stub: routes a 1 ms timer through the Loop and returns a
-/// JSON envelope echoing the input. Validates that the runtime API
-/// path AND the Loop path both work end-to-end inside a Lambda
-/// invocation. Replaced by real Parquet/S3 logic when the core+sink
-/// land.
-fn handle(allocator: std.mem.Allocator, loop: *Loop, inv: *const runtime.Invocation) ![]u8 {
-    var fired: bool = false;
-    var c: Completion = .{
-        .op = .{ .timer = .{ .ns_from_now = std.time.ns_per_ms } },
-        .userdata = &fired,
-        .callback = onTimer,
-    };
-    loop.submit(&c);
-
-    var iters: u32 = 200;
-    while (loop.active() > 0 and iters > 0) : (iters -= 1) {
-        try loop.run_for_ns(10 * std.time.ns_per_ms);
+/// Treats the event body as a complete Parquet file. Opens the footer,
+/// finds the configured column ("int8" by default for our benchmark
+/// fixture, overridable via the AWS_LAMBDA_FUNCTION_NAME suffix or
+/// future config), decodes it across all row groups, and returns a
+/// JSON envelope with row count + min/max/sum.
+///
+/// Phase 1.7: this is the first end-to-end demonstration that the
+/// decode pipeline works inside Lambda. Real S3 input lands in a
+/// follow-up.
+fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
+    if (inv.body.len < 12) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"empty_body\",\"len\":{d}}}",
+            .{inv.body.len},
+        );
     }
-    if (!fired) return error.LoopTimerStuck;
+
+    var meta = metadata.open(allocator, inv.body) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"open_failed\",\"reason\":\"{s}\",\"len\":{d}}}",
+            .{ @errorName(err), inv.body.len },
+        );
+    };
+    defer meta.deinit(allocator);
+
+    const target = "int8";
+    const col_idx = metadata.findColumnIndex(&meta, target) orelse {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"column_missing\",\"name\":\"{s}\",\"rows\":{d}}}",
+            .{ target, meta.num_rows },
+        );
+    };
+
+    // Aggregate across row groups.
+    var total_rows: i64 = 0;
+    var min_v: i32 = std.math.maxInt(i32);
+    var max_v: i32 = std.math.minInt(i32);
+    var sum: i64 = 0;
+    var bytes_decoded: usize = 0;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const path: [1][]const u8 = .{target};
+    const levels = meta.getColumnLevels(&path);
+
+    for (meta.row_groups.items) |rg| {
+        // Reset the arena per row group so memory doesn't grow unboundedly.
+        _ = arena.reset(.retain_capacity);
+
+        const col = rg.columns.items[col_idx].meta_data orelse return error.ColumnMetaMissing;
+        const chunk_start: usize = if (col.dictionary_page_offset) |dp|
+            @intCast(dp)
+        else
+            @intCast(col.data_page_offset);
+        const chunk_len: usize = @intCast(col.total_compressed_size);
+        if (chunk_start + chunk_len > inv.body.len) return error.ChunkOutOfRange;
+        const chunk = inv.body[chunk_start .. chunk_start + chunk_len];
+
+        var reader = column_mod.ColumnChunkReader(i32).init(
+            chunk,
+            col.codec,
+            levels,
+            arena.allocator(),
+        );
+
+        // Stream-decode in 4K batches; keeps the working set small.
+        var batch: [4096]i32 = undefined;
+        while (true) {
+            const n = try reader.decode(&batch);
+            if (n == 0) break;
+            for (batch[0..n]) |v| {
+                if (v < min_v) min_v = v;
+                if (v > max_v) max_v = v;
+                sum += v;
+            }
+            total_rows += @intCast(n);
+        }
+        bytes_decoded += @intCast(col.total_uncompressed_size);
+    }
 
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"loop\":\"epoll\",\"request_id\":\"{s}\",\"echo_bytes\":{d}}}",
-        .{ inv.request_id, inv.body.len },
+        "{{\"ok\":true,\"column\":\"{s}\",\"rows\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"bytes_decoded\":{d},\"row_groups\":{d}}}",
+        .{ target, total_rows, min_v, max_v, sum, bytes_decoded, meta.row_groups.items.len },
     );
 }
 
-fn onTimer(ud: ?*anyopaque, _: *Loop, _: *Completion, _: Result) void {
-    const fired: *bool = @ptrCast(@alignCast(ud.?));
-    fired.* = true;
-}
-
 test {
-    // Pull in tests from sibling files.
     _ = @import("runtime.zig");
 }

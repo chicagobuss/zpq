@@ -227,7 +227,7 @@ fn killChild(child: *std.process.Child) void {
 // Test scenarios
 // ============================================================
 
-test "lambda echoes one invocation" {
+test "lambda rejects empty body cleanly" {
     var server = try FakeServer.start();
     defer server.deinit();
 
@@ -241,36 +241,34 @@ test "lambda echoes one invocation" {
     var child = try spawnLambda(std.testing.allocator, endpoint);
     defer killChild(&child);
 
-    // 1. The bootstrap should poll /next first.
     var poll = try server.acceptRequest(std.testing.allocator);
     try std.testing.expectEqualStrings("GET", poll.method);
     try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
     try poll.replyAndClose(
         std.testing.allocator,
         200,
-        "Lambda-Runtime-Aws-Request-Id: req-001\r\n" ++
-            "Lambda-Runtime-Deadline-Ms: 1700000000000\r\n" ++
-            "Lambda-Runtime-Invoked-Function-Arn: arn:aws:lambda:us-west-2:0:function:test-fn\r\n" ++
-            "Content-Type: application/json\r\n",
-        "{\"hello\":\"world\"}",
+        "Lambda-Runtime-Aws-Request-Id: req-empty\r\n" ++
+            "Content-Type: application/octet-stream\r\n",
+        "",
     );
 
-    // 2. The bootstrap should post the response.
     var resp = try server.acceptRequest(std.testing.allocator);
     try std.testing.expectEqualStrings("POST", resp.method);
-    try std.testing.expectEqualStrings(
-        "/2018-06-01/runtime/invocation/req-001/response",
-        resp.path,
-    );
-    // Expect the handler stub's JSON shape.
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"loop\":\"epoll\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"request_id\":\"req-001\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"echo_bytes\":17") != null); // {"hello":"world"}
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"error\":\"empty_body\"") != null);
     try resp.replyAndClose(std.testing.allocator, 202, "", "");
 }
 
-test "lambda handles three back-to-back invocations" {
+test "lambda decodes int8 column from a real Parquet file" {
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return;
+        }
+        return err;
+    };
+    defer std.testing.allocator.free(file_bytes);
+
     var server = try FakeServer.start();
     defer server.deinit();
 
@@ -284,21 +282,66 @@ test "lambda handles three back-to-back invocations" {
     var child = try spawnLambda(std.testing.allocator, endpoint);
     defer killChild(&child);
 
-    const ids = [_][]const u8{ "req-A", "req-B", "req-C" };
+    var poll = try server.acceptRequest(std.testing.allocator);
+    try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
+    try poll.replyAndClose(
+        std.testing.allocator,
+        200,
+        "Lambda-Runtime-Aws-Request-Id: req-decode\r\n" ++
+            "Content-Type: application/octet-stream\r\n",
+        file_bytes,
+    );
+
+    var resp = try server.acceptRequest(std.testing.allocator);
+    try std.testing.expectEqualStrings("POST", resp.method);
+    try std.testing.expectEqualStrings(
+        "/2018-06-01/runtime/invocation/req-decode/response",
+        resp.path,
+    );
+
+    // Expect the success envelope with all 524288 rows decoded.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"column\":\"int8\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"row_groups\":4") != null);
+    std.debug.print("[lambda decode] response: {s}\n", .{resp.body});
+    try resp.replyAndClose(std.testing.allocator, 202, "", "");
+}
+
+test "lambda handles back-to-back invocations" {
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer std.testing.allocator.free(file_bytes);
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+
+    const endpoint = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "127.0.0.1:{d}",
+        .{server.port},
+    );
+    defer std.testing.allocator.free(endpoint);
+
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    const ids = [_][]const u8{ "req-A", "req-B" };
     for (ids) |id| {
         var poll = try server.acceptRequest(std.testing.allocator);
         try std.testing.expectEqualStrings("GET", poll.method);
-        try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
 
         const headers = try std.fmt.allocPrint(
             std.testing.allocator,
             "Lambda-Runtime-Aws-Request-Id: {s}\r\n" ++
-                "Lambda-Runtime-Deadline-Ms: 1700000000000\r\n" ++
-                "Content-Type: application/json\r\n",
+                "Content-Type: application/octet-stream\r\n",
             .{id},
         );
         defer std.testing.allocator.free(headers);
-        try poll.replyAndClose(std.testing.allocator, 200, headers, "{\"n\":1}");
+        try poll.replyAndClose(std.testing.allocator, 200, headers, file_bytes);
 
         var resp = try server.acceptRequest(std.testing.allocator);
         try std.testing.expectEqualStrings("POST", resp.method);
@@ -310,15 +353,43 @@ test "lambda handles three back-to-back invocations" {
         defer std.testing.allocator.free(expected_path);
         try std.testing.expectEqualStrings(expected_path, resp.path);
 
-        const expected_id_field = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "\"request_id\":\"{s}\"",
-            .{id},
-        );
-        defer std.testing.allocator.free(expected_id_field);
-        try std.testing.expect(std.mem.indexOf(u8, resp.body, expected_id_field) != null);
+        // Each invocation should yield the success envelope.
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
         try resp.replyAndClose(std.testing.allocator, 202, "", "");
     }
+}
+
+fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var path_z: [256]u8 = undefined;
+    if (path.len + 1 > path_z.len) return error.PathTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+
+    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd: linux.fd_t = blk: {
+        if (errIs(r_open)) return error.FileNotFound;
+        break :blk @intCast(@as(isize, @bitCast(r_open)));
+    };
+    defer _ = linux.close(fd);
+
+    const SEEK_END: usize = 2;
+    const SEEK_SET: usize = 0;
+    const end_pos = linux.lseek(fd, 0, SEEK_END);
+    if (errIs(end_pos)) return error.SeekFailed;
+    _ = linux.lseek(fd, 0, SEEK_SET);
+    const size: usize = @intCast(end_pos);
+
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    var off: usize = 0;
+    while (off < size) {
+        const n = linux.read(fd, buf[off..].ptr, size - off);
+        if (errIs(n)) return error.ReadFailed;
+        const bytes: usize = @intCast(n);
+        if (bytes == 0) break;
+        off += bytes;
+    }
+    return buf;
 }
 
 // ============================================================

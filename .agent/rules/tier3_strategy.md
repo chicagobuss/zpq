@@ -51,7 +51,7 @@ Saturate the network with **S3-to-S3** workloads. ZPQ wins by doing the absolute
     *   `io/source.zig` — S3 + local file source.
 3.  **Wire the planner.** Strict separation: `Planner` (decision — does this query need decoding? what columns? what predicates?) returns a plan. `Executor` (action) consumes the plan and runs it via the I/O strategy. Keep them in different files.
 4.  **Lambda binary excludes io_uring.** Already enforced by the build system; preserve as we add code.
-5.  **Re-introduce libxev for the CLI hot path.** Currently the CLI binary doesn't import libxev because the vendored fork's io_uring backend doesn't compile against Zig 0.16.0. Fix is either patching the fork or bumping to a newer commit. Do this before any CLI hot-path work — without it, the CLI is a placeholder.
+5.  **Add libxev when the CLI hot path needs it.** libxev was removed entirely from this branch — the vendored fork didn't compile against Zig 0.16.0. When ready, fetch a fresh upstream commit (or patch the fork) and re-add it as a `build.zig.zon` dependency. Don't pre-add it; only land it with the code that uses it.
 
 ## What was deferred
 

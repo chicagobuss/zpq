@@ -1,181 +1,71 @@
-# ZPQ: Fast Parquet for Cloud & Lambda
+# ZPQ
 
-ZPQ is a high-performance Parquet CLI and Lambda runtime. Filter, project, and transform Parquet files locally or in S3 with minimal latency and memory.
+A high-performance Parquet engine for cloud and serverless workloads, written in Zig.
 
-## Quick Start
+> **This branch (`v2-sans-io`) is mid-rewrite.** The skeleton compiles
+> and the Lambda capability probe deploys, but the Parquet decoder and
+> S3 pipeline have not been ported into the new tree yet. For the
+> previous shipping version see `main`.
 
-### Download Binary
+## What's here
+
+```
+src/
+  zpq.zig            Pure module surface — exports core.* + io.*
+  core/              Sans-IO logic (schema, thrift)
+  io/strategy.zig    IOStrategy duck-typing trait + MemoryReader
+  cli/main.zig       zpq binary (workstation / native)
+  lambda/main.zig    zpq-lambda binary (AWS Lambda bootstrap)
+
+probes/
+  probe_lambda_caps/ Capability probe — what Lambda actually allows.
+
+docs/
+  lambda_capabilities.md         Empirical seccomp + kernel findings
+  tier_3_s3_pipeline_strategy.md S3-to-S3 orchestration plan
+  COMPARISON_TO_HARDWOOD.md      Feature-completeness map
+
+.agent/rules/        Tier 1–3 operating manuals (philosophy / knowledge / strategy)
+vendor/boring_tls/   Vendored prebuilt-only BoringSSL bindings
+```
+
+## Build
+
+Requires **Zig 0.16.0** (release, not master) — pinned in `.zig-version`.
 
 ```bash
-# Linux x86_64
-curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-linux-x86_64.tar.gz | tar -xz
-
-# Linux ARM64 (Graviton)
-curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-linux-arm64.tar.gz | tar -xz
-
-# macOS ARM64 (Apple Silicon)
-curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-macos-arm64.tar.gz | tar -xz
-
-# macOS x86_64
-curl -fsSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-macos-x86_64.tar.gz | tar -xz
+just build           # ReleaseFast for both binaries
+just test            # unit tests
+just cross-check     # confirm linux+macos targets compile
+just lambda-build    # static musl Lambda binary, both archs
 ```
 
-### CLI Usage
+The first build runs `tools/r2-fetch-artifacts.sh` to fetch prebuilt
+BoringSSL artifacts. No source-builds. No AWS SDK. No system OpenSSL.
+
+## Lambda capability probe
+
+The `probe_lambda_caps` binary enumerates what AWS Lambda actually allows
+(seccomp filter, kernel version, allowed setsockopt options, CPU
+affinity at each memory tier, `/tmp` throughput). Re-run any time AWS
+announces a runtime change — seccomp policy is not API contract.
 
 ```bash
-# View schema
-./zpq data.parquet --schema
-
-# View metadata (row groups, compression, etc.)
-./zpq data.parquet --meta
-
-# Filter rows and output to new file
-./zpq input.parquet output.parquet --filter "status=active"
-
-# Filter with column projection
-./zpq input.parquet output.parquet --filter "country=US" --select "id,name,email"
-
-# Works with S3 (requires AWS credentials in env)
-./zpq s3://bucket/input.parquet output.parquet --filter "year=2024"
+just probe-local              # JSON to stdout from your workstation
+just probe-lambda             # deploy + invoke in AWS, prints JSON
+just probe-lambda x86_64      # same for x86_64
 ```
 
-### Environment Variables
+Findings driving the v2 architecture are written up in
+[`docs/lambda_capabilities.md`](docs/lambda_capabilities.md).
 
-For S3 access:
-```bash
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-export AWS_REGION="us-west-2"
+## Philosophy
 
-# For non-AWS S3 (R2, MinIO, etc.)
-export S3_ENDPOINT="https://your-endpoint.com"
-```
-
-## AWS Lambda
-
-Deploy ZPQ as a Lambda function for serverless Parquet filtering.
-
-### Quick Deploy
-
-```bash
-# Download Lambda zip (ARM64 recommended for cost/performance)
-curl -fsSLO https://github.com/chicagobuss/zpq/releases/latest/download/zpq-lambda-arm64.zip
-
-# Create function
-aws lambda create-function \
-  --function-name zpq-filter \
-  --runtime provided.al2023 \
-  --handler bootstrap \
-  --architectures arm64 \
-  --memory-size 512 \
-  --timeout 120 \
-  --zip-file fileb://zpq-lambda-arm64.zip \
-  --role arn:aws:iam::YOUR_ACCOUNT:role/YOUR_ROLE
-```
-
-### Invoke
-
-```bash
-aws lambda invoke \
-  --function-name zpq-filter \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "input_path": "s3://source-bucket/data.parquet",
-    "output_path": "s3://dest-bucket/filtered.parquet",
-    "filter": "status=active",
-    "select": "id,name,created_at"
-  }' \
-  response.json
-```
-
-### Lambda Payload Schema
-
-```json
-{
-  "input_path": "s3://bucket/input.parquet",
-  "output_path": "s3://bucket/output.parquet",
-  "filter": "column=value",
-  "select": "col1,col2,col3"
-}
-```
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `input_path` | Yes | S3 path to source Parquet file |
-| `output_path` | Yes | S3 path for filtered output |
-| `filter` | Yes | Filter expression (e.g., `status=active`, `year>=2020`) |
-| `select` | No | Comma-separated columns to include (default: all) |
-
-## Performance
-
-ZPQ is built for serverless - minimal cold start, low memory, fast execution.
-
-| Metric | ZPQ | PyArrow | Polars |
-|--------|-----|---------|--------|
-| S3 Cold Start | ~42ms | ~35ms | ~121ms |
-| Local Scan | 842 MB/s | 372 MB/s | 160 MB/s |
-| Lambda Binary | ~4 MB | ~50 MB | ~30 MB |
-
-## Build from Source
-
-Requires [Zig 0.16.x](https://ziglang.org/download/) (master branch).
-
-```bash
-git clone https://github.com/chicagobuss/zpq
-cd zpq
-
-# Fetch pre-built BoringSSL
-just fetch-deps
-
-# Build
-just build
-
-# Test
-just test
-
-# Binary at zig-out/bin/zpq
-```
-
-## Benchmarking
-
-ZPQ includes a unified benchmarking suite for comparing native, Lambda, and RIE performance.
-
-```bash
-# S3 -> S3 (Native): Estable baseline performance
-just bench native s3 s3 100mb
-
-# S3 -> S3 (AWS Lambda): Real remote execution
-just bench lambda s3 s3 100mb
-
-# S3 -> S3 (Local RIE): Test Lambda behavior locally
-just bench lambda-rie s3 s3 100mb
-
-# Engine Comparison: Compare against DuckDB, Polars, PyArrow
-just engine compare s3 100mb
-```
-
-## Design Philosophy
-
-### The Laziness Principle
-
-> ZPQ preserves data in its most compact/encoded form as long as possible.
-
-| Operation | Conventional | ZPQ |
-|-----------|--------------|-----|
-| Column projection | Decode all, select some | Never read unselected columns |
-| Row filtering | Decode all, discard | Skip row groups via stats |
-| Pass-through columns | Decode → re-encode | Copy compressed bytes verbatim |
-
-This makes ZPQ dramatically faster for selective operations - the exact workloads that dominate serverless data processing.
-
-### Architecture Highlights
-
-- **Native S3/SigV4**: No SDK dependencies, zero-copy where possible
-- **Async I/O**: Single-threaded completion-based state machine
-- **Static Binary**: ~4MB with TLS, no runtime dependencies
-- **Cross-Platform**: Linux (io_uring), macOS (kqueue), x86_64 & ARM64
+See [`.agent/rules/tier1_soul.md`](.agent/rules/tier1_soul.md). The short
+version: laziness as performance, sans-IO core, two binaries (CLI with
+io_uring, Lambda with epoll-only) sharing one core, vendored prebuilt
+crypto, native S3/SigV4 for a 4 MB static binary.
 
 ## License
 
 MIT
-

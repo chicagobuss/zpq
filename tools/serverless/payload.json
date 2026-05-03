@@ -1,6 +1,0 @@
-{
-    "file": "s3://skyway-staging-perf-test/zpq_test_data/benchmark/benchmark_100mb.parquet",
-    "output": "s3://skyway-staging-perf-test/zpq_test_data/benchmark/output_lambda/bench.parquet",
-    "threads": 4,
-    "log_level": "info"
-}

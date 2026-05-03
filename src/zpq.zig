@@ -7,6 +7,9 @@
 pub const core = struct {
     pub const schema = @import("core/schema.zig");
     pub const thrift = @import("core/thrift.zig");
+    pub const parquet = struct {
+        pub const metadata = @import("core/parquet/metadata.zig");
+    };
 };
 
 pub const io = struct {
@@ -17,6 +20,7 @@ pub const io = struct {
 test {
     _ = core.schema;
     _ = core.thrift;
+    _ = core.parquet.metadata;
     _ = io.strategy;
     _ = io.loop;
 }

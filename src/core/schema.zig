@@ -548,8 +548,8 @@ pub const ColumnMetaData = struct {
 
         var meta = ColumnMetaData{
             .type = .INT32,
-            .encodings = .{},
-            .path_in_schema = .{},
+            .encodings = .empty,
+            .path_in_schema = .empty,
             .codec = .UNCOMPRESSED,
             .num_values = 0,
             .total_uncompressed_size = 0,
@@ -705,7 +705,7 @@ pub const RowGroup = struct {
         defer reader.last_field_id = saved_id;
 
         var rg = RowGroup{
-            .columns = .{},
+            .columns = .empty,
             .total_byte_size = 0,
             .num_rows = 0,
         };
@@ -769,10 +769,10 @@ pub const FileMetaData = struct {
 
         var meta = FileMetaData{
             .version = 0,
-            .schema = .{},
+            .schema = .empty,
             .num_rows = 0,
             .created_by = null,
-            .row_groups = .{},
+            .row_groups = .empty,
         };
         errdefer meta.schema.deinit(allocator);
         errdefer meta.row_groups.deinit(allocator);

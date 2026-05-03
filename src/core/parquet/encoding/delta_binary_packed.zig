@@ -66,6 +66,14 @@ pub fn Decoder(comptime T: type) type {
         mini_block_bit_widths: [MAX_MINI_BLOCKS]u8,
         current_mini_block: u32,
         mini_block_pos: u32,
+        /// Byte offset where the current block's bit-packed data
+        /// starts (right after the bit_widths header bytes). Used by
+        /// finishBlock to skip past padded values when
+        /// total_value_count is exhausted before the block is fully
+        /// consumed — chained streams (DELTA_BYTE_ARRAY) rely on
+        /// `pos` pointing at the byte right after the last padded
+        /// value of the last block.
+        block_data_start: usize,
 
         // Bit accumulator for the current mini-block.
         bit_buffer: u64,
@@ -86,6 +94,7 @@ pub fn Decoder(comptime T: type) type {
                 .mini_block_bit_widths = std.mem.zeroes([MAX_MINI_BLOCKS]u8),
                 .current_mini_block = MAX_MINI_BLOCKS, // forces a block read on first decode
                 .mini_block_pos = 0,
+                .block_data_start = 0,
                 .bit_buffer = 0,
                 .bits_in_buffer = 0,
             };
@@ -166,6 +175,15 @@ pub fn Decoder(comptime T: type) type {
                 }
             }
 
+            // If we just finished emitting all values mid-block, advance
+            // past the padded portion so `pos` is at the byte after the
+            // last block — chained streams (DELTA_BYTE_ARRAY) need this.
+            if (self.values_emitted >= self.total_value_count and
+                self.current_mini_block < self.num_mini_blocks)
+            {
+                self.finishBlock();
+            }
+
             return written;
         }
 
@@ -177,8 +195,30 @@ pub fn Decoder(comptime T: type) type {
                 self.mini_block_bit_widths[i] = self.bytes[self.pos];
                 self.pos += 1;
             }
+            self.block_data_start = self.pos;
             self.current_mini_block = 0;
             self.mini_block_pos = 0;
+            self.bit_buffer = 0;
+            self.bits_in_buffer = 0;
+        }
+
+        /// Advance `pos` to the end of the current block's bit-packed
+        /// data, accounting for any mini-blocks the caller never
+        /// consumed because total_value_count was reached early.
+        /// Called automatically by decode() when emission completes.
+        fn finishBlock(self: *Self) void {
+            // Block data length = sum(mini_block_size * bit_widths[i] / 8).
+            // mini_block_size is always divisible by 8 (block_size is a
+            // multiple of 128, num_mini_blocks divides block_size, so
+            // mini_block_size is at least 32 — divisible by 8 for any bw).
+            var total_bytes: usize = 0;
+            var i: u32 = 0;
+            while (i < self.num_mini_blocks) : (i += 1) {
+                total_bytes += @as(usize, self.mini_block_size) *
+                    self.mini_block_bit_widths[i] / 8;
+            }
+            self.pos = self.block_data_start + total_bytes;
+            self.current_mini_block = self.num_mini_blocks;
             self.bit_buffer = 0;
             self.bits_in_buffer = 0;
         }

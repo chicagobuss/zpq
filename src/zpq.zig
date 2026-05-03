@@ -18,6 +18,7 @@ pub const core = struct {
             pub const hybrid_rle = @import("core/parquet/encoding/hybrid_rle.zig");
             pub const rle_dict = @import("core/parquet/encoding/rle_dict.zig");
             pub const delta_binary_packed = @import("core/parquet/encoding/delta_binary_packed.zig");
+            pub const delta_byte_array = @import("core/parquet/encoding/delta_byte_array.zig");
         };
     };
 };
@@ -39,6 +40,7 @@ test {
     _ = core.parquet.encoding.hybrid_rle;
     _ = core.parquet.encoding.rle_dict;
     _ = core.parquet.encoding.delta_binary_packed;
+    _ = core.parquet.encoding.delta_byte_array;
     _ = io.strategy;
     _ = io.loop;
 }

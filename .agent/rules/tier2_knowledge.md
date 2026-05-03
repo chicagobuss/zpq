@@ -84,6 +84,24 @@ Re-run `just probe-lambda` any time AWS announces runtime changes — seccomp po
 *   **`just` is the source of truth** — only ship recipes that work today.
 *   **Reproducibility**: Zig version is pinned in `.zig-version` and enforced by `build.zig.zon` `minimum_zig_version`. Standard test file: `data/benchmark/benchmark_100mb.parquet` (also in S3 at `s3://${AWS_S3_BUCKET}/zpq_test_data/benchmark/`).
 
+## Local Lambda testing (TDD-grade feedback)
+**Default for any Lambda code change**: `just test-integration`. Spawns the built `zpq-lambda` binary against an in-process fake runtime API (`tests/lambda_integration.zig`), serves canned invocations, captures responses, asserts. ~21 ms for the current 2 scenarios, including subprocess spawn. No Docker required.
+
+When adding a Lambda feature:
+1. Write the integration test scenario first (assertion on the response shape you want).
+2. Watch it fail.
+3. Implement in `src/lambda/`.
+4. Iterate at compiler speed.
+
+Three escalation layers, fastest first:
+1.  **In-process fake** (`zig build test-integration`) — the default. Pure Zig, no external deps.
+2.  **`aws-lambda-rie`** (no Docker; just download the Go binary) — for interactive `curl` testing or attaching a debugger to the bootstrap. Slower iteration; use only when the fake can't simulate what you need.
+3.  **Real AWS Lambda deploy** — `just lambda-deploy` + `just lambda-invoke`. Tens-of-seconds round trip. Use only for verifying actual Lambda-environment behavior (seccomp, kernel version, CPU metering, real S3 paths).
+
+Cross-arch testing without Docker: `qemu-user-static` + `binfmt_misc` on Linux makes ARM64 binaries first-class on x86_64 hosts. Process-level emulation, not a container — gdb/ptrace/perf all work.
+
+Full reference: `docs/local_lambda_testing.md`. **Read it before reaching for Docker or AWS SAM**.
+
 ## DNS & Networking
 The 3-tier resolver stack we want to maintain (when we re-introduce it):
 1.  **Fast path**: in-memory LRU cache.

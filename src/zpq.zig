@@ -11,10 +11,12 @@ pub const core = struct {
 
 pub const io = struct {
     pub const strategy = @import("io/strategy.zig");
+    pub const loop = @import("io/loop.zig");
 };
 
 test {
     _ = core.schema;
     _ = core.thrift;
     _ = io.strategy;
+    _ = io.loop;
 }

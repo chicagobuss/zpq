@@ -9,6 +9,9 @@ pub const core = struct {
     pub const thrift = @import("core/thrift.zig");
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
+        pub const snappy = @import("core/parquet/snappy.zig");
+        pub const compression = @import("core/parquet/compression.zig");
+        pub const page = @import("core/parquet/page.zig");
     };
 };
 
@@ -21,6 +24,9 @@ test {
     _ = core.schema;
     _ = core.thrift;
     _ = core.parquet.metadata;
+    _ = core.parquet.snappy;
+    _ = core.parquet.compression;
+    _ = core.parquet.page;
     _ = io.strategy;
     _ = io.loop;
 }

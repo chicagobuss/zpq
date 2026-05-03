@@ -182,9 +182,11 @@ Implement only what's needed for the benchmark file's hot columns:
 | BYTE_STREAM_SPLIT | Phase 2 | Float/double perf encoding. |
 | PLAIN_DICTIONARY (legacy) | Skip | Treat as RLE_DICTIONARY equivalent. |
 
-Compression: Snappy + Zstd in Phase 1 (matches what we ship in our
-own write path). LZ4_RAW + GZIP land in Phase 2 alongside the
-DELTA_* encodings.
+Compression: Snappy in Phase 1 — that's what our benchmark fixture
+uses end-to-end. Zstd, GZIP, LZ4_RAW deferred to Phase 2. Stdlib has
+`std.compress.zstd.Decompress` + `std.compress.flate.Decompress`,
+both `*Reader`-based — they'll wrap nicely once we build the rest of
+the pipeline; we just don't need them yet.
 
 ### 7. SIMD: opportunistic, not foundational
 

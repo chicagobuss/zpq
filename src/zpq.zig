@@ -15,6 +15,7 @@ pub const core = struct {
         pub const encoding = struct {
             pub const plain = @import("core/parquet/encoding/plain.zig");
             pub const hybrid_rle = @import("core/parquet/encoding/hybrid_rle.zig");
+            pub const rle_dict = @import("core/parquet/encoding/rle_dict.zig");
         };
     };
 };
@@ -33,6 +34,7 @@ test {
     _ = core.parquet.page;
     _ = core.parquet.encoding.plain;
     _ = core.parquet.encoding.hybrid_rle;
+    _ = core.parquet.encoding.rle_dict;
     _ = io.strategy;
     _ = io.loop;
 }

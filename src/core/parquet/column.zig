@@ -27,6 +27,8 @@ const schema = @import("../schema.zig");
 const page_mod = @import("page.zig");
 const plain = @import("encoding/plain.zig");
 const rle_dict = @import("encoding/rle_dict.zig");
+const dbp = @import("encoding/delta_binary_packed.zig");
+const dba = @import("encoding/delta_byte_array.zig");
 
 pub const Error = error{
     UnsupportedEncoding,
@@ -61,9 +63,19 @@ fn RleDictDecFor(comptime T: type) type {
     };
 }
 
+/// DELTA_BINARY_PACKED applies to i32/i64 only; for other Ts we use a
+/// placeholder type that's never instantiated.
+fn DeltaIntDecFor(comptime T: type) type {
+    return switch (T) {
+        i32, i64 => dbp.Decoder(T),
+        else => dbp.Decoder(i32), // unused
+    };
+}
+
 pub fn ColumnChunkReader(comptime T: type) type {
     const PlainDec = PlainDecoderFor(T);
     const RleDictDec = RleDictDecFor(T);
+    const DeltaIntDec = DeltaIntDecFor(T);
 
     return struct {
         const Self = @This();
@@ -76,11 +88,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// first DICTIONARY_PAGE we encounter.
         dictionary: ?[]const T = null,
 
-        /// Active per-page decoder state. Mutually exclusive: either
-        /// `current_plain` is set, or `current_rle_dict` is, or neither
-        /// (we just finished a page; fetch the next one on next decode).
+        /// Active per-page decoder state. Exactly one variant is set
+        /// while a page is being decoded; all are null between pages.
         current_plain: ?PlainDec = null,
         current_rle_dict: ?RleDictDec = null,
+        current_delta_int: ?DeltaIntDec = null,
+        current_delta_len_ba: ?dba.DeltaLengthByteArrayDecoder = null,
+        current_delta_ba: ?dba.DeltaByteArrayDecoder = null,
 
         pub fn init(
             chunk_bytes: []const u8,
@@ -108,6 +122,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 // Current page exhausted (or none active); advance.
                 self.current_plain = null;
                 self.current_rle_dict = null;
+                self.current_delta_int = null;
+                self.current_delta_len_ba = null;
+                self.current_delta_ba = null;
                 if (!try self.advancePage()) break;
             }
             return written;
@@ -120,6 +137,19 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (T != bool) {
                 if (self.current_rle_dict) |*d| {
                     return @as(*RleDictDec, d).decode(dest) catch return error.UnexpectedPage;
+                }
+            }
+            if (T == i32 or T == i64) {
+                if (self.current_delta_int) |*d| {
+                    return @as(*DeltaIntDec, d).decode(dest) catch return error.UnexpectedPage;
+                }
+            }
+            if (T == []const u8) {
+                if (self.current_delta_len_ba) |*d| {
+                    return d.decode(dest) catch return error.UnexpectedPage;
+                }
+                if (self.current_delta_ba) |*d| {
+                    return d.decode(dest) catch return error.UnexpectedPage;
                 }
             }
             return 0;
@@ -192,6 +222,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 values_bytes = values_bytes[4 + def_len ..];
             }
 
+            // Reset all variant slots — only one will be populated below.
+            self.current_plain = null;
+            self.current_rle_dict = null;
+            self.current_delta_int = null;
+            self.current_delta_len_ba = null;
+            self.current_delta_ba = null;
+
             switch (dph.encoding) {
                 .PLAIN => {
                     self.current_plain = switch (T) {
@@ -205,6 +242,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (T == bool) return error.UnsupportedEncoding;
                     const dict = self.dictionary orelse return error.DictionaryMissing;
                     self.current_rle_dict = rle_dict.Decoder(T).init(values_bytes, dict) catch return error.UnexpectedPage;
+                },
+                .DELTA_BINARY_PACKED => {
+                    if (T != i32 and T != i64) return error.UnsupportedEncoding;
+                    self.current_delta_int = dbp.Decoder(T).init(values_bytes) catch return error.UnexpectedPage;
+                },
+                .DELTA_LENGTH_BYTE_ARRAY => {
+                    if (T != []const u8) return error.UnsupportedEncoding;
+                    self.current_delta_len_ba = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
+                },
+                .DELTA_BYTE_ARRAY => {
+                    if (T != []const u8) return error.UnsupportedEncoding;
+                    self.current_delta_ba = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
                 },
                 else => return error.UnsupportedEncoding,
             }

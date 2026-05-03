@@ -12,6 +12,7 @@ pub const core = struct {
         pub const snappy = @import("core/parquet/snappy.zig");
         pub const compression = @import("core/parquet/compression.zig");
         pub const page = @import("core/parquet/page.zig");
+        pub const column = @import("core/parquet/column.zig");
         pub const encoding = struct {
             pub const plain = @import("core/parquet/encoding/plain.zig");
             pub const hybrid_rle = @import("core/parquet/encoding/hybrid_rle.zig");
@@ -32,6 +33,7 @@ test {
     _ = core.parquet.snappy;
     _ = core.parquet.compression;
     _ = core.parquet.page;
+    _ = core.parquet.column;
     _ = core.parquet.encoding.plain;
     _ = core.parquet.encoding.hybrid_rle;
     _ = core.parquet.encoding.rle_dict;

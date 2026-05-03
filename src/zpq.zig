@@ -12,6 +12,9 @@ pub const core = struct {
         pub const snappy = @import("core/parquet/snappy.zig");
         pub const compression = @import("core/parquet/compression.zig");
         pub const page = @import("core/parquet/page.zig");
+        pub const encoding = struct {
+            pub const plain = @import("core/parquet/encoding/plain.zig");
+        };
     };
 };
 
@@ -27,6 +30,7 @@ test {
     _ = core.parquet.snappy;
     _ = core.parquet.compression;
     _ = core.parquet.page;
+    _ = core.parquet.encoding.plain;
     _ = io.strategy;
     _ = io.loop;
 }

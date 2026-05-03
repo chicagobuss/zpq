@@ -53,3 +53,9 @@ benchmarks/bootstrap
 benchmarks/zpq
 benchmarks/*.zip
 
+
+# Probe outputs (regeneratable)
+output/
+
+# Zig package cache
+zig-pkg/

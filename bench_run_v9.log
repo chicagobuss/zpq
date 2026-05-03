@@ -1,3 +1,0 @@
-[engine] ⚡ Zero-Copy Fast Path Detected!
-[factory] Creating AsyncS3SinkGen for s3://skyway-staging-perf-test/zpq_test_data/output/bench_100mb_optimized_v9.parquet
-[S3Sink] background thread started

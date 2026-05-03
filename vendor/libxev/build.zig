@@ -26,7 +26,6 @@ pub fn build(b: *std.Build) !void {
         true
     else |err| switch (err) {
         error.FileNotFound => false,
-        else => return err,
     };
 
     const emit_bench = b.option(

@@ -1,10 +1,8 @@
 .{
     .name = .zpq,
-    .version = "0.16.0-dev.1484+d0ba6642b",
+    .version = "0.1.0",
     .fingerprint = 0xae1a0cc8c4cc362f,
-    // Pin Zig version for vendor compat (libxev, boring_tls, minish)
-    // TODO: Update vendored deps for latest Zig master
-    .minimum_zig_version = "0.16.0-dev.1912+0cbaaa5eb",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .boring_tls = .{
             .path = "vendor/boring_tls",

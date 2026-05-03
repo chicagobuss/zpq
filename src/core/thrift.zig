@@ -170,13 +170,13 @@ pub const Reader = struct {
 
 /// Thrift Compact Protocol Writer
 pub const Writer = struct {
-    buffer: std.ArrayListUnmanaged(u8),
+    buffer: std.ArrayList(u8),
     allocator: std.mem.Allocator,
     last_field_id: i16,
 
     pub fn init(allocator: std.mem.Allocator) Writer {
         return Writer{
-            .buffer = .{},
+            .buffer = .empty,
             .allocator = allocator,
             .last_field_id = 0,
         };

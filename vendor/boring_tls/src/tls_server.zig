@@ -1,5 +1,4 @@
 const std = @import("std");
-const xev = @import("xev");
 const tls = @import("tls.zig");
 
 const c = tls.c;

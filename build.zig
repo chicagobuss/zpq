@@ -130,12 +130,20 @@ fn makeZpqModule(
     opts.addOption(bool, "lambda", is_lambda);
     const opts_mod = opts.createModule();
 
+    // BoringSSL bindings — required for HTTPS to S3 (and any other TLS).
+    const boring_tls_dep = b.dependency("boring_tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const boring_tls_mod = boring_tls_dep.module("boring_tls");
+
     const zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = opts_mod },
+            .{ .name = "boring_tls", .module = boring_tls_mod },
         },
     });
 
@@ -146,6 +154,7 @@ fn makeZpqModule(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = opts_mod },
+            .{ .name = "boring_tls", .module = boring_tls_mod },
         },
     });
 

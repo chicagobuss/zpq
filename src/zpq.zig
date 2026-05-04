@@ -27,6 +27,7 @@ pub const core = struct {
 pub const io = struct {
     pub const strategy = @import("io/strategy.zig");
     pub const loop = @import("io/loop.zig");
+    pub const tls = @import("io/tls.zig");
 };
 
 test {
@@ -45,4 +46,5 @@ test {
     _ = core.parquet.encoding.delta_byte_array;
     _ = io.strategy;
     _ = io.loop;
+    _ = io.tls;
 }

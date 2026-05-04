@@ -22,9 +22,22 @@
 //! follow-up.
 
 const std = @import("std");
+const Io = std.Io;
 const tls = @import("tls.zig");
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
+
+/// Maximum concurrent multipart parts. Sized for the bakeoff-validated
+/// sweet spot — see docs/journal/2026-05.md (entry 2026-05-04 03:00).
+pub const MAX_PARTS: usize = 8;
+/// S3's hard minimum for a non-final multipart part.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+/// Below this size, single-PUT is faster than multipart even with
+/// parallel parts — the Create+Complete round-trips dominate. Roughly
+/// the crossover where single-stream-PUT (~100 MB/s) ties parallel
+/// multipart (~250 MB/s aggregate) after factoring 200 ms of fixed
+/// multipart overhead. Tunable; revisit when CPU/network shifts.
+pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 
 pub const Error = error{
     NoCredentials,
@@ -264,6 +277,233 @@ pub fn put(
         .headers = req_headers.items,
         .body = body,
     });
+}
+
+/// Parallel multipart upload of `body` to `url`. Uses `Io.Group.concurrent`
+/// to dispatch each part on its own thread; each task owns its own TLS
+/// connection for its lifetime (no pooling — see writer_design.md).
+///
+/// Number of parts is auto-computed: aim for ~MULTIPART_THRESHOLD-sized
+/// parts up to MAX_PARTS, with a 5 MB floor (S3's hard minimum). For
+/// bodies smaller than MULTIPART_THRESHOLD the caller should use `put`
+/// instead — single-PUT wins at that size.
+pub fn uploadMultipart(
+    io: Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    body: []const u8,
+) !void {
+    if (body.len < MIN_PART_SIZE) return error.BodyTooSmallForMultipart;
+
+    const num_parts = @min(MAX_PARTS, @max(@as(usize, 2), body.len / MULTIPART_THRESHOLD));
+    const part_size = (body.len + num_parts - 1) / num_parts;
+    std.debug.assert(part_size >= MIN_PART_SIZE or num_parts == 1);
+
+    const upload_id = try createMultipart(arena, creds, url);
+
+    // Pre-allocate per-part state. Stack arrays sized to MAX_PARTS;
+    // we only use the first `num_parts` slots.
+    var etag_storage: [MAX_PARTS][512]u8 = undefined;
+    var etag_lens: [MAX_PARTS]usize = .{0} ** MAX_PARTS;
+    var ctxs: [MAX_PARTS]PartCtx = undefined;
+
+    for (0..num_parts) |i| {
+        const start = i * part_size;
+        const end = @min(start + part_size, body.len);
+        ctxs[i] = .{
+            .gpa = gpa,
+            .creds = creds,
+            .url = url,
+            .upload_id = upload_id,
+            .part_number = @intCast(i + 1),
+            .body = body[start..end],
+            .etag_buf = &etag_storage[i],
+            .etag_len = &etag_lens[i],
+        };
+    }
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    for (0..num_parts) |i| {
+        try group.concurrent(io, uploadPartTask, .{ &ctxs[i] });
+    }
+    try group.await(io);
+
+    // Detect any failures by checking ETags landed.
+    for (0..num_parts) |i| {
+        if (etag_lens[i] == 0) return error.PartUploadFailed;
+    }
+
+    try completeMultipart(arena, creds, url, upload_id, &etag_storage, &etag_lens, num_parts);
+}
+
+const PartCtx = struct {
+    gpa: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    upload_id: []const u8,
+    part_number: u32,
+    body: []const u8,
+    etag_buf: *[512]u8,
+    etag_len: *usize,
+};
+
+fn uploadPartTask(ctx: *PartCtx) Io.Cancelable!void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const host = std.fmt.allocPrint(
+        arena,
+        "{s}.s3.{s}.amazonaws.com",
+        .{ ctx.url.bucket, ctx.creds.region },
+    ) catch return;
+    const path = std.fmt.allocPrint(arena, "/{s}", .{ctx.url.key}) catch return;
+    const query = std.fmt.allocPrint(
+        arena,
+        "partNumber={d}&uploadId={s}",
+        .{ ctx.part_number, ctx.upload_id },
+    ) catch return;
+    const path_with_query = std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query }) catch return;
+
+    const addr_v4 = resolveIpv4(arena, host) catch return;
+    var conn = tls.Connection.connect(arena, addr_v4, 443, host) catch return;
+    defer conn.deinit();
+
+    const signer: sigv4.SigV4 = .{
+        .region = ctx.creds.region,
+        .access_key = ctx.creds.access_key,
+        .secret_key = ctx.creds.secret_key,
+        .session_token = ctx.creds.session_token,
+    };
+    const signed = signer.sign(
+        arena,
+        "PUT",
+        host,
+        path,
+        query,
+        &.{},
+        ctx.body,
+        .{ .use_unsigned_payload = true },
+    ) catch return;
+
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| (headers.append(arena, .{ .name = h.name, .value = h.value }) catch return);
+
+    const resp = http.sendRequest(arena, &conn, .{
+        .method = .PUT,
+        .host = host,
+        .path = path_with_query,
+        .headers = headers.items,
+        .body = ctx.body,
+    }) catch return;
+    if (resp.status != 200) return;
+
+    const etag = resp.header("ETag") orelse return;
+    if (etag.len > ctx.etag_buf.len) return;
+    @memcpy(ctx.etag_buf[0..etag.len], etag);
+    ctx.etag_len.* = etag.len;
+}
+
+fn createMultipart(
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+) ![]const u8 {
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ url.bucket, creds.region });
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+    const query = "uploads=";
+    const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
+
+    const addr_v4 = try resolveIpv4(arena, host);
+    var conn = try tls.Connection.connect(arena, addr_v4, 443, host);
+    defer conn.deinit();
+
+    const signer: sigv4.SigV4 = .{
+        .region = creds.region,
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+    const signed = try signer.sign(arena, "POST", host, path, query, &.{}, "", .{});
+
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+
+    const resp = try http.sendRequest(arena, &conn, .{
+        .method = .POST,
+        .host = host,
+        .path = path_with_query,
+        .headers = headers.items,
+        .body = "",
+    });
+    if (resp.status != 200) return error.CreateMultipartFailed;
+
+    return try extractXml(arena, resp.body, "UploadId");
+}
+
+fn completeMultipart(
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    upload_id: []const u8,
+    etag_storage: *const [MAX_PARTS][512]u8,
+    etag_lens: *const [MAX_PARTS]usize,
+    num_parts: usize,
+) !void {
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ url.bucket, creds.region });
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+    const query = try std.fmt.allocPrint(arena, "uploadId={s}", .{upload_id});
+    const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
+
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(arena, "<CompleteMultipartUpload>");
+    for (0..num_parts) |i| {
+        const etag = etag_storage[i][0..etag_lens[i]];
+        const piece = try std.fmt.allocPrint(
+            arena,
+            "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>",
+            .{ i + 1, etag },
+        );
+        try body.appendSlice(arena, piece);
+    }
+    try body.appendSlice(arena, "</CompleteMultipartUpload>");
+
+    const addr_v4 = try resolveIpv4(arena, host);
+    var conn = try tls.Connection.connect(arena, addr_v4, 443, host);
+    defer conn.deinit();
+
+    const signer: sigv4.SigV4 = .{
+        .region = creds.region,
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+    const signed = try signer.sign(arena, "POST", host, path, query, &.{}, body.items, .{});
+
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+
+    const resp = try http.sendRequest(arena, &conn, .{
+        .method = .POST,
+        .host = host,
+        .path = path_with_query,
+        .headers = headers.items,
+        .body = body.items,
+    });
+    if (resp.status != 200) return error.CompleteMultipartFailed;
+    if (std.mem.indexOf(u8, resp.body, "<Error>") != null) return error.CompleteMultipartFailed;
+}
+
+fn extractXml(arena: std.mem.Allocator, xml: []const u8, tag: []const u8) ![]const u8 {
+    const open = try std.fmt.allocPrint(arena, "<{s}>", .{tag});
+    const close = try std.fmt.allocPrint(arena, "</{s}>", .{tag});
+    const start = std.mem.indexOf(u8, xml, open) orelse return error.XmlTagMissing;
+    const after_open = start + open.len;
+    const end = std.mem.indexOfPos(u8, xml, after_open, close) orelse return error.XmlTagMissing;
+    return try arena.dupe(u8, xml[after_open..end]);
 }
 
 fn buildAndSend(

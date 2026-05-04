@@ -40,12 +40,12 @@ const TAIL_SIZE: u64 = 64 * 1024;
 const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .{};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const env = init.minimal.environ;
+    const io = init.io;
 
-    var client = runtime.Client.fromEnv(allocator, init.environ) catch |err| {
+    var client = runtime.Client.fromEnv(allocator, env) catch |err| {
         std.debug.print("zpq lambda: runtime client init failed: {s}\n", .{@errorName(err)});
         return err;
     };
@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         defer inv.deinit(allocator);
 
-        const response = handle(allocator, init.environ, &inv) catch |err| {
+        const response = handle(io, allocator, env, &inv) catch |err| {
             client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 fn handle(
+    io: std.Io,
     allocator: std.mem.Allocator,
     env: std.process.Environ,
     inv: *const runtime.Invocation,
@@ -94,7 +95,7 @@ fn handle(
         };
         const filter_str = extractField(trimmed, "filter") catch null;
         const output_url = extractField(trimmed, "output_url") catch null;
-        if (output_url) |out| return try handleS3Write(allocator, env, url, filter_str, out);
+        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out);
         return try handleS3(allocator, env, url, filter_str);
     }
 
@@ -371,6 +372,7 @@ fn handleS3(
 ///     output; downstream readers fall back to row-group-level
 ///     pruning.
 fn handleS3Write(
+    io: std.Io,
     allocator: std.mem.Allocator,
     env: std.process.Environ,
     input_url_str: []const u8,
@@ -497,24 +499,30 @@ fn handleS3Write(
     const out_bytes = try fastpath.build(a, file_buf, &meta, survivors);
     const t_after_build = nowMonoNs();
 
-    // 6. PUT to the output URL.
-    const put_resp = try s3.put(a, creds, out_url, out_bytes);
-    if (put_resp.status != 200) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"put_status\",\"status\":{d},\"body\":\"{s}\"}}",
-            .{ put_resp.status, put_resp.body },
-        );
-    }
+    // 6. PUT (single or multipart based on size).
+    const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
+        const put_resp = try s3.put(a, creds, out_url, out_bytes);
+        if (put_resp.status != 200) {
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"put_status\",\"status\":{d},\"body\":\"{s}\"}}",
+                .{ put_resp.status, put_resp.body },
+            );
+        }
+        break :blk "single";
+    } else blk: {
+        try s3.uploadMultipart(io, a, allocator, creds, out_url, out_bytes);
+        break :blk "multipart";
+    };
     const t_end = nowMonoNs();
 
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"input\":\"{s}\",\"output\":\"{s}\",\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups\":{d},\"row_groups_pruned\":{d},\"rows_kept\":{d},\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
+        "{{\"ok\":true,\"input\":\"{s}\",\"output\":\"{s}\",\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups\":{d},\"row_groups_pruned\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
         .{
             input_url_str, output_url_str,
             total_size, bytes_fetched, out_bytes.len,
-            meta.row_groups.items.len, rg_pruned, rows_kept,
+            meta.row_groups.items.len, rg_pruned, rows_kept, upload_mode,
             @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
             @divTrunc(t_after_build - t_after_fetch, std.time.ns_per_ms),
             @divTrunc(t_end - t_after_build, std.time.ns_per_ms),

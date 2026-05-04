@@ -15,6 +15,9 @@ pub const core = struct {
         pub const selection = @import("core/filter/selection.zig");
         pub const eval = @import("core/filter/eval.zig");
     };
+    pub const writer = struct {
+        pub const fastpath = @import("core/writer/fastpath.zig");
+    };
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
         pub const snappy = @import("core/parquet/snappy.zig");
@@ -51,6 +54,7 @@ test {
     _ = core.filter.prune;
     _ = core.filter.selection;
     _ = core.filter.eval;
+    _ = core.writer.fastpath;
     _ = core.parquet.metadata;
     _ = core.parquet.snappy;
     _ = core.parquet.lz4;

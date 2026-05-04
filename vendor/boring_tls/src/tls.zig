@@ -119,8 +119,8 @@ pub fn logDetailedSslError(ssl: *c.SSL) void {
 }
 
 pub const TlsBuffers = struct {
-    encrypted_out: std.ArrayListUnmanaged(u8) = .{},
-    decrypted_out: std.ArrayListUnmanaged(u8) = .{},
+    encrypted_out: std.ArrayListUnmanaged(u8) = .empty,
+    decrypted_out: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn deinit(self: *TlsBuffers, allocator: std.mem.Allocator) void {
         self.encrypted_out.deinit(allocator);

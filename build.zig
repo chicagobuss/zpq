@@ -152,6 +152,10 @@ fn makeZpqModule(
         .root_source_file = b.path(root_path),
         .target = target,
         .optimize = optimize,
+        // libc gives us getaddrinfo; under -O ReleaseSmall + musl static
+        // it adds ~150 KB which is dwarfed by BoringSSL anyway. Until
+        // we ship our own DNS resolver, this is the right tradeoff.
+        .link_libc = true,
         .imports = &.{
             .{ .name = "build_options", .module = opts_mod },
             .{ .name = "boring_tls", .module = boring_tls_mod },

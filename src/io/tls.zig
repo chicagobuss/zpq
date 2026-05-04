@@ -30,6 +30,11 @@ pub const Connection = struct {
     fd: linux.fd_t,
     tls: boring.tls_client.TlsClient,
     allocator: std.mem.Allocator,
+    /// Plaintext bytes that the TLS layer decrypted but the caller's
+    /// recv() buffer wasn't big enough to consume. Drained first on
+    /// the next recv() call. processIncoming() clears its internal
+    /// buffer on each invocation, so we must own this carry-over.
+    pending: std.ArrayList(u8) = .empty,
 
     /// Open a TCP connection, perform a TLS handshake, return the
     /// connected client. Caller eventually calls deinit().
@@ -72,6 +77,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        self.pending.deinit(self.allocator);
         self.tls.deinit();
         _ = linux.close(self.fd);
         self.* = undefined;
@@ -91,28 +97,37 @@ pub const Connection = struct {
 
     /// Read up to `dest.len` plaintext bytes. Returns 0 on clean EOF.
     pub fn recv(self: *Connection, dest: []u8) Error!usize {
-        var rx_buf: [16 * 1024]u8 = undefined;
-        // Try draining any plaintext already buffered in TLS first.
-        if (self.tls.processIncoming(&[_]u8{}, dest) catch null) |plain| {
-            if (plain.len > 0) return copyOut(dest, plain);
+        // Drain anything we previously buffered.
+        if (self.pending.items.len > 0) {
+            return self.consumePending(dest);
         }
-        // Otherwise pull from the socket and feed.
+        // Otherwise pull from the socket and decrypt.
+        var rx_buf: [16 * 1024]u8 = undefined;
         while (true) {
             const n = readSome(self.fd, &rx_buf) catch return error.RecvFailed;
             if (n == 0) return 0; // socket closed
-            if (self.tls.processIncoming(rx_buf[0..n], dest) catch null) |plain| {
-                if (plain.len > 0) return copyOut(dest, plain);
+            if (self.tls.processIncoming(rx_buf[0..n], null) catch null) |plain| {
+                if (plain.len > 0) {
+                    try self.pending.appendSlice(self.allocator, plain);
+                    return self.consumePending(dest);
+                }
             }
             // No plaintext yet (mid-record); loop and read more.
         }
     }
-};
 
-fn copyOut(dest: []u8, src: []const u8) usize {
-    const n = @min(dest.len, src.len);
-    @memcpy(dest[0..n], src[0..n]);
-    return n;
-}
+    fn consumePending(self: *Connection, dest: []u8) usize {
+        const n = @min(dest.len, self.pending.items.len);
+        @memcpy(dest[0..n], self.pending.items[0..n]);
+        // Shift the rest down. Cheap for our typical small dest sizes.
+        const remaining = self.pending.items.len - n;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[n..]);
+        }
+        self.pending.shrinkRetainingCapacity(remaining);
+        return n;
+    }
+};
 
 // ============================================================
 // Raw socket helpers

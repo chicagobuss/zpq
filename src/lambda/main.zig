@@ -13,9 +13,15 @@
 //! Lifecycle:
 //!   1. Init the runtime API client.
 //!   2. Long-poll for invocations.
-//!   3. For each invocation: decode the request body as a Parquet file,
-//!      compute stats over a target column, post the response.
+//!   3. For each invocation: extract the s3_url, fetch the file via
+//!      our SigV4 + HTTPS + range-GET stack, decode one column, post
+//!      the response.
 //!   4. Repeat. Process exits on fatal errors only.
+//!
+//! Event body shape:
+//!     {"s3_url": "s3://bucket/key"}    (production path — fetches from S3)
+//! or  raw Parquet bytes                 (legacy local-fixture path used by
+//!                                        the in-process integration test)
 
 const std = @import("std");
 const zpq = @import("zpq");
@@ -23,6 +29,7 @@ const runtime = @import("runtime.zig");
 
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
+const s3 = zpq.io.s3;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
@@ -44,7 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         defer inv.deinit(allocator);
 
-        const response = handle(allocator, &inv) catch |err| {
+        const response = handle(allocator, init.environ, &inv) catch |err| {
             client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
@@ -58,31 +65,91 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-/// Per-invocation handler.
-///
-/// Treats the event body as a complete Parquet file. Opens the footer,
-/// finds the configured column ("int8" by default for our benchmark
-/// fixture, overridable via the AWS_LAMBDA_FUNCTION_NAME suffix or
-/// future config), decodes it across all row groups, and returns a
-/// JSON envelope with row count + min/max/sum.
-///
-/// Phase 1.7: this is the first end-to-end demonstration that the
-/// decode pipeline works inside Lambda. Real S3 input lands in a
-/// follow-up.
-fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
-    if (inv.body.len < 12) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"empty_body\",\"len\":{d}}}",
-            .{inv.body.len},
-        );
+fn handle(
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    inv: *const runtime.Invocation,
+) ![]u8 {
+    if (inv.body.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
     }
 
-    var meta = metadata.open(allocator, inv.body) catch |err| {
+    // Try parsing as the production JSON envelope first. If it looks
+    // like JSON (starts with `{`), extract s3_url and fetch from S3.
+    // Otherwise treat the body as raw Parquet bytes (legacy local
+    // integration-test path).
+    const trimmed = std.mem.trim(u8, inv.body, " \r\n\t");
+    const file_bytes = if (trimmed.len > 0 and trimmed[0] == '{') blk: {
+        const url = extractS3Url(trimmed) catch |err| {
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}",
+                .{@errorName(err)},
+            );
+        };
+        const fetched = fetchS3File(allocator, env, url) catch |err| {
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"s3_fetch_failed\",\"reason\":\"{s}\",\"url\":\"{s}\"}}",
+                .{ @errorName(err), url },
+            );
+        };
+        break :blk fetched;
+    } else inv.body;
+    defer if (file_bytes.ptr != inv.body.ptr) allocator.free(file_bytes);
+
+    return try aggregateInt8(allocator, file_bytes);
+}
+
+fn extractS3Url(body: []const u8) ![]const u8 {
+    // Hand-rolled JSON sniff for {"s3_url": "..."}. Fully-validated
+    // parsing isn't worth the API surface for one field.
+    const key = "\"s3_url\"";
+    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
+    var i = pos + key.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':')) : (i += 1) {}
+    if (i >= body.len or body[i] != '"') return error.BadJson;
+    i += 1;
+    const start = i;
+    while (i < body.len and body[i] != '"') : (i += 1) {}
+    if (i >= body.len) return error.BadJson;
+    return body[start..i];
+}
+
+fn fetchS3File(
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    s3_url: []const u8,
+) ![]u8 {
+    const url = try s3.Url.parse(s3_url);
+    const creds = try s3.Credentials.fromEnv(env);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const resp = try s3.get(arena.allocator(), creds, url, null);
+    if (resp.status != 200) {
+        // Pull the response body into stderr (Lambda CloudWatch picks
+        // it up) so we can see what S3 actually said.
+        std.debug.print("zpq lambda: s3 status={d}, body={s}\n", .{ resp.status, resp.body });
+        return error.S3Status;
+    }
+
+    // Copy out of the arena into a fresh allocator-owned slice so the
+    // caller doesn't need to manage the arena lifetime.
+    return try allocator.dupe(u8, resp.body);
+}
+
+fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
+    if (file_bytes.len < 12) {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"too_small\",\"len\":{d}}}", .{file_bytes.len});
+    }
+
+    var meta = metadata.open(allocator, file_bytes) catch |err| {
         return std.fmt.allocPrint(
             allocator,
             "{{\"error\":\"open_failed\",\"reason\":\"{s}\",\"len\":{d}}}",
-            .{ @errorName(err), inv.body.len },
+            .{ @errorName(err), file_bytes.len },
         );
     };
     defer meta.deinit(allocator);
@@ -91,12 +158,11 @@ fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
     const col_idx = metadata.findColumnIndex(&meta, target) orelse {
         return std.fmt.allocPrint(
             allocator,
-            "{{\"error\":\"column_missing\",\"name\":\"{s}\",\"rows\":{d}}}",
-            .{ target, meta.num_rows },
+            "{{\"error\":\"column_missing\",\"name\":\"{s}\"}}",
+            .{target},
         );
     };
 
-    // Aggregate across row groups.
     var total_rows: i64 = 0;
     var min_v: i32 = std.math.maxInt(i32);
     var max_v: i32 = std.math.minInt(i32);
@@ -110,7 +176,6 @@ fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
     const levels = meta.getColumnLevels(&path);
 
     for (meta.row_groups.items) |rg| {
-        // Reset the arena per row group so memory doesn't grow unboundedly.
         _ = arena.reset(.retain_capacity);
 
         const col = rg.columns.items[col_idx].meta_data orelse return error.ColumnMetaMissing;
@@ -119,8 +184,8 @@ fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
         else
             @intCast(col.data_page_offset);
         const chunk_len: usize = @intCast(col.total_compressed_size);
-        if (chunk_start + chunk_len > inv.body.len) return error.ChunkOutOfRange;
-        const chunk = inv.body[chunk_start .. chunk_start + chunk_len];
+        if (chunk_start + chunk_len > file_bytes.len) return error.ChunkOutOfRange;
+        const chunk = file_bytes[chunk_start .. chunk_start + chunk_len];
 
         var reader = column_mod.ColumnChunkReader(i32).init(
             chunk,
@@ -129,7 +194,6 @@ fn handle(allocator: std.mem.Allocator, inv: *const runtime.Invocation) ![]u8 {
             arena.allocator(),
         );
 
-        // Stream-decode in 4K batches; keeps the working set small.
         var batch: [4096]i32 = undefined;
         while (true) {
             const n = try reader.decode(&batch);

@@ -1,0 +1,36 @@
+label	total_ms	fetch_ms	put_ms	bytes_out	rg_pruned	upload
+zpq:copy	3649	2538	860	155512528	0	multipart
+zpq:copy	3107	2035	935	155512528	0	multipart
+zpq:copy	2937	1978	823	155512528	0	multipart
+zpq:copy	2885	1923	827	155512528	0	multipart
+zpq:copy	3164	1928	1101	155512528	0	multipart
+zpq:prune_all	189	104	85	642	4	single
+zpq:prune_all	249	100	148	642	4	single
+zpq:prune_all	183	107	76	642	4	single
+zpq:prune_all	172	96	76	642	4	single
+zpq:prune_all	179	91	87	642	4	single
+py:boto3	2973	1586	1386	155534563		
+py:boto3	2991	1590	1401	155534563		
+py:boto3	2956	1586	1369	155534563		
+py:boto3	3098	1600	1497	155534563		
+py:boto3	2981	1586	1395	155534563		
+py:polars_copy	2254			117798354		
+py:polars_copy	1892			117798354		
+py:polars_copy	1879			117798354		
+py:polars_copy	1895			117798354		
+py:polars_copy	1904			117798354		
+py:polars_prune	2753			2740		
+py:polars_prune	1117			2740		
+py:polars_prune	1497			2740		
+py:polars_prune	1608			2740		
+py:polars_prune	1529			2740		
+py:duckdb_copy	3762			140689226		
+py:duckdb_copy	2766			140689226		
+py:duckdb_copy	2825			140689226		
+py:duckdb_copy	2850			140689226		
+py:duckdb_copy	3141			140689226		
+py:duckdb_prune	124			603		
+py:duckdb_prune	111			603		
+py:duckdb_prune	137			603		
+py:duckdb_prune	116			603		
+py:duckdb_prune	117			603		

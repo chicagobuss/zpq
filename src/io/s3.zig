@@ -229,14 +229,12 @@ pub fn get(
     return try client.get(arena, url.key, range);
 }
 
-/// Single-shot S3 PUT. Body must fit in a single HTTP request — S3's
-/// per-PUT limit is 5 GB. Use multipart upload for larger payloads.
+/// Single-shot S3 PUT. Body must fit in one HTTP request — S3's per-PUT
+/// limit is 5 GB. Use uploadMultipart for larger or parallelism.
 ///
-/// Connection lifetime is tied to this call: a fresh TLS handshake
-/// per PUT, no pooling. Lambda invocations typically PUT once per
-/// run, and the writer's parallel-multipart path (Phase 5.3) uses
-/// thread-local clients rather than reusing one across PUTs, so the
-/// no-pooling shape matches our real workload.
+/// Fresh TLS handshake per call. For warm Lambda invocations where a
+/// pool already exists for the same host, prefer `putViaPool` —
+/// reusing a pooled connection saves ~50 ms of handshake.
 pub fn put(
     arena: std.mem.Allocator,
     creds: Credentials,
@@ -251,8 +249,45 @@ pub fn put(
     const addr_v4 = try resolveIpv4(arena, host);
     var conn = try tls.Connection.connect(arena, addr_v4, 443, host);
     defer conn.deinit();
+    return try sendPut(arena, &conn, creds, host, url.key, body);
+}
 
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+/// Same as `put`, but acquires a connection from the supplied pool
+/// instead of opening a fresh one. Caller is responsible for the
+/// pool's host matching `url`'s bucket.
+pub fn putViaPool(
+    io: Io,
+    p: anytype,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    body: []const u8,
+) !http.Response {
+    const handle = try p.acquire(io);
+    var released = false;
+    errdefer if (!released) p.discard(io, handle);
+
+    const host = try std.fmt.allocPrint(
+        arena,
+        "{s}.s3.{s}.amazonaws.com",
+        .{ url.bucket, creds.region },
+    );
+    const resp = try sendPut(arena, handle.conn, creds, host, url.key, body);
+
+    try p.release(io, handle);
+    released = true;
+    return resp;
+}
+
+fn sendPut(
+    arena: std.mem.Allocator,
+    conn: *tls.Connection,
+    creds: Credentials,
+    host: []const u8,
+    key: []const u8,
+    body: []const u8,
+) Error!http.Response {
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{key});
 
     const signer: sigv4.SigV4 = .{
         .region = creds.region,
@@ -278,7 +313,7 @@ pub fn put(
         try req_headers.append(arena, .{ .name = h.name, .value = h.value });
     }
 
-    return try http.sendRequest(arena, &conn, .{
+    return try http.sendRequest(arena, conn, .{
         .method = .PUT,
         .host = host,
         .path = path,

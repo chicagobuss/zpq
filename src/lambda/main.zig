@@ -600,7 +600,12 @@ fn handleS3Write(
     // bucket == input bucket; otherwise s3.put fresh-handshakes.
     const same_bucket = std.mem.eql(u8, in_url.bucket, out_url.bucket);
     const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
-        const put_resp = try s3.put(a, creds, out_url, out_bytes);
+        // Small output: single PUT. Reuse the pool when same bucket
+        // (saves the ~50 ms TLS handshake on warm invocations).
+        const put_resp = if (same_bucket)
+            try s3.putViaPool(io, &pool, a, creds, out_url, out_bytes)
+        else
+            try s3.put(a, creds, out_url, out_bytes);
         if (put_resp.status != 200) {
             return std.fmt.allocPrint(
                 allocator,
@@ -608,7 +613,7 @@ fn handleS3Write(
                 .{ put_resp.status, put_resp.body },
             );
         }
-        break :blk "single";
+        break :blk if (same_bucket) "single_pooled" else "single";
     } else if (same_bucket) blk: {
         try s3.uploadMultipart(io, &pool, a, allocator, creds, out_url, out_bytes);
         break :blk "multipart_pooled";

@@ -128,6 +128,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
 
     var headers_end: ?usize = null;
     var content_length: ?usize = null;
+    var chunked: bool = false;
 
     while (true) {
         var tmp: [16 * 1024]u8 = undefined;
@@ -139,14 +140,16 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
                 if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
                 headers_end = i;
                 content_length = parseContentLength(stream.items[0..i]);
+                chunked = parseTransferEncodingChunked(stream.items[0..i]);
             }
         }
         if (headers_end) |he| {
             if (content_length) |clen| {
                 if (stream.items.len >= he + 4 + clen) break;
+            } else if (chunked) {
+                if (chunkedBodyComplete(stream.items, he + 4)) break;
             }
-            // No Content-Length: read until conn closes.
-            // (HTTP/1.0 / chunked. For S3 we'll always have Content-Length.)
+            // No Content-Length, no chunked: read until conn closes.
         }
     }
 
@@ -155,21 +158,81 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
     const headers = try parseHeaders(arena, stream.items[0..he]);
 
     const body_start = he + 4;
-    const body_end = if (content_length) |clen|
+    const raw_body_end = if (content_length) |clen|
         @min(body_start + clen, stream.items.len)
     else
         stream.items.len;
 
     if (content_length) |clen| {
-        if (body_end < body_start + clen) return error.BodyTruncated;
+        if (raw_body_end < body_start + clen) return error.BodyTruncated;
     }
 
-    // Move body bytes from the working buffer into a fresh arena alloc
-    // so the response is independent of the working stream's lifetime.
-    const body_slice = stream.items[body_start..body_end];
-    const body = try arena.dupe(u8, body_slice);
+    const raw_body = stream.items[body_start..raw_body_end];
+    const body = if (chunked)
+        try decodeChunked(arena, raw_body)
+    else
+        try arena.dupe(u8, raw_body);
 
     return .{ .status = status, .headers = headers, .body = body };
+}
+
+fn parseTransferEncodingChunked(headers_bytes: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = line[0..colon];
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            // Chunked is the de-facto value S3 sends; tolerate "chunked" mixed
+            // with other tokens.
+            return std.ascii.indexOfIgnoreCase(value, "chunked") != null;
+        }
+    }
+    return false;
+}
+
+/// Returns true once `bytes[body_start..]` contains a complete chunked
+/// body — i.e. the terminating zero-length chunk has been received.
+fn chunkedBodyComplete(bytes: []const u8, body_start: usize) bool {
+    if (body_start > bytes.len) return false;
+    var i = body_start;
+    while (i < bytes.len) {
+        // Each chunk: <hex-len>[;ext]\r\n<data>\r\n
+        const line_end = std.mem.indexOfPos(u8, bytes, i, "\r\n") orelse return false;
+        const size_str_end = std.mem.indexOfScalarPos(u8, bytes, i, ';') orelse line_end;
+        const size_str = std.mem.trim(u8, bytes[i..@min(size_str_end, line_end)], " \t");
+        const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return false;
+        const data_start = line_end + 2;
+        if (chunk_len == 0) {
+            // Trailers (optional headers) ending in CRLF, then final CRLF.
+            // Find the final \r\n\r\n at or after data_start.
+            return std.mem.indexOfPos(u8, bytes, data_start - 2, "\r\n\r\n") != null;
+        }
+        const data_end = data_start + chunk_len;
+        if (data_end + 2 > bytes.len) return false; // need data + trailing CRLF
+        i = data_end + 2;
+    }
+    return false;
+}
+
+fn decodeChunked(arena: std.mem.Allocator, raw: []const u8) Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    var i: usize = 0;
+    while (i < raw.len) {
+        const line_end = std.mem.indexOfPos(u8, raw, i, "\r\n") orelse return error.BodyTruncated;
+        const size_str_end = std.mem.indexOfScalarPos(u8, raw, i, ';') orelse line_end;
+        const size_str = std.mem.trim(u8, raw[i..@min(size_str_end, line_end)], " \t");
+        const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.BodyTruncated;
+        const data_start = line_end + 2;
+        if (chunk_len == 0) break;
+        const data_end = data_start + chunk_len;
+        if (data_end > raw.len) return error.BodyTruncated;
+        try out.appendSlice(arena, raw[data_start..data_end]);
+        i = data_end + 2; // skip trailing CRLF
+    }
+    return out.toOwnedSlice(arena);
 }
 
 fn parseStatus(headers_bytes: []const u8) Error!u16 {

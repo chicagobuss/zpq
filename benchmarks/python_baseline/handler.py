@@ -170,6 +170,79 @@ def _duckdb_copy(event: dict) -> dict:
     }
 
 
+def _polars_multi(event: dict) -> dict:
+    """Multi-file scan via Polars. inputs is a list of s3 URIs;
+    columns is the projection; filter_sql is optional."""
+    import polars as pl
+
+    inputs = event["inputs"]  # list of s3:// URIs
+    dst = event["output_url"]
+    cols = event.get("columns")
+    flt = event.get("filter_sql")
+
+    t0 = _now_ns()
+    lf = pl.scan_parquet(inputs)
+    if cols:
+        lf = lf.select(cols)
+    if flt:
+        ctx = pl.SQLContext(register_globals=False, eager=False)
+        ctx.register("t", lf)
+        lf = ctx.execute(f"SELECT * FROM t WHERE {flt}")
+    lf.sink_parquet(dst)
+    t1 = _now_ns()
+
+    dst_b, dst_k = _parse_s3(dst)
+    bytes_out = _head_size(dst_b, dst_k)
+
+    return {
+        "mode": "polars_multi",
+        "input_count": len(inputs),
+        "columns": cols,
+        "filter_sql": flt,
+        "bytes_out": bytes_out,
+        "total_ms": _ms(t0, t1),
+    }
+
+
+def _duckdb_multi(event: dict) -> dict:
+    """Multi-file scan via DuckDB read_parquet([list])."""
+    import duckdb
+
+    inputs = event["inputs"]
+    dst = event["output_url"]
+    cols = event.get("columns")
+    flt = event.get("filter_sql")
+
+    os.environ.setdefault("HOME", "/tmp")
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    con.execute(f"SET s3_region='{region}';")
+    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+
+    select_cols = ", ".join(cols) if cols else "*"
+    where = f" WHERE {flt}" if flt else ""
+    files_lit = "[" + ", ".join(f"'{u}'" for u in inputs) + "]"
+    sql = f"COPY (SELECT {select_cols} FROM read_parquet({files_lit}){where}) TO '{dst}' (FORMAT 'parquet');"
+
+    t0 = _now_ns()
+    con.execute(sql)
+    t1 = _now_ns()
+
+    dst_b, dst_k = _parse_s3(dst)
+    bytes_out = _head_size(dst_b, dst_k)
+
+    return {
+        "mode": "duckdb_multi",
+        "input_count": len(inputs),
+        "columns": cols,
+        "filter_sql": flt,
+        "bytes_out": bytes_out,
+        "total_ms": _ms(t0, t1),
+    }
+
+
 def _duckdb_project(event: dict) -> dict:
     import duckdb
 
@@ -210,8 +283,10 @@ _DISPATCH = {
     "boto3_copy": _boto3_copy,
     "polars_copy": _polars_copy,
     "polars_project": _polars_project,
+    "polars_multi": _polars_multi,
     "duckdb_copy": _duckdb_copy,
     "duckdb_project": _duckdb_project,
+    "duckdb_multi": _duckdb_multi,
 }
 
 

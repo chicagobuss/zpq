@@ -352,7 +352,7 @@ fn sendPut(
     key: []const u8,
     body: []const u8,
 ) Error!http.Response {
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{key});
+    const path = try buildEncodedPath(arena, key);
 
     const signer: sigv4.SigV4 = .{
         .region = creds.region,
@@ -555,7 +555,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
 /// the caller can decide whether to retry.
 fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !bool {
     const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ ctx.bucket, ctx.creds.region });
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{ctx.key});
+    const path = try buildEncodedPath(arena, ctx.key);
 
     var range_buf: [64]u8 = undefined;
     const inclusive: Range = .{ .start = ctx.range.start, .end = ctx.range.end - 1 };
@@ -712,7 +712,7 @@ fn doUploadPart(arena: std.mem.Allocator, ctx: *PartCtx, conn: *tls.Connection) 
         "{s}.s3.{s}.amazonaws.com",
         .{ ctx.url.bucket, ctx.creds.region },
     );
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{ctx.url.key});
+    const path = try buildEncodedPath(arena, ctx.url.key);
     const query = try std.fmt.allocPrint(
         arena,
         "partNumber={d}&uploadId={s}",
@@ -762,7 +762,7 @@ fn createMultipart(
     url: Url,
 ) ![]const u8 {
     const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ url.bucket, creds.region });
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+    const path = try buildEncodedPath(arena, url.key);
     const query = "uploads=";
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
@@ -803,7 +803,7 @@ fn completeMultipart(
     num_parts: usize,
 ) !void {
     const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ url.bucket, creds.region });
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+    const path = try buildEncodedPath(arena, url.key);
     const query = try std.fmt.allocPrint(arena, "uploadId={s}", .{upload_id});
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
@@ -863,7 +863,7 @@ fn buildAndSend(
     key: []const u8,
     range: ?Range,
 ) Error!http.Response {
-    const path = try std.fmt.allocPrint(req_arena, "/{s}", .{key});
+    const path = try buildEncodedPath(req_arena, key);
 
     var range_buf: [64]u8 = undefined;
     const range_header_value: ?[]const u8 = if (range) |r|
@@ -942,6 +942,34 @@ const c = struct {
 
     const AF_INET: c_int = 2;
 };
+
+/// URI-encode an S3 key for use in path + SigV4 canonical URI. Both
+/// the HTTP request line and the SigV4 signature canonical-URI must
+/// use the SAME encoding, otherwise S3 returns 403 SignatureDoesNotMatch.
+/// Per RFC 3986: keep A-Z, a-z, 0-9, '-', '.', '_', '~', '/'; %-encode
+/// everything else. (Hive-style partitions like `year=2026` use '=',
+/// which must be encoded as %3D.)
+fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    try out.ensureTotalCapacity(arena, key.len + 16);
+    try out.append(arena, '/');
+    for (key) |b| {
+        const safe = (b >= 'A' and b <= 'Z') or
+            (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '-' or b == '.' or b == '_' or b == '~' or b == '/';
+        if (safe) {
+            try out.append(arena, b);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try out.append(arena, '%');
+            try out.append(arena, hex[(b >> 4) & 0xF]);
+            try out.append(arena, hex[b & 0xF]);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
 
 pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
     const host_z = try arena.dupeZ(u8, host);

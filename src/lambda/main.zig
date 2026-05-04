@@ -27,6 +27,7 @@ const runtime = @import("runtime.zig");
 const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
+const fastpath = zpq.core.writer.fastpath;
 const s3 = zpq.io.s3;
 const coalescer = zpq.io.coalescer;
 const filter_ast = zpq.core.filter.ast;
@@ -92,6 +93,8 @@ fn handle(
             );
         };
         const filter_str = extractField(trimmed, "filter") catch null;
+        const output_url = extractField(trimmed, "output_url") catch null;
+        if (output_url) |out| return try handleS3Write(allocator, env, url, filter_str, out);
         return try handleS3(allocator, env, url, filter_str);
     }
 
@@ -351,6 +354,179 @@ fn handleS3(
         "{{\"ok\":true,\"column\":\"{s}\",\"rows_seen\":{d},\"rows_matched\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"row_groups_pruned\":{d},\"row_groups\":{d}}}",
         .{ TARGET_COLUMN, rows_seen, rows_matched, min_v, max_v, sum, rg_pruned, meta.row_groups.items.len },
     );
+}
+
+/// Phase 5.1 fast-path writer. Same read-side as handleS3 (fetch
+/// footer + parse metadata + parse filter), but instead of decoding
+/// values, builds a survivors bitmask from row-group-level pruning,
+/// range-fetches the surviving row groups' bytes, runs
+/// fastpath.build, and PUTs the result to `output_url`.
+///
+/// Limitations of the fast path:
+///   - Pruning is stat-based only. Any filter clause that would
+///     normally narrow rows *within* a surviving row group is
+///     ignored — that row group is copied whole. Per-row filtering
+///     waits for Phase 5.4 (decoder + re-encoder).
+///   - Page-index and bloom-filter offsets are dropped from the
+///     output; downstream readers fall back to row-group-level
+///     pruning.
+fn handleS3Write(
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    input_url_str: []const u8,
+    filter_str: ?[]const u8,
+    output_url_str: []const u8,
+) ![]u8 {
+    const t_start = nowMonoNs();
+
+    const in_url = s3.Url.parse(input_url_str) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_input_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    };
+    const out_url = s3.Url.parse(output_url_str) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_output_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    };
+    const creds = s3.Credentials.fromEnv(env) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var client = s3.Client.init(a, creds, in_url.bucket) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"client_init\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    };
+    defer client.deinit();
+
+    // 1. Tail GET for total size + footer.
+    const tail_resp = try client.get(a, in_url.key, s3.Range.suffix(TAIL_SIZE));
+    if (tail_resp.status != 206 and tail_resp.status != 200) {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_status\",\"status\":{d}}}", .{tail_resp.status});
+    }
+    const total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
+
+    const file_buf = try allocator.alloc(u8, total_size);
+    defer allocator.free(file_buf);
+    const tail_start = total_size - tail_resp.body.len;
+    @memcpy(file_buf[tail_start..], tail_resp.body);
+
+    if (tail_resp.body.len < 8) return error.TailTooSmall;
+    const tail = tail_resp.body;
+    if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
+    const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
+    const footer_actual_start = total_size - 8 - footer_len;
+
+    // The leading PAR1 magic is needed by metadata.open AND will be
+    // used by the fast path (it copies row group bytes which start
+    // after the magic). Pull head + any footer prefix the tail missed.
+    const head = try client.get(a, in_url.key, s3.Range.span(0, 7));
+    if (head.status != 206) return error.RangeStatus;
+    @memcpy(file_buf[0..head.body.len], head.body);
+
+    if (footer_actual_start < tail_start) {
+        const need = try client.get(a, in_url.key, s3.Range.span(footer_actual_start, tail_start - 1));
+        if (need.status != 206) return error.RangeStatus;
+        @memcpy(file_buf[footer_actual_start..tail_start], need.body);
+    }
+
+    var meta = try metadata.open(a, file_buf);
+    defer meta.deinit(a);
+
+    // 2. Parse the filter (optional).
+    var filter: ?filter_ast.Filter = null;
+    if (filter_str) |fs| {
+        if (fs.len > 0) {
+            filter = filter_parser.parse(a, fs, &meta) catch |err| {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"filter_parse\",\"reason\":\"{s}\",\"expr\":\"{s}\"}}",
+                    .{ @errorName(err), fs },
+                );
+            };
+        }
+    }
+
+    // 3. Build survivors[] via stat-level pruning.
+    const survivors = try a.alloc(bool, meta.row_groups.items.len);
+    var rg_pruned: usize = 0;
+    var rows_kept: i64 = 0;
+    for (meta.row_groups.items, 0..) |rg, i| {
+        if (filter) |f| {
+            const decision = try filter_prune.pruneRowGroup(&rg, f, a);
+            if (decision == .skip) {
+                survivors[i] = false;
+                rg_pruned += 1;
+                continue;
+            }
+        }
+        survivors[i] = true;
+        rows_kept += rg.num_rows;
+    }
+
+    // 4. Range-fetch surviving row groups' bytes (coalesced).
+    var ranges: std.ArrayList(coalescer.Range) = .empty;
+    for (survivors, 0..) |keep, i| {
+        if (!keep) continue;
+        const rg = &meta.row_groups.items[i];
+        var min_s: u64 = std.math.maxInt(u64);
+        var max_e: u64 = 0;
+        for (rg.columns.items) |chunk| {
+            const m = chunk.meta_data orelse continue;
+            const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+            const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+            if (s < min_s) min_s = s;
+            if (e > max_e) max_e = e;
+        }
+        if (min_s == std.math.maxInt(u64)) continue;
+        try ranges.append(a, .{ .start = min_s, .end = max_e });
+    }
+    const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
+    var bytes_fetched: u64 = 0;
+    for (merged) |r| {
+        if (r.start >= tail_start) continue;
+        const fetch_end_excl = @min(r.end, tail_start);
+        const resp = try client.get(a, in_url.key, s3.Range.span(r.start, fetch_end_excl - 1));
+        if (resp.status != 206) return error.RangeStatus;
+        @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
+        bytes_fetched += fetch_end_excl - r.start;
+    }
+
+    const t_after_fetch = nowMonoNs();
+
+    // 5. Build the fast-path output.
+    const out_bytes = try fastpath.build(a, file_buf, &meta, survivors);
+    const t_after_build = nowMonoNs();
+
+    // 6. PUT to the output URL.
+    const put_resp = try s3.put(a, creds, out_url, out_bytes);
+    if (put_resp.status != 200) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"put_status\",\"status\":{d},\"body\":\"{s}\"}}",
+            .{ put_resp.status, put_resp.body },
+        );
+    }
+    const t_end = nowMonoNs();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"ok\":true,\"input\":\"{s}\",\"output\":\"{s}\",\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups\":{d},\"row_groups_pruned\":{d},\"rows_kept\":{d},\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
+        .{
+            input_url_str, output_url_str,
+            total_size, bytes_fetched, out_bytes.len,
+            meta.row_groups.items.len, rg_pruned, rows_kept,
+            @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
+            @divTrunc(t_after_build - t_after_fetch, std.time.ns_per_ms),
+            @divTrunc(t_end - t_after_build, std.time.ns_per_ms),
+            @divTrunc(t_end - t_start, std.time.ns_per_ms),
+        },
+    );
+}
+
+fn nowMonoNs() i64 {
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 fn decodeAll(comptime T: type, reader: anytype, out: []T) !void {

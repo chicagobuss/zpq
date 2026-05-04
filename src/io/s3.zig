@@ -208,6 +208,64 @@ pub fn get(
     return try client.get(arena, url.key, range);
 }
 
+/// Single-shot S3 PUT. Body must fit in a single HTTP request — S3's
+/// per-PUT limit is 5 GB. Use multipart upload for larger payloads.
+///
+/// Connection lifetime is tied to this call: a fresh TLS handshake
+/// per PUT, no pooling. Lambda invocations typically PUT once per
+/// run, and the writer's parallel-multipart path (Phase 5.3) uses
+/// thread-local clients rather than reusing one across PUTs, so the
+/// no-pooling shape matches our real workload.
+pub fn put(
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    body: []const u8,
+) Error!http.Response {
+    const host = try std.fmt.allocPrint(
+        arena,
+        "{s}.s3.{s}.amazonaws.com",
+        .{ url.bucket, creds.region },
+    );
+    const addr_v4 = try resolveIpv4(arena, host);
+    var conn = try tls.Connection.connect(arena, addr_v4, 443, host);
+    defer conn.deinit();
+
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
+
+    const signer: sigv4.SigV4 = .{
+        .region = creds.region,
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+
+    const signed_headers = signer.sign(
+        arena,
+        "PUT",
+        host,
+        path,
+        null,
+        &.{},
+        body,
+        .{ .use_unsigned_payload = true },
+    ) catch return error.SignFailed;
+
+    var req_headers: std.ArrayList(http.Header) = .empty;
+    defer req_headers.deinit(arena);
+    for (signed_headers) |h| {
+        try req_headers.append(arena, .{ .name = h.name, .value = h.value });
+    }
+
+    return try http.sendRequest(arena, &conn, .{
+        .method = .PUT,
+        .host = host,
+        .path = path,
+        .headers = req_headers.items,
+        .body = body,
+    });
+}
+
 fn buildAndSend(
     req_arena: std.mem.Allocator,
     conn: *tls.Connection,

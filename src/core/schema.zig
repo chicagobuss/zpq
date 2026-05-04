@@ -625,13 +625,13 @@ pub const ColumnMetaData = struct {
         try writer.writeFieldI64(5, self.num_values);
         try writer.writeFieldI64(6, self.total_uncompressed_size);
         try writer.writeFieldI64(7, self.total_compressed_size);
-        if (self.statistics) |*s| {
-            try writer.writeFieldBegin(.Struct, 8);
-            try s.write(writer);
-        }
         try writer.writeFieldI64(9, self.data_page_offset);
         if (self.index_page_offset) |v| try writer.writeFieldI64(10, v);
         if (self.dictionary_page_offset) |v| try writer.writeFieldI64(11, v);
+        if (self.statistics) |*s| {
+            try writer.writeFieldBegin(.Struct, 12);
+            try s.write(writer);
+        }
         try writer.writeStructEnd();
     }
 };

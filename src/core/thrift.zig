@@ -173,6 +173,14 @@ pub const Writer = struct {
     buffer: std.ArrayList(u8),
     allocator: std.mem.Allocator,
     last_field_id: i16,
+    /// When a struct is nested as a field within another struct, the
+    /// inner struct must use its own delta-encoding namespace for field
+    /// IDs (starting at 0), but the *outer* struct's `last_field_id`
+    /// must be preserved across the nested write so the next outer
+    /// field encodes correctly. We push on writeStructBegin and pop on
+    /// writeStructEnd. Stack depth 8 is plenty for Parquet metadata.
+    saved_stack: [8]i16 = undefined,
+    saved_stack_pos: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Writer {
         return Writer{
@@ -197,6 +205,7 @@ pub const Writer = struct {
     pub fn reset(self: *Writer) void {
         self.buffer.clearRetainingCapacity();
         self.last_field_id = 0;
+        self.saved_stack_pos = 0;
     }
 
     pub fn writeByte(self: *Writer, b: u8) !void {
@@ -249,11 +258,19 @@ pub const Writer = struct {
     }
 
     pub fn writeStructBegin(self: *Writer) void {
+        if (self.saved_stack_pos < self.saved_stack.len) {
+            self.saved_stack[self.saved_stack_pos] = self.last_field_id;
+            self.saved_stack_pos += 1;
+        }
         self.last_field_id = 0;
     }
 
     pub fn writeStructEnd(self: *Writer) !void {
         try self.writeByte(0); // Stop field
+        if (self.saved_stack_pos > 0) {
+            self.saved_stack_pos -= 1;
+            self.last_field_id = self.saved_stack[self.saved_stack_pos];
+        }
     }
 
     pub fn writeFieldBegin(self: *Writer, field_type: Type, field_id: i16) !void {

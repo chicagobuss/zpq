@@ -38,103 +38,34 @@ Lambda has ~5 Gbps egress. One TLS stream sustains ~100–300 MB/s in
 practice. To saturate that pipe we need 4–8 concurrent streams.
 Sequential won't cut it.
 
-But "we need parallelism" doesn't mean "we need a generic worker-pool
-runtime." Here's what comparable projects use:
+Decided substrate: `std.Io.Threaded` + `Io.Group.concurrent`. Reasoning
+trail and bakeoff data in `docs/journal/2026-05.md` (entry 2026-05-04).
+Short version:
 
-**Polars** (`crates/polars-io/src/pl_async.rs`):
-- Single global tokio runtime.
-- One `Semaphore` bounds in-flight requests (`MAX_BUDGET_PER_REQUEST = 10`).
-- Each request `acquire`s some permits; on completion they're released.
-- Self-tuning based on observed throughput.
-- *No worker pool*. Futures are cooperatively scheduled by tokio.
-
-**DuckDB** (`src/parallel/task_scheduler.cpp`):
-- Lock-free MPMC queue (`moodycamel::ConcurrentQueue`).
-- OS thread pool.
-- Pipelines: source → operators → sink, each parallelizable.
-- This is *much* heavier than we need — DuckDB runs arbitrary SQL.
-
-### What 0.16 changes (and what it doesn't)
-
-Zig 0.16 stable shipped `std.Io` as a vtable interface with concrete
-backends — `Io.Threaded` (production), `Io.Evented` (fibers, experimental),
-`Io.Uring`, `Io.Kqueue`. On top of that:
-
-- **`Io.Group`** — manages many tasks with O(1) overhead. Spawn with
-  `group.async(io, fn, args)`, drain with `group.await(io)`. **This is
-  the morsel pattern, in stdlib.** What we were going to call `InFlight`,
-  Andrew already wrote.
-- **`Io.async` / `Io.concurrent`** — return `Future(T)`. `concurrent`
-  guarantees parallelism; `async` permits cooperative scheduling.
-- **`Io.Queue(T)`** — bounded MPMC channel. (Polars's
-  `tune_with_concurrency_budget` is just a `Semaphore` over a queue.)
-- **`Io.Semaphore` / `Io.Mutex` / `Io.Condition`** — Io-aware sync
-  primitives that suspend the task instead of blocking the thread.
-- **"Juicy Main"** — `pub fn main(init: std.process.Init) !void`
-  hands you `init.io`, `init.gpa`, `init.arena` pre-wired.
-
-For Lambda specifically: io_uring is blocked by the seccomp filter
-(`probes/probe_lambda_caps` confirmed this empirically). `Io.Threaded`
-is the only sane backend — threads block on syscalls, the kernel
-time-slices them; no `io_uring_setup`, no `io_uring_enter`.
-
-### The honest tradeoff
-
-The temptation: rip out the in-tree epoll loop, run `Io.Threaded` for
-everything, get all the above for free.
-
-The reality: `src/io/{epoll, tls, http, sigv4, s3, coalescer}.zig` are
-already built on the in-tree loop and they work — read-side is shipped
-and benchmarked. Replacing the substrate now is a Phase-0 rewrite, not
-a writer feature.
-
-Three real options:
-
-1. **All-in on `std.Io`.** Port s3/tls/http to the `std.Io` interface,
-   delete the epoll loop. Largest scope; clean end-state; cancels
-   sunk cost. *Defer until after 5.x ships.*
-2. **Hybrid: `Io.Threaded` for the writer only.** Reads use the
-   in-tree loop; the writer spawns threads via `Io.Group`. Two I/O
-   models in the same binary, but they don't share state — reads
-   complete fully before the writer starts. Cheap to try.
-3. **Keep the in-tree loop, mirror the `Group` API ourselves.** Build
-   the `~50 LoC InFlight(N)` primitive as originally planned, but
-   shape its surface to look like `Io.Group` so option 1 is mechanical
-   later.
-
-**Recommendation: option 2 for 5.3, with option 1 as the eventual
-end-state.** Justification:
-
-- Writer-side parallelism is *thread-shaped* anyway. S3 PUTs are
-  large, blocking-syscall-heavy, and have no shared state across
-  parts. `Io.Threaded` + `Io.Group` does this in ~10 lines of caller
-  code and zero lines of framework code.
-- The reader side is *event-loop-shaped* — many small range
-  fetches over keep-alive connections, multiplex-friendly. Our
-  in-tree loop is already tuned for it.
-- "Two models" sounds bad in the abstract but is actually how
-  most real systems work (e.g., DuckDB has both a task scheduler
-  and blocking I/O). The seam is at the phase boundary, not
-  inside a hot loop.
+- Zig 0.16 stable ships `Io.Group` as the morsel pattern in stdlib.
+  ~10 lines of caller code parallelizes 8 multipart PUTs across
+  threads. No custom worker-pool, no channels.
+- Hybrid model: in-tree epoll loop stays for the reader (shipped,
+  works), `Io.Threaded` for the writer. The seam is at the phase
+  boundary, not inside a hot loop.
+- Bakeoff confirmed: throughput is CPU-bound on TLS encryption and
+  scales with Lambda memory tier. An event loop would lose by
+  construction (single-threaded, can't parallelize encryption across
+  cores).
 
 ```zig
-// 5.3 sketch — note this is std.Io, not our in-tree loop:
+// Writer parallel-dispatch shape:
 pub fn writeMultipart(io: std.Io, parts: []const Part, ...) !void {
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (parts) |p| group.async(io, uploadPart, .{ io, p });
+    for (parts) |p| try group.concurrent(io, uploadPart, .{ io, p });
     try group.await(io);
 }
 ```
 
-No `InFlight` struct. No `ClientPool` array. No completion-callback
-state machine. The thread owns its connection for the upload's
-lifetime; when the function returns, the connection drops.
-
-If `Io.Group` doesn't materialize a usable connection-pooling story
-(threads contending for a shared `s3.Client` would need `Io.Mutex`
-and we're back to plumbing), we fall back to option 3 and accept
-the ~100 LoC.
+The thread owns its TLS connection for the upload's lifetime; when
+the function returns, the connection drops. No shared `s3.Client`, no
+`Io.Mutex`, no slot tracking.
 
 ## Phase plan (revised)
 

@@ -28,6 +28,8 @@ pub const io = struct {
     pub const strategy = @import("io/strategy.zig");
     pub const loop = @import("io/loop.zig");
     pub const tls = @import("io/tls.zig");
+    pub const sigv4 = @import("io/sigv4.zig");
+    pub const http = @import("io/http.zig");
 };
 
 test {
@@ -47,4 +49,6 @@ test {
     _ = io.strategy;
     _ = io.loop;
     _ = io.tls;
+    _ = io.sigv4;
+    _ = io.http;
 }

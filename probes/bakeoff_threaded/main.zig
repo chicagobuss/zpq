@@ -28,6 +28,7 @@ const s3 = zpq.io.s3;
 
 const PART_COUNT: usize = 8;
 const DEFAULT_FILE = "data/benchmark_100mb.parquet";
+const SYNTH_BYTES: usize = 155 * 1024 * 1024;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -40,12 +41,39 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: AWS_S3_BUCKET not set\n", .{});
         return error.MissingBucket;
     };
-    const file_path = env.getPosix("BAKEOFF_FILE") orelse DEFAULT_FILE;
 
+    if (env.getPosix("AWS_LAMBDA_RUNTIME_API")) |api| {
+        try runLambda(io, gpa, arena, env, creds, bucket, api);
+        return;
+    }
+
+    const file_path = env.getPosix("BAKEOFF_FILE") orelse DEFAULT_FILE;
     std.debug.print("[setup] reading {s}\n", .{file_path});
     const file_data = try readFile(arena, file_path);
     std.debug.print("[setup] {d} bytes loaded\n", .{file_data.len});
 
+    const m = try runBakeoff(io, arena, gpa, creds, bucket, file_data);
+    printMetrics("data/benchmark_100mb.parquet", &m);
+}
+
+const Metrics = struct {
+    file_bytes: usize,
+    part_size: usize,
+    create_ns: u64,
+    parallel_ns: u64,
+    complete_ns: u64,
+    total_ns: u64,
+    per_part_ns: [PART_COUNT]i64,
+};
+
+fn runBakeoff(
+    io: Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    creds: s3.Credentials,
+    bucket: []const u8,
+    file_data: []const u8,
+) !Metrics {
     // --- Slice into PART_COUNT parts ---
     var part_slices: [PART_COUNT][]const u8 = undefined;
     const part_size = (file_data.len + PART_COUNT - 1) / PART_COUNT;
@@ -60,14 +88,10 @@ pub fn main(init: std.process.Init) !void {
     const key = try std.fmt.allocPrint(arena, "bakeoff/{d}/threaded.parquet", .{ts});
     std.debug.print("[setup] target s3://{s}/{s}\n", .{ bucket, key });
 
-    // --- 1. CreateMultipartUpload (sequential) ---
+    // --- 1. CreateMultipartUpload ---
     const t_create_start = nowMonoNs();
     const upload_id = try createMultipart(arena, creds, bucket, key);
     const t_create_end = nowMonoNs();
-    std.debug.print(
-        "[create] upload_id={s}  ({d:.3}s)\n",
-        .{ upload_id, nsToS(t_create_end - t_create_start) },
-    );
 
     // --- 2. Parallel UploadPart via Io.Group ---
     var etag_storage: [PART_COUNT][512]u8 = undefined;
@@ -93,11 +117,12 @@ pub fn main(init: std.process.Init) !void {
     const t_par_start = nowMonoNs();
     var group: Io.Group = .init;
     defer group.cancel(io);
-    for (&ctxs) |*ctx_ptr| group.async(io, uploadPart, .{ io, ctx_ptr });
+    // .concurrent guarantees real parallelism; .async would let the runtime
+    // run tasks synchronously when its async_limit is hit (cpu_count - 1).
+    for (&ctxs) |*ctx_ptr| try group.concurrent(io, uploadPart, .{ io, ctx_ptr });
     try group.await(io);
     const t_par_end = nowMonoNs();
 
-    // Gather etags / detect failures.
     var failed: bool = false;
     for (0..PART_COUNT) |i| {
         if (etag_lens[i] == 0) {
@@ -107,27 +132,144 @@ pub fn main(init: std.process.Init) !void {
     }
     if (failed) return error.PartUploadFailed;
 
-    // --- 3. CompleteMultipartUpload (sequential) ---
+    // --- 3. CompleteMultipartUpload ---
     const t_complete_start = nowMonoNs();
     try completeMultipart(arena, creds, bucket, key, upload_id, &etag_storage, &etag_lens);
     const t_complete_end = nowMonoNs();
 
-    // --- 4. Report ---
-    const par_ns: u64 = @intCast(t_par_end - t_par_start);
-    const total_ns: u64 = @intCast(t_complete_end - t_create_start);
-    const par_mbps = mbPerSec(file_data.len, par_ns);
-    const total_mbps = mbPerSec(file_data.len, total_ns);
+    return .{
+        .file_bytes = file_data.len,
+        .part_size = part_size,
+        .create_ns = @intCast(t_create_end - t_create_start),
+        .parallel_ns = @intCast(t_par_end - t_par_start),
+        .complete_ns = @intCast(t_complete_end - t_complete_start),
+        .total_ns = @intCast(t_complete_end - t_create_start),
+        .per_part_ns = task_durations,
+    };
+}
 
+fn printMetrics(label: []const u8, m: *const Metrics) void {
+    const par_mbps = mbPerSec(m.file_bytes, m.parallel_ns);
+    const total_mbps = mbPerSec(m.file_bytes, m.total_ns);
     std.debug.print("\n=== bakeoff_threaded ===\n", .{});
-    std.debug.print("file       : {s} ({d} bytes)\n", .{ file_path, file_data.len });
-    std.debug.print("parts      : {d} of ~{d} bytes\n", .{ PART_COUNT, part_size });
-    std.debug.print("create     : {d:.3}s\n", .{nsToS(t_create_end - t_create_start)});
-    std.debug.print("parallel   : {d:.3}s   {d:.1} MB/s\n", .{ nsToS(@intCast(par_ns)), par_mbps });
-    std.debug.print("complete   : {d:.3}s\n", .{nsToS(t_complete_end - t_complete_start)});
-    std.debug.print("total      : {d:.3}s   {d:.1} MB/s\n", .{ nsToS(@intCast(total_ns)), total_mbps });
+    std.debug.print("file       : {s} ({d} bytes)\n", .{ label, m.file_bytes });
+    std.debug.print("parts      : {d} of ~{d} bytes\n", .{ PART_COUNT, m.part_size });
+    std.debug.print("create     : {d:.3}s\n", .{nsToS(@intCast(m.create_ns))});
+    std.debug.print("parallel   : {d:.3}s   {d:.1} MB/s\n", .{ nsToS(@intCast(m.parallel_ns)), par_mbps });
+    std.debug.print("complete   : {d:.3}s\n", .{nsToS(@intCast(m.complete_ns))});
+    std.debug.print("total      : {d:.3}s   {d:.1} MB/s\n", .{ nsToS(@intCast(m.total_ns)), total_mbps });
     std.debug.print("per-part durations (s):", .{});
-    for (task_durations) |d| std.debug.print(" {d:.3}", .{nsToS(d)});
+    for (m.per_part_ns) |d| std.debug.print(" {d:.3}", .{nsToS(d)});
     std.debug.print("\n", .{});
+}
+
+// ============================================================
+// Lambda mode
+// ============================================================
+
+fn runLambda(
+    io: Io,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    env: std.process.Environ,
+    creds: s3.Credentials,
+    bucket: []const u8,
+    runtime_api: []const u8,
+) !void {
+    // Pre-generate the synthetic 155 MB payload once at cold start.
+    // Pseudo-random pattern so any TLS layer can't trivially compress.
+    const file_data = try arena.alloc(u8, SYNTH_BYTES);
+    var rng = std.Random.DefaultPrng.init(0xdeadbeef);
+    rng.fill(file_data);
+    std.debug.print("[lambda] cold-start ready: {d} bytes synthetic payload\n", .{file_data.len});
+
+    const colon = std.mem.indexOfScalar(u8, runtime_api, ':') orelse runtime_api.len;
+    const host = runtime_api[0..colon];
+    const port: u16 = if (colon < runtime_api.len)
+        std.fmt.parseInt(u16, runtime_api[colon + 1 ..], 10) catch 80
+    else
+        80;
+
+    while (true) {
+        const event = getNextInvocation(gpa, host, port) catch |err| {
+            std.debug.print("[lambda] poll error {s}\n", .{@errorName(err)});
+            const ts: linux.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = linux.nanosleep(&ts, null);
+            continue;
+        };
+        defer gpa.free(event.body);
+        defer gpa.free(event.request_id);
+
+        const result = runBakeoff(io, arena, gpa, creds, bucket, file_data) catch |err| {
+            const msg = std.fmt.allocPrint(gpa, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch continue;
+            defer gpa.free(msg);
+            postResponse(gpa, host, port, event.request_id, msg) catch {};
+            continue;
+        };
+
+        const json = formatMetricsJson(gpa, env, &result) catch |err| {
+            std.debug.print("[lambda] format error {s}\n", .{@errorName(err)});
+            continue;
+        };
+        defer gpa.free(json);
+
+        printMetrics("synthetic-155MB", &result);
+        postResponse(gpa, host, port, event.request_id, json) catch |err| {
+            std.debug.print("[lambda] post error {s}\n", .{@errorName(err)});
+        };
+    }
+}
+
+fn formatMetricsJson(gpa: std.mem.Allocator, env: std.process.Environ, m: *const Metrics) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+
+    try buf.appendSlice(gpa, "{");
+    try appendKv(gpa, &buf, "memory_mb", env.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") orelse "?");
+    try appendKv(gpa, &buf, "region", env.getPosix("AWS_REGION") orelse "?");
+    try appendKv(gpa, &buf, "arch", @tagName(@import("builtin").target.cpu.arch));
+    try buf.appendSlice(gpa, ",");
+
+    const w = struct {
+        fn intField(g: std.mem.Allocator, b: *std.ArrayList(u8), name: []const u8, v: i128) !void {
+            const s = try std.fmt.allocPrint(g, "\"{s}\":{d},", .{ name, v });
+            defer g.free(s);
+            try b.appendSlice(g, s);
+        }
+        fn floatField(g: std.mem.Allocator, b: *std.ArrayList(u8), name: []const u8, v: f64) !void {
+            const s = try std.fmt.allocPrint(g, "\"{s}\":{d:.4},", .{ name, v });
+            defer g.free(s);
+            try b.appendSlice(g, s);
+        }
+    };
+
+    try w.intField(gpa, &buf, "file_bytes", @intCast(m.file_bytes));
+    try w.intField(gpa, &buf, "part_count", PART_COUNT);
+    try w.intField(gpa, &buf, "part_size", @intCast(m.part_size));
+    try w.floatField(gpa, &buf, "create_s", nsToS(@intCast(m.create_ns)));
+    try w.floatField(gpa, &buf, "parallel_s", nsToS(@intCast(m.parallel_ns)));
+    try w.floatField(gpa, &buf, "complete_s", nsToS(@intCast(m.complete_ns)));
+    try w.floatField(gpa, &buf, "total_s", nsToS(@intCast(m.total_ns)));
+    try w.floatField(gpa, &buf, "parallel_mbps", mbPerSec(m.file_bytes, m.parallel_ns));
+    try w.floatField(gpa, &buf, "total_mbps", mbPerSec(m.file_bytes, m.total_ns));
+
+    try buf.appendSlice(gpa, "\"per_part_s\":[");
+    for (m.per_part_ns, 0..) |d, i| {
+        if (i > 0) try buf.appendSlice(gpa, ",");
+        const s = try std.fmt.allocPrint(gpa, "{d:.4}", .{nsToS(d)});
+        defer gpa.free(s);
+        try buf.appendSlice(gpa, s);
+    }
+    try buf.appendSlice(gpa, "]}");
+
+    return buf.toOwnedSlice(gpa);
+}
+
+fn appendKv(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, val: []const u8) !void {
+    const s = try std.fmt.allocPrint(gpa, "\"{s}\":\"{s}\"", .{ key, val });
+    defer gpa.free(s);
+    if (buf.items.len > 1) try buf.appendSlice(gpa, ",");
+    try buf.appendSlice(gpa, s);
 }
 
 // ============================================================
@@ -448,6 +590,102 @@ fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
         (ip >> 8) & 0xff,
         ip & 0xff,
     });
+}
+
+// ============================================================
+// Lambda runtime API (plain HTTP/1.1 over a local socket).
+// Cribbed from probes/probe_lambda_caps.
+// ============================================================
+
+const InvocationEvent = struct { body: []u8, request_id: []u8 };
+
+fn getNextInvocation(gpa: std.mem.Allocator, host: []const u8, port: u16) !InvocationEvent {
+    const sock = try connectToHost(host, port);
+    defer _ = linux.close(sock);
+    _ = try sysWrite(sock, "GET /2018-06-01/runtime/invocation/next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var tmp: [8192]u8 = undefined;
+    while (true) {
+        const n = sysRead(sock, &tmp) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(gpa, tmp[0..n]);
+    }
+
+    const response = buf.items;
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.Malformed;
+    const headers = response[0..header_end];
+    const body = response[header_end + 4 ..];
+
+    var req_id: []const u8 = "unknown";
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "lambda-runtime-aws-request-id:")) {
+            req_id = std.mem.trim(u8, line["lambda-runtime-aws-request-id:".len..], " \t");
+            break;
+        }
+    }
+    return .{ .body = try gpa.dupe(u8, body), .request_id = try gpa.dupe(u8, req_id) };
+}
+
+fn postResponse(gpa: std.mem.Allocator, host: []const u8, port: u16, id: []const u8, body: []const u8) !void {
+    const sock = try connectToHost(host, port);
+    defer _ = linux.close(sock);
+    const req = try std.fmt.allocPrint(
+        gpa,
+        "POST /2018-06-01/runtime/invocation/{s}/response HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{s}",
+        .{ id, body.len, body },
+    );
+    defer gpa.free(req);
+    var off: usize = 0;
+    while (off < req.len) {
+        const n = try sysWrite(sock, req[off..]);
+        if (n == 0) break;
+        off += n;
+    }
+    var drain: [1024]u8 = undefined;
+    _ = sysRead(sock, &drain) catch {};
+}
+
+fn connectToHost(host: []const u8, port: u16) !linux.fd_t {
+    const r = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    if (sysErr(r)) return error.SocketFailed;
+    const sock: linux.fd_t = @intCast(@as(isize, @bitCast(r)));
+    errdefer _ = linux.close(sock);
+
+    var parts: [4]u8 = undefined;
+    var i: usize = 0;
+    var iter = std.mem.splitScalar(u8, host, '.');
+    while (iter.next()) |p| : (i += 1) {
+        if (i >= 4) break;
+        parts[i] = std.fmt.parseInt(u8, p, 10) catch 0;
+    }
+    var addr = std.mem.zeroes(linux.sockaddr.in);
+    addr.family = linux.AF.INET;
+    addr.port = std.mem.nativeToBig(u16, port);
+    const ip: u32 = (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | parts[3];
+    addr.addr = std.mem.nativeToBig(u32, ip);
+    const cr = linux.connect(sock, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+    if (sysErr(cr)) return error.ConnectFailed;
+    return sock;
+}
+
+fn sysErr(r: usize) bool {
+    const signed: isize = @bitCast(r);
+    return signed >= -4095 and signed < 0;
+}
+
+fn sysRead(fd: linux.fd_t, buf: []u8) !usize {
+    const r = linux.read(fd, buf.ptr, buf.len);
+    if (sysErr(r)) return error.ReadFailed;
+    return @intCast(r);
+}
+
+fn sysWrite(fd: linux.fd_t, buf: []const u8) !usize {
+    const r = linux.write(fd, buf.ptr, buf.len);
+    if (sysErr(r)) return error.WriteFailed;
+    return @intCast(r);
 }
 
 // ============================================================

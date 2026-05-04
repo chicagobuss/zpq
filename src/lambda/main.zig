@@ -6,34 +6,38 @@
 //!   - epoll/eventfd2/timerfd_create/signalfd4/mlock are allowed.
 //!   - SO_ZEROCOPY and TCP_FASTOPEN setsockopt allowed.
 //!
-//! This binary intentionally excludes io_uring code at compile time via
-//! `build_options.lambda`. The in-tree epoll backend is the only event
-//! loop driver linked here.
-//!
 //! Lifecycle (production / S3 path):
-//!   1. Receive `{"s3_url": "s3://bucket/key"}` invocation event.
+//!   1. Receive `{"s3_url": "...", "filter": "...optional..."}`.
 //!   2. Suffix GET for the last 64 KB to discover file size + footer.
 //!   3. If the footer is bigger than 64 KB, fetch the rest.
-//!   4. Plan: which column chunks does the query need?
-//!   5. Coalesce nearby chunk ranges; fetch each.
-//!   6. Stitch fetched bytes into a sparse file buffer; decode.
-//!   7. Return aggregate stats.
-//!
-//! Legacy (local fixture) path: if the body looks like raw Parquet
-//! bytes (doesn't start with `{`), decode directly. Used by the
-//! in-process integration test.
+//!   4. Parse FileMetaData. If filter is present, parse it against
+//!      the schema.
+//!   5. For each row group: prune via the filter's stats. For
+//!      survivors, range-fetch the int8 column AND any filter
+//!      columns. Coalesce nearby ranges.
+//!   6. Decode each column into typed slices, build a SelectionVector,
+//!      run filter.eval, then aggregate matched int8 values.
+//!   7. Return JSON envelope with row_groups_pruned + matched count
+//!      + min/max/sum.
 
 const std = @import("std");
 const zpq = @import("zpq");
 const runtime = @import("runtime.zig");
 
+const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
 const s3 = zpq.io.s3;
 const coalescer = zpq.io.coalescer;
+const filter_ast = zpq.core.filter.ast;
+const filter_parser = zpq.core.filter.parser;
+const filter_prune = zpq.core.filter.prune;
+const filter_selection = zpq.core.filter.selection;
+const filter_eval = zpq.core.filter.eval;
 
 const TAIL_SIZE: u64 = 64 * 1024;
 const COALESCE_GAP: u64 = 64 * 1024;
+const TARGET_COLUMN: []const u8 = "int8";
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
@@ -80,22 +84,29 @@ fn handle(
 
     const trimmed = std.mem.trim(u8, inv.body, " \r\n\t");
     if (trimmed.len > 0 and trimmed[0] == '{') {
-        const url = extractS3Url(trimmed) catch |err| {
+        const url = extractField(trimmed, "s3_url") catch |err| {
             return std.fmt.allocPrint(
                 allocator,
                 "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}",
                 .{@errorName(err)},
             );
         };
-        return try handleS3(allocator, env, url);
+        const filter_str = extractField(trimmed, "filter") catch null;
+        return try handleS3(allocator, env, url, filter_str);
     }
 
     // Legacy raw-bytes path used by the in-process integration test.
-    return try aggregateInt8(allocator, inv.body);
+    return try aggregateInt8(allocator, inv.body, null);
 }
 
-fn extractS3Url(body: []const u8) ![]const u8 {
-    const key = "\"s3_url\"";
+fn extractField(body: []const u8, name: []const u8) ![]const u8 {
+    var key_buf: [64]u8 = undefined;
+    if (name.len + 2 > key_buf.len) return error.NameTooLong;
+    key_buf[0] = '"';
+    @memcpy(key_buf[1 .. 1 + name.len], name);
+    key_buf[1 + name.len] = '"';
+    const key = key_buf[0 .. 2 + name.len];
+
     const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
     var i = pos + key.len;
     while (i < body.len and (body[i] == ' ' or body[i] == ':')) : (i += 1) {}
@@ -107,166 +118,262 @@ fn extractS3Url(body: []const u8) ![]const u8 {
     return body[start..i];
 }
 
-/// Production S3 path. Range-fetches only the bytes the query needs.
-fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []const u8) ![]u8 {
+fn handleS3(
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    s3_url: []const u8,
+    filter_str: ?[]const u8,
+) ![]u8 {
     const url = s3.Url.parse(s3_url) catch |err| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"bad_s3_url\",\"reason\":\"{s}\"}}",
-            .{@errorName(err)},
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_s3_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     const creds = s3.Credentials.fromEnv(env) catch |err| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}",
-            .{@errorName(err)},
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Single Client over a single keep-alive TLS connection. All N
-    // range fetches share one DNS lookup and one TLS handshake.
     var client = s3.Client.init(a, creds, url.bucket) catch |err| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"client_init_failed\",\"reason\":\"{s}\"}}",
-            .{@errorName(err)},
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"client_init\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     defer client.deinit();
 
-    // 1. Suffix GET — last 64 KB. Tells us total file size via
-    //    Content-Range, and usually contains the entire footer.
+    // 1. Tail GET to discover total size and pull the footer.
     const tail_resp = client.get(a, url.key, s3.Range.suffix(TAIL_SIZE)) catch |err| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"tail_fetch_failed\",\"reason\":\"{s}\"}}",
-            .{@errorName(err)},
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_fetch\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     if (tail_resp.status != 206 and tail_resp.status != 200) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"tail_status\",\"status\":{d},\"body\":\"{s}\"}}",
-            .{ tail_resp.status, tail_resp.body[0..@min(tail_resp.body.len, 256)] },
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_status\",\"status\":{d}}}", .{tail_resp.status});
     }
 
     const total_size = parseTotalFromContentRange(tail_resp.header("Content-Range")) catch |err| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}",
-            .{@errorName(err)},
-        );
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    // 2. Allocate the sparse file buffer and stamp the tail in.
-    //    On Linux, allocator.alloc backs the buffer with mmap'd pages
-    //    that are lazily committed on first write — physical RSS only
-    //    grows for pages we actually populate.
+    // 2. Allocate sparse file buffer; stamp the tail.
     const file_buf = try allocator.alloc(u8, total_size);
     defer allocator.free(file_buf);
-
     const tail_start = total_size - tail_resp.body.len;
     @memcpy(file_buf[tail_start..], tail_resp.body);
 
-    // 3. Locate the footer. Last 8 bytes: footer_length (4 LE) + "PAR1".
+    // 3. Locate the footer and fetch the missing prefix if needed.
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
-    // Parquet layout:
-    //   [0..4]                                 leading magic "PAR1"
-    //   [4..total_size-8]                      row groups + footer
-    //   [total_size-8..total_size-4]           footer_len u32 LE
-    //   [total_size-4..total_size]             trailing magic "PAR1"
     const footer_actual_start = total_size - 8 - footer_len;
-
-    // 4. If footer extends before the tail we already fetched, get the rest.
     if (footer_actual_start < tail_start) {
-        const need_start = footer_actual_start;
-        const need_end = tail_start; // exclusive
-        const need_resp = try client.get(
-            a,
-            url.key,
-            s3.Range.span(need_start, need_end - 1),
-        );
-        if (need_resp.status != 206) return error.RangeStatus;
-        @memcpy(file_buf[need_start..need_end], need_resp.body);
+        const need = try client.get(a, url.key, s3.Range.span(footer_actual_start, tail_start - 1));
+        if (need.status != 206) return error.RangeStatus;
+        @memcpy(file_buf[footer_actual_start..tail_start], need.body);
     }
+    const head = try client.get(a, url.key, s3.Range.span(0, 7));
+    if (head.status != 206) return error.RangeStatus;
+    @memcpy(file_buf[0..head.body.len], head.body);
 
-    // 5. Always fetch the leading magic so metadata.open's validation
-    //    passes. Cheap (8 bytes) and avoids special-casing the parser.
-    const head_resp = try client.get(a, url.key, s3.Range.span(0, 7));
-    if (head_resp.status != 206) return error.RangeStatus;
-    @memcpy(file_buf[0..head_resp.body.len], head_resp.body);
-
-    // 6. Parse metadata.
     var meta = try metadata.open(a, file_buf);
     defer meta.deinit(a);
 
-    const target = "int8";
-    const col_idx = metadata.findColumnIndex(&meta, target) orelse {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"column_missing\",\"name\":\"{s}\"}}",
-            .{target},
-        );
+    // 4. Parse the filter (if any) against the schema.
+    var filter: ?filter_ast.Filter = null;
+    if (filter_str) |fs| {
+        if (fs.len > 0) {
+            filter = filter_parser.parse(a, fs, &meta) catch |err| {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"filter_parse\",\"reason\":\"{s}\",\"expr\":\"{s}\"}}",
+                    .{ @errorName(err), fs },
+                );
+            };
+        }
+    }
+
+    // 5. Find target column index (the column we aggregate over).
+    const target_idx = metadata.findColumnIndex(&meta, TARGET_COLUMN) orelse {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"target_missing\"}}", .{});
     };
 
-    // 7. Plan column chunk ranges across all row groups.
-    var ranges: std.ArrayList(coalescer.Range) = .empty;
+    // 6. Collect filter columns (if any). Dedup against target.
+    var filter_cols: std.ArrayList(usize) = .empty;
+    if (filter) |f| try f.collectColumns(&filter_cols, a);
+
+    // Dedup + ensure target is included.
+    var fetch_cols: std.ArrayList(usize) = .empty;
+    try fetch_cols.append(a, target_idx);
+    for (filter_cols.items) |ci| {
+        if (std.mem.indexOfScalar(usize, fetch_cols.items, ci) == null) {
+            try fetch_cols.append(a, ci);
+        }
+    }
+
+    // 7. Walk row groups: prune (if filter), then fetch + decode +
+    //    eval + aggregate.
+    var rg_pruned: usize = 0;
+    var rows_seen: i64 = 0;
+    var rows_matched: i64 = 0;
+    var min_v: i32 = std.math.maxInt(i32);
+    var max_v: i32 = std.math.minInt(i32);
+    var sum: i64 = 0;
+
     for (meta.row_groups.items) |rg| {
-        const col = rg.columns.items[col_idx].meta_data orelse continue;
-        const start: u64 = if (col.dictionary_page_offset) |dp|
-            @intCast(dp)
-        else
-            @intCast(col.data_page_offset);
-        const len: u64 = @intCast(col.total_compressed_size);
-        try ranges.append(a, .{ .start = start, .end = start + len });
+        if (filter) |f| {
+            const decision = try filter_prune.pruneRowGroup(&rg, f, a);
+            if (decision == .skip) {
+                rg_pruned += 1;
+                continue;
+            }
+        }
+
+        // Fetch all needed column chunks for this row group.
+        var ranges: std.ArrayList(coalescer.Range) = .empty;
+        for (fetch_cols.items) |ci| {
+            const col_meta = rg.columns.items[ci].meta_data orelse continue;
+            const start: u64 = if (col_meta.dictionary_page_offset) |dp|
+                @intCast(dp)
+            else
+                @intCast(col_meta.data_page_offset);
+            const len: u64 = @intCast(col_meta.total_compressed_size);
+            try ranges.append(a, .{ .start = start, .end = start + len });
+        }
+        const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
+        for (merged) |r| {
+            if (r.start >= tail_start) continue;
+            const fetch_end_excl = @min(r.end, tail_start);
+            const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
+            if (resp.status != 206) return error.RangeStatus;
+            @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
+        }
+
+        // Decode each fetch_col into a typed slice. For our demo,
+        // values for the target are always INT32 (int8 logical type
+        // stored as INT32 physical).
+        var rg_arena = std.heap.ArenaAllocator.init(allocator);
+        defer rg_arena.deinit();
+        const ra = rg_arena.allocator();
+
+        const num_rows: usize = @intCast(rg.num_rows);
+        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+
+        // Decode columns referenced by the filter; build a Batch.
+        const col_count = fetch_cols.items.len;
+        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+        try batch_cols.ensureTotalCapacity(ra, col_count);
+        var lookup = try ra.alloc(?usize, meta.schema.items.len);
+        @memset(lookup, null);
+
+        var target_values: ?[]const i32 = null;
+
+        for (fetch_cols.items, 0..) |ci, batch_pos| {
+            const col_meta = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+            const chunk_start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
+            const chunk_len: usize = @intCast(col_meta.total_compressed_size);
+            const chunk = file_buf[chunk_start .. chunk_start + chunk_len];
+
+            const path = meta.schema.items[ci + 1].name;
+            const path_arr: [1][]const u8 = .{path};
+            const levels = meta.getColumnLevels(&path_arr);
+
+            const pt = col_meta.type;
+            const decoded: filter_eval.Batch.Column = switch (pt) {
+                .INT32 => blk: {
+                    const out = try ra.alloc(i32, num_rows);
+                    var reader = column_mod.ColumnChunkReader(i32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i32, &reader, out);
+                    if (ci == target_idx) target_values = out;
+                    break :blk .{ .i32 = out };
+                },
+                .INT64 => blk: {
+                    const out = try ra.alloc(i64, num_rows);
+                    var reader = column_mod.ColumnChunkReader(i64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i64, &reader, out);
+                    break :blk .{ .i64 = out };
+                },
+                .FLOAT => blk: {
+                    const out = try ra.alloc(f32, num_rows);
+                    var reader = column_mod.ColumnChunkReader(f32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f32, &reader, out);
+                    break :blk .{ .f32 = out };
+                },
+                .DOUBLE => blk: {
+                    const out = try ra.alloc(f64, num_rows);
+                    var reader = column_mod.ColumnChunkReader(f64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f64, &reader, out);
+                    break :blk .{ .f64 = out };
+                },
+                .BYTE_ARRAY => blk: {
+                    const out = try ra.alloc([]const u8, num_rows);
+                    var reader = column_mod.ColumnChunkReader([]const u8).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll([]const u8, &reader, out);
+                    break :blk .{ .string = out };
+                },
+                .BOOLEAN => blk: {
+                    const out = try ra.alloc(bool, num_rows);
+                    var reader = column_mod.ColumnChunkReader(bool).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(bool, &reader, out);
+                    break :blk .{ .boolean = out };
+                },
+                else => return error.UnsupportedColumnType,
+            };
+            try batch_cols.append(ra, decoded);
+            lookup[ci] = batch_pos;
+        }
+
+        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+
+        // Apply filter (or leave selection all-active).
+        if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+
+        // Aggregate target values masked by selection.
+        const tv = target_values orelse return error.TargetNotDecoded;
+        for (tv, 0..) |v, i| {
+            if (sel.isActive(i)) {
+                if (v < min_v) min_v = v;
+                if (v > max_v) max_v = v;
+                sum += v;
+                rows_matched += 1;
+            }
+            rows_seen += 1;
+        }
     }
 
-    // 8. Coalesce nearby ranges to reduce request count.
-    const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
-
-    // 9. Fetch each merged range. Skip pieces the tail already covered.
-    var fetched_bytes: u64 = 0;
-    for (merged) |r| {
-        // If the tail already covers this whole range, skip.
-        if (r.start >= tail_start) continue;
-        const fetch_end_excl = @min(r.end, tail_start);
-        const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
-        if (resp.status != 206) return error.RangeStatus;
-        @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
-        fetched_bytes += resp.body.len;
+    // Emit response. Min/max are only meaningful when rows_matched > 0.
+    if (rows_matched == 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"ok\":true,\"column\":\"{s}\",\"rows_seen\":{d},\"rows_matched\":0,\"row_groups_pruned\":{d},\"row_groups\":{d}}}",
+            .{ TARGET_COLUMN, rows_seen, rg_pruned, meta.row_groups.items.len },
+        );
     }
-
-    // 10. Decode using the now-populated sparse buffer. The decoder
-    //     only touches the bytes we've fetched; the rest is undefined.
-    const result = try aggregateInt8WithMeta(allocator, file_buf, &meta, col_idx);
-
-    // Append fetch stats so we can see the win in the response.
     return std.fmt.allocPrint(
         allocator,
-        "{s}",
-        .{result},
+        "{{\"ok\":true,\"column\":\"{s}\",\"rows_seen\":{d},\"rows_matched\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"row_groups_pruned\":{d},\"row_groups\":{d}}}",
+        .{ TARGET_COLUMN, rows_seen, rows_matched, min_v, max_v, sum, rg_pruned, meta.row_groups.items.len },
     );
+}
+
+fn decodeAll(comptime T: type, reader: anytype, out: []T) !void {
+    var written: usize = 0;
+    while (written < out.len) {
+        const n = try reader.decode(out[written..]);
+        if (n == 0) break;
+        written += n;
+    }
+    if (written != out.len) return error.ShortDecode;
 }
 
 fn parseTotalFromContentRange(cr_or_null: ?[]const u8) !u64 {
     const cr = cr_or_null orelse return error.NoContentRange;
-    // Format: "bytes X-Y/Z"
     const slash = std.mem.indexOfScalar(u8, cr, '/') orelse return error.BadContentRange;
     const total = std.mem.trim(u8, cr[slash + 1 ..], " \t");
     if (total.len == 0 or total[0] == '*') return error.BadContentRange;
     return std.fmt.parseInt(u64, total, 10) catch error.BadContentRange;
 }
 
-fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
+/// Local-fixture path: decode the whole file (it's already in memory).
+/// Filter not supported on this path — used only by integration tests.
+fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filter_ast.Filter) ![]u8 {
     if (file_bytes.len < 12) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"too_small\",\"len\":{d}}}", .{file_bytes.len});
     }
@@ -280,55 +387,29 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
     };
     defer meta.deinit(allocator);
 
-    const target = "int8";
-    const col_idx = metadata.findColumnIndex(&meta, target) orelse {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"error\":\"column_missing\",\"name\":\"{s}\"}}",
-            .{target},
-        );
+    const target_idx = metadata.findColumnIndex(&meta, TARGET_COLUMN) orelse {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"target_missing\"}}", .{});
     };
-    return try aggregateInt8WithMeta(allocator, file_bytes, &meta, col_idx);
-}
 
-fn aggregateInt8WithMeta(
-    allocator: std.mem.Allocator,
-    file_bytes: []const u8,
-    meta: *const zpq.core.schema.FileMetaData,
-    col_idx: usize,
-) ![]u8 {
     var total_rows: i64 = 0;
     var min_v: i32 = std.math.maxInt(i32);
     var max_v: i32 = std.math.minInt(i32);
     var sum: i64 = 0;
-    var bytes_decoded: usize = 0;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const target = "int8";
-    const path: [1][]const u8 = .{target};
-    const levels = meta.getColumnLevels(&path);
+    const path_arr: [1][]const u8 = .{TARGET_COLUMN};
+    const levels = meta.getColumnLevels(&path_arr);
 
     for (meta.row_groups.items) |rg| {
         _ = arena.reset(.retain_capacity);
-
-        const col = rg.columns.items[col_idx].meta_data orelse return error.ColumnMetaMissing;
-        const chunk_start: usize = if (col.dictionary_page_offset) |dp|
-            @intCast(dp)
-        else
-            @intCast(col.data_page_offset);
+        const col = rg.columns.items[target_idx].meta_data orelse return error.ColumnMetaMissing;
+        const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
         const chunk_len: usize = @intCast(col.total_compressed_size);
-        if (chunk_start + chunk_len > file_bytes.len) return error.ChunkOutOfRange;
         const chunk = file_bytes[chunk_start .. chunk_start + chunk_len];
 
-        var reader = column_mod.ColumnChunkReader(i32).init(
-            chunk,
-            col.codec,
-            levels,
-            arena.allocator(),
-        );
-
+        var reader = column_mod.ColumnChunkReader(i32).init(chunk, col.codec, levels, arena.allocator());
         var batch: [4096]i32 = undefined;
         while (true) {
             const n = try reader.decode(&batch);
@@ -340,13 +421,12 @@ fn aggregateInt8WithMeta(
             }
             total_rows += @intCast(n);
         }
-        bytes_decoded += @intCast(col.total_uncompressed_size);
     }
 
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"column\":\"{s}\",\"rows\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"bytes_decoded\":{d},\"row_groups\":{d}}}",
-        .{ target, total_rows, min_v, max_v, sum, bytes_decoded, meta.row_groups.items.len },
+        "{{\"ok\":true,\"column\":\"{s}\",\"rows\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"row_groups\":{d}}}",
+        .{ TARGET_COLUMN, total_rows, min_v, max_v, sum, meta.row_groups.items.len },
     );
 }
 

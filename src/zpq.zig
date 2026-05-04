@@ -12,6 +12,8 @@ pub const core = struct {
         pub const encoded = @import("core/filter/encoded.zig");
         pub const parser = @import("core/filter/parser.zig");
         pub const prune = @import("core/filter/prune.zig");
+        pub const selection = @import("core/filter/selection.zig");
+        pub const eval = @import("core/filter/eval.zig");
     };
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
@@ -47,6 +49,8 @@ test {
     _ = core.filter.encoded;
     _ = core.filter.parser;
     _ = core.filter.prune;
+    _ = core.filter.selection;
+    _ = core.filter.eval;
     _ = core.parquet.metadata;
     _ = core.parquet.snappy;
     _ = core.parquet.lz4;

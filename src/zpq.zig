@@ -31,6 +31,7 @@ pub const io = struct {
     pub const sigv4 = @import("io/sigv4.zig");
     pub const http = @import("io/http.zig");
     pub const s3 = @import("io/s3.zig");
+    pub const coalescer = @import("io/coalescer.zig");
 };
 
 test {
@@ -53,4 +54,5 @@ test {
     _ = io.sigv4;
     _ = io.http;
     _ = io.s3;
+    _ = io.coalescer;
 }

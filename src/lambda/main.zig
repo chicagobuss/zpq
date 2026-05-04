@@ -10,18 +10,18 @@
 //! `build_options.lambda`. The in-tree epoll backend is the only event
 //! loop driver linked here.
 //!
-//! Lifecycle:
-//!   1. Init the runtime API client.
-//!   2. Long-poll for invocations.
-//!   3. For each invocation: extract the s3_url, fetch the file via
-//!      our SigV4 + HTTPS + range-GET stack, decode one column, post
-//!      the response.
-//!   4. Repeat. Process exits on fatal errors only.
+//! Lifecycle (production / S3 path):
+//!   1. Receive `{"s3_url": "s3://bucket/key"}` invocation event.
+//!   2. Suffix GET for the last 64 KB to discover file size + footer.
+//!   3. If the footer is bigger than 64 KB, fetch the rest.
+//!   4. Plan: which column chunks does the query need?
+//!   5. Coalesce nearby chunk ranges; fetch each.
+//!   6. Stitch fetched bytes into a sparse file buffer; decode.
+//!   7. Return aggregate stats.
 //!
-//! Event body shape:
-//!     {"s3_url": "s3://bucket/key"}    (production path — fetches from S3)
-//! or  raw Parquet bytes                 (legacy local-fixture path used by
-//!                                        the in-process integration test)
+//! Legacy (local fixture) path: if the body looks like raw Parquet
+//! bytes (doesn't start with `{`), decode directly. Used by the
+//! in-process integration test.
 
 const std = @import("std");
 const zpq = @import("zpq");
@@ -30,6 +30,10 @@ const runtime = @import("runtime.zig");
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
 const s3 = zpq.io.s3;
+const coalescer = zpq.io.coalescer;
+
+const TAIL_SIZE: u64 = 64 * 1024;
+const COALESCE_GAP: u64 = 64 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .{};
@@ -74,12 +78,8 @@ fn handle(
         return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
     }
 
-    // Try parsing as the production JSON envelope first. If it looks
-    // like JSON (starts with `{`), extract s3_url and fetch from S3.
-    // Otherwise treat the body as raw Parquet bytes (legacy local
-    // integration-test path).
     const trimmed = std.mem.trim(u8, inv.body, " \r\n\t");
-    const file_bytes = if (trimmed.len > 0 and trimmed[0] == '{') blk: {
+    if (trimmed.len > 0 and trimmed[0] == '{') {
         const url = extractS3Url(trimmed) catch |err| {
             return std.fmt.allocPrint(
                 allocator,
@@ -87,23 +87,14 @@ fn handle(
                 .{@errorName(err)},
             );
         };
-        const fetched = fetchS3File(allocator, env, url) catch |err| {
-            return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"s3_fetch_failed\",\"reason\":\"{s}\",\"url\":\"{s}\"}}",
-                .{ @errorName(err), url },
-            );
-        };
-        break :blk fetched;
-    } else inv.body;
-    defer if (file_bytes.ptr != inv.body.ptr) allocator.free(file_bytes);
+        return try handleS3(allocator, env, url);
+    }
 
-    return try aggregateInt8(allocator, file_bytes);
+    // Legacy raw-bytes path used by the in-process integration test.
+    return try aggregateInt8(allocator, inv.body);
 }
 
 fn extractS3Url(body: []const u8) ![]const u8 {
-    // Hand-rolled JSON sniff for {"s3_url": "..."}. Fully-validated
-    // parsing isn't worth the API surface for one field.
     const key = "\"s3_url\"";
     const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
     var i = pos + key.len;
@@ -116,28 +107,153 @@ fn extractS3Url(body: []const u8) ![]const u8 {
     return body[start..i];
 }
 
-fn fetchS3File(
-    allocator: std.mem.Allocator,
-    env: std.process.Environ,
-    s3_url: []const u8,
-) ![]u8 {
-    const url = try s3.Url.parse(s3_url);
-    const creds = try s3.Credentials.fromEnv(env);
+/// Production S3 path. Range-fetches only the bytes the query needs.
+fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []const u8) ![]u8 {
+    const url = s3.Url.parse(s3_url) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"bad_s3_url\",\"reason\":\"{s}\"}}",
+            .{@errorName(err)},
+        );
+    };
+    const creds = s3.Credentials.fromEnv(env) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}",
+            .{@errorName(err)},
+        );
+    };
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    const a = arena.allocator();
 
-    const resp = try s3.get(arena.allocator(), creds, url, null);
-    if (resp.status != 200) {
-        // Pull the response body into stderr (Lambda CloudWatch picks
-        // it up) so we can see what S3 actually said.
-        std.debug.print("zpq lambda: s3 status={d}, body={s}\n", .{ resp.status, resp.body });
-        return error.S3Status;
+    // 1. Suffix GET — last 64 KB. Tells us total file size via
+    //    Content-Range, and usually contains the entire footer.
+    const tail_resp = s3.get(a, creds, url, s3.Range.suffix(TAIL_SIZE)) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"tail_fetch_failed\",\"reason\":\"{s}\"}}",
+            .{@errorName(err)},
+        );
+    };
+    if (tail_resp.status != 206 and tail_resp.status != 200) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"tail_status\",\"status\":{d},\"body\":\"{s}\"}}",
+            .{ tail_resp.status, tail_resp.body[0..@min(tail_resp.body.len, 256)] },
+        );
     }
 
-    // Copy out of the arena into a fresh allocator-owned slice so the
-    // caller doesn't need to manage the arena lifetime.
-    return try allocator.dupe(u8, resp.body);
+    const total_size = parseTotalFromContentRange(tail_resp.header("Content-Range")) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}",
+            .{@errorName(err)},
+        );
+    };
+
+    // 2. Allocate the sparse file buffer and stamp the tail in.
+    //    On Linux, allocator.alloc backs the buffer with mmap'd pages
+    //    that are lazily committed on first write — physical RSS only
+    //    grows for pages we actually populate.
+    const file_buf = try allocator.alloc(u8, total_size);
+    defer allocator.free(file_buf);
+
+    const tail_start = total_size - tail_resp.body.len;
+    @memcpy(file_buf[tail_start..], tail_resp.body);
+
+    // 3. Locate the footer. Last 8 bytes: footer_length (4 LE) + "PAR1".
+    if (tail_resp.body.len < 8) return error.TailTooSmall;
+    const tail = tail_resp.body;
+    if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
+    const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
+    // Parquet layout:
+    //   [0..4]                                 leading magic "PAR1"
+    //   [4..total_size-8]                      row groups + footer
+    //   [total_size-8..total_size-4]           footer_len u32 LE
+    //   [total_size-4..total_size]             trailing magic "PAR1"
+    const footer_actual_start = total_size - 8 - footer_len;
+
+    // 4. If footer extends before the tail we already fetched, get the rest.
+    if (footer_actual_start < tail_start) {
+        const need_start = footer_actual_start;
+        const need_end = tail_start; // exclusive
+        const need_resp = try s3.get(
+            a,
+            creds,
+            url,
+            s3.Range.span(need_start, need_end - 1),
+        );
+        if (need_resp.status != 206) return error.RangeStatus;
+        @memcpy(file_buf[need_start..need_end], need_resp.body);
+    }
+
+    // 5. Always fetch the leading magic so metadata.open's validation
+    //    passes. Cheap (8 bytes) and avoids special-casing the parser.
+    const head_resp = try s3.get(a, creds, url, s3.Range.span(0, 7));
+    if (head_resp.status != 206) return error.RangeStatus;
+    @memcpy(file_buf[0..head_resp.body.len], head_resp.body);
+
+    // 6. Parse metadata.
+    var meta = try metadata.open(a, file_buf);
+    defer meta.deinit(a);
+
+    const target = "int8";
+    const col_idx = metadata.findColumnIndex(&meta, target) orelse {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"column_missing\",\"name\":\"{s}\"}}",
+            .{target},
+        );
+    };
+
+    // 7. Plan column chunk ranges across all row groups.
+    var ranges: std.ArrayList(coalescer.Range) = .empty;
+    for (meta.row_groups.items) |rg| {
+        const col = rg.columns.items[col_idx].meta_data orelse continue;
+        const start: u64 = if (col.dictionary_page_offset) |dp|
+            @intCast(dp)
+        else
+            @intCast(col.data_page_offset);
+        const len: u64 = @intCast(col.total_compressed_size);
+        try ranges.append(a, .{ .start = start, .end = start + len });
+    }
+
+    // 8. Coalesce nearby ranges to reduce request count.
+    const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
+
+    // 9. Fetch each merged range. Skip pieces the tail already covered.
+    var fetched_bytes: u64 = 0;
+    for (merged) |r| {
+        // If the tail already covers this whole range, skip.
+        if (r.start >= tail_start) continue;
+        const fetch_end_excl = @min(r.end, tail_start);
+        const resp = try s3.get(a, creds, url, s3.Range.span(r.start, fetch_end_excl - 1));
+        if (resp.status != 206) return error.RangeStatus;
+        @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
+        fetched_bytes += resp.body.len;
+    }
+
+    // 10. Decode using the now-populated sparse buffer. The decoder
+    //     only touches the bytes we've fetched; the rest is undefined.
+    const result = try aggregateInt8WithMeta(allocator, file_buf, &meta, col_idx);
+
+    // Append fetch stats so we can see the win in the response.
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}",
+        .{result},
+    );
+}
+
+fn parseTotalFromContentRange(cr_or_null: ?[]const u8) !u64 {
+    const cr = cr_or_null orelse return error.NoContentRange;
+    // Format: "bytes X-Y/Z"
+    const slash = std.mem.indexOfScalar(u8, cr, '/') orelse return error.BadContentRange;
+    const total = std.mem.trim(u8, cr[slash + 1 ..], " \t");
+    if (total.len == 0 or total[0] == '*') return error.BadContentRange;
+    return std.fmt.parseInt(u64, total, 10) catch error.BadContentRange;
 }
 
 fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
@@ -162,7 +278,15 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
             .{target},
         );
     };
+    return try aggregateInt8WithMeta(allocator, file_bytes, &meta, col_idx);
+}
 
+fn aggregateInt8WithMeta(
+    allocator: std.mem.Allocator,
+    file_bytes: []const u8,
+    meta: *const zpq.core.schema.FileMetaData,
+    col_idx: usize,
+) ![]u8 {
     var total_rows: i64 = 0;
     var min_v: i32 = std.math.maxInt(i32);
     var max_v: i32 = std.math.minInt(i32);
@@ -172,6 +296,7 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    const target = "int8";
     const path: [1][]const u8 = .{target};
     const levels = meta.getColumnLevels(&path);
 

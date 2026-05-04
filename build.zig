@@ -108,6 +108,25 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run Lambda integration tests");
     integration_step.dependOn(&run_integration_tests.step);
+
+    // ----- Bakeoff probes -----
+    // Disposable. Probe std.Io.Threaded vs an epoll-driven variant for
+    // multipart S3 PUTs. See docs/writer_design.md.
+    const bakeoff_threaded = b.addExecutable(.{
+        .name = "bakeoff_threaded",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/bakeoff_threaded/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "zpq", .module = cli_zpq.zpq },
+            },
+        }),
+    });
+    b.installArtifact(bakeoff_threaded);
+    const bakeoff_threaded_step = b.step("bakeoff-threaded", "Build the Io.Threaded multipart-PUT bakeoff probe");
+    bakeoff_threaded_step.dependOn(&b.addInstallArtifact(bakeoff_threaded, .{}).step);
 }
 
 /// Bundle the per-binary modules. We give each binary its own zpq module

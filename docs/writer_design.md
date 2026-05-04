@@ -1,94 +1,131 @@
 # Parquet Writer + S3 Sink Design (Phase 5)
 
-The contract for `src/io/s3_sink.zig` (or wherever the writer
-ends up). Read this before writing or modifying writer code.
+The contract for `src/io/s3_sink.zig` and the small concurrency
+primitives it sits on top of. Read this before writing or modifying
+writer code.
 
 > **The previous writer attempt is what made the project lose
 > shape.** This document leads with the failure modes so we don't
-> repeat them. The "what we are NOT building" section is the most
-> important part of this doc; treat it as a budget, not a wish list.
+> repeat them. The lesson was *not* "parallelism is bad" — Lambda
+> has ~5 Gbps egress and we'll never saturate it serially. The
+> lesson was "the abstractions around parallelism sprawled."
 
-## What we are NOT building (yet)
+## What we are NOT building (the v1 failure modes)
 
 The pre-rewrite writer/sink layer was ~1,300 LoC across ten files.
 For comparison, our entire current filter system (AST + parser +
 encoded comparator + prune + selection vector + eval) is ~900 LoC.
 A single feature with more code than the entire filter pipeline is
-a clear signal of premature abstraction.
+the smoking gun.
 
 Specifically rejected:
 
 | Pre-rewrite artifact | Rejected because |
 |---|---|
-| `Sink` vtable with three impls (`s3`, `local`, `memory`) | We have one production sink (S3). Build it directly. Add an interface only when the second concrete impl actually exists. |
+| `Sink` vtable with three impls (`s3`, `local`, `memory`) | One production sink (S3). Build it directly. Add an interface only when a second concrete impl actually exists. |
 | `factory.zig` (110 LoC) | Implies enough variation to need dispatch. Today there isn't. |
-| `sink/morsel.zig` + `sink/channel.zig` + `sink/task.zig` triad | Three abstractions for "send a unit of work to a worker." Premature parallelism scaffolding. The whole point of phase 5.1 is to ship the writer *without* parallelism, then prove what to parallelize from real numbers. |
-| `sink/writer.zig` separate from `core/writer.zig` separate from `s3/sink_writer.zig` | Three writer abstractions. Pick one location. |
-| 495-line `core/writer.zig` Parquet writer | Phase 5 deliberately skips per-row decode/encode. The fast path doesn't need it. |
+| `sink/morsel.zig` + `sink/channel.zig` + `sink/task.zig` triad (245 LoC) | Three abstractions for "send work to a worker." Channel + morsel + task is the *generic* worker-pool scaffolding from systems like DuckDB's task scheduler. We don't need it; see Concurrency below. |
+| Three Parquet writer locations (`sink/writer.zig`, `s3/sink_writer.zig`, `core/writer.zig`) | One writer file. Pick a location. |
 
-The pre-reset code wasn't bad code — each file is reasonable in
-isolation. The problem was the composition: too many seams, too
-many shared abstractions, too many concrete impls behind interfaces
-that didn't earn their cost.
+The pre-reset code wasn't *bad* in isolation — each file was reasonable.
+The problem was the composition: too many seams, too many shared
+abstractions, three concrete sinks behind a vtable when only S3 mattered,
+worker-pool plumbing for parallelism that hadn't been measured.
 
-## Provenance — what we're keeping in mind
+## Concurrency: the shape we *do* want
 
-- `docs/tier_3_s3_pipeline_strategy.md` — the comprehensive S3-to-S3
-  plan that survived the v2 reset. Conductor model, prefetching,
-  range coalescing, multipart upload sizing. Most of the macro
-  design lives here; this doc fills in the writer-specific bits.
-- Apache Arrow `ArrowWriter` (Rust) — buffers entire row groups
-  before flushing; this constraint is intrinsic to Parquet's
-  columnar layout.
-- `AsyncArrowWriter` — eagerly streams to S3 during row-group
-  assembly. Same shape we want eventually.
-- DuckDB `COPY TO` — same row-group buffering, multipart sizing
-  heuristic of "row group ≥ 8 MB → its own part."
+Lambda has ~5 Gbps egress. One TLS stream sustains ~100–300 MB/s in
+practice. To saturate that pipe we need 4–8 concurrent streams.
+Sequential won't cut it.
 
-## Decisions
+But "we need parallelism" doesn't mean "we need a generic worker-pool
+runtime." Here's what comparable projects use:
 
-### 1. Fast path is the primary path
+**Polars** (`crates/polars-io/src/pl_async.rs`):
+- Single global tokio runtime.
+- One `Semaphore` bounds in-flight requests (`MAX_BUDGET_PER_REQUEST = 10`).
+- Each request `acquire`s some permits; on completion they're released.
+- Self-tuning based on observed throughput.
+- *No worker pool*. Futures are cooperatively scheduled by tokio.
 
-The project's actual differentiator (per Tier-1 mission, per
-tier_3 strategy doc) is "looks like `cp` for the SELECT * case."
-Our Phase 5.1 ships this and only this. Specifically:
+**DuckDB** (`src/parallel/task_scheduler.cpp`):
+- Lock-free MPMC queue (`moodycamel::ConcurrentQueue`).
+- OS thread pool.
+- Pipelines: source → operators → sink, each parallelizable.
+- This is *much* heavier than we need — DuckDB runs arbitrary SQL.
 
-- Input: `s3://bucket-in/file.parquet` plus optional filter
-  (whole-row-group prunable only — see scope below).
-- Output: `s3://bucket-out/key`. Surviving row groups copied
-  byte-for-byte. Footer rewritten with shifted offsets.
+ZPQ's translation: **a bounded in-flight tracker driven by the Loop**.
 
-No decode. No encode. No buffer of decoded values. The bytes
-fetched from S3 input flow through to S3 output, with a fresh
-metadata footer at the end.
+```zig
+// ~50 LoC primitive that lives in src/io/inflight.zig
+pub fn InFlight(comptime Slot: type, comptime N: usize) type {
+    return struct {
+        slots: [N]Slot,
+        active: [N]bool,
+        active_count: usize,
 
-Per-row filtering (where we keep some rows in a row group, drop
-others) requires full decode/encode and lives in a later phase.
+        pub fn anyIdle(self: *@This()) ?usize { ... }
+        pub fn occupy(self: *@This(), idx: usize, s: Slot) void { ... }
+        pub fn release(self: *@This(), idx: usize) void { ... }
+        // No mutexes; the Loop is single-threaded.
+    };
+}
+```
 
-### 2. Single-request PUT first, multipart later
+A `Slot` is whatever state the morsel-state-machine carries:
+`{ phase: enum { sending_request, receiving_response, ... }, completion: *Loop.Completion, ... }`.
 
-S3 supports two upload modes:
+The dispatcher is a tight loop:
+1. While there's pending work AND an idle slot: assign next morsel to slot.
+2. `loop.run()` until at least one slot's I/O completes.
+3. Advance that slot's state machine (next phase, or release if done).
+4. Repeat until all morsels done.
 
-- **PUT** — one HTTP request, body up to 5 GB. Simple. No state.
-- **Multipart** — initiate / upload N parts in parallel / complete.
-  Required for >5 GB. Useful below that for parallelism.
+That's the Polars semaphore pattern for our Loop. **No channel, no
+thread pool, no queue, no morsel-as-separate-type.** Just an array
+of state structs and a tight dispatcher.
 
-Phase 5.1 ships **PUT only**. Reasoning:
+When a future workload demands real CPU concurrency (Phase 5.4
+decode/encode), we add a small thread pool that pulls from the same
+in-flight tracker. Worker threads then post completion-events back
+into the Loop's completion queue. We don't add it pre-emptively.
 
-- 99% of our test fixtures (and most realistic Lambda workloads
-  bounded by 6 GB ephemeral storage) fit in a single PUT.
-- Sequential PUT is one HTTP round-trip. Parallel multipart with
-  4 parts is also four round-trips, just to different parts.
-  The latter only wins when single-PUT throughput saturates
-  before parallelism limits do — a Lambda-specific question we
-  haven't measured.
-- Adding multipart later is purely additive; we don't rebuild
-  the writer.
+## Phase plan (revised)
 
-Phase 5.2 adds multipart sequentially. Phase 5.3 parallelizes
-parts via the loop-driven async work we deferred from Phase 3.D.
+| Phase | What it ships | Concurrency model |
+|---|---|---|
+| **5.1** | Single-PUT fast path: surviving row groups copied byte-for-byte, footer offsets rewritten. Output ≤5 GB. End-to-end S3-to-S3 in Lambda. | Sequential. One TLS connection. |
+| **5.2** | Sequential multipart for output >5 MB (or >5 GB; the threshold is configurable). Each row group's bytes streamed into multipart parts. | Sequential. One TLS connection. |
+| **5.3** | **Parallel multipart parts via the in-flight tracker.** Multiple concurrent PUTs driven by the Loop. | `InFlight(N=8)`. One TLS handshake amortized via keep-alive across slots — see Connection Pool below. |
+| **5.4** | Decoder + encoder pipeline for per-row filtering and column projection. | Adds CPU concurrency (small thread pool) on top of 5.3's I/O concurrency. |
 
-### 3. Output file layout
+5.1 and 5.2 are sequential — they ship the headline fast-path product.
+5.3 lands the parallelism primitive. 5.4 is the largest phase and
+ships only after 5.1–5.3 are battle-tested.
+
+## Connection pool for parallel parts
+
+Phase 5.3 needs N concurrent TLS connections to S3 (one per in-flight
+slot, since HTTP/1.1 doesn't multiplex). The s3.Client we have today
+holds *one* connection. The minimum extension: a `ClientPool(N)` that
+holds N pre-warmed clients and round-robins. Each in-flight slot
+uses one client for its lifetime; releases on slot release.
+
+```zig
+pub fn ClientPool(comptime N: usize) type {
+    return struct {
+        clients: [N]s3.Client,
+        in_use: [N]bool,
+        // No vtable. No factory. Just an array.
+    };
+}
+```
+
+This is a real connection pool, not just a vtable. Sized fixed at
+init; doesn't grow. Lambda's per-invocation lifetime makes idle
+timeout management irrelevant.
+
+## Output file layout
 
 Standard Parquet:
 ```
@@ -102,133 +139,123 @@ relative to the output file's start. The footer's
 `dictionary_page_offset` if present) need to be rewritten with
 the shifted values.
 
-Concretely, if input has row groups 0..3 each ~38 MB, and the
-filter keeps row groups 1, 2:
+We never re-encode anything; we renumber pointers. This is the trick
+that makes the fast path actually fast.
 
-```
-output_offset = 4                       # past leading PAR1 magic
-for rg in [rg1, rg2]:
-    new_rg.columns[*].data_page_offset = output_offset + (col.data_page_offset - rg_start_in_input)
-    output_offset += rg.total_byte_size
-```
+## Memory model
 
-The exact arithmetic is "shift each per-chunk offset by the
-delta between input row-group-start and output row-group-start."
-We never re-encode anything; we just renumber pointers.
+**Phase 5.1**: PUT requires the full body in one HTTP request. So we
+buffer the entire output in memory before issuing the PUT. Lambda has
+2+ GB; our 155 MB benchmark trivially fits. Files larger than ~1 GB
+are Phase 5.2 territory.
 
-### 4. Memory model
+**Phase 5.2**: Stream into multipart parts. Each part is buffered
+in-flight (~5–8 MB). Many parts; bounded memory.
 
-PUT requires the full body in one HTTP request. So Phase 5.1
-buffers the entire output in memory before issuing the PUT.
+**Phase 5.3**: Parallel parts means multiple in-flight buffers
+concurrently — bounded by N × part_size. With N=8 and part=8 MB,
+that's 64 MB peak — well under any Lambda tier.
 
-For our 155 MB benchmark fixture:
-- Worst case (no filter): 155 MB output → 155 MB allocation
-- Filtered case (1 row group): ~38 MB output → 38 MB allocation
-- Lambda has 2 GB+ memory; this is fine
+## File layout
 
-Phase 5.2 streams to multipart parts (≥5 MB each), so the
-in-flight buffer is ~ part-size, not file-size. That's the moment
-we'll need it.
-
-### 5. File layout
-
-Single file, ~400 LoC max:
+Single sink file, ~400 LoC max:
 
 ```
 src/io/s3_sink.zig
-  pub const Writer = struct {
+  pub const FastPathWriter = struct {
       // Lifecycle
-      pub fn init(arena, s3_client, key) !Writer;
-      pub fn writeFastPath(input_meta, input_bytes, surviving_rgs) !void;
+      pub fn init(arena, s3_client, key) !FastPathWriter;
+      pub fn writeFromInput(input_file_bytes, input_meta, surviving_rgs) !void;
       pub fn finish() !void;
       pub fn deinit();
-      // ... internal helpers
   };
 ```
 
-No `Sink` vtable. No factory. No separate `sink/morsel.zig`.
-When a second concrete sink (local file? in-memory for tests?)
-materializes, **then** we extract an interface. Not before.
+Plus, when 5.3 ships:
 
-### 6. What "got out of hand" means and how we avoid it
+```
+src/io/inflight.zig    (~50 LoC)
+src/io/client_pool.zig (~50 LoC; or fold into s3.zig)
+```
 
-Three rules:
+That's it. No `sink/` subdirectory. No factory. No vtable. ~500 LoC
+total for the entire writer subsystem at end of Phase 5.3.
 
-**Rule A: One concrete impl before any interface.** If we end
-up with `Sink` as a vtable behind two concrete types, fine. If
-we ship one concrete type with an interface "for future use,"
-that's the bloat trap.
+## Three rules (the budget)
 
-**Rule B: One file per real responsibility, not per category.**
-`s3_sink.zig` does S3 sink work. If it grows past ~500 LoC,
-*then* split — and only at a real seam (e.g., "footer assembly"
-vs "S3 upload"). Don't pre-split into `sink/`, `s3/sink/`, etc.
+**Rule A — One concrete impl before any interface.** No `Sink` vtable
+unless a second concrete sink actually materializes. If it does, the
+extraction is mechanical.
 
-**Rule C: No parallelism scaffolding until a benchmark says so.**
-Channel + morsel + task is three abstractions for "send work to
-a worker." If we add it before measuring sequential cost, we
-don't know whether it actually pays off — the v1 result was
-1300 LoC of plumbing for a perf win we hadn't validated.
+**Rule B — One file per real responsibility, not per category.**
+`s3_sink.zig` does S3 sink work. If it grows past ~500 LoC, *then*
+split — and only at a real seam (e.g., "footer assembly" vs "S3
+upload"). Don't pre-split into `sink/`, `s3/sink/`, etc.
 
-## Phase plan
+**Rule C — Parallelism via primitives, not runtimes.** When Phase 5.3
+ships, the in-flight tracker is ~50 LoC. The client pool is ~50 LoC.
+That's the whole concurrency framework. No channels. No worker-pool
+runtime. No "morsel" type — just an array slot. If we ever need
+something heavier, that's the moment to evaluate; not now.
 
-| Phase | What | Out of scope |
-|---|---|---|
-| 5.1 | Single-PUT fast-path writer. Filter prunes row groups; surviving ones copied byte-for-byte; footer rewritten. End-to-end S3-to-S3 working in Lambda. | Multipart, parallel parts, per-row filter, encoder |
-| 5.2 | Sequential multipart for files >5 MB output. Threshold-based switch. | Parallel parts, per-row filter |
-| 5.3 | Parallel multipart parts via the in-tree epoll Loop. *This* is where we cash in the parallel-Loop work. | Per-row filter |
-| 5.4 | Decoder + encoder pipeline for per-row filtering and column projection. | (Eventually: writer-side compression strategy heuristics, dict-rebuild thresholds, etc.) |
-
-Phase 5.1 is small and ships the headline product. Phase 5.4 is
-big and we don't start it until 5.1–5.3 are battle-tested.
-
-## What this rejects
+## What this rejects (and why)
 
 - **Local file sink.** Not a real workload for ZPQ; deploy targets
-  are Lambda + (eventually) container/CLI. CLI can use the same
-  S3 path against MinIO or local S3-compatible. Don't add a
-  separate code path.
+  are Lambda + (eventually) container/CLI. CLI can use the same S3
+  path against MinIO or local S3-compatible. Don't add a separate
+  code path.
 - **In-memory sink.** Tests use raw bytes from the integration
   test harness; no need for a vtable.
-- **Channel-based work-stealing.** When we go parallel, the
-  pattern is N concurrent multipart PUTs from the same Loop, not
-  workers consuming a queue. Different shape from the old design.
-- **Encoder before benchmarks demand it.** The fast path covers
-  any workload where rows aren't filtered out within a row group
-  (which is most ETL-style copies and most simple filters). When
-  a real workload demonstrates we're losing on per-row filters,
-  ship 5.4.
+- **Channel-based work-stealing.** When we go parallel, the pattern
+  is N concurrent multipart PUTs from the same Loop, not workers
+  consuming a queue. Different shape from the old design.
+- **Encoder before benchmarks demand it.** The fast path covers any
+  workload where rows aren't filtered out within a row group (which
+  is most ETL-style copies and most simple filters). When a real
+  workload demonstrates we're losing on per-row filters, ship 5.4.
+- **HTTP/2 / pipelining for parallel parts.** N independent HTTP/1.1
+  connections is the dispatch model that matches our access pattern
+  (one upload per part, no shared semantics across parts). HTTP/2
+  multiplexing would be more efficient for many small requests but
+  marginal for ~8 large parts.
 
 ## Test plan
 
-### 5.1
-- Unit: synthetic input bytes + filter that prunes 0/some/all row
-  groups. Output buffer assembled correctly: check leading magic,
-  trailing magic, parseable footer.
+### 5.1 (sequential PUT)
+- Unit: synthetic input bytes + filter pruning 0/some/all row
+  groups → output buffer assembled correctly: leading magic,
+  trailing magic, parseable footer, correct shifted offsets.
 - Roundtrip: write → read back via metadata.open + ColumnChunkReader,
-  verify decoded values match original input's surviving row groups.
-- Integration: real Lambda invocation. Input the benchmark file,
-  filter `int8>0`, write to a fresh S3 key, verify the output is
-  a valid Parquet file via a follow-up GET + decode.
+  verify decoded values match input's surviving row groups.
+- Integration: real Lambda invocation. Input the benchmark, filter
+  `int8>0`, write to a fresh S3 key, verify the output is a valid
+  Parquet file (re-invoke ZPQ on the output and confirm row count).
 
-### 5.2 / 5.3
-- Same shape, plus assertions about part count + size.
+### 5.2 (sequential multipart)
+- All 5.1 tests still pass.
+- Add: assertion about part count + size.
+- Add: large-output test (≥10 MB) confirms multipart path is taken.
 
-### 5.4 (when we get there)
-- Property test: for each (input, filter) pair, decoded output
-  equals the input rows where the filter holds. Compare against
-  PyArrow / DuckDB for cross-validation.
+### 5.3 (parallel)
+- All 5.2 tests still pass.
+- Add: timing test confirming N=8 wallclock < N=1 wallclock for the
+  large-output case. (Validates the perf was real.)
+
+### 5.4 (decode + re-encode)
+- Property test: for each (input, filter, projection) tuple, decoded
+  output equals input rows where filter holds, projected to selected
+  columns. Cross-validate against PyArrow / DuckDB.
 
 ## Anti-patterns checklist (from `tier_3_s3_pipeline_strategy.md`)
 
-The surviving design doc already lists what to avoid. Re-quoting
-because it's load-bearing:
+The surviving design doc already lists what to avoid:
 
-1. ~~Workers calling loop.run()~~ — N/A in 5.1 (no workers).
-2. **Serial S3 requests** — explicitly accepted in 5.1 as the
-   simplest correct version. Phase 5.3 fixes this.
-3. **Buffering entire file before writing** — yes in 5.1
-   (intentional, file fits in RAM). 5.2 fixes via multipart.
+1. **Workers calling loop.run()** — N/A in 5.1–5.3 (no separate workers).
+   Will become relevant in 5.4 if/when we add CPU workers.
+2. **Serial S3 requests** — accepted in 5.1 (simplest correct version).
+   5.3 fixes this.
+3. **Buffering entire file before writing** — yes in 5.1 (intentional;
+   file fits in RAM). 5.2 fixes via multipart.
 4. **Single connection for all reads** — already addressed by the
    keep-alive S3 client.
 5. **Ignoring column statistics** — already addressed by filter

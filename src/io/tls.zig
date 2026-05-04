@@ -85,12 +85,19 @@ pub const Connection = struct {
 
     /// Encrypt and send plaintext. Loops until all bytes are committed
     /// to the socket.
+    ///
+    /// SSL_write can return 0 with WANT_WRITE when the underlying mem BIO
+    /// hits internal back-pressure on a large plaintext (~MBs). In that
+    /// case `consumed == 0` doesn't mean failure — it means "drain the
+    /// encrypted bytes to the socket, then I can encrypt more." Only fail
+    /// when neither side makes progress.
     pub fn send(self: *Connection, plaintext: []const u8) Error!void {
         var off: usize = 0;
         while (off < plaintext.len) {
             const out = self.tls.processOutgoing(plaintext[off..]) catch return error.SendFailed;
-            if (out.encrypted) |bytes| try writeAll(self.fd, bytes);
-            if (out.consumed == 0) return error.SendFailed;
+            const drained = if (out.encrypted) |bytes| bytes.len else 0;
+            if (drained > 0) try writeAll(self.fd, out.encrypted.?);
+            if (out.consumed == 0 and drained == 0) return error.SendFailed;
             off += out.consumed;
         }
     }

@@ -151,6 +151,10 @@ pub const TlsClient = struct {
         }
 
         _ = c.SSL_CTX_set_options(ctx, c.SSL_OP_NO_SSLv2 | c.SSL_OP_NO_SSLv3 | c.SSL_OP_NO_COMPRESSION);
+        // Allow SSL_write to make partial progress on large plaintexts —
+        // returns the bytes-actually-written rather than 0/WANT_WRITE when
+        // the BIO needs draining. Required for ~MB-sized PUT bodies.
+        _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_ENABLE_PARTIAL_WRITE | c.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         return ctx;
     }
 

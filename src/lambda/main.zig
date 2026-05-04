@@ -128,9 +128,20 @@ fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []co
     defer arena.deinit();
     const a = arena.allocator();
 
+    // Single Client over a single keep-alive TLS connection. All N
+    // range fetches share one DNS lookup and one TLS handshake.
+    var client = s3.Client.init(a, creds, url.bucket) catch |err| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"client_init_failed\",\"reason\":\"{s}\"}}",
+            .{@errorName(err)},
+        );
+    };
+    defer client.deinit();
+
     // 1. Suffix GET — last 64 KB. Tells us total file size via
     //    Content-Range, and usually contains the entire footer.
-    const tail_resp = s3.get(a, creds, url, s3.Range.suffix(TAIL_SIZE)) catch |err| {
+    const tail_resp = client.get(a, url.key, s3.Range.suffix(TAIL_SIZE)) catch |err| {
         return std.fmt.allocPrint(
             allocator,
             "{{\"error\":\"tail_fetch_failed\",\"reason\":\"{s}\"}}",
@@ -179,10 +190,9 @@ fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []co
     if (footer_actual_start < tail_start) {
         const need_start = footer_actual_start;
         const need_end = tail_start; // exclusive
-        const need_resp = try s3.get(
+        const need_resp = try client.get(
             a,
-            creds,
-            url,
+            url.key,
             s3.Range.span(need_start, need_end - 1),
         );
         if (need_resp.status != 206) return error.RangeStatus;
@@ -191,7 +201,7 @@ fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []co
 
     // 5. Always fetch the leading magic so metadata.open's validation
     //    passes. Cheap (8 bytes) and avoids special-casing the parser.
-    const head_resp = try s3.get(a, creds, url, s3.Range.span(0, 7));
+    const head_resp = try client.get(a, url.key, s3.Range.span(0, 7));
     if (head_resp.status != 206) return error.RangeStatus;
     @memcpy(file_buf[0..head_resp.body.len], head_resp.body);
 
@@ -229,7 +239,7 @@ fn handleS3(allocator: std.mem.Allocator, env: std.process.Environ, s3_url: []co
         // If the tail already covers this whole range, skip.
         if (r.start >= tail_start) continue;
         const fetch_end_excl = @min(r.end, tail_start);
-        const resp = try s3.get(a, creds, url, s3.Range.span(r.start, fetch_end_excl - 1));
+        const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
         if (resp.status != 206) return error.RangeStatus;
         @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
         fetched_bytes += resp.body.len;

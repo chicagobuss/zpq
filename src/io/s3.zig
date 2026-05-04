@@ -96,40 +96,134 @@ pub const Url = struct {
     }
 };
 
-/// Single-shot S3 GET. Resolves the host, opens TLS, signs the
-/// request, sends it, drains the response.
+/// Multi-fetch S3 client over a single keep-alive TLS connection.
 ///
-/// Returns the Response (status + headers + body), all in `arena`.
+/// Lifecycle:
+///   var client = try Client.init(allocator, creds, bucket);
+///   defer client.deinit();
+///   const r1 = try client.get(req_arena, key, range1);
+///   const r2 = try client.get(req_arena, key, range2);  // reuses TLS
+///
+/// One DNS lookup + one TLS handshake amortized across N requests.
+/// On a connection error during a request (e.g. S3 closed the idle
+/// socket past its server-side keep-alive timeout), we close and
+/// retry once with a fresh connection.
+pub const Client = struct {
+    /// Long-lived storage: the resolved IPv4 string, the host string,
+    /// and the TLS connection itself.
+    client_arena: std.mem.Allocator,
+    creds: Credentials,
+    bucket: []const u8,
+    host: []u8, // owned, in client_arena
+    addr_v4: []const u8, // owned, in client_arena
+    conn: ?tls.Connection,
+
+    pub fn init(
+        client_arena: std.mem.Allocator,
+        creds: Credentials,
+        bucket: []const u8,
+    ) Error!Client {
+        const host = try std.fmt.allocPrint(
+            client_arena,
+            "{s}.s3.{s}.amazonaws.com",
+            .{ bucket, creds.region },
+        );
+        const addr_v4 = try resolveIpv4(client_arena, host);
+        return .{
+            .client_arena = client_arena,
+            .creds = creds,
+            .bucket = bucket,
+            .host = host,
+            .addr_v4 = addr_v4,
+            .conn = null,
+        };
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (self.conn) |*conn| {
+            conn.deinit();
+            self.conn = null;
+        }
+    }
+
+    /// Send a GET. Reuses the existing TLS connection when possible;
+    /// reconnects on a stale-connection error and retries once.
+    /// Body / headers are arena-allocated in `req_arena`.
+    pub fn get(
+        self: *Client,
+        req_arena: std.mem.Allocator,
+        key: []const u8,
+        range: ?Range,
+    ) Error!http.Response {
+        return self.sendOnce(req_arena, key, range) catch |err| switch (err) {
+            // Stale-connection signals: server closed our idle socket
+            // since the last request. Retry once with a fresh conn.
+            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
+                if (self.conn) |*conn| {
+                    conn.deinit();
+                    self.conn = null;
+                }
+                break :blk try self.sendOnce(req_arena, key, range);
+            },
+            else => return err,
+        };
+    }
+
+    fn sendOnce(
+        self: *Client,
+        req_arena: std.mem.Allocator,
+        key: []const u8,
+        range: ?Range,
+    ) Error!http.Response {
+        if (self.conn == null) {
+            self.conn = try tls.Connection.connect(
+                self.client_arena,
+                self.addr_v4,
+                443,
+                self.host,
+            );
+        }
+        return try buildAndSend(
+            req_arena,
+            &self.conn.?,
+            self.creds,
+            self.host,
+            key,
+            range,
+        );
+    }
+};
+
+/// Single-shot S3 GET. Convenience wrapper for one-off fetches.
+/// For multiple GETs against the same bucket, use Client which keeps
+/// the TLS connection warm.
 pub fn get(
     arena: std.mem.Allocator,
     creds: Credentials,
     url: Url,
     range: ?Range,
 ) Error!http.Response {
-    // Construct virtual-hosted endpoint:
-    //   <bucket>.s3.<region>.amazonaws.com
-    const host = try std.fmt.allocPrint(
-        arena,
-        "{s}.s3.{s}.amazonaws.com",
-        .{ url.bucket, creds.region },
-    );
+    var client = try Client.init(arena, creds, url.bucket);
+    defer client.deinit();
+    return try client.get(arena, url.key, range);
+}
 
-    // Resolve to an IPv4 dotted-quad.
-    const addr_v4 = try resolveIpv4(arena, host);
+fn buildAndSend(
+    req_arena: std.mem.Allocator,
+    conn: *tls.Connection,
+    creds: Credentials,
+    host: []const u8,
+    key: []const u8,
+    range: ?Range,
+) Error!http.Response {
+    const path = try std.fmt.allocPrint(req_arena, "/{s}", .{key});
 
-    // Build the request path (key prepended with /). We don't url-
-    // encode here; AWS accepts most key bytes as-is. If the caller has
-    // a key with funky characters, they pass an already-encoded one.
-    const path = try std.fmt.allocPrint(arena, "/{s}", .{url.key});
-
-    // Range header (if any).
     var range_buf: [64]u8 = undefined;
     const range_header_value: ?[]const u8 = if (range) |r|
         r.writeHeader(&range_buf) catch return error.BadResponse
     else
         null;
 
-    // Sign the request. Always UNSIGNED-PAYLOAD for GET (we're on HTTPS).
     const signer: sigv4.SigV4 = .{
         .region = creds.region,
         .access_key = creds.access_key,
@@ -138,13 +232,13 @@ pub fn get(
     };
 
     var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
-    defer hdr_in.deinit(arena);
+    defer hdr_in.deinit(req_arena);
     if (range_header_value) |rv| {
-        try hdr_in.append(arena, .{ .name = "Range", .value = rv });
+        try hdr_in.append(req_arena, .{ .name = "Range", .value = rv });
     }
 
     const signed_headers = signer.sign(
-        arena,
+        req_arena,
         "GET",
         host,
         path,
@@ -154,19 +248,13 @@ pub fn get(
         .{ .use_unsigned_payload = true },
     ) catch return error.SignFailed;
 
-    // Translate sigv4.Header → http.Header (same shape but different
-    // type to keep the modules independent).
     var req_headers: std.ArrayList(http.Header) = .empty;
-    defer req_headers.deinit(arena);
+    defer req_headers.deinit(req_arena);
     for (signed_headers) |h| {
-        try req_headers.append(arena, .{ .name = h.name, .value = h.value });
+        try req_headers.append(req_arena, .{ .name = h.name, .value = h.value });
     }
 
-    // Connect, send, drain.
-    var conn = try tls.Connection.connect(arena, addr_v4, 443, host);
-    defer conn.deinit();
-
-    return try http.sendRequest(arena, &conn, .{
+    return try http.sendRequest(req_arena, conn, .{
         .method = .GET,
         .host = host,
         .path = path,

@@ -84,19 +84,17 @@ pub fn sendRequest(
 
     // Emit Host: only if the caller didn't already include it (e.g.
     // SigV4-signed requests carry it in their signed-headers list).
+    // HTTP/1.1's default is persistent connections — we don't auto-emit
+    // Connection: close. Callers that want one-shot semantics pass it
+    // explicitly via req.headers.
     var caller_has_host = false;
-    var caller_has_connection = false;
     for (req.headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "Host")) caller_has_host = true;
-        if (std.ascii.eqlIgnoreCase(h.name, "Connection")) caller_has_connection = true;
     }
     if (!caller_has_host) {
         try buf.appendSlice(arena, "Host: ");
         try buf.appendSlice(arena, req.host);
         try buf.appendSlice(arena, "\r\n");
-    }
-    if (!caller_has_connection) {
-        try buf.appendSlice(arena, "Connection: close\r\n");
     }
     for (req.headers) |h| {
         try buf.appendSlice(arena, h.name);

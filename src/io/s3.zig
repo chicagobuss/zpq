@@ -252,10 +252,75 @@ pub fn put(
     return try sendPut(arena, &conn, creds, host, url.key, body);
 }
 
-/// Same as `put`, but acquires a connection from the supplied pool
+/// Same as `get`, but acquires a connection from the supplied pool
 /// instead of opening a fresh one. Caller is responsible for the
-/// pool's host matching `url`'s bucket.
+/// pool's host matching `url.bucket`. Retries once on stale-connection
+/// errors (S3 closes idle connections after ~30s; the pool can hand
+/// out a closed slot when warm-container reuse spans that gap).
+pub fn getViaPool(
+    io: Io,
+    p: anytype,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    range: ?Range,
+) !http.Response {
+    var attempt: u8 = 0;
+    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
+        return getViaPoolOnce(io, p, arena, creds, url, range) catch |err| switch (err) {
+            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
+            else => return err,
+        };
+    }
+    return error.RecvFailed;
+}
+
+fn getViaPoolOnce(
+    io: Io,
+    p: anytype,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    range: ?Range,
+) !http.Response {
+    const handle = try p.acquire(io);
+    var released = false;
+    errdefer if (!released) p.discard(io, handle);
+
+    const host = try std.fmt.allocPrint(
+        arena,
+        "{s}.s3.{s}.amazonaws.com",
+        .{ url.bucket, creds.region },
+    );
+    const resp = try buildAndSend(arena, handle.conn, creds, host, url.key, range);
+
+    try p.release(io, handle);
+    released = true;
+    return resp;
+}
+
+/// Same as `put`, but acquires a connection from the supplied pool
+/// instead of opening a fresh one. Retries once on stale-connection
+/// errors (see getViaPool).
 pub fn putViaPool(
+    io: Io,
+    p: anytype,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    url: Url,
+    body: []const u8,
+) !http.Response {
+    var attempt: u8 = 0;
+    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
+        return putViaPoolOnce(io, p, arena, creds, url, body) catch |err| switch (err) {
+            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
+            else => return err,
+        };
+    }
+    return error.SendFailed;
+}
+
+fn putViaPoolOnce(
     io: Io,
     p: anytype,
     arena: std.mem.Allocator,
@@ -451,22 +516,50 @@ fn poolDiscardFn(comptime P: type) *const fn (*anyopaque, Io, usize) void {
 }
 
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
-    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // Retry up to POOL_SIZE+1 times on stale-connection errors. After
+    // idle, S3 may have closed every pooled connection; each failed
+    // acquire discards-and-recycles its slot to the queue tail, so
+    // worst case we burn through all 8 stale slots before getting a
+    // freshly-init'd one.
+    var attempts: u8 = 0;
+    while (attempts < MAX_PARTS + 1) : (attempts += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-    const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
-    var released = false;
-    errdefer if (!released) ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+        const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
+        const ok = doFetch(arena, ctx, handle.conn) catch |err| {
+            ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+            switch (err) {
+                error.RecvFailed,
+                error.SendFailed,
+                error.BodyTruncated,
+                error.BadStatusLine,
+                => continue,
+                else => return,
+            }
+        };
+        if (!ok) {
+            ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+            return;
+        }
+        ctx.ok = true;
+        ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
+        return;
+    }
+}
 
-    const host = std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ ctx.bucket, ctx.creds.region }) catch return;
-    const path = std.fmt.allocPrint(arena, "/{s}", .{ctx.key}) catch return;
+/// Issue one ranged GET on the given connection and copy the bytes
+/// into ctx.into. Returns true on success, false on a non-error
+/// failure (e.g. wrong status, length mismatch). Errors propagate so
+/// the caller can decide whether to retry.
+fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !bool {
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ ctx.bucket, ctx.creds.region });
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{ctx.key});
 
-    // ctx.range uses exclusive end (coalescer semantics); HTTP Range
-    // wants inclusive end.
     var range_buf: [64]u8 = undefined;
     const inclusive: Range = .{ .start = ctx.range.start, .end = ctx.range.end - 1 };
-    const range_header = inclusive.writeHeader(&range_buf) catch return;
+    const range_header = try inclusive.writeHeader(&range_buf);
 
     const signer: sigv4.SigV4 = .{
         .region = ctx.creds.region,
@@ -476,32 +569,28 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     };
 
     var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
-    (hdr_in.append(arena, .{ .name = "Range", .value = range_header }) catch return);
+    try hdr_in.append(arena, .{ .name = "Range", .value = range_header });
 
-    const signed = signer.sign(arena, "GET", host, path, null, hdr_in.items, "", .{ .use_unsigned_payload = true }) catch return;
+    const signed = try signer.sign(arena, "GET", host, path, null, hdr_in.items, "", .{ .use_unsigned_payload = true });
 
     var headers: std.ArrayList(http.Header) = .empty;
-    for (signed) |h| (headers.append(arena, .{ .name = h.name, .value = h.value }) catch return);
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = http.sendRequest(arena, handle.conn, .{
+    const resp = try http.sendRequest(arena, conn, .{
         .method = .GET,
         .host = host,
         .path = path,
         .headers = headers.items,
-    }) catch return;
+    });
 
-    if (resp.status != 206 and resp.status != 200) return;
+    if (resp.status != 206 and resp.status != 200) return false;
 
-    // Copy into the sparse buffer at the range's file offset.
     const start: usize = @intCast(ctx.range.start);
     const end: usize = @intCast(ctx.range.end);
     const expected_len = end - start;
-    if (resp.body.len != expected_len) return;
+    if (resp.body.len != expected_len) return false;
     @memcpy(ctx.into[start..end], resp.body);
-
-    ctx.ok = true;
-    ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
-    released = true;
+    return true;
 }
 
 /// Parallel multipart upload of `body` to `url`. Uses `Io.Group.concurrent`
@@ -586,26 +675,50 @@ const PartCtx = struct {
 };
 
 fn uploadPartTask(io: Io, ctx: *PartCtx) Io.Cancelable!void {
-    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    // Retry up to POOL_SIZE+1 times: after idle, every slot may be
+    // stale; each failed acquire discards-and-recycles its slot to
+    // the queue tail, so worst case we burn through all 8 stale slots
+    // before getting a freshly-init'd one.
+    var attempts: u8 = 0;
+    while (attempts < MAX_PARTS + 1) : (attempts += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-    const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
-    var released = false;
-    errdefer if (!released) ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+        const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
+        const ok = doUploadPart(arena, ctx, handle.conn) catch |err| {
+            ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+            switch (err) {
+                error.RecvFailed,
+                error.SendFailed,
+                error.BodyTruncated,
+                error.BadStatusLine,
+                => continue,
+                else => return,
+            }
+        };
+        if (!ok) {
+            ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+            return;
+        }
+        ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
+        return;
+    }
+}
 
-    const host = std.fmt.allocPrint(
+fn doUploadPart(arena: std.mem.Allocator, ctx: *PartCtx, conn: *tls.Connection) !bool {
+    const host = try std.fmt.allocPrint(
         arena,
         "{s}.s3.{s}.amazonaws.com",
         .{ ctx.url.bucket, ctx.creds.region },
-    ) catch return;
-    const path = std.fmt.allocPrint(arena, "/{s}", .{ctx.url.key}) catch return;
-    const query = std.fmt.allocPrint(
+    );
+    const path = try std.fmt.allocPrint(arena, "/{s}", .{ctx.url.key});
+    const query = try std.fmt.allocPrint(
         arena,
         "partNumber={d}&uploadId={s}",
         .{ ctx.part_number, ctx.upload_id },
-    ) catch return;
-    const path_with_query = std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query }) catch return;
+    );
+    const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
     const signer: sigv4.SigV4 = .{
         .region = ctx.creds.region,
@@ -613,7 +726,7 @@ fn uploadPartTask(io: Io, ctx: *PartCtx) Io.Cancelable!void {
         .secret_key = ctx.creds.secret_key,
         .session_token = ctx.creds.session_token,
     };
-    const signed = signer.sign(
+    const signed = try signer.sign(
         arena,
         "PUT",
         host,
@@ -622,27 +735,25 @@ fn uploadPartTask(io: Io, ctx: *PartCtx) Io.Cancelable!void {
         &.{},
         ctx.body,
         .{ .use_unsigned_payload = true },
-    ) catch return;
+    );
 
     var headers: std.ArrayList(http.Header) = .empty;
-    for (signed) |h| (headers.append(arena, .{ .name = h.name, .value = h.value }) catch return);
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = http.sendRequest(arena, handle.conn, .{
+    const resp = try http.sendRequest(arena, conn, .{
         .method = .PUT,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = ctx.body,
-    }) catch return;
-    if (resp.status != 200) return;
+    });
+    if (resp.status != 200) return false;
 
-    const etag = resp.header("ETag") orelse return;
-    if (etag.len > ctx.etag_buf.len) return;
+    const etag = resp.header("ETag") orelse return false;
+    if (etag.len > ctx.etag_buf.len) return false;
     @memcpy(ctx.etag_buf[0..etag.len], etag);
     ctx.etag_len.* = etag.len;
-
-    ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
-    released = true;
+    return true;
 }
 
 fn createMultipart(

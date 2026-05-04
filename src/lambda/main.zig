@@ -40,6 +40,57 @@ const TAIL_SIZE: u64 = 64 * 1024;
 const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 
+/// Persistent connection pool that lives for the lifetime of one Lambda
+/// container (across invocations). Re-initialized when the bucket
+/// (host) changes between invocations. Trace data showed every cold
+/// pool created inside a per-invocation arena was paying ~6 fresh TLS
+/// handshakes per call; persisting it across warm-container runs
+/// eliminates that on subsequent invocations.
+const PersistentPool = struct {
+    const Inner = s3.Pool(POOL_SIZE);
+    inner: Inner = undefined,
+    initialized: bool = false,
+    /// Owned by gpa so it outlives the per-invocation arena.
+    host_owned: ?[]u8 = null,
+    addr_owned: ?[]u8 = null,
+    bucket_owned: ?[]u8 = null,
+
+    pub fn ensureForBucket(
+        self: *PersistentPool,
+        gpa: std.mem.Allocator,
+        creds: s3.Credentials,
+        bucket: []const u8,
+    ) !*Inner {
+        if (self.initialized) {
+            if (self.bucket_owned) |b| {
+                if (std.mem.eql(u8, b, bucket)) return &self.inner;
+            }
+            // Bucket changed — tear down and recreate.
+            self.inner.deinit();
+            if (self.host_owned) |h| gpa.free(h);
+            if (self.addr_owned) |a| gpa.free(a);
+            if (self.bucket_owned) |b| gpa.free(b);
+            self.* = .{};
+        }
+
+        const host = try std.fmt.allocPrint(gpa, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
+        errdefer gpa.free(host);
+        const addr_const = try s3.resolveIpv4(gpa, host);
+        // s3.resolveIpv4 returns const slice; we already alloc'd via gpa.
+        const addr: []u8 = @constCast(addr_const);
+        errdefer gpa.free(addr);
+        const owned_bucket = try gpa.dupe(u8, bucket);
+        errdefer gpa.free(owned_bucket);
+
+        try self.inner.init(gpa, host, addr, 443);
+        self.host_owned = host;
+        self.addr_owned = addr;
+        self.bucket_owned = owned_bucket;
+        self.initialized = true;
+        return &self.inner;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const env = init.minimal.environ;
@@ -51,6 +102,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
+    var pool: PersistentPool = .{};
+
     while (true) {
         var inv = client.nextInvocation() catch |err| {
             std.debug.print("zpq lambda: poll error {s}\n", .{@errorName(err)});
@@ -60,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer inv.deinit(allocator);
 
-        const response = handle(io, allocator, env, &inv) catch |err| {
+        const response = handle(io, allocator, env, &inv, &pool) catch |err| {
             client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
@@ -79,6 +132,7 @@ fn handle(
     allocator: std.mem.Allocator,
     env: std.process.Environ,
     inv: *const runtime.Invocation,
+    pool: *PersistentPool,
 ) ![]u8 {
     if (inv.body.len == 0) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
@@ -97,7 +151,7 @@ fn handle(
         const output_url = extractField(trimmed, "output_url") catch null;
         const columns_csv = extractStringArray(trimmed, "columns", allocator) catch null;
         defer if (columns_csv) |c| allocator.free(c);
-        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out, columns_csv);
+        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out, columns_csv, pool);
         return try handleS3(allocator, env, url, filter_str);
     }
 
@@ -423,6 +477,7 @@ fn handleS3Write(
     filter_str: ?[]const u8,
     output_url_str: []const u8,
     columns_csv: ?[]const u8,
+    persistent_pool: *PersistentPool,
 ) ![]u8 {
     const t_start = nowMonoNs();
 
@@ -440,13 +495,13 @@ fn handleS3Write(
     defer arena.deinit();
     const a = arena.allocator();
 
-    var client = s3.Client.init(a, creds, in_url.bucket) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"client_init\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    const pool = persistent_pool.ensureForBucket(allocator, creds, in_url.bucket) catch |err| {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"pool_init\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
-    defer client.deinit();
 
-    // 1. Tail GET for total size + footer.
-    const tail_resp = try client.get(a, in_url.key, s3.Range.suffix(TAIL_SIZE));
+    // 1. Tail GET via pool. Whole metadata-fetch sequence (tail/head/
+    // optional footer-prefix) shares one pooled connection.
+    const tail_resp = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.suffix(TAIL_SIZE));
     if (tail_resp.status != 206 and tail_resp.status != 200) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_status\",\"status\":{d}}}", .{tail_resp.status});
     }
@@ -463,15 +518,12 @@ fn handleS3Write(
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
     const footer_actual_start = total_size - 8 - footer_len;
 
-    // The leading PAR1 magic is needed by metadata.open AND will be
-    // used by the fast path (it copies row group bytes which start
-    // after the magic). Pull head + any footer prefix the tail missed.
-    const head = try client.get(a, in_url.key, s3.Range.span(0, 7));
+    const head = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.span(0, 7));
     if (head.status != 206) return error.RangeStatus;
     @memcpy(file_buf[0..head.body.len], head.body);
 
     if (footer_actual_start < tail_start) {
-        const need = try client.get(a, in_url.key, s3.Range.span(footer_actual_start, tail_start - 1));
+        const need = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.span(footer_actual_start, tail_start - 1));
         if (need.status != 206) return error.RangeStatus;
         @memcpy(file_buf[footer_actual_start..tail_start], need.body);
     }
@@ -569,13 +621,9 @@ fn handleS3Write(
         try fetch_jobs.append(a, .{ .start = r.start, .end = end });
     }
 
-    // Lazy-init pool sized to MAX_PARTS=8 — one shared pool serves the
-    // read phase (fetchManyRanges) and write phase (uploadMultipart).
-    // When input bucket == output bucket (typical), this means the same
-    // 8 TLS connections cover the full Lambda invocation.
-    var pool: s3.Pool(POOL_SIZE) = undefined;
-    try initPool(&pool, a, creds, in_url.bucket);
-    defer pool.deinit();
+    // The persistent pool already covers the input bucket (we
+    // ensured it at the top of this fn). fetchManyRanges + putViaPool
+    // share it across phases.
 
     // Convert coalescer.Range -> s3.Range for the fetch primitive.
     var fetch_s3: std.ArrayList(s3.Range) = .empty;
@@ -584,7 +632,7 @@ fn handleS3Write(
     var bytes_fetched: u64 = 0;
     if (fetch_s3.items.len > 0) {
         bytes_fetched = try s3.fetchManyRanges(
-            io, &pool, allocator, a, creds,
+            io, pool, allocator, a, creds,
             in_url.bucket, in_url.key, fetch_s3.items, file_buf,
         );
     }
@@ -600,10 +648,9 @@ fn handleS3Write(
     // bucket == input bucket; otherwise s3.put fresh-handshakes.
     const same_bucket = std.mem.eql(u8, in_url.bucket, out_url.bucket);
     const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
-        // Small output: single PUT. Reuse the pool when same bucket
-        // (saves the ~50 ms TLS handshake on warm invocations).
+        // Small output: single PUT. Reuse the pool when same bucket.
         const put_resp = if (same_bucket)
-            try s3.putViaPool(io, &pool, a, creds, out_url, out_bytes)
+            try s3.putViaPool(io, pool, a, creds, out_url, out_bytes)
         else
             try s3.put(a, creds, out_url, out_bytes);
         if (put_resp.status != 200) {
@@ -615,10 +662,11 @@ fn handleS3Write(
         }
         break :blk if (same_bucket) "single_pooled" else "single";
     } else if (same_bucket) blk: {
-        try s3.uploadMultipart(io, &pool, a, allocator, creds, out_url, out_bytes);
+        try s3.uploadMultipart(io, pool, a, allocator, creds, out_url, out_bytes);
         break :blk "multipart_pooled";
     } else blk: {
-        // Different bucket: build a fresh pool for the output host.
+        // Different bucket: build a fresh local pool for the output host.
+        // Doesn't persist across invocations (rare path).
         var out_pool: s3.Pool(POOL_SIZE) = undefined;
         try initPool(&out_pool, a, creds, out_url.bucket);
         defer out_pool.deinit();

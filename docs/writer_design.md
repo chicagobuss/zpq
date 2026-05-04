@@ -54,41 +54,87 @@ runtime." Here's what comparable projects use:
 - Pipelines: source → operators → sink, each parallelizable.
 - This is *much* heavier than we need — DuckDB runs arbitrary SQL.
 
-ZPQ's translation: **a bounded in-flight tracker driven by the Loop**.
+### What 0.16 changes (and what it doesn't)
+
+Zig 0.16 stable shipped `std.Io` as a vtable interface with concrete
+backends — `Io.Threaded` (production), `Io.Evented` (fibers, experimental),
+`Io.Uring`, `Io.Kqueue`. On top of that:
+
+- **`Io.Group`** — manages many tasks with O(1) overhead. Spawn with
+  `group.async(io, fn, args)`, drain with `group.await(io)`. **This is
+  the morsel pattern, in stdlib.** What we were going to call `InFlight`,
+  Andrew already wrote.
+- **`Io.async` / `Io.concurrent`** — return `Future(T)`. `concurrent`
+  guarantees parallelism; `async` permits cooperative scheduling.
+- **`Io.Queue(T)`** — bounded MPMC channel. (Polars's
+  `tune_with_concurrency_budget` is just a `Semaphore` over a queue.)
+- **`Io.Semaphore` / `Io.Mutex` / `Io.Condition`** — Io-aware sync
+  primitives that suspend the task instead of blocking the thread.
+- **"Juicy Main"** — `pub fn main(init: std.process.Init) !void`
+  hands you `init.io`, `init.gpa`, `init.arena` pre-wired.
+
+For Lambda specifically: io_uring is blocked by the seccomp filter
+(`probes/probe_lambda_caps` confirmed this empirically). `Io.Threaded`
+is the only sane backend — threads block on syscalls, the kernel
+time-slices them; no `io_uring_setup`, no `io_uring_enter`.
+
+### The honest tradeoff
+
+The temptation: rip out the in-tree epoll loop, run `Io.Threaded` for
+everything, get all the above for free.
+
+The reality: `src/io/{epoll, tls, http, sigv4, s3, coalescer}.zig` are
+already built on the in-tree loop and they work — read-side is shipped
+and benchmarked. Replacing the substrate now is a Phase-0 rewrite, not
+a writer feature.
+
+Three real options:
+
+1. **All-in on `std.Io`.** Port s3/tls/http to the `std.Io` interface,
+   delete the epoll loop. Largest scope; clean end-state; cancels
+   sunk cost. *Defer until after 5.x ships.*
+2. **Hybrid: `Io.Threaded` for the writer only.** Reads use the
+   in-tree loop; the writer spawns threads via `Io.Group`. Two I/O
+   models in the same binary, but they don't share state — reads
+   complete fully before the writer starts. Cheap to try.
+3. **Keep the in-tree loop, mirror the `Group` API ourselves.** Build
+   the `~50 LoC InFlight(N)` primitive as originally planned, but
+   shape its surface to look like `Io.Group` so option 1 is mechanical
+   later.
+
+**Recommendation: option 2 for 5.3, with option 1 as the eventual
+end-state.** Justification:
+
+- Writer-side parallelism is *thread-shaped* anyway. S3 PUTs are
+  large, blocking-syscall-heavy, and have no shared state across
+  parts. `Io.Threaded` + `Io.Group` does this in ~10 lines of caller
+  code and zero lines of framework code.
+- The reader side is *event-loop-shaped* — many small range
+  fetches over keep-alive connections, multiplex-friendly. Our
+  in-tree loop is already tuned for it.
+- "Two models" sounds bad in the abstract but is actually how
+  most real systems work (e.g., DuckDB has both a task scheduler
+  and blocking I/O). The seam is at the phase boundary, not
+  inside a hot loop.
 
 ```zig
-// ~50 LoC primitive that lives in src/io/inflight.zig
-pub fn InFlight(comptime Slot: type, comptime N: usize) type {
-    return struct {
-        slots: [N]Slot,
-        active: [N]bool,
-        active_count: usize,
-
-        pub fn anyIdle(self: *@This()) ?usize { ... }
-        pub fn occupy(self: *@This(), idx: usize, s: Slot) void { ... }
-        pub fn release(self: *@This(), idx: usize) void { ... }
-        // No mutexes; the Loop is single-threaded.
-    };
+// 5.3 sketch — note this is std.Io, not our in-tree loop:
+pub fn writeMultipart(io: std.Io, parts: []const Part, ...) !void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (parts) |p| group.async(io, uploadPart, .{ io, p });
+    try group.await(io);
 }
 ```
 
-A `Slot` is whatever state the morsel-state-machine carries:
-`{ phase: enum { sending_request, receiving_response, ... }, completion: *Loop.Completion, ... }`.
+No `InFlight` struct. No `ClientPool` array. No completion-callback
+state machine. The thread owns its connection for the upload's
+lifetime; when the function returns, the connection drops.
 
-The dispatcher is a tight loop:
-1. While there's pending work AND an idle slot: assign next morsel to slot.
-2. `loop.run()` until at least one slot's I/O completes.
-3. Advance that slot's state machine (next phase, or release if done).
-4. Repeat until all morsels done.
-
-That's the Polars semaphore pattern for our Loop. **No channel, no
-thread pool, no queue, no morsel-as-separate-type.** Just an array
-of state structs and a tight dispatcher.
-
-When a future workload demands real CPU concurrency (Phase 5.4
-decode/encode), we add a small thread pool that pulls from the same
-in-flight tracker. Worker threads then post completion-events back
-into the Loop's completion queue. We don't add it pre-emptively.
+If `Io.Group` doesn't materialize a usable connection-pooling story
+(threads contending for a shared `s3.Client` would need `Io.Mutex`
+and we're back to plumbing), we fall back to option 3 and accept
+the ~100 LoC.
 
 ## Phase plan (revised)
 
@@ -96,8 +142,8 @@ into the Loop's completion queue. We don't add it pre-emptively.
 |---|---|---|
 | **5.1** | Single-PUT fast path: surviving row groups copied byte-for-byte, footer offsets rewritten. Output ≤5 GB. End-to-end S3-to-S3 in Lambda. | Sequential. One TLS connection. |
 | **5.2** | Sequential multipart for output >5 MB (or >5 GB; the threshold is configurable). Each row group's bytes streamed into multipart parts. | Sequential. One TLS connection. |
-| **5.3** | **Parallel multipart parts via the in-flight tracker.** Multiple concurrent PUTs driven by the Loop. | `InFlight(N=8)`. One TLS handshake amortized via keep-alive across slots — see Connection Pool below. |
-| **5.4** | Decoder + encoder pipeline for per-row filtering and column projection. | Adds CPU concurrency (small thread pool) on top of 5.3's I/O concurrency. |
+| **5.3** | **Parallel multipart parts via `std.Io.Group` on `Io.Threaded`.** Multiple concurrent PUTs, one thread per in-flight part. | `Io.Group` + `Io.Threaded`. N≈8 threads, each owning one TLS connection for its lifetime. |
+| **5.4** | Decoder + encoder pipeline for per-row filtering and column projection. | Same `Io.Group` pattern; CPU work and I/O share the thread pool. |
 
 5.1 and 5.2 are sequential — they ship the headline fast-path product.
 5.3 lands the parallelism primitive. 5.4 is the largest phase and
@@ -106,24 +152,22 @@ ships only after 5.1–5.3 are battle-tested.
 ## Connection pool for parallel parts
 
 Phase 5.3 needs N concurrent TLS connections to S3 (one per in-flight
-slot, since HTTP/1.1 doesn't multiplex). The s3.Client we have today
-holds *one* connection. The minimum extension: a `ClientPool(N)` that
-holds N pre-warmed clients and round-robins. Each in-flight slot
-uses one client for its lifetime; releases on slot release.
+part, since HTTP/1.1 doesn't multiplex). With `Io.Threaded` each
+spawned task is a real OS thread, so the natural shape is:
 
-```zig
-pub fn ClientPool(comptime N: usize) type {
-    return struct {
-        clients: [N]s3.Client,
-        in_use: [N]bool,
-        // No vtable. No factory. Just an array.
-    };
-}
-```
+- The writer constructs an `s3.Client` per task at task start,
+  PUTs the part, and drops the connection on return.
+- No shared mutable client, no `Io.Mutex`, no slot-tracking.
+- TLS handshake cost is paid N times rather than amortized — but
+  this only happens once per Lambda invocation (8 connections
+  total for an 8-part upload), and the handshake is ~100ms while
+  the part upload is several seconds.
 
-This is a real connection pool, not just a vtable. Sized fixed at
-init; doesn't grow. Lambda's per-invocation lifetime makes idle
-timeout management irrelevant.
+If profiling shows handshake cost matters, the upgrade is a
+fixed-size `[N]s3.Client` array guarded by an `Io.Semaphore` —
+threads `acquire` a permit, take the matching client, release on
+return. Still under 50 LoC. Lambda's per-invocation lifetime
+makes idle-timeout management irrelevant either way.
 
 ## Output file layout
 
@@ -173,13 +217,17 @@ src/io/s3_sink.zig
 
 Plus, when 5.3 ships:
 
-```
-src/io/inflight.zig    (~50 LoC)
-src/io/client_pool.zig (~50 LoC; or fold into s3.zig)
-```
+- The Lambda entry point upgrades from
+  `pub fn main(init: std.process.Init.Minimal)` to
+  `pub fn main(init: std.process.Init)` so we get `init.io`
+  (a `Threaded` backend instance).
+- `src/io/s3_sink.zig` gains an `uploadParts(io, parts) !void`
+  function that spawns into an `Io.Group`. **No new files.**
 
-That's it. No `sink/` subdirectory. No factory. No vtable. ~500 LoC
-total for the entire writer subsystem at end of Phase 5.3.
+If we end up needing the bounded-client pool (see Connection Pool
+above), it's ~50 LoC inside `s3_sink.zig` or folded into `s3.zig`.
+~500 LoC total for the entire writer subsystem at end of Phase 5.3,
+zero new framework files.
 
 ## Three rules (the budget)
 
@@ -192,10 +240,13 @@ extraction is mechanical.
 split — and only at a real seam (e.g., "footer assembly" vs "S3
 upload"). Don't pre-split into `sink/`, `s3/sink/`, etc.
 
-**Rule C — Parallelism via primitives, not runtimes.** When Phase 5.3
-ships, the in-flight tracker is ~50 LoC. The client pool is ~50 LoC.
-That's the whole concurrency framework. No channels. No worker-pool
-runtime. No "morsel" type — just an array slot. If we ever need
+**Rule C — Use stdlib primitives before writing your own.** Zig 0.16
+ships `Io.Group`, `Io.async`, `Io.Threaded` — these *are* the morsel
+pattern. We don't write a worker pool; we call `group.async`. We don't
+write an in-flight tracker; `Io.Group` tracks. The only custom
+concurrency code we should write is whatever stdlib is missing — and
+the burden of proof is on us to demonstrate it's missing. No
+channels, no worker-pool runtime, no "morsel" type. If we ever need
 something heavier, that's the moment to evaluate; not now.
 
 ## What this rejects (and why)

@@ -387,52 +387,68 @@ fn sendPut(
     });
 }
 
-/// Parallel range fetch using a shared `Pool`. Splits any input range
-/// larger than SPLIT_THRESHOLD into sub-ranges; dispatches all jobs
-/// via Io.Group.concurrent, bounded by the pool's connection budget.
-/// Same primitive serves both the "1 giant coalesced range" case
-/// (sub-range fan-out) and the "many small post-prune ranges" case
-/// (parallel pool-bounded). See journal 2026-05-04.
+/// One unit of work for `fetchJobs` — fetch the bytes of `range` from
+/// (bucket, key) and write them into `target`. `target.len` must equal
+/// `range.end - range.start`. Multiple jobs from different files can
+/// be submitted to one `fetchJobs` call so the pool's parallelism is
+/// shared across all of them.
+pub const FetchJob = struct {
+    bucket: []const u8,
+    key: []const u8,
+    range: Range, // exclusive end (coalescer semantics)
+    target: []u8,
+};
+
+/// Parallel multi-file range fetch using a shared `Pool`. Splits any
+/// input range larger than SPLIT_THRESHOLD into sub-ranges; dispatches
+/// all sub-jobs via Io.Group.concurrent, bounded by the pool's
+/// connection budget. Returns total bytes fetched.
 ///
-/// `into` is a sparse buffer: each fetched sub-range is written at
-/// its file offset. Caller is responsible for sizing it.
-///
-/// Returns total bytes fetched (sum of all sub-range lengths).
-pub fn fetchManyRanges(
+/// Generalizes the old single-file fetchManyRanges shape to work
+/// across N input files in one call — the pool's 8 in-flight slots
+/// dispatch ranges from different (bucket, key) interchangeably.
+/// Underpins multi-file scan (Phase 6.1).
+pub fn fetchJobs(
     io: Io,
     p: anytype, // *Pool(N) for some comptime N
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     creds: Credentials,
-    bucket: []const u8,
-    key: []const u8,
-    ranges: []const Range,
-    into: []u8,
+    jobs: []const FetchJob,
 ) !u64 {
-    // 1. Pre-process: split big ranges into sub-ranges, build job list.
-    var jobs: std.ArrayList(Range) = .empty;
-    defer jobs.deinit(arena);
-    for (ranges) |r| {
-        const len = r.end - r.start;
+    // 1. Pre-process: split big ranges into sub-jobs.
+    var split: std.ArrayList(FetchJob) = .empty;
+    defer split.deinit(arena);
+    for (jobs) |j| {
+        std.debug.assert(j.target.len == j.range.end - j.range.start);
+        const len = j.range.end - j.range.start;
         if (len > SPLIT_THRESHOLD) {
             const k = @max(@as(u64, 2), len / TARGET_SUB_SIZE);
             const sub = (len + k - 1) / k; // ceil
             var i: u64 = 0;
             while (i < k) : (i += 1) {
-                const sub_start = r.start + i * sub;
-                const sub_end = @min(r.start + (i + 1) * sub, r.end);
-                if (sub_start >= sub_end) break;
-                try jobs.append(arena, .{ .start = sub_start, .end = sub_end });
+                const sub_off_start: usize = @intCast(i * sub);
+                const sub_off_end: usize = @intCast(@min((i + 1) * sub, len));
+                if (sub_off_start >= sub_off_end) break;
+                try split.append(arena, .{
+                    .bucket = j.bucket,
+                    .key = j.key,
+                    .range = .{
+                        .start = j.range.start + @as(u64, sub_off_start),
+                        .end = j.range.start + @as(u64, sub_off_end),
+                    },
+                    .target = j.target[sub_off_start..sub_off_end],
+                });
             }
         } else {
-            try jobs.append(arena, r);
+            try split.append(arena, j);
         }
     }
-    if (jobs.items.len == 0) return 0;
+    if (split.items.len == 0) return 0;
 
-    // 2. Per-job context (sized to capacity).
-    var ctxs = try arena.alloc(FetchCtx, jobs.items.len);
-    for (jobs.items, 0..) |job, i| {
+    // 2. Per-sub-job context.
+    var ctxs = try arena.alloc(FetchCtx, split.items.len);
+    for (split.items, 0..) |j, i| {
         ctxs[i] = .{
             .pool_ptr = @ptrCast(p),
             .pool_acquire_fn = poolAcquireFn(@TypeOf(p.*)),
@@ -440,10 +456,10 @@ pub fn fetchManyRanges(
             .pool_discard_fn = poolDiscardFn(@TypeOf(p.*)),
             .gpa = gpa,
             .creds = creds,
-            .bucket = bucket,
-            .key = key,
-            .range = job,
-            .into = into,
+            .bucket = j.bucket,
+            .key = j.key,
+            .range = j.range,
+            .target = j.target,
             .ok = false,
         };
     }
@@ -458,9 +474,37 @@ pub fn fetchManyRanges(
     var fetched: u64 = 0;
     for (ctxs) |ctx| {
         if (!ctx.ok) return error.RangeFetchFailed;
-        fetched += ctx.range.end - ctx.range.start;
+        fetched += ctx.target.len;
     }
     return fetched;
+}
+
+/// Backward-compat wrapper: single-file ranges into a sparse `into`
+/// buffer (each range is written at its absolute file offset). Built
+/// on top of fetchJobs.
+pub fn fetchManyRanges(
+    io: Io,
+    p: anytype,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    bucket: []const u8,
+    key: []const u8,
+    ranges: []const Range,
+    into: []u8,
+) !u64 {
+    var jobs: std.ArrayList(FetchJob) = .empty;
+    defer jobs.deinit(arena);
+    try jobs.ensureTotalCapacity(arena, ranges.len);
+    for (ranges) |r| {
+        try jobs.append(arena, .{
+            .bucket = bucket,
+            .key = key,
+            .range = r,
+            .target = into[@intCast(r.start)..@intCast(r.end)],
+        });
+    }
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items);
 }
 
 /// Type-erased view of `Pool(N).Handle` so the dispatch glue between
@@ -483,7 +527,8 @@ const FetchCtx = struct {
     bucket: []const u8,
     key: []const u8,
     range: Range,
-    into: []u8,
+    /// Pre-sized target buffer; `target.len == range.end - range.start`.
+    target: []u8,
     ok: bool,
 };
 
@@ -585,11 +630,8 @@ fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !boo
 
     if (resp.status != 206 and resp.status != 200) return false;
 
-    const start: usize = @intCast(ctx.range.start);
-    const end: usize = @intCast(ctx.range.end);
-    const expected_len = end - start;
-    if (resp.body.len != expected_len) return false;
-    @memcpy(ctx.into[start..end], resp.body);
+    if (resp.body.len != ctx.target.len) return false;
+    @memcpy(ctx.target, resp.body);
     return true;
 }
 

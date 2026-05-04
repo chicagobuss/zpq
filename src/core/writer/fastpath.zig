@@ -50,6 +50,120 @@ pub const Error = error{
 /// Nested schemas (struct/list/map) are not yet supported under
 /// projection — error.NestedSchemaUnsupported is returned in that
 /// case. Phase 5.4b will lift this.
+/// One input file for the multi-file build path. `bytes` covers
+/// (at minimum) the tail/head/footer plus the bytes of every kept
+/// column-chunk of every surviving row group — i.e., everything the
+/// builder needs to byte-copy. `meta` is the parsed FileMetaData;
+/// `survivors[i]` says whether row-group `i` survives.
+pub const FileSpec = struct {
+    bytes: []const u8,
+    meta: *const schema.FileMetaData,
+    survivors: []const bool,
+};
+
+/// Multi-file fastpath: concatenate surviving row groups from N input
+/// files into one Parquet output. All files must have compatible
+/// schemas (the caller validates this). Falls through to the single-
+/// file path when len(files) == 1.
+pub fn buildMulti(
+    arena: std.mem.Allocator,
+    files: []const FileSpec,
+    kept_columns: ?[]const usize,
+) Error![]u8 {
+    if (files.len == 0) return error.SurvivorsLenMismatch;
+
+    // Use the first file's metadata as the source of truth for
+    // schema. Subsequent files are byte-copied; their schema is
+    // assumed to match (caller's responsibility to verify).
+    const meta0 = files[0].meta;
+
+    if (kept_columns) |kc| {
+        if (meta0.schema.items.len < 1) return error.NestedSchemaUnsupported;
+        const root = meta0.schema.items[0];
+        const expected_leaves: usize = if (root.num_children) |nc| @intCast(nc) else 0;
+        if (meta0.schema.items.len != 1 + expected_leaves) return error.NestedSchemaUnsupported;
+        for (kc) |idx| {
+            if (idx >= expected_leaves) return error.BadColumnIndex;
+        }
+    }
+
+    // Pre-size estimate: sum kept ranges across all files + footer.
+    var bytes_estimate: usize = MAGIC.len * 2 + 4;
+    for (files) |f| {
+        if (f.survivors.len != f.meta.row_groups.items.len) return error.SurvivorsLenMismatch;
+        for (f.survivors, 0..) |keep, i| {
+            if (!keep) continue;
+            const rg = &f.meta.row_groups.items[i];
+            if (kept_columns) |kc| {
+                for (kc) |col_idx| {
+                    if (col_idx >= rg.columns.items.len) continue;
+                    const m = rg.columns.items[col_idx].meta_data orelse continue;
+                    bytes_estimate += @intCast(m.total_compressed_size);
+                }
+            } else {
+                const range = rowGroupByteRange(rg) orelse continue;
+                bytes_estimate += range.len;
+            }
+        }
+    }
+    bytes_estimate += 64 * 1024;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    try out.ensureTotalCapacity(arena, bytes_estimate);
+    try out.appendSlice(arena, &MAGIC);
+
+    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    errdefer new_row_groups.deinit(arena);
+    var total_rows: i64 = 0;
+
+    for (files) |f| {
+        for (f.survivors, 0..) |keep, i| {
+            if (!keep) continue;
+            const rg = &f.meta.row_groups.items[i];
+            if (kept_columns) |kc| {
+                const new_rg = try copyProjectedRowGroup(arena, &out, f.bytes, rg, kc);
+                try new_row_groups.append(arena, new_rg);
+            } else {
+                const range = rowGroupByteRange(rg) orelse continue;
+                if (range.start + range.len > f.bytes.len) return error.InvalidColumnOffsets;
+                const new_start: usize = out.items.len;
+                try out.appendSlice(arena, f.bytes[range.start .. range.start + range.len]);
+                const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(range.start));
+                const cloned = try cloneRowGroupShifted(arena, rg, delta);
+                try new_row_groups.append(arena, cloned);
+            }
+            total_rows += rg.num_rows;
+        }
+    }
+
+    // Schema from first file (projected if applicable).
+    var new_schema = meta0.schema;
+    if (kept_columns) |kc| new_schema = try projectSchema(arena, meta0.schema, kc);
+
+    const new_meta: schema.FileMetaData = .{
+        .version = meta0.version,
+        .schema = new_schema,
+        .num_rows = total_rows,
+        .created_by = meta0.created_by,
+        .row_groups = new_row_groups,
+    };
+
+    var w: thrift.Writer = .init(arena);
+    defer w.deinit();
+    try new_meta.write(&w);
+
+    const footer_start: usize = out.items.len;
+    try out.appendSlice(arena, w.bytes());
+    const footer_len: u32 = @intCast(out.items.len - footer_start);
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
+    try out.appendSlice(arena, &len_bytes);
+    try out.appendSlice(arena, &MAGIC);
+
+    return out.toOwnedSlice(arena);
+}
+
 pub fn build(
     arena: std.mem.Allocator,
     input: []const u8,

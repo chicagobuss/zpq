@@ -142,19 +142,37 @@ fn handle(
 
     const trimmed = std.mem.trim(u8, inv.body, " \r\n\t");
     if (trimmed.len > 0 and trimmed[0] == '{') {
-        const url = extractField(trimmed, "s3_url") catch |err| {
-            return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}",
-                .{@errorName(err)},
-            );
-        };
+        // Inputs: either {"inputs": ["s3://...", ...]} (multi-file)
+        // or {"s3_url": "s3://..."} (single-file shorthand).
+        var input_urls = std.ArrayList([]const u8).empty;
+        defer {
+            for (input_urls.items) |s| allocator.free(s);
+            input_urls.deinit(allocator);
+        }
+        if (extractStringArrayItems(trimmed, "inputs", allocator)) |items| {
+            for (items) |s| input_urls.append(allocator, s) catch {};
+            allocator.free(items);
+        } else |_| {
+            const url = extractField(trimmed, "s3_url") catch |err| {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}",
+                    .{@errorName(err)},
+                );
+            };
+            const owned = try allocator.dupe(u8, url);
+            try input_urls.append(allocator, owned);
+        }
+
         const filter_str = extractField(trimmed, "filter") catch null;
         const output_url = extractField(trimmed, "output_url") catch null;
         const columns_csv = extractStringArray(trimmed, "columns", allocator) catch null;
         defer if (columns_csv) |c| allocator.free(c);
-        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out, columns_csv, pool);
-        return try handleS3(allocator, env, url, filter_str);
+        if (output_url) |out| return try handleS3Write(io, allocator, env, input_urls.items, filter_str, out, columns_csv, pool);
+        // Aggregate path stays single-file (legacy diagnostic).
+        if (input_urls.items.len > 0)
+            return try handleS3(allocator, env, input_urls.items[0], filter_str);
+        return try aggregateInt8(allocator, inv.body, null);
     }
 
     // Legacy raw-bytes path used by the in-process integration test.
@@ -201,6 +219,49 @@ fn extractStringArray(
         i += 1;
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Extract a JSON string-array as a list of owned strings (caller
+/// frees each item AND the outer slice). Used for the multi-file
+/// `inputs: [...]` field where the order matters.
+fn extractStringArrayItems(
+    body: []const u8,
+    name: []const u8,
+    allocator: std.mem.Allocator,
+) ![][]const u8 {
+    var key_buf: [64]u8 = undefined;
+    if (name.len + 2 > key_buf.len) return error.NameTooLong;
+    key_buf[0] = '"';
+    @memcpy(key_buf[1 .. 1 + name.len], name);
+    key_buf[1 + name.len] = '"';
+    const key = key_buf[0 .. 2 + name.len];
+
+    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
+    var i = pos + key.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
+    if (i >= body.len or body[i] != '[') return error.BadJson;
+    i += 1;
+
+    var items: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (items.items) |s| allocator.free(s);
+        items.deinit(allocator);
+    }
+
+    while (i < body.len) {
+        while (i < body.len and (body[i] == ' ' or body[i] == ',' or body[i] == '\t' or body[i] == '\n')) : (i += 1) {}
+        if (i >= body.len) return error.BadJson;
+        if (body[i] == ']') break;
+        if (body[i] != '"') return error.BadJson;
+        i += 1;
+        const start = i;
+        while (i < body.len and body[i] != '"') : (i += 1) {}
+        if (i >= body.len) return error.BadJson;
+        const owned = try allocator.dupe(u8, body[start..i]);
+        try items.append(allocator, owned);
+        i += 1;
+    }
+    return items.toOwnedSlice(allocator);
 }
 
 fn extractField(body: []const u8, name: []const u8) ![]const u8 {
@@ -457,25 +518,118 @@ fn handleS3(
     );
 }
 
-/// Phase 5.1 fast-path writer. Same read-side as handleS3 (fetch
-/// footer + parse metadata + parse filter), but instead of decoding
-/// values, builds a survivors bitmask from row-group-level pruning,
-/// range-fetches the surviving row groups' bytes, runs
-/// fastpath.build, and PUTs the result to `output_url`.
+/// Per-task context for parallel metadata fetch (tail/head/footer-prefix
+/// + parse). Type-erased pool dispatch mirrors s3.zig's FetchCtx pattern.
+const MetaFetchCtx = struct {
+    pool_ptr: *anyopaque,
+    pool_acquire_fn: *const fn (*anyopaque, std.Io) anyerror!s3.PoolHandle,
+    pool_release_fn: *const fn (*anyopaque, std.Io, usize) anyerror!void,
+    pool_discard_fn: *const fn (*anyopaque, std.Io, usize) void,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    sp: *FileSpec,
+    err: ?[]const u8,
+};
+
+fn poolAcquireForMeta(comptime P: type) *const fn (*anyopaque, std.Io) anyerror!s3.PoolHandle {
+    return struct {
+        fn f(p: *anyopaque, io: std.Io) anyerror!s3.PoolHandle {
+            const typed: *P = @ptrCast(@alignCast(p));
+            const h = try typed.acquire(io);
+            return .{ .conn = h.conn, .idx = h.idx };
+        }
+    }.f;
+}
+
+fn poolReleaseForMeta(comptime P: type) *const fn (*anyopaque, std.Io, usize) anyerror!void {
+    return struct {
+        fn f(p: *anyopaque, io: std.Io, idx: usize) anyerror!void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            try typed.release(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
+fn poolDiscardForMeta(comptime P: type) *const fn (*anyopaque, std.Io, usize) void {
+    return struct {
+        fn f(p: *anyopaque, io: std.Io, idx: usize) void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            typed.discard(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
+fn fetchMetaTask(io: std.Io, ctx: *MetaFetchCtx) std.Io.Cancelable!void {
+    doFetchMeta(io, ctx) catch |err| {
+        ctx.err = @errorName(err);
+    };
+}
+
+fn doFetchMeta(io: std.Io, ctx: *MetaFetchCtx) !void {
+    const sp = ctx.sp;
+
+    // Tail GET via pool.
+    const tail_resp = try s3.getViaPool(io, makePoolPtr(ctx), ctx.arena, ctx.creds, sp.url, s3.Range.suffix(TAIL_SIZE));
+    if (tail_resp.status != 206 and tail_resp.status != 200) return error.TailStatus;
+
+    sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
+    sp.file_buf = try ctx.gpa.alloc(u8, sp.total_size);
+    sp.tail_start = sp.total_size - tail_resp.body.len;
+    @memcpy(sp.file_buf[sp.tail_start..], tail_resp.body);
+
+    if (tail_resp.body.len < 8) return error.TailTooSmall;
+    const tail = tail_resp.body;
+    if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
+    const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
+    const footer_actual_start = sp.total_size - 8 - footer_len;
+
+    const head = try s3.getViaPool(io, makePoolPtr(ctx), ctx.arena, ctx.creds, sp.url, s3.Range.span(0, 7));
+    if (head.status != 206) return error.RangeStatus;
+    @memcpy(sp.file_buf[0..head.body.len], head.body);
+
+    if (footer_actual_start < sp.tail_start) {
+        const need = try s3.getViaPool(io, makePoolPtr(ctx), ctx.arena, ctx.creds, sp.url, s3.Range.span(footer_actual_start, sp.tail_start - 1));
+        if (need.status != 206) return error.RangeStatus;
+        @memcpy(sp.file_buf[footer_actual_start..sp.tail_start], need.body);
+    }
+
+    sp.meta = try metadata.open(ctx.arena, sp.file_buf);
+}
+
+/// Wrap the type-erased pool pointer back into a typed Pool reference
+/// for getViaPool's `anytype`. We know the concrete type at the call
+/// site is Pool(POOL_SIZE).
+fn makePoolPtr(ctx: *MetaFetchCtx) *s3.Pool(POOL_SIZE) {
+    return @ptrCast(@alignCast(ctx.pool_ptr));
+}
+
+/// Per-input-file state during a multi-file write.
+const FileSpec = struct {
+    url: s3.Url,
+    meta: schema.FileMetaData,
+    /// Sparse per-file buffer; tail/head/footer prefilled, surviving
+    /// column-chunk bytes get fetched into it. Owned in `gpa` so it
+    /// lives across the per-file arenas used during decode/encode.
+    file_buf: []u8,
+    total_size: u64,
+    tail_start: u64,
+    survivors: []bool,
+};
+
+/// Phase 5.1+ fast-path writer, generalized to multi-file input
+/// (Phase 6.1). Per-file: tail/head/footer fetch, parse, stat-prune,
+/// range-fetch; then either byte-copy (no filter) via fastpath.buildMulti
+/// or decode+filter+encode via buildFilteredOutputMulti, producing a
+/// single unified Parquet output.
 ///
-/// Limitations of the fast path:
-///   - Pruning is stat-based only. Any filter clause that would
-///     normally narrow rows *within* a surviving row group is
-///     ignored — that row group is copied whole. Per-row filtering
-///     waits for Phase 5.4 (decoder + re-encoder).
-///   - Page-index and bloom-filter offsets are dropped from the
-///     output; downstream readers fall back to row-group-level
-///     pruning.
+/// All inputs must share a compatible schema (validated by checking
+/// schema list lengths + leaf-name equality against the first file).
 fn handleS3Write(
     io: std.Io,
     allocator: std.mem.Allocator,
     env: std.process.Environ,
-    input_url_str: []const u8,
+    input_urls: []const []const u8,
     filter_str: ?[]const u8,
     output_url_str: []const u8,
     columns_csv: ?[]const u8,
@@ -483,9 +637,10 @@ fn handleS3Write(
 ) ![]u8 {
     const t_start = nowMonoNs();
 
-    const in_url = s3.Url.parse(input_url_str) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_input_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
-    };
+    if (input_urls.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"error\":\"no_inputs\"}}", .{});
+    }
+
     const out_url = s3.Url.parse(output_url_str) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_output_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
@@ -497,47 +652,85 @@ fn handleS3Write(
     defer arena.deinit();
     const a = arena.allocator();
 
-    const pool = persistent_pool.ensureForBucket(allocator, creds, in_url.bucket) catch |err| {
+    // Parse + validate all input URLs share the same bucket (single-
+    // bucket-pool simplifying assumption for now). Extend later if
+    // cross-bucket scans become a real workload.
+    var specs = try a.alloc(FileSpec, input_urls.len);
+    var first_bucket: []const u8 = undefined;
+    for (input_urls, 0..) |s, i| {
+        const u = s3.Url.parse(s) catch |err| {
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_input_url\",\"reason\":\"{s}\",\"url\":\"{s}\"}}", .{ @errorName(err), s });
+        };
+        if (i == 0) first_bucket = u.bucket;
+        if (!std.mem.eql(u8, u.bucket, first_bucket)) {
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"cross_bucket_inputs_not_supported\"}}", .{});
+        }
+        specs[i] = .{
+            .url = u,
+            .meta = undefined,
+            .file_buf = &.{},
+            .total_size = 0,
+            .tail_start = 0,
+            .survivors = &.{},
+        };
+    }
+
+    const pool = persistent_pool.ensureForBucket(allocator, creds, first_bucket) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"pool_init\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    // 1. Tail GET via pool. Whole metadata-fetch sequence (tail/head/
-    // optional footer-prefix) shares one pooled connection.
-    const tail_resp = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.suffix(TAIL_SIZE));
-    if (tail_resp.status != 206 and tail_resp.status != 200) {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_status\",\"status\":{d}}}", .{tail_resp.status});
+    // 1. Per-file metadata fetch (tail/head/footer-prefix + parse).
+    // Parallelized via Io.Group — each task acquires its own pool
+    // slot, does its 2-3 GETs, releases. With 8 pool slots the 10
+    // files' metadata fetches finish in roughly max-2-batches time
+    // rather than 10× sequential cost.
+    defer {
+        for (specs) |*sp| if (sp.file_buf.len > 0) allocator.free(sp.file_buf);
     }
-    const total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
-
-    const file_buf = try allocator.alloc(u8, total_size);
-    defer allocator.free(file_buf);
-    const tail_start = total_size - tail_resp.body.len;
-    @memcpy(file_buf[tail_start..], tail_resp.body);
-
-    if (tail_resp.body.len < 8) return error.TailTooSmall;
-    const tail = tail_resp.body;
-    if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
-    const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
-    const footer_actual_start = total_size - 8 - footer_len;
-
-    const head = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.span(0, 7));
-    if (head.status != 206) return error.RangeStatus;
-    @memcpy(file_buf[0..head.body.len], head.body);
-
-    if (footer_actual_start < tail_start) {
-        const need = try s3.getViaPool(io, pool, a, creds, in_url, s3.Range.span(footer_actual_start, tail_start - 1));
-        if (need.status != 206) return error.RangeStatus;
-        @memcpy(file_buf[footer_actual_start..tail_start], need.body);
+    var meta_ctxs = try a.alloc(MetaFetchCtx, specs.len);
+    for (specs, 0..) |*sp, i| meta_ctxs[i] = .{
+        .pool_ptr = @ptrCast(pool),
+        .pool_acquire_fn = poolAcquireForMeta(@TypeOf(pool.*)),
+        .pool_release_fn = poolReleaseForMeta(@TypeOf(pool.*)),
+        .pool_discard_fn = poolDiscardForMeta(@TypeOf(pool.*)),
+        .gpa = allocator,
+        .arena = a,
+        .creds = creds,
+        .sp = sp,
+        .err = null,
+    };
+    {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (meta_ctxs) |*c| try group.concurrent(io, fetchMetaTask, .{ io, c });
+        try group.await(io);
+    }
+    for (meta_ctxs) |c| {
+        if (c.err) |err_msg| {
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"meta_fetch\",\"reason\":\"{s}\"}}", .{err_msg});
+        }
     }
 
-    var meta = try metadata.open(a, file_buf);
-    defer meta.deinit(a);
+    // 1b. Validate schemas match across inputs (compare leaf names
+    // against first file's schema).
+    for (specs[1..]) |sp| {
+        if (sp.meta.schema.items.len != specs[0].meta.schema.items.len) {
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"schema_mismatch\"}}", .{});
+        }
+        for (sp.meta.schema.items, specs[0].meta.schema.items) |a_elem, b_elem| {
+            if (!std.mem.eql(u8, a_elem.name, b_elem.name)) {
+                return std.fmt.allocPrint(allocator, "{{\"error\":\"schema_mismatch\",\"col\":\"{s}_vs_{s}\"}}", .{ a_elem.name, b_elem.name });
+            }
+        }
+    }
 
-    // 2. Parse the filter (optional).
+    const meta0 = &specs[0].meta;
+
+    // 2. Parse the filter (optional) against first file's schema.
     var filter: ?filter_ast.Filter = null;
     if (filter_str) |fs| {
         if (fs.len > 0) {
-            filter = filter_parser.parse(a, fs, &meta) catch |err| {
+            filter = filter_parser.parse(a, fs, meta0) catch |err| {
                 return std.fmt.allocPrint(
                     allocator,
                     "{{\"error\":\"filter_parse\",\"reason\":\"{s}\",\"expr\":\"{s}\"}}",
@@ -547,14 +740,16 @@ fn handleS3Write(
         }
     }
 
-    // 2b. Resolve projection columns (if any) to schema indices.
+    // 2b. Resolve projection columns (if any) to schema indices —
+    // valid against first file; same indices apply to all inputs by
+    // virtue of the schema match check above.
     var kept_columns_opt: ?[]const usize = null;
     if (columns_csv) |csv| {
         var kept = std.ArrayList(usize).empty;
         var iter = std.mem.splitScalar(u8, csv, ',');
         while (iter.next()) |name| {
             if (name.len == 0) continue;
-            const idx = metadata.findColumnIndex(&meta, name) orelse {
+            const idx = metadata.findColumnIndex(meta0, name) orelse {
                 return std.fmt.allocPrint(
                     allocator,
                     "{{\"error\":\"bad_column\",\"name\":\"{s}\"}}",
@@ -566,128 +761,123 @@ fn handleS3Write(
         if (kept.items.len > 0) kept_columns_opt = kept.items;
     }
 
-    // 3. Build survivors[] via stat-level pruning.
-    const survivors = try a.alloc(bool, meta.row_groups.items.len);
-    var rg_pruned: usize = 0;
-    var rows_kept: i64 = 0;
-    for (meta.row_groups.items, 0..) |rg, i| {
-        if (filter) |f| {
-            const decision = try filter_prune.pruneRowGroup(&rg, f, a);
-            if (decision == .skip) {
-                survivors[i] = false;
-                rg_pruned += 1;
-                continue;
-            }
-        }
-        survivors[i] = true;
-        rows_kept += rg.num_rows;
-    }
-
-    // 4. Range-fetch surviving row groups' bytes (coalesced).
-    // - With filter: fetch (filter cols ∪ kept cols) per RG. Decode
-    //   path needs filter cols to evaluate; encode path needs kept
-    //   cols to write.
-    // - Without filter, with projection: per kept column, one range
-    //   per RG (byte-copy at column granularity).
-    // - Without filter, no projection: span across all columns of
-    //   each surviving RG (byte-copy whole RG).
-    var ranges: std.ArrayList(coalescer.Range) = .empty;
-
     var filter_cols_for_fetch: std.ArrayList(usize) = .empty;
     if (filter) |f| try f.collectColumns(&filter_cols_for_fetch, a);
 
-    for (survivors, 0..) |keep, i| {
-        if (!keep) continue;
-        const rg = &meta.row_groups.items[i];
-        if (filter != null) {
-            // Mark columns we need: filter cols ∪ kept cols (or all if no projection).
-            const num_leaves = rg.columns.items.len;
-            const needed = try a.alloc(bool, num_leaves);
-            @memset(needed, false);
-            if (kept_columns_opt) |kc| {
-                for (kc) |idx| if (idx < num_leaves) {
-                    needed[idx] = true;
+    // 3. Per-file: stat-prune survivors + build fetch ranges.
+    var rg_pruned: usize = 0;
+    var rows_kept: i64 = 0;
+    var total_input_rows: i64 = 0;
+    var total_input_size: u64 = 0;
+    var jobs: std.ArrayList(s3.FetchJob) = .empty;
+
+    for (specs) |*sp| {
+        total_input_size += sp.total_size;
+        for (sp.meta.row_groups.items) |rg| total_input_rows += rg.num_rows;
+
+        sp.survivors = try a.alloc(bool, sp.meta.row_groups.items.len);
+        for (sp.meta.row_groups.items, 0..) |rg, i| {
+            if (filter) |f| {
+                const decision = try filter_prune.pruneRowGroup(&rg, f, a);
+                if (decision == .skip) {
+                    sp.survivors[i] = false;
+                    rg_pruned += 1;
+                    continue;
+                }
+            }
+            sp.survivors[i] = true;
+            rows_kept += rg.num_rows;
+        }
+
+        // Build per-file ranges using the same logic as before, then
+        // turn them into FetchJobs whose target slices into sp.file_buf.
+        var ranges: std.ArrayList(coalescer.Range) = .empty;
+        for (sp.survivors, 0..) |keep, i| {
+            if (!keep) continue;
+            const rg = &sp.meta.row_groups.items[i];
+            if (filter != null) {
+                const num_leaves = rg.columns.items.len;
+                const needed = try a.alloc(bool, num_leaves);
+                @memset(needed, false);
+                if (kept_columns_opt) |kc| {
+                    for (kc) |idx| if (idx < num_leaves) {
+                        needed[idx] = true;
+                    };
+                } else {
+                    @memset(needed, true);
+                }
+                for (filter_cols_for_fetch.items) |c| if (c < num_leaves) {
+                    needed[c] = true;
                 };
+                for (needed, 0..) |b, ci| {
+                    if (!b) continue;
+                    const m = rg.columns.items[ci].meta_data orelse continue;
+                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                    try ranges.append(a, .{ .start = s, .end = e });
+                }
+            } else if (kept_columns_opt) |kc| {
+                for (kc) |col_idx| {
+                    if (col_idx >= rg.columns.items.len) continue;
+                    const m = rg.columns.items[col_idx].meta_data orelse continue;
+                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                    try ranges.append(a, .{ .start = s, .end = e });
+                }
             } else {
-                @memset(needed, true);
+                var min_s: u64 = std.math.maxInt(u64);
+                var max_e: u64 = 0;
+                for (rg.columns.items) |chunk| {
+                    const m = chunk.meta_data orelse continue;
+                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                    if (s < min_s) min_s = s;
+                    if (e > max_e) max_e = e;
+                }
+                if (min_s == std.math.maxInt(u64)) continue;
+                try ranges.append(a, .{ .start = min_s, .end = max_e });
             }
-            for (filter_cols_for_fetch.items) |c| if (c < num_leaves) {
-                needed[c] = true;
-            };
-            for (needed, 0..) |b, ci| {
-                if (!b) continue;
-                const m = rg.columns.items[ci].meta_data orelse continue;
-                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                try ranges.append(a, .{ .start = s, .end = e });
-            }
-        } else if (kept_columns_opt) |kc| {
-            for (kc) |col_idx| {
-                if (col_idx >= rg.columns.items.len) continue;
-                const m = rg.columns.items[col_idx].meta_data orelse continue;
-                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                try ranges.append(a, .{ .start = s, .end = e });
-            }
-        } else {
-            var min_s: u64 = std.math.maxInt(u64);
-            var max_e: u64 = 0;
-            for (rg.columns.items) |chunk| {
-                const m = chunk.meta_data orelse continue;
-                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                if (s < min_s) min_s = s;
-                if (e > max_e) max_e = e;
-            }
-            if (min_s == std.math.maxInt(u64)) continue;
-            try ranges.append(a, .{ .start = min_s, .end = max_e });
+        }
+        const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
+
+        for (merged) |r| {
+            if (r.start >= sp.tail_start) continue;
+            const end = @min(r.end, sp.tail_start);
+            try jobs.append(a, .{
+                .bucket = sp.url.bucket,
+                .key = sp.url.key,
+                .range = .{ .start = r.start, .end = end },
+                .target = sp.file_buf[@intCast(r.start)..@intCast(end)],
+            });
         }
     }
-    const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
-
-    // Truncate any range that overlaps the tail (we already have those
-    // bytes from the suffix GET) to avoid refetching.
-    var fetch_jobs: std.ArrayList(coalescer.Range) = .empty;
-    for (merged) |r| {
-        if (r.start >= tail_start) continue;
-        const end = @min(r.end, tail_start);
-        try fetch_jobs.append(a, .{ .start = r.start, .end = end });
-    }
-
-    // The persistent pool already covers the input bucket (we
-    // ensured it at the top of this fn). fetchManyRanges + putViaPool
-    // share it across phases.
-
-    // Convert coalescer.Range -> s3.Range for the fetch primitive.
-    var fetch_s3: std.ArrayList(s3.Range) = .empty;
-    for (fetch_jobs.items) |r| try fetch_s3.append(a, .{ .start = r.start, .end = r.end });
 
     var bytes_fetched: u64 = 0;
-    if (fetch_s3.items.len > 0) {
-        bytes_fetched = try s3.fetchManyRanges(
-            io, pool, allocator, a, creds,
-            in_url.bucket, in_url.key, fetch_s3.items, file_buf,
-        );
+    if (jobs.items.len > 0) {
+        bytes_fetched = try s3.fetchJobs(io, pool, allocator, a, creds, jobs.items);
     }
 
     const t_after_fetch = nowMonoNs();
 
-    // 5. Build the output. With a filter, we decode + filter + encode
-    // surviving RGs (correctness — value-level filtering ZPQ couldn't
-    // produce in 5.1/5.4a). Without a filter, the byte-copy fastpath
-    // path is faster and lossless.
+    // 4. Build unified output. Filter path = decode/filter/encode
+    // multi-file. Otherwise = byte-copy multi-file.
     const out_bytes = if (filter) |f|
-        try buildFilteredOutput(a, allocator, file_buf, &meta, survivors, f, kept_columns_opt)
-    else
-        try fastpath.build(a, file_buf, &meta, survivors, kept_columns_opt);
+        try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt)
+    else blk: {
+        var fp_specs = try a.alloc(fastpath.FileSpec, specs.len);
+        for (specs, 0..) |sp, i| fp_specs[i] = .{
+            .bytes = sp.file_buf,
+            .meta = &sp.meta,
+            .survivors = sp.survivors,
+        };
+        break :blk try fastpath.buildMulti(a, fp_specs, kept_columns_opt);
+    };
     const t_after_build = nowMonoNs();
 
-    // 6. PUT (single or multipart based on size).
-    // Multipart shares the pool with the read phase iff the output
-    // bucket == input bucket; otherwise s3.put fresh-handshakes.
-    const same_bucket = std.mem.eql(u8, in_url.bucket, out_url.bucket);
+    // 5. PUT (single or multipart based on size). Multipart shares the
+    // pool when output bucket matches input bucket (typical).
+    const same_bucket = std.mem.eql(u8, first_bucket, out_url.bucket);
     const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
-        // Small output: single PUT. Reuse the pool when same bucket.
         const put_resp = if (same_bucket)
             try s3.putViaPool(io, pool, a, creds, out_url, out_bytes)
         else
@@ -704,8 +894,6 @@ fn handleS3Write(
         try s3.uploadMultipart(io, pool, a, allocator, creds, out_url, out_bytes);
         break :blk "multipart_pooled";
     } else blk: {
-        // Different bucket: build a fresh local pool for the output host.
-        // Doesn't persist across invocations (rare path).
         var out_pool: s3.Pool(POOL_SIZE) = undefined;
         try initPool(&out_pool, a, creds, out_url.bucket);
         defer out_pool.deinit();
@@ -716,11 +904,12 @@ fn handleS3Write(
 
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"input\":\"{s}\",\"output\":\"{s}\",\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups\":{d},\"row_groups_pruned\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
+        "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
         .{
-            input_url_str, output_url_str,
-            total_size, bytes_fetched, out_bytes.len,
-            meta.row_groups.items.len, rg_pruned, rows_kept, upload_mode,
+            output_url_str,
+            input_urls.len,
+            total_input_size, bytes_fetched, out_bytes.len,
+            rg_pruned, total_input_rows, rows_kept, upload_mode,
             @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
             @divTrunc(t_after_build - t_after_fetch, std.time.ns_per_ms),
             @divTrunc(t_end - t_after_build, std.time.ns_per_ms),
@@ -729,23 +918,235 @@ fn handleS3Write(
     );
 }
 
-/// Decode + filter + encode each surviving row group, then assemble
-/// a complete Parquet output file. Used when the filter has value-
-/// level conditions that aren't fully resolved by row-group stat
-/// pruning (which is true for any non-trivial filter).
-///
-/// `file_buf` must already contain the bytes of every surviving RG's
-/// columns referenced by `filter` and (if non-null) `kept_columns_opt`.
-/// The caller is responsible for fetching those column ranges before
-/// invoking us.
-///
-/// Output layout: standard Parquet — leading PAR1, then encoded RGs
-/// (in input order, but possibly with fewer rows per RG and dropped
-/// unkept columns), then footer thrift, then footer length, trailing
-/// PAR1.
-///
-/// Limitations matching encoder.zig: PLAIN encoding, UNCOMPRESSED
-/// codec, single page per column, required (non-null) columns only.
+/// Multi-file decode + filter + encode. Iterates over `specs` (each
+/// with its own meta + file_buf + survivors), produces one unified
+/// Parquet output. Single-file is just the N=1 case.
+fn buildFilteredOutputMulti(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    specs: []const FileSpec,
+    filter: filter_ast.Filter,
+    kept_columns_opt: ?[]const usize,
+) ![]u8 {
+    const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
+
+    if (specs.len == 0) return error.NoInputs;
+    const meta0 = &specs[0].meta;
+    const num_leaves = meta0.row_groups.items[0].columns.items.len;
+
+    // Compute kept_set + fetch_set against first file's schema (all
+    // inputs share schema by construction).
+    var kept_set = try arena.alloc(bool, num_leaves);
+    @memset(kept_set, false);
+    if (kept_columns_opt) |kc| {
+        for (kc) |idx| if (idx < num_leaves) {
+            kept_set[idx] = true;
+        };
+    } else {
+        @memset(kept_set, true);
+    }
+
+    var filter_cols: std.ArrayList(usize) = .empty;
+    try filter.collectColumns(&filter_cols, arena);
+
+    var fetch_set = try arena.alloc(bool, num_leaves);
+    @memset(fetch_set, false);
+    for (kept_set, 0..) |b, i| if (b) {
+        fetch_set[i] = true;
+    };
+    for (filter_cols.items) |c| if (c < num_leaves) {
+        fetch_set[c] = true;
+    };
+
+    var kept_in_order: std.ArrayList(usize) = .empty;
+    for (kept_set, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, 64 * 1024);
+    try out.appendSlice(arena, &MAGIC);
+
+    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var total_rows: i64 = 0;
+
+    for (specs) |sp| {
+        const enc_count = try encodeFilteredFile(
+            arena,
+            gpa,
+            &sp,
+            &fetch_set,
+            kept_in_order.items,
+            filter,
+            &out,
+            &new_row_groups,
+        );
+        total_rows += enc_count;
+    }
+
+    const new_schema = try cloneSchemaAsRequired(arena, meta0.schema, kept_in_order.items);
+
+    const new_meta: schema.FileMetaData = .{
+        .version = meta0.version,
+        .schema = new_schema,
+        .num_rows = total_rows,
+        .created_by = meta0.created_by,
+        .row_groups = new_row_groups,
+    };
+
+    var w: thrift.Writer = .init(arena);
+    defer w.deinit();
+    try new_meta.write(&w);
+
+    const footer_start: usize = out.items.len;
+    try out.appendSlice(arena, w.bytes());
+    const footer_len: u32 = @intCast(out.items.len - footer_start);
+
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
+    try out.appendSlice(arena, &len_bytes);
+    try out.appendSlice(arena, &MAGIC);
+
+    return out.toOwnedSlice(arena);
+}
+
+/// Per-file decode/filter/encode of all surviving row groups. Appends
+/// encoded RG bytes to `out` and the corresponding RowGroup metadata
+/// structs to `new_row_groups`. Returns the count of surviving rows
+/// across this file's RGs.
+fn encodeFilteredFile(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    sp: *const FileSpec,
+    fetch_set: *const []bool,
+    kept_in_order: []const usize,
+    filter: filter_ast.Filter,
+    out: *std.ArrayList(u8),
+    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+) !i64 {
+    const meta = &sp.meta;
+    const num_leaves = meta.row_groups.items[0].columns.items.len;
+    var total_rows: i64 = 0;
+
+    for (sp.survivors, 0..) |keep, rg_idx| {
+        if (!keep) continue;
+        const rg = &meta.row_groups.items[rg_idx];
+        const num_rows: usize = @intCast(rg.num_rows);
+
+        var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer rg_arena_state.deinit();
+        const ra = rg_arena_state.allocator();
+
+        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+        var lookup = try ra.alloc(?usize, meta.schema.items.len);
+        @memset(lookup, null);
+
+        var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
+        @memset(batch_pos_for_col, null);
+
+        for (fetch_set.*, 0..) |needed, ci| {
+            if (!needed) continue;
+            const col = &rg.columns.items[ci];
+            const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
+            const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
+            const len: usize = @intCast(col_meta.total_compressed_size);
+            if (start + len > sp.file_buf.len) return error.MissingChunkBytes;
+            const chunk = sp.file_buf[start .. start + len];
+
+            const path_arr: [1][]const u8 = .{meta.schema.items[ci + 1].name};
+            const levels = meta.getColumnLevels(&path_arr);
+
+            const decoded: filter_eval.Batch.Column = switch (col_meta.type) {
+                .INT32 => blk: {
+                    const buf = try ra.alloc(i32, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(i32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i32, &rdr, buf);
+                    break :blk .{ .i32 = buf };
+                },
+                .INT64 => blk: {
+                    const buf = try ra.alloc(i64, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(i64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i64, &rdr, buf);
+                    break :blk .{ .i64 = buf };
+                },
+                .FLOAT => blk: {
+                    const buf = try ra.alloc(f32, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(f32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f32, &rdr, buf);
+                    break :blk .{ .f32 = buf };
+                },
+                .DOUBLE => blk: {
+                    const buf = try ra.alloc(f64, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(f64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f64, &rdr, buf);
+                    break :blk .{ .f64 = buf };
+                },
+                .BYTE_ARRAY => blk: {
+                    const buf = try ra.alloc([]const u8, num_rows);
+                    var rdr = column_mod.ColumnChunkReader([]const u8).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll([]const u8, &rdr, buf);
+                    break :blk .{ .string = buf };
+                },
+                .BOOLEAN => blk: {
+                    const buf = try ra.alloc(bool, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(bool).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(bool, &rdr, buf);
+                    break :blk .{ .boolean = buf };
+                },
+                else => return error.UnsupportedColumnType,
+            };
+            batch_pos_for_col[ci] = batch_cols.items.len;
+            lookup[ci] = batch_cols.items.len;
+            try batch_cols.append(ra, decoded);
+        }
+
+        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+        try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
+
+        const surviving_count = sel.count();
+        if (surviving_count == 0) continue;
+
+        var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        try rg_columns.ensureTotalCapacity(arena, kept_in_order.len);
+        var rg_total: i64 = 0;
+
+        for (kept_in_order) |kept_ci| {
+            const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
+            const filtered = try encoder.applySelection(arena, batch_cols.items[batch_pos], &sel);
+
+            const path_arr: [1][]const u8 = .{meta.schema.items[kept_ci + 1].name};
+            const enc = try encoder.encodeColumn(arena, .{
+                .values = filtered,
+                .schema_elem = &meta.schema.items[kept_ci + 1],
+                .path_in_schema = &path_arr,
+            });
+
+            const col_start_in_file: i64 = @intCast(out.items.len);
+            var em = enc.meta;
+            em.data_page_offset = col_start_in_file;
+            try out.appendSlice(arena, enc.bytes);
+            rg_total += @intCast(enc.bytes.len);
+
+            try rg_columns.append(arena, .{
+                .file_path = null,
+                .file_offset = col_start_in_file,
+                .meta_data = em,
+            });
+        }
+
+        try new_row_groups.append(arena, .{
+            .columns = rg_columns,
+            .total_byte_size = rg_total,
+            .num_rows = @intCast(surviving_count),
+        });
+        total_rows += @intCast(surviving_count);
+    }
+
+    return total_rows;
+}
+
+/// Single-file convenience wrapper kept for compatibility with the
+/// existing single-file path semantics. (Phase 6.1: no longer used by
+/// handleS3Write directly, but kept for tests / smaller call sites.)
 fn buildFilteredOutput(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,

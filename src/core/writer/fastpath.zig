@@ -35,24 +35,58 @@ pub const Error = error{
     SurvivorsLenMismatch,
     EmptyOutput,
     InvalidColumnOffsets,
+    NestedSchemaUnsupported,
+    BadColumnIndex,
 } || std.mem.Allocator.Error;
 
+/// Build the fast-path output. When `kept_columns` is null, every
+/// column of every surviving row group is copied byte-for-byte (the
+/// original whole-RG fast path). When non-null, each surviving row
+/// group emits only the listed column chunks (in input order) — a
+/// column-projection writer. `kept_columns` indexes are positions in
+/// each row group's `columns` list, which for flat schemas equals
+/// schema-leaf index.
+///
+/// Nested schemas (struct/list/map) are not yet supported under
+/// projection — error.NestedSchemaUnsupported is returned in that
+/// case. Phase 5.4b will lift this.
 pub fn build(
     arena: std.mem.Allocator,
     input: []const u8,
     meta: *const schema.FileMetaData,
     survivors: []const bool,
+    kept_columns: ?[]const usize,
 ) Error![]u8 {
     if (survivors.len != meta.row_groups.items.len) return error.SurvivorsLenMismatch;
 
-    // Pre-size the output buffer. Footer size is unknown but typically
-    // 1-2% of file size; reserve generously.
-    var bytes_estimate: usize = MAGIC.len * 2 + 4; // leading magic + footer-len + trailing magic
+    if (kept_columns) |kc| {
+        // For flat schemas, schema is [root, leaf_0, leaf_1, ...] —
+        // total entries = 1 + N leaves, root has num_children = N. Any
+        // shape outside that means nested types we don't handle yet.
+        if (meta.schema.items.len < 1) return error.NestedSchemaUnsupported;
+        const root = meta.schema.items[0];
+        const expected_leaves: usize = if (root.num_children) |nc| @intCast(nc) else 0;
+        if (meta.schema.items.len != 1 + expected_leaves) return error.NestedSchemaUnsupported;
+        for (kc) |idx| {
+            if (idx >= expected_leaves) return error.BadColumnIndex;
+        }
+    }
+
+    // Pre-size the output buffer.
+    var bytes_estimate: usize = MAGIC.len * 2 + 4;
     for (survivors, 0..) |keep, i| {
         if (!keep) continue;
         const rg = &meta.row_groups.items[i];
-        const range = rowGroupByteRange(rg) orelse continue;
-        bytes_estimate += range.len;
+        if (kept_columns) |kc| {
+            for (kc) |col_idx| {
+                if (col_idx >= rg.columns.items.len) continue;
+                const m = rg.columns.items[col_idx].meta_data orelse continue;
+                bytes_estimate += @intCast(m.total_compressed_size);
+            }
+        } else {
+            const range = rowGroupByteRange(rg) orelse continue;
+            bytes_estimate += range.len;
+        }
     }
     bytes_estimate += 64 * 1024;
 
@@ -62,8 +96,6 @@ pub fn build(
 
     try out.appendSlice(arena, &MAGIC);
 
-    // For each surviving row group: copy bytes, build a shifted clone
-    // for the new footer.
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     errdefer new_row_groups.deinit(arena);
 
@@ -71,23 +103,30 @@ pub fn build(
     for (survivors, 0..) |keep, i| {
         if (!keep) continue;
         const rg = &meta.row_groups.items[i];
-        const range = rowGroupByteRange(rg) orelse continue;
-        if (range.start + range.len > input.len) return error.InvalidColumnOffsets;
 
-        const new_start: usize = out.items.len;
-        try out.appendSlice(arena, input[range.start .. range.start + range.len]);
-
-        const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(range.start));
-        const cloned = try cloneRowGroupShifted(arena, rg, delta);
-        try new_row_groups.append(arena, cloned);
+        if (kept_columns) |kc| {
+            const new_rg = try copyProjectedRowGroup(arena, &out, input, rg, kc);
+            try new_row_groups.append(arena, new_rg);
+        } else {
+            const range = rowGroupByteRange(rg) orelse continue;
+            if (range.start + range.len > input.len) return error.InvalidColumnOffsets;
+            const new_start: usize = out.items.len;
+            try out.appendSlice(arena, input[range.start .. range.start + range.len]);
+            const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(range.start));
+            const cloned = try cloneRowGroupShifted(arena, rg, delta);
+            try new_row_groups.append(arena, cloned);
+        }
         total_rows += rg.num_rows;
     }
 
-    // Build new FileMetaData. Shallow share schema and created_by — they
-    // point into `meta`'s footer buffer.
+    // Build new FileMetaData. Schema is shared by reference unless
+    // we're projecting — projection requires a reduced schema list.
+    var new_schema = meta.schema;
+    if (kept_columns) |kc| new_schema = try projectSchema(arena, meta.schema, kc);
+
     const new_meta: schema.FileMetaData = .{
         .version = meta.version,
-        .schema = meta.schema,
+        .schema = new_schema,
         .num_rows = total_rows,
         .created_by = meta.created_by,
         .row_groups = new_row_groups,
@@ -107,6 +146,81 @@ pub fn build(
     try out.appendSlice(arena, &MAGIC);
 
     return out.toOwnedSlice(arena);
+}
+
+/// Copy only the kept column chunks of one row group to the output
+/// buffer, contiguously, and return a new RowGroup struct with shifted
+/// offsets. The new RG's `total_byte_size` is the sum of kept column
+/// sizes; `num_rows` is unchanged from the source.
+fn copyProjectedRowGroup(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    input: []const u8,
+    src_rg: *const schema.RowGroup,
+    kept: []const usize,
+) Error!schema.RowGroup {
+    var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    errdefer new_cols.deinit(arena);
+    try new_cols.ensureTotalCapacity(arena, kept.len);
+
+    var rg_total: i64 = 0;
+    for (kept) |col_idx| {
+        if (col_idx >= src_rg.columns.items.len) return error.BadColumnIndex;
+        const src_chunk = src_rg.columns.items[col_idx];
+        const m = src_chunk.meta_data orelse return error.InvalidColumnOffsets;
+
+        const src_start: usize = if (m.dictionary_page_offset) |d| @intCast(d) else @intCast(m.data_page_offset);
+        const src_len: usize = @intCast(m.total_compressed_size);
+        if (src_start + src_len > input.len) return error.InvalidColumnOffsets;
+
+        const new_col_start: usize = out.items.len;
+        try out.appendSlice(arena, input[src_start .. src_start + src_len]);
+
+        const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
+        var new_chunk = src_chunk;
+        new_chunk.offset_index_offset = null;
+        new_chunk.offset_index_length = null;
+        new_chunk.column_index_offset = null;
+        new_chunk.column_index_length = null;
+        if (new_chunk.meta_data) |*nm| {
+            nm.data_page_offset += delta;
+            if (nm.dictionary_page_offset) |d| nm.dictionary_page_offset = d + delta;
+            if (nm.index_page_offset) |d| nm.index_page_offset = d + delta;
+        }
+        if (new_chunk.meta_data) |nm| new_chunk.file_offset = nm.data_page_offset;
+
+        try new_cols.append(arena, new_chunk);
+        rg_total += @intCast(src_len);
+    }
+
+    return .{
+        .columns = new_cols,
+        .total_byte_size = rg_total,
+        .num_rows = src_rg.num_rows,
+    };
+}
+
+/// Build a new schema list: root (with adjusted num_children) + the
+/// listed leaf elements in input order. Caller is the projection path
+/// only; flat-schema invariant is checked by `build`.
+fn projectSchema(
+    arena: std.mem.Allocator,
+    src: std.ArrayListUnmanaged(schema.SchemaElement),
+    kept: []const usize,
+) Error!std.ArrayListUnmanaged(schema.SchemaElement) {
+    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    errdefer out.deinit(arena);
+    try out.ensureTotalCapacity(arena, 1 + kept.len);
+
+    var new_root = src.items[0];
+    new_root.num_children = @intCast(kept.len);
+    try out.append(arena, new_root);
+
+    for (kept) |idx| {
+        if (idx + 1 >= src.items.len) return error.BadColumnIndex;
+        try out.append(arena, src.items[idx + 1]);
+    }
+    return out;
 }
 
 const ByteRange = struct { start: usize, len: usize };
@@ -203,7 +317,7 @@ test "build with all survivors round-trips through metadata.open" {
     const survivors = try arena.alloc(bool, meta.row_groups.items.len);
     @memset(survivors, true);
 
-    const out = try build(arena, file_bytes, &meta, survivors);
+    const out = try build(arena, file_bytes, &meta, survivors, null);
 
     // Output should be parseable as a Parquet file.
     const out_meta = try metadata.open(arena, out);
@@ -263,7 +377,7 @@ test "build dropping all but the first row group" {
     @memset(survivors, false);
     survivors[0] = true;
 
-    const out = try build(arena, file_bytes, &meta, survivors);
+    const out = try build(arena, file_bytes, &meta, survivors, null);
 
     const out_meta = try metadata.open(arena, out);
     try testing.expectEqual(@as(usize, 1), out_meta.row_groups.items.len);
@@ -299,13 +413,60 @@ test "build with zero survivors produces an empty-row-group file" {
     const survivors = try arena.alloc(bool, meta.row_groups.items.len);
     @memset(survivors, false);
 
-    const out = try build(arena, file_bytes, &meta, survivors);
+    const out = try build(arena, file_bytes, &meta, survivors, null);
 
     const out_meta = try metadata.open(arena, out);
     try testing.expectEqual(@as(usize, 0), out_meta.row_groups.items.len);
     try testing.expectEqual(@as(i64, 0), out_meta.num_rows);
     // Schema must still be present so downstream readers see a valid file.
     try testing.expectEqual(meta.schema.items.len, out_meta.schema.items.len);
+}
+
+test "build with projection emits only kept columns" {
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta = try metadata.open(arena, file_bytes);
+
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+
+    // Keep just int8 (col 0) and int32_sorted (col 2) — non-adjacent.
+    const kept = [_]usize{ 0, 2 };
+    const out = try build(arena, file_bytes, &meta, survivors, &kept);
+
+    const out_meta = try metadata.open(arena, out);
+
+    // Schema reduced to root + 2 kept leaves.
+    try testing.expectEqual(@as(usize, 3), out_meta.schema.items.len);
+    try testing.expectEqualStrings("int8", out_meta.schema.items[1].name);
+    try testing.expectEqualStrings("int32_sorted", out_meta.schema.items[2].name);
+    // Root's num_children matches.
+    try testing.expectEqual(@as(?i32, 2), out_meta.schema.items[0].num_children);
+    // Each row group has only 2 columns.
+    try testing.expectEqual(meta.row_groups.items.len, out_meta.row_groups.items.len);
+    for (out_meta.row_groups.items) |rg| {
+        try testing.expectEqual(@as(usize, 2), rg.columns.items.len);
+    }
+
+    // Output bytes should be much smaller than input.
+    try testing.expect(out.len < file_bytes.len / 4);
+
+    std.debug.print(
+        "[fastpath] projected [int8, int32_sorted]: in={d}B out={d}B (~{d:.0}%)\n",
+        .{ file_bytes.len, out.len, @as(f64, @floatFromInt(out.len)) * 100.0 / @as(f64, @floatFromInt(file_bytes.len)) },
+    );
 }
 
 test "build rejects mismatched survivors length" {
@@ -319,7 +480,7 @@ test "build rejects mismatched survivors length" {
         .row_groups = .empty,
     };
     const wrong: [3]bool = .{ true, false, true };
-    try testing.expectError(error.SurvivorsLenMismatch, build(arena, &empty_bytes, &meta, &wrong));
+    try testing.expectError(error.SurvivorsLenMismatch, build(arena, &empty_bytes, &meta, &wrong, null));
 }
 
 fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {

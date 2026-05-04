@@ -95,12 +95,56 @@ fn handle(
         };
         const filter_str = extractField(trimmed, "filter") catch null;
         const output_url = extractField(trimmed, "output_url") catch null;
-        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out);
+        const columns_csv = extractStringArray(trimmed, "columns", allocator) catch null;
+        defer if (columns_csv) |c| allocator.free(c);
+        if (output_url) |out| return try handleS3Write(io, allocator, env, url, filter_str, out, columns_csv);
         return try handleS3(allocator, env, url, filter_str);
     }
 
     // Legacy raw-bytes path used by the in-process integration test.
     return try aggregateInt8(allocator, inv.body, null);
+}
+
+/// Extract a JSON string-array field as a comma-separated list (we
+/// don't need a full JSON parser for this). Returns an allocator-
+/// owned `name1,name2,name3` string. Caller frees.
+fn extractStringArray(
+    body: []const u8,
+    name: []const u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    var key_buf: [64]u8 = undefined;
+    if (name.len + 2 > key_buf.len) return error.NameTooLong;
+    key_buf[0] = '"';
+    @memcpy(key_buf[1 .. 1 + name.len], name);
+    key_buf[1 + name.len] = '"';
+    const key = key_buf[0 .. 2 + name.len];
+
+    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
+    var i = pos + key.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
+    if (i >= body.len or body[i] != '[') return error.BadJson;
+    i += 1;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var first = true;
+    while (i < body.len) {
+        while (i < body.len and (body[i] == ' ' or body[i] == ',' or body[i] == '\t' or body[i] == '\n')) : (i += 1) {}
+        if (i >= body.len) return error.BadJson;
+        if (body[i] == ']') break;
+        if (body[i] != '"') return error.BadJson;
+        i += 1;
+        const start = i;
+        while (i < body.len and body[i] != '"') : (i += 1) {}
+        if (i >= body.len) return error.BadJson;
+        if (!first) try out.append(allocator, ',');
+        try out.appendSlice(allocator, body[start..i]);
+        first = false;
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn extractField(body: []const u8, name: []const u8) ![]const u8 {
@@ -378,6 +422,7 @@ fn handleS3Write(
     input_url_str: []const u8,
     filter_str: ?[]const u8,
     output_url_str: []const u8,
+    columns_csv: ?[]const u8,
 ) ![]u8 {
     const t_start = nowMonoNs();
 
@@ -448,6 +493,25 @@ fn handleS3Write(
         }
     }
 
+    // 2b. Resolve projection columns (if any) to schema indices.
+    var kept_columns_opt: ?[]const usize = null;
+    if (columns_csv) |csv| {
+        var kept = std.ArrayList(usize).empty;
+        var iter = std.mem.splitScalar(u8, csv, ',');
+        while (iter.next()) |name| {
+            if (name.len == 0) continue;
+            const idx = metadata.findColumnIndex(&meta, name) orelse {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{{\"error\":\"bad_column\",\"name\":\"{s}\"}}",
+                    .{name},
+                );
+            };
+            try kept.append(a, idx);
+        }
+        if (kept.items.len > 0) kept_columns_opt = kept.items;
+    }
+
     // 3. Build survivors[] via stat-level pruning.
     const survivors = try a.alloc(bool, meta.row_groups.items.len);
     var rg_pruned: usize = 0;
@@ -466,21 +530,33 @@ fn handleS3Write(
     }
 
     // 4. Range-fetch surviving row groups' bytes (coalesced).
+    // Projection: per kept column, one range per RG. No projection:
+    // span across all columns of each surviving RG.
     var ranges: std.ArrayList(coalescer.Range) = .empty;
     for (survivors, 0..) |keep, i| {
         if (!keep) continue;
         const rg = &meta.row_groups.items[i];
-        var min_s: u64 = std.math.maxInt(u64);
-        var max_e: u64 = 0;
-        for (rg.columns.items) |chunk| {
-            const m = chunk.meta_data orelse continue;
-            const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-            const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-            if (s < min_s) min_s = s;
-            if (e > max_e) max_e = e;
+        if (kept_columns_opt) |kc| {
+            for (kc) |col_idx| {
+                if (col_idx >= rg.columns.items.len) continue;
+                const m = rg.columns.items[col_idx].meta_data orelse continue;
+                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                try ranges.append(a, .{ .start = s, .end = e });
+            }
+        } else {
+            var min_s: u64 = std.math.maxInt(u64);
+            var max_e: u64 = 0;
+            for (rg.columns.items) |chunk| {
+                const m = chunk.meta_data orelse continue;
+                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                if (s < min_s) min_s = s;
+                if (e > max_e) max_e = e;
+            }
+            if (min_s == std.math.maxInt(u64)) continue;
+            try ranges.append(a, .{ .start = min_s, .end = max_e });
         }
-        if (min_s == std.math.maxInt(u64)) continue;
-        try ranges.append(a, .{ .start = min_s, .end = max_e });
     }
     const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
 
@@ -516,7 +592,7 @@ fn handleS3Write(
     const t_after_fetch = nowMonoNs();
 
     // 5. Build the fast-path output.
-    const out_bytes = try fastpath.build(a, file_buf, &meta, survivors);
+    const out_bytes = try fastpath.build(a, file_buf, &meta, survivors, kept_columns_opt);
     const t_after_build = nowMonoNs();
 
     // 6. PUT (single or multipart based on size).

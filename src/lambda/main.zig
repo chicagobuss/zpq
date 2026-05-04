@@ -483,14 +483,34 @@ fn handleS3Write(
         try ranges.append(a, .{ .start = min_s, .end = max_e });
     }
     const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
-    var bytes_fetched: u64 = 0;
+
+    // Truncate any range that overlaps the tail (we already have those
+    // bytes from the suffix GET) to avoid refetching.
+    var fetch_jobs: std.ArrayList(coalescer.Range) = .empty;
     for (merged) |r| {
         if (r.start >= tail_start) continue;
-        const fetch_end_excl = @min(r.end, tail_start);
-        const resp = try client.get(a, in_url.key, s3.Range.span(r.start, fetch_end_excl - 1));
-        if (resp.status != 206) return error.RangeStatus;
-        @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
-        bytes_fetched += fetch_end_excl - r.start;
+        const end = @min(r.end, tail_start);
+        try fetch_jobs.append(a, .{ .start = r.start, .end = end });
+    }
+
+    // Lazy-init pool sized to MAX_PARTS=8 — one shared pool serves the
+    // read phase (fetchManyRanges) and write phase (uploadMultipart).
+    // When input bucket == output bucket (typical), this means the same
+    // 8 TLS connections cover the full Lambda invocation.
+    var pool: s3.Pool(POOL_SIZE) = undefined;
+    try initPool(&pool, a, creds, in_url.bucket);
+    defer pool.deinit();
+
+    // Convert coalescer.Range -> s3.Range for the fetch primitive.
+    var fetch_s3: std.ArrayList(s3.Range) = .empty;
+    for (fetch_jobs.items) |r| try fetch_s3.append(a, .{ .start = r.start, .end = r.end });
+
+    var bytes_fetched: u64 = 0;
+    if (fetch_s3.items.len > 0) {
+        bytes_fetched = try s3.fetchManyRanges(
+            io, &pool, allocator, a, creds,
+            in_url.bucket, in_url.key, fetch_s3.items, file_buf,
+        );
     }
 
     const t_after_fetch = nowMonoNs();
@@ -500,6 +520,9 @@ fn handleS3Write(
     const t_after_build = nowMonoNs();
 
     // 6. PUT (single or multipart based on size).
+    // Multipart shares the pool with the read phase iff the output
+    // bucket == input bucket; otherwise s3.put fresh-handshakes.
+    const same_bucket = std.mem.eql(u8, in_url.bucket, out_url.bucket);
     const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
         const put_resp = try s3.put(a, creds, out_url, out_bytes);
         if (put_resp.status != 200) {
@@ -510,9 +533,16 @@ fn handleS3Write(
             );
         }
         break :blk "single";
+    } else if (same_bucket) blk: {
+        try s3.uploadMultipart(io, &pool, a, allocator, creds, out_url, out_bytes);
+        break :blk "multipart_pooled";
     } else blk: {
-        try s3.uploadMultipart(io, a, allocator, creds, out_url, out_bytes);
-        break :blk "multipart";
+        // Different bucket: build a fresh pool for the output host.
+        var out_pool: s3.Pool(POOL_SIZE) = undefined;
+        try initPool(&out_pool, a, creds, out_url.bucket);
+        defer out_pool.deinit();
+        try s3.uploadMultipart(io, &out_pool, a, allocator, creds, out_url, out_bytes);
+        break :blk "multipart_fresh";
     };
     const t_end = nowMonoNs();
 
@@ -535,6 +565,19 @@ fn nowMonoNs() i64 {
     var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+}
+
+const POOL_SIZE: usize = s3.MAX_PARTS;
+
+fn initPool(
+    self: *s3.Pool(POOL_SIZE),
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    bucket: []const u8,
+) !void {
+    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
+    const addr_v4 = try s3.resolveIpv4(arena, host);
+    try self.init(arena, host, addr_v4, 443);
 }
 
 fn decodeAll(comptime T: type, reader: anytype, out: []T) !void {

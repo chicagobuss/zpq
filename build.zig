@@ -46,12 +46,19 @@ pub fn build(b: *std.Build) void {
     test_opts.addOption(bool, "lambda", true);
     const test_opts_mod = test_opts.createModule();
 
+    const test_boring_dep = b.dependency("boring_tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_boring_mod = test_boring_dep.module("boring_tls");
+
     const test_zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = test_opts_mod },
+            .{ .name = "boring_tls", .module = test_boring_mod },
         },
     });
 

@@ -26,18 +26,26 @@ const Io = std.Io;
 const tls = @import("tls.zig");
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
+const pool_mod = @import("pool.zig");
 
-/// Maximum concurrent multipart parts. Sized for the bakeoff-validated
-/// sweet spot — see docs/journal/2026-05.md (entry 2026-05-04 03:00).
+pub const Pool = pool_mod.Pool;
+
+/// Maximum concurrent in-flight requests against S3 (multipart parts
+/// or split sub-range fetches). Sized for the bakeoff sweet spot —
+/// see journal 2026-05-04.
 pub const MAX_PARTS: usize = 8;
 /// S3's hard minimum for a non-final multipart part.
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
-/// Below this size, single-PUT is faster than multipart even with
-/// parallel parts — the Create+Complete round-trips dominate. Roughly
-/// the crossover where single-stream-PUT (~100 MB/s) ties parallel
-/// multipart (~250 MB/s aggregate) after factoring 200 ms of fixed
-/// multipart overhead. Tunable; revisit when CPU/network shifts.
+/// Below this size, single-PUT is faster than multipart — the
+/// Create+Complete round-trips dominate.
 pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
+/// Above this size, fetchManyRanges splits a single range into
+/// sub-ranges so we can fan out across the pool. Below it the
+/// per-request TLS handshake amortizes badly across tiny fetches.
+pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
+/// Target sub-range size when splitting. ~19 MB matches the per-part
+/// size we use for multipart writes.
+pub const TARGET_SUB_SIZE: usize = 19 * 1024 * 1024;
 
 pub const Error = error{
     NoCredentials,
@@ -279,6 +287,188 @@ pub fn put(
     });
 }
 
+/// Parallel range fetch using a shared `Pool`. Splits any input range
+/// larger than SPLIT_THRESHOLD into sub-ranges; dispatches all jobs
+/// via Io.Group.concurrent, bounded by the pool's connection budget.
+/// Same primitive serves both the "1 giant coalesced range" case
+/// (sub-range fan-out) and the "many small post-prune ranges" case
+/// (parallel pool-bounded). See journal 2026-05-04.
+///
+/// `into` is a sparse buffer: each fetched sub-range is written at
+/// its file offset. Caller is responsible for sizing it.
+///
+/// Returns total bytes fetched (sum of all sub-range lengths).
+pub fn fetchManyRanges(
+    io: Io,
+    p: anytype, // *Pool(N) for some comptime N
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    bucket: []const u8,
+    key: []const u8,
+    ranges: []const Range,
+    into: []u8,
+) !u64 {
+    // 1. Pre-process: split big ranges into sub-ranges, build job list.
+    var jobs: std.ArrayList(Range) = .empty;
+    defer jobs.deinit(arena);
+    for (ranges) |r| {
+        const len = r.end - r.start;
+        if (len > SPLIT_THRESHOLD) {
+            const k = @max(@as(u64, 2), len / TARGET_SUB_SIZE);
+            const sub = (len + k - 1) / k; // ceil
+            var i: u64 = 0;
+            while (i < k) : (i += 1) {
+                const sub_start = r.start + i * sub;
+                const sub_end = @min(r.start + (i + 1) * sub, r.end);
+                if (sub_start >= sub_end) break;
+                try jobs.append(arena, .{ .start = sub_start, .end = sub_end });
+            }
+        } else {
+            try jobs.append(arena, r);
+        }
+    }
+    if (jobs.items.len == 0) return 0;
+
+    // 2. Per-job context (sized to capacity).
+    var ctxs = try arena.alloc(FetchCtx, jobs.items.len);
+    for (jobs.items, 0..) |job, i| {
+        ctxs[i] = .{
+            .pool_ptr = @ptrCast(p),
+            .pool_acquire_fn = poolAcquireFn(@TypeOf(p.*)),
+            .pool_release_fn = poolReleaseFn(@TypeOf(p.*)),
+            .pool_discard_fn = poolDiscardFn(@TypeOf(p.*)),
+            .gpa = gpa,
+            .creds = creds,
+            .bucket = bucket,
+            .key = key,
+            .range = job,
+            .into = into,
+            .ok = false,
+        };
+    }
+
+    // 3. Dispatch via Io.Group.concurrent — pool gates parallelism.
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    for (ctxs) |*ctx_ptr| try group.concurrent(io, fetchOneTask, .{ io, ctx_ptr });
+    try group.await(io);
+
+    // 4. Tally + check for failures.
+    var fetched: u64 = 0;
+    for (ctxs) |ctx| {
+        if (!ctx.ok) return error.RangeFetchFailed;
+        fetched += ctx.range.end - ctx.range.start;
+    }
+    return fetched;
+}
+
+/// Type-erased view of `Pool(N).Handle` so the dispatch glue between
+/// `fetchManyRanges` / `uploadMultipart` and any `Pool(N)` instance
+/// can speak a common shape regardless of the comptime size.
+pub const PoolHandle = struct {
+    conn: *tls.Connection,
+    idx: usize,
+};
+
+const FetchCtx = struct {
+    /// Type-erased pool handle so this works for any Pool(N).
+    pool_ptr: *anyopaque,
+    pool_acquire_fn: *const fn (*anyopaque, Io) anyerror!PoolHandle,
+    pool_release_fn: *const fn (*anyopaque, Io, usize) anyerror!void,
+    pool_discard_fn: *const fn (*anyopaque, Io, usize) void,
+
+    gpa: std.mem.Allocator,
+    creds: Credentials,
+    bucket: []const u8,
+    key: []const u8,
+    range: Range,
+    into: []u8,
+    ok: bool,
+};
+
+fn poolAcquireFn(comptime P: type) *const fn (*anyopaque, Io) anyerror!PoolHandle {
+    return struct {
+        fn f(p: *anyopaque, io: Io) anyerror!PoolHandle {
+            const typed: *P = @ptrCast(@alignCast(p));
+            const h = try typed.acquire(io);
+            return .{ .conn = h.conn, .idx = h.idx };
+        }
+    }.f;
+}
+
+fn poolReleaseFn(comptime P: type) *const fn (*anyopaque, Io, usize) anyerror!void {
+    return struct {
+        fn f(p: *anyopaque, io: Io, idx: usize) anyerror!void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            try typed.release(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
+fn poolDiscardFn(comptime P: type) *const fn (*anyopaque, Io, usize) void {
+    return struct {
+        fn f(p: *anyopaque, io: Io, idx: usize) void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            typed.discard(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
+fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
+    var released = false;
+    errdefer if (!released) ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
+
+    const host = std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ ctx.bucket, ctx.creds.region }) catch return;
+    const path = std.fmt.allocPrint(arena, "/{s}", .{ctx.key}) catch return;
+
+    // ctx.range uses exclusive end (coalescer semantics); HTTP Range
+    // wants inclusive end.
+    var range_buf: [64]u8 = undefined;
+    const inclusive: Range = .{ .start = ctx.range.start, .end = ctx.range.end - 1 };
+    const range_header = inclusive.writeHeader(&range_buf) catch return;
+
+    const signer: sigv4.SigV4 = .{
+        .region = ctx.creds.region,
+        .access_key = ctx.creds.access_key,
+        .secret_key = ctx.creds.secret_key,
+        .session_token = ctx.creds.session_token,
+    };
+
+    var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
+    (hdr_in.append(arena, .{ .name = "Range", .value = range_header }) catch return);
+
+    const signed = signer.sign(arena, "GET", host, path, null, hdr_in.items, "", .{ .use_unsigned_payload = true }) catch return;
+
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| (headers.append(arena, .{ .name = h.name, .value = h.value }) catch return);
+
+    const resp = http.sendRequest(arena, handle.conn, .{
+        .method = .GET,
+        .host = host,
+        .path = path,
+        .headers = headers.items,
+    }) catch return;
+
+    if (resp.status != 206 and resp.status != 200) return;
+
+    // Copy into the sparse buffer at the range's file offset.
+    const start: usize = @intCast(ctx.range.start);
+    const end: usize = @intCast(ctx.range.end);
+    const expected_len = end - start;
+    if (resp.body.len != expected_len) return;
+    @memcpy(ctx.into[start..end], resp.body);
+
+    ctx.ok = true;
+    ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
+    released = true;
+}
+
 /// Parallel multipart upload of `body` to `url`. Uses `Io.Group.concurrent`
 /// to dispatch each part on its own thread; each task owns its own TLS
 /// connection for its lifetime (no pooling — see writer_design.md).
@@ -289,6 +479,7 @@ pub fn put(
 /// instead — single-PUT wins at that size.
 pub fn uploadMultipart(
     io: Io,
+    p: anytype, // *Pool(N) shared with the read phase when buckets match
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     creds: Credentials,
@@ -313,6 +504,10 @@ pub fn uploadMultipart(
         const start = i * part_size;
         const end = @min(start + part_size, body.len);
         ctxs[i] = .{
+            .pool_ptr = @ptrCast(p),
+            .pool_acquire_fn = poolAcquireFn(@TypeOf(p.*)),
+            .pool_release_fn = poolReleaseFn(@TypeOf(p.*)),
+            .pool_discard_fn = poolDiscardFn(@TypeOf(p.*)),
             .gpa = gpa,
             .creds = creds,
             .url = url,
@@ -327,7 +522,7 @@ pub fn uploadMultipart(
     var group: Io.Group = .init;
     defer group.cancel(io);
     for (0..num_parts) |i| {
-        try group.concurrent(io, uploadPartTask, .{ &ctxs[i] });
+        try group.concurrent(io, uploadPartTask, .{ io, &ctxs[i] });
     }
     try group.await(io);
 
@@ -340,6 +535,11 @@ pub fn uploadMultipart(
 }
 
 const PartCtx = struct {
+    pool_ptr: *anyopaque,
+    pool_acquire_fn: *const fn (*anyopaque, Io) anyerror!PoolHandle,
+    pool_release_fn: *const fn (*anyopaque, Io, usize) anyerror!void,
+    pool_discard_fn: *const fn (*anyopaque, Io, usize) void,
+
     gpa: std.mem.Allocator,
     creds: Credentials,
     url: Url,
@@ -350,10 +550,14 @@ const PartCtx = struct {
     etag_len: *usize,
 };
 
-fn uploadPartTask(ctx: *PartCtx) Io.Cancelable!void {
+fn uploadPartTask(io: Io, ctx: *PartCtx) Io.Cancelable!void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io) catch return;
+    var released = false;
+    errdefer if (!released) ctx.pool_discard_fn(ctx.pool_ptr, io, handle.idx);
 
     const host = std.fmt.allocPrint(
         arena,
@@ -367,10 +571,6 @@ fn uploadPartTask(ctx: *PartCtx) Io.Cancelable!void {
         .{ ctx.part_number, ctx.upload_id },
     ) catch return;
     const path_with_query = std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query }) catch return;
-
-    const addr_v4 = resolveIpv4(arena, host) catch return;
-    var conn = tls.Connection.connect(arena, addr_v4, 443, host) catch return;
-    defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
         .region = ctx.creds.region,
@@ -392,7 +592,7 @@ fn uploadPartTask(ctx: *PartCtx) Io.Cancelable!void {
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| (headers.append(arena, .{ .name = h.name, .value = h.value }) catch return);
 
-    const resp = http.sendRequest(arena, &conn, .{
+    const resp = http.sendRequest(arena, handle.conn, .{
         .method = .PUT,
         .host = host,
         .path = path_with_query,
@@ -405,6 +605,9 @@ fn uploadPartTask(ctx: *PartCtx) Io.Cancelable!void {
     if (etag.len > ctx.etag_buf.len) return;
     @memcpy(ctx.etag_buf[0..etag.len], etag);
     ctx.etag_len.* = etag.len;
+
+    ctx.pool_release_fn(ctx.pool_ptr, io, handle.idx) catch return;
+    released = true;
 }
 
 fn createMultipart(
@@ -594,7 +797,7 @@ const c = struct {
     const AF_INET: c_int = 2;
 };
 
-fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
+pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
     const host_z = try arena.dupeZ(u8, host);
 
     var hints = std.mem.zeroes(c.addrinfo);

@@ -98,6 +98,37 @@ def _polars_copy(event: dict) -> dict:
     }
 
 
+def _polars_project(event: dict) -> dict:
+    """Polars with column-projection pushdown. `columns` is a list of
+    column names to keep; everything else is dropped."""
+    import polars as pl
+
+    src = event["s3_url"]
+    dst = event["output_url"]
+    cols = event["columns"]  # required for projection
+    flt = event.get("filter_sql")
+
+    t0 = _now_ns()
+    lf = pl.scan_parquet(src).select(cols)
+    if flt:
+        ctx = pl.SQLContext(register_globals=False, eager=False)
+        ctx.register("t", lf)
+        lf = ctx.execute(f"SELECT * FROM t WHERE {flt}")
+    lf.sink_parquet(dst)
+    t1 = _now_ns()
+
+    dst_b, dst_k = _parse_s3(dst)
+    bytes_out = _head_size(dst_b, dst_k)
+
+    return {
+        "mode": "polars_project",
+        "columns": cols,
+        "filter_sql": flt,
+        "bytes_out": bytes_out,
+        "total_ms": _ms(t0, t1),
+    }
+
+
 def _duckdb_copy(event: dict) -> dict:
     import duckdb
 
@@ -139,10 +170,48 @@ def _duckdb_copy(event: dict) -> dict:
     }
 
 
+def _duckdb_project(event: dict) -> dict:
+    import duckdb
+
+    src = event["s3_url"]
+    dst = event["output_url"]
+    cols = event["columns"]
+    flt = event.get("filter_sql")
+
+    os.environ.setdefault("HOME", "/tmp")
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    con.execute(f"SET s3_region='{region}';")
+    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+
+    select_cols = ", ".join(cols)
+    where = f" WHERE {flt}" if flt else ""
+    sql = f"COPY (SELECT {select_cols} FROM read_parquet('{src}'){where}) TO '{dst}' (FORMAT 'parquet');"
+
+    t0 = _now_ns()
+    con.execute(sql)
+    t1 = _now_ns()
+
+    dst_b, dst_k = _parse_s3(dst)
+    bytes_out = _head_size(dst_b, dst_k)
+
+    return {
+        "mode": "duckdb_project",
+        "columns": cols,
+        "filter_sql": flt,
+        "bytes_out": bytes_out,
+        "total_ms": _ms(t0, t1),
+    }
+
+
 _DISPATCH = {
     "boto3_copy": _boto3_copy,
     "polars_copy": _polars_copy,
+    "polars_project": _polars_project,
     "duckdb_copy": _duckdb_copy,
+    "duckdb_project": _duckdb_project,
 }
 
 

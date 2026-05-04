@@ -261,8 +261,8 @@ pub const PageType = enum(i32) {
 };
 
 // Aliases for ArrayLists
-const EncodingList = std.ArrayListUnmanaged(Encoding);
-const StringList = std.ArrayListUnmanaged([]const u8);
+pub const EncodingList = std.ArrayListUnmanaged(Encoding);
+pub const StringList = std.ArrayListUnmanaged([]const u8);
 
 pub const FieldRepetitionType = enum(i32) {
     REQUIRED = 0,

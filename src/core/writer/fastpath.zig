@@ -203,7 +203,7 @@ fn copyProjectedRowGroup(
 /// Build a new schema list: root (with adjusted num_children) + the
 /// listed leaf elements in input order. Caller is the projection path
 /// only; flat-schema invariant is checked by `build`.
-fn projectSchema(
+pub fn projectSchema(
     arena: std.mem.Allocator,
     src: std.ArrayListUnmanaged(schema.SchemaElement),
     kept: []const usize,

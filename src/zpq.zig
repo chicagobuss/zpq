@@ -17,6 +17,7 @@ pub const core = struct {
     };
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
+        pub const encoder = @import("core/writer/encoder.zig");
     };
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
@@ -56,6 +57,7 @@ test {
     _ = core.filter.selection;
     _ = core.filter.eval;
     _ = core.writer.fastpath;
+    _ = core.writer.encoder;
     _ = core.parquet.metadata;
     _ = core.parquet.snappy;
     _ = core.parquet.lz4;

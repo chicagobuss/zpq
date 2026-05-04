@@ -28,6 +28,8 @@ const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
 const fastpath = zpq.core.writer.fastpath;
+const encoder = zpq.core.writer.encoder;
+const thrift = zpq.core.thrift;
 const s3 = zpq.io.s3;
 const coalescer = zpq.io.coalescer;
 const filter_ast = zpq.core.filter.ast;
@@ -582,13 +584,44 @@ fn handleS3Write(
     }
 
     // 4. Range-fetch surviving row groups' bytes (coalesced).
-    // Projection: per kept column, one range per RG. No projection:
-    // span across all columns of each surviving RG.
+    // - With filter: fetch (filter cols ∪ kept cols) per RG. Decode
+    //   path needs filter cols to evaluate; encode path needs kept
+    //   cols to write.
+    // - Without filter, with projection: per kept column, one range
+    //   per RG (byte-copy at column granularity).
+    // - Without filter, no projection: span across all columns of
+    //   each surviving RG (byte-copy whole RG).
     var ranges: std.ArrayList(coalescer.Range) = .empty;
+
+    var filter_cols_for_fetch: std.ArrayList(usize) = .empty;
+    if (filter) |f| try f.collectColumns(&filter_cols_for_fetch, a);
+
     for (survivors, 0..) |keep, i| {
         if (!keep) continue;
         const rg = &meta.row_groups.items[i];
-        if (kept_columns_opt) |kc| {
+        if (filter != null) {
+            // Mark columns we need: filter cols ∪ kept cols (or all if no projection).
+            const num_leaves = rg.columns.items.len;
+            const needed = try a.alloc(bool, num_leaves);
+            @memset(needed, false);
+            if (kept_columns_opt) |kc| {
+                for (kc) |idx| if (idx < num_leaves) {
+                    needed[idx] = true;
+                };
+            } else {
+                @memset(needed, true);
+            }
+            for (filter_cols_for_fetch.items) |c| if (c < num_leaves) {
+                needed[c] = true;
+            };
+            for (needed, 0..) |b, ci| {
+                if (!b) continue;
+                const m = rg.columns.items[ci].meta_data orelse continue;
+                const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                try ranges.append(a, .{ .start = s, .end = e });
+            }
+        } else if (kept_columns_opt) |kc| {
             for (kc) |col_idx| {
                 if (col_idx >= rg.columns.items.len) continue;
                 const m = rg.columns.items[col_idx].meta_data orelse continue;
@@ -639,8 +672,14 @@ fn handleS3Write(
 
     const t_after_fetch = nowMonoNs();
 
-    // 5. Build the fast-path output.
-    const out_bytes = try fastpath.build(a, file_buf, &meta, survivors, kept_columns_opt);
+    // 5. Build the output. With a filter, we decode + filter + encode
+    // surviving RGs (correctness — value-level filtering ZPQ couldn't
+    // produce in 5.1/5.4a). Without a filter, the byte-copy fastpath
+    // path is faster and lossless.
+    const out_bytes = if (filter) |f|
+        try buildFilteredOutput(a, allocator, file_buf, &meta, survivors, f, kept_columns_opt)
+    else
+        try fastpath.build(a, file_buf, &meta, survivors, kept_columns_opt);
     const t_after_build = nowMonoNs();
 
     // 6. PUT (single or multipart based on size).
@@ -688,6 +727,249 @@ fn handleS3Write(
             @divTrunc(t_end - t_start, std.time.ns_per_ms),
         },
     );
+}
+
+/// Decode + filter + encode each surviving row group, then assemble
+/// a complete Parquet output file. Used when the filter has value-
+/// level conditions that aren't fully resolved by row-group stat
+/// pruning (which is true for any non-trivial filter).
+///
+/// `file_buf` must already contain the bytes of every surviving RG's
+/// columns referenced by `filter` and (if non-null) `kept_columns_opt`.
+/// The caller is responsible for fetching those column ranges before
+/// invoking us.
+///
+/// Output layout: standard Parquet — leading PAR1, then encoded RGs
+/// (in input order, but possibly with fewer rows per RG and dropped
+/// unkept columns), then footer thrift, then footer length, trailing
+/// PAR1.
+///
+/// Limitations matching encoder.zig: PLAIN encoding, UNCOMPRESSED
+/// codec, single page per column, required (non-null) columns only.
+fn buildFilteredOutput(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    file_buf: []const u8,
+    meta: *const schema.FileMetaData,
+    survivors: []const bool,
+    filter: filter_ast.Filter,
+    kept_columns_opt: ?[]const usize,
+) ![]u8 {
+    const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
+
+    // Compute the union of kept output columns + filter input columns.
+    // We need filter cols decoded for evaluation and kept cols encoded
+    // for output; they may overlap.
+    const num_leaves = meta.row_groups.items[0].columns.items.len;
+
+    var kept_set = try arena.alloc(bool, num_leaves);
+    @memset(kept_set, false);
+    if (kept_columns_opt) |kc| {
+        for (kc) |idx| if (idx < num_leaves) {
+            kept_set[idx] = true;
+        };
+    } else {
+        @memset(kept_set, true);
+    }
+
+    var filter_cols: std.ArrayList(usize) = .empty;
+    try filter.collectColumns(&filter_cols, arena);
+
+    var fetch_set = try arena.alloc(bool, num_leaves);
+    @memset(fetch_set, false);
+    for (kept_set, 0..) |b, i| if (b) {
+        fetch_set[i] = true;
+    };
+    for (filter_cols.items) |c| if (c < num_leaves) {
+        fetch_set[c] = true;
+    };
+
+    // Build the list of kept columns in input order (for the output
+    // schema and per-RG column order).
+    var kept_in_order: std.ArrayList(usize) = .empty;
+    for (kept_set, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
+
+    // Output buffer. Reserve enough headroom that we don't constantly
+    // reallocate during encode.
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, 64 * 1024);
+    try out.appendSlice(arena, &MAGIC);
+
+    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+
+    var total_rows: i64 = 0;
+    for (survivors, 0..) |keep, rg_idx| {
+        if (!keep) continue;
+        const rg = &meta.row_groups.items[rg_idx];
+        const num_rows: usize = @intCast(rg.num_rows);
+
+        // Per-RG arena for decoded values + sel.
+        var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer rg_arena_state.deinit();
+        const ra = rg_arena_state.allocator();
+
+        // Decode every column in fetch_set, build a Batch.
+        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+        var lookup = try ra.alloc(?usize, meta.schema.items.len);
+        @memset(lookup, null);
+
+        // Track which slot each (input) column index occupies in batch_cols.
+        var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
+        @memset(batch_pos_for_col, null);
+
+        for (fetch_set, 0..) |needed, ci| {
+            if (!needed) continue;
+            const col = &rg.columns.items[ci];
+            const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
+            const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
+            const len: usize = @intCast(col_meta.total_compressed_size);
+            if (start + len > file_buf.len) return error.MissingChunkBytes;
+            const chunk = file_buf[start .. start + len];
+
+            const path_arr: [1][]const u8 = .{meta.schema.items[ci + 1].name};
+            const levels = meta.getColumnLevels(&path_arr);
+
+            const decoded: filter_eval.Batch.Column = switch (col_meta.type) {
+                .INT32 => blk: {
+                    const buf = try ra.alloc(i32, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(i32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i32, &rdr, buf);
+                    break :blk .{ .i32 = buf };
+                },
+                .INT64 => blk: {
+                    const buf = try ra.alloc(i64, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(i64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(i64, &rdr, buf);
+                    break :blk .{ .i64 = buf };
+                },
+                .FLOAT => blk: {
+                    const buf = try ra.alloc(f32, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(f32).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f32, &rdr, buf);
+                    break :blk .{ .f32 = buf };
+                },
+                .DOUBLE => blk: {
+                    const buf = try ra.alloc(f64, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(f64).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(f64, &rdr, buf);
+                    break :blk .{ .f64 = buf };
+                },
+                .BYTE_ARRAY => blk: {
+                    const buf = try ra.alloc([]const u8, num_rows);
+                    var rdr = column_mod.ColumnChunkReader([]const u8).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll([]const u8, &rdr, buf);
+                    break :blk .{ .string = buf };
+                },
+                .BOOLEAN => blk: {
+                    const buf = try ra.alloc(bool, num_rows);
+                    var rdr = column_mod.ColumnChunkReader(bool).init(chunk, col_meta.codec, levels, ra);
+                    try decodeAll(bool, &rdr, buf);
+                    break :blk .{ .boolean = buf };
+                },
+                else => return error.UnsupportedColumnType,
+            };
+            batch_pos_for_col[ci] = batch_cols.items.len;
+            lookup[ci] = batch_cols.items.len;
+            try batch_cols.append(ra, decoded);
+        }
+
+        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+        try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
+
+        const surviving_count = sel.count();
+        if (surviving_count == 0) continue; // drop empty RG
+
+        // Encode each kept column with the selection applied.
+        var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        try rg_columns.ensureTotalCapacity(arena, kept_in_order.items.len);
+        var rg_total: i64 = 0;
+
+        for (kept_in_order.items) |kept_ci| {
+            const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
+            const filtered = try encoder.applySelection(arena, batch_cols.items[batch_pos], &sel);
+
+            const path_arr: [1][]const u8 = .{meta.schema.items[kept_ci + 1].name};
+            const enc = try encoder.encodeColumn(arena, .{
+                .values = filtered,
+                .schema_elem = &meta.schema.items[kept_ci + 1],
+                .path_in_schema = &path_arr,
+            });
+
+            // Patch absolute file offset for the data page.
+            const col_start_in_file: i64 = @intCast(out.items.len);
+            var em = enc.meta;
+            em.data_page_offset = col_start_in_file;
+            try out.appendSlice(arena, enc.bytes);
+            rg_total += @intCast(enc.bytes.len);
+
+            try rg_columns.append(arena, .{
+                .file_path = null,
+                .file_offset = col_start_in_file,
+                .meta_data = em,
+            });
+        }
+
+        try new_row_groups.append(arena, .{
+            .columns = rg_columns,
+            .total_byte_size = rg_total,
+            .num_rows = @intCast(surviving_count),
+        });
+        total_rows += @intCast(surviving_count);
+    }
+
+    // Build new schema. Leaves are forced to REQUIRED because we
+    // don't emit definition levels in the encoded pages — surviving
+    // values from filter eval are always non-null, so REQUIRED is
+    // semantically correct.
+    const new_schema = try cloneSchemaAsRequired(arena, meta.schema, kept_in_order.items);
+
+    const new_meta: schema.FileMetaData = .{
+        .version = meta.version,
+        .schema = new_schema,
+        .num_rows = total_rows,
+        .created_by = meta.created_by,
+        .row_groups = new_row_groups,
+    };
+
+    var w: thrift.Writer = .init(arena);
+    defer w.deinit();
+    try new_meta.write(&w);
+
+    const footer_start: usize = out.items.len;
+    try out.appendSlice(arena, w.bytes());
+    const footer_len: u32 = @intCast(out.items.len - footer_start);
+
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
+    try out.appendSlice(arena, &len_bytes);
+    try out.appendSlice(arena, &MAGIC);
+
+    return out.toOwnedSlice(arena);
+}
+
+/// Build a new schema list for the filtered-output path: root +
+/// only the kept leaves, with each leaf's repetition_type forced
+/// to REQUIRED. Required because our encoder doesn't emit def levels.
+fn cloneSchemaAsRequired(
+    arena: std.mem.Allocator,
+    src: std.ArrayListUnmanaged(schema.SchemaElement),
+    kept: []const usize,
+) !std.ArrayListUnmanaged(schema.SchemaElement) {
+    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try out.ensureTotalCapacity(arena, 1 + kept.len);
+
+    var new_root = src.items[0];
+    new_root.num_children = @intCast(kept.len);
+    try out.append(arena, new_root);
+
+    for (kept) |idx| {
+        if (idx + 1 >= src.items.len) return error.BadColumnIndex;
+        var leaf = src.items[idx + 1];
+        leaf.repetition_type = .REQUIRED;
+        try out.append(arena, leaf);
+    }
+    return out;
 }
 
 fn nowMonoNs() i64 {

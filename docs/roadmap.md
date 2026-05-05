@@ -107,22 +107,46 @@ pivot here, we redo those features.
   Cold start unchanged. Outstanding edge case: V2 BOOLEAN with
   SNAPPY (col[3] of `datapage_v2.snappy.parquet`) hits an
   UnsupportedEncoding in the boolean path — small follow-up.
-- **B3. Streaming output.** Today: build the whole output buffer in
-  memory, then upload. Cap is whatever fits in Lambda's 5GB tier
-  minus working set. Streaming inverts to: encode one row group →
-  feed it to a multipart-upload sink → free arena → encode next.
-  Touches:
-  - Encoder gains a "produce row group N, return bytes, free
-    intermediates" API instead of "build the whole file."
-  - `s3.uploadMultipart` becomes a sink that the encoder pushes to,
-    not a one-shot call.
-  - Footer writing has to happen *after* all data parts but be
-    appendable as a final part with the right offsets.
-  - The whole multi-file orchestration (`buildFilteredOutputMulti`)
-    flips inside-out.
+- **B3. Streaming output** (shipped 2026-05-05). Five commits on
+  `b3-streaming`:
+  1. `io.multipart_sink.MultipartSink` primitive — DuckDB-style
+     bounded concurrency × Vortex-style byte-aware permits, expressed
+     in Zig 0.16's `Io.Mutex`/`Io.Condition`/`Io.Group`.
+  2. `s3.uploadMultipart` collapsed to a 3-line wrapper over the
+     sink (-180 lines of duplicated S3 multipart machinery).
+  3. `core.writer.streaming` — generic-Sink counterpart of
+     `fastpath.buildMulti`. Tests assert byte-for-byte equivalence
+     with the buffered version across (no-projection, projection,
+     N=10 multi-file) including a 1.55 GB streamed output.
+  4. Lambda fastpath case (no filter, no nested projection) routed
+     through `MultipartSink`.
+  5. Encoder path (`buildFilteredOutputMulti`) likewise; lambda main
+     flow collapsed to a single sink-construction site.
+     `buildFilteredOutput` and `cloneProjectedSchema` deleted as
+     dead code (-340 lines, +73 lines net in lambda/main.zig).
 
-  Has to land before any new codec output (otherwise we design
-  snappy/zstd encoders for the buffered model and rework them).
+  **Memory unlock**: working set is O(footer + one in-flight chunk
+  inside the sink), independent of total output size. A 512-MB
+  Lambda can produce a multi-GB Parquet without OOM.
+
+  **Validated 2026-05-05** against real S3 (us-west-2, x86_64,
+  5120 MB):
+  - 8/8 nested round-trip scenarios (pyarrow + duckdb + hardwood +
+    python oracle).
+  - run_partition.sh head-to-head, median of 3:
+      `zpq:partprune  836 ms` (vs polars 1106, duckdb 1374)
+      `zpq:copyall   1675 ms` (vs polars 1947, duckdb 2844)
+    Both ~5% faster than pre-streaming-encoder; the intermediate
+    `[]u8` and its second copy are gone.
+  - Cold start: 10 ms init / 1752 ms total. No regression.
+
+  **Outstanding (B3 follow-ups, deferred):**
+  - **Input-side streaming.** Inputs are still fetched as full file
+    bytes upfront — the new memory ceiling. For inputs >> 512 MB,
+    that becomes the bottleneck. Touches `s3.fetchJobs` and the
+    decode path; can land independently of any output work.
+  - Tautology-filter dispatch hack (B1.z) still needs cleaning up
+    via a `?filter` parameter on `buildFilteredOutputMulti`.
 
 **What breaks if we skip B and do D (codecs) first?**
 - A snappy output encoder built for the current "encode whole file

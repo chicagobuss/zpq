@@ -35,6 +35,15 @@ const COALESCE_GAP: u64 = 64 * 1024;
 /// may or may not be filled depending on the coalescer's gap budget;
 /// consumers slice into this buffer using each `ColumnChunk`'s
 /// `data_page_offset - rg_byte_start`.
+///
+/// **Ownership transfer**: `next()` returns the result with
+/// `raw_bytes` allocated via the iterator's `gpa`. The CALLER owns
+/// the buffer and must `gpa.free(raw_bytes)` when done with it. The
+/// iterator does not retain a reference, so it's safe for the caller
+/// to call `next()` again before freeing the previous result.
+/// (This shape is what enables a fetcher-worker pattern: a worker
+/// can produce N RGs to a queue without each one stomping on the
+/// previous.)
 pub const RowGroupResult = struct {
     /// Cross-file ordering key. Stable from caller's spec list.
     file_idx: usize,
@@ -47,9 +56,8 @@ pub const RowGroupResult = struct {
     /// belongs. Use this to translate a column's `data_page_offset`
     /// into a slice index: `raw_bytes[col.data_page_offset - rg_byte_start ..]`.
     rg_byte_start: u64,
-    /// Backing buffer for this RG. Owned by the iterator's `gpa`;
-    /// freed when `next()` is called again or `deinit()` is called.
-    raw_bytes: []const u8,
+    /// Caller-owned. Free via `gpa.free(raw_bytes)` when done.
+    raw_bytes: []u8,
 };
 
 /// Configuration for which columns to fetch per RG. Two shapes:
@@ -79,11 +87,6 @@ pub const PerFileScan = struct {
     /// 0-based index of the NEXT RG to consider on the upcoming `next()`.
     cursor: usize = 0,
 
-    /// Backing buffer for the current RG. `next()` frees it before
-    /// fetching the next, so consumers must finish using it before
-    /// the subsequent call.
-    current_buf: ?[]u8 = null,
-
     // Wiring for the actual fetch.
     pool: *s3.Pool(POOL_SIZE),
     creds: s3.Credentials,
@@ -112,24 +115,16 @@ pub const PerFileScan = struct {
     }
 
     pub fn deinit(self: *PerFileScan) void {
-        if (self.current_buf) |b| {
-            self.gpa.free(b);
-            self.current_buf = null;
-        }
+        // No-op. Buffers are caller-owned (see `RowGroupResult`).
+        _ = self;
     }
 
     /// Yield the next surviving RG's bytes. Returns `null` when the
     /// iterator is drained. `arena` is used for ephemeral
     /// per-fetch-call allocations (range lists, jobs lists). The
-    /// returned `raw_bytes` is owned by the iterator and remains
-    /// valid until the next call to `next()` or `deinit()`.
+    /// returned `raw_bytes` is owned by the CALLER and must be freed
+    /// via `gpa.free`.
     pub fn next(self: *PerFileScan, io: Io, arena: std.mem.Allocator) !?RowGroupResult {
-        // Release previous RG's buffer, if any.
-        if (self.current_buf) |b| {
-            self.gpa.free(b);
-            self.current_buf = null;
-        }
-
         // Skip non-survivors.
         while (self.cursor < self.survivors.len and !self.survivors[self.cursor]) {
             self.cursor += 1;
@@ -190,7 +185,6 @@ pub const PerFileScan = struct {
 
         _ = try s3.fetchJobs(io, self.pool, self.gpa, arena, self.creds, jobs.items);
 
-        self.current_buf = rg_buf;
         return .{
             .file_idx = self.file_idx,
             .rg_idx = rg_idx,

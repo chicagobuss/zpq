@@ -1068,24 +1068,87 @@ fn buildFilteredOutputMulti(
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     var total_rows: i64 = 0;
 
-    for (specs, 0..) |sp, file_idx| {
-        const enc_count = try encodeFilteredFile(
-            arena,
-            gpa,
-            file_idx,
-            &sp,
-            &fetch_set,
-            kept_in_order.items,
-            filter,
-            sink,
-            &offset,
-            &new_row_groups,
-            io,
-            s3_pool,
-            creds,
-        );
-        total_rows += enc_count;
+    // Cross-file orchestration: spawn one fetcher worker per file.
+    // Each fetcher runs its `PerFileScan`, pushing fetched RG bytes
+    // into a per-file queue. The main task drains queues in file
+    // order — preserving deterministic RG ordering for the footer —
+    // and runs the (CPU-bound) decode + filter + encode + sink-write
+    // serially. Parallelism is in the I/O fetch layer; the encode
+    // hot path stays single-threaded so we don't need to worry about
+    // concurrent arena allocations or metadata-ownership transfer.
+    //
+    // Probe (2026-05-05): strict per-file serialization regressed
+    // 39-81% vs the old upfront-fetch model. Restoring the cross-file
+    // overlap recovers parity.
+    const QUEUE_CAP = 1;
+    const fetch_cols_buf = try arena.alloc(usize, num_leaves);
+    var fcb_len: usize = 0;
+    for (fetch_set, 0..) |needed, ci| if (needed) {
+        fetch_cols_buf[fcb_len] = ci;
+        fcb_len += 1;
+    };
+    const fetch_cols = fetch_cols_buf[0..fcb_len];
+
+    const queues = try arena.alloc(*std.Io.Queue(scan.RowGroupResult), specs.len);
+    const ctxs = try arena.alloc(*FetcherCtx, specs.len);
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    for (specs, 0..) |*sp, file_idx| {
+        const qbuf = try arena.alloc(scan.RowGroupResult, QUEUE_CAP);
+        queues[file_idx] = try arena.create(std.Io.Queue(scan.RowGroupResult));
+        queues[file_idx].* = std.Io.Queue(scan.RowGroupResult).init(qbuf);
+
+        ctxs[file_idx] = try arena.create(FetcherCtx);
+        ctxs[file_idx].* = .{
+            .scan = scan.PerFileScan.init(
+                gpa,
+                creds,
+                s3_pool,
+                file_idx,
+                sp.url,
+                &sp.meta,
+                sp.survivors,
+                .{ .columns = fetch_cols },
+            ),
+            .queue = queues[file_idx],
+            .gpa = gpa,
+        };
+        try group.concurrent(io, fileFetchTask, .{ io, ctxs[file_idx] });
     }
+
+    // Drain queues in file order. Each pulled RG is processed
+    // serially by encodeOneRG (the same function the sequential
+    // path calls). raw_bytes is freed after each RG.
+    for (queues, 0..) |q, file_idx| {
+        while (true) {
+            const rg_result = q.getOne(io) catch |err| switch (err) {
+                error.Closed => break,
+                else => return err,
+            };
+            defer gpa.free(rg_result.raw_bytes);
+            const surviving = try encodeOneRG(
+                arena,
+                gpa,
+                rg_result,
+                &fetch_set,
+                kept_in_order.items,
+                filter,
+                &specs[file_idx].meta,
+                sink,
+                &offset,
+                &new_row_groups,
+            );
+            total_rows += surviving;
+        }
+        if (ctxs[file_idx].err) |msg| {
+            std.log.warn("fetcher worker file_idx={d} failed: {s}", .{ file_idx, msg });
+            return error.FetcherFailed;
+        }
+    }
+
+    try group.await(io);
 
     // Build the output schema via the tree. projectSubset preserves
     // GROUP ancestors of every kept leaf along with their LIST/MAP
@@ -1122,146 +1185,137 @@ fn buildFilteredOutputMulti(
     return offset;
 }
 
-/// Per-file decode/filter/encode of all surviving row groups. Pushes
-/// each encoded column chunk's bytes to `sink` and bumps `offset.*` to
-/// match. Appends a `RowGroup` per surviving group to `new_row_groups`
-/// with offsets resolved to the running stream position.
-/// Returns the count of surviving rows across this file's RGs.
-///
-/// B4: fetches each surviving RG's column-chunk bytes on demand via a
-/// `scan.PerFileScan` iterator. Resident memory is one RG at a time,
-/// not the whole input file.
-fn encodeFilteredFile(
+/// Per-file fetcher worker. Drives a `scan.PerFileScan` to completion,
+/// pushing each fetched row group into the file's queue. Records any
+/// error in `ctx.err` and closes the queue when done so the consumer
+/// breaks out of its drain loop.
+const FetcherCtx = struct {
+    scan: scan.PerFileScan,
+    queue: *std.Io.Queue(scan.RowGroupResult),
+    gpa: std.mem.Allocator,
+    err: ?[]const u8 = null,
+};
+
+fn fileFetchTask(io: std.Io, ctx: *FetcherCtx) std.Io.Cancelable!void {
+    fileFetchImpl(io, ctx) catch |err| {
+        ctx.err = @errorName(err);
+    };
+    ctx.queue.close(io);
+}
+
+fn fileFetchImpl(io: std.Io, ctx: *FetcherCtx) !void {
+    while (true) {
+        var task_arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+        defer task_arena_state.deinit();
+        const task_arena = task_arena_state.allocator();
+
+        const rg_result = (try ctx.scan.next(io, task_arena)) orelse return;
+        try ctx.queue.putOne(io, rg_result);
+    }
+}
+
+/// Decode + filter + encode one RG's worth of bytes. Pushes encoded
+/// column chunks to `sink`, advances `offset.*`, appends a RowGroup
+/// to `new_row_groups`. Returns the number of surviving rows from
+/// this RG (0 if the filter dropped everything; the RG is then NOT
+/// appended to new_row_groups).
+fn encodeOneRG(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    file_idx: usize,
-    sp: *const FileSpec,
+    rg_result: scan.RowGroupResult,
     fetch_set: *const []bool,
     kept_in_order: []const usize,
     filter: filter_ast.Filter,
+    meta: *const schema.FileMetaData,
     sink: streaming.Sink,
     offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
-    io: std.Io,
-    s3_pool: *s3.Pool(POOL_SIZE),
-    creds: s3.Credentials,
 ) !i64 {
-    const meta = &sp.meta;
+    const rg = rg_result.rg_meta;
+    const num_rows: usize = @intCast(rg.num_rows);
     const num_leaves = meta.row_groups.items[0].columns.items.len;
-    var total_rows: i64 = 0;
 
-    // Translate fetch_set (boolean mask) into a sorted column-index
-    // list — what scan.PerFileScan wants for its `.columns` policy.
-    var fetch_cols: std.ArrayList(usize) = .empty;
-    for (fetch_set.*, 0..) |needed, ci| if (needed) try fetch_cols.append(arena, ci);
+    var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer rg_arena_state.deinit();
+    const ra = rg_arena_state.allocator();
 
-    var per_file: scan.PerFileScan = scan.PerFileScan.init(
-        gpa,
-        creds,
-        s3_pool,
-        file_idx,
-        sp.url,
-        meta,
-        sp.survivors,
-        .{ .columns = fetch_cols.items },
-    );
-    defer per_file.deinit();
+    var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+    var lookup = try ra.alloc(?usize, meta.schema.items.len);
+    @memset(lookup, null);
 
-    while (try per_file.next(io, arena)) |rg_result| {
-        const rg = rg_result.rg_meta;
-        const rg_idx = rg_result.rg_idx;
-        _ = rg_idx; // currently unused; reserved for ordered-output debug
-        const num_rows: usize = @intCast(rg.num_rows);
+    var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
+    @memset(batch_pos_for_col, null);
 
-        var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer rg_arena_state.deinit();
-        const ra = rg_arena_state.allocator();
+    for (fetch_set.*, 0..) |needed, ci| {
+        if (!needed) continue;
+        const col = &rg.columns.items[ci];
+        const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
+        const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
+        const len: usize = @intCast(col_meta.total_compressed_size);
+        const buf_off = start - @as(usize, @intCast(rg_result.rg_byte_start));
+        if (buf_off + len > rg_result.raw_bytes.len) return error.MissingChunkBytes;
+        const chunk = rg_result.raw_bytes[buf_off .. buf_off + len];
 
-        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
-        var lookup = try ra.alloc(?usize, meta.schema.items.len);
-        @memset(lookup, null);
+        const levels = meta.getColumnLevels(col_meta.path_in_schema.items);
 
-        var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
-        @memset(batch_pos_for_col, null);
-
-        for (fetch_set.*, 0..) |needed, ci| {
-            if (!needed) continue;
-            const col = &rg.columns.items[ci];
-            const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
-            const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
-            const len: usize = @intCast(col_meta.total_compressed_size);
-            // Slice into the per-RG buffer, not a full-file buffer.
-            const buf_off = start - @as(usize, @intCast(rg_result.rg_byte_start));
-            if (buf_off + len > rg_result.raw_bytes.len) return error.MissingChunkBytes;
-            const chunk = rg_result.raw_bytes[buf_off .. buf_off + len];
-
-            const levels = meta.getColumnLevels(col_meta.path_in_schema.items);
-
-            const n_leaves: usize = @intCast(col_meta.num_values);
-            const decoded: filter_eval.Batch.Column = switch (col_meta.type) {
-                .INT32 => .{ .i32 = try decodeColumnT(i32, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .INT64 => .{ .i64 = try decodeColumnT(i64, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .FLOAT => .{ .f32 = try decodeColumnT(f32, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .DOUBLE => .{ .f64 = try decodeColumnT(f64, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .BOOLEAN => .{ .boolean = try decodeColumnT(bool, ra, chunk, col_meta.codec, levels, n_leaves) },
-                else => return error.UnsupportedColumnType,
-            };
-            batch_pos_for_col[ci] = batch_cols.items.len;
-            lookup[ci] = batch_cols.items.len;
-            try batch_cols.append(ra, decoded);
-        }
-
-        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
-        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
-        try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
-
-        const surviving_count = sel.count();
-        if (surviving_count == 0) continue;
-
-        var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-        try rg_columns.ensureTotalCapacity(arena, kept_in_order.len);
-        var rg_total: i64 = 0;
-
-        for (kept_in_order) |kept_ci| {
-            const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
-            const filtered = try encoder.applySelection(arena, batch_cols.items[batch_pos], &sel);
-
-            // Find the schema-element matching this column chunk's
-            // path. For flat columns this is just `schema.items[ci+1]`;
-            // for nested it must be looked up via path_in_schema since
-            // intermediate GROUP nodes shift the indexing.
-            const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-            const leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
-            const enc = try encoder.encodeColumn(arena, .{
-                .values = filtered,
-                .schema_elem = &leaf_elem,
-                .path_in_schema = cm.path_in_schema.items,
-            });
-
-            const col_start_in_file: i64 = @intCast(offset.*);
-            var em = enc.meta;
-            em.data_page_offset = col_start_in_file;
-            try sink.write(enc.bytes);
-            offset.* += enc.bytes.len;
-            rg_total += @intCast(enc.bytes.len);
-
-            try rg_columns.append(arena, .{
-                .file_path = null,
-                .file_offset = col_start_in_file,
-                .meta_data = em,
-            });
-        }
-
-        try new_row_groups.append(arena, .{
-            .columns = rg_columns,
-            .total_byte_size = rg_total,
-            .num_rows = @intCast(surviving_count),
-        });
-        total_rows += @intCast(surviving_count);
+        const n_leaves: usize = @intCast(col_meta.num_values);
+        const decoded: filter_eval.Batch.Column = switch (col_meta.type) {
+            .INT32 => .{ .i32 = try decodeColumnT(i32, ra, chunk, col_meta.codec, levels, n_leaves) },
+            .INT64 => .{ .i64 = try decodeColumnT(i64, ra, chunk, col_meta.codec, levels, n_leaves) },
+            .FLOAT => .{ .f32 = try decodeColumnT(f32, ra, chunk, col_meta.codec, levels, n_leaves) },
+            .DOUBLE => .{ .f64 = try decodeColumnT(f64, ra, chunk, col_meta.codec, levels, n_leaves) },
+            .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, ra, chunk, col_meta.codec, levels, n_leaves) },
+            .BOOLEAN => .{ .boolean = try decodeColumnT(bool, ra, chunk, col_meta.codec, levels, n_leaves) },
+            else => return error.UnsupportedColumnType,
+        };
+        batch_pos_for_col[ci] = batch_cols.items.len;
+        lookup[ci] = batch_cols.items.len;
+        try batch_cols.append(ra, decoded);
     }
 
-    return total_rows;
+    const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+    try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
+
+    const surviving_count = sel.count();
+    if (surviving_count == 0) return 0;
+
+    var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try rg_columns.ensureTotalCapacity(arena, kept_in_order.len);
+    var rg_total: i64 = 0;
+
+    for (kept_in_order) |kept_ci| {
+        const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
+        const filtered = try encoder.applySelection(arena, batch_cols.items[batch_pos], &sel);
+
+        const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+        const leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+        const enc = try encoder.encodeColumn(arena, .{
+            .values = filtered,
+            .schema_elem = &leaf_elem,
+            .path_in_schema = cm.path_in_schema.items,
+        });
+
+        const col_start_in_file: i64 = @intCast(offset.*);
+        var em = enc.meta;
+        em.data_page_offset = col_start_in_file;
+        try sink.write(enc.bytes);
+        offset.* += enc.bytes.len;
+        rg_total += @intCast(enc.bytes.len);
+
+        try rg_columns.append(arena, .{
+            .file_path = null,
+            .file_offset = col_start_in_file,
+            .meta_data = em,
+        });
+    }
+
+    try new_row_groups.append(arena, .{
+        .columns = rg_columns,
+        .total_byte_size = rg_total,
+        .num_rows = @intCast(surviving_count),
+    });
+    return @intCast(surviving_count);
 }
 
 fn nowMonoNs() i64 {

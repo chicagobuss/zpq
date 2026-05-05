@@ -37,6 +37,7 @@ pub const Method = enum {
     HEAD,
     PUT,
     POST,
+    DELETE,
 
     fn str(self: Method) []const u8 {
         return @tagName(self);

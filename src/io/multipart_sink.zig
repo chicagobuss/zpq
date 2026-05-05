@@ -19,9 +19,8 @@ const s3 = @import("s3.zig");
 const tls = @import("tls.zig");
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
-const pool = @import("pool.zig");
 
-pub const POOL_SIZE = 8;
+pub const RETRY_LIMIT = 8;
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 pub const TARGET_PART_SIZE: usize = 19 * 1024 * 1024;
 pub const MAX_PARTS: u32 = 10_000;
@@ -58,11 +57,49 @@ const PartTaskCtx = struct {
     etag_slot: *EtagSlot,
 };
 
+/// Type-erased pool dispatch. Mirrors the existing `s3.PoolHandle`
+/// pattern in s3.zig so callers can hand us any `*Pool(N)` regardless
+/// of the comptime size.
+const PoolDispatch = struct {
+    ptr: *anyopaque,
+    acquireFn: *const fn (*anyopaque, Io) anyerror!s3.PoolHandle,
+    releaseFn: *const fn (*anyopaque, Io, usize) anyerror!void,
+    discardFn: *const fn (*anyopaque, Io, usize) void,
+};
+
+fn acquireFnFor(comptime P: type) *const fn (*anyopaque, Io) anyerror!s3.PoolHandle {
+    return struct {
+        fn f(p: *anyopaque, io: Io) anyerror!s3.PoolHandle {
+            const typed: *P = @ptrCast(@alignCast(p));
+            const h = try typed.acquire(io);
+            return .{ .conn = h.conn, .idx = h.idx };
+        }
+    }.f;
+}
+
+fn releaseFnFor(comptime P: type) *const fn (*anyopaque, Io, usize) anyerror!void {
+    return struct {
+        fn f(p: *anyopaque, io: Io, idx: usize) anyerror!void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            try typed.release(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
+fn discardFnFor(comptime P: type) *const fn (*anyopaque, Io, usize) void {
+    return struct {
+        fn f(p: *anyopaque, io: Io, idx: usize) void {
+            const typed: *P = @ptrCast(@alignCast(p));
+            typed.discard(io, .{ .conn = undefined, .idx = idx });
+        }
+    }.f;
+}
+
 pub const MultipartSink = struct {
     // S3 session
     creds: s3.Credentials,
     url: s3.Url,
-    pool_ptr: *pool.Pool(POOL_SIZE),
+    pool: PoolDispatch,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator, // for ephemeral per-control-message allocs
     io: Io,
@@ -94,19 +131,27 @@ pub const MultipartSink = struct {
 
     closed: bool = false,
 
+    /// `pool_ptr` is `*Pool(N)` for any comptime N — type-erased here
+    /// via `PoolDispatch` so the sink struct itself is not generic.
     pub fn init(
         io: Io,
         gpa: std.mem.Allocator,
         arena: std.mem.Allocator,
         creds: s3.Credentials,
         url: s3.Url,
-        pool_ptr: *pool.Pool(POOL_SIZE),
+        pool_ptr: anytype,
         options: Options,
     ) MultipartSink {
+        const P = @TypeOf(pool_ptr.*);
         return .{
             .creds = creds,
             .url = url,
-            .pool_ptr = pool_ptr,
+            .pool = .{
+                .ptr = @ptrCast(pool_ptr),
+                .acquireFn = acquireFnFor(P),
+                .releaseFn = releaseFnFor(P),
+                .discardFn = discardFnFor(P),
+            },
             .gpa = gpa,
             .arena = arena,
             .io = io,
@@ -116,7 +161,7 @@ pub const MultipartSink = struct {
 
     /// Append bytes to the producer-side buffer. When it crosses
     /// target_part_size, flush full parts to the multipart upload.
-    pub fn push(self: *MultipartSink, bytes: []const u8) Error!void {
+    pub fn push(self: *MultipartSink, bytes: []const u8) !void {
         if (self.closed) return error.SinkAlreadyClosed;
         try self.buffer.appendSlice(self.gpa, bytes);
         while (self.buffer.items.len >= self.options.target_part_size) {
@@ -124,7 +169,7 @@ pub const MultipartSink = struct {
         }
     }
 
-    fn flushOnePart(self: *MultipartSink, n: usize) Error!void {
+    fn flushOnePart(self: *MultipartSink, n: usize) !void {
         if (self.upload_id == null) {
             // Lazy-create on first part. Some outputs are small enough to
             // stay below target_part_size and never flush — they go via
@@ -169,7 +214,7 @@ pub const MultipartSink = struct {
         try self.group.concurrent(self.io, partWorker, .{ self.io, ctx });
     }
 
-    fn reserveBytes(self: *MultipartSink, n: usize) Error!void {
+    fn reserveBytes(self: *MultipartSink, n: usize) !void {
         try self.bytes_lock.lock(self.io);
         defer self.bytes_lock.unlock(self.io);
         while (self.bytes_in_flight > 0 and self.bytes_in_flight + n > self.options.max_bytes_in_flight) {
@@ -194,7 +239,7 @@ pub const MultipartSink = struct {
     /// Flush any remainder, drain in-flight workers, then either
     /// CompleteMultipartUpload or fall back to a single PutObject if
     /// nothing was multiparted.
-    pub fn close(self: *MultipartSink) Error!void {
+    pub fn close(self: *MultipartSink) !void {
         if (self.closed) return error.SinkAlreadyClosed;
         self.closed = true;
 
@@ -242,18 +287,19 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
     defer ctx.sink.releaseBytes(ctx.body_len);
 
     var attempts: u8 = 0;
-    while (attempts <= POOL_SIZE) : (attempts += 1) {
+    while (attempts <= RETRY_LIMIT) : (attempts += 1) {
         var arena_state = std.heap.ArenaAllocator.init(ctx.sink.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const handle = ctx.sink.pool_ptr.acquire(io) catch {
+        const dispatch = ctx.sink.pool;
+        const handle = dispatch.acquireFn(dispatch.ptr, io) catch {
             ctx.sink.recordError("pool_acquire_failed");
             return;
         };
 
         const ok = doUploadPart(arena, ctx, handle.conn) catch |err| {
-            ctx.sink.pool_ptr.discard(io, handle);
+            dispatch.discardFn(dispatch.ptr, io, handle.idx);
             switch (err) {
                 error.RecvFailed,
                 error.SendFailed,
@@ -267,11 +313,11 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
             }
         };
         if (!ok) {
-            ctx.sink.pool_ptr.discard(io, handle);
+            dispatch.discardFn(dispatch.ptr, io, handle.idx);
             ctx.sink.recordError("part_upload_bad_status");
             return;
         }
-        ctx.sink.pool_ptr.release(io, handle) catch return;
+        dispatch.releaseFn(dispatch.ptr, io, handle.idx) catch return;
         return;
     }
     ctx.sink.recordError("part_upload_exhausted_retries");

@@ -28,7 +28,9 @@ pub const Error = error{
     NullableNotSupported,
     UnsupportedType,
     TooLarge,
-} || std.mem.Allocator.Error || snappy.CompressError;
+    CorruptInput, // from snappy (vendored google/snappy)
+    OutputTooSmall, // from snappy
+} || std.mem.Allocator.Error;
 
 pub const EncodedColumn = struct {
     /// Page header thrift + encoded data bytes, ready to concatenate.

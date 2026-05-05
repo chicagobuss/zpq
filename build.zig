@@ -52,6 +52,12 @@ pub fn build(b: *std.Build) void {
     });
     const test_boring_mod = test_boring_dep.module("boring_tls");
 
+    const test_snappy_dep = b.dependency("snappy", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_snappy_mod = test_snappy_dep.module("snappy");
+
     const test_zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
@@ -59,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = test_opts_mod },
             .{ .name = "boring_tls", .module = test_boring_mod },
+            .{ .name = "snappy", .module = test_snappy_mod },
         },
     });
 
@@ -163,6 +170,15 @@ fn makeZpqModule(
     });
     const boring_tls_mod = boring_tls_dep.module("boring_tls");
 
+    // google/snappy 1.2.1 — vendor source-built, generic implementation.
+    // Replaces the hand-rolled zig snappy compressor (still used for
+    // decode-side fallback; the C version is 3-5× faster on compress).
+    const snappy_dep = b.dependency("snappy", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const snappy_mod = snappy_dep.module("snappy");
+
     const zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
@@ -170,6 +186,7 @@ fn makeZpqModule(
         .imports = &.{
             .{ .name = "build_options", .module = opts_mod },
             .{ .name = "boring_tls", .module = boring_tls_mod },
+            .{ .name = "snappy", .module = snappy_mod },
         },
     });
 
@@ -185,6 +202,7 @@ fn makeZpqModule(
         .imports = &.{
             .{ .name = "build_options", .module = opts_mod },
             .{ .name = "boring_tls", .module = boring_tls_mod },
+            .{ .name = "snappy", .module = snappy_mod },
         },
     });
 

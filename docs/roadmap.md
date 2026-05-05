@@ -143,25 +143,60 @@ pivot here, we redo those features.
   **Outstanding (B3 follow-ups, deferred):**
   - Tautology-filter dispatch hack (B1.z) still needs cleaning up
     via a `?filter` parameter on `buildFilteredOutputMulti`.
-- **B4. Streaming input** (in progress on `b4-input-streaming`).
-  Counterpart to B3: inputs are still fetched as full file bytes
-  upfront — the new memory ceiling. For inputs >> 512 MB, that
-  becomes the bottleneck. The architectural pattern (per-file RG
-  iterator with bounded resident memory, parallel across files) is
-  cribbed from DuckDB / Hardwood; the merge-write composition that
-  feeds it is ZPQ-specific (none of the comparables target N→1
-  streaming Parquet output).
+- **B4. Streaming input** (shipped 2026-05-05). Four commits on
+  `b4-input-streaming`:
+  1. `lambda/scan.zig` per-file RG iterator. `PerFileScan.next()`
+     fetches one row group's column-chunk bytes (with caller-owned
+     buffer transfer for queue-based hand-off). `FetchPolicy` is a
+     tagged union: `.all_kept` (whole RG span, fastpath) or
+     `.columns = [...]` (per-leaf, encoder/projection).
+  2. Encoder path migrated to consume from the iterator. Per-RG
+     bytes fetched on-demand instead of up-front.
+  3. Cross-file `Io.Group` orchestrator. **Single decoder, parallel
+     fetchers** — N fetcher workers feed per-file `Io.Queue` of
+     capacity 1; main task drains queues in file order and runs the
+     existing per-RG processing serially. CPU-bound encode stays
+     single-threaded (no concurrent arena races); only I/O fan-out
+     parallelizes. Probe-confirmed: strict per-file serialization
+     regressed 39-81%; this restores parity.
+  4. Fastpath migrated to the same iterator + orchestrator. The
+     upfront `s3.fetchJobs` call is gone. `bytes_fetched=0` always
+     in the JSON envelope. `buildOutputMulti` is the single
+     orchestrator; `encodeOneRG` and `copyOneRG` are the two per-RG
+     consumers it dispatches to.
 
-  **Probe result (2026-05-05):** strict per-file serialization
-  regresses 39% on partprune and 81% on copyall. v1 must preserve
-  cross-file parallelism via an `Io.Group` of N concurrent file
-  iterators.
+  **Memory unlock complete.** Working set is now
+  O(N_files × QUEUE_CAP × max_RG_compressed) — for our 10-file
+  test fixture that's ~140 MB plus per-RG decoded values
+  (~50–150 MB during encode), total ~200–300 MB. ZPQ on a 512 MB
+  Lambda can stream a 50 GB Parquet through. Practical input limit
+  is now the 15-min Lambda wall clock and S3 5 TB max object size,
+  not memory.
 
-  **Design hint from medium-term roadmap:** the per-file iterator
-  should yield a generic `{ raw_bytes, decoded_batch }` per RG, not
-  raw bytes only. That lets the same iterator feed (a) byte-copy
-  fastpath, (b) filter+encode, (c) future aggregate consumers (see
-  Phase C) — all reading from the same scan primitive.
+  **Validated 2026-05-05** against real S3 (us-west-2, x86_64,
+  5120 MB):
+  - 8/8 nested round-trip scenarios pass through the unified
+    encoder + fastpath streaming-input path.
+  - run_partition.sh head-to-head, median of 5:
+      `zpq:partprune  887 ms` (B3 baseline 836; +6%)
+      `zpq:copyall   1702 ms` (B3 baseline 1675; +2%)
+    Slight regression is the cost of per-RG fetches losing some
+    coalescing efficiency vs one big upfront fetchJobs. Operating
+    envelope expanded by 100×+ in exchange.
+  - Encoder-heavy bench (`int8 >= 0` filter on 10-file fixture,
+    warm runs): 4026 ms (sequential per-file) → 1943 ms (cross-file
+    parallel). 2× speedup from restoring fan-out.
+  - Cold start: 11 ms init (unchanged from B3).
+
+  **Outstanding (B4 follow-ups, deferred):**
+  - `sp.file_buf` is still allocated at `total_size` in
+    `fetchMetaTask`. Only metadata regions get written; Linux
+    demand-paging keeps resident memory small. Tightening this to
+    a metadata-only buffer is a separate commit.
+  - `core/writer/streaming.build` (the in-memory FileSpec-driven
+    path) is no longer called by lambda but still exists for tests.
+    Could be removed if we migrate its tests to drive
+    `scan.PerFileScan` through a memory-backed source.
 
 **What breaks if we skip B and do D (codecs) first?**
 - A snappy output encoder built for the current "encode whole file

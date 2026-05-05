@@ -197,14 +197,20 @@ pub fn encodeRG(
                 const path_buf = try out_arena.alloc([]const u8, 1);
                 path_buf[0] = c.alias;
                 path_in_schema = path_buf;
+                const expr_type = c.expr.typeOf();
+                // BYTE_ARRAY columns need a UTF8 / STRING annotation
+                // for downstream readers (pyarrow, polars, etc) to
+                // surface them as strings rather than raw binary. Our
+                // string concat result is always UTF-8 because the
+                // input string columns are UTF-8.
                 leaf_elem = .{
-                    .type = c.expr.typeOf().toParquet(),
+                    .type = expr_type.toParquet(),
                     .type_length = null,
                     .repetition_type = .REQUIRED,
                     .name = c.alias,
                     .num_children = 0,
-                    .converted_type = null,
-                    .logical_type = null,
+                    .converted_type = if (expr_type == .str) .UTF8 else null,
+                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
                     .scale = null,
                     .precision = null,
                     .field_id = null,

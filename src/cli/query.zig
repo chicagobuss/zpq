@@ -394,14 +394,15 @@ fn buildSelectSchema(
                 try out.append(arena, copy);
             },
             .computed => |c| {
+                const expr_type = c.expr.typeOf();
                 try out.append(arena, .{
-                    .type = c.expr.typeOf().toParquet(),
+                    .type = expr_type.toParquet(),
                     .type_length = null,
                     .repetition_type = .REQUIRED,
                     .name = c.alias,
                     .num_children = 0,
-                    .converted_type = null,
-                    .logical_type = null,
+                    .converted_type = if (expr_type == .str) .UTF8 else null,
+                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
                     .scale = null,
                     .precision = null,
                     .field_id = null,

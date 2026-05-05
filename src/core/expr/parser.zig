@@ -25,6 +25,8 @@ pub const Error = error{
     BadNumber,
     UnknownColumn,
     UnsupportedColumnType,
+    UnterminatedString,
+    TypeMismatch,
     ExpectedRParen,
     ExpectedIdentifier,
     TrailingTokens,
@@ -33,11 +35,14 @@ pub const Error = error{
 const TokenKind = enum {
     number_int,
     number_float,
+    string,
     ident,
     plus,
     minus,
     star,
     slash,
+    /// `||` — SQL string concatenation.
+    pipe_pipe,
     lparen,
     rparen,
     comma,
@@ -93,6 +98,25 @@ const Lexer = struct {
             ',' => {
                 self.pos += 1;
                 return .{ .kind = .comma, .text = "" };
+            },
+            '|' => {
+                if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '|') {
+                    self.pos += 2;
+                    return .{ .kind = .pipe_pipe, .text = "" };
+                }
+                return error.UnexpectedChar;
+            },
+            '\'' => {
+                // Single-quoted string literal. No escapes in v1; a
+                // literal like `'it\'s'` would need either `''` doubling
+                // or `\'` escapes. Future work.
+                self.pos += 1;
+                const start = self.pos;
+                while (self.pos < self.src.len and self.src[self.pos] != '\'') self.pos += 1;
+                if (self.pos >= self.src.len) return error.UnterminatedString;
+                const text = self.src[start..self.pos];
+                self.pos += 1; // consume closing quote
+                return .{ .kind = .string, .text = text };
             },
             else => {},
         }
@@ -192,6 +216,10 @@ fn parseExpr(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMeta
         const op: ast.Op = switch (tk.kind) {
             .plus => .add,
             .minus => .sub,
+            // SQL `||` binds at the same precedence as `+`/`-`. Strings
+            // and numerics live in disjoint type lanes — the eval layer
+            // surfaces TypeMismatch if a user mixes them.
+            .pipe_pipe => .concat,
             else => return left,
         };
         _ = try lex.next();
@@ -226,6 +254,9 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             const v = std.fmt.parseFloat(f64, tk.text) catch return error.BadNumber;
             return .{ .literal = .{ .f64 = v } };
         },
+        .string => {
+            return .{ .literal = .{ .str = tk.text } };
+        },
         .ident => {
             const col_idx = metadata.findColumnIndex(file, tk.text) orelse return error.UnknownColumn;
             const elem = file.getColumnSchema(&[_][]const u8{tk.text}) orelse return error.UnknownColumn;
@@ -233,6 +264,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             const expr_type: ast.Type = switch (phys) {
                 .INT32, .INT64 => .i64,
                 .FLOAT, .DOUBLE => .f64,
+                .BYTE_ARRAY => .str,
                 else => return error.UnsupportedColumnType,
             };
             return .{ .col_ref = .{
@@ -253,6 +285,12 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
 }
 
 fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
+    const result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
+    // Op/type compatibility: `concat` is string-only, arithmetic ops
+    // are numeric-only.
+    if (op == .concat and result_type != .str) return error.TypeMismatch;
+    if (op != .concat and result_type == .str) return error.TypeMismatch;
+
     const lp = try arena.create(ast.Expr);
     const rp = try arena.create(ast.Expr);
     lp.* = l;
@@ -261,7 +299,7 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
         .op = op,
         .left = lp,
         .right = rp,
-        .result_type = ast.Type.promote(l.typeOf(), r.typeOf()),
+        .result_type = result_type,
     } };
 }
 
@@ -397,6 +435,43 @@ test "parse: unknown column errors" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
     try testing.expectError(error.UnknownColumn, parseExprOnly(a, "y + 1", &file));
+}
+
+test "parse: string literal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{}, &.{});
+    const e = try parseExprOnly(a, "'hello'", &file);
+    try testing.expectEqual(ast.Type.str, e.typeOf());
+    try testing.expectEqualStrings("hello", e.literal.str);
+}
+
+test "parse: string column ref" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
+    const e = try parseExprOnly(a, "name", &file);
+    try testing.expectEqual(ast.Type.str, e.typeOf());
+}
+
+test "parse: || string concat" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "first", "last" }, &.{ .BYTE_ARRAY, .BYTE_ARRAY });
+    const e = try parseExprOnly(a, "first || ' ' || last", &file);
+    try testing.expectEqual(ast.Type.str, e.typeOf());
+    try testing.expectEqual(ast.Op.concat, e.binop.op);
+}
+
+test "parse: type mismatch — string + number errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "name + 1", &file));
 }
 
 test "parse: incomplete trailing operator fails" {

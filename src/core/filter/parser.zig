@@ -55,7 +55,11 @@ fn parseDisjunction(arena: std.mem.Allocator, expr: []const u8, file: *const sch
 }
 
 fn parseConjunction(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData) Error!ast.Filter {
-    if (std.mem.indexOf(u8, expr, " AND ")) |i| {
+    // Find a top-level " AND " — one that doesn't pair with a BETWEEN.
+    // For each " BETWEEN " in the expression, the *next* " AND " after
+    // it belongs to the BETWEEN bounds, not to a conjunction. Skip
+    // over them.
+    if (findTopLevelAnd(expr)) |i| {
         const left = try arena.create(ast.Filter);
         const right = try arena.create(ast.Filter);
         left.* = try parseLeaf(arena, std.mem.trim(u8, expr[0..i], " "), file);
@@ -65,7 +69,90 @@ fn parseConjunction(arena: std.mem.Allocator, expr: []const u8, file: *const sch
     return try parseLeaf(arena, expr, file);
 }
 
+/// Find the first ` AND ` token in `expr` that is NOT part of a
+/// `BETWEEN x AND y` clause. Returns its byte index, or null if every
+/// ` AND ` belongs to a BETWEEN (or none exist).
+fn findTopLevelAnd(expr: []const u8) ?usize {
+    // Walk left-to-right tracking a "skip-next-AND" counter that we
+    // bump each time we see a `BETWEEN` keyword. Each subsequent
+    // ` AND ` decrements the counter (consumed by that BETWEEN's
+    // bounds) until it hits zero — then the next ` AND ` is the
+    // top-level conjunction split.
+    var i: usize = 0;
+    var skip: usize = 0;
+    while (i + 5 <= expr.len) {
+        // Check for ` BETWEEN ` (case-insensitive). The leading space
+        // disambiguates from identifiers like `between_threshold`.
+        if (i + " BETWEEN ".len <= expr.len and asciiEqIgnoreCase(expr[i .. i + " BETWEEN ".len], " BETWEEN ")) {
+            skip += 1;
+            i += " BETWEEN ".len;
+            continue;
+        }
+        if (asciiEqIgnoreCase(expr[i .. i + 5], " AND ")) {
+            if (skip > 0) {
+                skip -= 1;
+                i += 5;
+                continue;
+            }
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn asciiEqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xl = if (x >= 'A' and x <= 'Z') x + 32 else x;
+        const yl = if (y >= 'A' and y <= 'Z') y + 32 else y;
+        if (xl != yl) return false;
+    }
+    return true;
+}
+
+fn caseInsensitiveIndexOf(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (asciiEqIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 fn parseLeaf(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData) Error!ast.Filter {
+    // BETWEEN check runs before operator detection — `col BETWEEN x AND y`
+    // doesn't contain a binary op the comparison-finder would recognize.
+    if (caseInsensitiveIndexOf(expr, " BETWEEN ")) |_| {
+        return parseBetween(arena, expr, file);
+    }
+    return parseComparisonLeaf(arena, expr, file);
+}
+
+/// Parse `col BETWEEN x AND y` into the conjunction `(col >= x AND col <= y)`.
+/// SQL semantics: BETWEEN is inclusive on both sides.
+fn parseBetween(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData) Error!ast.Filter {
+    const between_at = caseInsensitiveIndexOf(expr, " BETWEEN ") orelse return error.BadOperator;
+    const after_between = between_at + " BETWEEN ".len;
+    const and_at = caseInsensitiveIndexOf(expr[after_between..], " AND ") orelse return error.BadOperator;
+
+    const col_name = std.mem.trim(u8, expr[0..between_at], " ");
+    const x_str = std.mem.trim(u8, expr[after_between .. after_between + and_at], " ");
+    const y_str = std.mem.trim(u8, expr[after_between + and_at + " AND ".len ..], " ");
+    if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
+
+    const col_idx = metadata.findColumnIndex(file, col_name) orelse return error.UnknownColumn;
+    const elem = file.getColumnSchema(&[_][]const u8{col_name}) orelse return error.UnknownColumn;
+    const ptype = elem.type orelse return error.UnsupportedType;
+
+    const left = try arena.create(ast.Filter);
+    const right = try arena.create(ast.Filter);
+    left.* = try buildLeafFilter(col_idx, .GtEq, x_str, ptype);
+    right.* = try buildLeafFilter(col_idx, .LtEq, y_str, ptype);
+    return .{ .and_filter = .{ .left = left, .right = right } };
+}
+
+fn parseComparisonLeaf(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData) Error!ast.Filter {
     _ = arena;
     // Find the operator. Two-char ops checked first so "<=" doesn't
     // match the "<" arm.
@@ -300,4 +387,51 @@ test "parse rejects bad operator" {
     defer meta.deinit(a);
 
     try testing.expectError(error.BadOperator, parse(a, "id LIKE '5'", &meta));
+}
+
+test "parse BETWEEN expands to >= AND <= conjunction" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const f = try parse(a, "id BETWEEN 10 AND 20", &meta);
+    try testing.expect(f == .and_filter);
+    try testing.expect(f.and_filter.left.* == .int32);
+    try testing.expect(f.and_filter.right.* == .int32);
+    try testing.expectEqual(ast.Operator.GtEq, f.and_filter.left.int32.op);
+    try testing.expectEqual(@as(i32, 10), f.and_filter.left.int32.value);
+    try testing.expectEqual(ast.Operator.LtEq, f.and_filter.right.int32.op);
+    try testing.expectEqual(@as(i32, 20), f.and_filter.right.int32.value);
+}
+
+test "parse BETWEEN composes with outer AND" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // `score BETWEEN 0.5 AND 0.9 AND id=1` should parse as
+    // `(score >= 0.5 AND score <= 0.9) AND (id=1)`. The BETWEEN's
+    // bound-AND must NOT be the conjunction split point.
+    const f = try parse(a, "score BETWEEN 0.5 AND 0.9 AND id=1", &meta);
+    try testing.expect(f == .and_filter);
+    // Left side is the BETWEEN's expansion (and_filter of two doubles).
+    try testing.expect(f.and_filter.left.* == .and_filter);
+    // Right side is the trailing id=1.
+    try testing.expect(f.and_filter.right.* == .int32);
+    try testing.expectEqual(@as(i32, 1), f.and_filter.right.int32.value);
+}
+
+test "parse BETWEEN is case-insensitive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const f = try parse(a, "id between 1 and 5", &meta);
+    try testing.expect(f == .and_filter);
 }

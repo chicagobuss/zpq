@@ -24,17 +24,34 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 
-pub const Op = enum { add, sub, mul, div };
+/// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`) work on
+/// `i64` or `f64`; `concat` works on `str` and is the SQL `||`
+/// operator.
+pub const Op = enum {
+    add,
+    sub,
+    mul,
+    div,
+    concat,
+};
 
-/// The value type an expression evaluates to. We deliberately keep
-/// just two — i64 and f64 — to keep the kernel matrix small in the
-/// first slice. Promotion happens at column-ref load time (i32 → i64,
-/// f32 → f64) so binops only see these two types.
+/// The value type an expression evaluates to. Three lanes — i64, f64,
+/// str — keep the kernel matrix tractable. Numeric promotion happens
+/// at column-ref load time (i32 → i64, f32 → f64); strings stay as
+/// strings and don't mix with numerics.
 pub const Type = enum {
     i64,
     f64,
+    str,
 
-    pub fn promote(a: Type, b: Type) Type {
+    /// Result type of `lhs op rhs`. Strings can only combine with
+    /// strings (concat); any cross-lane mix returns null and the
+    /// caller must surface a TypeMismatch error.
+    pub fn promote(a: Type, b: Type) ?Type {
+        if (a == .str or b == .str) {
+            if (a == .str and b == .str) return .str;
+            return null;
+        }
         if (a == .f64 or b == .f64) return .f64;
         return .i64;
     }
@@ -44,6 +61,7 @@ pub const Type = enum {
         return switch (self) {
             .i64 => .INT64,
             .f64 => .DOUBLE,
+            .str => .BYTE_ARRAY,
         };
     }
 };
@@ -51,11 +69,13 @@ pub const Type = enum {
 pub const Literal = union(enum) {
     i64: i64,
     f64: f64,
+    str: []const u8,
 
     pub fn typeOf(self: Literal) Type {
         return switch (self) {
             .i64 => .i64,
             .f64 => .f64,
+            .str => .str,
         };
     }
 };
@@ -111,10 +131,14 @@ pub const SelectItem = struct {
 const testing = std.testing;
 
 test "Type.promote" {
-    try testing.expectEqual(Type.i64, Type.promote(.i64, .i64));
-    try testing.expectEqual(Type.f64, Type.promote(.i64, .f64));
-    try testing.expectEqual(Type.f64, Type.promote(.f64, .i64));
-    try testing.expectEqual(Type.f64, Type.promote(.f64, .f64));
+    try testing.expectEqual(Type.i64, Type.promote(.i64, .i64).?);
+    try testing.expectEqual(Type.f64, Type.promote(.i64, .f64).?);
+    try testing.expectEqual(Type.f64, Type.promote(.f64, .i64).?);
+    try testing.expectEqual(Type.f64, Type.promote(.f64, .f64).?);
+    try testing.expectEqual(Type.str, Type.promote(.str, .str).?);
+    // Cross-lane mixes return null (caller surfaces TypeMismatch).
+    try testing.expectEqual(@as(?Type, null), Type.promote(.str, .i64));
+    try testing.expectEqual(@as(?Type, null), Type.promote(.f64, .str));
 }
 
 test "Type.toParquet" {

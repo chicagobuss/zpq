@@ -832,12 +832,14 @@ fn handleS3Write(
     var filter_cols_for_fetch: std.ArrayList(usize) = .empty;
     if (filter) |f| try f.collectColumns(&filter_cols_for_fetch, a);
 
-    // 3. Per-file: stat-prune survivors + build fetch ranges.
+    // 3a. Per-file: stat-prune survivors only. Range-building +
+    // upfront column-chunk fetch is now conditional on the output
+    // routing decision below.
     var rg_pruned: usize = 0;
     var rows_kept: i64 = 0;
     var total_input_rows: i64 = 0;
     var total_input_size: u64 = 0;
-    var jobs: std.ArrayList(s3.FetchJob) = .empty;
+    var bytes_fetched: u64 = 0;
 
     for (specs) |*sp| {
         total_input_size += sp.total_size;
@@ -856,84 +858,13 @@ fn handleS3Write(
             sp.survivors[i] = true;
             rows_kept += rg.num_rows;
         }
-
-        // Build per-file ranges using the same logic as before, then
-        // turn them into FetchJobs whose target slices into sp.file_buf.
-        var ranges: std.ArrayList(coalescer.Range) = .empty;
-        for (sp.survivors, 0..) |keep, i| {
-            if (!keep) continue;
-            const rg = &sp.meta.row_groups.items[i];
-            if (filter != null) {
-                const num_leaves = rg.columns.items.len;
-                const needed = try a.alloc(bool, num_leaves);
-                @memset(needed, false);
-                if (kept_columns_opt) |kc| {
-                    for (kc) |idx| if (idx < num_leaves) {
-                        needed[idx] = true;
-                    };
-                } else {
-                    @memset(needed, true);
-                }
-                for (filter_cols_for_fetch.items) |c| if (c < num_leaves) {
-                    needed[c] = true;
-                };
-                for (needed, 0..) |b, ci| {
-                    if (!b) continue;
-                    const m = rg.columns.items[ci].meta_data orelse continue;
-                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                    try ranges.append(a, .{ .start = s, .end = e });
-                }
-            } else if (kept_columns_opt) |kc| {
-                for (kc) |col_idx| {
-                    if (col_idx >= rg.columns.items.len) continue;
-                    const m = rg.columns.items[col_idx].meta_data orelse continue;
-                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                    try ranges.append(a, .{ .start = s, .end = e });
-                }
-            } else {
-                var min_s: u64 = std.math.maxInt(u64);
-                var max_e: u64 = 0;
-                for (rg.columns.items) |chunk| {
-                    const m = chunk.meta_data orelse continue;
-                    const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                    const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                    if (s < min_s) min_s = s;
-                    if (e > max_e) max_e = e;
-                }
-                if (min_s == std.math.maxInt(u64)) continue;
-                try ranges.append(a, .{ .start = min_s, .end = max_e });
-            }
-        }
-        const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
-
-        for (merged) |r| {
-            if (r.start >= sp.tail_start) continue;
-            const end = @min(r.end, sp.tail_start);
-            try jobs.append(a, .{
-                .bucket = sp.url.bucket,
-                .key = sp.url.key,
-                .range = .{ .start = r.start, .end = end },
-                .target = sp.file_buf[@intCast(r.start)..@intCast(end)],
-            });
-        }
     }
 
-    var bytes_fetched: u64 = 0;
-    if (jobs.items.len > 0) {
-        bytes_fetched = try s3.fetchJobs(io, pool, allocator, a, creds, jobs.items);
-    }
-
-    const t_after_fetch = nowMonoNs();
-
-    // 4. Build unified output. Three paths:
-    //    - Filter set                            → buildFilteredOutputMulti
-    //    - No filter, no projection              → fastpath byte-copy
-    //    - No filter, projection includes nested → buildFilteredOutputMulti
-    //      with a synthetic always-active filter (decodes + emits all
-    //      leaves correctly, including rep-aware list/map projection
-    //      which the byte-copy fastpath can't yet handle).
+    // 3b. Decide routing now (was previously after the upfront fetch).
+    // The fastpath (no filter, no nested projection) still consumes
+    // from sp.file_buf and needs the upfront fetch. Encoder paths
+    // (filter set, or nested projection) use the scan iterator and
+    // skip upfront column-chunk fetching entirely.
     const projection_includes_nested = blk_pn: {
         if (kept_columns_opt) |kc| {
             for (kc) |idx| {
@@ -946,6 +877,64 @@ fn handleS3Write(
         }
         break :blk_pn false;
     };
+    const use_streaming_input = filter != null or projection_includes_nested;
+
+    // 3c. Upfront fetch — fastpath only.
+    if (!use_streaming_input) {
+        var jobs: std.ArrayList(s3.FetchJob) = .empty;
+        for (specs) |*sp| {
+            var ranges: std.ArrayList(coalescer.Range) = .empty;
+            for (sp.survivors, 0..) |keep, i| {
+                if (!keep) continue;
+                const rg = &sp.meta.row_groups.items[i];
+                if (kept_columns_opt) |kc| {
+                    for (kc) |col_idx| {
+                        if (col_idx >= rg.columns.items.len) continue;
+                        const m = rg.columns.items[col_idx].meta_data orelse continue;
+                        const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                        const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                        try ranges.append(a, .{ .start = s, .end = e });
+                    }
+                } else {
+                    var min_s: u64 = std.math.maxInt(u64);
+                    var max_e: u64 = 0;
+                    for (rg.columns.items) |chunk| {
+                        const m = chunk.meta_data orelse continue;
+                        const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
+                        const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
+                        if (s < min_s) min_s = s;
+                        if (e > max_e) max_e = e;
+                    }
+                    if (min_s == std.math.maxInt(u64)) continue;
+                    try ranges.append(a, .{ .start = min_s, .end = max_e });
+                }
+            }
+            const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
+            for (merged) |r| {
+                if (r.start >= sp.tail_start) continue;
+                const end = @min(r.end, sp.tail_start);
+                try jobs.append(a, .{
+                    .bucket = sp.url.bucket,
+                    .key = sp.url.key,
+                    .range = .{ .start = r.start, .end = end },
+                    .target = sp.file_buf[@intCast(r.start)..@intCast(end)],
+                });
+            }
+        }
+        if (jobs.items.len > 0) {
+            bytes_fetched = try s3.fetchJobs(io, pool, allocator, a, creds, jobs.items);
+        }
+    }
+
+    const t_after_fetch = nowMonoNs();
+
+    // 4. Build unified output. Three paths:
+    //    - Filter set                            → buildFilteredOutputMulti
+    //    - No filter, no projection              → fastpath byte-copy
+    //    - No filter, projection includes nested → buildFilteredOutputMulti
+    //      with a synthetic always-active filter (decodes + emits all
+    //      leaves correctly, including rep-aware list/map projection
+    //      which the byte-copy fastpath can't yet handle).
 
     // 4. Stream the output. All paths now feed a `MultipartSink`:
     //   - no filter, no nested projection → byte-copy via streaming.build
@@ -999,7 +988,7 @@ fn handleS3Write(
             .op = .GtEq,
             .value = std.math.minInt(i64),
         } };
-        break :blk try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt, sink);
+        break :blk try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt, sink, io, sink_pool, creds);
     };
     try mp_sink.close();
 
@@ -1035,6 +1024,9 @@ fn buildFilteredOutputMulti(
     filter: filter_ast.Filter,
     kept_columns_opt: ?[]const usize,
     sink: streaming.Sink,
+    io: std.Io,
+    s3_pool: *s3.Pool(POOL_SIZE),
+    creds: s3.Credentials,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
@@ -1076,10 +1068,11 @@ fn buildFilteredOutputMulti(
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     var total_rows: i64 = 0;
 
-    for (specs) |sp| {
+    for (specs, 0..) |sp, file_idx| {
         const enc_count = try encodeFilteredFile(
             arena,
             gpa,
+            file_idx,
             &sp,
             &fetch_set,
             kept_in_order.items,
@@ -1087,6 +1080,9 @@ fn buildFilteredOutputMulti(
             sink,
             &offset,
             &new_row_groups,
+            io,
+            s3_pool,
+            creds,
         );
         total_rows += enc_count;
     }
@@ -1131,9 +1127,14 @@ fn buildFilteredOutputMulti(
 /// match. Appends a `RowGroup` per surviving group to `new_row_groups`
 /// with offsets resolved to the running stream position.
 /// Returns the count of surviving rows across this file's RGs.
+///
+/// B4: fetches each surviving RG's column-chunk bytes on demand via a
+/// `scan.PerFileScan` iterator. Resident memory is one RG at a time,
+/// not the whole input file.
 fn encodeFilteredFile(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    file_idx: usize,
     sp: *const FileSpec,
     fetch_set: *const []bool,
     kept_in_order: []const usize,
@@ -1141,14 +1142,35 @@ fn encodeFilteredFile(
     sink: streaming.Sink,
     offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    io: std.Io,
+    s3_pool: *s3.Pool(POOL_SIZE),
+    creds: s3.Credentials,
 ) !i64 {
     const meta = &sp.meta;
     const num_leaves = meta.row_groups.items[0].columns.items.len;
     var total_rows: i64 = 0;
 
-    for (sp.survivors, 0..) |keep, rg_idx| {
-        if (!keep) continue;
-        const rg = &meta.row_groups.items[rg_idx];
+    // Translate fetch_set (boolean mask) into a sorted column-index
+    // list — what scan.PerFileScan wants for its `.columns` policy.
+    var fetch_cols: std.ArrayList(usize) = .empty;
+    for (fetch_set.*, 0..) |needed, ci| if (needed) try fetch_cols.append(arena, ci);
+
+    var per_file: scan.PerFileScan = scan.PerFileScan.init(
+        gpa,
+        creds,
+        s3_pool,
+        file_idx,
+        sp.url,
+        meta,
+        sp.survivors,
+        .{ .columns = fetch_cols.items },
+    );
+    defer per_file.deinit();
+
+    while (try per_file.next(io, arena)) |rg_result| {
+        const rg = rg_result.rg_meta;
+        const rg_idx = rg_result.rg_idx;
+        _ = rg_idx; // currently unused; reserved for ordered-output debug
         const num_rows: usize = @intCast(rg.num_rows);
 
         var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1168,8 +1190,10 @@ fn encodeFilteredFile(
             const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
             const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
             const len: usize = @intCast(col_meta.total_compressed_size);
-            if (start + len > sp.file_buf.len) return error.MissingChunkBytes;
-            const chunk = sp.file_buf[start .. start + len];
+            // Slice into the per-RG buffer, not a full-file buffer.
+            const buf_off = start - @as(usize, @intCast(rg_result.rg_byte_start));
+            if (buf_off + len > rg_result.raw_bytes.len) return error.MissingChunkBytes;
+            const chunk = rg_result.raw_bytes[buf_off .. buf_off + len];
 
             const levels = meta.getColumnLevels(col_meta.path_in_schema.items);
 

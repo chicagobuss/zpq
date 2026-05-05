@@ -63,6 +63,7 @@ tools/hardwood/
 # Bench result snapshots (churn every run; journal records the meaningful numbers)
 benchmarks/coldstart_results.tsv
 benchmarks/partition_results.tsv
+benchmarks/selectivity_results.tsv
 tools/conformance_report.tsv
 
 # Zig package cache

@@ -23,6 +23,7 @@
 const std = @import("std");
 const zpq = @import("zpq");
 const runtime = @import("runtime.zig");
+const scan = @import("scan.zig");
 
 const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
@@ -1397,4 +1398,5 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
 
 test {
     _ = @import("runtime.zig");
+    _ = @import("scan.zig");
 }

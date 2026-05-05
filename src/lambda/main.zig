@@ -903,6 +903,7 @@ fn handleS3Write(
         .write_fn = multipart_sink.sinkWriteFn,
     };
 
+    var timings: Timings = .{};
     const bytes_out = try buildOutputMulti(
         a,
         allocator,
@@ -914,6 +915,7 @@ fn handleS3Write(
         io,
         sink_pool,
         creds,
+        &timings,
     );
     try mp_sink.close();
 
@@ -921,9 +923,16 @@ fn handleS3Write(
     const t_end = nowMonoNs();
     const upload_mode: []const u8 = if (same_bucket) "streaming_pooled" else "streaming_fresh";
 
+    // Per-phase breakdown (μs → ms). decode/eval/encode/sink are
+    // serial on the main task; fetch_concurrent is the SUM across
+    // fetcher workers (sum > wall-clock-fetch ⇒ cross-file overlap
+    // is doing work). footer_ns is the schema-build + final-write
+    // tail. Numbers won't sum to total_ms because they overlap with
+    // S3 multipart upload (which the sink does asynchronously) and
+    // because mp_sink.close() blocks until the last part is acked.
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
+        "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d},\"phase\":{{\"fetch_concurrent_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}",
         .{
             output_url_str,
             specs.len,
@@ -935,6 +944,12 @@ fn handleS3Write(
             @divTrunc(t_after_build - t_after_fetch, std.time.ns_per_ms),
             @divTrunc(t_end - t_after_build, std.time.ns_per_ms),
             @divTrunc(t_end - t_start, std.time.ns_per_ms),
+            timings.fetch_concurrent_ns / std.time.ns_per_ms,
+            timings.decode_ns / std.time.ns_per_ms,
+            timings.eval_ns / std.time.ns_per_ms,
+            timings.encode_ns / std.time.ns_per_ms,
+            timings.sink_ns / std.time.ns_per_ms,
+            timings.footer_ns / std.time.ns_per_ms,
         },
     );
 }
@@ -960,6 +975,7 @@ fn buildOutputMulti(
     io: std.Io,
     s3_pool: *s3.Pool(POOL_SIZE),
     creds: s3.Credentials,
+    timings: *Timings,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
@@ -1094,6 +1110,7 @@ fn buildOutputMulti(
                 sink,
                 &offset,
                 &new_row_groups,
+                timings,
             ) else try copyOneRG(
                 arena,
                 rg_result,
@@ -1101,6 +1118,7 @@ fn buildOutputMulti(
                 sink,
                 &offset,
                 &new_row_groups,
+                timings,
             );
             total_rows += surviving;
         }
@@ -1111,6 +1129,12 @@ fn buildOutputMulti(
     }
 
     try group.await(io);
+
+    // Aggregate fetcher worker timings. Sum > wall-clock-fetch is
+    // exactly the cross-file overlap.
+    for (ctxs) |c| timings.fetch_concurrent_ns += c.fetch_ns;
+
+    const t_footer_start = nowMonoNs();
 
     // Build the output schema via the tree. projectSubset preserves
     // GROUP ancestors of every kept leaf along with their LIST/MAP
@@ -1144,8 +1168,24 @@ fn buildOutputMulti(
     try sink.write(&MAGIC);
     offset += MAGIC.len;
 
+    timings.footer_ns += @intCast(nowMonoNs() - t_footer_start);
+
     return offset;
 }
+
+/// Per-phase timing accumulator. All values in nanoseconds. The main
+/// task touches these directly (decode/eval/encode/sink/footer);
+/// fetcher workers each accumulate into their own ctx.fetch_ns and
+/// the driver sums them at the end. Since each fetcher writes only
+/// to its own field, no atomics needed.
+const Timings = struct {
+    decode_ns: u64 = 0,
+    eval_ns: u64 = 0,
+    encode_ns: u64 = 0,
+    sink_ns: u64 = 0,
+    footer_ns: u64 = 0,
+    fetch_concurrent_ns: u64 = 0,
+};
 
 /// Per-file fetcher worker. Drives a `scan.PerFileScan` to completion,
 /// pushing each fetched row group into the file's queue. Records any
@@ -1156,6 +1196,10 @@ const FetcherCtx = struct {
     queue: *std.Io.Queue(scan.RowGroupResult),
     gpa: std.mem.Allocator,
     err: ?[]const u8 = null,
+    /// Cumulative wall-clock spent inside `scan.next()` for THIS file.
+    /// The driver sums these across files at end of invocation. Sum
+    /// > wall-clock-fetch shows the cross-file overlap is paying off.
+    fetch_ns: u64 = 0,
 };
 
 fn fileFetchTask(io: std.Io, ctx: *FetcherCtx) std.Io.Cancelable!void {
@@ -1171,7 +1215,12 @@ fn fileFetchImpl(io: std.Io, ctx: *FetcherCtx) !void {
         defer task_arena_state.deinit();
         const task_arena = task_arena_state.allocator();
 
-        const rg_result = (try ctx.scan.next(io, task_arena)) orelse return;
+        const t0 = nowMonoNs();
+        const rg_result_opt = try ctx.scan.next(io, task_arena);
+        const t1 = nowMonoNs();
+        ctx.fetch_ns += @intCast(t1 - t0);
+
+        const rg_result = rg_result_opt orelse return;
         try ctx.queue.putOne(io, rg_result);
     }
 }
@@ -1192,6 +1241,7 @@ fn encodeOneRG(
     sink: streaming.Sink,
     offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    timings: *Timings,
 ) !i64 {
     const rg = rg_result.rg_meta;
     const num_rows: usize = @intCast(rg.num_rows);
@@ -1208,6 +1258,7 @@ fn encodeOneRG(
     var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
     @memset(batch_pos_for_col, null);
 
+    const t_decode_start = nowMonoNs();
     for (fetch_set.*, 0..) |needed, ci| {
         if (!needed) continue;
         const col = &rg.columns.items[ci];
@@ -1234,10 +1285,14 @@ fn encodeOneRG(
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
     }
+    const t_decode_end = nowMonoNs();
+    timings.decode_ns += @intCast(t_decode_end - t_decode_start);
 
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
+    const t_eval_end = nowMonoNs();
+    timings.eval_ns += @intCast(t_eval_end - t_decode_end);
 
     const surviving_count = sel.count();
     if (surviving_count == 0) return 0;
@@ -1252,16 +1307,21 @@ fn encodeOneRG(
 
         const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
         const leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+        const t_enc_start = nowMonoNs();
         const enc = try encoder.encodeColumn(arena, .{
             .values = filtered,
             .schema_elem = &leaf_elem,
             .path_in_schema = cm.path_in_schema.items,
         });
+        const t_enc_end = nowMonoNs();
+        timings.encode_ns += @intCast(t_enc_end - t_enc_start);
 
         const col_start_in_file: i64 = @intCast(offset.*);
         var em = enc.meta;
         em.data_page_offset = col_start_in_file;
         try sink.write(enc.bytes);
+        const t_sink_end = nowMonoNs();
+        timings.sink_ns += @intCast(t_sink_end - t_enc_end);
         offset.* += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
 
@@ -1297,6 +1357,7 @@ fn copyOneRG(
     sink: streaming.Sink,
     offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    timings: *Timings,
 ) !i64 {
     const src_rg = rg_result.rg_meta;
 
@@ -1316,7 +1377,9 @@ fn copyOneRG(
             const slice = rg_result.raw_bytes[buf_off .. buf_off + src_len];
 
             const new_col_start = offset.*;
+            const t_sink_start = nowMonoNs();
             try sink.write(slice);
+            timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
             offset.* += src_len;
 
             const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
@@ -1348,7 +1411,9 @@ fn copyOneRG(
     // iterator's `.all_kept` policy fetched [min_col_start, max_col_end);
     // that span IS the entire RG's data, so one sink.write does it.
     const new_start = offset.*;
+    const t_sink_start = nowMonoNs();
     try sink.write(rg_result.raw_bytes);
+    timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
     offset.* += rg_result.raw_bytes.len;
     const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(rg_result.rg_byte_start));
 

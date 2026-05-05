@@ -946,135 +946,65 @@ fn handleS3Write(
         break :blk_pn false;
     };
 
-    // 4a. Streaming fastpath: no filter, no nested projection. Bytes
-    // flow writer → sink → S3 with no in-memory accumulation. The sink
-    // internally picks single-PUT vs multipart based on whether the
-    // body ever crosses TARGET_PART_SIZE. build_ms is reported as 0
-    // for streaming runs — there's no separate build phase to time.
+    // 4. Stream the output. All paths now feed a `MultipartSink`:
+    //   - no filter, no nested projection → byte-copy via streaming.build
+    //   - filter set                       → decode/filter/encode via
+    //                                          buildFilteredOutputMulti
+    //   - no filter + nested projection    → tautology filter through
+    //                                          the same encoder path
+    // The sink picks single-PUT vs multipart internally based on
+    // whether the body ever crosses TARGET_PART_SIZE. `build_ms` is
+    // reported as 0 for streaming — there's no separate build phase.
     const same_bucket = std.mem.eql(u8, first_bucket, out_url.bucket);
-    const use_streaming = filter == null and !projection_includes_nested;
 
-    if (use_streaming) {
+    var out_pool: s3.Pool(POOL_SIZE) = undefined;
+    if (!same_bucket) try initPool(&out_pool, a, creds, out_url.bucket);
+    defer if (!same_bucket) out_pool.deinit();
+    const sink_pool: *s3.Pool(POOL_SIZE) = if (same_bucket) pool else &out_pool;
+
+    var mp_sink = multipart_sink.MultipartSink.init(
+        io,
+        allocator,
+        a,
+        creds,
+        out_url,
+        sink_pool,
+        .{},
+    );
+    defer mp_sink.deinit();
+    const sink: streaming.Sink = .{
+        .ctx = @ptrCast(&mp_sink),
+        .write_fn = multipart_sink.sinkWriteFn,
+    };
+
+    const bytes_out: u64 = if (filter == null and !projection_includes_nested) blk: {
         var fp_specs = try a.alloc(fastpath.FileSpec, specs.len);
         for (specs, 0..) |*sp, i| fp_specs[i] = .{
             .bytes = sp.file_buf,
             .meta = &sp.meta,
             .survivors = sp.survivors,
         };
-
-        const t_after_build_streaming = t_after_fetch;
-        const bytes_out: u64 = if (same_bucket) blk_s: {
-            var mp_sink = multipart_sink.MultipartSink.init(
-                io,
-                allocator,
-                a,
-                creds,
-                out_url,
-                pool,
-                .{},
-            );
-            defer mp_sink.deinit();
-            const sink: streaming.Sink = .{
-                .ctx = @ptrCast(&mp_sink),
-                .write_fn = multipart_sink.sinkWriteFn,
-            };
-            const n = try streaming.build(a, sink, fp_specs, kept_columns_opt);
-            try mp_sink.close();
-            break :blk_s n;
-        } else blk_s: {
-            var out_pool: s3.Pool(POOL_SIZE) = undefined;
-            try initPool(&out_pool, a, creds, out_url.bucket);
-            defer out_pool.deinit();
-            var mp_sink = multipart_sink.MultipartSink.init(
-                io,
-                allocator,
-                a,
-                creds,
-                out_url,
-                &out_pool,
-                .{},
-            );
-            defer mp_sink.deinit();
-            const sink: streaming.Sink = .{
-                .ctx = @ptrCast(&mp_sink),
-                .write_fn = multipart_sink.sinkWriteFn,
-            };
-            const n = try streaming.build(a, sink, fp_specs, kept_columns_opt);
-            try mp_sink.close();
-            break :blk_s n;
-        };
-        const t_end_streaming = nowMonoNs();
-        const upload_mode_streaming: []const u8 = if (same_bucket) "streaming_pooled" else "streaming_fresh";
-
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
-            .{
-                output_url_str,
-                specs.len,
-                total_files,
-                files_pruned,
-                total_input_size, bytes_fetched, bytes_out,
-                rg_pruned, total_input_rows, rows_kept, upload_mode_streaming,
-                @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
-                @as(i64, 0),
-                @divTrunc(t_end_streaming - t_after_build_streaming, std.time.ns_per_ms),
-                @divTrunc(t_end_streaming - t_start, std.time.ns_per_ms),
-            },
-        );
-    }
-
-    // 4b. Buffered path: filter or nested projection. The encoder
-    // produces a single `[]u8` we then upload via PUT or multipart.
-    // Migrating this to streaming requires the encoder to emit
-    // row-group-sized chunks instead of one big slice — tracked as
-    // a follow-up to B3.
-    const out_bytes = if (filter) |f|
-        try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt)
-    else blk: {
-        // Tautology filter: any-row-survives. Routes the no-filter +
-        // nested-projection case through the decode/filter/encode
-        // pipeline, where the encoder's rep/def emission preserves
-        // nested structure that the byte-copy fastpath would clobber.
-        // Safe only when col_idx 0 is a flat int64 — true for the
-        // partitioned-fixture and nested_edges fixtures; future
-        // hardening (B1.w) teaches `buildFilteredOutputMulti` to
-        // accept null filter and skip eval entirely.
-        const tautology = filter_ast.Filter{ .int64 = .{
+        break :blk try streaming.build(a, sink, fp_specs, kept_columns_opt);
+    } else blk: {
+        // Tautology filter for the no-filter + nested-projection case:
+        // routes through decode/filter/encode where the encoder's
+        // rep/def emission preserves nested structure that the byte-
+        // copy fastpath would clobber. Safe when col_idx 0 is a flat
+        // int64 — true for partitioned-fixture and nested_edges
+        // fixtures; future hardening (B1.w) teaches
+        // `buildFilteredOutputMulti` to accept null filter directly.
+        const f = filter orelse filter_ast.Filter{ .int64 = .{
             .col_idx = 0,
             .op = .GtEq,
             .value = std.math.minInt(i64),
         } };
-        break :blk try buildFilteredOutputMulti(a, allocator, specs, tautology, kept_columns_opt);
+        break :blk try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt, sink);
     };
-    const t_after_build = nowMonoNs();
+    try mp_sink.close();
 
-    // 5. PUT (single or multipart based on size). Multipart shares the
-    // pool when output bucket matches input bucket (typical).
-    const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
-        const put_resp = if (same_bucket)
-            try s3.putViaPool(io, pool, a, creds, out_url, out_bytes)
-        else
-            try s3.put(a, creds, out_url, out_bytes);
-        if (put_resp.status != 200) {
-            return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"put_status\",\"status\":{d},\"body\":\"{s}\"}}",
-                .{ put_resp.status, put_resp.body },
-            );
-        }
-        break :blk if (same_bucket) "single_pooled" else "single";
-    } else if (same_bucket) blk: {
-        try s3.uploadMultipart(io, pool, a, allocator, creds, out_url, out_bytes);
-        break :blk "multipart_pooled";
-    } else blk: {
-        var out_pool: s3.Pool(POOL_SIZE) = undefined;
-        try initPool(&out_pool, a, creds, out_url.bucket);
-        defer out_pool.deinit();
-        try s3.uploadMultipart(io, &out_pool, a, allocator, creds, out_url, out_bytes);
-        break :blk "multipart_fresh";
-    };
+    const t_after_build = t_after_fetch;
     const t_end = nowMonoNs();
+    const upload_mode: []const u8 = if (same_bucket) "streaming_pooled" else "streaming_fresh";
 
     return std.fmt.allocPrint(
         allocator,
@@ -1084,7 +1014,7 @@ fn handleS3Write(
             specs.len,
             total_files,
             files_pruned,
-            total_input_size, bytes_fetched, out_bytes.len,
+            total_input_size, bytes_fetched, bytes_out,
             rg_pruned, total_input_rows, rows_kept, upload_mode,
             @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
             @divTrunc(t_after_build - t_after_fetch, std.time.ns_per_ms),
@@ -1096,14 +1026,15 @@ fn handleS3Write(
 
 /// Multi-file decode + filter + encode. Iterates over `specs` (each
 /// with its own meta + file_buf + survivors), produces one unified
-/// Parquet output. Single-file is just the N=1 case.
+/// Parquet output streamed to `sink`. Returns total bytes written.
 fn buildFilteredOutputMulti(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     specs: []const FileSpec,
     filter: filter_ast.Filter,
     kept_columns_opt: ?[]const usize,
-) ![]u8 {
+    sink: streaming.Sink,
+) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
     if (specs.len == 0) return error.NoInputs;
@@ -1137,9 +1068,9 @@ fn buildFilteredOutputMulti(
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_set, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(arena, 64 * 1024);
-    try out.appendSlice(arena, &MAGIC);
+    var offset: u64 = 0;
+    try sink.write(&MAGIC);
+    offset += MAGIC.len;
 
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     var total_rows: i64 = 0;
@@ -1152,7 +1083,8 @@ fn buildFilteredOutputMulti(
             &fetch_set,
             kept_in_order.items,
             filter,
-            &out,
+            sink,
+            &offset,
             &new_row_groups,
         );
         total_rows += enc_count;
@@ -1178,23 +1110,26 @@ fn buildFilteredOutputMulti(
     var w: thrift.Writer = .init(arena);
     defer w.deinit();
     try new_meta.write(&w);
+    const footer_bytes = w.bytes();
 
-    const footer_start: usize = out.items.len;
-    try out.appendSlice(arena, w.bytes());
-    const footer_len: u32 = @intCast(out.items.len - footer_start);
+    try sink.write(footer_bytes);
+    offset += footer_bytes.len;
 
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
-    try out.appendSlice(arena, &len_bytes);
-    try out.appendSlice(arena, &MAGIC);
+    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    try sink.write(&len_bytes);
+    offset += len_bytes.len;
+    try sink.write(&MAGIC);
+    offset += MAGIC.len;
 
-    return out.toOwnedSlice(arena);
+    return offset;
 }
 
-/// Per-file decode/filter/encode of all surviving row groups. Appends
-/// encoded RG bytes to `out` and the corresponding RowGroup metadata
-/// structs to `new_row_groups`. Returns the count of surviving rows
-/// across this file's RGs.
+/// Per-file decode/filter/encode of all surviving row groups. Pushes
+/// each encoded column chunk's bytes to `sink` and bumps `offset.*` to
+/// match. Appends a `RowGroup` per surviving group to `new_row_groups`
+/// with offsets resolved to the running stream position.
+/// Returns the count of surviving rows across this file's RGs.
 fn encodeFilteredFile(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1202,7 +1137,8 @@ fn encodeFilteredFile(
     fetch_set: *const []bool,
     kept_in_order: []const usize,
     filter: filter_ast.Filter,
-    out: *std.ArrayList(u8),
+    sink: streaming.Sink,
+    offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
 ) !i64 {
     const meta = &sp.meta;
@@ -1278,10 +1214,11 @@ fn encodeFilteredFile(
                 .path_in_schema = cm.path_in_schema.items,
             });
 
-            const col_start_in_file: i64 = @intCast(out.items.len);
+            const col_start_in_file: i64 = @intCast(offset.*);
             var em = enc.meta;
             em.data_page_offset = col_start_in_file;
-            try out.appendSlice(arena, enc.bytes);
+            try sink.write(enc.bytes);
+            offset.* += enc.bytes.len;
             rg_total += @intCast(enc.bytes.len);
 
             try rg_columns.append(arena, .{
@@ -1300,210 +1237,6 @@ fn encodeFilteredFile(
     }
 
     return total_rows;
-}
-
-/// Single-file convenience wrapper kept for compatibility with the
-/// existing single-file path semantics. (Phase 6.1: no longer used by
-/// handleS3Write directly, but kept for tests / smaller call sites.)
-fn buildFilteredOutput(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    file_buf: []const u8,
-    meta: *const schema.FileMetaData,
-    survivors: []const bool,
-    filter: filter_ast.Filter,
-    kept_columns_opt: ?[]const usize,
-) ![]u8 {
-    const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
-
-    // Compute the union of kept output columns + filter input columns.
-    // We need filter cols decoded for evaluation and kept cols encoded
-    // for output; they may overlap.
-    const num_leaves = meta.row_groups.items[0].columns.items.len;
-
-    var kept_set = try arena.alloc(bool, num_leaves);
-    @memset(kept_set, false);
-    if (kept_columns_opt) |kc| {
-        for (kc) |idx| if (idx < num_leaves) {
-            kept_set[idx] = true;
-        };
-    } else {
-        @memset(kept_set, true);
-    }
-
-    var filter_cols: std.ArrayList(usize) = .empty;
-    try filter.collectColumns(&filter_cols, arena);
-
-    var fetch_set = try arena.alloc(bool, num_leaves);
-    @memset(fetch_set, false);
-    for (kept_set, 0..) |b, i| if (b) {
-        fetch_set[i] = true;
-    };
-    for (filter_cols.items) |c| if (c < num_leaves) {
-        fetch_set[c] = true;
-    };
-
-    // Build the list of kept columns in input order (for the output
-    // schema and per-RG column order).
-    var kept_in_order: std.ArrayList(usize) = .empty;
-    for (kept_set, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
-
-    // Output buffer. Reserve enough headroom that we don't constantly
-    // reallocate during encode.
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(arena, 64 * 1024);
-    try out.appendSlice(arena, &MAGIC);
-
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
-
-    var total_rows: i64 = 0;
-    for (survivors, 0..) |keep, rg_idx| {
-        if (!keep) continue;
-        const rg = &meta.row_groups.items[rg_idx];
-        const num_rows: usize = @intCast(rg.num_rows);
-
-        // Per-RG arena for decoded values + sel.
-        var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer rg_arena_state.deinit();
-        const ra = rg_arena_state.allocator();
-
-        // Decode every column in fetch_set, build a Batch.
-        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
-        var lookup = try ra.alloc(?usize, meta.schema.items.len);
-        @memset(lookup, null);
-
-        // Track which slot each (input) column index occupies in batch_cols.
-        var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
-        @memset(batch_pos_for_col, null);
-
-        for (fetch_set, 0..) |needed, ci| {
-            if (!needed) continue;
-            const col = &rg.columns.items[ci];
-            const col_meta = col.meta_data orelse return error.ColumnMetaMissing;
-            const start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
-            const len: usize = @intCast(col_meta.total_compressed_size);
-            if (start + len > file_buf.len) return error.MissingChunkBytes;
-            const chunk = file_buf[start .. start + len];
-
-            const levels = meta.getColumnLevels(col_meta.path_in_schema.items);
-
-            const n_leaves: usize = @intCast(col_meta.num_values);
-            const decoded: filter_eval.Batch.Column = switch (col_meta.type) {
-                .INT32 => .{ .i32 = try decodeColumnT(i32, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .INT64 => .{ .i64 = try decodeColumnT(i64, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .FLOAT => .{ .f32 = try decodeColumnT(f32, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .DOUBLE => .{ .f64 = try decodeColumnT(f64, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, ra, chunk, col_meta.codec, levels, n_leaves) },
-                .BOOLEAN => .{ .boolean = try decodeColumnT(bool, ra, chunk, col_meta.codec, levels, n_leaves) },
-                else => return error.UnsupportedColumnType,
-            };
-            batch_pos_for_col[ci] = batch_cols.items.len;
-            lookup[ci] = batch_cols.items.len;
-            try batch_cols.append(ra, decoded);
-        }
-
-        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
-        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
-        try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
-
-        const surviving_count = sel.count();
-        if (surviving_count == 0) continue; // drop empty RG
-
-        // Encode each kept column with the selection applied.
-        var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-        try rg_columns.ensureTotalCapacity(arena, kept_in_order.items.len);
-        var rg_total: i64 = 0;
-
-        for (kept_in_order.items) |kept_ci| {
-            const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
-            const filtered = try encoder.applySelection(arena, batch_cols.items[batch_pos], &sel);
-
-            const cm2 = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-            const leaf_elem = meta.getColumnSchema(cm2.path_in_schema.items) orelse return error.SchemaLookupFailed;
-            const enc = try encoder.encodeColumn(arena, .{
-                .values = filtered,
-                .schema_elem = &leaf_elem,
-                .path_in_schema = cm2.path_in_schema.items,
-            });
-
-            // Patch absolute file offset for the data page.
-            const col_start_in_file: i64 = @intCast(out.items.len);
-            var em = enc.meta;
-            em.data_page_offset = col_start_in_file;
-            try out.appendSlice(arena, enc.bytes);
-            rg_total += @intCast(enc.bytes.len);
-
-            try rg_columns.append(arena, .{
-                .file_path = null,
-                .file_offset = col_start_in_file,
-                .meta_data = em,
-            });
-        }
-
-        try new_row_groups.append(arena, .{
-            .columns = rg_columns,
-            .total_byte_size = rg_total,
-            .num_rows = @intCast(surviving_count),
-        });
-        total_rows += @intCast(surviving_count);
-    }
-
-    // Build new schema via the tree (preserves GROUP ancestors and
-    // LIST/MAP annotations). The tree-build is cheap (small DFS over
-    // the schema list) so doing it on-demand here keeps the function
-    // self-contained.
-    const local_tree = try schema_tree.SchemaTree.build(arena, meta.schema.items);
-    const kept_u32 = try arena.alloc(u32, kept_in_order.items.len);
-    for (kept_in_order.items, 0..) |idx, i| kept_u32[i] = @intCast(idx);
-    const projected_tree = try local_tree.projectSubset(arena, kept_u32);
-    const new_schema = try projected_tree.writeFlatThrift(arena);
-
-    const new_meta: schema.FileMetaData = .{
-        .version = meta.version,
-        .schema = new_schema,
-        .num_rows = total_rows,
-        .created_by = meta.created_by,
-        .row_groups = new_row_groups,
-    };
-
-    var w: thrift.Writer = .init(arena);
-    defer w.deinit();
-    try new_meta.write(&w);
-
-    const footer_start: usize = out.items.len;
-    try out.appendSlice(arena, w.bytes());
-    const footer_len: u32 = @intCast(out.items.len - footer_start);
-
-    var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
-    try out.appendSlice(arena, &len_bytes);
-    try out.appendSlice(arena, &MAGIC);
-
-    return out.toOwnedSlice(arena);
-}
-
-/// Build a new schema list for the filtered-output path: root +
-/// only the kept leaves, preserving each leaf's source repetition_type.
-/// The encoder emits a definition-level prefix when a leaf is OPTIONAL
-/// (all-1s today, since the decode path treats every row as present),
-/// so the output is wire-correct as a nullable column with no nulls.
-fn cloneProjectedSchema(
-    arena: std.mem.Allocator,
-    src: std.ArrayListUnmanaged(schema.SchemaElement),
-    kept: []const usize,
-) !std.ArrayListUnmanaged(schema.SchemaElement) {
-    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
-    try out.ensureTotalCapacity(arena, 1 + kept.len);
-
-    var new_root = src.items[0];
-    new_root.num_children = @intCast(kept.len);
-    try out.append(arena, new_root);
-
-    for (kept) |idx| {
-        if (idx + 1 >= src.items.len) return error.BadColumnIndex;
-        try out.append(arena, src.items[idx + 1]);
-    }
-    return out;
 }
 
 fn nowMonoNs() i64 {

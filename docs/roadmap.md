@@ -342,8 +342,29 @@ modules.
   common (better ratio than snappy at similar speed). Probably
   vendor `libzstd` like we vendor BoringSSL.
 - **E3. Gzip input.** Older parquet files; Hadoop-era tooling.
-- **E4. Dictionary encoding writer.** RLE_DICTIONARY for low-card
-  columns. Big perf win for re-encoded strings.
+- **E4. Dictionary encoding writer** (shipped 2026-05-05). Detects
+  low-cardinality BYTE_ARRAY columns (≤ 25% unique among present
+  values) and emits a two-page chunk: DICTIONARY_PAGE (PLAIN-encoded
+  unique values) + DATA_PAGE (RLE_DICTIONARY-encoded indices). For
+  higher cardinalities the build bails out early and falls through
+  to PLAIN.
+
+  Plumbing change: the encoder now sets `data_page_offset` and
+  (new) `dictionary_page_offset` RELATIVE to chunk start; callers
+  add the absolute offset. Single-page (PLAIN) chunks have offset
+  zero and the addition is a no-op.
+
+  Threshold tuning: started at 50%, found via the new instrumentation
+  that build-side hashmap inserts on high-cardinality columns
+  swamped the savings (encode_ms went 316 → 396). Tightened to 25%;
+  encode_ms recovered to 271, BELOW pre-E4. The instrumentation paid
+  for itself on the very first feature it watched.
+
+  Results (`int8 >= 0` filter on 10-file fixture, median of 5):
+    pre-E4 (vendored snappy):     1880 ms
+    post-E4 (25% threshold):      1548 ms  (-18%)
+  Bytes_out 72 MB → 71 MB (-1.5% — only 2/27 columns are dict-shaped).
+  ZPQ now beats Polars (1634 ms) on this query.
 - **E5. DELTA_BINARY_PACKED writer.** For sorted/timestamp columns.
 - **E6. DELTA_BYTE_ARRAY writer.** For correlated string columns.
 - **E7. Bloom filter writer.** Footer-level structure for

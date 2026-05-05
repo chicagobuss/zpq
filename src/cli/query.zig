@@ -25,6 +25,8 @@ const thrift = zpq.core.thrift;
 const filter_ast = zpq.core.filter.ast;
 const filter_parser = zpq.core.filter.parser;
 const filter_prune = zpq.core.filter.prune;
+const expr_ast = zpq.core.expr.ast;
+const expr_parser = zpq.core.expr.parser;
 const consumer = zpq.core.consumer;
 const streaming = zpq.core.writer.streaming;
 
@@ -35,6 +37,11 @@ pub const Args = struct {
     output: []const u8,
     filter: ?[]const u8 = null,
     columns: ?[]const []const u8 = null,
+    /// Comma-separated SELECT expressions. Mutually exclusive with
+    /// `columns`. When set, the output schema is flat — one leaf per
+    /// item, named by `AS alias` or by the bare column name. Supports
+    /// arithmetic on numeric columns; see `core/expr/`.
+    select: ?[]const u8 = null,
     codec: schema.CompressionCodec = .SNAPPY,
 };
 
@@ -78,6 +85,8 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
     var meta = try metadata.open(arena, file_bytes);
     const tree = try schema_tree.SchemaTree.build(arena, meta.schema.items);
 
+    if (args.select != null and args.columns != null) return error.ConflictingFlags;
+
     // 2. Resolve column projection. Names → leaf indices via the
     // schema tree (handles nested structs/lists/maps correctly).
     var kept_set: ?[]bool = null;
@@ -95,6 +104,16 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
         }
         kept_set = set;
     }
+
+    // 2b. Parse --select if given. Each item becomes either a
+    // passthrough (for bare column refs) or a computed entry (for
+    // expressions). When --select is in play, the output schema is
+    // FLAT — one leaf per item, no nested projection. The CLI rejects
+    // mixing --select with --columns above; future work can unify.
+    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
+        try expr_parser.parseSelect(arena, s, &meta)
+    else
+        null;
 
     // 3. Parse filter (against the schema; column names → indices).
     var filter_opt: ?filter_ast.Filter = null;
@@ -120,9 +139,16 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
     try sink.write(&PAR1);
     out_offset += PAR1.len;
 
-    // 5. Build per-leaf bool vectors that mirror what the Lambda
-    // engine uses: `kept_set` (output columns) and `fetch_set`
-    // (output columns ∪ filter input columns).
+    // 5. Build per-leaf bool vectors and the output_specs list.
+    //
+    // Three modes:
+    //   - --select given: one OutputCol per select item. Bare column
+    //     refs without alias collapse to `passthrough`; everything
+    //     else is `computed`. fetch_arr is the union of every
+    //     referenced column.
+    //   - --columns given (or no projection): every kept column
+    //     becomes a passthrough OutputCol. fetch_arr = kept_arr ∪
+    //     filter_cols.
     const num_leaves = meta.row_groups.items[0].columns.items.len;
     const kept_arr = try arena.alloc(bool, num_leaves);
     if (kept_set) |s| {
@@ -131,7 +157,44 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
         @memset(kept_arr, true);
     }
     const fetch_arr = try arena.alloc(bool, num_leaves);
-    @memcpy(fetch_arr, kept_arr);
+    @memset(fetch_arr, false);
+
+    var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
+    var any_computed = false;
+
+    if (select_items) |items| {
+        for (items) |item| {
+            switch (item.expr) {
+                .col_ref => |c| {
+                    if (item.alias) |alias| {
+                        // Passthrough with rename: still requires the
+                        // encode path so the output schema picks up
+                        // the alias. Treat as computed (eval is a
+                        // memcpy in this case anyway).
+                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                        any_computed = true;
+                    } else {
+                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
+                    }
+                    if (c.col_idx < num_leaves) fetch_arr[c.col_idx] = true;
+                },
+                else => {
+                    const alias = item.alias orelse return error.MissingAlias;
+                    try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                    any_computed = true;
+                    collectExprCols(item.expr, fetch_arr);
+                },
+            }
+        }
+    } else {
+        // --columns or default: passthrough every kept leaf in DFS
+        // order so the output respects the source's column ordering.
+        for (kept_arr, 0..) |b, i| if (b) {
+            try output_specs.append(arena, .{ .passthrough = i });
+            fetch_arr[i] = true;
+        };
+    }
+
     if (filter_opt) |f| {
         var filter_cols: std.ArrayList(usize) = .empty;
         try f.collectColumns(&filter_cols, arena);
@@ -156,9 +219,13 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
 
     // For the no-filter copy path: bool[]-shaped projection (or null
     // when there's no projection — the consumer then does a single
-    // bounding-box write). The encoder path uses fetch_arr +
-    // kept_in_order directly.
+    // bounding-box write). The encoder path uses output_specs.
     const copy_kept_set: ?[]const bool = if (kept_set != null) kept_arr else null;
+
+    // Encoder is required when there's a real predicate or when the
+    // output includes any computed (or aliased) column. Otherwise
+    // copyRG can byte-copy.
+    const need_encoder = filter_opt != null or any_computed;
 
     for (meta.row_groups.items) |*src_rg| {
         rows_in += src_rg.num_rows;
@@ -168,15 +235,15 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
             if ((try filter_prune.pruneRowGroup(src_rg, f, arena)) == .skip) continue;
         }
 
-        const out = if (filter_opt) |f| try consumer.encodeRG(
+        const out = if (need_encoder) try consumer.encodeRG(
             arena,
             gpa,
             src_rg,
             &meta,
             rg_src,
-            f,
+            filter_opt,
             fetch_arr,
-            kept_in_order.items,
+            output_specs.items,
             sink,
             &out_offset,
             args.codec,
@@ -218,7 +285,10 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
     const t_footer_start = nowMonoNs();
 
     var new_schema = meta.schema;
-    if (kept_set) |_| {
+    if (select_items != null) {
+        // --select: flat schema, one leaf per OutputCol.
+        new_schema = try buildSelectSchema(arena, &meta, output_specs.items);
+    } else if (kept_set) |_| {
         const kept_u32 = try arena.alloc(u32, kept_in_order.items.len);
         for (kept_in_order.items, 0..) |idx, i| kept_u32[i] = @intCast(idx);
         const projected = try tree.projectSubset(arena, kept_u32);
@@ -258,6 +328,84 @@ pub fn run(gpa: std.mem.Allocator, args: Args) !Result {
         .row_groups_kept = rg_kept,
         .timings = t,
     };
+}
+
+/// Walk an expression and mark every referenced column index in
+/// `fetch_arr`. Used so the consumer's decode pass loads only the
+/// columns the select expressions actually need.
+fn collectExprCols(e: expr_ast.Expr, fetch_arr: []bool) void {
+    switch (e) {
+        .literal => {},
+        .col_ref => |c| if (c.col_idx < fetch_arr.len) {
+            fetch_arr[c.col_idx] = true;
+        },
+        .binop => |b| {
+            collectExprCols(b.left.*, fetch_arr);
+            collectExprCols(b.right.*, fetch_arr);
+        },
+    }
+}
+
+/// Build a flat output schema for the `--select` path. The Parquet
+/// thrift schema is DFS-ordered: schema[0] is the root group with
+/// `num_children = N`, followed by N leaves. For passthrough specs we
+/// copy the input column's SchemaElement (preserving converted_type /
+/// logical_type metadata where present); for computed specs we
+/// synthesize a REQUIRED leaf with type INT64 or DOUBLE.
+fn buildSelectSchema(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    specs: []const consumer.OutputCol,
+) !std.ArrayListUnmanaged(schema.SchemaElement) {
+    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try out.ensureTotalCapacity(arena, specs.len + 1);
+
+    // Root group.
+    try out.append(arena, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = null,
+        .name = "schema",
+        .num_children = @intCast(specs.len),
+        .converted_type = null,
+        .logical_type = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+
+    for (specs) |spec| {
+        switch (spec) {
+            .passthrough => |ci| {
+                // Look up the input leaf via the first RG's column
+                // chunk metadata — its path_in_schema points at the
+                // SchemaElement. For a flat input this is just one
+                // hop; for nested inputs we'd need to flatten, but the
+                // CLI rejects --select with --columns above so the
+                // expression parser only resolves to flat columns.
+                const cm = meta.row_groups.items[0].columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+                const elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+                var copy = elem;
+                copy.num_children = 0;
+                try out.append(arena, copy);
+            },
+            .computed => |c| {
+                try out.append(arena, .{
+                    .type = c.expr.typeOf().toParquet(),
+                    .type_length = null,
+                    .repetition_type = .REQUIRED,
+                    .name = c.alias,
+                    .num_children = 0,
+                    .converted_type = null,
+                    .logical_type = null,
+                    .scale = null,
+                    .precision = null,
+                    .field_id = null,
+                });
+            },
+        }
+    }
+    return out;
 }
 
 /// Bounding-box span of an RG in the source file: [min_col_start, max_col_end).

@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   zpq query <input.parquet> --output <out.parquet>
 //!         [--filter EXPR] [--columns COL1,COL2,...]
+//!         [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
 //!         [--codec snappy|zstd|uncompressed]
 //!     — local-file query: decode → filter → re-encode → write.
 //!       JSON envelope with phase timings goes to stderr.
@@ -30,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
             \\usage:
             \\  zpq query <input.parquet> --output <out.parquet>
             \\            [--filter EXPR] [--columns COL1,COL2,...]
+            \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
             \\            [--codec snappy|zstd|uncompressed]
             \\  zpq conform <file.parquet>
             \\
@@ -56,6 +58,7 @@ fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
     var output: ?[]const u8 = null;
     var filter: ?[]const u8 = null;
     var columns_csv: ?[]const u8 = null;
+    var select: ?[]const u8 = null;
     var codec: schema.CompressionCodec = .SNAPPY;
 
     // First positional after "query" is the input path; subsequent
@@ -67,6 +70,8 @@ fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
             filter = iter.next();
         } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
             columns_csv = iter.next();
+        } else if (std.mem.eql(u8, tok, "--select") or std.mem.eql(u8, tok, "-s")) {
+            select = iter.next();
         } else if (std.mem.eql(u8, tok, "--codec")) {
             const v = iter.next() orelse continue;
             if (std.ascii.eqlIgnoreCase(v, "zstd")) codec = .ZSTD;
@@ -104,6 +109,7 @@ fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
         .output = out,
         .filter = filter,
         .columns = cols,
+        .select = select,
         .codec = codec,
     });
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);

@@ -24,6 +24,8 @@ const schema = @import("schema.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_eval = @import("filter/eval.zig");
 const filter_selection = @import("filter/selection.zig");
+const expr_ast = @import("expr/ast.zig");
+const expr_eval = @import("expr/eval.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
 const column_mod = @import("parquet/column.zig");
@@ -75,6 +77,21 @@ pub const RGOut = struct {
     rg: ?schema.RowGroup,
 };
 
+/// One output column. `passthrough` re-encodes a kept input column;
+/// `computed` evaluates an expression against the (post-filter) decoded
+/// batch and encodes the result as a new flat leaf.
+pub const OutputCol = union(enum) {
+    passthrough: usize,
+    computed: Computed,
+
+    pub const Computed = struct {
+        expr: expr_ast.Expr,
+        /// Output column name. The caller's footer-build step uses
+        /// the same string as the leaf SchemaElement's name.
+        alias: []const u8,
+    };
+};
+
 /// Decode → filter → re-encode kept columns → write to `sink`.
 ///
 /// `out_arena` lifetime: holds the new `RGOut.rg` metadata + encoded
@@ -89,9 +106,11 @@ pub fn encodeRG(
     rg: *const schema.RowGroup,
     meta: *const schema.FileMetaData,
     src: RGSrc,
-    filter: filter_ast.Filter,
+    /// Optional filter. When null, every row in the RG survives — used
+    /// by the projection-only and `--select`-with-computed-only paths.
+    filter: ?filter_ast.Filter,
     fetch_set: []const bool,
-    kept_in_order: []const usize,
+    output_specs: []const OutputCol,
     sink: streaming.Sink,
     out_offset: *u64,
     output_codec: schema.CompressionCodec,
@@ -143,7 +162,7 @@ pub fn encodeRG(
 
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
-    try filter_eval.evaluate(filter, &batch, &sel, lookup, ra);
+    if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     timings.eval_ns += @intCast(t_eval_end - t_decode_end);
 
@@ -151,20 +170,53 @@ pub fn encodeRG(
     if (surviving == 0) return .{ .surviving_rows = 0, .rg = null };
 
     var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-    try rg_columns.ensureTotalCapacity(out_arena, kept_in_order.len);
+    try rg_columns.ensureTotalCapacity(out_arena, output_specs.len);
     var rg_total: i64 = 0;
 
-    for (kept_in_order) |kept_ci| {
-        const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
-        const filtered = try encoder.applySelection(out_arena, batch_cols.items[batch_pos], &sel);
+    for (output_specs) |spec| {
+        // Build the (filtered_values, schema_elem, path_in_schema)
+        // tuple per output column. Passthrough copies from the
+        // decoded input + uses the input's schema element; computed
+        // evaluates an expression against the post-decode batch and
+        // synthesizes a flat leaf SchemaElement on the fly.
+        var path_in_schema: []const []const u8 = undefined;
+        var leaf_elem: schema.SchemaElement = undefined;
+        var filtered: filter_eval.Batch.Column = undefined;
 
-        const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-        const leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+        switch (spec) {
+            .passthrough => |kept_ci| {
+                const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
+                filtered = try encoder.applySelection(out_arena, batch_cols.items[batch_pos], &sel);
+                const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+                leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+                path_in_schema = cm.path_in_schema.items;
+            },
+            .computed => |c| {
+                const result = try expr_eval.evalExpr(ra, &batch, lookup, c.expr);
+                filtered = try encoder.applySelection(out_arena, result, &sel);
+                const path_buf = try out_arena.alloc([]const u8, 1);
+                path_buf[0] = c.alias;
+                path_in_schema = path_buf;
+                leaf_elem = .{
+                    .type = c.expr.typeOf().toParquet(),
+                    .type_length = null,
+                    .repetition_type = .REQUIRED,
+                    .name = c.alias,
+                    .num_children = 0,
+                    .converted_type = null,
+                    .logical_type = null,
+                    .scale = null,
+                    .precision = null,
+                    .field_id = null,
+                };
+            },
+        }
+
         const t_enc_start = nowMonoNs();
         const enc = try encoder.encodeColumn(out_arena, .{
             .values = filtered,
             .schema_elem = &leaf_elem,
-            .path_in_schema = cm.path_in_schema.items,
+            .path_in_schema = path_in_schema,
             .codec = output_codec,
         });
         const t_enc_end = nowMonoNs();

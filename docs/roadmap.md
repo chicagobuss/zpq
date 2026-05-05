@@ -224,18 +224,24 @@ coverage."
 file" as the user-facing capability matrix. Joins, window functions,
 complex SQL surface, and full optimizer machinery stay out of scope.
 
-- **C1. Batch-iterator-as-primitive.** Refactor the lambda's
-  filter/encode and fastpath consumers to read from the B4 scan
-  iterator's `{ raw_bytes, decoded_batch }` per-RG output. Lifts
-  the current ad-hoc "lambda owns the loop" shape into an explicit
-  scan→consumer protocol. Light, no new features. ~150 LoC of
-  reorganization. Lands the moment B4 ships.
-- **C2. Expression evaluator.** A small typed-expression AST and
-  evaluator for transformations like `col_a * 2 + col_b`,
-  `coalesce(x, 0)`, `case when x > 10 then 'high' else 'low' end`.
-  Hand-coded kernels per operator-type combination — no generic
-  comptime VM, no LLVM, no plan optimization. Output of C2 is a
-  new `Batch.Column` per row, fed back into the encoder.
+- **C1. Batch-iterator-as-primitive** (shipped 2026-05-05).
+  `src/core/consumer.zig` exposes `encodeRG` / `copyRG` /
+  `decodeColumnT` over an `RGSrc { bytes, byte_origin }` view. Both
+  the lambda's parallel-fetcher orchestrator and the CLI's
+  sequential local driver now plug into the same per-RG protocol;
+  CLI wraps its output fd in a `streaming.Sink` so the consumer is
+  agnostic to the backend. Net -499 LoC across the two call sites.
+- **C2. Expression evaluator** (first slice shipped 2026-05-05).
+  `src/core/expr/{ast,parser,eval}.zig` — typed AST, recursive-
+  descent parser with arithmetic precedence + parens, comptime-
+  specialized kernels per (op, T). First-slice surface: literals,
+  column refs, `+ - * /` on numerics, `expr AS alias`. Promotion:
+  any-int → i64, any-float → f64. Wired into the CLI as
+  `--select "EXPR1 [AS name], EXPR2 [AS name], ..."`; the consumer
+  now takes `output_specs: []OutputCol` (passthrough or computed).
+  Lambda continues to use passthrough-only output_specs until
+  nested-schema splicing is decided. Follow-ups: string concat,
+  `coalesce`, `case when`, null-aware arithmetic, lambda surface.
 - **C3. Filter operator coverage.** Folded from old Phase E:
   - **C3.a `IS NULL` / `IS NOT NULL`** — uses def_levels we
     already produce.

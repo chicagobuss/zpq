@@ -1003,12 +1003,6 @@ fn buildOutputMulti(
     // byte-copy.
     const use_encoder = filter_opt != null or projection_includes_nested;
 
-    // Tautology filter for the no-filter+nested-projection case so
-    // the encoder's eval path runs uniformly.
-    const filter: filter_ast.Filter = filter_opt orelse filter_ast.Filter{
-        .int64 = .{ .col_idx = 0, .op = .GtEq, .value = std.math.minInt(i64) },
-    };
-
     // Compute kept_set + fetch_set against first file's schema (all
     // inputs share schema by construction).
     var kept_set = try arena.alloc(bool, num_leaves);
@@ -1105,9 +1099,15 @@ fn buildOutputMulti(
 
     // Per-RG copy path needs a bool[] kept_set when projection is
     // active; null means "no projection — push whole-RG bounding-box
-    // span". The encoder path doesn't need this (it walks
-    // `kept_in_order` directly).
+    // span". The encoder path uses `output_specs` instead.
     const copy_kept_set: ?[]const bool = if (kept_columns_opt != null) kept_set else null;
+
+    // Lambda doesn't expose --select yet — build a passthrough-only
+    // output_specs from kept_in_order. (CLI is the first surface for
+    // computed columns; lambda picks up the wiring once nested-schema
+    // splicing is sorted out.)
+    const output_specs = try arena.alloc(consumer.OutputCol, kept_in_order.items.len);
+    for (kept_in_order.items, 0..) |ci, i| output_specs[i] = .{ .passthrough = ci };
 
     // Drain queues in file order. Each pulled RG is processed serially
     // through `consumer.encodeRG` (filter + re-encode) or
@@ -1129,9 +1129,9 @@ fn buildOutputMulti(
                 rg_result.rg_meta,
                 &specs[file_idx].meta,
                 rg_src,
-                filter,
+                filter_opt,
                 fetch_set,
-                kept_in_order.items,
+                output_specs,
                 sink,
                 &offset,
                 output_codec,

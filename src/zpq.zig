@@ -17,6 +17,11 @@ pub const core = struct {
         pub const eval = @import("core/filter/eval.zig");
         pub const partition = @import("core/filter/partition.zig");
     };
+    pub const expr = struct {
+        pub const ast = @import("core/expr/ast.zig");
+        pub const parser = @import("core/expr/parser.zig");
+        pub const eval = @import("core/expr/eval.zig");
+    };
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");
@@ -63,6 +68,9 @@ test {
     _ = core.filter.selection;
     _ = core.filter.eval;
     _ = core.filter.partition;
+    _ = core.expr.ast;
+    _ = core.expr.parser;
+    _ = core.expr.eval;
     _ = core.writer.fastpath;
     _ = core.writer.encoder;
     _ = core.writer.streaming;

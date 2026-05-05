@@ -23,6 +23,7 @@ const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
 const hybrid_rle = @import("../parquet/encoding/hybrid_rle.zig");
 const snappy = @import("../parquet/snappy.zig");
+const compression = @import("../parquet/compression.zig");
 
 pub const Error = error{
     NullableNotSupported,
@@ -30,7 +31,7 @@ pub const Error = error{
     TooLarge,
     CorruptInput, // from snappy (vendored google/snappy)
     OutputTooSmall, // from snappy
-} || std.mem.Allocator.Error;
+} || std.mem.Allocator.Error || compression.Error;
 
 pub const EncodedColumn = struct {
     /// Page header thrift + encoded data bytes, ready to concatenate.
@@ -50,6 +51,11 @@ pub const ColumnInput = struct {
     /// path_in_schema for the resulting ColumnMetaData. Typically a
     /// one-element list [name] for flat schemas.
     path_in_schema: []const []const u8,
+    /// Output codec for this column's pages. SNAPPY is the default
+    /// (small overhead, ~250 MB/s); ZSTD is a higher-ratio option
+    /// (~30% smaller output, ~400 MB/s encode at level 3).
+    /// UNCOMPRESSED is supported but discouraged outside diagnostics.
+    codec: schema.CompressionCodec = .SNAPPY,
 };
 
 /// Encode one column chunk: header + (optional def-level prefix) + data + ColumnMetaData.
@@ -158,7 +164,7 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     //     data) we still ship the compressed version; the format
     //     allows it and a 1-2% bloat is preferable to a per-page
     //     branching codec.
-    const compressed = try snappy.compressAlloc(arena, payload);
+    const compressed = try compression.compress(arena, payload, in.codec);
 
     // 5. Build PageHeader. uncompressed_page_size measures the
     //    payload-as-if-uncompressed; compressed_page_size measures
@@ -201,7 +207,7 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .type = phys,
         .encodings = encodings,
         .path_in_schema = path_list,
-        .codec = .SNAPPY,
+        .codec = in.codec,
         .num_values = num_values,
         .total_uncompressed_size = @intCast(header_bytes.len + data_total_len),
         .total_compressed_size = @intCast(total.len),
@@ -276,7 +282,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
         try dict_raw.appendSlice(arena, &len_bytes);
         try dict_raw.appendSlice(arena, v);
     }
-    const dict_compressed = try snappy.compressAlloc(arena, dict_raw.items);
+    const dict_compressed = try compression.compress(arena, dict_raw.items, in.codec);
 
     var dict_page_hdr: schema.PageHeader = .{
         .type = .DICTIONARY_PAGE,
@@ -330,7 +336,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
         pos += 1;
         @memcpy(data_payload[pos..], idx_rle);
     }
-    const data_compressed = try snappy.compressAlloc(arena, data_payload);
+    const data_compressed = try compression.compress(arena, data_payload, in.codec);
 
     var data_page_hdr: schema.PageHeader = .{
         .type = .DATA_PAGE,
@@ -381,7 +387,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
         .type = phys,
         .encodings = encodings,
         .path_in_schema = path_list,
-        .codec = .SNAPPY,
+        .codec = in.codec,
         .num_values = num_values,
         .total_uncompressed_size = @intCast(total_uncompressed),
         .total_compressed_size = @intCast(total_len),

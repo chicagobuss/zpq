@@ -173,7 +173,17 @@ fn handle(
         const output_url = extractField(trimmed, "output_url") catch null;
         const columns_csv = extractStringArray(trimmed, "columns", allocator) catch null;
         defer if (columns_csv) |c| allocator.free(c);
-        if (output_url) |out| return try handleS3Write(io, allocator, env, input_urls.items, filter_str, out, columns_csv, pool);
+        // Output codec selection. "snappy" (default), "zstd", or
+        // "uncompressed". Anything else is treated as snappy with no
+        // error — strict validation can come with the API-versioning
+        // work in F2.
+        const codec_str = extractField(trimmed, "output_codec") catch null;
+        const output_codec: schema.CompressionCodec = if (codec_str) |s| blk: {
+            if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;
+            if (std.ascii.eqlIgnoreCase(s, "uncompressed")) break :blk .UNCOMPRESSED;
+            break :blk .SNAPPY;
+        } else .SNAPPY;
+        if (output_url) |out| return try handleS3Write(io, allocator, env, input_urls.items, filter_str, out, columns_csv, output_codec, pool);
         // Aggregate path stays single-file (legacy diagnostic).
         if (input_urls.items.len > 0)
             return try handleS3(allocator, env, input_urls.items[0], filter_str);
@@ -623,6 +633,7 @@ fn handleS3Write(
     filter_str: ?[]const u8,
     output_url_str: []const u8,
     columns_csv: ?[]const u8,
+    output_codec: schema.CompressionCodec,
     persistent_pool: *PersistentPool,
 ) ![]u8 {
     const t_start = nowMonoNs();
@@ -915,6 +926,7 @@ fn handleS3Write(
         io,
         sink_pool,
         creds,
+        output_codec,
         &timings,
     );
     try mp_sink.close();
@@ -975,6 +987,7 @@ fn buildOutputMulti(
     io: std.Io,
     s3_pool: *s3.Pool(POOL_SIZE),
     creds: s3.Credentials,
+    output_codec: schema.CompressionCodec,
     timings: *Timings,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
@@ -1110,6 +1123,7 @@ fn buildOutputMulti(
                 sink,
                 &offset,
                 &new_row_groups,
+                output_codec,
                 timings,
             ) else try copyOneRG(
                 arena,
@@ -1241,6 +1255,7 @@ fn encodeOneRG(
     sink: streaming.Sink,
     offset: *u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    output_codec: schema.CompressionCodec,
     timings: *Timings,
 ) !i64 {
     const rg = rg_result.rg_meta;
@@ -1312,6 +1327,7 @@ fn encodeOneRG(
             .values = filtered,
             .schema_elem = &leaf_elem,
             .path_in_schema = cm.path_in_schema.items,
+            .codec = output_codec,
         });
         const t_enc_end = nowMonoNs();
         timings.encode_ns += @intCast(t_enc_end - t_enc_start);

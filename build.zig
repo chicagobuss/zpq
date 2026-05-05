@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
     });
     const test_snappy_mod = test_snappy_dep.module("snappy");
 
+    const test_zstd_dep = b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+        .decompression = false,
+        .dictbuilder = false,
+    });
+    const test_zstd_lib = test_zstd_dep.artifact("zstd");
+
     const test_zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
@@ -68,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "snappy", .module = test_snappy_mod },
         },
     });
+    test_zpq_mod.linkLibrary(test_zstd_lib);
 
     // Sans-IO + io tests (live in src/zpq.zig and what it imports).
     const lib_tests = b.addTest(.{
@@ -179,6 +188,20 @@ fn makeZpqModule(
     });
     const snappy_mod = snappy_dep.module("snappy");
 
+    // facebook/zstd 1.5.7 — vendor via allyourcodebase/zstd. Used for
+    // E2b output encoding. Decode side uses pure-Zig
+    // `std.compress.zstd` (no dep needed) — that path is already
+    // wired via core/parquet/compression.zig::decompress.
+    const zstd_dep = b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+        // Decompression is bundled by the dep but we don't use it (std
+        // covers that). Strip it to keep the binary size down.
+        .decompression = false,
+        .dictbuilder = false,
+    });
+    const zstd_lib = zstd_dep.artifact("zstd");
+
     const zpq_mod = b.createModule(.{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
@@ -189,6 +212,7 @@ fn makeZpqModule(
             .{ .name = "snappy", .module = snappy_mod },
         },
     });
+    zpq_mod.linkLibrary(zstd_lib);
 
     const root_path = if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig";
     const root_mod = b.createModule(.{

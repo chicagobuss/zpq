@@ -10,11 +10,56 @@ const schema = @import("../schema.zig");
 const snappy = @import("snappy.zig");
 const lz4 = @import("lz4.zig");
 
+const c_zstd = @cImport({
+    @cInclude("zstd.h");
+});
+
 pub const Error = error{
     UnsupportedCodec,
     DecompressionFailed,
+    CompressionFailed,
     SizeMismatch,
 } || std.mem.Allocator.Error;
+
+/// Default zstd compression level. 3 is the upstream default — fast
+/// encode (~400 MB/s on modern x86_64) with compression ratio close
+/// to gzip-6. Higher levels (up to 22) compress better but are
+/// slower; for our streaming-output use case the network is rarely
+/// the bottleneck so we prefer the fast knob.
+pub const ZSTD_DEFAULT_LEVEL: c_int = 3;
+
+/// Compress a buffer using `codec`. Returns a newly-allocated slice
+/// owned by `arena`. UNCOMPRESSED is a no-op identity copy onto the
+/// arena (so the caller can free with the same allocator regardless
+/// of codec).
+pub fn compress(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    codec: schema.CompressionCodec,
+) Error![]u8 {
+    return switch (codec) {
+        .UNCOMPRESSED => try arena.dupe(u8, src),
+        .SNAPPY => snappy.compressAlloc(arena, src) catch return error.CompressionFailed,
+        .ZSTD => compressZstd(arena, src),
+        else => error.UnsupportedCodec,
+    };
+}
+
+fn compressZstd(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
+    const max_len = c_zstd.ZSTD_compressBound(src.len);
+    if (c_zstd.ZSTD_isError(max_len) != 0) return error.CompressionFailed;
+    const buf = try arena.alloc(u8, max_len);
+    errdefer arena.free(buf);
+    const n = c_zstd.ZSTD_compress(
+        buf.ptr,
+        buf.len,
+        src.ptr,
+        src.len,
+        ZSTD_DEFAULT_LEVEL,
+    );
+    if (c_zstd.ZSTD_isError(n) != 0) return error.CompressionFailed;
+    return buf[0..n];
+}
 
 /// Decompress a single Parquet page's payload.
 ///

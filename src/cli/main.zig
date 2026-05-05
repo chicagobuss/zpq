@@ -120,7 +120,7 @@ fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
     , .{});
     try writeJsonString(&w, out);
     try w.print(
-        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"write_ms":{d}}}}}
+        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
         \\
     , .{
         @tagName(codec),
@@ -133,10 +133,11 @@ fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
         total_ms,
         result.timings.read_ns / std.time.ns_per_ms,
         result.timings.parse_ns / std.time.ns_per_ms,
-        result.timings.decode_ns / std.time.ns_per_ms,
-        result.timings.eval_ns / std.time.ns_per_ms,
-        result.timings.encode_ns / std.time.ns_per_ms,
-        result.timings.write_ns / std.time.ns_per_ms,
+        result.timings.core.decode_ns / std.time.ns_per_ms,
+        result.timings.core.eval_ns / std.time.ns_per_ms,
+        result.timings.core.encode_ns / std.time.ns_per_ms,
+        result.timings.core.sink_ns / std.time.ns_per_ms,
+        result.timings.footer_ns / std.time.ns_per_ms,
     });
 }
 

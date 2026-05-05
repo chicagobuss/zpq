@@ -7,6 +7,7 @@
 pub const core = struct {
     pub const schema = @import("core/schema.zig");
     pub const thrift = @import("core/thrift.zig");
+    pub const consumer = @import("core/consumer.zig");
     pub const filter = struct {
         pub const ast = @import("core/filter/ast.zig");
         pub const encoded = @import("core/filter/encoded.zig");
@@ -54,6 +55,7 @@ pub const io = struct {
 test {
     _ = core.schema;
     _ = core.thrift;
+    _ = core.consumer;
     _ = core.filter.ast;
     _ = core.filter.encoded;
     _ = core.filter.parser;

@@ -101,16 +101,33 @@ pub const BinOp = struct {
     result_type: Type,
 };
 
+/// Built-in scalar functions. The first slice ships only `coalesce`
+/// (replace nulls with a default). Add cases here as functions land:
+/// `abs`, `length`, `lower`, `upper`, etc. The parser routes `IDENT(...)`
+/// to whichever Func tag matches the name (case-insensitive).
+pub const Func = enum {
+    coalesce,
+};
+
+pub const Call = struct {
+    func: Func,
+    args: []const *Expr,
+    /// Result type, resolved at parse time from the args' types.
+    result_type: Type,
+};
+
 pub const Expr = union(enum) {
     literal: Literal,
     col_ref: ColRef,
     binop: BinOp,
+    call: Call,
 
     pub fn typeOf(self: Expr) Type {
         return switch (self) {
             .literal => |l| l.typeOf(),
             .col_ref => |c| c.expr_type,
             .binop => |b| b.result_type,
+            .call => |c| c.result_type,
         };
     }
 };

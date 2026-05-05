@@ -242,7 +242,7 @@ complex SQL surface, and full optimizer machinery stay out of scope.
   Lambda continues to use passthrough-only output_specs until
   nested-schema splicing is decided. Follow-ups: string concat,
   `coalesce`, `case when`, null-aware arithmetic, lambda surface.
-- **C3. Filter operator coverage.** Folded from old Phase E:
+- **C3. Filter / expression operator coverage.** Folded from old Phase E:
   - **C3.a `IS NULL` / `IS NOT NULL`** — uses def_levels we
     already produce.
   - **C3.b `NOT`** — unary negation.
@@ -250,9 +250,20 @@ complex SQL surface, and full optimizer machinery stay out of scope.
   - **C3.d `IN (...)`** — sugar for OR-of-equalities, or its own
     leaf with hash-set lookup if the list is large.
   - **C3.e `LIKE`** — pattern match with `%` / `_` and escape.
-  - **C3.f `BETWEEN x AND y`** — sugar for `>= x AND <= y`. Not in
-    the original list but common in user SQL; v1 had it
-    (commit `abc3d12`).
+  - **C3.f `BETWEEN x AND y`** (shipped 2026-05-05). Filter parser
+    desugars to `>= x AND <= y`; the bound-AND is skipped via a
+    counter in `findTopLevelAnd` so composing with outer
+    conjunctions works. Case-insensitive.
+  - **C3.g string concat `||`** (shipped 2026-05-05). Adds a `Type.str`
+    lane to the expression evaluator, BYTE_ARRAY column refs,
+    string literals, and a `concatKernel`. Synthesized output
+    leaves carry `converted_type = UTF8` so downstream readers
+    surface them as strings.
+  - **C3.h `coalesce(col, default)`** (shipped 2026-05-05). First
+    user-callable function. New `Func` enum + `Call` AST node so
+    future functions (`abs`, `length`, etc.) extend the dispatch.
+    First-slice constraint: 2 args, first must be a col_ref,
+    second must be a literal. Walks def_levels per row.
   Each lands independently in any order. C2 makes some of these
   trivial because the evaluator already handles the typing
   machinery.

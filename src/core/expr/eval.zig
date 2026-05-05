@@ -33,6 +33,7 @@ pub const Error = error{
     NullableNotSupported,
     NestedNotSupported,
     DivisionByZero,
+    UnsupportedCoalesce,
 } || std.mem.Allocator.Error;
 
 const Batch = filter_eval.Batch;
@@ -52,6 +53,7 @@ pub fn evalExpr(
         .literal => |lit| literalAsColumn(arena, lit, batch.num_rows),
         .col_ref => |c| try colRefAsColumn(arena, batch, column_lookup, c),
         .binop => |b| try evalBinOp(arena, batch, column_lookup, b),
+        .call => |c| try evalCall(arena, batch, column_lookup, c),
     };
 }
 
@@ -153,6 +155,169 @@ fn concatKernel(
         out[i] = buf;
     }
     return out;
+}
+
+/// `coalesce(arg1, arg2, ..., default)` — return the first non-null
+/// value per row. First-slice scope: only `coalesce(<col_ref>, <literal>)`.
+/// Multi-arg with non-literal trailing fallbacks lands when we have
+/// a real workload that needs it.
+///
+/// Semantics:
+///   - Walk the column's def_levels per row.
+///   - def_level == max_def → row is present → output = col.values[i]
+///   - def_level <  max_def → row is null → output = literal default
+/// Output column is REQUIRED (no nulls).
+fn evalCall(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    c: ast.Call,
+) Error!Batch.Column {
+    switch (c.func) {
+        .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type),
+    }
+}
+
+fn evalCoalesce(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    args: []const *ast.Expr,
+    result_type: ast.Type,
+) Error!Batch.Column {
+    if (args.len != 2) return error.UnsupportedCoalesce;
+    if (args[0].* != .col_ref) return error.UnsupportedCoalesce;
+    if (args[1].* != .literal) return error.UnsupportedCoalesce;
+
+    const col_ref = args[0].col_ref;
+    const lit = args[1].literal;
+    const pos = column_lookup[col_ref.col_idx] orelse return error.BadColumn;
+    const col = batch.cols[pos];
+
+    // Reject nested (LIST/MAP). Null def levels are FINE here — coalesce
+    // exists precisely to handle them.
+    switch (col) {
+        inline else => |cc| if (cc.max_rep > 0) return error.NestedNotSupported,
+    }
+
+    return switch (result_type) {
+        .i64 => .{ .i64 = .{ .values = try coalesceToI64(arena, col, lit) } },
+        .f64 => .{ .f64 = .{ .values = try coalesceToF64(arena, col, lit) } },
+        .str => .{ .string = .{ .values = try coalesceToStr(arena, col, lit) } },
+    };
+}
+
+fn defaultI64(lit: ast.Literal) Error!i64 {
+    return switch (lit) {
+        .i64 => |v| v,
+        else => error.TypeMismatch,
+    };
+}
+
+fn defaultF64(lit: ast.Literal) Error!f64 {
+    return switch (lit) {
+        .i64 => |v| @floatFromInt(v),
+        .f64 => |v| v,
+        else => error.TypeMismatch,
+    };
+}
+
+fn defaultStr(lit: ast.Literal) Error![]const u8 {
+    return switch (lit) {
+        .str => |v| v,
+        else => error.TypeMismatch,
+    };
+}
+
+fn coalesceToI64(arena: std.mem.Allocator, col: Batch.Column, lit: ast.Literal) Error![]i64 {
+    const def = try defaultI64(lit);
+    return switch (col) {
+        .i32 => |c| try coalesceWiden(arena, i32, i64, c.values, c.def_levels, c.max_def, def, intWiden(i32, i64)),
+        .i64 => |c| try coalesceWiden(arena, i64, i64, c.values, c.def_levels, c.max_def, def, identityI64),
+        else => error.TypeMismatch,
+    };
+}
+
+fn coalesceToF64(arena: std.mem.Allocator, col: Batch.Column, lit: ast.Literal) Error![]f64 {
+    const def = try defaultF64(lit);
+    return switch (col) {
+        .i32 => |c| try coalesceWiden(arena, i32, f64, c.values, c.def_levels, c.max_def, def, intToFloat(i32)),
+        .i64 => |c| try coalesceWiden(arena, i64, f64, c.values, c.def_levels, c.max_def, def, intToFloat(i64)),
+        .f32 => |c| try coalesceWiden(arena, f32, f64, c.values, c.def_levels, c.max_def, def, floatWiden),
+        .f64 => |c| try coalesceWiden(arena, f64, f64, c.values, c.def_levels, c.max_def, def, identityF64),
+        else => error.TypeMismatch,
+    };
+}
+
+fn coalesceToStr(
+    arena: std.mem.Allocator,
+    col: Batch.Column,
+    lit: ast.Literal,
+) Error![]const []const u8 {
+    const def = try defaultStr(lit);
+    return switch (col) {
+        .string => |c| blk: {
+            const out = try arena.alloc([]const u8, c.values.len);
+            if (c.def_levels) |dls| {
+                for (c.values, dls, 0..) |v, dl, i| out[i] = if (dl >= c.max_def) v else def;
+            } else {
+                @memcpy(out, c.values);
+            }
+            break :blk out;
+        },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Generic coalesce kernel. `convert` widens a source value into the
+/// result type for non-null rows; null rows fall through to `default`.
+/// PLAIN-encoded OPTIONAL columns store null slots as zeroed values,
+/// so we still must consult def_levels — we cannot trust the values.
+fn coalesceWiden(
+    arena: std.mem.Allocator,
+    comptime SrcT: type,
+    comptime DstT: type,
+    values: []const SrcT,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    default: DstT,
+    convert: *const fn (SrcT) DstT,
+) Error![]DstT {
+    const out = try arena.alloc(DstT, values.len);
+    if (def_levels) |dls| {
+        for (values, dls, 0..) |v, dl, i| out[i] = if (dl >= max_def) convert(v) else default;
+    } else {
+        for (values, 0..) |v, i| out[i] = convert(v);
+    }
+    return out;
+}
+
+fn intWiden(comptime SrcT: type, comptime DstT: type) *const fn (SrcT) DstT {
+    return struct {
+        fn f(x: SrcT) DstT {
+            return @intCast(x);
+        }
+    }.f;
+}
+
+fn intToFloat(comptime SrcT: type) *const fn (SrcT) f64 {
+    return struct {
+        fn f(x: SrcT) f64 {
+            return @floatFromInt(x);
+        }
+    }.f;
+}
+
+fn floatWiden(x: f32) f64 {
+    return x;
+}
+
+fn identityI64(x: i64) i64 {
+    return x;
+}
+
+fn identityF64(x: f64) f64 {
+    return x;
 }
 
 /// Hand-coded kernel for binary arithmetic. Comptime-specialized per
@@ -488,6 +653,81 @@ test "string concat: column || column" {
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("Hello, world", out.string.values[0]);
     try testing.expectEqualStrings("Goodbye, world", out.string.values[1]);
+}
+
+test "coalesce: i64 column with nulls + i64 default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Column with nulls at indices 1 and 3.
+    const xs = [_]i64{ 10, 0, 30, 0, 50 };
+    const dls = [_]u32{ 1, 0, 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .i64 = .{ .values = &xs, .def_levels = &dls, .max_def = 1 } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 5 };
+    const lookup = [_]?usize{0};
+
+    const arg0 = try a.create(ast.Expr);
+    arg0.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg1 = try a.create(ast.Expr);
+    arg1.* = .{ .literal = .{ .i64 = -1 } };
+    const args = try a.alloc(*ast.Expr, 2);
+    args[0] = arg0;
+    args[1] = arg1;
+
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64 } };
+    const out = try evalExpr(a, &batch, &lookup, e);
+    try testing.expectEqualSlices(i64, &.{ 10, -1, 30, -1, 50 }, out.i64.values);
+}
+
+test "coalesce: i32 column widened to i64 with default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const xs = [_]i32{ 1, 0, 3 };
+    const dls = [_]u32{ 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .i32 = .{ .values = &xs, .def_levels = &dls, .max_def = 1 } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+
+    const arg0 = try a.create(ast.Expr);
+    arg0.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const arg1 = try a.create(ast.Expr);
+    arg1.* = .{ .literal = .{ .i64 = 99 } };
+    const args = try a.alloc(*ast.Expr, 2);
+    args[0] = arg0;
+    args[1] = arg1;
+
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64 } };
+    const out = try evalExpr(a, &batch, &lookup, e);
+    try testing.expectEqualSlices(i64, &.{ 1, 99, 3 }, out.i64.values);
+}
+
+test "coalesce: string column with empty default" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const xs = [_][]const u8{ "alpha", "", "gamma" };
+    const dls = [_]u32{ 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .string = .{ .values = &xs, .def_levels = &dls, .max_def = 1 } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+
+    const arg0 = try a.create(ast.Expr);
+    arg0.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const arg1 = try a.create(ast.Expr);
+    arg1.* = .{ .literal = .{ .str = "<missing>" } };
+    const args = try a.alloc(*ast.Expr, 2);
+    args[0] = arg0;
+    args[1] = arg1;
+
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str } };
+    const out = try evalExpr(a, &batch, &lookup, e);
+    try testing.expectEqualStrings("alpha", out.string.values[0]);
+    try testing.expectEqualStrings("<missing>", out.string.values[1]);
+    try testing.expectEqualStrings("gamma", out.string.values[2]);
 }
 
 test "nullable column rejected" {

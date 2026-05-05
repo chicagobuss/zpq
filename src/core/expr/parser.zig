@@ -27,6 +27,8 @@ pub const Error = error{
     UnsupportedColumnType,
     UnterminatedString,
     TypeMismatch,
+    UnknownFunction,
+    WrongArity,
     ExpectedRParen,
     ExpectedIdentifier,
     TrailingTokens,
@@ -246,6 +248,33 @@ fn parseTerm(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMeta
 fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
     const tk = try lex.next();
     switch (tk.kind) {
+        .minus => {
+            // Unary minus: parse the next factor and negate. Folds
+            // numeric literals at parse time so `-5` lands as a single
+            // literal node; non-literal sub-exprs become `0 - expr`.
+            const inner = try parseFactor(arena, lex, file);
+            switch (inner) {
+                .literal => |lit| switch (lit) {
+                    .i64 => |v| return .{ .literal = .{ .i64 = -v } },
+                    .f64 => |v| return .{ .literal = .{ .f64 = -v } },
+                    .str => return error.TypeMismatch,
+                },
+                else => {
+                    const lp = try arena.create(ast.Expr);
+                    lp.* = .{ .literal = .{ .i64 = 0 } };
+                    const rp = try arena.create(ast.Expr);
+                    rp.* = inner;
+                    const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
+                    if (result_type == .str) return error.TypeMismatch;
+                    return .{ .binop = .{
+                        .op = .sub,
+                        .left = lp,
+                        .right = rp,
+                        .result_type = result_type,
+                    } };
+                },
+            }
+        },
         .number_int => {
             const v = std.fmt.parseInt(i64, tk.text, 10) catch return error.BadNumber;
             return .{ .literal = .{ .i64 = v } };
@@ -258,6 +287,14 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             return .{ .literal = .{ .str = tk.text } };
         },
         .ident => {
+            // IDENT followed by `(` is a function call; otherwise it's
+            // a column reference. Function names are matched
+            // case-insensitively against `ast.Func`.
+            const after = try lex.peek();
+            if (after.kind == .lparen) {
+                _ = try lex.next(); // consume '('
+                return parseCall(arena, lex, file, tk.text);
+            }
             const col_idx = metadata.findColumnIndex(file, tk.text) orelse return error.UnknownColumn;
             const elem = file.getColumnSchema(&[_][]const u8{tk.text}) orelse return error.UnknownColumn;
             const phys = elem.type orelse return error.UnsupportedColumnType;
@@ -281,6 +318,66 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
         },
         .eof => return error.UnexpectedEnd,
         else => return error.UnexpectedChar,
+    }
+}
+
+/// Parse a function call body: `arg1, arg2, ... )`. The opening `(`
+/// has already been consumed. Resolves the function by name
+/// (case-insensitive) and validates arity + arg types.
+fn parseCall(
+    arena: std.mem.Allocator,
+    lex: *Lexer,
+    file: *const schema.FileMetaData,
+    name: []const u8,
+) Error!ast.Expr {
+    const func = resolveFunc(name) orelse return error.UnknownFunction;
+
+    var args: std.ArrayList(*ast.Expr) = .empty;
+    // Empty arg list: `func()`.
+    const first = try lex.peek();
+    if (first.kind == .rparen) {
+        _ = try lex.next();
+    } else {
+        while (true) {
+            const arg = try arena.create(ast.Expr);
+            arg.* = try parseExpr(arena, lex, file);
+            try args.append(arena, arg);
+            const sep = try lex.next();
+            switch (sep.kind) {
+                .comma => continue,
+                .rparen => break,
+                else => return error.ExpectedRParen,
+            }
+        }
+    }
+
+    const result_type = try resolveCallType(func, args.items);
+    return .{ .call = .{
+        .func = func,
+        .args = args.items,
+        .result_type = result_type,
+    } };
+}
+
+fn resolveFunc(name: []const u8) ?ast.Func {
+    if (asciiEqIgnoreCase(name, "coalesce")) return .coalesce;
+    return null;
+}
+
+/// Validate arity + argument types per function and return the result
+/// type. coalesce requires ≥2 args, all promotable to a common type.
+fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
+    switch (func) {
+        .coalesce => {
+            if (args.len < 2) return error.WrongArity;
+            // Reduce arg types via Type.promote — every cross-lane
+            // mix is rejected. Result type is the common lane.
+            var t = args[0].typeOf();
+            for (args[1..]) |a| {
+                t = ast.Type.promote(t, a.typeOf()) orelse return error.TypeMismatch;
+            }
+            return t;
+        },
     }
 }
 
@@ -472,6 +569,51 @@ test "parse: type mismatch — string + number errors" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "name + 1", &file));
+}
+
+test "parse: coalesce(col, default)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"x"}, &.{.INT64});
+    const e = try parseExprOnly(a, "coalesce(x, 0)", &file);
+    try testing.expectEqual(ast.Type.i64, e.typeOf());
+    try testing.expectEqual(ast.Func.coalesce, e.call.func);
+    try testing.expectEqual(@as(usize, 2), e.call.args.len);
+}
+
+test "parse: coalesce is case-insensitive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"x"}, &.{.INT64});
+    const e = try parseExprOnly(a, "COALESCE(x, 0)", &file);
+    try testing.expectEqual(ast.Func.coalesce, e.call.func);
+}
+
+test "parse: coalesce promotes int+float arg types to f64" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "i", "f" }, &.{ .INT64, .DOUBLE });
+    const e = try parseExprOnly(a, "coalesce(i, f)", &file);
+    try testing.expectEqual(ast.Type.f64, e.typeOf());
+}
+
+test "parse: coalesce arity error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"x"}, &.{.INT64});
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "coalesce(x)", &file));
+}
+
+test "parse: unknown function errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"x"}, &.{.INT64});
+    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "abs(x)", &file));
 }
 
 test "parse: incomplete trailing operator fails" {

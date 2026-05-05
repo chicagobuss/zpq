@@ -347,6 +347,7 @@ fn collectExprCols(e: expr_ast.Expr, fetch_arr: []bool) void {
             collectExprCols(b.left.*, fetch_arr);
             collectExprCols(b.right.*, fetch_arr);
         },
+        .call => |c| for (c.args) |arg| collectExprCols(arg.*, fetch_arr),
     }
 }
 

@@ -1,16 +1,20 @@
 //! ZPQ CLI binary entry point.
 //!
 //! Subcommands:
+//!   zpq query <input.parquet> --output <out.parquet>
+//!         [--filter EXPR] [--columns COL1,COL2,...]
+//!         [--codec snappy|zstd|uncompressed]
+//!     — local-file query: decode → filter → re-encode → write.
+//!       JSON envelope with phase timings goes to stderr.
+//!
 //!   zpq conform <file.parquet>   — emit a JSON report of what ZPQ
 //!                                  sees in this file. Used by the
 //!                                  conformance runner against the
 //!                                  apache/parquet-testing corpus.
-//!
-//! No event loop is wired in yet — the CLI is a placeholder until the
-//! first hot-path code lands.
 
 const std = @import("std");
 const zpq = @import("zpq");
+const query = @import("query.zig");
 
 const metadata = zpq.core.parquet.metadata;
 const schema = zpq.core.schema;
@@ -22,19 +26,134 @@ pub fn main(init: std.process.Init) !void {
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
-        std.debug.print("usage: zpq conform <file.parquet>\n", .{});
+        std.debug.print(
+            \\usage:
+            \\  zpq query <input.parquet> --output <out.parquet>
+            \\            [--filter EXPR] [--columns COL1,COL2,...]
+            \\            [--codec snappy|zstd|uncompressed]
+            \\  zpq conform <file.parquet>
+            \\
+        , .{});
         return;
     };
-    if (!std.mem.eql(u8, cmd, "conform")) {
-        std.debug.print("unknown subcommand: {s}\n", .{cmd});
+    if (std.mem.eql(u8, cmd, "query")) {
+        try runQuery(gpa, &iter);
         return;
     }
-    const path = iter.next() orelse {
-        std.debug.print("conform: missing path\n", .{});
+    if (std.mem.eql(u8, cmd, "conform")) {
+        const path = iter.next() orelse {
+            std.debug.print("conform: missing path\n", .{});
+            return;
+        };
+        try runConform(gpa, path);
         return;
+    }
+    std.debug.print("unknown subcommand: {s}\n", .{cmd});
+}
+
+fn runQuery(gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !void {
+    var input: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+    var filter: ?[]const u8 = null;
+    var columns_csv: ?[]const u8 = null;
+    var codec: schema.CompressionCodec = .SNAPPY;
+
+    // First positional after "query" is the input path; subsequent
+    // tokens are flag/value pairs.
+    while (iter.next()) |tok| {
+        if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
+            output = iter.next();
+        } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
+            filter = iter.next();
+        } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
+            columns_csv = iter.next();
+        } else if (std.mem.eql(u8, tok, "--codec")) {
+            const v = iter.next() orelse continue;
+            if (std.ascii.eqlIgnoreCase(v, "zstd")) codec = .ZSTD;
+            if (std.ascii.eqlIgnoreCase(v, "uncompressed")) codec = .UNCOMPRESSED;
+            // anything else stays SNAPPY (default)
+        } else if (input == null) {
+            input = tok;
+        } else {
+            std.debug.print("zpq query: unexpected arg: {s}\n", .{tok});
+            return error.BadArgs;
+        }
+    }
+
+    const in = input orelse {
+        std.debug.print("zpq query: missing <input.parquet>\n", .{});
+        return error.BadArgs;
+    };
+    const out = output orelse {
+        std.debug.print("zpq query: missing --output <path>\n", .{});
+        return error.BadArgs;
     };
 
-    try runConform(gpa, path);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cols: ?[]const []const u8 = if (columns_csv) |csv|
+        try splitCsv(arena, csv)
+    else
+        null;
+
+    const t_start = nowMonoNs();
+    const result = try query.run(gpa, .{
+        .input = in,
+        .output = out,
+        .filter = filter,
+        .columns = cols,
+        .codec = codec,
+    });
+    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
+
+    // JSON envelope to stderr — same shape as the Lambda response.
+    var w: StdoutWriter = .{ .fd = 2 };
+    defer w.flush();
+    try w.print(
+        \\{{"ok":true,"input":"
+    , .{});
+    try writeJsonString(&w, in);
+    try w.print(
+        \\","output":"
+    , .{});
+    try writeJsonString(&w, out);
+    try w.print(
+        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"write_ms":{d}}}}}
+        \\
+    , .{
+        @tagName(codec),
+        result.rows_in,
+        result.rows_kept,
+        result.bytes_in,
+        result.bytes_out,
+        result.row_groups_in,
+        result.row_groups_kept,
+        total_ms,
+        result.timings.read_ns / std.time.ns_per_ms,
+        result.timings.parse_ns / std.time.ns_per_ms,
+        result.timings.decode_ns / std.time.ns_per_ms,
+        result.timings.eval_ns / std.time.ns_per_ms,
+        result.timings.encode_ns / std.time.ns_per_ms,
+        result.timings.write_ns / std.time.ns_per_ms,
+    });
+}
+
+fn splitCsv(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.splitScalar(u8, csv, ',');
+    while (iter.next()) |s| {
+        const trimmed = std.mem.trim(u8, s, " \t");
+        if (trimmed.len > 0) try out.append(arena, trimmed);
+    }
+    return out.items;
+}
+
+fn nowMonoNs() i64 {
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 /// Open a parquet file via ZPQ and emit a JSON report describing what
@@ -227,11 +346,12 @@ fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
     }
 }
 
-/// Tiny buffered stdout writer using direct linux.write syscalls —
-/// avoids the std.Io vtable so the conformance binary stays a
-/// self-contained CLI tool.
+/// Tiny buffered writer using direct linux.write syscalls — avoids
+/// the std.Io vtable so this binary stays self-contained. fd
+/// defaults to stdout (1); set fd=2 for stderr.
 const StdoutWriter = struct {
     const linux = std.os.linux;
+    fd: linux.fd_t = 1,
     buf: [4096]u8 = undefined,
     pos: usize = 0,
 
@@ -248,7 +368,7 @@ const StdoutWriter = struct {
     }
 
     pub fn print(self: *StdoutWriter, comptime fmt: []const u8, args: anytype) !void {
-        var tmp: [256]u8 = undefined;
+        var tmp: [512]u8 = undefined;
         const out = try std.fmt.bufPrint(&tmp, fmt, args);
         try self.writeAll(out);
     }
@@ -257,7 +377,7 @@ const StdoutWriter = struct {
         if (self.pos == 0) return;
         var written: usize = 0;
         while (written < self.pos) {
-            const r = linux.write(1, self.buf[written..].ptr, self.pos - written);
+            const r = linux.write(self.fd, self.buf[written..].ptr, self.pos - written);
             const n: isize = @bitCast(r);
             if (n <= 0) break;
             written += @intCast(n);

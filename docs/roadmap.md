@@ -447,26 +447,36 @@ shape improvements that could land together.
 Things a real production deploy needs, none of which change the
 engine itself.
 
-- **F1. CLI binary feature parity.** `src/cli/main.zig` exists but
-  isn't wired to anything useful. Make `zpq query --input s3://...
-  --filter "x>10" --output s3://...` work locally and on workstations.
-  Same engine, no Lambda runtime API.
+- **F1. CLI binary feature parity** (v0 shipped 2026-05-05). Local-
+  file `query` subcommand:
 
-  Specifically includes:
-  - `--report-timings` (or always-on summary) emitting the same
-    per-phase breakdown the Lambda already returns in its JSON
-    envelope (`fetch_concurrent_ms`, `decode_ms`, `eval_ms`,
-    `encode_ms`, `sink_ms`, `footer_ms`). The instrumentation
-    primitives in lambda/main.zig (`Timings` struct, `nowMonoNs`)
-    are CLI-ready as-is; the work is wiring an output shape.
-    Cribbing the Lambda JSON shape verbatim is the path of least
-    resistance — same parser everywhere.
-  - Reading from local files (no S3 round-trip) for ad-hoc dev
-    work and for any future probe scripts that don't want to
-    pay AWS latency.
-  - Writing to stdout / local file as well as S3, so unit-level
-    perf benchmarks can iterate without round-tripping through
-    Lambda deploy.
+      zpq query <input.parquet> --output <out.parquet>
+                [--filter EXPR] [--columns COL1,COL2,...]
+                [--codec snappy|zstd|uncompressed]
+
+  Reads a local parquet, applies optional filter + projection, runs
+  through the same encoder pipeline as the Lambda (snappy/zstd/dict/
+  delta), writes a fresh parquet. JSON envelope to stderr with
+  per-phase timings (`read_ms`, `parse_ms`, `decode_ms`, `eval_ms`,
+  `encode_ms`, `write_ms`) — same shape as the Lambda response so a
+  single parser walks both.
+
+  Validated against pyarrow on local 155 MB benchmark fixture:
+  - filter `int8 >= 0`: 524,288 → 260,963 rows, 65.9 MB output,
+    1929 ms total
+  - column projection (fastpath byte-copy): 524,288 rows × 2 cols,
+    3.7 MB output, 74 ms total
+  - zstd output codec: 57 MB output (vs snappy 66 MB)
+
+  **What's deferred to F1.b** (separate session):
+  - S3 input/output from CLI (currently local files only — for S3
+    use Lambda)
+  - The query orchestrator currently lives in two places: the
+    Lambda's `handleS3Write` and the CLI's `cli/query.zig`. They
+    duplicate ~200 LoC of decode/filter/encode flow. A future
+    refactor extracts a shared `engine.query` module.
+  - stdout output (currently --output requires a file path; binary
+    parquet to stdout works in principle but isn't wired).
 - **F2. API versioning.** Add `version: "1"` to the request shape
   with a default. Document the JSON contract.
 - **F3. Structured logs.** Replace `std.debug.print` usage in the

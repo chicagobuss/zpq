@@ -829,17 +829,16 @@ fn handleS3Write(
         if (kept.items.len > 0) kept_columns_opt = kept.items;
     }
 
-    var filter_cols_for_fetch: std.ArrayList(usize) = .empty;
-    if (filter) |f| try f.collectColumns(&filter_cols_for_fetch, a);
-
-    // 3a. Per-file: stat-prune survivors only. Range-building +
-    // upfront column-chunk fetch is now conditional on the output
-    // routing decision below.
+    // 3. Per-file: stat-prune survivors. No upfront column-chunk
+    // fetch — every path now uses the per-file scan iterator inside
+    // `buildOutputMulti`. Metadata bytes (tail/head/footer) were
+    // fetched during meta-resolve above, so `t_after_fetch` reflects
+    // metadata + pruning only.
     var rg_pruned: usize = 0;
     var rows_kept: i64 = 0;
     var total_input_rows: i64 = 0;
     var total_input_size: u64 = 0;
-    var bytes_fetched: u64 = 0;
+    const bytes_fetched: u64 = 0;
 
     for (specs) |*sp| {
         total_input_size += sp.total_size;
@@ -860,11 +859,6 @@ fn handleS3Write(
         }
     }
 
-    // 3b. Decide routing now (was previously after the upfront fetch).
-    // The fastpath (no filter, no nested projection) still consumes
-    // from sp.file_buf and needs the upfront fetch. Encoder paths
-    // (filter set, or nested projection) use the scan iterator and
-    // skip upfront column-chunk fetching entirely.
     const projection_includes_nested = blk_pn: {
         if (kept_columns_opt) |kc| {
             for (kc) |idx| {
@@ -877,74 +871,16 @@ fn handleS3Write(
         }
         break :blk_pn false;
     };
-    const use_streaming_input = filter != null or projection_includes_nested;
-
-    // 3c. Upfront fetch — fastpath only.
-    if (!use_streaming_input) {
-        var jobs: std.ArrayList(s3.FetchJob) = .empty;
-        for (specs) |*sp| {
-            var ranges: std.ArrayList(coalescer.Range) = .empty;
-            for (sp.survivors, 0..) |keep, i| {
-                if (!keep) continue;
-                const rg = &sp.meta.row_groups.items[i];
-                if (kept_columns_opt) |kc| {
-                    for (kc) |col_idx| {
-                        if (col_idx >= rg.columns.items.len) continue;
-                        const m = rg.columns.items[col_idx].meta_data orelse continue;
-                        const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                        const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                        try ranges.append(a, .{ .start = s, .end = e });
-                    }
-                } else {
-                    var min_s: u64 = std.math.maxInt(u64);
-                    var max_e: u64 = 0;
-                    for (rg.columns.items) |chunk| {
-                        const m = chunk.meta_data orelse continue;
-                        const s: u64 = if (m.dictionary_page_offset) |dp| @intCast(dp) else @intCast(m.data_page_offset);
-                        const e: u64 = s + @as(u64, @intCast(m.total_compressed_size));
-                        if (s < min_s) min_s = s;
-                        if (e > max_e) max_e = e;
-                    }
-                    if (min_s == std.math.maxInt(u64)) continue;
-                    try ranges.append(a, .{ .start = min_s, .end = max_e });
-                }
-            }
-            const merged = try coalescer.Coalescer.coalesce(a, ranges.items, COALESCE_GAP);
-            for (merged) |r| {
-                if (r.start >= sp.tail_start) continue;
-                const end = @min(r.end, sp.tail_start);
-                try jobs.append(a, .{
-                    .bucket = sp.url.bucket,
-                    .key = sp.url.key,
-                    .range = .{ .start = r.start, .end = end },
-                    .target = sp.file_buf[@intCast(r.start)..@intCast(end)],
-                });
-            }
-        }
-        if (jobs.items.len > 0) {
-            bytes_fetched = try s3.fetchJobs(io, pool, allocator, a, creds, jobs.items);
-        }
-    }
 
     const t_after_fetch = nowMonoNs();
 
-    // 4. Build unified output. Three paths:
-    //    - Filter set                            → buildFilteredOutputMulti
-    //    - No filter, no projection              → fastpath byte-copy
-    //    - No filter, projection includes nested → buildFilteredOutputMulti
-    //      with a synthetic always-active filter (decodes + emits all
-    //      leaves correctly, including rep-aware list/map projection
-    //      which the byte-copy fastpath can't yet handle).
-
-    // 4. Stream the output. All paths now feed a `MultipartSink`:
-    //   - no filter, no nested projection → byte-copy via streaming.build
-    //   - filter set                       → decode/filter/encode via
-    //                                          buildFilteredOutputMulti
-    //   - no filter + nested projection    → tautology filter through
-    //                                          the same encoder path
-    // The sink picks single-PUT vs multipart internally based on
-    // whether the body ever crosses TARGET_PART_SIZE. `build_ms` is
-    // reported as 0 for streaming — there's no separate build phase.
+    // 4. Stream the output. One unified path: parallel-fetcher
+    // orchestrator (`buildOutputMulti`) drives a per-file
+    // `scan.PerFileScan`; the drain loop dispatches each fetched RG
+    // to either `encodeOneRG` (filter / nested projection) or
+    // `copyOneRG` (byte-copy fastpath). `build_ms` is reported as 0
+    // since fetching, decoding, and sink writes are interleaved
+    // throughout `put_ms`.
     const same_bucket = std.mem.eql(u8, first_bucket, out_url.bucket);
 
     var out_pool: s3.Pool(POOL_SIZE) = undefined;
@@ -967,29 +903,18 @@ fn handleS3Write(
         .write_fn = multipart_sink.sinkWriteFn,
     };
 
-    const bytes_out: u64 = if (filter == null and !projection_includes_nested) blk: {
-        var fp_specs = try a.alloc(fastpath.FileSpec, specs.len);
-        for (specs, 0..) |*sp, i| fp_specs[i] = .{
-            .bytes = sp.file_buf,
-            .meta = &sp.meta,
-            .survivors = sp.survivors,
-        };
-        break :blk try streaming.build(a, sink, fp_specs, kept_columns_opt);
-    } else blk: {
-        // Tautology filter for the no-filter + nested-projection case:
-        // routes through decode/filter/encode where the encoder's
-        // rep/def emission preserves nested structure that the byte-
-        // copy fastpath would clobber. Safe when col_idx 0 is a flat
-        // int64 — true for partitioned-fixture and nested_edges
-        // fixtures; future hardening (B1.w) teaches
-        // `buildFilteredOutputMulti` to accept null filter directly.
-        const f = filter orelse filter_ast.Filter{ .int64 = .{
-            .col_idx = 0,
-            .op = .GtEq,
-            .value = std.math.minInt(i64),
-        } };
-        break :blk try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt, sink, io, sink_pool, creds);
-    };
+    const bytes_out = try buildOutputMulti(
+        a,
+        allocator,
+        specs,
+        filter,
+        kept_columns_opt,
+        projection_includes_nested,
+        sink,
+        io,
+        sink_pool,
+        creds,
+    );
     try mp_sink.close();
 
     const t_after_build = t_after_fetch;
@@ -1017,12 +942,20 @@ fn handleS3Write(
 /// Multi-file decode + filter + encode. Iterates over `specs` (each
 /// with its own meta + file_buf + survivors), produces one unified
 /// Parquet output streamed to `sink`. Returns total bytes written.
-fn buildFilteredOutputMulti(
+///
+/// `filter_opt = null` AND no nested projection → byte-copy fastpath
+/// (per-RG raw bytes pushed to sink; metadata cloned with shifted
+/// offsets). Otherwise → encoder path (decode + filter + re-encode
+/// per kept column). Both paths use the same parallel-fetcher
+/// orchestrator; the only difference is the per-RG consumer in the
+/// drain loop.
+fn buildOutputMulti(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     specs: []const FileSpec,
-    filter: filter_ast.Filter,
+    filter_opt: ?filter_ast.Filter,
     kept_columns_opt: ?[]const usize,
+    projection_includes_nested: bool,
     sink: streaming.Sink,
     io: std.Io,
     s3_pool: *s3.Pool(POOL_SIZE),
@@ -1033,6 +966,18 @@ fn buildFilteredOutputMulti(
     if (specs.len == 0) return error.NoInputs;
     const meta0 = &specs[0].meta;
     const num_leaves = meta0.row_groups.items[0].columns.items.len;
+
+    // The encoder path is selected when there's a real predicate to
+    // evaluate OR projection includes nested columns (fastpath byte-
+    // copy can't reassemble nested structure). Otherwise we go
+    // byte-copy.
+    const use_encoder = filter_opt != null or projection_includes_nested;
+
+    // Tautology filter for the no-filter+nested-projection case so
+    // the encoder's eval path runs uniformly.
+    const filter: filter_ast.Filter = filter_opt orelse filter_ast.Filter{
+        .int64 = .{ .col_idx = 0, .op = .GtEq, .value = std.math.minInt(i64) },
+    };
 
     // Compute kept_set + fetch_set against first file's schema (all
     // inputs share schema by construction).
@@ -1047,7 +992,7 @@ fn buildFilteredOutputMulti(
     }
 
     var filter_cols: std.ArrayList(usize) = .empty;
-    try filter.collectColumns(&filter_cols, arena);
+    if (filter_opt) |f| try f.collectColumns(&filter_cols, arena);
 
     var fetch_set = try arena.alloc(bool, num_leaves);
     @memset(fetch_set, false);
@@ -1081,13 +1026,23 @@ fn buildFilteredOutputMulti(
     // 39-81% vs the old upfront-fetch model. Restoring the cross-file
     // overlap recovers parity.
     const QUEUE_CAP = 1;
-    const fetch_cols_buf = try arena.alloc(usize, num_leaves);
-    var fcb_len: usize = 0;
-    for (fetch_set, 0..) |needed, ci| if (needed) {
-        fetch_cols_buf[fcb_len] = ci;
-        fcb_len += 1;
-    };
-    const fetch_cols = fetch_cols_buf[0..fcb_len];
+
+    // Pick the fetch policy. Encoder path needs kept ∪ filter cols.
+    // Fastpath with projection needs just kept cols. Fastpath
+    // without projection wants the whole RG span (`.all_kept`) since
+    // the iterator's bounding-box fetch is cheaper than per-column
+    // assembly when every column is being byte-copied anyway.
+    const policy: scan.FetchPolicy = if (use_encoder) blk: {
+        const buf = try arena.alloc(usize, num_leaves);
+        var n: usize = 0;
+        for (fetch_set, 0..) |needed, ci| if (needed) {
+            buf[n] = ci;
+            n += 1;
+        };
+        break :blk .{ .columns = buf[0..n] };
+    } else if (kept_columns_opt) |kc| blk: {
+        break :blk .{ .columns = kc };
+    } else .{ .all_kept = {} };
 
     const queues = try arena.alloc(*std.Io.Queue(scan.RowGroupResult), specs.len);
     const ctxs = try arena.alloc(*FetcherCtx, specs.len);
@@ -1110,7 +1065,7 @@ fn buildFilteredOutputMulti(
                 sp.url,
                 &sp.meta,
                 sp.survivors,
-                .{ .columns = fetch_cols },
+                policy,
             ),
             .queue = queues[file_idx],
             .gpa = gpa,
@@ -1128,7 +1083,7 @@ fn buildFilteredOutputMulti(
                 else => return err,
             };
             defer gpa.free(rg_result.raw_bytes);
-            const surviving = try encodeOneRG(
+            const surviving = if (use_encoder) try encodeOneRG(
                 arena,
                 gpa,
                 rg_result,
@@ -1136,6 +1091,13 @@ fn buildFilteredOutputMulti(
                 kept_in_order.items,
                 filter,
                 &specs[file_idx].meta,
+                sink,
+                &offset,
+                &new_row_groups,
+            ) else try copyOneRG(
+                arena,
+                rg_result,
+                kept_columns_opt,
                 sink,
                 &offset,
                 &new_row_groups,
@@ -1316,6 +1278,103 @@ fn encodeOneRG(
         .num_rows = @intCast(surviving_count),
     });
     return @intCast(surviving_count);
+}
+
+/// Byte-copy fastpath equivalent of `encodeOneRG`. No decode, no
+/// re-encode — just push the source bytes (or a per-column subset)
+/// to `sink` and clone the source RowGroup metadata with offsets
+/// shifted to the new stream position.
+///
+/// `kept_columns_opt = null` → push the whole RG span (the iterator
+/// fetched it via `.all_kept`). With projection → push each kept
+/// column's chunk individually, mirroring fastpath's per-column
+/// copy. The two cases differ in whether the iterator's `raw_bytes`
+/// covers the full RG bounding box or only the kept-column bytes.
+fn copyOneRG(
+    arena: std.mem.Allocator,
+    rg_result: scan.RowGroupResult,
+    kept_columns_opt: ?[]const usize,
+    sink: streaming.Sink,
+    offset: *u64,
+    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+) !i64 {
+    const src_rg = rg_result.rg_meta;
+
+    if (kept_columns_opt) |kept| {
+        var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        try new_cols.ensureTotalCapacity(arena, kept.len);
+        var rg_total: i64 = 0;
+
+        for (kept) |col_idx| {
+            if (col_idx >= src_rg.columns.items.len) return error.BadColumnIndex;
+            const src_chunk = src_rg.columns.items[col_idx];
+            const m = src_chunk.meta_data orelse return error.InvalidColumnOffsets;
+            const src_start: usize = if (m.dictionary_page_offset) |d| @intCast(d) else @intCast(m.data_page_offset);
+            const src_len: usize = @intCast(m.total_compressed_size);
+            const buf_off = src_start - @as(usize, @intCast(rg_result.rg_byte_start));
+            if (buf_off + src_len > rg_result.raw_bytes.len) return error.MissingChunkBytes;
+            const slice = rg_result.raw_bytes[buf_off .. buf_off + src_len];
+
+            const new_col_start = offset.*;
+            try sink.write(slice);
+            offset.* += src_len;
+
+            const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
+            var new_chunk = src_chunk;
+            new_chunk.offset_index_offset = null;
+            new_chunk.offset_index_length = null;
+            new_chunk.column_index_offset = null;
+            new_chunk.column_index_length = null;
+            if (new_chunk.meta_data) |*nm| {
+                nm.data_page_offset += delta;
+                if (nm.dictionary_page_offset) |d| nm.dictionary_page_offset = d + delta;
+                if (nm.index_page_offset) |d| nm.index_page_offset = d + delta;
+            }
+            if (new_chunk.meta_data) |nm| new_chunk.file_offset = nm.data_page_offset;
+
+            try new_cols.append(arena, new_chunk);
+            rg_total += @intCast(src_len);
+        }
+
+        try new_row_groups.append(arena, .{
+            .columns = new_cols,
+            .total_byte_size = rg_total,
+            .num_rows = src_rg.num_rows,
+        });
+        return src_rg.num_rows;
+    }
+
+    // No projection: push the whole RG bounding-box span. The
+    // iterator's `.all_kept` policy fetched [min_col_start, max_col_end);
+    // that span IS the entire RG's data, so one sink.write does it.
+    const new_start = offset.*;
+    try sink.write(rg_result.raw_bytes);
+    offset.* += rg_result.raw_bytes.len;
+    const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(rg_result.rg_byte_start));
+
+    var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try cols.ensureTotalCapacity(arena, src_rg.columns.items.len);
+    for (src_rg.columns.items) |chunk| {
+        var new_chunk = chunk;
+        new_chunk.offset_index_offset = null;
+        new_chunk.offset_index_length = null;
+        new_chunk.column_index_offset = null;
+        new_chunk.column_index_length = null;
+        if (new_chunk.meta_data) |*m| {
+            m.data_page_offset += delta;
+            if (m.dictionary_page_offset) |d| m.dictionary_page_offset = d + delta;
+            if (m.index_page_offset) |d| m.index_page_offset = d + delta;
+        }
+        if (new_chunk.meta_data) |m| new_chunk.file_offset = m.data_page_offset;
+        try cols.append(arena, new_chunk);
+    }
+
+    try new_row_groups.append(arena, .{
+        .columns = cols,
+        .total_byte_size = src_rg.total_byte_size,
+        .num_rows = src_rg.num_rows,
+    });
+    return src_rg.num_rows;
 }
 
 fn nowMonoNs() i64 {

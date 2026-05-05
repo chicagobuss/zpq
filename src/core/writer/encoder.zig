@@ -78,6 +78,17 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     const src_rep_levels = sourceRepLevels(in.values);
     const src_max_rep = sourceMaxRep(in.values);
 
+    // Try dictionary encoding for BYTE_ARRAY first. If unique-count is
+    // ≤ 50% of present values AND there are at least 64 present values
+    // we emit a two-page chunk (DICTIONARY_PAGE then DATA_PAGE with
+    // RLE_DICTIONARY-encoded indices). Otherwise we fall through to
+    // the plain path. Numeric columns stay PLAIN (snappy already
+    // compresses fixed-width well; dict adds overhead with marginal
+    // gain on most numeric distributions).
+    if (in.values == .string and src_max_rep == 0) {
+        if (try tryEncodeDictBytes(arena, in, num_values)) |enc| return enc;
+    }
+
     // 1. Encode values via PLAIN — only the non-null subset when input
     //    has actual nulls. For dense inputs (def_levels == null), this
     //    is a straight copy of every value.
@@ -197,6 +208,187 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .data_page_offset = 0, // caller adjusts to absolute offset
         .index_page_offset = null,
         .dictionary_page_offset = null,
+        .statistics = stats,
+    };
+
+    return .{ .bytes = total, .meta = meta };
+}
+
+/// Try to dictionary-encode a BYTE_ARRAY column. Returns null when
+/// the cardinality is too high for dict to help (and we should fall
+/// through to PLAIN), or when there are too few values to bother.
+///
+/// Output layout when we DO dict-encode:
+///   [dict_page_thrift][dict_page_compressed][data_page_thrift][data_page_compressed]
+///
+/// The dict page contains the unique values PLAIN-encoded. The data
+/// page contains the def-level prefix (if optional) then a `<u8 bit_width>`
+/// byte followed by hybrid-RLE-encoded indices into the dictionary.
+/// `data_page_offset` is set to the relative byte offset of the data
+/// page inside the returned `bytes` slice; `dictionary_page_offset` is
+/// 0. Callers must ADD their absolute chunk-start offset to both.
+fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64) Error!?EncodedColumn {
+    const elem = in.schema_elem;
+    const phys = elem.type.?;
+    const string_col = in.values.string;
+    const values = string_col.values;
+    const def_levels = string_col.def_levels;
+    const max_def = string_col.max_def;
+    const is_optional = elem.repetition_type == .OPTIONAL;
+
+    const num_present = countPresent(values.len, def_levels, max_def);
+    if (num_present < 64) return null;
+
+    var lookup = std.StringHashMap(u32).init(arena);
+    defer lookup.deinit();
+    var dict_values: std.ArrayList([]const u8) = .empty;
+    var indices = try arena.alloc(u32, num_present);
+
+    // Bail early if dictionary would grow past 25% of values. Above
+    // that the dict-build cost (hashmap inserts on every distinct
+    // value) starts swamping the snappy savings; at 25% the dict
+    // page itself approaches the size of the PLAIN values, leaving
+    // only the smaller index page as savings — usually not worth
+    // the build-side CPU.
+    const max_cardinality = num_present / 4;
+
+    var idx_pos: usize = 0;
+    for (values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) continue;
+        const gop = try lookup.getOrPut(v);
+        if (!gop.found_existing) {
+            if (dict_values.items.len >= max_cardinality) return null;
+            const new_idx: u32 = @intCast(dict_values.items.len);
+            try dict_values.append(arena, v);
+            gop.value_ptr.* = new_idx;
+        }
+        indices[idx_pos] = gop.value_ptr.*;
+        idx_pos += 1;
+    }
+
+    if (dict_values.items.len == 0) return null;
+
+    // ----- Build dict page -----
+    var dict_raw: std.ArrayList(u8) = .empty;
+    for (dict_values.items) |v| {
+        var len_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, @intCast(v.len), .little);
+        try dict_raw.appendSlice(arena, &len_bytes);
+        try dict_raw.appendSlice(arena, v);
+    }
+    const dict_compressed = try snappy.compressAlloc(arena, dict_raw.items);
+
+    var dict_page_hdr: schema.PageHeader = .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = @intCast(dict_raw.items.len),
+        .compressed_page_size = @intCast(dict_compressed.len),
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = .{
+            .num_values = @intCast(dict_values.items.len),
+            .encoding = .PLAIN,
+            .is_sorted = null,
+        },
+        .data_page_header_v2 = null,
+    };
+    var dw: thrift.Writer = .init(arena);
+    defer dw.deinit();
+    try dict_page_hdr.write(&dw);
+    const dict_thrift_bytes = try arena.dupe(u8, dw.bytes());
+    const dict_total_len = dict_thrift_bytes.len + dict_compressed.len;
+
+    // ----- Build data page (def prefix + bit-width + RLE indices) -----
+    const def_prefix: []const u8 = if (is_optional) blk: {
+        const dl_for_encode = if (def_levels) |dl| dl else mk_all_ones: {
+            const buf = try arena.alloc(u32, @intCast(num_values));
+            @memset(buf, 1);
+            break :mk_all_ones buf;
+        };
+        const def_max = if (max_def > 0) max_def else 1;
+        const bw = bitWidthFor(def_max);
+        const rle = try hybrid_rle.encode(arena, dl_for_encode, bw);
+        const prefix = try arena.alloc(u8, 4 + rle.len);
+        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
+        @memcpy(prefix[4..], rle);
+        break :blk prefix;
+    } else &.{};
+
+    const dict_size: u32 = @intCast(dict_values.items.len);
+    const idx_bit_width = if (dict_size <= 1) @as(u8, 0) else bitWidthFor(dict_size - 1);
+    const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
+
+    const indices_section_len = 1 + idx_rle.len;
+    const data_total_len = def_prefix.len + indices_section_len;
+    const data_payload = try arena.alloc(u8, data_total_len);
+    {
+        var pos: usize = 0;
+        if (def_prefix.len > 0) {
+            @memcpy(data_payload[pos..][0..def_prefix.len], def_prefix);
+            pos += def_prefix.len;
+        }
+        data_payload[pos] = idx_bit_width;
+        pos += 1;
+        @memcpy(data_payload[pos..], idx_rle);
+    }
+    const data_compressed = try snappy.compressAlloc(arena, data_payload);
+
+    var data_page_hdr: schema.PageHeader = .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(data_total_len),
+        .compressed_page_size = @intCast(data_compressed.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = @intCast(num_values),
+            .encoding = .PLAIN_DICTIONARY,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var dpw: thrift.Writer = .init(arena);
+    defer dpw.deinit();
+    try data_page_hdr.write(&dpw);
+    const data_thrift_bytes = try arena.dupe(u8, dpw.bytes());
+    const data_total_with_thrift = data_thrift_bytes.len + data_compressed.len;
+
+    // ----- Concatenate -----
+    const total_len = dict_total_len + data_total_with_thrift;
+    const total = try arena.alloc(u8, total_len);
+    var offset: usize = 0;
+    @memcpy(total[offset..][0..dict_thrift_bytes.len], dict_thrift_bytes);
+    offset += dict_thrift_bytes.len;
+    @memcpy(total[offset..][0..dict_compressed.len], dict_compressed);
+    offset += dict_compressed.len;
+    @memcpy(total[offset..][0..data_thrift_bytes.len], data_thrift_bytes);
+    offset += data_thrift_bytes.len;
+    @memcpy(total[offset..], data_compressed);
+
+    const stats = computeStats(arena, in.values, def_levels, max_def);
+
+    var encodings: schema.EncodingList = .empty;
+    try encodings.append(arena, .RLE);
+    try encodings.append(arena, .PLAIN);
+    try encodings.append(arena, .PLAIN_DICTIONARY);
+
+    var path_list: schema.StringList = .empty;
+    try path_list.appendSlice(arena, in.path_in_schema);
+
+    const total_uncompressed: usize = dict_thrift_bytes.len + dict_raw.items.len +
+        data_thrift_bytes.len + data_total_len;
+
+    const meta: schema.ColumnMetaData = .{
+        .type = phys,
+        .encodings = encodings,
+        .path_in_schema = path_list,
+        .codec = .SNAPPY,
+        .num_values = num_values,
+        .total_uncompressed_size = @intCast(total_uncompressed),
+        .total_compressed_size = @intCast(total_len),
+        // Relative-to-chunk-start. Caller adds absolute chunk start.
+        .data_page_offset = @intCast(dict_total_len),
+        .dictionary_page_offset = 0,
+        .index_page_offset = null,
         .statistics = stats,
     };
 

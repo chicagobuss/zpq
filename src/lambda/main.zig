@@ -1318,7 +1318,14 @@ fn encodeOneRG(
 
         const col_start_in_file: i64 = @intCast(offset.*);
         var em = enc.meta;
-        em.data_page_offset = col_start_in_file;
+        // Encoder sets data_page_offset and (for dict-encoded chunks)
+        // dictionary_page_offset RELATIVE to the start of `enc.bytes`.
+        // We add the absolute col_start_in_file to translate them
+        // into the output stream's coordinate system. Single-page
+        // (PLAIN) chunks have data_page_offset=0 and no dict offset,
+        // so the addition is just a no-op for that case.
+        em.data_page_offset += col_start_in_file;
+        if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
         try sink.write(enc.bytes);
         const t_sink_end = nowMonoNs();
         timings.sink_ns += @intCast(t_sink_end - t_enc_end);

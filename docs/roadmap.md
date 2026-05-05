@@ -338,10 +338,30 @@ modules.
     target if a workload demands it.
   - The hand-rolled zig snappy.compress is preserved but unused. Can
     be removed once we're confident in the vendored impl.
-- **E2. Zstd input + output.** Whole new codec. zstd is increasingly
-  common (better ratio than snappy at similar speed). Probably
-  vendor `libzstd` like we vendor BoringSSL.
-- **E3. Gzip input.** Older parquet files; Hadoop-era tooling.
+- **E2. Zstd input + output** (shipped 2026-05-05).
+  - **E2a (input)**: pure-Zig via `std.compress.zstd.Decompress`.
+    Zero new deps; just wired into the existing
+    `core/parquet/compression.zig::decompress` dispatch. The Zig
+    0.16 stdlib has a production-grade decoder built in.
+  - **E2b (output)**: source-built C library via the existing
+    `allyourcodebase/zstd` dep (was already in `build.zig.zon` from
+    earlier work, just unused). Compression-only build (decoder
+    stripped; std handles that side). Added
+    `compression.compress(arena, src, codec)` mirror of the
+    decompress dispatch. The encoder's `ColumnInput` struct gains
+    an optional `codec` field; lambda exposes the choice via the
+    new `output_codec` request field ("snappy" / "zstd" /
+    "uncompressed").
+
+  Real-S3 measurement (10-file balanced filter, warm runs):
+    snappy output: 71 MB / encode 353 ms / total 1884 ms (default)
+    zstd output:   59 MB / encode 821 ms / total 2296 ms
+  17% smaller files at 22% higher latency — workload-driven choice.
+
+- **E3. Gzip input** (shipped 2026-05-05). Pure-Zig via
+  `std.compress.flate` with `.gzip` container. Same place as E2a;
+  one-line dispatch addition. Lifts a "ZPQ doesn't read this codec"
+  cliff-edge for older Hadoop-era files.
 - **E4. Dictionary encoding writer** (shipped 2026-05-05). Detects
   low-cardinality BYTE_ARRAY columns (≤ 25% unique among present
   values) and emits a two-page chunk: DICTIONARY_PAGE (PLAIN-encoded

@@ -303,9 +303,41 @@ Once the fundamental shapes are settled, we expand "what bytes ZPQ
 can read and write." Each item is contained to encoder/decoder
 modules.
 
-- **E1. Snappy output encoder.** We already decode snappy. Closing
-  the loop is ~200 LoC + tests. Reduces output size 2-3× without
-  perf regression on warm runs.
+- **E1. Snappy output encoder** (shipped 2026-05-05). Two commits
+  on `e1-snappy-output`:
+  1. Wire snappy compression into the encoder; switch
+     `ColumnMetaData.codec` from UNCOMPRESSED to SNAPPY. Caught and
+     fixed a critical bug in our hand-rolled compress where Zig 0.16
+     result-location semantics narrowed `((copy_len-1)<<2)|2` to u8
+     before the shift, dropping the high bit for copy_len > 32 and
+     producing snappy output our own decoder accepted but pyarrow
+     refused as "Corrupt snappy compressed data."
+  2. Vendor google/snappy 1.2.1 source under `vendor/snappy/`,
+     replace `compressAlloc` body with FFI to the C++ implementation.
+     Hand-rolled `compress` preserved as a reference / decode-side
+     fallback. The C++ generic implementation hits ~250 MB/s vs our
+     hand-rolled at ~75 MB/s.
+
+  **Results** (`int8 >= 0` filter on 10-file fixture, warm runs):
+    pre-E1 (uncompressed):                       2007 ms
+    E1 hand-rolled snappy (ReleaseSmall):        2640 ms
+    E1 hand-rolled snappy (ReleaseFast):         2215 ms
+    E1 vendored google/snappy (ReleaseFast):     1818 ms
+
+  Vendored snappy is **9% faster** than uncompressed despite writing
+  72 MB instead of 85 MB. Closes 75% of the gap to Polars (1628 ms);
+  remaining ~190 ms is in encode-loop / decode-loop CPU paths,
+  not compression.
+
+  Lambda binary: 23 MB → 24 MB (+1 MB for libstdc++ static linkage).
+  Well within the 250 MB unzipped quota.
+
+  **Outstanding (E1 follow-ups, deferred):**
+  - Architecture-specific snappy paths (SSSE3, BMI2, NEON-CRC32) are
+    disabled in our vendored build for portability. Re-enable per
+    target if a workload demands it.
+  - The hand-rolled zig snappy.compress is preserved but unused. Can
+    be removed once we're confident in the vendored impl.
 - **E2. Zstd input + output.** Whole new codec. zstd is increasingly
   common (better ratio than snappy at similar speed). Probably
   vendor `libzstd` like we vendor BoringSSL.

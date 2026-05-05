@@ -888,7 +888,7 @@ fn completeMultipart(
     if (std.mem.indexOf(u8, resp.body, "<Error>") != null) return error.CompleteMultipartFailed;
 }
 
-fn extractXml(arena: std.mem.Allocator, xml: []const u8, tag: []const u8) ![]const u8 {
+pub fn extractXml(arena: std.mem.Allocator, xml: []const u8, tag: []const u8) ![]const u8 {
     const open = try std.fmt.allocPrint(arena, "<{s}>", .{tag});
     const close = try std.fmt.allocPrint(arena, "</{s}>", .{tag});
     const start = std.mem.indexOf(u8, xml, open) orelse return error.XmlTagMissing;
@@ -991,7 +991,7 @@ const c = struct {
 /// Per RFC 3986: keep A-Z, a-z, 0-9, '-', '.', '_', '~', '/'; %-encode
 /// everything else. (Hive-style partitions like `year=2026` use '=',
 /// which must be encoded as %3D.)
-fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
+pub fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
     try out.ensureTotalCapacity(arena, key.len + 16);

@@ -47,6 +47,7 @@ pub const io = struct {
     pub const s3 = @import("io/s3.zig");
     pub const pool = @import("io/pool.zig");
     pub const coalescer = @import("io/coalescer.zig");
+    pub const multipart_sink = @import("io/multipart_sink.zig");
 };
 
 test {
@@ -81,4 +82,5 @@ test {
     _ = io.s3;
     _ = io.pool;
     _ = io.coalescer;
+    _ = io.multipart_sink;
 }

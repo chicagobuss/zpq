@@ -269,34 +269,57 @@ const testing = std.testing;
 
 /// Hand-rolled encoder matching the spec; lets tests be self-contained.
 /// Not optimized; intent is clarity, not speed.
-fn encode(comptime T: type, values: []const T, block_size: u32, mini_blocks: u32) ![]u8 {
+/// Default DELTA_BINARY_PACKED block parameters. Multiple of 128 is
+/// required by spec; 128/4 (= 32-value miniblocks) is what most
+/// implementations emit and what every reader is well-tested against.
+pub const DEFAULT_BLOCK_SIZE: u32 = 128;
+pub const DEFAULT_MINI_BLOCKS: u32 = 4;
+
+/// Encode `values` as DELTA_BINARY_PACKED. Returns a newly-allocated
+/// slice owned by `allocator`. T must be i32 or i64.
+///
+/// The encoder always writes the same wire format regardless of input
+/// distribution. For sorted/timestamp columns this dominates PLAIN by
+/// 4-8×; for random columns it's roughly equivalent (per-block
+/// overhead is small and bit-packing adapts to the actual delta range).
+pub fn encode(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    values: []const T,
+    block_size: u32,
+    mini_blocks: u32,
+) ![]u8 {
+    comptime {
+        switch (T) {
+            i32, i64 => {},
+            else => @compileError("DELTA_BINARY_PACKED only supports i32 / i64"),
+        }
+    }
     std.debug.assert(block_size > 0 and block_size % mini_blocks == 0);
     var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(testing.allocator);
+    errdefer buf.deinit(allocator);
 
-    try writeUVarint(&buf, block_size);
-    try writeUVarint(&buf, mini_blocks);
-    try writeUVarint(&buf, values.len);
+    try writeUVarint(allocator, &buf, block_size);
+    try writeUVarint(allocator, &buf, mini_blocks);
+    try writeUVarint(allocator, &buf, values.len);
     if (values.len == 0) {
-        try writeZigzag(T, &buf, 0);
-        return buf.toOwnedSlice(testing.allocator);
+        try writeZigzag(T, allocator, &buf, 0);
+        return buf.toOwnedSlice(allocator);
     }
-    try writeZigzag(T, &buf, values[0]);
+    try writeZigzag(T, allocator, &buf, values[0]);
 
     const mini_block_size = block_size / mini_blocks;
 
     var i: usize = 1;
     while (i < values.len) {
-        // Block: collect deltas for up to block_size values.
         const block_end = @min(i + block_size, values.len);
         const n = block_end - i;
 
         var deltas: [4096]T = undefined;
         var j: usize = 0;
         while (j < n) : (j += 1) {
-            deltas[j] = values[i + j] - values[i + j - 1];
+            deltas[j] = values[i + j] -% values[i + j - 1];
         }
-        // Pad with min_delta value so bit-packing math stays clean.
         var min_d: T = if (n == 0) 0 else deltas[0];
         var k: usize = 1;
         while (k < n) : (k += 1) {
@@ -305,9 +328,8 @@ fn encode(comptime T: type, values: []const T, block_size: u32, mini_blocks: u32
         // Pad the rest of the block with min_d so the bit-packed delta = 0.
         while (j < block_size) : (j += 1) deltas[j] = min_d;
 
-        try writeZigzag(T, &buf, min_d);
+        try writeZigzag(T, allocator, &buf, min_d);
 
-        // Compute per-mini-block bit widths.
         var widths: [MAX_MINI_BLOCKS]u8 = std.mem.zeroes([MAX_MINI_BLOCKS]u8);
         var mb: u32 = 0;
         while (mb < mini_blocks) : (mb += 1) {
@@ -316,15 +338,20 @@ fn encode(comptime T: type, values: []const T, block_size: u32, mini_blocks: u32
             var max_diff: u64 = 0;
             var v: usize = start;
             while (v < stop) : (v += 1) {
-                const d = deltas[v] - min_d;
-                const u: u64 = @intCast(d);
+                // (delta - min_d) is guaranteed non-negative by min_d's
+                // definition; widen via @bitCast for the unsigned compare.
+                const d_signed: T = deltas[v] -% min_d;
+                const u: u64 = switch (T) {
+                    i32 => @as(u64, @as(u32, @bitCast(d_signed))),
+                    i64 => @as(u64, @bitCast(d_signed)),
+                    else => unreachable,
+                };
                 if (u > max_diff) max_diff = u;
             }
             widths[mb] = if (max_diff == 0) 0 else @intCast(64 - @clz(max_diff));
         }
-        try buf.appendSlice(testing.allocator, widths[0..mini_blocks]);
+        try buf.appendSlice(allocator, widths[0..mini_blocks]);
 
-        // Pack each mini-block.
         mb = 0;
         while (mb < mini_blocks) : (mb += 1) {
             const start = mb * mini_block_size;
@@ -336,40 +363,53 @@ fn encode(comptime T: type, values: []const T, block_size: u32, mini_blocks: u32
             var bits: u8 = 0;
             var v: usize = start;
             while (v < stop) : (v += 1) {
-                const d = deltas[v] - min_d;
-                const u: u64 = @intCast(d);
+                const d_signed: T = deltas[v] -% min_d;
+                const u: u64 = switch (T) {
+                    i32 => @as(u64, @as(u32, @bitCast(d_signed))),
+                    i64 => @as(u64, @bitCast(d_signed)),
+                    else => unreachable,
+                };
                 bit_buffer |= u << @intCast(bits);
                 bits += bw;
                 while (bits >= 8) {
-                    try buf.append(testing.allocator, @truncate(bit_buffer));
+                    try buf.append(allocator, @truncate(bit_buffer));
                     bit_buffer >>= 8;
                     bits -= 8;
                 }
             }
             if (bits > 0) {
-                try buf.append(testing.allocator, @truncate(bit_buffer));
+                try buf.append(allocator, @truncate(bit_buffer));
             }
         }
 
         i = block_end;
     }
 
-    return buf.toOwnedSlice(testing.allocator);
+    return buf.toOwnedSlice(allocator);
 }
 
-fn writeUVarint(buf: *std.ArrayList(u8), value: u64) !void {
+/// Convenience wrapper: encode with the default block parameters.
+pub fn encodeDefault(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    values: []const T,
+) ![]u8 {
+    return encode(T, allocator, values, DEFAULT_BLOCK_SIZE, DEFAULT_MINI_BLOCKS);
+}
+
+fn writeUVarint(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: u64) !void {
     var v = value;
     while (true) {
         if (v < 0x80) {
-            try buf.append(testing.allocator, @intCast(v));
+            try buf.append(allocator, @intCast(v));
             return;
         }
-        try buf.append(testing.allocator, @as(u8, @intCast(v & 0x7f)) | 0x80);
+        try buf.append(allocator, @as(u8, @intCast(v & 0x7f)) | 0x80);
         v >>= 7;
     }
 }
 
-fn writeZigzag(comptime T: type, buf: *std.ArrayList(u8), value: T) !void {
+fn writeZigzag(comptime T: type, allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: T) !void {
     const w: u64 = switch (T) {
         i32 => blk: {
             const z: i32 = (value << 1) ^ (value >> 31);
@@ -381,12 +421,12 @@ fn writeZigzag(comptime T: type, buf: *std.ArrayList(u8), value: T) !void {
         },
         else => @compileError("unsupported"),
     };
-    try writeUVarint(buf, w);
+    try writeUVarint(allocator, buf, w);
 }
 
 test "single block, simple ascending sequence i32" {
     const values = [_]i32{ 10, 12, 14, 16, 18, 20, 22, 24 };
-    const enc = try encode(i32, &values, 128, 4);
+    const enc = try encode(i32, testing.allocator, &values, 128, 4);
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i32).init(enc);
@@ -398,7 +438,7 @@ test "single block, simple ascending sequence i32" {
 
 test "constant sequence (all-zero deltas)" {
     const values = [_]i32{42} ** 32;
-    const enc = try encode(i32, &values, 128, 4);
+    const enc = try encode(i32, testing.allocator, &values, 128, 4);
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i32).init(enc);
@@ -412,7 +452,7 @@ test "descending sequence (negative deltas) i64" {
     var values: [16]i64 = undefined;
     var i: usize = 0;
     while (i < values.len) : (i += 1) values[i] = 1000 - @as(i64, @intCast(i)) * 7;
-    const enc = try encode(i64, &values, 128, 4);
+    const enc = try encode(i64, testing.allocator, &values, 128, 4);
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i64).init(enc);
@@ -426,7 +466,7 @@ test "spans two blocks" {
     var values: [200]i32 = undefined;
     var i: usize = 0;
     while (i < values.len) : (i += 1) values[i] = @intCast(i * i);
-    const enc = try encode(i32, &values, 128, 4); // 128/block, 200 values → 2 blocks
+    const enc = try encode(i32, testing.allocator, &values, 128, 4); // 128/block, 200 values → 2 blocks
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i32).init(enc);
@@ -437,7 +477,7 @@ test "spans two blocks" {
 }
 
 test "empty stream returns 0" {
-    const enc = try encode(i32, &[_]i32{}, 128, 4);
+    const enc = try encode(i32, testing.allocator, &[_]i32{}, 128, 4);
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i32).init(enc);
@@ -450,7 +490,7 @@ test "partial decode preserves state across calls" {
     var values: [50]i32 = undefined;
     var i: usize = 0;
     while (i < values.len) : (i += 1) values[i] = @intCast(i * 3);
-    const enc = try encode(i32, &values, 128, 4);
+    const enc = try encode(i32, testing.allocator, &values, 128, 4);
     defer testing.allocator.free(enc);
 
     var dec = try Decoder(i32).init(enc);

@@ -24,6 +24,7 @@ const filter_selection = @import("../filter/selection.zig");
 const hybrid_rle = @import("../parquet/encoding/hybrid_rle.zig");
 const snappy = @import("../parquet/snappy.zig");
 const compression = @import("../parquet/compression.zig");
+const delta_binary_packed = @import("../parquet/encoding/delta_binary_packed.zig");
 
 pub const Error = error{
     NullableNotSupported,
@@ -95,10 +96,22 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         if (try tryEncodeDictBytes(arena, in, num_values)) |enc| return enc;
     }
 
-    // 1. Encode values via PLAIN — only the non-null subset when input
-    //    has actual nulls. For dense inputs (def_levels == null), this
-    //    is a straight copy of every value.
-    const values_bytes = try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def);
+    // 1. Encode values. For i32/i64 columns we use DELTA_BINARY_PACKED
+    //    — it dominates PLAIN by 4-8× on sorted/timestamp columns and
+    //    is roughly equivalent on random data (per-block overhead is
+    //    small and bit-packing adapts to actual delta range). For
+    //    f32/f64/string/bool we use PLAIN.
+    //
+    //    The page-header `encoding` field is set accordingly below.
+    const delta_bytes_opt = if (src_max_rep == 0)
+        try tryEncodeValuesDelta(arena, in.values, src_def_levels, src_max_def)
+    else
+        null;
+    const values_bytes = if (delta_bytes_opt) |b|
+        b
+    else
+        try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def);
+    const values_encoding: schema.Encoding = if (delta_bytes_opt != null) .DELTA_BINARY_PACKED else .PLAIN;
 
     // 2a. Rep-level prefix when the column has nesting (max_rep > 0).
     //     Same `<u32 LE byte_len><RLE bytes>` framing as def levels.
@@ -177,7 +190,7 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .crc = null,
         .data_page_header = .{
             .num_values = @intCast(num_values),
-            .encoding = .PLAIN,
+            .encoding = values_encoding,
             .definition_level_encoding = .RLE,
             .repetition_level_encoding = .RLE,
         },
@@ -197,8 +210,13 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     // 7. Build ColumnMetaData. total_uncompressed_size and
     //    total_compressed_size include the page header (parquet spec).
     //    They differ by `data_total_len - compressed.len`.
+    //
+    //    The encodings list reports every encoding present in the
+    //    chunk. We always have RLE (def/rep levels), then either
+    //    PLAIN or DELTA_BINARY_PACKED for the values themselves.
     var encodings: schema.EncodingList = .empty;
-    try encodings.append(arena, .PLAIN);
+    try encodings.append(arena, .RLE);
+    try encodings.append(arena, values_encoding);
 
     var path_list: schema.StringList = .empty;
     try path_list.appendSlice(arena, in.path_in_schema);
@@ -601,6 +619,54 @@ fn encodeValuesPlain(
         .string => |c| try encodePlainBytes(arena, c.values, def_levels, max_def),
         .boolean => |c| try encodePlainBool(arena, c.values, def_levels, max_def),
     };
+}
+
+/// DELTA_BINARY_PACKED encoding for i32/i64 columns. Materializes the
+/// present-only subset as a contiguous typed slice (for use in the
+/// delta encoder which doesn't know about def_levels), then encodes
+/// it. Returns null for non-INT32/INT64 columns — caller falls back
+/// to PLAIN.
+fn tryEncodeValuesDelta(
+    arena: std.mem.Allocator,
+    vals: filter_eval.Batch.Column,
+    def_levels: ?[]const u32,
+    max_def: u32,
+) Error!?[]u8 {
+    return switch (vals) {
+        .i32 => |c| try buildAndDeltaEncode(i32, arena, c.values, def_levels, max_def),
+        .i64 => |c| try buildAndDeltaEncode(i64, arena, c.values, def_levels, max_def),
+        else => null,
+    };
+}
+
+fn buildAndDeltaEncode(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    values: []const T,
+    def_levels: ?[]const u32,
+    max_def: u32,
+) Error![]u8 {
+    const num_present = countPresent(values.len, def_levels, max_def);
+    if (num_present == 0) {
+        // Empty payload still needs a valid header. delta encoder
+        // handles len=0 by writing header-only with 0 first_value.
+        return try delta_binary_packed.encodeDefault(T, arena, &[_]T{});
+    }
+
+    if (def_levels == null) {
+        // Dense path — values is already the present-only slice.
+        return try delta_binary_packed.encodeDefault(T, arena, values);
+    }
+
+    // Sparse path — copy present values into a contiguous buffer.
+    const dense = try arena.alloc(T, num_present);
+    var pos: usize = 0;
+    for (values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) continue;
+        dense[pos] = v;
+        pos += 1;
+    }
+    return try delta_binary_packed.encodeDefault(T, arena, dense);
 }
 
 /// Number of slots where def_levels[i] == max_def. When def_levels is

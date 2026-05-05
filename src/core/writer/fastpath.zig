@@ -583,6 +583,43 @@ test "build with projection emits only kept columns" {
     );
 }
 
+test "buildMulti with N=10 copies of the same file" {
+    // Repro for the lambda-side InvalidColumnOffsets bug observed at
+    // N=10 no-filter against the partitioned fixture. If the fastpath
+    // is the culprit, this test fails locally (no network involved).
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var meta = try metadata.open(arena, file_bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+
+    const N = 10;
+    const specs = try arena.alloc(FileSpec, N);
+    for (specs) |*sp| sp.* = .{
+        .bytes = file_bytes,
+        .meta = &meta,
+        .survivors = survivors,
+    };
+
+    const out = try buildMulti(arena, specs, null);
+    const out_meta = try metadata.open(arena, out);
+    try testing.expectEqual(meta.num_rows * N, out_meta.num_rows);
+    try testing.expectEqual(meta.row_groups.items.len * N, out_meta.row_groups.items.len);
+    std.debug.print("[fastpath] N=10 multi: in={d}B×N={d}B out={d}B rg={d}\n", .{ file_bytes.len, file_bytes.len * N, out.len, out_meta.row_groups.items.len });
+}
+
 test "build rejects mismatched survivors length" {
     const arena = testing.allocator;
     const empty_bytes: [12]u8 = .{ 'P', 'A', 'R', '1', 0, 0, 0, 0, 'P', 'A', 'R', '1' };

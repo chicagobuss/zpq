@@ -177,7 +177,10 @@ pub const LogicalType = union(enum) {
             const field = try reader.readFieldBegin();
             if (field.type == .Stop) break;
             switch (field.id) {
-                1 => res.bitWidth = @as(i8, @intCast(try reader.readZigZag(i16))),
+                1 => res.bitWidth = if (field.type == .Byte)
+                    @as(i8, @bitCast(try reader.readByte()))
+                else
+                    @as(i8, @intCast(try reader.readZigZag(i16))),
                 2 => res.isSigned = (field.type == .True),
                 else => try reader.skip(field.type),
             }
@@ -217,7 +220,7 @@ pub const LogicalType = union(enum) {
             .INTEGER => |i| {
                 try writer.writeFieldBegin(.Struct, 10);
                 writer.writeStructBegin();
-                try writer.writeFieldI32(1, @as(i32, i.bitWidth));
+                try writer.writeFieldI8(1, i.bitWidth);
                 try writer.writeFieldBool(2, i.isSigned);
                 try writer.writeStructEnd();
             },
@@ -425,6 +428,72 @@ pub const DictionaryPageHeader = struct {
     }
 };
 
+/// Modern data page header (page_type == DATA_PAGE_V2). Differs from
+/// V1 in three load-bearing ways:
+///   1. Levels are stored UNCOMPRESSED in the page body, with their
+///      lengths reported in this header (not as `<u32 LE>` prefixes
+///      inside the compressed payload).
+///   2. Only the values portion is optionally compressed (per
+///      `is_compressed`); levels are never compressed.
+///   3. The header distinguishes leaves (`num_values`) from logical
+///      rows (`num_rows`), and reports `num_nulls` directly.
+pub const DataPageHeaderV2 = struct {
+    num_values: i32,
+    num_nulls: i32,
+    num_rows: i32,
+    encoding: Encoding,
+    definition_levels_byte_length: i32,
+    repetition_levels_byte_length: i32,
+    is_compressed: bool, // default true per spec
+    // statistics intentionally skipped (we don't consume v2 stats yet)
+
+    pub fn read(reader: *thrift.Reader) !DataPageHeaderV2 {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+
+        var header = DataPageHeaderV2{
+            .num_values = 0,
+            .num_nulls = 0,
+            .num_rows = 0,
+            .encoding = .PLAIN,
+            .definition_levels_byte_length = 0,
+            .repetition_levels_byte_length = 0,
+            .is_compressed = true, // spec default
+        };
+
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => header.num_values = try reader.readZigZag(i32),
+                2 => header.num_nulls = try reader.readZigZag(i32),
+                3 => header.num_rows = try reader.readZigZag(i32),
+                4 => header.encoding = @as(Encoding, @enumFromInt(try reader.readZigZag(i32))),
+                5 => header.definition_levels_byte_length = try reader.readZigZag(i32),
+                6 => header.repetition_levels_byte_length = try reader.readZigZag(i32),
+                7 => header.is_compressed = (field.type == .True),
+                else => try reader.skip(field.type),
+            }
+        }
+        return header;
+    }
+
+    pub fn write(self: *const DataPageHeaderV2, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        try writer.writeFieldI32(1, self.num_values);
+        try writer.writeFieldI32(2, self.num_nulls);
+        try writer.writeFieldI32(3, self.num_rows);
+        try writer.writeFieldI32(4, @intFromEnum(self.encoding));
+        try writer.writeFieldI32(5, self.definition_levels_byte_length);
+        try writer.writeFieldI32(6, self.repetition_levels_byte_length);
+        // is_compressed defaults to true; only emit when false.
+        if (!self.is_compressed) try writer.writeFieldBool(7, false);
+        try writer.writeStructEnd();
+    }
+};
+
 pub const PageHeader = struct {
     type: PageType,
     uncompressed_page_size: i32,
@@ -432,7 +501,7 @@ pub const PageHeader = struct {
     crc: ?i32,
     data_page_header: ?DataPageHeader,
     dictionary_page_header: ?DictionaryPageHeader,
-    // v2 skipped for now
+    data_page_header_v2: ?DataPageHeaderV2,
 
     pub fn read(reader: *thrift.Reader) !PageHeader {
         const saved_id = reader.last_field_id;
@@ -446,6 +515,7 @@ pub const PageHeader = struct {
             .crc = null,
             .data_page_header = null,
             .dictionary_page_header = null,
+            .data_page_header_v2 = null,
         };
 
         reader.readStructBegin();
@@ -460,6 +530,7 @@ pub const PageHeader = struct {
                 4 => header.crc = try reader.readZigZag(i32),
                 5 => header.data_page_header = try DataPageHeader.read(reader),
                 7 => header.dictionary_page_header = try DictionaryPageHeader.read(reader),
+                8 => header.data_page_header_v2 = try DataPageHeaderV2.read(reader),
                 else => try reader.skip(field.type),
             }
         }
@@ -478,6 +549,10 @@ pub const PageHeader = struct {
         }
         if (self.dictionary_page_header) |*dph| {
             try writer.writeFieldBegin(.Struct, 7);
+            try dph.write(writer);
+        }
+        if (self.data_page_header_v2) |*dph| {
+            try writer.writeFieldBegin(.Struct, 8);
             try dph.write(writer);
         }
         try writer.writeStructEnd();
@@ -1007,6 +1082,7 @@ test "page header roundtrip" {
             .repetition_level_encoding = .RLE,
         },
         .dictionary_page_header = null,
+        .data_page_header_v2 = null,
     };
 
     var writer = thrift.Writer.init(allocator);

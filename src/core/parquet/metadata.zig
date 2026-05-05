@@ -149,6 +149,51 @@ test "open rejects bad magic" {
     try testing.expectError(error.BadMagic, open(testing.allocator, &bytes));
 }
 
+test "footer round-trip: read → write → read produces identical metadata" {
+    const fixture_path = "data/benchmark_100mb.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = try open(arena, file_bytes);
+
+    // Write the parsed meta into a fresh thrift buffer.
+    var w: thrift.Writer = .init(arena);
+    defer w.deinit();
+    try meta.write(&w);
+    const footer_bytes = w.bytes();
+
+    // Build a synthetic parquet "skeleton" with this footer so we can
+    // re-open it via the same code path (round-trip).
+    var synth: std.ArrayList(u8) = .empty;
+    defer synth.deinit(arena);
+    try synth.appendSlice(arena, &MAGIC);
+    try synth.appendSlice(arena, footer_bytes);
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    try synth.appendSlice(arena, &len_bytes);
+    try synth.appendSlice(arena, &MAGIC);
+
+    // Open again — this will fail if our writer produces invalid thrift.
+    const meta2 = try open(arena, synth.items);
+    try testing.expectEqual(meta.num_rows, meta2.num_rows);
+    try testing.expectEqual(meta.row_groups.items.len, meta2.row_groups.items.len);
+    try testing.expectEqual(meta.schema.items.len, meta2.schema.items.len);
+    for (meta.schema.items, meta2.schema.items) |a, b| {
+        try testing.expectEqualStrings(a.name, b.name);
+        try testing.expectEqual(a.repetition_type, b.repetition_type);
+    }
+}
+
 test "open the bench fixture" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {

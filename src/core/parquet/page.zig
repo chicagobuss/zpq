@@ -54,6 +54,25 @@ pub const PageReader = struct {
     }
 
     /// Read the next page. Returns null at end of chunk.
+    ///
+    /// V1 (DATA_PAGE / DICTIONARY_PAGE): the entire payload is
+    /// compressed by the column codec. We decompress all of it and
+    /// return the resulting bytes via `page.bytes`.
+    ///
+    /// V2 (DATA_PAGE_V2): per spec, levels are stored UNCOMPRESSED in
+    /// the page body and only the values portion is optionally
+    /// compressed (per the V2 header's `is_compressed` flag). Layout:
+    ///
+    ///     [rep_levels (rep_byte_len, uncompressed)]
+    ///     [def_levels (def_byte_len, uncompressed)]
+    ///     [values (compressed_page_size - rep_byte_len - def_byte_len bytes,
+    ///       compressed iff is_compressed)]
+    ///
+    /// We materialise a single `bytes` slice that's `uncompressed_
+    /// page_size` long, with levels copied verbatim and values
+    /// decompressed in place. Downstream V2 decoders slice the result
+    /// by the same level lengths and never need to know whether the
+    /// source was compressed.
     pub fn next(self: *PageReader) Error!?Page {
         if (self.pos >= self.chunk.len) return null;
 
@@ -76,6 +95,44 @@ pub const PageReader = struct {
         const payload_start = self.pos + header_size;
         const payload = self.chunk[payload_start..][0..csize];
         self.pos = payload_start + csize;
+
+        if (header.type == .DATA_PAGE_V2) {
+            const v2 = header.data_page_header_v2 orelse return error.BadPageHeader;
+            if (v2.repetition_levels_byte_length < 0 or v2.definition_levels_byte_length < 0) {
+                return error.NegativeSize;
+            }
+            const rep_len: usize = @intCast(v2.repetition_levels_byte_length);
+            const def_len: usize = @intCast(v2.definition_levels_byte_length);
+            if (rep_len + def_len > csize) return error.UnexpectedEndOfChunk;
+
+            const compressed_value_len = csize - rep_len - def_len;
+            const value_uncompressed_len = if (usize_ >= rep_len + def_len)
+                usize_ - rep_len - def_len
+            else
+                return error.UnexpectedEndOfChunk;
+
+            const out = try self.arena.alloc(u8, usize_);
+            @memcpy(out[0..rep_len], payload[0..rep_len]);
+            @memcpy(out[rep_len..][0..def_len], payload[rep_len..][0..def_len]);
+
+            const value_src = payload[rep_len + def_len ..][0..compressed_value_len];
+            const values_dst = out[rep_len + def_len ..][0..value_uncompressed_len];
+            if (v2.is_compressed and self.codec != .UNCOMPRESSED) {
+                const decompressed = try compression.decompress(
+                    self.arena,
+                    value_src,
+                    self.codec,
+                    value_uncompressed_len,
+                );
+                if (decompressed.len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
+                @memcpy(values_dst, decompressed);
+            } else {
+                if (compressed_value_len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
+                @memcpy(values_dst, value_src);
+            }
+
+            return .{ .header = header, .bytes = out };
+        }
 
         const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
         return .{ .header = header, .bytes = decompressed };

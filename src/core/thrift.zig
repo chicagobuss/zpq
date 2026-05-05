@@ -287,6 +287,15 @@ pub const Writer = struct {
         self.last_field_id = field_id;
     }
 
+    pub fn writeFieldI8(self: *Writer, field_id: i16, value: i8) !void {
+        // Compact thrift i8/byte values are written as a single signed
+        // byte — NOT zigzag, NOT varint. Strict readers (pyarrow,
+        // parquet-mr, DuckDB) reject IntType.bitWidth and similar i8
+        // fields when written with the I32 type marker.
+        try self.writeFieldBegin(.Byte, field_id);
+        try self.writeByte(@as(u8, @bitCast(value)));
+    }
+
     pub fn writeFieldI32(self: *Writer, field_id: i16, value: i32) !void {
         try self.writeFieldBegin(.I32, field_id);
         try self.writeZigZag(value);

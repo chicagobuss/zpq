@@ -14,6 +14,7 @@ pub const core = struct {
         pub const prune = @import("core/filter/prune.zig");
         pub const selection = @import("core/filter/selection.zig");
         pub const eval = @import("core/filter/eval.zig");
+        pub const partition = @import("core/filter/partition.zig");
     };
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
@@ -21,6 +22,7 @@ pub const core = struct {
     };
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
+        pub const schema_tree = @import("core/parquet/schema_tree.zig");
         pub const snappy = @import("core/parquet/snappy.zig");
         pub const lz4 = @import("core/parquet/lz4.zig");
         pub const compression = @import("core/parquet/compression.zig");
@@ -56,9 +58,11 @@ test {
     _ = core.filter.prune;
     _ = core.filter.selection;
     _ = core.filter.eval;
+    _ = core.filter.partition;
     _ = core.writer.fastpath;
     _ = core.writer.encoder;
     _ = core.parquet.metadata;
+    _ = core.parquet.schema_tree;
     _ = core.parquet.snappy;
     _ = core.parquet.lz4;
     _ = core.parquet.compression;

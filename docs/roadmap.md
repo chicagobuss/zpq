@@ -390,6 +390,22 @@ engine itself.
   isn't wired to anything useful. Make `zpq query --input s3://...
   --filter "x>10" --output s3://...` work locally and on workstations.
   Same engine, no Lambda runtime API.
+
+  Specifically includes:
+  - `--report-timings` (or always-on summary) emitting the same
+    per-phase breakdown the Lambda already returns in its JSON
+    envelope (`fetch_concurrent_ms`, `decode_ms`, `eval_ms`,
+    `encode_ms`, `sink_ms`, `footer_ms`). The instrumentation
+    primitives in lambda/main.zig (`Timings` struct, `nowMonoNs`)
+    are CLI-ready as-is; the work is wiring an output shape.
+    Cribbing the Lambda JSON shape verbatim is the path of least
+    resistance — same parser everywhere.
+  - Reading from local files (no S3 round-trip) for ad-hoc dev
+    work and for any future probe scripts that don't want to
+    pay AWS latency.
+  - Writing to stdout / local file as well as S3, so unit-level
+    perf benchmarks can iterate without round-tripping through
+    Lambda deploy.
 - **F2. API versioning.** Add `version: "1"` to the request shape
   with a default. Document the JSON contract.
 - **F3. Structured logs.** Replace `std.debug.print` usage in the

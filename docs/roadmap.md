@@ -141,12 +141,27 @@ pivot here, we redo those features.
   - Cold start: 10 ms init / 1752 ms total. No regression.
 
   **Outstanding (B3 follow-ups, deferred):**
-  - **Input-side streaming.** Inputs are still fetched as full file
-    bytes upfront — the new memory ceiling. For inputs >> 512 MB,
-    that becomes the bottleneck. Touches `s3.fetchJobs` and the
-    decode path; can land independently of any output work.
   - Tautology-filter dispatch hack (B1.z) still needs cleaning up
     via a `?filter` parameter on `buildFilteredOutputMulti`.
+- **B4. Streaming input** (in progress on `b4-input-streaming`).
+  Counterpart to B3: inputs are still fetched as full file bytes
+  upfront — the new memory ceiling. For inputs >> 512 MB, that
+  becomes the bottleneck. The architectural pattern (per-file RG
+  iterator with bounded resident memory, parallel across files) is
+  cribbed from DuckDB / Hardwood; the merge-write composition that
+  feeds it is ZPQ-specific (none of the comparables target N→1
+  streaming Parquet output).
+
+  **Probe result (2026-05-05):** strict per-file serialization
+  regresses 39% on partprune and 81% on copyall. v1 must preserve
+  cross-file parallelism via an `Io.Group` of N concurrent file
+  iterators.
+
+  **Design hint from medium-term roadmap:** the per-file iterator
+  should yield a generic `{ raw_bytes, decoded_batch }` per RG, not
+  raw bytes only. That lets the same iterator feed (a) byte-copy
+  fastpath, (b) filter+encode, (c) future aggregate consumers (see
+  Phase C) — all reading from the same scan primitive.
 
 **What breaks if we skip B and do D (codecs) first?**
 - A snappy output encoder built for the current "encode whole file
@@ -159,80 +174,122 @@ pivot here, we redo those features.
 
 ---
 
-## Phase C — Architectural Variants (medium rewrite risk; localised)
+## Phase C — Compute Primitives (medium rewrite risk; absorbs old E)
+
+Once input + output streaming are done, ZPQ becomes capable of doing
+real per-RG compute work without touching its memory ceiling. This
+phase generalizes "filter and re-encode" into a small but coherent
+compute layer: expressions (transformations), aggregate kernels, and
+group-by. The existing filter surface (`Phase E` in earlier
+revisions of this doc) folds in here as "expression operator
+coverage."
+
+**Strategic frame:** ZPQ is not becoming DuckDB. The target is
+"simple filters + transformations + simple aggregations within a
+file" as the user-facing capability matrix. Joins, window functions,
+complex SQL surface, and full optimizer machinery stay out of scope.
+
+- **C1. Batch-iterator-as-primitive.** Refactor the lambda's
+  filter/encode and fastpath consumers to read from the B4 scan
+  iterator's `{ raw_bytes, decoded_batch }` per-RG output. Lifts
+  the current ad-hoc "lambda owns the loop" shape into an explicit
+  scan→consumer protocol. Light, no new features. ~150 LoC of
+  reorganization. Lands the moment B4 ships.
+- **C2. Expression evaluator.** A small typed-expression AST and
+  evaluator for transformations like `col_a * 2 + col_b`,
+  `coalesce(x, 0)`, `case when x > 10 then 'high' else 'low' end`.
+  Hand-coded kernels per operator-type combination — no generic
+  comptime VM, no LLVM, no plan optimization. Output of C2 is a
+  new `Batch.Column` per row, fed back into the encoder.
+- **C3. Filter operator coverage.** Folded from old Phase E:
+  - **C3.a `IS NULL` / `IS NOT NULL`** — uses def_levels we
+    already produce.
+  - **C3.b `NOT`** — unary negation.
+  - **C3.c parentheses** — parser only; precedence already exists.
+  - **C3.d `IN (...)`** — sugar for OR-of-equalities, or its own
+    leaf with hash-set lookup if the list is large.
+  - **C3.e `LIKE`** — pattern match with `%` / `_` and escape.
+  Each lands independently in any order. C2 makes some of these
+  trivial because the evaluator already handles the typing
+  machinery.
+- **C4. Aggregate kernels (no group-by).** `sum`, `count`,
+  `min`, `max`, `avg` over a column or expression. Single-pass over
+  decoded batches; final flush at end. Output is one row.
+- **C5. Group-by, in-memory only.** Hash-table keyed by group-by
+  expressions, valued by accumulator state. Memory ceiling becomes
+  `O(num_groups × num_aggregates)` — for high-cardinality keys this
+  can blow up. v1: fail loud above a configurable threshold (e.g.
+  10M groups). Spilling to `/tmp` (Lambda has 10 GB) is a future
+  C6.
+- **C6. Group-by spilling.** Same model as DuckDB / Polars: when
+  the in-memory hash table exceeds a budget, spill partitions to
+  `/tmp` and merge during finalization. Real engineering project;
+  defer until a workload demands it.
+
+**What breaks if we skip C and do D (codecs) first?**
+- D5/D6 (DELTA writers) make the most sense when there's an
+  expression-level "is this column sorted / correlated?" check,
+  which lives naturally in C2's evaluator infrastructure.
+- D7 (bloom filter writer) wants to know which columns to build
+  bloom filters for — a hint that comes from C-layer analysis.
+
+---
+
+## Phase D — Architectural Variants (medium rewrite risk; localised)
 
 Things that change *one* major subsystem but don't ripple. Order
-within this phase is flexible; B1 must precede C2.
+within this phase is flexible; B1 must precede D2.
 
-- **C1. Cross-bucket inputs / outputs.** Pool is single-bucket today
+- **D1. Cross-bucket inputs / outputs.** Pool is single-bucket today
   by simplifying assumption. Most real data platforms separate read
   and write buckets. Either: (a) one pool per bucket, lazy-init; or
   (b) a single pool that knows N hosts. (a) is simpler and probably
   fine for ≤3 buckets per invocation. Independent of B; could land
-  any time, but better before HTTP/2 multiplex (G2) so the multi-host
+  any time, but better before HTTP/2 multiplex (H2) so the multi-host
   model influences the connection design.
-- **C2. Schema evolution across files.** Today: identical schemas
+- **D2. Schema evolution across files.** Today: identical schemas
   required, error otherwise. Realistic: column added month over
   month. Output schema = union; missing column in older file = all
   nulls in that file's contribution. Depends on B1 — the schema
   reconciliation logic is much cleaner once nested types are real.
 
-**What breaks if we skip C2 and assume identical schemas through D
-and E?** Filter binding logic codifies "lookup by index in file 0";
-when schema evolution lands the index→column_path mapping has to be
-reworked. Filter AST that uses `col_idx` may need to switch to
-column-path keys. Better to settle that before we accumulate filter
-features (E).
+**What breaks if we skip D2 and assume identical schemas through E
+and beyond?** Filter binding logic codifies "lookup by index in
+file 0"; when schema evolution lands the index→column_path mapping
+has to be reworked. Filter AST that uses `col_idx` may need to switch
+to column-path keys. Better to settle that before we accumulate more
+expression features (C).
 
 ---
 
-## Phase D — Codec & Encoding Breadth (low rewrite risk; additive)
+## Phase E — Codec & Encoding Breadth (low rewrite risk; additive)
 
 Once the fundamental shapes are settled, we expand "what bytes ZPQ
 can read and write." Each item is contained to encoder/decoder
 modules.
 
-- **D1. Snappy output encoder.** We already decode snappy. Closing
+- **E1. Snappy output encoder.** We already decode snappy. Closing
   the loop is ~200 LoC + tests. Reduces output size 2-3× without
   perf regression on warm runs.
-- **D2. Zstd input + output.** Whole new codec. zstd is increasingly
+- **E2. Zstd input + output.** Whole new codec. zstd is increasingly
   common (better ratio than snappy at similar speed). Probably
   vendor `libzstd` like we vendor BoringSSL.
-- **D3. Gzip input.** Older parquet files; Hadoop-era tooling.
-- **D4. Dictionary encoding writer.** RLE_DICTIONARY for low-card
+- **E3. Gzip input.** Older parquet files; Hadoop-era tooling.
+- **E4. Dictionary encoding writer.** RLE_DICTIONARY for low-card
   columns. Big perf win for re-encoded strings.
-- **D5. DELTA_BINARY_PACKED writer.** For sorted/timestamp columns.
-- **D6. DELTA_BYTE_ARRAY writer.** For correlated string columns.
-- **D7. Bloom filter writer.** Footer-level structure for
+- **E5. DELTA_BINARY_PACKED writer.** For sorted/timestamp columns.
+- **E6. DELTA_BYTE_ARRAY writer.** For correlated string columns.
+- **E7. Bloom filter writer.** Footer-level structure for
   high-cardinality predicate pushdown.
-- **D8. Page index writer (offset_index + column_index).** We
+- **E8. Page index writer (offset_index + column_index).** We
   currently *drop* these on re-encode. Restoring them lets
   downstream readers do row-level pruning instead of falling back
   to row-group-level.
-- **D9. `null_count` in column stats.** Strict pruners (parquet-mr)
+- **E9. `null_count` in column stats.** Strict pruners (parquet-mr)
   treat unset null_count as pessimistic. Free correctness win.
 
-D1 first (biggest single win, smallest LoC). D7/D8/D9 are footer-
+E1 first (biggest single win, smallest LoC). E7/E8/E9 are footer-
 shape improvements that could land together.
-
----
-
-## Phase E — Filter Surface (low rewrite risk; contained to filter/)
-
-The current filter language is `=, !=, <, <=, >, >=, AND, OR`. To be
-credible as a "drop in for DuckDB" each of these is required.
-
-- **E1. `IS NULL` / `IS NOT NULL`.** Trivial AST + eval addition
-  (~30 LoC). The decode path now produces def_levels; checking them
-  is one more leaf type.
-- **E2. `NOT`.** Negation operator. AST gains a unary node.
-- **E3. Parens.** Parser-side; precedence already exists for AND/OR.
-- **E4. `IN (...)`.** Sugar for OR-of-equalities; can compile to
-  existing AST or add a new leaf type.
-- **E5. `LIKE`.** Pattern match. `%`/`_` wildcards, escape handling.
-
-These can land independently and in any order. None affect the
-decode/encode shape.
 
 ---
 
@@ -296,12 +353,12 @@ Last because optimizing an incorrect engine wastes time.
 - **Sub-row-group filter pushdown via min/max page indices.** Would
   require row-level granular reads and an active page-skipping
   decoder. Big architectural change for marginal gain on our access
-  pattern. Reconsider after Phase D.
+  pattern. Reconsider after Phase E.
 - **Multi-format input (CSV, JSON, Avro).** Out of scope for ZPQ's
   identity. Use other tools for those, write parquet, then ZPQ.
-- **Compute primitives beyond filter + projection** (joins, aggs,
-  group-bys). DuckDB / Polars exist; we don't compete on that axis.
-  ZPQ is the I/O-bound predicate-pushdown lane.
+- **Joins, window functions, complex SQL surface.** DuckDB / Polars
+  exist; we don't compete on that axis. ZPQ targets simple filters,
+  transformations, and aggregations within a file (Phase C).
 - **Encryption.** Parquet modular encryption is rare in our target
   workloads and would significantly complicate the engine. If it
   becomes a hard requirement, that's a v2 conversation.
@@ -311,15 +368,18 @@ Last because optimizing an incorrect engine wastes time.
 ## Sequencing summary
 
 ```
-A → B1 → B2 → B3 → C1, C2 → D1..D9 → E1..E5 → F1..F7 → G1..G6
-    └────────┬─────────┘    └────┬────┘  (parallel ok within group)
-       structural             additive
+A → B1 → B2 → B3 → B4 → C1 → (C2..C5 parallel) → D1, D2 → E1..E9 → F1..F7 → G1..G6
+    └─────────┬─────────┘    └─────┬──────┘   └──┬──┘  └────┬────┘
+       structural foundations    compute      arch     additive breadth
 ```
 
-A is a 1-week task. B is a multi-week phase (B1 alone is probably
-the heaviest single piece of work in the roadmap). C is mid-weight.
-D, E, F, G can land in any order within each phase and against
-multiple contributors.
+A is a 1-week task. B is the heaviest single phase (B1 alone was
+the biggest piece of work to date; B4 brings input parity with B3's
+output streaming). C lands the compute layer and folds the old
+"filter surface" phase in. D is mid-weight. E, F, G can land in any
+order within each phase and against multiple contributors.
 
-The critical commitment: **don't start D until B is done**, even if
-a specific D item looks fast and tempting in isolation.
+The critical commitment: **don't start E until B and C are done**,
+even if a specific E item (codec, footer feature) looks fast and
+tempting in isolation. The compute primitives in C influence which
+codecs / footer features pay off most.

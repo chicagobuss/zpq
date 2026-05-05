@@ -38,12 +38,20 @@ build() {
         *) error "Unknown arch: $arch (use arm64 or x86_64)"; exit 1 ;;
     esac
 
-    info "Building zpq for $target..."
-    zig build -Dtarget="$target" -Doptimize=ReleaseFast
+    info "Building zpq-lambda for $target-musl..."
+    # Build the lambda-flavored binary (excludes io_uring, etc) and use
+    # the linux-musl target so the result is statically linked and
+    # runs on Lambda's `provided.al2023` without dynamic-loader help.
+    # Without `lambda` as the build step, this would package the CLI
+    # binary's `main` (with help-text on missing args) — Lambda runtime
+    # then fails with `Runtime.ExitError` because the bootstrap exits
+    # before talking to the runtime API. Caught in production by
+    # the post-C1 sweep on 2026-05-05.
+    zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast lambda
 
-    local zpq_bin="zig-out/bin/zpq"
+    local zpq_bin="zig-out/bin/zpq-lambda"
     if [[ ! -f "$zpq_bin" ]]; then
-        error "Build failed - no zpq at $zpq_bin"
+        error "Build failed - no zpq-lambda at $zpq_bin"
         exit 1
     fi
 

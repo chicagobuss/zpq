@@ -21,6 +21,21 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
         .link_libcpp = true,
     });
+    // -mno-avx is x86-only and rejected by clang on aarch64. We only
+    // need it on x86 because that's the target where snappy.cc's
+    // `defined(__x86_64__) && defined(__AVX__)` fast path triggers
+    // without an immintrin.h include. ARM has no analog.
+    const t_arch = target.result.cpu.arch;
+    var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    try flags.appendSlice(b.allocator, &.{
+        "-std=c++17",
+        "-DHAVE_CONFIG_H",
+        "-fno-exceptions",
+        "-fno-rtti",
+    });
+    if (t_arch == .x86_64 or t_arch == .x86) {
+        try flags.append(b.allocator, "-mno-avx");
+    }
     lib_mod.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{
@@ -29,21 +44,7 @@ pub fn build(b: *std.Build) !void {
             "snappy-sinksource.cc",
             "snappy-stubs-internal.cc",
         },
-        .flags = &.{
-            "-std=c++17",
-            "-DHAVE_CONFIG_H",
-            "-fno-exceptions",
-            "-fno-rtti",
-            // Snappy's source uses inline AVX2 intrinsics under
-            // `defined(__x86_64__) && defined(__AVX__)`, but only
-            // includes <immintrin.h> when SNAPPY_HAVE_BMI2 /
-            // SNAPPY_HAVE_X86_CRC32 are set. We target generic x86_64
-            // without those flags, so we explicitly drop AVX from the
-            // compiler's predefined macros to keep the code path
-            // portable. -1% on AVX-capable hardware; portable to
-            // older Lambda execution environments.
-            "-mno-avx",
-        },
+        .flags = flags.items,
     });
     lib_mod.addIncludePath(b.path("."));
 

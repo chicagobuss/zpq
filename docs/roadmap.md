@@ -244,6 +244,9 @@ complex SQL surface, and full optimizer machinery stay out of scope.
   - **C3.d `IN (...)`** — sugar for OR-of-equalities, or its own
     leaf with hash-set lookup if the list is large.
   - **C3.e `LIKE`** — pattern match with `%` / `_` and escape.
+  - **C3.f `BETWEEN x AND y`** — sugar for `>= x AND <= y`. Not in
+    the original list but common in user SQL; v1 had it
+    (commit `abc3d12`).
   Each lands independently in any order. C2 makes some of these
   trivial because the evaluator already handles the typing
   machinery.
@@ -495,6 +498,25 @@ engine itself.
   with copies of the corpus and a `just conform` recipe that runs
   ZPQ against each, reports pass/fail. Surface for users to verify
   ZPQ handles their files.
+- **F8. Chrome Tracing (JSON) profiler output.** The phase counters
+  in lambda/main.zig give per-invocation totals; a per-RG event
+  log emitted as Chrome's trace-event JSON would feed
+  `chrome://tracing` for visual flame graphs. ~50-100 LoC of
+  begin/end-event emission alongside the existing `nowMonoNs()`
+  measurements. Big debug value when investigating "why is RG 7
+  slower than RG 6?" type questions. The v1 codebase had this
+  (commit `abc3d12` on the pre-rewrite main) — reasonable to crib
+  the JSON shape from there if we don't want to invent it.
+- **F9. MD5 hashes of benchmark fixtures.** Tiny `bench/fixtures.tsv`
+  (or similar) recording known-good MD5s of the canonical benchmark
+  files in S3. CI / re-run scripts verify the fixture didn't drift.
+  v1 had this (`f914a2f`).
+- **F10. Architecture overview doc.** v1 had `ARCH_EXPLAINED.md`
+  giving a "what each piece does and how they interact" tour
+  separate from strategy/tier docs. v2 has `streaming_design.md`
+  (deep on B3) and the tier 1/2/3 strategy docs but no
+  pedagogical overview. New onboarders today have to grep their
+  way around. ~1 day of writing.
 
 ---
 
@@ -525,10 +547,17 @@ Last because optimizing an incorrect engine wastes time.
 
 ## What we're explicitly NOT planning
 
-- **Sub-row-group filter pushdown via min/max page indices.** Would
-  require row-level granular reads and an active page-skipping
-  decoder. Big architectural change for marginal gain on our access
-  pattern. Reconsider after Phase E.
+- **Sub-row-group filter pushdown via min/max page indices** ("surgical
+  mode"). Would use `ColumnIndex` + `OffsetIndex` to identify exactly
+  which pages match a filter, then range-fetch only those pages.
+  v1 of ZPQ (commit `abc3d12` on the pre-rewrite main) demonstrated
+  this can reduce I/O by 99% on needle-in-haystack queries — so the
+  payoff is real, not marginal. We're deferring on opportunity-cost
+  grounds: it requires (a) restoring the page-index reader we
+  currently strip on re-encode (E8), (b) a new page-granular fetch
+  planner, (c) a page-skipping decoder. Reconsider when a workload
+  with extreme selectivity (e.g. point lookups over billions of
+  rows) becomes the dominant use case.
 - **Multi-format input (CSV, JSON, Avro).** Out of scope for ZPQ's
   identity. Use other tools for those, write parquet, then ZPQ.
 - **Joins, window functions, complex SQL surface.** DuckDB / Polars

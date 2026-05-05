@@ -278,6 +278,15 @@ pub const MultipartSink = struct {
     }
 };
 
+/// Adapter matching `core.writer.streaming.Sink.write_fn`'s signature.
+/// Defined here to keep `core/` from depending on `io/`: callers in
+/// `lambda/` or `cli/` build the bridge as
+///   `streaming.Sink{ .ctx = &mp_sink, .write_fn = sinkWriteFn }`.
+pub fn sinkWriteFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+    const self: *MultipartSink = @ptrCast(@alignCast(ctx));
+    return self.push(bytes);
+}
+
 /// Worker task. Acquires a connection from the sink's pool, sends
 /// the UploadPart, parses the ETag from the response. Releases its
 /// in-flight byte reservation on exit (success or failure).

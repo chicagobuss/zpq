@@ -48,7 +48,7 @@ pub fn build(
     sink: Sink,
     files: []const fastpath.FileSpec,
     kept_columns: ?[]const usize,
-) !void {
+) !u64 {
     if (files.len == 0) return error.SurvivorsLenMismatch;
 
     const meta0 = files[0].meta;
@@ -110,10 +110,14 @@ pub fn build(
     const footer_bytes = w.bytes();
 
     try sink.write(footer_bytes);
+    offset += footer_bytes.len;
     var len_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
     try sink.write(&len_bytes);
+    offset += len_bytes.len;
     try sink.write(&MAGIC);
+    offset += MAGIC.len;
+    return @intCast(offset);
 }
 
 fn writeProjectedRowGroup(
@@ -263,7 +267,7 @@ test "streaming.build is byte-identical to fastpath.buildMulti (no projection)" 
     const buf_out = try fastpath.buildMulti(arena, &specs, null);
 
     var msink: MemorySink = .{ .arena = arena };
-    try build(arena, msink.sink(), &specs, null);
+    _ = try build(arena, msink.sink(), &specs, null);
 
     try testing.expectEqualSlices(u8, buf_out, msink.buffer.items);
     std.debug.print(
@@ -298,7 +302,7 @@ test "streaming.build is byte-identical to fastpath.buildMulti (with projection)
     const buf_out = try fastpath.buildMulti(arena, &specs, &kept);
 
     var msink: MemorySink = .{ .arena = arena };
-    try build(arena, msink.sink(), &specs, &kept);
+    _ = try build(arena, msink.sink(), &specs, &kept);
 
     try testing.expectEqualSlices(u8, buf_out, msink.buffer.items);
     std.debug.print(
@@ -334,7 +338,7 @@ test "streaming.build N=10 multi-file" {
     const buf_out = try fastpath.buildMulti(arena, specs, null);
 
     var msink: MemorySink = .{ .arena = arena };
-    try build(arena, msink.sink(), specs, null);
+    _ = try build(arena, msink.sink(), specs, null);
 
     try testing.expectEqualSlices(u8, buf_out, msink.buffer.items);
 

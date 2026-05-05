@@ -28,9 +28,11 @@ const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
 const column_mod = zpq.core.parquet.column;
 const fastpath = zpq.core.writer.fastpath;
+const streaming = zpq.core.writer.streaming;
 const encoder = zpq.core.writer.encoder;
 const thrift = zpq.core.thrift;
 const s3 = zpq.io.s3;
+const multipart_sink = zpq.io.multipart_sink;
 const coalescer = zpq.io.coalescer;
 const filter_ast = zpq.core.filter.ast;
 const filter_parser = zpq.core.filter.parser;
@@ -944,43 +946,111 @@ fn handleS3Write(
         break :blk_pn false;
     };
 
-    const out_bytes = if (filter) |f|
-        try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt)
-    else if (projection_includes_nested) blk: {
-        // No filter but projection includes nested. Route through the
-        // decode/filter/encode pipeline with no real filter — every
-        // row passes. Encoder's nested rep/def emission preserves
-        // structure that fastpath would clobber.
-        // Build a tautology filter: any-row-survives by setting every
-        // selection bit. We do this by skipping filter-eval entirely
-        // inside buildFilteredOutputMulti when filter is null… but
-        // that path already exists upstream. Simplest: use a known-
-        // always-true predicate on a flat column. id >= INT64_MIN.
-        const tautology = filter_ast.Filter{ .int64 = .{
-            .col_idx = 0,
-            .op = .GtEq,
-            .value = std.math.minInt(i64),
-        } };
-        // The filter evaluates against col_idx 0 — only safe if col 0
-        // is a flat int64. For our partitioned-fixture and
-        // nested_edges fixtures this holds; future hardening (B1.w)
-        // teaches buildFilteredOutputMulti to accept null filter and
-        // skip eval entirely. For now this routes correctly.
-        break :blk try buildFilteredOutputMulti(a, allocator, specs, tautology, kept_columns_opt);
-    } else blk: {
+    // 4a. Streaming fastpath: no filter, no nested projection. Bytes
+    // flow writer → sink → S3 with no in-memory accumulation. The sink
+    // internally picks single-PUT vs multipart based on whether the
+    // body ever crosses TARGET_PART_SIZE. build_ms is reported as 0
+    // for streaming runs — there's no separate build phase to time.
+    const same_bucket = std.mem.eql(u8, first_bucket, out_url.bucket);
+    const use_streaming = filter == null and !projection_includes_nested;
+
+    if (use_streaming) {
         var fp_specs = try a.alloc(fastpath.FileSpec, specs.len);
         for (specs, 0..) |*sp, i| fp_specs[i] = .{
             .bytes = sp.file_buf,
             .meta = &sp.meta,
             .survivors = sp.survivors,
         };
-        break :blk try fastpath.buildMulti(a, fp_specs, kept_columns_opt);
+
+        const t_after_build_streaming = t_after_fetch;
+        const bytes_out: u64 = if (same_bucket) blk_s: {
+            var mp_sink = multipart_sink.MultipartSink.init(
+                io,
+                allocator,
+                a,
+                creds,
+                out_url,
+                pool,
+                .{},
+            );
+            defer mp_sink.deinit();
+            const sink: streaming.Sink = .{
+                .ctx = @ptrCast(&mp_sink),
+                .write_fn = multipart_sink.sinkWriteFn,
+            };
+            const n = try streaming.build(a, sink, fp_specs, kept_columns_opt);
+            try mp_sink.close();
+            break :blk_s n;
+        } else blk_s: {
+            var out_pool: s3.Pool(POOL_SIZE) = undefined;
+            try initPool(&out_pool, a, creds, out_url.bucket);
+            defer out_pool.deinit();
+            var mp_sink = multipart_sink.MultipartSink.init(
+                io,
+                allocator,
+                a,
+                creds,
+                out_url,
+                &out_pool,
+                .{},
+            );
+            defer mp_sink.deinit();
+            const sink: streaming.Sink = .{
+                .ctx = @ptrCast(&mp_sink),
+                .write_fn = multipart_sink.sinkWriteFn,
+            };
+            const n = try streaming.build(a, sink, fp_specs, kept_columns_opt);
+            try mp_sink.close();
+            break :blk_s n;
+        };
+        const t_end_streaming = nowMonoNs();
+        const upload_mode_streaming: []const u8 = if (same_bucket) "streaming_pooled" else "streaming_fresh";
+
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d}}}",
+            .{
+                output_url_str,
+                specs.len,
+                total_files,
+                files_pruned,
+                total_input_size, bytes_fetched, bytes_out,
+                rg_pruned, total_input_rows, rows_kept, upload_mode_streaming,
+                @divTrunc(t_after_fetch - t_start, std.time.ns_per_ms),
+                @as(i64, 0),
+                @divTrunc(t_end_streaming - t_after_build_streaming, std.time.ns_per_ms),
+                @divTrunc(t_end_streaming - t_start, std.time.ns_per_ms),
+            },
+        );
+    }
+
+    // 4b. Buffered path: filter or nested projection. The encoder
+    // produces a single `[]u8` we then upload via PUT or multipart.
+    // Migrating this to streaming requires the encoder to emit
+    // row-group-sized chunks instead of one big slice — tracked as
+    // a follow-up to B3.
+    const out_bytes = if (filter) |f|
+        try buildFilteredOutputMulti(a, allocator, specs, f, kept_columns_opt)
+    else blk: {
+        // Tautology filter: any-row-survives. Routes the no-filter +
+        // nested-projection case through the decode/filter/encode
+        // pipeline, where the encoder's rep/def emission preserves
+        // nested structure that the byte-copy fastpath would clobber.
+        // Safe only when col_idx 0 is a flat int64 — true for the
+        // partitioned-fixture and nested_edges fixtures; future
+        // hardening (B1.w) teaches `buildFilteredOutputMulti` to
+        // accept null filter and skip eval entirely.
+        const tautology = filter_ast.Filter{ .int64 = .{
+            .col_idx = 0,
+            .op = .GtEq,
+            .value = std.math.minInt(i64),
+        } };
+        break :blk try buildFilteredOutputMulti(a, allocator, specs, tautology, kept_columns_opt);
     };
     const t_after_build = nowMonoNs();
 
     // 5. PUT (single or multipart based on size). Multipart shares the
     // pool when output bucket matches input bucket (typical).
-    const same_bucket = std.mem.eql(u8, first_bucket, out_url.bucket);
     const upload_mode: []const u8 = if (out_bytes.len < s3.MULTIPART_THRESHOLD) blk: {
         const put_resp = if (same_bucket)
             try s3.putViaPool(io, pool, a, creds, out_url, out_bytes)

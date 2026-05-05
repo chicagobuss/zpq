@@ -181,7 +181,11 @@ def _polars_multi(event: dict) -> dict:
     flt = event.get("filter_sql")
 
     t0 = _now_ns()
-    lf = pl.scan_parquet(inputs)
+    # hive_partitioning=True makes Polars expose path-encoded `k=v`
+    # segments as columns the filter can reference (e.g. `month`).
+    # Pruning happens at scan-plan time when the filter resolves to
+    # constants on those columns.
+    lf = pl.scan_parquet(inputs, hive_partitioning=True)
     if cols:
         lf = lf.select(cols)
     if flt:
@@ -224,7 +228,10 @@ def _duckdb_multi(event: dict) -> dict:
     select_cols = ", ".join(cols) if cols else "*"
     where = f" WHERE {flt}" if flt else ""
     files_lit = "[" + ", ".join(f"'{u}'" for u in inputs) + "]"
-    sql = f"COPY (SELECT {select_cols} FROM read_parquet({files_lit}){where}) TO '{dst}' (FORMAT 'parquet');"
+    # hive_partitioning=true exposes path-encoded `k=v` segments as
+    # columns the filter can reference. DuckDB will skip files whose
+    # constants don't satisfy the predicate before opening them.
+    sql = f"COPY (SELECT {select_cols} FROM read_parquet({files_lit}, hive_partitioning=true){where}) TO '{dst}' (FORMAT 'parquet');"
 
     t0 = _now_ns()
     con.execute(sql)

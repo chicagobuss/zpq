@@ -69,7 +69,11 @@ deploy() {
     local fn_name="$1"
     local zip_path="$2"
     local arch="${3:-arm64}"
-    local memory="${4:-$DEFAULT_MEMORY}"
+    # Empty default: when updating an existing function, preserve its
+    # configured memory unless the caller explicitly passed `$4`. This
+    # closes a long-standing footgun where every code-only redeploy
+    # silently reset memory back to 512 MB, regressing benchmarks.
+    local memory="${4:-}"
     local region="${5:-$DEFAULT_REGION}"
 
     load_env
@@ -94,16 +98,25 @@ deploy() {
         # Wait for update to complete
         aws lambda wait function-updated --function-name "$fn_name" --region "$region"
 
-        # Update config if memory changed
-        aws lambda update-function-configuration \
-            --function-name "$fn_name" \
-            --memory-size "$memory" \
-            --timeout "$DEFAULT_TIMEOUT" \
-            --region "$region" \
-            --query '{MemorySize: MemorySize, Timeout: Timeout}' \
-            --output json
+        # Only touch memory if the caller passed an explicit value.
+        # Otherwise preserve whatever the function is configured for.
+        if [[ -n "$memory" ]]; then
+            aws lambda update-function-configuration \
+                --function-name "$fn_name" \
+                --memory-size "$memory" \
+                --timeout "$DEFAULT_TIMEOUT" \
+                --region "$region" \
+                --query '{MemorySize: MemorySize, Timeout: Timeout}' \
+                --output json
+        else
+            info "Memory unchanged (preserving existing config)."
+        fi
     else
         info "Creating new function $fn_name..."
+
+        # For new function, use default if no explicit memory.
+        local create_memory="${memory:-$DEFAULT_MEMORY}"
+        memory="$create_memory"
 
         # Get role
         local role="$DEFAULT_ROLE"
@@ -129,7 +142,7 @@ deploy() {
             --output json
     fi
 
-    success "Deployed $fn_name ($aws_arch, ${memory}MB)"
+    success "Deployed $fn_name ($aws_arch${memory:+, ${memory}MB})"
 }
 
 # --- Invoke Lambda ---

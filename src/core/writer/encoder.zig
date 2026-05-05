@@ -22,12 +22,13 @@ const thrift = @import("../thrift.zig");
 const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
 const hybrid_rle = @import("../parquet/encoding/hybrid_rle.zig");
+const snappy = @import("../parquet/snappy.zig");
 
 pub const Error = error{
     NullableNotSupported,
     UnsupportedType,
     TooLarge,
-} || std.mem.Allocator.Error;
+} || std.mem.Allocator.Error || snappy.CompressError;
 
 pub const EncodedColumn = struct {
     /// Page header thrift + encoded data bytes, ready to concatenate.
@@ -120,11 +121,40 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     var stats = computeStats(arena, in.values, src_def_levels, src_max_def);
     _ = &stats;
 
-    // 4. Build PageHeader.
+    // 4a. Concatenate the V1 data-page payload: rep_prefix (if
+    //     max_rep > 0), def_prefix (if optional/nested), values.
+    //     This is the "uncompressed page" that compressed_page_size
+    //     measures against in the spec.
+    const payload = try arena.alloc(u8, data_total_len);
+    {
+        var pos: usize = 0;
+        if (rep_prefix.len > 0) {
+            @memcpy(payload[pos..][0..rep_prefix.len], rep_prefix);
+            pos += rep_prefix.len;
+        }
+        if (def_prefix.len > 0) {
+            @memcpy(payload[pos..][0..def_prefix.len], def_prefix);
+            pos += def_prefix.len;
+        }
+        @memcpy(payload[pos..], values_bytes);
+    }
+
+    // 4b. Snappy-compress the payload. Page header thrift is NEVER
+    //     compressed in Parquet — only the data portion. If the
+    //     compressed output is somehow >= original (incompressible
+    //     data) we still ship the compressed version; the format
+    //     allows it and a 1-2% bloat is preferable to a per-page
+    //     branching codec.
+    const compressed = try snappy.compressAlloc(arena, payload);
+
+    // 5. Build PageHeader. uncompressed_page_size measures the
+    //    payload-as-if-uncompressed; compressed_page_size measures
+    //    the on-disk payload we actually write. Header bytes are
+    //    counted in neither — only by total_*_size on ColumnMetaData.
     var page_hdr: schema.PageHeader = .{
         .type = .DATA_PAGE,
         .uncompressed_page_size = @intCast(data_total_len),
-        .compressed_page_size = @intCast(data_total_len), // codec=UNCOMPRESSED
+        .compressed_page_size = @intCast(compressed.len),
         .crc = null,
         .data_page_header = .{
             .num_values = @intCast(num_values),
@@ -140,22 +170,14 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     try page_hdr.write(&w);
     const header_bytes = w.bytes();
 
-    // 5. Concatenate: page header thrift, then per V1 data-page
-    //    layout: rep_prefix (if max_rep > 0), def_prefix, values.
-    const total = try arena.alloc(u8, header_bytes.len + data_total_len);
+    // 6. Concatenate: page header thrift (uncompressed) || compressed payload.
+    const total = try arena.alloc(u8, header_bytes.len + compressed.len);
     @memcpy(total[0..header_bytes.len], header_bytes);
-    var pos: usize = header_bytes.len;
-    if (rep_prefix.len > 0) {
-        @memcpy(total[pos..][0..rep_prefix.len], rep_prefix);
-        pos += rep_prefix.len;
-    }
-    if (def_prefix.len > 0) {
-        @memcpy(total[pos..][0..def_prefix.len], def_prefix);
-        pos += def_prefix.len;
-    }
-    @memcpy(total[pos..], values_bytes);
+    @memcpy(total[header_bytes.len..], compressed);
 
-    // 5. Build ColumnMetaData.
+    // 7. Build ColumnMetaData. total_uncompressed_size and
+    //    total_compressed_size include the page header (parquet spec).
+    //    They differ by `data_total_len - compressed.len`.
     var encodings: schema.EncodingList = .empty;
     try encodings.append(arena, .PLAIN);
 
@@ -166,9 +188,9 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .type = phys,
         .encodings = encodings,
         .path_in_schema = path_list,
-        .codec = .UNCOMPRESSED,
+        .codec = .SNAPPY,
         .num_values = num_values,
-        .total_uncompressed_size = @intCast(total.len),
+        .total_uncompressed_size = @intCast(header_bytes.len + data_total_len),
         .total_compressed_size = @intCast(total.len),
         .data_page_offset = 0, // caller adjusts to absolute offset
         .index_page_offset = null,

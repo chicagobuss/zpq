@@ -239,15 +239,25 @@ fn emitCopy(dest: []u8, offset: usize, length: usize) CompressError!usize {
             // Format: (len-4) in bits 2-4, high 3 bits of offset in bits 5-7, tag 01
             // Next byte: low 8 bits of offset
             if (d_idx + 2 > dest.len) return error.OutputTooSmall;
-            dest[d_idx] = @intCast(((len - 4) << 2) | ((offset >> 8) << 5) | 1);
+            // Same narrowing-on-shift footgun as below — keep operands in usize.
+            const tag_byte: u8 = @intCast((@as(usize, len - 4) << 2) | (@as(usize, offset >> 8) << 5) | 1);
+            dest[d_idx] = tag_byte;
             dest[d_idx + 1] = @intCast(offset & 0xff);
             d_idx += 2;
             return d_idx;
         } else if (offset < 65536) {
-            // Copy with 2-byte offset (tag 02)
+            // Copy with 2-byte offset (tag 02). copy_len in [1..64] →
+            // (copy_len - 1) << 2 in [0..252], OR'd with the tag bits
+            // (2) gives a byte in [2..254]. The earlier inline form
+            // `@intCast(((copy_len-1)<<2)|2)` was triggering the result-
+            // type to narrow the SHIFT to u8, where for copy_len > 32
+            // the value 144+ would lose the 0x80 bit and produce a
+            // wrong tag byte (e.g. 0x12 instead of 0x92 for copy_len=37).
+            // Forcing the operands into usize first keeps full precision.
             const copy_len = @min(len, 64);
             if (d_idx + 3 > dest.len) return error.OutputTooSmall;
-            dest[d_idx] = @intCast(((copy_len - 1) << 2) | 2);
+            const tag_byte: u8 = @intCast((@as(usize, copy_len - 1) << 2) | 2);
+            dest[d_idx] = tag_byte;
             std.mem.writeInt(u16, dest[d_idx + 1 ..][0..2], @intCast(offset), .little);
             d_idx += 3;
             len -= copy_len;
@@ -255,7 +265,8 @@ fn emitCopy(dest: []u8, offset: usize, length: usize) CompressError!usize {
             // Copy with 4-byte offset (tag 03)
             const copy_len = @min(len, 64);
             if (d_idx + 5 > dest.len) return error.OutputTooSmall;
-            dest[d_idx] = @intCast(((copy_len - 1) << 2) | 3);
+            const tag_byte: u8 = @intCast((@as(usize, copy_len - 1) << 2) | 3);
+            dest[d_idx] = tag_byte;
             std.mem.writeInt(u32, dest[d_idx + 1 ..][0..4], @intCast(offset), .little);
             d_idx += 5;
             len -= copy_len;
@@ -409,4 +420,79 @@ test "snappy compress repetitive" {
     var decompressed: [100]u8 = undefined;
     const dec_len = try uncompress(compressed[0..comp_len], &decompressed);
     try std.testing.expectEqualStrings(input, decompressed[0..dec_len]);
+}
+
+test "snappy compress sparse-bool-like pattern roundtrip" {
+    // Mirrors the bool_sparse output: mostly-zero bit-packed bytes.
+    // This is what fails when read by pyarrow against our /tmp/snappy_out.
+    const allocator = std.testing.allocator;
+
+    // Build a 3266-byte payload that looks like our def-prefix + values:
+    // first 4 bytes = u32 LE length of the RLE-encoded def levels, then
+    // some RLE bytes, then bit-packed values mostly zero.
+    var input: [3266]u8 = undefined;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) input[i] = 0;
+    // Sprinkle a few non-zero bytes to mimic the actual data.
+    input[0] = 0x10;
+    input[1] = 0x40;
+    input[100] = 0x05;
+    input[500] = 0x09;
+    input[1000] = 0x21;
+    input[2000] = 0x36;
+    input[3000] = 0x4e;
+    input[3265] = 0x07;
+
+    const compressed = try compressAlloc(allocator, &input);
+    defer allocator.free(compressed);
+
+    var out = try allocator.alloc(u8, input.len);
+    defer allocator.free(out);
+    const dec_len = try uncompress(compressed, out);
+    try std.testing.expectEqual(input.len, dec_len);
+    try std.testing.expectEqualSlices(u8, &input, out[0..dec_len]);
+}
+
+test "snappy compress regression: size=294 k%256 pattern" {
+    // First failing case found by sweep. Deterministic.
+    const allocator = std.testing.allocator;
+    const size = 294;
+    const input = try allocator.alloc(u8, size);
+    defer allocator.free(input);
+    for (input, 0..) |*b, k| b.* = @intCast(k % 256);
+
+    const compressed = try compressAlloc(allocator, input);
+    defer allocator.free(compressed);
+
+    const out = try allocator.alloc(u8, size);
+    defer allocator.free(out);
+    const dec_len = try uncompress(compressed, out);
+    if (dec_len != size) {
+        std.debug.print("\n[bug] size={d} dec_len={d} compressed_len={d}\n", .{ size, dec_len, compressed.len });
+        std.debug.print("[bug] LAST 30 compressed bytes (offsets {d}..{d}): ", .{ compressed.len - 30, compressed.len });
+        for (compressed[compressed.len - 30 ..]) |b| std.debug.print("{x:0>2} ", .{b});
+        std.debug.print("\n", .{});
+    }
+    try std.testing.expectEqual(size, dec_len);
+}
+
+test "snappy compress: copy-byte tag-narrowing regression sweep" {
+    // Sweep many sizes that will trigger long backward-references (the
+    // case where the bug bit). Each one's decompression must round-trip.
+    const allocator = std.testing.allocator;
+    var size: usize = 200;
+    while (size <= 600) : (size += 1) {
+        const input = try allocator.alloc(u8, size);
+        defer allocator.free(input);
+        for (input, 0..) |*b, k| b.* = @intCast(k % 256);
+
+        const compressed = try compressAlloc(allocator, input);
+        defer allocator.free(compressed);
+
+        const out = try allocator.alloc(u8, size);
+        defer allocator.free(out);
+        const dec_len = try uncompress(compressed, out);
+        try std.testing.expectEqual(size, dec_len);
+        try std.testing.expectEqualSlices(u8, input, out[0..dec_len]);
+    }
 }

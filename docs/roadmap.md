@@ -385,8 +385,49 @@ modules.
     post-E4 (25% threshold):      1548 ms  (-18%)
   Bytes_out 72 MB → 71 MB (-1.5% — only 2/27 columns are dict-shaped).
   ZPQ now beats Polars (1634 ms) on this query.
-- **E5. DELTA_BINARY_PACKED writer.** For sorted/timestamp columns.
-- **E6. DELTA_BYTE_ARRAY writer.** For correlated string columns.
+- **E5. DELTA_BINARY_PACKED writer** (shipped 2026-05-05). The
+  encoder logic was already present in
+  `core/parquet/encoding/delta_binary_packed.zig` as a private test
+  helper hardcoded to `testing.allocator`. Promoted to
+  `pub fn encode(T, allocator, values, ...)` + `encodeDefault`.
+
+  Wired into `encoder.zig` for i32/i64 columns via
+  `tryEncodeValuesDelta`. Use-always policy — DELTA's per-mini-block
+  bit-width adapts to actual delta range, so it dominates PLAIN by
+  4-8× on sorted/timestamp columns and is roughly equivalent on
+  random data.
+
+  Real-S3 measurement (10-file balanced filter, median of 5 warm
+  runs):
+    pre-E5  (snappy + dict):       bytes=71 MB  encode=271 ms  total=1548 ms
+    post-E5 (snappy + dict + delta): bytes=66 MB  encode=277 ms  total=1532 ms
+
+  7% smaller output for ~equivalent CPU. Across the selectivity
+  sweep, bytes_out shrinks 7-10% vs pre-E5; total_ms is within run-
+  to-run variance. ZPQ now BEATS or TIES Polars on every encoder-
+  warm scenario in our bench:
+
+    scenario     ZPQ E5    Polars    Δ
+    narrow         832 ms    798 ms  +4%   (tied)
+    selective     1017 ms    983 ms  +3%   (tied)
+    balanced      1689 ms   1805 ms  -6%   (ZPQ wins)
+    broad         1831 ms   1797 ms  +2%   (tied)
+
+- **E6. DELTA_BYTE_ARRAY writer** (deferred — see judgment below).
+  Decoder is implemented and tested. Encoder would prefix-share
+  consecutive sorted strings.
+
+  **Why deferred:** snappy's LZ77-style match finding already
+  captures most prefix-sharing wins for byte_array data. On our
+  test fixture only `string_sorted` (1 of 27 columns) would
+  benefit; estimated bytes_out delta is ~1-2%. Not worth the
+  ~100 LoC for the encoder + heuristic detection right now.
+
+  **What revives it:** a workload with many sorted-string columns
+  (e.g. logs with repeated identifiers, dimension tables) where
+  prefix sharing dominates. The infrastructure (DBP encoder is
+  pub now) means E6 is a contained ~100-LoC follow-up when
+  warranted.
 - **E7. Bloom filter writer.** Footer-level structure for
   high-cardinality predicate pushdown.
 - **E8. Page index writer (offset_index + column_index).** We

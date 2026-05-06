@@ -930,9 +930,11 @@ fn handleS3Write(
         output_codec,
         &timings,
     );
+    // Split build_ms and close_ms apart so we can see whether the
+    // tail-time is "encode + sink-emit" or "waiting for the last
+    // multipart part to upload."
+    const t_after_build = nowMonoNs();
     try mp_sink.close();
-
-    const t_after_build = t_after_fetch;
     const t_end = nowMonoNs();
     const upload_mode: []const u8 = if (same_bucket) "streaming_pooled" else "streaming_fresh";
 
@@ -945,7 +947,7 @@ fn handleS3Write(
     // because mp_sink.close() blocks until the last part is acked.
     return std.fmt.allocPrint(
         allocator,
-        "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"put_ms\":{d},\"total_ms\":{d},\"phase\":{{\"fetch_concurrent_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}",
+        "{{\"ok\":true,\"output\":\"{s}\",\"input_count\":{d},\"files_total\":{d},\"files_pruned\":{d},\"bytes_in\":{d},\"bytes_fetched\":{d},\"bytes_out\":{d},\"row_groups_pruned\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"upload\":\"{s}\",\"fetch_ms\":{d},\"build_ms\":{d},\"close_ms\":{d},\"total_ms\":{d},\"phase\":{{\"fetch_concurrent_ms\":{d},\"wait_for_rg_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}",
         .{
             output_url_str,
             specs.len,
@@ -958,6 +960,7 @@ fn handleS3Write(
             @divTrunc(t_end - t_after_build, std.time.ns_per_ms),
             @divTrunc(t_end - t_start, std.time.ns_per_ms),
             timings.fetch_concurrent_ns / std.time.ns_per_ms,
+            timings.wait_for_rg_ns / std.time.ns_per_ms,
             timings.core.decode_ns / std.time.ns_per_ms,
             timings.core.eval_ns / std.time.ns_per_ms,
             timings.core.encode_ns / std.time.ns_per_ms,
@@ -1049,7 +1052,16 @@ fn buildOutputMulti(
     // Probe (2026-05-05): strict per-file serialization regressed
     // 39-81% vs the old upfront-fetch model. Restoring the cross-file
     // overlap recovers parity.
-    const QUEUE_CAP = 1;
+    //
+    // Queue depth (2026-05-05): bumped from 1 → 16. With cap=1 each
+    // file's fetcher could only stage one RG ahead, so the drain loop
+    // ate ~400ms of `wait_for_rg_ns` per balanced run waiting for
+    // files 1-9's 2nd-Nth RGs to arrive after we'd moved on from file 0.
+    // cap=16 lets every file's 4 RGs pre-stage during file 0's
+    // processing window; wait time drops to single-digit ms. Memory
+    // ceiling: 10 files × 16 RGs × ~16 MB raw_bytes = ~2.5 GB peak,
+    // well within the 5 GB Lambda config.
+    const QUEUE_CAP = 16;
 
     // Pick the fetch policy. Encoder path needs kept ∪ filter cols.
     // Fastpath with projection needs just kept cols. Fastpath
@@ -1114,10 +1126,12 @@ fn buildOutputMulti(
     // `consumer.copyRG` (byte-copy). raw_bytes is freed after each RG.
     for (queues, 0..) |q, file_idx| {
         while (true) {
+            const t_wait_start = nowMonoNs();
             const rg_result = q.getOne(io) catch |err| switch (err) {
                 error.Closed => break,
                 else => return err,
             };
+            timings.wait_for_rg_ns += @intCast(nowMonoNs() - t_wait_start);
             defer gpa.free(rg_result.raw_bytes);
             const rg_src: consumer.RGSrc = .{
                 .bytes = rg_result.raw_bytes,
@@ -1205,10 +1219,14 @@ fn buildOutputMulti(
 /// driver writes it after the drain loop. `fetch_concurrent_ns` is the
 /// sum of every fetcher worker's per-file fetch wall-clock — sum >
 /// wall-clock-fetch directly measures the cross-file overlap.
+/// `wait_for_rg_ns` is wall-clock time the drain loop spent blocked
+/// on `queue.getOne` waiting for the next RG to arrive — directly
+/// measures fetch/decode pipeline starvation.
 const Timings = struct {
     core: consumer.Timings = .{},
     footer_ns: u64 = 0,
     fetch_concurrent_ns: u64 = 0,
+    wait_for_rg_ns: u64 = 0,
 };
 
 /// Per-file fetcher worker. Drives a `scan.PerFileScan` to completion,

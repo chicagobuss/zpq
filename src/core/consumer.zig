@@ -173,68 +173,83 @@ pub fn encodeRG(
     try rg_columns.ensureTotalCapacity(out_arena, output_specs.len);
     var rg_total: i64 = 0;
 
-    for (output_specs) |spec| {
-        // Build the (filtered_values, schema_elem, path_in_schema)
-        // tuple per output column. Passthrough copies from the
-        // decoded input + uses the input's schema element; computed
-        // evaluates an expression against the post-decode batch and
-        // synthesizes a flat leaf SchemaElement on the fly.
-        var path_in_schema: []const []const u8 = undefined;
-        var leaf_elem: schema.SchemaElement = undefined;
-        var filtered: filter_eval.Batch.Column = undefined;
+    // Encode every output column in parallel into per-task arenas, then
+    // walk the results sequentially to push bytes to the sink and
+    // record offsets in deterministic order. Lambda has 2 vCPUs so we
+    // cap workers at min(N, cpus); the encode step on balanced /
+    // broad workloads is ~360-700ms single-threaded and dominates the
+    // remaining gap to polars.
+    const n_specs = output_specs.len;
+    const cpus = std.Thread.getCpuCount() catch 2;
+    const num_workers: usize = @min(n_specs, @max(@as(usize, 2), cpus));
 
-        switch (spec) {
-            .passthrough => |kept_ci| {
-                const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
-                filtered = try encoder.applySelection(out_arena, batch_cols.items[batch_pos], &sel);
-                const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-                leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
-                path_in_schema = cm.path_in_schema.items;
-            },
-            .computed => |c| {
-                const result = try expr_eval.evalExpr(ra, &batch, lookup, c.expr);
-                filtered = try encoder.applySelection(out_arena, result, &sel);
-                const path_buf = try out_arena.alloc([]const u8, 1);
-                path_buf[0] = c.alias;
-                path_in_schema = path_buf;
-                const expr_type = c.expr.typeOf();
-                // BYTE_ARRAY columns need a UTF8 / STRING annotation
-                // for downstream readers (pyarrow, polars, etc) to
-                // surface them as strings rather than raw binary. Our
-                // string concat result is always UTF-8 because the
-                // input string columns are UTF-8.
-                leaf_elem = .{
-                    .type = expr_type.toParquet(),
-                    .type_length = null,
-                    .repetition_type = .REQUIRED,
-                    .name = c.alias,
-                    .num_children = 0,
-                    .converted_type = if (expr_type == .str) .UTF8 else null,
-                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
-                    .scale = null,
-                    .precision = null,
-                    .field_id = null,
-                };
-            },
+    const results = try ra.alloc(?encoder.EncodedColumn, n_specs);
+    @memset(results, null);
+
+    // Per-task arenas are declared here so their deinit fires AFTER
+    // the write phase below — `enc.meta`'s inner slices live in these
+    // arenas and are deep-cloned into out_arena during the write
+    // phase. Allocating only when num_workers > 1 keeps the
+    // single-thread fast path free of arena init overhead.
+    var task_arenas: ?[]std.heap.ArenaAllocator = null;
+    defer if (task_arenas) |arenas| {
+        for (arenas) |*ar| ar.deinit();
+    };
+
+    const t_enc_start = nowMonoNs();
+    if (num_workers <= 1) {
+        // Trivial path: single-threaded fallback. Avoids the spawn
+        // cost when there's nothing to parallelize.
+        for (output_specs, 0..) |spec, i| {
+            results[i] = try encodeOneSpec(ra, spec, rg, meta, &batch, &sel, lookup, batch_pos_for_col, output_codec);
         }
+    } else {
+        const arenas = try ra.alloc(std.heap.ArenaAllocator, num_workers);
+        for (arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(gpa);
+        task_arenas = arenas;
 
-        const t_enc_start = nowMonoNs();
-        const enc = try encoder.encodeColumn(out_arena, .{
-            .values = filtered,
-            .schema_elem = &leaf_elem,
-            .path_in_schema = path_in_schema,
-            .codec = output_codec,
-        });
-        const t_enc_end = nowMonoNs();
-        timings.encode_ns += @intCast(t_enc_end - t_enc_start);
+        const ctxs = try ra.alloc(EncodeWorkerCtx, num_workers);
+        const threads = try ra.alloc(std.Thread, num_workers);
+        for (0..num_workers) |w| {
+            ctxs[w] = .{
+                .arena = arenas[w].allocator(),
+                .start = w,
+                .stride = num_workers,
+                .output_specs = output_specs,
+                .rg = rg,
+                .meta = meta,
+                .batch = &batch,
+                .sel = &sel,
+                .lookup = lookup,
+                .batch_pos_for_col = batch_pos_for_col,
+                .output_codec = output_codec,
+                .results = results,
+                .err = null,
+            };
+            threads[w] = try std.Thread.spawn(.{}, encodeWorker, .{&ctxs[w]});
+        }
+        for (threads) |t| t.join();
+        for (ctxs) |c| if (c.err) |err| return err;
+    }
+    timings.encode_ns += @intCast(nowMonoNs() - t_enc_start);
 
+    // Sequential write phase — bytes go to sink in deterministic
+    // output order, even though parallel workers produced them
+    // out-of-order. `sink.write` copies bytes into the sink's own
+    // buffer so per-task arenas can be deinited at function return.
+    // ColumnMetaData inner slices live in per-task arenas; deep-clone
+    // into out_arena so they outlive the function (footer references
+    // them).
+    for (results, 0..) |maybe_enc, i| {
+        _ = i;
+        const enc = maybe_enc orelse return error.MissingEncodeResult;
         const col_start_in_file: i64 = @intCast(out_offset.*);
-        var em = enc.meta;
+        var em = try cloneColumnMeta(out_arena, enc.meta);
         em.data_page_offset += col_start_in_file;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
+        const t_sink_start = nowMonoNs();
         try sink.write(enc.bytes);
-        const t_sink_end = nowMonoNs();
-        timings.sink_ns += @intCast(t_sink_end - t_enc_end);
+        timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
         out_offset.* += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
 
@@ -252,6 +267,154 @@ pub fn encodeRG(
             .total_byte_size = rg_total,
             .num_rows = @intCast(surviving),
         },
+    };
+}
+
+const EncodeWorkerCtx = struct {
+    arena: std.mem.Allocator,
+    /// First spec index this worker handles. Worker iterates
+    /// `start, start + stride, start + 2*stride, ...` until end.
+    start: usize,
+    stride: usize,
+    output_specs: []const OutputCol,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    /// Read-only view of the decoded batch (shared across workers).
+    batch: *const filter_eval.Batch,
+    sel: *const filter_selection.SelectionVector,
+    lookup: []const ?usize,
+    batch_pos_for_col: []const ?usize,
+    output_codec: schema.CompressionCodec,
+    /// Output slot per spec index. Workers write only their own
+    /// indices; no synchronization needed across slots.
+    results: []?encoder.EncodedColumn,
+    err: ?anyerror,
+};
+
+fn encodeWorker(ctx: *EncodeWorkerCtx) void {
+    var i = ctx.start;
+    while (i < ctx.output_specs.len) : (i += ctx.stride) {
+        ctx.results[i] = encodeOneSpec(
+            ctx.arena,
+            ctx.output_specs[i],
+            ctx.rg,
+            ctx.meta,
+            ctx.batch,
+            ctx.sel,
+            ctx.lookup,
+            ctx.batch_pos_for_col,
+            ctx.output_codec,
+        ) catch |err| {
+            ctx.err = err;
+            return;
+        };
+    }
+}
+
+/// Encode one output spec into `arena`. Identical work to the old
+/// inline body — extracted so both the single-threaded fallback and
+/// the parallel worker can share it.
+fn encodeOneSpec(
+    arena: std.mem.Allocator,
+    spec: OutputCol,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    batch: *const filter_eval.Batch,
+    sel: *const filter_selection.SelectionVector,
+    lookup: []const ?usize,
+    batch_pos_for_col: []const ?usize,
+    output_codec: schema.CompressionCodec,
+) !encoder.EncodedColumn {
+    var path_in_schema: []const []const u8 = undefined;
+    var leaf_elem: schema.SchemaElement = undefined;
+    var filtered: filter_eval.Batch.Column = undefined;
+
+    switch (spec) {
+        .passthrough => |kept_ci| {
+            const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
+            filtered = try encoder.applySelection(arena, batch.cols[batch_pos], sel);
+            const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+            leaf_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+            path_in_schema = cm.path_in_schema.items;
+        },
+        .computed => |c| {
+            const result = try expr_eval.evalExpr(arena, batch, lookup, c.expr);
+            filtered = try encoder.applySelection(arena, result, sel);
+            const path_buf = try arena.alloc([]const u8, 1);
+            path_buf[0] = c.alias;
+            path_in_schema = path_buf;
+            const expr_type = c.expr.typeOf();
+            leaf_elem = .{
+                .type = expr_type.toParquet(),
+                .type_length = null,
+                .repetition_type = .REQUIRED,
+                .name = c.alias,
+                .num_children = 0,
+                .converted_type = if (expr_type == .str) .UTF8 else null,
+                .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
+                .scale = null,
+                .precision = null,
+                .field_id = null,
+            };
+        },
+    }
+
+    return try encoder.encodeColumn(arena, .{
+        .values = filtered,
+        .schema_elem = &leaf_elem,
+        .path_in_schema = path_in_schema,
+        .codec = output_codec,
+    });
+}
+
+/// Deep-clone a ColumnMetaData's inner slices into `arena`. Used by
+/// the parallel-encode write phase to migrate metadata out of per-task
+/// arenas (which get freed at end of RG processing) into the longer-
+/// lived `out_arena` (which survives until footer write).
+///
+/// What gets duped:
+///   - `encodings.items` and `path_in_schema.items` containers (POD
+///     element arrays — safe to copy header-by-header). The strings
+///     inside path_in_schema already live in long-lived storage
+///     (source-meta arena for passthrough, parser arena for computed).
+///   - `statistics.{min,max,min_value,max_value}` byte slices: for
+///     BYTE_ARRAY columns these point into per-task arena, so we
+///     `arena.dupe`. For numeric stats they're page_allocator-owned
+///     and could be borrowed, but uniform dupe keeps the code simple.
+fn cloneColumnMeta(
+    arena: std.mem.Allocator,
+    src: schema.ColumnMetaData,
+) !schema.ColumnMetaData {
+    var encodings: schema.EncodingList = .empty;
+    try encodings.appendSlice(arena, src.encodings.items);
+
+    var path_list: schema.StringList = .empty;
+    try path_list.appendSlice(arena, src.path_in_schema.items);
+
+    var stats: ?schema.Statistics = null;
+    if (src.statistics) |st| {
+        stats = .{
+            .max = if (st.max) |v| try arena.dupe(u8, v) else null,
+            .min = if (st.min) |v| try arena.dupe(u8, v) else null,
+            .null_count = st.null_count,
+            .distinct_count = st.distinct_count,
+            .max_value = if (st.max_value) |v| try arena.dupe(u8, v) else null,
+            .min_value = if (st.min_value) |v| try arena.dupe(u8, v) else null,
+        };
+    }
+
+    return .{
+        .type = src.type,
+        .encodings = encodings,
+        .path_in_schema = path_list,
+        .codec = src.codec,
+        .num_values = src.num_values,
+        .total_uncompressed_size = src.total_uncompressed_size,
+        .total_compressed_size = src.total_compressed_size,
+        .data_page_offset = src.data_page_offset,
+        .index_page_offset = src.index_page_offset,
+        .dictionary_page_offset = src.dictionary_page_offset,
+        .statistics = stats,
     };
 }
 

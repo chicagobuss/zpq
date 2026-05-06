@@ -131,15 +131,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/zpq-smoke
-          # Generate a 50k-row mixed-type fixture via pyarrow.
+          # Generate a 50k-row mixed-type fixture via pyarrow. The
+          # `nullable` columns sprinkle nulls every 5th row so the
+          # coalesce test below has something to actually replace.
           python3 - <<'PY'
           import pyarrow as pa, pyarrow.parquet as pq
           n = 50_000
           t = pa.table({
-              "i32":   pa.array([i - n//2 for i in range(n)], type=pa.int32()),
-              "i64":   pa.array([i * 7 for i in range(n)], type=pa.int64()),
-              "f64":   pa.array([i * 0.5 for i in range(n)], type=pa.float64()),
-              "name":  pa.array([f"row_{i:05d}" for i in range(n)], type=pa.string()),
+              "i32":         pa.array([i - n//2 for i in range(n)], type=pa.int32()),
+              "i64":         pa.array([i * 7 for i in range(n)], type=pa.int64()),
+              "f64":         pa.array([i * 0.5 for i in range(n)], type=pa.float64()),
+              "name":        pa.array([f"row_{i:05d}" for i in range(n)], type=pa.string()),
+              "i32_null":    pa.array([None if i % 5 == 0 else i for i in range(n)], type=pa.int32()),
+              "name_null":   pa.array([None if i % 5 == 0 else f"v_{i}" for i in range(n)], type=pa.string()),
           })
           pq.write_table(t, "/tmp/zpq-smoke/in.parquet", compression="snappy")
           PY
@@ -155,6 +159,9 @@ jobs:
           # 3. BETWEEN.
           $ZPQ query /tmp/zpq-smoke/in.parquet -o /tmp/zpq-smoke/between.parquet \
             --filter "i64 BETWEEN 0 AND 1000"
+          # 4. coalesce — substitute defaults for nulls.
+          $ZPQ query /tmp/zpq-smoke/in.parquet -o /tmp/zpq-smoke/coalesced.parquet \
+            --select "coalesce(i32_null, -1) AS i32_filled, coalesce(name_null, '<missing>') AS name_filled"
 
           # Validate every output via pyarrow.
           python3 - <<'PY'
@@ -179,5 +186,25 @@ jobs:
           # BETWEEN test: inclusive bounds.
           b = pq.read_table("/tmp/zpq-smoke/between.parquet")
           assert all(0 <= v <= 1000 for v in b["i64"].to_pylist())
+
+          # coalesce test: every null in the source becomes the default
+          # in the output; non-null rows pass through unchanged.
+          c = pq.read_table("/tmp/zpq-smoke/coalesced.parquet")
+          src_i32_null = src["i32_null"].to_pylist()
+          src_name_null = src["name_null"].to_pylist()
+          out_i32 = c["i32_filled"].to_pylist()
+          out_name = c["name_filled"].to_pylist()
+          assert not any(v is None for v in out_i32), "coalesce left nulls in i32 output"
+          assert not any(v is None for v in out_name), "coalesce left nulls in name output"
+          for src_v, out_v in zip(src_i32_null, out_i32):
+              expected = -1 if src_v is None else src_v
+              assert out_v == expected, f"coalesce(i32) mismatch: src={src_v}, out={out_v}"
+          for src_v, out_v in zip(src_name_null, out_name):
+              expected = "<missing>" if src_v is None else src_v
+              assert out_v == expected, f"coalesce(name) mismatch: src={src_v!r}, out={out_v!r}"
+          # Non-null rate sanity check (we sprinkled nulls every 5th row).
+          null_count_src = sum(1 for v in src_i32_null if v is None)
+          assert null_count_src > 0, "fixture should contain nulls"
+
           print("All cross-impl checks passed")
           PY

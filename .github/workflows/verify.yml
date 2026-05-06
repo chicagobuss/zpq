@@ -1,0 +1,183 @@
+name: Verify
+
+# One job, one platform (linux-x86_64), <2 min target. Verifies the
+# things that, if broken, mean a real user has a bad day:
+#   1. Both binaries compile (CLI + Lambda).
+#   2. The Lambda binary is a Lambda binary (identity check — catches
+#      the deploy-bug class where aws.sh packaged the CLI by mistake).
+#   3. Unit tests pass.
+#   4. Lambda integration tests pass (real binary against in-process fake).
+#   5. CLI roundtrips a parquet through filter/select/projection and
+#      pyarrow can read the output (cross-impl correctness).
+#
+# Cross-platform compile (macOS, ARM64) is verified at release time,
+# not on every PR. Conformance against the apache parquet-testing
+# corpus is a separate manual / cron concern; this workflow guards
+# the production target.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.zig"
+      - "build.zig.zon"
+      - "vendor/**"
+      - "tools/**"
+      - "tests/**"
+      - ".github/workflows/verify.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.zig"
+      - "build.zig.zon"
+      - "vendor/**"
+      - "tools/**"
+      - "tests/**"
+      - ".github/workflows/verify.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (via anyzig — pins to build.zig.zon's minimum_zig_version)
+        run: |
+          mkdir -p $HOME/zig-bin
+          curl -fsSL "https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz" \
+            | tar -xz -C $HOME/zig-bin
+          echo "$HOME/zig-bin" >> $GITHUB_PATH
+
+      - name: Install Just
+        uses: extractions/setup-just@v2
+
+      - name: Install pyarrow
+        run: pip install --quiet --no-input "pyarrow==18.*"
+
+      - name: Cache Zig Global Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
+          restore-keys: ${{ runner.os }}-x86_64-zig-
+
+      - name: Fetch Pre-built BoringSSL
+        run: |
+          # vendor/boring_tls is prebuilt-only by doctrine. Fail loud if
+          # R2 is down — there's no source-build fallback to fall back to.
+          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux"
+          mkdir -p vendor/boring_tls/prebuilt/x86_64-linux
+          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a
+          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libssl.a
+          # Sanity: must be > 1 KB (R2 returns a 0-byte body on miss).
+          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a) -gt 1024
+          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libssl.a) -gt 1024
+
+      # Step 1: builds zpq + zpq-lambda for native linux-x86_64.
+      - name: Build (debug)
+        run: zig build --summary all
+
+      # Step 2: lambda binary identity check. Catches today's deploy-bug
+      # class — aws.sh used to package zig-out/bin/zpq (the CLI) as
+      # `bootstrap`, which exits immediately on Lambda. This guard makes
+      # that fail at PR time, not on first invoke.
+      - name: Lambda binary identity check
+        run: |
+          test -x zig-out/bin/zpq-lambda
+          file zig-out/bin/zpq-lambda | grep -q "ELF.*executable"
+          # The Lambda Runtime API path string ONLY appears in the lambda
+          # binary's invocation loop. If this isn't present, we packaged
+          # the wrong artifact.
+          strings zig-out/bin/zpq-lambda | grep -q "/2018-06-01/runtime/invocation/"
+          # Negative test: this string MUST NOT appear in the CLI binary.
+          if strings zig-out/bin/zpq | grep -q "/2018-06-01/runtime/invocation/"; then
+            echo "FAIL: CLI binary contains lambda-runtime symbols (binary mix-up?)"
+            exit 1
+          fi
+
+      # Step 3: also build the Lambda binary the way `aws.sh build` does
+      # — cross-compile to x86_64-linux-musl with ReleaseFast — so the
+      # identity check above also covers the deploy artifact, not just
+      # the dev-build artifact.
+      - name: Build Lambda deploy artifact (musl, ReleaseFast)
+        run: ./tools/serverless/aws.sh build x86_64
+
+      - name: Lambda deploy artifact identity check
+        run: |
+          # Unzip and inspect the bootstrap that would actually be sent
+          # to AWS. Same checks as above.
+          mkdir -p /tmp/lambda-check
+          unzip -q zig-out/lambda/zpq-lambda-x86_64.zip -d /tmp/lambda-check
+          file /tmp/lambda-check/bootstrap | grep -q "ELF.*executable"
+          file /tmp/lambda-check/bootstrap | grep -q "statically linked"
+          strings /tmp/lambda-check/bootstrap | grep -q "/2018-06-01/runtime/invocation/"
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Lambda integration tests
+        run: zig build test-integration --summary all
+
+      # Cross-impl smoke: write parquet via ZPQ, read via pyarrow.
+      # Catches the codec class of bug (e.g. snappy round-tripping
+      # through our own decoder but failing in cramjam) and the
+      # output-schema class (e.g. computed string columns missing the
+      # UTF8 annotation).
+      - name: CLI smoke + cross-impl validation
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/zpq-smoke
+          # Generate a 50k-row mixed-type fixture via pyarrow.
+          python3 - <<'PY'
+          import pyarrow as pa, pyarrow.parquet as pq
+          n = 50_000
+          t = pa.table({
+              "i32":   pa.array([i - n//2 for i in range(n)], type=pa.int32()),
+              "i64":   pa.array([i * 7 for i in range(n)], type=pa.int64()),
+              "f64":   pa.array([i * 0.5 for i in range(n)], type=pa.float64()),
+              "name":  pa.array([f"row_{i:05d}" for i in range(n)], type=pa.string()),
+          })
+          pq.write_table(t, "/tmp/zpq-smoke/in.parquet", compression="snappy")
+          PY
+
+          ZPQ=zig-out/bin/zpq
+
+          # 1. Filter + projection.
+          $ZPQ query /tmp/zpq-smoke/in.parquet -o /tmp/zpq-smoke/filtered.parquet \
+            --filter "i32 >= 0" --columns i32,i64,name
+          # 2. Select with arithmetic + string concat.
+          $ZPQ query /tmp/zpq-smoke/in.parquet -o /tmp/zpq-smoke/selected.parquet \
+            --select "i32, i32 + 1000 AS shifted, name || '!' AS shouted"
+          # 3. BETWEEN.
+          $ZPQ query /tmp/zpq-smoke/in.parquet -o /tmp/zpq-smoke/between.parquet \
+            --filter "i64 BETWEEN 0 AND 1000"
+
+          # Validate every output via pyarrow.
+          python3 - <<'PY'
+          import pyarrow.parquet as pq
+          src = pq.read_table("/tmp/zpq-smoke/in.parquet")
+
+          # Filter test: every row's i32 >= 0; row count matches.
+          f = pq.read_table("/tmp/zpq-smoke/filtered.parquet")
+          assert f.num_columns == 3, f"expected 3 cols, got {f.num_columns}"
+          assert all(v >= 0 for v in f["i32"].to_pylist()), "filter let through negative i32"
+          expected_rows = sum(1 for v in src["i32"].to_pylist() if v >= 0)
+          assert f.num_rows == expected_rows, f"row count: {f.num_rows} vs expected {expected_rows}"
+
+          # Select test: arithmetic + string concat correctness.
+          s = pq.read_table("/tmp/zpq-smoke/selected.parquet")
+          schema = {f.name: str(f.type) for f in s.schema}
+          assert schema == {"i32": "int32", "shifted": "int64", "shouted": "string"}, \
+              f"unexpected schema: {schema}"
+          assert all(a + 1000 == b for a, b in zip(s["i32"].to_pylist(), s["shifted"].to_pylist()))
+          assert all(n + "!" == sh for n, sh in zip(src["name"].to_pylist(), s["shouted"].to_pylist()))
+
+          # BETWEEN test: inclusive bounds.
+          b = pq.read_table("/tmp/zpq-smoke/between.parquet")
+          assert all(0 <= v <= 1000 for v in b["i64"].to_pylist())
+          print("All cross-impl checks passed")
+          PY

@@ -1,9 +1,17 @@
 name: Release
 
+# Tag-driven release. Builds the CLI for 4 platforms, packages each as
+# a tar.gz with sha256, uploads to R2 (public, CDN-fronted) and
+# attaches to a GitHub Release. No CI handoff, no artifact reuse —
+# releases are rare and a clean rebuild is worth the simplicity.
+#
+# Lambda binaries are NOT shipped here. They're author-deployed via
+# `just lambda-deploy`; `tools/serverless/aws.sh build` is what
+# produces the artifact that hits AWS.
+
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -12,119 +20,44 @@ on:
         type: string
 
 jobs:
-  # Wait for CI to complete on the same commit (only for tag pushes)
-  wait-for-ci:
-    name: Wait for CI
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Wait for CI workflow
-        uses: lewagon/wait-on-check-action@v1.3.4
-        with:
-          ref: ${{ github.sha }}
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          wait-interval: 10
-          running-workflow-name: "Wait for CI"
-          check-regexp: "(linux|macos)-" # Match CI job names
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [wait-for-ci]
-    if: always() && (needs.wait-for-ci.result == 'success' || needs.wait-for-ci.result == 'skipped')
-    runs-on: ${{ matrix.os }}
-    permissions:
-      actions: read # Required for dawidd6/action-download-artifact to list CI runs
-      contents: read
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-linux
+          - target: x86_64-linux
             artifact: zpq-linux-x86_64
-            ci_artifact: zpq-x86_64-linux
-          - os: [self-hosted, Linux, ARM64, zpq-arm]
-            target: aarch64-linux
+          - target: aarch64-linux
             artifact: zpq-linux-arm64
-            ci_artifact: zpq-aarch64-linux
-          - os: macos-latest
-            target: x86_64-macos
+          - target: x86_64-macos
             artifact: zpq-macos-x86_64
-            ci_artifact: zpq-x86_64-macos
-          - os: macos-latest
-            target: aarch64-macos
+          - target: aarch64-macos
             artifact: zpq-macos-arm64
-            ci_artifact: zpq-aarch64-macos
-
     steps:
       - uses: actions/checkout@v4
 
-      # Try to download pre-built binary from CI for this specific commit
-      - name: Try CI Artifact
-        id: ci-artifact
-        uses: dawidd6/action-download-artifact@v3
-        continue-on-error: true
-        with:
-          workflow: ci.yml
-          commit: ${{ github.sha }}
-          name: ${{ matrix.ci_artifact }}
-          path: ci-bin/
-          if_no_artifact_found: ignore
-
-      - name: Check CI Artifact
-        id: check-ci
+      - name: Install Zig (anyzig pins to build.zig.zon)
         run: |
-          if [ -f "ci-bin/zpq" ]; then
-            echo "Found CI artifact for commit ${{ github.sha }}, using pre-built binary"
-            echo "found=true" >> $GITHUB_OUTPUT
-            chmod +x ci-bin/zpq
-            mkdir -p zig-out/bin
-            mv ci-bin/zpq zig-out/bin/zpq
-            ls -la zig-out/bin/
-          else
-            echo "No CI artifact found for commit ${{ github.sha }}, will build from source"
-            echo "found=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Only run build steps if CI artifact not found
-      - name: Set up anyzig
-        if: steps.check-ci.outputs.found != 'true'
-        run: |
-          ARCH=$(uname -m)
-          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-          if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
-
-          if [ "$OS" = "darwin" ]; then
-            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ARCH}-macos.tar.gz"
-          else
-            URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ARCH}-linux.tar.gz"
-          fi
-
           mkdir -p $HOME/zig-bin
-          curl -fsSL "$URL" | tar -xz -C $HOME/zig-bin
+          curl -fsSL "https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz" \
+            | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
       - name: Fetch Pre-built BoringSSL
-        if: steps.check-ci.outputs.found != 'true'
         run: |
-          R2_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${{ matrix.target }}"
+          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${{ matrix.target }}"
           mkdir -p vendor/boring_tls/prebuilt/${{ matrix.target }}
+          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a
+          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a
+          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a) -gt 1024
+          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a) -gt 1024
 
-          curl -fsSL "${R2_URL}/libcrypto.a" -o "vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a" || true
-          curl -fsSL "${R2_URL}/libssl.a" -o "vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a" || true
+      - name: Build CLI
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast cli --summary all
 
-          ls -la vendor/boring_tls/prebuilt/${{ matrix.target }}/
-
-      - name: Build zpq
-        if: steps.check-ci.outputs.found != 'true'
-        run: |
-          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast --summary all
-
-          # Show binary info
-          ls -la zig-out/bin/
-          file zig-out/bin/zpq || true
-
-      - name: Package CLI
+      - name: Package
         run: |
           mkdir -p dist
           cp zig-out/bin/zpq dist/
@@ -132,7 +65,7 @@ jobs:
           tar -czvf ${{ matrix.artifact }}.tar.gz zpq
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
-      - name: Upload CLI artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -140,11 +73,10 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v4
 
@@ -153,13 +85,13 @@ jobs:
         with:
           path: artifacts
 
-      - name: Prepare release assets
+      - name: Stage release directory
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec cp {} release/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
           ls -la release/
 
-      - name: Upload to R2 (public access)
+      - name: Upload to R2 (public)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -167,59 +99,15 @@ jobs:
         run: |
           R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           TAG="${GITHUB_REF#refs/tags/}"
-
-          echo "Uploading release binaries to R2..."
-          for file in release/*.tar.gz; do
+          for file in release/*; do
             name=$(basename "$file")
-            echo "Uploading $name..."
             aws s3 cp "$file" "s3://zpq/releases/${TAG}/${name}" --endpoint-url "$R2_ENDPOINT"
-            # Also upload as "latest" for easy access
             aws s3 cp "$file" "s3://zpq/releases/latest/${name}" --endpoint-url "$R2_ENDPOINT"
           done
-          echo "Done uploading to R2"
 
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ZPQ ${{ steps.tag.outputs.tag }}
-          draft: false
-          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
           files: release/*
-          body: |
-            ## ZPQ ${{ steps.tag.outputs.tag }}
-
-            ### Downloads
-
-            | Platform | Download |
-            |----------|----------|
-            | Linux x86_64 | [zpq-linux-x86_64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-x86_64.tar.gz) |
-            | Linux ARM64 | [zpq-linux-arm64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz) |
-            | macOS x86_64 | [zpq-macos-x86_64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-macos-x86_64.tar.gz) |
-            | macOS ARM64 | [zpq-macos-arm64.tar.gz](https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-macos-arm64.tar.gz) |
-
-            ### Quick Start
-
-            ```bash
-            # Download and extract (Linux ARM64 example)
-            curl -fsSL https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/${{ steps.tag.outputs.tag }}/zpq-linux-arm64.tar.gz | tar -xz
-
-            # View schema
-            ./zpq myfile.parquet --schema
-
-            # Filter and output
-            ./zpq input.parquet output.parquet --filter "status=active" --select "id,name,email"
-            ```
-
-            ### Serverless Deployment
-
-            See [examples/serverless/README.md](https://github.com/${{ github.repository }}/blob/main/examples/serverless/README.md) for AWS Lambda, Cloud Run, and other serverless deployments.
+          generate_release_notes: true
+          fail_on_unmatched_files: true

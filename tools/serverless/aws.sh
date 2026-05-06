@@ -95,6 +95,21 @@ deploy() {
 
     # Check if function exists
     if aws lambda get-function --function-name "$fn_name" --region "$region" &>/dev/null; then
+        # Pre-flight: refuse to push a zip whose target arch doesn't
+        # match the function's configured architecture. Without this
+        # check, a wrong-arch deploy succeeds silently and every
+        # subsequent invoke fails with `Runtime.ExitError` (exit 126).
+        # Cost me an hour on 2026-05-05 — never again.
+        local existing_arch
+        existing_arch=$(aws lambda get-function-configuration \
+            --function-name "$fn_name" --region "$region" \
+            --query 'Architectures[0]' --output text)
+        if [[ "$existing_arch" != "$aws_arch" ]]; then
+            error "Arch mismatch: zip is $aws_arch but function $fn_name is $existing_arch."
+            error "Either build for $existing_arch or recreate the function with the new arch."
+            exit 1
+        fi
+
         info "Updating existing function $fn_name..."
         aws lambda update-function-code \
             --function-name "$fn_name" \

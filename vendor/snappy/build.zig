@@ -1,0 +1,67 @@
+//! vendor/snappy build — google/snappy 1.2.1, source-built.
+//!
+//! Produces a static `libsnappy.a` plus a Zig module exposing the
+//! header. The implementation is C++; we link `libc++` statically
+//! (the Zig-bundled libc++) to keep the lambda binary self-contained.
+//!
+//! Generic build only — no architecture-specific intrinsics. The
+//! generic implementation hits ~250 MB/s on x86_64, plenty for our
+//! workloads. SSSE3 / BMI2 / NEON-CRC32 paths can be re-enabled
+//! later via per-target Zig flags if a workload demands them.
+
+const std = @import("std");
+
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const lib_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    // -mno-avx is x86-only and rejected by clang on aarch64. We only
+    // need it on x86 because that's the target where snappy.cc's
+    // `defined(__x86_64__) && defined(__AVX__)` fast path triggers
+    // without an immintrin.h include. ARM has no analog.
+    const t_arch = target.result.cpu.arch;
+    var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    try flags.appendSlice(b.allocator, &.{
+        "-std=c++17",
+        "-DHAVE_CONFIG_H",
+        "-fno-exceptions",
+        "-fno-rtti",
+    });
+    if (t_arch == .x86_64 or t_arch == .x86) {
+        try flags.append(b.allocator, "-mno-avx");
+    }
+    lib_mod.addCSourceFiles(.{
+        .root = b.path("."),
+        .files = &.{
+            "snappy.cc",
+            "snappy-c.cc",
+            "snappy-sinksource.cc",
+            "snappy-stubs-internal.cc",
+        },
+        .flags = flags.items,
+    });
+    lib_mod.addIncludePath(b.path("."));
+
+    const lib = b.addLibrary(.{
+        .name = "snappy",
+        .root_module = lib_mod,
+    });
+    lib.installHeader(b.path("snappy-c.h"), "snappy-c.h");
+
+    b.installArtifact(lib);
+
+    // Expose the include directory and library to dependents.
+    const mod = b.addModule("snappy", .{
+        .root_source_file = b.path("root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addIncludePath(b.path("."));
+    mod.linkLibrary(lib);
+}

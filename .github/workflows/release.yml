@@ -1,0 +1,113 @@
+name: Release
+
+# Tag-driven release. Builds the CLI for 4 platforms, packages each as
+# a tar.gz with sha256, uploads to R2 (public, CDN-fronted) and
+# attaches to a GitHub Release. No CI handoff, no artifact reuse —
+# releases are rare and a clean rebuild is worth the simplicity.
+#
+# Lambda binaries are NOT shipped here. They're author-deployed via
+# `just lambda-deploy`; `tools/serverless/aws.sh build` is what
+# produces the artifact that hits AWS.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., v0.1.0)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact: zpq-linux-x86_64
+          - target: aarch64-linux
+            artifact: zpq-linux-arm64
+          - target: x86_64-macos
+            artifact: zpq-macos-x86_64
+          - target: aarch64-macos
+            artifact: zpq-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (anyzig pins to build.zig.zon)
+        run: |
+          mkdir -p $HOME/zig-bin
+          curl -fsSL "https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz" \
+            | tar -xz -C $HOME/zig-bin
+          echo "$HOME/zig-bin" >> $GITHUB_PATH
+
+      - name: Fetch Pre-built BoringSSL
+        run: |
+          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${{ matrix.target }}"
+          mkdir -p vendor/boring_tls/prebuilt/${{ matrix.target }}
+          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a
+          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a
+          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a) -gt 1024
+          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a) -gt 1024
+
+      - name: Build CLI
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast cli --summary all
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/zpq dist/
+          cd dist
+          tar -czvf ${{ matrix.artifact }}.tar.gz zpq
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release directory
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Upload to R2 (public)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          TAG="${GITHUB_REF#refs/tags/}"
+          for file in release/*; do
+            name=$(basename "$file")
+            aws s3 cp "$file" "s3://zpq/releases/${TAG}/${name}" --endpoint-url "$R2_ENDPOINT"
+            aws s3 cp "$file" "s3://zpq/releases/latest/${name}" --endpoint-url "$R2_ENDPOINT"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,0 +1,51 @@
+label	total_ms	fetch_ms	put_ms	bytes_out	rg_pruned	upload
+zpq:copy	1941	904	893	155512528	0	multipart_pooled
+zpq:copy	3903	579	3182	155512528	0	multipart_pooled
+zpq:copy	1467	556	768	155512528	0	multipart_pooled
+zpq:copy	1475	574	759	155512528	0	multipart_pooled
+zpq:copy	1484	552	792	155512528	0	multipart_pooled
+zpq:prune_all	80	53	27	642	4	single_pooled
+zpq:prune_all	97	46	51	642	4	single_pooled
+zpq:prune_all	86	57	28	642	4	single_pooled
+zpq:prune_all	78	51	26	642	4	single_pooled
+zpq:prune_all	74	48	26	642	4	single_pooled
+zpq:project	175	86	88	530087	0	single_pooled
+zpq:project	153	74	78	530087	0	single_pooled
+zpq:project	131	71	59	530087	0	single_pooled
+zpq:project	116	80	35	530087	0	single_pooled
+zpq:project	156	67	88	530087	0	single_pooled
+py:boto3	2973	1585	1388	155534563		
+py:boto3	2969	1584	1384	155534563		
+py:boto3	2978	1585	1392	155534563		
+py:boto3	2973	1585	1388	155534563		
+py:boto3	2953	1586	1367	155534563		
+py:polars_copy	1881			117798354		
+py:polars_copy	1874			117798354		
+py:polars_copy	1924			117798354		
+py:polars_copy	2005			117798354		
+py:polars_copy	2080			117798354		
+py:polars_prune	576			2740		
+py:polars_prune	1175			2740		
+py:polars_prune	1591			2740		
+py:polars_prune	1589			2740		
+py:polars_prune	1598			2740		
+py:polars_project	271			529670		
+py:polars_project	265			529670		
+py:polars_project	261			529670		
+py:polars_project	231			529670		
+py:polars_project	310			529670		
+py:duckdb_copy	3119			140689226		
+py:duckdb_copy	2971			140689226		
+py:duckdb_copy	2882			140689226		
+py:duckdb_copy	2823			140689226		
+py:duckdb_copy	3108			140689226		
+py:duckdb_prune	105			603		
+py:duckdb_prune	114			603		
+py:duckdb_prune	110			603		
+py:duckdb_prune	183			603		
+py:duckdb_prune	130			603		
+py:duckdb_project	238			534966		
+py:duckdb_project	237			534966		
+py:duckdb_project	291			534966		
+py:duckdb_project	275			534966		
+py:duckdb_project	288			534966		

@@ -1,0 +1,15 @@
+{
+  "agg": {
+    "n": 43046,
+    "s": -37276731165
+  },
+  "bytes_in": 155534563,
+  "bytes_out": 0,
+  "files_in": 1,
+  "input": "<path>",
+  "ok": true,
+  "row_groups_in": 4,
+  "row_groups_pruned": 0,
+  "rows_in": 524288,
+  "rows_kept": 524288
+}

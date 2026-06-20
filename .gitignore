@@ -1,0 +1,81 @@
+# Local-only artifacts / scratch
+certs/
+data/
+references/
+
+# Zig / Build
+zig-cache/
+.zig-cache/
+zig-out/
+.bin/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Python / Venv
+.venv/
+__pycache__/
+*.pyc
+
+# Compiled libraries
+*.dylib
+*.so
+*.dll
+
+# Env
+.env*
+!.env.example
+mock_s3_server
+nc_output.txt
+
+# RustFS / Local Testing
+rustfs_data/
+tools/rustfs_tls/certs/
+*.parquet
+!ci/fixtures/parquet/*.parquet
+ci/fixtures/parquet/sales_large.parquet
+!data/simple.parquet
+!data/large_bitpacked.parquet
+!data/large_rle.parquet
+tmp/
+vendor/boring_tls/prebuilt/
+
+# Comparison project build artifacts
+examples/lambda/comparison/rust-arrow/target/
+examples/lambda/comparison/**/*.zip
+CURRENT_CONTEXT.md
+.agent/
+.claude/
+.cursor/
+
+# Benchmark binaries
+benchmarks/bootstrap
+benchmarks/zpq
+benchmarks/*.zip
+
+
+# Probe outputs (regeneratable)
+output/
+
+# Vendored hardwood CLI (downloaded prebuilt; large, regeneratable)
+tools/hardwood/
+
+# Bench result snapshots (churn every run; commit only curated measurements)
+benchmarks/coldstart_results.tsv
+benchmarks/partition_results.tsv
+benchmarks/selectivity_results.tsv
+benchmarks/common_four_results.tsv
+tools/conformance_report.tsv
+
+# Zig package cache
+zig-pkg/
+
+# Regression harness scratch
+benchmarks/regression/.tmp_glob/
+
+prof/
+
+# Generated codebase-index snapshots (point-in-time scratch, drift fast — keep local)
+zpq-index-*.md

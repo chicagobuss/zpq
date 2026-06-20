@@ -1,0 +1,36 @@
+{
+  "cli_count_max_sum_1file": {
+    "max_ms": 18,
+    "max_rss_kb": 13179
+  },
+  "cli_count_max_sum_glob": {
+    "max_ms": 21,
+    "max_rss_kb": 43084
+  },
+  "cli_count_star_1file": {
+    "max_ms": 7,
+    "max_rss_kb": 3904
+  },
+  "cli_count_star_glob": {
+    "max_ms": 10,
+    "max_rss_kb": 6544
+  },
+  "cli_filtered_1file": {
+    "max_ms": 27,
+    "max_rss_kb": 16069
+  },
+  "cli_filtered_glob": {
+    "max_ms": 34,
+    "max_rss_kb": 53829
+  },
+  "lambda_aggregate": {
+    "max_internal_ms": 564,
+    "max_ms": 1152,
+    "max_rss_kb": 1024
+  },
+  "lambda_compaction": {
+    "max_internal_ms": 1522,
+    "max_ms": 2162,
+    "max_rss_kb": 1024
+  }
+}

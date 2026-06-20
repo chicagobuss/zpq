@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "bucket": "zpq",
+  "endpoint": "https://<accountid>.r2.cloudflarestorage.com",
+  "region": "auto",
+  "host": "<accountid>.r2.cloudflarestorage.com",
+  "resolved_ipv4": "<redacted>",
+  "dns_ms": 0.48,
+  "tls_handshake_ms": 15.11,
+  "first_get": {"status": 206, "body_bytes": 65536, "ms": 128.08},
+  "reuse_get": {"count": 8, "total_ms": 496.76, "min_ms": 55.52, "max_ms": 70.29, "avg_ms": 62.09},
+  "pool_serial_fanout": {"requested": 24, "ok": 24, "err": 0, "total_ms": 2302.19, "avg_ms": 95.9245}
+}

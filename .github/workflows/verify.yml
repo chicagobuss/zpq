@@ -1,0 +1,179 @@
+name: Verify
+
+# One job, one platform (linux-x86_64), <2 min target. Verifies the
+# things that, if broken, mean a real user has a bad day:
+#   1. Both binaries compile (CLI + Lambda), and the lean-core CLI
+#      (-Dsql=false) compiles too and is genuinely SQL-free.
+#   2. The Lambda binary is a Lambda binary (identity check — catches
+#      the deploy-bug class where aws.sh packaged the CLI by mistake).
+#   3. Unit tests pass.
+#   4. Lambda integration tests pass (real binary against in-process fake).
+#   5. CLI roundtrips a parquet through filter/select/projection and
+#      pyarrow can read the output (cross-impl correctness).
+#   6. Conformance against the apache parquet-testing corpus, with a
+#      regression floor: hard failures (crash / wrong shape / wrong
+#      row counts) always fail; the full-pass count must not drop
+#      below the recorded baseline (69 @ 2026-06-14).
+#
+# Cross-platform compile (ARM64) is verified at release time, not on
+# every PR; macOS lands with the kqueue backend. This workflow guards
+# the production target.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.zig"
+      - "build.zig.zon"
+      - "vendor/**"
+      - "tools/**"
+      - "tests/**"
+      - ".github/workflows/verify.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.zig"
+      - "build.zig.zon"
+      - "vendor/**"
+      - "tools/**"
+      - "tests/**"
+      - ".github/workflows/verify.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Was 10 min; bumped 2026-05-07 after a string of timeouts when
+    # the cache was cold + ziglang.org was returning 500s. Compile
+    # itself is ~5 min on the runner; the rest is setup + downstream
+    # checks. Real headroom matters more than aspirational tightness.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # mlugg/setup-zig uses community-zig-builds with multi-mirror
+      # fallback. Switched from raw anyzig install on 2026-05-07 after
+      # ziglang.org returned HTTP 500 on a Zig 0.16.0 tarball download
+      # and hung the runner for the full job budget. anyzig downloads
+      # the *exact* tarball from ziglang.org with no fallback; setup-zig
+      # has redundancy.
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Just
+        uses: extractions/setup-just@v2
+
+      - name: Install pyarrow
+        # pyarrow>=21 recognizes the GEOMETRY/GEOGRAPHY logical type. The
+        # pinned corpus SHA ships 10 geospatial fixtures; pyarrow 18 fails to
+        # *open* them ("Thrift LogicalType not recognized") — not a zpq issue,
+        # but it dropped the conformance oracle below the floor. zpq reads all
+        # 10 correctly (WKB as BYTE_ARRAY); a current pyarrow lets the floor
+        # (69) count them. Bump deliberately alongside the corpus SHA.
+        run: pip install --quiet --no-input "pyarrow==24.*"
+
+      - name: Cache Zig global build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          # mlugg/setup-zig handles Zig-binary caching itself; we
+          # only need to cache the *build* artifacts here. Cache key
+          # is keyed on build.zig + build.zig.zon + vendor build.zigs
+          # so a meaningful build-graph change invalidates correctly.
+          key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
+          restore-keys: ${{ runner.os }}-x86_64-zig-
+
+      - name: Fetch Pre-built BoringSSL
+        run: |
+          # vendor/boring_tls is prebuilt-only by doctrine. Fail loud if
+          # R2 is down — there's no source-build fallback to fall back to.
+          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux"
+          mkdir -p vendor/boring_tls/prebuilt/x86_64-linux
+          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a
+          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libssl.a
+          # Sanity: must be > 1 KB (R2 returns a 0-byte body on miss).
+          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a) -gt 1024
+          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libssl.a) -gt 1024
+
+      # Step 1: builds zpq + zpq-lambda for native linux-x86_64.
+      # Default build = SQL-enabled CLI (-Dsql defaults true) + Lambda.
+      - name: Build (debug)
+        run: zig build --summary all
+
+      # Step 1b: the lean-core build (-Dsql=false). "Build the binary you
+      # want" is a real promise only if CI keeps the minimal path compiling
+      # and genuinely SQL-free. Built into a separate prefix so it can't
+      # clobber the default artifacts the identity checks below inspect.
+      - name: Build minimal CLI (no SQL frontend)
+        run: |
+          zig build -Dsql=false cli --prefix zig-out-minimal --summary all
+          # Must reject `query` with a clear error — not crash, and not
+          # silently accept SQL (which would mean the frontend leaked in).
+          if zig-out-minimal/bin/zpq query --query "SELECT 1 FROM t" 2>err.txt; then
+            echo "FAIL: minimal CLI accepted a SQL query"; cat err.txt; exit 1
+          fi
+          grep -q "no SQL frontend" err.txt || { echo "FAIL: minimal CLI gave the wrong error"; cat err.txt; exit 1; }
+
+      # Step 2: lambda binary identity check. Catches today's deploy-bug
+      # class — aws.sh used to package zig-out/bin/zpq (the CLI) as
+      # `bootstrap`, which exits right away on Lambda. This guard makes
+      # that fail at PR time, not on first invoke.
+      - name: Lambda binary identity check
+        run: |
+          test -x zig-out/bin/zpq-lambda
+          file zig-out/bin/zpq-lambda | grep -q "ELF.*executable"
+          # The Lambda Runtime API path string ONLY appears in the lambda
+          # binary's invocation loop. If this isn't present, we packaged
+          # the wrong artifact.
+          strings zig-out/bin/zpq-lambda | grep -q "/2018-06-01/runtime/invocation/"
+          # Negative test: this string MUST NOT appear in the CLI binary.
+          if strings zig-out/bin/zpq | grep -q "/2018-06-01/runtime/invocation/"; then
+            echo "FAIL: CLI binary contains lambda-runtime symbols (binary mix-up?)"
+            exit 1
+          fi
+
+      # Step 3: also build the Lambda binary the way `aws.sh build` does
+      # — cross-compile to x86_64-linux-musl with ReleaseFast — so the
+      # identity check above also covers the deploy artifact, not just
+      # the dev-build artifact.
+      - name: Build Lambda deploy artifact (musl, ReleaseFast)
+        run: ./tools/serverless/aws.sh build x86_64
+
+      - name: Lambda deploy artifact identity check
+        run: |
+          # Unzip and inspect the bootstrap that would actually be sent
+          # to AWS. Same checks as above.
+          mkdir -p /tmp/lambda-check
+          unzip -q zig-out/lambda/zpq-lambda-x86_64.zip -d /tmp/lambda-check
+          file /tmp/lambda-check/bootstrap | grep -q "ELF.*executable"
+          file /tmp/lambda-check/bootstrap | grep -q "statically linked"
+          strings /tmp/lambda-check/bootstrap | grep -q "/2018-06-01/runtime/invocation/"
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Lambda integration tests
+        run: zig build test-integration --summary all
+
+      # Cross-impl smoke: write parquet via ZPQ, read via pyarrow.
+      # Catches the codec class of bug (e.g. snappy round-tripping
+      # through our own decoder but failing in cramjam) and the
+      # output-schema class (e.g. computed string columns missing the
+      # UTF8 annotation). Lives in tools/cli_smoke.sh so the same
+      # checks run locally (`just smoke`) and here.
+      - name: CLI smoke + cross-impl validation
+        run: tools/cli_smoke.sh
+
+      # Step 6: conformance with a regression floor. The corpus clone is
+      # pinned to a known SHA so upstream additions can't fail us
+      # surprise-style; bump the SHA + floor together, deliberately.
+      - name: Conformance (apache/parquet-testing)
+        run: |
+          git clone https://github.com/apache/parquet-testing /tmp/parquet-testing
+          git -C /tmp/parquet-testing checkout --quiet 1a2a75127be06fc0123f03ebd36c966f7beda27d
+          zig build -Doptimize=ReleaseFast
+          python3 tools/conformance.py --corpus /tmp/parquet-testing/data --min-pass 69

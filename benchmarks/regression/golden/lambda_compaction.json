@@ -1,0 +1,11 @@
+{
+  "bytes_in": 100310925,
+  "bytes_out": 14208,
+  "files_in": 2,
+  "ok": true,
+  "output": "<path>",
+  "row_groups_in": 6,
+  "row_groups_kept": 6,
+  "rows_in": 5972150,
+  "rows_kept": 1088
+}

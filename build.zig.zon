@@ -1,0 +1,19 @@
+.{
+    .name = .zpq,
+    .version = "0.1.4",
+    .fingerprint = 0xae1a0cc8c4cc362f,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .boring_tls = .{
+            .path = "vendor/boring_tls",
+        },
+        .snappy = .{
+            .path = "vendor/snappy",
+        },
+        .zstd = .{
+            .url = "https://github.com/allyourcodebase/zstd/archive/e1a501be57f42c541e8a5597e4b59a074dfd09a3.tar.gz",
+            .hash = "zstd-1.5.7-1-KEItkAMwAAD6OKY3m0OOmXG7aL-aLUfrDqbP5J5oYapU",
+        },
+    },
+    .paths = .{""},
+}

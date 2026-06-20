@@ -1,0 +1,13 @@
+{
+  "agg": {
+    "count": 2097152
+  },
+  "bytes_in": 622138252,
+  "bytes_out": 0,
+  "files_in": 4,
+  "ok": true,
+  "row_groups_in": 16,
+  "row_groups_pruned": 0,
+  "rows_in": 2097152,
+  "rows_kept": 2097152
+}

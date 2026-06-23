@@ -206,6 +206,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    through the open step + the scan step.)
     const r = try scan.runMultiAggregate(ctx.gpa, arena, .{
         .inputs = opened.inputs,
+        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened) else null,
         .filter = args.filter,
         .aggregate = agg_str,
         .parallelism = args.parallelism,
@@ -265,8 +266,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // 2. Parse meta of every file (cheap; serial), validate schemas
     //    against meta[0].
     const t_parse_start = nowMonoNs();
-    var metas = try arena.alloc(schema.FileMetaData, opened.inputs.len);
-    for (opened.inputs, 0..) |in, i| metas[i] = try metadata.open(arena, in.bytes);
+    const metas = try materializeMetas(arena, opened);
     const meta0 = &metas[0];
     for (metas[1..], 1..) |*m, i| {
         if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
@@ -713,6 +713,9 @@ fn buildSelectSchema(
 const OpenedInputs = struct {
     gpa: std.mem.Allocator,
     inputs: []const scan.Input,
+    metas: []schema.FileMetaData,
+    meta_ready: []bool,
+    has_preparsed_meta: bool = false,
     /// Per-input mmap state — set for local files so we can munmap on
     /// deinit. Null for s3 inputs (their bytes live in the arena).
     mmaps: []const ?MmapHandle,
@@ -732,6 +735,17 @@ const OpenedInputs = struct {
     }
 };
 
+fn materializeMetas(arena: std.mem.Allocator, opened: OpenedInputs) ![]const schema.FileMetaData {
+    var metas = try arena.alloc(schema.FileMetaData, opened.inputs.len);
+    for (opened.inputs, 0..) |in, i| {
+        metas[i] = if (opened.meta_ready[i])
+            opened.metas[i]
+        else
+            try metadata.open(arena, in.bytes);
+    }
+    return metas;
+}
+
 const MmapHandle = struct {
     addr: [*]const u8,
     len: usize,
@@ -744,6 +758,9 @@ fn openInputs(
 ) !OpenedInputs {
     const paths = args.inputs;
     var inputs = try arena.alloc(scan.Input, paths.len);
+    var metas = try arena.alloc(schema.FileMetaData, paths.len);
+    var meta_ready = try arena.alloc(bool, paths.len);
+    @memset(meta_ready, false);
     var mmaps = try arena.alloc(?MmapHandle, paths.len);
     @memset(mmaps, null);
 
@@ -764,7 +781,7 @@ fn openInputs(
     for (local_indices.items) |i| {
         const m = try mmapFile(paths[i]);
         mmaps[i] = m;
-        inputs[i] = .{ .name = paths[i], .bytes = m.addr[0..m.len] };
+        inputs[i] = .{ .name = paths[i], .bytes = m.addr[0..m.len], .logical_size = m.len };
     }
 
     // S3: gather per-bucket batches, one pool per bucket, fetch each
@@ -804,12 +821,18 @@ fn openInputs(
         var specs = try arena.alloc(FetchSpec, s3_urls.len);
         for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u };
         fetchMetaBatch(ctx, arena, creds, pool, specs) catch |err| {
-            for (specs) |sp| if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
+            for (specs) |sp| {
+                if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
+                if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
+            }
             return err;
         };
         var specs_returned = false;
         errdefer if (!specs_returned) {
-            for (specs) |sp| if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
+            for (specs) |sp| {
+                if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
+                if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
+            }
         };
 
         // Compute fetch_set from whatever args are set: aggregate,
@@ -909,9 +932,11 @@ fn openInputs(
         // because column chunks in a parquet RG are written back-to-
         // back; fetching them as separate GETs spends most of the wall
         // in HTTP round-trip overhead even though the bytes are
-        // physically adjacent. Merged spans land directly in the file
-        // buffer at their absolute offsets — gap bytes get fetched but
-        // the decoder ignores them.
+        // physically adjacent.
+        //
+        // S3 inputs do NOT materialize a total_size-sized dense buffer.
+        // Instead, merged source ranges are packed into a compact buffer
+        // and the parsed metadata offsets are rebased to that layout.
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
         for (specs) |*sp| {
             const meta = &sp.meta;
@@ -940,20 +965,47 @@ fn openInputs(
                 }
             }
 
-            if (ranges.items.len == 0) continue;
+            if (ranges.items.len == 0) {
+                sp.file_buf = &.{};
+                continue;
+            }
             const merged = try coalescer.Coalescer.coalesce(arena, ranges.items, COALESCE_GAP);
-            for (merged) |r| {
-                // If a writer crammed a chunk right against the footer,
-                // clamp here — those bytes already arrived in the tail
-                // fetch.
-                const end = @min(r.end, sp.tail_start);
-                if (r.start >= end) continue;
-                try fetch_jobs.append(arena, .{
-                    .bucket = sp.url.bucket,
-                    .key = sp.url.key,
-                    .range = .{ .start = r.start, .end = end },
-                    .target = sp.file_buf[r.start..end],
-                });
+            var compact_len: usize = 0;
+            sp.compact_ranges = try arena.alloc(CompactRange, merged.len);
+            for (merged, 0..) |r, ri| {
+                if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
+                const len: usize = @intCast(r.end - r.start);
+                sp.compact_ranges[ri] = .{
+                    .start = r.start,
+                    .end = r.end,
+                    .dst_start = compact_len,
+                };
+                compact_len += len;
+            }
+            sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
+            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges);
+
+            for (sp.compact_ranges) |r| {
+                const source_len: usize = @intCast(r.end - r.start);
+                const dst = sp.file_buf[r.dst_start .. r.dst_start + source_len];
+
+                const fetch_end = @min(r.end, sp.tail_start);
+                if (r.start < fetch_end) {
+                    try fetch_jobs.append(arena, .{
+                        .bucket = sp.url.bucket,
+                        .key = sp.url.key,
+                        .range = .{ .start = r.start, .end = fetch_end },
+                        .target = dst[0 .. @intCast(fetch_end - r.start)],
+                    });
+                }
+
+                if (r.end > sp.tail_start) {
+                    const tail_copy_start = @max(r.start, sp.tail_start);
+                    const dst_off: usize = @intCast(tail_copy_start - r.start);
+                    const tail_off: usize = @intCast(tail_copy_start - sp.tail_start);
+                    const copy_len: usize = @intCast(r.end - tail_copy_start);
+                    @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
+                }
             }
         }
 
@@ -964,14 +1016,18 @@ fn openInputs(
             _ = try s3.fetchJobs(ctx.io, pool, ctx.gpa, arena, creds, fetch_jobs.items);
         }
 
-        // Build scan.Inputs. bytes is the per-file buffer with all the
-        // needed chunks materialized at their absolute offsets.
+        // Build scan.Inputs. bytes is the compact per-file buffer with
+        // all needed chunks materialized and metadata already rebased.
         for (s3_indices.items, 0..) |orig_idx, k| {
             inputs[orig_idx] = .{
                 .name = paths[orig_idx],
                 .bytes = specs[k].file_buf,
+                .logical_size = specs[k].total_size,
             };
-            try s3_buffers.append(arena, specs[k].file_buf);
+            if (specs[k].file_buf.len > 0) try s3_buffers.append(arena, specs[k].file_buf);
+            if (specs[k].footer_region.len > 0) try s3_buffers.append(arena, specs[k].footer_region);
+            metas[orig_idx] = specs[k].meta;
+            meta_ready[orig_idx] = true;
         }
         specs_returned = true;
     }
@@ -979,20 +1035,33 @@ fn openInputs(
     return .{
         .gpa = ctx.gpa,
         .inputs = inputs,
+        .metas = metas,
+        .meta_ready = meta_ready,
+        .has_preparsed_meta = s3_indices.items.len > 0,
         .mmaps = mmaps,
         .owned_pools = try owned_pools.toOwnedSlice(arena),
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
     };
 }
 
+const CompactRange = struct {
+    start: u64,
+    end: u64,
+    dst_start: usize,
+};
+
 /// Per-s3-file state during the meta-fetch + range-fetch dance.
-/// `file_buf` is sized to total file size; we sparse-fill the regions
-/// the query touches. Parquet's absolute byte offsets in metadata
-/// (data_page_offset, dictionary_page_offset) index into this.
+/// `file_buf` is a compact packed buffer containing only fetched ranges.
+/// Parsed metadata offsets are rebased from source-file offsets into this
+/// buffer before consumers see the input.
 const FetchSpec = struct {
     url: s3.Url,
     meta: schema.FileMetaData = undefined,
     file_buf: []u8 = &.{},
+    compact_ranges: []CompactRange = &.{},
+    tail: []const u8 = &.{},
+    footer_region: []u8 = &.{},
+    footer_offset: u64 = 0,
     total_size: u64 = 0,
     tail_start: u64 = 0,
     survivors: []bool = &.{},
@@ -1035,7 +1104,11 @@ fn fetchMetaBatch(
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| return err;
-    for (specs) |*sp| sp.meta = try metadata.open(arena, sp.file_buf);
+    for (specs) |*sp| {
+        if (sp.footer_region.len < 8) return error.BadResponse;
+        const footer_len = sp.footer_region.len - 8;
+        sp.meta = try metadata.openFooter(arena, sp.footer_region[0..footer_len]);
+    }
 }
 
 fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
@@ -1043,9 +1116,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 
     // Cache fast path: if we have a previously-cached entry, issue the
     // tail GET with `If-None-Match`. A 304 means the object is
-    // unchanged → reconstruct the sparse file_buf from the cached
-    // footer bytes + a stamped leading PAR1 magic. Skips the head GET
-    // and the footer-prefix GET entirely.
+    // unchanged → reuse the cached footer bytes. Skips the head GET and
+    // the footer-prefix GET entirely; column ranges still fetch later
+    // into compact buffers.
     //
     // On 200/206 the object has changed — the cached entry is stale,
     // we proceed exactly as the cold path. The fresh entry is
@@ -1057,17 +1130,11 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
                 .if_none_match = entry.etag,
             });
             if (cond.status == 304) {
-                // Reconstruct the file_buf so downstream metadata.open
-                // sees a valid (sparse) view.
                 sp.total_size = entry.total_size;
-                sp.file_buf = try t.ctx.gpa.alloc(u8, sp.total_size);
-                errdefer {
-                    t.ctx.gpa.free(sp.file_buf);
-                    sp.file_buf = &.{};
-                }
-                @memcpy(sp.file_buf[0..PAR1.len], &PAR1);
-                @memcpy(sp.file_buf[entry.footer_offset..sp.total_size], entry.footer_bytes);
-                sp.tail_start = entry.footer_offset; // not strictly used by callers
+                sp.footer_offset = entry.footer_offset;
+                sp.tail_start = entry.footer_offset;
+                sp.footer_region = try t.ctx.gpa.dupe(u8, entry.footer_bytes);
+                sp.tail = sp.footer_region;
                 cache.noteRevalidated(t.ctx.io);
                 return;
             }
@@ -1095,19 +1162,13 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 
 /// Shared "we have the tail response, finish the metadata fetch" path
 /// used by both the cold and (cache-stale → 200) paths. On entry,
-/// `sp` is empty; on success, `sp.file_buf`/`total_size`/`tail_start`
-/// are populated and the file_buf has its head + footer regions
-/// filled in.
+/// `sp` is empty; on success, `total_size`/`tail_start` are populated
+/// and `footer_region` contains `[footer_offset, total_size)`.
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
-    sp.file_buf = try t.ctx.gpa.alloc(u8, sp.total_size);
-    errdefer {
-        t.ctx.gpa.free(sp.file_buf);
-        sp.file_buf = &.{};
-    }
     sp.tail_start = sp.total_size - tail_resp.body.len;
-    @memcpy(sp.file_buf[sp.tail_start..], tail_resp.body);
+    sp.tail = tail_resp.body;
 
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
@@ -1124,24 +1185,36 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     // validate honestly.
     const head = try s3.getViaPool(t.ctx.io, t.pool, scratch, t.creds, sp.url, s3.Range.span(0, 7));
     if (head.status != 206) return error.BadResponse;
-    if (head.body.len < PAR1.len) return error.NotParquet;
-    if (!std.mem.eql(u8, head.body[0..PAR1.len], &PAR1)) return error.NotParquet;
-    @memcpy(sp.file_buf[0..head.body.len], head.body);
+    if (head.body.len < PAR1.len or !std.mem.eql(u8, head.body[0..PAR1.len], &PAR1)) return error.NotParquet;
+
+    const footer_region_len: usize = @intCast(footer_len + 8);
+    const footer_region = try t.ctx.gpa.alloc(u8, footer_region_len);
+    sp.footer_region = footer_region;
+    sp.footer_offset = footer_actual_start;
 
     // Footer: if it doesn't all fit in the tail we just fetched, fetch
     // the part we're missing.
     if (footer_actual_start < sp.tail_start) {
         const need = try s3.getViaPool(t.ctx.io, t.pool, scratch, t.creds, sp.url, s3.Range.span(footer_actual_start, sp.tail_start - 1));
         if (need.status != 206) return error.BadResponse;
-        @memcpy(sp.file_buf[footer_actual_start..sp.tail_start], need.body);
+        const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
+        if (need.body.len != missing_len) return error.BadResponse;
+        @memcpy(footer_region[0..missing_len], need.body);
+        @memcpy(footer_region[missing_len..], tail[0 .. footer_region_len - missing_len]);
+    } else {
+        const tail_off: usize = @intCast(footer_actual_start - sp.tail_start);
+        @memcpy(footer_region, tail[tail_off .. tail_off + footer_region_len]);
     }
+
+    const parsed_footer_len = std.mem.readInt(u32, footer_region[footer_region.len - 8 ..][0..4], .little);
+    if (parsed_footer_len != footer_len) return error.BadResponse;
+    if (!std.mem.eql(u8, footer_region[footer_region.len - 4 ..], &PAR1)) return error.NotParquet;
 }
 
 /// Insert the just-fetched object into the cache (if cache is wired
 /// and we got an ETag back from S3). Bytes captured cover
 /// `[footer_offset, total_size)` — the thrift footer plus the trailer
-/// (4-byte length + PAR1) — which is what the cache hit path
-/// rebuilds from.
+/// (4-byte length + PAR1).
 fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
     const cache = ctx.meta_cache orelse return;
     const etag_raw = etag_opt orelse return;
@@ -1153,14 +1226,7 @@ fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
         etag = etag[1 .. etag.len - 1];
     }
 
-    if (sp.file_buf.len < 8) return; // can't compute footer offset
-    const footer_len: u64 = std.mem.readInt(
-        u32,
-        sp.file_buf[sp.total_size - 8 ..][0..4],
-        .little,
-    );
-    const footer_offset = sp.total_size - 8 - footer_len;
-    const cached_bytes = sp.file_buf[footer_offset..sp.total_size];
+    if (sp.footer_region.len < 8) return;
 
     cache.put(
         ctx.io,
@@ -1168,12 +1234,46 @@ fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
         sp.url.key,
         etag,
         sp.total_size,
-        footer_offset,
-        cached_bytes,
+        sp.footer_offset,
+        sp.footer_region,
     ) catch {
         // Cache insert failures are non-fatal — proceed without
         // caching this entry.
     };
+}
+
+fn rebaseFetchedOffsets(
+    meta: *schema.FileMetaData,
+    fetch_arr: []const bool,
+    ranges: []const CompactRange,
+) !void {
+    for (meta.row_groups.items) |*rg| {
+        for (rg.columns.items, 0..) |*chunk, ci| {
+            if (ci >= fetch_arr.len or !fetch_arr[ci]) continue;
+            if (chunk.meta_data) |*cm| {
+                cm.data_page_offset = try rebaseOneOffset(cm.data_page_offset, ranges);
+                if (cm.dictionary_page_offset) |d| {
+                    cm.dictionary_page_offset = try rebaseOneOffset(d, ranges);
+                }
+                if (cm.index_page_offset) |d| {
+                    cm.index_page_offset = rebaseOneOffset(d, ranges) catch null;
+                }
+            }
+            if (chunk.meta_data) |cm| chunk.file_offset = cm.data_page_offset;
+        }
+    }
+}
+
+fn rebaseOneOffset(old: i64, ranges: []const CompactRange) !i64 {
+    if (old < 0) return error.BadResponse;
+    const src: u64 = @intCast(old);
+    for (ranges) |r| {
+        if (src >= r.start and src < r.end) {
+            const dst: u64 = @as(u64, @intCast(r.dst_start)) + (src - r.start);
+            return @intCast(dst);
+        }
+    }
+    return error.BadResponse;
 }
 
 fn parseTotalFromContentRange(hdr: ?[]const u8) !u64 {

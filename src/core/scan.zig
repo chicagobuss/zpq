@@ -44,10 +44,16 @@ pub const Input = struct {
     /// Display name used in error messages. Path or URL.
     name: []const u8,
     bytes: []const u8,
+    /// Logical source size. S3 inputs may compact fetched ranges into
+    /// `bytes`; keep reporting the object size in query results.
+    logical_size: u64 = 0,
 };
 
 pub const MultiAggArgs = struct {
     inputs: []const Input,
+    /// Optional metadata parsed by the I/O layer. When null, metadata is
+    /// parsed from each Input.bytes as before.
+    metas: ?[]const schema.FileMetaData = null,
     filter: ?[]const u8 = null,
     aggregate: []const u8,
     /// 0 = use cpu_count. 1 = serial. Row-group granularity: work is the
@@ -196,10 +202,16 @@ pub fn runMultiAggregate(
     // 1. Parse metadata for every input. Cheap (~ms per file); serial
     //    keeps the schema-validation order deterministic.
     const t_parse = nowMonoNs();
-    var metas = try arena.alloc(schema.FileMetaData, args.inputs.len);
-    for (args.inputs, 0..) |in, i| {
-        metas[i] = try metadata.open(arena, in.bytes);
-    }
+    const metas: []const schema.FileMetaData = if (args.metas) |m| blk: {
+        if (m.len != args.inputs.len) return error.SchemaMismatch;
+        break :blk m;
+    } else blk: {
+        var parsed = try arena.alloc(schema.FileMetaData, args.inputs.len);
+        for (args.inputs, 0..) |in, i| {
+            parsed[i] = try metadata.open(arena, in.bytes);
+        }
+        break :blk parsed;
+    };
 
     // Validate schemas match the first file's: same number of leaves
     // and same names *case-insensitively*. Real-world datasets drift on
@@ -385,7 +397,7 @@ pub fn runMultiAggregate(
     }
 
     var bytes_in: u64 = 0;
-    for (args.inputs) |in| bytes_in += in.bytes.len;
+    for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
 
     return .{
         .files_in = args.inputs.len,

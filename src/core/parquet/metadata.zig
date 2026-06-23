@@ -57,6 +57,17 @@ pub fn open(
     return schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
 }
 
+/// Parse a parquet footer thrift payload that was fetched separately from
+/// the full file body. S3 range reads use this to avoid materializing a
+/// virtual slice whose length is the whole object.
+pub fn openFooter(
+    allocator: std.mem.Allocator,
+    footer_bytes: []const u8,
+) !schema.FileMetaData {
+    var reader = thrift.Reader.init(footer_bytes);
+    return schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
+}
+
 /// Resolve a top-level column path (for now: just a single name; nested
 /// support arrives with definition-level handling) to its index in a
 /// row group's column list. Returns null if the path doesn't match any

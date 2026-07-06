@@ -240,12 +240,13 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             }
         }
         try ws.print(
-            "}},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
+            "}},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
             .{
                 total_ms_a,
                 ar.timings.read_ns / std.time.ns_per_ms,
                 ar.timings.parse_ns / std.time.ns_per_ms,
                 ar.timings.core.decode_ns / std.time.ns_per_ms,
+                ar.timings.decode_wall_ns / std.time.ns_per_ms,
                 ar.timings.core.eval_ns / std.time.ns_per_ms,
                 ar.timings.core.encode_ns / std.time.ns_per_ms,
             },

@@ -156,6 +156,8 @@ pub const Timings = struct {
     read_ns: u64 = 0,
     parse_ns: u64 = 0,
     core: consumer.Timings = .{},
+    /// Wall-clock of the parallel scan region (see scan.Timings.decode_wall_ns).
+    decode_wall_ns: u64 = 0,
     footer_ns: u64 = 0,
     /// Multipart-upload-only counters; zero for local-fd output.
     /// `complete_ns` is the CompleteMultipartUpload round-trip
@@ -214,6 +216,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
+    t.decode_wall_ns = r.timings.decode_wall_ns;
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.

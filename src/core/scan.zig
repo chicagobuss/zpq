@@ -92,6 +92,12 @@ pub const AggOutputItem = struct {
 pub const Timings = struct {
     parse_ns: u64 = 0,
     core: consumer.Timings = .{},
+    /// Wall-clock of the parallel scan region (spawn → join), i.e. the
+    /// real elapsed decode+eval time. Distinct from `core.decode_ns`,
+    /// which is the *sum* of per-worker CPU time (so wall < core.decode_ns
+    /// whenever >1 worker ran). `core.decode_ns / decode_wall_ns` is the
+    /// effective decode parallelism.
+    decode_wall_ns: u64 = 0,
 };
 
 pub const MultiAggResult = struct {
@@ -119,22 +125,26 @@ pub const MultiAggResult = struct {
     timings: Timings,
 };
 
-/// One unit of parallel work: a single row group within one input file.
-/// Row-group granularity (not file) is what lets a single large file
-/// saturate every core in one invocation.
-const WorkItem = struct { file: usize, rg: usize };
+/// One unit of parallel work: a single row group within one input file,
+/// optionally restricted to a subset of the query's aggregates/columns.
+const WorkItem = struct {
+    file: usize,
+    rg: usize,
+    agg_start: usize,
+    agg_len: usize,
+    fetch_arr: []const bool,
+    accumulators: []expr_agg.Accumulator,
+};
 
-/// One worker thread's slice of work + its result accumulators.
+/// One worker thread's slice of work.
 const Worker = struct {
     gpa: std.mem.Allocator,
     inputs: []const Input,
     metas: []const schema.FileMetaData,
     work: []const WorkItem,
     agg_calls: []const expr_agg.AggCall,
-    fetch_arr: []const bool,
     filter_opt: ?filter_ast.Filter,
     scan_all: bool,
-    accumulators: []expr_agg.Accumulator,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_kept: i64 = 0,
@@ -156,19 +166,26 @@ fn workerRunErr(w: *Worker) !void {
         // File bytes are shared read-only across workers (one mmap / one
         // in-memory buffer); concurrent ranged reads are safe.
         const rg_src: consumer.RGSrc = .{ .bytes = w.inputs[item.file].bytes, .byte_origin = 0 };
-        w.rgs_in += 1;
-        w.rows_in += rg.num_rows;
+        if (item.agg_start == 0) {
+            w.rgs_in += 1;
+            w.rows_in += rg.num_rows;
+        }
         if (w.filter_opt) |f| if (!w.scan_all) {
             // pruneRowGroup needs a transient allocator; per-RG arena
             // keeps the working set small. Skipped under --scan-all.
             var rg_arena = std.heap.ArenaAllocator.init(w.gpa);
             defer rg_arena.deinit();
             if ((try filter_prune.pruneRowGroup(rg, f, rg_arena.allocator(), meta)) == .skip) {
-                w.rgs_pruned += 1;
+                if (item.agg_start == 0) {
+                    w.rgs_pruned += 1;
+                }
                 continue;
             }
         };
-        w.rows_kept += rg.num_rows;
+        if (item.agg_start == 0) {
+            w.rows_kept += rg.num_rows;
+        }
+        const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
         try consumer.scanRGForAgg(
             w.gpa,
             rg,
@@ -176,9 +193,9 @@ fn workerRunErr(w: *Worker) !void {
             rg_src,
             w.filter_opt,
             w.scan_all,
-            w.fetch_arr,
-            w.agg_calls,
-            w.accumulators,
+            item.fetch_arr,
+            sub_agg_calls,
+            item.accumulators,
             &w.timings,
         );
     }
@@ -314,21 +331,78 @@ pub fn runMultiAggregate(
         }
     }
 
-    // 4. Build the flat row-group work list and distribute it round-robin
-    //    across workers. The unit of parallelism is one ROW GROUP (not one
-    //    file), so a single large file saturates every core in this
-    //    invocation — not just multi-file fan-out across Lambdas. Per-worker
-    //    accumulators merge at the end (step 6), same as before. Row groups
-    //    are near-uniform in size, so round-robin balances work well.
-    var work_items: std.ArrayList(WorkItem) = .empty;
+    // 4. Build the flat row-group work list. If we have fewer row groups
+    //    than the requested parallelism (e.g. wide scans on few large row groups),
+    //    we split each row group's aggregates into chunks (horizontal scaling/sub-RG).
+    var raw_work_items: std.ArrayList(struct { file: usize, rg: usize }) = .empty;
     for (metas, 0..) |*m, fi| {
-        for (0..m.row_groups.items.len) |ri| try work_items.append(arena, .{ .file = fi, .rg = ri });
+        for (0..m.row_groups.items.len) |ri| try raw_work_items.append(arena, .{ .file = fi, .rg = ri });
     }
-    const total_rgs = work_items.items.len;
+    const total_rgs = raw_work_items.items.len;
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const requested = if (args.parallelism == 0) cpu_count else args.parallelism;
-    const n_workers = @max(@as(usize, 1), @min(requested, total_rgs));
+
+    var chunks_per_rg = if (total_rgs >= requested) @as(usize, 1) else (requested + total_rgs - 1) / total_rgs;
+    if (chunks_per_rg > agg_calls.len) chunks_per_rg = agg_calls.len;
+    if (chunks_per_rg < 1) chunks_per_rg = 1;
+
+    // Precompute filter columns set to intersect with each chunk's references
+    const filter_cols = try arena.alloc(bool, num_leaves);
+    @memset(filter_cols, false);
+    if (filter_opt) |f| {
+        var cols: std.ArrayList(usize) = .empty;
+        try f.collectColumns(&cols, arena);
+        for (cols.items) |ci| if (ci < num_leaves) {
+            filter_cols[ci] = true;
+        };
+    }
+
+    var work_items: std.ArrayList(WorkItem) = .empty;
+    for (raw_work_items.items) |raw| {
+        const base_chunk_size = agg_calls.len / chunks_per_rg;
+        const remainder = agg_calls.len % chunks_per_rg;
+
+        var chunk_idx: usize = 0;
+        while (chunk_idx < chunks_per_rg) : (chunk_idx += 1) {
+            const agg_start = chunk_idx * base_chunk_size + @min(chunk_idx, remainder);
+            const agg_len = base_chunk_size + if (chunk_idx < remainder) @as(usize, 1) else @as(usize, 0);
+
+            // Build specialized fetch_arr for this chunk
+            const chunk_fetch_arr = try arena.alloc(bool, num_leaves);
+            @memset(chunk_fetch_arr, false);
+            for (agg_calls[agg_start .. agg_start + agg_len]) |call| {
+                if (call.arg) |arg_expr| arg_expr.collectColumns(chunk_fetch_arr);
+                if (call.where) |w_expr| {
+                    var wcols: std.ArrayList(usize) = .empty;
+                    try w_expr.collectColumns(&wcols, arena);
+                    for (wcols.items) |wci| if (wci < num_leaves) {
+                        chunk_fetch_arr[wci] = true;
+                    };
+                }
+            }
+            for (0..num_leaves) |ci| {
+                chunk_fetch_arr[ci] = fetch_arr[ci] and (filter_cols[ci] or chunk_fetch_arr[ci]);
+            }
+
+            // Initialize accumulators for this chunk
+            const sub_accs = try arena.alloc(expr_agg.Accumulator, agg_len);
+            for (agg_calls[agg_start .. agg_start + agg_len], 0..) |call, ci| {
+                sub_accs[ci] = expr_agg.Accumulator.init(call);
+            }
+
+            try work_items.append(arena, .{
+                .file = raw.file,
+                .rg = raw.rg,
+                .agg_start = agg_start,
+                .agg_len = agg_len,
+                .fetch_arr = chunk_fetch_arr,
+                .accumulators = sub_accs,
+            });
+        }
+    }
+
+    const n_workers = @max(@as(usize, 1), @min(requested, work_items.items.len));
 
     var workers = try arena.alloc(Worker, n_workers);
     var assignments = try arena.alloc(std.ArrayList(WorkItem), n_workers);
@@ -336,22 +410,21 @@ pub fn runMultiAggregate(
     for (work_items.items, 0..) |item, k| try assignments[k % n_workers].append(arena, item);
 
     for (workers, 0..) |*w, wi| {
-        const accs = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
-        for (agg_calls, 0..) |call, ci| accs[ci] = expr_agg.Accumulator.init(call);
         w.* = .{
             .gpa = gpa,
             .inputs = args.inputs,
             .metas = metas,
             .work = assignments[wi].items,
             .agg_calls = agg_calls,
-            .fetch_arr = fetch_arr,
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
-            .accumulators = accs,
         };
     }
 
-    // 5. Spawn, join, propagate first error.
+    // 5. Spawn, join, propagate first error. Time the whole parallel
+    //    region as one wall-clock span (real elapsed decode), separate
+    //    from the per-worker CPU sum in `core.decode_ns`.
+    const t_decode = nowMonoNs();
     if (n_workers > 1) {
         var threads = try arena.alloc(std.Thread, n_workers);
         for (workers, 0..) |*w, i| {
@@ -362,9 +435,10 @@ pub fn runMultiAggregate(
         // Single-threaded fast path. Avoids std.Thread overhead.
         workerRun(&workers[0]);
     }
+    t.decode_wall_ns = @intCast(nowMonoNs() - t_decode);
     for (workers) |w| if (w.err) |e| return e;
 
-    // 6. Merge per-worker accumulators into one final slice.
+    // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
     for (agg_calls, 0..) |call, i| accumulators[i] = expr_agg.Accumulator.init(call);
     var rows_in: i64 = 0;
@@ -372,7 +446,11 @@ pub fn runMultiAggregate(
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
     for (workers) |w| {
-        for (accumulators, 0..) |*acc, i| acc.merge(w.accumulators[i]);
+        for (w.work) |item| {
+            for (item.accumulators, 0..) |sub_acc, i| {
+                accumulators[item.agg_start + i].merge(sub_acc);
+            }
+        }
         rows_in += w.rows_in;
         rows_kept += w.rows_kept;
         rgs_in += w.rgs_in;

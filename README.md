@@ -1,8 +1,7 @@
 # ZPQ
 
-An agentically-engineered Apache Parquet engine in Zig, optimized for 
+An agentically-engineered Apache Parquet engine in Zig, optimized for
 serverless compute against object storage.
-
 
 Workloads it's intended for:
 
@@ -32,9 +31,10 @@ captured. Harnesses:
 ## What it can do
 
 **Read** standard Parquet — V1 + V2 data pages; PLAIN / RLE /
-RLE_DICTIONARY / DELTA_BINARY_PACKED / DELTA_BYTE_ARRAY encodings;
-SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED codecs; flat, struct,
-and LIST/MAP nested schemas.
+RLE_DICTIONARY / DELTA_BINARY_PACKED / DELTA_LENGTH_BYTE_ARRAY /
+DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY / ZSTD / GZIP /
+LZ4_RAW / UNCOMPRESSED codecs; all physical types including
+FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
 
 **Filter** with `= != < <= > >=`, `AND` / `OR`, `BETWEEN x AND y`,
 plus row-group stat pruning and Hive-partition pruning before any
@@ -53,8 +53,13 @@ straight from row-group metadata; `min / max / sum` are computed by
 decoding the data unless you opt into trusting file statistics — see
 [Statistics: trust is opt-in](#statistics-trust-is-opt-in).
 
-**Write** with SNAPPY / ZSTD / UNCOMPRESSED output; RLE_DICTIONARY for
-low-cardinality byte arrays; DELTA_BINARY_PACKED for INT32 / INT64.
+**Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output;
+RLE_DICTIONARY for low-cardinality byte arrays; DELTA_BINARY_PACKED for
+INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL
+columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY
+backings carry the unscaled integer — never a lossy detour through
+DOUBLE), and every write path preserves or synthesizes the page index
+so page-level pruning survives a rewrite.
 
 **Stream** S3-to-S3 with `O(one-row-group)` memory regardless of total
 file size — multipart upload as the encoder produces bytes, parallel
@@ -117,17 +122,38 @@ No system OpenSSL.
 
 ```bash
 just build           # ReleaseFast — both binaries
-just test            # 224 unit tests
+just test            # unit tests (fixture-dependent ones report as
+                     # skipped unless the parquet-testing corpus is present)
 just test-integration  # Lambda integration tests
 just lambda-build    # static musl Lambda binary, both archs
 just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 ```
+
+`zpq --version` reports the release the binary was built from.
 
 The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is
 `zig-out/bin/zpq-lambda`. Tagged releases (Linux x86_64 + aarch64;
 macOS lands with the kqueue backend) ship to
 `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/`
 and a matching GitHub Release.
+
+## Use as a library
+
+The engine is consumable as a Zig module — the same sans-IO core the
+binaries use, minus the SQL frontend (no C sources for consumers):
+
+```zig
+// build.zig.zon
+.zpq = .{ .url = "...", .hash = "..." },
+
+// build.zig
+const zpq = b.dependency("zpq", .{ .target = target, .optimize = optimize })
+    .module("zpq");
+exe.root_module.addImport("zpq", zpq);
+```
+
+`@import("zpq")` exposes `core.*` (schema, thrift, scan, filter, expr,
+writer) and `io.*` (S3, SigV4, TLS, epoll loop).
 
 ## Profiling
 

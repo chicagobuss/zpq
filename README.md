@@ -203,4 +203,4 @@ The capabilities above are what's shipped.
 
 ## License
 
-MIT
+MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party dependency licenses.

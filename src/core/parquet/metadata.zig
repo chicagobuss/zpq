@@ -175,7 +175,7 @@ test "footer round-trip: read → write → read produces identical metadata" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -220,7 +220,7 @@ test "open the bench fixture" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };

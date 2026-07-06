@@ -28,34 +28,50 @@ const schema_tree = zpq.core.parquet.schema_tree;
 const engine = zpq.engine;
 const s3 = zpq.io.s3;
 
+const usage_text =
+    \\usage:
+    \\  zpq query <input.parquet> [--output <out.parquet>]
+    \\            [--filter EXPR] [--columns COL1,COL2,...]
+    \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
+    \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
+    \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
+    \\            [--scan-all] [--trust-stats]
+    \\  zpq query --query "<sql query>" [--output <out.parquet>]
+    \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
+    \\            [--scan-all] [--trust-stats]
+    \\  zpq conform <file.parquet>
+    \\
+    \\  --scan-all     decode every page/byte: disables all stats shortcuts
+    \\                 (row-group pruning, stats-as-answer). Slower but
+    \\                 thorough — use when you don't trust a file's stats.
+    \\  --trust-stats  answer min/max/sum from file statistics instead of
+    \\                 decoding (fast, but trusts the writer's stats — off
+    \\                 by default; count(*) is always answered from metadata).
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
-        std.debug.print(
-            \\usage:
-            \\  zpq query <input.parquet> [--output <out.parquet>]
-            \\            [--filter EXPR] [--columns COL1,COL2,...]
-            \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
-            \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
-            \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
-            \\            [--scan-all] [--trust-stats]
-            \\  zpq query --query "<sql query>" [--output <out.parquet>]
-            \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
-            \\            [--scan-all] [--trust-stats]
-            \\  zpq conform <file.parquet>
-            \\
-            \\  --scan-all     decode every page/byte: disables all stats shortcuts
-            \\                 (row-group pruning, stats-as-answer). Slower but
-            \\                 thorough — use when you don't trust a file's stats.
-            \\  --trust-stats  answer min/max/sum from file statistics instead of
-            \\                 decoding (fast, but trusts the writer's stats — off
-            \\                 by default; count(*) is always answered from metadata).
-            \\
-        , .{});
+        var ws: StdoutWriter = .{};
+        defer ws.flush();
+        try ws.writeAll(usage_text);
         return;
     };
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
+        var ws: StdoutWriter = .{};
+        defer ws.flush();
+        try ws.writeAll(usage_text);
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V") or std.mem.eql(u8, cmd, "version")) {
+        var ws: StdoutWriter = .{};
+        defer ws.flush();
+        try ws.print("zpq {s}\n", .{build_options.version});
+        return;
+    }
     if (std.mem.eql(u8, cmd, "query")) {
         try runQuery(init, &iter);
         return;
@@ -92,7 +108,12 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     // patterns allowed — `data/*.parquet`); subsequent tokens are
     // flag/value pairs. Mirrors duckdb's `read_parquet('data/*.parquet')`.
     while (iter.next()) |tok| {
-        if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
+        if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
+            var ws: StdoutWriter = .{};
+            defer ws.flush();
+            try ws.writeAll(usage_text);
+            return;
+        } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
             output = iter.next();
         } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
             filter = iter.next();

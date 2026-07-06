@@ -299,7 +299,7 @@ test "streaming.build is byte-identical to fastpath.buildMulti (no projection)" 
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -332,7 +332,7 @@ test "streaming.build is byte-identical to fastpath.buildMulti (no projection)" 
 test "streaming.build is byte-identical to fastpath.buildMulti (with projection)" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);
@@ -369,7 +369,7 @@ test "streaming.build carries the page index forward" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -386,7 +386,7 @@ test "streaming.build carries the page index forward" {
     };
     if (!src_has_index) {
         std.debug.print("skipping: fixture carries no page index\n", .{});
-        return;
+        return error.SkipZigTest;
     }
 
     const survivors = try arena.alloc(bool, meta.row_groups.items.len);
@@ -425,7 +425,7 @@ test "streaming.build carries the page index forward" {
 test "streaming.build N=10 multi-file" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);

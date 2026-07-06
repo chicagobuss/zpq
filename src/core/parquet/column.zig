@@ -704,7 +704,7 @@ test "decode int8 column from the bench fixture" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -773,7 +773,7 @@ test "decode int8 column from the bench fixture" {
 test "decode bool column from the bench fixture" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);
@@ -825,7 +825,7 @@ test "decode bool column from the bench fixture" {
 test "decode string_dict_low column from the bench fixture" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);
@@ -880,7 +880,7 @@ test "decode int32_nullable column (with actual nulls) from the bench fixture" {
     // default (0) and decoded values at their real positions.
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);
@@ -950,7 +950,7 @@ test "decode string_nullable column (with actual nulls) from the bench fixture" 
     // distinct from int32_nullable's PLAIN path.
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(file_bytes);

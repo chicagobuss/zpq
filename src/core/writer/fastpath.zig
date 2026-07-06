@@ -519,7 +519,7 @@ test "build with all survivors round-trips through metadata.open" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -575,7 +575,7 @@ test "build dropping all but the first row group" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -588,7 +588,7 @@ test "build dropping all but the first row group" {
     var meta = try metadata.open(arena, file_bytes);
     if (meta.row_groups.items.len < 2) {
         std.debug.print("skipping: fixture has <2 row groups\n", .{});
-        return;
+        return error.SkipZigTest;
     }
 
     const survivors = try arena.alloc(bool, meta.row_groups.items.len);
@@ -616,7 +616,7 @@ test "build with zero survivors produces an empty-row-group file" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -645,7 +645,7 @@ test "build with projection emits only kept columns" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -694,7 +694,7 @@ test "buildMulti with N=10 copies of the same file" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -731,7 +731,7 @@ test "page index survives an all-survivors copy" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -752,7 +752,7 @@ test "page index survives an all-survivors copy" {
     }
     if (!src_has_index) {
         std.debug.print("skipping: fixture carries no page index\n", .{});
-        return;
+        return error.SkipZigTest;
     }
 
     const survivors = try arena.alloc(bool, meta.row_groups.items.len);

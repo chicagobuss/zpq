@@ -99,6 +99,14 @@ jobs:
           test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a) -gt 1024
           test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libssl.a) -gt 1024
 
+      - name: Fetch parquet-testing corpus
+        run: |
+          git clone https://github.com/apache/parquet-testing data/parquet-testing
+          git -C data/parquet-testing checkout --quiet 1a2a75127be06fc0123f03ebd36c966f7beda27d
+
+      - name: Generate nested edges fixture
+        run: python3 tools/gen_nested_fixture.py
+
       # Step 1: builds zpq + zpq-lambda for native linux-x86_64.
       # Default build = SQL-enabled CLI (-Dsql defaults true) + Lambda.
       - name: Build (debug)
@@ -173,7 +181,5 @@ jobs:
       # surprise-style; bump the SHA + floor together, deliberately.
       - name: Conformance (apache/parquet-testing)
         run: |
-          git clone https://github.com/apache/parquet-testing /tmp/parquet-testing
-          git -C /tmp/parquet-testing checkout --quiet 1a2a75127be06fc0123f03ebd36c966f7beda27d
           zig build -Doptimize=ReleaseFast
-          python3 tools/conformance.py --corpus /tmp/parquet-testing/data --min-pass 69
+          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 69

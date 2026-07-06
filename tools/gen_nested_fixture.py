@@ -30,7 +30,6 @@ import os
 import sys
 from pathlib import Path
 
-import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -104,6 +103,7 @@ def main() -> int:
     if not bucket:
         print("AWS_S3_BUCKET unset; skipping upload", file=sys.stderr)
         return 0
+    import boto3
     s3 = boto3.client("s3")
     s3.put_object(
         Bucket=bucket,

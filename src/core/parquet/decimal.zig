@@ -892,7 +892,7 @@ fn checkDecimalFixture(
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -1015,7 +1015,7 @@ test "decodeColumnAsI128 returns exact unscaled integers (int64 fixture)" {
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };

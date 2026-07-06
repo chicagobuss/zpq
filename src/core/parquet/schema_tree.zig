@@ -598,7 +598,7 @@ test "build tree from flat fixture (benchmark_100mb.parquet)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const file_bytes = readFile(arena, "data/benchmark_100mb.parquet") catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     const meta = try metadata.open(arena, file_bytes);
@@ -621,7 +621,7 @@ test "build tree from nested fixture (nested_edges.parquet)" {
     const file_bytes = readFile(arena, "data/nested_edges.parquet") catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: data/nested_edges.parquet not present\n", .{});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };

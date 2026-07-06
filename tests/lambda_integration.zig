@@ -263,7 +263,7 @@ test "lambda decodes int8 column from a real Parquet file" {
     const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return;
+            return error.SkipZigTest;
         }
         return err;
     };
@@ -311,7 +311,7 @@ test "lambda decodes int8 column from a real Parquet file" {
 test "lambda handles back-to-back invocations" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
-        if (err == error.FileNotFound) return;
+        if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer std.testing.allocator.free(file_bytes);

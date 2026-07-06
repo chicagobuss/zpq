@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 /// ZPQ build system.
 ///
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
     const pub_opts = b.addOptions();
     pub_opts.addOption(bool, "lambda", false);
     pub_opts.addOption(bool, "enable_sql", false);
+    pub_opts.addOption([]const u8, "version", zon.version);
     const pub_zpq = b.addModule("zpq", .{
         .root_source_file = b.path("src/zpq.zig"),
         .target = target,
@@ -129,6 +131,7 @@ pub fn build(b: *std.Build) void {
     const test_opts = b.addOptions();
     test_opts.addOption(bool, "lambda", true);
     test_opts.addOption(bool, "enable_sql", true); // tests exercise the SQL parser
+    test_opts.addOption([]const u8, "version", zon.version);
     const test_opts_mod = test_opts.createModule();
 
     const test_boring_dep = b.dependency("boring_tls", .{
@@ -235,62 +238,7 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run Lambda integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
-    // ----- Bakeoff probes -----
-    // Disposable probe for std.Io.Threaded multipart S3 PUTs.
-    const bakeoff_threaded = b.addExecutable(.{
-        .name = "bakeoff_threaded",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("probes/bakeoff_threaded/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    // Probes are opt-in via their explicit step (`zig build bakeoff-threaded`)
-    // — they each pull a full BoringSSL + zstd link, blowing past CI's
-    // 10 min budget when included in the default install.
-    const bakeoff_threaded_step = b.step("bakeoff-threaded", "Build the Io.Threaded multipart-PUT bakeoff probe");
-    bakeoff_threaded_step.dependOn(&b.addInstallArtifact(bakeoff_threaded, .{}).step);
 
-    // probe_r2_latency: measure DNS / TLS / Range GET cost from a
-    // workstation against R2 (or any S3-compatible endpoint). Drives
-    // the architectural decision on whether to plumb S3 through the
-    // CLI directly or fan out per-file Lambdas. Output is JSON; see
-    // probes/probe_r2_latency/main.zig.
-    const probe_r2_latency = b.addExecutable(.{
-        .name = "probe_r2_latency",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("probes/probe_r2_latency/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    const probe_r2_latency_step = b.step("probe-r2-latency", "Build the R2/S3 latency probe");
-    probe_r2_latency_step.dependOn(&b.addInstallArtifact(probe_r2_latency, .{}).step);
-
-    // probe_r2_list: confirm ListObjectsV2 against R2/S3, time it,
-    // exercise pagination. Inputs glob expansion design for `s3://...`.
-    const probe_r2_list = b.addExecutable(.{
-        .name = "probe_r2_list",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("probes/probe_r2_list/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    const probe_r2_list_step = b.step("probe-r2-list", "Build the ListObjectsV2 probe");
-    probe_r2_list_step.dependOn(&b.addInstallArtifact(probe_r2_list, .{}).step);
 
     // probe_simd_decoders: compare zigzag, bit-unpacking, and gather performance
     const probe_simd_decoders = b.addExecutable(.{
@@ -345,6 +293,7 @@ fn makeZpqModule(
 ) Bundle {
     const opts = b.addOptions();
     opts.addOption(bool, "lambda", is_lambda);
+    opts.addOption([]const u8, "version", zon.version);
     // SQL frontend (liteparser) is opt-in and CLI-only: Lambda is
     // JSON-event-driven and cold-start cost scales with binary size, so the
     // ~950 KB parser + its C dep are never in the Lambda build; the CLI gets

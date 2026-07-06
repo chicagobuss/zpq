@@ -98,8 +98,8 @@ check: test test-integration smoke duckdb-smoke differential
 
 # Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
 # fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration smoke duckdb-smoke (conform "data/parquet-testing") triangulate
-    @echo "gauntlet: all tiers green (corpus-backed cross-impl + conformance + triangulation)."
+gauntlet: fetch-corpus test test-integration smoke duckdb-smoke soak (conform "data/parquet-testing") triangulate
+    @echo "gauntlet: all tiers green (corpus-backed cross-impl + soak + conformance + triangulation)."
 
 # Fetch apache/parquet-testing into data/parquet-testing (gitignored under
 # data/) so the in-tree fixture decode tests run against real foreign-writer
@@ -145,6 +145,13 @@ conform corpus="/tmp/parquet-testing":
 triangulate: fetch-corpus
     zig build -Doptimize=ReleaseFast
     {{python}} tools/triangulate.py
+
+# Edge-case soak checks (Tier 3 only): malformed synthetic streams and
+# external-oracle fixtures that are too narrow for the critical path.
+soak:
+    zig build test-soak --summary all
+    zig build -Doptimize=ReleaseFast
+    {{python}} tools/soak.py
 
 
 # Coverage-guided fuzzing of the parquet decode path (Q0a/Q1). NOTE: blocked

@@ -79,3 +79,6 @@ prof/
 
 # Generated codebase-index snapshots (point-in-time scratch, drift fast — keep local)
 zpq-index-*.md
+
+# local oracle venvs (pyarrow/duckdb)
+.venv*

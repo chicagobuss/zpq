@@ -509,6 +509,7 @@ fn decodeFlbaBacked(
         .max_def = raw.max_def,
         .rep_levels = raw.rep_levels,
         .max_rep = raw.max_rep,
+        .has_nulls = raw.has_nulls,
     };
 }
 

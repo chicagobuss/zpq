@@ -27,6 +27,7 @@ Usage:
   .venv/bin/python tools/corpus_diff.py --local data/parquet-testing/data
 """
 import argparse
+import math
 import os
 import random
 import subprocess
@@ -106,14 +107,22 @@ def columns_of(local_path: str) -> list[tuple[str, str]]:
 def sample_literal(local_path: str, col: str, ty: str, rng: random.Random):
     """A literal drawn from the column's real values, so filters keep some
     rows (a random constant would usually select 0 or all)."""
+    # Seed DuckDB's reservoir sample so the drawn values are reproducible —
+    # an unseeded SAMPLE varies per run and makes `--seed` a lie (the generated
+    # predicates, and thus the whole result, change run-to-run).
+    samp = rng.getrandbits(31)
     try:
         rows = run_duckdb_sql(
             f"SELECT \"{col}\" AS v FROM read_parquet('{local_path}') "
-            f"WHERE \"{col}\" IS NOT NULL USING SAMPLE 20 ROWS"
+            f"WHERE \"{col}\" IS NOT NULL USING SAMPLE 20 ROWS (RESERVOIR, {samp})"
         )
     except RuntimeError:
         return None
     vals = [r["v"] for r in rows if r["v"] is not None]
+    # Drop non-finite floats: repr(nan)/repr(inf) emit bare `nan`/`inf`, which
+    # every SQL engine parses as an identifier (missing column), not a literal —
+    # that poisons the generated predicate for ZPQ *and* the oracles.
+    vals = [v for v in vals if not (isinstance(v, float) and not math.isfinite(v))]
     if not vals:
         return None
     v = rng.choice(vals)
@@ -185,7 +194,7 @@ def run_read(files, args):
         except RuntimeError:
             skipped += 1  # DuckDB can't read it → no oracle; not our verdict
             continue
-        frng = random.Random((args.seed, f.name).__hash__())
+        frng = random.Random(f"{args.seed}:{f.name}")  # stable across processes (tuple.__hash__ is salted)
         for agg, where in gen_ops(local, cols, args.ops, frng):
             try:
                 d = duck_agg(local, agg, where)
@@ -277,7 +286,7 @@ def run_write(files, args):
             continue
         if not cols:
             continue
-        frng = random.Random((args.seed, "w", f.name).__hash__())
+        frng = random.Random(f"{args.seed}:w:{f.name}")  # stable across processes
         for i, (proj, where) in enumerate(gen_write_ops(local, cols, args.ops, frng)):
             out_s3 = f"{out_prefix}/{f.name}.{i}.parquet"
             cmd = [ZPQ_BIN, "query", in_s3, "-o", out_s3, "--columns", ",".join(proj)]

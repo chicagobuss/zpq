@@ -265,7 +265,9 @@ pub fn Decoder(comptime T: type) type {
             if (self.pos + self.num_mini_blocks > self.bytes.len) return error.UnexpectedEndOfStream;
             var i: u32 = 0;
             while (i < self.num_mini_blocks) : (i += 1) {
-                self.mini_block_bit_widths[i] = self.bytes[self.pos];
+                const bw = self.bytes[self.pos];
+                if (bw > @bitSizeOf(asUnsigned(T))) return error.InvalidHeader;
+                self.mini_block_bit_widths[i] = bw;
                 self.pos += 1;
             }
             self.block_data_start = self.pos;

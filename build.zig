@@ -189,6 +189,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
 
+    // Opt-in soak tests for edge-case regressions. Kept out of the default
+    // unit-test step so Tier 1/Tier 2 stay fast; `just gauntlet` runs these.
+    const soak_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/soak.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = test_zpq_mod },
+            },
+        }),
+    });
+    const run_soak_tests = b.addRunArtifact(soak_tests);
+
+    const soak_step = b.step("test-soak", "Run opt-in soak/regression tests");
+    soak_step.dependOn(&run_soak_tests.step);
+
     // ----- Integration tests (Lambda fake runtime) -----
     // Spawns the built zpq-lambda binary against an in-process fake
     // runtime API. Doesn't run as part of `zig build test` because it

@@ -80,6 +80,49 @@ pub fn build(b: *std.Build) void {
     const lambda_step = b.step("lambda", "Build the Lambda binary (zpq-lambda)");
     lambda_step.dependOn(&b.addInstallArtifact(lambda, .{}).step);
 
+    // ----- Public library module -----
+    // Lets downstream projects consume the engine as a dependency:
+    //
+    //   .zpq = .{ .url = "...", .hash = "..." }        (build.zig.zon)
+    //   const zpq = b.dependency("zpq", .{ .target = t, .optimize = o })
+    //       .module("zpq");
+    //
+    // Configuration is the workstation one (lambda=false, epoll backend).
+    // The SQL frontend stays out: it's a CLI concern, and excluding it means
+    // consumers never link the liteparser C sources. Everything else (codecs,
+    // TLS, S3) comes along — the module is the same surface the binaries use.
+    const pub_opts = b.addOptions();
+    pub_opts.addOption(bool, "lambda", false);
+    pub_opts.addOption(bool, "enable_sql", false);
+    const pub_zpq = b.addModule("zpq", .{
+        .root_source_file = b.path("src/zpq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        .imports = &.{
+            .{ .name = "build_options", .module = pub_opts.createModule() },
+            .{
+                .name = "boring_tls",
+                .module = b.dependency("boring_tls", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("boring_tls"),
+            },
+            .{
+                .name = "snappy",
+                .module = b.dependency("snappy", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("snappy"),
+            },
+        },
+    });
+    pub_zpq.linkLibrary(b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+        .dictbuilder = false,
+    }).artifact("zstd"));
+
     // ----- Tests -----
     // Tests pin lambda=true since epoll is the only backend implemented;
     // other backends @compileError until they exist.

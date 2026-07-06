@@ -838,11 +838,7 @@ fn colRefForAgg(
 
 inline fn columnHasNulls(col: filter_eval.Batch.Column) bool {
     return switch (col) {
-        inline else => |c| blk: {
-            const dls = c.def_levels orelse break :blk false;
-            for (dls) |dl| if (dl < c.max_def) break :blk true;
-            break :blk false;
-        },
+        inline else => |c| c.has_nulls,
     };
 }
 
@@ -2033,6 +2029,7 @@ test "sum/count over OPTIONAL i64 column with real nulls" {
             .values = &xs,
             .def_levels = &dls,
             .max_def = 1,
+            .has_nulls = true,
         } },
     };
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 5 };

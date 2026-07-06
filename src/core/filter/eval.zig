@@ -185,6 +185,7 @@ pub fn ColumnT(comptime T: type) type {
         /// Null when max_rep == 0. Otherwise length == values.len.
         rep_levels: ?[]const u32 = null,
         max_rep: u32 = 0,
+        has_nulls: bool = false,
     };
 }
 

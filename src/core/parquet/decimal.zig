@@ -259,6 +259,7 @@ fn decodeIntBacked(
         .max_def = @intCast(levels.max_def),
         .rep_levels = rep_levels_buf,
         .max_rep = @intCast(levels.max_rep),
+        .has_nulls = reader.has_nulls,
     };
 }
 
@@ -337,6 +338,7 @@ fn decodeByteArrayBacked(
         .max_def = @intCast(levels.max_def),
         .rep_levels = rep_levels_buf,
         .max_rep = @intCast(levels.max_rep),
+        .has_nulls = reader.has_nulls,
     };
 }
 
@@ -373,6 +375,7 @@ fn decodeFlbaBacked(
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
     var written: usize = 0;
+    var has_nulls = false;
 
     while (try pr.next()) |pg| {
         switch (pg.header.type) {
@@ -399,6 +402,7 @@ fn decodeFlbaBacked(
                     def_levels_buf,
                     rep_levels_buf,
                     &written,
+                    &has_nulls,
                 );
             },
             .INDEX_PAGE => continue,
@@ -413,6 +417,7 @@ fn decodeFlbaBacked(
         .max_def = @intCast(levels.max_def),
         .rep_levels = rep_levels_buf,
         .max_rep = @intCast(levels.max_rep),
+        .has_nulls = has_nulls,
     };
 }
 
@@ -426,6 +431,7 @@ fn decodeFlbaDataPage(
     def_levels_buf: ?[]u32,
     rep_levels_buf: ?[]u32,
     written: *usize,
+    has_nulls: *bool,
 ) Error!void {
     // Page-header-level metadata varies between V1 and V2.
     var page_num_values: usize = 0;
@@ -489,6 +495,10 @@ fn decodeFlbaDataPage(
         };
         break :blk c;
     } else page_num_values;
+
+    if (num_present < page_num_values) {
+        has_nulls.* = true;
+    }
 
     switch (encoding) {
         .PLAIN => {

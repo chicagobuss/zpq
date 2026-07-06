@@ -63,6 +63,7 @@ pub fn decodeColumnAsI64Nanos(
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
     var written: usize = 0;
+    var has_nulls = false;
 
     while (try pr.next()) |pg| {
         switch (pg.header.type) {
@@ -79,7 +80,7 @@ pub fn decodeColumnAsI64Nanos(
                 dict_i64 = dict;
             },
             .DATA_PAGE, .DATA_PAGE_V2 => {
-                try decodeDataPage(pg, dict_i64, levels, values, def_levels_buf, rep_levels_buf, &written);
+                try decodeDataPage(pg, dict_i64, levels, values, def_levels_buf, rep_levels_buf, &written, &has_nulls);
             },
             .INDEX_PAGE => continue,
         }
@@ -93,6 +94,7 @@ pub fn decodeColumnAsI64Nanos(
         .max_def = @intCast(levels.max_def),
         .rep_levels = rep_levels_buf,
         .max_rep = @intCast(levels.max_rep),
+        .has_nulls = has_nulls,
     };
 }
 
@@ -104,6 +106,7 @@ fn decodeDataPage(
     def_levels_buf: ?[]u32,
     rep_levels_buf: ?[]u32,
     written: *usize,
+    has_nulls: *bool,
 ) Error!void {
     var page_num_values: usize = 0;
     var encoding: schema.Encoding = .PLAIN;
@@ -156,6 +159,10 @@ fn decodeDataPage(
         };
         break :blk c;
     } else page_num_values;
+
+    if (num_present < page_num_values) {
+        has_nulls.* = true;
+    }
 
     switch (encoding) {
         .PLAIN => {

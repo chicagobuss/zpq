@@ -122,6 +122,34 @@ pub fn Decoder(comptime T: type) type {
             return s;
         }
 
+        fn unpack32(comptime bw: u8, dest: []T, src: []const u8, min_delta: T, prev_val: *T) void {
+            const mask = comptime if (bw == 64) std.math.maxInt(u64) else (@as(u64, 1) << bw) - 1;
+            var prev = prev_val.*;
+            inline for (0..32) |k| {
+                const start_bit: usize = k * bw;
+                const byte_off = start_bit / 8;
+                const bit_off: u6 = @intCast(start_bit % 8);
+                const raw = if (bw <= 57) blk: {
+                    const word = std.mem.readInt(u64, src[byte_off..][0..8], .little);
+                    break :blk (word >> bit_off) & mask;
+                } else blk: {
+                    const word = std.mem.readInt(u128, src[byte_off..][0..16], .little);
+                    break :blk @as(u64, @truncate((word >> bit_off) & mask));
+                };
+                const delta = @as(T, @bitCast(@as(asUnsigned(T), @truncate(raw)))) +% min_delta;
+                prev +%= delta;
+                dest[k] = prev;
+            }
+            prev_val.* = prev;
+        }
+
+        fn unpack32Dispatch(bw: u8, dest: []T, src: []const u8, min_delta: T, prev_val: *T) void {
+            switch (bw) {
+                inline 1...64 => |b| unpack32(b, dest, src, min_delta, prev_val),
+                else => unreachable,
+            }
+        }
+
         pub fn decode(self: *Self, dest: []T) Error!usize {
             var written: usize = 0;
 
@@ -146,6 +174,46 @@ pub fn Decoder(comptime T: type) type {
                 const max_in_minilock = self.mini_block_size - self.mini_block_pos;
                 const max_total = self.total_value_count - self.values_emitted;
                 const take = @min(@min(want, max_in_minilock), max_total);
+
+                if (self.mini_block_size == 32 and take == 32 and self.mini_block_pos == 0) {
+                    if (bw == 0) {
+                        var prev = self.prev_value;
+                        for (0..32) |k| {
+                            prev +%= self.block_min_delta;
+                            dest[written + k] = prev;
+                        }
+                        self.prev_value = prev;
+
+                        written += 32;
+                        self.values_emitted += 32;
+                        self.current_mini_block += 1;
+                        self.mini_block_pos = 0;
+                        self.bit_buffer = 0;
+                        self.bits_in_buffer = 0;
+                        continue;
+                    } else {
+                        const needed_bytes = 4 * @as(usize, bw);
+                        const safety_margin: usize = if (bw <= 57) 8 else 16;
+                        if (self.pos + needed_bytes + safety_margin <= self.bytes.len) {
+                            unpack32Dispatch(
+                                bw,
+                                dest[written..][0..32],
+                                self.bytes[self.pos..],
+                                self.block_min_delta,
+                                &self.prev_value,
+                            );
+                            self.pos += needed_bytes;
+
+                            written += 32;
+                            self.values_emitted += 32;
+                            self.current_mini_block += 1;
+                            self.mini_block_pos = 0;
+                            self.bit_buffer = 0;
+                            self.bits_in_buffer = 0;
+                            continue;
+                        }
+                    }
+                }
 
                 var i: usize = 0;
                 while (i < take) : (i += 1) {

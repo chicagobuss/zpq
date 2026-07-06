@@ -1133,6 +1133,7 @@ fn decodeFloat16ColumnAsF64(
         .def_levels = cb.def_levels,
         .max_def = cb.max_def,
         .rep_levels = cb.rep_levels,
+        .has_nulls = cb.has_nulls,
     };
 }
 
@@ -1153,6 +1154,7 @@ fn decodeU32ColumnAsI64(
         .def_levels = c32.def_levels,
         .max_def = c32.max_def,
         .rep_levels = c32.rep_levels,
+        .has_nulls = c32.has_nulls,
     };
 }
 
@@ -1197,6 +1199,7 @@ fn decodeWithReader(
             .max_def = @intCast(levels.max_def),
             .rep_levels = rep_levels,
             .max_rep = @intCast(levels.max_rep),
+            .has_nulls = reader.has_nulls,
         };
     }
     if (levels.max_def > 0) {
@@ -1208,7 +1211,12 @@ fn decodeWithReader(
             written += n;
         }
         if (written != num_leaves) return error.ShortDecode;
-        return .{ .values = values, .def_levels = def_levels, .max_def = @intCast(levels.max_def) };
+        return .{
+            .values = values,
+            .def_levels = def_levels,
+            .max_def = @intCast(levels.max_def),
+            .has_nulls = reader.has_nulls,
+        };
     }
     var written: usize = 0;
     while (written < num_leaves) {

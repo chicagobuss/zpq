@@ -275,6 +275,19 @@ pub fn build(b: *std.Build) void {
     const probe_r2_list_step = b.step("probe-r2-list", "Build the ListObjectsV2 probe");
     probe_r2_list_step.dependOn(&b.addInstallArtifact(probe_r2_list, .{}).step);
 
+    // probe_simd_decoders: compare zigzag, bit-unpacking, and gather performance
+    const probe_simd_decoders = b.addExecutable(.{
+        .name = "probe_simd_decoders",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("probes/probe_simd_decoders/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const probe_simd_decoders_step = b.step("probe-simd-decoders", "Build the SIMD decoders microbenchmark probe");
+    probe_simd_decoders_step.dependOn(&b.addInstallArtifact(probe_simd_decoders, .{}).step);
+
     // microbench: time decode of one column-chunk in isolation.
     // Used to map ns/value across (encoding × type × bit_width × null
     // rate) — without the glob/mmap/aggregate noise of the full

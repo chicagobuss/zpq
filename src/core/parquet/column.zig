@@ -116,6 +116,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         pages: page_mod.PageReader,
         arena: std.mem.Allocator,
         levels: schema.Levels,
+        has_nulls: bool = false,
 
         /// For FIXED_LEN_BYTE_ARRAY columns: the fixed value width in bytes
         /// (0 for every other type). When > 0, PLAIN / dictionary `[]const u8`
@@ -322,6 +323,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (got != values.len) return error.UnexpectedPage;
                 return;
             }
+
+            self.has_nulls = true;
 
             if (num_present > 0) {
                 const got = try self.decodePackedFromCurrentPage(values[0..num_present]);

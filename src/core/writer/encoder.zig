@@ -267,6 +267,143 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     return .{ .bytes = total, .meta = meta };
 }
 
+/// PLAIN-encode a FIXED_LEN_BYTE_ARRAY-backed DECIMAL column from its
+/// unscaled i128 values (the lossless lane for precision > 18 — D2).
+/// Each present value is written as `byte_width` big-endian two's-
+/// complement bytes (parquet's decimal-FLBA wire format), matching what
+/// `decimal.decodeColumnAsI128` reads back. The DECIMAL annotation lives
+/// in the footer `schema_elem`, unchanged. Single data page, PLAIN.
+pub fn encodeDecimalFlba(
+    arena: std.mem.Allocator,
+    col: filter_eval.ColumnT(i128),
+    schema_elem: *const schema.SchemaElement,
+    path_in_schema: []const []const u8,
+    codec: schema.CompressionCodec,
+) Error!EncodedColumn {
+    if (schema_elem.type != .FIXED_LEN_BYTE_ARRAY) return error.UnsupportedType;
+    const bw: usize = if (schema_elem.type_length) |tl| @intCast(tl) else return error.UnsupportedType;
+    if (bw == 0 or bw > 16) return error.UnsupportedType;
+
+    const num_values: i64 = @intCast(col.values.len);
+    const is_optional = schema_elem.repetition_type == .OPTIONAL;
+    const def_levels = col.def_levels;
+    const max_def = col.max_def;
+    const num_present = countPresent(col.values.len, def_levels, max_def);
+
+    // PLAIN values: `bw` big-endian bytes per present value.
+    const values_bytes = try arena.alloc(u8, num_present * bw);
+    {
+        var pos: usize = 0;
+        for (col.values, 0..) |v, i| {
+            if (!isPresent(def_levels, max_def, i)) continue;
+            var be: [16]u8 = undefined;
+            std.mem.writeInt(i128, &be, v, .big);
+            @memcpy(values_bytes[pos .. pos + bw], be[16 - bw ..]);
+            pos += bw;
+        }
+    }
+
+    // Def-level prefix for OPTIONAL columns (same RLE framing as encodeColumn).
+    const def_prefix: []const u8 = if (is_optional) blk: {
+        const dl_for_encode = if (def_levels) |dl| dl else mk: {
+            const buf = try arena.alloc(u32, @intCast(num_values));
+            @memset(buf, 1);
+            break :mk buf;
+        };
+        const def_max = if (max_def > 0) max_def else 1;
+        const rle = try hybrid_rle.encode(arena, dl_for_encode, bitWidthFor(def_max));
+        const prefix = try arena.alloc(u8, 4 + rle.len);
+        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
+        @memcpy(prefix[4..], rle);
+        break :blk prefix;
+    } else &.{};
+
+    const data_total_len = def_prefix.len + values_bytes.len;
+    const payload = try arena.alloc(u8, data_total_len);
+    @memcpy(payload[0..def_prefix.len], def_prefix);
+    @memcpy(payload[def_prefix.len..], values_bytes);
+    const compressed = try compression.compress(arena, payload, codec);
+
+    // Stats: min/max over present values as big-endian `bw` bytes.
+    var stats = schema.Statistics{};
+    {
+        var have = false;
+        var lo: i128 = 0;
+        var hi: i128 = 0;
+        var nulls: i64 = 0;
+        for (col.values, 0..) |v, i| {
+            if (!isPresent(def_levels, max_def, i)) {
+                nulls += 1;
+                continue;
+            }
+            if (!have) {
+                lo = v;
+                hi = v;
+                have = true;
+            } else {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        }
+        if (have) {
+            const lob = try arena.alloc(u8, bw);
+            const hib = try arena.alloc(u8, bw);
+            var be: [16]u8 = undefined;
+            std.mem.writeInt(i128, &be, lo, .big);
+            @memcpy(lob, be[16 - bw ..]);
+            std.mem.writeInt(i128, &be, hi, .big);
+            @memcpy(hib, be[16 - bw ..]);
+            stats.min_value = lob;
+            stats.max_value = hib;
+        }
+        stats.null_count = nulls;
+    }
+
+    var page_hdr: schema.PageHeader = .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(data_total_len),
+        .compressed_page_size = @intCast(compressed.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = @intCast(num_values),
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var w: thrift.Writer = .init(arena);
+    defer w.deinit();
+    try page_hdr.write(&w);
+    const header_bytes = w.bytes();
+
+    const total = try arena.alloc(u8, header_bytes.len + compressed.len);
+    @memcpy(total[0..header_bytes.len], header_bytes);
+    @memcpy(total[header_bytes.len..], compressed);
+
+    var encodings: schema.EncodingList = .empty;
+    try encodings.append(arena, .RLE);
+    try encodings.append(arena, .PLAIN);
+    var path_list: schema.StringList = .empty;
+    try path_list.appendSlice(arena, path_in_schema);
+
+    const meta: schema.ColumnMetaData = .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .encodings = encodings,
+        .path_in_schema = path_list,
+        .codec = codec,
+        .num_values = num_values,
+        .total_uncompressed_size = @intCast(header_bytes.len + data_total_len),
+        .total_compressed_size = @intCast(total.len),
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = stats,
+    };
+    return .{ .bytes = total, .meta = meta };
+}
+
 /// Try to dictionary-encode a BYTE_ARRAY column. Returns null when
 /// the cardinality is too high for dict to help (and we should fall
 /// through to PLAIN), or when there are too few values to bother.
@@ -860,6 +997,16 @@ pub fn applySelection(
         .string => |col| .{ .string = try filterColumn([]const u8, arena, col, sel, surviving) },
         .boolean => |col| .{ .boolean = try filterColumn(bool, arena, col, sel, surviving) },
     };
+}
+
+/// Apply a selection vector to an i128 column (the decimal output lane,
+/// which lives outside `Batch.Column`). Reuses the generic compactor.
+pub fn applySelectionI128(
+    arena: std.mem.Allocator,
+    col: filter_eval.ColumnT(i128),
+    sel: *const filter_selection.SelectionVector,
+) Error!filter_eval.ColumnT(i128) {
+    return filterColumn(i128, arena, col, sel, sel.count());
 }
 
 fn filterColumn(
@@ -1737,4 +1884,40 @@ test "Statistics with only null_count round-trips through thrift" {
     try testing.expectEqual(@as(?i64, 42), round.null_count);
     try testing.expectEqual(@as(?[]const u8, null), round.min_value);
     try testing.expectEqual(@as(?[]const u8, null), round.max_value);
+}
+
+const decimal_mod_test = @import("../parquet/decimal.zig");
+
+test "encodeDecimalFlba round-trips i128 through decodeColumnAsI128 (DECIMAL(38,8))" {
+    var arena_s = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_s.deinit();
+    const arena = arena_s.allocator();
+
+    // DECIMAL(38,8) backed by FLBA(16): values f64 cannot represent.
+    const elem = schema.SchemaElement{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 16,
+        .repetition_type = .REQUIRED,
+        .name = "cost",
+        .num_children = 0,
+        .converted_type = null,
+        .logical_type = .{ .DECIMAL = .{ .scale = 8, .precision = 38 } },
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const vals = [_]i128{
+        1_00000001,
+        1234567890123456789012345678, // ~28 digits
+        -5555555555555555555500000001,
+        std.math.maxInt(i128) >> 4,
+    };
+    const col = filter_eval.ColumnT(i128){ .values = &vals };
+    const enc = try encodeDecimalFlba(arena, col, &elem, &[_][]const u8{"cost"}, .UNCOMPRESSED);
+    try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, enc.meta.type);
+
+    const kind = decimal_mod_test.kindFromSchema(&elem).?;
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    const back = try decimal_mod_test.decodeColumnAsI128(arena, enc.bytes, .UNCOMPRESSED, levels, vals.len, kind);
+    for (vals, 0..) |v, i| try testing.expectEqual(v, back.values[i]);
 }

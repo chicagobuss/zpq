@@ -30,6 +30,7 @@ const expr_agg = @import("expr/agg.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
 const fastpath = @import("writer/fastpath.zig");
+const thrift = @import("thrift.zig");
 const column_mod = @import("parquet/column.zig");
 const decimal_mod = @import("parquet/decimal.zig");
 const invariant = @import("invariant.zig");
@@ -112,6 +113,11 @@ pub const OutputAggregator = struct {
         f64: TypedBuf(f64),
         string: TypedBuf([]const u8),
         boolean: TypedBuf(bool),
+        /// Lossless DECIMAL output lane: unscaled integers (widened to
+        /// i128). Only INT32/INT64-backed decimals use it (D1); the buf
+        /// is converted back to an i32/i64 column at encode time, with
+        /// the source DECIMAL schema element preserved.
+        decimal: TypedBuf(i128),
     };
 
     pub fn TypedBuf(comptime T: type) type {
@@ -149,15 +155,22 @@ pub fn initOutputAggregator(
                     return error.SchemaLookupFailed;
                 paths[i] = cm.path_in_schema.items;
 
-                // DECIMAL source columns get decoded to f64; we have to
-                // emit the OUTPUT column as DOUBLE so the encoder sees
-                // the type that matches the buffer we'll feed it. The
-                // user-facing semantic loss (the output schema's
-                // Decimal-ness goes away) is a documented tradeoff of
-                // this f64 output lane. Byte-copy
-                // projection (via copyRG / fastpath, not this path)
-                // preserves DECIMAL faithfully since it never decodes.
-                if (decimal_mod.kindFromSchema(&src_elem) != null) {
+                // DECIMAL source columns. INT32/INT64-backed (precision
+                // ≤ 18) take the lossless integer lane (D1): decode to
+                // unscaled i128, keep the source DECIMAL schema element,
+                // re-encode as the same physical type. FLBA/BYTE_ARRAY
+                // (precision > 18) still route through f64 → DOUBLE until
+                // the FLBA writer lands (D2; see
+                // docs/plans/02-decimal-lossless-reencode.md). Byte-copy
+                // projection (copyRG / fastpath) preserves any DECIMAL.
+                if (decimal_mod.kindFromSchema(&src_elem)) |k| {
+                    if (k.physical == .INT32 or k.physical == .INT64 or
+                        k.physical == .FIXED_LEN_BYTE_ARRAY)
+                    {
+                        schemas[i] = src_elem; // keep DECIMAL annotation
+                        cols[i] = .{ .decimal = .{} };
+                        continue;
+                    }
                     schemas[i] = .{
                         .type = .DOUBLE,
                         .type_length = null,
@@ -330,6 +343,22 @@ pub fn appendProjectedRG(
     // agg.arena (slice bytes live on the per-RG arena which is freed
     // when this function returns).
     for (output_specs, 0..) |spec, i| {
+        // Lossless DECIMAL lane: the buf is `.decimal` only for an
+        // INT32/INT64-backed passthrough decimal. Decode the source
+        // chunk to unscaled i128 (a second, cheap decode beside the f64
+        // batch copy — see the decode-once follow-up in plan 02), apply
+        // the selection, and append the integers untouched.
+        if (agg.cols[i] == .decimal) {
+            const kept_ci = switch (spec) {
+                .passthrough => |ci| ci,
+                .computed => return error.MissingDecodedColumn,
+            };
+            const dcol = try decodeDecimalI128(ra, rg, meta, src, kept_ci);
+            const filtered_dec = try encoder.applySelectionI128(ra, dcol, &sel);
+            try appendTyped(i128, &agg.cols[i].decimal, filtered_dec.values, filtered_dec.def_levels, filtered_dec.max_def, agg.arena);
+            continue;
+        }
+
         var filtered: filter_eval.Batch.Column = undefined;
         switch (spec) {
             .passthrough => |kept_ci| {
@@ -347,6 +376,91 @@ pub fn appendProjectedRG(
 
     agg.num_rows += surviving;
     return surviving;
+}
+
+/// Decode one DECIMAL column's chunk to unscaled i128 integers (the
+/// lossless output lane). Re-derives the chunk window the same way the
+/// batch-decode loop does. Caller guarantees the column is an
+/// INT32/INT64-backed decimal.
+fn decodeDecimalI128(
+    ra: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    kept_ci: usize,
+) !filter_eval.ColumnT(i128) {
+    const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+    const len: usize = @intCast(cm.total_compressed_size);
+    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
+    const buf_off = start - @as(usize, @intCast(src.byte_origin));
+    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
+    const chunk = src.bytes[buf_off .. buf_off + len];
+
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n_leaves: usize = @intCast(cm.num_values);
+    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+    const kind = decimal_mod.kindFromSchema(&se) orelse return error.SchemaLookupFailed;
+    return decimal_mod.decodeColumnAsI128(ra, chunk, cm.codec, levels, n_leaves, kind);
+}
+
+/// Synthesize and write a one-page OffsetIndex + ColumnIndex for a
+/// freshly-encoded chunk (the encoder emits a single data page per
+/// chunk), derived from `meta`'s stats. `abs_data_offset` is the data
+/// page's absolute file offset. Returns the new pointers; emits no
+/// ColumnIndex when stats lack usable min/max (readers fall back).
+fn synthPageIndexToSink(
+    out_arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    out_offset: *u64,
+    meta: *const schema.ColumnMetaData,
+    abs_data_offset: i64,
+) !fastpath.PageIndexPtrs {
+    var ptrs = fastpath.PageIndexPtrs{};
+    const stats = meta.statistics orelse return ptrs;
+    // Data-page byte size = total chunk size minus the dictionary page
+    // (the relative data_page_offset is the dict-page span, 0 if none).
+    const data_size: i32 = @intCast(meta.total_compressed_size - meta.data_page_offset);
+    const null_count = stats.null_count orelse 0;
+    const all_null = meta.num_values > 0 and null_count == meta.num_values;
+
+    // ColumnIndex (one page) — needs min/max bytes unless the page is
+    // all-null (in which case both are empty per the spec).
+    if (all_null or (stats.min_value != null and stats.max_value != null)) {
+        var ci = schema.ColumnIndex{ .boundary_order = .UNORDERED };
+        try ci.null_pages.append(out_arena, all_null);
+        try ci.min_values.append(out_arena, if (all_null) "" else stats.min_value.?);
+        try ci.max_values.append(out_arena, if (all_null) "" else stats.max_value.?);
+        var ncs: std.ArrayListUnmanaged(i64) = .empty;
+        try ncs.append(out_arena, null_count);
+        ci.null_counts = ncs;
+
+        var w = thrift.Writer.init(out_arena);
+        try ci.write(&w);
+        const bytes = w.bytes();
+        ptrs.column_index_offset = @intCast(out_offset.*);
+        try sink.write(bytes);
+        out_offset.* += bytes.len;
+        ptrs.column_index_length = @intCast(bytes.len);
+    }
+
+    // OffsetIndex (one data page).
+    {
+        var oi = schema.OffsetIndex{};
+        try oi.page_locations.append(out_arena, .{
+            .offset = abs_data_offset,
+            .compressed_page_size = data_size,
+            .first_row_index = 0,
+        });
+        var w = thrift.Writer.init(out_arena);
+        try oi.write(&w);
+        const bytes = w.bytes();
+        ptrs.offset_index_offset = @intCast(out_offset.*);
+        try sink.write(bytes);
+        out_offset.* += bytes.len;
+        ptrs.offset_index_length = @intCast(bytes.len);
+    }
+    return ptrs;
 }
 
 fn appendIntoBuf(
@@ -448,6 +562,31 @@ pub fn encodeAggregator(
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
             } },
+            // Lossless DECIMAL: narrow the unscaled i128 back to its
+            // source physical width (exact — the values were decoded
+            // from i32/i64 and widened) and feed the existing integer
+            // encoder. The kept DECIMAL schema element makes the footer
+            // (and `meta.type`) carry the logical type through.
+            .decimal => |b| blk: {
+                const phys = agg.schema_elems[i].type orelse return error.UnsupportedColumnType;
+                const dl = if (b.max_def > 0) b.def_levels.items else null;
+                switch (phys) {
+                    .INT32 => {
+                        const vals = try ra.alloc(i32, b.values.items.len);
+                        for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
+                        break :blk .{ .i32 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
+                    },
+                    .INT64 => {
+                        const vals = try ra.alloc(i64, b.values.items.len);
+                        for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
+                        break :blk .{ .i64 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
+                    },
+                    // FLBA decimals can't ride an integer lane — placeholder
+                    // here; the pre-pass below encodes them via encodeDecimalFlba.
+                    .FIXED_LEN_BYTE_ARRAY => break :blk .{ .i64 = .{ .values = &.{} } },
+                    else => return error.UnsupportedColumnType,
+                }
+            },
         };
     }
 
@@ -466,9 +605,24 @@ pub fn encodeAggregator(
         for (arenas) |*ar| ar.deinit();
     };
 
+    // Pre-pass: FLBA-backed decimals don't fit a Batch.Column lane, so
+    // encode them directly (a small subset; serial is fine). The encode
+    // loops below skip any index already filled here.
+    for (agg.cols, 0..) |cbuf, i| {
+        if (cbuf == .decimal and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) {
+            const b = cbuf.decimal;
+            results[i] = try encoder.encodeDecimalFlba(ra, .{
+                .values = b.values.items,
+                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+                .max_def = b.max_def,
+            }, &agg.schema_elems[i], agg.paths[i], output_codec);
+        }
+    }
+
     const t_enc_start = nowMonoNs();
     if (num_workers <= 1) {
         for (0..n_specs) |i| {
+            if (results[i] != null) continue; // FLBA decimal done in pre-pass
             results[i] = try encoder.encodeColumn(ra, .{
                 .values = batch_cols[i],
                 .schema_elem = &agg.schema_elems[i],
@@ -521,10 +675,21 @@ pub fn encodeAggregator(
         out_offset.* += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
 
+        // Synthesize the page index for this freshly-encoded chunk (one
+        // data page → one OffsetIndex + ColumnIndex entry, built from the
+        // stats the encoder already computed), written right after the
+        // chunk data. Mirrors the byte-copy carry-forward so a filtered
+        // re-encode keeps page-level pruning too. (2b)
+        const idx = try synthPageIndexToSink(out_arena, sink, out_offset, &enc.meta, em.data_page_offset);
+
         try rg_columns.append(out_arena, .{
             .file_path = null,
             .file_offset = col_start_in_file,
             .meta_data = em,
+            .offset_index_offset = idx.offset_index_offset,
+            .offset_index_length = idx.offset_index_length,
+            .column_index_offset = idx.column_index_offset,
+            .column_index_length = idx.column_index_length,
         });
     }
 
@@ -553,6 +718,7 @@ const AggEncodeCtx = struct {
 fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
     var i = ctx.start;
     while (i < ctx.batch_cols.len) : (i += ctx.stride) {
+        if (ctx.results[i] != null) continue; // FLBA decimal done in pre-pass
         ctx.results[i] = encoder.encodeColumn(ctx.arena, .{
             .values = ctx.batch_cols[i],
             .schema_elem = &ctx.schema_elems[i],
@@ -740,7 +906,6 @@ pub fn writeOneRowAggregate(
         .row_groups = new_row_groups,
     };
 
-    const thrift = @import("thrift.zig");
     var w: thrift.Writer = .init(arena);
     defer w.deinit();
     try new_meta.write(&w);

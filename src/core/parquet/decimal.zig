@@ -190,13 +190,79 @@ pub fn decodeColumnAsF64(
     };
 }
 
+const column_mod = @import("column.zig");
+
+/// Decode a DECIMAL column to its **unscaled integers** widened to i128
+/// (no scale applied) — the lossless representation the re-encode path
+/// carries so a filtered/projected decimal survives as DECIMAL, not
+/// DOUBLE. Mirror of `decodeColumnAsF64` minus the scale-apply. Wired
+/// for INT32/INT64 (D1) and FIXED_LEN_BYTE_ARRAY (D2); BYTE_ARRAY-backed
+/// decimals (rare) still route through the f64→DOUBLE path.
+pub fn decodeColumnAsI128(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+) Error!filter_eval.ColumnT(i128) {
+    return switch (kind.physical) {
+        .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves),
+        .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves),
+        .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind),
+        else => error.UnsupportedDecimalPhysicalType,
+    };
+}
+
+fn decodeIntBackedI128(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+) Error!filter_eval.ColumnT(i128) {
+    // Decode the raw ints exactly as the f64 path does, but keep them as
+    // integers (widened to i128) — no scale divide.
+    const raw_values = try arena.alloc(T, num_leaves);
+    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+
+    var def_levels_buf: ?[]u32 = null;
+    if (levels.max_def > 0) {
+        const dl = try arena.alloc(u32, num_leaves);
+        var written: usize = 0;
+        while (written < num_leaves) {
+            const n = reader.decodeWithLevels(raw_values[written..], dl[written..]) catch return error.ShortDecode;
+            if (n == 0) break;
+            written += n;
+        }
+        if (written != num_leaves) return error.ShortDecode;
+        def_levels_buf = dl;
+    } else {
+        var written: usize = 0;
+        while (written < num_leaves) {
+            const n = reader.decode(raw_values[written..]) catch return error.ShortDecode;
+            if (n == 0) break;
+            written += n;
+        }
+        if (written != num_leaves) return error.ShortDecode;
+    }
+
+    const values = try arena.alloc(i128, num_leaves);
+    for (raw_values, 0..) |v, i| values[i] = @intCast(v);
+
+    return .{
+        .values = values,
+        .def_levels = def_levels_buf,
+        .max_def = @intCast(levels.max_def),
+    };
+}
+
 // ----- INT32 / INT64-backed -----
 //
 // The wire format is identical to a regular fixed-width int column.
 // We lean on the existing column reader for that, then map values to
 // f64 with scale.
-
-const column_mod = @import("column.zig");
 
 fn decodeIntBacked(
     comptime T: type,
@@ -348,30 +414,33 @@ fn decodeByteArrayBacked(
 // reader only knows i32/i64/f32/f64/bool/[]const u8). Walk pages
 // directly here; the surface is small.
 
-fn decodeFlbaBacked(
+/// Decode an FLBA-backed DECIMAL column to its raw unscaled i128 values
+/// (no scale applied). The f64 lane scales the result afterward; the
+/// lossless re-encode lane (`decodeColumnAsI128`) uses it directly — so
+/// the page/dict/BSS walking lives in one place.
+fn decodeFlbaBackedI128(
     arena: std.mem.Allocator,
     chunk: []const u8,
     codec: schema.CompressionCodec,
     levels: schema.Levels,
     num_leaves: usize,
     kind: Kind,
-) Error!filter_eval.ColumnT(f64) {
+) Error!filter_eval.ColumnT(i128) {
     if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH) {
         return error.DecimalByteWidthTooLarge;
     }
     const bw: usize = kind.byte_width;
-    const scale = kind.scale;
 
-    const values = try arena.alloc(f64, num_leaves);
+    const values = try arena.alloc(i128, num_leaves);
 
     var def_levels_buf: ?[]u32 = null;
     var rep_levels_buf: ?[]u32 = null;
     if (levels.max_def > 0) def_levels_buf = try arena.alloc(u32, num_leaves);
     if (levels.max_rep > 0) rep_levels_buf = try arena.alloc(u32, num_leaves);
 
-    // Cached dict (FLBA values from the DICTIONARY_PAGE, decoded as
-    // f64 once so data-page index resolution is direct).
-    var dict_f64: ?[]const f64 = null;
+    // Cached dict (raw i128 from the DICTIONARY_PAGE so data-page index
+    // resolution is direct).
+    var dict_i128: ?[]const i128 = null;
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
     var written: usize = 0;
@@ -384,19 +453,18 @@ fn decodeFlbaBacked(
                 const dict_count: usize = @intCast(dh.num_values);
                 const expected_bytes = dict_count * bw;
                 if (pg.bytes.len < expected_bytes) return error.ShortDecode;
-                const dict = try arena.alloc(f64, dict_count);
+                const dict = try arena.alloc(i128, dict_count);
                 for (0..dict_count) |i| {
                     const off = i * bw;
-                    dict[i] = applyScaleI128(flbaToI128(pg.bytes[off .. off + bw]), scale);
+                    dict[i] = flbaToI128(pg.bytes[off .. off + bw]);
                 }
-                dict_f64 = dict;
+                dict_i128 = dict;
             },
             .DATA_PAGE, .DATA_PAGE_V2 => {
                 try decodeFlbaDataPage(
                     pg,
                     bw,
-                    scale,
-                    dict_f64,
+                    dict_i128,
                     levels,
                     values,
                     def_levels_buf,
@@ -421,13 +489,35 @@ fn decodeFlbaBacked(
     };
 }
 
+/// f64 wrapper over `decodeFlbaBackedI128`: apply scale per value. The
+/// results are bit-identical to the old inline-scale path (same
+/// `applyScaleI128`), only the scale is applied once at the end.
+fn decodeFlbaBacked(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+) Error!filter_eval.ColumnT(f64) {
+    const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind);
+    const out = try arena.alloc(f64, raw.values.len);
+    for (raw.values, 0..) |v, i| out[i] = applyScaleI128(v, kind.scale);
+    return .{
+        .values = out,
+        .def_levels = raw.def_levels,
+        .max_def = raw.max_def,
+        .rep_levels = raw.rep_levels,
+        .max_rep = raw.max_rep,
+    };
+}
+
 fn decodeFlbaDataPage(
     pg: page_mod.Page,
     byte_width: usize,
-    scale: i32,
-    dict_f64: ?[]const f64,
+    dict_i128: ?[]const i128,
     levels: schema.Levels,
-    values_out: []f64,
+    values_out: []i128,
     def_levels_buf: ?[]u32,
     rep_levels_buf: ?[]u32,
     written: *usize,
@@ -505,28 +595,28 @@ fn decodeFlbaDataPage(
             const expected = num_present * byte_width;
             if (values_bytes.len < expected) return error.ShortDecode;
             if (def_levels_buf) |dl| {
-                // Sparse path: emit zeros for null slots (the f64 zero
-                // is harmless; the aggregator inspects def_levels).
+                // Sparse path: emit zeros for null slots (the zero is
+                // harmless; the aggregator inspects def_levels).
                 var raw_pos: usize = 0;
                 for (0..page_num_values) |i| {
                     const idx = written.* + i;
                     if (dl[idx] == levels.max_def) {
                         const off = raw_pos * byte_width;
-                        values_out[idx] = applyScaleI128(flbaToI128(values_bytes[off .. off + byte_width]), scale);
+                        values_out[idx] = flbaToI128(values_bytes[off .. off + byte_width]);
                         raw_pos += 1;
                     } else {
-                        values_out[idx] = 0.0;
+                        values_out[idx] = 0;
                     }
                 }
             } else {
                 for (0..page_num_values) |i| {
                     const off = i * byte_width;
-                    values_out[written.* + i] = applyScaleI128(flbaToI128(values_bytes[off .. off + byte_width]), scale);
+                    values_out[written.* + i] = flbaToI128(values_bytes[off .. off + byte_width]);
                 }
             }
         },
         .PLAIN_DICTIONARY, .RLE_DICTIONARY => {
-            const dict = dict_f64 orelse return error.DictionaryMissing;
+            const dict = dict_i128 orelse return error.DictionaryMissing;
             // Data page: [bit_width: u8][hybrid_rle indices]
             if (values_bytes.len == 0) return error.ShortDecode;
             const bit_width = values_bytes[0];
@@ -548,7 +638,7 @@ fn decodeFlbaDataPage(
                     while (k < n) {
                         // Find the next present slot in this page
                         while (page_pos < page_num_values and dl[written.* + page_pos] != levels.max_def) {
-                            values_out[written.* + page_pos] = 0.0;
+                            values_out[written.* + page_pos] = 0;
                             page_pos += 1;
                         }
                         if (page_pos >= page_num_values) return error.ShortDecode;
@@ -570,7 +660,7 @@ fn decodeFlbaDataPage(
             if (def_levels_buf) |dl| {
                 while (page_pos < page_num_values) {
                     if (dl[written.* + page_pos] != levels.max_def) {
-                        values_out[written.* + page_pos] = 0.0;
+                        values_out[written.* + page_pos] = 0;
                     }
                     page_pos += 1;
                 }
@@ -592,16 +682,16 @@ fn decodeFlbaDataPage(
                     const idx = written.* + i;
                     if (dl[idx] == levels.max_def) {
                         for (0..byte_width) |j| tmp[j] = values_bytes[j * num_present + raw_pos];
-                        values_out[idx] = applyScaleI128(flbaToI128(tmp[0..byte_width]), scale);
+                        values_out[idx] = flbaToI128(tmp[0..byte_width]);
                         raw_pos += 1;
                     } else {
-                        values_out[idx] = 0.0;
+                        values_out[idx] = 0;
                     }
                 }
             } else {
                 for (0..page_num_values) |i| {
                     for (0..byte_width) |j| tmp[j] = values_bytes[j * num_present + i];
-                    values_out[written.* + i] = applyScaleI128(flbaToI128(tmp[0..byte_width]), scale);
+                    values_out[written.* + i] = flbaToI128(tmp[0..byte_width]);
                 }
             }
         },
@@ -914,6 +1004,43 @@ test "applyScaleI128: scale 0 identity and signed scaling" {
     try testing.expectApproxEqAbs(@as(f64, 12345.0), applyScaleI128(12345, 0), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 123.45), applyScaleI128(12345, 2), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, -123.45), applyScaleI128(-12345, 2), 1e-9);
+}
+
+test "decodeColumnAsI128 returns exact unscaled integers (int64 fixture)" {
+    // int64_decimal.parquet holds 24 values 1.00..24.00 (scale 2), so the
+    // unscaled integers are 100..2400. The lossless lane must return those
+    // exactly — no f64, no scale-apply.
+    const fixture_path = "data/parquet-testing/data/int64_decimal.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var meta = try metadata.open(testing.allocator, file_bytes);
+    defer meta.deinit(testing.allocator);
+
+    const col = meta.row_groups.items[0].columns.items[0].meta_data.?;
+    const path: [1][]const u8 = .{"value"};
+    const elem = meta.getColumnSchema(&path) orelse return error.SchemaLookupFailed;
+    const kind = kindFromSchema(&elem) orelse return error.NotRecognisedAsDecimal;
+
+    const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
+    const chunk = file_bytes[chunk_start .. chunk_start + @as(usize, @intCast(col.total_compressed_size))];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const levels = meta.getColumnLevels(&path);
+    const column = try decodeColumnAsI128(arena.allocator(), chunk, col.codec, levels, @intCast(col.num_values), kind);
+
+    try testing.expectEqual(@as(usize, 24), column.values.len);
+    for (column.values, 0..) |v, i| {
+        try testing.expectEqual(@as(i128, @intCast((i + 1) * 100)), v);
+    }
 }
 
 test "applyScaleI128: out-of-table scale uses the pow fallback without trapping" {

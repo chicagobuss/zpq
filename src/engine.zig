@@ -646,7 +646,12 @@ fn coerceDecimalLeavesToDouble(
         // Only leaves (no children) can be DECIMAL.
         const nc = elem.num_children orelse 0;
         if (nc != 0) continue;
-        if (decimal_mod.kindFromSchema(elem) == null) continue;
+        const k = decimal_mod.kindFromSchema(elem) orelse continue;
+        // INT32/INT64 (D1) and FIXED_LEN_BYTE_ARRAY (D2) decimals now ride
+        // the lossless i128 lane and keep their DECIMAL annotation. Only
+        // BYTE_ARRAY-backed decimals (rare) still decode→f64→DOUBLE.
+        if (k.physical == .INT32 or k.physical == .INT64 or
+            k.physical == .FIXED_LEN_BYTE_ARRAY) continue;
 
         elem.type = .DOUBLE;
         elem.type_length = null;

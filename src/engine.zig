@@ -93,6 +93,13 @@ pub const QueryArgs = struct {
     /// every page/byte. Slower but thorough — the paranoid path, and the
     /// correctness valve for files whose writer emitted untrustworthy stats.
     scan_all: bool = false,
+    /// `--trust-stats`: opt in to answering min/max/sum from file statistics
+    /// (the fast path) instead of decoding. Off by default — file stats can be
+    /// inaccurate (seen from parquet-mr/Spark), so trusting them risks a
+    /// silently wrong answer. `count(*)` is always answered from num_rows.
+    /// Row-group pruning still uses stats regardless (that path only skips
+    /// provably-non-matching groups, so it can't produce a wrong value).
+    trust_stats: bool = false,
 };
 
 pub const Context = struct {
@@ -213,6 +220,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .aggregate = agg_str,
         .parallelism = args.parallelism,
         .scan_all = args.scan_all,
+        .trust_stats = args.trust_stats,
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -911,7 +919,7 @@ fn openInputs(
                             }
                         }
                         if (!per_agg_cols[ci]) continue;
-                        if (!expr_agg.statsCoverageComplete(call, metas_for_stats, ci)) {
+                        if (!expr_agg.statsCoverageComplete(call, metas_for_stats, ci, args.trust_stats)) {
                             prunable = false;
                             break;
                         }

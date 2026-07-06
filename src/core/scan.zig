@@ -64,6 +64,10 @@ pub const MultiAggArgs = struct {
     /// no stats-driven column drop, no aggregate stat short-circuit. Forces
     /// a full page/byte decode. The paranoid / untrusted-writer-stats path.
     scan_all: bool = false,
+    /// `--trust-stats`: answer min/max/sum from file statistics (the fast
+    /// path) instead of decoding. Off by default — file stats can be wrong.
+    /// `count(*)` is always answered from num_rows regardless.
+    trust_stats: bool = false,
 };
 
 pub const AggValue = union(enum) {
@@ -145,6 +149,7 @@ const Worker = struct {
     agg_calls: []const expr_agg.AggCall,
     filter_opt: ?filter_ast.Filter,
     scan_all: bool,
+    trust_stats: bool,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_kept: i64 = 0,
@@ -193,6 +198,7 @@ fn workerRunErr(w: *Worker) !void {
             rg_src,
             w.filter_opt,
             w.scan_all,
+            w.trust_stats,
             item.fetch_arr,
             sub_agg_calls,
             item.accumulators,
@@ -319,7 +325,7 @@ pub fn runMultiAggregate(
                     };
                 }
                 if (!per_agg_cols[ci]) continue;
-                if (!expr_agg.statsCoverageComplete(call, metas, ci)) {
+                if (!expr_agg.statsCoverageComplete(call, metas, ci, args.trust_stats)) {
                     prunable = false;
                     break;
                 }
@@ -418,6 +424,7 @@ pub fn runMultiAggregate(
             .agg_calls = agg_calls,
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
+            .trust_stats = args.trust_stats,
         };
     }
 

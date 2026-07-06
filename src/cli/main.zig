@@ -40,15 +40,18 @@ pub fn main(init: std.process.Init) !void {
             \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
             \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
             \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
-            \\            [--scan-all]
+            \\            [--scan-all] [--trust-stats]
             \\  zpq query --query "<sql query>" [--output <out.parquet>]
             \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
-            \\            [--scan-all]
+            \\            [--scan-all] [--trust-stats]
             \\  zpq conform <file.parquet>
             \\
-            \\  --scan-all  decode every page/byte: disables all stats shortcuts
-            \\              (row-group pruning, stats-as-answer). Slower but
-            \\              thorough — use when you don't trust a file's stats.
+            \\  --scan-all     decode every page/byte: disables all stats shortcuts
+            \\                 (row-group pruning, stats-as-answer). Slower but
+            \\                 thorough — use when you don't trust a file's stats.
+            \\  --trust-stats  answer min/max/sum from file statistics instead of
+            \\                 decoding (fast, but trusts the writer's stats — off
+            \\                 by default; count(*) is always answered from metadata).
             \\
         , .{});
         return;
@@ -83,6 +86,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var codec: schema.CompressionCodec = .SNAPPY;
     var parallelism: usize = 0;
     var scan_all: bool = false;
+    var trust_stats: bool = false;
 
     // Positionals after "query" are input paths (one or more, glob
     // patterns allowed — `data/*.parquet`); subsequent tokens are
@@ -112,6 +116,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             parallelism = std.fmt.parseInt(usize, v, 10) catch 0;
         } else if (std.mem.eql(u8, tok, "--scan-all")) {
             scan_all = true; // valueless: disable all stats shortcuts, decode everything
+        } else if (std.mem.eql(u8, tok, "--trust-stats")) {
+            trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
         } else {
             try inputs_raw.append(gpa, tok);
         }
@@ -196,6 +202,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .codec = codec,
             .parallelism = parallelism,
             .scan_all = scan_all,
+            .trust_stats = trust_stats,
         });
         const ar = result.aggregate;
         defer gpa.free(ar.aggs);
@@ -278,6 +285,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         .codec = codec,
         .parallelism = parallelism,
         .scan_all = scan_all,
+        .trust_stats = trust_stats,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);

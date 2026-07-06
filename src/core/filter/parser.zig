@@ -414,6 +414,16 @@ fn buildTypedComparison(
     if (temporalKind(elem)) |tk| {
         return buildTemporalLeaf(col_idx, op, val_str, tk);
     }
+    // FLOAT16 is physically FIXED_LEN_BYTE_ARRAY(2); without an IEEE-half →
+    // f64 lane in the filter/prune path, a numeric predicate falls through to
+    // the byte (.string) leaf below and is compared lexicographically against
+    // raw half-float stat bytes. That silently mis-prunes row groups (the
+    // stats path returns a bogus 0/empty while --scan-all errors at decode).
+    // Fail loud and consistently on both paths until the f64 lane is wired.
+    if (schema.isFloat16(elem.*)) {
+        std.debug.print("filter: FLOAT16 column `{s}` is not yet supported for filtering\n", .{elem.name});
+        return error.UnsupportedType;
+    }
     const ptype = elem.type orelse return error.UnsupportedType;
     return buildLeafFilter(col_idx, op, val_str, ptype);
 }

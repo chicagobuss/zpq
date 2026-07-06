@@ -215,9 +215,18 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
 /// `count(nullable_col)` needs `null_count`; otherwise the caller
 /// falls back to decode. `updateOneFromStats` returns false in that
 /// case.
-pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool) bool {
+pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: bool) bool {
     if (has_outer_filter) return false;
     if (call.where != null) return false;
+    // count(*) is answered from RowGroup.num_rows — structural, always exact.
+    // Every other short-circuit (min/max/sum, and count(col) via null_count)
+    // reads file-written statistics, which real-world writers (e.g. parquet-mr
+    // 1.8.2 / Spark) sometimes emit *inaccurately* — yielding a silently wrong
+    // answer. Trust those only under --trust-stats; otherwise decode for the
+    // true value (row-group pruning still uses stats — that path is safe
+    // because it only ever skips provably-non-matching groups).
+    const is_count_star = call.func == .count and call.arg == null;
+    if (!trust_stats and !is_count_star) return false;
     // BOOLEAN columns widen to i64 (0/1) at decode time but have no
     // stat-bytes folding path (1-byte stats aren't wired into the int/float
     // stat decoders), so force the decode path for any bool-column agg.
@@ -261,8 +270,9 @@ pub fn statsCoverageComplete(
     call: AggCall,
     metas: []const schema.FileMetaData,
     ci: usize,
+    trust_stats: bool,
 ) bool {
-    if (!canStatShortCircuit(call, false)) return false;
+    if (!canStatShortCircuit(call, false, trust_stats)) return false;
     if (call.func == .count and call.arg == null) return true; // count(*)
     const arg_ci = statArgColumn(call) orelse return false;
     if (arg_ci != ci) return false;
@@ -1569,12 +1579,16 @@ test "canStatShortCircuit eligibility rules" {
     const a_count: AggCall = .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 };
     const a_min_ref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const a_min: AggCall = .{ .func = .min, .arg = a_min_ref, .where = null, .alias = "lo", .result = .i64 };
-    try testing.expect(canStatShortCircuit(a_count, false));
-    try testing.expect(canStatShortCircuit(a_min, false));
+    // count(*) is answered from num_rows — eligible regardless of trust_stats.
+    try testing.expect(canStatShortCircuit(a_count, false, false));
+    try testing.expect(canStatShortCircuit(a_count, false, true));
+    // min reads file stats → eligible ONLY under --trust-stats.
+    try testing.expect(canStatShortCircuit(a_min, false, true));
+    try testing.expect(!canStatShortCircuit(a_min, false, false));
 
     // Outer filter present → ineligible (stats reflect ALL rows)
-    try testing.expect(!canStatShortCircuit(a_count, true));
-    try testing.expect(!canStatShortCircuit(a_min, true));
+    try testing.expect(!canStatShortCircuit(a_count, true, true));
+    try testing.expect(!canStatShortCircuit(a_min, true, true));
 
     // Per-agg WHERE → ineligible
     const a_min_where: AggCall = .{
@@ -1584,7 +1598,7 @@ test "canStatShortCircuit eligibility rules" {
         .alias = "lo",
         .result = .i64,
     };
-    try testing.expect(!canStatShortCircuit(a_min_where, false));
+    try testing.expect(!canStatShortCircuit(a_min_where, false, true));
 
     // sum is eligible at this stage: per-RG, updateOneFromStats
     // returns true only when min == max (constant-column case) and
@@ -1593,11 +1607,13 @@ test "canStatShortCircuit eligibility rules" {
     // weighted answer).
     const a_sum: AggCall = .{ .func = .sum, .arg = a_min_ref, .where = null, .alias = "s", .result = .i64 };
     const a_avg: AggCall = .{ .func = .avg, .arg = a_min_ref, .where = null, .alias = "m", .result = .avg_f64 };
-    try testing.expect(canStatShortCircuit(a_sum, false));
-    try testing.expect(!canStatShortCircuit(a_avg, false));
+    // sum reads stats → eligible only under --trust-stats; avg never.
+    try testing.expect(canStatShortCircuit(a_sum, false, true));
+    try testing.expect(!canStatShortCircuit(a_sum, false, false));
+    try testing.expect(!canStatShortCircuit(a_avg, false, true));
 
     // Outer filter / per-agg WHERE still disqualify sum.
-    try testing.expect(!canStatShortCircuit(a_sum, true));
+    try testing.expect(!canStatShortCircuit(a_sum, true, true));
     const a_sum_where: AggCall = .{
         .func = .sum,
         .arg = a_min_ref,
@@ -1605,7 +1621,7 @@ test "canStatShortCircuit eligibility rules" {
         .alias = "s",
         .result = .i64,
     };
-    try testing.expect(!canStatShortCircuit(a_sum_where, false));
+    try testing.expect(!canStatShortCircuit(a_sum_where, false, true));
 }
 
 test "updateOneFromStats sum: constant-column RG folds num_rows × value" {
@@ -1913,12 +1929,15 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
     const sum_call: AggCall = .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 };
     const star_call: AggCall = .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 };
 
-    // max with full stats coverage → prunable
-    try testing.expect(statsCoverageComplete(max_call, &.{meta_complete}, 0));
-    // max with one RG missing stats → NOT prunable
-    try testing.expect(!statsCoverageComplete(max_call, &.{meta_partial}, 0));
+    // max with full stats coverage → prunable, but ONLY under --trust-stats
+    // (reading min/max stats for the answer). Untrusted → must decode → not
+    // prunable, so the column can't be dropped from the fetch set.
+    try testing.expect(statsCoverageComplete(max_call, &.{meta_complete}, 0, true));
+    try testing.expect(!statsCoverageComplete(max_call, &.{meta_complete}, 0, false));
+    // max with one RG missing stats → NOT prunable (even when trusting)
+    try testing.expect(!statsCoverageComplete(max_call, &.{meta_partial}, 0, true));
     // sum is only prunable when every RG is constant; these stats are variable.
-    try testing.expect(!statsCoverageComplete(sum_call, &.{meta_complete}, 0));
+    try testing.expect(!statsCoverageComplete(sum_call, &.{meta_complete}, 0, true));
     const left = try a.create(expr_ast.Expr);
     left.* = arg;
     const right = try a.create(expr_ast.Expr);
@@ -1930,10 +1949,11 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
         .result_type = .i64,
     } };
     const computed_sum: AggCall = .{ .func = .sum, .arg = computed_arg, .where = null, .alias = "s", .result = .i64 };
-    try testing.expect(!statsCoverageComplete(computed_sum, &.{meta_complete}, 0));
-    // count(*) doesn't need column stats — always prunable
-    try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0));
-    try testing.expect(statsCoverageComplete(star_call, &.{meta_partial}, 0));
+    try testing.expect(!statsCoverageComplete(computed_sum, &.{meta_complete}, 0, true));
+    // count(*) is answered from num_rows — always prunable, trust or not.
+    try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, true));
+    try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, false));
+    try testing.expect(statsCoverageComplete(star_call, &.{meta_partial}, 0, false));
 }
 
 test "simdSumI64 widens correctly across positive and negative i64 extremes" {

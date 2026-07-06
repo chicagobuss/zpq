@@ -48,9 +48,10 @@ promotion (`i32 + 1.0 → f64`), string concat (`||`),
 `coalesce(col, default)`, parens, unary minus.
 
 **Aggregate** with `sum / count / min / max / avg`, including
-conditional `agg(...) FILTER (WHERE ...)`. Stat-only short-circuit
-for `count(*)` / `count(col)` / `min(col)` / `max(col)` when the row
-group's metadata has the answer.
+conditional `agg(...) FILTER (WHERE ...)`. `count(*)` is answered
+straight from row-group metadata; `min / max / sum` are computed by
+decoding the data unless you opt into trusting file statistics — see
+[Statistics: trust is opt-in](#statistics-trust-is-opt-in).
 
 **Write** with SNAPPY / ZSTD / UNCOMPRESSED output; RLE_DICTIONARY for
 low-cardinality byte arrays; DELTA_BINARY_PACKED for INT32 / INT64.
@@ -64,6 +65,38 @@ zpq query data.parquet -o out.parquet \
   --filter "int8 BETWEEN -10 AND 10" \
   --select "name, qty * price AS revenue, coalesce(notes, '') AS notes"
 ```
+
+## Statistics: trust is opt-in
+
+Parquet files carry per-column statistics (min / max / null counts). The
+spec says they must be accurate — but real-world writers ship inaccurate
+ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded
+`min` is `2.00` when the column actually contains `1.00`). A reader that
+trusts those stats returns a **silently wrong answer**.
+
+ZPQ's default is **correctness**: `min / max / sum` are computed by
+decoding the data, so the answer is right regardless of what the file
+claims. Two things are still always fast and always safe, because they
+can't produce a wrong value:
+
+- **`count(*)`** is answered from the row group's `num_rows` (structural,
+  not a statistic).
+- **Row-group pruning** uses stats only to *skip* groups that provably
+  can't match a filter — it never invents a value, so a bad stat can at
+  worst cost a little extra decoding, never a wrong result.
+
+If you know your writer's statistics are trustworthy, opt into the
+stats fast-path — `min / max / sum` answered from metadata in
+microseconds, without touching a data page:
+
+```bash
+zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
+```
+
+`--trust-stats` is a scalpel: it trades correctness-on-bad-files for
+speed, and it's your call per query. `--scan-all` is the opposite
+extreme — decode everything, disable pruning too, for when you don't
+trust even the row counts.
 
 ## Test coverage
 

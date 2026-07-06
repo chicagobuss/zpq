@@ -208,6 +208,7 @@ fn handle(
             .aggregate = extractField(trimmed, "aggregate") catch null,
             .codec = output_codec,
             .scan_all = extractBool(trimmed, "scan_all"),
+            .trust_stats = extractBool(trimmed, "trust_stats"),
         };
 
         // Dispatch mirrors engine.runQuery's own precedence: aggregate

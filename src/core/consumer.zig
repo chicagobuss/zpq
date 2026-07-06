@@ -945,6 +945,11 @@ pub fn scanRGForAgg(
     /// force every agg down the decode path (the `--scan-all` escape
     /// hatch: paranoid / untrusted-stats mode).
     scan_all: bool,
+    /// When false (the default), min/max/sum are answered by decoding rather
+    /// than trusting file statistics, which can be inaccurate. `count(*)` is
+    /// always answered from RowGroup.num_rows regardless. `--trust-stats`
+    /// sets this true to restore the stats fast-path for trusted writers.
+    trust_stats: bool,
     fetch_set: []const bool,
     agg_calls: []const expr_agg.AggCall,
     accumulators: []expr_agg.Accumulator,
@@ -967,7 +972,7 @@ pub fn scanRGForAgg(
     var any_decode_required = false;
     const t_stats_start = nowMonoNs();
     for (agg_calls, 0..) |call, i| {
-        if (scan_all or !expr_agg.canStatShortCircuit(call, has_outer_filter)) {
+        if (scan_all or !expr_agg.canStatShortCircuit(call, has_outer_filter, trust_stats)) {
             any_decode_required = true;
             continue;
         }

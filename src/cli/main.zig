@@ -377,7 +377,13 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         });
         const ar = result.aggregate;
         defer gpa.free(ar.aggs);
-        defer for (ar.aggs) |item| gpa.free(item.alias);
+        defer for (ar.aggs) |item| {
+            gpa.free(item.alias);
+            switch (item.value) {
+                .s => |s| gpa.free(s),
+                else => {},
+            }
+        };
         const total_ms_a = @divTrunc(nowMonoNs() - t_start_a, std.time.ns_per_ms);
 
         var ws: StdoutWriter = .{ .fd = 1 };

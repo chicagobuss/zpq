@@ -391,7 +391,13 @@ fn lambdaAggregate(
     };
     const ar = result.aggregate;
     defer allocator.free(ar.aggs);
-    defer for (ar.aggs) |item| allocator.free(item.alias);
+    defer for (ar.aggs) |item| {
+        allocator.free(item.alias);
+        switch (item.value) {
+            .s => |s| allocator.free(s),
+            else => {},
+        }
+    };
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
     var buf: std.ArrayList(u8) = .empty;

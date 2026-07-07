@@ -458,7 +458,7 @@ pub fn runMultiAggregate(
     for (workers) |w| {
         for (w.work) |item| {
             for (item.accumulators, 0..) |sub_acc, i| {
-                accumulators[item.agg_start + i].merge(sub_acc);
+                accumulators[item.agg_start + i].merge(sub_acc, gpa);
             }
         }
         rows_in += w.rows_in;
@@ -480,7 +480,7 @@ pub fn runMultiAggregate(
     for (agg_calls, 0..) |call, i| {
         items[i] = .{
             .alias = try gpa.dupe(u8, call.alias),
-            .value = try materializeOne(call, accumulators[i]),
+            .value = try materializeOne(gpa, call, accumulators[i]),
         };
     }
 
@@ -503,7 +503,7 @@ pub fn runMultiAggregate(
 }
 
 /// Convert one agg's final accumulator state into a wire-friendly value.
-pub fn materializeOne(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
+pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     return switch (call.func) {
         .count => .{ .i = @intCast(state.count) },
         .sum => switch (call.result) {
@@ -516,13 +516,13 @@ pub fn materializeOne(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggV
         .min => switch (call.result) {
             .i64 => .{ .i = state.min_i orelse 0 },
             .f64 => .{ .f = state.min_f orelse 0 },
-            .bytes => .{ .s = state.min_bytes orelse "" },
+            .bytes => .{ .s = if (state.min_bytes) |b| b else try gpa.dupe(u8, "") },
             .avg_f64 => unreachable,
         },
         .max => switch (call.result) {
             .i64 => .{ .i = state.max_i orelse 0 },
             .f64 => .{ .f = state.max_f orelse 0 },
-            .bytes => .{ .s = state.max_bytes orelse "" },
+            .bytes => .{ .s = if (state.max_bytes) |b| b else try gpa.dupe(u8, "") },
             .avg_f64 => unreachable,
         },
         .avg => .{ .avg = .{ .sum = state.avg.sum, .count = @intCast(state.avg.count) } },

@@ -135,7 +135,7 @@ pub const Accumulator = union(enum) {
     /// to merge per-thread / per-file accumulators back into a single
     /// final result after a parallel multi-file scan. A null min/max
     /// means "no values seen"; merging skips it.
-    pub fn merge(dst: *Accumulator, src: Accumulator) void {
+    pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) void {
         switch (dst.*) {
             .count => |*c| c.* += src.count,
             .sum_i => |*s| s.* += src.sum_i,
@@ -153,12 +153,32 @@ pub const Accumulator = union(enum) {
                 if (m.* == null or sv > m.*.?) m.* = sv;
             },
             // Pointer copy: both src and the merged dst hold slices dup'd
-            // into the shared persist allocator (lives until query end).
+            // into the shared persist allocator. We free the loser to prevent leaks.
             .min_bytes => |*m| if (src.min_bytes) |sv| {
-                if (m.* == null or std.mem.order(u8, sv, m.*.?) == .lt) m.* = sv;
+                if (m.* == null) {
+                    m.* = sv;
+                } else {
+                    const ord = std.mem.order(u8, sv, m.*.?);
+                    if (ord == .lt) {
+                        allocator.free(m.*.?);
+                        m.* = sv;
+                    } else {
+                        allocator.free(sv);
+                    }
+                }
             },
             .max_bytes => |*m| if (src.max_bytes) |sv| {
-                if (m.* == null or std.mem.order(u8, sv, m.*.?) == .gt) m.* = sv;
+                if (m.* == null) {
+                    m.* = sv;
+                } else {
+                    const ord = std.mem.order(u8, sv, m.*.?);
+                    if (ord == .gt) {
+                        allocator.free(m.*.?);
+                        m.* = sv;
+                    } else {
+                        allocator.free(sv);
+                    }
+                }
             },
             .avg => |*a| {
                 a.sum += src.avg.sum;

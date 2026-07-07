@@ -34,11 +34,13 @@ const usage_text =
     \\            [--filter EXPR] [--columns COL1,COL2,...]
     \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
-    \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
+    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats]
+    \\            [--format csv|jsonl] [--limit N]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
-    \\            [--codec snappy|zstd|gzip|uncompressed] [--threads N | -j N]
+    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats]
+    \\  zpq schema <file.parquet>
     \\  zpq conform <file.parquet>
     \\
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
@@ -73,18 +75,74 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "query")) {
-        try runQuery(init, &iter);
+        runQuery(init, &iter) catch |err| {
+            switch (err) {
+                error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
+                error.NoInputs => std.debug.print("zpq query: no input files specified\n", .{}),
+                error.EmptyAggregate => std.debug.print("zpq query: empty aggregate expression\n", .{}),
+                error.AggregateMutexWithSelect => std.debug.print("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
+                error.MissingOutputOrAggregate => std.debug.print("zpq query: missing --output or --aggregate\n", .{}),
+                error.SchemaMismatch => std.debug.print("zpq query: schema mismatch across inputs\n", .{}),
+                error.NestedReencodeNotSupported => std.debug.print("zpq query: nested re-encoding is not supported yet\n", .{}),
+                error.FooterSchemaChunkMismatch => std.debug.print("zpq query: footer schema chunk mismatch\n", .{}),
+                error.CrossBucketNotSupported => std.debug.print("zpq query: cross-bucket queries are not supported\n", .{}),
+                error.BadInputUrl => std.debug.print("zpq query: invalid input S3 URL\n", .{}),
+                error.BadOutputUrl => std.debug.print("zpq query: invalid output S3 URL\n", .{}),
+                error.NoCredentials => std.debug.print("zpq query: missing AWS credentials for S3 query\n", .{}),
+                error.BadResponse => std.debug.print("zpq query: bad S3 HTTP response\n", .{}),
+                error.TailTooSmall => std.debug.print("zpq query: file footer metadata tail too small\n", .{}),
+                error.NotParquet, error.BadMagic => std.debug.print("zpq query: input file is not a valid Parquet file\n", .{}),
+                error.AggSumOverflow => std.debug.print("zpq query: aggregate sum overflowed integer limits\n", .{}),
+                error.OpenFailed => std.debug.print("zpq query: failed to open input file\n", .{}),
+                error.EmptyFile => std.debug.print("zpq query: input file is empty\n", .{}),
+                error.PathTooLong => std.debug.print("zpq query: input file path too long\n", .{}),
+                error.EmptyExpr => std.debug.print("zpq query: empty expression\n", .{}),
+                error.UnexpectedChar => std.debug.print("zpq query: unexpected character in expression\n", .{}),
+                error.UnexpectedEnd => std.debug.print("zpq query: unexpected end of expression\n", .{}),
+                error.BadNumber => std.debug.print("zpq query: invalid number in expression\n", .{}),
+                error.UnknownColumn => std.debug.print("zpq query: unknown column referenced in expression\n", .{}),
+                error.UnsupportedColumnType => std.debug.print("zpq query: unsupported column type\n", .{}),
+                error.UnterminatedString => std.debug.print("zpq query: unterminated string literal in expression\n", .{}),
+                error.TypeMismatch => std.debug.print("zpq query: type mismatch in expression\n", .{}),
+                error.UnknownFunction => std.debug.print("zpq query: unknown scalar function in expression\n", .{}),
+                error.UnknownAggFunc => std.debug.print("zpq query: unknown aggregate function in expression\n", .{}),
+                error.WrongArity => std.debug.print("zpq query: wrong number of arguments for function\n", .{}),
+                error.BadAggArg => std.debug.print("zpq query: invalid argument for aggregate function\n", .{}),
+                error.ExpectedLParen => std.debug.print("zpq query: expected '(' in expression\n", .{}),
+                error.ExpectedRParen => std.debug.print("zpq query: expected ')' in expression\n", .{}),
+                error.ExpectedIdentifier => std.debug.print("zpq query: expected column identifier in expression\n", .{}),
+                error.ExpectedWhere => std.debug.print("zpq query: expected WHERE keyword in expression\n", .{}),
+                error.ExpectedAggFunc => std.debug.print("zpq query: expected aggregate function\n", .{}),
+                error.StarOnlyValidInCount => std.debug.print("zpq query: '*' is only valid inside count(*)\n", .{}),
+                error.TrailingTokens => std.debug.print("zpq query: trailing tokens after expression\n", .{}),
+                error.GroupingNotSupported => std.debug.print("zpq query: grouping parentheses are not supported in filter\n", .{}),
+                error.BadOperator => std.debug.print("zpq query: invalid operator in filter\n", .{}),
+                error.BadValue => std.debug.print("zpq query: invalid value in filter\n", .{}),
+                error.UnsupportedType => std.debug.print("zpq query: unsupported type in filter\n", .{}),
+                else => return err,
+            }
+            std.process.exit(1);
+        };
         return;
     }
     if (std.mem.eql(u8, cmd, "conform")) {
         const path = iter.next() orelse {
             std.debug.print("conform: missing path\n", .{});
-            return;
+            std.process.exit(1);
         };
         try runConform(gpa, path);
         return;
     }
+    if (std.mem.eql(u8, cmd, "schema")) {
+        const path = iter.next() orelse {
+            std.debug.print("schema: missing path\n", .{});
+            std.process.exit(1);
+        };
+        try runSchema(gpa, path);
+        return;
+    }
     std.debug.print("unknown subcommand: {s}\n", .{cmd});
+    std.process.exit(1);
 }
 
 fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
@@ -103,10 +161,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
+    var format: ?engine.PrintFormat = null;
+    var limit: ?usize = null;
 
-    // Positionals after "query" are input paths (one or more, glob
-    // patterns allowed — `data/*.parquet`); subsequent tokens are
-    // flag/value pairs. Mirrors duckdb's `read_parquet('data/*.parquet')`.
     while (iter.next()) |tok| {
         if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
             var ws: StdoutWriter = .{};
@@ -114,31 +171,92 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             try ws.writeAll(usage_text);
             return;
         } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
-            output = iter.next();
+            output = iter.next() orelse {
+                std.debug.print("zpq query: --output requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
-            filter = iter.next();
+            filter = iter.next() orelse {
+                std.debug.print("zpq query: --filter requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
-            columns_csv = iter.next();
+            columns_csv = iter.next() orelse {
+                std.debug.print("zpq query: --columns requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--select") or std.mem.eql(u8, tok, "-s")) {
-            select = iter.next();
+            select = iter.next() orelse {
+                std.debug.print("zpq query: --select requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--aggregate") or std.mem.eql(u8, tok, "-a")) {
-            aggregate = iter.next();
+            aggregate = iter.next() orelse {
+                std.debug.print("zpq query: --aggregate requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--query") or std.mem.eql(u8, tok, "-q")) {
-            query = iter.next();
+            query = iter.next() orelse {
+                std.debug.print("zpq query: --query requires a value\n", .{});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--codec")) {
-            const v = iter.next() orelse continue;
-            if (std.ascii.eqlIgnoreCase(v, "zstd")) codec = .ZSTD;
-            if (std.ascii.eqlIgnoreCase(v, "uncompressed")) codec = .UNCOMPRESSED;
-            if (std.ascii.eqlIgnoreCase(v, "gzip")) codec = .GZIP;
-            if (std.ascii.eqlIgnoreCase(v, "lz4") or std.ascii.eqlIgnoreCase(v, "lz4_raw")) codec = .LZ4_RAW;
-            // anything else stays SNAPPY (default)
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --codec requires a value\n", .{});
+                return error.BadArgs;
+            };
+            if (std.ascii.eqlIgnoreCase(v, "zstd")) {
+                codec = .ZSTD;
+            } else if (std.ascii.eqlIgnoreCase(v, "uncompressed")) {
+                codec = .UNCOMPRESSED;
+            } else if (std.ascii.eqlIgnoreCase(v, "gzip")) {
+                codec = .GZIP;
+            } else if (std.ascii.eqlIgnoreCase(v, "lz4") or std.ascii.eqlIgnoreCase(v, "lz4_raw")) {
+                codec = .LZ4_RAW;
+            } else if (std.ascii.eqlIgnoreCase(v, "snappy")) {
+                codec = .SNAPPY;
+            } else {
+                std.debug.print("zpq query: invalid codec: {s}\n", .{v});
+                return error.BadArgs;
+            }
         } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {
-            const v = iter.next() orelse continue;
-            parallelism = std.fmt.parseInt(usize, v, 10) catch 0;
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --threads requires a value\n", .{});
+                return error.BadArgs;
+            };
+            parallelism = std.fmt.parseInt(usize, v, 10) catch {
+                std.debug.print("zpq query: invalid threads value: {s}\n", .{v});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--scan-all")) {
             scan_all = true; // valueless: disable all stats shortcuts, decode everything
         } else if (std.mem.eql(u8, tok, "--trust-stats")) {
             trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
+        } else if (std.mem.eql(u8, tok, "--format")) {
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --format requires a value\n", .{});
+                return error.BadArgs;
+            };
+            if (std.ascii.eqlIgnoreCase(v, "csv")) {
+                format = .csv;
+            } else if (std.ascii.eqlIgnoreCase(v, "jsonl")) {
+                format = .jsonl;
+            } else {
+                std.debug.print("zpq query: invalid format: {s} (supported: csv, jsonl)\n", .{v});
+                return error.BadArgs;
+            }
+        } else if (std.mem.eql(u8, tok, "--limit")) {
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --limit requires a value\n", .{});
+                return error.BadArgs;
+            };
+            limit = std.fmt.parseInt(usize, v, 10) catch {
+                std.debug.print("zpq query: invalid limit value: {s}\n", .{v});
+                return error.BadArgs;
+            };
+        } else if (std.mem.startsWith(u8, tok, "-")) {
+            std.debug.print("zpq query: unrecognized option: {s}\n", .{tok});
+            return error.BadArgs;
         } else {
             try inputs_raw.append(gpa, tok);
         }
@@ -149,8 +267,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             std.debug.print("zpq query: cannot specify input files on the command line when using --query\n", .{});
             return error.BadArgs;
         }
-        if (select != null or aggregate != null or filter != null or columns_csv != null) {
-            std.debug.print("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns\n", .{});
+        if (select != null or aggregate != null or filter != null or columns_csv != null or format != null or limit != null) {
+            std.debug.print("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit\n", .{});
             return error.BadArgs;
         }
     } else {
@@ -158,8 +276,16 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             std.debug.print("zpq query: missing <input.parquet> [more.parquet ...]\n", .{});
             return error.BadArgs;
         }
-        if (aggregate != null and (select != null or columns_csv != null)) {
-            std.debug.print("zpq query: --aggregate is mutually exclusive with --select / --columns\n", .{});
+        if (aggregate != null and (select != null or columns_csv != null or format != null)) {
+            std.debug.print("zpq query: --aggregate is mutually exclusive with --select / --columns / --format\n", .{});
+            return error.BadArgs;
+        }
+        if (format != null and output != null) {
+            std.debug.print("zpq query: --format is mutually exclusive with --output\n", .{});
+            return error.BadArgs;
+        }
+        if (limit != null and format == null) {
+            std.debug.print("zpq query: --limit is only supported with --format\n", .{});
             return error.BadArgs;
         }
     }
@@ -206,7 +332,30 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             for (matches) |m| try inputs_list.append(arena, m);
         }
     }
-    const inputs: []const []const u8 = inputs_list.items;
+    const inputs = inputs_list.items;
+
+    if (format) |fmt| {
+        const cols = if (columns_csv) |csv|
+            try splitCsv(arena, csv)
+        else
+            null;
+        try engine.runPrint(.{
+            .gpa = gpa,
+            .env = env,
+            .io = io,
+        }, .{
+            .inputs = inputs,
+            .output = null,
+            .filter = filter,
+            .columns = cols,
+            .select = select,
+            .codec = codec,
+            .parallelism = parallelism,
+            .scan_all = scan_all,
+            .trust_stats = trust_stats,
+        }, fmt, limit);
+        return;
+    }
 
     // Aggregate path: -o is OPTIONAL (JSON-only mode is the default).
     if (aggregate) |agg_str| {
@@ -745,43 +894,29 @@ fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
     }
 }
 
-/// Tiny buffered writer using direct linux.write syscalls — avoids
-/// the std.Io vtable so this binary stays self-contained. fd
-/// defaults to stdout (1); set fd=2 for stderr.
 const StdoutWriter = struct {
-    const linux = std.os.linux;
-    fd: linux.fd_t = 1,
-    buf: [4096]u8 = undefined,
-    pos: usize = 0,
+    fd: std.os.linux.fd_t = 1,
+    inner: ?engine.StdoutWriter = null,
+
+    fn getInner(self: *StdoutWriter) *engine.StdoutWriter {
+        if (self.inner == null) {
+            self.inner = .{ .fd = self.fd };
+        }
+        return &self.inner.?;
+    }
 
     pub fn writeAll(self: *StdoutWriter, bytes: []const u8) !void {
-        var i: usize = 0;
-        while (i < bytes.len) {
-            const space = self.buf.len - self.pos;
-            const n = @min(bytes.len - i, space);
-            @memcpy(self.buf[self.pos..][0..n], bytes[i..][0..n]);
-            self.pos += n;
-            i += n;
-            if (self.pos == self.buf.len) self.flush();
-        }
+        try self.getInner().writeAll(bytes);
     }
 
     pub fn print(self: *StdoutWriter, comptime fmt: []const u8, args: anytype) !void {
-        var tmp: [512]u8 = undefined;
-        const out = try std.fmt.bufPrint(&tmp, fmt, args);
-        try self.writeAll(out);
+        try self.getInner().print(fmt, args);
     }
 
     pub fn flush(self: *StdoutWriter) void {
-        if (self.pos == 0) return;
-        var written: usize = 0;
-        while (written < self.pos) {
-            const r = linux.write(self.fd, self.buf[written..].ptr, self.pos - written);
-            const n: isize = @bitCast(r);
-            if (n <= 0) break;
-            written += @intCast(n);
+        if (self.inner) |*in| {
+            in.flush() catch {};
         }
-        self.pos = 0;
     }
 };
 
@@ -816,4 +951,110 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
     if (off != size) return error.ShortRead;
     return buf;
+}
+
+fn printLogicalType(ws: *StdoutWriter, lt: schema.LogicalType) !void {
+    switch (lt) {
+        .STRING => try ws.writeAll("STRING"),
+        .MAP => try ws.writeAll("MAP"),
+        .LIST => try ws.writeAll("LIST"),
+        .ENUM => try ws.writeAll("ENUM"),
+        .DECIMAL => |d| try ws.print("DECIMAL({d},{d})", .{ d.precision, d.scale }),
+        .DATE => try ws.writeAll("DATE"),
+        .TIME => |t| try ws.print("TIME({s},isAdjustedToUTC={})", .{ @tagName(t.unit), t.isAdjustedToUTC }),
+        .TIMESTAMP => |ts| try ws.print("TIMESTAMP({s},isAdjustedToUTC={})", .{ @tagName(ts.unit), ts.isAdjustedToUTC }),
+        .INTEGER => |i| try ws.print("INTEGER({d},{s})", .{ i.bitWidth, if (i.isSigned) "signed" else "unsigned" }),
+        .UNKNOWN => try ws.writeAll("UNKNOWN"),
+        .JSON => try ws.writeAll("JSON"),
+        .BSON => try ws.writeAll("BSON"),
+        .UUID => try ws.writeAll("UUID"),
+        .FLOAT16 => try ws.writeAll("FLOAT16"),
+    }
+}
+
+fn printLogicalOrConverted(ws: *StdoutWriter, leaf: schema_tree.PrimitiveNode) !void {
+    if (leaf.logical_type) |lt| {
+        try ws.writeAll(" [Logical: ");
+        try printLogicalType(ws, lt);
+        try ws.writeAll("]");
+    } else if (leaf.converted_type) |ct| {
+        try ws.writeAll(" [Logical: ");
+        switch (ct) {
+            .UTF8 => try ws.writeAll("STRING"),
+            .MAP => try ws.writeAll("MAP"),
+            .MAP_KEY_VALUE => try ws.writeAll("MAP"),
+            .LIST => try ws.writeAll("LIST"),
+            .ENUM => try ws.writeAll("ENUM"),
+            .DECIMAL => {
+                const p = leaf.precision orelse 0;
+                const s = leaf.scale orelse 0;
+                try ws.print("DECIMAL({d},{d})", .{ p, s });
+            },
+            .DATE => try ws.writeAll("DATE"),
+            .TIME_MILLIS => try ws.writeAll("TIME(MILLIS,isAdjustedToUTC=true)"),
+            .TIME_MICROS => try ws.writeAll("TIME(MICROS,isAdjustedToUTC=true)"),
+            .TIMESTAMP_MILLIS => try ws.writeAll("TIMESTAMP(MILLIS,isAdjustedToUTC=true)"),
+            .TIMESTAMP_MICROS => try ws.writeAll("TIMESTAMP(MICROS,isAdjustedToUTC=true)"),
+            .UINT_8 => try ws.writeAll("INTEGER(8,unsigned)"),
+            .UINT_16 => try ws.writeAll("INTEGER(16,unsigned)"),
+            .UINT_32 => try ws.writeAll("INTEGER(32,unsigned)"),
+            .UINT_64 => try ws.writeAll("INTEGER(64,unsigned)"),
+            .INT_8 => try ws.writeAll("INTEGER(8,signed)"),
+            .INT_16 => try ws.writeAll("INTEGER(16,signed)"),
+            .INT_32 => try ws.writeAll("INTEGER(32,signed)"),
+            .INT_64 => try ws.writeAll("INTEGER(64,signed)"),
+            .JSON => try ws.writeAll("JSON"),
+            .BSON => try ws.writeAll("BSON"),
+            .INTERVAL => try ws.writeAll("INTERVAL"),
+        }
+        try ws.writeAll("]");
+    }
+}
+
+fn runSchema(gpa: std.mem.Allocator, path: []const u8) !void {
+    if (std.mem.startsWith(u8, path, "s3://")) {
+        std.debug.print("zpq schema: S3 paths are not supported for schema inspection in this version\n", .{});
+        std.process.exit(1);
+    }
+    const file_bytes = readFile(gpa, path) catch |err| {
+        std.debug.print("zpq schema: failed to open input file: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer gpa.free(file_bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = metadata.open(arena, file_bytes) catch |err| {
+        std.debug.print("zpq schema: file footer metadata open failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var ws: StdoutWriter = .{};
+    defer ws.flush();
+
+    var codec_name: []const u8 = "UNCOMPRESSED";
+    if (meta.row_groups.items.len > 0 and meta.row_groups.items[0].columns.items.len > 0) {
+        if (meta.row_groups.items[0].columns.items[0].meta_data) |cm| {
+            codec_name = @tagName(cm.codec);
+        }
+    }
+
+    try ws.print("rows: {d}, row_groups: {d}, codec: {s}\n", .{ meta.num_rows, meta.row_groups.items.len, codec_name });
+
+    const tree = schema_tree.SchemaTree.build(arena, meta.schema.items) catch |err| {
+        std.debug.print("zpq schema: schema tree build failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    for (tree.leaves) |leaf| {
+        for (leaf.path, 0..) |seg, i| {
+            if (i > 0) try ws.writeAll(".");
+            try ws.writeAll(seg);
+        }
+        try ws.print(": {s} ({s})", .{ @tagName(leaf.type), @tagName(leaf.repetition) });
+        try printLogicalOrConverted(&ws, leaf);
+        try ws.writeAll("\n");
+    }
 }

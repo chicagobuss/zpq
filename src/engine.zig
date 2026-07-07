@@ -783,7 +783,19 @@ pub fn fetchS3Schema(
 
     var specs = [_]FetchSpec{.{ .url = url }};
     try fetchMetaBatch(ctx, arena, creds, pool, &specs);
-    return specs[0].meta;
+
+    // fetchMetaBatch's parsed metadata borrows string bytes from the
+    // gpa-owned footer_region (thrift readString borrows, never copies).
+    // Re-parse from an arena-owned copy so the gpa buffers can be freed
+    // here instead of leaking out of this one-shot helper.
+    const sp = &specs[0];
+    if (sp.tail.len > 0 and sp.tail.ptr != sp.footer_region.ptr) {
+        ctx.gpa.free(sp.tail);
+    }
+    const footer_len = sp.footer_region.len - 8;
+    const footer_copy = try arena.dupe(u8, sp.footer_region[0..footer_len]);
+    ctx.gpa.free(sp.footer_region);
+    return metadata.openFooter(arena, footer_copy);
 }
 
 const MmapHandle = struct {
@@ -1004,10 +1016,12 @@ fn openInputs(
                     const cm = rg.columns.items[ci].meta_data orelse continue;
                     const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
                     const len: u64 = @intCast(cm.total_compressed_size);
-                    // Skip ranges already covered by the prefetched tail
-                    // (head + footer). Anything below tail_start is new
-                    // bytes we need.
-                    if (start >= sp.tail_start) continue;
+                    // EVERY needed chunk goes into the range list — including
+                    // ones inside the prefetched tail — so the compact buffer
+                    // covers it and offset rebasing can find it. Bytes at or
+                    // past tail_start are satisfied by copying from the tail
+                    // below (no re-fetch); only the sub-tail_start portion
+                    // becomes a fetch job.
                     try ranges.append(arena, .{ .start = start, .end = start + len });
                 }
             }
@@ -1030,7 +1044,7 @@ fn openInputs(
                 compact_len += len;
             }
             sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
-            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges);
+            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges, sp.survivors);
 
             for (sp.compact_ranges) |r| {
                 const source_len: usize = @intCast(r.end - r.start);
@@ -1051,9 +1065,18 @@ fn openInputs(
                     const dst_off: usize = @intCast(tail_copy_start - r.start);
                     const tail_off: usize = @intCast(tail_copy_start - sp.tail_start);
                     const copy_len: usize = @intCast(r.end - tail_copy_start);
+                    if (tail_off + copy_len > sp.tail.len) return error.BadResponse;
                     @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
                 }
             }
+
+            // The tail buffer has served its purpose (footer parse + the
+            // copies above). Free it now — unless it aliases footer_region
+            // (the warm meta-cache path), which s3_buffers tracks separately.
+            if (sp.tail.len > 0 and sp.tail.ptr != sp.footer_region.ptr) {
+                ctx.gpa.free(sp.tail);
+            }
+            sp.tail = &.{};
         }
 
         // Parallel fetch all the column-chunk ranges across all files.
@@ -1215,7 +1238,15 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
     sp.tail_start = sp.total_size - tail_resp.body.len;
-    sp.tail = tail_resp.body;
+    // The response body lives in the per-task scratch arena, which is
+    // freed when the fetch task returns — but openInputs reads sp.tail
+    // later to materialize tail-resident chunk bytes without re-fetching.
+    // Copy it somewhere stable; openInputs frees it after the copies.
+    sp.tail = try t.ctx.gpa.dupe(u8, tail_resp.body);
+    errdefer {
+        t.ctx.gpa.free(sp.tail);
+        sp.tail = &.{};
+    }
 
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
@@ -1293,8 +1324,14 @@ fn rebaseFetchedOffsets(
     meta: *schema.FileMetaData,
     fetch_arr: []const bool,
     ranges: []const CompactRange,
+    survivors: []const bool,
 ) !void {
-    for (meta.row_groups.items) |*rg| {
+    for (meta.row_groups.items, 0..) |*rg, rg_i| {
+        // Pruned row groups contributed no fetch ranges, so their chunk
+        // offsets can't be rebased — and never need to be: the scan
+        // workers re-prune with the same stats predicate before touching
+        // any offset in these groups.
+        if (rg_i < survivors.len and !survivors[rg_i]) continue;
         for (rg.columns.items, 0..) |*chunk, ci| {
             if (ci >= fetch_arr.len or !fetch_arr[ci]) continue;
             if (chunk.meta_data) |*cm| {

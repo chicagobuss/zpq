@@ -1408,8 +1408,476 @@ fn nowMonoNs() i64 {
 }
 
 // ============================================================
+// Print path - CSV / JSONL streaming row output
+// ============================================================
+
+pub const PrintFormat = enum {
+    csv,
+    jsonl,
+};
+
+pub const StdoutWriter = struct {
+    const linux = std.os.linux;
+    fd: linux.fd_t = 1,
+    buf: [4096]u8 = undefined,
+    pos: usize = 0,
+
+    pub fn writeAll(self: *StdoutWriter, bytes: []const u8) !void {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            const space = self.buf.len - self.pos;
+            const n = @min(bytes.len - i, space);
+            @memcpy(self.buf[self.pos..][0..n], bytes[i..][0..n]);
+            self.pos += n;
+            i += n;
+            if (self.pos == self.buf.len) try self.flush();
+        }
+    }
+
+    pub fn writeByte(self: *StdoutWriter, c: u8) !void {
+        try self.writeAll(&[_]u8{c});
+    }
+
+    pub fn print(self: *StdoutWriter, comptime fmt: []const u8, args: anytype) !void {
+        var tmp: [512]u8 = undefined;
+        const out = try std.fmt.bufPrint(&tmp, fmt, args);
+        try self.writeAll(out);
+    }
+
+    pub fn flush(self: *StdoutWriter) !void {
+        if (self.pos == 0) return;
+        var written: usize = 0;
+        while (written < self.pos) {
+            const r = linux.write(self.fd, self.buf[written..].ptr, self.pos - written);
+            const n: isize = @bitCast(r);
+            if (n < 0) return error.BrokenPipe;
+            if (n == 0) break;
+            written += @intCast(n);
+        }
+        self.pos = 0;
+    }
+};
+
+fn checkNestedListMap(node: schema_tree.Node, is_nested: bool, list_map_cols: []bool) void {
+    switch (node) {
+        .primitive => |p| {
+            if (is_nested) {
+                list_map_cols[p.column_index] = true;
+            }
+        },
+        .group => |g| {
+            const nested = is_nested or (g.kind == .list or g.kind == .map);
+            for (g.children) |child| {
+                checkNestedListMap(child, nested, list_map_cols);
+            }
+        },
+    }
+}
+
+fn writeFloat(writer: anytype, f: anytype, is_jsonl: bool) !void {
+    if (std.math.isFinite(f)) {
+        try writer.print("{d}", .{f});
+    } else if (std.math.isNan(f)) {
+        if (is_jsonl) {
+            try writer.writeAll("\"NaN\"");
+        } else {
+            try writer.writeAll("NaN");
+        }
+    } else if (f > 0) {
+        if (is_jsonl) {
+            try writer.writeAll("\"Infinity\"");
+        } else {
+            try writer.writeAll("Infinity");
+        }
+    } else {
+        if (is_jsonl) {
+            try writer.writeAll("\"-Infinity\"");
+        } else {
+            try writer.writeAll("-Infinity");
+        }
+    }
+}
+
+fn writeDecimal(writer: anytype, unscaled: i128, scale: i32) !void {
+    if (scale <= 0) {
+        try writer.print("{d}", .{unscaled});
+        return;
+    }
+    const abs_val = @abs(unscaled);
+    const sign = if (unscaled < 0) "-" else "";
+    const divisor = std.math.pow(u128, 10, @intCast(scale));
+    const integer_part = abs_val / divisor;
+    const fractional_part = abs_val % divisor;
+
+    try writer.print("{s}{d}.", .{ sign, integer_part });
+
+    var temp = fractional_part;
+    var digits: usize = 0;
+    if (temp == 0) {
+        digits = 1;
+    } else {
+        while (temp > 0) {
+            digits += 1;
+            temp /= 10;
+        }
+    }
+
+    const num_zeros = if (@as(usize, @intCast(scale)) > digits) @as(usize, @intCast(scale)) - digits else 0;
+    var z: usize = 0;
+    while (z < num_zeros) : (z += 1) {
+        try writer.writeByte('0');
+    }
+    try writer.print("{d}", .{fractional_part});
+}
+
+fn writeCsvString(writer: anytype, s: []const u8) !void {
+    var needs_quotes = false;
+    for (s) |c| {
+        if (c == ',' or c == '"' or c == '\n' or c == '\r') {
+            needs_quotes = true;
+            break;
+        }
+    }
+    if (needs_quotes) {
+        try writer.writeByte('"');
+        for (s) |c| {
+            if (c == '"') {
+                try writer.writeAll("\"\"");
+            } else {
+                try writer.writeByte(c);
+            }
+        }
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll(s);
+    }
+}
+
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const n = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try writer.writeAll(n);
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+fn writeColName(writer: anytype, paths: [][]const []const u8, schemas: []const schema.SchemaElement, col_idx: usize) !void {
+    if (col_idx < paths.len and paths[col_idx].len > 0) {
+        for (paths[col_idx], 0..) |seg, i| {
+            if (i > 0) try writer.writeAll(".");
+            try writer.writeAll(seg);
+        }
+    } else {
+        try writer.writeAll(schemas[col_idx].name);
+    }
+}
+
+fn printCell(writer: anytype, col: consumer.OutputAggregator.ColumnBuf, row_idx: usize, scale: i32, is_jsonl: bool) !void {
+    switch (col) {
+        .i32 => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writer.print("{d}", .{tb.values.items[row_idx]});
+            }
+        },
+        .i64 => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writer.print("{d}", .{tb.values.items[row_idx]});
+            }
+        },
+        .f32 => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writeFloat(writer, tb.values.items[row_idx], is_jsonl);
+            }
+        },
+        .f64 => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writeFloat(writer, tb.values.items[row_idx], is_jsonl);
+            }
+        },
+        .string => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                const val = tb.values.items[row_idx];
+                if (is_jsonl) {
+                    try writer.writeByte('"');
+                    try writeJsonString(writer, val);
+                    try writer.writeByte('"');
+                } else {
+                    try writeCsvString(writer, val);
+                }
+            }
+        },
+        .boolean => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writer.writeAll(if (tb.values.items[row_idx]) "true" else "false");
+            }
+        },
+        .decimal => |tb| {
+            if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
+                try writer.writeAll(if (is_jsonl) "null" else "");
+            } else {
+                try writeDecimal(writer, tb.values.items[row_idx], scale);
+            }
+        },
+    }
+}
+
+fn flushAggregator(
+    agg: *consumer.OutputAggregator,
+    writer: anytype,
+    is_jsonl: bool,
+    limit: ?usize,
+    total_printed: *usize,
+) !void {
+    if (agg.num_rows == 0) return;
+
+    var row_idx: usize = 0;
+    while (row_idx < agg.num_rows) : (row_idx += 1) {
+        if (limit) |lim| {
+            if (total_printed.* >= lim) break;
+        }
+
+        if (is_jsonl) {
+            try writer.writeAll("{");
+            for (agg.cols, 0..) |col, col_idx| {
+                if (col_idx > 0) try writer.writeAll(",");
+                try writer.writeByte('"');
+                try writeColName(writer, agg.paths, agg.schema_elems, col_idx);
+                try writer.writeAll("\":");
+                const scale = agg.schema_elems[col_idx].scale orelse 0;
+                try printCell(writer, col, row_idx, scale, true);
+            }
+            try writer.writeAll("}\n");
+        } else {
+            for (agg.cols, 0..) |col, col_idx| {
+                if (col_idx > 0) try writer.writeAll(",");
+                const scale = agg.schema_elems[col_idx].scale orelse 0;
+                try printCell(writer, col, row_idx, scale, false);
+            }
+            try writer.writeAll("\n");
+        }
+        total_printed.* += 1;
+    }
+}
+
+pub fn runPrint(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
+    runPrintInternal(ctx, args, format, limit) catch |err| {
+        if (err == error.BrokenPipe) {
+            return;
+        }
+        return err;
+    };
+}
+
+fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
+    const t_start = nowMonoNs();
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (args.select != null and args.columns != null) return error.AggregateMutexWithSelect;
+
+    var opened = try openInputs(ctx, arena, args);
+    defer opened.deinit();
+
+    const metas = try materializeMetas(arena, opened);
+    if (metas.len == 0) return;
+    const meta0 = &metas[0];
+
+    for (metas[1..]) |*m| {
+        if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
+        for (m.schema.items, meta0.schema.items) |a_e, b_e| {
+            if (!std.ascii.eqlIgnoreCase(a_e.name, b_e.name)) return error.SchemaMismatch;
+            if (a_e.type != b_e.type) return error.SchemaMismatch;
+            if (a_e.repetition_type != b_e.repetition_type) return error.SchemaMismatch;
+            if (a_e.converted_type != b_e.converted_type) return error.SchemaMismatch;
+            if (!std.meta.eql(a_e.logical_type, b_e.logical_type)) return error.SchemaMismatch;
+            if (a_e.type_length != b_e.type_length) return error.SchemaMismatch;
+        }
+    }
+
+    const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
+
+    var kept_set: ?[]bool = null;
+    if (args.columns) |cols_list| {
+        const set = try arena.alloc(bool, tree0.leaves.len);
+        @memset(set, false);
+        for (cols_list) |name| {
+            const indices = try tree0.resolveTopLevel(arena, name);
+            for (indices) |idx| set[idx] = true;
+        }
+        kept_set = set;
+    }
+
+    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
+        try expr_parser.parseSelect(arena, s, meta0)
+    else
+        null;
+
+    var filter_opt: ?filter_ast.Filter = null;
+    if (args.filter) |fs| if (fs.len > 0) {
+        filter_opt = try filter_parser.parse(arena, fs, meta0);
+    };
+
+    // Check nested columns
+    const list_map_cols = try arena.alloc(bool, tree0.leaves.len);
+    @memset(list_map_cols, false);
+    checkNestedListMap(.{ .group = tree0.root }, false, list_map_cols);
+
+    const num_leaves = meta0.row_groups.items[0].columns.items.len;
+    const kept_arr = try arena.alloc(bool, num_leaves);
+    if (kept_set) |s| @memcpy(kept_arr, s) else @memset(kept_arr, true);
+    const fetch_arr = try arena.alloc(bool, num_leaves);
+    @memset(fetch_arr, false);
+
+    var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
+    var any_computed = false;
+    if (select_items) |items| {
+        for (items) |item| {
+            switch (item.expr) {
+                .col_ref => |c| {
+                    if (item.alias) |alias| {
+                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                        any_computed = true;
+                    } else {
+                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
+                    }
+                    if (c.col_idx < num_leaves) fetch_arr[c.col_idx] = true;
+                },
+                else => {
+                    const alias = item.alias orelse return error.MissingOutputOrAggregate;
+                    try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                    any_computed = true;
+                    item.expr.collectColumns(fetch_arr);
+                },
+            }
+        }
+    } else {
+        for (kept_arr, 0..) |b, i| if (b) {
+            try output_specs.append(arena, .{ .passthrough = i });
+            fetch_arr[i] = true;
+        };
+    }
+    if (filter_opt) |f| {
+        var filter_cols: std.ArrayList(usize) = .empty;
+        try f.collectColumns(&filter_cols, arena);
+        for (filter_cols.items) |ci| {
+            if (ci < num_leaves) fetch_arr[ci] = true;
+        }
+    }
+
+    // Fail loud on nested LIST/MAP columns in output
+    for (output_specs.items) |spec| {
+        switch (spec) {
+            .passthrough => |ci| {
+                if (ci < list_map_cols.len and list_map_cols[ci]) {
+                    std.debug.print("zpq query: nested LIST/MAP columns are not supported in row output yet\n", .{});
+                    return error.BadArgs;
+                }
+            },
+            .computed => |comp| {
+                const comp_cols = try arena.alloc(bool, tree0.leaves.len);
+                @memset(comp_cols, false);
+                comp.expr.collectColumns(comp_cols);
+                for (comp_cols, 0..) |referenced, ci| {
+                    if (referenced and ci < list_map_cols.len and list_map_cols[ci]) {
+                        std.debug.print("zpq query: nested LIST/MAP columns are not supported in row output yet\n", .{});
+                        return error.BadArgs;
+                    }
+                }
+            },
+        }
+    }
+
+    var agg = try consumer.initOutputAggregator(arena, meta0, output_specs.items);
+
+    var stdout_writer = StdoutWriter{ .fd = 1 };
+    defer stdout_writer.flush() catch {};
+
+    const is_jsonl = (format == .jsonl);
+    if (!is_jsonl) {
+        for (agg.cols, 0..) |_, col_idx| {
+            if (col_idx > 0) try stdout_writer.writeAll(",");
+            try writeColName(&stdout_writer, agg.paths, agg.schema_elems, col_idx);
+        }
+        try stdout_writer.writeAll("\n");
+    }
+
+    var total_printed: usize = 0;
+    var rows_in: usize = 0;
+
+    var t: Timings = .{};
+
+    for (opened.inputs, metas) |in, meta_i| {
+        const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+        const meta_const = meta_i;
+        for (meta_const.row_groups.items) |*src_rg| {
+            if (limit) |lim| {
+                if (total_printed >= lim) break;
+            }
+
+            rows_in += @intCast(src_rg.num_rows);
+
+            if (filter_opt) |f| if (!args.scan_all) {
+                if ((try filter_prune.pruneRowGroup(src_rg, f, arena, &meta_const)) == .skip) continue;
+            };
+
+            _ = try consumer.appendProjectedRG(
+                &agg,
+                ctx.gpa,
+                src_rg,
+                &meta_const,
+                rg_src,
+                filter_opt,
+                fetch_arr,
+                output_specs.items,
+                &t.core,
+            );
+
+            try flushAggregator(&agg, &stdout_writer, is_jsonl, limit, &total_printed);
+            consumer.resetAggregator(&agg);
+        }
+    }
+
+    // JSON envelope to stderr
+    var stderr_writer = StdoutWriter{ .fd = 2 };
+    defer stderr_writer.flush() catch {};
+    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
+    stderr_writer.print(
+        "{{\"ok\":true,\"rows_in\":{d},\"rows_printed\":{d},\"total_ms\":{d}}}\n",
+        .{ rows_in, total_printed, total_ms }
+    ) catch {};
+}
+
+// ============================================================
 // Compile-time API check.
 // ============================================================
 test "engine: API is well-typed" {
     _ = runQuery;
+    _ = runPrint;
 }
+

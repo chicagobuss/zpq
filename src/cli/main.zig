@@ -77,13 +77,14 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "query")) {
         runQuery(init, &iter) catch |err| {
             switch (err) {
-                error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
+                error.BadArgs, error.NoMatches, error.SqlNotCompiledIn, error.AlreadyReported => {},
                 error.NoInputs => std.debug.print("zpq query: no input files specified\n", .{}),
                 error.EmptyAggregate => std.debug.print("zpq query: empty aggregate expression\n", .{}),
                 error.AggregateMutexWithSelect => std.debug.print("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
                 error.MissingOutputOrAggregate => std.debug.print("zpq query: missing --output or --aggregate\n", .{}),
                 error.SchemaMismatch => std.debug.print("zpq query: schema mismatch across inputs\n", .{}),
                 error.NestedReencodeNotSupported => std.debug.print("zpq query: nested re-encoding is not supported yet\n", .{}),
+                error.INT96ReencodeNotSupported => std.debug.print("zpq query: INT96 re-encoding is not supported yet\n", .{}),
                 error.FooterSchemaChunkMismatch => std.debug.print("zpq query: footer schema chunk mismatch\n", .{}),
                 error.CrossBucketNotSupported => std.debug.print("zpq query: cross-bucket queries are not supported\n", .{}),
                 error.BadInputUrl => std.debug.print("zpq query: invalid input S3 URL\n", .{}),
@@ -138,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("schema: missing path\n", .{});
             std.process.exit(1);
         };
-        try runSchema(gpa, path);
+        try runSchema(init, path);
         return;
     }
     std.debug.print("unknown subcommand: {s}\n", .{cmd});
@@ -1011,25 +1012,34 @@ fn printLogicalOrConverted(ws: *StdoutWriter, leaf: schema_tree.PrimitiveNode) !
     }
 }
 
-fn runSchema(gpa: std.mem.Allocator, path: []const u8) !void {
-    if (std.mem.startsWith(u8, path, "s3://")) {
-        std.debug.print("zpq schema: S3 paths are not supported for schema inspection in this version\n", .{});
-        std.process.exit(1);
-    }
-    const file_bytes = readFile(gpa, path) catch |err| {
-        std.debug.print("zpq schema: failed to open input file: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    defer gpa.free(file_bytes);
-
+fn runSchema(init: std.process.Init, path: []const u8) !void {
+    const gpa = init.gpa;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const meta = metadata.open(arena, file_bytes) catch |err| {
-        std.debug.print("zpq schema: file footer metadata open failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
+    var meta: schema.FileMetaData = undefined;
+    if (std.mem.startsWith(u8, path, "s3://")) {
+        meta = engine.fetchS3Schema(.{
+            .gpa = gpa,
+            .env = init.minimal.environ,
+            .io = init.io,
+        }, path, arena) catch |err| {
+            std.debug.print("zpq schema: failed to fetch S3 schema for {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+    } else {
+        const file_bytes = readFile(gpa, path) catch |err| {
+            std.debug.print("zpq schema: failed to open input file {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+        defer gpa.free(file_bytes);
+
+        meta = metadata.open(arena, file_bytes) catch |err| {
+            std.debug.print("zpq schema: input file {s} is not a valid Parquet file ({s})\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+    }
 
     var ws: StdoutWriter = .{};
     defer ws.flush();

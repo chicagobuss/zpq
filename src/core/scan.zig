@@ -231,7 +231,10 @@ pub fn runMultiAggregate(
     } else blk: {
         var parsed = try arena.alloc(schema.FileMetaData, args.inputs.len);
         for (args.inputs, 0..) |in, i| {
-            parsed[i] = try metadata.open(arena, in.bytes);
+            parsed[i] = metadata.open(arena, in.bytes) catch |err| {
+                std.debug.print("zpq query: input file {s} is not a valid Parquet file ({s})\n", .{ in.name, @errorName(err) });
+                return error.AlreadyReported;
+            };
         }
         break :blk parsed;
     };

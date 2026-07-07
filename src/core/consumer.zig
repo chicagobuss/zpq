@@ -155,13 +155,11 @@ pub fn initOutputAggregator(
                     return error.SchemaLookupFailed;
                 paths[i] = cm.path_in_schema.items;
 
-                // DECIMAL source columns. INT32/INT64-backed (precision
-                // ≤ 18) take the lossless integer lane (D1): decode to
-                // unscaled i128, keep the source DECIMAL schema element,
-                // re-encode as the same physical type. FLBA/BYTE_ARRAY
-                // (precision > 18) still route through f64 → DOUBLE until
-                // the FLBA writer lands (D2; see
-                // docs/plans/02-decimal-lossless-reencode.md). Byte-copy
+                // DECIMAL source columns. INT32/INT64/FLBA-backed take the
+                // lossless integer lane: decode to unscaled i128, keep the
+                // source DECIMAL schema element, re-encode at the same
+                // physical type. Only BYTE_ARRAY-backed DECIMAL (rare)
+                // still routes through f64 → DOUBLE. Byte-copy
                 // projection (copyRG / fastpath) preserves any DECIMAL.
                 if (decimal_mod.kindFromSchema(&src_elem)) |k| {
                     if (k.physical == .INT32 or k.physical == .INT64 or
@@ -213,6 +211,7 @@ pub fn initOutputAggregator(
         cols[i] = switch (phys_type) {
             .INT32 => .{ .i32 = .{} },
             .INT64 => .{ .i64 = .{} },
+            .INT96 => .{ .i64 = .{} },
             .FLOAT => .{ .f32 = .{} },
             .DOUBLE => .{ .f64 = .{} },
             .BYTE_ARRAY => .{ .string = .{} },
@@ -220,7 +219,6 @@ pub fn initOutputAggregator(
             // Non-decimal FLBA decodes to raw bytes → the string lane. (Decode→
             // re-encode emits BYTE_ARRAY; byte-copy passthrough preserves FLBA.)
             .FIXED_LEN_BYTE_ARRAY => .{ .string = .{} },
-            else => return error.UnsupportedColumnType,
         };
     }
 

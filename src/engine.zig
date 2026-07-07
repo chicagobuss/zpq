@@ -65,6 +65,8 @@ pub const Error = error{
     MissingOutputOrAggregate,
     SchemaMismatch,
     NestedReencodeNotSupported,
+    INT96ReencodeNotSupported,
+    AlreadyReported,
     FooterSchemaChunkMismatch,
     CrossBucketNotSupported,
     BadInputUrl,
@@ -454,6 +456,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             .passthrough => |ci| {
                 if (ci >= num_leaves) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
+                if (cm.type == .INT96)
+                    return error.INT96ReencodeNotSupported;
                 if (meta0.getColumnLevels(cm.path_in_schema.items).max_rep > 0)
                     return error.NestedReencodeNotSupported;
             },
@@ -757,9 +761,29 @@ fn materializeMetas(arena: std.mem.Allocator, opened: OpenedInputs) ![]const sch
         metas[i] = if (opened.meta_ready[i])
             opened.metas[i]
         else
-            try metadata.open(arena, in.bytes);
+            metadata.open(arena, in.bytes) catch |err| {
+                std.debug.print("zpq query: input file {s} is not a valid Parquet file ({s})\n", .{ in.name, @errorName(err) });
+                return error.AlreadyReported;
+            };
     }
     return metas;
+}
+
+pub fn fetchS3Schema(
+    ctx: Context,
+    path: []const u8,
+    arena: std.mem.Allocator,
+) !schema.FileMetaData {
+    const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+    const url = s3.Url.parse(path) catch return error.BadInputUrl;
+
+    const pool = try arena.create(s3.Pool(POOL_SIZE));
+    try pool.init(ctx.gpa);
+    defer pool.deinit();
+
+    var specs = [_]FetchSpec{.{ .url = url }};
+    try fetchMetaBatch(ctx, arena, creds, pool, &specs);
+    return specs[0].meta;
 }
 
 const MmapHandle = struct {
@@ -795,7 +819,14 @@ fn openInputs(
 
     // Local: mmap each, slice into bytes.
     for (local_indices.items) |i| {
-        const m = try mmapFile(paths[i]);
+        const m = mmapFile(paths[i]) catch |err| {
+            switch (err) {
+                error.EmptyFile => std.debug.print("zpq query: input file {s} is empty\n", .{paths[i]}),
+                error.PathTooLong => std.debug.print("zpq query: input file path {s} too long\n", .{paths[i]}),
+                else => std.debug.print("zpq query: failed to open input file {s} ({s})\n", .{ paths[i], @errorName(err) }),
+            }
+            return error.AlreadyReported;
+        };
         mmaps[i] = m;
         inputs[i] = .{ .name = paths[i], .bytes = m.addr[0..m.len], .logical_size = m.len };
     }

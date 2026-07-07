@@ -39,7 +39,7 @@ pub fn int96ToEpochNanos(bytes: []const u8) i64 {
     const nanos_of_day = std.mem.readInt(i64, bytes[0..8], .little);
     const julian_day = std.mem.readInt(u32, bytes[8..12], .little);
     const days_since_epoch = @as(i64, julian_day) - JULIAN_TO_UNIX_EPOCH_DAYS;
-    return days_since_epoch * NANOSECONDS_PER_DAY + nanos_of_day;
+    return days_since_epoch *% NANOSECONDS_PER_DAY +% nanos_of_day;
 }
 
 /// Decode an INT96 column chunk to a ColumnT(i64) of epoch-nanoseconds.

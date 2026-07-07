@@ -1,7 +1,10 @@
 # ZPQ
 
 An agentically-engineered Apache Parquet engine in Zig, optimized for
-serverless compute against object storage.
+serverless compute against object storage.  The core philosophy is to 
+do only the minimum work necessary to get the requested task finished
+to the desired accuracy level.  Vendored prebuilt crypto, and native 
+S3/SigV4 for further minimization of lambda execution time.
 
 Workloads it's intended for:
 
@@ -219,13 +222,6 @@ just probe-lambda        # deploy + invoke in AWS, prints JSON
 
 Findings driving the architecture are in
 [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md).
-
-## Philosophy
-
-Do the absolute minimum work the query requires: sans-IO core, two
-binaries (workstation CLI and Lambda bootstrap) sharing one engine,
-vendored prebuilt crypto, and native S3/SigV4 for a small static binary.
-The capabilities above are what's shipped.
 
 ## License
 

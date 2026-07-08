@@ -220,6 +220,39 @@ pub fn parseSelect(
     return items.items;
 }
 
+pub fn parseGroupBy(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    file: *const schema.FileMetaData,
+) Error![]ast.SelectItem {
+    const trimmed = std.mem.trim(u8, src, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyExpr;
+
+    var items: std.ArrayList(ast.SelectItem) = .empty;
+    var lex: Lexer = .{ .src = trimmed };
+
+    while (true) {
+        const e = try parseExpr(arena, &lex, file);
+        var alias: ?[]const u8 = null;
+        const after = try lex.peek();
+        if (after.kind == .ident and asciiEqIgnoreCase(after.text, "AS")) {
+            _ = try lex.next();
+            const id = try lex.next();
+            if (id.kind != .ident) return error.ExpectedIdentifier;
+            alias = id.text;
+        }
+        try items.append(arena, .{ .expr = e, .alias = alias });
+
+        const sep = try lex.next();
+        switch (sep.kind) {
+            .eof => break,
+            .comma => continue,
+            else => return error.TrailingTokens,
+        }
+    }
+    return items.items;
+}
+
 /// Parse a single expression. Convenience for callers that already
 /// know they only have one (e.g. tests).
 pub fn parseExprOnly(
@@ -897,4 +930,15 @@ test "agg: double-quoted column identifier resolves like bare" {
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expectEqualStrings("c", items[0].alias);
     try testing.expectEqualStrings("m", items[1].alias);
+}
+
+test "group-by: bare column and AS alias" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "region", "kind" }, &.{ .INT32, .BYTE_ARRAY });
+    const items = try parseGroupBy(a, "region, kind AS k", &file);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(?[]const u8, null), items[0].alias);
+    try testing.expectEqualStrings("k", items[1].alias.?);
 }

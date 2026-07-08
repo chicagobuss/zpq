@@ -209,11 +209,13 @@ fn handle(
             .codec = output_codec,
             .scan_all = extractBool(trimmed, "scan_all"),
             .trust_stats = extractBool(trimmed, "trust_stats"),
+            .max_memory = extractMaxMemory(trimmed) orelse zpq.core.system.discoverAvailableMemory(env),
+            .group_by = extractField(trimmed, "group_by") catch null,
+            .column_order = extractField(trimmed, "column_order") catch null,
         };
 
-        // Dispatch mirrors engine.runQuery's own precedence: aggregate
-        // wins, then write, then the single-file diagnostic path.
-        if (qa.aggregate != null) return try lambdaAggregate(io, allocator, env, pool, qa);
+        // or group-by wins, then write, then the legacy single-file diagnostics.
+        if (qa.aggregate != null or qa.group_by != null) return try lambdaAggregate(io, allocator, env, pool, qa);
         if (qa.output != null) return try lambdaWrite(io, allocator, env, pool, qa);
         if (input_urls.items.len > 0)
             return try handleS3(allocator, env, input_urls.items[0], qa.filter);
@@ -344,6 +346,29 @@ fn extractBool(body: []const u8, name: []const u8) bool {
     return std.mem.startsWith(u8, body[i..], "true");
 }
 
+fn extractMaxMemory(body: []const u8) ?usize {
+    const key = "\"max_memory\"";
+    const pos = std.mem.indexOf(u8, body, key) orelse return null;
+    var i = pos + key.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
+    if (i >= body.len) return null;
+
+    if (body[i] == '"') {
+        i += 1;
+        const start = i;
+        while (i < body.len and body[i] != '"') : (i += 1) {}
+        if (i >= body.len) return null;
+        const val_str = body[start..i];
+        return zpq.core.system.parseSizeString(val_str) catch null;
+    } else {
+        const start = i;
+        while (i < body.len and ((body[i] >= '0' and body[i] <= '9') or body[i] == '.')) : (i += 1) {}
+        const val_str = body[start..i];
+        const val_float = std.fmt.parseFloat(f64, val_str) catch return null;
+        return @intFromFloat(val_float);
+    }
+}
+
 /// Adapter that lets engine.runQuery use the lambda's PersistentPool
 /// (warm-container connection reuse) without engine knowing about it.
 fn persistentPoolAdapter(pool: *PersistentPool) engine.PoolRegistry {
@@ -398,26 +423,64 @@ fn lambdaAggregate(
             else => {},
         }
     };
+    defer if (ar.group_rows) |rows| {
+        for (rows) |r| {
+            for (r) |v| {
+                switch (v) {
+                    .s => |s| allocator.free(s),
+                    else => {},
+                }
+            }
+            allocator.free(r);
+        }
+        allocator.free(rows);
+    };
+    defer if (ar.group_cols) |cols| {
+        for (cols) |c| allocator.free(c);
+        allocator.free(cols);
+    };
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
     var buf: std.ArrayList(u8) = .empty;
-    try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
-        ar.files_in, ar.rows_in, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned, ar.bytes_in,
-    });
-    for (ar.aggs, 0..) |item, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",");
-        try buf.print(allocator, "\"{s}\":", .{item.alias});
-        switch (item.value) {
-            .i => |v| try buf.print(allocator, "{d}", .{v}),
-            .f => |v| try buf.print(allocator, "{d}", .{v}),
-            // String min/max (bytewise). Emitted as a JSON string; like the
-            // alias above, control/quote chars aren't escaped (column min/max
-            // values are typically clean) — a shared escaper is a follow-up.
-            .s => |v| try buf.print(allocator, "\"{s}\"", .{v}),
-            .avg => |v| try buf.print(allocator, "{{\"sum\":{d},\"count\":{d}}}", .{ v.sum, v.count }),
+    if (ar.group_rows) |rows| {
+        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
+            ar.files_in, ar.rows_in, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned, ar.bytes_in,
+        });
+        for (rows, 0..) |row_vals, row_idx| {
+            if (row_idx > 0) try buf.appendSlice(allocator, ",");
+            try buf.appendSlice(allocator, "{");
+            for (ar.group_cols.?, 0..) |col_name, col_idx| {
+                if (col_idx > 0) try buf.appendSlice(allocator, ",");
+                try buf.print(allocator, "\"{s}\":", .{col_name});
+                switch (row_vals[col_idx]) {
+                    .i => |v| try buf.print(allocator, "{d}", .{v}),
+                    .f => |v| try buf.print(allocator, "{d}", .{v}),
+                    .s => |v| try buf.print(allocator, "\"{s}\"", .{v}),
+                    .avg => |v| try buf.print(allocator, "{{\"sum\":{d},\"count\":{d}}}", .{ v.sum, v.count }),
+                    .null_val => try buf.appendSlice(allocator, "null"),
+                }
+            }
+            try buf.appendSlice(allocator, "}");
         }
+        try buf.appendSlice(allocator, "]");
+    } else {
+        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
+            ar.files_in, ar.rows_in, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned, ar.bytes_in,
+        });
+        for (ar.aggs, 0..) |item, i| {
+            if (i > 0) try buf.appendSlice(allocator, ",");
+            try buf.print(allocator, "\"{s}\":", .{item.alias});
+            switch (item.value) {
+                .i => |v| try buf.print(allocator, "{d}", .{v}),
+                .f => |v| try buf.print(allocator, "{d}", .{v}),
+                .s => |v| try buf.print(allocator, "\"{s}\"", .{v}),
+                .avg => |v| try buf.print(allocator, "{{\"sum\":{d},\"count\":{d}}}", .{ v.sum, v.count }),
+                .null_val => try buf.appendSlice(allocator, "null"),
+            }
+        }
+        try buf.appendSlice(allocator, "}");
     }
-    try buf.print(allocator, "}},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}", .{
+    try buf.print(allocator, ",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}", .{
         total_ms,
         ar.timings.read_ns / std.time.ns_per_ms,
         ar.timings.core.decode_ns / std.time.ns_per_ms,

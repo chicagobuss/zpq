@@ -57,6 +57,198 @@ pub fn evalExpr(
     };
 }
 
+/// Evaluate a GROUP BY key expression. Unlike `evalExpr`, nullable
+/// source columns are allowed — null rows serialize as absent keys.
+/// Binops propagate null when either operand is null.
+pub fn evalGroupKeyExpr(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    e: ast.Expr,
+) Error!Batch.Column {
+    return switch (e) {
+        .literal => |lit| literalAsColumn(arena, lit, batch.num_rows),
+        .col_ref => |c| try colRefAsGroupKeyColumn(arena, batch, column_lookup, c),
+        .binop => |b| try evalGroupKeyBinOp(arena, batch, column_lookup, b),
+        .call => |c| try evalCall(arena, batch, column_lookup, c),
+    };
+}
+
+fn rowIsNull(col: Batch.Column, row: usize) bool {
+    return switch (col) {
+        inline else => |c| if (c.def_levels) |dl| dl[row] < c.max_def else false,
+    };
+}
+
+fn colHasNulls(col: Batch.Column) bool {
+    return switch (col) {
+        inline else => |c| c.def_levels != null and c.max_def > 0,
+    };
+}
+
+fn colRefAsGroupKeyColumn(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    c: ast.ColRef,
+) Error!Batch.Column {
+    const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
+    const col = batch.cols[pos];
+    switch (col) {
+        inline else => |cc| if (cc.max_rep > 0) return error.NestedNotSupported,
+    }
+    const nulls = col.nullInfo();
+
+    return switch (c.expr_type) {
+        .i64 => .{ .i64 = .{
+            .values = try widenToI64(arena, col),
+            .def_levels = nulls.def_levels,
+            .max_def = nulls.max_def,
+            .rep_levels = switch (col) {
+                inline else => |cc| cc.rep_levels,
+            },
+            .max_rep = nulls.max_rep,
+            .has_nulls = switch (col) {
+                inline else => |cc| cc.has_nulls,
+            },
+        } },
+        .f64 => .{ .f64 = .{
+            .values = try widenToF64(arena, col),
+            .def_levels = nulls.def_levels,
+            .max_def = nulls.max_def,
+            .rep_levels = switch (col) {
+                inline else => |cc| cc.rep_levels,
+            },
+            .max_rep = nulls.max_rep,
+            .has_nulls = switch (col) {
+                inline else => |cc| cc.has_nulls,
+            },
+        } },
+        .str => .{ .string = .{
+            .values = try borrowStr(col),
+            .def_levels = nulls.def_levels,
+            .max_def = nulls.max_def,
+            .rep_levels = switch (col) {
+                inline else => |cc| cc.rep_levels,
+            },
+            .max_rep = nulls.max_rep,
+            .has_nulls = switch (col) {
+                inline else => |cc| cc.has_nulls,
+            },
+        } },
+    };
+}
+
+fn evalGroupKeyBinOp(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    b: ast.BinOp,
+) Error!Batch.Column {
+    const l_col = try evalGroupKeyExpr(arena, batch, column_lookup, b.left.*);
+    const r_col = try evalGroupKeyExpr(arena, batch, column_lookup, b.right.*);
+
+    return switch (b.result_type) {
+        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col),
+        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col),
+        .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
+    };
+}
+
+fn evalGroupKeyNumericBinOp(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    op: ast.Op,
+    l_col: Batch.Column,
+    r_col: Batch.Column,
+) Error!Batch.Column {
+    const l_vals = if (T == i64) l_col.i64.values else l_col.f64.values;
+    const r_vals = if (T == i64) r_col.i64.values else r_col.f64.values;
+    std.debug.assert(l_vals.len == r_vals.len);
+
+    const out = try arena.alloc(T, l_vals.len);
+    const needs_nulls = colHasNulls(l_col) or colHasNulls(r_col);
+    var def_out: ?[]u32 = null;
+    if (needs_nulls) {
+        def_out = try arena.alloc(u32, l_vals.len);
+    }
+
+    for (l_vals, r_vals, 0..) |lv, rv, i| {
+        if (rowIsNull(l_col, i) or rowIsNull(r_col, i)) {
+            if (def_out) |dl| dl[i] = 0;
+            out[i] = 0;
+            continue;
+        }
+        if (def_out) |dl| dl[i] = 1;
+        out[i] = try applyScalarKernel(T, op, lv, rv);
+    }
+
+    if (T == i64) {
+        return .{ .i64 = .{
+            .values = out,
+            .def_levels = def_out,
+            .max_def = if (needs_nulls) 1 else 0,
+        } };
+    }
+    return .{ .f64 = .{
+        .values = out,
+        .def_levels = def_out,
+        .max_def = if (needs_nulls) 1 else 0,
+    } };
+}
+
+fn evalGroupKeyConcatBinOp(
+    arena: std.mem.Allocator,
+    l_col: Batch.Column,
+    r_col: Batch.Column,
+) Error!Batch.Column {
+    const l_vals = l_col.string.values;
+    const r_vals = r_col.string.values;
+    std.debug.assert(l_vals.len == r_vals.len);
+
+    const out = try arena.alloc([]const u8, l_vals.len);
+    const needs_nulls = colHasNulls(l_col) or colHasNulls(r_col);
+    var def_out: ?[]u32 = null;
+    if (needs_nulls) {
+        def_out = try arena.alloc(u32, l_vals.len);
+    }
+
+    for (l_vals, r_vals, 0..) |lv, rv, i| {
+        if (rowIsNull(l_col, i) or rowIsNull(r_col, i)) {
+            if (def_out) |dl| dl[i] = 0;
+            out[i] = "";
+            continue;
+        }
+        if (def_out) |dl| dl[i] = 1;
+        const buf = try arena.alloc(u8, lv.len + rv.len);
+        @memcpy(buf[0..lv.len], lv);
+        @memcpy(buf[lv.len..], rv);
+        out[i] = buf;
+    }
+
+    return .{ .string = .{
+        .values = out,
+        .def_levels = def_out,
+        .max_def = if (needs_nulls) 1 else 0,
+    } };
+}
+
+fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
+    return switch (op) {
+        .add => a + b,
+        .sub => a - b,
+        .mul => a * b,
+        .div => blk: {
+            if (@typeInfo(T) == .int) {
+                if (b == 0) return error.DivisionByZero;
+                break :blk @divTrunc(a, b);
+            }
+            break :blk a / b;
+        },
+        .concat => return error.TypeMismatch,
+    };
+}
+
 /// Evaluate `e` and coerce the result to `target` if needed. Only
 /// widening is supported (i64 → f64); narrowing is rejected.
 fn evalAs(

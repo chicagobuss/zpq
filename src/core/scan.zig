@@ -35,6 +35,9 @@ pub const Error = error{
     SchemaMismatch,
     EmptyAggregate,
     AggSumOverflow,
+    GroupKeyAliasRequired,
+    UnknownColumn,
+    ExceededMemoryBudget,
 } || std.mem.Allocator.Error;
 
 /// One file's contribution to a multi-file scan. Bytes can come from
@@ -56,6 +59,13 @@ pub const MultiAggArgs = struct {
     metas: ?[]const schema.FileMetaData = null,
     filter: ?[]const u8 = null,
     aggregate: []const u8,
+    group_by: ?[]const u8 = null,
+    max_memory: usize = 512 * 1024 * 1024,
+    select_cols: ?[]const []const u8 = null,
+    /// Comma-separated output column names. Only used with GROUP BY when
+    /// `select_cols` is unset (e.g. CLI `--column-order`). Reorders the
+    /// default key-then-aggregate layout.
+    column_order: ?[]const u8 = null,
     /// 0 = use cpu_count. 1 = serial. Row-group granularity: work is the
     /// flat list of all row groups across all inputs, distributed across
     /// `min(this, total_row_groups)` workers — so one big file uses all cores.
@@ -83,6 +93,7 @@ pub const AggValue = union(enum) {
     /// String (bytewise/unsigned) min/max result. Borrowed from the
     /// accumulator's persist allocator (query-lifetime `gpa`).
     s: []const u8,
+    null_val: void,
 };
 
 pub const AggOutputItem = struct {
@@ -127,6 +138,8 @@ pub const MultiAggResult = struct {
     /// Aggregate calls (parsed AST). Same lifetime as `accumulators`.
     agg_calls: []const expr_agg.AggCall,
     timings: Timings,
+    group_cols: ?[]const []const u8 = null,
+    group_rows: ?[]const []const AggValue = null,
 };
 
 /// One unit of parallel work: a single row group within one input file,
@@ -155,6 +168,8 @@ const Worker = struct {
     rows_kept: i64 = 0,
     rgs_in: usize = 0,
     rgs_pruned: usize = 0,
+    group_by_keys: ?[]const expr_ast.Expr = null,
+    group_table: ?expr_agg.GroupTable = null,
     err: ?anyerror = null,
 };
 
@@ -191,19 +206,39 @@ fn workerRunErr(w: *Worker) !void {
             w.rows_kept += rg.num_rows;
         }
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
-        try consumer.scanRGForAgg(
-            w.gpa,
-            rg,
-            meta,
-            rg_src,
-            w.filter_opt,
-            w.scan_all,
-            w.trust_stats,
-            item.fetch_arr,
-            sub_agg_calls,
-            item.accumulators,
-            &w.timings,
-        );
+        if (w.group_table) |*gt| {
+            try consumer.scanRGForAgg(
+                w.gpa,
+                rg,
+                meta,
+                rg_src,
+                w.filter_opt,
+                w.scan_all,
+                w.trust_stats,
+                item.fetch_arr,
+                sub_agg_calls,
+                &[_]expr_agg.Accumulator{},
+                w.group_by_keys,
+                gt,
+                &w.timings,
+            );
+        } else {
+            try consumer.scanRGForAgg(
+                w.gpa,
+                rg,
+                meta,
+                rg_src,
+                w.filter_opt,
+                w.scan_all,
+                w.trust_stats,
+                item.fetch_arr,
+                sub_agg_calls,
+                item.accumulators,
+                null,
+                null,
+                &w.timings,
+            );
+        }
     }
 }
 
@@ -261,17 +296,29 @@ pub fn runMultiAggregate(
 
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
-    const agg_calls = try expr_parser.parseAggList(arena, args.aggregate, meta0);
-    if (agg_calls.len == 0) return error.EmptyAggregate;
+    const agg_calls = if (args.group_by != null and args.aggregate.len == 0)
+        &[_]expr_agg.AggCall{}
+    else
+        try expr_parser.parseAggList(arena, args.aggregate, meta0);
+    if (agg_calls.len == 0 and args.group_by == null) return error.EmptyAggregate;
 
     var filter_opt: ?filter_ast.Filter = null;
     if (args.filter) |expr_str| {
         if (expr_str.len > 0) filter_opt = try filter_parser.parse(arena, expr_str, meta0);
     }
+    const group_by_items = if (args.group_by) |gb_str|
+        try expr_parser.parseGroupBy(arena, gb_str, meta0)
+    else
+        null;
+    const group_by_keys = if (group_by_items) |items| blk: {
+        const exprs = try arena.alloc(expr_ast.Expr, items.len);
+        for (items, 0..) |item, i| exprs[i] = item.expr;
+        break :blk exprs;
+    } else null;
     t.parse_ns = @intCast(nowMonoNs() - t_parse);
 
     // 3. fetch_set: union of outer-filter columns + each agg's arg
-    //    columns + each agg's per-agg WHERE columns. Same set applies
+    //    columns + each agg's per-agg WHERE columns + GROUP BY columns. Same set applies
     //    to every file (schemas match).
     const num_leaves = meta0.row_groups.items[0].columns.items.len;
     const fetch_arr = try arena.alloc(bool, num_leaves);
@@ -293,6 +340,11 @@ pub fn runMultiAggregate(
             };
         }
     }
+    if (group_by_keys) |keys| {
+        for (keys) |key_expr| {
+            key_expr.collectColumns(fetch_arr);
+        }
+    }
 
     // 3b. Stats-driven fetch pruning. For each column in the fetch
     //     set: if EVERY aggregate that references it can be answered
@@ -308,7 +360,7 @@ pub fn runMultiAggregate(
     //     Per-agg WHERE makes a call ineligible for stats period —
     //     `statsCoverageComplete` enforces that via canStatShortCircuit.
     var cols_stat_pruned: usize = 0;
-    if (filter_opt == null and !args.scan_all) {
+    if (filter_opt == null and group_by_keys == null and !args.scan_all) {
         var per_agg_cols = try arena.alloc(bool, num_leaves);
         for (fetch_arr, 0..) |needed, ci| {
             if (!needed) continue;
@@ -353,8 +405,12 @@ pub fn runMultiAggregate(
     const requested = if (args.parallelism == 0) cpu_count else args.parallelism;
 
     var chunks_per_rg = if (total_rgs >= requested) @as(usize, 1) else (requested + total_rgs - 1) / total_rgs;
-    if (chunks_per_rg > agg_calls.len) chunks_per_rg = agg_calls.len;
-    if (chunks_per_rg < 1) chunks_per_rg = 1;
+    if (group_by_keys != null) {
+        chunks_per_rg = 1;
+    } else {
+        if (chunks_per_rg > agg_calls.len) chunks_per_rg = agg_calls.len;
+        if (chunks_per_rg < 1) chunks_per_rg = 1;
+    }
 
     // Precompute filter columns set to intersect with each chunk's references
     const filter_cols = try arena.alloc(bool, num_leaves);
@@ -390,15 +446,23 @@ pub fn runMultiAggregate(
                     };
                 }
             }
+            if (group_by_keys) |keys| {
+                for (keys) |key_expr| key_expr.collectColumns(chunk_fetch_arr);
+            }
             for (0..num_leaves) |ci| {
                 chunk_fetch_arr[ci] = fetch_arr[ci] and (filter_cols[ci] or chunk_fetch_arr[ci]);
             }
 
             // Initialize accumulators for this chunk
-            const sub_accs = try arena.alloc(expr_agg.Accumulator, agg_len);
-            for (agg_calls[agg_start .. agg_start + agg_len], 0..) |call, ci| {
-                sub_accs[ci] = expr_agg.Accumulator.init(call);
-            }
+            const sub_accs = if (group_by_keys != null)
+                try arena.alloc(expr_agg.Accumulator, 0)
+            else blk: {
+                const arr = try arena.alloc(expr_agg.Accumulator, agg_len);
+                for (agg_calls[agg_start .. agg_start + agg_len], 0..) |call, ci| {
+                    arr[ci] = expr_agg.Accumulator.init(call);
+                }
+                break :blk arr;
+            };
 
             try work_items.append(arena, .{
                 .file = raw.file,
@@ -418,6 +482,9 @@ pub fn runMultiAggregate(
     for (assignments) |*a| a.* = .empty;
     for (work_items.items, 0..) |item, k| try assignments[k % n_workers].append(arena, item);
 
+    const actual_parallelism = if (args.parallelism > 0) args.parallelism else requested;
+    const max_memory_per_worker = args.max_memory / actual_parallelism;
+
     for (workers, 0..) |*w, wi| {
         w.* = .{
             .gpa = gpa,
@@ -428,8 +495,15 @@ pub fn runMultiAggregate(
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
             .trust_stats = args.trust_stats,
+            .group_by_keys = group_by_keys,
+            .group_table = if (group_by_keys != null) expr_agg.GroupTable.init(gpa, max_memory_per_worker) else null,
         };
     }
+    defer if (group_by_keys != null) {
+        for (workers) |*w| {
+            if (w.group_table) |*gt| gt.deinit();
+        }
+    };
 
     // 5. Spawn, join, propagate first error. Time the whole parallel
     //    region as one wall-clock span (real elapsed decode), separate
@@ -455,33 +529,175 @@ pub fn runMultiAggregate(
     var rows_kept: i64 = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
-    for (workers) |w| {
-        for (w.work) |item| {
-            for (item.accumulators, 0..) |sub_acc, i| {
-                accumulators[item.agg_start + i].merge(sub_acc, gpa);
+
+    var group_cols: ?[]const []const u8 = null;
+    var group_rows: ?[]const []const AggValue = null;
+
+    if (group_by_keys) |keys| {
+        var coord_table = expr_agg.GroupTable.init(gpa, args.max_memory);
+        errdefer coord_table.deinit();
+
+        for (workers) |*w| {
+            if (w.group_table) |*gt| {
+                try coord_table.mergeTable(gt, agg_calls);
             }
+            rows_in += w.rows_in;
+            rows_kept += w.rows_kept;
+            rgs_in += w.rgs_in;
+            rgs_pruned += w.rgs_pruned;
+            t.core.decode_ns += w.timings.decode_ns;
+            t.core.eval_ns += w.timings.eval_ns;
+            t.core.encode_ns += w.timings.encode_ns;
         }
-        rows_in += w.rows_in;
-        rows_kept += w.rows_kept;
-        rgs_in += w.rgs_in;
-        rgs_pruned += w.rgs_pruned;
-        // Sum core CPU time across workers — wall is dominated by the
-        // slowest worker, but sum-of-CPU is the more interpretable
-        // number for "where did the work go."
-        t.core.decode_ns += w.timings.decode_ns;
-        t.core.eval_ns += w.timings.eval_ns;
-        t.core.encode_ns += w.timings.encode_ns;
+
+        const group_indices = try gpa.alloc(u32, coord_table.keys.items.len);
+        defer gpa.free(group_indices);
+        for (group_indices, 0..) |*idx, j| idx.* = @intCast(j);
+
+        const KeySorter = struct {
+            keys: []const []const u8,
+            pub fn lessThan(ctx: @This(), lhs: u32, rhs: u32) bool {
+                return std.mem.lessThan(u8, ctx.keys[lhs], ctx.keys[rhs]);
+            }
+        };
+        std.mem.sort(u32, group_indices, KeySorter{ .keys = coord_table.keys.items }, KeySorter.lessThan);
+
+        const select_cols = try resolveGroupSelectCols(
+            arena,
+            group_by_items.?,
+            agg_calls,
+            meta0,
+            args.select_cols,
+            args.column_order,
+        );
+        const ColSource = union(enum) {
+            key: usize,
+            agg: usize,
+        };
+        var col_sources = try gpa.alloc(ColSource, select_cols.len);
+        defer gpa.free(col_sources);
+
+        for (select_cols, 0..) |col_name, idx| {
+            var resolved = false;
+            const expr_name = selectColumnExpr(col_name);
+            const alias_name = selectColumnName(col_name);
+            for (group_by_items.?, 0..) |item, k_idx| {
+                const label = try groupKeyLabel(item, meta0);
+                if (std.ascii.eqlIgnoreCase(expr_name, label) or
+                    std.ascii.eqlIgnoreCase(alias_name, label))
+                {
+                    col_sources[idx] = .{ .key = k_idx };
+                    resolved = true;
+                    break;
+                }
+                if (item.expr == .col_ref) {
+                    const k_name = leafSchemaElem(meta0, item.expr.col_ref.col_idx).name;
+                    if (std.ascii.eqlIgnoreCase(expr_name, k_name) or
+                        std.ascii.eqlIgnoreCase(alias_name, k_name))
+                    {
+                        col_sources[idx] = .{ .key = k_idx };
+                        resolved = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!resolved) {
+                for (agg_calls, 0..) |call, a_idx| {
+                    if (std.ascii.eqlIgnoreCase(alias_name, call.alias) or
+                        std.ascii.eqlIgnoreCase(expr_name, call.alias))
+                    {
+                        col_sources[idx] = .{ .agg = a_idx };
+                        resolved = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!resolved) return error.UnknownColumn;
+        }
+
+        var key_types = try gpa.alloc(KeyType, keys.len);
+        defer gpa.free(key_types);
+        for (keys, 0..) |key_expr, idx| {
+            key_types[idx] = try keyTypeFromExpr(key_expr, meta0);
+        }
+
+        var rows = try gpa.alloc([]const AggValue, coord_table.keys.items.len);
+        errdefer {
+            for (rows) |r| {
+                for (r) |v| {
+                    switch (v) {
+                        .s => |s| gpa.free(s),
+                        else => {},
+                    }
+                }
+                gpa.free(r);
+            }
+            gpa.free(rows);
+        }
+
+        for (group_indices, 0..) |g_idx, r_idx| {
+            const key_bytes = coord_table.keys.items[g_idx];
+            var row_vals = try gpa.alloc(AggValue, select_cols.len);
+            errdefer gpa.free(row_vals);
+
+            for (col_sources, 0..) |src, col_idx| {
+                switch (src) {
+                    .key => |k_idx| {
+                        row_vals[col_idx] = try deserializeKeyColumn(gpa, key_bytes, k_idx, key_types);
+                    },
+                    .agg => |a_idx| {
+                        const state = coord_table.accumulators.items[g_idx * agg_calls.len + a_idx];
+                        row_vals[col_idx] = try materializeOne(gpa, agg_calls[a_idx], state);
+                    },
+                }
+            }
+            rows[r_idx] = row_vals;
+        }
+
+        group_rows = rows;
+
+        var cols = try gpa.alloc([]const u8, select_cols.len);
+        errdefer {
+            for (cols) |c| gpa.free(c);
+            gpa.free(cols);
+        }
+        for (select_cols, 0..) |col, idx| {
+            cols[idx] = try gpa.dupe(u8, selectColumnName(col));
+        }
+        group_cols = cols;
+
+        coord_table.deinit();
+    } else {
+        for (workers) |w| {
+            for (w.work) |item| {
+                for (item.accumulators, 0..) |sub_acc, i| {
+                    accumulators[item.agg_start + i].merge(sub_acc, gpa);
+                }
+            }
+            rows_in += w.rows_in;
+            rows_kept += w.rows_kept;
+            rgs_in += w.rgs_in;
+            rgs_pruned += w.rgs_pruned;
+            t.core.decode_ns += w.timings.decode_ns;
+            t.core.eval_ns += w.timings.eval_ns;
+            t.core.encode_ns += w.timings.encode_ns;
+        }
     }
 
     // 7. Materialize. Allocate results from gpa so they outlive the
     //    arena the caller will eventually deinit.
-    var items = try gpa.alloc(AggOutputItem, agg_calls.len);
-    errdefer gpa.free(items);
-    for (agg_calls, 0..) |call, i| {
-        items[i] = .{
-            .alias = try gpa.dupe(u8, call.alias),
-            .value = try materializeOne(gpa, call, accumulators[i]),
-        };
+    var items: []AggOutputItem = &[_]AggOutputItem{};
+    if (group_by_keys == null) {
+        items = try gpa.alloc(AggOutputItem, agg_calls.len);
+        errdefer gpa.free(items);
+        for (agg_calls, 0..) |call, i| {
+            items[i] = .{
+                .alias = try gpa.dupe(u8, call.alias),
+                .value = try materializeOne(gpa, call, accumulators[i]),
+            };
+        }
     }
 
     var bytes_in: u64 = 0;
@@ -499,7 +715,175 @@ pub fn runMultiAggregate(
         .accumulators = accumulators,
         .agg_calls = agg_calls,
         .timings = t,
+        .group_cols = group_cols,
+        .group_rows = group_rows,
     };
+}
+
+const KeyType = enum { i32, i64, f32, f64, string, boolean };
+
+fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
+    if (item.alias) |a| return a;
+    switch (item.expr) {
+        .col_ref => |ref| return leafSchemaElem(meta, ref.col_idx).name,
+        else => return error.GroupKeyAliasRequired,
+    }
+}
+
+fn splitColumnList(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t\r\n");
+        if (name.len > 0) try names.append(arena, name);
+    }
+    return names.items;
+}
+
+fn resolveGroupSelectCols(
+    arena: std.mem.Allocator,
+    group_items: []const expr_ast.SelectItem,
+    agg_calls: []const expr_agg.AggCall,
+    meta: *const schema.FileMetaData,
+    select_cols: ?[]const []const u8,
+    column_order: ?[]const u8,
+) ![]const []const u8 {
+    if (select_cols) |cols| {
+        if (cols.len > 0) return cols;
+    }
+    if (column_order) |order| {
+        const names = try splitColumnList(arena, order);
+        if (names.len == 0) return error.UnknownColumn;
+        const owned = try arena.alloc([]const u8, names.len);
+        for (names, 0..) |name, i| owned[i] = try arena.dupe(u8, name);
+        return owned;
+    }
+    const owned = try arena.alloc([]const u8, group_items.len + agg_calls.len);
+    var idx: usize = 0;
+    for (group_items) |item| {
+        owned[idx] = try arena.dupe(u8, try groupKeyLabel(item, meta));
+        idx += 1;
+    }
+    for (agg_calls) |call| {
+        owned[idx] = try arena.dupe(u8, call.alias);
+        idx += 1;
+    }
+    return owned;
+}
+
+fn keyTypeFromExpr(expr: expr_ast.Expr, meta: *const schema.FileMetaData) Error!KeyType {
+    return switch (expr) {
+        .col_ref => |ref| {
+            const schema_elem = leafSchemaElem(meta, ref.col_idx);
+            return switch (schema_elem.type.?) {
+                .INT32 => if (schema.isUnsignedIntTo32(schema_elem.*)) .i64 else .i32,
+                .INT64 => .i64,
+                .FLOAT => .f32,
+                .DOUBLE => .f64,
+                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => .string,
+                .BOOLEAN => .boolean,
+                .INT96 => .i64,
+            };
+        },
+        .literal, .binop, .call => keyTypeFromComputedExpr(expr.typeOf()),
+    };
+}
+
+fn keyTypeFromComputedExpr(t: expr_ast.Type) KeyType {
+    return switch (t) {
+        .i64 => .i64,
+        .f64 => .f64,
+        .str => .string,
+    };
+}
+
+fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) *const schema.SchemaElement {
+    return &meta.schema.items[leaf_idx + 1];
+}
+
+fn selectColumnName(col_name: []const u8) []const u8 {
+    const clean_col = std.mem.trim(u8, col_name, " ");
+    if (std.mem.lastIndexOf(u8, clean_col, " AS ")) |as_idx| {
+        return std.mem.trim(u8, clean_col[as_idx + 4 ..], " ");
+    }
+    return stripQuotes(clean_col);
+}
+
+fn selectColumnExpr(col_name: []const u8) []const u8 {
+    const clean_col = std.mem.trim(u8, col_name, " ");
+    if (std.mem.lastIndexOf(u8, clean_col, " AS ")) |as_idx| {
+        return stripQuotes(std.mem.trim(u8, clean_col[0..as_idx], " "));
+    }
+    return stripQuotes(clean_col);
+}
+
+fn stripQuotes(name: []const u8) []const u8 {
+    if (name.len >= 2 and ((name[0] == '\'' and name[name.len - 1] == '\'') or (name[0] == '"' and name[name.len - 1] == '"'))) {
+        return name[1 .. name.len - 1];
+    }
+    return name;
+}
+
+pub fn deserializeKeyColumn(
+    allocator: std.mem.Allocator,
+    key_bytes: []const u8,
+    target_idx: usize,
+    key_types: []const KeyType,
+) !AggValue {
+    var cursor: usize = 0;
+    var current_idx: usize = 0;
+    while (current_idx <= target_idx) : (current_idx += 1) {
+        const is_present = key_bytes[cursor];
+        cursor += 1;
+        const ktype = key_types[current_idx];
+
+        if (is_present == 0) {
+            if (current_idx == target_idx) {
+                return .null_val;
+            }
+            continue;
+        }
+
+        switch (ktype) {
+            .i32 => {
+                const val = std.mem.readInt(i64, key_bytes[cursor..][0..8], .little);
+                cursor += 8;
+                if (current_idx == target_idx) return .{ .i = @intCast(val) };
+            },
+            .i64 => {
+                const val = std.mem.readInt(i64, key_bytes[cursor..][0..8], .little);
+                cursor += 8;
+                if (current_idx == target_idx) return .{ .i = val };
+            },
+            .f32 => {
+                const val = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
+                cursor += 8;
+                if (current_idx == target_idx) return .{ .f = @as(f32, @floatCast(@as(f64, @bitCast(val)))) };
+            },
+            .f64 => {
+                const val = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
+                cursor += 8;
+                if (current_idx == target_idx) return .{ .f = @bitCast(val) };
+            },
+            .string => {
+                const len = std.mem.readInt(u32, key_bytes[cursor..][0..4], .little);
+                cursor += 4;
+                if (current_idx == target_idx) {
+                    const buf = try allocator.alloc(u8, len);
+                    @memcpy(buf, key_bytes[cursor .. cursor + len]);
+                    return .{ .s = buf };
+                } else {
+                    cursor += len;
+                }
+            },
+            .boolean => {
+                const val = key_bytes[cursor];
+                cursor += 1;
+                if (current_idx == target_idx) return .{ .i = if (val != 0) 1 else 0 };
+            },
+        }
+    }
+    unreachable;
 }
 
 /// Convert one agg's final accumulator state into a wire-friendly value.
@@ -516,13 +900,13 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         .min => switch (call.result) {
             .i64 => .{ .i = state.min_i orelse 0 },
             .f64 => .{ .f = state.min_f orelse 0 },
-            .bytes => .{ .s = if (state.min_bytes) |b| b else try gpa.dupe(u8, "") },
+            .bytes => .{ .s = if (state.min_bytes) |b| try gpa.dupe(u8, b) else try gpa.dupe(u8, "") },
             .avg_f64 => unreachable,
         },
         .max => switch (call.result) {
             .i64 => .{ .i = state.max_i orelse 0 },
             .f64 => .{ .f = state.max_f orelse 0 },
-            .bytes => .{ .s = if (state.max_bytes) |b| b else try gpa.dupe(u8, "") },
+            .bytes => .{ .s = if (state.max_bytes) |b| try gpa.dupe(u8, b) else try gpa.dupe(u8, "") },
             .avg_f64 => unreachable,
         },
         .avg => .{ .avg = .{ .sum = state.avg.sum, .count = @intCast(state.avg.count) } },

@@ -2211,3 +2211,448 @@ test "decimalStatBytesToF64: malformed inputs return null (no UB)" {
     try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
     try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);
 }
+
+pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {
+    return switch (col) {
+        inline else => |c| if (c.def_levels) |dl| dl[r] < c.max_def else false,
+    };
+}
+
+pub fn serializeRowKey(
+    allocator: std.mem.Allocator,
+    key_cols: []const filter_eval.Batch.Column,
+    row: usize,
+) ![]const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    for (key_cols) |col| {
+        if (isRowNull(col, row)) {
+            try list.append(allocator, 0); // 0 = null
+        } else {
+            try list.append(allocator, 1); // 1 = present
+            switch (col) {
+                .i32 => |c| {
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &buf, @intCast(c.values[row]), .little);
+                    try list.appendSlice(allocator, &buf);
+                },
+                .i64 => |c| {
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &buf, c.values[row], .little);
+                    try list.appendSlice(allocator, &buf);
+                },
+                .f32 => |c| {
+                    var f: f64 = @floatCast(c.values[row]);
+                    if (std.math.isNan(f)) {
+                        f = std.math.nan(f64);
+                    } else if (f == 0.0) {
+                        f = 0.0;
+                    }
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &buf, @bitCast(f), .little);
+                    try list.appendSlice(allocator, &buf);
+                },
+                .f64 => |c| {
+                    var f = c.values[row];
+                    if (std.math.isNan(f)) {
+                        f = std.math.nan(f64);
+                    } else if (f == 0.0) {
+                        f = 0.0;
+                    }
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &buf, @bitCast(f), .little);
+                    try list.appendSlice(allocator, &buf);
+                },
+                .string => |c| {
+                    const s = c.values[row];
+                    var len_buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &len_buf, @intCast(s.len), .little);
+                    try list.appendSlice(allocator, &len_buf);
+                    try list.appendSlice(allocator, s);
+                },
+                .boolean => |c| {
+                    try list.append(allocator, if (c.values[row]) 1 else 0);
+                },
+            }
+        }
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+pub const GroupTable = struct {
+    allocator: std.mem.Allocator,
+    keys: std.ArrayList([]const u8),
+    accumulators: std.ArrayList(Accumulator),
+    map: std.StringHashMap(u32),
+    allocated_bytes: usize,
+    max_memory_bytes: usize,
+
+    const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
+
+    pub fn init(allocator: std.mem.Allocator, max_memory_bytes: usize) GroupTable {
+        return .{
+            .allocator = allocator,
+            .keys = .empty,
+            .accumulators = .empty,
+            .map = std.StringHashMap(u32).init(allocator),
+            .allocated_bytes = 0,
+            .max_memory_bytes = max_memory_bytes,
+        };
+    }
+
+    pub fn deinit(self: *GroupTable) void {
+        for (self.keys.items) |key| {
+            self.allocator.free(key);
+        }
+        self.keys.deinit(self.allocator);
+
+        for (self.accumulators.items) |acc| {
+            switch (acc) {
+                .min_bytes => |mb| if (mb) |s| self.allocator.free(s),
+                .max_bytes => |mb| if (mb) |s| self.allocator.free(s),
+                else => {},
+            }
+        }
+        self.accumulators.deinit(self.allocator);
+        self.map.deinit();
+    }
+
+    pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall) !u32 {
+        if (self.map.get(key)) |id| {
+            return id;
+        }
+
+        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + MapNodeOverhead;
+        if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
+            return error.ExceededMemoryBudget;
+        }
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+
+        const group_id = @as(u32, @intCast(self.keys.items.len));
+
+        try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
+        for (agg_calls) |call| {
+            self.accumulators.appendAssumeCapacity(Accumulator.init(call));
+        }
+
+        try self.map.put(key_copy, group_id);
+        try self.keys.append(self.allocator, key_copy);
+
+        self.allocated_bytes += entry_size;
+
+        return group_id;
+    }
+
+    pub fn mergeTable(self: *GroupTable, other: *const GroupTable, agg_calls: []const AggCall) !void {
+        var i: usize = 0;
+        while (i < other.keys.items.len) : (i += 1) {
+            const key = other.keys.items[i];
+            const other_id = other.map.get(key).?;
+
+            if (self.map.get(key)) |target_id| {
+                const target_offset = target_id * @as(u32, @intCast(agg_calls.len));
+                const other_offset = other_id * @as(u32, @intCast(agg_calls.len));
+
+                for (0..agg_calls.len) |idx| {
+                    const target_acc = &self.accumulators.items[target_offset + idx];
+                    const other_acc = other.accumulators.items[other_offset + idx];
+                    try mergeGroupAccumulator(target_acc, other_acc, self.allocator);
+                }
+            } else {
+                const target_id = try self.getOrInsert(key, agg_calls);
+                const target_offset = target_id * @as(u32, @intCast(agg_calls.len));
+                const other_offset = other_id * @as(u32, @intCast(agg_calls.len));
+
+                for (0..agg_calls.len) |idx| {
+                    const target_acc = &self.accumulators.items[target_offset + idx];
+                    const other_acc = other.accumulators.items[other_offset + idx];
+
+                    switch (other_acc) {
+                        .min_bytes => |mb| {
+                            if (mb) |s| {
+                                target_acc.* = .{ .min_bytes = try self.allocator.dupe(u8, s) };
+                            } else {
+                                target_acc.* = .{ .min_bytes = null };
+                            }
+                        },
+                        .max_bytes => |mb| {
+                            if (mb) |s| {
+                                target_acc.* = .{ .max_bytes = try self.allocator.dupe(u8, s) };
+                            } else {
+                                target_acc.* = .{ .max_bytes = null };
+                            }
+                        },
+                        else => target_acc.* = other_acc,
+                    }
+                }
+            }
+        }
+    }
+};
+
+fn mergeGroupAccumulator(
+    dst: *Accumulator,
+    src: Accumulator,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (dst.*) {
+        .count => |*c| c.* += src.count,
+        .sum_i => |*s| s.* += src.sum_i,
+        .sum_f => |*s| s.* += src.sum_f,
+        .min_i => |*m| if (src.min_i) |sv| {
+            if (m.* == null or sv < m.*.?) m.* = sv;
+        },
+        .min_f => |*m| if (src.min_f) |sv| {
+            if (m.* == null or sv < m.*.?) m.* = sv;
+        },
+        .max_i => |*m| if (src.max_i) |sv| {
+            if (m.* == null or sv > m.*.?) m.* = sv;
+        },
+        .max_f => |*m| if (src.max_f) |sv| {
+            if (m.* == null or sv > m.*.?) m.* = sv;
+        },
+        .min_bytes => |*m| if (src.min_bytes) |sv| {
+            if (m.* == null) {
+                m.* = try allocator.dupe(u8, sv);
+            } else {
+                const ord = std.mem.order(u8, sv, m.*.?);
+                if (ord == .lt) {
+                    allocator.free(m.*.?);
+                    m.* = try allocator.dupe(u8, sv);
+                }
+            }
+        },
+        .max_bytes => |*m| if (src.max_bytes) |sv| {
+            if (m.* == null) {
+                m.* = try allocator.dupe(u8, sv);
+            } else {
+                const ord = std.mem.order(u8, sv, m.*.?);
+                if (ord == .gt) {
+                    allocator.free(m.*.?);
+                    m.* = try allocator.dupe(u8, sv);
+                }
+            }
+        },
+        .avg => |*a| {
+            a.sum += src.avg.sum;
+            a.count += src.avg.count;
+        },
+    }
+}
+
+pub fn updateOneGrouped(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    outer_sel: *const filter_selection.SelectionVector,
+) Error!void {
+    var sel_owned: ?filter_selection.SelectionVector = null;
+    defer if (sel_owned) |*s| s.deinit();
+
+    if (call.where) |pred| {
+        sel_owned = try outer_sel.cloneAlloc(arena);
+        try filter_eval.evaluate(pred, batch, &sel_owned.?, column_lookup, arena);
+    }
+
+    var values: ?filter_eval.Batch.Column = null;
+    if (call.arg) |arg| {
+        if (arg == .col_ref) {
+            values = try colRefForAgg(arena, batch, column_lookup, arg.col_ref, outer_sel, &sel_owned);
+        } else {
+            values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
+        }
+    }
+
+    const sel: *const filter_selection.SelectionVector =
+        if (sel_owned) |*s| s else outer_sel;
+
+    const u64_col = if (call.arg) |a| (a == .col_ref and a.col_ref.unsigned_64) else false;
+
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (sel.isActive(r)) {
+            const gid = group_id_arr[r];
+            const state = &accs[gid * agg_len + agg_idx];
+            switch (call.func) {
+                .count => state.count += 1,
+                .sum => try foldSumGroupedOne(state, values.?, r, u64_col),
+                .min => if (call.result == .bytes)
+                    try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
+                else
+                    foldMinGroupedOne(state, values.?, r, u64_col),
+                .max => if (call.result == .bytes)
+                    try foldMinMaxBytesGroupedOne(persist, false, state, values.?, r)
+                else
+                    foldMaxGroupedOne(state, values.?, r, u64_col),
+                .avg => try foldAvgGroupedOne(state, values.?, r),
+            }
+        }
+    }
+}
+
+fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) Error!void {
+    switch (state.*) {
+        .sum_i => |*s| {
+            const v = switch (col) {
+                .i32 => |c| @as(i128, c.values[r]),
+                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
+                else => return error.UnsupportedAggType,
+            };
+            s.* += v;
+        },
+        .sum_f => |*s| {
+            const v = switch (col) {
+                .f32 => |c| @as(f64, c.values[r]),
+                .f64 => |c| c.values[r],
+                else => return error.UnsupportedAggType,
+            };
+            s.* += v;
+        },
+        else => return error.UnsupportedAggType,
+    }
+}
+
+fn foldMinGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) void {
+    switch (state.*) {
+        .min_i => |*m| {
+            const v = switch (col) {
+                .i32 => |c| @as(i128, c.values[r]),
+                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
+                else => unreachable,
+            };
+            if (m.* == null or v < m.*.?) m.* = v;
+        },
+        .min_f => |*m| {
+            const v = switch (col) {
+                .f32 => |c| @as(f64, c.values[r]),
+                .f64 => |c| c.values[r],
+                else => unreachable,
+            };
+            if (m.* == null or v < m.*.?) m.* = v;
+        },
+        else => unreachable,
+    }
+}
+
+fn foldMaxGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) void {
+    switch (state.*) {
+        .max_i => |*m| {
+            const v = switch (col) {
+                .i32 => |c| @as(i128, c.values[r]),
+                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
+                else => unreachable,
+            };
+            if (m.* == null or v > m.*.?) m.* = v;
+        },
+        .max_f => |*m| {
+            const v = switch (col) {
+                .f32 => |c| @as(f64, c.values[r]),
+                .f64 => |c| c.values[r],
+                else => unreachable,
+            };
+            if (m.* == null or v > m.*.?) m.* = v;
+        },
+        else => unreachable,
+    }
+}
+
+fn foldMinMaxBytesGroupedOne(
+    persist: std.mem.Allocator,
+    is_min: bool,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    r: usize,
+) !void {
+    const sv = col.string.values[r];
+    const m_ptr = if (is_min) &state.min_bytes else &state.max_bytes;
+    if (m_ptr.* == null) {
+        m_ptr.* = try persist.dupe(u8, sv);
+    } else {
+        const ord = std.mem.order(u8, sv, m_ptr.*.?);
+        const condition = if (is_min) (ord == .lt) else (ord == .gt);
+        if (condition) {
+            persist.free(m_ptr.*.?);
+            m_ptr.* = try persist.dupe(u8, sv);
+        }
+    }
+}
+
+fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize) !void {
+    const v = switch (col) {
+        .i32 => |c| @as(f64, @floatFromInt(c.values[r])),
+        .i64 => |c| @as(f64, @floatFromInt(c.values[r])),
+        .f32 => |c| @as(f64, c.values[r]),
+        .f64 => |c| c.values[r],
+        else => return error.UnsupportedAggType,
+    };
+    state.avg.sum += v;
+    state.avg.count += 1;
+}
+
+test "GroupTable basic grouping, float normalization, and memory capping" {
+    const allocator = std.testing.allocator;
+
+    var gt = GroupTable.init(allocator, 1024);
+    defer gt.deinit();
+
+    const agg_calls = &[_]AggCall{
+        .{
+            .func = .sum,
+            .alias = "sum_val",
+            .result = .i64,
+            .arg = null,
+            .where = null,
+        },
+    };
+
+    const gid1 = try gt.getOrInsert("group_a", agg_calls);
+    const gid2 = try gt.getOrInsert("group_b", agg_calls);
+    const gid1_dup = try gt.getOrInsert("group_a", agg_calls);
+
+    try std.testing.expect(gid1 == 0);
+    try std.testing.expect(gid2 == 1);
+    try std.testing.expect(gid1_dup == 0);
+
+    var f32_vals_1 = [_]f32{ 0.0 };
+    const f32_col_1 = filter_eval.Batch.Column{
+        .f32 = .{ .values = &f32_vals_1 },
+    };
+    var f32_vals_2 = [_]f32{ -0.0 };
+    const f32_col_2 = filter_eval.Batch.Column{
+        .f32 = .{ .values = &f32_vals_2 },
+    };
+    const key1 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_col_1 }, 0);
+    defer allocator.free(key1);
+    const key2 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_col_2 }, 0);
+    defer allocator.free(key2);
+
+    try std.testing.expectEqualSlices(u8, key1, key2);
+
+    var f32_nan_1 = [_]f32{ std.math.nan(f32) };
+    const f32_nan_col_1 = filter_eval.Batch.Column{
+        .f32 = .{ .values = &f32_nan_1 },
+    };
+    var f32_nan_2 = [_]f32{ std.math.nan(f32) };
+    const f32_nan_col_2 = filter_eval.Batch.Column{
+        .f32 = .{ .values = &f32_nan_2 },
+    };
+    const nan_key1 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_1 }, 0);
+    defer allocator.free(nan_key1);
+    const nan_key2 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_2 }, 0);
+    defer allocator.free(nan_key2);
+
+    try std.testing.expectEqualSlices(u8, nan_key1, nan_key2);
+
+    var small_gt = GroupTable.init(allocator, 10);
+    defer small_gt.deinit();
+    try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls));
+}

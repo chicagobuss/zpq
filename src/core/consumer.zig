@@ -951,9 +951,16 @@ pub fn scanRGForAgg(
     fetch_set: []const bool,
     agg_calls: []const expr_agg.AggCall,
     accumulators: []expr_agg.Accumulator,
+    group_by_keys: ?[]const expr_ast.Expr,
+    group_table: ?*expr_agg.GroupTable,
     timings: *Timings,
 ) !void {
-    std.debug.assert(agg_calls.len == accumulators.len);
+    const is_grouped = group_table != null;
+    if (is_grouped) {
+        std.debug.assert(accumulators.len == 0);
+    } else {
+        std.debug.assert(agg_calls.len == accumulators.len);
+    }
     const num_rows: usize = @intCast(rg.num_rows);
     const num_leaves = rg.columns.items.len;
     const has_outer_filter = filter != null;
@@ -968,20 +975,24 @@ pub fn scanRGForAgg(
     @memset(handled_via_stats, false);
 
     var any_decode_required = false;
-    const t_stats_start = nowMonoNs();
-    for (agg_calls, 0..) |call, i| {
-        if (scan_all or !expr_agg.canStatShortCircuit(call, has_outer_filter, trust_stats)) {
-            any_decode_required = true;
-            continue;
+    if (is_grouped) {
+        any_decode_required = true;
+    } else {
+        const t_stats_start = nowMonoNs();
+        for (agg_calls, 0..) |call, i| {
+            if (scan_all or !expr_agg.canStatShortCircuit(call, has_outer_filter, trust_stats)) {
+                any_decode_required = true;
+                continue;
+            }
+            const ok = try expr_agg.updateOneFromStats(&accumulators[i], call, rg, meta);
+            if (ok) {
+                handled_via_stats[i] = true;
+            } else {
+                any_decode_required = true;
+            }
         }
-        const ok = try expr_agg.updateOneFromStats(&accumulators[i], call, rg, meta);
-        if (ok) {
-            handled_via_stats[i] = true;
-        } else {
-            any_decode_required = true;
-        }
+        timings.eval_ns += @intCast(nowMonoNs() - t_stats_start);
     }
-    timings.eval_ns += @intCast(nowMonoNs() - t_stats_start);
 
     // Fast path: every agg answered from stats, no decode needed at
     // all. This is the headline win — `max(cost)`, `count(*)`, etc.
@@ -1055,14 +1066,49 @@ pub fn scanRGForAgg(
     const t_eval_end = nowMonoNs();
     timings.eval_ns += @intCast(t_eval_end - t_decode_end);
 
-    // Update only the aggs that weren't handled via stats. The agg's
-    // own per-WHERE predicate (if any) is composed inside updateOne.
-    for (agg_calls, 0..) |call, i| {
-        if (handled_via_stats[i]) continue;
-        // `ra` is per-RG scratch; `gpa` is the persist allocator for owned
-        // results (string min/max winner) that outlive both `ra` and the
-        // cross-worker merge.
-        try expr_agg.updateOne(ra, gpa, &accumulators[i], call, &batch, lookup, &sel);
+    if (is_grouped) {
+        const gb_keys = group_by_keys.?;
+        var key_cols = try ra.alloc(filter_eval.Batch.Column, gb_keys.len);
+        for (gb_keys, 0..) |key_expr, idx| {
+            key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch, lookup, key_expr);
+        }
+
+        var group_id_arr = try ra.alloc(u32, num_rows);
+        @memset(group_id_arr, 0);
+
+        var r: usize = 0;
+        while (r < num_rows) : (r += 1) {
+            if (sel.isActive(r)) {
+                const key = try expr_agg.serializeRowKey(ra, key_cols, r);
+                const gid = try group_table.?.getOrInsert(key, agg_calls);
+                group_id_arr[r] = gid;
+            }
+        }
+
+        for (agg_calls, 0..) |call, i| {
+            try expr_agg.updateOneGrouped(
+                ra,
+                gpa,
+                group_table.?.accumulators.items,
+                group_id_arr,
+                i,
+                agg_calls.len,
+                call,
+                &batch,
+                lookup,
+                &sel,
+            );
+        }
+    } else {
+        // Update only the aggs that weren't handled via stats. The agg's
+        // own per-WHERE predicate (if any) is composed inside updateOne.
+        for (agg_calls, 0..) |call, i| {
+            if (handled_via_stats[i]) continue;
+            // `ra` is per-RG scratch; `gpa` is the persist allocator for owned
+            // results (string min/max winner) that outlive both `ra` and the
+            // cross-worker merge.
+            try expr_agg.updateOne(ra, gpa, &accumulators[i], call, &batch, lookup, &sel);
+        }
     }
     timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
 }

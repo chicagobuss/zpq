@@ -31,6 +31,7 @@ pub const core = struct {
         else
             struct {};
     };
+    pub const system = @import("core/system.zig");
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");
@@ -93,6 +94,7 @@ test {
     _ = core.writer.fastpath;
     _ = core.writer.encoder;
     _ = core.writer.streaming;
+    _ = core.system;
     _ = core.parquet.metadata;
     _ = core.parquet.schema_tree;
     _ = core.parquet.snappy;

@@ -79,6 +79,9 @@ pub const Error = error{
     OpenFailed,
     EmptyFile,
     PathTooLong,
+    ExceededMemoryBudget,
+    ColumnMustBeGrouped,
+    GroupKeyAliasRequired,
 } || std.mem.Allocator.Error;
 
 pub const QueryArgs = struct {
@@ -86,8 +89,12 @@ pub const QueryArgs = struct {
     output: ?[]const u8 = null,
     filter: ?[]const u8 = null,
     aggregate: ?[]const u8 = null,
+    group_by: ?[]const u8 = null,
     columns: ?[]const []const u8 = null,
     select: ?[]const u8 = null,
+    select_cols: ?[]const []const u8 = null,
+    /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
+    column_order: ?[]const u8 = null,
     codec: schema.CompressionCodec = .SNAPPY,
     parallelism: usize = 0,
     /// `--scan-all`: disable every stats shortcut (row-group pruning,
@@ -102,6 +109,7 @@ pub const QueryArgs = struct {
     /// Row-group pruning still uses stats regardless (that path only skips
     /// provably-non-matching groups, so it can't produce a wrong value).
     trust_stats: bool = false,
+    max_memory: usize = 512 * 1024 * 1024,
 };
 
 pub const Context = struct {
@@ -159,6 +167,8 @@ pub const AggResult = struct {
     cols_stat_pruned: usize,
     aggs: []scan.AggOutputItem,
     timings: Timings,
+    group_cols: ?[]const []const u8 = null,
+    group_rows: ?[]const []const scan.AggValue = null,
 };
 
 pub const Timings = struct {
@@ -179,10 +189,11 @@ pub const Timings = struct {
 
 pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
     if (args.inputs.len == 0) return error.NoInputs;
-    if (args.aggregate != null and (args.select != null or args.columns != null)) {
+    if ((args.aggregate != null or args.group_by != null) and (args.select != null or args.columns != null)) {
         return error.AggregateMutexWithSelect;
     }
-    if (args.aggregate) |agg_str| {
+    if (args.aggregate != null or args.group_by != null) {
+        const agg_str = args.aggregate orelse "";
         return .{ .aggregate = try runAggregate(ctx, args, agg_str) };
     }
     if (args.output) |out_path| {
@@ -220,9 +231,13 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened) else null,
         .filter = args.filter,
         .aggregate = agg_str,
+        .group_by = args.group_by,
         .parallelism = args.parallelism,
         .scan_all = args.scan_all,
         .trust_stats = args.trust_stats,
+        .select_cols = args.select_cols,
+        .column_order = args.column_order,
+        .max_memory = args.max_memory,
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -251,6 +266,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .cols_stat_pruned = r.cols_stat_pruned,
         .aggs = r.aggs,
         .timings = t,
+        .group_cols = r.group_cols,
+        .group_rows = r.group_rows,
     };
 }
 

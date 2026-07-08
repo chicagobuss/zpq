@@ -10,6 +10,18 @@ pub const ParsedQuery = struct {
     select_str: ?[]const u8,
     aggregate_str: ?[]const u8,
     filter_str: ?[]const u8,
+    group_by_str: ?[]const u8 = null,
+    select_cols: []const []const u8 = &[_][]const u8{},
+
+    pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        if (self.select_str) |s| allocator.free(s);
+        if (self.aggregate_str) |a| allocator.free(a);
+        if (self.filter_str) |f| allocator.free(f);
+        if (self.group_by_str) |g| allocator.free(g);
+        for (self.select_cols) |col| allocator.free(col);
+        allocator.free(self.select_cols);
+    }
 };
 
 fn stripQuotes(name: []const u8) []const u8 {
@@ -121,10 +133,7 @@ fn rejectUnsupportedClauses(sel: anytype) !void {
         std.debug.print("sql: DISTINCT is not supported yet\n", .{});
         return error.DistinctNotSupported;
     }
-    if (sel.group_by.count > 0) {
-        std.debug.print("sql: GROUP BY is not supported yet (planned — partial aggregation per shard)\n", .{});
-        return error.GroupByNotSupported;
-    }
+    // GROUP BY is supported
     if (sel.having != null) {
         std.debug.print("sql: HAVING is not supported yet\n", .{});
         return error.HavingNotSupported;
@@ -255,13 +264,18 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         if (info.has_agg) has_agg = true;
         if (info.has_bare_col) has_bare = true;
     }
-    // Aggregate + a bare (non-aggregated) column is implicit GROUP BY — whether
-    // across columns (`a, sum(b)`) or within one (`sum(a) + b`). Reject both.
-    if (has_agg and has_bare) {
-        std.debug.print("sql: mixing aggregates with plain columns requires GROUP BY, which is not supported yet\n", .{});
-        return error.MixedSelectNotSupported;
+    const has_group_by = root.*.u.select.group_by.count > 0;
+    const is_aggregate = has_agg or has_group_by;
+
+    if (is_aggregate) {
+        if (has_bare and !has_group_by) {
+            std.debug.print("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
+            return error.MixedSelectNotSupported;
+        }
+        if (has_group_by) {
+            try validateGroupBy(allocator, root.*.u.select, lp_arena);
+        }
     }
-    const is_aggregate = has_agg;
 
     // Unparse result columns
     var columns_list: std.ArrayList([]const u8) = .empty;
@@ -274,6 +288,15 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
         try columns_list.append(allocator, col_sql);
+    }
+
+    const select_cols = try allocator.alloc([]const u8, columns_list.items.len);
+    errdefer {
+        for (select_cols) |col| allocator.free(col);
+        allocator.free(select_cols);
+    }
+    for (columns_list.items, 0..) |col, idx| {
+        select_cols[idx] = try allocator.dupe(u8, col);
     }
 
     // Join result columns with ", "
@@ -297,13 +320,72 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     }
     errdefer if (filter_str) |fs| allocator.free(fs);
 
+    // Extract GROUP BY clause if present
+    var group_by_str: ?[]const u8 = null;
+    if (has_group_by) {
+        var group_by_list: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (group_by_list.items) |col| allocator.free(col);
+            group_by_list.deinit(allocator);
+        }
+        var j: usize = 0;
+        while (j < @as(usize, @intCast(root.*.u.select.group_by.count))) : (j += 1) {
+            const gb_node = root.*.u.select.group_by.items[j] orelse continue;
+            const gb_c = c.lp_ast_to_sql(gb_node, lp_arena);
+            if (gb_c == null) return error.UnparseError;
+            const gb_sql = try allocator.dupe(u8, std.mem.span(gb_c));
+            try group_by_list.append(allocator, gb_sql);
+        }
+
+        var joined_gb: std.ArrayList(u8) = .empty;
+        errdefer joined_gb.deinit(allocator);
+        for (group_by_list.items, 0..) |col, idx| {
+            if (idx > 0) try joined_gb.appendSlice(allocator, ", ");
+            try joined_gb.appendSlice(allocator, col);
+        }
+        group_by_str = try joined_gb.toOwnedSlice(allocator);
+    }
+    errdefer if (group_by_str) |gs| allocator.free(gs);
+
+    var aggregate_str: []const u8 = columns_str;
+    if (is_aggregate and has_group_by) {
+        var agg_list: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (agg_list.items) |col| allocator.free(col);
+            agg_list.deinit(allocator);
+        }
+        i = 0;
+        while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
+            const rc = root.*.u.select.result_columns.items[i] orelse continue;
+            const info = analyzeExpr(rc);
+            if (!info.has_agg) continue;
+            const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
+            try agg_list.append(allocator, col_sql);
+        }
+
+        allocator.free(columns_str);
+        if (agg_list.items.len == 0) {
+            aggregate_str = try allocator.dupe(u8, "");
+        } else {
+            var joined_agg: std.ArrayList(u8) = .empty;
+            errdefer joined_agg.deinit(allocator);
+            for (agg_list.items, 0..) |col, idx| {
+                if (idx > 0) try joined_agg.appendSlice(allocator, ", ");
+                try joined_agg.appendSlice(allocator, col);
+            }
+            aggregate_str = try joined_agg.toOwnedSlice(allocator);
+        }
+    }
+
     if (is_aggregate) {
         return .{
             .table_name = table_name,
             .is_aggregate = true,
             .select_str = null,
-            .aggregate_str = columns_str,
+            .aggregate_str = aggregate_str,
             .filter_str = filter_str,
+            .group_by_str = group_by_str,
+            .select_cols = select_cols,
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
@@ -311,12 +393,15 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // A bare star can't be an aggregate, so this only reaches the plain path.
     if (std.mem.eql(u8, std.mem.trim(u8, columns_str, " "), "*")) {
         allocator.free(columns_str);
+        for (select_cols) |col| allocator.free(col);
+        allocator.free(select_cols);
         return .{
             .table_name = table_name,
             .is_aggregate = false,
             .select_str = null,
             .aggregate_str = null,
             .filter_str = filter_str,
+            .select_cols = &[_][]const u8{},
         };
     }
     return .{
@@ -325,18 +410,62 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         .select_str = columns_str,
         .aggregate_str = null,
         .filter_str = filter_str,
+        .select_cols = select_cols,
     };
+}
+
+fn validateGroupBy(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t) !void {
+    // 1. Unparse and collect all GROUP BY expressions
+    var group_by_list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (group_by_list.items) |col| allocator.free(col);
+        group_by_list.deinit(allocator);
+    }
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(sel.group_by.count))) : (i += 1) {
+        const gb_node = sel.group_by.items[i] orelse continue;
+        const gb_c = c.lp_ast_to_sql(gb_node, lp_arena);
+        if (gb_c == null) return error.UnparseError;
+        const gb_sql = try allocator.dupe(u8, std.mem.span(gb_c));
+        try group_by_list.append(allocator, gb_sql);
+    }
+
+    // 2. Validate each SELECT result column
+    i = 0;
+    while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
+        const rc = sel.result_columns.items[i] orelse continue;
+        const info = analyzeExpr(rc);
+        if (info.has_bare_col) {
+            // Result column contains a bare column. We must unparse the expression
+            // itself (not including the AS alias, which is at the result_column level).
+            const expr_node = rc.*.u.result_column.expr orelse continue;
+            const expr_c = c.lp_ast_to_sql(expr_node, lp_arena);
+            if (expr_c == null) return error.UnparseError;
+            const expr_sql = std.mem.span(expr_c);
+
+            // Check if this raw expression SQL exists in our group_by list (case-insensitively).
+            var found = false;
+            for (group_by_list.items) |gb| {
+                const a = stripQuotes(std.mem.trim(u8, expr_sql, " "));
+                const b = stripQuotes(std.mem.trim(u8, gb, " "));
+                if (std.ascii.eqlIgnoreCase(a, b)) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                std.debug.print("sql: result column '{s}' must be in the GROUP BY list\n", .{expr_sql});
+                return error.ColumnMustBeGrouped;
+            }
+        }
+    }
 }
 
 test "sql_parser basic select" {
     const allocator = std.testing.allocator;
     const q = try parseSqlQuery(allocator, "SELECT a, b + c AS sum_val FROM 'test.parquet' WHERE a > 10");
-    defer {
-        allocator.free(q.table_name);
-        if (q.select_str) |s| allocator.free(s);
-        if (q.aggregate_str) |a| allocator.free(a);
-        if (q.filter_str) |f| allocator.free(f);
-    }
+    defer q.deinit(allocator);
 
     try std.testing.expectEqualStrings("test.parquet", q.table_name);
     try std.testing.expect(!q.is_aggregate);
@@ -349,13 +478,26 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     const a = std.testing.allocator;
     // Each of these previously parsed and SILENTLY ignored the clause →
     // a confidently wrong answer. They must error with a named clause now.
-    try std.testing.expectError(error.GroupByNotSupported, parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' GROUP BY y"));
+    // GROUP BY y: x is aggregated, y is not but y is in GROUP BY, so it's valid:
+    const q_gb = try parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' GROUP BY y");
+    defer q_gb.deinit(a);
+    try std.testing.expectEqualStrings("y", q_gb.group_by_str.?);
+    try std.testing.expectEqualStrings("sum(x) AS s", q_gb.aggregate_str.?);
+
+    const q_gb_mixed = try parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY y");
+    defer q_gb_mixed.deinit(a);
+    try std.testing.expectEqualStrings("sum(x) AS s", q_gb_mixed.aggregate_str.?);
+    try std.testing.expectEqual(@as(usize, 2), q_gb_mixed.select_cols.len);
+    try std.testing.expectEqualStrings("y", q_gb_mixed.select_cols[0]);
+    try std.testing.expectEqualStrings("sum(x) AS s", q_gb_mixed.select_cols[1]);
+
     try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x"));
     try std.testing.expectError(error.LimitNotSupported, parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5"));
     try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT x FROM 't'"));
     try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' HAVING sum(x) > 1"));
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
     try std.testing.expectError(error.UnsupportedStatement, parseSqlQuery(a, "SELECT x FROM 't' UNION SELECT x FROM 'u'"));
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY z"));
 }
 
 test "sql_parser rejects unsupported aggregate shapes" {
@@ -375,12 +517,7 @@ test "sql_parser rejects unsupported aggregate shapes" {
 test "sql_parser aggregate select" {
     const allocator = std.testing.allocator;
     const q = try parseSqlQuery(allocator, "SELECT sum(a) AS total, count(*) AS count_val FROM \"data.parquet\"");
-    defer {
-        allocator.free(q.table_name);
-        if (q.select_str) |s| allocator.free(s);
-        if (q.aggregate_str) |a| allocator.free(a);
-        if (q.filter_str) |f| allocator.free(f);
-    }
+    defer q.deinit(allocator);
 
     try std.testing.expectEqualStrings("data.parquet", q.table_name);
     try std.testing.expect(q.is_aggregate);

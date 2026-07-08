@@ -5,6 +5,7 @@
 //!         [--filter EXPR] [--columns COL1,COL2,...]
 //!         [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
 //!         [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
+//!         [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
 //!         [--codec snappy|zstd|gzip|uncompressed]
 //!     — local-file query: decode → filter → re-encode → write,
 //!       OR aggregate (sum/count/min/max/avg with optional FILTER).
@@ -34,6 +35,7 @@ const usage_text =
     \\            [--filter EXPR] [--columns COL1,COL2,...]
     \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
+    \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats]
     \\            [--format csv|jsonl] [--limit N]
@@ -116,6 +118,11 @@ pub fn main(init: std.process.Init) !void {
                 error.ExpectedAggFunc => std.debug.print("zpq query: expected aggregate function\n", .{}),
                 error.StarOnlyValidInCount => std.debug.print("zpq query: '*' is only valid inside count(*)\n", .{}),
                 error.TrailingTokens => std.debug.print("zpq query: trailing tokens after expression\n", .{}),
+                error.GroupKeyAliasRequired => std.debug.print("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
+                error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
+                error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
+                error.NestedNotSupported => std.debug.print("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
+                error.DivisionByZero => std.debug.print("zpq query: division by zero in GROUP BY expression\n", .{}),
                 error.GroupingNotSupported => std.debug.print("zpq query: grouping parentheses are not supported in filter\n", .{}),
                 error.BadOperator => std.debug.print("zpq query: invalid operator in filter\n", .{}),
                 error.BadValue => std.debug.print("zpq query: invalid value in filter\n", .{}),
@@ -146,6 +153,8 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(1);
 }
 
+
+
 fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     const gpa = init.gpa;
     const env = init.minimal.environ;
@@ -164,6 +173,10 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var trust_stats: bool = false;
     var format: ?engine.PrintFormat = null;
     var limit: ?usize = null;
+    var max_memory: ?usize = null;
+    var group_by: ?[]const u8 = null;
+    var select_cols: ?[]const []const u8 = null;
+    var column_order: ?[]const u8 = null;
 
     while (iter.next()) |tok| {
         if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
@@ -255,6 +268,25 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                 std.debug.print("zpq query: invalid limit value: {s}\n", .{v});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--group-by")) {
+            group_by = iter.next() orelse {
+                std.debug.print("zpq query: --group-by requires a value\n", .{});
+                return error.BadArgs;
+            };
+        } else if (std.mem.eql(u8, tok, "--column-order")) {
+            column_order = iter.next() orelse {
+                std.debug.print("zpq query: --column-order requires a value\n", .{});
+                return error.BadArgs;
+            };
+        } else if (std.mem.eql(u8, tok, "--max-memory")) {
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --max-memory requires a value\n", .{});
+                return error.BadArgs;
+            };
+            max_memory = zpq.core.system.parseSizeString(v) catch {
+                std.debug.print("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
+                return error.BadArgs;
+            };
         } else if (std.mem.startsWith(u8, tok, "-")) {
             std.debug.print("zpq query: unrecognized option: {s}\n", .{tok});
             return error.BadArgs;
@@ -268,8 +300,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             std.debug.print("zpq query: cannot specify input files on the command line when using --query\n", .{});
             return error.BadArgs;
         }
-        if (select != null or aggregate != null or filter != null or columns_csv != null or format != null or limit != null) {
-            std.debug.print("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit\n", .{});
+        if (select != null or aggregate != null or filter != null or columns_csv != null or format != null or limit != null or group_by != null or column_order != null) {
+            std.debug.print("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit / --group-by / --column-order\n", .{});
             return error.BadArgs;
         }
     } else {
@@ -279,6 +311,14 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         }
         if (aggregate != null and (select != null or columns_csv != null or format != null)) {
             std.debug.print("zpq query: --aggregate is mutually exclusive with --select / --columns / --format\n", .{});
+            return error.BadArgs;
+        }
+        if (group_by != null and (select != null or columns_csv != null or format != null)) {
+            std.debug.print("zpq query: --group-by is mutually exclusive with --select / --columns / --format\n", .{});
+            return error.BadArgs;
+        }
+        if (column_order != null and group_by == null) {
+            std.debug.print("zpq query: --column-order requires --group-by\n", .{});
             return error.BadArgs;
         }
         if (format != null and output != null) {
@@ -310,6 +350,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             filter = pq.filter_str;
             select = pq.select_str;
             aggregate = pq.aggregate_str;
+            group_by = pq.group_by_str;
+            select_cols = pq.select_cols;
 
             const matches = try expandGlob(arena, pq.table_name, env);
             if (matches.len == 0) {
@@ -334,6 +376,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         }
     }
     const inputs = inputs_list.items;
+    const max_mem_limit = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
 
     if (format) |fmt| {
         const cols = if (columns_csv) |csv|
@@ -354,12 +397,17 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
+            .max_memory = max_mem_limit,
+            .group_by = group_by,
+            .select_cols = select_cols,
+            .column_order = column_order,
         }, fmt, limit);
         return;
     }
 
     // Aggregate path: -o is OPTIONAL (JSON-only mode is the default).
-    if (aggregate) |agg_str| {
+    if (aggregate != null or group_by != null) {
+        const agg_str = aggregate orelse "";
         const t_start_a = nowMonoNs();
         const result = try engine.runQuery(.{
             .gpa = gpa,
@@ -374,6 +422,10 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
+            .max_memory = max_mem_limit,
+            .group_by = group_by,
+            .select_cols = select_cols,
+            .column_order = column_order,
         });
         const ar = result.aggregate;
         defer gpa.free(ar.aggs);
@@ -383,6 +435,22 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                 .s => |s| gpa.free(s),
                 else => {},
             }
+        };
+        defer if (ar.group_rows) |rows| {
+            for (rows) |r| {
+                for (r) |v| {
+                    switch (v) {
+                        .s => |s| gpa.free(s),
+                        else => {},
+                    }
+                }
+                gpa.free(r);
+            }
+            gpa.free(rows);
+        };
+        defer if (ar.group_cols) |cols| {
+            for (cols) |c| gpa.free(c);
+            gpa.free(cols);
         };
         const total_ms_a = @divTrunc(nowMonoNs() - t_start_a, std.time.ns_per_ms);
 
@@ -399,32 +467,68 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             try writeJsonString(&ws, op);
             try ws.print("\"", .{});
         }
-        try ws.print(
-            ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"agg\":{{",
-            .{ ar.rows_in, ar.rows_kept, ar.bytes_in, ar.bytes_out, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned },
-        );
-        for (ar.aggs, 0..) |item, i| {
-            if (i > 0) try ws.print(",", .{});
-            try ws.print("\"", .{});
-            try writeJsonString(&ws, item.alias);
-            try ws.print("\":", .{});
-            switch (item.value) {
-                .i => |v| try ws.print("{d}", .{v}),
-                .f => |v| try writeJsonFloat(&ws, v),
-                .s => |v| {
+        if (ar.group_rows) |rows| {
+            try ws.print(
+                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"agg\":[",
+                .{ ar.rows_in, ar.rows_kept, ar.bytes_in, ar.bytes_out, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned },
+            );
+            for (rows, 0..) |row_vals, row_idx| {
+                if (row_idx > 0) try ws.print(",", .{});
+                try ws.print("{{", .{});
+                for (ar.group_cols.?, 0..) |col_name, col_idx| {
+                    if (col_idx > 0) try ws.print(",", .{});
                     try ws.print("\"", .{});
-                    try writeJsonString(&ws, v);
-                    try ws.print("\"", .{});
-                },
-                .avg => |v| {
-                    try ws.writeAll("{\"sum\":");
-                    try writeJsonFloat(&ws, v.sum);
-                    try ws.print(",\"count\":{d}}}", .{v.count});
-                },
+                    try writeJsonString(&ws, col_name);
+                    try ws.print("\":", .{});
+                    switch (row_vals[col_idx]) {
+                        .i => |v| try ws.print("{d}", .{v}),
+                        .f => |v| try writeJsonFloat(&ws, v),
+                        .s => |v| {
+                            try ws.print("\"", .{});
+                            try writeJsonString(&ws, v);
+                            try ws.print("\"", .{});
+                        },
+                        .avg => |v| {
+                            try ws.writeAll("{\"sum\":");
+                            try writeJsonFloat(&ws, v.sum);
+                            try ws.print(",\"count\":{d}}}", .{v.count});
+                        },
+                        .null_val => try ws.writeAll("null"),
+                    }
+                }
+                try ws.print("}}", .{});
             }
+            try ws.writeAll("],");
+        } else {
+            try ws.print(
+                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"agg\":{{",
+                .{ ar.rows_in, ar.rows_kept, ar.bytes_in, ar.bytes_out, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned },
+            );
+            for (ar.aggs, 0..) |item, i| {
+                if (i > 0) try ws.print(",", .{});
+                try ws.print("\"", .{});
+                try writeJsonString(&ws, item.alias);
+                try ws.print("\":", .{});
+                switch (item.value) {
+                    .i => |v| try ws.print("{d}", .{v}),
+                    .f => |v| try writeJsonFloat(&ws, v),
+                    .s => |v| {
+                        try ws.print("\"", .{});
+                        try writeJsonString(&ws, v);
+                        try ws.print("\"", .{});
+                    },
+                    .avg => |v| {
+                        try ws.writeAll("{\"sum\":");
+                        try writeJsonFloat(&ws, v.sum);
+                        try ws.print(",\"count\":{d}}}", .{v.count});
+                    },
+                    .null_val => try ws.writeAll("null"),
+                }
+            }
+            try ws.writeAll("},");
         }
         try ws.print(
-            "}},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
+            "\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
             .{
                 total_ms_a,
                 ar.timings.read_ns / std.time.ns_per_ms,
@@ -463,6 +567,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         .parallelism = parallelism,
         .scan_all = scan_all,
         .trust_stats = trust_stats,
+        .max_memory = max_mem_limit,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);

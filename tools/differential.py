@@ -14,7 +14,7 @@ is the oracle (same role Hardwood gives it).
 
 Usage: .venv/bin/python tools/differential.py
 """
-import duckdb, subprocess, os, sys, tempfile
+import duckdb, subprocess, os, sys, tempfile, json
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
 
 ZPQ = "zig-out/bin/zpq"
@@ -94,6 +94,8 @@ from decimal import Decimal
 
 
 def norm(v):
+    if isinstance(v, bool):
+        return 1 if v else 0
     if isinstance(v, (float, Decimal)):
         return round(float(v), 4)
     return v
@@ -215,7 +217,7 @@ def main():
                 print(f"  FAIL  {label}  ZPQ error: {(r.stderr or r.stdout).strip()[:70]}")
                 fails += 1
                 continue
-            import json
+
             try:
                 zvals = [norm(v) for v in json.loads(r.stdout)["agg"].values()]
             except Exception as e:
@@ -235,6 +237,69 @@ def main():
                 fails += 1
                 print(f"  FAIL  {label}  zpq={zvals} duck={dvals}")
 
+    # --- GROUP BY × aggregate matrix ---
+    GROUP_BYS = [
+        ("gb_simple", "flag", "count(id) AS c", None, 
+         "SELECT flag, count(id) AS c FROM '{fixture}' GROUP BY flag"),
+        ("gb_arith", "id + 1 AS id_plus1", "sum(price) AS s", None, 
+         "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{fixture}' GROUP BY id_plus1"),
+        ("gb_concat", "name || '_z' AS concat", "max(price) AS mx, min(price) AS mn", None, 
+         "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{fixture}' GROUP BY concat"),
+        ("gb_coalesce", "coalesce(nname, 'NA') AS coal", "count(id) AS c", "c,coal",
+         "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{fixture}' GROUP BY coal"),
+    ]
+    for glabel, gby, agg, order, d_sql in GROUP_BYS:
+        for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500")]:
+            total += 1
+            cmd = [ZPQ, "query", fixture, "--group-by", gby]
+            if agg:
+                cmd += ["--aggregate", agg]
+            if order:
+                cmd += ["--column-order", order]
+            if zf is not None:
+                cmd += ["--filter", zf]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            label = f"groupby:{glabel:15} × {flabel:6}"
+            if r.returncode != 0:
+                print(f"  FAIL  {label}  ZPQ error: {(r.stderr or r.stdout).strip()[:70]}")
+                fails += 1
+                continue
+
+            try:
+                zrows_raw = json.loads(r.stdout)["agg"]
+            except Exception as e:
+                print(f"  FAIL  {label}  bad json: {e}")
+                fails += 1
+                continue
+            
+            where = f" WHERE {dw}" if dw is not None else ""
+            duck_query = d_sql.format(fixture=fixture)
+            if where:
+                parts = duck_query.split(" GROUP BY ")
+                duck_query = f"{parts[0]}{where} GROUP BY {parts[1]}"
+            
+            try:
+                duck_rel = con.execute(duck_query)
+                col_names = [desc[0] for desc in duck_rel.description]
+                drows = sorted([tuple(norm(c) for c in row) for row in duck_rel.fetchall()], key=repr)
+                
+                zrows_list = []
+                for row_dict in zrows_raw:
+                    row_tuple = tuple(norm(row_dict.get(c)) for c in col_names)
+                    zrows_list.append(row_tuple)
+                zrows = sorted(zrows_list, key=repr)
+            except Exception as e:
+                print(f"  FAIL  {label}  compare setup error: {e}")
+                fails += 1
+                continue
+                
+            if zrows != drows:
+                fails += 1
+                detail = f"zpq={len(zrows)} duck={len(drows)}" if len(zrows) != len(drows) else \
+                    next(f"row zpq={a} duck={b}" for a, b in zip(zrows, drows) if a != b)
+                print(f"  FAIL  {label}  {detail}")
+            else:
+                print(f"  OK    {label}  ({len(zrows)} rows)")
     # ZPQ must preserve INPUT row order through filter+write (Iceberg compaction /
     # S3-to-S3 passthrough expect determinism; parallel per-RG workers must not
     # scramble). Compared in FILE order vs the input filtered in file order — this

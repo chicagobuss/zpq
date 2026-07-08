@@ -1076,11 +1076,14 @@ pub fn scanRGForAgg(
         var group_id_arr = try ra.alloc(u32, num_rows);
         @memset(group_id_arr, 0);
 
+        var key_scratch: std.ArrayList(u8) = .empty;
+        defer key_scratch.deinit(ra);
+
         var r: usize = 0;
         while (r < num_rows) : (r += 1) {
             if (sel.isActive(r)) {
-                const key = try expr_agg.serializeRowKey(ra, key_cols, r);
-                const gid = try group_table.?.getOrInsert(key, agg_calls);
+                try expr_agg.serializeRowKey(&key_scratch, ra, key_cols, r);
+                const gid = try group_table.?.getOrInsert(key_scratch.items, agg_calls);
                 group_id_arr[r] = gid;
             }
         }

@@ -540,6 +540,10 @@ pub fn runMultiAggregate(
         for (workers) |*w| {
             if (w.group_table) |*gt| {
                 try coord_table.mergeTable(gt, agg_calls);
+                // Deallocate worker table immediately to reclaim memory before merging
+                // the next worker. Set to null so the defer block doesn't double-free.
+                gt.deinit();
+                w.group_table = null;
             }
             rows_in += w.rows_in;
             rows_kept += w.rows_kept;

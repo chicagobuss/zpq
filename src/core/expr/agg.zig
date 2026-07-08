@@ -2219,12 +2219,12 @@ pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {
 }
 
 pub fn serializeRowKey(
+    list: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     key_cols: []const filter_eval.Batch.Column,
     row: usize,
-) ![]const u8 {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
+) !void {
+    list.clearRetainingCapacity();
 
     for (key_cols) |col| {
         if (isRowNull(col, row)) {
@@ -2277,7 +2277,6 @@ pub fn serializeRowKey(
             }
         }
     }
-    return list.toOwnedSlice(allocator);
 }
 
 pub const GroupTable = struct {
@@ -2333,12 +2332,16 @@ pub const GroupTable = struct {
 
         const group_id = @as(u32, @intCast(self.keys.items.len));
 
+        const old_accumulators_len = self.accumulators.items.len;
         try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
+        errdefer self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
         for (agg_calls) |call| {
             self.accumulators.appendAssumeCapacity(Accumulator.init(call));
         }
 
         try self.map.put(key_copy, group_id);
+        errdefer _ = self.map.remove(key_copy);
+
         try self.keys.append(self.allocator, key_copy);
 
         self.allocated_bytes += entry_size;
@@ -2630,9 +2633,15 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     const f32_col_2 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_vals_2 },
     };
-    const key1 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_col_1 }, 0);
+    var key_scratch: std.ArrayList(u8) = .empty;
+    defer key_scratch.deinit(allocator);
+
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_col_1 }, 0);
+    const key1 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(key1);
-    const key2 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_col_2 }, 0);
+
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_col_2 }, 0);
+    const key2 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(key2);
 
     try std.testing.expectEqualSlices(u8, key1, key2);
@@ -2645,9 +2654,12 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     const f32_nan_col_2 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_nan_2 },
     };
-    const nan_key1 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_1 }, 0);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_1 }, 0);
+    const nan_key1 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(nan_key1);
-    const nan_key2 = try serializeRowKey(allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_2 }, 0);
+
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_2 }, 0);
+    const nan_key2 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(nan_key2);
 
     try std.testing.expectEqualSlices(u8, nan_key1, nan_key2);

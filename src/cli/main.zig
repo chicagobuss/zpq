@@ -1129,6 +1129,9 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    var file_bytes: ?[]u8 = null;
+    defer if (file_bytes) |fb| gpa.free(fb);
+
     var meta: schema.FileMetaData = undefined;
     if (std.mem.startsWith(u8, path, "s3://")) {
         meta = engine.fetchS3Schema(.{
@@ -1140,13 +1143,13 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
             std.process.exit(1);
         };
     } else {
-        const file_bytes = readFile(gpa, path) catch |err| {
+        const bytes = readFile(gpa, path) catch |err| {
             std.debug.print("zpq schema: failed to open input file {s}: {s}\n", .{ path, @errorName(err) });
             std.process.exit(1);
         };
-        defer gpa.free(file_bytes);
+        file_bytes = bytes;
 
-        meta = metadata.open(arena, file_bytes) catch |err| {
+        meta = metadata.open(arena, bytes) catch |err| {
             std.debug.print("zpq schema: input file {s} is not a valid Parquet file ({s})\n", .{ path, @errorName(err) });
             std.process.exit(1);
         };

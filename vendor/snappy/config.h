@@ -25,9 +25,9 @@
 
 // Intrinsic-specific defines. Off — generic implementation is fast
 // enough and saves us from per-target Zig flag plumbing.
-#define SNAPPY_HAVE_SSSE3 0
-#define SNAPPY_HAVE_X86_CRC32 0
-#define SNAPPY_HAVE_BMI2 0
+#define SNAPPY_HAVE_SSSE3 1
+#define SNAPPY_HAVE_X86_CRC32 1
+#define SNAPPY_HAVE_BMI2 1
 #define SNAPPY_HAVE_NEON 0
 #define SNAPPY_HAVE_NEON_CRC32 0
 

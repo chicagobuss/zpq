@@ -82,3 +82,10 @@ zpq-index-*.md
 
 # local oracle venvs (pyarrow/duckdb)
 .venv*
+
+# local perf profiling data
+perf.data
+perf.data.old
+
+# local scratch scripts/folders
+scratch/

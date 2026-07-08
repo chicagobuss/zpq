@@ -21,11 +21,6 @@ pub fn build(b: *std.Build) !void {
         .link_libc = true,
         .link_libcpp = true,
     });
-    // -mno-avx is x86-only and rejected by clang on aarch64. We only
-    // need it on x86 because that's the target where snappy.cc's
-    // `defined(__x86_64__) && defined(__AVX__)` fast path triggers
-    // without an immintrin.h include. ARM has no analog.
-    const t_arch = target.result.cpu.arch;
     var flags: std.ArrayListUnmanaged([]const u8) = .empty;
     try flags.appendSlice(b.allocator, &.{
         "-std=c++17",
@@ -33,9 +28,6 @@ pub fn build(b: *std.Build) !void {
         "-fno-exceptions",
         "-fno-rtti",
     });
-    if (t_arch == .x86_64 or t_arch == .x86) {
-        try flags.append(b.allocator, "-mno-avx");
-    }
     lib_mod.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{

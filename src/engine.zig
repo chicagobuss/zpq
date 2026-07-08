@@ -243,6 +243,14 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     t.core = r.timings.core;
     t.decode_wall_ns = r.timings.decode_wall_ns;
 
+    defer for (r.accumulators) |acc| {
+        switch (acc) {
+            .min_bytes => |mb| if (mb) |s| ctx.gpa.free(s),
+            .max_bytes => |mb| if (mb) |s| ctx.gpa.free(s),
+            else => {},
+        }
+    };
+
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.
     var bytes_out: u64 = 0;

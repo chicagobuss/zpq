@@ -18,18 +18,24 @@ pub const Decision = enum {
     keep,
     skip,
     unknown,
+    always_match,
 
     fn andCombine(a: Decision, b: Decision) Decision {
         // AND: if either says skip, the conjunction can't match.
         if (a == .skip or b == .skip) return .skip;
-        // Otherwise "keep" wins over "unknown".
-        if (a == .keep or b == .keep) return .keep;
+        // If both are always_match, the conjunction always matches.
+        if (a == .always_match and b == .always_match) return .always_match;
+        // Otherwise, if either is keep or always_match, we must keep/evaluate.
+        if (a == .keep or b == .keep or a == .always_match or b == .always_match) return .keep;
         return .unknown;
     }
 
     fn orCombine(a: Decision, b: Decision) Decision {
+        // OR: if either is always_match, the disjunction always matches.
+        if (a == .always_match or b == .always_match) return .always_match;
         // OR: only skip if BOTH can't match.
         if (a == .skip and b == .skip) return .skip;
+        // If either is keep, we must keep/evaluate.
         if (a == .keep or b == .keep) return .keep;
         return .unknown;
     }
@@ -503,3 +509,205 @@ test "pruneRowGroup unknown when stats absent" {
     const filter: ast.Filter = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 42 } };
     try testing.expectEqual(Decision.unknown, try pruneRowGroup(&rg, filter, a, null));
 }
+
+/// Walk the filter AST against a specific page's ColumnIndex metadata.
+pub fn prunePage(
+    rg: *const schema.RowGroup,
+    page_idx: usize,
+    filter: ast.Filter,
+    col_indexes: []const ?schema.ColumnIndex,
+    arena: std.mem.Allocator,
+    file_meta: ?*const schema.FileMetaData,
+    trust_stats: bool,
+) !Decision {
+    return switch (filter) {
+        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, arena, file_meta, trust_stats),
+        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, arena, file_meta, trust_stats),
+        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, arena, file_meta, trust_stats),
+        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, arena, file_meta, trust_stats),
+        .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
+        .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
+        .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
+        .like => .unknown,
+        .and_filter => |c| Decision.andCombine(
+            try prunePage(rg, page_idx, c.left.*, col_indexes, arena, file_meta, trust_stats),
+            try prunePage(rg, page_idx, c.right.*, col_indexes, arena, file_meta, trust_stats),
+        ),
+        .or_filter => |c| Decision.orCombine(
+            try prunePage(rg, page_idx, c.left.*, col_indexes, arena, file_meta, trust_stats),
+            try prunePage(rg, page_idx, c.right.*, col_indexes, arena, file_meta, trust_stats),
+        ),
+    };
+}
+
+fn prunePageNullCheck(page_idx: usize, col_idx: usize, is_not: bool, col_indexes: []const ?schema.ColumnIndex) Decision {
+    if (col_idx >= col_indexes.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    const is_null_page = ci.null_pages.items[page_idx];
+    if (is_null_page) {
+        return if (is_not) .skip else .always_match;
+    }
+    if (ci.null_counts) |nc| {
+        if (page_idx < nc.items.len) {
+            const null_count = nc.items[page_idx];
+            if (is_not) {
+                if (null_count == 0) return .always_match;
+            } else {
+                if (null_count == 0) return .skip;
+            }
+        }
+    }
+    return .keep;
+}
+
+fn prunePageNumeric(
+    comptime T: type,
+    rg: *const schema.RowGroup,
+    page_idx: usize,
+    col_idx: usize,
+    op: ast.Operator,
+    value: T,
+    parquet_type: schema.Type,
+    col_indexes: []const ?schema.ColumnIndex,
+    arena: std.mem.Allocator,
+    file_meta: ?*const schema.FileMetaData,
+    trust_stats: bool,
+) !Decision {
+    if (col_idx >= col_indexes.len or col_idx >= rg.columns.items.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
+
+    // DECIMAL path
+    if (parquet_type == .DOUBLE and meta.type != .DOUBLE and T == f64) {
+        if (file_meta) |fm| {
+            if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
+                if (decimal_mod.kindFromSchema(&elem)) |kind| {
+                    return prunePageDecimal(page_idx, ci, op, value, kind, trust_stats);
+                }
+            }
+        }
+    }
+
+    if (meta.type != parquet_type) return .unknown;
+
+    // Check if null page
+    if (ci.null_pages.items[page_idx]) return .skip;
+
+    if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
+    const min = ci.min_values.items[page_idx];
+    const max = ci.max_values.items[page_idx];
+
+    const encoded_val = encoded.encode(arena, valueToString(T, value, arena) catch return .unknown, parquet_type) catch return .unknown;
+    if (!encoded_val.rangeIntersects(op, min, max)) return .skip;
+
+    if (trust_stats) {
+        const has_nulls = blk: {
+            if (ci.null_counts) |nc| {
+                if (page_idx < nc.items.len) break :blk nc.items[page_idx] > 0;
+            }
+            break :blk true;
+        };
+        if (!has_nulls) {
+            if (encoded_val.rangeAlwaysMatches(op, min, max)) return .always_match;
+        }
+    }
+
+    return .keep;
+}
+
+fn prunePageDecimal(
+    page_idx: usize,
+    ci: schema.ColumnIndex,
+    op: ast.Operator,
+    value: f64,
+    kind: decimal_mod.Kind,
+    trust_stats: bool,
+) Decision {
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    if (ci.null_pages.items[page_idx]) return .skip;
+
+    if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
+    const min_bytes = ci.min_values.items[page_idx];
+    const max_bytes = ci.max_values.items[page_idx];
+
+    const min_f = decimalStatBytesToF64(min_bytes, kind) orelse return .unknown;
+    const max_f = decimalStatBytesToF64(max_bytes, kind) orelse return .unknown;
+    if (min_f > max_f) return .unknown; // corrupt stats
+
+    const intersects = switch (op) {
+        .Eq => value >= min_f and value <= max_f,
+        .NotEq => !(min_f == max_f and min_f == value),
+        .Gt => max_f > value,
+        .GtEq => max_f >= value,
+        .Lt => min_f < value,
+        .LtEq => min_f <= value,
+    };
+    if (!intersects) return .skip;
+
+    if (trust_stats) {
+        const has_nulls = blk: {
+            if (ci.null_counts) |nc| {
+                if (page_idx < nc.items.len) break :blk nc.items[page_idx] > 0;
+            }
+            break :blk true;
+        };
+        if (!has_nulls) {
+            const always = switch (op) {
+                .Eq => min_f == max_f and min_f == value,
+                .NotEq => value < min_f or value > max_f,
+                .Gt => min_f > value,
+                .GtEq => min_f >= value,
+                .Lt => max_f < value,
+                .LtEq => max_f <= value,
+            };
+            if (always) return .always_match;
+        }
+    }
+
+    return .keep;
+}
+
+fn prunePageBytes(
+    page_idx: usize,
+    col_idx: usize,
+    op: ast.Operator,
+    value: []const u8,
+    parquet_type: schema.Type,
+    col_indexes: []const ?schema.ColumnIndex,
+) Decision {
+    _ = parquet_type;
+    if (col_idx >= col_indexes.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    if (ci.null_pages.items[page_idx]) return .skip;
+
+    if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
+    const min = ci.min_values.items[page_idx];
+    const max = ci.max_values.items[page_idx];
+
+    const intersects = encoded.rangeIntersectsBytes(op, min, max, value);
+    return if (intersects) .keep else .skip;
+}
+
+fn prunePageBoolean(
+    page_idx: usize,
+    col_idx: usize,
+    op: ast.Operator,
+    value: bool,
+    col_indexes: []const ?schema.ColumnIndex,
+) Decision {
+    if (col_idx >= col_indexes.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    if (ci.null_pages.items[page_idx]) return .skip;
+
+    if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
+    const min = ci.min_values.items[page_idx];
+    const max = ci.max_values.items[page_idx];
+
+    const intersects = encoded.rangeIntersectsBytes(if (op == .Eq) .Eq else .NotEq, min, max, &[_]u8{if (value) 1 else 0});
+    return if (intersects) .keep else .skip;
+}
+

@@ -24,6 +24,7 @@ const schema = @import("schema.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_eval = @import("filter/eval.zig");
 const filter_selection = @import("filter/selection.zig");
+const filter_prune = @import("filter/prune.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_eval = @import("expr/eval.zig");
 const expr_agg = @import("expr/agg.zig");
@@ -921,6 +922,35 @@ pub fn writeOneRowAggregate(
     return off;
 }
 
+const ConjunctiveLeaf = struct {
+    filter: filter_ast.Filter,
+    col_idx: usize,
+};
+
+fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(ConjunctiveLeaf), allocator: std.mem.Allocator) !void {
+    switch (f) {
+        .and_filter => |c| {
+            try collectConjunctiveLeaves(c.left.*, list, allocator);
+            try collectConjunctiveLeaves(c.right.*, list, allocator);
+        },
+        .or_filter => {},
+        else => {
+            const col_idx = switch (f) {
+                .int32 => |l| l.col_idx,
+                .int64 => |l| l.col_idx,
+                .float => |l| l.col_idx,
+                .double => |l| l.col_idx,
+                .string => |l| l.col_idx,
+                .boolean => |l| l.col_idx,
+                .null_check => |l| l.col_idx,
+                .like => |l| l.col_idx,
+                else => unreachable,
+            };
+            try list.append(allocator, .{ .filter = f, .col_idx = col_idx });
+        },
+    }
+}
+
 /// Per-RG aggregator update. Decodes the columns referenced by the
 /// outer filter + each aggregate's args/predicates, applies the outer
 /// filter, then folds active rows into each accumulator (with each
@@ -1008,6 +1038,102 @@ pub fn scanRGForAgg(
     var lookup = try ra.alloc(?usize, meta.schema.items.len);
     @memset(lookup, null);
 
+    const PageIndex = struct {
+        col_index: schema.ColumnIndex,
+        offset_index: schema.OffsetIndex,
+    };
+
+    const col_indexes = try ra.alloc(?PageIndex, num_leaves);
+    @memset(col_indexes, null);
+
+    if (!scan_all) {
+        for (fetch_set, 0..) |needed, ci| {
+            if (!needed) continue;
+            if (ci >= num_leaves) continue;
+            const chunk_meta = rg.columns.items[ci];
+
+            const co = chunk_meta.column_index_offset orelse continue;
+            const cl = chunk_meta.column_index_length orelse continue;
+            const oo = chunk_meta.offset_index_offset orelse continue;
+            const ol = chunk_meta.offset_index_length orelse continue;
+
+            const col_bytes = originSlice(src, co, cl) orelse continue;
+            const off_bytes = originSlice(src, oo, ol) orelse continue;
+
+            var col_reader = thrift.Reader.init(col_bytes);
+            const col_index = schema.ColumnIndex.read(ra, &col_reader) catch continue;
+
+            var off_reader = thrift.Reader.init(off_bytes);
+            const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
+
+            col_indexes[ci] = PageIndex{
+                .col_index = col_index,
+                .offset_index = offset_index,
+            };
+        }
+    }
+
+    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+
+    const col_page_is_skipped = try ra.alloc(?[]bool, num_leaves);
+    @memset(col_page_is_skipped, null);
+    const col_page_is_always_match = try ra.alloc(?[]bool, num_leaves);
+    @memset(col_page_is_always_match, null);
+
+    var conj_leaves: std.ArrayList(ConjunctiveLeaf) = .empty;
+    if (filter) |f| {
+        try collectConjunctiveLeaves(f, &conj_leaves, ra);
+    }
+
+    for (conj_leaves.items) |leaf| {
+        const ci = leaf.col_idx;
+        if (ci >= num_leaves) continue;
+        if (col_indexes[ci]) |pi| {
+            const locs = pi.offset_index.page_locations.items;
+            const skipped = col_page_is_skipped[ci] orelse blk: {
+                const s = try ra.alloc(bool, locs.len);
+                @memset(s, false);
+                break :blk s;
+            };
+            const always = col_page_is_always_match[ci] orelse blk: {
+                const a = try ra.alloc(bool, locs.len);
+                @memset(a, false);
+                break :blk a;
+            };
+            const is_first = col_page_is_skipped[ci] == null;
+
+            var ci_list = try ra.alloc(?schema.ColumnIndex, num_leaves);
+            @memset(ci_list, null);
+            for (col_indexes, 0..) |p_idx, idx| {
+                if (p_idx) |p| ci_list[idx] = p.col_index;
+            }
+
+            for (locs, 0..) |loc, page_idx| {
+                const dec = try filter_prune.prunePage(rg, page_idx, leaf.filter, ci_list, ra, meta, trust_stats);
+                const start: usize = @intCast(loc.first_row_index);
+                const end: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
+
+                if (dec == .skip) {
+                    skipped[page_idx] = true;
+                    var r = start;
+                    while (r < end) : (r += 1) {
+                        sel.set(r, false);
+                    }
+                }
+
+                const is_always = dec == .always_match;
+                if (is_first) {
+                    always[page_idx] = is_always;
+                } else {
+                    always[page_idx] = always[page_idx] and is_always;
+                }
+            }
+
+            col_page_is_skipped[ci] = skipped;
+            col_page_is_always_match[ci] = always;
+        }
+    }
+
     const t_decode_start = nowMonoNs();
     for (fetch_set, 0..) |needed, ci| {
         if (!needed) continue;
@@ -1015,10 +1141,6 @@ pub fn scanRGForAgg(
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
         const len: usize = @intCast(cm.total_compressed_size);
-        // Programmer invariant: the chunk's absolute start is at or past
-        // this byte window's origin, so the subtraction below can't
-        // underflow. A malformed file is caught by the bounds error on
-        // the next line; this guards our own RGSrc/byte_origin math.
         invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
         const buf_off = start - @as(usize, @intCast(src.byte_origin));
         if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
@@ -1027,32 +1149,67 @@ pub fn scanRGForAgg(
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
         const n_leaves: usize = @intCast(cm.num_values);
 
-        // DECIMAL: decode to f64 with scale applied (see decimal_mod
-        // for the trade-off; comment in appendProjectedRG above
-        // duplicates the rationale for the projection path).
+        var prune_info: ?PruningInfo = null;
+        if (col_indexes[ci]) |pi| {
+            const locs = pi.offset_index.page_locations.items;
+            var skipped = col_page_is_skipped[ci];
+            var always = col_page_is_always_match[ci];
+
+            if (skipped == null) {
+                const s = try ra.alloc(bool, locs.len);
+                @memset(s, false);
+                const a = try ra.alloc(bool, locs.len);
+                @memset(a, false);
+
+                for (locs, 0..) |loc, page_idx| {
+                    const start_idx: usize = @intCast(loc.first_row_index);
+                    const end_idx: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
+
+                    var has_active = false;
+                    var r = start_idx;
+                    while (r < end_idx) : (r += 1) {
+                        if (sel.isActive(r)) {
+                            has_active = true;
+                            break;
+                        }
+                    }
+                    if (!has_active) {
+                        s[page_idx] = true;
+                    }
+                }
+                skipped = s;
+                always = a;
+            }
+
+            prune_info = PruningInfo{
+                .locations = locs,
+                .page_is_skipped = skipped.?,
+                .page_is_always_match = always.?,
+                .dictionary_page_offset = cm.dictionary_page_offset,
+                .chunk_file_offset = @intCast(start),
+                .col_index = pi.col_index,
+            };
+        }
+
         const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
         const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
         const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
             .f64 = try decimal_mod.decodeColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, k),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
-            // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
-            .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves),
+            .f64 = try decodeFloat16ColumnAsF64Pruned(ra, chunk, cm.codec, levels, n_leaves, prune_info),
         } else switch (cm.type) {
-            // Unsigned ≤32-bit ints zero-extend into the i64 lane so sum/min/max
-            // are correct (signed i32 decode turns 0xFFFFFFFF into -1).
             .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
-                .{ .i64 = try decodeU32ColumnAsI64(ra, chunk, cm.codec, levels, n_leaves) }
+                .{ .i64 = try decodeU32ColumnAsI64Pruned(ra, chunk, cm.codec, levels, n_leaves, prune_info) }
             else
-                .{ .i32 = try decodeColumnT(i32, ra, chunk, cm.codec, levels, n_leaves) },
-            .INT64 => .{ .i64 = try decodeColumnT(i64, ra, chunk, cm.codec, levels, n_leaves) },
-            .FLOAT => .{ .f32 = try decodeColumnT(f32, ra, chunk, cm.codec, levels, n_leaves) },
-            .DOUBLE => .{ .f64 = try decodeColumnT(f64, ra, chunk, cm.codec, levels, n_leaves) },
-            .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, ra, chunk, cm.codec, levels, n_leaves) },
-            .BOOLEAN => .{ .boolean = try decodeColumnT(bool, ra, chunk, cm.codec, levels, n_leaves) },
-            // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
+                .{ .i32 = try decodeColumnTPruned(i32, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+            .INT64 => .{ .i64 = try decodeColumnTPruned(i64, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+            .FLOAT => .{ .f32 = try decodeColumnTPruned(f32, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+            .DOUBLE => .{ .f64 = try decodeColumnTPruned(f64, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+            .BYTE_ARRAY => .{ .string = try decodeColumnTPruned([]const u8, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+            .BOOLEAN => .{ .boolean = try decodeColumnTPruned(bool, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
             .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
-            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumn(ra, chunk, cm.codec, levels, n_leaves, flbaWidth(schema_elem)) },
+            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(ra, chunk, cm.codec, levels, n_leaves, flbaWidth(schema_elem), prune_info) },
         };
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -1061,7 +1218,6 @@ pub fn scanRGForAgg(
     timings.decode_ns += @intCast(t_decode_end - t_decode_start);
 
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
-    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     timings.eval_ns += @intCast(t_eval_end - t_decode_end);
@@ -1306,6 +1462,197 @@ fn carryIndexToSink(
 /// `num_leaves` is the column chunk's `num_values` from metadata
 /// (counts LEAVES, not logical rows — for nested cols this can be
 /// larger than the RG's row count).
+pub const PruningInfo = struct {
+    locations: []const schema.PageLocation,
+    page_is_skipped: []const bool,
+    page_is_always_match: []const bool,
+    dictionary_page_offset: ?i64,
+    chunk_file_offset: i64,
+    col_index: schema.ColumnIndex,
+};
+
+fn defaultVal(comptime T: type) T {
+    return switch (T) {
+        i32, i64 => 0,
+        f32, f64 => 0.0,
+        bool => false,
+        []const u8 => "",
+        else => unreachable,
+    };
+}
+
+fn decodeWithReaderPruned(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    reader: *column_mod.ColumnChunkReader(T),
+    levels: schema.Levels,
+    num_leaves: usize,
+    prune: PruningInfo,
+) !filter_eval.ColumnT(T) {
+    const values = try arena.alloc(T, num_leaves);
+    @memset(values, defaultVal(T));
+
+    const max_def = levels.max_def;
+    const max_rep = levels.max_rep;
+
+    var def_levels: ?[]u32 = null;
+    var rep_levels: ?[]u32 = null;
+
+    if (max_rep > 0) {
+        def_levels = try arena.alloc(u32, num_leaves);
+        @memset(def_levels.?, 0);
+        rep_levels = try arena.alloc(u32, num_leaves);
+        @memset(rep_levels.?, 0);
+    } else if (max_def > 0) {
+        def_levels = try arena.alloc(u32, num_leaves);
+        @memset(def_levels.?, 0);
+    }
+
+    if (prune.dictionary_page_offset) |dict_off| {
+        try reader.pages.seekToPage(dict_off, prune.chunk_file_offset);
+        _ = try reader.advancePage();
+    }
+
+    // 2. Loop over pages and decode or skip
+    for (prune.locations, 0..) |loc, pi| {
+        const start: usize = @intCast(loc.first_row_index);
+        const end: usize = if (pi + 1 < prune.locations.len) @intCast(prune.locations[pi + 1].first_row_index) else num_leaves;
+
+        const is_skipped = prune.page_is_skipped[pi];
+        const is_always_match = prune.page_is_always_match[pi];
+
+        if (is_skipped or is_always_match) {
+            if (is_always_match) {
+                const min_bytes = prune.col_index.min_values.items[pi];
+                const min_v = if (T == []const u8 or T == bool)
+                    defaultVal(T)
+                else blk: {
+                    const encoded_mod = @import("filter/encoded.zig");
+                    break :blk encoded_mod.readFixedLE(T, min_bytes) orelse defaultVal(T);
+                };
+                @memset(values[start..end], min_v);
+
+                if (def_levels) |dl| {
+                    @memset(dl[start..end], @intCast(max_def));
+                }
+            }
+
+            // Reposition the PageReader past this page
+            if (pi + 1 < prune.locations.len) {
+                try reader.pages.seekToPage(prune.locations[pi + 1].offset, prune.chunk_file_offset);
+            } else {
+                reader.pages.pos = reader.pages.chunk.len;
+            }
+            continue;
+        }
+
+        _ = try reader.seekAndInstallPage(loc.offset, prune.chunk_file_offset);
+
+        const want = end - start;
+        if (max_rep > 0) {
+            const n = try reader.decodeWithRepLevels(values[start..end], def_levels.?[start..end], rep_levels.?[start..end]);
+            if (n != want) return error.ShortDecode;
+        } else if (max_def > 0) {
+            const n = try reader.decodeWithLevels(values[start..end], def_levels.?[start..end]);
+            if (n != want) return error.ShortDecode;
+        } else {
+            const n = try reader.decode(values[start..end]);
+            if (n != want) return error.ShortDecode;
+        }
+    }
+
+    return .{
+        .values = values,
+        .def_levels = def_levels,
+        .max_def = @intCast(max_def),
+        .rep_levels = rep_levels,
+        .max_rep = @intCast(max_rep),
+        .has_nulls = reader.has_nulls,
+    };
+}
+
+pub fn decodeColumnTPruned(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    prune: ?PruningInfo,
+) !filter_eval.ColumnT(T) {
+    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+    if (prune) |p| {
+        return decodeWithReaderPruned(T, arena, &reader, levels, num_leaves, p);
+    } else {
+        return decodeWithReader(T, arena, &reader, levels, num_leaves);
+    }
+}
+
+fn decodeFloat16ColumnAsF64Pruned(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    prune: ?PruningInfo,
+) !filter_eval.ColumnT(f64) {
+    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune);
+    const out = try arena.alloc(f64, cb.values.len);
+    @memset(out, 0);
+    for (cb.values, 0..) |bytes, i| {
+        if (bytes.len >= 2) {
+            const bits = std.mem.readInt(u16, bytes[0..2], .little);
+            out[i] = @floatCast(@as(f16, @bitCast(bits)));
+        }
+    }
+    return .{
+        .values = out,
+        .def_levels = cb.def_levels,
+        .max_def = cb.max_def,
+        .rep_levels = cb.rep_levels,
+        .has_nulls = cb.has_nulls,
+    };
+}
+
+fn decodeU32ColumnAsI64Pruned(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    prune: ?PruningInfo,
+) !filter_eval.ColumnT(i64) {
+    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune);
+    const out = try arena.alloc(i64, c32.values.len);
+    @memset(out, 0);
+    for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
+    return .{
+        .values = out,
+        .def_levels = c32.def_levels,
+        .max_def = c32.max_def,
+        .rep_levels = c32.rep_levels,
+        .has_nulls = c32.has_nulls,
+    };
+}
+
+pub fn decodeFlbaColumnPruned(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    type_length: usize,
+    prune: ?PruningInfo,
+) !filter_eval.ColumnT([]const u8) {
+    var reader = column_mod.ColumnChunkReader([]const u8).init(chunk, codec, levels, arena);
+    reader.type_length = type_length;
+    if (prune) |p| {
+        return decodeWithReaderPruned([]const u8, arena, &reader, levels, num_leaves, p);
+    } else {
+        return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
+    }
+}
+
 pub fn decodeColumnT(
     comptime T: type,
     arena: std.mem.Allocator,

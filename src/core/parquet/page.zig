@@ -137,6 +137,14 @@ pub const PageReader = struct {
         const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
         return .{ .header = header, .bytes = decompressed };
     }
+
+    /// Reposition the reader's cursor to an absolute file offset.
+    pub fn seekToPage(self: *PageReader, absolute_offset: i64, chunk_file_offset: i64) !void {
+        if (absolute_offset < chunk_file_offset) return error.UnexpectedEndOfChunk;
+        const off: usize = @intCast(absolute_offset - chunk_file_offset);
+        if (off > self.chunk.len) return error.UnexpectedEndOfChunk;
+        self.pos = off;
+    }
 };
 
 // ============================================================

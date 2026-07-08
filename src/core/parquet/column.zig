@@ -425,10 +425,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
             };
         }
 
+        /// Reposition the page reader to the page at `absolute_offset`, then advance
+        /// and install its decoder.
+        pub fn seekAndInstallPage(self: *Self, absolute_offset: i64, chunk_file_offset: i64) !bool {
+            self.resetPageState();
+            try self.pages.seekToPage(absolute_offset, chunk_file_offset);
+            return self.advancePage();
+        }
+
         /// Pull the next page; if it's a dictionary page, cache it and
         /// loop to the next page. Returns true iff a data-page decoder
         /// was set up for use; false if the chunk is exhausted.
-        fn advancePage(self: *Self) Error!bool {
+        pub fn advancePage(self: *Self) Error!bool {
             while (try self.pages.next()) |pg| {
                 switch (pg.header.type) {
                     .DICTIONARY_PAGE => {

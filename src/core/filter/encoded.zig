@@ -53,9 +53,40 @@ pub const EncodedValue = struct {
             .INT96 => return true, // legacy / deprecated; conservative
         }
     }
+
+    /// True iff ALL values in `[min, max]` satisfy `column op self.bytes`.
+    /// Used for `.always_match` positive assertion page pruning.
+    pub fn rangeAlwaysMatches(self: EncodedValue, op: ast.Operator, min: []const u8, max: []const u8) bool {
+        switch (self.parquet_type) {
+            .INT32 => return rangeAlwaysMatchesSigned(i32, op, min, max, self.bytes),
+            .INT64 => return rangeAlwaysMatchesSigned(i64, op, min, max, self.bytes),
+            .FLOAT => return rangeAlwaysMatchesSigned(f32, op, min, max, self.bytes),
+            .DOUBLE => return rangeAlwaysMatchesSigned(f64, op, min, max, self.bytes),
+            // Truncated bounds makes BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY always_match unsafe,
+            // so we return false for these in v1.
+            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => return false,
+            .BOOLEAN => return false,
+            .INT96 => return false,
+        }
+    }
 };
 
-fn readFixedLE(comptime T: type, bytes: []const u8) ?T {
+fn rangeAlwaysMatchesSigned(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: []const u8) bool {
+    const min_v = readFixedLE(T, min) orelse return false;
+    const max_v = readFixedLE(T, max) orelse return false;
+    const needle_v = readFixedLE(T, needle) orelse return false;
+    if (min_v > max_v) return false; // corrupt stats
+    return switch (op) {
+        .Eq => min_v == max_v and min_v == needle_v,
+        .NotEq => needle_v < min_v or needle_v > max_v,
+        .Lt => max_v < needle_v,
+        .LtEq => max_v <= needle_v,
+        .Gt => min_v > needle_v,
+        .GtEq => min_v >= needle_v,
+    };
+}
+
+pub fn readFixedLE(comptime T: type, bytes: []const u8) ?T {
     const sz = @sizeOf(T);
     if (bytes.len != sz) return null;
     return switch (T) {
@@ -88,7 +119,7 @@ fn rangeOverlapsValue(comptime T: type, op: ast.Operator, lo: T, hi: T, needle: 
     };
 }
 
-fn rangeIntersectsBytes(op: ast.Operator, min: []const u8, max: []const u8, needle: []const u8) bool {
+pub fn rangeIntersectsBytes(op: ast.Operator, min: []const u8, max: []const u8, needle: []const u8) bool {
     return switch (op) {
         .Eq => !(std.mem.lessThan(u8, needle, min) or std.mem.lessThan(u8, max, needle)),
         .NotEq => !(std.mem.eql(u8, min, max) and std.mem.eql(u8, min, needle)),

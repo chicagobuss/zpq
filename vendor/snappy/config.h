@@ -23,11 +23,25 @@
 #define HAVE_UNISTD_H 1
 #define HAVE_WINDOWS_H 0
 
-// Intrinsic-specific defines. Off — generic implementation is fast
-// enough and saves us from per-target Zig flag plumbing.
+// Intrinsic-specific defines. Conditionally enabled based on target CPU features.
+#ifdef __SSSE3__
 #define SNAPPY_HAVE_SSSE3 1
+#else
+#define SNAPPY_HAVE_SSSE3 0
+#endif
+
+#ifdef __SSE4_2__
 #define SNAPPY_HAVE_X86_CRC32 1
+#else
+#define SNAPPY_HAVE_X86_CRC32 0
+#endif
+
+#ifdef __BMI2__
 #define SNAPPY_HAVE_BMI2 1
+#else
+#define SNAPPY_HAVE_BMI2 0
+#endif
+
 #define SNAPPY_HAVE_NEON 0
 #define SNAPPY_HAVE_NEON_CRC32 0
 

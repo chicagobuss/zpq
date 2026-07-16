@@ -61,12 +61,14 @@ RLE_DICTIONARY for low-cardinality byte arrays; DELTA_BINARY_PACKED for
 INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL
 columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY
 backings carry the unscaled integer — never a lossy detour through
-DOUBLE), and every write path preserves or synthesizes the page index
-so page-level pruning survives a rewrite.
+DOUBLE). Direct projection copies preserve page indexes; windowed
+filter/re-encode writes currently omit them and readers fall back to
+row-group pruning.
 
-**Stream** S3-to-S3 with `O(one-row-group)` memory regardless of total
-file size — multipart upload as the encoder produces bytes, parallel
-fetcher across files, single decoder per file.
+**Stream** S3-to-S3 with byte-bounded in-flight memory independent of
+total file size — multipart upload as the encoder produces bytes, a
+sliding row-group window for re-encode backpressure, and parallel fetch
+across files.
 
 ```bash
 zpq query data.parquet -o out.parquet \

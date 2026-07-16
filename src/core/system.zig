@@ -52,6 +52,16 @@ pub fn onLambda(env: ?std.process.Environ) bool {
     return e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") != null;
 }
 
+/// Maximum jobs admitted to a byte-buffering pipeline at once. The byte
+/// budget is authoritative: when even one average job exceeds it we still
+/// admit one so the pipeline can make progress, but requested worker
+/// parallelism must not raise this cap.
+pub fn windowCapacity(inflight_budget: u64, avg_job_bytes: u64, job_count: usize) usize {
+    if (job_count == 0) return 0;
+    const slots = @max(@as(u64, 1), inflight_budget / @max(@as(u64, 1), avg_job_bytes));
+    return @intCast(@min(slots, @as(u64, @intCast(job_count))));
+}
+
 fn getLambdaMemory(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
     if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
@@ -60,6 +70,19 @@ fn getLambdaMemory(env: ?std.process.Environ) ?usize {
         }
     }
     return null;
+}
+
+test "window capacity keeps byte budget authoritative over worker count" {
+    const mb: u64 = 1024 * 1024;
+
+    // A high requested -j must not turn a 256 MiB budget into an 8 GiB
+    // window when average row groups are 128 MiB.
+    try std.testing.expectEqual(@as(usize, 2), windowCapacity(256 * mb, 128 * mb, 100));
+    // Always admit one oversized row group so the pipeline makes progress.
+    try std.testing.expectEqual(@as(usize, 1), windowCapacity(64 * mb, 128 * mb, 100));
+    // Never create more slots than there are jobs.
+    try std.testing.expectEqual(@as(usize, 3), windowCapacity(256 * mb, 1 * mb, 3));
+    try std.testing.expectEqual(@as(usize, 0), windowCapacity(256 * mb, 1 * mb, 0));
 }
 
 fn linuxDiscover() usize {

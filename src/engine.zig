@@ -818,13 +818,11 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 system.discoverAvailableMemory(ctx.env) / 2
             else
                 @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
-            // Floor at the worker count so producers aren't starved (that many
-            // buffers are inherently required to run the requested concurrency).
-            const window: usize = std.math.clamp(
-                @as(usize, @intCast(inflight_budget / avg_rg)),
-                @min(async_budget, jobs.items.len),
-                jobs.items.len,
-            );
+            const window = system.windowCapacity(inflight_budget, avg_rg, jobs.items.len);
+            // A tight byte budget may intentionally reduce effective CPU
+            // parallelism. Idle requested workers are preferable to exceeding
+            // the memory cap and risking an OOM.
+            const effective_async_budget = @min(async_budget, window);
 
             // 3. Slots hold per-RG results; their meta arenas live to the footer.
             const slots = try arena.alloc(Slot, jobs.items.len);
@@ -849,7 +847,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .new_row_groups = &new_row_groups,
                 .arena = arena,
             };
-            try runWindowedReencode(&w, async_budget);
+            try runWindowedReencode(&w, effective_async_budget);
             out_offset = w.out_offset;
             rows_kept += w.rows_kept;
             rg_kept += w.rgs_kept;
@@ -2247,4 +2245,3 @@ test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
 }
-

@@ -314,6 +314,10 @@ const RGJob = struct {
     bytes: []const u8, // source file bytes containing this RG
     meta: *const schema.FileMetaData, // owning file's metadata (shared, read-only)
     rg: *const schema.RowGroup, // the source row group
+    /// Stats prove every row passes the filter (Decision.always_match) and the
+    /// query is byte-copy-eligible → copy the chunk verbatim instead of
+    /// decode→filter→encode. Set only when safe (see bytecopy_ok in runWrite).
+    passthrough: bool = false,
 };
 
 const EncodedRG = struct {
@@ -367,6 +371,25 @@ fn encodeRGToBuffer(
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
 }
 
+/// Byte-copy a fully-passing row group's kept columns into a buffer (no decode
+/// or re-encode) — the filter fast path. Same buffer/relative-offset shape as
+/// `encodeRGToBuffer` so the windowed writer places it identically.
+fn copyRGToBuffer(
+    gpa: std.mem.Allocator,
+    meta_alloc: std.mem.Allocator,
+    job: RGJob,
+    kept_set: ?[]const bool,
+) !EncodedRG {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
+    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
+    var local_off: u64 = 0;
+    var timings: consumer.Timings = .{};
+    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings);
+    const owned = try buf.toOwnedSlice(gpa);
+    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
+}
+
 const WinCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io = undefined, // set in runWindowedReencode once the runtime exists
@@ -374,6 +397,7 @@ const WinCtx = struct {
     filter: ?filter_ast.Filter,
     fetch_arr: []const bool,
     output_specs: []const consumer.OutputCol,
+    kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
     slots: []Slot,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
@@ -394,15 +418,11 @@ const WinCtx = struct {
 };
 
 fn winProducer(w: *WinCtx, i: usize) void {
-    const enc = encodeRGToBuffer(
-        w.gpa,
-        w.slots[i].meta_arena.allocator(),
-        w.jobs[i],
-        w.filter,
-        w.fetch_arr,
-        w.output_specs,
-        w.codec,
-    ) catch |e| {
+    const ma = w.slots[i].meta_arena.allocator();
+    const enc = (if (w.jobs[i].passthrough)
+        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set)
+    else
+        encodeRGToBuffer(w.gpa, ma, w.jobs[i], w.filter, w.fetch_arr, w.output_specs, w.codec)) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
@@ -718,6 +738,28 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         // memory is bounded by a sliding window (W row groups). No env gate —
         // the two knobs below size themselves from the environment.
 
+        // Byte-copy passthrough eligibility: a fully-passing row group
+        // (Decision.always_match) can be copied verbatim instead of
+        // decoded/filtered/re-encoded — but only for a plain filter over
+        // passthrough columns. A reordering `--select` or a DECIMAL output
+        // (which the footer coerces on re-encode) would make a byte-copied RG
+        // disagree with the footer, so exclude those.
+        var has_decimal_output = false;
+        if (select_items == null and filter_opt != null) {
+            for (0..num_leaves) |ci| {
+                if (!kept_arr[ci]) continue;
+                const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
+                if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem_val| {
+                    var e = elem_val;
+                    if (decimal_mod.kindFromSchema(&e) != null) {
+                        has_decimal_output = true;
+                        break;
+                    }
+                }
+            }
+        }
+        const bytecopy_ok = select_items == null and filter_opt != null and !has_decimal_output;
+
         // 1. Collect surviving row groups (serial, cheap stats-only pruning).
         var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
         for (opened.inputs, 0..) |in, ii| {
@@ -726,10 +768,13 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             for (meta_p.row_groups.items) |*src_rg| {
                 rgs_in += 1;
                 rows_in += src_rg.num_rows;
+                var passthrough = false;
                 if (filter_opt) |f| if (!args.scan_all) {
-                    if ((try filter_prune.pruneRowGroup(src_rg, f, arena, meta_p)) == .skip) continue;
+                    const d = try filter_prune.pruneRowGroup(src_rg, f, arena, meta_p);
+                    if (d == .skip) continue;
+                    if (bytecopy_ok and d == .always_match) passthrough = true;
                 };
-                try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg });
+                try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg, .passthrough = passthrough });
             }
         }
 
@@ -765,6 +810,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .filter = filter_opt,
                 .fetch_arr = fetch_arr,
                 .output_specs = output_specs.items,
+                .kept_set = kept_set,
                 .codec = args.codec,
                 .slots = slots,
                 .window = &window_sem,

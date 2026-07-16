@@ -133,7 +133,13 @@ fn pruneNumeric(
 
     // Encode `value` once, then compare against min/max bytes.
     const encoded_val = encoded.encode(arena, valueToString(T, value, arena) catch return .unknown, parquet_type) catch return .unknown;
-    return if (encoded_val.rangeIntersects(op, min, max)) .keep else .skip;
+    if (!encoded_val.rangeIntersects(op, min, max)) return .skip;
+    // Positive assertion: if the entire [min,max] satisfies the predicate AND
+    // the chunk has no nulls (a null never satisfies a comparison), then every
+    // row passes — the caller can byte-copy this row group instead of decoding,
+    // filtering, and re-encoding it. Requires null_count to be present and 0.
+    if ((stats.null_count orelse -1) == 0 and encoded_val.rangeAlwaysMatches(op, min, max)) return .always_match;
+    return .keep;
 }
 
 /// Pruning for DECIMAL columns: stat min/max bytes are in the

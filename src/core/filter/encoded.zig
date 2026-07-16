@@ -60,8 +60,13 @@ pub const EncodedValue = struct {
         switch (self.parquet_type) {
             .INT32 => return rangeAlwaysMatchesSigned(i32, op, min, max, self.bytes),
             .INT64 => return rangeAlwaysMatchesSigned(i64, op, min, max, self.bytes),
-            .FLOAT => return rangeAlwaysMatchesSigned(f32, op, min, max, self.bytes),
-            .DOUBLE => return rangeAlwaysMatchesSigned(f64, op, min, max, self.bytes),
+            // FLOAT/DOUBLE: a positive assertion from min/max is UNSAFE. NaNs
+            // may be excluded from (legacy) bounds, so [min,max] can look like
+            // it covers every value while NaN rows silently fail the predicate.
+            // Proving NaN absence needs `nan_count`, which zpq does not parse;
+            // per Apache Parquet's IEEE-754 total-order guidance a missing
+            // nan_count must be treated as unknown. Never claim always_match.
+            .FLOAT, .DOUBLE => return false,
             // Truncated bounds makes BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY always_match unsafe,
             // so we return false for these in v1.
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => return false,

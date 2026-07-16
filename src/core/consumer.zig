@@ -98,6 +98,7 @@ pub fn rebaseRowGroupOffsets(rg: *schema.RowGroup, base: i64) void {
         if (col.meta_data) |*md| {
             md.data_page_offset += base;
             if (md.dictionary_page_offset) |dp| md.dictionary_page_offset = dp + base;
+            if (md.index_page_offset) |ip| md.index_page_offset = ip + base;
         }
     }
 }
@@ -539,6 +540,12 @@ pub fn encodeAggregator(
     // force serial column encode when the CALLER is already parallel across
     // row groups, so we don't oversubscribe (N_rg_workers × N_col_workers).
     encode_workers: usize,
+    // Whether to synthesize + write the page index (ColumnIndex/OffsetIndex)
+    // inline after each chunk. MUST be false when writing to a relative-offset
+    // buffer that is later placed at a nonzero file offset: the OffsetIndex's
+    // serialized PageLocation.offset would stay buffer-relative and mislead
+    // readers. Direct-to-file callers (absolute out_offset) pass true.
+    emit_page_index: bool,
 ) !RGOut {
     if (agg.num_rows == 0) return .{ .surviving_rows = 0, .rg = null };
 
@@ -702,7 +709,10 @@ pub fn encodeAggregator(
         // stats the encoder already computed), written right after the
         // chunk data. Mirrors the byte-copy carry-forward so a filtered
         // re-encode keeps page-level pruning too. (2b)
-        const idx = try synthPageIndexToSink(out_arena, sink, out_offset, &enc.meta, em.data_page_offset);
+        const idx = if (emit_page_index)
+            try synthPageIndexToSink(out_arena, sink, out_offset, &enc.meta, em.data_page_offset)
+        else
+            fastpath.PageIndexPtrs{};
 
         try rg_columns.append(out_arena, .{
             .file_path = null,
@@ -1305,6 +1315,10 @@ pub fn copyRG(
     sink: streaming.Sink,
     out_offset: *u64,
     timings: *Timings,
+    // See encodeAggregator: false when writing to a relative-offset buffer that
+    // is later placed at a nonzero file offset (the carried OffsetIndex's
+    // PageLocation.offset would stay buffer-relative). Direct-to-file: true.
+    emit_page_index: bool,
 ) !RGOut {
     if (kept_set) |kept| {
         var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
@@ -1331,7 +1345,10 @@ pub fn copyRG(
             const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
             // Carry the page index forward, written to the sink right
             // after this chunk's data (offsets rebased by `delta`).
-            const idx = try carryIndexToSink(out_arena, sink, out_offset, src, src_chunk, delta);
+            const idx = if (emit_page_index)
+                try carryIndexToSink(out_arena, sink, out_offset, src, src_chunk, delta)
+            else
+                fastpath.PageIndexPtrs{};
             try new_cols.append(out_arena, shiftChunkWithIndex(src_chunk, delta, idx));
             rg_total += @intCast(src_len);
         }
@@ -1385,7 +1402,10 @@ pub fn copyRG(
     for (rg.columns.items) |chunk| {
         // Whole-RG copy: one delta for the group. Index bytes for each
         // chunk are appended after the RG data block, in column order.
-        const idx = try carryIndexToSink(out_arena, sink, out_offset, src, chunk, delta);
+        const idx = if (emit_page_index)
+            try carryIndexToSink(out_arena, sink, out_offset, src, chunk, delta)
+        else
+            fastpath.PageIndexPtrs{};
         try cols.append(out_arena, shiftChunkWithIndex(chunk, delta, idx));
     }
 
@@ -1937,6 +1957,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
         sink,
         &out_offset,
         &timings,
+        true, // direct-to-file: emit page index
     );
 
     // Bounding box for RG0 is [100, 160) = 60 bytes. Anything more

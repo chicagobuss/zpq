@@ -366,7 +366,7 @@ fn encodeRGToBuffer(
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
-    const out = try consumer.encodeAggregator(&agg, meta_alloc, gpa, sink, &local_off, codec, &timings, 1);
+    const out = try consumer.encodeAggregator(&agg, meta_alloc, gpa, sink, &local_off, codec, &timings, 1, false);
     const owned = try buf.toOwnedSlice(gpa);
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
 }
@@ -385,7 +385,7 @@ fn copyRGToBuffer(
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
     var timings: consumer.Timings = .{};
-    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings);
+    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings, false);
     const owned = try buf.toOwnedSlice(gpa);
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
 }
@@ -484,6 +484,18 @@ fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
     }
     try group.await(w.io);
     if (w.first_err) |e| return e;
+}
+
+/// True when every kept (output) column chunk of `rg` is already stored in
+/// `codec` — the precondition for a byte-copy passthrough to honor a requested
+/// --codec without re-encoding.
+fn keptColumnsUseCodec(rg: *const schema.RowGroup, kept: []const bool, codec: schema.CompressionCodec) bool {
+    for (rg.columns.items, 0..) |*col, ci| {
+        if (ci < kept.len and !kept[ci]) continue;
+        const md = col.meta_data orelse return false;
+        if (md.codec != codec) return false;
+    }
+    return true;
 }
 
 fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
@@ -718,6 +730,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     sink,
                     &out_offset,
                     &t.core,
+                    true,
                 ) else try consumer.copyRG(
                     arena,
                     src_rg,
@@ -726,6 +739,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     sink,
                     &out_offset,
                     &t.core,
+                    true,
                 );
                 if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
                 rows_kept += out.surviving_rows;
@@ -772,7 +786,12 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 if (filter_opt) |f| if (!args.scan_all) {
                     const d = try filter_prune.pruneRowGroup(src_rg, f, arena, meta_p);
                     if (d == .skip) continue;
-                    if (bytecopy_ok and d == .always_match) passthrough = true;
+                    // Byte-copy preserves the source codec, so it may only stand
+                    // in for a re-encode when the requested --codec already
+                    // matches every kept column (else re-encode to honor it).
+                    if (bytecopy_ok and d == .always_match and
+                        keptColumnsUseCodec(src_rg, kept_arr, args.codec))
+                        passthrough = true;
                 };
                 try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg, .passthrough = passthrough });
             }
@@ -791,11 +810,21 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             var sum_bytes: u64 = 0;
             for (jobs.items) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
             const avg_rg = @max(@as(u64, 1), sum_bytes / jobs.items.len);
-            const window: usize = if (system.onLambda(ctx.env)) win: {
-                // Use ~half the owned tier for in-flight encoded output.
-                const half_mem = system.discoverAvailableMemory(ctx.env) / 2;
-                break :win std.math.clamp(half_mem / avg_rg, @min(async_budget, jobs.items.len), jobs.items.len);
-            } else @min(@max(2 * async_budget, @as(usize, 1)), jobs.items.len);
+            // In-flight memory budget for buffered encoded output, byte-derived
+            // in BOTH environments so a large -j or large row groups can't
+            // retain many GB. On Lambda we own the container → ~half the tier;
+            // elsewhere stay polite (a modest cap / small fraction of avail).
+            const inflight_budget: u64 = if (system.onLambda(ctx.env))
+                system.discoverAvailableMemory(ctx.env) / 2
+            else
+                @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
+            // Floor at the worker count so producers aren't starved (that many
+            // buffers are inherently required to run the requested concurrency).
+            const window: usize = std.math.clamp(
+                @as(usize, @intCast(inflight_budget / avg_rg)),
+                @min(async_budget, jobs.items.len),
+                jobs.items.len,
+            );
 
             // 3. Slots hold per-RG results; their meta arenas live to the footer.
             const slots = try arena.alloc(Slot, jobs.items.len);

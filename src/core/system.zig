@@ -23,6 +23,35 @@ pub fn discoverAvailableMemory(env: ?std.process.Environ) usize {
     return 512 * 1024 * 1024;
 }
 
+/// Effective usable CPU parallelism.
+///
+/// On AWS Lambda the vCPU allocation is proportional to the memory tier
+/// (~1 full vCPU per 1769 MB) and is throttled far below the *host* core
+/// count that `std.Thread.getCpuCount()` reports. Fanning work across host
+/// cores there oversubscribes the throttle and slows things down — measured
+/// as a real regression on the re-encode write path. So on Lambda we derive
+/// cores from the memory tier; everywhere else we trust `getCpuCount()`.
+pub fn discoverAvailableParallelism(env: ?std.process.Environ) usize {
+    const host = std.Thread.getCpuCount() catch 1;
+    if (env) |e| {
+        if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
+            if (std.fmt.parseInt(usize, val_str, 10) catch null) |mem_mb| {
+                const vcpus = @max(@as(usize, 1), mem_mb / 1769);
+                return @min(vcpus, host);
+            }
+        }
+    }
+    return host;
+}
+
+/// True when running inside an AWS Lambda container (memory tier is known and
+/// the whole container is ours). Callers use this to size in-flight memory
+/// generously from the owned tier, vs. staying polite on a shared machine.
+pub fn onLambda(env: ?std.process.Environ) bool {
+    const e = env orelse return false;
+    return e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") != null;
+}
+
 fn getLambdaMemory(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
     if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {

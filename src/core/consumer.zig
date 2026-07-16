@@ -84,6 +84,24 @@ pub const RGOut = struct {
     rg: ?schema.RowGroup,
 };
 
+/// Shift every absolute file offset in a row group's column metadata by
+/// `base`. Used by the row-group-parallel write path: each RG is encoded
+/// into its own buffer with offsets relative to 0, then placed at its
+/// final file position `base` and rebased here. Mirrors exactly the
+/// `+= out_offset.*` arithmetic `encodeAggregator` does inline when it
+/// writes straight to the sink.
+pub fn rebaseRowGroupOffsets(rg: *schema.RowGroup, base: i64) void {
+    for (rg.columns.items) |*col| {
+        col.file_offset += base;
+        if (col.column_index_offset) |v| col.column_index_offset = v + base;
+        if (col.offset_index_offset) |v| col.offset_index_offset = v + base;
+        if (col.meta_data) |*md| {
+            md.data_page_offset += base;
+            if (md.dictionary_page_offset) |dp| md.dictionary_page_offset = dp + base;
+        }
+    }
+}
+
 /// Accumulates filtered+projected output columns across multiple input
 /// row groups so the encoder can emit one large output RG.
 ///
@@ -517,6 +535,10 @@ pub fn encodeAggregator(
     out_offset: *u64,
     output_codec: schema.CompressionCodec,
     timings: *Timings,
+    // Column-encode parallelism: 0 = auto (min(n_cols, cpus)). Pass 1 to
+    // force serial column encode when the CALLER is already parallel across
+    // row groups, so we don't oversubscribe (N_rg_workers × N_col_workers).
+    encode_workers: usize,
 ) !RGOut {
     if (agg.num_rows == 0) return .{ .surviving_rows = 0, .rg = null };
 
@@ -594,7 +616,8 @@ pub fn encodeAggregator(
     // of indices via stride. Results indexed by spec position so the
     // sequential write phase below preserves output order.
     const cpus = std.Thread.getCpuCount() catch 2;
-    const num_workers: usize = @min(n_specs, @max(@as(usize, 2), cpus));
+    const auto_workers: usize = @min(n_specs, @max(@as(usize, 2), cpus));
+    const num_workers: usize = if (encode_workers > 0) @min(n_specs, encode_workers) else auto_workers;
 
     const results = try ra.alloc(?encoder.EncodedColumn, n_specs);
     @memset(results, null);

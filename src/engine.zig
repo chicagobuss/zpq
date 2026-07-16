@@ -27,6 +27,7 @@ const decimal_mod = @import("core/parquet/decimal.zig");
 const consumer = @import("core/consumer.zig");
 const invariant = @import("core/invariant.zig");
 const scan = @import("core/scan.zig");
+const system = @import("core/system.zig");
 const metadata = @import("core/parquet/metadata.zig");
 const schema_tree = @import("core/parquet/schema_tree.zig");
 const thrift = @import("core/thrift.zig");
@@ -285,6 +286,186 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
 
 const PAR1: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
+// ── Windowed parallel re-encode (Io.Group.async + sliding window) ─────
+// Producers decode+filter+encode whole row groups concurrently, bounded by the
+// Io's `async_limit`; a single in-order writer drains their buffers to the
+// sink, rebasing each row group's file offsets. A sliding window (an
+// Io.Semaphore of W permits) caps how many encoded row groups may be in flight
+// at once, so peak memory = W × rg_bytes regardless of total output size. W is
+// sized from the environment by the caller: generously from the owned memory
+// tier on Lambda, a small polite multiple of the worker count elsewhere.
+//
+// Idiom: this is the same std.Io concurrency the S3 paths already use, applied
+// to CPU work — replacing raw std.Thread.spawn + buffer-all. (See the
+// probe_io_concurrency / probe_backpressure spikes for why async + async_limit,
+// not concurrent, and why a sliding window rather than byte credits.)
+
+/// A Sink that appends into an in-memory buffer (offsets relative to 0).
+const BufSink = struct {
+    buf: *std.ArrayListUnmanaged(u8),
+    gpa: std.mem.Allocator,
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *BufSink = @ptrCast(@alignCast(ctx));
+        try self.buf.appendSlice(self.gpa, bytes);
+    }
+};
+
+const RGJob = struct {
+    bytes: []const u8, // source file bytes containing this RG
+    meta: *const schema.FileMetaData, // owning file's metadata (shared, read-only)
+    rg: *const schema.RowGroup, // the source row group
+};
+
+const EncodedRG = struct {
+    bytes: []u8 = &.{}, // encoded RG bytes (gpa-owned; writer frees after sink.write)
+    rg: ?schema.RowGroup = null, // footer meta, offsets relative to 0 (meta_arena-owned)
+    surviving: i64 = 0,
+    err: ?anyerror = null,
+};
+
+const Slot = struct {
+    enc: EncodedRG = .{},
+    /// Private per-producer arena for this RG's (small, long-lived) footer
+    /// metadata — no cross-thread sharing, so no locking. Freed after the
+    /// footer is written. The bulk bytes live on gpa and are freed early.
+    meta_arena: std.heap.ArenaAllocator,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+/// Encode one row group into a gpa-owned byte buffer with offsets relative to
+/// 0; footer metadata is allocated on `meta_alloc` (the slot's private arena).
+fn encodeRGToBuffer(
+    gpa: std.mem.Allocator,
+    meta_alloc: std.mem.Allocator,
+    job: RGJob,
+    filter: ?filter_ast.Filter,
+    fetch_arr: []const bool,
+    output_specs: []const consumer.OutputCol,
+    codec: schema.CompressionCodec,
+) !EncodedRG {
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    var timings: consumer.Timings = .{};
+    var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
+    _ = try consumer.appendProjectedRG(
+        &agg,
+        gpa,
+        job.rg,
+        job.meta,
+        .{ .bytes = job.bytes, .byte_origin = 0 },
+        filter,
+        fetch_arr,
+        output_specs,
+        &timings,
+    );
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
+    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
+    var local_off: u64 = 0;
+    const out = try consumer.encodeAggregator(&agg, meta_alloc, gpa, sink, &local_off, codec, &timings, 1);
+    const owned = try buf.toOwnedSlice(gpa);
+    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
+}
+
+const WinCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io = undefined, // set in runWindowedReencode once the runtime exists
+    jobs: []const RGJob,
+    filter: ?filter_ast.Filter,
+    fetch_arr: []const bool,
+    output_specs: []const consumer.OutputCol,
+    codec: schema.CompressionCodec,
+    slots: []Slot,
+    window: *std.Io.Semaphore, // W permits = max row groups in flight
+    completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
+
+    // Writer-owned (single writer → no races); read back after the fan-out.
+    sink: streaming.Sink,
+    out_offset: u64,
+    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    arena: std.mem.Allocator, // writer-only append target
+    rows_kept: i64 = 0,
+    rgs_kept: usize = 0,
+    sink_ns: u64 = 0,
+    first_err: ?anyerror = null,
+
+    inflight: std.atomic.Value(usize) = .init(0),
+    peak_bytes: std.atomic.Value(usize) = .init(0),
+};
+
+fn winProducer(w: *WinCtx, i: usize) void {
+    const enc = encodeRGToBuffer(
+        w.gpa,
+        w.slots[i].meta_arena.allocator(),
+        w.jobs[i],
+        w.filter,
+        w.fetch_arr,
+        w.output_specs,
+        w.codec,
+    ) catch |e| {
+        w.slots[i].enc = .{ .err = e };
+        w.slots[i].done.store(true, .release);
+        w.completions.post(w.io);
+        return;
+    };
+    const now = w.inflight.fetchAdd(enc.bytes.len, .acq_rel) + enc.bytes.len;
+    var p = w.peak_bytes.load(.monotonic);
+    while (now > p) p = w.peak_bytes.cmpxchgWeak(p, now, .monotonic, .monotonic) orelse break;
+    w.slots[i].enc = enc;
+    w.slots[i].done.store(true, .release);
+    w.completions.post(w.io);
+}
+
+/// In-order writer: drains slots 0..N, rebasing offsets, writing to the sink,
+/// then freeing the bulk bytes and posting a window permit (sliding forward).
+fn winWriter(w: *WinCtx) void {
+    var next: usize = 0;
+    while (next < w.slots.len) : (next += 1) {
+        while (!w.slots[next].done.load(.acquire)) w.completions.waitUncancelable(w.io);
+        const enc = w.slots[next].enc;
+        if (enc.err) |e| {
+            if (w.first_err == null) w.first_err = e;
+        } else if (enc.rg) |rg| {
+            if (enc.surviving > 0) {
+                var rgm = rg;
+                consumer.rebaseRowGroupOffsets(&rgm, @intCast(w.out_offset));
+                const t0 = nowMonoNs();
+                w.sink.write(enc.bytes) catch |e| {
+                    if (w.first_err == null) w.first_err = e;
+                };
+                w.sink_ns += @intCast(nowMonoNs() - t0);
+                w.out_offset += enc.bytes.len;
+                w.rows_kept += enc.surviving;
+                w.rgs_kept += 1;
+                w.new_row_groups.append(w.arena, rgm) catch |e| {
+                    if (w.first_err == null) w.first_err = e;
+                };
+            }
+        }
+        if (enc.bytes.len > 0) w.gpa.free(enc.bytes);
+        _ = w.inflight.fetchSub(enc.bytes.len, .acq_rel);
+        w.window.post(w.io);
+    }
+}
+
+/// Drive the fan-out: a dedicated concurrent writer plus async producers,
+/// admitting new producers only as the window has room (back-pressure).
+fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
+    var threaded = std.Io.Threaded.init(w.gpa, .{ .async_limit = .limited(async_budget) });
+    defer threaded.deinit();
+    w.io = threaded.io();
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(w.io);
+    try group.concurrent(w.io, winWriter, .{w}); // dedicated in-order writer
+    for (0..w.jobs.len) |i| {
+        w.window.waitUncancelable(w.io); // back-pressure: block until window has room
+        group.async(w.io, winProducer, .{ w, i });
+    }
+    try group.await(w.io);
+    if (w.first_err) |e| return e;
+}
+
 fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
@@ -490,59 +671,25 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         };
     }
 
-    // Threshold for flushing the output aggregator mid-stream. Larger
-    // → better snappy compression on DOUBLE columns (per-page hash
-    // table sees more redundancy). 250K rows × 10 cols × ~15 B avg
-    // ≈ 37 MB peak buffer, well within a 2GB Lambda. Above this we
-    // flush and start a new output RG.
-    const TARGET_ROWS_PER_OUTPUT_RG: usize = 250_000;
+    // The re-encode path (need_encoder) fans row groups across the Io pool
+    // below; the byte-copy fastpath stays serial (memcpy-bound). win_slots hold
+    // the small per-row-group footer metadata (on private arenas) that the
+    // footer write further down still references, so they are freed at function
+    // scope, AFTER the footer is built. (The bulk encoded bytes are freed
+    // earlier, by the windowed writer.)
+    var win_slots: []Slot = &.{};
+    defer for (win_slots) |*s| s.meta_arena.deinit();
 
-    var agg_opt: ?consumer.OutputAggregator = null;
-    defer if (need_encoder and agg_opt != null) {
-        // Buffers live on `arena`; arena cleanup handles them.
-    };
-    if (need_encoder and metas.len > 0) {
-        agg_opt = try consumer.initOutputAggregator(arena, &metas[0], output_specs.items);
-    }
-
-    for (opened.inputs, metas) |in, meta_i| {
-        bytes_in += in.bytes.len;
-        const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
-        const meta_const = meta_i;
-        for (meta_const.row_groups.items) |*src_rg| {
-            rgs_in += 1;
-            rows_in += src_rg.num_rows;
-            if (filter_opt) |f| if (!args.scan_all) {
-                if ((try filter_prune.pruneRowGroup(src_rg, f, arena, &meta_const)) == .skip) continue;
-            };
-            if (need_encoder) {
-                _ = try consumer.appendProjectedRG(
-                    &agg_opt.?,
-                    ctx.gpa,
-                    src_rg,
-                    &meta_const,
-                    rg_src,
-                    filter_opt,
-                    fetch_arr,
-                    output_specs.items,
-                    &t.core,
-                );
-                if (agg_opt.?.num_rows >= TARGET_ROWS_PER_OUTPUT_RG) {
-                    const out = try consumer.encodeAggregator(
-                        &agg_opt.?,
-                        arena,
-                        ctx.gpa,
-                        sink,
-                        &out_offset,
-                        args.codec,
-                        &t.core,
-                    );
-                    if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
-                    rows_kept += out.surviving_rows;
-                    if (out.surviving_rows > 0) rg_kept += 1;
-                    consumer.resetAggregator(&agg_opt.?);
-                }
-            } else {
+    if (!need_encoder) {
+        // Byte-copy fastpath: copy kept column chunks verbatim (serial;
+        // memcpy-bound and already faster than every other engine).
+        for (opened.inputs, metas) |in, meta_i| {
+            bytes_in += in.bytes.len;
+            const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+            const meta_const = meta_i;
+            for (meta_const.row_groups.items) |*src_rg| {
+                rgs_in += 1;
+                rows_in += src_rg.num_rows;
                 const out = if (kept_set != null) try consumer.copyRG(
                     arena,
                     src_rg,
@@ -565,22 +712,74 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 if (out.surviving_rows > 0) rg_kept += 1;
             }
         }
-    }
+    } else {
+        // Windowed re-encode: one path for all environments. Concurrency is
+        // bounded by the Io's async_limit (Lambda-aware vCPU budget); in-flight
+        // memory is bounded by a sliding window (W row groups). No env gate —
+        // the two knobs below size themselves from the environment.
 
-    // Final flush: any remaining buffered rows go into one trailing RG.
-    if (need_encoder and agg_opt != null and agg_opt.?.num_rows > 0) {
-        const out = try consumer.encodeAggregator(
-            &agg_opt.?,
-            arena,
-            ctx.gpa,
-            sink,
-            &out_offset,
-            args.codec,
-            &t.core,
-        );
-        if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
-        rows_kept += out.surviving_rows;
-        if (out.surviving_rows > 0) rg_kept += 1;
+        // 1. Collect surviving row groups (serial, cheap stats-only pruning).
+        var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+        for (opened.inputs, 0..) |in, ii| {
+            bytes_in += in.bytes.len;
+            const meta_p = &metas[ii];
+            for (meta_p.row_groups.items) |*src_rg| {
+                rgs_in += 1;
+                rows_in += src_rg.num_rows;
+                if (filter_opt) |f| if (!args.scan_all) {
+                    if ((try filter_prune.pruneRowGroup(src_rg, f, arena, meta_p)) == .skip) continue;
+                };
+                try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg });
+            }
+        }
+
+        if (jobs.items.len > 0) {
+            // 2. Size the two knobs from the environment.
+            //    - concurrency: explicit -j, else Lambda-aware vCPU budget.
+            //    - window: on Lambda, generously from the owned memory tier;
+            //      elsewhere a small polite multiple of the worker count.
+            const async_budget = if (args.parallelism > 0)
+                args.parallelism
+            else
+                system.discoverAvailableParallelism(ctx.env);
+
+            var sum_bytes: u64 = 0;
+            for (jobs.items) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
+            const avg_rg = @max(@as(u64, 1), sum_bytes / jobs.items.len);
+            const window: usize = if (system.onLambda(ctx.env)) win: {
+                // Use ~half the owned tier for in-flight encoded output.
+                const half_mem = system.discoverAvailableMemory(ctx.env) / 2;
+                break :win std.math.clamp(half_mem / avg_rg, @min(async_budget, jobs.items.len), jobs.items.len);
+            } else @min(@max(2 * async_budget, @as(usize, 1)), jobs.items.len);
+
+            // 3. Slots hold per-RG results; their meta arenas live to the footer.
+            const slots = try arena.alloc(Slot, jobs.items.len);
+            for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(ctx.gpa) };
+            win_slots = slots;
+
+            var window_sem: std.Io.Semaphore = .{ .permits = window };
+            var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+            var w = WinCtx{
+                .gpa = ctx.gpa,
+                .jobs = jobs.items,
+                .filter = filter_opt,
+                .fetch_arr = fetch_arr,
+                .output_specs = output_specs.items,
+                .codec = args.codec,
+                .slots = slots,
+                .window = &window_sem,
+                .completions = &completions_sem,
+                .sink = sink,
+                .out_offset = out_offset,
+                .new_row_groups = &new_row_groups,
+                .arena = arena,
+            };
+            try runWindowedReencode(&w, async_budget);
+            out_offset = w.out_offset;
+            rows_kept += w.rows_kept;
+            rg_kept += w.rgs_kept;
+            t.core.sink_ns += w.sink_ns;
+        }
     }
 
     // 9. Build footer.

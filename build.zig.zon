@@ -1,6 +1,6 @@
 .{
     .name = .zpq,
-    .version = "0.1.4",
+    .version = "0.3.0",
     .fingerprint = 0xae1a0cc8c4cc362f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

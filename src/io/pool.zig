@@ -37,6 +37,10 @@ pub fn Pool(comptime N: usize) type {
     return struct {
         const Self = @This();
 
+        /// Permit count, readable from a `*Pool(N)` held as `anytype`. A ceiling for callers sizing worker loops —
+        /// extra workers would only park in `acquire` — not a concurrency policy in itself.
+        pub const capacity: usize = N;
+
         pub const Node = struct {
             conn: tls.Connection,
             host: []u8,

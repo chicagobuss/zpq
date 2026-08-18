@@ -104,6 +104,9 @@ pub const BinOp = struct {
     /// Result type — `Type.promote(left.typeOf(), right.typeOf())`.
     /// Cached at parse time.
     result_type: Type,
+    /// Height of this subtree — `1 + max(left.depth(), right.depth())`. Cached because the parser checks it on every
+    /// node it builds; a recursive walk would be O(nodes) per check.
+    depth: u32,
 };
 
 /// Built-in scalar functions. The first slice ships only `coalesce`
@@ -119,6 +122,8 @@ pub const Call = struct {
     args: []const *Expr,
     /// Result type, resolved at parse time from the args' types.
     result_type: Type,
+    /// Height of this subtree — `1 + max(arg.depth())`. See `BinOp.depth`.
+    depth: u32,
 };
 
 pub const Expr = union(enum) {
@@ -133,6 +138,16 @@ pub const Expr = union(enum) {
             .col_ref => |c| c.expr_type,
             .binop => |b| b.result_type,
             .call => |c| c.result_type,
+        };
+    }
+
+    /// Height of this subtree — leaves are 1. This, not the parser's recursion depth, is what `parser.MAX_EXPR_DEPTH`
+    /// bounds: it sets how many full intermediate columns are live at once.
+    pub fn depth(self: Expr) u32 {
+        return switch (self) {
+            .literal, .col_ref => 1,
+            .binop => |b| b.depth,
+            .call => |c| c.depth,
         };
     }
 
@@ -207,6 +222,7 @@ test "Expr.typeOf composes through binop" {
         .left = left,
         .right = right,
         .result_type = .f64,
+        .depth = 2,
     } };
     try testing.expectEqual(Type.f64, e.typeOf());
 }

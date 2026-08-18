@@ -1967,6 +1967,7 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
         .left = left,
         .right = right,
         .result_type = .i64,
+        .depth = 1 + arg.depth(),
     } };
     const computed_sum: AggCall = .{ .func = .sum, .arg = computed_arg, .where = null, .alias = "s", .result = .i64 };
     try testing.expect(!statsCoverageComplete(computed_sum, &.{meta_complete}, 0, true));
@@ -2218,6 +2219,79 @@ pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {
     };
 }
 
+/// Resolves group-by keys to group ids, with a fast path for the dominant GROUP BY shape: a single string key.
+///
+/// Dictionary-encoded values are slices into one cached dictionary buffer, so
+/// rows sharing a dictionary entry share a slice pointer. Memoizing
+/// (ptr, len) -> group id collapses one key hash per *row* into one per
+/// *distinct dictionary value*.
+///
+/// Strictly an accelerator over `GroupTable`: it hits only on exact (ptr, len) identity, `getOrInsert` stays the sole
+/// creator of groups so memory accounting is unchanged, and null rows always take the slow path (which keeps
+/// null-vs-empty-string semantics intact).
+///
+/// LIFETIME: the memo keys are raw pointers into the decode arena. Use one resolver per scan call and never across row
+/// groups — a reset arena can reissue an address and alias a stale entry to the wrong group.
+pub const GroupKeyResolver = struct {
+    scratch: std.ArrayList(u8),
+    memo: std.HashMapUnmanaged(SliceId, u32, SliceIdContext, std.hash_map.default_max_load_percentage),
+    fast_path: bool,
+
+    /// Exact identity of a decoded string: same pointer and length means the same bytes. Compared field-wise, so there
+    /// is no collision to reason about.
+    const SliceId = struct { ptr: usize, len: usize };
+
+    /// `AutoHashMap` would wyhash all 16 bytes of `SliceId` on this per-row path. Mixing the pointer alone suffices —
+    /// dictionary entries sit at well-spread addresses — and `len` still participates in `eql`, so identity stays exact
+    /// even if two keys hashed alike.
+    const SliceIdContext = struct {
+        pub fn hash(_: SliceIdContext, k: SliceId) u64 {
+            return (k.ptr ^ (k.ptr >> 32)) *% 0x9E3779B97F4A7C15;
+        }
+        pub fn eql(_: SliceIdContext, a: SliceId, b: SliceId) bool {
+            return a.ptr == b.ptr and a.len == b.len;
+        }
+    };
+
+    pub fn init(key_cols: []const filter_eval.Batch.Column) GroupKeyResolver {
+        return .{
+            .scratch = .empty,
+            .memo = .empty,
+            .fast_path = key_cols.len == 1 and key_cols[0] == .string,
+        };
+    }
+
+    pub fn deinit(self: *GroupKeyResolver, allocator: std.mem.Allocator) void {
+        self.scratch.deinit(allocator);
+        self.memo.deinit(allocator);
+    }
+
+    pub fn resolve(
+        self: *GroupKeyResolver,
+        allocator: std.mem.Allocator,
+        table: *GroupTable,
+        key_cols: []const filter_eval.Batch.Column,
+        row: usize,
+        agg_calls: []const AggCall,
+    ) !u32 {
+        if (self.fast_path and !isRowNull(key_cols[0], row)) {
+            const s = key_cols[0].string.values[row];
+            const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
+            const gop = try self.memo.getOrPut(allocator, id);
+            if (gop.found_existing) return gop.value_ptr.*;
+            // On error the entry just reserved would hold an undefined value.
+            errdefer _ = self.memo.remove(id);
+            try serializeRowKey(&self.scratch, allocator, key_cols, row);
+            const gid = try table.getOrInsert(self.scratch.items, agg_calls);
+            gop.value_ptr.* = gid;
+            return gid;
+        }
+
+        try serializeRowKey(&self.scratch, allocator, key_cols, row);
+        return table.getOrInsert(self.scratch.items, agg_calls);
+    }
+};
+
 pub fn serializeRowKey(
     list: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -2279,6 +2353,70 @@ pub fn serializeRowKey(
     }
 }
 
+/// One declared `max_memory` shared by every group table filling in parallel, rather than partitioned into fixed
+/// per-worker quotas — which made required headroom scale with parallelism.
+///
+/// A hard cap — usage never exceeds `limit` — but admission near the ceiling is approximate, since tables draw in
+/// blocks and can sit on part of one: a query within a few percent of its ceiling may be admitted at one `-j` and
+/// rejected at another. Exact per-entry accounting would instead put a contended atomic on every insertion. The
+/// stranded residue is at most ~5% of the budget in aggregate regardless of worker count (see `blockFor`), and shrinks
+/// as workers finish and return their unused blocks.
+pub const SharedBudget = struct {
+    used: std.atomic.Value(usize) = .init(0),
+    limit: usize,
+    /// Largest block a table may draw. Set by the creator, which knows how many tables will share the pool; see
+    /// `blockFor`.
+    block: usize = 64 * 1024,
+
+    /// Blocks keep the shared counter off the per-group path: the counter is cheap, but many workers invalidating one
+    /// cache line is not. Capping the block also stops a barely-grouping worker from taking a full 64 KiB and stranding
+    /// quota an active table needs.
+    const BlockMax: usize = 64 * 1024;
+
+    /// Caps blocks so all tables together strand at most ~5% of the budget. A per-worker fraction would be far wider:
+    /// early workers can reserve most of the pool between them.
+    pub fn blockFor(limit: usize, n_tables: usize) usize {
+        return @max(1, @min(BlockMax, limit / @max(1, n_tables) / 20));
+    }
+
+    fn blockSize(self: *const SharedBudget) usize {
+        return self.block;
+    }
+
+    /// True once the pool is into its last quarter.
+    ///
+    /// Block drawing and exact admission conflict: held slack can fail another table while total use is under the
+    /// limit, making admission depend on how row groups were scheduled. Slack only decides anything near the ceiling,
+    /// so blocks are used while the pool is roomy and dropped once it is not — exact where exactness is observable,
+    /// atomic off the hot path elsewhere.
+    pub fn tight(self: *const SharedBudget) bool {
+        return self.used.load(.monotonic) >= self.limit - self.limit / 4;
+    }
+
+    /// Claim at least `need` bytes, preferring a block. Returns the amount claimed, or null if even `need` will not
+    /// fit.
+    pub fn draw(self: *SharedBudget, need: usize) ?usize {
+        // Near the ceiling take exactly what is needed, so no table holds budget another table could have used.
+        const first: usize = if (self.tight()) need else @max(need, self.blockSize());
+        for ([_]usize{ first, need }) |want| {
+            var cur = self.used.load(.monotonic);
+            while (cur + want <= self.limit) {
+                if (self.used.cmpxchgWeak(cur, cur + want, .monotonic, .monotonic)) |actual| {
+                    cur = actual;
+                    continue;
+                }
+                return want;
+            }
+        }
+        return null;
+    }
+
+    pub fn release(self: *SharedBudget, bytes: usize) void {
+        if (bytes == 0) return;
+        _ = self.used.fetchSub(bytes, .monotonic);
+    }
+};
+
 pub const GroupTable = struct {
     allocator: std.mem.Allocator,
     keys: std.ArrayList([]const u8),
@@ -2286,6 +2424,11 @@ pub const GroupTable = struct {
     map: std.StringHashMap(u32),
     allocated_bytes: usize,
     max_memory_bytes: usize,
+    /// Parallel tables share one budget instead of each owning a fixed slice. Work is claimed off a shared cursor, so
+    /// which worker meets the group-heavy row groups is not knowable in advance; per-worker quotas therefore rejected
+    /// queries that fit the total, and did so *only at higher parallelism*, so raising `-j` could fail a query a lower
+    /// `-j` ran on identical data.
+    shared: ?*SharedBudget = null,
 
     const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
 
@@ -2301,6 +2444,9 @@ pub const GroupTable = struct {
     }
 
     pub fn deinit(self: *GroupTable) void {
+        // A shared table starts at a zero ceiling, so all of `max_memory_bytes` was drawn from the pool and must go
+        // back.
+        if (self.shared) |budget| budget.release(self.max_memory_bytes);
         for (self.keys.items) |key| {
             self.allocator.free(key);
         }
@@ -2317,6 +2463,17 @@ pub const GroupTable = struct {
         self.map.deinit();
     }
 
+    /// Hand back budget this table drew but has not used. Safe only from the thread that owns the table. A table that
+    /// has stopped growing must not sit on a partly-used block while another worker is still filling, or admission
+    /// again depends on how row groups happened to be scheduled.
+    pub fn releaseSlack(self: *GroupTable) void {
+        const budget = self.shared orelse return;
+        const slack = self.max_memory_bytes - self.allocated_bytes;
+        if (slack == 0) return;
+        self.max_memory_bytes = self.allocated_bytes;
+        budget.release(slack);
+    }
+
     pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall) !u32 {
         if (self.map.get(key)) |id| {
             return id;
@@ -2324,7 +2481,18 @@ pub const GroupTable = struct {
 
         const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + MapNodeOverhead;
         if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
-            return error.ExceededMemoryBudget;
+            const budget = self.shared orelse return error.ExceededMemoryBudget;
+            // Once the pool is tight, held slack distorts admission. Checked here on the draw path, not per new group,
+            // to keep the shared atomic off the insertion hot path.
+            if (budget.tight()) self.releaseSlack();
+            const deficit = (self.allocated_bytes + entry_size) - self.max_memory_bytes;
+            const got = budget.draw(deficit) orelse blk: {
+                // Our own unused block may be part of why the pool is empty.
+                self.releaseSlack();
+                break :blk budget.draw(entry_size + self.allocated_bytes - self.max_memory_bytes) orelse
+                    return error.ExceededMemoryBudget;
+            };
+            self.max_memory_bytes += got;
         }
 
         const key_copy = try self.allocator.dupe(u8, key);
@@ -2625,40 +2793,40 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     try std.testing.expect(gid2 == 1);
     try std.testing.expect(gid1_dup == 0);
 
-    var f32_vals_1 = [_]f32{ 0.0 };
+    var f32_vals_1 = [_]f32{0.0};
     const f32_col_1 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_vals_1 },
     };
-    var f32_vals_2 = [_]f32{ -0.0 };
+    var f32_vals_2 = [_]f32{-0.0};
     const f32_col_2 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_vals_2 },
     };
     var key_scratch: std.ArrayList(u8) = .empty;
     defer key_scratch.deinit(allocator);
 
-    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_col_1 }, 0);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{f32_col_1}, 0);
     const key1 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(key1);
 
-    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_col_2 }, 0);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{f32_col_2}, 0);
     const key2 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(key2);
 
     try std.testing.expectEqualSlices(u8, key1, key2);
 
-    var f32_nan_1 = [_]f32{ std.math.nan(f32) };
+    var f32_nan_1 = [_]f32{std.math.nan(f32)};
     const f32_nan_col_1 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_nan_1 },
     };
-    var f32_nan_2 = [_]f32{ std.math.nan(f32) };
+    var f32_nan_2 = [_]f32{std.math.nan(f32)};
     const f32_nan_col_2 = filter_eval.Batch.Column{
         .f32 = .{ .values = &f32_nan_2 },
     };
-    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_1 }, 0);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{f32_nan_col_1}, 0);
     const nan_key1 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(nan_key1);
 
-    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{ f32_nan_col_2 }, 0);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{f32_nan_col_2}, 0);
     const nan_key2 = try allocator.dupe(u8, key_scratch.items);
     defer allocator.free(nan_key2);
 
@@ -2667,4 +2835,48 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     var small_gt = GroupTable.init(allocator, 10);
     defer small_gt.deinit();
     try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls));
+}
+
+test "SharedBudget: tables share one budget instead of owning fixed slices" {
+    const allocator = std.testing.allocator;
+    const agg_calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 }};
+
+    // Two tables under one budget, as parallel workers are: whichever meets the group-heavy work may take the whole
+    // budget if it is the only one busy.
+    var budget = SharedBudget{ .limit = 4096 };
+    var a = GroupTable.init(allocator, 0);
+    a.shared = &budget;
+    defer a.deinit();
+    var b = GroupTable.init(allocator, 0);
+    b.shared = &budget;
+    defer b.deinit();
+
+    // `a` is idle; `b` uses far more than an even split would allow.
+    var key_buf: [16]u8 = undefined;
+    var placed: usize = 0;
+    while (placed < 500) : (placed += 1) {
+        const key = std.fmt.bufPrint(&key_buf, "k{d}", .{placed}) catch unreachable;
+        _ = b.getOrInsert(key, &agg_calls) catch break;
+    }
+    try std.testing.expect(b.keys.items.len > 0);
+    try std.testing.expect(budget.used.load(.monotonic) > 4096 / 2);
+    try std.testing.expect(a.max_memory_bytes == 0); // the idle table reserved nothing
+
+    // The ceiling is still real: drain it and the next insert is refused.
+    var full = SharedBudget{ .limit = 8 };
+    var c = GroupTable.init(allocator, 0);
+    c.shared = &full;
+    defer c.deinit();
+    try std.testing.expectError(error.ExceededMemoryBudget, c.getOrInsert("too-big", &agg_calls));
+
+    // A table that goes away returns its quota (workers merge, then free).
+    var recycle = SharedBudget{ .limit = 4096 };
+    {
+        var tmp = GroupTable.init(allocator, 0);
+        tmp.shared = &recycle;
+        _ = try tmp.getOrInsert("k", &agg_calls);
+        try std.testing.expect(recycle.used.load(.monotonic) > 0);
+        tmp.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), recycle.used.load(.monotonic));
 }

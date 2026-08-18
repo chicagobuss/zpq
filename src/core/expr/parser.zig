@@ -43,6 +43,9 @@ pub const Error = error{
     ExpectedAggFunc,
     StarOnlyValidInCount,
     TrailingTokens,
+    /// Expression nests deeper than MAX_EXPR_DEPTH. Bounds the evaluator's O(depth x rows) intermediate-column
+    /// allocation.
+    ExpressionTooDeep,
     UnsupportedAggType,
 } || std.mem.Allocator.Error || filter_parser.Error;
 
@@ -69,9 +72,22 @@ const Token = struct {
     text: []const u8,
 };
 
+/// Deepest nesting accepted in a `--select` / aggregate expression.
+///
+/// A memory bound, not a stack one: the evaluator materializes a full intermediate column per AST node and the writer
+/// keeps W row groups in flight, so peak cost is O(workers x depth x rows_per_row_group). 32 is well above ordinary
+/// hand-written expressions while keeping that multiplier bounded.
+///
+/// `max_memory` is still not enforced on the select/encode path, so this cap is the only thing stopping the
+/// pathological case.
+pub const MAX_EXPR_DEPTH: u32 = 32;
+
 const Lexer = struct {
     src: []const u8,
     pos: usize = 0,
+    /// Current parenthesis / call-argument nesting. Lives on the Lexer because it is already threaded through every
+    /// parse function.
+    depth: u32 = 0,
 
     fn peek(self: *Lexer) Error!Token {
         const save = self.pos;
@@ -310,7 +326,13 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             // Unary minus: parse the next factor and negate. Folds
             // numeric literals at parse time so `-5` lands as a single
             // literal node; non-literal sub-exprs become `0 - expr`.
+            //
+            // Self-recursive (`- - - x`), so it needs the same parse-recursion guard as parens: a long run of minus
+            // signs would overflow the parser's own stack before any node exists to measure.
+            lex.depth += 1;
+            if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             const inner = try parseFactor(arena, lex, file);
+            lex.depth -= 1;
             switch (inner) {
                 .literal => |lit| switch (lit) {
                     .i64 => |v| return .{ .literal = .{ .i64 = -v } },
@@ -324,11 +346,14 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     rp.* = inner;
                     const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
                     if (result_type == .str) return error.TypeMismatch;
+                    const depth = 1 + inner.depth();
+                    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
                     return .{ .binop = .{
                         .op = .sub,
                         .left = lp,
                         .right = rp,
                         .result_type = result_type,
+                        .depth = depth,
                     } };
                 },
             }
@@ -375,17 +400,22 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                 // same runtime lane as BYTE_ARRAY.
                 .FIXED_LEN_BYTE_ARRAY => .str,
             };
-            return .{ .col_ref = .{
-                .col_idx = col_idx,
-                .physical_type = phys,
-                .expr_type = expr_type,
-                // INT64-physical unsigned: the agg fold reads the i64 lane as
-                // u64 (≤32-bit unsigned already zero-extends at decode).
-                .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
-            } };
+            return .{
+                .col_ref = .{
+                    .col_idx = col_idx,
+                    .physical_type = phys,
+                    .expr_type = expr_type,
+                    // INT64-physical unsigned: the agg fold reads the i64 lane as u64 (≤32-bit unsigned already
+                    // zero-extends at decode).
+                    .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
+                },
+            };
         },
         .lparen => {
+            lex.depth += 1;
+            if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             const inner = try parseExpr(arena, lex, file);
+            lex.depth -= 1;
             const close = try lex.next();
             if (close.kind != .rparen) return error.ExpectedRParen;
             return inner;
@@ -414,7 +444,10 @@ fn parseCall(
     } else {
         while (true) {
             const arg = try arena.create(ast.Expr);
+            lex.depth += 1;
+            if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             arg.* = try parseExpr(arena, lex, file);
+            lex.depth -= 1;
             try args.append(arena, arg);
             const sep = try lex.next();
             switch (sep.kind) {
@@ -426,10 +459,15 @@ fn parseCall(
     }
 
     const result_type = try resolveCallType(func, args.items);
+    var deepest: u32 = 0;
+    for (args.items) |a| deepest = @max(deepest, a.depth());
+    const depth = 1 + deepest;
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
     return .{ .call = .{
         .func = func,
         .args = args.items,
         .result_type = result_type,
+        .depth = depth,
     } };
 }
 
@@ -462,6 +500,12 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
     if (op == .concat and result_type != .str) return error.TypeMismatch;
     if (op != .concat and result_type == .str) return error.TypeMismatch;
 
+    // Bounds tree height, not parser recursion: left-associative chains (`a + 1 + 1 + ...`) are parsed by a loop but
+    // still grow the left spine, which the evaluator does recurse over. Checking as we build also rejects a runaway
+    // chain before the whole AST is allocated.
+    const depth = 1 + @max(l.depth(), r.depth());
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+
     const lp = try arena.create(ast.Expr);
     const rp = try arena.create(ast.Expr);
     lp.* = l;
@@ -471,6 +515,7 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
         .left = lp,
         .right = rp,
         .result_type = result_type,
+        .depth = depth,
     } };
 }
 
@@ -532,7 +577,10 @@ fn parseAggCall(
         if (func != .count) return error.StarOnlyValidInCount;
         _ = try lex.next();
     } else {
+        lex.depth += 1;
+        if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
         arg = try parseExpr(arena, lex, file);
+        lex.depth -= 1;
     }
 
     const rp = try lex.next();

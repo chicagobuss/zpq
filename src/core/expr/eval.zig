@@ -915,7 +915,7 @@ test "binop add i64 + i64" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .add, .left = lp, .right = rp, .result_type = .i64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .add, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 11, 22, 33 }, out.i64.values);
@@ -935,7 +935,7 @@ test "binop mul with literal promotes correctly" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .literal = .{ .i64 = 10 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .mul, .left = lp, .right = rp, .result_type = .i64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .mul, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 10, 20, 30 }, out.i64.values);
@@ -956,7 +956,7 @@ test "mixed-type binop promotes both sides to f64" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .add, .left = lp, .right = rp, .result_type = .f64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .add, .left = lp, .right = rp, .result_type = .f64, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqual(@as(usize, 3), out.f64.values.len);
@@ -979,7 +979,7 @@ test "integer division truncates" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 3, 4, 4 }, out.i64.values);
@@ -1000,7 +1000,7 @@ test "integer division by zero errors" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     try testing.expectError(error.DivisionByZero, evalExpr(a, &batch, &lookup, e));
 }
@@ -1035,7 +1035,7 @@ test "string concat: column || literal" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .literal = .{ .str = "_x" } };
-    const e: ast.Expr = .{ .binop = .{ .op = .concat, .left = lp, .right = rp, .result_type = .str } };
+    const e: ast.Expr = .{ .binop = .{ .op = .concat, .left = lp, .right = rp, .result_type = .str, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqual(@as(usize, 3), out.string.values.len);
@@ -1062,7 +1062,7 @@ test "string concat: column || column" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
-    const e: ast.Expr = .{ .binop = .{ .op = .concat, .left = lp, .right = rp, .result_type = .str } };
+    const e: ast.Expr = .{ .binop = .{ .op = .concat, .left = lp, .right = rp, .result_type = .str, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("Hello, world", out.string.values[0]);
@@ -1089,7 +1089,7 @@ test "coalesce: i64 column with nulls + i64 default" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64 } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 10, -1, 30, -1, 50 }, out.i64.values);
 }
@@ -1113,7 +1113,7 @@ test "coalesce: i32 column widened to i64 with default" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64 } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 1, 99, 3 }, out.i64.values);
 }
@@ -1137,7 +1137,7 @@ test "coalesce: string column with empty default" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("alpha", out.string.values[0]);
     try testing.expectEqualStrings("<missing>", out.string.values[1]);
@@ -1169,7 +1169,7 @@ test "coalesce: col + col (str) — b fills a's nulls" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("us-west-2", out.string.values[0]);
     try testing.expectEqualStrings("ap-south-1", out.string.values[1]);
@@ -1200,7 +1200,7 @@ test "coalesce: col + col (str) — both null falls to empty" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("alpha", out.string.values[0]);
     try testing.expectEqualStrings("", out.string.values[1]);
@@ -1232,7 +1232,7 @@ test "coalesce: col + col (str) — REQUIRED col_a fast-paths to memcpy" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("x", out.string.values[0]);
     try testing.expectEqualStrings("y", out.string.values[1]);
@@ -1263,7 +1263,7 @@ test "coalesce: col + col (i64) — promotes i32+i64" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64 } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .i64, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 10, 200, 30 }, out.i64.values);
 }
@@ -1292,7 +1292,7 @@ test "coalesce: col + col (f64) — both null falls to 0.0" {
     args[0] = arg0;
     args[1] = arg1;
 
-    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .f64 } };
+    const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .f64, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expect(@abs(out.f64.values[0] - 1.5) < 1e-9);
     try testing.expect(@abs(out.f64.values[1] - 0.0) < 1e-9);

@@ -51,6 +51,15 @@ const usage_text =
     \\  --trust-stats  answer min/max/sum from file statistics instead of
     \\                 decoding (fast, but trusts the writer's stats — off
     \\                 by default; count(*) is always answered from metadata).
+    \\  --max-memory   ceiling on GROUP BY table memory across all workers.
+    \\                 A hard cap: usage never exceeds it. Workers draw from
+    \\                 it in blocks rather than each owning a fixed slice, so
+    \\                 raising -j does not shrink what a query may use. One
+    \\                 caveat: workers can briefly hold partly-used blocks,
+    \\                 together at most ~5% of the budget, so a query sitting
+    \\                 within a few percent of its ceiling may be accepted at
+    \\                 one -j and rejected at another. Give it headroom
+    \\                 rather than tuning it to the exact byte.
     \\
 ;
 
@@ -113,6 +122,12 @@ pub fn main(init: std.process.Init) !void {
                 error.BadAggArg => std.debug.print("zpq query: invalid argument for aggregate function\n", .{}),
                 error.ExpectedLParen => std.debug.print("zpq query: expected '(' in expression\n", .{}),
                 error.ExpectedRParen => std.debug.print("zpq query: expected ')' in expression\n", .{}),
+                error.ExpressionTooDeep => std.debug.print(
+                    "zpq query: expression nests too deeply (limit {d}). Each nesting level " ++
+                        "materializes another full intermediate column, so very deep expressions " ++
+                        "can exhaust memory; split the expression or precompute part of it.\n",
+                    .{zpq.core.expr.parser.MAX_EXPR_DEPTH},
+                ),
                 error.ExpectedIdentifier => std.debug.print("zpq query: expected column identifier in expression\n", .{}),
                 error.ExpectedWhere => std.debug.print("zpq query: expected WHERE keyword in expression\n", .{}),
                 error.ExpectedAggFunc => std.debug.print("zpq query: expected aggregate function\n", .{}),
@@ -152,8 +167,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("unknown subcommand: {s}\n", .{cmd});
     std.process.exit(1);
 }
-
-
 
 fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     const gpa = init.gpa;
@@ -604,7 +617,6 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         result.timings.footer_ns / std.time.ns_per_ms,
     });
 }
-
 
 fn splitCsv(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;

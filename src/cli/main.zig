@@ -123,8 +123,8 @@ pub fn main(init: std.process.Init) !void {
                 error.ExpectedLParen => std.debug.print("zpq query: expected '(' in expression\n", .{}),
                 error.ExpectedRParen => std.debug.print("zpq query: expected ')' in expression\n", .{}),
                 error.ExpressionTooDeep => std.debug.print(
-                    "zpq query: expression nests too deeply (limit {d}). Each nesting level " ++
-                        "materializes another full intermediate column, so very deep expressions " ++
+                    "zpq query: expression nests too deeply (limit {d}). Each nesting level\n" ++
+                        "materializes another full intermediate column, so very deep expressions\n" ++
                         "can exhaust memory; split the expression or precompute part of it.\n",
                     .{zpq.core.expr.parser.MAX_EXPR_DEPTH},
                 ),

@@ -1,16 +1,15 @@
 # Regression harness
 
-Locks in current behavior so we can refactor without silent perf or
-correctness regressions. Three things asserted per scenario:
+Locks in current behavior so we can refactor without silent perf or correctness regressions. Three things asserted per
+scenario:
 
-1. **Result envelope** (timing fields stripped, paths normalized) matches
-   committed golden in `golden/<name>.json`.
+1. **Result envelope** (timing fields stripped, paths normalized) matches committed golden in `golden/<name>.json`.
 2. **Median wall time** stays within `baseline.json`'s `max_ms`.
-3. **Peak RSS** stays within `max_rss_kb`. Lambda paths also assert
-   `max_internal_ms` (response's `total_ms`) which strips network jitter.
+3. **Peak RSS** stays within `max_rss_kb`. Lambda paths also assert `max_internal_ms` (response's `total_ms`) which
+   strips network jitter.
 
-Each scenario runs N times (default 5); we take the median to dampen
-first-call jitter while still catching consistent slowdowns.
+Each scenario runs N times (default 5); we take the median to dampen first-call jitter while still catching consistent
+slowdowns.
 
 ## Run
 
@@ -21,13 +20,11 @@ just bench-regression --filter glob    # only run scenarios with "glob" in name
 just bench-regression --runs 10        # more samples for stable medians
 ```
 
-Lambda scenarios need `R2_BUCKET` in env (`source .env`) and the
-`zpq-filter-r2` function deployed.
+Lambda scenarios need `R2_BUCKET` in env (`source .env`) and the `zpq-filter-r2` function deployed.
 
 ## When to update goldens / baseline
 
-After an *intentional* behavior change — new feature, planned perf
-improvement, accepted output-shape change. The flow:
+After an *intentional* behavior change — new feature, planned perf improvement, accepted output-shape change. The flow:
 
 ```bash
 # Make your change, verify it's correct.
@@ -40,9 +37,8 @@ git add benchmarks/regression/golden benchmarks/regression/baseline.json
 git commit -m "..."
 ```
 
-Don't commit baseline updates that came from "I think it ran slower
-because my laptop was hot." Re-run a few times with `--runs 10` to
-get a stable median first.
+Don't commit baseline updates that came from "I think it ran slower because my laptop was hot." Re-run a few times with
+`--runs 10` to get a stable median first.
 
 ## What's in the suite
 
@@ -59,24 +55,18 @@ get a stable median first.
 
 Notably **not** in the suite:
 
-- **Cold-start init time** — measured separately by `just probe-lambda`;
-  re-run it after changes to lambda init code (libzstd, BoringSSL
-  loader, etc.). Putting it in the regression harness would require
-  forcing AWS to scale the function down between samples, which is
-  fragile.
-- **Microbench for isolated decode throughput** — the per-scenario
-  `total_ms` and `decode_ms` proxies for this; if we want a number
-  that's *just* decode rate we'd need an instrumented binary.
-- **Cross-impl correctness** — that's `tools/conformance.py` against
-  apache/parquet-testing.
+- **Cold-start init time** — measured separately by `just probe-lambda`; re-run it after changes to lambda init code
+  (libzstd, BoringSSL loader, etc.). Putting it in the regression harness would require forcing AWS to scale the
+  function down between samples, which is fragile.
+- **Microbench for isolated decode throughput** — the per-scenario `total_ms` and `decode_ms` proxies for this; if we
+  want a number that's *just* decode rate we'd need an instrumented binary.
+- **Cross-impl correctness** — that's `tools/conformance.py` against apache/parquet-testing.
 
 ## Fixtures
 
-`data/benchmark_100mb.parquet` is the canonical single-file fixture
-(committed; 155 MB, 524 288 rows, 4 row groups, mixed column types).
-For multi-file scenarios, the harness symlinks 4 copies into
-`benchmarks/regression/.tmp_glob/` (gitignored) so glob queries see a
-4-file dataset without 4× the disk.
+`data/benchmark_100mb.parquet` is the canonical single-file fixture (committed; 155 MB, 524 288 rows, 4 row groups,
+mixed column types). For multi-file scenarios, the harness symlinks 4 copies into `benchmarks/regression/.tmp_glob/`
+(gitignored) so glob queries see a 4-file dataset without 4× the disk.
 
 ## Tolerances
 
@@ -84,7 +74,5 @@ For multi-file scenarios, the harness symlinks 4 copies into
 - RSS: peak × 1.25 + 1 MB (Linux's RSS measurement is noisy).
 - Lambda internal: median × 1.2 + 50 ms (lambda-side scheduling jitter).
 
-If your system is quieter or noisier than the one the baseline was
-captured on, re-capture with `just bench-regression-update`. The
-absolute numbers aren't load-bearing; the *ratio* between current and
-baseline is.
+If your system is quieter or noisier than the one the baseline was captured on, re-capture with `just
+bench-regression-update`. The absolute numbers aren't load-bearing; the *ratio* between current and baseline is.

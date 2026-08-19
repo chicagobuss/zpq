@@ -70,10 +70,10 @@ const Token = struct {
     text: []const u8,
 };
 
-/// A memory bound, not a stack one: the evaluator materializes a full intermediate column per AST node, in each of the
-/// row groups a worker holds in flight, so peak cost is O(workers x depth x rows_per_row_group). `max_memory` is
-/// unenforced on this path, so the cap is the only thing bounding the pathological case; 32 is well above any
-/// hand-written expression.
+/// Bounds AST height and the parser's own recursion alike: `lex.depth` catches paren/unary-minus/call nesting before
+/// any node exists, while the tree-height checks bound memory — the evaluator materializes a full intermediate column
+/// per AST node in each row group a worker holds in flight, so peak cost is O(workers x depth x rows_per_row_group).
+/// `max_memory` is unenforced on this path, so this cap is the only thing bounding the pathological case.
 pub const MAX_EXPR_DEPTH: u32 = 32;
 
 const Lexer = struct {

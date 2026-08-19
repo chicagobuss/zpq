@@ -954,7 +954,8 @@ fn resolveGroupSelectCols(
 
 /// Framing for a group-key column, taken from the expression's own type.
 ///
-/// Must match `evalGroupKeyExpr`, which serializes the column off the same switch, so the two cannot drift.
+/// Must agree with the lane `evalGroupKeyExpr` produces and `expr_agg.serializeRowKey` then writes: i32 and i64 both
+/// serialize as an 8-byte i64, f32 and f64 as an 8-byte f64, so these three cover every column variant.
 /// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
 fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
     return switch (expr.typeOf()) {

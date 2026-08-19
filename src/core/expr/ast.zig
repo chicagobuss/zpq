@@ -139,7 +139,7 @@ pub const Expr = union(enum) {
         };
     }
 
-    /// This height, not the parser's recursion depth, is what `parser.MAX_EXPR_DEPTH` bounds: it sets how many full
+    /// Tree height, which `parser.MAX_EXPR_DEPTH` bounds alongside the parser's own recursion: it sets how many full
     /// intermediate columns are live at once.
     pub fn depth(self: Expr) u32 {
         return switch (self) {

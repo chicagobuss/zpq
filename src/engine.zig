@@ -1255,8 +1255,8 @@ fn openInputs(
             }
         }
         // GROUP BY keys are needed bytes: without them the remote plan hits MissingChunkBytes/ShortDecode, a bug local
-        // mmap hides by handing over the whole file. Tracked apart from `fetch_arr` so the stats-drop below cannot
-        // undo them.
+        // mmap hides by handing over the whole file. The stats-drop below cannot strip them again: it is gated on
+        // `args.group_by == null`.
         const group_cols = try arena.alloc(bool, num_leaves);
         @memset(group_cols, false);
         if (args.group_by) |gb| {

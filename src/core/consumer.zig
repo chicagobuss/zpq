@@ -20,6 +20,11 @@
 //! any I/O. The `Sink` is opaque; the source is a borrowed slice.
 
 const std = @import("std");
+
+/// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
+/// scan.zig, which imports this module.
+const WORKER_STACK_SIZE: usize = 1 << 20;
+const spawn_util = @import("spawn.zig");
 const schema = @import("schema.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_eval = @import("filter/eval.zig");
@@ -666,6 +671,8 @@ pub fn encodeAggregator(
 
         const ctxs = try ra.alloc(AggEncodeCtx, num_workers);
         const threads = try ra.alloc(std.Thread, num_workers);
+        // Initialize every context before spawning: a partial spawn failure runs the rest inline, so none may be
+        // half-built.
         for (0..num_workers) |w| {
             ctxs[w] = .{
                 .arena = arenas[w].allocator(),
@@ -678,9 +685,19 @@ pub fn encodeAggregator(
                 .results = results,
                 .err = null,
             };
-            threads[w] = try std.Thread.spawn(.{}, aggEncodeWorker, .{&ctxs[w]});
         }
-        for (threads) |t| t.join();
+
+        var spawned: usize = 0;
+        for (0..num_workers) |w| {
+            // Not `try`: an early return would unwind while earlier workers are still encoding into `arenas`, which
+            // the caller releases.
+            threads[w] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, aggEncodeWorker, .{&ctxs[w]}) catch break;
+            spawned += 1;
+        }
+        // Every context that missed its thread must run here, or its columns go unencoded and the write phase fails
+        // with MissingEncodeResult.
+        for (spawned..num_workers) |w| aggEncodeWorker(&ctxs[w]);
+        for (threads[0..spawned]) |t| t.join();
         for (ctxs) |c| if (c.err) |err| return err;
     }
     timings.encode_ns += @intCast(nowMonoNs() - t_enc_start);
@@ -762,7 +779,6 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
         };
     }
 }
-
 
 /// One output column. `passthrough` re-encodes a kept input column;
 /// `computed` evaluates an expression against the (post-filter) decoded
@@ -1016,6 +1032,8 @@ pub fn scanRGForAgg(
     accumulators: []expr_agg.Accumulator,
     group_by_keys: ?[]const expr_ast.Expr,
     group_table: ?*expr_agg.GroupTable,
+    /// Caller-owned decode scratch, reused across row groups: reset here, never destroyed.
+    rg_arena_state: *std.heap.ArenaAllocator,
     timings: *Timings,
 ) !void {
     const is_grouped = group_table != null;
@@ -1063,8 +1081,9 @@ pub fn scanRGForAgg(
     if (!any_decode_required) return;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
-    var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer rg_arena_state.deinit();
+    // Reset, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
+    // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
+    _ = rg_arena_state.reset(.retain_capacity);
     const ra = rg_arena_state.allocator();
 
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
@@ -1265,15 +1284,14 @@ pub fn scanRGForAgg(
         var group_id_arr = try ra.alloc(u32, num_rows);
         @memset(group_id_arr, 0);
 
-        var key_scratch: std.ArrayList(u8) = .empty;
-        defer key_scratch.deinit(ra);
+        // Never cached across row groups: the resolver's memo holds pointers into `ra`.
+        var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
+        defer key_resolver.deinit(ra);
 
         var r: usize = 0;
         while (r < num_rows) : (r += 1) {
             if (sel.isActive(r)) {
-                try expr_agg.serializeRowKey(&key_scratch, ra, key_cols, r);
-                const gid = try group_table.?.getOrInsert(key_scratch.items, agg_calls);
-                group_id_arr[r] = gid;
+                group_id_arr[r] = try key_resolver.resolve(ra, &group_table.?.*, key_cols, r, agg_calls);
             }
         }
 
@@ -1551,8 +1569,17 @@ fn decodeWithReaderPruned(
         @memset(def_levels.?, 0);
     }
 
+    // `dictionary_page_offset` is OPTIONAL, so when absent we rely on `data_page_offset` pointing at the chunk start
+    // — a claim about real writers, not the spec. Measured across parquet-testing: of the 34 chunks that omit it, 31
+    // have a DICTIONARY_PAGE there and 3 (alltypes_plain bool_col) have a real DATA_PAGE and no dictionary, so
+    // `advancePage` dispatches on page type (regression test in parquet/column.zig). `ColumnChunk.file_offset` is
+    // deliberately not consulted: deprecated and inconsistent across writers. Guards a bug where these chunks failed on
+    // the page-pruned path only.
     if (prune.dictionary_page_offset) |dict_off| {
         try reader.pages.seekToPage(dict_off, prune.chunk_file_offset);
+        _ = try reader.advancePage();
+    } else {
+        try reader.pages.seekToPage(prune.chunk_file_offset, prune.chunk_file_offset);
         _ = try reader.advancePage();
     }
 
@@ -1993,9 +2020,15 @@ test "decimal: INT32/INT64 backings decode round-trip through the encoder" {
     { // INT32-backed, scale 2 → raw / 100
         const raw = [_]i32{ 12345, -6789, 100, 0, 999999 };
         const elem = schema.SchemaElement{
-            .type = .INT32,       .type_length = null, .repetition_type = .REQUIRED,
-            .name = "value",      .num_children = 0,   .converted_type = .DECIMAL,
-            .logical_type = null, .scale = 2,          .precision = 9,
+            .type = .INT32,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .name = "value",
+            .num_children = 0,
+            .converted_type = .DECIMAL,
+            .logical_type = null,
+            .scale = 2,
+            .precision = 9,
             .field_id = null,
         };
         const enc = try encoder.encodeColumn(arena, .{
@@ -2014,9 +2047,15 @@ test "decimal: INT32/INT64 backings decode round-trip through the encoder" {
     { // INT64-backed, scale 3
         const raw = [_]i64{ 1000, -250, 0, 123456789 };
         const elem = schema.SchemaElement{
-            .type = .INT64,       .type_length = null, .repetition_type = .REQUIRED,
-            .name = "value",      .num_children = 0,   .converted_type = .DECIMAL,
-            .logical_type = null, .scale = 3,          .precision = 18,
+            .type = .INT64,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .name = "value",
+            .num_children = 0,
+            .converted_type = .DECIMAL,
+            .logical_type = null,
+            .scale = 3,
+            .precision = 18,
             .field_id = null,
         };
         const enc = try encoder.encodeColumn(arena, .{

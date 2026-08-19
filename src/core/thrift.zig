@@ -94,7 +94,7 @@ pub const Reader = struct {
 
     /// Bytes remaining from the cursor. The cursor never passes `data.len`,
     /// so this never underflows.
-    fn remaining(self: *const Reader) usize {
+    pub fn remaining(self: *const Reader) usize {
         return self.data.len - self.pos;
     }
 

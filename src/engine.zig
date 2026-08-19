@@ -45,6 +45,7 @@ const http = @import("io/http.zig");
 const sigv4 = @import("io/sigv4.zig");
 const multipart_sink = @import("io/multipart_sink.zig");
 const coalescer = @import("io/coalescer.zig");
+const AtomicWorkCursor = @import("io/work_cursor.zig").AtomicWorkCursor;
 const meta_cache_mod = @import("io/meta_cache.zig");
 
 /// Range-coalesce gap. Adjacent column-chunk ranges within a file are
@@ -58,6 +59,27 @@ const COALESCE_GAP: u64 = 64 * 1024;
 
 pub const POOL_SIZE: usize = 8;
 pub const TAIL_SIZE: u64 = 64 * 1024;
+
+/// Zig's 16 MiB default makes short-lived worker creation expensive, but this is deliberately not tuned to the minimum:
+/// a real fetch descends into BoringSSL and libc `getaddrinfo`/NSS, whose stack use nothing here bounds.
+const READ_WORKER_STACK_SIZE: usize = 4 << 20;
+
+/// Fetch worker loops in the read stage. Equal to `POOL_SIZE` so one worker holds one permit and never parks in
+/// `acquire`. A worker sleeping in retry backoff still holds its slot, so live concurrency can dip below this while a
+/// host throttles.
+pub const READ_CONCURRENCY: usize = POOL_SIZE;
+
+/// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
+/// `Io.Group.concurrent` spawns a fresh OS thread whenever every worker is busy — including one parked on a blocking
+/// socket read — so pool permits alone bound sockets only. The limit is a backstop, not a throttle: submissions past it
+/// are rejected with `error.ConcurrencyUnavailable` rather than queued, and both fetch sites submit under `try` inside
+/// a `defer group.cancel`, so exceeding it aborts the query. Raising `READ_CONCURRENCY` must raise this limit too.
+fn readExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
+    return std.Io.Threaded.init(gpa, .{
+        .concurrent_limit = .limited(READ_CONCURRENCY),
+        .stack_size = READ_WORKER_STACK_SIZE,
+    });
+}
 
 pub const Error = error{
     NoInputs,
@@ -1078,8 +1100,13 @@ pub fn fetchS3Schema(
     try pool.init(ctx.gpa);
     defer pool.deinit();
 
+    var read_exec = readExecutor(ctx.gpa);
+    defer read_exec.deinit();
+    var read_ctx = ctx;
+    read_ctx.io = read_exec.io();
+
     var specs = [_]FetchSpec{.{ .url = url }};
-    try fetchMetaBatch(ctx, arena, creds, pool, &specs);
+    try fetchMetaBatch(read_ctx, arena, creds, pool, &specs);
 
     // fetchMetaBatch's parsed metadata borrows string bytes from the
     // gpa-owned footer_region (thrift readString borrows, never copies).
@@ -1147,6 +1174,11 @@ fn openInputs(
     if (s3_indices.items.len > 0) {
         const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
 
+        var read_exec = readExecutor(ctx.gpa);
+        defer read_exec.deinit();
+        var read_ctx = ctx;
+        read_ctx.io = read_exec.io();
+
         // Parse and validate s3 URLs, group by bucket. The current rule:
         // all s3 inputs share one bucket per call (matches lambda's
         // existing constraint). Cross-bucket scans are a separate
@@ -1176,7 +1208,7 @@ fn openInputs(
         // total file size + tail_start.
         var specs = try arena.alloc(FetchSpec, s3_urls.len);
         for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u };
-        fetchMetaBatch(ctx, arena, creds, pool, specs) catch |err| {
+        fetchMetaBatch(read_ctx, arena, creds, pool, specs) catch |err| {
             for (specs) |sp| {
                 if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
@@ -1222,6 +1254,18 @@ fn openInputs(
                 if (ci < num_leaves) fetch_arr[ci] = true;
             }
         }
+        // GROUP BY keys are needed bytes: without them the remote plan hits MissingChunkBytes/ShortDecode, a bug local
+        // mmap hides by handing over the whole file. The stats-drop below cannot strip them again: it is gated on
+        // `args.group_by == null`.
+        const group_cols = try arena.alloc(bool, num_leaves);
+        @memset(group_cols, false);
+        if (args.group_by) |gb| {
+            const items = try expr_parser.parseGroupBy(arena, gb, meta0);
+            for (items) |item| item.expr.collectColumns(group_cols);
+            for (group_cols, 0..) |needed, ci| if (needed) {
+                fetch_arr[ci] = true;
+            };
+        }
         const agg_calls_for_plan: ?[]const expr_agg.AggCall = if (args.aggregate) |agg_str|
             try expr_parser.parseAggList(arena, agg_str, meta0)
         else
@@ -1238,7 +1282,9 @@ fn openInputs(
                 }
             }
         }
-        if (filter_for_plan == null and !args.scan_all) {
+        // A whole-file statistic cannot answer a per-group aggregate, so under grouping no column is stats-answerable
+        // — mirrors the gate in `scan.runMultiAggregate`. Dropping one left grouped decode without its bytes.
+        if (filter_for_plan == null and args.group_by == null and !args.scan_all) {
             if (agg_calls_for_plan) |calls| {
                 const metas_for_stats = try arena.alloc(schema.FileMetaData, specs.len);
                 for (specs, 0..) |sp, i| metas_for_stats[i] = sp.meta;
@@ -1353,7 +1399,7 @@ fn openInputs(
                         .bucket = sp.url.bucket,
                         .key = sp.url.key,
                         .range = .{ .start = r.start, .end = fetch_end },
-                        .target = dst[0 .. @intCast(fetch_end - r.start)],
+                        .target = dst[0..@intCast(fetch_end - r.start)],
                     });
                 }
 
@@ -1380,7 +1426,7 @@ fn openInputs(
         // s3.fetchJobs handles the Io.Group fan-out + per-job pool
         // acquire/release.
         if (fetch_jobs.items.len > 0) {
-            _ = try s3.fetchJobs(ctx.io, pool, ctx.gpa, arena, creds, fetch_jobs.items);
+            _ = try s3.fetchJobs(read_ctx.io, pool, ctx.gpa, arena, creds, fetch_jobs.items, READ_CONCURRENCY);
         }
 
         // Build scan.Inputs. bytes is the compact per-file buffer with
@@ -1464,10 +1510,20 @@ fn fetchMetaBatch(
         .pool = pool,
         .sp = sp,
     };
+    // One worker loop per permit rather than one task per file: `Io.Group.concurrent` grows the thread pool on every
+    // submission that finds all workers busy, so a thousand-file glob spawned a thousand.
     {
+        var shared: AtomicWorkCursor(TaskCtx) = .{ .items = task_ctxs };
+        const Worker = struct {
+            fn run(sh: *AtomicWorkCursor(TaskCtx)) std.Io.Cancelable!void {
+                while (sh.next()) |tc| try Task.run(tc);
+            }
+        };
         var group: std.Io.Group = .init;
         defer group.cancel(ctx.io);
-        for (task_ctxs) |*tc| try group.concurrent(ctx.io, Task.run, .{tc});
+        for (0..@min(READ_CONCURRENCY, task_ctxs.len)) |_| {
+            try group.concurrent(ctx.io, Worker.run, .{&shared});
+        }
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| return err;
@@ -1623,6 +1679,19 @@ fn rebaseFetchedOffsets(
     ranges: []const CompactRange,
     survivors: []const bool,
 ) !void {
+    // Page-index blocks are never fetched, so their offsets have nothing to rebase onto — yet consumers bounds-check
+    // them against the compact buffer, not the file. In a noncanonical file a stale offset can land inside that buffer,
+    // where unrelated bytes may decode as a ColumnIndex whose foreign min/max prune pages on read and get copied into
+    // output on write. Pruned row groups are cleared too: the metadata no longer describes the source layout.
+    for (meta.row_groups.items) |*rg| {
+        for (rg.columns.items) |*chunk| {
+            chunk.column_index_offset = null;
+            chunk.column_index_length = null;
+            chunk.offset_index_offset = null;
+            chunk.offset_index_length = null;
+        }
+    }
+
     for (meta.row_groups.items, 0..) |*rg, rg_i| {
         // Pruned row groups contributed no fetch ranges, so their chunk
         // offsets can't be rebased — and never need to be: the scan
@@ -1698,6 +1767,7 @@ fn mmapFile(path: []const u8) !MmapHandle {
     if (r_signed < 0) return error.OpenFailed;
 
     const ptr: [*]const u8 = @ptrFromInt(r_map);
+
     return .{ .addr = ptr, .len = size };
 }
 
@@ -2232,10 +2302,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     var stderr_writer = StdoutWriter{ .fd = 2 };
     defer stderr_writer.flush() catch {};
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
-    stderr_writer.print(
-        "{{\"ok\":true,\"rows_in\":{d},\"rows_printed\":{d},\"total_ms\":{d}}}\n",
-        .{ rows_in, total_printed, total_ms }
-    ) catch {};
+    stderr_writer.print("{{\"ok\":true,\"rows_in\":{d},\"rows_printed\":{d},\"total_ms\":{d}}}\n", .{ rows_in, total_printed, total_ms }) catch {};
 }
 
 // ============================================================
@@ -2244,4 +2311,82 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
+}
+
+test "rebaseFetchedOffsets clears page-index pointers that would resolve inside the compact buffer" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The index pointers deliberately fall *inside* the implied 128-byte compact buffer, modelling the noncanonical
+    // file this clearing exists for; a conforming writer's offsets would fail bounds anyway.
+    var meta: schema.FileMetaData = .{};
+    for ([_]i64{ 1_000_000, 2_000_000 }) |dpo| {
+        var rg: schema.RowGroup = .{};
+        var chunk: schema.ColumnChunk = .{
+            .file_offset = dpo,
+            .column_index_offset = 32,
+            .column_index_length = 16,
+            .offset_index_offset = 96,
+            .offset_index_length = 16,
+        };
+        chunk.meta_data = .{ .data_page_offset = dpo };
+        try rg.columns.append(arena, chunk);
+        try meta.row_groups.append(arena, rg);
+    }
+
+    const ranges = [_]CompactRange{
+        .{ .start = 1_000_000, .end = 1_000_064, .dst_start = 0 },
+        .{ .start = 2_000_000, .end = 2_000_064, .dst_start = 64 },
+    };
+    const fetch_arr = [_]bool{true};
+    const survivors = [_]bool{ true, true };
+
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors);
+
+    for (meta.row_groups.items, 0..) |rg, i| {
+        const chunk = rg.columns.items[0];
+        try std.testing.expectEqual(
+            @as(i64, @intCast(i * 64)),
+            chunk.meta_data.?.data_page_offset,
+        );
+        try std.testing.expectEqual(@as(?i64, null), chunk.column_index_offset);
+        try std.testing.expectEqual(@as(?i32, null), chunk.column_index_length);
+        try std.testing.expectEqual(@as(?i64, null), chunk.offset_index_offset);
+        try std.testing.expectEqual(@as(?i32, null), chunk.offset_index_length);
+    }
+}
+
+test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A pruned row group is skipped by the rebase loop, so clearing that rode along with rebasing would leave its
+    // stale pointers.
+    var meta: schema.FileMetaData = .{};
+    var rg: schema.RowGroup = .{};
+    var chunk: schema.ColumnChunk = .{
+        .file_offset = 9_000_000,
+        .column_index_offset = 128,
+        .column_index_length = 32,
+        .offset_index_offset = 160,
+        .offset_index_length = 16,
+    };
+    chunk.meta_data = .{ .data_page_offset = 9_000_000 };
+    try rg.columns.append(arena, chunk);
+    try meta.row_groups.append(arena, rg);
+
+    const ranges = [_]CompactRange{};
+    const fetch_arr = [_]bool{true};
+    const survivors = [_]bool{false};
+
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors);
+
+    const out = meta.row_groups.items[0].columns.items[0];
+    try std.testing.expectEqual(@as(?i64, null), out.column_index_offset);
+    try std.testing.expectEqual(@as(?i64, null), out.offset_index_offset);
+    try std.testing.expectEqual(@as(i64, 9_000_000), out.meta_data.?.data_page_offset);
 }

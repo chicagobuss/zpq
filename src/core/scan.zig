@@ -20,6 +20,7 @@
 
 const std = @import("std");
 
+const spawn_util = @import("spawn.zig");
 const schema = @import("schema.zig");
 const consumer = @import("consumer.zig");
 const metadata = @import("parquet/metadata.zig");
@@ -32,6 +33,8 @@ const filter_prune = @import("filter/prune.zig");
 
 pub const Error = error{
     NoInputs,
+    /// A serialized group key did not match the framing the writer used.
+    BadGroupKey,
     SchemaMismatch,
     EmptyAggregate,
     AggSumOverflow,
@@ -153,12 +156,122 @@ const WorkItem = struct {
     accumulators: []expr_agg.Accumulator,
 };
 
+/// Zig's 16 MiB default makes worker creation expensive for short scans. Safe to shrink: these workers decode, and
+/// every nesting path here is bounded.
+pub const WORKER_STACK_SIZE: usize = 1 << 20;
+
+/// One footer-parsing worker. Files are claimed dynamically so wildly uneven file sizes don't leave threads idle.
+const ParseCtx = struct {
+    inputs: []const Input,
+    out: []schema.FileMetaData,
+    cursor: *std.atomic.Value(usize),
+    /// Private to this worker: ArenaAllocator is not thread-safe, so no two threads may ever share one ParseCtx.
+    arena: *std.heap.ArenaAllocator,
+    err: ?anyerror = null,
+    bad_index: usize = 0,
+    /// Entries into `parseWorker` with this context; must never exceed 1. Asserted after join rather than watching for
+    /// the race itself, which is UB and unreliable to observe.
+    runs: std.atomic.Value(u32) = .init(0),
+};
+
+fn parseWorker(c: *ParseCtx) void {
+    _ = c.runs.fetchAdd(1, .monotonic);
+    while (true) {
+        const i = c.cursor.fetchAdd(1, .monotonic);
+        if (i >= c.inputs.len) break;
+        c.out[i] = metadata.open(c.arena.allocator(), c.inputs[i].bytes) catch |e| {
+            if (c.err == null) {
+                c.err = e;
+                c.bad_index = i;
+            }
+            // Don't stop: the reported failure must be the lowest-indexed one.
+            continue;
+        };
+    }
+}
+
+/// Outcome of parsing every input's footer. Failure reports the LOWEST failing index, not whichever worker lost the
+/// race, so runs stay reproducible.
+const FooterParse = union(enum) {
+    ok: []schema.FileMetaData,
+    failed: struct { err: anyerror, index: usize },
+};
+
+/// Parse all input footers, in parallel when there is more than one file.
+///
+/// Ownership of the per-worker arenas passes to the caller via `meta_arenas_out`, which must outlive the returned
+/// metadata: the returned slice points into them.
+fn parseFooters(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    inputs: []const Input,
+    parallelism: usize,
+    meta_arenas_out: *[]std.heap.ArenaAllocator,
+) std.mem.Allocator.Error!FooterParse {
+    const parsed = try arena.alloc(schema.FileMetaData, inputs.len);
+    const parse_threads = @min(
+        inputs.len,
+        if (parallelism == 0) (std.Thread.getCpuCount() catch 1) else parallelism,
+    );
+
+    if (parse_threads <= 1) {
+        for (inputs, 0..) |in, i| {
+            parsed[i] = metadata.open(arena, in.bytes) catch |err| {
+                return .{ .failed = .{ .err = err, .index = i } };
+            };
+        }
+        return .{ .ok = parsed };
+    }
+
+    const meta_arenas = try arena.alloc(std.heap.ArenaAllocator, parse_threads);
+    for (meta_arenas) |*a| a.* = std.heap.ArenaAllocator.init(gpa);
+    meta_arenas_out.* = meta_arenas;
+
+    var cursor = std.atomic.Value(usize).init(0);
+    const ctxs = try arena.alloc(ParseCtx, parse_threads);
+    for (ctxs, 0..) |*c, i| c.* = .{
+        .inputs = inputs,
+        .out = parsed,
+        .cursor = &cursor,
+        .arena = &meta_arenas[i],
+    };
+
+    const threads = try arena.alloc(std.Thread, parse_threads);
+    var spawned: usize = 0;
+    for (ctxs) |*c| {
+        threads[spawned] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, parseWorker, .{c}) catch break;
+        spawned += 1;
+    }
+    // Must use a context no thread owns — see `ParseCtx.arena`; reusing ctxs[0] would race live worker 0. One inline
+    // pass drains whatever is left however many spawns failed, since work comes off a shared cursor.
+    if (spawned < parse_threads) parseWorker(&ctxs[spawned]);
+    // Join before reading anything the threads wrote, and before the caller can tear `meta_arenas` down underneath
+    // them.
+    for (threads[0..spawned]) |th| th.join();
+
+    // Historical bug: the inline pass ran on `ctxs[0]` while worker 0 was still live, putting two threads in one arena.
+    for (ctxs) |*c| std.debug.assert(c.runs.load(.monotonic) <= 1);
+
+    var worst: ?ParseCtx = null;
+    for (ctxs) |c| {
+        if (c.err == null) continue;
+        if (worst == null or c.bad_index < worst.?.bad_index) worst = c;
+    }
+    if (worst) |w| return .{ .failed = .{ .err = w.err.?, .index = w.bad_index } };
+    return .{ .ok = parsed };
+}
+
 /// One worker thread's slice of work.
 const Worker = struct {
     gpa: std.mem.Allocator,
     inputs: []const Input,
     metas: []const schema.FileMetaData,
+    /// The FULL work list, shared by every worker; items are claimed through `cursor`. Row-group cost varies too much
+    /// — size, encoding, whether a filter prunes them — for a static split not to leave workers idle.
     work: []const WorkItem,
+    /// Relaxed ordering suffices: this only hands out disjoint indices, and the post-join merge is the real
+    /// synchronization edge.
+    cursor: *std.atomic.Value(usize),
     agg_calls: []const expr_agg.AggCall,
     filter_opt: ?filter_ast.Filter,
     scan_all: bool,
@@ -177,10 +290,20 @@ fn workerRun(w: *Worker) void {
     workerRunErr(w) catch |e| {
         w.err = e;
     };
+    // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
+    // doing the real work.
+    if (w.group_table) |*gt| gt.releaseSlack();
 }
 
 fn workerRunErr(w: *Worker) !void {
-    for (w.work) |item| {
+    // One decode arena for the whole run: scanRGForAgg resets it per row group instead of regrowing a fresh one.
+    var rg_decode_arena = std.heap.ArenaAllocator.init(w.gpa);
+    defer rg_decode_arena.deinit();
+
+    while (true) {
+        const idx = w.cursor.fetchAdd(1, .monotonic);
+        if (idx >= w.work.len) break;
+        const item = w.work[idx];
         const meta = &w.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
         // File bytes are shared read-only across workers (one mmap / one
@@ -220,6 +343,7 @@ fn workerRunErr(w: *Worker) !void {
                 &[_]expr_agg.Accumulator{},
                 w.group_by_keys,
                 gt,
+                &rg_decode_arena,
                 &w.timings,
             );
         } else {
@@ -236,6 +360,7 @@ fn workerRunErr(w: *Worker) !void {
                 item.accumulators,
                 null,
                 null,
+                &rg_decode_arena,
                 &w.timings,
             );
         }
@@ -257,21 +382,26 @@ pub fn runMultiAggregate(
 
     var t: Timings = .{};
 
-    // 1. Parse metadata for every input. Cheap (~ms per file); serial
-    //    keeps the schema-validation order deterministic.
+    // Parallel because footer parsing scales with file count and schema width and can dominate short multi-file scans.
+    // `meta_arenas` must outlive this call: `metas` points into them.
+    var meta_arenas: []std.heap.ArenaAllocator = &.{};
+    defer for (meta_arenas) |*a| a.deinit();
+
     const t_parse = nowMonoNs();
     const metas: []const schema.FileMetaData = if (args.metas) |m| blk: {
         if (m.len != args.inputs.len) return error.SchemaMismatch;
         break :blk m;
     } else blk: {
-        var parsed = try arena.alloc(schema.FileMetaData, args.inputs.len);
-        for (args.inputs, 0..) |in, i| {
-            parsed[i] = metadata.open(arena, in.bytes) catch |err| {
-                std.debug.print("zpq query: input file {s} is not a valid Parquet file ({s})\n", .{ in.name, @errorName(err) });
+        switch (try parseFooters(arena, gpa, args.inputs, args.parallelism, &meta_arenas)) {
+            .ok => |parsed| break :blk parsed,
+            .failed => |f| {
+                std.debug.print(
+                    "zpq query: input file {s} is not a valid Parquet file ({s})\n",
+                    .{ args.inputs[f.index].name, @errorName(f.err) },
+                );
                 return error.AlreadyReported;
-            };
+            },
         }
-        break :blk parsed;
     };
 
     // Validate schemas match the first file's: same number of leaves
@@ -475,28 +605,59 @@ pub fn runMultiAggregate(
         }
     }
 
-    const n_workers = @max(@as(usize, 1), @min(requested, work_items.items.len));
+    // Size the worker set by BYTES to decode, not row-group count: thread creation has a fixed cost and a query may
+    // touch only a small part of a wide schema. 2 MiB per worker is a conservative floor.
+    const MIN_BYTES_PER_WORKER: u64 = 2 * 1024 * 1024;
+    var fetch_bytes: u64 = 0;
+    for (work_items.items) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        for (rg.columns.items, 0..) |col, ci| {
+            if (ci < item.fetch_arr.len and item.fetch_arr[ci]) {
+                // Larger of two proxies: uncompressed bytes makes BOOLEAN (8 rows per byte) and dictionary-encoded
+                // strings (index stream only) look nearly free, so `rows x 4` floors the cost they pay when
+                // materialized.
+                if (col.meta_data) |cm| {
+                    const uncompressed: u64 = @intCast(cm.total_uncompressed_size);
+                    const by_rows: u64 = @as(u64, @intCast(rg.num_rows)) * 4;
+                    fetch_bytes += @max(uncompressed, by_rows);
+                }
+            }
+        }
+    }
+    const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / MIN_BYTES_PER_WORKER)));
+    const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
 
     var workers = try arena.alloc(Worker, n_workers);
-    var assignments = try arena.alloc(std.ArrayList(WorkItem), n_workers);
-    for (assignments) |*a| a.* = .empty;
-    for (work_items.items, 0..) |item, k| try assignments[k % n_workers].append(arena, item);
+    // One budget shared by every worker table, not per-worker quotas: work is claimed off a shared cursor, so which
+    // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
+    // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished
+    // budget.
+    var group_budget = expr_agg.SharedBudget{
+        .limit = args.max_memory,
+        .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
+    };
 
-    const actual_parallelism = if (args.parallelism > 0) args.parallelism else requested;
-    const max_memory_per_worker = args.max_memory / actual_parallelism;
-
+    var work_cursor = std.atomic.Value(usize).init(0);
     for (workers, 0..) |*w, wi| {
+        _ = wi;
         w.* = .{
             .gpa = gpa,
             .inputs = args.inputs,
             .metas = metas,
-            .work = assignments[wi].items,
+            .work = work_items.items,
+            .cursor = &work_cursor,
             .agg_calls = agg_calls,
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
             .trust_stats = args.trust_stats,
             .group_by_keys = group_by_keys,
-            .group_table = if (group_by_keys != null) expr_agg.GroupTable.init(gpa, max_memory_per_worker) else null,
+            .group_table = if (group_by_keys != null) blk_gt: {
+                // Zero local ceiling: everything is drawn from the shared pool, so an idle worker reserves nothing
+                // others could use.
+                var gt = expr_agg.GroupTable.init(gpa, 0);
+                gt.shared = &group_budget;
+                break :blk_gt gt;
+            } else null,
         };
     }
     defer if (group_by_keys != null) {
@@ -511,10 +672,16 @@ pub fn runMultiAggregate(
     const t_decode = nowMonoNs();
     if (n_workers > 1) {
         var threads = try arena.alloc(std.Thread, n_workers);
+        var spawned: usize = 0;
         for (workers, 0..) |*w, i| {
-            threads[i] = try std.Thread.spawn(.{}, workerRun, .{w});
+            // Deliberately not `try`: running threads hold pointers into `arena` and their own `group_table`, both
+            // freed by the caller, so an early return here is a use-after-free, not just a leak.
+            threads[i] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, workerRun, .{w}) catch break;
+            spawned += 1;
         }
-        for (threads) |th| th.join();
+        // Run the work that never got a thread; one runner drains the shared cursor however many spawns failed.
+        if (spawned < n_workers) workerRun(&workers[spawned]);
+        for (threads[0..spawned]) |th| th.join();
     } else {
         // Single-threaded fast path. Avoids std.Thread overhead.
         workerRun(&workers[0]);
@@ -624,7 +791,7 @@ pub fn runMultiAggregate(
         var key_types = try gpa.alloc(KeyType, keys.len);
         defer gpa.free(key_types);
         for (keys, 0..) |key_expr, idx| {
-            key_types[idx] = try keyTypeFromExpr(key_expr, meta0);
+            key_types[idx] = keyTypeFromExpr(key_expr);
         }
 
         var rows = try gpa.alloc([]const AggValue, coord_table.keys.items.len);
@@ -674,12 +841,14 @@ pub fn runMultiAggregate(
 
         coord_table.deinit();
     } else {
-        for (workers) |w| {
-            for (w.work) |item| {
-                for (item.accumulators, 0..) |sub_acc, i| {
-                    accumulators[item.agg_start + i].merge(sub_acc, gpa);
-                }
+        // Merge each work item exactly ONCE: `work` is shared and claimed dynamically, so folding it per worker would
+        // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.
+        for (work_items.items) |item| {
+            for (item.accumulators, 0..) |sub_acc, i| {
+                accumulators[item.agg_start + i].merge(sub_acc, gpa);
             }
+        }
+        for (workers) |w| {
             rows_in += w.rows_in;
             rows_kept += w.rows_kept;
             rgs_in += w.rgs_in;
@@ -724,7 +893,11 @@ pub fn runMultiAggregate(
     };
 }
 
-const KeyType = enum { i32, i64, f32, f64, string, boolean };
+/// How one group-key column is framed in a serialized composite key.
+///
+/// Framing from the physical Parquet type let writer and reader disagree: a BOOLEAN serialized 8 bytes but
+/// deserialized 1, silently truncating every later column of the key.
+const KeyType = enum { i64, f64, string };
 
 fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
     if (item.alias) |a| return a;
@@ -775,34 +948,34 @@ fn resolveGroupSelectCols(
     return owned;
 }
 
-fn keyTypeFromExpr(expr: expr_ast.Expr, meta: *const schema.FileMetaData) Error!KeyType {
-    return switch (expr) {
-        .col_ref => |ref| {
-            const schema_elem = leafSchemaElem(meta, ref.col_idx);
-            return switch (schema_elem.type.?) {
-                .INT32 => if (schema.isUnsignedIntTo32(schema_elem.*)) .i64 else .i32,
-                .INT64 => .i64,
-                .FLOAT => .f32,
-                .DOUBLE => .f64,
-                .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => .string,
-                .BOOLEAN => .boolean,
-                .INT96 => .i64,
-            };
-        },
-        .literal, .binop, .call => keyTypeFromComputedExpr(expr.typeOf()),
-    };
-}
-
-fn keyTypeFromComputedExpr(t: expr_ast.Type) KeyType {
-    return switch (t) {
+/// Framing for a group-key column, taken from the expression's own type.
+///
+/// Must agree with the lane `evalGroupKeyExpr` produces and `expr_agg.serializeRowKey` then writes: i32 and i64 both
+/// serialize as an 8-byte i64, f32 and f64 as an 8-byte f64, so these three cover every column variant.
+/// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
+fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
+    return switch (expr.typeOf()) {
         .i64 => .i64,
         .f64 => .f64,
         .str => .string,
     };
 }
 
+/// The schema element for the `leaf_idx`-th primitive column.
+///
+/// `col_idx` counts LEAVES, but `meta.schema` is a flattened DFS including group nodes, so `leaf_idx + 1` is correct
+/// only for files with no nested types. Used for output column NAMES; key framing must not depend on it.
 fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) *const schema.SchemaElement {
-    return &meta.schema.items[leaf_idx + 1];
+    var seen: usize = 0;
+    // Element 0 is the root, which is always a group.
+    for (meta.schema.items[1..]) |*elem| {
+        const is_leaf = elem.num_children == null or elem.num_children.? == 0;
+        if (!is_leaf) continue;
+        if (seen == leaf_idx) return elem;
+        seen += 1;
+    }
+    // Callers resolved `leaf_idx` from this same schema, so it exists.
+    return &meta.schema.items[meta.schema.items.len - 1];
 }
 
 fn selectColumnName(col_name: []const u8) []const u8 {
@@ -828,6 +1001,9 @@ fn stripQuotes(name: []const u8) []const u8 {
     return name;
 }
 
+/// Pull one column out of a serialized composite group key: a 1-byte present flag, then what
+/// `expr_agg.serializeRowKey` wrote for that lane. Bounds-checked rather than trusting the framing: a writer/reader
+/// disagreement turns a length field into the previous column's payload bytes, panicking or allocating wildly.
 pub fn deserializeKeyColumn(
     allocator: std.mem.Allocator,
     key_bytes: []const u8,
@@ -837,57 +1013,44 @@ pub fn deserializeKeyColumn(
     var cursor: usize = 0;
     var current_idx: usize = 0;
     while (current_idx <= target_idx) : (current_idx += 1) {
+        if (current_idx >= key_types.len) return error.BadGroupKey;
+        if (cursor >= key_bytes.len) return error.BadGroupKey;
         const is_present = key_bytes[cursor];
         cursor += 1;
-        const ktype = key_types[current_idx];
 
         if (is_present == 0) {
-            if (current_idx == target_idx) {
-                return .null_val;
-            }
+            if (current_idx == target_idx) return .null_val;
             continue;
         }
 
-        switch (ktype) {
-            .i32 => {
-                const val = std.mem.readInt(i64, key_bytes[cursor..][0..8], .little);
+        switch (key_types[current_idx]) {
+            .i64, .f64 => {
+                if (cursor + 8 > key_bytes.len) return error.BadGroupKey;
+                const raw = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
                 cursor += 8;
-                if (current_idx == target_idx) return .{ .i = @intCast(val) };
-            },
-            .i64 => {
-                const val = std.mem.readInt(i64, key_bytes[cursor..][0..8], .little);
-                cursor += 8;
-                if (current_idx == target_idx) return .{ .i = val };
-            },
-            .f32 => {
-                const val = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
-                cursor += 8;
-                if (current_idx == target_idx) return .{ .f = @as(f32, @floatCast(@as(f64, @bitCast(val)))) };
-            },
-            .f64 => {
-                const val = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
-                cursor += 8;
-                if (current_idx == target_idx) return .{ .f = @bitCast(val) };
+                if (current_idx == target_idx) {
+                    return switch (key_types[current_idx]) {
+                        .i64 => .{ .i = @as(i64, @bitCast(raw)) },
+                        .f64 => .{ .f = @bitCast(raw) },
+                        .string => unreachable,
+                    };
+                }
             },
             .string => {
+                if (cursor + 4 > key_bytes.len) return error.BadGroupKey;
                 const len = std.mem.readInt(u32, key_bytes[cursor..][0..4], .little);
                 cursor += 4;
+                if (cursor + len > key_bytes.len) return error.BadGroupKey;
                 if (current_idx == target_idx) {
                     const buf = try allocator.alloc(u8, len);
                     @memcpy(buf, key_bytes[cursor .. cursor + len]);
                     return .{ .s = buf };
-                } else {
-                    cursor += len;
                 }
-            },
-            .boolean => {
-                const val = key_bytes[cursor];
-                cursor += 1;
-                if (current_idx == target_idx) return .{ .i = if (val != 0) 1 else 0 };
+                cursor += len;
             },
         }
     }
-    unreachable;
+    return error.BadGroupKey;
 }
 
 /// Convert one agg's final accumulator state into a wire-friendly value.
@@ -930,4 +1093,575 @@ fn nowMonoNs() i64 {
 test "scan: API is well-typed" {
     _ = runMultiAggregate;
     _ = materializeOne;
+}
+
+// ============================================================ Partial thread-spawn failure.
+//
+// `Thread.spawn` can fail partway through a loop (EAGAIN); leftover work must still run and started threads must still
+// be joined. Driven through the seam in spawn.zig, since real spawn failure is not reproducible.
+// ============================================================
+
+const testing = std.testing;
+const spawn_test_fixture = "data/parquet-testing/data/nan_in_stats.parquet";
+/// The padding columns exist only to push fetch volume past the 2 MiB-per-worker threshold, so workers really spawn.
+const SPAWN_FIXTURE_AGG =
+    "count(*) AS n" ++
+    ", sum(pad0) AS s0" ++ ", sum(pad1) AS s1" ++ ", sum(pad2) AS s2" ++
+    ", sum(pad3) AS s3" ++ ", sum(pad4) AS s4" ++ ", sum(pad5) AS s5" ++
+    ", sum(pad6) AS s6" ++ ", sum(pad7) AS s7" ++ ", sum(pad8) AS s8" ++
+    ", sum(pad9) AS s9" ++ ", sum(pad10) AS s10";
+/// Rows in `spawn_test_fixture` — proves a footer was really parsed rather than left as undefined memory.
+const spawn_test_fixture_rows: i64 = 2;
+
+/// 64 bytes that are definitively not parquet, so `metadata.open` rejects them at the magic check.
+const not_parquet = [_]u8{'x'} ** 64;
+
+test "parseFooters: every file is parsed even when spawns fail partway" {
+    const bytes = metadata.readFileSlice(spawn_test_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{spawn_test_fixture});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+
+    const n_files = 8;
+    const parse_threads = 4;
+    // The last entry is the control: `parse_threads` successes means no injected failure at all.
+    for ([_]usize{ 0, 1, parse_threads - 1, parse_threads }) |fail_after| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        var meta_arenas: []std.heap.ArenaAllocator = &.{};
+        defer for (meta_arenas) |*a| a.deinit();
+
+        var inputs: [n_files]Input = undefined;
+        for (&inputs) |*in| in.* = .{ .name = spawn_test_fixture, .bytes = bytes };
+
+        spawn_util.injectFailureAfter(fail_after);
+        defer spawn_util.resetFailure();
+
+        const res = try parseFooters(
+            arena_state.allocator(),
+            testing.allocator,
+            &inputs,
+            parse_threads,
+            &meta_arenas,
+        );
+
+        switch (res) {
+            .failed => |f| {
+                std.debug.print(
+                    "fail_after={d}: unexpected parse failure at index {d} ({s})\n",
+                    .{ fail_after, f.index, @errorName(f.err) },
+                );
+                return error.TestUnexpectedResult;
+            },
+            .ok => |parsed| {
+                try testing.expectEqual(@as(usize, n_files), parsed.len);
+                // A worker whose thread never started would leave its share of `parsed` untouched.
+                for (parsed) |m| {
+                    try testing.expectEqual(spawn_test_fixture_rows, m.num_rows);
+                }
+            },
+        }
+    }
+}
+
+test "parseFooters: lowest-index failure is reported whatever the spawn outcome" {
+    const bytes = metadata.readFileSlice(spawn_test_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{spawn_test_fixture});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+
+    const n_files = 8;
+    const parse_threads = 4;
+    // Whichever worker claims which file, the reported index must be the lower of the two.
+    const first_bad = 2;
+    const second_bad = 5;
+
+    for ([_]usize{ 0, 1, parse_threads - 1, parse_threads }) |fail_after| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        var meta_arenas: []std.heap.ArenaAllocator = &.{};
+        defer for (meta_arenas) |*a| a.deinit();
+
+        var inputs: [n_files]Input = undefined;
+        for (&inputs, 0..) |*in, i| in.* = .{
+            .name = spawn_test_fixture,
+            .bytes = if (i == first_bad or i == second_bad) &not_parquet else bytes,
+        };
+
+        spawn_util.injectFailureAfter(fail_after);
+        defer spawn_util.resetFailure();
+
+        const res = try parseFooters(
+            arena_state.allocator(),
+            testing.allocator,
+            &inputs,
+            parse_threads,
+            &meta_arenas,
+        );
+
+        switch (res) {
+            .ok => {
+                std.debug.print("fail_after={d}: malformed inputs were not detected\n", .{fail_after});
+                return error.TestUnexpectedResult;
+            },
+            .failed => |f| try testing.expectEqual(@as(usize, first_bad), f.index),
+        }
+    }
+}
+
+test "runMultiAggregate: injected spawn failures don't change the answer" {
+    // The scan workers, unlike the footer parsers, are the loop whose old `try spawn` returned while earlier threads
+    // still read the arena the caller frees. Sizing is by decode volume, so a small fixture would test nothing.
+    const fixture = "data/bench_types.parquet";
+    const bytes = metadata.readFileSlice(fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+
+    const parallelism = 4;
+    const inputs = [_]Input{.{ .name = fixture, .bytes = bytes }};
+
+    const Answer = struct { sum: i128, rows: i64 };
+    var baseline: ?Answer = null;
+    for ([_]?usize{ null, 0, 1, parallelism - 1 }) |fail_after| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        if (fail_after) |n| spawn_util.injectFailureAfter(n);
+        defer spawn_util.resetFailure();
+
+        const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "sum(id) AS s",
+            .parallelism = parallelism,
+            // Force a real decode; otherwise the sum is answered from statistics and no worker ever runs.
+            .scan_all = true,
+        });
+        defer {
+            for (res.aggs) |a| testing.allocator.free(a.alias);
+            testing.allocator.free(res.aggs);
+        }
+
+        try testing.expectEqual(@as(usize, 1), res.aggs.len);
+        const got: Answer = .{ .sum = res.aggs[0].value.i, .rows = res.rows_in };
+        // Work dropped by a failed spawn and never picked up inline would show as a short row count.
+        try testing.expect(got.rows > 0);
+
+        if (baseline) |b| {
+            try testing.expectEqual(b.sum, got.sum);
+            try testing.expectEqual(b.rows, got.rows);
+            // Prove the run took the failure path; one worker means nothing was tested.
+            if (spawn_util.failuresInjected() == 0) {
+                std.debug.print(
+                    "spawn injection never fired (fail_after={?d}) — test is vacuous\n",
+                    .{fail_after},
+                );
+                return error.TestUnexpectedResult;
+            }
+        } else {
+            baseline = got;
+        }
+    }
+}
+
+test "runMultiAggregate: skewed work does not let idle workers strand the budget" {
+    // Blocks sized as a fraction of the whole budget rather than of each worker's share let fifteen barely-grouping
+    // workers strand most of the pool at -j16. Admission cannot depend on worker count when live state fits the budget.
+    const heavy = "ci/fixtures/parquet/spawn_budget_a.parquet";
+    const light = "ci/fixtures/parquet/spawn_budget_b.parquet";
+    var bytes: [2][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (bytes[0..loaded]) |b| testing.allocator.free(b);
+    for ([_][]const u8{ heavy, light }, 0..) |f, i| {
+        bytes[i] = metadata.readFileSlice(f, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{f});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        loaded += 1;
+    }
+
+    var inputs: [16]Input = undefined;
+    inputs[0] = .{ .name = heavy, .bytes = bytes[0] };
+    for (inputs[1..]) |*in| in.* = .{ .name = light, .bytes = bytes[1] };
+
+    // The fixed budget includes modest headroom for the surviving groups and must be enough at any -j.
+    for ([_]usize{ 1, 4, 16 }) |parallelism| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = "group_key < 1001",
+            .aggregate = SPAWN_FIXTURE_AGG,
+            .group_by = "group_key",
+            .parallelism = parallelism,
+            .max_memory = 710000,
+        }) catch |err| {
+            std.debug.print(
+                "-j{d}: skewed work rejected a query with 10% headroom: {s}\n",
+                .{ parallelism, @errorName(err) },
+            );
+            return err;
+        };
+        defer {
+            for (res.aggs) |a| testing.allocator.free(a.alias);
+            testing.allocator.free(res.aggs);
+            if (res.group_rows) |rows| {
+                for (rows) |r| {
+                    for (r) |v| switch (v) {
+                        .s => |str| testing.allocator.free(str),
+                        else => {},
+                    };
+                    testing.allocator.free(r);
+                }
+                testing.allocator.free(rows);
+            }
+            if (res.group_cols) |cols| {
+                for (cols) |c| testing.allocator.free(c);
+                testing.allocator.free(cols);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1001), (res.group_rows orelse return error.TestUnexpectedResult).len);
+    }
+}
+
+test "runMultiAggregate: --max-memory means the same thing at every -j" {
+    // 800 bytes fits exactly one group — enough at -j1, and the shared budget must make it enough at every -j.
+    const files = [_][]const u8{
+        "ci/fixtures/parquet/spawn_budget_a.parquet",
+        "ci/fixtures/parquet/spawn_budget_b.parquet",
+    };
+    var bytes: [files.len][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (bytes[0..loaded]) |b| testing.allocator.free(b);
+    for (files, 0..) |f, i| {
+        bytes[i] = metadata.readFileSlice(f, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{f});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        loaded += 1;
+    }
+    var inputs: [files.len]Input = undefined;
+    for (files, 0..) |f, i| inputs[i] = .{ .name = f, .bytes = bytes[i] };
+
+    for ([_]usize{ 1, 2, 4 }) |parallelism| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+
+        const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = "group_key = 0",
+            .aggregate = SPAWN_FIXTURE_AGG,
+            .group_by = "group_key",
+            .parallelism = parallelism,
+            .max_memory = 800,
+        }) catch |err| {
+            std.debug.print(
+                "-j{d}: a GROUP BY that fits 800 bytes at -j1 was rejected: {s}\n",
+                .{ parallelism, @errorName(err) },
+            );
+            return err;
+        };
+        defer {
+            for (res.aggs) |a| testing.allocator.free(a.alias);
+            testing.allocator.free(res.aggs);
+            if (res.group_rows) |rows| {
+                for (rows) |r| {
+                    for (r) |v| switch (v) {
+                        .s => |str| testing.allocator.free(str),
+                        else => {},
+                    };
+                    testing.allocator.free(r);
+                }
+                testing.allocator.free(rows);
+            }
+            if (res.group_cols) |cols| {
+                for (cols) |c| testing.allocator.free(c);
+                testing.allocator.free(cols);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), (res.group_rows orelse return error.TestUnexpectedResult).len);
+    }
+}
+
+test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns fail" {
+    // A spawn failure must not turn a query that fits `max_memory` into ExceededMemoryBudget. Reaching that path
+    // needs four things at once:
+    //
+    //  1. GROUP BY, or there is no group table and no budget to get wrong.
+    //  2. n_workers >= 2, hence twelve fetched columns to clear the 2 MiB-per-worker sizing threshold.
+    //  3. Group keys disjoint per work item, so one worker holding the union really needs ~2x; shared keys hide it.
+    //  4. A budget that fits only when the fallback worker gets the full shared allowance, not one worker's share.
+    //
+    // Metadata is passed in so every injected failure is necessarily a scan-worker spawn; otherwise footer-parse spawns
+    // satisfy the "injection fired" check while the scan loop quietly runs single-threaded.
+    //
+    // Tracked fixtures, not data/ (gitignored, so a test pointed there would skip in a clean clone): regenerate with
+    // tools/gen_spawn_budget_fixture.py.
+    const files = [_][]const u8{
+        "ci/fixtures/parquet/spawn_budget_a.parquet",
+        "ci/fixtures/parquet/spawn_budget_b.parquet",
+    };
+    const group_by = "group_key";
+    const aggregate = SPAWN_FIXTURE_AGG;
+    const budget = 2 * 1024 * 1024;
+    const parallelism = 2;
+
+    var bytes: [files.len][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (bytes[0..loaded]) |b| testing.allocator.free(b);
+    for (files, 0..) |f, i| {
+        bytes[i] = metadata.readFileSlice(f, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{f});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        loaded += 1;
+    }
+
+    var inputs: [files.len]Input = undefined;
+    for (files, 0..) |f, i| inputs[i] = .{ .name = f, .bytes = bytes[i] };
+
+    var baseline_groups: ?usize = null;
+    for ([_]?usize{ null, 0, 1 }) |fail_after| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var metas: [files.len]schema.FileMetaData = undefined;
+        for (bytes[0..], 0..) |b, i| metas[i] = try metadata.open(arena, b);
+
+        if (fail_after) |n| spawn_util.injectFailureAfter(n);
+        defer spawn_util.resetFailure();
+
+        const res = runMultiAggregate(testing.allocator, arena, .{
+            .inputs = &inputs,
+            .metas = &metas,
+            .aggregate = aggregate,
+            .group_by = group_by,
+            .parallelism = parallelism,
+            .max_memory = budget,
+        }) catch |err| {
+            std.debug.print(
+                "fail_after={?d}: a GROUP BY that fits {d} KiB was rejected: {s}\n",
+                .{ fail_after, budget / 1024, @errorName(err) },
+            );
+            return err;
+        };
+        defer {
+            for (res.aggs) |a| testing.allocator.free(a.alias);
+            testing.allocator.free(res.aggs);
+            if (res.group_rows) |rows| {
+                for (rows) |r| {
+                    for (r) |v| switch (v) {
+                        .s => |s| testing.allocator.free(s),
+                        else => {},
+                    };
+                    testing.allocator.free(r);
+                }
+                testing.allocator.free(rows);
+            }
+            if (res.group_cols) |cols| {
+                for (cols) |c| testing.allocator.free(c);
+                testing.allocator.free(cols);
+            }
+        }
+
+        const groups = (res.group_rows orelse return error.TestUnexpectedResult).len;
+        if (baseline_groups) |b| {
+            try testing.expectEqual(b, groups);
+            // Metadata was supplied, so this can only be a scan-worker spawn.
+            if (spawn_util.failuresInjected() == 0) {
+                std.debug.print(
+                    "fail_after={?d}: no scan-worker spawn was refused — test is vacuous\n",
+                    .{fail_after},
+                );
+                return error.TestUnexpectedResult;
+            }
+        } else {
+            baseline_groups = groups;
+        }
+    }
+}
+
+// ============================================================ Group-key framing.
+//
+// Leaf-indexed framing read the wrong schema element for every column after the first nested one (see
+// `leafSchemaElem`). The fixture puts a MAP ahead of ordinary scalars to reproduce that shape.
+// ============================================================
+
+const nested_key_fixture = "ci/fixtures/parquet/nested_key_shape.parquet";
+
+fn loadNestedKeyFixture() !?[]u8 {
+    return metadata.readFileSlice(nested_key_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{nested_key_fixture});
+            return null;
+        }
+        return err;
+    };
+}
+
+fn freeGroupResult(res: MultiAggResult) void {
+    for (res.aggs) |a| testing.allocator.free(a.alias);
+    testing.allocator.free(res.aggs);
+    if (res.group_rows) |rows| {
+        for (rows) |r| {
+            for (r) |v| switch (v) {
+                .s => |str| testing.allocator.free(str),
+                else => {},
+            };
+            testing.allocator.free(r);
+        }
+        testing.allocator.free(rows);
+    }
+    if (res.group_cols) |cols| {
+        for (cols) |c| testing.allocator.free(c);
+        testing.allocator.free(cols);
+    }
+}
+
+test "group key: a scalar column after a MAP is framed by its own type" {
+    // `ts` is INT64 but leaf-indexed lookup resolved a BYTE_ARRAY element, so deserialization read the timestamp bytes
+    // as a string length: "index out of bounds: index 2690342917, len 9".
+    const bytes = (try loadNestedKeyFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const inputs = [_]Input{.{ .name = nested_key_fixture, .bytes = bytes }};
+    const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n",
+        .group_by = "ts",
+        .parallelism = 1,
+    });
+    defer freeGroupResult(res);
+
+    const rows = res.group_rows orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    var total: i128 = 0;
+    for (rows) |r| total += r[1].i;
+    try testing.expectEqual(@as(i128, 60), total);
+    for (rows) |r| try testing.expect(r[0] == .i);
+
+    // The output column name also depends on resolving the right leaf.
+    const cols = res.group_cols orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("ts", cols[0]);
+}
+
+test "group key: a BOOLEAN first column does not truncate the rest" {
+    // BOOLEAN evaluates to the i64 lane (8 bytes) but the physical type said `boolean` and deserialization consumed 1,
+    // so every later key column was read from the wrong offset: `name` came back null while counts looked fine.
+    const bytes = (try loadNestedKeyFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const inputs = [_]Input{.{ .name = nested_key_fixture, .bytes = bytes }};
+    const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n",
+        .group_by = "flag, name",
+        .parallelism = 1,
+    });
+    defer freeGroupResult(res);
+
+    const rows = res.group_rows orelse return error.TestUnexpectedResult;
+    // 2 flags x 4 names, and every name must survive.
+    try testing.expectEqual(@as(usize, 8), rows.len);
+    for (rows) |r| {
+        try testing.expect(r[0] == .i);
+        try testing.expect(r[1] == .s);
+        try testing.expect(std.mem.startsWith(u8, r[1].s, "name"));
+    }
+}
+
+test "deserializeKeyColumn: corrupt framing errors instead of panicking" {
+    const a = testing.allocator;
+
+    // A length field claiming far more than the buffer holds — previously a panic or a huge alloc.
+    var runaway: [5]u8 = .{ 1, 0xFF, 0xFF, 0xFF, 0xFF };
+    try testing.expectError(
+        error.BadGroupKey,
+        deserializeKeyColumn(a, &runaway, 0, &.{.string}),
+    );
+
+    // Truncated mid-payload.
+    var short_i64: [4]u8 = .{ 1, 0, 0, 0 };
+    try testing.expectError(
+        error.BadGroupKey,
+        deserializeKeyColumn(a, &short_i64, 0, &.{.i64}),
+    );
+
+    // Asking for a column beyond what the key holds.
+    var one_null: [1]u8 = .{0};
+    try testing.expectError(
+        error.BadGroupKey,
+        deserializeKeyColumn(a, &one_null, 1, &.{ .i64, .i64 }),
+    );
+
+    // Empty input.
+    try testing.expectError(
+        error.BadGroupKey,
+        deserializeKeyColumn(a, &.{}, 0, &.{.i64}),
+    );
+
+    // A well-formed key still round-trips: null, then i64, then string.
+    var ok_key: std.ArrayList(u8) = .empty;
+    defer ok_key.deinit(a);
+    try ok_key.append(a, 0); // null
+    try ok_key.append(a, 1);
+    try ok_key.appendSlice(a, &std.mem.toBytes(@as(i64, -7)));
+    try ok_key.append(a, 1);
+    try ok_key.appendSlice(a, &std.mem.toBytes(@as(u32, 3)));
+    try ok_key.appendSlice(a, "abc");
+    const types = [_]KeyType{ .i64, .i64, .string };
+    try testing.expect((try deserializeKeyColumn(a, ok_key.items, 0, &types)) == .null_val);
+    try testing.expectEqual(@as(i128, -7), (try deserializeKeyColumn(a, ok_key.items, 1, &types)).i);
+    const s = try deserializeKeyColumn(a, ok_key.items, 2, &types);
+    defer a.free(s.s);
+    try testing.expectEqualStrings("abc", s.s);
+}
+
+test "parseFooters: serial path reports the lowest bad index too" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var meta_arenas: []std.heap.ArenaAllocator = &.{};
+    defer for (meta_arenas) |*a| a.deinit();
+
+    var inputs = [_]Input{
+        .{ .name = "bad0", .bytes = &not_parquet },
+        .{ .name = "bad1", .bytes = &not_parquet },
+    };
+    // parallelism 1 takes the serial branch, which never spawns.
+    const res = try parseFooters(arena_state.allocator(), testing.allocator, &inputs, 1, &meta_arenas);
+    switch (res) {
+        .ok => return error.TestUnexpectedResult,
+        .failed => |f| try testing.expectEqual(@as(usize, 0), f.index),
+    }
 }

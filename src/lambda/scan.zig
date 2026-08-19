@@ -183,7 +183,7 @@ pub const PerFileScan = struct {
             });
         }
 
-        _ = try s3.fetchJobs(io, self.pool, self.gpa, arena, self.creds, jobs.items);
+        _ = try s3.fetchJobs(io, self.pool, self.gpa, arena, self.creds, jobs.items, @TypeOf(self.pool.*).capacity);
 
         return .{
             .file_idx = self.file_idx,

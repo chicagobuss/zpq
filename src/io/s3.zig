@@ -24,6 +24,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls.zig");
+const AtomicWorkCursor = @import("work_cursor.zig").AtomicWorkCursor;
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
@@ -611,13 +612,16 @@ pub const FetchJob = struct {
 };
 
 /// Parallel multi-file range fetch using a shared `Pool`. Splits any
-/// input range larger than SPLIT_THRESHOLD into sub-ranges; dispatches
-/// all sub-jobs via Io.Group.concurrent, bounded by the pool's
-/// connection budget. Returns total bytes fetched.
+/// input range larger than SPLIT_THRESHOLD into sub-ranges, then runs them through `workers` worker loops. Returns
+/// total bytes fetched.
 ///
 /// Dispatches ranges from different `(bucket, key)` inputs
 /// interchangeably through the same bounded pool, so multi-file scans
 /// share one global connection budget.
+///
+/// `workers` is clamped to pool capacity and to the job count, but must not exceed the `Io`'s concurrency limit:
+/// `Io.Group.concurrent` rejects submissions past its limit rather than queueing them, and dispatch runs under `try`
+/// inside a `defer group.cancel`, so an over-large count cancels the batch.
 pub fn fetchJobs(
     io: Io,
     p: anytype, // *Pool(N) for some comptime N
@@ -625,6 +629,7 @@ pub fn fetchJobs(
     arena: std.mem.Allocator,
     creds: Credentials,
     jobs: []const FetchJob,
+    workers: usize,
 ) !u64 {
     // 1. Pre-process: split big ranges into sub-jobs.
     var split: std.ArrayList(FetchJob) = .empty;
@@ -696,10 +701,26 @@ pub fn fetchJobs(
         };
     }
 
-    // 4. Dispatch via Io.Group.concurrent — pool permits gate parallelism.
+    // 4. Pool permits gate *sockets*, not threads: `Io.Group.concurrent` spawns an OS thread whenever all workers are
+    //    busy, and a worker parked on a blocking socket read is busy, so submitting every sub-job at once created far
+    //    more threads than permits. Completion order is arbitrary either way — nothing may depend on it.
+    var shared: AtomicWorkCursor(FetchCtx) = .{ .items = ctxs };
+    const Worker = struct {
+        fn run(loop_io: Io, sh: *AtomicWorkCursor(FetchCtx)) Io.Cancelable!void {
+            while (sh.next()) |ctx_ptr| try fetchOneTask(loop_io, ctx_ptr);
+        }
+    };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    for (ctxs) |*ctx_ptr| try group.concurrent(io, fetchOneTask, .{ io, ctx_ptr });
+    // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
+    // rather than as the bad argument it is.
+    const n_workers = if (ctxs.len == 0)
+        0
+    else
+        @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
+    for (0..n_workers) |_| {
+        try group.concurrent(io, Worker.run, .{ io, &shared });
+    }
     try group.await(io);
 
     // 5. Tally + check for failures.
@@ -736,7 +757,7 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    return fetchJobs(io, p, gpa, arena, creds, jobs.items);
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
 }
 
 /// Type-erased view of `Pool(N).Handle` so the dispatch glue between
@@ -1232,4 +1253,39 @@ test "Range.suffix formats negative-N suffix" {
     var buf: [64]u8 = undefined;
     const got = try Range.suffix(65536).writeHeader(&buf);
     try testing.expectEqualStrings("bytes=-65536", got);
+}
+
+test "fetchManyRanges instantiates and short-circuits on an empty range list" {
+    // Signature-break guard, not a behaviour test: `fetchManyRanges` has no in-repo caller, so Zig's lazy analysis
+    // never type-checks its body unless something instantiates it — a `fetchJobs` arity change once slipped past the
+    // whole build. Zero ranges opens no socket.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var p: pool_mod.Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+    };
+
+    var io_threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer io_threaded.deinit();
+
+    const n = try fetchManyRanges(
+        io_threaded.io(),
+        &p,
+        testing.allocator,
+        arena,
+        creds,
+        "bucket",
+        "key",
+        &.{},
+        &.{},
+    );
+    try testing.expectEqual(@as(u64, 0), n);
 }

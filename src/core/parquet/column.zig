@@ -707,6 +707,63 @@ test "unsplitByteStreamSplit transposes byte-planes back to PLAIN" {
     try testing.expectError(error.UnexpectedPage, unsplitByteStreamSplit(arena, &encoded, 5));
 }
 
+test "chunk-start seek installs a dictionary only when one actually leads the chunk" {
+    // Installing a leading data page as a dictionary would silently corrupt every value, so assert on the reader's
+    // dictionary state directly. Both parquet-testing shapes reach the omitted-offset path: alltypes_plain bool_col
+    // leads with a DATA_PAGE, alltypes_tiny_pages string_col with a DICTIONARY_PAGE.
+    const Case = struct {
+        path: []const u8,
+        column: []const u8,
+        expect_dictionary: bool,
+    };
+    const cases = [_]Case{
+        .{ .path = "data/parquet-testing/data/alltypes_plain.parquet", .column = "bool_col", .expect_dictionary = false },
+        .{ .path = "data/parquet-testing/data/alltypes_tiny_pages.parquet", .column = "string_col", .expect_dictionary = true },
+    };
+
+    for (cases) |case| {
+        const file_bytes = readFileSlice(case.path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{case.path});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(file_bytes);
+
+        var meta = try metadata.open(testing.allocator, file_bytes);
+        defer meta.deinit(testing.allocator);
+
+        const col_idx = metadata.findColumnIndex(&meta, case.column) orelse return error.MissingColumn;
+        const col = meta.row_groups.items[0].columns.items[col_idx].meta_data.?;
+
+        // Fail loudly if a parquet-testing bump adds the offset, rather than quietly stop covering the
+        // omitted-offset shape.
+        try testing.expect(col.dictionary_page_offset == null);
+
+        const chunk_start: i64 = col.data_page_offset;
+        const chunk = file_bytes[@intCast(chunk_start)..][0..@intCast(col.total_compressed_size)];
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        const path: [1][]const u8 = .{case.column};
+        const levels = meta.getColumnLevels(&path);
+
+        if (case.expect_dictionary) {
+            var reader = ColumnChunkReader([]const u8).init(chunk, col.codec, levels, arena.allocator());
+            try reader.pages.seekToPage(chunk_start, chunk_start);
+            try testing.expect(try reader.advancePage());
+            try testing.expect(reader.dictionary != null);
+        } else {
+            var reader = ColumnChunkReader(bool).init(chunk, col.codec, levels, arena.allocator());
+            try reader.pages.seekToPage(chunk_start, chunk_start);
+            try testing.expect(try reader.advancePage());
+            try testing.expect(reader.dictionary == null);
+        }
+    }
+}
+
 test "decode int8 column from the bench fixture" {
     const fixture_path = "data/benchmark_100mb.parquet";
     const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {

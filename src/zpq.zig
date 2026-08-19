@@ -10,6 +10,7 @@ pub const core = struct {
     pub const consumer = @import("core/consumer.zig");
     pub const invariant = @import("core/invariant.zig");
     pub const scan = @import("core/scan.zig");
+    pub const spawn = @import("core/spawn.zig");
     pub const filter = struct {
         pub const ast = @import("core/filter/ast.zig");
         pub const encoded = @import("core/filter/encoded.zig");
@@ -69,6 +70,7 @@ pub const io = struct {
     pub const s3 = @import("io/s3.zig");
     pub const pool = @import("io/pool.zig");
     pub const coalescer = @import("io/coalescer.zig");
+    pub const work_cursor = @import("io/work_cursor.zig");
     pub const multipart_sink = @import("io/multipart_sink.zig");
     pub const meta_cache = @import("io/meta_cache.zig");
     pub const retry = @import("io/retry.zig");
@@ -78,6 +80,9 @@ test {
     _ = core.schema;
     _ = core.thrift;
     _ = core.consumer;
+    // Zig only compiles tests from modules named here; scan.zig was missing, so its tests silently never ran.
+    _ = core.scan;
+    _ = core.spawn;
     _ = core.invariant;
     _ = core.filter.ast;
     _ = core.filter.encoded;
@@ -118,6 +123,7 @@ test {
     _ = io.s3;
     _ = io.pool;
     _ = io.coalescer;
+    _ = io.work_cursor;
     _ = io.multipart_sink;
     _ = io.meta_cache;
     _ = io.retry;

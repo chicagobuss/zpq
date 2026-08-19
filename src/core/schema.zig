@@ -53,9 +53,18 @@ pub const TimeUnit = union(enum) {
             const field = try reader.readFieldBegin();
             if (field.type == .Stop) break;
             switch (field.id) {
-                1 => { try reader.skip(.Struct); unit = .{ .MILLIS = .{} }; },
-                2 => { try reader.skip(.Struct); unit = .{ .MICROS = .{} }; },
-                3 => { try reader.skip(.Struct); unit = .{ .NANOS = .{} }; },
+                1 => {
+                    try reader.skip(.Struct);
+                    unit = .{ .MILLIS = .{} };
+                },
+                2 => {
+                    try reader.skip(.Struct);
+                    unit = .{ .MICROS = .{} };
+                },
+                3 => {
+                    try reader.skip(.Struct);
+                    unit = .{ .NANOS = .{} };
+                },
                 else => try reader.skip(field.type),
             }
         }
@@ -65,9 +74,21 @@ pub const TimeUnit = union(enum) {
     pub fn write(self: TimeUnit, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         switch (self) {
-            .MILLIS => { try writer.writeFieldBegin(.Struct, 1); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .MICROS => { try writer.writeFieldBegin(.Struct, 2); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .NANOS => { try writer.writeFieldBegin(.Struct, 3); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .MILLIS => {
+                try writer.writeFieldBegin(.Struct, 1);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .MICROS => {
+                try writer.writeFieldBegin(.Struct, 2);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .NANOS => {
+                try writer.writeFieldBegin(.Struct, 3);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
         }
         try writer.writeStructEnd();
     }
@@ -105,20 +126,50 @@ pub const LogicalType = union(enum) {
             const field = try reader.readFieldBegin();
             if (field.type == .Stop) break;
             switch (field.id) {
-                1 => { try reader.skip(.Struct); lt = .{ .STRING = .{} }; },
-                2 => { try reader.skip(.Struct); lt = .{ .MAP = .{} }; },
-                3 => { try reader.skip(.Struct); lt = .{ .LIST = .{} }; },
-                4 => { try reader.skip(.Struct); lt = .{ .ENUM = .{} }; },
+                1 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .STRING = .{} };
+                },
+                2 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .MAP = .{} };
+                },
+                3 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .LIST = .{} };
+                },
+                4 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .ENUM = .{} };
+                },
                 5 => lt = .{ .DECIMAL = try readDecimal(reader) },
-                6 => { try reader.skip(.Struct); lt = .{ .DATE = .{} }; },
+                6 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .DATE = .{} };
+                },
                 7 => lt = .{ .TIME = try readTime(reader) },
                 8 => lt = .{ .TIMESTAMP = try readTimestamp(reader) },
                 10 => lt = .{ .INTEGER = try readInteger(reader) },
-                11 => { try reader.skip(.Struct); lt = .{ .UNKNOWN = .{} }; },
-                12 => { try reader.skip(.Struct); lt = .{ .JSON = .{} }; },
-                13 => { try reader.skip(.Struct); lt = .{ .BSON = .{} }; },
-                14 => { try reader.skip(.Struct); lt = .{ .UUID = .{} }; },
-                15 => { try reader.skip(.Struct); lt = .{ .FLOAT16 = .{} }; },
+                11 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .UNKNOWN = .{} };
+                },
+                12 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .JSON = .{} };
+                },
+                13 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .BSON = .{} };
+                },
+                14 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .UUID = .{} };
+                },
+                15 => {
+                    try reader.skip(.Struct);
+                    lt = .{ .FLOAT16 = .{} };
+                },
                 else => try reader.skip(field.type),
             }
         }
@@ -193,10 +244,26 @@ pub const LogicalType = union(enum) {
     pub fn write(self: LogicalType, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         switch (self) {
-            .STRING => { try writer.writeFieldBegin(.Struct, 1); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .MAP => { try writer.writeFieldBegin(.Struct, 2); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .LIST => { try writer.writeFieldBegin(.Struct, 3); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .ENUM => { try writer.writeFieldBegin(.Struct, 4); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .STRING => {
+                try writer.writeFieldBegin(.Struct, 1);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .MAP => {
+                try writer.writeFieldBegin(.Struct, 2);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .LIST => {
+                try writer.writeFieldBegin(.Struct, 3);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .ENUM => {
+                try writer.writeFieldBegin(.Struct, 4);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
             .DECIMAL => |d| {
                 try writer.writeFieldBegin(.Struct, 5);
                 writer.writeStructBegin();
@@ -204,19 +271,25 @@ pub const LogicalType = union(enum) {
                 try writer.writeFieldI32(2, d.precision);
                 try writer.writeStructEnd();
             },
-            .DATE => { try writer.writeFieldBegin(.Struct, 6); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .DATE => {
+                try writer.writeFieldBegin(.Struct, 6);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
             .TIME => |t| {
                 try writer.writeFieldBegin(.Struct, 7);
                 writer.writeStructBegin();
                 try writer.writeFieldBool(1, t.isAdjustedToUTC);
-                try writer.writeFieldBegin(.Struct, 2); try t.unit.write(writer);
+                try writer.writeFieldBegin(.Struct, 2);
+                try t.unit.write(writer);
                 try writer.writeStructEnd();
             },
             .TIMESTAMP => |t| {
                 try writer.writeFieldBegin(.Struct, 8);
                 writer.writeStructBegin();
                 try writer.writeFieldBool(1, t.isAdjustedToUTC);
-                try writer.writeFieldBegin(.Struct, 2); try t.unit.write(writer);
+                try writer.writeFieldBegin(.Struct, 2);
+                try t.unit.write(writer);
                 try writer.writeStructEnd();
             },
             .INTEGER => |i| {
@@ -226,11 +299,31 @@ pub const LogicalType = union(enum) {
                 try writer.writeFieldBool(2, i.isSigned);
                 try writer.writeStructEnd();
             },
-            .UNKNOWN => { try writer.writeFieldBegin(.Struct, 11); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .JSON => { try writer.writeFieldBegin(.Struct, 12); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .BSON => { try writer.writeFieldBegin(.Struct, 13); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .UUID => { try writer.writeFieldBegin(.Struct, 14); writer.writeStructBegin(); try writer.writeStructEnd(); },
-            .FLOAT16 => { try writer.writeFieldBegin(.Struct, 15); writer.writeStructBegin(); try writer.writeStructEnd(); },
+            .UNKNOWN => {
+                try writer.writeFieldBegin(.Struct, 11);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .JSON => {
+                try writer.writeFieldBegin(.Struct, 12);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .BSON => {
+                try writer.writeFieldBegin(.Struct, 13);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .UUID => {
+                try writer.writeFieldBegin(.Struct, 14);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
+            .FLOAT16 => {
+                try writer.writeFieldBegin(.Struct, 15);
+                writer.writeStructBegin();
+                try writer.writeStructEnd();
+            },
         }
         try writer.writeStructEnd();
     }
@@ -700,6 +793,9 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    // Clamped by `remaining()`: `size` is attacker-controlled, so an oversized list header must
+                    // not preallocate.
+                    try meta.encodings.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.encodings.append(allocator, (std.enums.fromInt(Encoding, try reader.readZigZag(i32)) orelse return error.InvalidEnumValue));
@@ -709,6 +805,7 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try meta.path_in_schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.path_in_schema.append(allocator, try reader.readString());
@@ -906,6 +1003,7 @@ pub const OffsetIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try oi.page_locations.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try oi.page_locations.append(allocator, try PageLocation.read(reader));
@@ -958,6 +1056,7 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try ci.null_pages.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     // Compact protocol: a bool list element is a single
                     // byte (1 = true, 2 = false).
@@ -969,6 +1068,7 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try ci.min_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try ci.min_values.append(allocator, try reader.readString());
@@ -978,6 +1078,7 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try ci.max_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try ci.max_values.append(allocator, try reader.readString());
@@ -989,6 +1090,7 @@ pub const ColumnIndex = struct {
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
                     var nc: std.ArrayListUnmanaged(i64) = .empty;
+                    try nc.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try nc.append(allocator, try reader.readZigZag(i64));
@@ -1048,6 +1150,7 @@ pub const RowGroup = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try rg.columns.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         const col = try ColumnChunk.read(allocator, reader);
@@ -1115,6 +1218,7 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try meta.schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.schema.append(allocator, try SchemaElement.read(reader));
@@ -1125,6 +1229,7 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
+                    try meta.row_groups.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.row_groups.append(allocator, try RowGroup.read(allocator, reader));
@@ -1292,8 +1397,14 @@ pub const Levels = struct {
 
 test "isUnsignedIntTo32 — converted + logical, signed/unsigned, width boundary" {
     const base = SchemaElement{
-        .type = .INT32, .type_length = null, .repetition_type = .REQUIRED,
-        .name = "c", .num_children = null, .scale = null, .precision = null, .field_id = null,
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "c",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
     };
     var e = base;
 

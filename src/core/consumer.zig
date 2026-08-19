@@ -1569,18 +1569,24 @@ fn decodeWithReaderPruned(
         @memset(def_levels.?, 0);
     }
 
-    // `dictionary_page_offset` is OPTIONAL, so when absent we rely on `data_page_offset` pointing at the chunk start
-    // — a claim about real writers, not the spec. Measured across parquet-testing: of the 34 chunks that omit it, 31
-    // have a DICTIONARY_PAGE there and 3 (alltypes_plain bool_col) have a real DATA_PAGE and no dictionary, so
-    // `advancePage` dispatches on page type (regression test in parquet/column.zig). `ColumnChunk.file_offset` is
-    // deliberately not consulted: deprecated and inconsistent across writers. Guards a bug where these chunks failed on
-    // the page-pruned path only.
-    if (prune.dictionary_page_offset) |dict_off| {
-        try reader.pages.seekToPage(dict_off, prune.chunk_file_offset);
-        _ = try reader.advancePage();
-    } else {
-        try reader.pages.seekToPage(prune.chunk_file_offset, prune.chunk_file_offset);
-        _ = try reader.advancePage();
+    // `dictionary_page_offset` is optional. When it is absent, writers may
+    // place a dictionary at `data_page_offset` or put the first data page
+    // there. The OffsetIndex distinguishes the observed shapes: a first data
+    // page after the chunk start leaves a leading page worth probing, while an
+    // equal offset proves there is nothing to install. Do not use the
+    // deprecated `ColumnChunk.file_offset`, which is inconsistent across
+    // writers. A file that hides a dictionary before an unfetched
+    // `data_page_offset` still fails cleanly with DictionaryMissing.
+    const possible_dict_offset = prune.dictionary_page_offset orelse blk: {
+        if (prune.locations.len > 0 and
+            prune.locations[0].offset > prune.chunk_file_offset)
+        {
+            break :blk prune.chunk_file_offset;
+        }
+        break :blk null;
+    };
+    if (possible_dict_offset) |dict_off| {
+        _ = try reader.seekAndInstallDictionaryPage(dict_off, prune.chunk_file_offset);
     }
 
     // 2. Loop over pages and decode or skip

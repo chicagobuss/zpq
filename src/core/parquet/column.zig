@@ -433,6 +433,31 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return self.advancePage();
         }
 
+        /// Reposition to a possible leading dictionary and install only that
+        /// page. When a dictionary exists, returning immediately after it
+        /// avoids decoding the first data page before the indexed caller seeks
+        /// to that page. Without a dictionary, PageReader must still read the
+        /// candidate data page to identify its type, but leaves it uninstalled.
+        pub fn seekAndInstallDictionaryPage(
+            self: *Self,
+            absolute_offset: i64,
+            chunk_file_offset: i64,
+        ) !bool {
+            self.resetPageState();
+            try self.pages.seekToPage(absolute_offset, chunk_file_offset);
+            while (try self.pages.next()) |pg| {
+                switch (pg.header.type) {
+                    .DICTIONARY_PAGE => {
+                        try self.installDictionary(pg);
+                        return true;
+                    },
+                    .INDEX_PAGE => continue,
+                    .DATA_PAGE, .DATA_PAGE_V2 => return false,
+                }
+            }
+            return false;
+        }
+
         /// Pull the next page; if it's a dictionary page, cache it and
         /// loop to the next page. Returns true iff a data-page decoder
         /// was set up for use; false if the chunk is exhausted.
@@ -752,13 +777,13 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
 
         if (case.expect_dictionary) {
             var reader = ColumnChunkReader([]const u8).init(chunk, col.codec, levels, arena.allocator());
-            try reader.pages.seekToPage(chunk_start, chunk_start);
-            try testing.expect(try reader.advancePage());
+            try testing.expect(try reader.seekAndInstallDictionaryPage(chunk_start, chunk_start));
             try testing.expect(reader.dictionary != null);
         } else {
             var reader = ColumnChunkReader(bool).init(chunk, col.codec, levels, arena.allocator());
-            try reader.pages.seekToPage(chunk_start, chunk_start);
-            try testing.expect(try reader.advancePage());
+            try testing.expect(!try reader.seekAndInstallDictionaryPage(chunk_start, chunk_start));
+            // The leading page was data, so nothing may have been
+            // installed as a dictionary.
             try testing.expect(reader.dictionary == null);
         }
     }

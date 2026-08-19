@@ -1,6 +1,5 @@
-// ! A slice handed out one element at a time to however many workers ask. ! ! Lets a fixed number of worker loops cover
-// an arbitrarily long work list, ! instead of the task-per-item submission that makes `Io.Group.concurrent` ! grow the
-// thread pool without bound.
+//! A slice handed out one element at a time, so a fixed number of worker loops can cover an arbitrarily long work
+//! list. The task-per-item alternative makes `Io.Group.concurrent` grow the thread pool without bound.
 
 const std = @import("std");
 
@@ -9,8 +8,8 @@ pub fn AtomicWorkCursor(comptime T: type) type {
         items: []T,
         cursor: std.atomic.Value(usize) = .init(0),
 
-        /// The next unclaimed item, or null once the list is drained. `.monotonic` suffices: claims only need to be
-        /// distinct, and each item writes its own slot, so there is no ordering to publish.
+        /// `.monotonic` suffices: claims only need to be distinct, and each item writes its own slot, so there is no
+        /// ordering to publish.
         pub fn next(self: *@This()) ?*T {
             const i = self.cursor.fetchAdd(1, .monotonic);
             if (i >= self.items.len) return null;

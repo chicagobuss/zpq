@@ -293,8 +293,7 @@ test "pruneEqual skips when stats range excludes the value" {
 
 // Read a file fully into memory using raw syscalls. Std.Io.Dir would
 // require an Io vtable; the test suite doesn't have one set up.
-/// Test helper; `pub` so other modules' tests can load the same parquet-testing fixtures without repeating the syscall
-/// dance.
+/// `pub` so other modules' tests can load parquet-testing fixtures without repeating the syscall dance.
 pub fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
     const linux = std.os.linux;
     var path_z: [256]u8 = undefined;

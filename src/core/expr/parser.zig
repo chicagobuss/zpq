@@ -43,8 +43,6 @@ pub const Error = error{
     ExpectedAggFunc,
     StarOnlyValidInCount,
     TrailingTokens,
-    /// Expression nests deeper than MAX_EXPR_DEPTH. Bounds the evaluator's O(depth x rows) intermediate-column
-    /// allocation.
     ExpressionTooDeep,
     UnsupportedAggType,
 } || std.mem.Allocator.Error || filter_parser.Error;
@@ -72,21 +70,16 @@ const Token = struct {
     text: []const u8,
 };
 
-/// Deepest nesting accepted in a `--select` / aggregate expression.
-///
-/// A memory bound, not a stack one: the evaluator materializes a full intermediate column per AST node and the writer
-/// keeps W row groups in flight, so peak cost is O(workers x depth x rows_per_row_group). 32 is well above ordinary
-/// hand-written expressions while keeping that multiplier bounded.
-///
-/// `max_memory` is still not enforced on the select/encode path, so this cap is the only thing stopping the
-/// pathological case.
+/// A memory bound, not a stack one: the evaluator materializes a full intermediate column per AST node, in each of the
+/// row groups a worker holds in flight, so peak cost is O(workers x depth x rows_per_row_group). `max_memory` is
+/// unenforced on this path, so the cap is the only thing bounding the pathological case; 32 is well above any
+/// hand-written expression.
 pub const MAX_EXPR_DEPTH: u32 = 32;
 
 const Lexer = struct {
     src: []const u8,
     pos: usize = 0,
-    /// Current parenthesis / call-argument nesting. Lives on the Lexer because it is already threaded through every
-    /// parse function.
+    /// Lives on the Lexer because it is already threaded through every parse function.
     depth: u32 = 0,
 
     fn peek(self: *Lexer) Error!Token {
@@ -327,8 +320,8 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             // numeric literals at parse time so `-5` lands as a single
             // literal node; non-literal sub-exprs become `0 - expr`.
             //
-            // Self-recursive (`- - - x`), so it needs the same parse-recursion guard as parens: a long run of minus
-            // signs would overflow the parser's own stack before any node exists to measure.
+            // Self-recursive, so it needs the parse-recursion guard parens get: `- - - x` overflows the parser's own
+            // stack before any node exists to measure.
             lex.depth += 1;
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             const inner = try parseFactor(arena, lex, file);
@@ -500,9 +493,8 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
     if (op == .concat and result_type != .str) return error.TypeMismatch;
     if (op != .concat and result_type == .str) return error.TypeMismatch;
 
-    // Bounds tree height, not parser recursion: left-associative chains (`a + 1 + 1 + ...`) are parsed by a loop but
-    // still grow the left spine, which the evaluator does recurse over. Checking as we build also rejects a runaway
-    // chain before the whole AST is allocated.
+    // Tree height, not parser recursion: `a + 1 + 1 + ...` parses in a loop but still grows the left spine, which the
+    // evaluator does recurse over. Checking as we build rejects a runaway chain before the whole AST is allocated.
     const depth = 1 + @max(l.depth(), r.depth());
     if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
 

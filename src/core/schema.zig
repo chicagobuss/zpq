@@ -793,8 +793,8 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
+                    // Clamped by `remaining()`: `size` is attacker-controlled, so an oversized list header must
+                    // not preallocate.
                     try meta.encodings.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -805,8 +805,6 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try meta.path_in_schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1005,8 +1003,6 @@ pub const OffsetIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try oi.page_locations.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1060,8 +1056,6 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try ci.null_pages.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     // Compact protocol: a bool list element is a single
@@ -1074,8 +1068,6 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try ci.min_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1086,8 +1078,6 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try ci.max_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1099,8 +1089,6 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     var nc: std.ArrayListUnmanaged(i64) = .empty;
                     try nc.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
@@ -1162,8 +1150,6 @@ pub const RowGroup = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try rg.columns.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1232,8 +1218,6 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try meta.schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
@@ -1245,8 +1229,6 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Reserve from the list header's count instead of regrowing per append, clamped by `remaining()`
-                    // since `size` is attacker-controlled.
                     try meta.row_groups.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
                     var i: usize = 0;
                     while (i < size) : (i += 1) {

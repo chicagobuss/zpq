@@ -619,9 +619,9 @@ pub const FetchJob = struct {
 /// interchangeably through the same bounded pool, so multi-file scans
 /// share one global connection budget.
 ///
-/// `workers` is clamped to the pool's capacity and to the job count, but must not exceed the concurrency limit of the
-/// `Io` passed in: `Io.Group.concurrent` *rejects* submissions past its limit rather than queueing them, and dispatch
-/// runs under `try` inside a `defer group.cancel`, so an over-large count cancels the batch.
+/// `workers` is clamped to pool capacity and to the job count, but must not exceed the `Io`'s concurrency limit:
+/// `Io.Group.concurrent` rejects submissions past its limit rather than queueing them, and dispatch runs under `try`
+/// inside a `defer group.cancel`, so an over-large count cancels the batch.
 pub fn fetchJobs(
     io: Io,
     p: anytype, // *Pool(N) for some comptime N
@@ -701,12 +701,9 @@ pub fn fetchJobs(
         };
     }
 
-    // 4. Run the sub-jobs through a fixed set of worker loops. Pool permits
-    //    gate *sockets*, not threads: `Io.Group.concurrent` spawns an OS
-    //    thread whenever all workers are busy, and a worker parked on a
-    //    blocking socket read is busy, so submitting every sub-job at once
-    //    created far more threads than permits. Completion order stays
-    //    arbitrary either way — nothing may depend on it.
+    // 4. Pool permits gate *sockets*, not threads: `Io.Group.concurrent` spawns an OS thread whenever all workers are
+    //    busy, and a worker parked on a blocking socket read is busy, so submitting every sub-job at once created far
+    //    more threads than permits. Completion order is arbitrary either way — nothing may depend on it.
     var shared: AtomicWorkCursor(FetchCtx) = .{ .items = ctxs };
     const Worker = struct {
         fn run(loop_io: Io, sh: *AtomicWorkCursor(FetchCtx)) Io.Cancelable!void {
@@ -715,8 +712,8 @@ pub fn fetchJobs(
     };
     var group: Io.Group = .init;
     defer group.cancel(io);
-    // Zero workers with work pending would leave every `ctx.ok` false and surface as `RangeFetchFailed` rather than as
-    // the bad argument it is.
+    // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
+    // rather than as the bad argument it is.
     const n_workers = if (ctxs.len == 0)
         0
     else
@@ -760,8 +757,6 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    // Preserves this wrapper's arity: pool capacity is what its callers implicitly got before `fetchJobs` took an
-    // explicit worker count.
     return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
 }
 

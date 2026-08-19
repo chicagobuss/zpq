@@ -64,20 +64,16 @@ pub const TAIL_SIZE: u64 = 64 * 1024;
 /// a real fetch descends into BoringSSL and libc `getaddrinfo`/NSS, whose stack use nothing here bounds.
 const READ_WORKER_STACK_SIZE: usize = 4 << 20;
 
-/// How many fetch worker loops the read stage runs. Equal to `POOL_SIZE` so one worker holds one permit, which also
-/// makes it the ceiling on threads (see `readExecutor`). A worker sleeping in retry backoff holds its slot, so active
-/// concurrency can dip below `POOL_SIZE` while a host throttles. Not runtime-configurable while `s3.MAX_PARTS` doubles
-/// as the retry budget and the pool's capacity is comptime.
+/// Fetch worker loops in the read stage. Equal to `POOL_SIZE` so one worker holds one permit and never parks in
+/// `acquire`. A worker sleeping in retry backoff still holds its slot, so live concurrency can dip below this while a
+/// host throttles.
 pub const READ_CONCURRENCY: usize = POOL_SIZE;
 
-/// The executor the read stage's blocking fetches run on. Without it, reads inherit the process-wide `std.Io.Threaded`,
-/// whose `concurrent_limit` is `.unlimited`: `Io.Group.concurrent` spawns a fresh OS thread whenever every worker is
-/// busy, and a worker parked on a blocking socket read is busy — so `POOL_SIZE` bounds sockets, never threads.
-///
-/// The limit here is only a backstop: it *rejects* submissions past it with `error.ConcurrencyUnavailable` instead of
-/// queueing, and both fetch sites submit under `try` inside a `defer group.cancel`, so exceeding it aborts the query
-/// rather than throttling it. The real bound is the fixed number of worker loops claiming from a shared cursor; raising
-/// `READ_CONCURRENCY` must raise this limit with it.
+/// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
+/// `Io.Group.concurrent` spawns a fresh OS thread whenever every worker is busy — including one parked on a blocking
+/// socket read — so pool permits alone bound sockets only. The limit is a backstop, not a throttle: submissions past it
+/// are rejected with `error.ConcurrencyUnavailable` rather than queued, and both fetch sites submit under `try` inside
+/// a `defer group.cancel`, so exceeding it aborts the query. Raising `READ_CONCURRENCY` must raise this limit too.
 fn readExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(gpa, .{
         .concurrent_limit = .limited(READ_CONCURRENCY),
@@ -1178,8 +1174,6 @@ fn openInputs(
     if (s3_indices.items.len > 0) {
         const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
 
-        // One executor for the whole read stage. `read_ctx` differs from `ctx` only in `io`, which is what moves both
-        // the metadata and the range fetches onto the bounded pool.
         var read_exec = readExecutor(ctx.gpa);
         defer read_exec.deinit();
         var read_ctx = ctx;
@@ -1260,9 +1254,9 @@ fn openInputs(
                 if (ci < num_leaves) fetch_arr[ci] = true;
             }
         }
-        // GROUP BY keys are needed bytes: without them the remote plan decodes into MissingChunkBytes/ShortDecode,
-        // while local mmap hides the bug by handing over the whole file. Tracked apart from `fetch_arr` so the
-        // stats-drop below cannot take them back out.
+        // GROUP BY keys are needed bytes: without them the remote plan hits MissingChunkBytes/ShortDecode, a bug local
+        // mmap hides by handing over the whole file. Tracked apart from `fetch_arr` so the stats-drop below cannot
+        // undo them.
         const group_cols = try arena.alloc(bool, num_leaves);
         @memset(group_cols, false);
         if (args.group_by) |gb| {
@@ -1288,9 +1282,8 @@ fn openInputs(
                 }
             }
         }
-        // Mirrors the gate in `scan.runMultiAggregate`: a whole-file statistic cannot answer a per-group aggregate, so
-        // under grouping no column is stats-answerable. Dropping one (reachable via `--trust-stats`) left grouped
-        // decode without its bytes.
+        // A whole-file statistic cannot answer a per-group aggregate, so under grouping no column is stats-answerable
+        // — mirrors the gate in `scan.runMultiAggregate`. Dropping one left grouped decode without its bytes.
         if (filter_for_plan == null and args.group_by == null and !args.scan_all) {
             if (agg_calls_for_plan) |calls| {
                 const metas_for_stats = try arena.alloc(schema.FileMetaData, specs.len);
@@ -1686,13 +1679,10 @@ fn rebaseFetchedOffsets(
     ranges: []const CompactRange,
     survivors: []const bool,
 ) !void {
-    // Page-index blocks are never part of the fetch plan, so their offsets have nothing to rebase onto — yet consumers
-    // bounds-check them against the compact buffer rather than the file. For conforming files the index sits past all
-    // column data, so a stale offset cannot fit and `originSlice`/`sliceInBounds` fall back to row-group granularity.
-    // Nothing enforces that placement: in a noncanonical file a stale offset can land inside the buffer, where
-    // unrelated bytes may decode as a ColumnIndex whose foreign min/max prune pages on read and get copied into output
-    // on write. Clearing removes that for every consumer at once. Pruned row groups are cleared too — the metadata as a
-    // whole no longer describes the source layout.
+    // Page-index blocks are never fetched, so their offsets have nothing to rebase onto — yet consumers bounds-check
+    // them against the compact buffer, not the file. In a noncanonical file a stale offset can land inside that buffer,
+    // where unrelated bytes may decode as a ColumnIndex whose foreign min/max prune pages on read and get copied into
+    // output on write. Pruned row groups are cleared too: the metadata no longer describes the source layout.
     for (meta.row_groups.items) |*rg| {
         for (rg.columns.items) |*chunk| {
             chunk.column_index_offset = null;
@@ -2329,8 +2319,8 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The implied compact buffer is 128 bytes and the index pointers deliberately fall *inside* it, modelling the
-    // noncanonical file this clearing exists for; a conforming writer's would fail bounds anyway.
+    // The index pointers deliberately fall *inside* the implied 128-byte compact buffer, modelling the noncanonical
+    // file this clearing exists for; a conforming writer's offsets would fail bounds anyway.
     var meta: schema.FileMetaData = .{};
     for ([_]i64{ 1_000_000, 2_000_000 }) |dpo| {
         var rg: schema.RowGroup = .{};
@@ -2357,12 +2347,10 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
 
     for (meta.row_groups.items, 0..) |rg, i| {
         const chunk = rg.columns.items[0];
-        // Data offsets rebased into the compact buffer...
         try std.testing.expectEqual(
             @as(i64, @intCast(i * 64)),
             chunk.meta_data.?.data_page_offset,
         );
-        // ...and the un-rebaseable index pointers are gone, not aimed at compact-buffer bytes they do not describe.
         try std.testing.expectEqual(@as(?i64, null), chunk.column_index_offset);
         try std.testing.expectEqual(@as(?i32, null), chunk.column_index_length);
         try std.testing.expectEqual(@as(?i64, null), chunk.offset_index_offset);
@@ -2376,8 +2364,8 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A pruned row group is skipped by the rebase loop, so if clearing rode along with rebasing it would keep its stale
-    // pointers.
+    // A pruned row group is skipped by the rebase loop, so clearing that rode along with rebasing would leave its
+    // stale pointers.
     var meta: schema.FileMetaData = .{};
     var rg: schema.RowGroup = .{};
     var chunk: schema.ColumnChunk = .{
@@ -2400,6 +2388,5 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
     const out = meta.row_groups.items[0].columns.items[0];
     try std.testing.expectEqual(@as(?i64, null), out.column_index_offset);
     try std.testing.expectEqual(@as(?i64, null), out.offset_index_offset);
-    // The pruned group's data offset is deliberately left un-rebased.
     try std.testing.expectEqual(@as(i64, 9_000_000), out.meta_data.?.data_page_offset);
 }

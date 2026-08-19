@@ -708,10 +708,9 @@ test "unsplitByteStreamSplit transposes byte-planes back to PLAIN" {
 }
 
 test "chunk-start seek installs a dictionary only when one actually leads the chunk" {
-    // With `dictionary_page_offset` absent, the pruned decode path seeks to the chunk start and advances one page. Both
-    // shapes in parquet-testing reach that code and must be told apart: alltypes_plain bool_col leads with a DATA_PAGE,
-    // alltypes_tiny_pages string_col with a DICTIONARY_PAGE. Installing a leading data page as a dictionary would
-    // silently corrupt every value, so assert on the reader's dictionary state directly.
+    // Installing a leading data page as a dictionary would silently corrupt every value, so assert on the reader's
+    // dictionary state directly. Both parquet-testing shapes reach the omitted-offset path: alltypes_plain bool_col
+    // leads with a DATA_PAGE, alltypes_tiny_pages string_col with a DICTIONARY_PAGE.
     const Case = struct {
         path: []const u8,
         column: []const u8,
@@ -738,7 +737,7 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
         const col_idx = metadata.findColumnIndex(&meta, case.column) orelse return error.MissingColumn;
         const col = meta.row_groups.items[0].columns.items[col_idx].meta_data.?;
 
-        // Precondition: if a parquet-testing bump adds the offset, fail here rather than quietly stop covering the
+        // Fail loudly if a parquet-testing bump adds the offset, rather than quietly stop covering the
         // omitted-offset shape.
         try testing.expect(col.dictionary_page_offset == null);
 
@@ -760,7 +759,6 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
             var reader = ColumnChunkReader(bool).init(chunk, col.codec, levels, arena.allocator());
             try reader.pages.seekToPage(chunk_start, chunk_start);
             try testing.expect(try reader.advancePage());
-            // Leading page was data: nothing may be installed as a dictionary.
             try testing.expect(reader.dictionary == null);
         }
     }

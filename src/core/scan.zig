@@ -160,20 +160,17 @@ const WorkItem = struct {
 /// every nesting path here is bounded.
 pub const WORKER_STACK_SIZE: usize = 1 << 20;
 
-/// One footer-parsing worker. Files are claimed dynamically so a lake of wildly different file sizes doesn't leave
-/// threads idle.
+/// One footer-parsing worker. Files are claimed dynamically so wildly uneven file sizes don't leave threads idle.
 const ParseCtx = struct {
     inputs: []const Input,
     out: []schema.FileMetaData,
     cursor: *std.atomic.Value(usize),
-    /// Private to this worker — ArenaAllocator is not thread-safe.
+    /// Private to this worker: ArenaAllocator is not thread-safe, so no two threads may ever share one ParseCtx.
     arena: *std.heap.ArenaAllocator,
     err: ?anyerror = null,
-    /// Index of the file `err` came from, so the caller can report the lowest-numbered failure and stay deterministic
-    /// across runs.
     bad_index: usize = 0,
-    /// Entries into `parseWorker` with this context; must never exceed 1, since the arena is not thread-safe. Asserted
-    /// after join because the race itself is UB and unreliable to observe, while double-entry is exact.
+    /// Entries into `parseWorker` with this context; must never exceed 1. Asserted after join rather than watching for
+    /// the race itself, which is UB and unreliable to observe.
     runs: std.atomic.Value(u32) = .init(0),
 };
 
@@ -202,8 +199,8 @@ const FooterParse = union(enum) {
 
 /// Parse all input footers, in parallel when there is more than one file.
 ///
-/// Each worker parses into its OWN arena — ArenaAllocator is not thread-safe. Ownership passes to the caller via
-/// `meta_arenas_out`, which must outlive the returned metadata: the returned slice points into those arenas.
+/// Ownership of the per-worker arenas passes to the caller via `meta_arenas_out`, which must outlive the returned
+/// metadata: the returned slice points into them.
 fn parseFooters(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -245,15 +242,14 @@ fn parseFooters(
         threads[spawned] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, parseWorker, .{c}) catch break;
         spawned += 1;
     }
-    // Must use a context no thread owns: ParseCtx's arena is not thread-safe, so reusing ctxs[0] would race live worker
-    // 0. One inline pass drains whatever is left regardless of how many spawns failed — work comes off a shared cursor.
+    // Must use a context no thread owns — see `ParseCtx.arena`; reusing ctxs[0] would race live worker 0. One inline
+    // pass drains whatever is left however many spawns failed, since work comes off a shared cursor.
     if (spawned < parse_threads) parseWorker(&ctxs[spawned]);
     // Join before reading anything the threads wrote, and before the caller can tear `meta_arenas` down underneath
     // them.
     for (threads[0..spawned]) |th| th.join();
 
-    // Historical bug: the inline pass ran on `ctxs[0]` while worker 0 was still live, putting two threads in one
-    // ArenaAllocator.
+    // Historical bug: the inline pass ran on `ctxs[0]` while worker 0 was still live, putting two threads in one arena.
     for (ctxs) |*c| std.debug.assert(c.runs.load(.monotonic) <= 1);
 
     var worst: ?ParseCtx = null;
@@ -270,11 +266,11 @@ const Worker = struct {
     gpa: std.mem.Allocator,
     inputs: []const Input,
     metas: []const schema.FileMetaData,
-    /// The FULL work list, shared by every worker; items are claimed dynamically through `cursor`. Row-group cost
-    /// varies too much — size, encoding, whether a filter prunes them — for a static split not to leave workers idle.
+    /// The FULL work list, shared by every worker; items are claimed through `cursor`. Row-group cost varies too much
+    /// — size, encoding, whether a filter prunes them — for a static split not to leave workers idle.
     work: []const WorkItem,
-    /// Shared claim counter. Relaxed ordering suffices: it only hands out disjoint indices, and the post-join merge is
-    /// the real synchronization edge.
+    /// Relaxed ordering suffices: this only hands out disjoint indices, and the post-join merge is the real
+    /// synchronization edge.
     cursor: *std.atomic.Value(usize),
     agg_calls: []const expr_agg.AggCall,
     filter_opt: ?filter_ast.Filter,
@@ -294,14 +290,13 @@ fn workerRun(w: *Worker) void {
     workerRunErr(w) catch |e| {
         w.err = e;
     };
-    // Return unused budget now, while other workers may still be filling. Holding it until teardown let a worker that
-    // drew a block for a handful of groups strand a small budget and fail the worker doing the real work.
+    // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
+    // doing the real work.
     if (w.group_table) |*gt| gt.releaseSlack();
 }
 
 fn workerRunErr(w: *Worker) !void {
-    // One decode arena for the whole run; scanRGForAgg resets it per row group rather than regrowing a fresh arena from
-    // scratch each time.
+    // One decode arena for the whole run: scanRGForAgg resets it per row group instead of regrowing a fresh one.
     var rg_decode_arena = std.heap.ArenaAllocator.init(w.gpa);
     defer rg_decode_arena.deinit();
 
@@ -387,8 +382,6 @@ pub fn runMultiAggregate(
 
     var t: Timings = .{};
 
-    // 1. Parse metadata for every input.
-    //
     // Parallel because footer parsing scales with file count and schema width and can dominate short multi-file scans.
     // `meta_arenas` must outlive this call: `metas` points into them.
     var meta_arenas: []std.heap.ArenaAllocator = &.{};
@@ -612,18 +605,17 @@ pub fn runMultiAggregate(
         }
     }
 
-    // Size the worker set by BYTES to be decoded, not row-group count: thread creation has a fixed cost, and a query
-    // may touch only a small part of a wide schema. 2 MiB per worker is a conservative floor — big scans clear it
-    // immediately, small ones stop paying for parallelism they can't use.
+    // Size the worker set by BYTES to decode, not row-group count: thread creation has a fixed cost and a query may
+    // touch only a small part of a wide schema. 2 MiB per worker is a conservative floor.
     const MIN_BYTES_PER_WORKER: u64 = 2 * 1024 * 1024;
     var fetch_bytes: u64 = 0;
     for (work_items.items) |item| {
         const rg = &metas[item.file].row_groups.items[item.rg];
         for (rg.columns.items, 0..) |col, ci| {
             if (ci < item.fetch_arr.len and item.fetch_arr[ci]) {
-                // Larger of two proxies; neither is sufficient alone. Uncompressed bytes fits fixed-width types but
-                // makes BOOLEAN (8 rows per byte) and dictionary-encoded strings (index stream only) look nearly free,
-                // so `rows x 4` floors the per-row cost those encodings pay when materialized.
+                // Larger of two proxies: uncompressed bytes makes BOOLEAN (8 rows per byte) and dictionary-encoded
+                // strings (index stream only) look nearly free, so `rows x 4` floors the cost they pay when
+                // materialized.
                 if (col.meta_data) |cm| {
                     const uncompressed: u64 = @intCast(cm.total_uncompressed_size);
                     const by_rows: u64 = @as(u64, @intCast(rg.num_rows)) * 4;
@@ -640,10 +632,10 @@ pub fn runMultiAggregate(
     for (assignments) |*a| a.* = .empty;
     _ = &assignments; // superseded by dynamic claiming via Worker.cursor
 
-    // One budget shared by every worker table rather than per-worker quotas: work is claimed off a shared cursor, so
-    // which worker meets the group-heavy row groups is not knowable in advance. Fixed quotas made `-j2` reject queries
-    // that `-j1` ran on identical data. Fully initialized before any worker exists, so none can insert against an
-    // unpublished budget.
+    // One budget shared by every worker table, not per-worker quotas: work is claimed off a shared cursor, so which
+    // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
+    // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished
+    // budget.
     var group_budget = expr_agg.SharedBudget{
         .limit = args.max_memory,
         .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
@@ -907,9 +899,8 @@ pub fn runMultiAggregate(
 
 /// How one group-key column is framed in a serialized composite key.
 ///
-/// Only three shapes exist because `evalGroupKeyExpr` builds key columns from the EXPRESSION type, which has three
-/// lanes. Framing from the physical Parquet type let the two disagree: a BOOLEAN serialized 8 bytes but deserialized 1,
-/// silently truncating every later column in a composite key.
+/// Framing from the physical Parquet type let writer and reader disagree: a BOOLEAN serialized 8 bytes but
+/// deserialized 1, silently truncating every later column of the key.
 const KeyType = enum { i64, f64, string };
 
 fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
@@ -963,10 +954,8 @@ fn resolveGroupSelectCols(
 
 /// Framing for a group-key column, taken from the expression's own type.
 ///
-/// Must match `evalGroupKeyExpr`, which produces the column that gets serialized; it switches on `expr_type` exactly as
-/// this does, so the two cannot drift. Deliberately does NOT consult the Parquet schema: `col_idx` counts leaves while
-/// `meta.schema` is a DFS containing MAP/LIST/STRUCT group nodes, so after any nested field a leaf index selects the
-/// wrong element.
+/// Must match `evalGroupKeyExpr`, which serializes the column off the same switch, so the two cannot drift.
+/// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
 fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
     return switch (expr.typeOf()) {
         .i64 => .i64,
@@ -977,10 +966,8 @@ fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
 
 /// The schema element for the `leaf_idx`-th primitive column.
 ///
-/// `col_idx` counts LEAVES, but `meta.schema` is the flattened DFS including group nodes, so `leaf_idx + 1` is only
-/// correct for files with no nested types at all. This walks the DFS counting primitives instead.
-///
-/// Used for output column NAMES. Key framing must not depend on it — see `keyTypeFromExpr`.
+/// `col_idx` counts LEAVES, but `meta.schema` is a flattened DFS including group nodes, so `leaf_idx + 1` is correct
+/// only for files with no nested types. Used for output column NAMES; key framing must not depend on it.
 fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) *const schema.SchemaElement {
     var seen: usize = 0;
     // Element 0 is the root, which is always a group.
@@ -1017,11 +1004,9 @@ fn stripQuotes(name: []const u8) []const u8 {
     return name;
 }
 
-/// Pull one column out of a serialized composite group key: a 1-byte present flag per column, then what
-/// `expr_agg.serializeRowKey` wrote for that lane.
-///
-/// Bounds-checked rather than trusting the framing: a writer/reader disagreement turns a length field into the previous
-/// column's payload bytes, and the failure mode was a panic or a huge allocation rather than an error.
+/// Pull one column out of a serialized composite group key: a 1-byte present flag, then what
+/// `expr_agg.serializeRowKey` wrote for that lane. Bounds-checked rather than trusting the framing: a writer/reader
+/// disagreement turns a length field into the previous column's payload bytes, panicking or allocating wildly.
 pub fn deserializeKeyColumn(
     allocator: std.mem.Allocator,
     key_bytes: []const u8,
@@ -1115,15 +1100,13 @@ test "scan: API is well-typed" {
 
 // ============================================================ Partial thread-spawn failure.
 //
-// `Thread.spawn` can fail partway through a loop (EAGAIN). Threads already running hold pointers into per-worker arenas
-// an unwinding caller would free, so leftover work must run inline and started threads must be joined. Driven
-// deterministically through the seam in spawn.zig, which real spawn failure is not.
+// `Thread.spawn` can fail partway through a loop (EAGAIN); leftover work must still run and started threads must still
+// be joined. Driven through the seam in spawn.zig, since real spawn failure is not reproducible.
 // ============================================================
 
 const testing = std.testing;
 const spawn_test_fixture = "data/parquet-testing/data/nan_in_stats.parquet";
-/// The padding columns exist only to push estimated fetch volume past the 2 MiB-per-worker sizing threshold, so the
-/// scan actually spawns workers.
+/// The padding columns exist only to push fetch volume past the 2 MiB-per-worker threshold, so workers really spawn.
 const SPAWN_FIXTURE_AGG =
     "count(*) AS n" ++
     ", sum(pad0) AS s0" ++ ", sum(pad1) AS s1" ++ ", sum(pad2) AS s2" ++
@@ -1148,8 +1131,7 @@ test "parseFooters: every file is parsed even when spawns fail partway" {
 
     const n_files = 8;
     const parse_threads = 4;
-    // Fail at the first spawn, after one, and after all-but-one. The last entry is the control: 4 of 4 successes means
-    // no injected failure at all.
+    // The last entry is the control: `parse_threads` successes means no injected failure at all.
     for ([_]usize{ 0, 1, parse_threads - 1, parse_threads }) |fail_after| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
@@ -1181,8 +1163,7 @@ test "parseFooters: every file is parsed even when spawns fail partway" {
             },
             .ok => |parsed| {
                 try testing.expectEqual(@as(usize, n_files), parsed.len);
-                // Every file must be parsed. A worker whose thread never started would leave its share of `parsed`
-                // untouched.
+                // A worker whose thread never started would leave its share of `parsed` untouched.
                 for (parsed) |m| {
                     try testing.expectEqual(spawn_test_fixture_rows, m.num_rows);
                 }
@@ -1203,8 +1184,7 @@ test "parseFooters: lowest-index failure is reported whatever the spawn outcome"
 
     const n_files = 8;
     const parse_threads = 4;
-    // Two bad files. Whichever worker happens to claim which file, the reported index must always be the lower of the
-    // two.
+    // Whichever worker claims which file, the reported index must be the lower of the two.
     const first_bad = 2;
     const second_bad = 5;
 
@@ -1281,12 +1261,10 @@ test "runMultiAggregate: injected spawn failures don't change the answer" {
 
         try testing.expectEqual(@as(usize, 1), res.aggs.len);
         const got: Answer = .{ .sum = res.aggs[0].value.i, .rows = res.rows_in };
-        // Work dropped by a failed spawn and not picked up inline would show as a short row count and a correspondingly
-        // wrong sum.
+        // Work dropped by a failed spawn and never picked up inline would show as a short row count.
         try testing.expect(got.rows > 0);
 
         if (baseline) |b| {
-            // Same answer no matter how many threads never started.
             try testing.expectEqual(b.sum, got.sum);
             try testing.expectEqual(b.rows, got.rows);
             // Prove the run took the failure path; one worker means nothing was tested.
@@ -1304,10 +1282,8 @@ test "runMultiAggregate: injected spawn failures don't change the answer" {
 }
 
 test "runMultiAggregate: skewed work does not let idle workers strand the budget" {
-    // Sixteen work items: one contributes a thousand groups, fifteen one each. At -j16, blocks sized as a fraction of
-    // the whole budget rather than of each worker's share let the fifteen light workers strand most of the pool. That
-    // is what "at most ~5% collectively" in --max-memory has to mean: admission cannot depend on worker count when live
-    // state fits the budget.
+    // Blocks sized as a fraction of the whole budget rather than of each worker's share let fifteen barely-grouping
+    // workers strand most of the pool at -j16. Admission cannot depend on worker count when live state fits the budget.
     const heavy = "ci/fixtures/parquet/spawn_budget_a.parquet";
     const light = "ci/fixtures/parquet/spawn_budget_b.parquet";
     var bytes: [2][]u8 = undefined;
@@ -1370,12 +1346,7 @@ test "runMultiAggregate: skewed work does not let idle workers strand the budget
 }
 
 test "runMultiAggregate: --max-memory means the same thing at every -j" {
-    // The budget is global, not a per-worker partition: raising -j must never reject a query a lower -j ran on
-    // identical data — the guarantee 0a94bad established for requested-vs-actual worker count, which fixed quotas
-    // reintroduced one level down.
-    //
-    // 800 bytes fits exactly one group; split two ways each worker saw 400 and
-    // -j2 failed.
+    // 800 bytes fits exactly one group — enough at -j1, and the shared budget must make it enough at every -j.
     const files = [_][]const u8{
         "ci/fixtures/parquet/spawn_budget_a.parquet",
         "ci/fixtures/parquet/spawn_budget_b.parquet",
@@ -1437,22 +1408,19 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
 }
 
 test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns fail" {
-    // End-to-end form of the inlineWorkerBudget regression: a spawn failure must not turn a query that fits
-    // `max_memory` into ExceededMemoryBudget. Reaching that code needs four things at once:
+    // A spawn failure must not turn a query that fits `max_memory` into ExceededMemoryBudget. Reaching that path
+    // needs four things at once:
     //
     //  1. GROUP BY, or there is no group table and no budget to get wrong.
-    //  2. n_workers >= 2, hence twelve fetched columns to clear the 2 MiB
-    //     per-worker sizing threshold on a small fixture.
-    //  3. Group keys disjoint per work item, so one worker holding the union
-    //     really does need ~2x; with shared keys the bug is invisible.
-    //  4. A budget that fits only when the fallback worker receives the full
-    //     shared allowance rather than one worker's share.
+    //  2. n_workers >= 2, hence twelve fetched columns to clear the 2 MiB-per-worker sizing threshold.
+    //  3. Group keys disjoint per work item, so one worker holding the union really needs ~2x; shared keys hide it.
+    //  4. A budget that fits only when the fallback worker gets the full shared allowance, not one worker's share.
     //
     // Metadata is passed in so every injected failure is necessarily a scan-worker spawn; otherwise footer-parse spawns
     // satisfy the "injection fired" check while the scan loop quietly runs single-threaded.
     //
-    // Tracked fixtures, not corpus files: data/ is gitignored, so a test pointed there degrades to SkipZigTest in a
-    // clean clone. Regenerate with tools/gen_spawn_budget_fixture.py.
+    // Tracked fixtures, not data/ (gitignored, so a test pointed there would skip in a clean clone): regenerate with
+    // tools/gen_spawn_budget_fixture.py.
     const files = [_][]const u8{
         "ci/fixtures/parquet/spawn_budget_a.parquet",
         "ci/fixtures/parquet/spawn_budget_b.parquet",
@@ -1543,9 +1511,9 @@ test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns 
 
 // ============================================================ Group-key framing.
 //
-// `col_idx` counts primitive leaves; `meta.schema` is a DFS that also holds MAP/LIST/STRUCT group nodes, so
-// leaf-indexed framing read the wrong element for every column after the first nested one. The fixture puts a MAP ahead
-// of ordinary scalars to reproduce that shape. ============================================================
+// Leaf-indexed framing read the wrong schema element for every column after the first nested one (see
+// `leafSchemaElem`). The fixture puts a MAP ahead of ordinary scalars to reproduce that shape.
+// ============================================================
 
 const nested_key_fixture = "ci/fixtures/parquet/nested_key_shape.parquet";
 
@@ -1579,8 +1547,8 @@ fn freeGroupResult(res: MultiAggResult) void {
 }
 
 test "group key: a scalar column after a MAP is framed by its own type" {
-    // `ts` is INT64/TIMESTAMP but leaf-indexed lookup resolves to a BYTE_ARRAY element, so deserialization read the
-    // timestamp's bytes as a string length: "index out of bounds: index 2690342917, len 9" — 9 being a nullable i64.
+    // `ts` is INT64 but leaf-indexed lookup resolved a BYTE_ARRAY element, so deserialization read the timestamp bytes
+    // as a string length: "index out of bounds: index 2690342917, len 9".
     const bytes = (try loadNestedKeyFixture()) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
 
@@ -1601,7 +1569,6 @@ test "group key: a scalar column after a MAP is framed by its own type" {
     var total: i128 = 0;
     for (rows) |r| total += r[1].i;
     try testing.expectEqual(@as(i128, 60), total);
-    // Keys must come back as integers, not as a string or a null.
     for (rows) |r| try testing.expect(r[0] == .i);
 
     // The output column name also depends on resolving the right leaf.
@@ -1640,8 +1607,7 @@ test "group key: a BOOLEAN first column does not truncate the rest" {
 test "deserializeKeyColumn: corrupt framing errors instead of panicking" {
     const a = testing.allocator;
 
-    // A string whose length field claims far more than the buffer holds — the shape a framing disagreement produces,
-    // previously a panic or a huge alloc.
+    // A length field claiming far more than the buffer holds — previously a panic or a huge alloc.
     var runaway: [5]u8 = .{ 1, 0xFF, 0xFF, 0xFF, 0xFF };
     try testing.expectError(
         error.BadGroupKey,

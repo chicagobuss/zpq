@@ -80,8 +80,7 @@ test {
     _ = core.schema;
     _ = core.thrift;
     _ = core.consumer;
-    // Zig only compiles tests from modules this block names. scan.zig was missing here, so its tests silently never
-    // ran.
+    // Zig only compiles tests from modules named here; scan.zig was missing, so its tests silently never ran.
     _ = core.scan;
     _ = core.spawn;
     _ = core.invariant;

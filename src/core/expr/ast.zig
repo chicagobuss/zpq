@@ -104,8 +104,7 @@ pub const BinOp = struct {
     /// Result type — `Type.promote(left.typeOf(), right.typeOf())`.
     /// Cached at parse time.
     result_type: Type,
-    /// Height of this subtree — `1 + max(left.depth(), right.depth())`. Cached because the parser checks it on every
-    /// node it builds; a recursive walk would be O(nodes) per check.
+    /// Cached because the parser checks it on every node it builds; a recursive walk would be O(nodes) per check.
     depth: u32,
 };
 
@@ -122,7 +121,6 @@ pub const Call = struct {
     args: []const *Expr,
     /// Result type, resolved at parse time from the args' types.
     result_type: Type,
-    /// Height of this subtree — `1 + max(arg.depth())`. See `BinOp.depth`.
     depth: u32,
 };
 
@@ -141,8 +139,8 @@ pub const Expr = union(enum) {
         };
     }
 
-    /// Height of this subtree — leaves are 1. This, not the parser's recursion depth, is what `parser.MAX_EXPR_DEPTH`
-    /// bounds: it sets how many full intermediate columns are live at once.
+    /// This height, not the parser's recursion depth, is what `parser.MAX_EXPR_DEPTH` bounds: it sets how many full
+    /// intermediate columns are live at once.
     pub fn depth(self: Expr) u32 {
         return switch (self) {
             .literal, .col_ref => 1,

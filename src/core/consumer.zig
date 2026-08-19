@@ -21,8 +21,8 @@
 
 const std = @import("std");
 
-/// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicates scan.zig's `WORKER_STACK_SIZE`;
-/// scan.zig imports this module.
+/// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
+/// scan.zig, which imports this module.
 const WORKER_STACK_SIZE: usize = 1 << 20;
 const spawn_util = @import("spawn.zig");
 const schema = @import("schema.zig");
@@ -671,8 +671,8 @@ pub fn encodeAggregator(
 
         const ctxs = try ra.alloc(AggEncodeCtx, num_workers);
         const threads = try ra.alloc(std.Thread, num_workers);
-        // Initialize every context before spawning any thread: a partial spawn failure runs the rest inline, so none
-        // may be half-built.
+        // Initialize every context before spawning: a partial spawn failure runs the rest inline, so none may be
+        // half-built.
         for (0..num_workers) |w| {
             ctxs[w] = .{
                 .arena = arenas[w].allocator(),
@@ -689,13 +689,13 @@ pub fn encodeAggregator(
 
         var spawned: usize = 0;
         for (0..num_workers) |w| {
-            // Not `try`: an early return would unwind while earlier workers are still encoding into `arenas`, which the
-            // caller releases.
+            // Not `try`: an early return would unwind while earlier workers are still encoding into `arenas`, which
+            // the caller releases.
             threads[w] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, aggEncodeWorker, .{&ctxs[w]}) catch break;
             spawned += 1;
         }
-        // Fixed stride, not a shared cursor: every context that missed its thread must run here, or its columns go
-        // unencoded and the write phase fails with MissingEncodeResult.
+        // Every context that missed its thread must run here, or its columns go unencoded and the write phase fails
+        // with MissingEncodeResult.
         for (spawned..num_workers) |w| aggEncodeWorker(&ctxs[w]);
         for (threads[0..spawned]) |t| t.join();
         for (ctxs) |c| if (c.err) |err| return err;
@@ -1032,7 +1032,7 @@ pub fn scanRGForAgg(
     accumulators: []expr_agg.Accumulator,
     group_by_keys: ?[]const expr_ast.Expr,
     group_table: ?*expr_agg.GroupTable,
-    /// Caller-owned decode scratch, reused across row groups: reset here, never destroyed. See the reset call for why.
+    /// Caller-owned decode scratch, reused across row groups: reset here, never destroyed.
     rg_arena_state: *std.heap.ArenaAllocator,
     timings: *Timings,
 ) !void {
@@ -1081,9 +1081,8 @@ pub fn scanRGForAgg(
     if (!any_decode_required) return;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
-    //
-    // Reset, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time. The
-    // price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
+    // Reset, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
+    // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
     _ = rg_arena_state.reset(.retain_capacity);
     const ra = rg_arena_state.allocator();
 
@@ -1570,20 +1569,12 @@ fn decodeWithReaderPruned(
         @memset(def_levels.?, 0);
     }
 
-    // Install the dictionary before decoding any page that references it.
-    //
-    // `dictionary_page_offset` is OPTIONAL, so when it is absent we rely on `data_page_offset` pointing at the chunk
-    // start. That is a claim about writers, not about the spec, so it was measured across parquet-testing: of the 34
-    // chunks that omit the offset while advertising a dictionary encoding, 31 have a DICTIONARY_PAGE exactly there; the
-    // other 3 (alltypes_plain bool_col) have a real DATA_PAGE and no dictionary at all, which `advancePage` handles by
-    // dispatching on page type (regression test in parquet/column.zig).
-    //
-    // A spec-literal writer that omitted the offset while pointing past a real dictionary page would fail cleanly with
-    // DictionaryMissing rather than answer wrongly; no such file exists in the corpus, and recovering would need the
-    // previous chunk's end. `ColumnChunk.file_offset` is deliberately not consulted: deprecated and inconsistent across
-    // writers.
-    //
-    // Guards a bug where such chunks failed on the page-pruned path only.
+    // `dictionary_page_offset` is OPTIONAL, so when absent we rely on `data_page_offset` pointing at the chunk start
+    // — a claim about real writers, not the spec. Measured across parquet-testing: of the 34 chunks that omit it, 31
+    // have a DICTIONARY_PAGE there and 3 (alltypes_plain bool_col) have a real DATA_PAGE and no dictionary, so
+    // `advancePage` dispatches on page type (regression test in parquet/column.zig). `ColumnChunk.file_offset` is
+    // deliberately not consulted: deprecated and inconsistent across writers. Guards a bug where these chunks failed on
+    // the page-pruned path only.
     if (prune.dictionary_page_offset) |dict_off| {
         try reader.pages.seekToPage(dict_off, prune.chunk_file_offset);
         _ = try reader.advancePage();

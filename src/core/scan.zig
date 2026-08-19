@@ -81,6 +81,7 @@ pub const MultiAggArgs = struct {
     /// path) instead of decoding. Off by default — file stats can be wrong.
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
+    fast_levels: bool = false,
 };
 
 pub const AggValue = union(enum) {
@@ -276,6 +277,7 @@ const Worker = struct {
     filter_opt: ?filter_ast.Filter,
     scan_all: bool,
     trust_stats: bool,
+    decode_options: consumer.DecodeOptions,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_kept: i64 = 0,
@@ -338,6 +340,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
+                w.decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 &[_]expr_agg.Accumulator{},
@@ -355,6 +358,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
+                w.decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 item.accumulators,
@@ -650,6 +654,7 @@ pub fn runMultiAggregate(
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
             .trust_stats = args.trust_stats,
+            .decode_options = .{ .fast_levels = args.fast_levels },
             .group_by_keys = group_by_keys,
             .group_table = if (group_by_keys != null) blk_gt: {
                 // Zero local ceiling: everything is drawn from the shared pool, so an idle worker reserves nothing

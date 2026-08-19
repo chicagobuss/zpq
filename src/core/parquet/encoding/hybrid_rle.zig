@@ -168,6 +168,28 @@ pub const HybridRleDecoder = struct {
         return written;
     }
 
+    /// Peek the stream's opening run without expanding a single value.
+    ///
+    /// Returns null when the stream is empty/truncated or opens with a
+    /// bit-packed run. Otherwise reports the RLE run's value and length
+    /// in values, read straight out of the run header — O(1) regardless
+    /// of how many values the run covers.
+    ///
+    /// This is the primitive behind the all-present definition-level
+    /// check: a level stream that opens with one long enough RLE run at
+    /// max_def proves the page has no nulls, so the page's levels never
+    /// have to be materialised at all.
+    pub fn peekFirstRun(bytes: []const u8, bit_width: u8) ?struct { value: u32, count: usize } {
+        // bit_width 0 means every level is implicitly 0 with no run
+        // structure to read; report it as an unbounded run of zeros so
+        // callers compare against their own max level as usual.
+        if (bit_width == 0) return .{ .value = 0, .count = std.math.maxInt(usize) };
+        var d = HybridRleDecoder.init(bytes, bit_width);
+        d.readNextRun() catch return null;
+        if (!d.in_rle) return null;
+        return .{ .value = d.rle_value, .count = d.remaining_in_run };
+    }
+
     fn readNextRun(self: *HybridRleDecoder) Error!void {
         const header = try self.readVarint();
         self.in_rle = (header & 1) == 0;
@@ -504,7 +526,7 @@ test "BooleanRleDecoder decodes a bit-width-1 RLE run" {
     const n = try d.decode(&out);
     try std.testing.expectEqual(@as(usize, 13), n);
     try std.testing.expectEqualSlices(bool, &.{
-        true, true, true,  true,  true, // RLE run of 5 ones
+        true, true, true, true, true, // RLE run of 5 ones
         false, true, false, false, false, false, false, false, // bit-packed 8
     }, &out);
 }

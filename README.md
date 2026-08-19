@@ -82,6 +82,10 @@ zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
 `--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
 is the opposite extreme — decode everything, disable pruning too, for when you don't trust even the row counts.
 
+For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
+levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
+decoder unless one RLE run proves that the entire page is present. It is off by default while the path is new.
+
 ## Test coverage
 
 CI ([`.github/workflows/verify.yml`](.github/workflows/verify.yml)) runs unit tests, Lambda integration tests, CLI

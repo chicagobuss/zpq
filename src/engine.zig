@@ -132,6 +132,11 @@ pub const QueryArgs = struct {
     /// Row-group pruning still uses stats regardless (that path only skips
     /// provably-non-matching groups, so it can't produce a wrong value).
     trust_stats: bool = false,
+    /// `--fast-levels`: skip materialising definition levels for data
+    /// pages proven to have no nulls. Off by default — it is new, and a
+    /// wrong answer here would be silent. See `core/parquet/column.zig`
+    /// (`fast_levels`) for what the detection actually proves.
+    fast_levels: bool = false,
     max_memory: usize = 512 * 1024 * 1024,
 };
 
@@ -258,6 +263,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .parallelism = args.parallelism,
         .scan_all = args.scan_all,
         .trust_stats = args.trust_stats,
+        .fast_levels = args.fast_levels,
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
@@ -368,12 +374,13 @@ fn encodeRGToBuffer(
     fetch_arr: []const bool,
     output_specs: []const consumer.OutputCol,
     codec: schema.CompressionCodec,
+    decode_options: consumer.DecodeOptions,
 ) !EncodedRG {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     var timings: consumer.Timings = .{};
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
-    _ = try consumer.appendProjectedRG(
+    _ = try consumer.appendProjectedRGWithOptions(
         &agg,
         gpa,
         job.rg,
@@ -383,6 +390,7 @@ fn encodeRGToBuffer(
         fetch_arr,
         output_specs,
         &timings,
+        decode_options,
     );
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
@@ -421,6 +429,7 @@ const WinCtx = struct {
     output_specs: []const consumer.OutputCol,
     kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
+    decode_options: consumer.DecodeOptions,
     slots: []Slot,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
@@ -444,7 +453,16 @@ fn winProducer(w: *WinCtx, i: usize) void {
     const enc = (if (w.jobs[i].passthrough)
         copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set)
     else
-        encodeRGToBuffer(w.gpa, ma, w.jobs[i], w.filter, w.fetch_arr, w.output_specs, w.codec)) catch |e| {
+        encodeRGToBuffer(
+            w.gpa,
+            ma,
+            w.jobs[i],
+            w.filter,
+            w.fetch_arr,
+            w.output_specs,
+            w.codec,
+            w.decode_options,
+        )) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
@@ -861,6 +879,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .output_specs = output_specs.items,
                 .kept_set = kept_set,
                 .codec = args.codec,
+                .decode_options = .{ .fast_levels = args.fast_levels },
                 .slots = slots,
                 .window = &window_sem,
                 .completions = &completions_sem,
@@ -2281,7 +2300,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 if ((try filter_prune.pruneRowGroup(src_rg, f, arena, &meta_const)) == .skip) continue;
             };
 
-            _ = try consumer.appendProjectedRG(
+            _ = try consumer.appendProjectedRGWithOptions(
                 &agg,
                 ctx.gpa,
                 src_rg,
@@ -2291,6 +2310,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 fetch_arr,
                 output_specs.items,
                 &t.core,
+                .{ .fast_levels = args.fast_levels },
             );
 
             try flushAggregator(&agg, &stdout_writer, is_jsonl, limit, &total_printed);

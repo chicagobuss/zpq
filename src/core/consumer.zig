@@ -42,6 +42,8 @@ const decimal_mod = @import("parquet/decimal.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 
+pub const DecodeOptions = column_mod.DecodeOptions;
+
 /// Error set the consumer functions can return. Inferred from the
 /// underlying decoders/encoders/sinks; unioned here for documentation.
 /// (The actual function signatures use `anyerror` because `sink.write`
@@ -288,6 +290,32 @@ pub fn appendProjectedRG(
     output_specs: []const OutputCol,
     timings: *Timings,
 ) !usize {
+    return appendProjectedRGWithOptions(
+        agg,
+        gpa,
+        rg,
+        meta,
+        src,
+        filter,
+        fetch_set,
+        output_specs,
+        timings,
+        .{},
+    );
+}
+
+pub fn appendProjectedRGWithOptions(
+    agg: *OutputAggregator,
+    gpa: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    filter: ?filter_ast.Filter,
+    fetch_set: []const bool,
+    output_specs: []const OutputCol,
+    timings: *Timings,
+    decode_options: DecodeOptions,
+) !usize {
     const num_rows: usize = @intCast(rg.num_rows);
     const num_leaves = rg.columns.items.len;
 
@@ -328,22 +356,58 @@ pub fn appendProjectedRG(
         const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
         const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-            .f64 = try decimal_mod.decodeColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, k),
+            .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                k,
+                decode_options,
+            ),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
             // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
-            .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves),
+            .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
         } else switch (cm.type) {
-            .INT32 => .{ .i32 = try decodeColumnT(i32, ra, chunk, cm.codec, levels, n_leaves) },
-            .INT64 => .{ .i64 = try decodeColumnT(i64, ra, chunk, cm.codec, levels, n_leaves) },
-            .FLOAT => .{ .f32 = try decodeColumnT(f32, ra, chunk, cm.codec, levels, n_leaves) },
-            .DOUBLE => .{ .f64 = try decodeColumnT(f64, ra, chunk, cm.codec, levels, n_leaves) },
-            .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, ra, chunk, cm.codec, levels, n_leaves) },
-            .BOOLEAN => .{ .boolean = try decodeColumnT(bool, ra, chunk, cm.codec, levels, n_leaves) },
+            .INT32 => .{
+                .i32 = try decodeColumnTWithOptions(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+            },
+            .INT64 => .{
+                .i64 = try decodeColumnTWithOptions(i64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+            },
+            .FLOAT => .{
+                .f32 = try decodeColumnTWithOptions(f32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+            },
+            .DOUBLE => .{
+                .f64 = try decodeColumnTWithOptions(f64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+            },
+            .BYTE_ARRAY => .{
+                .string = try decodeColumnTWithOptions(
+                    []const u8,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    decode_options,
+                ),
+            },
+            .BOOLEAN => .{
+                .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+            },
             // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
             .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
             // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
             // fixed-width bytes (UUID / Float16 / fixed binary).
-            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumn(ra, chunk, cm.codec, levels, n_leaves, flbaWidth(schema_elem)) },
+            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                flbaWidth(schema_elem),
+                decode_options,
+            ) },
         };
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
@@ -376,7 +440,7 @@ pub fn appendProjectedRG(
                 .passthrough => |ci| ci,
                 .computed => return error.MissingDecodedColumn,
             };
-            const dcol = try decodeDecimalI128(ra, rg, meta, src, kept_ci);
+            const dcol = try decodeDecimalI128(ra, rg, meta, src, kept_ci, decode_options);
             const filtered_dec = try encoder.applySelectionI128(ra, dcol, &sel);
             try appendTyped(i128, &agg.cols[i].decimal, filtered_dec.values, filtered_dec.def_levels, filtered_dec.max_def, agg.arena);
             continue;
@@ -411,6 +475,7 @@ fn decodeDecimalI128(
     meta: *const schema.FileMetaData,
     src: RGSrc,
     kept_ci: usize,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(i128) {
     const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -424,7 +489,15 @@ fn decodeDecimalI128(
     const n_leaves: usize = @intCast(cm.num_values);
     const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
     const kind = decimal_mod.kindFromSchema(&se) orelse return error.SchemaLookupFailed;
-    return decimal_mod.decodeColumnAsI128(ra, chunk, cm.codec, levels, n_leaves, kind);
+    return decimal_mod.decodeColumnAsI128WithOptions(
+        ra,
+        chunk,
+        cm.codec,
+        levels,
+        n_leaves,
+        kind,
+        decode_options,
+    );
 }
 
 /// Synthesize and write a one-page OffsetIndex + ColumnIndex for a
@@ -1027,6 +1100,7 @@ pub fn scanRGForAgg(
     /// always answered from RowGroup.num_rows regardless. `--trust-stats`
     /// sets this true to restore the stats fast-path for trusted writers.
     trust_stats: bool,
+    decode_options: DecodeOptions,
     fetch_set: []const bool,
     agg_calls: []const expr_agg.AggCall,
     accumulators: []expr_agg.Accumulator,
@@ -1247,21 +1321,120 @@ pub fn scanRGForAgg(
         const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
         const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-            .f64 = try decimal_mod.decodeColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, k),
+            .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                k,
+                decode_options,
+            ),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
-            .f64 = try decodeFloat16ColumnAsF64Pruned(ra, chunk, cm.codec, levels, n_leaves, prune_info),
+            .f64 = try decodeFloat16ColumnAsF64Pruned(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                prune_info,
+                decode_options,
+            ),
         } else switch (cm.type) {
             .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
-                .{ .i64 = try decodeU32ColumnAsI64Pruned(ra, chunk, cm.codec, levels, n_leaves, prune_info) }
+                .{ .i64 = try decodeU32ColumnAsI64Pruned(
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ) }
             else
-                .{ .i32 = try decodeColumnTPruned(i32, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
-            .INT64 => .{ .i64 = try decodeColumnTPruned(i64, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
-            .FLOAT => .{ .f32 = try decodeColumnTPruned(f32, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
-            .DOUBLE => .{ .f64 = try decodeColumnTPruned(f64, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
-            .BYTE_ARRAY => .{ .string = try decodeColumnTPruned([]const u8, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
-            .BOOLEAN => .{ .boolean = try decodeColumnTPruned(bool, ra, chunk, cm.codec, levels, n_leaves, prune_info) },
+                .{
+                    .i32 = try decodeColumnTPruned(
+                        i32,
+                        ra,
+                        chunk,
+                        cm.codec,
+                        levels,
+                        n_leaves,
+                        prune_info,
+                        decode_options,
+                    ),
+                },
+            .INT64 => .{
+                .i64 = try decodeColumnTPruned(
+                    i64,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ),
+            },
+            .FLOAT => .{
+                .f32 = try decodeColumnTPruned(
+                    f32,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ),
+            },
+            .DOUBLE => .{
+                .f64 = try decodeColumnTPruned(
+                    f64,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ),
+            },
+            .BYTE_ARRAY => .{
+                .string = try decodeColumnTPruned(
+                    []const u8,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ),
+            },
+            .BOOLEAN => .{
+                .boolean = try decodeColumnTPruned(
+                    bool,
+                    ra,
+                    chunk,
+                    cm.codec,
+                    levels,
+                    n_leaves,
+                    prune_info,
+                    decode_options,
+                ),
+            },
             .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
-            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(ra, chunk, cm.codec, levels, n_leaves, flbaWidth(schema_elem), prune_info) },
+            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                flbaWidth(schema_elem),
+                prune_info,
+                decode_options,
+            ) },
         };
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -1565,6 +1738,13 @@ fn decodeWithReaderPruned(
         rep_levels = try arena.alloc(u32, num_leaves);
         @memset(rep_levels.?, 0);
     } else if (max_def > 0) {
+        // Always materialised on the pruned path, even under
+        // `--fast-levels`. The zero-fill is load-bearing here: a page
+        // this scan skips keeps def level 0, which is what makes
+        // downstream treat its untouched default values as null rather
+        // than as real data. Dropping the array would turn skipped
+        // pages into present zeros. Pages that ARE decoded still take
+        // the cheap all-present path inside `decodePageSlice`.
         def_levels = try arena.alloc(u32, num_leaves);
         @memset(def_levels.?, 0);
     }
@@ -1655,8 +1835,9 @@ pub fn decodeColumnTPruned(
     levels: schema.Levels,
     num_leaves: usize,
     prune: ?PruningInfo,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
     if (prune) |p| {
         return decodeWithReaderPruned(T, arena, &reader, levels, num_leaves, p);
     } else {
@@ -1671,8 +1852,9 @@ fn decodeFloat16ColumnAsF64Pruned(
     levels: schema.Levels,
     num_leaves: usize,
     prune: ?PruningInfo,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(f64) {
-    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune);
+    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune, decode_options);
     const out = try arena.alloc(f64, cb.values.len);
     @memset(out, 0);
     for (cb.values, 0..) |bytes, i| {
@@ -1697,8 +1879,9 @@ fn decodeU32ColumnAsI64Pruned(
     levels: schema.Levels,
     num_leaves: usize,
     prune: ?PruningInfo,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(i64) {
-    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune);
+    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune, decode_options);
     const out = try arena.alloc(i64, c32.values.len);
     @memset(out, 0);
     for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
@@ -1719,8 +1902,15 @@ pub fn decodeFlbaColumnPruned(
     num_leaves: usize,
     type_length: usize,
     prune: ?PruningInfo,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT([]const u8) {
-    var reader = column_mod.ColumnChunkReader([]const u8).init(chunk, codec, levels, arena);
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk,
+        codec,
+        levels,
+        arena,
+        decode_options,
+    );
     reader.type_length = type_length;
     if (prune) |p| {
         return decodeWithReaderPruned([]const u8, arena, &reader, levels, num_leaves, p);
@@ -1737,7 +1927,19 @@ pub fn decodeColumnT(
     levels: schema.Levels,
     num_leaves: usize,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+    return decodeColumnTWithOptions(T, arena, chunk, codec, levels, num_leaves, .{});
+}
+
+pub fn decodeColumnTWithOptions(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    decode_options: DecodeOptions,
+) !filter_eval.ColumnT(T) {
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
     return decodeWithReader(T, arena, &reader, levels, num_leaves);
 }
 
@@ -1757,8 +1959,9 @@ fn decodeFloat16ColumnAsF64(
     codec: schema.CompressionCodec,
     levels: schema.Levels,
     num_leaves: usize,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(f64) {
-    const cb = try decodeFlbaColumn(arena, chunk, codec, levels, num_leaves, 2);
+    const cb = try decodeFlbaColumnWithOptions(arena, chunk, codec, levels, num_leaves, 2, decode_options);
     const out = try arena.alloc(f64, cb.values.len);
     for (cb.values, 0..) |bytes, i| {
         if (bytes.len >= 2) {
@@ -1785,8 +1988,9 @@ fn decodeU32ColumnAsI64(
     codec: schema.CompressionCodec,
     levels: schema.Levels,
     num_leaves: usize,
+    decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(i64) {
-    const c32 = try decodeColumnT(i32, arena, chunk, codec, levels, num_leaves);
+    const c32 = try decodeColumnTWithOptions(i32, arena, chunk, codec, levels, num_leaves, decode_options);
     const out = try arena.alloc(i64, c32.values.len);
     for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
     return .{
@@ -1810,7 +2014,25 @@ pub fn decodeFlbaColumn(
     num_leaves: usize,
     type_length: usize,
 ) !filter_eval.ColumnT([]const u8) {
-    var reader = column_mod.ColumnChunkReader([]const u8).init(chunk, codec, levels, arena);
+    return decodeFlbaColumnWithOptions(arena, chunk, codec, levels, num_leaves, type_length, .{});
+}
+
+pub fn decodeFlbaColumnWithOptions(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    type_length: usize,
+    decode_options: DecodeOptions,
+) !filter_eval.ColumnT([]const u8) {
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk,
+        codec,
+        levels,
+        arena,
+        decode_options,
+    );
     reader.type_length = type_length;
     return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
 }
@@ -1843,8 +2065,39 @@ fn decodeWithReader(
         };
     }
     if (levels.max_def > 0) {
-        const def_levels = try arena.alloc(u32, num_leaves);
         var written: usize = 0;
+
+        // `--fast-levels`: try to get through the whole chunk without
+        // ever allocating the level array. `ColumnT.def_levels == null`
+        // then carries the same meaning it always has — every leaf is
+        // present — so nothing downstream needs to know this happened.
+        //
+        // Restricted to max_def == 1, the top-level OPTIONAL leaf that
+        // arrow/spark/pandas emit for every nullable flat column. At
+        // max_def >= 2 (an optional leaf under an optional group) a null
+        // def_levels would have to be re-synthesised as "max_def
+        // everywhere" by anything re-encoding the column, and
+        // encoder.zig's fallback writes level 1, not level max_def. Not
+        // worth widening for: the deeper shapes are rare, and they still
+        // get the per-page half of this in `decodePageSlice`.
+        const skip_levels = reader.options.fast_levels and levels.max_rep == 0 and levels.max_def == 1;
+        if (skip_levels) {
+            written = reader.decodeAllPresent(values) catch return error.ShortDecode;
+            if (written == num_leaves) {
+                return .{
+                    .values = values,
+                    .def_levels = null,
+                    .max_def = @intCast(levels.max_def),
+                    .has_nulls = reader.has_nulls,
+                };
+            }
+        }
+
+        // Either fast levels are off, or a page with nulls stopped the
+        // pass above. Everything already written came from all-present
+        // pages, so its levels are max_def by construction.
+        const def_levels = try arena.alloc(u32, num_leaves);
+        @memset(def_levels[0..written], @intCast(levels.max_def));
         while (written < num_leaves) {
             const n = reader.decodeWithLevels(values[written..], def_levels[written..]) catch return error.ShortDecode;
             if (n == 0) break;
@@ -2076,4 +2329,232 @@ test "decimal: INT32/INT64 backings decode round-trip through the encoder" {
         try testing.expectEqual(want.len, col.values.len);
         for (want, col.values) |w, g| try testing.expectApproxEqAbs(w, g, 1e-6);
     }
+}
+
+// --- --fast-levels: all-present definition-level detection ---
+//
+// The flag lets a decode skip materialising definition levels for any
+// page whose level stream proves every value present. These build the
+// awkward shapes by hand — an all-present page, a page with real nulls,
+// and a chunk that changes from one to the other mid-stream — because
+// the mid-stream transition is the only place the optimisation has to
+// hand work back to the ordinary path, and getting the hand-off wrong
+// would silently shift every value after it.
+//
+// Every case asserts the SAME values with the flag on and off. A faster
+// wrong answer is the failure mode worth guarding, not a slower one.
+
+const fl_test_elem = schema.SchemaElement{
+    .type = .INT32,
+    .type_length = null,
+    .repetition_type = .OPTIONAL,
+    .name = "v",
+    .num_children = 0,
+    .converted_type = null,
+    .logical_type = null,
+    .scale = null,
+    .precision = null,
+    .field_id = null,
+};
+
+/// Encode one OPTIONAL INT32 page. `def` of null means "no level array
+/// supplied" — the encoder then writes an all-present stream itself.
+fn flEncodePage(
+    arena: std.mem.Allocator,
+    values: []const i32,
+    def: ?[]const u32,
+) ![]u8 {
+    const enc = try encoder.encodeColumn(arena, .{
+        .values = .{ .i32 = .{ .values = values, .def_levels = def, .max_def = 1 } },
+        .schema_elem = &fl_test_elem,
+        .path_in_schema = &[_][]const u8{"v"},
+        .codec = .UNCOMPRESSED,
+    });
+    return enc.bytes;
+}
+
+const fl_levels = schema.Levels{ .max_def = 1, .max_rep = 0 };
+
+test "fast-levels: all-present OPTIONAL column decodes identically with the flag on" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // High-cardinality so the encoder stays PLAIN rather than dict.
+    var vals: [512]i32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @intCast(i * 7919);
+    const chunk = try flEncodePage(arena, &vals, null);
+
+    const off = try decodeColumnT(i32, arena, chunk, .UNCOMPRESSED, fl_levels, vals.len);
+    const on = try decodeColumnTWithOptions(
+        i32,
+        arena,
+        chunk,
+        .UNCOMPRESSED,
+        fl_levels,
+        vals.len,
+        .{ .fast_levels = true },
+    );
+
+    try testing.expectEqualSlices(i32, &vals, off.values);
+    try testing.expectEqualSlices(i32, &vals, on.values);
+
+    // The whole point: with the flag on the level array is never built.
+    // `def_levels == null` alongside `max_def == 1` is how the column
+    // reports "no nulls", which is exactly what the off path spells out
+    // one u32 at a time.
+    try testing.expect(off.def_levels != null);
+    for (off.def_levels.?) |d| try testing.expectEqual(@as(u32, 1), d);
+    try testing.expect(on.def_levels == null);
+    try testing.expectEqual(@as(u32, 1), on.max_def);
+    try testing.expect(!on.has_nulls);
+}
+
+test "fast-levels: a page with real nulls still decodes through the ordinary path" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 300 slots, every 5th one null. Values sit at their logical index
+    // so a misplaced scatter is visible, not just a wrong count.
+    const n = 300;
+    var vals: [n]i32 = undefined;
+    var def: [n]u32 = undefined;
+    for (0..n) |i| {
+        const is_null = (i % 5) == 0;
+        def[i] = if (is_null) 0 else 1;
+        vals[i] = if (is_null) 0 else @intCast(i * 31 + 1);
+    }
+    const chunk = try flEncodePage(arena, &vals, &def);
+
+    const off = try decodeColumnT(i32, arena, chunk, .UNCOMPRESSED, fl_levels, n);
+    const on = try decodeColumnTWithOptions(
+        i32,
+        arena,
+        chunk,
+        .UNCOMPRESSED,
+        fl_levels,
+        n,
+        .{ .fast_levels = true },
+    );
+
+    try testing.expectEqualSlices(i32, &vals, off.values);
+    try testing.expectEqualSlices(i32, &vals, on.values);
+    // Nulls are present, so the levels must be materialised either way.
+    try testing.expect(on.def_levels != null);
+    try testing.expectEqualSlices(u32, &def, on.def_levels.?);
+    try testing.expect(on.has_nulls);
+}
+
+test "fast-levels: chunk that turns null part-way hands back to the level path" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Page 1: 256 values, all present — taken by the fast path.
+    // Page 2: 256 values, half null — must stop the fast path, allocate
+    //         the level array, back-fill page 1 as all-present, and
+    //         resume without dropping or shifting a value.
+    const per_page = 256;
+    var p1: [per_page]i32 = undefined;
+    for (&p1, 0..) |*v, i| v.* = @intCast(i * 7919 + 3);
+
+    var p2: [per_page]i32 = undefined;
+    var p2_def: [per_page]u32 = undefined;
+    for (0..per_page) |i| {
+        const is_null = (i % 2) == 1;
+        p2_def[i] = if (is_null) 0 else 1;
+        p2[i] = if (is_null) 0 else @intCast(1_000_000 + i * 13);
+    }
+
+    // `EncodedColumn.bytes` is documented as header-plus-data ready to
+    // concatenate, which is what makes a two-page chunk buildable here.
+    const page1 = try flEncodePage(arena, &p1, null);
+    const page2 = try flEncodePage(arena, &p2, &p2_def);
+    const chunk = try arena.alloc(u8, page1.len + page2.len);
+    @memcpy(chunk[0..page1.len], page1);
+    @memcpy(chunk[page1.len..], page2);
+
+    const total = per_page * 2;
+    var want_vals: [total]i32 = undefined;
+    var want_def: [total]u32 = undefined;
+    @memcpy(want_vals[0..per_page], &p1);
+    @memcpy(want_vals[per_page..], &p2);
+    @memset(want_def[0..per_page], 1);
+    @memcpy(want_def[per_page..], &p2_def);
+
+    const off = try decodeColumnT(i32, arena, chunk, .UNCOMPRESSED, fl_levels, total);
+    const on = try decodeColumnTWithOptions(
+        i32,
+        arena,
+        chunk,
+        .UNCOMPRESSED,
+        fl_levels,
+        total,
+        .{ .fast_levels = true },
+    );
+
+    try testing.expectEqualSlices(i32, &want_vals, off.values);
+    try testing.expectEqualSlices(i32, &want_vals, on.values);
+    try testing.expect(on.def_levels != null);
+    // Page 1's levels were never decoded from the wire — they are the
+    // back-fill. If the hand-off is off by a page these are 0, not 1.
+    try testing.expectEqualSlices(u32, &want_def, on.def_levels.?);
+    try testing.expect(on.has_nulls);
+}
+
+test "fast-levels: all-present pages on both sides of a null page" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The fast path only runs while it has never seen a null. Once it
+    // hands off it must not resume, or the third page's levels would go
+    // unwritten and read back as the zeroes nobody wrote.
+    const per_page = 128;
+    var present: [per_page]i32 = undefined;
+    for (&present, 0..) |*v, i| v.* = @intCast(i * 104729 + 5);
+
+    var mid: [per_page]i32 = undefined;
+    var mid_def: [per_page]u32 = undefined;
+    for (0..per_page) |i| {
+        const is_null = i < 4;
+        mid_def[i] = if (is_null) 0 else 1;
+        mid[i] = if (is_null) 0 else @intCast(500 + i);
+    }
+
+    const pages = [_][]u8{
+        try flEncodePage(arena, &present, null),
+        try flEncodePage(arena, &mid, &mid_def),
+        try flEncodePage(arena, &present, null),
+    };
+    var total_len: usize = 0;
+    for (pages) |p| total_len += p.len;
+    const chunk = try arena.alloc(u8, total_len);
+    var at: usize = 0;
+    for (pages) |p| {
+        @memcpy(chunk[at .. at + p.len], p);
+        at += p.len;
+    }
+
+    const total = per_page * 3;
+    const off = try decodeColumnT(i32, arena, chunk, .UNCOMPRESSED, fl_levels, total);
+    const on = try decodeColumnTWithOptions(
+        i32,
+        arena,
+        chunk,
+        .UNCOMPRESSED,
+        fl_levels,
+        total,
+        .{ .fast_levels = true },
+    );
+
+    try testing.expectEqualSlices(i32, off.values, on.values);
+    try testing.expectEqualSlices(u32, off.def_levels.?, on.def_levels.?);
+    try testing.expectEqualSlices(i32, &present, on.values[per_page * 2 ..]);
+    for (on.def_levels.?[per_page * 2 ..]) |d| try testing.expectEqual(@as(u32, 1), d);
 }

@@ -178,7 +178,11 @@ pub fn evalLeafBool(
 pub fn ColumnT(comptime T: type) type {
     return struct {
         values: []const T,
-        /// Null when the source column is REQUIRED at every level.
+        /// Null when no leaf in this column is null — either because
+        /// the source is REQUIRED at every level (max_def == 0), or
+        /// because `--fast-levels` proved an OPTIONAL column all-present
+        /// and never materialised its levels. Both mean the same thing
+        /// to every reader: no null rows, so `max_def` may be > 0 here.
         /// Otherwise length == values.len; entry < max_def → leaf null.
         def_levels: ?[]const u32 = null,
         max_def: u32 = 0,

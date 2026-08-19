@@ -2339,7 +2339,12 @@ pub fn serializeRowKey(
                     try list.appendSlice(allocator, s);
                 },
                 .boolean => |c| {
-                    try list.append(allocator, if (c.values[row]) 1 else 0);
+                    // Same framing as evalGroupKeyExpr: BOOLEAN widens to the
+                    // i64 lane. deserializeKeyColumn only knows {i64,f64,string},
+                    // so a 1-byte write here would disagree with the reader.
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &buf, if (c.values[row]) 1 else 0, .little);
+                    try list.appendSlice(allocator, &buf);
                 },
             }
         }
@@ -2488,103 +2493,7 @@ pub const GroupTable = struct {
 
         return group_id;
     }
-
-    pub fn mergeTable(self: *GroupTable, other: *const GroupTable, agg_calls: []const AggCall) !void {
-        var i: usize = 0;
-        while (i < other.keys.items.len) : (i += 1) {
-            const key = other.keys.items[i];
-            const other_id = other.map.get(key).?;
-
-            if (self.map.get(key)) |target_id| {
-                const target_offset = target_id * @as(u32, @intCast(agg_calls.len));
-                const other_offset = other_id * @as(u32, @intCast(agg_calls.len));
-
-                for (0..agg_calls.len) |idx| {
-                    const target_acc = &self.accumulators.items[target_offset + idx];
-                    const other_acc = other.accumulators.items[other_offset + idx];
-                    try mergeGroupAccumulator(target_acc, other_acc, self.allocator);
-                }
-            } else {
-                const target_id = try self.getOrInsert(key, agg_calls);
-                const target_offset = target_id * @as(u32, @intCast(agg_calls.len));
-                const other_offset = other_id * @as(u32, @intCast(agg_calls.len));
-
-                for (0..agg_calls.len) |idx| {
-                    const target_acc = &self.accumulators.items[target_offset + idx];
-                    const other_acc = other.accumulators.items[other_offset + idx];
-
-                    switch (other_acc) {
-                        .min_bytes => |mb| {
-                            if (mb) |s| {
-                                target_acc.* = .{ .min_bytes = try self.allocator.dupe(u8, s) };
-                            } else {
-                                target_acc.* = .{ .min_bytes = null };
-                            }
-                        },
-                        .max_bytes => |mb| {
-                            if (mb) |s| {
-                                target_acc.* = .{ .max_bytes = try self.allocator.dupe(u8, s) };
-                            } else {
-                                target_acc.* = .{ .max_bytes = null };
-                            }
-                        },
-                        else => target_acc.* = other_acc,
-                    }
-                }
-            }
-        }
-    }
 };
-
-fn mergeGroupAccumulator(
-    dst: *Accumulator,
-    src: Accumulator,
-    allocator: std.mem.Allocator,
-) !void {
-    switch (dst.*) {
-        .count => |*c| c.* += src.count,
-        .sum_i => |*s| s.* += src.sum_i,
-        .sum_f => |*s| s.* += src.sum_f,
-        .min_i => |*m| if (src.min_i) |sv| {
-            if (m.* == null or sv < m.*.?) m.* = sv;
-        },
-        .min_f => |*m| if (src.min_f) |sv| {
-            if (m.* == null or sv < m.*.?) m.* = sv;
-        },
-        .max_i => |*m| if (src.max_i) |sv| {
-            if (m.* == null or sv > m.*.?) m.* = sv;
-        },
-        .max_f => |*m| if (src.max_f) |sv| {
-            if (m.* == null or sv > m.*.?) m.* = sv;
-        },
-        .min_bytes => |*m| if (src.min_bytes) |sv| {
-            if (m.* == null) {
-                m.* = try allocator.dupe(u8, sv);
-            } else {
-                const ord = std.mem.order(u8, sv, m.*.?);
-                if (ord == .lt) {
-                    allocator.free(m.*.?);
-                    m.* = try allocator.dupe(u8, sv);
-                }
-            }
-        },
-        .max_bytes => |*m| if (src.max_bytes) |sv| {
-            if (m.* == null) {
-                m.* = try allocator.dupe(u8, sv);
-            } else {
-                const ord = std.mem.order(u8, sv, m.*.?);
-                if (ord == .gt) {
-                    allocator.free(m.*.?);
-                    m.* = try allocator.dupe(u8, sv);
-                }
-            }
-        },
-        .avg => |*a| {
-            a.sum += src.avg.sum;
-            a.count += src.avg.count;
-        },
-    }
-}
 
 pub fn updateOneGrouped(
     arena: std.mem.Allocator,
@@ -2803,6 +2712,17 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     defer allocator.free(nan_key2);
 
     try std.testing.expectEqualSlices(u8, nan_key1, nan_key2);
+
+    var bool_true = [_]bool{true};
+    const bool_col = filter_eval.Batch.Column{ .boolean = .{ .values = &bool_true } };
+    var i64_one = [_]i64{1};
+    const i64_col = filter_eval.Batch.Column{ .i64 = .{ .values = &i64_one } };
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{bool_col}, 0);
+    const bool_key = try allocator.dupe(u8, key_scratch.items);
+    defer allocator.free(bool_key);
+    try serializeRowKey(&key_scratch, allocator, &[_]filter_eval.Batch.Column{i64_col}, 0);
+    try std.testing.expectEqualSlices(u8, bool_key, key_scratch.items);
+    try std.testing.expectEqual(@as(usize, 1 + 8), bool_key.len);
 
     var small_gt = GroupTable.init(allocator, 10);
     defer small_gt.deinit();

@@ -628,10 +628,6 @@ pub fn runMultiAggregate(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
 
     var workers = try arena.alloc(Worker, n_workers);
-    var assignments = try arena.alloc(std.ArrayList(WorkItem), n_workers);
-    for (assignments) |*a| a.* = .empty;
-    _ = &assignments; // superseded by dynamic claiming via Worker.cursor
-
     // One budget shared by every worker table, not per-worker quotas: work is claimed off a shared cursor, so which
     // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
     // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished

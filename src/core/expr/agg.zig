@@ -2238,7 +2238,8 @@ pub const GroupKeyResolver = struct {
     /// under any collision.
     const SliceIdContext = struct {
         pub fn hash(_: SliceIdContext, k: SliceId) u64 {
-            return (k.ptr ^ (k.ptr >> 32)) *% 0x9E3779B97F4A7C15;
+            const p: u64 = k.ptr;
+            return (p ^ (p >> 32)) *% 0x9E3779B97F4A7C15;
         }
         pub fn eql(_: SliceIdContext, a: SliceId, b: SliceId) bool {
             return a.ptr == b.ptr and a.len == b.len;
@@ -2460,7 +2461,7 @@ pub const GroupTable = struct {
             const got = budget.draw(deficit) orelse blk: {
                 // Our own unused block may be part of why the pool is empty.
                 self.releaseSlack();
-                break :blk budget.draw(entry_size + self.allocated_bytes - self.max_memory_bytes) orelse
+                break :blk budget.draw(entry_size) orelse
                     return error.ExceededMemoryBudget;
             };
             self.max_memory_bytes += got;

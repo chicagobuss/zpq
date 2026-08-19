@@ -6,10 +6,10 @@
 //!   select_item := expr ( "AS" IDENT )?
 //!   expr        := term ( ("+" | "-") term )*
 //!   term        := factor ( ("*" | "/") factor )*
-//!   factor      := NUMBER | IDENT | "(" expr ")"
+//!   factor      := "-" factor | NUMBER | IDENT | IDENT "(" args ")" | "(" expr ")"
 //!
-//! Negative literals are written as `0 - x` for now — unary minus
-//! lands in a follow-up. `AS` is case-insensitive (`as` works too).
+//! Unary minus folds numeric literals at parse time; non-literal operands become `0 - expr`.
+//! `AS` is case-insensitive (`as` works too).
 //! Identifiers reference column names; resolution to `(col_idx,
 //! physical_type)` happens here so the AST is fully typed.
 
@@ -685,6 +685,40 @@ fn fakeFile(arena: std.mem.Allocator, names: []const []const u8, types: []const 
         .row_groups = .empty,
         .created_by = null,
     };
+}
+
+test "parse: nesting past MAX_EXPR_DEPTH is rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{}, &.{});
+
+    // Parenthesis nesting trips the parser-recursion guard, before any AST node exists to measure.
+    const n = MAX_EXPR_DEPTH + 1;
+    const parens = try a.alloc(u8, n * 2 + 1);
+    @memset(parens[0..n], '(');
+    parens[n] = '1';
+    @memset(parens[n + 1 ..], ')');
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, parens, &file));
+
+    // A left-associative chain is parsed by a loop, not recursion, so only the tree-height check catches it.
+    var chain: std.ArrayList(u8) = .empty;
+    try chain.appendSlice(a, "1");
+    for (0..n) |_| try chain.appendSlice(a, " + 1");
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, chain.items, &file));
+
+    // A run of unary minus is self-recursive and hits the same guard.
+    const minuses = try a.alloc(u8, n + 1);
+    @memset(minuses[0..n], '-');
+    minuses[n] = '1';
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, minuses, &file));
+
+    // Just inside the cap still parses.
+    const ok_parens = try a.alloc(u8, (MAX_EXPR_DEPTH - 1) * 2 + 1);
+    @memset(ok_parens[0 .. MAX_EXPR_DEPTH - 1], '(');
+    ok_parens[MAX_EXPR_DEPTH - 1] = '1';
+    @memset(ok_parens[MAX_EXPR_DEPTH ..], ')');
+    _ = try parseExprOnly(a, ok_parens, &file);
 }
 
 test "parse: literal int" {

@@ -134,6 +134,7 @@ pub fn main(init: std.process.Init) !void {
                 error.StarOnlyValidInCount => std.debug.print("zpq query: '*' is only valid inside count(*)\n", .{}),
                 error.TrailingTokens => std.debug.print("zpq query: trailing tokens after expression\n", .{}),
                 error.GroupKeyAliasRequired => std.debug.print("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
+                error.BadGroupKey => std.debug.print("zpq query: corrupted GROUP BY key framing\n", .{}),
                 error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
                 error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
                 error.NestedNotSupported => std.debug.print("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),

@@ -10,9 +10,12 @@ key deserialization read the timestamp's own bytes as a length.
 
 The scalar columns after the map cover the framing lanes that can disagree:
 
-  ts    INT64/TIMESTAMP  -> i64 lane   (the column that crashed) flag  BOOLEAN          -> i64 lane, though the physical
-  type says boolean; a composite key with this first used to truncate every later column name  STRING           ->
-  string lane, the one that got truncated ratio DOUBLE           -> f64 lane
+  ts    INT64/TIMESTAMP  -> i64 lane   (the column that crashed)
+  flag  BOOLEAN          -> i64 lane, though the physical type says boolean;
+                           a composite key with this first used to truncate
+                           every later column
+  name  STRING           -> string lane, the one that got truncated
+  ratio DOUBLE           -> f64 lane
 
 Usage:  .venv/bin/python tools/gen_nested_key_fixture.py
 """

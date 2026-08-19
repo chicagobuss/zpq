@@ -1,8 +1,11 @@
 # Lambda Capabilities: Empirical Probe Results
 
-**Run date**: 2026-06-13 **Probe binary**: `probes/probe_lambda_caps/main.zig` (165 KB static musl) **Runtime**:
-`provided.al2023` **Region**: `us-west-2` **Account**: sandbox staging (id redacted) **Schema**: v1 — see top of
-`probes/probe_lambda_caps/main.zig`
+**Run date**: 2026-06-13
+**Probe binary**: `probes/probe_lambda_caps/main.zig` (165 KB static musl)
+**Runtime**: `provided.al2023`
+**Region**: `us-west-2`
+**Account**: sandbox staging (id redacted)
+**Schema**: v1 — see top of `probes/probe_lambda_caps/main.zig`
 
 ## TL;DR
 

@@ -1,6 +1,18 @@
 const std = @import("std");
 const thrift = @import("thrift.zig");
 
+/// Capacity worth reserving before a thrift list has been validated.
+///
+/// The compact-protocol count is attacker-controlled. Bounding it only by
+/// input bytes still lets a malformed footer turn (for example) 4 MiB of
+/// remaining input into hundreds of MiB of `RowGroup` or `SchemaElement`
+/// storage before parsing the first item. Keep the initial allocation no
+/// larger than the unread input; valid larger lists continue growing as
+/// elements are successfully decoded.
+fn safeListReserve(comptime T: type, declared: usize, remaining: usize) usize {
+    return @min(declared, remaining / @max(1, @sizeOf(T)));
+}
+
 pub const Type = enum(i32) {
     BOOLEAN = 0,
     INT32 = 1,
@@ -793,9 +805,10 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    // Clamped by `remaining()`: `size` is attacker-controlled, so an oversized list header must
-                    // not preallocate.
-                    try meta.encodings.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try meta.encodings.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(Encoding, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.encodings.append(allocator, (std.enums.fromInt(Encoding, try reader.readZigZag(i32)) orelse return error.InvalidEnumValue));
@@ -805,7 +818,10 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try meta.path_in_schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try meta.path_in_schema.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve([]const u8, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.path_in_schema.append(allocator, try reader.readString());
@@ -1003,7 +1019,10 @@ pub const OffsetIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try oi.page_locations.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try oi.page_locations.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(PageLocation, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try oi.page_locations.append(allocator, try PageLocation.read(reader));
@@ -1056,7 +1075,10 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try ci.null_pages.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try ci.null_pages.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(bool, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     // Compact protocol: a bool list element is a single
                     // byte (1 = true, 2 = false).
@@ -1068,7 +1090,10 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try ci.min_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try ci.min_values.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve([]const u8, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try ci.min_values.append(allocator, try reader.readString());
@@ -1078,7 +1103,10 @@ pub const ColumnIndex = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try ci.max_values.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try ci.max_values.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve([]const u8, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try ci.max_values.append(allocator, try reader.readString());
@@ -1090,7 +1118,10 @@ pub const ColumnIndex = struct {
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
                     var nc: std.ArrayListUnmanaged(i64) = .empty;
-                    try nc.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try nc.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(i64, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try nc.append(allocator, try reader.readZigZag(i64));
@@ -1150,7 +1181,10 @@ pub const RowGroup = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try rg.columns.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try rg.columns.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(ColumnChunk, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         const col = try ColumnChunk.read(allocator, reader);
@@ -1218,7 +1252,10 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try meta.schema.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try meta.schema.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(SchemaElement, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.schema.append(allocator, try SchemaElement.read(reader));
@@ -1229,7 +1266,10 @@ pub const FileMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    try meta.row_groups.ensureTotalCapacity(allocator, @min(size, reader.remaining()));
+                    try meta.row_groups.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(RowGroup, size, reader.remaining()),
+                    );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
                         try meta.row_groups.append(allocator, try RowGroup.read(allocator, reader));
@@ -1394,6 +1434,12 @@ pub const Levels = struct {
     max_def: i32,
     max_rep: i32,
 };
+
+test "safeListReserve caps initial allocation bytes" {
+    try std.testing.expectEqual(@as(usize, 100), safeListReserve(u8, 100, 1000));
+    try std.testing.expectEqual(@as(usize, 8), safeListReserve(u64, 100, 64));
+    try std.testing.expectEqual(@as(usize, 0), safeListReserve(RowGroup, 100, @sizeOf(RowGroup) - 1));
+}
 
 test "isUnsignedIntTo32 — converted + logical, signed/unsigned, width boundary" {
     const base = SchemaElement{

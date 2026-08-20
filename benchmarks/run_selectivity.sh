@@ -13,11 +13,18 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-set -a; source .env; set +a
+
+ENV_FILE="${ENV_FILE:-.env}"
+[[ -r "$ENV_FILE" ]] || { echo "missing readable ENV_FILE=$ENV_FILE" >&2; exit 2; }
+set -a; source "$ENV_FILE"; set +a
 
 REGION="${AWS_REGION:-us-west-2}"
 BUCKET="${AWS_S3_BUCKET}"
 RUNS="${RUNS:-3}"
+ZPQ_FUNCTION="${ZPQ_BENCH_FUNCTION:-${LAMBDA_FUNCTION_NAME:-zpq-filter-s3}}"
+PYTHON_FUNCTION="${PYTHON_BENCH_FUNCTION:-zpq-bench-python}"
+RESULTS_OUT="${RESULTS_OUT:-benchmarks/selectivity_results.tsv}"
+VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/selectivity_validation.tsv}"
 
 INPUTS=()
 for mm in 01 02 03 04 05 06 07 08 09 10; do
@@ -53,11 +60,16 @@ echo "# warm-up..." >&2
 cat > /tmp/warm.json <<EOF
 {"inputs":[$INPUTS_JSON],"output_url":"s3://${BUCKET}/bench/$(ts)/warm.parquet","filter":"int8 >= 0"}
 EOF
-aws lambda invoke --function-name zpq-filter-s3 --cli-binary-format raw-in-base64-out --payload file:///tmp/warm.json --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
+aws lambda invoke --function-name "$ZPQ_FUNCTION" \
+  --cli-binary-format raw-in-base64-out --payload file:///tmp/warm.json \
+  --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
 cat > /tmp/warm_polars.json <<EOF
-{"mode":"polars_multi","inputs":[$INPUTS_JSON],"output_url":"s3://${BUCKET}/bench/$(ts)/warm.parquet","filter_sql":"int8 >= 0"}
+{"mode":"polars_multi","inputs":[$INPUTS_JSON],
+ "output_url":"s3://${BUCKET}/bench/$(ts)/warm.parquet","filter_sql":"int8 >= 0"}
 EOF
-aws lambda invoke --function-name zpq-bench-python --cli-binary-format raw-in-base64-out --payload file:///tmp/warm_polars.json --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
+aws lambda invoke --function-name "$PYTHON_FUNCTION" \
+  --cli-binary-format raw-in-base64-out --payload file:///tmp/warm_polars.json \
+  --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
 
 # Output validation map: collect all output URLs to verify at end.
 declare -A OUT_URLS=()
@@ -80,9 +92,9 @@ EOF
 EOF
 
   echo "# $label ($predicate, expect ~$pct surviving)" >&2
-  invoke zpq-filter-s3 "zpq:${label}" /tmp/zpq_${label}.json
-  invoke zpq-bench-python "polars:${label}" /tmp/polars_${label}.json
-  invoke zpq-bench-python "duckdb:${label}" /tmp/duckdb_${label}.json
+  invoke "$ZPQ_FUNCTION" "zpq:${label}" /tmp/zpq_${label}.json
+  invoke "$PYTHON_FUNCTION" "polars:${label}" /tmp/polars_${label}.json
+  invoke "$PYTHON_FUNCTION" "duckdb:${label}" /tmp/duckdb_${label}.json
 
   OUT_URLS["zpq:${label}"]="$zpq_out"
   OUT_URLS["polars:${label}"]="$polars_out"
@@ -95,7 +107,7 @@ EOF
     IFS='|' read -r label predicate pct <<<"$scenario"
     run_scenario "$label" "$predicate" "$pct"
   done
-} | tee benchmarks/selectivity_results.tsv
+} | tee "$RESULTS_OUT"
 
 echo
 echo "===================================================================="
@@ -105,4 +117,4 @@ echo "===================================================================="
   for k in "${!OUT_URLS[@]}"; do
     printf "%s\t%s\n" "$k" "${OUT_URLS[$k]}"
   done
-} | python3 benchmarks/validate_outputs.py --from-stdin
+} | python3 benchmarks/validate_outputs.py --from-stdin | tee "$VALIDATION_OUT"

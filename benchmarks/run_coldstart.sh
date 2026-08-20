@@ -12,11 +12,21 @@
 # `month >= 08` filter, 3 surviving files written.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-set -a; source .env; set +a
+
+ENV_FILE="${ENV_FILE:-.env}"
+[[ -r "$ENV_FILE" ]] || { echo "missing readable ENV_FILE=$ENV_FILE" >&2; exit 2; }
+set -a; source "$ENV_FILE"; set +a
 
 REGION="${AWS_REGION:-us-west-2}"
 BUCKET="${AWS_S3_BUCKET}"
 TRIALS="${TRIALS:-5}"
+ZPQ_FUNCTION="${ZPQ_BENCH_FUNCTION:-${LAMBDA_FUNCTION_NAME:-zpq-filter-s3}}"
+PYTHON_FUNCTION="${PYTHON_BENCH_FUNCTION:-zpq-bench-python}"
+RESULTS_OUT="${RESULTS_OUT:-benchmarks/coldstart_results.tsv}"
+VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/coldstart_validation.tsv}"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
 
 # Build the inputs once.
 INPUTS=()
@@ -28,15 +38,20 @@ GLOB="s3://${BUCKET}/zpq_test_data/partitioned/year=2026/month=*/data.parquet"
 
 ts() { date +%s%N; }
 
-# Bump BENCH_NONCE on a function so the next invocation is cold.
-# Wait for the config update to settle before invoking.
+# Bump BENCH_NONCE without clobbering the function's existing environment.
+# A configuration update invalidates warm containers, so wait before invoking.
 force_cold() {
   local fn="$1"
-  local nonce
+  local nonce env_json env_file
   nonce="$(date +%s%N)"
+  env_json=$(aws lambda get-function-configuration \
+    --function-name "$fn" --region "$REGION" --query 'Environment.Variables' --output json)
+  env_file="$TMPDIR/${fn}-${nonce}.json"
+  jq -n --arg nonce "$nonce" --argjson vars "$env_json" \
+    '{Variables: (($vars // {}) + {BENCH_NONCE: $nonce})}' >"$env_file"
   aws lambda update-function-configuration \
     --function-name "$fn" \
-    --environment "Variables={BENCH_NONCE=$nonce}" \
+    --environment "file://$env_file" \
     --region "$REGION" >/dev/null
   # Poll until the update completes; AWS rejects invokes during
   # InProgress so this matters.
@@ -106,28 +121,29 @@ EOF
     echo "# trial $trial" >&2
 
     echo "  zpq cold..." >&2
-    force_cold zpq-filter-s3
-    invoke_cold zpq-filter-s3 "zpq" /tmp/cs_zpq.json "$trial"
+    force_cold "$ZPQ_FUNCTION"
+    invoke_cold "$ZPQ_FUNCTION" "zpq" /tmp/cs_zpq.json "$trial"
 
     echo "  polars cold..." >&2
-    force_cold zpq-bench-python
-    invoke_cold zpq-bench-python "polars" /tmp/cs_polars.json "$trial"
+    force_cold "$PYTHON_FUNCTION"
+    invoke_cold "$PYTHON_FUNCTION" "polars" /tmp/cs_polars.json "$trial"
 
     echo "  duckdb cold..." >&2
-    force_cold zpq-bench-python
-    invoke_cold zpq-bench-python "duckdb" /tmp/cs_duckdb.json "$trial"
+    force_cold "$PYTHON_FUNCTION"
+    invoke_cold "$PYTHON_FUNCTION" "duckdb" /tmp/cs_duckdb.json "$trial"
   done
-} | tee benchmarks/coldstart_results.tsv
+} | tee "$RESULTS_OUT"
 
 echo
 echo "===================================================================="
 echo "Cold-start summary (median of $TRIALS trials)"
 echo "===================================================================="
-python3 <<'PY'
+RESULTS_OUT="$RESULTS_OUT" python3 <<'PY'
+import os
 import statistics
 from collections import defaultdict
 
-rows = open("benchmarks/coldstart_results.tsv").read().strip().splitlines()[1:]
+rows = open(os.environ["RESULTS_OUT"]).read().strip().splitlines()[1:]
 buckets = defaultdict(lambda: {"init": [], "dur": [], "total": []})
 for line in rows:
     label, _, init_s, dur_s, total_s = line.split("\t")
@@ -154,7 +170,7 @@ echo
 echo "===================================================================="
 echo "Validating cold-start outputs..."
 echo "===================================================================="
-python3 benchmarks/validate_outputs.py --from-stdin <<EOF
+python3 benchmarks/validate_outputs.py --from-stdin <<EOF | tee "$VALIDATION_OUT"
 zpq:cold	$ZPQ_OUT
 polars:cold	$POLARS_OUT
 duckdb:cold	$DUCKDB_OUT

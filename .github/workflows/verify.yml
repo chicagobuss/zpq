@@ -137,9 +137,9 @@ jobs:
           # The Lambda Runtime API path string ONLY appears in the lambda
           # binary's invocation loop. If this isn't present, we packaged
           # the wrong artifact.
-          strings zig-out/bin/zpq-lambda | grep -q "/2018-06-01/runtime/invocation/"
+          grep -aFq "/2018-06-01/runtime/invocation/" zig-out/bin/zpq-lambda
           # Negative test: this string MUST NOT appear in the CLI binary.
-          if strings zig-out/bin/zpq | grep -q "/2018-06-01/runtime/invocation/"; then
+          if grep -aFq "/2018-06-01/runtime/invocation/" zig-out/bin/zpq; then
             echo "FAIL: CLI binary contains lambda-runtime symbols (binary mix-up?)"
             exit 1
           fi
@@ -159,7 +159,7 @@ jobs:
           unzip -q zig-out/lambda/zpq-lambda-x86_64.zip -d /tmp/lambda-check
           file /tmp/lambda-check/bootstrap | grep -q "ELF.*executable"
           file /tmp/lambda-check/bootstrap | grep -q "statically linked"
-          strings /tmp/lambda-check/bootstrap | grep -q "/2018-06-01/runtime/invocation/"
+          grep -aFq "/2018-06-01/runtime/invocation/" /tmp/lambda-check/bootstrap
 
       - name: Test module coverage
         run: python3 tools/check_test_modules.py

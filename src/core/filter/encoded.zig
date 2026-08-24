@@ -2,15 +2,14 @@
 //! binary representation so row-group / page stats (also stored as
 //! Parquet bytes in metadata) become byte-comparable.
 //!
-//! The trick:
-//!   - Equality: `min <= needle <= max` works as raw byte comparison
-//!     for *all* fixed-width Parquet types and BYTE_ARRAY. The Parquet
-//!     spec defines its statistics ordering as the natural type order,
-//!     and for unsigned widths + lexicographic byte order, that
-//!     coincides with little-endian byte comparison.
-//!   - Range: signed integers (INT32, INT64) need type-aware compare
-//!     because LE byte order disagrees with numeric order across the
-//!     sign bit. We branch on physical type for range checks.
+//! Comparison strategy:
+//!   - INT32/INT64/FLOAT/DOUBLE: decode both sides with `readFixedLE`
+//!     and compare numerically. Raw little-endian byte order does not
+//!     match numeric order for multi-byte values.
+//!   - BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY: compare lexicographically.
+//!   - FLOAT/DOUBLE bounds containing NaN are unusable. Ordered
+//!     comparisons with NaN are false, which callers would otherwise
+//!     interpret as permission to prune the page.
 //!
 //! We encode once per filter rather than per row group; a typical
 //! query touches dozens of row groups so the savings compound.
@@ -34,8 +33,8 @@ pub const EncodedValue = struct {
     /// are fine (we'll re-evaluate value-level).
     pub fn rangeIntersects(self: EncodedValue, op: ast.Operator, min: []const u8, max: []const u8) bool {
         switch (self.parquet_type) {
-            // Signed types: compare numerically because byte ordering
-            // disagrees across the sign bit.
+            // Fixed-width numeric types compare decoded values because
+            // little-endian byte order does not match numeric order.
             .INT32 => return rangeIntersectsSigned(i32, op, min, max, self.bytes),
             .INT64 => return rangeIntersectsSigned(i64, op, min, max, self.bytes),
             .FLOAT => return rangeIntersectsSigned(f32, op, min, max, self.bytes),
@@ -106,6 +105,11 @@ fn rangeIntersectsSigned(comptime T: type, op: ast.Operator, min: []const u8, ma
     const min_v = readFixedLE(T, min) orelse return true;
     const max_v = readFixedLE(T, max) orelse return true;
     const needle_v = readFixedLE(T, needle) orelse return true;
+    if (comptime @typeInfo(T) == .float) {
+        // Real files sometimes contain NaN statistics despite the spec.
+        // Unordered bounds cannot safely prove that a page misses the filter.
+        if (std.math.isNan(min_v) or std.math.isNan(max_v)) return true;
+    }
     return rangeOverlapsValue(T, op, min_v, max_v, needle_v);
 }
 
@@ -251,6 +255,53 @@ test "rangeIntersects negative INT32 (sign-bit edge)" {
     try testing.expect(ev.rangeIntersects(.Eq, &min_buf, &max_buf));
     try testing.expect(ev.rangeIntersects(.Lt, &min_buf, &max_buf)); // -100 < -50
     try testing.expect(ev.rangeIntersects(.Gt, &min_buf, &max_buf)); // 100 > -50
+}
+
+test "rangeIntersects DOUBLE keeps pages with NaN bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try encode(arena.allocator(), "5.0", .DOUBLE);
+
+    var nan_buf: [8]u8 = undefined;
+    var real_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nan_buf, @bitCast(std.math.nan(f64)), .little);
+    std.mem.writeInt(u64, &real_buf, @bitCast(@as(f64, 100.0)), .little);
+
+    const ops = [_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq };
+    for (ops) |op| {
+        try testing.expect(ev.rangeIntersects(op, &nan_buf, &real_buf));
+        try testing.expect(ev.rangeIntersects(op, &real_buf, &nan_buf));
+        try testing.expect(ev.rangeIntersects(op, &nan_buf, &nan_buf));
+    }
+}
+
+test "rangeIntersects FLOAT keeps pages with NaN bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try encode(arena.allocator(), "5.0", .FLOAT);
+
+    var nan_buf: [4]u8 = undefined;
+    var real_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nan_buf, @bitCast(std.math.nan(f32)), .little);
+    std.mem.writeInt(u32, &real_buf, @bitCast(@as(f32, 100.0)), .little);
+
+    try testing.expect(ev.rangeIntersects(.Lt, &nan_buf, &real_buf));
+    try testing.expect(ev.rangeIntersects(.Gt, &real_buf, &nan_buf));
+}
+
+test "rangeIntersects DOUBLE still prunes real disjoint bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try encode(arena.allocator(), "5.0", .DOUBLE);
+
+    var min_buf: [8]u8 = undefined;
+    var max_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &min_buf, @bitCast(@as(f64, 10.0)), .little);
+    std.mem.writeInt(u64, &max_buf, @bitCast(@as(f64, 100.0)), .little);
+
+    try testing.expect(!ev.rangeIntersects(.Lt, &min_buf, &max_buf));
+    try testing.expect(!ev.rangeIntersects(.Eq, &min_buf, &max_buf));
+    try testing.expect(ev.rangeIntersects(.Gt, &min_buf, &max_buf));
 }
 
 test "rangeIntersects BYTE_ARRAY — Eq" {

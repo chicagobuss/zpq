@@ -45,6 +45,29 @@ def _head_size(bucket: str, key: str) -> int:
     return s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
 
 
+def _duckdb_connection():
+    """Open DuckDB with the image-bundled httpfs extension.
+
+    Benchmark invocations must not download an extension: that would measure
+    package-registry availability and contaminate cold starts. The DuckDB
+    image installs httpfs during its Docker build and exposes the directory
+    through this environment variable.
+    """
+    import duckdb
+
+    os.environ.setdefault("HOME", "/tmp")
+    con = duckdb.connect(":memory:")
+    extension_dir = os.environ.get("DUCKDB_EXTENSION_DIRECTORY")
+    if not extension_dir:
+        raise RuntimeError("DUCKDB_EXTENSION_DIRECTORY is required for benchmark images")
+    con.execute(f"SET extension_directory='{extension_dir}';")
+    con.execute("LOAD httpfs;")
+    region = os.environ.get("AWS_REGION", "us-west-2")
+    con.execute(f"SET s3_region='{region}';")
+    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+    return con
+
+
 def _boto3_copy(event: dict) -> dict:
     """GET + PUT — no Parquet awareness. Filter not supported."""
     if event.get("filter_sql"):
@@ -83,7 +106,7 @@ def _polars_copy(event: dict) -> dict:
         ctx = pl.SQLContext(register_globals=False, eager=False)
         ctx.register("t", lf)
         lf = ctx.execute(f"SELECT * FROM t WHERE {flt}")
-    lf.sink_parquet(dst)
+    lf.sink_parquet(dst, compression="snappy")
     t1 = _now_ns()
 
     # bytes_out via head — Polars doesn't return the size.
@@ -114,7 +137,7 @@ def _polars_project(event: dict) -> dict:
         ctx = pl.SQLContext(register_globals=False, eager=False)
         ctx.register("t", lf)
         lf = ctx.execute(f"SELECT * FROM t WHERE {flt}")
-    lf.sink_parquet(dst)
+    lf.sink_parquet(dst, compression="snappy")
     t1 = _now_ns()
 
     dst_b, dst_k = _parse_s3(dst)
@@ -130,30 +153,14 @@ def _polars_project(event: dict) -> dict:
 
 
 def _duckdb_copy(event: dict) -> dict:
-    import duckdb
-
     src = event["s3_url"]
     dst = event["output_url"]
     flt = event.get("filter_sql")
 
-    # DuckDB tries to write extension state to ~/.duckdb; in a Lambda
-    # the HOME env var isn't set by default, so point it at /tmp before
-    # opening the connection.
-    os.environ.setdefault("HOME", "/tmp")
-    con = duckdb.connect(":memory:")
-    # httpfs ships in the duckdb wheel; LOAD is a no-op if INSTALL ran
-    # at build time. Force-install at first use to be safe.
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    # Pick up Lambda exec-role creds from env. DuckDB reads
-    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN /
-    # AWS_REGION via the secret/credential chain when this is set.
-    region = os.environ.get("AWS_REGION", "us-west-2")
-    con.execute(f"SET s3_region='{region}';")
-    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+    con = _duckdb_connection()
 
     where = f" WHERE {flt}" if flt else ""
-    sql = f"COPY (SELECT * FROM read_parquet('{src}'){where}) TO '{dst}' (FORMAT 'parquet');"
+    sql = f"COPY (SELECT * FROM read_parquet('{src}'){where}) TO '{dst}' (FORMAT parquet, COMPRESSION snappy);"
 
     t0 = _now_ns()
     con.execute(sql)
@@ -192,7 +199,7 @@ def _polars_multi(event: dict) -> dict:
         ctx = pl.SQLContext(register_globals=False, eager=False)
         ctx.register("t", lf)
         lf = ctx.execute(f"SELECT * FROM t WHERE {flt}")
-    lf.sink_parquet(dst)
+    lf.sink_parquet(dst, compression="snappy")
     t1 = _now_ns()
 
     dst_b, dst_k = _parse_s3(dst)
@@ -210,20 +217,12 @@ def _polars_multi(event: dict) -> dict:
 
 def _duckdb_multi(event: dict) -> dict:
     """Multi-file scan via DuckDB read_parquet([list])."""
-    import duckdb
-
     inputs = event["inputs"]
     dst = event["output_url"]
     cols = event.get("columns")
     flt = event.get("filter_sql")
 
-    os.environ.setdefault("HOME", "/tmp")
-    con = duckdb.connect(":memory:")
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    region = os.environ.get("AWS_REGION", "us-west-2")
-    con.execute(f"SET s3_region='{region}';")
-    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+    con = _duckdb_connection()
 
     select_cols = ", ".join(cols) if cols else "*"
     where = f" WHERE {flt}" if flt else ""
@@ -231,7 +230,10 @@ def _duckdb_multi(event: dict) -> dict:
     # hive_partitioning=true exposes path-encoded `k=v` segments as
     # columns the filter can reference. DuckDB will skip files whose
     # constants don't satisfy the predicate before opening them.
-    sql = f"COPY (SELECT {select_cols} FROM read_parquet({files_lit}, hive_partitioning=true){where}) TO '{dst}' (FORMAT 'parquet');"
+    sql = (
+        f"COPY (SELECT {select_cols} FROM read_parquet({files_lit}, hive_partitioning=true){where}) "
+        f"TO '{dst}' (FORMAT parquet, COMPRESSION snappy);"
+    )
 
     t0 = _now_ns()
     con.execute(sql)
@@ -251,24 +253,16 @@ def _duckdb_multi(event: dict) -> dict:
 
 
 def _duckdb_project(event: dict) -> dict:
-    import duckdb
-
     src = event["s3_url"]
     dst = event["output_url"]
     cols = event["columns"]
     flt = event.get("filter_sql")
 
-    os.environ.setdefault("HOME", "/tmp")
-    con = duckdb.connect(":memory:")
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    region = os.environ.get("AWS_REGION", "us-west-2")
-    con.execute(f"SET s3_region='{region}';")
-    con.execute("CREATE SECRET (TYPE S3, PROVIDER credential_chain);")
+    con = _duckdb_connection()
 
     select_cols = ", ".join(cols)
     where = f" WHERE {flt}" if flt else ""
-    sql = f"COPY (SELECT {select_cols} FROM read_parquet('{src}'){where}) TO '{dst}' (FORMAT 'parquet');"
+    sql = f"COPY (SELECT {select_cols} FROM read_parquet('{src}'){where}) TO '{dst}' (FORMAT parquet, COMPRESSION snappy);"
 
     t0 = _now_ns()
     con.execute(sql)

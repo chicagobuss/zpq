@@ -22,6 +22,8 @@ BUCKET="${AWS_S3_BUCKET}"
 TRIALS="${TRIALS:-5}"
 ZPQ_FUNCTION="${ZPQ_BENCH_FUNCTION:-${LAMBDA_FUNCTION_NAME:-zpq-filter-s3}}"
 PYTHON_FUNCTION="${PYTHON_BENCH_FUNCTION:-zpq-bench-python}"
+POLARS_FUNCTION="${POLARS_BENCH_FUNCTION:-$PYTHON_FUNCTION}"
+DUCKDB_FUNCTION="${DUCKDB_BENCH_FUNCTION:-$PYTHON_FUNCTION}"
 RESULTS_OUT="${RESULTS_OUT:-benchmarks/coldstart_results.tsv}"
 VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/coldstart_validation.tsv}"
 
@@ -125,12 +127,12 @@ EOF
     invoke_cold "$ZPQ_FUNCTION" "zpq" /tmp/cs_zpq.json "$trial"
 
     echo "  polars cold..." >&2
-    force_cold "$PYTHON_FUNCTION"
-    invoke_cold "$PYTHON_FUNCTION" "polars" /tmp/cs_polars.json "$trial"
+    force_cold "$POLARS_FUNCTION"
+    invoke_cold "$POLARS_FUNCTION" "polars" /tmp/cs_polars.json "$trial"
 
     echo "  duckdb cold..." >&2
-    force_cold "$PYTHON_FUNCTION"
-    invoke_cold "$PYTHON_FUNCTION" "duckdb" /tmp/cs_duckdb.json "$trial"
+    force_cold "$DUCKDB_FUNCTION"
+    invoke_cold "$DUCKDB_FUNCTION" "duckdb" /tmp/cs_duckdb.json "$trial"
   done
 } | tee "$RESULTS_OUT"
 

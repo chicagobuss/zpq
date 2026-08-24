@@ -26,13 +26,27 @@ functions without changing a developer's saved `.env`. The cold-start runner
 preserves the existing function environment when it changes `BENCH_NONCE` to
 force a cold container.
 
+For the 0.3.2 candidate, run `benchmarks/deploy_lambda_comparators.sh` first.
+It creates only `zpq-032-*` dedicated x86_64 functions and makes the ZPQ,
+Polars, and DuckDB configurations identical (3008 MB, 120 seconds, us-west-2).
+It also builds one image per Python engine, pins DuckDB 1.5.5 and Polars 1.43.2,
+and bundles DuckDB's S3 extensions in the image so an invocation never measures
+an extension download.
+
+`benchmarks/run_lambda_overture_compare.sh` is the complementary real-world
+fixture: 868 MB / 4.7 M-row Overture Places, a nested five-row-group Parquet
+file. It makes every engine filter `confidence > 0.9`, project `id, confidence`,
+and write Snappy Parquet. `summarize_lambda_overture.py` refuses to emit a
+figure unless every warm-up and sample output was validated by PyArrow and
+DuckDB.
+
 ## 2026-08-20 — 0.3.2 candidate release probes
 
 These are workstation-to-R2 correctness/performance probes, not Lambda or
 cross-engine figures. They establish the remote GROUP BY cases that v0.3.0
 could not execute because its remote fetch plan omitted key columns.
 
-| probe | samples | min ms | median ms | p95 ms |
+| probe | samples | min ms | median ms | highest observed ms |
 | --- | ---: | ---: | ---: | ---: |
 | one NYC taxi file, dictionary-string GROUP BY | 5 | 1138 | 1289 | 1419 |
 | five explicit taxi files, same GROUP BY | 5 | 1423 | 1542 | 1608 |

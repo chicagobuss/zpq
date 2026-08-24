@@ -23,6 +23,8 @@ BUCKET="${AWS_S3_BUCKET}"
 RUNS="${RUNS:-3}"
 ZPQ_FUNCTION="${ZPQ_BENCH_FUNCTION:-${LAMBDA_FUNCTION_NAME:-zpq-filter-s3}}"
 PYTHON_FUNCTION="${PYTHON_BENCH_FUNCTION:-zpq-bench-python}"
+POLARS_FUNCTION="${POLARS_BENCH_FUNCTION:-$PYTHON_FUNCTION}"
+DUCKDB_FUNCTION="${DUCKDB_BENCH_FUNCTION:-$PYTHON_FUNCTION}"
 RESULTS_OUT="${RESULTS_OUT:-benchmarks/selectivity_results.tsv}"
 VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/selectivity_validation.tsv}"
 
@@ -67,7 +69,7 @@ cat > /tmp/warm_polars.json <<EOF
 {"mode":"polars_multi","inputs":[$INPUTS_JSON],
  "output_url":"s3://${BUCKET}/bench/$(ts)/warm.parquet","filter_sql":"int8 >= 0"}
 EOF
-aws lambda invoke --function-name "$PYTHON_FUNCTION" \
+aws lambda invoke --function-name "$POLARS_FUNCTION" \
   --cli-binary-format raw-in-base64-out --payload file:///tmp/warm_polars.json \
   --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
 
@@ -93,8 +95,8 @@ EOF
 
   echo "# $label ($predicate, expect ~$pct surviving)" >&2
   invoke "$ZPQ_FUNCTION" "zpq:${label}" /tmp/zpq_${label}.json
-  invoke "$PYTHON_FUNCTION" "polars:${label}" /tmp/polars_${label}.json
-  invoke "$PYTHON_FUNCTION" "duckdb:${label}" /tmp/duckdb_${label}.json
+  invoke "$POLARS_FUNCTION" "polars:${label}" /tmp/polars_${label}.json
+  invoke "$DUCKDB_FUNCTION" "duckdb:${label}" /tmp/duckdb_${label}.json
 
   OUT_URLS["zpq:${label}"]="$zpq_out"
   OUT_URLS["polars:${label}"]="$polars_out"

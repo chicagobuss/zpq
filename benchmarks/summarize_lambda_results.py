@@ -9,6 +9,7 @@ Parquet file can be read by pyarrow and DuckDB before a figure is produced.
 
 import argparse
 import csv
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -57,7 +58,7 @@ def summary(grouped):
             if not samples:
                 raise ValueError(f"{scenario!r} has no {engine} samples")
             times, output_bytes, rows = zip(*samples)
-            p95 = sorted(times)[max(0, int(len(times) * 0.95) - 1)]
+            p95 = sorted(times)[max(0, math.ceil(len(times) * 0.95) - 1)]
             lines.append(
                 f"| {scenario} | {engine} | {len(times)} | {statistics.median(times):.0f} | "
                 f"{p95:.0f} | {statistics.median(output_bytes):.0f} | {statistics.median(rows):.0f} |"

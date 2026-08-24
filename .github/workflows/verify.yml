@@ -62,14 +62,17 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Install pyarrow
+      - name: Create Python test environment
         # pyarrow>=21 recognizes the GEOMETRY/GEOGRAPHY logical type. The
         # pinned corpus SHA ships 10 geospatial fixtures; pyarrow 18 fails to
         # *open* them ("Thrift LogicalType not recognized") — not a zpq issue,
         # but it dropped the conformance oracle below the floor. zpq reads all
         # 10 correctly (WKB as BYTE_ARRAY); a current pyarrow lets the floor
         # (69) count them. Bump deliberately alongside the corpus SHA.
-        run: pip install --quiet --no-input "pyarrow==24.*"
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --no-input "pyarrow==24.*"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Cache Zig global build cache
         uses: actions/cache@v4

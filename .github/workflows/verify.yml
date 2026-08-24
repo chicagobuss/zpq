@@ -161,6 +161,9 @@ jobs:
           file /tmp/lambda-check/bootstrap | grep -q "statically linked"
           strings /tmp/lambda-check/bootstrap | grep -q "/2018-06-01/runtime/invocation/"
 
+      - name: Test module coverage
+        run: python3 tools/check_test_modules.py
+
       - name: Unit tests
         run: zig build test --summary all
 

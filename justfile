@@ -94,7 +94,12 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test test-integration smoke duckdb-smoke differential
+check: test-modules test test-integration smoke duckdb-smoke differential
+
+# Static guard for Zig's lazy test discovery. Every src file containing a
+# top-level test must be directly rooted by one of the two test artifacts.
+test-modules:
+    python3 tools/check_test_modules.py
 
 # Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
 # fetch-corpus first so `test` picks up the real decimal/etc. fixtures.

@@ -2333,6 +2333,30 @@ test "engine: API is well-typed" {
     _ = runPrint;
 }
 
+fn pageIndexTestChunk(data_page_offset: i64) schema.ColumnChunk {
+    return .{
+        .file_path = null,
+        .file_offset = data_page_offset,
+        .meta_data = .{
+            .type = .INT32,
+            .encodings = .empty,
+            .path_in_schema = .empty,
+            .codec = .UNCOMPRESSED,
+            .num_values = 0,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = data_page_offset,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = null,
+        },
+        .column_index_offset = 32,
+        .column_index_length = 16,
+        .offset_index_offset = 96,
+        .offset_index_length = 16,
+    };
+}
+
 test "rebaseFetchedOffsets clears page-index pointers that would resolve inside the compact buffer" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -2341,17 +2365,20 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
 
     // The index pointers deliberately fall *inside* the implied 128-byte compact buffer, modelling the noncanonical
     // file this clearing exists for; a conforming writer's offsets would fail bounds anyway.
-    var meta: schema.FileMetaData = .{};
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
     for ([_]i64{ 1_000_000, 2_000_000 }) |dpo| {
-        var rg: schema.RowGroup = .{};
-        var chunk: schema.ColumnChunk = .{
-            .file_offset = dpo,
-            .column_index_offset = 32,
-            .column_index_length = 16,
-            .offset_index_offset = 96,
-            .offset_index_length = 16,
+        var rg: schema.RowGroup = .{
+            .columns = .empty,
+            .total_byte_size = 0,
+            .num_rows = 0,
         };
-        chunk.meta_data = .{ .data_page_offset = dpo };
+        const chunk = pageIndexTestChunk(dpo);
         try rg.columns.append(arena, chunk);
         try meta.row_groups.append(arena, rg);
     }
@@ -2386,16 +2413,22 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
 
     // A pruned row group is skipped by the rebase loop, so clearing that rode along with rebasing would leave its
     // stale pointers.
-    var meta: schema.FileMetaData = .{};
-    var rg: schema.RowGroup = .{};
-    var chunk: schema.ColumnChunk = .{
-        .file_offset = 9_000_000,
-        .column_index_offset = 128,
-        .column_index_length = 32,
-        .offset_index_offset = 160,
-        .offset_index_length = 16,
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
     };
-    chunk.meta_data = .{ .data_page_offset = 9_000_000 };
+    var rg: schema.RowGroup = .{
+        .columns = .empty,
+        .total_byte_size = 0,
+        .num_rows = 0,
+    };
+    var chunk = pageIndexTestChunk(9_000_000);
+    chunk.column_index_offset = 128;
+    chunk.column_index_length = 32;
+    chunk.offset_index_offset = 160;
     try rg.columns.append(arena, chunk);
     try meta.row_groups.append(arena, rg);
 

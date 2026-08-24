@@ -798,21 +798,21 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         // passthrough columns. A reordering `--select` or a DECIMAL output
         // (which the footer coerces on re-encode) would make a byte-copied RG
         // disagree with the footer, so exclude those.
-        var has_decimal_output = false;
+        var has_widened_output = false;
         if (select_items == null and filter_opt != null) {
             for (0..num_leaves) |ci| {
                 if (!kept_arr[ci]) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
                 if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem_val| {
                     var e = elem_val;
-                    if (decimal_mod.kindFromSchema(&e) != null) {
-                        has_decimal_output = true;
+                    if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
+                        has_widened_output = true;
                         break;
                     }
                 }
             }
         }
-        const bytecopy_ok = select_items == null and filter_opt != null and !has_decimal_output;
+        const bytecopy_ok = select_items == null and filter_opt != null and !has_widened_output;
 
         // 1. Collect surviving row groups (serial, cheap stats-only pruning).
         var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
@@ -919,6 +919,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // copy passthrough (need_encoder=false) preserves DECIMAL.
     if (need_encoder) {
         try coerceDecimalLeavesToDouble(arena, &new_schema_items);
+        coerceFloat16LeavesToDouble(&new_schema_items);
     }
 
     const new_meta: schema.FileMetaData = .{
@@ -1003,6 +1004,22 @@ fn coerceDecimalLeavesToDouble(
         if (k.physical == .INT32 or k.physical == .INT64 or
             k.physical == .FIXED_LEN_BYTE_ARRAY) continue;
 
+        elem.type = .DOUBLE;
+        elem.type_length = null;
+        elem.converted_type = null;
+        elem.logical_type = null;
+        elem.scale = null;
+        elem.precision = null;
+    }
+}
+
+/// FLOAT16 decodes into the f64 lane and the writer has no half-float
+/// encoder. Re-encoded output is therefore DOUBLE; keep the footer in
+/// lockstep with the column metadata and eight-byte PLAIN values.
+fn coerceFloat16LeavesToDouble(items: *std.ArrayListUnmanaged(schema.SchemaElement)) void {
+    for (items.items) |*elem| {
+        const nc = elem.num_children orelse 0;
+        if (nc != 0 or !schema.isFloat16(elem.*)) continue;
         elem.type = .DOUBLE;
         elem.type_length = null;
         elem.converted_type = null;
@@ -2331,6 +2348,45 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
+}
+
+test "re-encoded FLOAT16 footer widens to DOUBLE" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try items.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 2,
+        .repetition_type = .OPTIONAL,
+        .name = "half",
+        .num_children = 0,
+        .logical_type = .{ .FLOAT16 = .{} },
+        .scale = null,
+        .precision = null,
+        .field_id = 4,
+    });
+    try items.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 16,
+        .repetition_type = .OPTIONAL,
+        .name = "opaque",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = 5,
+    });
+
+    coerceFloat16LeavesToDouble(&items);
+
+    try testing.expectEqual(schema.Type.DOUBLE, items.items[0].type.?);
+    try testing.expect(items.items[0].type_length == null);
+    try testing.expect(items.items[0].logical_type == null);
+    try testing.expectEqual(@as(?i32, 4), items.items[0].field_id);
+    try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, items.items[1].type.?);
+    try testing.expectEqual(@as(?i32, 16), items.items[1].type_length);
 }
 
 fn pageIndexTestChunk(data_page_offset: i64) schema.ColumnChunk {

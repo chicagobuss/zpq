@@ -125,8 +125,8 @@ pub const OutputAggregator = struct {
     arena: std.mem.Allocator,
     cols: []ColumnBuf,
     /// One per output spec. Captured on first append:
-    /// - passthrough → source RG's leaf schema element (borrowed from
-    ///   meta, which outlives the aggregator).
+    /// - passthrough → source RG's leaf schema element, except logical
+    ///   types widened by decode (currently FLOAT16 → DOUBLE).
     /// - computed   → synthesized schema element, alias arena-dupe'd.
     schema_elems: []schema.SchemaElement,
     paths: [][]const []const u8,
@@ -209,6 +209,28 @@ pub fn initOutputAggregator(
                         .field_id = null,
                     };
                     break :blk schema.Type.DOUBLE;
+                }
+
+                // FLOAT16 is physically FLBA(2), but decode widens it to
+                // the f64 lane. Keep the buffer and output schema aligned:
+                // row printing consumes f64 directly, while re-encoding
+                // writes a valid DOUBLE column instead of FLBA metadata over
+                // eight-byte values.
+                if (schema.isFloat16(src_elem)) {
+                    schemas[i] = .{
+                        .type = .DOUBLE,
+                        .type_length = null,
+                        .repetition_type = src_elem.repetition_type,
+                        .name = src_elem.name,
+                        .num_children = 0,
+                        .converted_type = null,
+                        .logical_type = null,
+                        .scale = null,
+                        .precision = null,
+                        .field_id = src_elem.field_id,
+                    };
+                    cols[i] = .{ .f64 = .{} };
+                    continue;
                 }
 
                 schemas[i] = src_elem;
@@ -2137,6 +2159,75 @@ test "consumer: API is well-typed" {
     _ = copyRG;
     _ = decodeColumnT;
     _ = shiftChunk;
+}
+
+test "initOutputAggregator widens FLOAT16 passthrough to DOUBLE" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var file_meta = schema.FileMetaData{
+        .version = 2,
+        .schema = .empty,
+        .num_rows = 1,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try file_meta.schema.append(arena, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 2,
+        .repetition_type = .OPTIONAL,
+        .name = "half",
+        .num_children = 0,
+        .logical_type = .{ .FLOAT16 = .{} },
+        .scale = null,
+        .precision = null,
+        .field_id = 7,
+    });
+
+    var path: schema.StringList = .empty;
+    try path.append(arena, "half");
+    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try columns.append(arena, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .FIXED_LEN_BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 1,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    });
+    try file_meta.row_groups.append(arena, .{
+        .columns = columns,
+        .total_byte_size = 0,
+        .num_rows = 1,
+    });
+
+    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const agg = try initOutputAggregator(arena, &file_meta, &specs);
+    try testing.expect(agg.cols[0] == .f64);
+    try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
+    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, agg.schema_elems[0].repetition_type.?);
+    try testing.expectEqual(@as(?i32, 7), agg.schema_elems[0].field_id);
+    try testing.expect(agg.schema_elems[0].logical_type == null);
 }
 
 // Regression: copyRG(no_projection) used to write whatever `src.bytes`

@@ -106,11 +106,19 @@ test-modules:
 gauntlet: fetch-corpus test test-integration smoke duckdb-smoke soak (conform "data/parquet-testing") triangulate
     @echo "gauntlet: all tiers green (corpus-backed cross-impl + soak + conformance + triangulation)."
 
-# Fetch apache/parquet-testing into data/parquet-testing (gitignored under
-# data/) so the in-tree fixture decode tests run against real foreign-writer
-# files instead of skipping. Refresh: git -C data/parquet-testing pull.
+# Fetch the same apache/parquet-testing revision used by CI into the gitignored
+# data directory. Pinning keeps the local release gate from changing whenever
+# upstream adds a new format fixture; bump this SHA and CI's together.
+parquet_testing_sha := "1a2a75127be06fc0123f03ebd36c966f7beda27d"
 fetch-corpus:
-    @test -d data/parquet-testing || git clone --depth 1 https://github.com/apache/parquet-testing data/parquet-testing
+    #!/usr/bin/env bash
+    set -euo pipefail
+    corpus=data/parquet-testing
+    if [[ ! -d "$corpus/.git" ]]; then
+      git clone --filter=blob:none --no-checkout https://github.com/apache/parquet-testing "$corpus"
+    fi
+    git -C "$corpus" fetch --quiet --depth 1 origin {{parquet_testing_sha}}
+    git -C "$corpus" checkout --quiet --detach {{parquet_testing_sha}}
 
 # Lambda integration tests — spawns the binary against an in-process fake.
 test-integration:

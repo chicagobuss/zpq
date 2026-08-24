@@ -62,9 +62,6 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Install Just
-        uses: extractions/setup-just@v2
-
       - name: Install pyarrow
         # pyarrow>=21 recognizes the GEOMETRY/GEOGRAPHY logical type. The
         # pinned corpus SHA ships 10 geospatial fixtures; pyarrow 18 fails to

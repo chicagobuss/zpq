@@ -1282,6 +1282,26 @@ pub fn scanRGForAgg(
         }
     }
 
+    // Columns read by an aggregate argument, a per-agg FILTER, or a GROUP BY
+    // key. The always-match shortcut in `decodeWithReaderPruned` fills such a
+    // page with the ColumnIndex minimum instead of decoding it, which is only
+    // sound when the filter is the sole consumer of the values.
+    const values_consumed = try ra.alloc(bool, num_leaves);
+    @memset(values_consumed, false);
+    for (agg_calls) |call| {
+        if (call.arg) |arg_expr| arg_expr.collectColumns(values_consumed);
+        if (call.where) |w_expr| {
+            var cols: std.ArrayList(usize) = .empty;
+            try w_expr.collectColumns(&cols, ra);
+            for (cols.items) |wci| if (wci < num_leaves) {
+                values_consumed[wci] = true;
+            };
+        }
+    }
+    if (group_by_keys) |keys| {
+        for (keys) |key_expr| key_expr.collectColumns(values_consumed);
+    }
+
     const t_decode_start = nowMonoNs();
     for (fetch_set, 0..) |needed, ci| {
         if (!needed) continue;
@@ -1326,6 +1346,11 @@ pub fn scanRGForAgg(
                     }
                 }
                 skipped = s;
+                always = a;
+            }
+            if (values_consumed[ci]) {
+                const a = try ra.alloc(bool, locs.len);
+                @memset(a, false);
                 always = a;
             }
 

@@ -132,6 +132,11 @@ pub const QueryArgs = struct {
     /// Row-group pruning still uses stats regardless (that path only skips
     /// provably-non-matching groups, so it can't produce a wrong value).
     trust_stats: bool = false,
+    /// `--fast-levels`: skip materialising definition levels for data
+    /// pages proven to have no nulls. Off by default — it is new, and a
+    /// wrong answer here would be silent. See `core/parquet/column.zig`
+    /// (`fast_levels`) for what the detection actually proves.
+    fast_levels: bool = false,
     max_memory: usize = 512 * 1024 * 1024,
 };
 
@@ -258,6 +263,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .parallelism = args.parallelism,
         .scan_all = args.scan_all,
         .trust_stats = args.trust_stats,
+        .fast_levels = args.fast_levels,
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
@@ -368,12 +374,13 @@ fn encodeRGToBuffer(
     fetch_arr: []const bool,
     output_specs: []const consumer.OutputCol,
     codec: schema.CompressionCodec,
+    decode_options: consumer.DecodeOptions,
 ) !EncodedRG {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     var timings: consumer.Timings = .{};
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
-    _ = try consumer.appendProjectedRG(
+    _ = try consumer.appendProjectedRGWithOptions(
         &agg,
         gpa,
         job.rg,
@@ -383,6 +390,7 @@ fn encodeRGToBuffer(
         fetch_arr,
         output_specs,
         &timings,
+        decode_options,
     );
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
@@ -421,6 +429,7 @@ const WinCtx = struct {
     output_specs: []const consumer.OutputCol,
     kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
+    decode_options: consumer.DecodeOptions,
     slots: []Slot,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
@@ -444,7 +453,16 @@ fn winProducer(w: *WinCtx, i: usize) void {
     const enc = (if (w.jobs[i].passthrough)
         copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set)
     else
-        encodeRGToBuffer(w.gpa, ma, w.jobs[i], w.filter, w.fetch_arr, w.output_specs, w.codec)) catch |e| {
+        encodeRGToBuffer(
+            w.gpa,
+            ma,
+            w.jobs[i],
+            w.filter,
+            w.fetch_arr,
+            w.output_specs,
+            w.codec,
+            w.decode_options,
+        )) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
@@ -780,21 +798,21 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         // passthrough columns. A reordering `--select` or a DECIMAL output
         // (which the footer coerces on re-encode) would make a byte-copied RG
         // disagree with the footer, so exclude those.
-        var has_decimal_output = false;
+        var has_widened_output = false;
         if (select_items == null and filter_opt != null) {
             for (0..num_leaves) |ci| {
                 if (!kept_arr[ci]) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
                 if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem_val| {
                     var e = elem_val;
-                    if (decimal_mod.kindFromSchema(&e) != null) {
-                        has_decimal_output = true;
+                    if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
+                        has_widened_output = true;
                         break;
                     }
                 }
             }
         }
-        const bytecopy_ok = select_items == null and filter_opt != null and !has_decimal_output;
+        const bytecopy_ok = select_items == null and filter_opt != null and !has_widened_output;
 
         // 1. Collect surviving row groups (serial, cheap stats-only pruning).
         var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
@@ -861,6 +879,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .output_specs = output_specs.items,
                 .kept_set = kept_set,
                 .codec = args.codec,
+                .decode_options = .{ .fast_levels = args.fast_levels },
                 .slots = slots,
                 .window = &window_sem,
                 .completions = &completions_sem,
@@ -900,6 +919,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // copy passthrough (need_encoder=false) preserves DECIMAL.
     if (need_encoder) {
         try coerceDecimalLeavesToDouble(arena, &new_schema_items);
+        coerceFloat16LeavesToDouble(&new_schema_items);
     }
 
     const new_meta: schema.FileMetaData = .{
@@ -984,6 +1004,22 @@ fn coerceDecimalLeavesToDouble(
         if (k.physical == .INT32 or k.physical == .INT64 or
             k.physical == .FIXED_LEN_BYTE_ARRAY) continue;
 
+        elem.type = .DOUBLE;
+        elem.type_length = null;
+        elem.converted_type = null;
+        elem.logical_type = null;
+        elem.scale = null;
+        elem.precision = null;
+    }
+}
+
+/// FLOAT16 decodes into the f64 lane and the writer has no half-float
+/// encoder. Re-encoded output is therefore DOUBLE; keep the footer in
+/// lockstep with the column metadata and eight-byte PLAIN values.
+fn coerceFloat16LeavesToDouble(items: *std.ArrayListUnmanaged(schema.SchemaElement)) void {
+    for (items.items) |*elem| {
+        const nc = elem.num_children orelse 0;
+        if (nc != 0 or !schema.isFloat16(elem.*)) continue;
         elem.type = .DOUBLE;
         elem.type_length = null;
         elem.converted_type = null;
@@ -2281,7 +2317,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 if ((try filter_prune.pruneRowGroup(src_rg, f, arena, &meta_const)) == .skip) continue;
             };
 
-            _ = try consumer.appendProjectedRG(
+            _ = try consumer.appendProjectedRGWithOptions(
                 &agg,
                 ctx.gpa,
                 src_rg,
@@ -2291,6 +2327,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 fetch_arr,
                 output_specs.items,
                 &t.core,
+                .{ .fast_levels = args.fast_levels },
             );
 
             try flushAggregator(&agg, &stdout_writer, is_jsonl, limit, &total_printed);
@@ -2313,6 +2350,69 @@ test "engine: API is well-typed" {
     _ = runPrint;
 }
 
+test "re-encoded FLOAT16 footer widens to DOUBLE" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try items.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 2,
+        .repetition_type = .OPTIONAL,
+        .name = "half",
+        .num_children = 0,
+        .logical_type = .{ .FLOAT16 = .{} },
+        .scale = null,
+        .precision = null,
+        .field_id = 4,
+    });
+    try items.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 16,
+        .repetition_type = .OPTIONAL,
+        .name = "opaque",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = 5,
+    });
+
+    coerceFloat16LeavesToDouble(&items);
+
+    try testing.expectEqual(schema.Type.DOUBLE, items.items[0].type.?);
+    try testing.expect(items.items[0].type_length == null);
+    try testing.expect(items.items[0].logical_type == null);
+    try testing.expectEqual(@as(?i32, 4), items.items[0].field_id);
+    try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, items.items[1].type.?);
+    try testing.expectEqual(@as(?i32, 16), items.items[1].type_length);
+}
+
+fn pageIndexTestChunk(data_page_offset: i64) schema.ColumnChunk {
+    return .{
+        .file_path = null,
+        .file_offset = data_page_offset,
+        .meta_data = .{
+            .type = .INT32,
+            .encodings = .empty,
+            .path_in_schema = .empty,
+            .codec = .UNCOMPRESSED,
+            .num_values = 0,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = data_page_offset,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = null,
+        },
+        .column_index_offset = 32,
+        .column_index_length = 16,
+        .offset_index_offset = 96,
+        .offset_index_length = 16,
+    };
+}
+
 test "rebaseFetchedOffsets clears page-index pointers that would resolve inside the compact buffer" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -2321,17 +2421,20 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
 
     // The index pointers deliberately fall *inside* the implied 128-byte compact buffer, modelling the noncanonical
     // file this clearing exists for; a conforming writer's offsets would fail bounds anyway.
-    var meta: schema.FileMetaData = .{};
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
     for ([_]i64{ 1_000_000, 2_000_000 }) |dpo| {
-        var rg: schema.RowGroup = .{};
-        var chunk: schema.ColumnChunk = .{
-            .file_offset = dpo,
-            .column_index_offset = 32,
-            .column_index_length = 16,
-            .offset_index_offset = 96,
-            .offset_index_length = 16,
+        var rg: schema.RowGroup = .{
+            .columns = .empty,
+            .total_byte_size = 0,
+            .num_rows = 0,
         };
-        chunk.meta_data = .{ .data_page_offset = dpo };
+        const chunk = pageIndexTestChunk(dpo);
         try rg.columns.append(arena, chunk);
         try meta.row_groups.append(arena, rg);
     }
@@ -2366,16 +2469,22 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
 
     // A pruned row group is skipped by the rebase loop, so clearing that rode along with rebasing would leave its
     // stale pointers.
-    var meta: schema.FileMetaData = .{};
-    var rg: schema.RowGroup = .{};
-    var chunk: schema.ColumnChunk = .{
-        .file_offset = 9_000_000,
-        .column_index_offset = 128,
-        .column_index_length = 32,
-        .offset_index_offset = 160,
-        .offset_index_length = 16,
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
     };
-    chunk.meta_data = .{ .data_page_offset = 9_000_000 };
+    var rg: schema.RowGroup = .{
+        .columns = .empty,
+        .total_byte_size = 0,
+        .num_rows = 0,
+    };
+    var chunk = pageIndexTestChunk(9_000_000);
+    chunk.column_index_offset = 128;
+    chunk.column_index_length = 32;
+    chunk.offset_index_offset = 160;
     try rg.columns.append(arena, chunk);
     try meta.row_groups.append(arena, rg);
 

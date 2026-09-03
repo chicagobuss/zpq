@@ -84,6 +84,29 @@ fn bitWidthFor(max: u32) u8 {
     return @intCast(32 - @clz(max));
 }
 
+pub const DecodeOptions = struct {
+    /// Skip materialising definition levels for pages whose level stream
+    /// proves every value present. Kept on each reader so concurrent queries
+    /// can choose independently without process-global mutable state.
+    fast_levels: bool = false,
+};
+
+/// Hardwood's definition-level test, ported: a page has no nulls iff its
+/// def-level stream is a single RLE run at max_def long enough to cover
+/// the page. Decided from the run header in O(1), against the O(n) cost
+/// of expanding the stream into a u32 per value and then counting it.
+///
+/// Conservative by construction — anything that is not obviously one
+/// long enough max_def run (bit-packed opener, short run, mixed runs)
+/// returns false and takes the ordinary path. A false negative costs the
+/// fast path; there is no input for which a false positive is possible,
+/// because "opens with an RLE run of value v and length >= n" is exactly
+/// the statement "the first n levels all equal v".
+fn defStreamAllPresent(def_bytes: []const u8, bit_width: u8, max_def: u32, num_values: usize) bool {
+    const run = hybrid_rle.HybridRleDecoder.peekFirstRun(def_bytes, bit_width) orelse return false;
+    return run.value == max_def and run.count >= num_values;
+}
+
 /// BYTE_STREAM_SPLIT un-split. The encoded buffer holds `width` contiguous
 /// byte-planes of N bytes each (N = encoded.len / width); value `i` is
 /// reassembled from `encoded[0*N+i], encoded[1*N+i], … encoded[(width-1)*N+i]`.
@@ -116,6 +139,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         pages: page_mod.PageReader,
         arena: std.mem.Allocator,
         levels: schema.Levels,
+        options: DecodeOptions,
         has_nulls: bool = false,
 
         /// For FIXED_LEN_BYTE_ARRAY columns: the fixed value width in bytes
@@ -155,16 +179,34 @@ pub fn ColumnChunkReader(comptime T: type) type {
         current_def_pos: usize = 0,
         current_page_num_values: usize = 0,
 
+        /// `--fast-levels`: the current page's def-level stream was
+        /// proven all-present in O(1), so it was never expanded and
+        /// `current_def_levels` stays null even though max_def > 0.
+        /// `decodePageSlice` stamps max_def into the caller's buffer
+        /// instead of copying and counting a materialised array.
+        current_def_all_present: bool = false,
+
         pub fn init(
             chunk_bytes: []const u8,
             codec: schema.CompressionCodec,
             levels: schema.Levels,
             arena: std.mem.Allocator,
         ) Self {
+            return initWithOptions(chunk_bytes, codec, levels, arena, .{});
+        }
+
+        pub fn initWithOptions(
+            chunk_bytes: []const u8,
+            codec: schema.CompressionCodec,
+            levels: schema.Levels,
+            arena: std.mem.Allocator,
+            options: DecodeOptions,
+        ) Self {
             return .{
                 .pages = page_mod.PageReader.init(chunk_bytes, codec, arena),
                 .arena = arena,
                 .levels = levels,
+                .options = options,
             };
         }
 
@@ -217,6 +259,42 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 return error.DefLevelsMismatch;
             }
             return self.decodeInner(values, def_levels, rep_levels);
+        }
+
+        /// Decode without a definition-level buffer at all, for as long
+        /// as every page proves itself null-free.
+        ///
+        /// Returns the number of values written. A short return means
+        /// the next page is NOT provably all-present (or the chunk ran
+        /// out). That page is installed but entirely unconsumed —
+        /// `current_def_pos` is still 0 — so the caller can allocate a
+        /// level buffer, back-fill max_def over what was already
+        /// written, and resume through `decodeWithLevels` with no gap
+        /// and no re-read.
+        ///
+        /// Only meaningful under `fast_levels`; with it off, no page is
+        /// ever marked all-present and this returns 0 immediately.
+        pub fn decodeAllPresent(self: *Self, values: []T) Error!usize {
+            var written: usize = 0;
+            while (written < values.len) {
+                const remaining_in_page = if (self.hasActivePage())
+                    self.current_page_num_values - self.current_def_pos
+                else
+                    0;
+
+                if (remaining_in_page > 0) {
+                    if (!self.current_def_all_present) return written;
+                    const want = @min(values.len - written, remaining_in_page);
+                    try self.decodePageSlicePresent(values[written .. written + want]);
+                    written += want;
+                    self.current_def_pos += want;
+                    continue;
+                }
+
+                self.resetPageState();
+                if (!try self.advancePage()) break;
+            }
+            return written;
         }
 
         fn decodeInner(self: *Self, values: []T, def_levels_opt: ?[]u32, rep_levels_opt: ?[]u32) Error!usize {
@@ -272,8 +350,23 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_bool_rle = null;
             self.current_def_levels = null;
             self.current_rep_levels = null;
+            self.current_def_all_present = false;
             self.current_def_pos = 0;
             self.current_page_num_values = 0;
+        }
+
+        /// Whether this page's def levels can be skipped entirely.
+        ///
+        /// Restricted to `max_rep == 0` on purpose. A repeated column's
+        /// caller wants rep levels regardless, so skipping the def array
+        /// saves half the level traffic at best — and every zpq query
+        /// surface rejects nested columns before decode, so the case has
+        /// no reachable consumer to justify the extra path. Flat columns
+        /// are where the levels are pure overhead.
+        fn canSkipDefLevels(self: *const Self, def_bytes: []const u8, bit_width: u8, num_values: usize) bool {
+            if (!self.options.fast_levels) return false;
+            if (self.levels.max_rep != 0) return false;
+            return defStreamAllPresent(def_bytes, bit_width, @intCast(self.levels.max_def), num_values);
         }
 
         /// REQUIRED-column path: ask the active per-page decoder for
@@ -291,6 +384,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// overwrite a packed value before reading it). Null slots
         /// default-initialise to zero / false / empty-slice.
         fn decodePageSlice(self: *Self, values: []T, def_levels_out: []u32, rep_levels_out: ?[]u32) Error!void {
+            // All-present page under --fast-levels: the levels were
+            // never expanded, so there is nothing to copy or count.
+            // Stamp the caller's slice and go straight to the packed
+            // values, exactly as the REQUIRED path does.
+            if (self.current_def_all_present) {
+                @memset(def_levels_out, @intCast(self.levels.max_def));
+                if (rep_levels_out) |rl_out| @memset(rl_out, 0);
+                const got = try self.decodePackedFromCurrentPage(values);
+                if (got != values.len) return error.UnexpectedPage;
+                return;
+            }
+
             const dl = self.current_def_levels.?;
             const src = dl[self.current_def_pos .. self.current_def_pos + values.len];
             @memcpy(def_levels_out, src);
@@ -433,6 +538,31 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return self.advancePage();
         }
 
+        /// Reposition to a possible leading dictionary and install only that
+        /// page. When a dictionary exists, returning immediately after it
+        /// avoids decoding the first data page before the indexed caller seeks
+        /// to that page. Without a dictionary, PageReader must still read the
+        /// candidate data page to identify its type, but leaves it uninstalled.
+        pub fn seekAndInstallDictionaryPage(
+            self: *Self,
+            absolute_offset: i64,
+            chunk_file_offset: i64,
+        ) !bool {
+            self.resetPageState();
+            try self.pages.seekToPage(absolute_offset, chunk_file_offset);
+            while (try self.pages.next()) |pg| {
+                switch (pg.header.type) {
+                    .DICTIONARY_PAGE => {
+                        try self.installDictionary(pg);
+                        return true;
+                    },
+                    .INDEX_PAGE => continue,
+                    .DATA_PAGE, .DATA_PAGE_V2 => return false,
+                }
+            }
+            return false;
+        }
+
         /// Pull the next page; if it's a dictionary page, cache it and
         /// loop to the next page. Returns true iff a data-page decoder
         /// was set up for use; false if the chunk is exhausted.
@@ -492,6 +622,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const num_values: usize = @intCast(dph.num_values);
             self.current_def_levels = null;
             self.current_rep_levels = null;
+            self.current_def_all_present = false;
             self.current_def_pos = 0;
             self.current_page_num_values = num_values;
 
@@ -521,12 +652,16 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (4 + def_len > values_bytes.len) return error.UnexpectedPage;
 
                 const def_bytes = values_bytes[4 .. 4 + def_len];
-                const buf = try self.arena.alloc(u32, num_values);
                 const bit_width = bitWidthFor(@intCast(self.levels.max_def));
-                var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
-                const got = dec.decode(buf) catch return error.UnexpectedPage;
-                if (got != num_values) return error.DefLevelsMismatch;
-                self.current_def_levels = buf;
+                if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
+                    self.current_def_all_present = true;
+                } else {
+                    const buf = try self.arena.alloc(u32, num_values);
+                    var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
+                    const got = dec.decode(buf) catch return error.UnexpectedPage;
+                    if (got != num_values) return error.DefLevelsMismatch;
+                    self.current_def_levels = buf;
+                }
 
                 values_bytes = values_bytes[4 + def_len ..];
             }
@@ -590,6 +725,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const num_values: usize = @intCast(dph.num_values);
             self.current_def_levels = null;
             self.current_rep_levels = null;
+            self.current_def_all_present = false;
             self.current_def_pos = 0;
             self.current_page_num_values = num_values;
 
@@ -617,12 +753,22 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (self.levels.max_def > 0) {
                 if (def_len == 0) return error.UnexpectedPage;
                 const def_bytes = pg.bytes[cursor..][0..def_len];
-                const buf = try self.arena.alloc(u32, num_values);
                 const bit_width = bitWidthFor(@intCast(self.levels.max_def));
-                var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
-                const got = dec.decode(buf) catch return error.UnexpectedPage;
-                if (got != num_values) return error.DefLevelsMismatch;
-                self.current_def_levels = buf;
+                // V2 headers also carry `num_nulls`, which would answer
+                // this without reading a byte — but that is the writer's
+                // claim, in the same class as the statistics this engine
+                // makes you opt into with --trust-stats. The run check
+                // below reads the levels themselves, so a writer that
+                // lies cannot turn it into a wrong answer.
+                if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
+                    self.current_def_all_present = true;
+                } else {
+                    const buf = try self.arena.alloc(u32, num_values);
+                    var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
+                    const got = dec.decode(buf) catch return error.UnexpectedPage;
+                    if (got != num_values) return error.DefLevelsMismatch;
+                    self.current_def_levels = buf;
+                }
                 cursor += def_len;
             } else if (def_len != 0) {
                 cursor += def_len;
@@ -752,13 +898,13 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
 
         if (case.expect_dictionary) {
             var reader = ColumnChunkReader([]const u8).init(chunk, col.codec, levels, arena.allocator());
-            try reader.pages.seekToPage(chunk_start, chunk_start);
-            try testing.expect(try reader.advancePage());
+            try testing.expect(try reader.seekAndInstallDictionaryPage(chunk_start, chunk_start));
             try testing.expect(reader.dictionary != null);
         } else {
             var reader = ColumnChunkReader(bool).init(chunk, col.codec, levels, arena.allocator());
-            try reader.pages.seekToPage(chunk_start, chunk_start);
-            try testing.expect(try reader.advancePage());
+            try testing.expect(!try reader.seekAndInstallDictionaryPage(chunk_start, chunk_start));
+            // The leading page was data, so nothing may have been
+            // installed as a dictionary.
             try testing.expect(reader.dictionary == null);
         }
     }

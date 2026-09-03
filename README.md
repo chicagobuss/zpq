@@ -38,9 +38,11 @@ pruning before any bytes are fetched.
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + 1.0 → f64`), string concat (`||`),
 `coalesce(col, default)`, parens, unary minus.
 
-**Aggregate** with `sum / count / min / max / avg`, including conditional `agg(...) FILTER (WHERE ...)`. `count(*)` is
-answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you opt into
-trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in).
+**Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`.
+`count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
+opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
+limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
+entry budget, so leave headroom.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output; RLE_DICTIONARY for low-cardinality byte arrays;
 DELTA_BINARY_PACKED for INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL columns re-encode
@@ -79,6 +81,10 @@ zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
 
 `--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
 is the opposite extreme — decode everything, disable pruning too, for when you don't trust even the row counts.
+
+For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
+levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
+decoder unless one RLE run proves that the entire page is present. It is off by default while the path is new.
 
 ## Test coverage
 

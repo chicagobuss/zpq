@@ -181,11 +181,31 @@ pub fn decodeColumnAsF64(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(f64) {
+    return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{});
+}
+
+pub fn decodeColumnAsF64WithOptions(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    decode_options: column_mod.DecodeOptions,
+) Error!filter_eval.ColumnT(f64) {
     return switch (kind.physical) {
-        .INT32 => try decodeIntBacked(i32, arena, chunk, codec, levels, num_leaves, kind.scale),
-        .INT64 => try decodeIntBacked(i64, arena, chunk, codec, levels, num_leaves, kind.scale),
+        .INT32 => try decodeIntBacked(i32, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
+        .INT64 => try decodeIntBacked(i64, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
         .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBacked(arena, chunk, codec, levels, num_leaves, kind),
-        .BYTE_ARRAY => try decodeByteArrayBacked(arena, chunk, codec, levels, num_leaves, kind.scale),
+        .BYTE_ARRAY => try decodeByteArrayBacked(
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind.scale,
+            decode_options,
+        ),
         else => return error.UnsupportedDecimalPhysicalType,
     };
 }
@@ -206,9 +226,21 @@ pub fn decodeColumnAsI128(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(i128) {
+    return decodeColumnAsI128WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{});
+}
+
+pub fn decodeColumnAsI128WithOptions(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    decode_options: column_mod.DecodeOptions,
+) Error!filter_eval.ColumnT(i128) {
     return switch (kind.physical) {
-        .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves),
-        .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves),
+        .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves, decode_options),
+        .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves, decode_options),
         .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind),
         else => error.UnsupportedDecimalPhysicalType,
     };
@@ -221,11 +253,12 @@ fn decodeIntBackedI128(
     codec: schema.CompressionCodec,
     levels: schema.Levels,
     num_leaves: usize,
+    decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(i128) {
     // Decode the raw ints exactly as the f64 path does, but keep them as
     // integers (widened to i128) — no scale divide.
     const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
 
     var def_levels_buf: ?[]u32 = null;
     if (levels.max_def > 0) {
@@ -272,13 +305,14 @@ fn decodeIntBacked(
     levels: schema.Levels,
     num_leaves: usize,
     scale: i32,
+    decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(f64) {
     // Decode the raw ints first using the existing column reader
     // shape. This mirrors decodeColumnT's body in consumer.zig but
     // without the indirection — we need the raw values to apply scale
     // in a second pass.
     const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).init(chunk, codec, levels, arena);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
 
     var def_levels_buf: ?[]u32 = null;
     var rep_levels_buf: ?[]u32 = null;
@@ -345,9 +379,16 @@ fn decodeByteArrayBacked(
     levels: schema.Levels,
     num_leaves: usize,
     scale: i32,
+    decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(f64) {
     const raw_slices = try arena.alloc([]const u8, num_leaves);
-    var reader = column_mod.ColumnChunkReader([]const u8).init(chunk, codec, levels, arena);
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk,
+        codec,
+        levels,
+        arena,
+        decode_options,
+    );
 
     var def_levels_buf: ?[]u32 = null;
     var rep_levels_buf: ?[]u32 = null;

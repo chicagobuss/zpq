@@ -67,6 +67,7 @@ benchmarks/coldstart_results.tsv
 benchmarks/partition_results.tsv
 benchmarks/selectivity_results.tsv
 benchmarks/common_four_results.tsv
+benchmarks/*.local.tsv
 tools/conformance_report.tsv
 
 # Zig package cache

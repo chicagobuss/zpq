@@ -126,6 +126,30 @@ else
   echo "  SKIP  INT96 (corpus absent — run 'just fetch-corpus' or 'just gauntlet')"
 fi
 
+# Page-index always-match pages must still be decoded when the filter column
+# is also aggregated or grouped. alltypes_tiny_pages carries a ColumnIndex with
+# null counts, so `IS NOT NULL` (default) and `>= 0` (--trust-stats) mark every
+# page always-match; the fill-with-page-min shortcut produced wrong sums here.
+TP="data/parquet-testing/data/alltypes_tiny_pages.parquet"
+if [[ -f "$TP" ]]; then
+  compare "always-match pages feed aggregates (IS NOT NULL, corpus: tiny_pages)" \
+    "$("$ZPQ" query "$TP" --filter 'id IS NOT NULL' --aggregate 'sum(id) AS s, max(id) AS m' 2>/dev/null)" \
+    "$("$DUCKDB" -noheader -csv -c "SELECT sum(id), max(id) FROM '$TP' WHERE id IS NOT NULL")"
+  compare "always-match pages feed aggregates (--trust-stats, corpus: tiny_pages)" \
+    "$("$ZPQ" query "$TP" --filter 'id >= 0' --aggregate 'sum(id) AS s, max(id) AS m' --trust-stats 2>/dev/null)" \
+    "$("$DUCKDB" -noheader -csv -c "SELECT sum(id), max(id) FROM '$TP' WHERE id >= 0")"
+  groups=$("$ZPQ" query "$TP" --filter 'id IS NOT NULL' --group-by id --aggregate 'count(*) AS n' 2>/dev/null \
+    | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["agg"]))')
+  want=$("$DUCKDB" -noheader -csv -c "SELECT count(DISTINCT id) FROM '$TP'")
+  if [[ "$groups" == "$want" ]]; then
+    echo "  OK    always-match pages feed GROUP BY keys (corpus: tiny_pages)   groups=$groups"
+  else
+    echo "  FAIL  always-match pages feed GROUP BY keys (corpus: tiny_pages)   zpq=$groups duckdb=$want"; fail=1
+  fi
+else
+  echo "  SKIP  always-match aggregate (corpus absent)"
+fi
+
 # --scan-all parity: forcing a full decode (every stats shortcut off) must
 # return IDENTICAL answers to the default stats-fast path. Guards the invariant
 # that the single flag disables shortcuts without changing results — and that

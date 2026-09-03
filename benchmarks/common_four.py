@@ -2,8 +2,8 @@
 """
 common_four.py — the canonical perf-tracking suite.
 
-Four cells, one row per cell, RUNS samples each. Re-run before AND after
-any hot-path change so wins/regressions show up in a consistent shape.
+Four baseline cells, one row per cell, RUNS samples each. Re-run before AND
+after any hot-path change so wins/regressions show up in a consistent shape.
 
 Cells:
   1. lambda_s3_to_s3   — Lambda: read 100 MB from S3, filter + project,
@@ -14,6 +14,11 @@ Cells:
   3. local_from_local  — workstation `zpq query` against local file.
   4. local_from_r2     — workstation `zpq query` against R2 (NYC taxi
                          yellow_tripdata_2023-01).
+
+Additional release probes can be selected explicitly without changing the
+Common 4 baseline:
+  - r2_groupby           — one R2 taxi file, low-cardinality string GROUP BY.
+  - r2_groupby_five_files — five explicit monthly R2 taxi inputs.
 
 Usage:
   python3 benchmarks/common_four.py [--runs N] [--cells a,b,c]
@@ -42,6 +47,12 @@ AGG_BENCH = "count(*) AS n, sum(int64_sorted) AS s, max(int8) AS mx"
 AGG_TAXI = "count(*) AS n, sum(fare_amount) AS f, max(tip_amount) AS t"
 
 CELLS = ["lambda_s3_to_s3", "local_from_s3", "local_from_local", "local_from_r2"]
+
+# `store_and_fwd_flag` is a dictionary-encoded STRING with about three values
+# over 3 M rows. It exercises remote GROUP BY key fetching and the dictionary
+# key fast path without changing the longitudinal Common 4 query shapes.
+GROUP_TAXI = "store_and_fwd_flag AS flag"
+AGG_TAXI_GROUPED = "count(*) AS n, sum(fare_amount) AS f, max(tip_amount) AS t"
 
 
 def need_env(*names):
@@ -105,13 +116,39 @@ def cell_local_from_local() -> float:
 
 
 def cell_local_from_r2() -> float:
+    env = r2_env()
+    url = f"s3://{env['R2_BUCKET']}/demo/nyc-taxi/yellow/yellow_tripdata_2023-01.parquet"
+    cmd = [ZPQ, "query", url, "--aggregate", AGG_TAXI]
+    return time_run(cmd, env=env)
+
+
+def r2_env():
+    """Map R2 credentials to ZPQ's S3 environment without mutating ours."""
     env = os.environ.copy()
     env["AWS_ACCESS_KEY_ID"] = env["R2_ACCESS_KEY_ID"]
     env["AWS_SECRET_ACCESS_KEY"] = env["R2_SECRET_ACCESS_KEY"]
     env["AWS_REGION"] = env.get("R2_REGION", "auto")
-    env["S3_ENDPOINT_URL"] = f"https://{env['R2_ENDPOINT']}"
+    endpoint = env["R2_ENDPOINT"]
+    env["S3_ENDPOINT_URL"] = endpoint if "://" in endpoint else f"https://{endpoint}"
+    return env
+
+
+def cell_r2_groupby() -> float:
+    """One file: remote key fetch plus dictionary-string GROUP BY."""
+    env = r2_env()
     url = f"s3://{env['R2_BUCKET']}/demo/nyc-taxi/yellow/yellow_tripdata_2023-01.parquet"
-    cmd = [ZPQ, "query", url, "--aggregate", AGG_TAXI]
+    cmd = [ZPQ, "query", url, "--group-by", GROUP_TAXI, "--aggregate", AGG_TAXI_GROUPED]
+    return time_run(cmd, env=env)
+
+
+def cell_r2_groupby_five_files() -> float:
+    """Five files: also exercises multi-file scheduling and merge/finalization."""
+    env = r2_env()
+    urls = [
+        f"s3://{env['R2_BUCKET']}/demo/nyc-taxi/yellow/yellow_tripdata_2023-{month:02d}.parquet"
+        for month in range(1, 6)
+    ]
+    cmd = [ZPQ, "query", *urls, "--group-by", GROUP_TAXI, "--aggregate", AGG_TAXI_GROUPED]
     return time_run(cmd, env=env)
 
 
@@ -122,8 +159,14 @@ CELL_DRIVERS = {
                         ["AWS_S3_BUCKET"]),
     "local_from_local": (cell_local_from_local, []),
     "local_from_r2":   (cell_local_from_r2,
-                        ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
-                         "R2_BUCKET", "R2_ENDPOINT"]),
+                         ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                          "R2_BUCKET", "R2_ENDPOINT"]),
+    "r2_groupby":      (cell_r2_groupby,
+                         ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                          "R2_BUCKET", "R2_ENDPOINT"]),
+    "r2_groupby_five_files": (cell_r2_groupby_five_files,
+                                ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
+                                 "R2_BUCKET", "R2_ENDPOINT"]),
 }
 
 

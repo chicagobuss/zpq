@@ -37,7 +37,7 @@ const usage_text =
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
-    \\            [--scan-all] [--trust-stats]
+    \\            [--scan-all] [--trust-stats] [--fast-levels]
     \\            [--format csv|jsonl] [--limit N]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
@@ -51,15 +51,18 @@ const usage_text =
     \\  --trust-stats  answer min/max/sum from file statistics instead of
     \\                 decoding (fast, but trusts the writer's stats — off
     \\                 by default; count(*) is always answered from metadata).
-    \\  --max-memory   ceiling on GROUP BY table memory across all workers.
-    \\                 A hard cap: usage never exceeds it. Workers draw from
-    \\                 it in blocks rather than each owning a fixed slice, so
-    \\                 raising -j does not shrink what a query may use. One
-    \\                 caveat: workers can briefly hold partly-used blocks,
-    \\                 together at most ~5% of the budget, so a query sitting
-    \\                 within a few percent of its ceiling may be accepted at
-    \\                 one -j and rejected at another. Give it headroom
-    \\                 rather than tuning it to the exact byte.
+    \\  --fast-levels  skip materializing definition levels for data pages
+    \\                 whose level stream proves every value is present.
+    \\                 Helps supported flat OPTIONAL primitive columns that
+    \\                 hold no nulls; off by default while it is new.
+    \\  --max-memory   ceiling on accounted GROUP BY entries across all worker
+    \\                 tables. Allocator capacity overhead, finalization
+    \\                 scratch, and materialized output rows are outside this
+    \\                 entry budget. Workers draw from it in blocks rather
+    \\                 than each owning fixed slices, so raising -j does not
+    \\                 shrink what a query may use. Partly-used blocks can
+    \\                 collectively strand at most ~5% of the budget, so give
+    \\                 it headroom rather than tuning to the exact byte.
     \\
 ;
 
@@ -185,6 +188,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
+    var fast_levels: bool = false;
     var format: ?engine.PrintFormat = null;
     var limit: ?usize = null;
     var max_memory: ?usize = null;
@@ -260,6 +264,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             scan_all = true; // valueless: disable all stats shortcuts, decode everything
         } else if (std.mem.eql(u8, tok, "--trust-stats")) {
             trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
+        } else if (std.mem.eql(u8, tok, "--fast-levels")) {
+            fast_levels = true; // valueless: skip def levels on provably no-null pages
         } else if (std.mem.eql(u8, tok, "--format")) {
             const v = iter.next() orelse {
                 std.debug.print("zpq query: --format requires a value\n", .{});
@@ -411,6 +417,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
+            .fast_levels = fast_levels,
             .max_memory = max_mem_limit,
             .group_by = group_by,
             .select_cols = select_cols,
@@ -436,6 +443,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
+            .fast_levels = fast_levels,
             .max_memory = max_mem_limit,
             .group_by = group_by,
             .select_cols = select_cols,
@@ -581,6 +589,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         .parallelism = parallelism,
         .scan_all = scan_all,
         .trust_stats = trust_stats,
+        .fast_levels = fast_levels,
         .max_memory = max_mem_limit,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below

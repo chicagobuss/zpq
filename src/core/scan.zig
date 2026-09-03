@@ -81,6 +81,7 @@ pub const MultiAggArgs = struct {
     /// path) instead of decoding. Off by default — file stats can be wrong.
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
+    fast_levels: bool = false,
 };
 
 pub const AggValue = union(enum) {
@@ -276,6 +277,7 @@ const Worker = struct {
     filter_opt: ?filter_ast.Filter,
     scan_all: bool,
     trust_stats: bool,
+    decode_options: consumer.DecodeOptions,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_kept: i64 = 0,
@@ -338,6 +340,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
+                w.decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 &[_]expr_agg.Accumulator{},
@@ -355,6 +358,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
+                w.decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 item.accumulators,
@@ -650,6 +654,7 @@ pub fn runMultiAggregate(
             .filter_opt = filter_opt,
             .scan_all = args.scan_all,
             .trust_stats = args.trust_stats,
+            .decode_options = .{ .fast_levels = args.fast_levels },
             .group_by_keys = group_by_keys,
             .group_table = if (group_by_keys != null) blk_gt: {
                 // Zero local ceiling: everything is drawn from the shared pool, so an idle worker reserves nothing
@@ -701,17 +706,7 @@ pub fn runMultiAggregate(
     var group_rows: ?[]const []const AggValue = null;
 
     if (group_by_keys) |keys| {
-        var coord_table = expr_agg.GroupTable.init(gpa, args.max_memory);
-        errdefer coord_table.deinit();
-
-        for (workers) |*w| {
-            if (w.group_table) |*gt| {
-                try coord_table.mergeTable(gt, agg_calls);
-                // Deallocate worker table immediately to reclaim memory before merging
-                // the next worker. Set to null so the defer block doesn't double-free.
-                gt.deinit();
-                w.group_table = null;
-            }
+        for (workers) |w| {
             rows_in += w.rows_in;
             rows_kept += w.rows_kept;
             rgs_in += w.rgs_in;
@@ -721,17 +716,61 @@ pub fn runMultiAggregate(
             t.core.encode_ns += w.timings.encode_ns;
         }
 
-        const group_indices = try gpa.alloc(u32, coord_table.keys.items.len);
-        defer gpa.free(group_indices);
-        for (group_indices, 0..) |*idx, j| idx.* = @intCast(j);
+        // Merge worker groups without building a second GroupTable. The old
+        // coordinator copied every key while the source table was still live,
+        // so a one-worker query admitted at the max-memory ceiling briefly
+        // held almost twice that much table state during finalization.
+        //
+        // Sorting lightweight references lets equal keys from different
+        // workers meet next to each other. Their accumulator ownership is
+        // folded directly into one temporary row state, then materialized;
+        // the worker tables remain the only GROUP BY tables in memory.
+        const GroupRef = struct {
+            worker: u32,
+            group: u32,
+        };
+        var total_group_refs: usize = 0;
+        for (workers) |w| {
+            if (w.group_table) |gt| total_group_refs += gt.keys.items.len;
+        }
+        const group_refs = try gpa.alloc(GroupRef, total_group_refs);
+        defer gpa.free(group_refs);
+        var ref_i: usize = 0;
+        for (workers, 0..) |w, wi| {
+            if (w.group_table) |gt| {
+                for (0..gt.keys.items.len) |gi| {
+                    group_refs[ref_i] = .{
+                        .worker = @intCast(wi),
+                        .group = @intCast(gi),
+                    };
+                    ref_i += 1;
+                }
+            }
+        }
 
-        const KeySorter = struct {
-            keys: []const []const u8,
-            pub fn lessThan(ctx: @This(), lhs: u32, rhs: u32) bool {
-                return std.mem.lessThan(u8, ctx.keys[lhs], ctx.keys[rhs]);
+        const GroupRefSorter = struct {
+            workers: []const Worker,
+
+            fn key(ctx: @This(), ref: GroupRef) []const u8 {
+                return ctx.workers[ref.worker].group_table.?.keys.items[ref.group];
+            }
+
+            pub fn lessThan(ctx: @This(), lhs: GroupRef, rhs: GroupRef) bool {
+                return std.mem.lessThan(u8, ctx.key(lhs), ctx.key(rhs));
             }
         };
-        std.mem.sort(u32, group_indices, KeySorter{ .keys = coord_table.keys.items }, KeySorter.lessThan);
+        const ref_sorter = GroupRefSorter{ .workers = workers };
+        std.mem.sort(GroupRef, group_refs, ref_sorter, GroupRefSorter.lessThan);
+
+        var distinct_groups: usize = 0;
+        var previous_key: ?[]const u8 = null;
+        for (group_refs) |ref| {
+            const key = ref_sorter.key(ref);
+            if (previous_key == null or !std.mem.eql(u8, previous_key.?, key)) {
+                distinct_groups += 1;
+                previous_key = key;
+            }
+        }
 
         const select_cols = try resolveGroupSelectCols(
             arena,
@@ -794,9 +833,10 @@ pub fn runMultiAggregate(
             key_types[idx] = keyTypeFromExpr(key_expr);
         }
 
-        var rows = try gpa.alloc([]const AggValue, coord_table.keys.items.len);
+        const rows = try gpa.alloc([]const AggValue, distinct_groups);
+        var rows_built: usize = 0;
         errdefer {
-            for (rows) |r| {
+            for (rows[0..rows_built]) |r| {
                 for (r) |v| {
                     switch (v) {
                         .s => |s| gpa.free(s),
@@ -808,38 +848,78 @@ pub fn runMultiAggregate(
             gpa.free(rows);
         }
 
-        for (group_indices, 0..) |g_idx, r_idx| {
-            const key_bytes = coord_table.keys.items[g_idx];
-            var row_vals = try gpa.alloc(AggValue, select_cols.len);
-            errdefer gpa.free(row_vals);
+        var group_start: usize = 0;
+        while (group_start < group_refs.len) {
+            const key_bytes = ref_sorter.key(group_refs[group_start]);
+            var group_end = group_start + 1;
+            while (group_end < group_refs.len and
+                std.mem.eql(u8, key_bytes, ref_sorter.key(group_refs[group_end])))
+            {
+                group_end += 1;
+            }
 
+            const merged = try gpa.alloc(expr_agg.Accumulator, agg_calls.len);
+            for (agg_calls, 0..) |call, i| merged[i] = expr_agg.Accumulator.init(call);
+            defer {
+                freeOwnedAccumulatorStrings(gpa, merged);
+                gpa.free(merged);
+            }
+
+            for (group_refs[group_start..group_end]) |ref| {
+                const gt = &workers[ref.worker].group_table.?;
+                const acc_start = @as(usize, ref.group) * agg_calls.len;
+                for (merged, gt.accumulators.items[acc_start..][0..agg_calls.len]) |*dst, *src| {
+                    mergeOwnedAccumulator(dst, src, gpa);
+                }
+            }
+
+            const row_vals = try gpa.alloc(AggValue, select_cols.len);
+            var row_cols_built: usize = 0;
+            errdefer {
+                for (row_vals[0..row_cols_built]) |v| switch (v) {
+                    .s => |s| gpa.free(s),
+                    else => {},
+                };
+                gpa.free(row_vals);
+            }
             for (col_sources, 0..) |src, col_idx| {
                 switch (src) {
                     .key => |k_idx| {
                         row_vals[col_idx] = try deserializeKeyColumn(gpa, key_bytes, k_idx, key_types);
                     },
                     .agg => |a_idx| {
-                        const state = coord_table.accumulators.items[g_idx * agg_calls.len + a_idx];
-                        row_vals[col_idx] = try materializeOne(gpa, agg_calls[a_idx], state);
+                        row_vals[col_idx] = try materializeOne(gpa, agg_calls[a_idx], merged[a_idx]);
                     },
                 }
+                row_cols_built += 1;
             }
-            rows[r_idx] = row_vals;
+            rows[rows_built] = row_vals;
+            rows_built += 1;
+            group_start = group_end;
         }
 
         group_rows = rows;
 
-        var cols = try gpa.alloc([]const u8, select_cols.len);
+        const cols = try gpa.alloc([]const u8, select_cols.len);
+        var cols_built: usize = 0;
         errdefer {
-            for (cols) |c| gpa.free(c);
+            for (cols[0..cols_built]) |c| gpa.free(c);
             gpa.free(cols);
         }
         for (select_cols, 0..) |col, idx| {
             cols[idx] = try gpa.dupe(u8, selectColumnName(col));
+            cols_built += 1;
         }
         group_cols = cols;
 
-        coord_table.deinit();
+        // Result rows own any strings they need; worker table keys and
+        // accumulator winners can now be released before returning.
+        for (workers) |*w| {
+            if (w.group_table) |*gt| {
+                gt.deinit();
+                w.group_table = null;
+            }
+        }
     } else {
         // Merge each work item exactly ONCE: `work` is shared and claimed dynamically, so folding it per worker would
         // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.
@@ -893,10 +973,45 @@ pub fn runMultiAggregate(
     };
 }
 
+/// Merge an accumulator while transferring ownership of any string winner
+/// out of the source table. `Accumulator.merge` intentionally consumes its
+/// source's owned string; clear the source so GroupTable.deinit cannot free it
+/// a second time.
+fn mergeOwnedAccumulator(
+    dst: *expr_agg.Accumulator,
+    src: *expr_agg.Accumulator,
+    allocator: std.mem.Allocator,
+) void {
+    const moved = src.*;
+    dst.merge(moved, allocator);
+    switch (src.*) {
+        .min_bytes => src.* = .{ .min_bytes = null },
+        .max_bytes => src.* = .{ .max_bytes = null },
+        else => {},
+    }
+}
+
+fn freeOwnedAccumulatorStrings(
+    allocator: std.mem.Allocator,
+    accumulators: []expr_agg.Accumulator,
+) void {
+    for (accumulators) |acc| switch (acc) {
+        .min_bytes => |s| if (s) |owned| allocator.free(owned),
+        .max_bytes => |s| if (s) |owned| allocator.free(owned),
+        else => {},
+    };
+}
+
 /// How one group-key column is framed in a serialized composite key.
 ///
-/// Framing from the physical Parquet type let writer and reader disagree: a BOOLEAN serialized 8 bytes but
-/// deserialized 1, silently truncating every later column of the key.
+/// These are the only three shapes `expr_agg.serializeRowKey` can write.
+/// `evalGroupKeyExpr` builds key columns from the EXPRESSION type (three
+/// lanes), and `serializeRowKey` widens BOOLEAN into the i64 lane so a
+/// caller that skips eval still matches `deserializeKeyColumn`. Deriving
+/// framing from the physical Parquet type instead let the two disagree: a
+/// BOOLEAN column evaluates to i64 (8 bytes) while the physical type said
+/// `boolean` (1 byte) — silently truncating every later column in a
+/// composite key.
 const KeyType = enum { i64, f64, string };
 
 fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
@@ -974,8 +1089,9 @@ fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) *const sche
         if (seen == leaf_idx) return elem;
         seen += 1;
     }
-    // Callers resolved `leaf_idx` from this same schema, so it exists.
-    return &meta.schema.items[meta.schema.items.len - 1];
+    // Callers resolved `leaf_idx` from this same schema. Falling back to
+    // the last element would just print the wrong column name.
+    std.debug.panic("leaf_idx {d} not in schema ({d} leaves)", .{ leaf_idx, seen });
 }
 
 fn selectColumnName(col_name: []const u8) []const u8 {

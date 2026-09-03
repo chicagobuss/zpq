@@ -1,0 +1,16 @@
+engine	sample	lambda_ms	bytes_out	output_url
+zpq	1	5288	41145517	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/zpq-sample-1.parquet
+zpq	2	1779	41145517	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/zpq-sample-2.parquet
+zpq	3	2277	41145517	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/zpq-sample-3.parquet
+zpq	4	1918	41145517	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/zpq-sample-4.parquet
+zpq	5	2083	41145517	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/zpq-sample-5.parquet
+polars	1	1989	41511852	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/polars-sample-1.parquet
+polars	2	2518	41511852	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/polars-sample-2.parquet
+polars	3	1648	41511852	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/polars-sample-3.parquet
+polars	4	1514	41511852	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/polars-sample-4.parquet
+polars	5	1804	41511852	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/polars-sample-5.parquet
+duckdb	1	2504	41520451	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/duckdb-sample-1.parquet
+duckdb	2	2749	41520451	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/duckdb-sample-2.parquet
+duckdb	3	2526	41520451	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/duckdb-sample-3.parquet
+duckdb	4	2681	41520451	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/duckdb-sample-4.parquet
+duckdb	5	2619	41520451	s3://zpq-bench-redacted/bench/zpq-032/overture/20260821Tlambda032clean/duckdb-sample-5.parquet

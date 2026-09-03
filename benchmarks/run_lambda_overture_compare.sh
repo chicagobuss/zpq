@@ -19,8 +19,10 @@ POLARS_FUNCTION="${POLARS_BENCH_FUNCTION:-zpq-032-polars-x86}"
 DUCKDB_FUNCTION="${DUCKDB_BENCH_FUNCTION:-zpq-032-duckdb-x86}"
 INPUT_URL="${OVERTURE_INPUT:-s3://${BUCKET}/test/overture_places.snappy.parquet}"
 FILTER="${OVERTURE_FILTER:-confidence > 0.9}"
-RESULTS_OUT="${RESULTS_OUT:-benchmarks/overture_lambda_results.tsv}"
-VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/overture_lambda_validation.tsv}"
+# Defaults are gitignored scratch files. The tracked overture_lambda_*.tsv are
+# a curated, bucket-redacted snapshot; copy over them deliberately.
+RESULTS_OUT="${RESULTS_OUT:-benchmarks/overture_lambda_results.local.tsv}"
+VALIDATION_OUT="${VALIDATION_OUT:-benchmarks/overture_lambda_validation.local.tsv}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 

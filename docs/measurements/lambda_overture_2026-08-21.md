@@ -37,7 +37,8 @@ Raw Lambda-reported milliseconds:
 Every emitted warm-up and measured object (18 total) opened successfully in
 both PyArrow and DuckDB. All contain 1,042,690 rows, two nullable columns, and
 valid Parquet metadata. For the first measured sample, an ordered SHA-256 over
-the `id, confidence` values was identical for all engines:
+the `id, confidence` values was identical for all engines (a one-off PyArrow
+check; `benchmarks/validate_outputs.py` itself verifies row counts and schema):
 
 `242901f7c009120684591c28b431b37887976268ece59fe554754c76068082ab`
 

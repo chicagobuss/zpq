@@ -9,7 +9,6 @@ Parquet file can be read by pyarrow and DuckDB before a figure is produced.
 
 import argparse
 import csv
-import math
 import statistics
 import sys
 from collections import defaultdict
@@ -49,7 +48,7 @@ def assert_validated(path: Path):
 def summary(grouped):
     scenarios = sorted({scenario for scenario, _ in grouped})
     lines = [
-        "| scenario | engine | samples | median Lambda ms | p95 Lambda ms | median output bytes | median rows |",
+        "| scenario | engine | samples | median Lambda ms | highest observed ms | median output bytes | median rows |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for scenario in scenarios:
@@ -58,10 +57,10 @@ def summary(grouped):
             if not samples:
                 raise ValueError(f"{scenario!r} has no {engine} samples")
             times, output_bytes, rows = zip(*samples)
-            p95 = sorted(times)[max(0, math.ceil(len(times) * 0.95) - 1)]
+            worst = max(times)
             lines.append(
                 f"| {scenario} | {engine} | {len(times)} | {statistics.median(times):.0f} | "
-                f"{p95:.0f} | {statistics.median(output_bytes):.0f} | {statistics.median(rows):.0f} |"
+                f"{worst:.0f} | {statistics.median(output_bytes):.0f} | {statistics.median(rows):.0f} |"
             )
     return lines
 

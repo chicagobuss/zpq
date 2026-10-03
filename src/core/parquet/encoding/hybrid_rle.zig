@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const readLe = @import("../../bytes.zig").readLe;
+const readUleb128 = @import("../../bytes.zig").readUleb128;
 
 pub const Error = error{
     InvalidBitWidth,
@@ -230,17 +231,9 @@ pub const HybridRleDecoder = struct {
 
     /// Read a ULEB128-encoded varint. Used for the run header.
     fn readVarint(self: *HybridRleDecoder) Error!u64 {
-        var result: u64 = 0;
-        var shift: u32 = 0;
-        while (true) {
-            if (shift >= 64) return error.UnexpectedEndOfStream;
-            if (self.pos >= self.bytes.len) return error.UnexpectedEndOfStream;
-            const b = self.bytes[self.pos];
-            self.pos += 1;
-            result |= @as(u64, b & 0x7f) << @intCast(shift);
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-        }
+        const d = readUleb128(self.bytes[self.pos..]) catch return error.UnexpectedEndOfStream;
+        self.pos += d.len;
+        return d.value;
     }
 
     fn readRleValue(self: *HybridRleDecoder) Error!u32 {
@@ -574,6 +567,10 @@ test "bit width 32 and hostile run headers are handled, not trapped on" {
     // Eleven continuation bytes: longer than any u64 varint.
     var overlong = HybridRleDecoder.init(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }, 4);
     try std.testing.expectError(error.UnexpectedEndOfStream, overlong.decode(&out));
+
+    // A run header of 2^64 used to wrap to an empty RLE run and decode on from the bytes after it.
+    var wrapped = HybridRleDecoder.init(&(@as([9]u8, @splat(0x80)) ++ [_]u8{ 0x02, 0x00, 0x02, 0x01 }), 4);
+    try std.testing.expectError(error.UnexpectedEndOfStream, wrapped.decode(out[0..1]));
 
     // A bit-packed header whose group count times 8 overflows usize.
     var huge = HybridRleDecoder.init(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }, 4);

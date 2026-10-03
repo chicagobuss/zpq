@@ -349,12 +349,10 @@ fn workerRunErr(w: *Worker) !void {
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
     // Both it and the scratch are written front to back and reused, the case huge pages pay off for.
     var thp: huge_pages.HugePageAdvisor = .{ .child = w.gpa };
-    var rg_decode_arena = std.heap.ArenaAllocator.init(thp.allocator());
+    var rg_decode_arena = consumer.RowGroupArena.init(thp.allocator());
     defer rg_decode_arena.deinit();
     var scratch = consumer.DecodeScratch.init(thp.allocator());
     defer scratch.deinit();
-    var decode_options = w.decode_options;
-    decode_options.scratch = &scratch;
 
     while (true) {
         const idx = w.cursor.fetchAdd(1, .monotonic);
@@ -406,7 +404,8 @@ fn workerRunErr(w: *Worker) !void {
                 rg_filter,
                 w.scan_all,
                 w.trust_stats,
-                decode_options,
+                w.decode_options,
+                &scratch,
                 fetch_arr,
                 sub_agg_calls,
                 &[_]expr_agg.Accumulator{},
@@ -424,7 +423,8 @@ fn workerRunErr(w: *Worker) !void {
                 rg_filter,
                 w.scan_all,
                 w.trust_stats,
-                decode_options,
+                w.decode_options,
+                &scratch,
                 fetch_arr,
                 sub_agg_calls,
                 item.accumulators,

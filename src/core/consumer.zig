@@ -47,6 +47,7 @@ const metadata = @import("parquet/metadata.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
+pub const RowGroupArena = @import("row_group_arena.zig").RowGroupArena;
 
 /// Error set the consumer functions can return. Inferred from the
 /// underlying decoders/encoders/sinks; unioned here for documentation.
@@ -375,6 +376,7 @@ pub fn appendProjectedRGWithOptions(
                 n_leaves,
                 k,
                 decode_options,
+                null,
             ),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
             // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
@@ -1148,13 +1150,15 @@ pub fn scanRGForAgg(
     /// sets this true to restore the stats fast-path for trusted writers.
     trust_stats: bool,
     decode_options: DecodeOptions,
+    /// The calling worker's, reused across row groups like `rg_arena`.
+    scratch: *DecodeScratch,
     fetch_set: []const bool,
     agg_calls: []const expr_agg.AggCall,
     accumulators: []expr_agg.Accumulator,
     group_by_keys: ?[]const expr_ast.Expr,
     group_table: ?*expr_agg.GroupTable,
-    /// Caller-owned decode scratch, reused across row groups: reset here, never destroyed.
-    rg_arena_state: *std.heap.ArenaAllocator,
+    /// Caller-owned decode arena, reused across row groups: this call starts a new row group in it.
+    rg_arena: *RowGroupArena,
     timings: *Timings,
 ) !void {
     const is_grouped = group_table != null;
@@ -1204,8 +1208,8 @@ pub fn scanRGForAgg(
     // 2. Decode path for the aggs that couldn't be stat-handled.
     // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
     // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
-    rewindArena(rg_arena_state);
-    const ra = rg_arena_state.allocator();
+    rg_arena.nextRowGroup();
+    const ra = rg_arena.allocator();
 
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, meta.schema.items.len);
@@ -1407,6 +1411,7 @@ pub fn scanRGForAgg(
                 n_leaves,
                 k,
                 decode_options,
+                scratch,
             ),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
             .f64 = try decodeFloat16ColumnAsF64Pruned(
@@ -1417,6 +1422,7 @@ pub fn scanRGForAgg(
                 n_leaves,
                 prune_info,
                 decode_options,
+                scratch,
             ),
         } else switch (cm.type) {
             .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
@@ -1428,6 +1434,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ) }
             else
                 .{
@@ -1440,6 +1447,7 @@ pub fn scanRGForAgg(
                         n_leaves,
                         prune_info,
                         decode_options,
+                        scratch,
                     ),
                 },
             .INT64 => .{
@@ -1452,6 +1460,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ),
             },
             .FLOAT => .{
@@ -1464,6 +1473,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ),
             },
             .DOUBLE => .{
@@ -1476,6 +1486,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ),
             },
             .BYTE_ARRAY => .{
@@ -1488,6 +1499,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ),
             },
             .BOOLEAN => .{
@@ -1500,6 +1512,7 @@ pub fn scanRGForAgg(
                     n_leaves,
                     prune_info,
                     decode_options,
+                    scratch,
                 ),
             },
             .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
@@ -1512,6 +1525,7 @@ pub fn scanRGForAgg(
                 flbaWidth(schema_elem),
                 prune_info,
                 decode_options,
+                scratch,
             ) },
         };
         lookup[ci] = batch_cols.items.len;
@@ -1573,119 +1587,6 @@ pub fn scanRGForAgg(
         }
     }
     timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
-}
-
-/// Make every byte of `arena` reusable while keeping all of its nodes. `reset(.retain_capacity)` instead merges the
-/// nodes into one freshly allocated block, so the second row group a worker decodes lands on new pages (and the old
-/// ones are unmapped mid-scan) before reuse starts at the third. The used nodes go onto the arena's own free list,
-/// which `alloc` already searches before asking the child allocator for more.
-///
-/// Reaches into ArenaAllocator.State (Zig 0.17 layout); the "rewind reuses nodes" and "rewound arena tolerates" tests
-/// pin the behaviour.
-pub fn rewindArena(arena: *std.heap.ArenaAllocator) void {
-    // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
-    // them in the order this one did and touches the same pages, not a scatter across every node's tail.
-    var reversed = arena.state.free_list;
-    var it = arena.state.used_list;
-    while (it) |node| {
-        it = node.next;
-        node.end_index = 0;
-        node.next = reversed;
-        reversed = node;
-    }
-    // Keep the oldest node as the arena's (empty) current node instead of leaving no current node. ArenaAllocator's
-    // free and resize unwrap the current node unconditionally, so with none, freeing or resizing pre-rewind memory
-    // before the next allocation unwraps null: a panic in safe builds, UB in ReleaseFast. Against an empty current
-    // node they are the ordinary not-most-recent no-ops. Fill order is unchanged: this is the node the free-list
-    // search would have handed the next allocation first.
-    const first = reversed orelse {
-        arena.state.free_list = null;
-        arena.state.used_list = null;
-        return;
-    };
-    arena.state.free_list = first.next;
-    first.end_index = 0;
-    first.next = null;
-    arena.state.used_list = first;
-}
-
-test "rewind reuses nodes: a repeat of the same allocation pattern never reaches the child allocator" {
-    const Counting = struct {
-        child: std.mem.Allocator,
-        allocs: usize = 0,
-        frees: usize = 0,
-
-        fn allocator(self: *@This()) std.mem.Allocator {
-            return .{ .ptr = self, .vtable = &.{
-                .alloc = alloc,
-                .resize = std.mem.Allocator.noResize,
-                .remap = std.mem.Allocator.noRemap,
-                .free = free,
-            } };
-        }
-        fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.allocs += 1;
-            return self.child.rawAlloc(n, a, ra);
-        }
-        fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.frees += 1;
-            self.child.rawFree(mem, a, ra);
-        }
-    };
-    var counting: Counting = .{ .child = std.testing.allocator };
-    var arena = std.heap.ArenaAllocator.init(counting.allocator());
-    defer arena.deinit();
-
-    // Mixed small and large requests force several nodes, like a row group's metadata plus column buffers.
-    const sizes = [_]usize{ 64, 300_000, 17, 1_200_000, 4096, 800_000, 3 };
-    for (0..3) |round| {
-        rewindArena(&arena);
-        for (sizes) |n| {
-            const buf = try arena.allocator().alloc(u8, n);
-            @memset(buf, @intCast(round));
-        }
-        if (round == 0) {
-            try std.testing.expect(counting.allocs > 1);
-            counting.allocs = 0;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 0), counting.allocs);
-    try std.testing.expectEqual(@as(usize, 0), counting.frees);
-}
-
-test "rewound arena tolerates freeing and resizing memory from before the rewind" {
-    // Code that releases a previous row group's buffers after the rewind, before allocating anything new, must not
-    // reach a null current node inside ArenaAllocator.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const small = try a.alloc(u8, 100);
-    const large = try a.alloc(u8, 300_000); // past the first node: the rewind has more than one node to hand back
-    rewindArena(&arena);
-
-    a.free(large);
-    try std.testing.expect(!a.resize(small, 200));
-    try std.testing.expect(a.resize(small, 50));
-    a.free(small);
-
-    // Still a working arena that reuses its nodes: both allocations land in memory it already owned.
-    const before = arena.queryCapacity();
-    const again_small = try a.alloc(u8, 100);
-    const again_large = try a.alloc(u8, 300_000);
-    @memset(again_small, 1);
-    @memset(again_large, 2);
-    try std.testing.expectEqual(before, arena.queryCapacity());
-    try std.testing.expectEqual(@as(u8, 1), again_small[99]);
-
-    // A rewind of an arena that never allocated leaves it empty and usable.
-    var empty = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer empty.deinit();
-    rewindArena(&empty);
-    try std.testing.expect(empty.state.used_list == null);
-    _ = try empty.allocator().alloc(u8, 8);
 }
 
 /// `kept_set != null`: per-column copy. Only chunks where
@@ -2487,12 +2388,13 @@ pub fn decodeColumnTPruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
     if (prune) |p| {
         return decodeWithReaderPruned(T, arena, &reader, levels, num_leaves, p);
     } else {
-        return decodeWithReader(T, arena, &reader, levels, num_leaves);
+        return decodeWithReader(T, &reader, num_leaves);
     }
 }
 
@@ -2504,8 +2406,9 @@ fn decodeFloat16ColumnAsF64Pruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(f64) {
-    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune, decode_options);
+    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune, decode_options, scratch);
     const out = try arena.alloc(f64, cb.values.len);
     @memset(out, 0);
     for (cb.values, 0..) |bytes, i| {
@@ -2531,8 +2434,9 @@ fn decodeU32ColumnAsI64Pruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(i64) {
-    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune, decode_options);
+    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune, decode_options, scratch);
     const out = try arena.alloc(i64, c32.values.len);
     @memset(out, 0);
     for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
@@ -2554,6 +2458,7 @@ pub fn decodeFlbaColumnPruned(
     type_length: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT([]const u8) {
     var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
         chunk,
@@ -2561,12 +2466,13 @@ pub fn decodeFlbaColumnPruned(
         levels,
         arena,
         decode_options,
+        scratch,
     );
     reader.type_length = type_length;
     if (prune) |p| {
         return decodeWithReaderPruned([]const u8, arena, &reader, levels, num_leaves, p);
     } else {
-        return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
+        return decodeWithReader([]const u8, &reader, num_leaves);
     }
 }
 
@@ -2590,8 +2496,8 @@ pub fn decodeColumnTWithOptions(
     num_leaves: usize,
     decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-    return decodeWithReader(T, arena, &reader, levels, num_leaves);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, null);
+    return decodeWithReader(T, &reader, num_leaves);
 }
 
 /// Fixed byte width of a FIXED_LEN_BYTE_ARRAY column from its SchemaElement
@@ -2683,95 +2589,26 @@ pub fn decodeFlbaColumnWithOptions(
         levels,
         arena,
         decode_options,
+        null,
     );
     reader.type_length = type_length;
-    return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
+    return decodeWithReader([]const u8, &reader, num_leaves);
 }
 
 fn decodeWithReader(
     comptime T: type,
-    arena: std.mem.Allocator,
     reader: *column_mod.ColumnChunkReader(T),
-    levels: schema.Levels,
     num_leaves: usize,
 ) !filter_eval.ColumnT(T) {
-    // Pages may claim no more values between them than the chunk holds.
-    reader.value_budget = num_leaves;
-    const values = try arena.alloc(T, num_leaves);
-    if (levels.max_rep > 0) {
-        const def_levels = try arena.alloc(u32, num_leaves);
-        const rep_levels = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = try reader.decodeWithRepLevels(values[written..], def_levels[written..], rep_levels[written..]);
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        return .{
-            .values = values,
-            .def_levels = def_levels,
-            .max_def = @intCast(levels.max_def),
-            .rep_levels = rep_levels,
-            .max_rep = @intCast(levels.max_rep),
-            .has_nulls = reader.has_nulls,
-        };
-    }
-    if (levels.max_def > 0) {
-        var written: usize = 0;
-
-        // `--fast-levels`: try to get through the whole chunk without
-        // ever allocating the level array. `ColumnT.def_levels == null`
-        // then carries the same meaning it always has — every leaf is
-        // present — so nothing downstream needs to know this happened.
-        //
-        // Restricted to max_def == 1, the top-level OPTIONAL leaf that
-        // arrow/spark/pandas emit for every nullable flat column. At
-        // max_def >= 2 (an optional leaf under an optional group) a null
-        // def_levels would have to be re-synthesised as "max_def
-        // everywhere" by anything re-encoding the column, and
-        // encoder.zig's fallback writes level 1, not level max_def. Not
-        // worth widening for: the deeper shapes are rare, and they still
-        // get the per-page half of this in `decodePageSlice`.
-        const skip_levels = reader.options.fast_levels and levels.max_rep == 0 and levels.max_def == 1;
-        if (skip_levels) {
-            written = try reader.decodeAllPresent(values);
-            if (written == num_leaves) {
-                return .{
-                    .values = values,
-                    .def_levels = null,
-                    .max_def = @intCast(levels.max_def),
-                    .has_nulls = reader.has_nulls,
-                };
-            }
-        }
-
-        // Either fast levels are off, or a page with nulls stopped the
-        // pass above. Everything already written came from all-present
-        // pages, so its levels are max_def by construction.
-        const def_levels = try arena.alloc(u32, num_leaves);
-        @memset(def_levels[0..written], @intCast(levels.max_def));
-        while (written < num_leaves) {
-            const n = try reader.decodeWithLevels(values[written..], def_levels[written..]);
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        return .{
-            .values = values,
-            .def_levels = def_levels,
-            .max_def = @intCast(levels.max_def),
-            .has_nulls = reader.has_nulls,
-        };
-    }
-    var written: usize = 0;
-    while (written < num_leaves) {
-        const n = try reader.decode(values[written..]);
-        if (n == 0) break;
-        written += n;
-    }
-    if (written != num_leaves) return error.ShortDecode;
-    return .{ .values = values };
+    const leaves = try reader.readAll(num_leaves);
+    return .{
+        .values = leaves.values,
+        .def_levels = leaves.def_levels,
+        .max_def = @intCast(reader.levels.max_def),
+        .rep_levels = leaves.rep_levels,
+        .max_rep = @intCast(reader.levels.max_rep),
+        .has_nulls = leaves.has_nulls,
+    };
 }
 
 // ============================================================

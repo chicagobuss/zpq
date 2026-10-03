@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const readLe = @import("../../bytes.zig").readLe;
+const readUleb128 = @import("../../bytes.zig").readUleb128;
 
 pub const Error = error{
     UnexpectedEndOfStream,
@@ -361,17 +362,12 @@ pub fn Decoder(comptime T: type) type {
         }
 
         fn readUVarintLong(self: *Self) Error!u64 {
-            var result: u64 = 0;
-            var shift: u7 = 0;
-            while (true) {
-                if (shift >= 64) return error.VarintOverflow;
-                if (self.pos >= self.bytes.len) return error.UnexpectedEndOfStream;
-                const b = self.bytes[self.pos];
-                self.pos += 1;
-                result |= @as(u64, b & 0x7f) << @intCast(shift);
-                if ((b & 0x80) == 0) return result;
-                shift += 7;
-            }
+            const d = readUleb128(self.bytes[self.pos..]) catch |err| return switch (err) {
+                error.Truncated => error.UnexpectedEndOfStream,
+                error.Overflow => error.VarintOverflow,
+            };
+            self.pos += d.len;
+            return d.value;
         }
 
         fn readZigzagT(self: *Self) Error!T {
@@ -816,4 +812,18 @@ test "miniblock size not a multiple of 32 is rejected" {
 test "overlong header varint is rejected, not overflowed" {
     const enc = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
     try testing.expectError(error.VarintOverflow, Decoder(i64).init(&enc));
+}
+
+test "header varints: maximum value, overflowing tenth byte, unterminated" {
+    // block 128, 4 miniblocks, 1 value; the first value's zigzag varint is 2^64 - 1, i.e. minInt(i64).
+    var dec = try Decoder(i64).init(&([_]u8{ 0x80, 0x01, 0x04, 0x01 } ++ @as([9]u8, @splat(0xff)) ++ [_]u8{0x01}));
+    var out: [1]i64 = undefined;
+    try testing.expectEqual(@as(usize, 1), try dec.decode(&out));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), out[0]);
+
+    // A value count of 2^64 used to wrap to zero and decode as an empty stream.
+    const nine_cont = @as([9]u8, @splat(0x80));
+    const head = [_]u8{ 0x80, 0x01, 0x04 };
+    try testing.expectError(error.VarintOverflow, Decoder(i64).init(&(head ++ nine_cont ++ [_]u8{0x02})));
+    try testing.expectError(error.UnexpectedEndOfStream, Decoder(i64).init(&(head ++ nine_cont)));
 }

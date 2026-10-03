@@ -1,4 +1,5 @@
 const std = @import("std");
+const readUleb128 = @import("bytes.zig").readUleb128;
 
 pub const Type = enum(u8) {
     Stop = 0,
@@ -30,22 +31,12 @@ pub const Reader = struct {
     }
 
     pub fn readVarInt(self: *Reader, comptime T: type) !T {
-        var result: u64 = 0;
-        var shift: u6 = 0;
-        while (true) {
-            if (self.pos >= self.data.len) return error.EndOfStream;
-            const byte = self.data[self.pos];
-            self.pos += 1;
-
-            result |= @as(u64, byte & 0x7f) << shift;
-            if ((byte & 0x80) == 0) break;
-            // A u64 varint is at most 10 groups of 7 bits; a further
-            // continuation byte would overflow `shift` (u6). Reject
-            // overlong encodings instead of trapping. Found by the
-            // decode fuzzer, 2026-06-12.
-            if (shift >= 63) return error.VarIntTooLong;
-            shift += 7;
-        }
+        const d = readUleb128(self.data[self.pos..]) catch |err| return switch (err) {
+            error.Truncated => error.EndOfStream,
+            error.Overflow => error.VarIntTooLong,
+        };
+        self.pos += d.len;
+        const result = d.value;
 
         // Check for overflow if T is smaller than u64?
         // For signed T, we just bitcast
@@ -381,6 +372,35 @@ test "thrift varint decoding" {
     var reader = Reader.init(&data);
     const val = try reader.readVarInt(u32);
     try std.testing.expectEqual(@as(u32, 261), val);
+}
+
+test "varints: maximum value, overflowing tenth byte, unterminated" {
+    const max_u64 = @as([9]u8, @splat(0xff)) ++ [_]u8{0x01};
+    const nine_cont: [9]u8 = @splat(0x80);
+
+    var r = Reader.init(&max_u64);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), try r.readVarInt(u64));
+    try std.testing.expectEqual(max_u64.len, r.pos);
+    // Zigzag extremes: 2^64 - 1 is minInt(i64), 2^64 - 2 is maxInt(i64); 2^32 - 1 is minInt(i32).
+    r = Reader.init(&max_u64);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), try r.readZigZag(i64));
+    r = Reader.init(&([_]u8{0xfe} ++ @as([8]u8, @splat(0xff)) ++ [_]u8{0x01}));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), try r.readZigZag(i64));
+    r = Reader.init(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0x0f });
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), try r.readZigZag(i32));
+    r = Reader.init(&[_]u8{ 0xfe, 0xff, 0xff, 0xff, 0x0f });
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), try r.readZigZag(i32));
+
+    // 2^64 used to drop its top bit and read as 0: a zero-length string or list, not a corrupt footer.
+    r = Reader.init(&(nine_cont ++ [_]u8{0x02}));
+    try std.testing.expectError(error.VarIntTooLong, r.readVarInt(usize));
+    r = Reader.init(&(nine_cont ++ [_]u8{0x02}));
+    try std.testing.expectError(error.VarIntTooLong, r.readZigZag(i64));
+
+    r = Reader.init(&nine_cont);
+    try std.testing.expectError(error.EndOfStream, r.readVarInt(u64));
+    r = Reader.init(&[_]u8{});
+    try std.testing.expectError(error.EndOfStream, r.readZigZag(i32));
 }
 
 test "thrift writer varint encoding" {

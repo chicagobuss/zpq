@@ -182,7 +182,7 @@ pub fn decodeColumnAsF64(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(f64) {
-    return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{});
+    return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{}, null);
 }
 
 pub fn decodeColumnAsF64WithOptions(
@@ -193,10 +193,31 @@ pub fn decodeColumnAsF64WithOptions(
     num_leaves: usize,
     kind: Kind,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
     return switch (kind.physical) {
-        .INT32 => try decodeIntBacked(i32, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
-        .INT64 => try decodeIntBacked(i64, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
+        .INT32 => try decodeIntBacked(
+            i32,
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind.scale,
+            decode_options,
+            scratch,
+        ),
+        .INT64 => try decodeIntBacked(
+            i64,
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind.scale,
+            decode_options,
+            scratch,
+        ),
         .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBacked(arena, chunk, codec, levels, num_leaves, kind),
         .BYTE_ARRAY => try decodeByteArrayBacked(
             arena,
@@ -206,6 +227,7 @@ pub fn decodeColumnAsF64WithOptions(
             num_leaves,
             kind.scale,
             decode_options,
+            scratch,
         ),
         else => return error.UnsupportedDecimalPhysicalType,
     };
@@ -256,40 +278,33 @@ fn decodeIntBackedI128(
     num_leaves: usize,
     decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(i128) {
+    // The lossless lane carries no repetition levels.
+    if (levels.max_rep > 0) return error.ShortDecode;
     // Decode the raw ints exactly as the f64 path does, but keep them as
     // integers (widened to i128) — no scale divide.
-    const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-    reader.value_budget = num_leaves;
-
-    var def_levels_buf: ?[]u32 = null;
-    if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_values[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_values[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, null);
+    const raw = try readAll(T, &reader, num_leaves);
 
     const values = try arena.alloc(i128, num_leaves);
-    for (raw_values, 0..) |v, i| values[i] = @intCast(v);
+    for (raw.values, 0..) |v, i| values[i] = @intCast(v);
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
+        .has_nulls = raw.has_nulls,
+    };
+}
+
+/// The shared column drain, with every decode failure reported as ShortDecode.
+fn readAll(
+    comptime T: type,
+    reader: *column_mod.ColumnChunkReader(T),
+    num_leaves: usize,
+) Error!column_mod.ColumnChunkReader(T).Leaves {
+    return reader.readAll(num_leaves) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ShortDecode,
     };
 }
 
@@ -308,61 +323,22 @@ fn decodeIntBacked(
     num_leaves: usize,
     scale: i32,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    // Decode the raw ints first using the existing column reader
-    // shape. This mirrors decodeColumnT's body in consumer.zig but
-    // without the indirection — we need the raw values to apply scale
-    // in a second pass.
-    const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-    reader.value_budget = num_leaves;
-
-    var def_levels_buf: ?[]u32 = null;
-    var rep_levels_buf: ?[]u32 = null;
-
-    if (levels.max_rep > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        const rl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(raw_values[written..], dl[written..], rl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-        rep_levels_buf = rl;
-    } else if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_values[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_values[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
+    const raw = try readAll(T, &reader, num_leaves);
 
     // Apply scale into a new f64 buffer.
     const values = try arena.alloc(f64, num_leaves);
-    applyScaleSimd(T, raw_values, scale, values);
+    applyScaleSimd(T, raw.values, scale, values);
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
-        .rep_levels = rep_levels_buf,
+        .rep_levels = raw.rep_levels,
         .max_rep = @intCast(levels.max_rep),
-        .has_nulls = reader.has_nulls,
+        .has_nulls = raw.has_nulls,
     };
 }
 
@@ -383,57 +359,23 @@ fn decodeByteArrayBacked(
     num_leaves: usize,
     scale: i32,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    const raw_slices = try arena.alloc([]const u8, num_leaves);
     var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
         chunk,
         codec,
         levels,
         arena,
         decode_options,
+        scratch,
     );
-    reader.value_budget = num_leaves;
-
-    var def_levels_buf: ?[]u32 = null;
-    var rep_levels_buf: ?[]u32 = null;
-
-    if (levels.max_rep > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        const rl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(raw_slices[written..], dl[written..], rl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-        rep_levels_buf = rl;
-    } else if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_slices[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_slices[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    const raw = try readAll([]const u8, &reader, num_leaves);
 
     const max_def: u32 = @intCast(levels.max_def);
     const values = try arena.alloc(f64, num_leaves);
-    for (raw_slices, 0..) |s, i| {
+    for (raw.values, 0..) |s, i| {
         // Null slot: leave 0.0; aggregators consult def_levels.
-        if (def_levels_buf) |dl| {
+        if (raw.def_levels) |dl| {
             if (dl[i] < max_def) {
                 values[i] = 0.0;
                 continue;
@@ -445,11 +387,11 @@ fn decodeByteArrayBacked(
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
-        .rep_levels = rep_levels_buf,
+        .rep_levels = raw.rep_levels,
         .max_rep = @intCast(levels.max_rep),
-        .has_nulls = reader.has_nulls,
+        .has_nulls = raw.has_nulls,
     };
 }
 

@@ -926,36 +926,11 @@ fn decodeOne(
 ) []const u8 {
     var rdr = column.ColumnChunkReader(T).init(chunk_bytes, codec, levels, arena);
     rdr.type_length = type_length;
-    rdr.value_budget = num_rows;
-    const values = arena.alloc(T, num_rows) catch return "alloc_failed";
-    if (levels.max_rep > 0) {
-        const def_levels = arena.alloc(u32, num_rows) catch return "alloc_failed";
-        const rep_levels = arena.alloc(u32, num_rows) catch return "alloc_failed";
-        var written: usize = 0;
-        while (written < num_rows) {
-            const n = rdr.decodeWithRepLevels(values[written..], def_levels[written..], rep_levels[written..]) catch |e| return @errorName(e);
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_rows) return "short_decode";
-    } else if (levels.max_def > 0) {
-        const def_levels = arena.alloc(u32, num_rows) catch return "alloc_failed";
-        var written: usize = 0;
-        while (written < num_rows) {
-            const n = rdr.decodeWithLevels(values[written..], def_levels[written..]) catch |e| return @errorName(e);
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_rows) return "short_decode";
-    } else {
-        var written: usize = 0;
-        while (written < num_rows) {
-            const n = rdr.decode(values[written..]) catch |e| return @errorName(e);
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_rows) return "short_decode";
-    }
+    _ = rdr.readAll(num_rows) catch |e| return switch (e) {
+        error.OutOfMemory => "alloc_failed",
+        error.ShortDecode => "short_decode",
+        else => @errorName(e),
+    };
     return "ok";
 }
 

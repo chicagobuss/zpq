@@ -1457,6 +1457,7 @@ test "scan: API is well-typed" {
 // ============================================================
 
 const testing = std.testing;
+const test_fixtures = @import("parquet/test_fixtures.zig");
 const spawn_test_fixture = "data/parquet-testing/data/nan_in_stats.parquet";
 /// The padding columns exist only to push fetch volume past the 2 MiB-per-worker threshold, so workers really spawn.
 const SPAWN_FIXTURE_AGG =
@@ -2750,8 +2751,8 @@ test "runMultiAggregate: inputs whose nesting differs are a schema mismatch" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const m0 = try metadata.sharedLeafNameMetaForTest(a);
-    var m1 = try metadata.sharedLeafNameMetaForTest(a);
+    const m0 = try test_fixtures.sharedLeafNameMeta(a);
+    var m1 = try test_fixtures.sharedLeafNameMeta(a);
     m1.schema.items[0].num_children = 6;
     m1.schema.items[1].num_children = 1;
 

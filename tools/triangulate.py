@@ -32,6 +32,8 @@ except ImportError:
     print("Missing dependencies: please run via .venv/bin/python (needs pyarrow and duckdb)")
     sys.exit(2)
 
+from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, duckdb_agg, same, self_check
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZPQ_BIN = "zig-out/bin/zpq"
 HARDWOOD_HOME = os.path.join(REPO_ROOT, "tools", "hardwood")  # populated by tools/fetch_hardwood.sh
@@ -56,6 +58,10 @@ REFEREE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "authority": "hardwood",
         "why": "chunk path_in_schema contradicts the schema's leaf order; a reader must reject, not guess",
     },
+    # Where DuckDB trusts statistics it should not (the list lives in oracle_compare.py), Hardwood, which prunes on
+    # none of them, decides.
+    **{f"zpq-ci:{os.path.basename(path)}": {"authority": "hardwood", "why": why}
+       for path, why in DUCKDB_STATS_DIVERGENCES.items()},
 }
 
 
@@ -87,7 +93,8 @@ def hardwood_version() -> str:
 # Typed values come from DuckDB (via Arrow) and ZPQ's JSON; Hardwood 1.1's JSON export is typed for numbers/bools and
 # renders everything else as text: decimals as plain strings, NaN/±Infinity as strings, temporals as ISO-8601 (INT96
 # and UTC-adjusted timestamps with a trailing Z), UUIDs canonically, binary as UTF-8 text or 0x-hex, nested values as
-# native JSON. When exactly one side of a pair is a string, it is coerced toward the other side's type.
+# native JSON. When exactly one side of a pair is a string, it is coerced toward the other side's type. Numbers then
+# compare under oracle_compare.same: NULL, integers and DECIMAL exactly, floats and zpq's f64 lane with a tolerance.
 
 def is_nan(v: Any) -> bool:
     return isinstance(v, float) and math.isnan(v)
@@ -183,8 +190,7 @@ def normalize_value(v: Any) -> Any:
             return "NaN"
         if v.is_infinite():
             return "Infinity" if v > 0 else "-Infinity"
-        # ZPQ decodes decimals to f64, so decimals compare as floats.
-        return float(v)
+        return v  # exact; same() compares it as a float only against a float or in zpq's f64 lane
     if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
         return canon_temporal(v)
     if isinstance(v, (bytes, bytearray)):
@@ -194,17 +200,18 @@ def normalize_value(v: Any) -> Any:
     return v
 
 
-def compare_values(v1: Any, v2: Any, tol: float = 1e-4) -> bool:
+def compare_values(v1: Any, v2: Any, lane: Optional[str] = None) -> bool:
+    """`lane` is oracle_compare's: F64 when zpq computed the value in its f64 lane."""
     if isinstance(v1, dict) and isinstance(v2, dict):
-        return v1.keys() == v2.keys() and all(compare_values(v1[k], v2[k], tol) for k in v1)
+        return v1.keys() == v2.keys() and all(compare_values(v1[k], v2[k]) for k in v1)
     if isinstance(v1, list) and isinstance(v2, list):
-        return len(v1) == len(v2) and all(compare_values(a, b, tol) for a, b in zip(v1, v2))
+        return len(v1) == len(v2) and all(compare_values(a, b) for a, b in zip(v1, v2))
     # Arrow hands maps over as [(k, v), ...]; Hardwood as a JSON object.
     if isinstance(v1, list) and isinstance(v2, dict):
         v1, v2 = v2, v1
     if isinstance(v1, dict) and isinstance(v2, list) and all(isinstance(e, tuple) and len(e) == 2 for e in v2):
         return len(v1) == len(v2) and all(
-            any(str(normalize_value(k)) == hk and compare_values(hv, val, tol) for hk, hv in v1.items())
+            any(str(normalize_value(k)) == hk and compare_values(hv, val) for hk, hv in v1.items())
             for k, val in v2)
 
     v2 = coerce_like(v1, v2)
@@ -213,16 +220,11 @@ def compare_values(v1: Any, v2: Any, tol: float = 1e-4) -> bool:
     nv2 = normalize_value(v2)
 
     if nv1 is None or nv2 is None:
-        return nv1 == nv2
-    # Numeric on both sides — compare tolerantly regardless of int/float mix.
-    # DuckDB promotes every integer SUM to DECIMAL/HUGEINT, so its `sum(id)`
-    # comes back as Decimal('6') while ZPQ emits int 6.
-    num1 = isinstance(nv1, (int, float)) and not isinstance(nv1, bool)
-    num2 = isinstance(nv2, (int, float)) and not isinstance(nv2, bool)
+        return nv1 is None and nv2 is None
+    num1 = isinstance(nv1, (int, float, decimal.Decimal)) and not isinstance(nv1, bool)
+    num2 = isinstance(nv2, (int, float, decimal.Decimal)) and not isinstance(nv2, bool)
     if num1 and num2:
-        if isinstance(nv1, int) and isinstance(nv2, int):
-            return nv1 == nv2
-        return abs(nv1 - nv2) <= tol * max(1.0, abs(nv2))
+        return same(nv1, nv2, lane)
     return str(nv1) == str(nv2)
 
 
@@ -717,15 +719,19 @@ def _nan_ignoring(i: AggItem) -> bool:
     return i.func in ("min", "max") and i.typ is not None and pa.types.is_floating(i.typ)
 
 
+def _lane(i: AggItem) -> Optional[str]:
+    """zpq answers sum/min/max of a DECIMAL column from its f64 lane."""
+    return F64 if i.func != "count" and i.typ is not None and pa.types.is_decimal(i.typ) else None
+
+
 def _sql_item(i: AggItem, duckdb_sql: bool) -> str:
     if i.func == "count":
         return f"count(*) AS {i.alias}"
     if not duckdb_sql:
         return f"{i.func}({i.col}) AS {i.alias}"
-    # DuckDB orders NaN above every number; zpq's float min/max skip NaN (as Arrow compute and Polars do). The harness
-    # judges the NaN-free extremes, so the order convention does not drown out real decode errors.
-    nan_filter = f' FILTER (WHERE NOT isnan("{i.col}"))' if _nan_ignoring(i) else ""
-    return f'{i.func}("{i.col}"){nan_filter} AS {i.alias}'
+    # Float min/max are judged NaN-free (see oracle_compare), so the order convention does not drown out real decode
+    # errors.
+    return f"{duckdb_agg(i.func, i.col, i.typ is not None and pa.types.is_floating(i.typ))} AS {i.alias}"
 
 
 def eval_probe(probe: Probe, rows: List[Dict]) -> List[Dict]:
@@ -780,6 +786,15 @@ def _cell(row: Dict[str, Any], alias: str) -> Tuple[bool, Any]:
 def referee(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineResult],
             override: Dict[str, Any]) -> Tuple[str, str]:
     """Returns (status, message). Status is OK, FAIL or INFO."""
+    status, msg = _vote(probe, z, d, h, override)
+    if status == "FAIL" and override.get("authority") == "hardwood" and h is None and not override.get("expected"):
+        # Hardwood decides this file and is absent; DuckDB alone can confirm zpq here but not overrule it.
+        return "INFO", "Hardwood (authoritative) absent; " + msg
+    return status, msg
+
+
+def _vote(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineResult],
+          override: Dict[str, Any]) -> Tuple[str, str]:
     expected: Dict[str, Any] = override.get("expected", {})
     hw_rules = override.get("authority") == "hardwood" and h is not None
     oracles = [("duckdb", d)] + ([("hardwood", h)] if h is not None else [])
@@ -799,7 +814,7 @@ def referee(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineRe
         if not has:
             return "FAIL", f"ZPQ result lacks {it.alias}: {z.row}"
         if it.alias in expected:
-            if not compare_values(expected[it.alias], zv):
+            if not compare_values(expected[it.alias], zv, _lane(it)):
                 status = "FAIL"
                 notes.append(f"{it.alias}: zpq={zv!r} expected={expected[it.alias]!r} (override)")
             continue
@@ -810,11 +825,11 @@ def referee(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineRe
             status = "FAIL"
             notes.append(f"{it.alias}: ZPQ accepted but others rejected (zpq={zv!r})")
             continue
-        agree = {n: compare_values(zv, v) for n, v in votes.items()}
+        agree = {n: compare_values(zv, v, _lane(it)) for n, v in votes.items()}
         if all(agree.values()):
             continue
         shown = ", ".join(f"{n}={v!r}" for n, v in votes.items())
-        if len(votes) == 1 or not any(agree.values()) and compare_values(*votes.values()):
+        if len(votes) == 1 or not any(agree.values()) and compare_values(*votes.values(), _lane(it)):
             # zpq against a single opinion, or against two oracles that agree with each other: zpq is the outlier.
             status = "FAIL"
             notes.append(f"{it.alias}: zpq={zv!r} {shown}")
@@ -890,6 +905,7 @@ def read_correctness(hw_fixtures: Optional[str], only: Optional[str]) -> Tuple[i
 
 
 def main():
+    self_check()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hardwood-fixtures", help="Hardwood checkout root or its core/src/test/resources "
                     "(default: $HARDWOOD_FIXTURES, then tools/hardwood/fixtures)")

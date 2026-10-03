@@ -4,14 +4,15 @@ const zon = @import("build.zig.zon");
 /// ZPQ build system.
 ///
 /// Produces two binaries from one source tree:
-///   - `zpq`        : CLI binary. Native event-loop backend
-///                    (io_uring on Linux, kqueue on macOS).
-///   - `zpq-lambda` : Lambda bootstrap binary. Excludes io_uring code at
-///                    comptime. Uses the in-tree epoll backend only.
+///   - `zpq`        : CLI binary. Includes the SQL frontend unless
+///                    `-Dsql=false`.
+///   - `zpq-lambda` : Lambda bootstrap binary. JSON-event-driven, so it
+///                    never includes the SQL frontend.
 ///
-/// The split is enforced by the `build_options.lambda` flag visible to
-/// every translation unit in each binary. We don't depend on libxev or
-/// any other event-loop library; the in-tree loop is part of the product.
+/// Both run the same engine (src/zpq.zig): blocking sockets over BoringSSL
+/// for S3 and `std.Io` for concurrency, with no event-loop library. Each
+/// binary compiles its own instance of that module so its `build_options`
+/// (`lambda`, `enable_sql`, `version`) resolve at comptime.
 pub fn build(b: *std.Build) void {
     const builtin = @import("builtin");
     if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
@@ -27,55 +28,30 @@ pub fn build(b: *std.Build) void {
     // JSON-event-driven and cold-start scales with size.
     const sql = b.option(bool, "sql", "Compile the SQL frontend into the CLI (default true; Lambda never includes it)") orelse true;
 
-    const liteparser_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    liteparser_mod.addCSourceFiles(.{
-        .root = b.path("vendor/liteparser"),
-        .files = &.{
-            "arena.c",
-            "liteparser.c",
-            "lp_tokenize.c",
-            "lp_unparse.c",
-            "parse.c",
-        },
-        .flags = &.{
-            "-Wall",
-            "-Wextra",
-            "-Wno-unused-parameter",
-            "-Wno-sign-compare",
-            "-Wno-unused-variable",
-            "-DNDEBUG",
-        },
-    });
-    liteparser_mod.addIncludePath(b.path("vendor/liteparser"));
+    // BoringSSL comes prebuilt: from vendor/boring_tls/prebuilt/<arch>-<os>/
+    // when present, else downloaded and sha256-checked by a build step.
+    // `-Dfetch-prebuilt=false` turns a missing local copy into an error.
+    const fetch_prebuilt = b.option(bool, "fetch-prebuilt", "Download pinned BoringSSL prebuilts that vendor/boring_tls/prebuilt lacks (default true)") orelse true;
 
-    const liteparser_lib = b.addLibrary(.{
-        .name = "liteparser",
-        .root_module = liteparser_mod,
-    });
+    const deps = CoreDeps.init(b, target, optimize, fetch_prebuilt);
 
     // ----- CLI binary -----
-    const cli_zpq = makeZpqModule(b, target, optimize, false, liteparser_lib, sql);
+    const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql);
     const cli = b.addExecutable(.{
         .name = "zpq",
         .root_module = cli_zpq.root,
     });
-    cli.root_module.addImport("zpq", cli_zpq.zpq);
     b.installArtifact(cli);
 
     const cli_step = b.step("cli", "Build the CLI binary (zpq)");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
 
     // ----- Lambda binary -----
-    const lambda_zpq = makeZpqModule(b, target, optimize, true, liteparser_lib, sql);
+    const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, sql);
     const lambda = b.addExecutable(.{
         .name = "zpq-lambda",
         .root_module = lambda_zpq.root,
     });
-    lambda.root_module.addImport("zpq", lambda_zpq.zpq);
     b.installArtifact(lambda);
 
     const lambda_step = b.step("lambda", "Build the Lambda binary (zpq-lambda)");
@@ -88,88 +64,26 @@ pub fn build(b: *std.Build) void {
     //   const zpq = b.dependency("zpq", .{ .target = t, .optimize = o })
     //       .module("zpq");
     //
-    // Configuration is the workstation one (lambda=false, epoll backend).
+    // Configuration is the workstation one (lambda=false).
     // The SQL frontend stays out: it's a CLI concern, and excluding it means
     // consumers never link the liteparser C sources. Everything else (codecs,
     // TLS, S3) comes along — the module is the same surface the binaries use.
-    const pub_opts = b.addOptions();
-    pub_opts.addOption(bool, "lambda", false);
-    pub_opts.addOption(bool, "enable_sql", false);
-    pub_opts.addOption([]const u8, "version", zon.version);
-    const pub_zpq = b.addModule("zpq", .{
-        .root_source_file = b.path("src/zpq.zig"),
-        .target = target,
-        .optimize = optimize,
-        .omit_frame_pointer = false,
-        .imports = &.{
-            .{ .name = "build_options", .module = pub_opts.createModule() },
-            .{
-                .name = "boring_tls",
-                .module = b.dependency("boring_tls", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("boring_tls"),
-            },
-            .{
-                .name = "snappy",
-                .module = b.dependency("snappy", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("snappy"),
-            },
-        },
+    _ = addCoreModule(b, deps, target, optimize, .{
+        .lambda = false,
+        .sql = false,
+        .export_as = "zpq",
     });
-    const pub_zstd_lib = b.dependency("zstd", .{
-        .target = target,
-        .optimize = optimize,
-        .dictbuilder = false,
-    }).artifact("zstd");
-    pub_zpq.linkLibrary(pub_zstd_lib);
-    pub_zpq.addImport("zstd_c", zstdCModule(b, target, optimize, pub_zstd_lib));
 
     // ----- Tests -----
-    // Tests pin lambda=true since epoll is the only backend implemented;
-    // other backends @compileError until they exist.
-    const test_opts = b.addOptions();
-    test_opts.addOption(bool, "lambda", true);
-    test_opts.addOption(bool, "enable_sql", true); // tests exercise the SQL parser
-    test_opts.addOption([]const u8, "version", zon.version);
-    const test_opts_mod = test_opts.createModule();
-
-    const test_boring_dep = b.dependency("boring_tls", .{
-        .target = target,
-        .optimize = optimize,
+    // Tests compile the Lambda configuration (lambda=true) with the SQL
+    // frontend switched on: no binary ships that combination, but it lets one
+    // test build cover the Lambda-only sources and the SQL parser.
+    const test_core = addCoreModule(b, deps, target, optimize, .{
+        .lambda = true,
+        .sql = true, // tests exercise the SQL parser
     });
-    const test_boring_mod = test_boring_dep.module("boring_tls");
-
-    const test_snappy_dep = b.dependency("snappy", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const test_snappy_mod = test_snappy_dep.module("snappy");
-
-    const test_zstd_dep = b.dependency("zstd", .{
-        .target = target,
-        .optimize = optimize,
-        .dictbuilder = false,
-    });
-    const test_zstd_lib = test_zstd_dep.artifact("zstd");
-
-    const test_zpq_mod = b.createModule(.{
-        .root_source_file = b.path("src/zpq.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "build_options", .module = test_opts_mod },
-            .{ .name = "boring_tls", .module = test_boring_mod },
-            .{ .name = "snappy", .module = test_snappy_mod },
-        },
-    });
-    test_zpq_mod.linkLibrary(test_zstd_lib);
-    test_zpq_mod.addImport("zstd_c", zstdCModule(b, target, optimize, test_zstd_lib));
-    test_zpq_mod.linkLibrary(liteparser_lib);
-    test_zpq_mod.addIncludePath(b.path("vendor/liteparser"));
-    test_zpq_mod.addImport("liteparser_c", liteparserCModule(b, target, optimize));
+    const test_zpq_mod = test_core.zpq;
+    const test_opts_mod = test_core.build_options;
 
     // Sans-IO + io tests (live in src/zpq.zig and what it imports).
     const lib_tests = b.addTest(.{
@@ -295,15 +209,208 @@ pub fn build(b: *std.Build) void {
     bench_labels_step.dependOn(&b.addRunArtifact(bench_labels).step);
 }
 
-/// Bundle the per-binary modules. We give each binary its own zpq module
-/// instance so the comptime `build_options.lambda` flag propagates
-/// correctly into src/io/loop.zig (which lives inside the zpq namespace).
-const Bundle = struct {
+/// Third-party modules and libraries every zpq module instance links. Built
+/// once per (target, optimize) and shared, so dependency wiring lives in one
+/// place however many option sets the build compiles.
+const CoreDeps = struct {
+    /// BoringSSL bindings — required for HTTPS to S3 (and any other TLS).
+    boring_tls: *std.Build.Module,
+    /// google/snappy 1.2.1 — vendor source-built, generic implementation.
+    /// Replaces the hand-rolled zig snappy compressor (still used for
+    /// decode-side fallback; the C version is 3-5× faster on compress).
+    snappy: *std.Build.Module,
+    /// facebook/zstd 1.5.7 — vendor via allyourcodebase/zstd. Used for
+    /// both encode (E2b) and decode. Zig stdlib's pure-Zig zstd
+    /// decoder works correctly but is ~10× slower than libzstd on
+    /// dict-encoded numeric column-chunks (perf profile 2026-05-06:
+    /// 92% of CLI aggregate CPU time was in `std.compress.zstd`).
+    /// Same library, different entry point — minor binary-size cost
+    /// for a large perf win.
+    zstd: *std.Build.Step.Compile,
+    zstd_c: *std.Build.Module,
+    /// The SQL frontend's C parser. Only linked into modules built with
+    /// `sql = true`; an unreferenced library step is never compiled.
+    liteparser: *std.Build.Step.Compile,
+    liteparser_c: *std.Build.Module,
+
+    fn init(
+        b: *std.Build,
+        target: std.Build.ResolvedTarget,
+        optimize: std.builtin.Optimize,
+        fetch_prebuilt: bool,
+    ) CoreDeps {
+        const zstd = b.dependency("zstd", .{
+            .target = target,
+            .optimize = optimize,
+            .dictbuilder = false,
+        }).artifact("zstd");
+
+        const liteparser_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        liteparser_mod.addCSourceFiles(.{
+            .root = b.path("vendor/liteparser"),
+            .files = &.{
+                "arena.c",
+                "liteparser.c",
+                "lp_tokenize.c",
+                "lp_unparse.c",
+                "parse.c",
+            },
+            .flags = &.{
+                "-Wall",
+                "-Wextra",
+                "-Wno-unused-parameter",
+                "-Wno-sign-compare",
+                "-Wno-unused-variable",
+                "-DNDEBUG",
+            },
+        });
+        liteparser_mod.addIncludePath(b.path("vendor/liteparser"));
+
+        return .{
+            .boring_tls = b.dependency("boring_tls", .{
+                .target = target,
+                .optimize = optimize,
+                .@"fetch-prebuilt" = fetch_prebuilt,
+            }).module("boring_tls"),
+            .snappy = b.dependency("snappy", .{
+                .target = target,
+                .optimize = optimize,
+            }).module("snappy"),
+            .zstd = zstd,
+            .zstd_c = zstdCModule(b, target, optimize, zstd),
+            .liteparser = b.addLibrary(.{
+                .name = "liteparser",
+                .root_module = liteparser_mod,
+            }),
+            .liteparser_c = liteparserCModule(b, target, optimize),
+        };
+    }
+};
+
+const CoreOptions = struct {
+    /// Which binary the module is compiled for. No source branches on it
+    /// yet; it is the switch that will keep a future io_uring backend out of
+    /// the Lambda binary (docs/lambda_capabilities.md).
+    lambda: bool,
+    /// Compile the SQL frontend (`build_options.enable_sql`) and link
+    /// liteparser.
+    sql: bool,
+    /// Register the module under this name for dependents
+    /// (`b.dependency("zpq", ...).module(name)`).
+    export_as: ?[]const u8 = null,
+};
+
+/// A zpq core module (src/zpq.zig) and the build_options module it was
+/// compiled with; roots that branch on the same options import both.
+const Core = struct {
+    zpq: *std.Build.Module,
+    build_options: *std.Build.Module,
+};
+
+/// The one place a zpq core module is assembled. Each distinct option set
+/// needs its own module instance, because `build_options` is resolved at
+/// comptime inside the zpq namespace.
+fn addCoreModule(
+    b: *std.Build,
+    deps: CoreDeps,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    options: CoreOptions,
+) Core {
+    const opts = b.addOptions();
+    opts.addOption(bool, "lambda", options.lambda);
+    opts.addOption(bool, "enable_sql", options.sql);
+    opts.addOption([]const u8, "version", zon.version);
+    const opts_mod = opts.createModule();
+
+    // Frame pointers on: makes `perf record --call-graph=fp` produce clean
+    // stacks instead of DWARF unwinding gaps. Cost is 0-2% on typical
+    // workloads (validated 2026-05-07 against the regression suite —
+    // medians within noise). Worth it for always-available flamegraphs.
+    // Flip to `true` (or remove) if a hot path ever shows real register-
+    // pressure regression.
+    const module_options: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("src/zpq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        .imports = &.{
+            .{ .name = "build_options", .module = opts_mod },
+            .{ .name = "boring_tls", .module = deps.boring_tls },
+            .{ .name = "snappy", .module = deps.snappy },
+            .{ .name = "zstd_c", .module = deps.zstd_c },
+        },
+    };
+    const zpq_mod = if (options.export_as) |name|
+        b.addModule(name, module_options)
+    else
+        b.createModule(module_options);
+    zpq_mod.linkLibrary(deps.zstd);
+    if (options.sql) {
+        zpq_mod.linkLibrary(deps.liteparser);
+        zpq_mod.addIncludePath(b.path("vendor/liteparser"));
+        zpq_mod.addImport("liteparser_c", deps.liteparser_c);
+    }
+    return .{ .zpq = zpq_mod, .build_options = opts_mod };
+}
+
+const Binary = enum { cli, lambda };
+
+/// A binary's root module plus the zpq core module it imports.
+const BinaryModules = struct {
     /// The binary's root_source_file module (cli/main.zig or lambda/main.zig).
     root: *std.Build.Module,
     /// The zpq module (src/zpq.zig) wired with this binary's build_options.
     zpq: *std.Build.Module,
 };
+
+fn addBinaryModules(
+    b: *std.Build,
+    deps: CoreDeps,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    binary: Binary,
+    sql: bool,
+) BinaryModules {
+    const is_lambda = binary == .lambda;
+    // SQL frontend (liteparser) is opt-in and CLI-only: Lambda is
+    // JSON-event-driven and cold-start cost scales with binary size, so the
+    // ~950 KB parser + its C dep are never in the Lambda build; the CLI gets
+    // it unless `-Dsql=false` asks for a minimal binary. Gated via
+    // build_options so the sql_parser module simply isn't compiled when off.
+    const enable_sql = !is_lambda and sql;
+    const core = addCoreModule(b, deps, target, optimize, .{
+        .lambda = is_lambda,
+        .sql = enable_sql,
+    });
+
+    const root_mod = b.createModule(.{
+        .root_source_file = b.path(if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        // libc gives us getaddrinfo; under -O ReleaseSmall + musl static
+        // it adds ~150 KB which is dwarfed by BoringSSL anyway. Until
+        // we ship our own DNS resolver, this is the right tradeoff.
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zpq", .module = core.zpq },
+            .{ .name = "build_options", .module = core.build_options },
+            .{ .name = "boring_tls", .module = deps.boring_tls },
+            .{ .name = "snappy", .module = deps.snappy },
+        },
+    });
+    if (enable_sql) {
+        root_mod.linkLibrary(deps.liteparser);
+        root_mod.addIncludePath(b.path("vendor/liteparser"));
+    }
+
+    return .{ .root = root_mod, .zpq = core.zpq };
+}
 
 /// Translates a one-off C header into a module. Replaces `@cImport`, which
 /// Zig 0.17 removed.
@@ -347,103 +454,4 @@ fn liteparserCModule(
     );
     tc.addIncludePath(b.path("vendor/liteparser"));
     return tc.createModule();
-}
-
-fn makeZpqModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
-    is_lambda: bool,
-    liteparser_lib: *std.Build.Step.Compile,
-    sql: bool,
-) Bundle {
-    const opts = b.addOptions();
-    opts.addOption(bool, "lambda", is_lambda);
-    opts.addOption([]const u8, "version", zon.version);
-    // SQL frontend (liteparser) is opt-in and CLI-only: Lambda is
-    // JSON-event-driven and cold-start cost scales with binary size, so the
-    // ~950 KB parser + its C dep are never in the Lambda build; the CLI gets
-    // it unless `-Dsql=false` asks for a minimal binary. Gated via
-    // build_options so the sql_parser module simply isn't compiled when off.
-    const enable_sql = !is_lambda and sql;
-    opts.addOption(bool, "enable_sql", enable_sql);
-    const opts_mod = opts.createModule();
-
-    // BoringSSL bindings — required for HTTPS to S3 (and any other TLS).
-    const boring_tls_dep = b.dependency("boring_tls", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const boring_tls_mod = boring_tls_dep.module("boring_tls");
-
-    // google/snappy 1.2.1 — vendor source-built, generic implementation.
-    // Replaces the hand-rolled zig snappy compressor (still used for
-    // decode-side fallback; the C version is 3-5× faster on compress).
-    const snappy_dep = b.dependency("snappy", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const snappy_mod = snappy_dep.module("snappy");
-
-    // facebook/zstd 1.5.7 — vendor via allyourcodebase/zstd. Used for
-    // both encode (E2b) and decode. Zig stdlib's pure-Zig zstd
-    // decoder works correctly but is ~10× slower than libzstd on
-    // dict-encoded numeric column-chunks (perf profile 2026-05-06:
-    // 92% of CLI aggregate CPU time was in `std.compress.zstd`).
-    // Same library, different entry point — minor binary-size cost
-    // for a large perf win.
-    const zstd_dep = b.dependency("zstd", .{
-        .target = target,
-        .optimize = optimize,
-        .dictbuilder = false,
-    });
-    const zstd_lib = zstd_dep.artifact("zstd");
-
-    // Frame pointers on for both modules: makes `perf record --call-graph=fp`
-    // produce clean stacks instead of DWARF unwinding gaps. Cost is 0-2% on
-    // typical workloads (validated 2026-05-07 against the regression suite —
-    // medians within noise). Worth it for always-available flamegraphs.
-    // Flip to `true` (or remove) if a hot path ever shows real register-
-    // pressure regression.
-    const zpq_mod = b.createModule(.{
-        .root_source_file = b.path("src/zpq.zig"),
-        .target = target,
-        .optimize = optimize,
-        .omit_frame_pointer = false,
-        .imports = &.{
-            .{ .name = "build_options", .module = opts_mod },
-            .{ .name = "boring_tls", .module = boring_tls_mod },
-            .{ .name = "snappy", .module = snappy_mod },
-            .{ .name = "zstd_c", .module = zstdCModule(b, target, optimize, zstd_lib) },
-        },
-    });
-    zpq_mod.linkLibrary(zstd_lib);
-    if (enable_sql) {
-        zpq_mod.linkLibrary(liteparser_lib);
-        zpq_mod.addIncludePath(b.path("vendor/liteparser"));
-        zpq_mod.addImport("liteparser_c", liteparserCModule(b, target, optimize));
-    }
-
-    const root_path = if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig";
-    const root_mod = b.createModule(.{
-        .root_source_file = b.path(root_path),
-        .target = target,
-        .optimize = optimize,
-        .omit_frame_pointer = false,
-        // libc gives us getaddrinfo; under -O ReleaseSmall + musl static
-        // it adds ~150 KB which is dwarfed by BoringSSL anyway. Until
-        // we ship our own DNS resolver, this is the right tradeoff.
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = opts_mod },
-            .{ .name = "boring_tls", .module = boring_tls_mod },
-            .{ .name = "snappy", .module = snappy_mod },
-        },
-    });
-    if (enable_sql) {
-        root_mod.linkLibrary(liteparser_lib);
-        root_mod.addIncludePath(b.path("vendor/liteparser"));
-    }
-
-    return .{ .root = root_mod, .zpq = zpq_mod };
 }

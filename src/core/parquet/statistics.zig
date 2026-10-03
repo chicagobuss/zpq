@@ -104,64 +104,9 @@ pub fn bytewiseOrder(elem: schema.SchemaElement) bool {
 // ============================================================
 
 const testing = std.testing;
-
-/// One flat column `c` with the given stats, 100 rows, in a file whose schema declares `elem`.
-pub const ColumnForTest = struct {
-    rg: schema.RowGroup,
-    fm: schema.FileMetaData,
-
-    pub fn init(a: std.mem.Allocator, elem: schema.SchemaElement, stats: schema.Statistics) !ColumnForTest {
-        var path: schema.StringList = .empty;
-        try path.append(a, "c");
-        var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 100 };
-        try rg.columns.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = .{
-            .type = elem.type.?,
-            .encodings = .empty,
-            .path_in_schema = path,
-            .codec = .UNCOMPRESSED,
-            .num_values = 100,
-            .total_uncompressed_size = 0,
-            .total_compressed_size = 0,
-            .data_page_offset = 0,
-            .index_page_offset = null,
-            .dictionary_page_offset = null,
-            .statistics = stats,
-        } });
-        var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
-        try items.append(a, .{
-            .type = null,
-            .type_length = null,
-            .repetition_type = null,
-            .name = "schema",
-            .num_children = 1,
-            .scale = null,
-            .precision = null,
-            .field_id = null,
-        });
-        var leaf = elem;
-        leaf.name = "c";
-        leaf.num_children = 0;
-        try items.append(a, leaf);
-        return .{
-            .rg = rg,
-            .fm = .{ .version = 1, .schema = items, .num_rows = 100, .created_by = null, .row_groups = .empty },
-        };
-    }
-};
-
-/// An OPTIONAL leaf `c` of physical type `t` with no annotation.
-pub fn leafForTest(t: schema.Type) schema.SchemaElement {
-    return .{
-        .type = t,
-        .type_length = null,
-        .repetition_type = .OPTIONAL,
-        .name = "c",
-        .num_children = 0,
-        .scale = null,
-        .precision = null,
-        .field_id = null,
-    };
-}
+const test_fixtures = @import("test_fixtures.zig");
+const leafForTest = test_fixtures.statsLeaf;
+const ColumnForTest = test_fixtures.StatsColumn;
 
 test "chunkBounds reads the deprecated pair only where signed is the type-defined order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

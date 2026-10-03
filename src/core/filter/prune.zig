@@ -566,13 +566,13 @@ test "pruneRowGroup unknown when stats absent" {
     try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, filter, null));
 }
 
-/// `statistics.ColumnForTest`, deciding filters against itself.
+/// `test_fixtures.StatsColumn`, deciding filters against itself.
 const ProofFixture = struct {
     rg: schema.RowGroup,
     fm: schema.FileMetaData,
 
     fn init(a: std.mem.Allocator, elem: schema.SchemaElement, stats: schema.Statistics) !ProofFixture {
-        const c = try statistics.ColumnForTest.init(a, elem, stats);
+        const c = try test_fixtures.StatsColumn.init(a, elem, stats);
         return .{ .rg = c.rg, .fm = c.fm };
     }
 
@@ -581,7 +581,8 @@ const ProofFixture = struct {
     }
 };
 
-const leafElem = statistics.leafForTest;
+const test_fixtures = @import("../parquet/test_fixtures.zig");
+const leafElem = test_fixtures.statsLeaf;
 
 fn le64(a: std.mem.Allocator, v: i64) ![]const u8 {
     const b = try a.alloc(u8, 8);

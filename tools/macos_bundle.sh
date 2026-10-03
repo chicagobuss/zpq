@@ -9,8 +9,8 @@
 # Then on the Mac:
 #   tar -xzf zpq-macos-check-<rev>.tar.gz && zpq-macos-check-<rev>/macos_check.sh
 #
-# Needs: zig 0.17.0; vendor/boring_tls/prebuilt/{aarch64,x86_64}-macos (fetch
-# them like .github/workflows/release.yml does); a python with pyarrow
+# Needs: zig 0.17.0 (the build fetches the macOS BoringSSL prebuilts unless
+# vendor/boring_tls/prebuilt/<target>/ has them); a python with pyarrow
 # ($PYTHON, else .venv/bin/python) to generate the smoke fixtures.
 set -euo pipefail
 
@@ -21,13 +21,6 @@ TARGETS="aarch64-macos x86_64-macos"
 PY="${PYTHON:-}"
 if [ -z "$PY" ]; then if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi
 "$PY" -c 'import pyarrow' 2> /dev/null || { echo "need a python with pyarrow (set PYTHON=...)" >&2; exit 2; }
-
-for t in $TARGETS; do
-  for lib in libssl.a libcrypto.a; do
-    [ -s "vendor/boring_tls/prebuilt/$t/$lib" ] || {
-      echo "missing vendor/boring_tls/prebuilt/$t/$lib — fetch it as .github/workflows/release.yml does" >&2; exit 2; }
-  done
-done
 
 REV="$(git describe --always --dirty 2> /dev/null || echo unknown)"
 NAME="zpq-macos-check-$REV"

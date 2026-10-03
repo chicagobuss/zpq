@@ -120,13 +120,7 @@ PY
 # ...nor is it confused with the field b of a group a, whose path joins to the
 # same "a.b": both columns read, --columns a.b names the top-level one, and the
 # bare b binds to the nested field.
-"$PY" - "$DIR" <<'PY'
-import sys
-import pyarrow as pa, pyarrow.parquet as pq
-pq.write_table(pa.table({"a.b": pa.array([1, None, 3], type=pa.int64()),
-                         "a": pa.array([{"b": 10}, {"b": 20}, {"b": None}], type=pa.struct([("b", pa.int64())]))}),
-               f"{sys.argv[1]}/dotted_twin.parquet")
-PY
+"$PY" "$(dirname "$0")/gen_dotted_twin_fixture.py" "$DIR/dotted_twin.parquet" > /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_top.parquet" --columns a.b 2> /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_both.parquet" --columns a.b,a 2> /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_filtered.parquet" --filter 'b > 10' 2> /dev/null

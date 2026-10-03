@@ -15,9 +15,9 @@ name: Verify
 #      row counts) always fail; the full-pass count must not drop
 #      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
-# Cross-platform compile (ARM64) is verified at release time, not on
-# every PR; macOS lands with the kqueue backend. This workflow guards
-# the production target.
+# Cross-platform compile (ARM64, macOS) is verified at release time, not
+# on every PR; docs/macos.md covers running the macOS build on a Mac.
+# This workflow guards the production target.
 
 on:
   push:
@@ -87,18 +87,6 @@ jobs:
           key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
           restore-keys: ${{ runner.os }}-x86_64-zig-
 
-      - name: Fetch Pre-built BoringSSL
-        run: |
-          # vendor/boring_tls is prebuilt-only by doctrine. Fail loud if
-          # R2 is down — there's no source-build fallback to fall back to.
-          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux"
-          mkdir -p vendor/boring_tls/prebuilt/x86_64-linux
-          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a
-          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libssl.a
-          # Sanity: must be > 1 KB (R2 returns a 0-byte body on miss).
-          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a) -gt 1024
-          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libssl.a) -gt 1024
-
       - name: Fetch parquet-testing corpus
         run: |
           git clone https://github.com/apache/parquet-testing data/parquet-testing
@@ -107,7 +95,9 @@ jobs:
       - name: Generate nested edges fixture
         run: python3 tools/gen_nested_fixture.py
 
-      # Step 1: builds zpq + zpq-lambda for native linux-x86_64.
+      # Step 1: builds zpq + zpq-lambda for native linux-x86_64. The build
+      # downloads the pinned BoringSSL prebuilts (sha256-checked against
+      # vendor/boring_tls/prebuilt.sha256) and keeps them in .zig-cache.
       # Default build = SQL-enabled CLI (-Dsql defaults true) + Lambda.
       - name: Build (debug)
         run: zig build --summary all

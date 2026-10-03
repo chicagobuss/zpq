@@ -958,14 +958,6 @@ fn cloneColumnMeta(
     };
 }
 
-/// Byte-copy the kept chunks (or the whole RG span) into `sink` and
-/// emit a cloned `schema.RowGroup` with offsets shifted to the new
-/// stream position.
-///
-/// `kept_set = null`: no projection — push `src.bytes` (which the
-/// caller has arranged to be the whole-RG bounding-box span) and
-/// shift every chunk by the same delta.
-///
 /// Write an aggregate result — one row, or one per GROUP BY group — as a
 /// single-row-group parquet file with one column-chunk per `OutputCol`
 /// (avg-style aggs already split into two cols upstream), each holding
@@ -1589,8 +1581,17 @@ pub fn scanRGForAgg(
     timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
 }
 
+/// Byte-copy one row group into `sink` and return a clone of it whose
+/// chunk offsets (and carried page indexes) point at the new stream
+/// position.
+///
+/// `kept_set = null`: no projection. The group's bounding span, from its
+/// first chunk start to its last chunk end, is copied from `src` in one
+/// write and every chunk shifts by the same delta.
+///
 /// `kept_set != null`: per-column copy. Only chunks where
-/// `kept_set[ci] == true` are written.
+/// `kept_set[ci] == true` are written. A `recompress` that changes any
+/// chunk's codec takes this path too, with every column kept.
 pub fn copyRG(
     out_arena: std.mem.Allocator,
     rg: *const schema.RowGroup,
@@ -2032,9 +2033,6 @@ pub fn pageIndexIsPlausible(
     return true;
 }
 
-/// Slice the source page-index bytes for a chunk out of `src.bytes`,
-/// accounting for `byte_origin` (the buffer may start partway into the
-/// file). Null when the index isn't present in the fetched bytes.
 /// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
 /// page's `first_row_index` slices the row selection, so the arrays must agree in length and the row starts must be
 /// in range and non-decreasing. Page offsets and sizes are checked again where the pages are read.
@@ -2182,6 +2180,9 @@ test "checkRowShape ties flat and repeated columns to the row count" {
     try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(no_start, 1));
 }
 
+/// Slice the source page-index bytes for a chunk out of `src.bytes`,
+/// accounting for `byte_origin` (the buffer may start partway into the
+/// file). Null when the index isn't present in the fetched bytes.
 fn originSlice(src: RGSrc, file_off: i64, len: i32) ?[]const u8 {
     if (file_off < 0 or len < 0) return null;
     const fo: u64 = @intCast(file_off);
@@ -2231,11 +2232,8 @@ fn carryIndexToSink(
     return ptrs;
 }
 
-/// Decode an entire column chunk into a `ColumnT(T)` view: values
-/// plus def_levels (OPTIONAL) and optionally rep_levels (LIST/MAP).
-/// `num_leaves` is the column chunk's `num_values` from metadata
-/// (counts LEAVES, not logical rows — for nested cols this can be
-/// larger than the RG's row count).
+/// A chunk's page index resolved against the filter: which pages to skip,
+/// which the filter matches in full, and where each page lies.
 pub const PruningInfo = struct {
     locations: []const schema.PageLocation,
     page_is_skipped: []const bool,
@@ -2379,6 +2377,11 @@ fn decodeWithReaderPruned(
     };
 }
 
+/// Decode an entire column chunk into a `ColumnT(T)` view: values
+/// plus def_levels (OPTIONAL) and optionally rep_levels (LIST/MAP).
+/// `num_leaves` is the column chunk's `num_values` from metadata
+/// (counts LEAVES, not logical rows — for nested cols this can be
+/// larger than the RG's row count).
 pub fn decodeColumnTPruned(
     comptime T: type,
     arena: std.mem.Allocator,

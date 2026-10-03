@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Fetch pre-built BoringSSL artifacts from Cloudflare R2
+# Fill vendor/boring_tls/prebuilt/<target>/ with the pinned BoringSSL
+# libraries, for builds that must not touch the network. A normal build
+# doesn't need this: build.zig fetches and verifies missing libraries itself.
 #
 # Usage: ./tools/r2-fetch-artifacts.sh [target]
 #   target: aarch64-linux, x86_64-linux, aarch64-macos, x86_64-macos
 #           If not specified, fetches for current platform
 #
-# No credentials required - uses public R2 URL
+# URLs and sha256 digests come from vendor/boring_tls/prebuilt.sha256. Each
+# file is downloaded beside its destination, verified, then renamed into
+# place, so an interrupted or mismatched download never leaves a library the
+# build would take for a good one.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-# Public R2 URL (no auth needed)
-R2_PUBLIC_URL="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev"
+MANIFEST="$PROJECT_ROOT/vendor/boring_tls/prebuilt.sha256"
 PREBUILT_DIR="$PROJECT_ROOT/vendor/boring_tls/prebuilt"
 
 detect_target() {
@@ -35,6 +38,10 @@ detect_target() {
     echo "${arch}-${os}"
 }
 
+sha256_of() {
+    if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+
 fetch_target() {
     local target="$1"
     local target_dir="$PREBUILT_DIR/$target"
@@ -42,30 +49,33 @@ fetch_target() {
     echo "Fetching artifacts for $target..."
     mkdir -p "$target_dir"
 
-    local files=("libcrypto.a" "libssl.a")
-
-    for filename in "${files[@]}"; do
-        local url="$R2_PUBLIC_URL/boring_tls/$target/$filename"
+    for filename in libcrypto.a libssl.a; do
+        local want url
+        read -r want url < <(awk -v k="$target/$filename" '$1 == k { print $2, $3 }' "$MANIFEST") || true
+        if [[ -z "${url:-}" ]]; then
+            echo "  no pinned $filename for $target in $MANIFEST" >&2
+            return 1
+        fi
         local dest="$target_dir/$filename"
+        local tmp="$dest.partial.$$"
 
         echo "  Downloading $filename..."
-        if curl -fSL "$url" -o "$dest" 2>/dev/null; then
-            local size=$(ls -lh "$dest" | awk '{print $5}')
-            echo "    OK ($size)"
-        else
-            echo "    FAILED (artifact may not exist for this target)"
-            rm -f "$dest"
+        if ! curl -fsSL "$url" -o "$tmp"; then
+            rm -f "$tmp"
+            echo "    FAILED: $url" >&2
+            return 1
         fi
+        local got
+        got=$(sha256_of "$tmp")
+        if [[ "$got" != "$want" ]]; then
+            rm -f "$tmp"
+            echo "    sha256 mismatch: pinned $want, served $got" >&2
+            return 1
+        fi
+        mv -f "$tmp" "$dest"
+        echo "    OK ($(ls -lh "$dest" | awk '{print $5}'), sha256 verified)"
     done
-
-    # Verify we got both files
-    if [[ -f "$target_dir/libcrypto.a" && -f "$target_dir/libssl.a" ]]; then
-        echo "Done: $target"
-        return 0
-    else
-        echo "Warning: Incomplete artifacts for $target"
-        return 1
-    fi
+    echo "Done: $target"
 }
 
 # Main

@@ -1,8 +1,8 @@
 # Checking zpq on macOS
 
 The macOS CLIs are cross-compiled on Linux (`zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast cli`, likewise
-`x86_64-macos`; BoringSSL comes from `vendor/boring_tls/prebuilt/<target>`, fetched from R2 as in
-`.github/workflows/release.yml`). CI cannot run them, so two scripts carry a check to a real Mac.
+`x86_64-macos`; the build fetches the pinned macOS BoringSSL prebuilts, or uses `vendor/boring_tls/prebuilt/<target>`
+when present). CI cannot run them, so two scripts carry a check to a real Mac.
 
 Local file I/O goes through `src/local_fs.zig` (`std.posix`, libc on every zpq binary), so the same code serves Linux
 and macOS. The one Linux-only fast path kept is the batched `getdents64` directory read behind glob expansion; macOS
@@ -21,7 +21,7 @@ It builds, for both `aarch64-macos` and `x86_64-macos`, the ReleaseFast `zpq` an
 so one would be a Linux syscall that survived. The tarball also holds the unit-test fixtures (`ci/fixtures`,
 `data/parquet-testing`, plus `data/{benchmark_100mb,nested_edges,bench_types}.parquet` when present), generated smoke
 fixtures, and golden CLI outputs recorded by running `macos_check.sh --record` with a native Linux build of the same tree.
-Needs zig 0.17.0, the macOS BoringSSL prebuilts, and a python with pyarrow (`.venv`).
+Needs zig 0.17.0 and a python with pyarrow (`.venv`).
 
 ## 2. Run the check (Mac)
 

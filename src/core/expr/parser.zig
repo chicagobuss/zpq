@@ -690,6 +690,7 @@ fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
 // ============================================================
 
 const testing = std.testing;
+const test_fixtures = @import("../parquet/test_fixtures.zig");
 
 fn fakeFile(arena: std.mem.Allocator, names: []const []const u8, types: []const schema.Type) !schema.FileMetaData {
     // Build a minimal FileMetaData with a flat schema: one root group +
@@ -1080,7 +1081,7 @@ test "parse: bare names bind top-level columns, dotted paths nested leaves" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const file = try metadata.sharedLeafNameMetaForTest(a);
+    const file = try test_fixtures.sharedLeafNameMeta(a);
 
     const aggs = try parseAggList(a, "sum(key) AS s, sum(r.key) AS t, count(*) FILTER (WHERE key > 1005) AS n", &file);
     try testing.expectEqual(@as(usize, 2), aggs[0].arg.?.col_ref.col_idx);
@@ -1106,7 +1107,7 @@ test "parse: a quoted path binds the nested leaf a top-level column's dotted nam
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var file = try metadata.sharedLeafNameMetaForTest(a);
+    var file = try test_fixtures.sharedLeafNameMeta(a);
     file.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`, beside the group r's field key
 
     try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "r.key", &file)).col_ref.col_idx);

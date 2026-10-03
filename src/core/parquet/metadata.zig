@@ -616,6 +616,7 @@ fn dottedPathEql(name: []const u8, segments: []const []const u8) bool {
 // ============================================================
 
 const testing = std.testing;
+const test_fixtures = @import("test_fixtures.zig");
 
 test "open rejects too-small input" {
     try testing.expectError(error.TooSmall, open(testing.allocator, ""));
@@ -1004,39 +1005,11 @@ pub fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return @import("../../local_fs.zig").readFile(allocator, path);
 }
 
-/// Test fixture: `root{ r{key: INT64, name: BYTE_ARRAY}, key: INT64, amount: INT64, a{x: INT32}, b{x: INT32} }`.
-/// Leaves in order: r.key, r.name, key, amount, a.x, b.x. The top-level `key` shares its leaf name with `r.key`
-/// and sits after it; `x` names a leaf in two groups and none at the top level.
-pub fn sharedLeafNameMetaForTest(arena: std.mem.Allocator) !schema.FileMetaData {
-    const E = struct {
-        fn group(name: []const u8, n: i32) schema.SchemaElement {
-            return .{ .type = null, .type_length = null, .repetition_type = .REQUIRED, .name = name, .num_children = n, .scale = null, .precision = null, .field_id = null };
-        }
-        fn leaf(name: []const u8, t: schema.Type) schema.SchemaElement {
-            return .{ .type = t, .type_length = null, .repetition_type = .REQUIRED, .name = name, .num_children = null, .scale = null, .precision = null, .field_id = null };
-        }
-    };
-    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
-    try meta.schema.appendSlice(arena, &.{
-        E.group("schema", 5),
-        E.group("r", 2),
-        E.leaf("key", .INT64),
-        E.leaf("name", .BYTE_ARRAY),
-        E.leaf("key", .INT64),
-        E.leaf("amount", .INT64),
-        E.group("a", 1),
-        E.leaf("x", .INT32),
-        E.group("b", 1),
-        E.leaf("x", .INT32),
-    });
-    return meta;
-}
-
 test "resolveColumn: bare names bind top-level, dotted paths bind nested, shared names are ambiguous" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const meta = try sharedLeafNameMetaForTest(a);
+    const meta = try test_fixtures.sharedLeafNameMeta(a);
 
     // The top-level column wins over the earlier nested leaf of the same name.
     try testing.expectEqual(@as(?usize, 2), findColumnIndex(&meta, "key"));
@@ -1073,7 +1046,7 @@ test "resolveColumn: an exact top-level name wins over a nested path it spells" 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var meta = try sharedLeafNameMetaForTest(a);
+    var meta = try test_fixtures.sharedLeafNameMeta(a);
     meta.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`
 
     try testing.expectEqual(@as(usize, 2), try resolveColumn(&meta, "r.key"));
@@ -1188,7 +1161,7 @@ test "quoted paths: parse, unquote, and bind by segments" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const meta = try sharedLeafNameMetaForTest(arena);
+    const meta = try test_fixtures.sharedLeafNameMeta(arena);
     try testing.expectEqual(@as(usize, 0), try resolveColumn(&meta, "\"r\".\"key\""));
     try testing.expectEqual(@as(usize, 2), try resolveColumn(&meta, "\"key\""));
     try testing.expectEqual(@as(usize, 5), try resolveColumn(&meta, "\"b\".\"x\""));

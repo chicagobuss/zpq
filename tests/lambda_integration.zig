@@ -397,7 +397,7 @@ test "lambda aggregate over no rows answers NULL for sum/avg/min/max, 0 for coun
 test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI" {
     // A string min/max and a group key carrying `"`, `\`, a newline and 0x01; a NaN sum and an +inf max.
     const fixture_path = "ci/fixtures/parquet/json_escape.parquet";
-    const events = [_]struct { body: []const u8, want: []const u8 }{
+    try expectResponses("lambda json escape", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"]," ++
                 "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a\"}",
@@ -414,36 +414,7 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
             .want = "[{\"b\":\"\\u2028\",\"n\":1},{\"b\":\"\u{FFFD}\u{FFFD}\u{FFFD}\",\"n\":1}," ++
                 "{\"b\":\"\u{FFFD}\u{FFFD}A\u{FFFD}\u{FFFD}\",\"n\":1}]",
         },
-    };
-
-    var server = try FakeServer.start();
-    defer server.deinit();
-    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
-    defer std.testing.allocator.free(endpoint);
-    var child = try spawnLambda(std.testing.allocator, endpoint);
-    defer killChild(&child);
-
-    for (events) |ev| {
-        var poll = try server.acceptRequest(std.testing.allocator);
-        try poll.replyAndClose(
-            std.testing.allocator,
-            200,
-            "Lambda-Runtime-Aws-Request-Id: req-json-escape\r\nContent-Type: application/json\r\n",
-            ev.body,
-        );
-        var resp = try server.acceptRequest(std.testing.allocator);
-        // The whole response must be valid JSON, not just contain the expected fragment.
-        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{}) catch |err| {
-            std.debug.print("[lambda json escape] invalid JSON ({s}): {s}\n", .{ @errorName(err), resp.body });
-            return err;
-        };
-        parsed.deinit();
-        if (std.mem.indexOf(u8, resp.body, ev.want) == null) {
-            std.debug.print("[lambda json escape] response: {s}\n", .{resp.body});
-            return error.TestUnexpectedResult;
-        }
-        try resp.replyAndClose(std.testing.allocator, 202, "", "");
-    }
+    });
 }
 
 test "lambda labels a nested GROUP BY key by its quoted path when a top-level column takes its dotted name" {
@@ -451,7 +422,7 @@ test "lambda labels a nested GROUP BY key by its quoted path when a top-level co
     // unquoted here (`b` binds the nested field, `a.b` the top-level column); quoted in the escapes test.
     const fixture_path = "ci/fixtures/parquet/dotted_twin.parquet";
     const q = "\"\\\"a\\\".\\\"b\\\"\""; // the JSON key "\"a\".\"b\""
-    const events = [_]struct { body: []const u8, want: []const u8 }{
+    try expectResponses("lambda dotted twin", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b, a.b\",\"aggregate\":\"count(*) AS n\"}",
             .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
@@ -461,35 +432,7 @@ test "lambda labels a nested GROUP BY key by its quoted path when a top-level co
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"max(a.b) AS m\"}",
             .want = "\"agg\":[{" ++ q ++ ":null,\"m\":3},{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null}]",
         },
-    };
-
-    var server = try FakeServer.start();
-    defer server.deinit();
-    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
-    defer std.testing.allocator.free(endpoint);
-    var child = try spawnLambda(std.testing.allocator, endpoint);
-    defer killChild(&child);
-
-    for (events) |ev| {
-        var poll = try server.acceptRequest(std.testing.allocator);
-        try poll.replyAndClose(
-            std.testing.allocator,
-            200,
-            "Lambda-Runtime-Aws-Request-Id: req-dotted-twin\r\nContent-Type: application/json\r\n",
-            ev.body,
-        );
-        var resp = try server.acceptRequest(std.testing.allocator);
-        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{}) catch |err| {
-            std.debug.print("[lambda dotted twin] invalid JSON ({s}): {s}\n", .{ @errorName(err), resp.body });
-            return err;
-        };
-        parsed.deinit();
-        if (std.mem.indexOf(u8, resp.body, ev.want) == null) {
-            std.debug.print("[lambda dotted twin] response: {s}\n", .{resp.body});
-            return error.TestUnexpectedResult;
-        }
-        try resp.replyAndClose(std.testing.allocator, 202, "", "");
-    }
+    });
 }
 
 /// Send each event in turn to one lambda process and require every response to be valid JSON containing `want`.
@@ -506,7 +449,7 @@ fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, w
         try poll.replyAndClose(
             std.testing.allocator,
             200,
-            "Lambda-Runtime-Aws-Request-Id: req-escapes\r\nContent-Type: application/json\r\n",
+            "Lambda-Runtime-Aws-Request-Id: req-event\r\nContent-Type: application/json\r\n",
             ev.body,
         );
         var resp = try server.acceptRequest(std.testing.allocator);

@@ -19,12 +19,10 @@ default:
 
 # Build (ReleaseFast) — produces zpq + zpq-lambda.
 build:
-    @./tools/r2-fetch-artifacts.sh
     zig build -Doptimize=ReleaseFast
 
 # Build with debug symbols.
 build-debug:
-    @./tools/r2-fetch-artifacts.sh
     zig build
 
 # Build the lean-core CLI — no SQL frontend (`-Dsql=false`), so liteparser
@@ -32,7 +30,6 @@ build-debug:
 # never includes SQL regardless; this is the minimal *CLI*. CI builds this
 # variant too, so the lean path can't bit-rot.
 build-minimal:
-    @./tools/r2-fetch-artifacts.sh
     zig build -Dsql=false -Doptimize=ReleaseFast cli
 
 # Verify all release targets compile (CLI + Lambda, x86_64 + arm64).
@@ -301,6 +298,7 @@ flamegraph-bpf duration="5":
 clean:
     rm -rf zig-out .zig-cache
 
-# Pre-fetch BoringSSL prebuilt artifacts.
+# Fill vendor/boring_tls/prebuilt/ with verified BoringSSL prebuilts so later
+# builds need no network (a normal build fetches them into .zig-cache itself).
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh

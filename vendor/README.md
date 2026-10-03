@@ -25,7 +25,9 @@ sources.
 ## boring_tls (`vendor/boring_tls`, Zig bindings over BoringSSL)
 
 - `build.zig` links prebuilt `libcrypto.a`/`libssl.a` from `prebuilt/<triple>/`, fetched from ZPQ's R2 bucket
-  when absent (present since the import).
+  when absent (present since the import). The URLs and sha256 digests are now pinned in `prebuilt.sha256`; a missing
+  pair is downloaded by a build step (`fetch_prebuilt.zig`) that verifies the digest and leaves the result in the Zig
+  cache, instead of by curl into the source tree at configure time.
 - `build.zig`, `src/tls.zig`: OpenSSL headers come through a translate-c step instead of `@cImport`, which Zig 0.17
-  removed; the prebuilt probe declares its file dependencies, since 0.17 runs the configure phase in its own
-  process, and a fetch poisons the configure cache.
+  removed, and the local-prebuilt probe declares its file dependencies to the configure cache, since 0.17 runs the
+  configure phase in its own process.

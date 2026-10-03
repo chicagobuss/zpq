@@ -100,15 +100,21 @@ REFEREE_OVERRIDES = {
 ```
 
 - `"authority": "hardwood"` — for strict-spec cases. DuckDB still runs and its answer is shown, but it gets no vote.
+  Without Hardwood, DuckDB can confirm ZPQ on such a file but not fail it: a disagreement is `INFO`. Every fixture in
+  `DUCKDB_STATS_DIVERGENCES` (`tools/oracle_compare.py`), where DuckDB prunes on statistics the spec says not to trust,
+  gets this override; `tools/differential.py` judges the same fixtures against rows pyarrow decodes.
 - `"expected"` — per result column (the probe's alias, e.g. `x_sum`, `total_rows`, `x_gt_count`); use when no engine
   can be trusted or Hardwood may be absent. `None` means SQL NULL.
 - `"why"` is required and printed with any non-OK result. Keep entries narrow: an override switches a referee off.
 
 ## Value Equality
-Hardwood 1.1's JSON export is typed for numbers and booleans and renders the rest as text; when one side of a pair is
-text, it is coerced toward the other side's type before comparing:
-- **Decimals:** ZPQ decodes DECIMALS to `f64`. Hardwood prints plain decimal strings; DuckDB returns `Decimal`. All
-  compare as floats.
+Numbers compare under the policy in `tools/oracle_compare.py`, shared with `tools/differential.py` (its docstring is the
+reference; `python tools/oracle_compare.py` checks it). Hardwood 1.1's JSON export is typed for numbers and booleans and
+renders the rest as text; when one side of a pair is text, it is coerced toward the other side's type before comparing:
+- **Nulls:** SQL NULL equals only NULL. An aggregate over no values is NULL on every engine, never 0.
+- **Integers:** exact, including integral results DuckDB widens to `DECIMAL`/`HUGEINT` (its integer `SUM`s).
+- **Decimals:** exact against each other. ZPQ answers `sum`/`min`/`max` of a DECIMAL column in `f64`, so those results
+  compare as floats; Hardwood prints plain decimal strings and DuckDB returns `Decimal`.
 - **Floats:** Compared using a relative tolerance ($1e-4$) to ignore precision jitter. `NaN` and `±Infinity` (strings
   in Hardwood's JSON) compare by token.
 - **Temporals:** ISO-8601 text with a `T` separator, trailing fractional zeros trimmed, UTC offset dropped. Hardwood

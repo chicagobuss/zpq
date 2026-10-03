@@ -9,14 +9,16 @@ duckdb_smoke only compares aggregate scalars; this compares the actual decoded
 rows ZPQ writes out against DuckDB's answer for the same query.
 
 For each (filter, projection): ZPQ writes filtered+projected parquet; we read it
-back and diff (order-independent, float/decimal tolerant) against DuckDB. DuckDB
-is the oracle (same role Hardwood gives it).
+back and diff it, order-independent, against DuckDB. DuckDB is the oracle (same
+role Hardwood gives it). Values compare under tools/oracle_compare.py: exact for
+NULL, integers and DECIMAL, tolerant for floats and zpq's f64 lane.
 
 Usage: .venv/bin/python tools/differential.py
 """
 import duckdb, subprocess, os, sys, tempfile, json
 import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
+from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, canon, same, self_check
 
 ZPQ = "zig-out/bin/zpq"
 # Physical column order of the fixture (gen_fixture below). `--columns` projects
@@ -108,16 +110,6 @@ def gen_fixture(con, path, n=4000):
 from decimal import Decimal
 
 
-def norm(v):
-    if isinstance(v, bool):
-        return 1 if v else 0
-    if isinstance(v, float) and v != v:
-        return "NaN"  # as zpq's jsonl prints it, and so NaN rows compare equal
-    if isinstance(v, (float, Decimal)):
-        return round(float(v), 4)
-    return v
-
-
 def fold_avg(v):
     """avg arrives as its re-aggregatable {sum, count} pair; no values averaged means NULL."""
     if isinstance(v, dict):
@@ -125,9 +117,18 @@ def fold_avg(v):
     return v
 
 
-def rows_sorted(con, sql):
-    rs = con.execute(sql).fetchall()
-    return sorted([tuple(norm(c) for c in row) for row in rs], key=repr)
+def canon_rows(rows, lanes=None):
+    """Rows as sorted tuples of canonical values (oracle_compare.canon), `lanes` giving each column's lane."""
+    return sorted((tuple(canon(v, lanes[i] if lanes else None) for i, v in enumerate(row)) for row in rows), key=repr)
+
+
+def rows_sorted(con, sql, lanes=None):
+    return canon_rows(con.execute(sql).fetchall(), lanes)
+
+
+def json_lanes(rel):
+    """Per result column of a DuckDB query: zpq's JSON answers a DECIMAL result from its f64 lane."""
+    return [F64 if str(d[1]).startswith("DECIMAL") else None for d in rel.description]
 
 
 # --- statistics order: columns whose stats order differs from the signed order of their bytes ---
@@ -180,7 +181,8 @@ STATS_ORDER_AGGS = {
                   lambda rows: [len(rows), sum(r["i"] for r in rows) if rows else None]),
     COLUMN_ORDER_FIXTURE: ("count(*) AS n, sum(i) AS si, min(s) AS lo", "count(*), sum(i), min(s)",
                            lambda rows: [len(rows), sum(r["i"] for r in rows) if rows else None,
-                                         min((r["s"].encode() for r in rows), default=b"").decode() or None]),
+                                         next((m.decode() for m in [min((r["s"].encode() for r in rows),
+                                                                         default=None)] if m is not None), None)]),
 }
 
 
@@ -204,18 +206,23 @@ def stats_order_checks(con, tmp):
         print(f"  {'OK  ' if ok else 'FAIL'}  stats-order:{label:28} {detail}")
 
     for label, fixture, zf, oracle in STATS_ORDER:
-        cols = [d[0] for d in con.execute(f"SELECT * FROM '{fixture}' LIMIT 0").description]
+        rel = con.execute(f"SELECT * FROM '{fixture}' LIMIT 0")
+        cols = [d[0] for d in rel.description]
+        row_lanes = json_lanes(rel)
         za, da, py_agg = STATS_ORDER_AGGS[fixture]
+        agg_lanes = json_lanes(con.execute(f"SELECT {da} FROM '{fixture}' LIMIT 0"))
         if callable(oracle):
+            assert fixture in DUCKDB_STATS_DIVERGENCES, f"{label}: DuckDB is overruled only where it is known to diverge"
             truth = [r for r in pq.read_table(fixture).to_pylist() if oracle(r)]
-            want = sorted([tuple(norm(r[c]) for c in cols) for r in truth], key=repr)
-            want_agg = [norm(v) for v in py_agg(truth)]
+            want_rows = [[r[c] for c in cols] for r in truth]
+            want_agg = py_agg(truth)
             src = "truth"
         else:
             where = f" WHERE {oracle}" if oracle is not None else ""
-            want = rows_sorted(con, f"SELECT {', '.join(cols)} FROM '{fixture}'{where}")
-            want_agg = [norm(v) for v in con.execute(f"SELECT {da} FROM '{fixture}'{where}").fetchone()]
+            want_rows = con.execute(f"SELECT {', '.join(cols)} FROM '{fixture}'{where}").fetchall()
+            want_agg = list(con.execute(f"SELECT {da} FROM '{fixture}'{where}").fetchone())
             src = "duck"
+        want = canon_rows(want_rows)
         filt = ["--filter", zf] if zf is not None else []
 
         total += 1
@@ -223,9 +230,9 @@ def stats_order_checks(con, tmp):
         if r.returncode != 0:
             report(False, f"{label} × jsonl", f"ZPQ error: {r.stderr.strip()[:70]}")
         else:
-            got = sorted([tuple(norm(json.loads(l)[c]) for c in cols) for l in r.stdout.splitlines() if l.strip()],
-                         key=repr)
-            report(got == want, f"{label} × jsonl", f"zpq={len(got)} {src}={len(want)} rows")
+            got = canon_rows([[json.loads(l)[c] for c in cols] for l in r.stdout.splitlines() if l.strip()], row_lanes)
+            want_json = canon_rows(want_rows, row_lanes)
+            report(got == want_json, f"{label} × jsonl", f"zpq={len(got)} {src}={len(want_json)} rows")
 
         total += 1
         out = os.path.join(tmp, "zstats.parquet")
@@ -236,7 +243,7 @@ def stats_order_checks(con, tmp):
             report(False, f"{label} × parquet", f"ZPQ error: {r.stderr.strip()[:70]}")
         else:
             tbl = pq.read_table(out)
-            got = sorted([tuple(norm(row[c]) for c in cols) for row in tbl.to_pylist()], key=repr)
+            got = canon_rows([[row[c] for c in cols] for row in tbl.to_pylist()])
             report(got == want, f"{label} × parquet", f"zpq={len(got)} {src}={len(want)} rows")
 
         # Unfiltered aggregates may be answered from statistics under --trust-stats; check that path too.
@@ -248,10 +255,8 @@ def stats_order_checks(con, tmp):
             if r.returncode != 0:
                 report(False, tag, f"ZPQ error: {r.stderr.strip()[:70]}")
                 continue
-            # An empty input sums to 0 in zpq and NULL in SQL; compare everything else exactly.
-            zvals = [norm(v) for v in json.loads(r.stdout)["agg"].values()]
-            ok = len(zvals) == len(want_agg) and all(
-                z == w or (w is None and z in (0, None)) for z, w in zip(zvals, want_agg))
+            zvals = list(json.loads(r.stdout)["agg"].values())
+            ok = len(zvals) == len(want_agg) and all(same(z, w, lane) for z, w, lane in zip(zvals, want_agg, agg_lanes))
             report(ok, tag, f"zpq={zvals} {src}={want_agg}")
 
     # Aliased unsigned references keep their values through --select; arithmetic on UINT64 is refused, not wrapped.
@@ -333,6 +338,7 @@ def stats_order_checks(con, tmp):
 
 
 def main():
+    self_check()
     con = duckdb.connect()
     tmp = tempfile.mkdtemp()
     fixture = os.path.join(tmp, "diff_fixture.parquet")
@@ -378,9 +384,9 @@ def main():
                     continue
             # Value diff vs the DuckDB oracle. Order-independent (DuckDB doesn't
             # guarantee row order); row-order determinism is checked separately.
-            canon = cols if cols is not None else \
+            sel_cols = cols if cols is not None else \
                 ["amt", "d", "flag", "id", "name", "nname", "price", "ts"]
-            sel = ", ".join(canon)
+            sel = ", ".join(sel_cols)
             where = f" WHERE {dw}" if dw is not None else ""
             try:
                 zrows = rows_sorted(con, f"SELECT {sel} FROM '{out}'")
@@ -452,19 +458,17 @@ def main():
 
             try:
                 zout = json.loads(r.stdout)
-                zvals = [norm(fold_avg(v)) for v in zout["agg"].values()]
+                zvals = [fold_avg(v) for v in zout["agg"].values()]
                 proven = zout.get("row_groups_full_match", 0)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
                 fails += 1
                 continue
             where = f" WHERE {dw}" if dw is not None else ""
-            dvals = [norm(v) for v in con.execute(f"SELECT {ds} FROM '{fixture}'{where}").fetchone()]
-            # tolerant scalar compare
-            ok = len(zvals) == len(dvals) and all(
-                (abs(float(a) - float(b)) <= 1e-4 * max(1.0, abs(float(b)))) if isinstance(b, (int, float)) and b is not None
-                else str(a) == str(b)
-                for a, b in zip(zvals, dvals))
+            duck = con.execute(f"SELECT {ds} FROM '{fixture}'{where}")
+            lanes = json_lanes(duck)
+            dvals = list(duck.fetchone())
+            ok = len(zvals) == len(dvals) and all(same(a, b, lane) for a, b, lane in zip(zvals, dvals, lanes))
             if ok:
                 print(f"  OK    {label}  {zvals}  (full-match row groups: {proven})")
             else:
@@ -530,13 +534,9 @@ def main():
             try:
                 duck_rel = con.execute(duck_query)
                 col_names = [desc[0] for desc in duck_rel.description]
-                drows = sorted([tuple(norm(c) for c in row) for row in duck_rel.fetchall()], key=repr)
-                
-                zrows_list = []
-                for row_dict in zrows_raw:
-                    row_tuple = tuple(norm(fold_avg(row_dict.get(c))) for c in col_names)
-                    zrows_list.append(row_tuple)
-                zrows = sorted(zrows_list, key=repr)
+                lanes = json_lanes(duck_rel)
+                drows = canon_rows(duck_rel.fetchall(), lanes)
+                zrows = canon_rows([[fold_avg(row_dict.get(c)) for c in col_names] for row_dict in zrows_raw], lanes)
             except Exception as e:
                 print(f"  FAIL  {label}  compare setup error: {e}")
                 fails += 1
@@ -565,12 +565,12 @@ def main():
                 vals = []
                 for v in row_dict.values():
                     vals += [v["sum"], v["count"]] if isinstance(v, dict) else [v]
-                want_rows.append(tuple(norm(v) for v in vals))
+                want_rows.append(tuple(canon(v) for v in vals))
             try:
                 if r.returncode != 0:
                     raise RuntimeError((r.stderr or r.stdout).strip()[:70])
                 tbl = pq.read_table(out)
-                got_rows = [tuple(norm(v.decode() if isinstance(v, bytes) else v) for v in row.values())
+                got_rows = [tuple(canon(v.decode() if isinstance(v, bytes) else v) for v in row.values())
                             for row in tbl.to_pylist()]
                 problem = None
                 if zrows_raw and list(tbl.column_names) != want_cols:
@@ -625,15 +625,13 @@ def main():
             types = [got.schema.field(c).type for c in (col, "lo", "hi", "n", "si")]
             if types != [want, want, want, pa.int64(), pa.int64()]:
                 raise RuntimeError(f"types {[str(t) for t in types]} want {want} x3, int64 x2")
-            # DuckDB hands back tz-aware timestamps only through pytz; compare them as naive UTC instead.
-            naive = lambda v: v.astimezone(dt.timezone.utc).replace(tzinfo=None) \
-                if isinstance(v, dt.datetime) and v.tzinfo else v
-            zrows = sorted((tuple(norm(naive(v)) for v in row.values()) for row in got.to_pylist()), key=repr)
+            # DuckDB hands back tz-aware timestamps only through pytz; it reads them as naive UTC instead, which is
+            # what canon() turns zpq's tz-aware values into.
+            lanes = [F64] * 3 + [None] * 2 if col == "dec" else None  # zpq writes DECIMAL extremes as DOUBLE
+            zrows = canon_rows([list(row.values()) for row in got.to_pylist()], lanes)
             c = f"timezone('UTC', {col})" if getattr(want, "tz", None) else col
-            drows = rows_sorted(con, f"SELECT {c}, min({c}), max({c}), count(*), sum(i8) FROM '{typed}' GROUP BY 1")
-            if col == "dec":  # zpq's DOUBLE vs DuckDB's DECIMAL: compare as numbers
-                drows = sorted((tuple(norm(None if v is None else float(v)) if j < 3 else v for j, v in enumerate(r_))
-                                for r_ in drows), key=repr)
+            drows = rows_sorted(con, f"SELECT {c}, min({c}), max({c}), count(*), sum(i8) FROM '{typed}' GROUP BY 1",
+                                lanes)
             if zrows != drows:
                 raise RuntimeError(f"rows zpq={zrows[:2]} duck={drows[:2]}")
             print(f"  OK    {label}  ({want})")

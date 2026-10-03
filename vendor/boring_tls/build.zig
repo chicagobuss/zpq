@@ -2,17 +2,21 @@ const std = @import("std");
 
 /// boring_tls build — prebuilt-only.
 ///
-/// We never source-build BoringSSL from this build.zig. The toolchain
-/// requires prebuilt `libcrypto.a` + `libssl.a` to be present under
-/// `prebuilt/<triple>/`, which `tools/r2-fetch-artifacts.sh` populates
-/// from a public R2 bucket. If they're missing locally we attempt the
-/// same fetch via curl and fail fast otherwise.
+/// We never source-build BoringSSL from this build.zig; it links prebuilt
+/// `libcrypto.a` + `libssl.a`, pinned by URL and sha256 in
+/// `prebuilt.sha256`. Each archive comes from one of two places:
+///
+///   - `prebuilt/<arch>-<os>/`, if both files are there: a local override
+///     for offline builds or a locally built BoringSSL, used as is.
+///     `tools/r2-fetch-artifacts.sh` fills it with verified downloads.
+///   - Otherwise a build step downloads the pinned URL, checks the digest,
+///     and keeps the result in the Zig cache, so it runs once per cache.
 ///
 /// The previous incarnation also had source-build paths (~500 lines).
 /// They were ripped out when migrating to Zig 0.16.0 — the project has
 /// always shipped prebuilt artifacts in practice, and the dead path was
 /// dragging multiple 0.16.0 incompatibilities.
-const R2_PUBLIC_URL = "https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev";
+const manifest = @embedFile("prebuilt.sha256");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -21,7 +25,7 @@ pub fn build(b: *std.Build) !void {
     const fetch_prebuilt = b.option(
         bool,
         "fetch-prebuilt",
-        "Fetch prebuilt libraries from R2 if not found locally",
+        "Fetch the pinned prebuilt libraries when prebuilt/<arch>-<os>/ lacks them",
     ) orelse true;
 
     // BoringSSL source dep — we only need the public C headers.
@@ -33,28 +37,45 @@ pub fn build(b: *std.Build) !void {
         "{s}-{s}",
         .{ @tagName(target_info.cpu.arch), @tagName(target_info.os.tag) },
     );
-    const prebuilt_path = b.path(b.fmt("prebuilt/{s}", .{triple}));
+    const libs = [_][]const u8{ "libcrypto.a", "libssl.a" };
 
-    // Configure-time file probes must be declared so the configure cache
-    // reruns when the prebuilt archives appear or vanish.
-    b.dependOnFileMetadata(prebuilt_path.path(b, "libcrypto.a"));
-    b.dependOnFileMetadata(prebuilt_path.path(b, "libssl.a"));
-    const crypto_rel = b.fmt("prebuilt/{s}/libcrypto.a", .{triple});
-    const ssl_rel = b.fmt("prebuilt/{s}/libssl.a", .{triple});
-
-    const have_locally = (b.root.access(b.graph.io, crypto_rel, .{}) catch null) != null and
-        (b.root.access(b.graph.io, ssl_rel, .{}) catch null) != null;
-
-    if (!have_locally) {
+    const have_locally = probeLocalPrebuilts(b, triple, &libs);
+    var lib_paths: [libs.len]std.Build.LazyPath = undefined;
+    if (have_locally) {
+        for (libs, &lib_paths) |lib, *path| path.* = b.path(b.fmt("prebuilt/{s}/{s}", .{ triple, lib }));
+    } else {
         if (!fetch_prebuilt) {
             std.log.err(
-                "boring_tls: prebuilt artifacts missing for {s} and -Dfetch-prebuilt=false",
-                .{triple},
+                "boring_tls: prebuilt/{s}/ lacks libcrypto.a and libssl.a, and -Dfetch-prebuilt=false; " ++
+                    "run tools/r2-fetch-artifacts.sh {s} to fill it",
+                .{ triple, triple },
             );
             return error.PrebuiltNotFound;
         }
-        std.log.info("boring_tls: fetching prebuilt artifacts for {s}...", .{triple});
-        try fetchFromR2(b, triple);
+        const fetcher = b.addExecutable(.{
+            .name = "fetch_prebuilt",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("fetch_prebuilt.zig"),
+                .target = b.graph.host,
+                // Fixed, so the fetch step's cache key doesn't follow
+                // -Doptimize. Debug compiles in seconds and still hashes
+                // the archives faster than the network delivers them.
+                .optimize = .Debug,
+            }),
+        });
+        for (libs, &lib_paths) |lib, *path| {
+            const pin = pinned(b.fmt("{s}/{s}", .{ triple, lib })) orelse {
+                std.log.err(
+                    "boring_tls: no prebuilt {s} is pinned for {s}; supported targets are listed in vendor/boring_tls/prebuilt.sha256",
+                    .{ lib, triple },
+                );
+                return error.PrebuiltNotFound;
+            };
+            const fetch = b.addRunArtifact(fetcher);
+            fetch.setName(b.fmt("fetch {s}/{s}", .{ triple, lib }));
+            fetch.addArgs(&.{ pin.url, pin.sha256 });
+            path.* = fetch.addOutputFileArg(lib);
+        }
     }
 
     const boring_tls_mod = b.addModule("boring_tls", .{
@@ -94,42 +115,41 @@ pub fn build(b: *std.Build) !void {
     openssl_c.addIncludePath(boringssl_dep.path("include"));
     boring_tls_mod.addImport("openssl_c", openssl_c.createModule());
 
-    boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
-    boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libssl.a"));
+    for (lib_paths) |path| boring_tls_mod.addObjectFile(path);
     boring_tls_mod.linkSystemLibrary("c++", .{});
 }
 
-fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
-    // Fetching is a configure-time side effect the cache cannot track.
-    b.graph.poisonCache();
-    const prebuilt_dir = try b.root.joinString(b.allocator, b.fmt("prebuilt/{s}", .{triple}));
-
-    // No pre-create: `curl --create-dirs` below builds the full path,
-    // including missing parents. (A non-recursive createDir here used
-    // to panic on fresh clones, where `prebuilt/` itself doesn't exist.)
-    const files = [_][]const u8{ "libcrypto.a", "libssl.a" };
-    for (files) |filename| {
-        const url = b.fmt("{s}/boring_tls/{s}/{s}", .{ R2_PUBLIC_URL, triple, filename });
-        const full_dest = b.fmt("{s}/{s}", .{ prebuilt_dir, filename });
-
-        const result = std.process.run(b.allocator, b.graph.io, .{
-            .argv = &[_][]const u8{ "curl", "-fSL", "--create-dirs", "-o", full_dest, url },
-        }) catch |err| {
-            std.log.err("curl spawn failed: {}", .{err});
-            return err;
-        };
-        b.allocator.free(result.stdout);
-        b.allocator.free(result.stderr);
-
-        switch (result.term) {
-            .exited => |code| if (code != 0) {
-                std.log.err("curl exited with code {} fetching {s}", .{ code, filename });
-                return error.FetchFailed;
-            },
-            else => {
-                std.log.err("curl terminated abnormally: {any}", .{result.term});
-                return error.FetchFailed;
-            },
-        }
+/// Whether `prebuilt/<triple>/` holds every lib. The probe runs at configure
+/// time, so it is declared to the configure cache. Zig cannot track a path
+/// that doesn't exist, so this tracks the entry list of the deepest directory
+/// on the way that does: whatever appears next changes that list.
+fn probeLocalPrebuilts(b: *std.Build, triple: []const u8, libs: []const []const u8) bool {
+    const dir = b.fmt("prebuilt/{s}", .{triple});
+    for ([_][]const u8{ dir, "prebuilt", "." }) |rel| {
+        if (b.root.access(b.graph.io, rel, .{})) |_| {
+            b.dependOnDirectoryContents(b.path(rel));
+            break;
+        } else |_| {}
     }
+    for (libs) |lib| {
+        b.root.access(b.graph.io, b.fmt("{s}/{s}", .{ dir, lib }), .{}) catch return false;
+    }
+    return true;
+}
+
+const Pin = struct { url: []const u8, sha256: []const u8 };
+
+/// Looks `<target>/<file>` up in prebuilt.sha256 (`<target>/<file> <sha256> <url>`
+/// per line, `#` comments).
+fn pinned(key: []const u8) ?Pin {
+    var lines = std.mem.tokenizeScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        if (!std.mem.eql(u8, fields.next() orelse continue, key)) continue;
+        const sha256 = fields.next() orelse return null;
+        const url = fields.next() orelse return null;
+        return .{ .url = url, .sha256 = sha256 };
+    }
+    return null;
 }

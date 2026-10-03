@@ -678,6 +678,7 @@ fn stripStringQuotes(s: []const u8) []const u8 {
 
 const testing = std.testing;
 const thrift = @import("../thrift.zig");
+const test_fixtures = @import("../parquet/test_fixtures.zig");
 
 // Mini synthetic FileMetaData for parser tests. Avoids needing a real
 // fixture file just to exercise the parser.
@@ -1267,7 +1268,7 @@ test "parse binds a bare name to the top-level column, not a nested leaf sharing
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const meta = try metadata.sharedLeafNameMetaForTest(a);
+    const meta = try test_fixtures.sharedLeafNameMeta(a);
 
     const top = try parse(a, "key > 1005", &meta);
     try testing.expect(top == .int64);
@@ -1292,7 +1293,7 @@ test "parse binds a quoted path to the nested leaf a top-level column's dotted n
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var meta = try metadata.sharedLeafNameMetaForTest(a);
+    var meta = try test_fixtures.sharedLeafNameMeta(a);
     meta.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`, beside the group r's field key
 
     try testing.expectEqual(@as(usize, 2), (try parse(a, "r.key > 1005", &meta)).int64.col_idx);

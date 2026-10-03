@@ -107,9 +107,10 @@ validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks th
 
 ## Build
 
-Requires **Zig 0.16.0** (release, not master) — pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
-the pinned toolchain to `~/.zvm/0.16.0` and warms the build. The first build fetches prebuilt BoringSSL artifacts from
-R2. No source builds. No system OpenSSL.
+Requires **Zig 0.17.0** (release, not master) — pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
+the pinned toolchain to `~/.zvm/0.17.0` and warms the build. The first build fetches prebuilt BoringSSL artifacts from
+R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha256`; `just fetch-deps` stores them in
+`vendor/boring_tls/prebuilt/` for offline builds. No source builds. No system OpenSSL.
 
 ```bash
 just build           # ReleaseFast — both binaries

@@ -459,8 +459,8 @@ pub const SchemaElement = struct {
 /// Such a column's top bit is a value bit, not a sign bit, so decoding it — or
 /// reading its `Statistics` min/max — as a signed `i32` turns `0xFFFFFFFF` into
 /// `-1` and corrupts sum/min/max. Callers route these through the zero-extended
-/// i64 lane instead. uint64 is intentionally excluded: a u64 (or its sum)
-/// overflows i64, so it needs the wider-accumulator work tracked separately.
+/// i64 lane instead. uint64 is excluded: a u64 can't zero-extend into i64, so
+/// `isUnsignedInt64` gives it its own lane.
 pub fn isUnsignedIntTo32(se: SchemaElement) bool {
     if (se.logical_type) |lt| switch (lt) {
         .INTEGER => |it| return !it.isSigned and it.bitWidth <= 32,
@@ -489,8 +489,10 @@ pub fn isUnsignedInt64(se: SchemaElement) bool {
     return false;
 }
 
-/// Any unsigned integer column. Used to force the decode path (the stats
-/// short-circuit reads min/max bytes in signed order).
+/// Any unsigned integer column. Its statistics are unsigned-ordered, so the
+/// signed stat fold and signed pruning must not read them; its values sit in
+/// the signed physical lane as raw bits, so filters, output and the writer
+/// treat them as unsigned.
 pub fn isUnsignedInt(se: SchemaElement) bool {
     return isUnsignedIntTo32(se) or isUnsignedInt64(se);
 }

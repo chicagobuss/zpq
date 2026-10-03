@@ -296,6 +296,7 @@ pub const MemorySink = struct {
 
 const testing = std.testing;
 const metadata = @import("../parquet/metadata.zig");
+const readFileSlice = metadata.readFileSlice;
 
 test "streaming.build is byte-identical to fastpath.buildMulti (no projection)" {
     const fixture_path = "data/benchmark_100mb.parquet";
@@ -463,46 +464,4 @@ test "streaming.build N=10 multi-file" {
         "[streaming] N=10 multi: {d}B, {d} row groups\n",
         .{ msink.buffer.items.len, out_meta.row_groups.items.len },
     );
-}
-
-fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = signedOrError(r_open) catch return error.FileNotFound;
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    if (errIs(end_pos)) return error.SeekFailed;
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        if (errIs(n)) return error.ReadFailed;
-        const bytes: usize = @intCast(n);
-        if (bytes == 0) break;
-        off += bytes;
-    }
-    return buf;
-}
-
-fn errIs(r: usize) bool {
-    const signed: isize = @bitCast(r);
-    return signed >= -4095 and signed < 0;
-}
-
-fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
-    if (errIs(r)) return error.SyscallFailed;
-    return @intCast(@as(isize, @bitCast(r)));
 }

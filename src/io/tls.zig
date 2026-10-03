@@ -13,7 +13,8 @@
 //! change without changing the TLS logic.
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const posix = std.posix;
 const boring = @import("boring_tls");
 
 pub const Error = error{
@@ -27,7 +28,7 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 pub const Connection = struct {
-    fd: linux.fd_t,
+    fd: posix.fd_t,
     tls: boring.tls_client.TlsClient,
     allocator: std.mem.Allocator,
     plain: bool = false,
@@ -51,7 +52,7 @@ pub const Connection = struct {
         sni_host: []const u8,
     ) Error!Connection {
         const fd = try openTcp(addr_v4, port);
-        errdefer _ = linux.close(fd);
+        errdefer closeFd(fd);
 
         var tls = boring.tls_client.TlsClient.init(allocator, sni_host, .{ .verify_certificate = true }) catch return error.HandshakeFailed;
         errdefer tls.deinit();
@@ -89,7 +90,7 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection) void {
         self.pending.deinit(self.allocator);
         if (!self.plain) self.tls.deinit();
-        _ = linux.close(self.fd);
+        closeFd(self.fd);
         self.* = undefined;
     }
 
@@ -154,11 +155,14 @@ pub const Connection = struct {
 // Raw socket helpers
 // ============================================================
 
-fn openTcp(addr_v4: []const u8, port: u16) Error!linux.fd_t {
-    const r = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    if (errIs(r)) return error.SocketFailed;
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r)));
-    errdefer _ = linux.close(fd);
+fn openTcp(addr_v4: []const u8, port: u16) Error!posix.fd_t {
+    // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
+    const cloexec_flag = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+    const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
+    if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
+    const fd: posix.fd_t = @intCast(r);
+    errdefer closeFd(fd);
+    if (builtin.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
 
     var parts: [4]u8 = undefined;
     var i: usize = 0;
@@ -169,35 +173,35 @@ fn openTcp(addr_v4: []const u8, port: u16) Error!linux.fd_t {
     }
     if (i != 4) return error.DnsFailed;
 
-    var addr = std.mem.zeroes(linux.sockaddr.in);
-    addr.family = linux.AF.INET;
-    addr.port = std.mem.nativeToBig(u16, port);
+    // `posix.sockaddr.in` carries Darwin's leading `len` byte and defaults `family`.
     const ip: u32 = (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | parts[3];
-    addr.addr = std.mem.nativeToBig(u32, ip);
+    const addr: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, ip),
+    };
 
-    const cr = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    if (errIs(cr)) return error.ConnectFailed;
+    const cr = posix.system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    if (posix.errno(cr) != .SUCCESS) return error.ConnectFailed;
     return fd;
 }
 
-fn writeAll(fd: linux.fd_t, buf: []const u8) Error!void {
+fn closeFd(fd: posix.fd_t) void {
+    _ = posix.system.close(fd);
+}
+
+fn writeAll(fd: posix.fd_t, buf: []const u8) Error!void {
     var off: usize = 0;
     while (off < buf.len) {
-        const r = linux.write(fd, buf[off..].ptr, buf.len - off);
-        if (errIs(r)) return error.SendFailed;
+        const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
+        if (posix.errno(r) != .SUCCESS) return error.SendFailed;
         const n: usize = @intCast(r);
         if (n == 0) return error.SendFailed;
         off += n;
     }
 }
 
-fn readSome(fd: linux.fd_t, buf: []u8) error{ReadFailed}!usize {
-    const r = linux.read(fd, buf.ptr, buf.len);
-    if (errIs(r)) return error.ReadFailed;
+fn readSome(fd: posix.fd_t, buf: []u8) error{ReadFailed}!usize {
+    const r = posix.system.read(fd, buf.ptr, buf.len);
+    if (posix.errno(r) != .SUCCESS) return error.ReadFailed;
     return @intCast(r);
-}
-
-fn errIs(r: usize) bool {
-    const signed: isize = @bitCast(r);
-    return signed >= -4095 and signed < 0;
 }

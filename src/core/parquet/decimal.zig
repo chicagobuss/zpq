@@ -903,36 +903,7 @@ test "kindFromSchema accepts legacy ConvertedType.DECIMAL" {
 // values + sum match.
 
 const metadata = @import("metadata.zig");
-
-fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (@as(isize, @bitCast(r_open)) < 0) return error.FileNotFound;
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        const bytes: usize = @intCast(@as(isize, @bitCast(n)));
-        if (bytes == 0) break;
-        off += bytes;
-    }
-    return buf;
-}
+const readFileSlice = metadata.readFileSlice;
 
 fn checkDecimalFixture(
     fixture_path: []const u8,

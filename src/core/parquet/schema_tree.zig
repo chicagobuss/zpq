@@ -614,29 +614,7 @@ const testing = std.testing;
 const metadata = @import("metadata.zig");
 
 fn readFile(arena: std.mem.Allocator, path: []const u8) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    if (@as(isize, @bitCast(r_open)) < 0) return error.FileNotFound;
-    defer _ = linux.close(fd);
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-    const buf = try arena.alloc(u8, size);
-    var off: usize = 0;
-    while (off < size) {
-        const r = linux.read(fd, buf[off..].ptr, size - off);
-        const n: isize = @bitCast(r);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-    return buf;
+    return metadata.readFileSlice(path, arena);
 }
 
 test "build tree from flat fixture (benchmark_100mb.parquet)" {

@@ -29,6 +29,7 @@ const column = zpq.core.parquet.column;
 const schema_tree = zpq.core.parquet.schema_tree;
 const engine = zpq.engine;
 const s3 = zpq.io.s3;
+const local_fs = zpq.local_fs;
 
 const usage_text =
     \\usage:
@@ -402,7 +403,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             group_by = pq.group_by_str;
             select_cols = pq.select_cols;
 
-            const matches = try expandGlob(arena, pq.table_name, env);
+            const matches = try expandGlob(arena, io, pq.table_name, env);
             if (matches.len == 0) {
                 std.debug.print("zpq query: no files matched FROM table: {s}\n", .{pq.table_name});
                 return error.NoMatches;
@@ -416,7 +417,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         }
     } else {
         for (inputs_raw.items) |pat| {
-            const matches = try expandGlob(arena, pat, env);
+            const matches = try expandGlob(arena, io, pat, env);
             if (matches.len == 0) {
                 std.debug.print("zpq query: no files matched: {s}\n", .{pat});
                 return error.NoMatches;
@@ -651,7 +652,7 @@ fn splitCsv(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
 /// Plain paths (no glob char) pass through as a single-element slice.
 /// Only `*` is supported as a wildcard, in the basename only — covers
 /// the duckdb-style `prefix/*.parquet` shape we want for the demo.
-fn expandGlob(arena: std.mem.Allocator, pattern: []const u8, env: std.process.Environ) ![][]const u8 {
+fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env: std.process.Environ) ![][]const u8 {
     // s3:// patterns: handled separately. Plain s3 URLs (no glob char)
     // pass through; globbed s3 URLs go through ListObjectsV2.
     if (std.mem.startsWith(u8, pattern, "s3://")) {
@@ -673,52 +674,18 @@ fn expandGlob(arena: std.mem.Allocator, pattern: []const u8, env: std.process.En
         return error.BadArgs;
     }
 
-    const linux = std.os.linux;
-    var dir_z: [4096]u8 = undefined;
-    if (dir_path.len + 1 > dir_z.len) return error.PathTooLong;
-    @memcpy(dir_z[0..dir_path.len], dir_path);
-    dir_z[dir_path.len] = 0;
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&dir_z[0]), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    const r_open_signed: isize = @bitCast(r_open);
-    if (r_open_signed < 0) {
+    const names = local_fs.listFiles(arena, io, dir_path) catch {
         std.debug.print("zpq query: cannot open dir {s}\n", .{dir_path});
         return error.OpenFailed;
-    }
-    const fd: i32 = @intCast(r_open_signed);
-    defer _ = linux.close(fd);
-
+    };
     var out: std.ArrayList([]const u8) = .empty;
-    var buf: [8192]u8 align(8) = undefined;
-    while (true) {
-        const n = linux.getdents64(fd, &buf, buf.len);
-        const n_signed: isize = @bitCast(n);
-        if (n_signed < 0) return error.GetdentsFailed;
-        if (n == 0) break;
-        var off: usize = 0;
-        while (off < n) {
-            const entry: *const linux.dirent64 = @ptrCast(@alignCast(&buf[off]));
-            const reclen: usize = entry.reclen;
-            // Skip non-regular-file entries. A regular file or a symlink
-            // pointing at one are both reasonable inputs; DT.UNKNOWN
-            // means the FS didn't report a type and we just trust the
-            // glob match.
-            const ok_type = entry.type == linux.DT.REG or
-                entry.type == linux.DT.LNK or
-                entry.type == linux.DT.UNKNOWN;
-            if (ok_type) {
-                const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
-                const name_len = std.mem.indexOfSentinel(u8, 0, name_ptr);
-                const name = name_ptr[0..name_len];
-                if (matchSimpleGlob(basename, name)) {
-                    const full = if (last_slash != null)
-                        try std.fs.path.join(arena, &.{ dir_path, name })
-                    else
-                        try arena.dupe(u8, name);
-                    try out.append(arena, full);
-                }
-            }
-            off += reclen;
-        }
+    for (names) |name| {
+        if (!matchSimpleGlob(basename, name)) continue;
+        const full = if (last_slash != null)
+            try std.fs.path.join(arena, &.{ dir_path, name })
+        else
+            name;
+        try out.append(arena, full);
     }
     std.sort.pdq([]const u8, out.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -1000,7 +967,7 @@ fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
 var query_diag: zpq.core.scan.Diag = .{};
 
 const StdoutWriter = struct {
-    fd: std.os.linux.fd_t = 1,
+    fd: local_fs.fd_t = 1,
     inner: ?engine.StdoutWriter = null,
 
     fn getInner(self: *StdoutWriter) *engine.StdoutWriter {
@@ -1030,36 +997,11 @@ const StdoutWriter = struct {
 };
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [1024]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const r_open_signed: isize = @bitCast(r_open);
-    if (r_open_signed < 0) return error.OpenFailed;
-    const fd: linux.fd_t = @intCast(r_open_signed);
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-
-    var off: usize = 0;
-    while (off < size) {
-        const r = linux.read(fd, buf[off..].ptr, size - off);
-        const n: isize = @bitCast(r);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-    if (off != size) return error.ShortRead;
-    return buf;
+    return local_fs.readFile(allocator, path) catch |err| switch (err) {
+        error.OutOfMemory, error.ShortRead => err,
+        error.NameTooLong => error.PathTooLong,
+        else => error.OpenFailed,
+    };
 }
 
 fn printLogicalType(ws: *StdoutWriter, lt: schema.LogicalType) !void {

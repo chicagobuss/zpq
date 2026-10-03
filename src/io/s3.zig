@@ -1147,35 +1147,8 @@ fn extractTag(haystack: []const u8, open_tag: []const u8, close_tag: []const u8)
 // DNS via libc getaddrinfo
 // ============================================================
 
-const c = struct {
-    extern fn getaddrinfo(
-        node: [*:0]const u8,
-        service: ?[*:0]const u8,
-        hints: ?*const addrinfo,
-        res: *?*addrinfo,
-    ) c_int;
-    extern fn freeaddrinfo(res: *addrinfo) void;
-
-    const addrinfo = extern struct {
-        flags: c_int,
-        family: c_int,
-        socktype: c_int,
-        protocol: c_int,
-        addrlen: u32,
-        addr: ?*sockaddr,
-        canonname: ?[*:0]u8,
-        next: ?*addrinfo,
-    };
-
-    const sockaddr = extern struct {
-        family: u16,
-        port: u16,
-        addr: u32, // for IPv4 only
-        zero: [8]u8,
-    };
-
-    const AF_INET: c_int = 2;
-};
+// `std.c.addrinfo` follows each OS's layout: Darwin orders `canonname` before `addr`, the reverse of Linux.
+const c = std.c;
 
 /// URI-encode an S3 key for use in path + SigV4 canonical URI. Both
 /// the HTTP request line and the SigV4 signature canonical-URI must
@@ -1209,14 +1182,15 @@ pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 
     const host_z = try arena.dupeSentinel(u8, host, 0);
 
     var hints = std.mem.zeroes(c.addrinfo);
-    hints.family = c.AF_INET;
+    hints.family = c.AF.INET;
     var result: ?*c.addrinfo = null;
     const rc = c.getaddrinfo(host_z, null, &hints, &result);
-    if (rc != 0 or result == null) return error.DnsFailed;
+    if (@backingInt(rc) != 0 or result == null) return error.DnsFailed;
     defer c.freeaddrinfo(result.?);
 
     const sa = result.?.addr orelse return error.DnsFailed;
-    const ip = std.mem.bigToNative(u32, sa.addr);
+    const sin: *align(1) const c.sockaddr.in = @ptrCast(sa);
+    const ip = std.mem.bigToNative(u32, sin.addr);
     return std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{
         (ip >> 24) & 0xff,
         (ip >> 16) & 0xff,

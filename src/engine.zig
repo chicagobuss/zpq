@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const nowMonoNs = @import("clock.zig").monoNs;
+const local_fs = @import("local_fs.zig");
 
 const schema = @import("core/schema.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
@@ -699,9 +700,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var mp_sink: ?multipart_sink.MultipartSink = null;
     var sink: streaming.Sink = undefined;
     var sink_owns_fd = false;
-    defer if (sink_owns_fd) {
-        _ = std.os.linux.close(fd_sink.fd);
-    };
+    defer if (sink_owns_fd) local_fs.close(fd_sink.fd);
     var out_owned_pool: ?*s3.Pool(POOL_SIZE) = null;
     defer if (out_owned_pool) |p| p.deinit();
     defer if (mp_sink) |*ms| {
@@ -711,7 +710,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 
     // A failed write must not leave a truncated local file that looks like output.
     var remove_on_error = false;
-    errdefer if (remove_on_error) removeFile(out_path);
+    errdefer if (remove_on_error) local_fs.removeFile(out_path);
     if (out_is_s3) {
         const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
         const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
@@ -1151,7 +1150,7 @@ const OpenedInputs = struct {
     has_preparsed_meta: bool = false,
     /// Per-input mmap state — set for local files so we can munmap on
     /// deinit. Null for s3 inputs (their bytes live in the arena).
-    mmaps: []const ?MmapHandle,
+    mmaps: []const ?local_fs.Mapped,
     /// One s3 pool per bucket touched. Owned here when the caller's
     /// `Context.pool_registry` is null; borrowed otherwise.
     owned_pools: []*s3.Pool(POOL_SIZE),
@@ -1160,7 +1159,7 @@ const OpenedInputs = struct {
     s3_buffers: []const []u8,
 
     pub fn deinit(self: *OpenedInputs) void {
-        for (self.mmaps) |m_opt| if (m_opt) |m| munmapFile(m);
+        for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
         for (self.s3_buffers) |buf| self.gpa.free(buf);
         for (self.owned_pools) |p| {
             p.deinit();
@@ -1216,11 +1215,6 @@ pub fn fetchS3Schema(
     return metadata.openFooter(arena, footer_copy);
 }
 
-const MmapHandle = struct {
-    addr: [*]const u8,
-    len: usize,
-};
-
 fn openInputs(
     ctx: Context,
     arena: std.mem.Allocator,
@@ -1231,7 +1225,7 @@ fn openInputs(
     var metas = try arena.alloc(schema.FileMetaData, paths.len);
     var meta_ready = try arena.alloc(bool, paths.len);
     @memset(meta_ready, false);
-    var mmaps = try arena.alloc(?MmapHandle, paths.len);
+    var mmaps = try arena.alloc(?local_fs.Mapped, paths.len);
     @memset(mmaps, null);
 
     // First pass: classify and group s3 URLs by bucket so we can build
@@ -1249,16 +1243,16 @@ fn openInputs(
 
     // Local: mmap each, slice into bytes.
     for (local_indices.items) |i| {
-        const m = mmapFile(paths[i]) catch |err| {
+        const m = local_fs.mapFile(paths[i]) catch |err| {
             switch (err) {
                 error.EmptyFile => std.debug.print("zpq query: input file {s} is empty\n", .{paths[i]}),
-                error.PathTooLong => std.debug.print("zpq query: input file path {s} too long\n", .{paths[i]}),
+                error.NameTooLong => std.debug.print("zpq query: input file path {s} too long\n", .{paths[i]}),
                 else => std.debug.print("zpq query: failed to open input file {s} ({s})\n", .{ paths[i], @errorName(err) }),
             }
             return error.AlreadyReported;
         };
         mmaps[i] = m;
-        inputs[i] = .{ .name = paths[i], .bytes = m.addr[0..m.len], .logical_size = m.len };
+        inputs[i] = .{ .name = paths[i], .bytes = m.bytes, .logical_size = m.bytes.len };
     }
 
     // S3: gather per-bucket batches, one pool per bucket, fetch each
@@ -1881,48 +1875,6 @@ fn parseTotalFromContentRange(hdr: ?[]const u8) !u64 {
 }
 
 // ============================================================
-// Local mmap (Linux-only — same as cli/query.zig had)
-// ============================================================
-
-fn mmapFile(path: []const u8) !MmapHandle {
-    const linux = std.os.linux;
-    var path_z: [4096]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const r_open_signed: isize = @bitCast(r_open);
-    if (r_open_signed < 0) return error.OpenFailed;
-    const fd: linux.fd_t = @intCast(r_open_signed);
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    const size: usize = @intCast(end_pos);
-    if (size == 0) return error.EmptyFile;
-
-    const r_map = linux.mmap(
-        null,
-        size,
-        .{ .READ = true },
-        .{ .TYPE = .PRIVATE },
-        @intCast(fd),
-        0,
-    );
-    const r_signed: isize = @bitCast(r_map);
-    if (r_signed < 0) return error.OpenFailed;
-
-    const ptr: [*]const u8 = @ptrFromInt(r_map);
-
-    return .{ .addr = ptr, .len = size };
-}
-
-fn munmapFile(m: MmapHandle) void {
-    _ = std.os.linux.munmap(@ptrCast(@constCast(m.addr)), m.len);
-}
-
-// ============================================================
 // 1-row aggregate output (local files)
 // ============================================================
 
@@ -1937,8 +1889,8 @@ fn writeOneRowParquet(
     codec: schema.CompressionCodec,
 ) !u64 {
     const fd = try createFile(out_path);
-    defer _ = std.os.linux.close(fd);
-    errdefer removeFile(out_path);
+    defer local_fs.close(fd);
+    errdefer local_fs.removeFile(out_path);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
 
@@ -1983,7 +1935,7 @@ fn writeGroupedParquet(
     };
 
     const fd = try createFile(out_path);
-    defer _ = std.os.linux.close(fd);
+    defer local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
     return consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec);
@@ -2095,47 +2047,22 @@ fn groupedColumn(
 }
 
 const FdSink = struct {
-    fd: std.os.linux.fd_t,
+    fd: local_fs.fd_t,
     written: u64 = 0,
 
     pub fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FdSink = @ptrCast(@alignCast(ctx));
-        var i: usize = 0;
-        while (i < bytes.len) {
-            const r = std.os.linux.write(self.fd, bytes.ptr + i, bytes.len - i);
-            const n: isize = @bitCast(r);
-            if (n <= 0) return error.WriteFailed;
-            i += @intCast(n);
-        }
+        try local_fs.writeAll(self.fd, bytes);
         self.written += bytes.len;
     }
 };
 
-/// Best-effort unlink of a partly written output; `createFile` already
-/// accepted the path, so it fits.
-fn removeFile(path: []const u8) void {
-    var path_z: [4096]u8 = undefined;
-    if (path.len + 1 > path_z.len) return;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    _ = std.os.linux.unlinkat(std.os.linux.AT.FDCWD, @ptrCast(&path_z[0]), 0);
-}
-
-fn createFile(path: []const u8) !std.os.linux.fd_t {
-    const linux = std.os.linux;
-    var path_z: [4096]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const r = linux.openat(
-        linux.AT.FDCWD,
-        @ptrCast(&path_z[0]),
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
-        0o644,
-    );
-    const r_signed: isize = @bitCast(r);
-    if (r_signed < 0) return error.OpenFailed;
-    return @intCast(r_signed);
+/// Keeps the engine's `OpenFailed` / `PathTooLong` contract over `local_fs.createFile`'s detailed errors.
+fn createFile(path: []const u8) !local_fs.fd_t {
+    return local_fs.createFile(path) catch |err| switch (err) {
+        error.NameTooLong => error.PathTooLong,
+        else => error.OpenFailed,
+    };
 }
 
 // ============================================================
@@ -2148,8 +2075,7 @@ pub const PrintFormat = enum {
 };
 
 pub const StdoutWriter = struct {
-    const linux = std.os.linux;
-    fd: linux.fd_t = 1,
+    fd: local_fs.fd_t = 1,
     buf: [4096]u8 = undefined,
     pos: usize = 0,
 
@@ -2177,15 +2103,9 @@ pub const StdoutWriter = struct {
 
     pub fn flush(self: *StdoutWriter) !void {
         if (self.pos == 0) return;
-        var written: usize = 0;
-        while (written < self.pos) {
-            const r = linux.write(self.fd, self.buf[written..].ptr, self.pos - written);
-            const n: isize = @bitCast(r);
-            if (n < 0) return error.BrokenPipe;
-            if (n == 0) break;
-            written += @intCast(n);
-        }
+        const pending = self.buf[0..self.pos];
         self.pos = 0;
+        local_fs.writeAll(self.fd, pending) catch return error.BrokenPipe;
     }
 };
 

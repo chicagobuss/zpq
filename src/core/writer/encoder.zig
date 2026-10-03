@@ -1759,28 +1759,11 @@ test "encodeColumn string with mixed nulls writes valid OPTIONAL page" {
     // encodeColumn with the source's def_levels carried through.
     const column = @import("../parquet/column.zig");
     const meta_mod = @import("../parquet/metadata.zig");
-    const linux = std.os.linux;
-
-    const fixture_path = "data/benchmark_100mb.parquet";
-    var path_z: [256]u8 = undefined;
-    @memcpy(path_z[0..fixture_path.len], fixture_path);
-    path_z[fixture_path.len] = 0;
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (@as(isize, @bitCast(r_open)) < 0) return; // missing fixture
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    defer _ = linux.close(fd);
-    const end_pos = linux.lseek(fd, 0, 2);
-    _ = linux.lseek(fd, 0, 0);
-    const size: usize = @intCast(end_pos);
-    const file_bytes = try testing.allocator.alloc(u8, size);
+    const file_bytes = meta_mod.readFileSlice("data/benchmark_100mb.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return; // missing fixture
+        return err;
+    };
     defer testing.allocator.free(file_bytes);
-    var off: usize = 0;
-    while (off < size) {
-        const r = linux.read(fd, file_bytes[off..].ptr, size - off);
-        const n: isize = @bitCast(r);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -8,8 +8,11 @@
 //!     that lets callbacks safely submit follow-up operations.
 //!   - Level-triggered + EPOLLONESHOT — each Completion = one operation.
 //!   - The Completion pointer rides in epoll_event.data.ptr; no hashmap.
+//!
+//! Linux-only (raw epoll/timerfd syscalls); its tests skip elsewhere.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 // ============================================================
@@ -344,6 +347,7 @@ fn errnoOrFd(r: usize) ?linux.fd_t {
 // ============================================================
 
 test "timer fires within deadline" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
@@ -375,6 +379,7 @@ test "timer fires within deadline" {
 }
 
 test "callback can submit follow-up op" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
@@ -420,6 +425,7 @@ test "callback can submit follow-up op" {
 }
 
 test "two concurrent timers both fire" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 

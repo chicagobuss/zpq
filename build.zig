@@ -196,6 +196,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
 
+    // Build the unit-test executables without running them, so a cross-compiled pair can be copied to and run on
+    // the target (tools/macos_bundle.sh). Run them from the repo root (or a bundle mirroring it): fixtures are
+    // cwd-relative.
+    const test_bin_step = b.step("test-bin", "Install the unit-test executables (zpq-test, zpq-lambda-test) without running them");
+    test_bin_step.dependOn(&b.addInstallArtifact(lib_tests, .{ .dest_sub_path = "zpq-test" }).step);
+    test_bin_step.dependOn(&b.addInstallArtifact(lambda_tests, .{ .dest_sub_path = "zpq-lambda-test" }).step);
+
     // Opt-in soak tests for edge-case regressions. Kept out of the default
     // unit-test step so Tier 1/Tier 2 stay fast; `just gauntlet` runs these.
     const soak_tests = b.addTest(.{

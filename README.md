@@ -31,7 +31,8 @@ DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY
 codecs; all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
 
 **Filter** with `= != < <= > >=`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and Hive-partition
-pruning before any bytes are fetched.
+pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals (`'2024-01-01'`,
+`'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is not rounded to it.
 
 **Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
 
@@ -39,6 +40,10 @@ pruning before any bytes are fetched.
 `coalesce(col, default)`, parens, unary minus.
 
 **Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`.
+As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet; avg's
+`{"sum", "count"}` pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
+`-o out.parquet` writes the result as parquet: one row, or one row per group with the same columns and values as the
+JSON (avg as `<name>__sum` / `<name>__count`).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the

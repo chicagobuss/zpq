@@ -35,6 +35,7 @@ const thrift = @import("core/thrift.zig");
 const expr_ast = @import("core/expr/ast.zig");
 const expr_parser = @import("core/expr/parser.zig");
 const expr_agg = @import("core/expr/agg.zig");
+const filter_eval = @import("core/filter/eval.zig");
 const filter_ast = @import("core/filter/ast.zig");
 const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
@@ -106,6 +107,8 @@ pub const Error = error{
     ExceededMemoryBudget,
     ColumnMustBeGrouped,
     GroupKeyAliasRequired,
+    DuplicateOutputColumn,
+    AmbiguousOutputColumn,
 } || std.mem.Allocator.Error;
 
 pub const QueryArgs = struct {
@@ -119,6 +122,8 @@ pub const QueryArgs = struct {
     select_cols: ?[]const []const u8 = null,
     /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
     column_order: ?[]const u8 = null,
+    /// Receives the column name behind an aggregate output-naming error.
+    diag: ?*scan.Diag = null,
     codec: schema.CompressionCodec = .SNAPPY,
     parallelism: usize = 0,
     /// `--scan-all`: disable every stats shortcut (row-group pruning,
@@ -269,6 +274,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
+        .diag = args.diag,
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -290,7 +296,10 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
             return error.BadOutputUrl;
         }
         const t_footer = nowMonoNs();
-        bytes_out = try writeOneRowParquet(arena, out_path, r.agg_calls, r.accumulators, args.codec);
+        bytes_out = if (r.group_rows) |rows|
+            try writeGroupedParquet(arena, out_path, r.group_cols.?, r.group_col_types.?, rows, args.codec)
+        else
+            try writeOneRowParquet(arena, out_path, r.agg_calls, r.accumulators, r.agg_sources, args.codec);
         t.footer_ns += @intCast(nowMonoNs() - t_footer);
     }
 
@@ -1885,6 +1894,7 @@ fn writeOneRowParquet(
     out_path: []const u8,
     agg_calls: []const expr_agg.AggCall,
     accumulators: []const expr_agg.Accumulator,
+    sources: []const ?schema.SchemaElement,
     codec: schema.CompressionCodec,
 ) !u64 {
     const fd = try createFile(out_path);
@@ -1895,10 +1905,153 @@ fn writeOneRowParquet(
     var all_outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (agg_calls, 0..) |call, i| {
         const cols = try expr_agg.finalize(arena, call, accumulators[i]);
-        for (cols) |c| try all_outs.append(arena, c);
+        for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
     }
-    const written = try consumer.writeOneRowAggregate(arena, sink, all_outs.items, codec);
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, 1, codec);
     return written;
+}
+
+/// Write GROUP BY results as parquet: one row per group, columns in `cols` order, values exactly as the JSON output
+/// reports them. avg splits into `<name>__sum` / `<name>__count` as in the 1-row output.
+fn writeGroupedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    rows: []const []const scan.AggValue,
+    codec: schema.CompressionCodec,
+) !u64 {
+    var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
+    for (cols, types, 0..) |name, ty, ci| switch (ty.lane) {
+        inline .i64, .f64, .string => |lane| {
+            const T, const phys: schema.Type = switch (lane) {
+                .i64 => .{ i64, .INT64 },
+                .f64 => .{ f64, .DOUBLE },
+                .string => .{ []const u8, .BYTE_ARRAY },
+                else => unreachable,
+            };
+            const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
+            const col = try groupedColumn(T, arena, name, ty.nullable, rows, ci, phys, raw_u64);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, col, src) else col);
+        },
+        .avg => {
+            const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
+            const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
+            try outs.append(arena, try groupedColumn(f64, arena, sum_name, true, rows, ci, .DOUBLE, false));
+            try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
+        },
+    };
+
+    const fd = try createFile(out_path);
+    defer _ = std.os.linux.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
+    return consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec);
+}
+
+/// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a
+/// bare GROUP BY key, min/max of a column), rather than its evaluation lane's plain INT64 / DOUBLE / BYTE_ARRAY: a
+/// DATE comes back a DATE, a string a STRING, an INT8 an INT8. DECIMAL and FLOAT16 stay DOUBLE, the f64 values the
+/// lane holds; INT96 becomes INT64 TIMESTAMP(NANOS), the value zpq decodes it to; fixed-length bytes stay plain
+/// BYTE_ARRAY.
+fn retypeOutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol, src: schema.SchemaElement) !expr_agg.OutputCol {
+    if (decimal_mod.kindFromSchema(&src) != null or schema.isFloat16(src)) return out;
+    var res = out;
+    res.logical_type = src.logical_type;
+    res.converted_type = src.converted_type;
+    switch (src.type orelse return out) {
+        .INT64, .DOUBLE, .BYTE_ARRAY => {},
+        .INT96 => {
+            res.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .NANOS = .{} } } };
+            res.converted_type = null;
+        },
+        .FIXED_LEN_BYTE_ARRAY => return out,
+        .INT32 => {
+            const c = out.col.i64;
+            const vals = try arena.alloc(i32, c.values.len);
+            // Low 32 bits: exact for signed values, and the stored form of UINT_32 values above 2^31.
+            for (c.values, vals) |v, *o| o.* = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(v)))));
+            res.col = .{ .i32 = sameNulls(i32, c, vals) };
+            res.parquet_type = .INT32;
+        },
+        .FLOAT => {
+            const c = out.col.f64;
+            const vals = try arena.alloc(f32, c.values.len);
+            for (c.values, vals) |v, *o| o.* = @floatCast(v);
+            res.col = .{ .f32 = sameNulls(f32, c, vals) };
+            res.parquet_type = .FLOAT;
+        },
+        .BOOLEAN => {
+            const c = out.col.i64;
+            const vals = try arena.alloc(bool, c.values.len);
+            for (c.values, vals) |v, *o| o.* = v != 0;
+            res.col = .{ .boolean = sameNulls(bool, c, vals) };
+            res.parquet_type = .BOOLEAN;
+        },
+    }
+    return res;
+}
+
+/// `values` under `src`'s null layout.
+fn sameNulls(comptime T: type, src: anytype, values: []const T) filter_eval.ColumnT(T) {
+    return .{ .values = values, .def_levels = src.def_levels, .max_def = src.max_def, .has_nulls = src.has_nulls };
+}
+
+/// Column `ci` of every grouped row as a `T` lane. For an avg column, `T == f64` takes the pair's sum and
+/// `T == i64` its count.
+fn groupedColumn(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    name: []const u8,
+    nullable: bool,
+    rows: []const []const scan.AggValue,
+    ci: usize,
+    parquet_type: schema.Type,
+    /// Values are unsigned 64-bit: store values of 2^63 and up as their raw bits (the column is annotated unsigned).
+    raw_u64: bool,
+) !expr_agg.OutputCol {
+    const values = try arena.alloc(T, rows.len);
+    const defs = try arena.alloc(u32, rows.len);
+    var has_nulls = false;
+    for (rows, values, defs) |row, *v, *d| {
+        const cell: ?T = switch (row[ci]) {
+            .null_val => null,
+            .i => |x| if (T != i64)
+                return error.TypeMismatch
+            else if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
+                @bitCast(@as(u64, @intCast(x)))
+            else
+                std.math.cast(i64, x) orelse return error.AggIntTooWide,
+            .f => |x| if (T == f64) x else return error.TypeMismatch,
+            .s => |x| if (T == []const u8) x else return error.TypeMismatch,
+            .avg => |p| switch (T) {
+                f64 => p.sum,
+                i64 => p.count,
+                else => return error.TypeMismatch,
+            },
+        };
+        v.* = cell orelse std.mem.zeroes(T);
+        d.* = @intFromBool(cell != null);
+        if (cell == null) has_nulls = true;
+    }
+    if (has_nulls and !nullable) return error.UnexpectedNull;
+    const col: filter_eval.ColumnT(T) = .{
+        .values = values,
+        .def_levels = if (has_nulls) defs else null,
+        .max_def = @intFromBool(nullable),
+        .has_nulls = has_nulls,
+    };
+    return .{
+        .name = name,
+        .col = switch (T) {
+            i64 => .{ .i64 = col },
+            f64 => .{ .f64 = col },
+            []const u8 => .{ .string = col },
+            else => unreachable,
+        },
+        .parquet_type = parquet_type,
+        .nullable = nullable,
+    };
 }
 
 const FdSink = struct {
@@ -2081,23 +2234,75 @@ fn writeCsvString(writer: anytype, s: []const u8) !void {
     }
 }
 
-fn writeJsonString(writer: anytype, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
+/// A JSON number for `f`. Aggregates can be non-finite (a NaN or ±inf input), and JSON has no literal for that: a bare
+/// `nan` is invalid and `null` would read as "no value". Write the strings "NaN", "Infinity" and "-Infinity", as
+/// `--format jsonl` does and DuckDB/pyarrow surface them.
+pub fn writeJsonFloat(writer: anytype, f: f64) !void {
+    try writeFloat(writer, f, true);
+}
+
+/// One aggregate result as a JSON value. The CLI and Lambda responses both go through here so they escape strings and
+/// spell NULL and NaN the same way.
+pub fn writeAggValueJson(writer: anytype, v: scan.AggValue) !void {
+    switch (v) {
+        .i => |x| try writer.print("{d}", .{x}),
+        .f => |x| try writeJsonFloat(writer, x),
+        .s => |x| try writeJsonQuoted(writer, x),
+        .avg => |pair| {
+            try writer.writeAll("{\"sum\":");
+            if (pair.sum) |sum| try writeJsonFloat(writer, sum) else try writer.writeAll("null");
+            try writer.print(",\"count\":{d}}}", .{pair.count});
+        },
+        .null_val => try writer.writeAll("null"),
+    }
+}
+
+/// `s` as a quoted, escaped JSON string.
+pub fn writeJsonQuoted(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    try writeJsonString(writer, s);
+    try writer.writeByte('"');
+}
+
+/// The body of a JSON string: quotes, backslashes and control characters escaped. JSON text must be UTF-8 and parquet
+/// strings need not be, so each byte that does not start a valid UTF-8 sequence (stray continuation bytes, bad
+/// leads, truncated, overlong or surrogate encodings) is written as U+FFFD, one per byte, as Python's
+/// `errors="replace"` and most decoders do for lone bytes. Valid sequences pass through; U+2028/U+2029 are escaped
+/// so the output also stays valid JavaScript.
+pub fn writeJsonString(writer: anytype, s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => if (c < 0x20) {
                     var buf: [8]u8 = undefined;
                     const n = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
                     try writer.writeAll(n);
                 } else {
                     try writer.writeByte(c);
-                }
-            },
+                },
+            }
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 0;
+        const cp: ?u21 = if (len == 0 or i + len > s.len) null else std.unicode.utf8Decode(s[i..][0..len]) catch null;
+        if (cp) |code| {
+            if (code == 0x2028 or code == 0x2029) {
+                try writer.print("\\u{x:0>4}", .{code});
+            } else {
+                try writer.writeAll(s[i..][0..len]);
+            }
+            i += len;
+        } else {
+            try writer.writeAll("\u{FFFD}");
+            i += 1;
         }
     }
 }
@@ -2643,4 +2848,25 @@ test "printCell prints an unsigned column's stored value, not its sign bit" {
     try w.writeByte(' ');
     try printCell(&w, .{ .i32 = c32 }, 0, plain, true);
     try testing.expectEqualStrings("3000000000 18000000000000000000 -1294967296", w.buffered());
+}
+
+test "writeJsonString: escapes, and replaces invalid UTF-8 with U+FFFD per byte" {
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "a\"b\\c\n\x01", .want = "a\\\"b\\\\c\\n\\u0001" },
+        .{ .in = "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80", .want = "caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80" },
+        .{ .in = "\xff\xfeA", .want = "\u{FFFD}\u{FFFD}A" }, // bad lead bytes
+        .{ .in = "x\xe2\x80", .want = "x\u{FFFD}\u{FFFD}" }, // truncated at the end
+        .{ .in = "\xe2\x80y", .want = "\u{FFFD}\u{FFFD}y" }, // truncated mid-string
+        .{ .in = "\xc0\xaf", .want = "\u{FFFD}\u{FFFD}" }, // overlong '/'
+        .{ .in = "\xed\xa0\x80", .want = "\u{FFFD}\u{FFFD}\u{FFFD}" }, // UTF-16 surrogate
+        .{ .in = "\x80", .want = "\u{FFFD}" }, // lone continuation byte
+        .{ .in = "\xe2\x80\xa8|\xe2\x80\xa9", .want = "\\u2028|\\u2029" },
+    };
+    for (cases) |c| {
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        try writeJsonString(&aw.writer, c.in);
+        try std.testing.expectEqualStrings(c.want, aw.written());
+        try std.testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
+    }
 }

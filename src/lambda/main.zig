@@ -405,6 +405,9 @@ fn lambdaAggregate(
     const t_start = nowMonoNs();
 
     var registry = persistentPoolAdapter(pool);
+    var diag: zpq.core.scan.Diag = .{};
+    var args = qa;
+    args.diag = &diag;
 
     const result = engine.runQuery(.{
         .gpa = allocator,
@@ -412,8 +415,17 @@ fn lambdaAggregate(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
-    }, qa) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"engine\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+    }, args) catch |err| switch (err) {
+        error.DuplicateOutputColumn, error.AmbiguousOutputColumn => {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            const w = &aw.writer;
+            try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\",\"column\":", .{@errorName(err)});
+            try engine.writeJsonQuoted(w, diag.column());
+            try w.writeByte('}');
+            return aw.toOwnedSlice();
+        },
+        else => return std.fmt.allocPrint(allocator, "{{\"error\":\"engine\",\"reason\":\"{s}\"}}", .{@errorName(err)}),
     };
     const ar = result.aggregate;
     defer allocator.free(ar.aggs);
@@ -442,55 +454,47 @@ fn lambdaAggregate(
     };
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
-    var buf: std.ArrayList(u8) = .empty;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
     if (ar.group_rows) |rows| {
-        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
+        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
         for (rows, 0..) |row_vals, row_idx| {
-            if (row_idx > 0) try buf.appendSlice(allocator, ",");
-            try buf.appendSlice(allocator, "{");
+            if (row_idx > 0) try w.writeByte(',');
+            try w.writeByte('{');
             for (ar.group_cols.?, 0..) |col_name, col_idx| {
-                if (col_idx > 0) try buf.appendSlice(allocator, ",");
-                try buf.print(allocator, "\"{s}\":", .{col_name});
-                switch (row_vals[col_idx]) {
-                    .i => |v| try buf.print(allocator, "{d}", .{v}),
-                    .f => |v| try buf.print(allocator, "{d}", .{v}),
-                    .s => |v| try buf.print(allocator, "\"{s}\"", .{v}),
-                    .avg => |v| try buf.print(allocator, "{{\"sum\":{d},\"count\":{d}}}", .{ v.sum, v.count }),
-                    .null_val => try buf.appendSlice(allocator, "null"),
-                }
+                if (col_idx > 0) try w.writeByte(',');
+                try engine.writeJsonQuoted(w, col_name);
+                try w.writeByte(':');
+                try engine.writeAggValueJson(w, row_vals[col_idx]);
             }
-            try buf.appendSlice(allocator, "}");
+            try w.writeByte('}');
         }
-        try buf.appendSlice(allocator, "]");
+        try w.writeByte(']');
     } else {
-        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
+        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
         for (ar.aggs, 0..) |item, i| {
-            if (i > 0) try buf.appendSlice(allocator, ",");
-            try buf.print(allocator, "\"{s}\":", .{item.alias});
-            switch (item.value) {
-                .i => |v| try buf.print(allocator, "{d}", .{v}),
-                .f => |v| try buf.print(allocator, "{d}", .{v}),
-                .s => |v| try buf.print(allocator, "\"{s}\"", .{v}),
-                .avg => |v| try buf.print(allocator, "{{\"sum\":{d},\"count\":{d}}}", .{ v.sum, v.count }),
-                .null_val => try buf.appendSlice(allocator, "null"),
-            }
+            if (i > 0) try w.writeByte(',');
+            try engine.writeJsonQuoted(w, item.alias);
+            try w.writeByte(':');
+            try engine.writeAggValueJson(w, item.value);
         }
-        try buf.appendSlice(allocator, "}");
+        try w.writeByte('}');
     }
-    try buf.print(allocator, ",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}", .{
+    try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}", .{
         total_ms,
         ar.timings.read_ns / std.time.ns_per_ms,
         ar.timings.core.decode_ns / std.time.ns_per_ms,
         ar.timings.core.eval_ns / std.time.ns_per_ms,
         ar.timings.core.encode_ns / std.time.ns_per_ms,
     });
-    return buf.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Lambda's write handler — the iceberg-compaction shape (filter +

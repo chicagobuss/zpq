@@ -43,7 +43,28 @@ pub const Error = error{
     GroupKeyAliasRequired,
     UnknownColumn,
     ExceededMemoryBudget,
+    /// Two output columns (aggregate aliases, GROUP BY keys, or one of each) share a name.
+    DuplicateOutputColumn,
+    /// An output column name refers to both a GROUP BY key and an aggregate.
+    AmbiguousOutputColumn,
 } || std.mem.Allocator.Error;
+
+/// The output column an error is about, for callers that report it. Only meaningful after a
+/// `DuplicateOutputColumn` / `AmbiguousOutputColumn` / `UnknownColumn` error from `runMultiAggregate`.
+pub const Diag = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    pub fn column(self: *const Diag) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn setColumn(diag: ?*Diag, name: []const u8) void {
+        const d = diag orelse return;
+        d.len = @min(name.len, d.buf.len);
+        @memcpy(d.buf[0..d.len], name[0..d.len]);
+    }
+};
 
 /// One file's contribution to a multi-file scan. Bytes can come from
 /// mmap (CLI), an S3 range-fetch into a buffer (Lambda / S3-source CLI),
@@ -84,6 +105,8 @@ pub const MultiAggArgs = struct {
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
     fast_levels: bool = false,
+    /// Receives the column name behind an output-naming error.
+    diag: ?*Diag = null,
 };
 
 pub const AggValue = union(enum) {
@@ -94,8 +117,9 @@ pub const AggValue = union(enum) {
     i: i128,
     /// Single f64 result (float sum/min/max).
     f: f64,
-    /// Avg's split-output: ship sum + count, caller divides at end.
-    avg: struct { sum: f64, count: i64 },
+    /// Avg's split-output: ship sum + count, caller divides at end. The sum is
+    /// NULL when count is 0, as sum() over no values is.
+    avg: struct { sum: ?f64, count: i64 },
     /// String (bytewise/unsigned) min/max result. Borrowed from the
     /// accumulator's persist allocator (query-lifetime `gpa`).
     s: []const u8,
@@ -149,6 +173,20 @@ pub const MultiAggResult = struct {
     timings: Timings,
     group_cols: ?[]const []const u8 = null,
     group_rows: ?[]const []const AggValue = null,
+    /// Value lane of each `group_cols` entry, so a writer can type a column that is NULL in every row. Allocated in
+    /// the `arena` passed to `runMultiAggregate`, like `accumulators`.
+    group_col_types: ?[]const GroupColType = null,
+    /// Per aggregate call: the source column of a min/max, which passes values through (see `passThroughSource`).
+    /// Same lifetime as `accumulators`.
+    agg_sources: []const ?schema.SchemaElement = &.{},
+};
+
+/// What one GROUP BY result column holds. `nullable` is false only for counts, matching the 1-row output.
+pub const GroupColType = struct {
+    lane: enum { i64, f64, string, avg },
+    nullable: bool,
+    /// The column whose values pass through unchanged (a bare key, min/max of a column), to type the output by.
+    source: ?schema.SchemaElement = null,
 };
 
 /// One unit of parallel work: a single row group within one input file,
@@ -457,8 +495,8 @@ pub fn runMultiAggregate(
 
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
-    const agg_calls = if (args.group_by != null and args.aggregate.len == 0)
-        &[_]expr_agg.AggCall{}
+    const agg_calls: []expr_agg.AggCall = if (args.group_by != null and args.aggregate.len == 0)
+        &.{}
     else
         try expr_parser.parseAggList(arena, args.aggregate, meta0);
     if (agg_calls.len == 0 and args.group_by == null) return error.EmptyAggregate;
@@ -476,6 +514,16 @@ pub fn runMultiAggregate(
         for (items, 0..) |item, i| exprs[i] = item.expr;
         break :blk exprs;
     } else null;
+    try nameUnaliasedAggs(arena, agg_calls, group_by_items, meta0);
+    const agg_sources = try arena.alloc(?schema.SchemaElement, agg_calls.len);
+    for (agg_calls, agg_sources) |call, *src| src.* = passThroughSource(call, meta0);
+    // Before any scanning: a clash would otherwise surface as one column silently showing another's values.
+    const group_select_cols: ?[]const []const u8 = if (group_by_items) |items|
+        try checkGroupOutputNames(arena, items, agg_calls, meta0, args)
+    else blk: {
+        try checkAggAliases(agg_calls, args.diag);
+        break :blk null;
+    };
     t.parse_ns = @intCast(nowMonoNs() - t_parse);
 
     // 3. fetch_set: union of outer-filter columns + each agg's arg
@@ -736,6 +784,7 @@ pub fn runMultiAggregate(
 
     var group_cols: ?[]const []const u8 = null;
     var group_rows: ?[]const []const AggValue = null;
+    var group_col_types: ?[]const GroupColType = null;
 
     if (group_by_keys) |keys| {
         for (workers) |w| {
@@ -805,59 +854,11 @@ pub fn runMultiAggregate(
             }
         }
 
-        const select_cols = try resolveGroupSelectCols(
-            arena,
-            group_by_items.?,
-            agg_calls,
-            meta0,
-            args.select_cols,
-            args.column_order,
-        );
-        const ColSource = union(enum) {
-            key: usize,
-            agg: usize,
-        };
-        var col_sources = try gpa.alloc(ColSource, select_cols.len);
+        const select_cols = group_select_cols.?;
+        const col_sources = try gpa.alloc(ColSource, select_cols.len);
         defer gpa.free(col_sources);
-
-        for (select_cols, 0..) |col_name, idx| {
-            var resolved = false;
-            const expr_name = selectColumnExpr(col_name);
-            const alias_name = selectColumnName(col_name);
-            for (group_by_items.?, 0..) |item, k_idx| {
-                const label = try groupKeyLabel(item, meta0);
-                if (std.ascii.eqlIgnoreCase(expr_name, label) or
-                    std.ascii.eqlIgnoreCase(alias_name, label))
-                {
-                    col_sources[idx] = .{ .key = k_idx };
-                    resolved = true;
-                    break;
-                }
-                if (item.expr == .col_ref) {
-                    const k_name = leafSchemaElem(meta0, item.expr.col_ref.col_idx).name;
-                    if (std.ascii.eqlIgnoreCase(expr_name, k_name) or
-                        std.ascii.eqlIgnoreCase(alias_name, k_name))
-                    {
-                        col_sources[idx] = .{ .key = k_idx };
-                        resolved = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!resolved) {
-                for (agg_calls, 0..) |call, a_idx| {
-                    if (std.ascii.eqlIgnoreCase(alias_name, call.alias) or
-                        std.ascii.eqlIgnoreCase(expr_name, call.alias))
-                    {
-                        col_sources[idx] = .{ .agg = a_idx };
-                        resolved = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!resolved) return error.UnknownColumn;
+        for (select_cols, col_sources) |col_name, *src| {
+            src.* = try resolveOutputColumn(group_by_items.?, agg_calls, meta0, col_name, args.diag);
         }
 
         var key_types = try gpa.alloc(KeyType, keys.len);
@@ -865,6 +866,30 @@ pub fn runMultiAggregate(
         for (keys, 0..) |key_expr, idx| {
             key_types[idx] = keyTypeFromExpr(key_expr);
         }
+
+        const col_types = try arena.alloc(GroupColType, col_sources.len);
+        for (col_sources, col_types) |src, *ct| ct.* = switch (src) {
+            .key => |k_idx| .{
+                .nullable = true,
+                .lane = switch (key_types[k_idx]) {
+                    .i64, .u64 => .i64,
+                    .f64 => .f64,
+                    .string => .string,
+                },
+                .source = if (keys[k_idx] == .col_ref) leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx).* else null,
+            },
+            .agg => |a_idx| .{
+                .nullable = agg_calls[a_idx].func != .count,
+                .lane = switch (agg_calls[a_idx].result) {
+                    .i64 => .i64,
+                    .f64 => .f64,
+                    .bytes => .string,
+                    .avg_f64 => .avg,
+                },
+                .source = agg_sources[a_idx],
+            },
+        };
+        group_col_types = col_types;
 
         const rows = try gpa.alloc([]const AggValue, distinct_groups);
         var rows_built: usize = 0;
@@ -1005,7 +1030,17 @@ pub fn runMultiAggregate(
         .timings = t,
         .group_cols = group_cols,
         .group_rows = group_rows,
+        .group_col_types = group_col_types,
+        .agg_sources = agg_sources,
     };
+}
+
+/// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
+fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
+    if (call.func != .min and call.func != .max) return null;
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref) return null;
+    return leafSchemaElem(meta, arg.col_ref.col_idx).*;
 }
 
 /// Merge an accumulator while transferring ownership of any string winner
@@ -1099,11 +1134,124 @@ fn resolveGroupSelectCols(
     return owned;
 }
 
+const ColSource = union(enum) {
+    key: usize,
+    agg: usize,
+};
+
+/// An unaliased aggregate is named after its function (`sum`), as it always has been, unless that name is taken by
+/// another aggregate or a GROUP BY key; then it takes its call text (`sum(x)`), as DuckDB names it. So
+/// `sum(x), sum(f)` gives `sum(x)` and `sum(f)`, while a lone `sum(x)` still prints as `sum`.
+fn nameUnaliasedAggs(
+    arena: std.mem.Allocator,
+    agg_calls: []expr_agg.AggCall,
+    group_items: ?[]const expr_ast.SelectItem,
+    meta: *const schema.FileMetaData,
+) Error!void {
+    const taken = try arena.alloc(bool, agg_calls.len);
+    for (agg_calls, taken, 0..) |call, *t, i| {
+        t.* = false;
+        if (call.default_name == null) continue;
+        for (agg_calls, 0..) |other, j| {
+            if (i != j and std.ascii.eqlIgnoreCase(call.alias, other.alias)) t.* = true;
+        }
+        for (group_items orelse &.{}) |item| {
+            const label = try groupKeyLabel(item, meta);
+            const source = if (item.expr == .col_ref) leafSchemaElem(meta, item.expr.col_ref.col_idx).name else label;
+            if (std.ascii.eqlIgnoreCase(call.alias, label) or std.ascii.eqlIgnoreCase(call.alias, source)) t.* = true;
+        }
+    }
+    // Decided before renaming any, so one rename can't make another name look unique.
+    for (agg_calls, taken) |*call, t| if (t) {
+        call.alias = call.default_name.?;
+    };
+}
+
+/// Reject two aggregates sharing an alias: both would land under one output name.
+fn checkAggAliases(agg_calls: []const expr_agg.AggCall, diag: ?*Diag) Error!void {
+    for (agg_calls, 0..) |call, i| for (agg_calls[0..i]) |prev| {
+        if (std.ascii.eqlIgnoreCase(call.alias, prev.alias)) {
+            Diag.setColumn(diag, call.alias);
+            return error.DuplicateOutputColumn;
+        }
+    };
+}
+
+/// Resolve the GROUP BY output columns and check their names up front: no aggregate alias twice, no output name
+/// twice, and no name that matches both a key and an aggregate. Returns the output column list.
+fn checkGroupOutputNames(
+    arena: std.mem.Allocator,
+    group_items: []const expr_ast.SelectItem,
+    agg_calls: []const expr_agg.AggCall,
+    meta: *const schema.FileMetaData,
+    args: MultiAggArgs,
+) Error![]const []const u8 {
+    try checkAggAliases(agg_calls, args.diag);
+    const cols = try resolveGroupSelectCols(arena, group_items, agg_calls, meta, args.select_cols, args.column_order);
+    for (cols, 0..) |col, i| {
+        const name = selectColumnName(col);
+        for (cols[0..i]) |prev| if (std.ascii.eqlIgnoreCase(name, selectColumnName(prev))) {
+            Diag.setColumn(args.diag, name);
+            return error.DuplicateOutputColumn;
+        };
+        _ = try resolveOutputColumn(group_items, agg_calls, meta, col, args.diag);
+    }
+    return cols;
+}
+
+/// Which GROUP BY key or aggregate an output column names. A key matches by its output label or, for a bare column
+/// key, its source column name; an aggregate by its alias. A name matching both is an error rather than a guess:
+/// with `--group-by 's AS k'` and `... AS s`, the key used to win and `s` silently showed the key's values.
+fn resolveOutputColumn(
+    group_items: []const expr_ast.SelectItem,
+    agg_calls: []const expr_agg.AggCall,
+    meta: *const schema.FileMetaData,
+    col_name: []const u8,
+    diag: ?*Diag,
+) Error!ColSource {
+    const expr_name = selectColumnExpr(col_name);
+    const alias_name = selectColumnName(col_name);
+    var key: ?usize = null;
+    for (group_items, 0..) |item, k_idx| {
+        const label = try groupKeyLabel(item, meta);
+        const source = if (item.expr == .col_ref) leafSchemaElem(meta, item.expr.col_ref.col_idx).name else label;
+        if (std.ascii.eqlIgnoreCase(expr_name, label) or std.ascii.eqlIgnoreCase(alias_name, label) or
+            std.ascii.eqlIgnoreCase(expr_name, source) or std.ascii.eqlIgnoreCase(alias_name, source))
+        {
+            key = k_idx;
+            break;
+        }
+    }
+    var agg: ?usize = null;
+    for (agg_calls, 0..) |call, a_idx| {
+        if (std.ascii.eqlIgnoreCase(alias_name, call.alias) or std.ascii.eqlIgnoreCase(expr_name, call.alias)) {
+            agg = a_idx;
+            break;
+        }
+        // An unaliased SQL select item (`count(*)`) names its aggregate by call text, whatever the alias became.
+        if (call.default_name) |text| if (std.ascii.eqlIgnoreCase(expr_name, text)) {
+            agg = a_idx;
+            break;
+        };
+    }
+    if (key != null and agg != null) {
+        // Name the aggregate alias: it is the clashing name whichever side of `AS` matched, and the one to rename.
+        Diag.setColumn(diag, agg_calls[agg.?].alias);
+        return error.AmbiguousOutputColumn;
+    }
+    if (key) |k| return .{ .key = k };
+    if (agg) |a| return .{ .agg = a };
+    Diag.setColumn(diag, alias_name);
+    return error.UnknownColumn;
+}
+
 /// Framing for a group-key column, taken from the expression's own type.
 ///
 /// Must agree with the lane `evalGroupKeyExpr` produces and `expr_agg.serializeRowKey` then writes: i32 and i64 both
 /// serialize as an 8-byte i64, f32 and f64 as an 8-byte f64, so these three cover every column variant.
 /// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
+/// An unsigned 64-bit column rides the i64 lane as raw bits, so a bare one is read back as `u64`: as `i64`, values of
+/// 2^63 and up came out negative.
 fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
     if (expr == .col_ref and expr.col_ref.unsigned_64) return .u64;
     return switch (expr.typeOf()) {
@@ -1211,26 +1359,27 @@ pub fn deserializeKeyColumn(
 pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     return switch (call.func) {
         .count => .{ .i = @intCast(state.count) },
+        // i128 carries the full sum (incl. i64 overflow + unsigned-64);
+        // the JSON layer prints it directly, no narrowing/overflow error.
+        // sum/min/max over no values are NULL, never a 0 or "" stand-in.
         .sum => switch (call.result) {
-            // i128 carries the full sum (incl. i64 overflow + unsigned-64);
-            // the JSON layer prints it directly, no narrowing/overflow error.
-            .i64 => .{ .i = state.sum_i },
-            .f64 => .{ .f = state.sum_f },
+            .i64 => if (state.sum_i) |v| .{ .i = v } else .null_val,
+            .f64 => if (state.sum_f) |v| .{ .f = v } else .null_val,
             .bytes, .avg_f64 => unreachable,
         },
         .min => switch (call.result) {
-            .i64 => .{ .i = state.min_i orelse 0 },
-            .f64 => .{ .f = state.min_f orelse 0 },
-            .bytes => .{ .s = if (state.min_bytes) |b| try gpa.dupe(u8, b) else try gpa.dupe(u8, "") },
+            .i64 => if (state.min_i) |v| .{ .i = v } else .null_val,
+            .f64 => if (state.min_f) |v| .{ .f = v } else .null_val,
+            .bytes => if (state.min_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
             .avg_f64 => unreachable,
         },
         .max => switch (call.result) {
-            .i64 => .{ .i = state.max_i orelse 0 },
-            .f64 => .{ .f = state.max_f orelse 0 },
-            .bytes => .{ .s = if (state.max_bytes) |b| try gpa.dupe(u8, b) else try gpa.dupe(u8, "") },
+            .i64 => if (state.max_i) |v| .{ .i = v } else .null_val,
+            .f64 => if (state.max_f) |v| .{ .f = v } else .null_val,
+            .bytes => if (state.max_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
             .avg_f64 => unreachable,
         },
-        .avg => .{ .avg = .{ .sum = state.avg.sum, .count = @intCast(state.avg.count) } },
+        .avg => .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } },
     };
 }
 
@@ -1747,6 +1896,16 @@ test "group key: a BOOLEAN first column does not truncate the rest" {
         try testing.expect(r[1] == .s);
         try testing.expect(std.mem.startsWith(u8, r[1].s, "name"));
     }
+}
+
+test "deserializeKeyColumn: an unsigned 64-bit key reads back unsigned" {
+    var key: [9]u8 = undefined;
+    key[0] = 1;
+    std.mem.writeInt(u64, key[1..9], std.math.maxInt(u64), .little);
+    const v = try deserializeKeyColumn(testing.allocator, &key, 0, &.{.u64});
+    try testing.expectEqual(@as(i128, std.math.maxInt(u64)), v.i);
+    const signed = try deserializeKeyColumn(testing.allocator, &key, 0, &.{.i64});
+    try testing.expectEqual(@as(i128, -1), signed.i);
 }
 
 test "deserializeKeyColumn: corrupt framing errors instead of panicking" {
@@ -2355,5 +2514,109 @@ test "!= on a float chunk whose bounds are the literal skips only when nan_count
             std.debug.print("d != 0: row group {d} decided {s}, want {s}\n", .{ i, @tagName(got), @tagName(want) });
             return err;
         };
+    }
+}
+
+test "clashing output column names are rejected and named" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+
+    const Case = struct {
+        group_by: ?[]const u8 = null,
+        aggregate: []const u8,
+        select_cols: ?[]const []const u8 = null,
+        want: anyerror,
+        column: []const u8,
+    };
+    const cases = [_]Case{
+        // A key renamed away from its source column and an aggregate named after it: `s` used to show the key.
+        .{ .group_by = "s AS k", .aggregate = "sum(x) AS s", .want = error.AmbiguousOutputColumn, .column = "s" },
+        .{ .group_by = "b", .aggregate = "count(*) AS b", .want = error.AmbiguousOutputColumn, .column = "b" },
+        .{
+            .group_by = "b",
+            .aggregate = "sum(x) AS t, min(x) AS T",
+            .want = error.DuplicateOutputColumn,
+            .column = "T",
+        },
+        .{ .aggregate = "sum(x) AS t, min(x) AS t", .want = error.DuplicateOutputColumn, .column = "t" },
+        .{
+            .group_by = "b AS k, ts AS k",
+            .aggregate = "count(*) AS c",
+            .want = error.DuplicateOutputColumn,
+            .column = "k",
+        },
+        // The SQL front end's select list: `SELECT s AS k, sum(x) AS s ... GROUP BY s`.
+        .{
+            .group_by = "s",
+            .aggregate = "sum(x) AS s",
+            .select_cols = &.{ "s AS k", "sum(x) AS s" },
+            .want = error.AmbiguousOutputColumn,
+            .column = "s",
+        },
+    };
+    for (cases) |c| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var diag: Diag = .{};
+        const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .select_cols = c.select_cols,
+            .parallelism = 1,
+            .diag = &diag,
+        });
+        try testing.expectError(c.want, res);
+        try testing.expectEqualStrings(c.column, diag.column());
+    }
+}
+
+test "unaliased aggregates keep the function name unless it clashes, then take the call text" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+
+    const Case = struct {
+        group_by: ?[]const u8 = null,
+        aggregate: []const u8,
+        select_cols: ?[]const []const u8 = null,
+        want: []const []const u8,
+    };
+    const cases = [_]Case{
+        .{ .aggregate = "sum(x)", .want = &.{"sum"} },
+        .{ .aggregate = "sum(x), sum(ts), count(*)", .want = &.{ "sum(x)", "sum(ts)", "count" } },
+        .{ .aggregate = "count(*) AS count, count(n)", .want = &.{ "count", "count(n)" } },
+        .{
+            .aggregate = "sum(x) FILTER (WHERE ts > 5), sum(x)",
+            .want = &.{ "sum(x) FILTER (WHERE ts > 5)", "sum(x)" },
+        },
+        .{ .group_by = "b", .aggregate = "min(x), min(ts)", .want = &.{ "b", "min(x)", "min(ts)" } },
+        // The SQL front end lists unaliased aggregates by call text, which used to resolve to nothing.
+        .{
+            .group_by = "b",
+            .aggregate = "count(*), sum(x)",
+            .select_cols = &.{ "b", "count(*)", "sum(x)" },
+            .want = &.{ "b", "count(*)", "sum(x)" },
+        },
+    };
+    for (cases) |c| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .select_cols = c.select_cols,
+            .parallelism = 1,
+        });
+        defer freeGroupResult(res);
+        if (res.group_cols) |cols| {
+            try testing.expectEqual(c.want.len, cols.len);
+            for (c.want, cols) |w, g| try testing.expectEqualStrings(w, g);
+        } else {
+            try testing.expectEqual(c.want.len, res.aggs.len);
+            for (c.want, res.aggs) |w, g| try testing.expectEqualStrings(w, g.alias);
+        }
     }
 }

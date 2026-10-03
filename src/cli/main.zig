@@ -94,6 +94,21 @@ pub fn main(init: std.process.Init) !void {
             switch (err) {
                 error.BadArgs, error.NoMatches, error.SqlNotCompiledIn, error.AlreadyReported => {},
                 error.NoInputs => std.debug.print("zpq query: no input files specified\n", .{}),
+                error.Unsigned64OutOfRange => std.debug.print(
+                    "zpq query: an unsigned 64-bit value of 2^63 or more cannot be used in\n" ++
+                        "  integer arithmetic; mix in a float (e.g. `col * 1.0`) to compute in DOUBLE\n",
+                    .{},
+                ),
+                error.DuplicateOutputColumn => std.debug.print(
+                    "zpq query: output column `{s}` is defined more than once;\n" ++
+                        "  give each aggregate and GROUP BY key a distinct name\n",
+                    .{query_diag.column()},
+                ),
+                error.AmbiguousOutputColumn => std.debug.print(
+                    "zpq query: output column `{s}` names both a GROUP BY key\n" ++
+                        "  and an aggregate; rename the aggregate alias\n",
+                    .{query_diag.column()},
+                ),
                 error.EmptyAggregate => std.debug.print("zpq query: empty aggregate expression\n", .{}),
                 error.AggregateMutexWithSelect => std.debug.print("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
                 error.MissingOutputOrAggregate => std.debug.print("zpq query: missing --output or --aggregate\n", .{}),
@@ -455,6 +470,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .group_by = group_by,
             .select_cols = select_cols,
             .column_order = column_order,
+            .diag = &query_diag,
         });
         const ar = result.aggregate;
         defer gpa.free(ar.aggs);
@@ -512,21 +528,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                     try ws.print("\"", .{});
                     try writeJsonString(&ws, col_name);
                     try ws.print("\":", .{});
-                    switch (row_vals[col_idx]) {
-                        .i => |v| try ws.print("{d}", .{v}),
-                        .f => |v| try writeJsonFloat(&ws, v),
-                        .s => |v| {
-                            try ws.print("\"", .{});
-                            try writeJsonString(&ws, v);
-                            try ws.print("\"", .{});
-                        },
-                        .avg => |v| {
-                            try ws.writeAll("{\"sum\":");
-                            try writeJsonFloat(&ws, v.sum);
-                            try ws.print(",\"count\":{d}}}", .{v.count});
-                        },
-                        .null_val => try ws.writeAll("null"),
-                    }
+                    try engine.writeAggValueJson(&ws, row_vals[col_idx]);
                 }
                 try ws.print("}}", .{});
             }
@@ -544,21 +546,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                 try ws.print("\"", .{});
                 try writeJsonString(&ws, item.alias);
                 try ws.print("\":", .{});
-                switch (item.value) {
-                    .i => |v| try ws.print("{d}", .{v}),
-                    .f => |v| try writeJsonFloat(&ws, v),
-                    .s => |v| {
-                        try ws.print("\"", .{});
-                        try writeJsonString(&ws, v);
-                        try ws.print("\"", .{});
-                    },
-                    .avg => |v| {
-                        try ws.writeAll("{\"sum\":");
-                        try writeJsonFloat(&ws, v.sum);
-                        try ws.print(",\"count\":{d}}}", .{v.count});
-                    },
-                    .null_val => try ws.writeAll("null"),
-                }
+                try engine.writeAggValueJson(&ws, item.value);
             }
             try ws.writeAll("},");
         }
@@ -996,44 +984,12 @@ fn jsonFatal(gpa: std.mem.Allocator, kind: []const u8, reason: []const u8) !void
     try w.writeAll("\"}\n");
 }
 
-/// JSON has no NaN / Infinity literals, but agg results can be non-finite
-/// (e.g. sum or avg of a column containing NaN, or ±inf values — see
-/// nan_in_stats.parquet). Emit a quoted token rather than a bare `nan`/`inf`
-/// (invalid JSON) — and rather than `null`, which would falsely read as
-/// "absent" when the result is genuinely indeterminate/unbounded. The quoted
-/// form preserves the value and matches what DuckDB/pyarrow surface.
-fn writeJsonFloat(w: *StdoutWriter, v: f64) !void {
-    if (std.math.isFinite(v)) {
-        try w.print("{d}", .{v});
-    } else if (std.math.isNan(v)) {
-        try w.writeAll("\"NaN\"");
-    } else if (v > 0) {
-        try w.writeAll("\"Infinity\"");
-    } else {
-        try w.writeAll("\"-Infinity\"");
-    }
+fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
+    try engine.writeJsonString(w, s);
 }
 
-fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    var buf: [8]u8 = undefined;
-                    const n = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try w.writeAll(n);
-                } else {
-                    try w.writeAll(&[_]u8{c});
-                }
-            },
-        }
-    }
-}
+/// Names the column behind an output-naming error from the aggregate path. `main` reports it once the query fails.
+var query_diag: zpq.core.scan.Diag = .{};
 
 const StdoutWriter = struct {
     fd: std.os.linux.fd_t = 1,
@@ -1052,6 +1008,10 @@ const StdoutWriter = struct {
 
     pub fn print(self: *StdoutWriter, comptime fmt: []const u8, args: anytype) !void {
         try self.getInner().print(fmt, args);
+    }
+
+    pub fn writeByte(self: *StdoutWriter, c: u8) !void {
+        try self.getInner().writeByte(c);
     }
 
     pub fn flush(self: *StdoutWriter) void {

@@ -61,6 +61,9 @@ pub const AggCall = struct {
     where: ?filter_ast.Filter,
     /// User-supplied alias (or auto-generated if AS was omitted).
     alias: []const u8,
+    /// Set when AS was omitted: the call's source text (`sum(x)`, `count(*)`), the output name to fall back on when
+    /// the bare function name `alias` defaults to would clash with another output column.
+    default_name: ?[]const u8 = null,
     /// Result lane resolved at parse time.
     result: ResultShape,
 };
@@ -87,8 +90,10 @@ pub const Accumulator = union(enum) {
     /// i64-overflowing sums (e.g. wide DELTA columns) without wrapping. The
     /// JSON output emits the full i128; only the 1-row result *parquet* column
     /// is INT64 and errors `AggIntTooWide` past i64 range.
-    sum_i: i128,
-    sum_f: f64,
+    /// `null` until a non-null value is folded in: SQL's sum over no values is
+    /// NULL, not 0.
+    sum_i: ?i128,
+    sum_f: ?f64,
     /// Min/max — `null` means no values seen yet. Distinguishes
     /// "all rows filtered out" from "min was 0". i128 so an unsigned-64
     /// extremum (up to 2^64-1) is representable; signed i64 values widen in.
@@ -112,8 +117,8 @@ pub const Accumulator = union(enum) {
         return switch (call.func) {
             .count => .{ .count = 0 },
             .sum => switch (call.result) {
-                .i64 => .{ .sum_i = 0 },
-                .f64 => .{ .sum_f = 0 },
+                .i64 => .{ .sum_i = null },
+                .f64 => .{ .sum_f = null },
                 .bytes, .avg_f64 => unreachable,
             },
             .min => switch (call.result) {
@@ -139,8 +144,12 @@ pub const Accumulator = union(enum) {
     pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) void {
         switch (dst.*) {
             .count => |*c| c.* += src.count,
-            .sum_i => |*s| s.* += src.sum_i,
-            .sum_f => |*s| s.* += src.sum_f,
+            .sum_i => |*s| if (src.sum_i) |sv| {
+                s.* = (s.* orelse 0) + sv;
+            },
+            .sum_f => |*s| if (src.sum_f) |sv| {
+                s.* = (s.* orelse 0) + sv;
+            },
             .min_i => |*m| if (src.min_i) |sv| {
                 if (m.* == null or sv < m.*.?) m.* = sv;
             },
@@ -353,6 +362,9 @@ pub fn updateOneFromStats(
         .min, .max => {
             // Only a bare col_ref is stat-eligible; an expression like `cost * qty` decodes.
             const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
+            // A chunk with no non-null values contributes nothing, whatever bounds its writer left behind.
+            const cm = rg.columns.items[statArgColumn(call).?].meta_data.?;
+            if (statPresentCount(rg, &cm, cm.statistics, file_meta) == 0) return true;
             const bytes = if (call.func == .min) plan.bounds.min else plan.bounds.max;
             switch (plan.lane) {
                 // DECIMAL stat bytes are in the physical wire format: decode them through the same
@@ -366,9 +378,9 @@ pub fn updateOneFromStats(
             // Constant-column case: when this RG's min == max, every value in it equals that constant, so it
             // contributes present × min. A non-constant RG decodes; the constant ones still fold from stats.
             const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
-            if (plan.present == 0) return true; // nothing to add
+            if (plan.present == 0) return true; // nothing to add; an all-null sum stays NULL
             switch (plan.lane) {
-                .decimal => |k| state.sum_f += decimalStatBytesToF64(plan.bounds.min, k).? *
+                .decimal => |k| state.sum_f = (state.sum_f orelse 0) + decimalStatBytesToF64(plan.bounds.min, k).? *
                     @as(f64, @floatFromInt(plan.present)),
                 .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
             }
@@ -515,7 +527,7 @@ fn foldConstantSumStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            s.* += @as(i128, v) * @as(i128, present);
+            s.* = (s.* orelse 0) + @as(i128, v) * @as(i128, present);
         },
         .sum_f => |*s| {
             const v: f64 = switch (parquet_type) {
@@ -531,7 +543,7 @@ fn foldConstantSumStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            s.* += v * @as(f64, @floatFromInt(present));
+            s.* = (s.* orelse 0) + v * @as(f64, @floatFromInt(present));
         },
         else => return error.UnsupportedAggType,
     }
@@ -1098,13 +1110,13 @@ fn foldSum(
     sel: *const filter_selection.SelectionVector,
     unsigned_64: bool,
 ) Error!void {
+    if (!sel.any()) return; // no values: leave a NULL sum NULL
     switch (state.*) {
         .sum_i => |*s| {
-            s.* += if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
+            s.* = (s.* orelse 0) + if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
         },
         .sum_f => |*s| {
-            const partial = simdSumF64(col.f64.values, sel);
-            s.* += partial;
+            s.* = (s.* orelse 0) + simdSumF64(col.f64.values, sel);
         },
         else => return error.UnsupportedAggType,
     }
@@ -1190,6 +1202,12 @@ pub const OutputCol = struct {
     /// Parquet physical type — used by the caller to synthesize a
     /// SchemaElement for the output leaf.
     parquet_type: schema.Type,
+    /// OPTIONAL in the output schema. Set by the aggregate kind, not by whether this result happens to be NULL, so
+    /// per-file outputs of one query share a schema and re-aggregate together.
+    nullable: bool,
+    /// Annotations carried from a source column whose values pass through unchanged (see `engine.retypeOutputCol`).
+    logical_type: ?schema.LogicalType = null,
+    converted_type: ?schema.ConvertedType = null,
 };
 
 pub fn finalize(
@@ -1198,66 +1216,87 @@ pub fn finalize(
     state: Accumulator,
 ) Error![]OutputCol {
     return switch (call.func) {
-        .count => try emitOneI64(arena, call.alias, @intCast(state.count)),
+        .count => try emitOneI64(arena, call.alias, @intCast(state.count), false),
         .sum => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.sum_i),
+            .i64 => try emitOneI64(arena, call.alias, state.sum_i, true),
             .f64 => try emitOneF64(arena, call.alias, state.sum_f),
             .bytes, .avg_f64 => unreachable,
         },
         .min => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.min_i orelse 0),
-            .f64 => try emitOneF64(arena, call.alias, state.min_f orelse 0),
-            // empty selection → "" (same sentinel-not-NULL gap as numerics;
-            // the NULL fix is a separate general agg item).
-            .bytes => try emitOneString(arena, call.alias, state.min_bytes orelse ""),
+            .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.min_i), true),
+            .f64 => try emitOneF64(arena, call.alias, state.min_f),
+            .bytes => try emitOneString(arena, call.alias, state.min_bytes),
             .avg_f64 => unreachable,
         },
         .max => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.max_i orelse 0),
-            .f64 => try emitOneF64(arena, call.alias, state.max_f orelse 0),
-            .bytes => try emitOneString(arena, call.alias, state.max_bytes orelse ""),
+            .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.max_i), true),
+            .f64 => try emitOneF64(arena, call.alias, state.max_f),
+            .bytes => try emitOneString(arena, call.alias, state.max_bytes),
             .avg_f64 => unreachable,
         },
         .avg => try emitAvgPair(arena, call.alias, state.avg),
     };
 }
 
-fn emitOneI64(arena: std.mem.Allocator, name: []const u8, v: i128) Error![]OutputCol {
+/// min/max of an unsigned 64-bit column as the raw bits it is stored as, so an extremum of 2^63 or more still fits the
+/// INT64 column; the writer annotates it unsigned.
+fn u64Bits(call: AggCall, v: ?i128) ?i128 {
+    const x = v orelse return null;
+    const unsigned = if (call.arg) |a| a == .col_ref and a.col_ref.unsigned_64 else false;
+    return if (unsigned) @as(i64, @bitCast(@as(u64, @intCast(x)))) else x;
+}
+
+/// A one-row output column. NULL is a placeholder value under def level 0, so it needs `nullable`.
+fn oneRow(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    v: ?T,
+    placeholder: T,
+    nullable: bool,
+) Error!filter_eval.ColumnT(T) {
+    std.debug.assert(nullable or v != null);
+    const slot = try arena.alloc(T, 1);
+    slot[0] = v orelse placeholder;
+    if (!nullable) return .{ .values = slot };
+    if (v != null) return .{ .values = slot, .max_def = 1 };
+    const def = try arena.alloc(u32, 1);
+    def[0] = 0;
+    return .{ .values = slot, .def_levels = def, .max_def = 1, .has_nulls = true };
+}
+
+fn emitOneI64(arena: std.mem.Allocator, name: []const u8, v: ?i128, nullable: bool) Error![]OutputCol {
     // The result parquet column is INT64; a value outside i64 range (an
     // overflowing sum or an unsigned-64 extremum) can't be stored. Error
     // rather than silently wrap — the JSON path carries the full i128.
-    if (v > std.math.maxInt(i64) or v < std.math.minInt(i64)) return error.AggIntTooWide;
-    const slot = try arena.alloc(i64, 1);
-    slot[0] = @intCast(v);
+    const narrowed: ?i64 = if (v) |x| std.math.cast(i64, x) orelse return error.AggIntTooWide else null;
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .i64 = .{ .values = slot } },
+        .col = .{ .i64 = try oneRow(i64, arena, narrowed, 0, nullable) },
         .parquet_type = .INT64,
+        .nullable = nullable,
     };
     return out;
 }
 
-fn emitOneString(arena: std.mem.Allocator, name: []const u8, v: []const u8) Error![]OutputCol {
-    const slot = try arena.alloc([]const u8, 1);
-    slot[0] = v;
+fn emitOneString(arena: std.mem.Allocator, name: []const u8, v: ?[]const u8) Error![]OutputCol {
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .string = .{ .values = slot } },
+        .col = .{ .string = try oneRow([]const u8, arena, v, "", true) },
         .parquet_type = .BYTE_ARRAY,
+        .nullable = true,
     };
     return out;
 }
 
-fn emitOneF64(arena: std.mem.Allocator, name: []const u8, v: f64) Error![]OutputCol {
-    const slot = try arena.alloc(f64, 1);
-    slot[0] = v;
+fn emitOneF64(arena: std.mem.Allocator, name: []const u8, v: ?f64) Error![]OutputCol {
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .f64 = .{ .values = slot } },
+        .col = .{ .f64 = try oneRow(f64, arena, v, 0, true) },
         .parquet_type = .DOUBLE,
+        .nullable = true,
     };
     return out;
 }
@@ -1266,27 +1305,21 @@ fn emitAvgPair(arena: std.mem.Allocator, name: []const u8, st: AvgState) Error![
     // Two columns: <alias>__sum (DOUBLE) and <alias>__count (INT64).
     // Caller running `zpq query --aggregate "avg(...) AS x"` over the
     // tier-1 outputs gets sum(x__sum) / sum(x__count) — algebraically
-    // correct re-aggregation.
+    // correct re-aggregation. With no values the sum is NULL like sum()'s,
+    // and the count 0 like count()'s.
     const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
     const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
-
-    const sum_slot = try arena.alloc(f64, 1);
-    sum_slot[0] = st.sum;
-    const count_slot = try arena.alloc(i64, 1);
-    count_slot[0] = @intCast(st.count);
-
+    const sum = try emitOneF64(arena, sum_name, avgSum(st));
+    const count = try emitOneI64(arena, count_name, st.count, false);
     const out = try arena.alloc(OutputCol, 2);
-    out[0] = .{
-        .name = sum_name,
-        .col = .{ .f64 = .{ .values = sum_slot } },
-        .parquet_type = .DOUBLE,
-    };
-    out[1] = .{
-        .name = count_name,
-        .col = .{ .i64 = .{ .values = count_slot } },
-        .parquet_type = .INT64,
-    };
+    out[0] = sum[0];
+    out[1] = count[0];
     return out;
+}
+
+/// The avg pair's sum, NULL when no value was averaged.
+pub fn avgSum(st: AvgState) ?f64 {
+    return if (st.count == 0) null else st.sum;
 }
 
 // ============================================================
@@ -1420,7 +1453,7 @@ test "unsigned-64 sum/min/max read the i64 lane as u64" {
         var state = Accumulator.init(call);
         try updateOne(a, a, &state, call, &batch, &lookup, &sel);
         const got: i128 = switch (state) {
-            .sum_i => |v| v,
+            .sum_i => |v| v.?,
             .min_i => |v| v.?,
             .max_i => |v| v.?,
             else => unreachable,
@@ -1668,7 +1701,51 @@ test "updateOneFromStats sum: constant-column RG folds num_rows × value" {
     rg.columns.items[0].meta_data.?.statistics.?.max_value = hi_buf;
     var state2 = Accumulator.init(sum_call);
     try testing.expectEqual(false, try updateOneFromStats(&state2, sum_call, &rg, &test_meta));
-    try testing.expectEqual(@as(i128, 0), state2.sum_i);
+    try testing.expectEqual(@as(?i128, null), state2.sum_i);
+}
+
+test "updateOneFromStats: an all-null row group leaves sum/min/max NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Bounds a writer left on a chunk whose every row is null must not become a value (or a 0 sum).
+    const bound = try a.alloc(u8, 8);
+    std.mem.writeInt(i64, bound[0..8], 7, .little);
+    var path: schema.StringList = .empty;
+    try path.append(a, "x");
+    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try col_chunks.append(a, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT64,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 100,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = .{ .min_value = bound, .max_value = bound, .null_count = 100 },
+        },
+    });
+    const rg: schema.RowGroup = .{ .columns = col_chunks, .total_byte_size = 0, .num_rows = 100 };
+    const meta = try testI64Meta(a, .empty, 100, .OPTIONAL);
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+
+    inline for (.{ AggFunc.sum, AggFunc.min, AggFunc.max }) |func| {
+        const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "x", .result = .i64 };
+        var state = Accumulator.init(call);
+        try testing.expect(try updateOneFromStats(&state, call, &rg, &meta));
+        const v: ?i128 = switch (state) {
+            .sum_i, .min_i, .max_i => |x| x,
+            else => unreachable,
+        };
+        try testing.expectEqual(@as(?i128, null), v);
+    }
 }
 
 test "updateOneFromStats decodes typed min/max bytes" {
@@ -2147,6 +2224,116 @@ test "conditional agg via FILTER predicate" {
     try testing.expectEqual(@as(i128, 90), state.sum_i);
 }
 
+test "sum/avg/min/max over no values are NULL; count is 0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Column 0: all null. Column 1: present, but rows are deselected below. Column 2: strings.
+    const nulls = [_]f64{ 7, 7, 7 };
+    const zeros = [_]u32{ 0, 0, 0 };
+    const ints = [_]i64{ 1, 2, 3 };
+    const strs = [_][]const u8{ "a", "b", "c" };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .f64 = .{ .values = &nulls, .def_levels = &zeros, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = &ints } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    var all = try filter_selection.SelectionVector.init(a, 3);
+    var none = try filter_selection.SelectionVector.init(a, 3);
+    for (0..3) |i| none.set(i, false);
+
+    const f_null: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const i_col: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const s_col: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const never: filter_ast.Filter = .{ .int64 = .{ .col_idx = 1, .op = .Lt, .value = 0 } };
+    const Case = struct { call: AggCall, sel: *filter_selection.SelectionVector };
+    const cases = [_]Case{
+        // all-null input
+        .{ .call = .{ .func = .sum, .arg = f_null, .where = null, .alias = "a", .result = .f64 }, .sel = &all },
+        .{ .call = .{ .func = .min, .arg = f_null, .where = null, .alias = "b", .result = .f64 }, .sel = &all },
+        .{ .call = .{ .func = .avg, .arg = f_null, .where = null, .alias = "c", .result = .avg_f64 }, .sel = &all },
+        // zero rows selected by the outer filter
+        .{ .call = .{ .func = .sum, .arg = i_col, .where = null, .alias = "d", .result = .i64 }, .sel = &none },
+        .{ .call = .{ .func = .max, .arg = i_col, .where = null, .alias = "e", .result = .i64 }, .sel = &none },
+        .{ .call = .{ .func = .min, .arg = s_col, .where = null, .alias = "f", .result = .bytes }, .sel = &none },
+        // a FILTER clause that selects nothing
+        .{ .call = .{ .func = .sum, .arg = i_col, .where = never, .alias = "g", .result = .i64 }, .sel = &all },
+        .{ .call = .{ .func = .max, .arg = s_col, .where = never, .alias = "h", .result = .bytes }, .sel = &all },
+    };
+    for (cases) |c| {
+        var state = Accumulator.init(c.call);
+        try updateOne(a, a, &state, c.call, &batch, &lookup, c.sel);
+        // A second, equally empty partial merged in must not turn NULL into 0.
+        state.merge(Accumulator.init(c.call), a);
+        const outs = try finalize(a, c.call, state);
+        // avg's count column stays a REQUIRED 0; every other output is a NULL.
+        for (outs) |o| {
+            if (std.mem.endsWith(u8, o.name, "__count")) {
+                try testing.expect(!o.nullable);
+                try testing.expectEqual(@as(i64, 0), o.col.i64.values[0]);
+                continue;
+            }
+            try testing.expect(o.nullable);
+            switch (o.col) {
+                inline else => |col| {
+                    try testing.expect(col.has_nulls);
+                    try testing.expectEqualSlices(u32, &.{0}, col.def_levels.?);
+                },
+            }
+        }
+    }
+
+    // count(*) and count(col) over the same inputs are 0, not NULL.
+    const count_col: AggCall = .{ .func = .count, .arg = f_null, .where = null, .alias = "n", .result = .i64 };
+    var cs = Accumulator.init(count_col);
+    try updateOne(a, a, &cs, count_col, &batch, &lookup, &all);
+    const cout = try finalize(a, count_col, cs);
+    try testing.expect(!cout[0].nullable);
+    try testing.expectEqual(@as(i64, 0), cout[0].col.i64.values[0]);
+
+    // NULL is the identity for merging partials: NULL + 6 = 6.
+    const sum_call: AggCall = .{ .func = .sum, .arg = i_col, .where = null, .alias = "s", .result = .i64 };
+    var empty = Accumulator.init(sum_call);
+    var full = Accumulator.init(sum_call);
+    try updateOne(a, a, &full, sum_call, &batch, &lookup, &all);
+    empty.merge(full, a);
+    try testing.expectEqual(@as(?i128, 6), empty.sum_i);
+}
+
+test "grouped sum/min over a group with only null values stays NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Group 0 holds rows 0 and 2 (both null); group 1 holds row 1 (value 5).
+    const vals = [_]i64{ 9, 5, 9 };
+    const dls = [_]u32{ 0, 1, 0 };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .i64 = .{ .values = &vals, .def_levels = &dls, .max_def = 1, .has_nulls = true } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+    const sel = try filter_selection.SelectionVector.init(a, 3);
+    const gids = [_]u32{ 0, 1, 0 };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .min, .arg = arg, .where = null, .alias = "m", .result = .i64 },
+    };
+    var accs: [4]Accumulator = undefined;
+    for (0..2) |g| for (calls, 0..) |c, i| {
+        accs[g * 2 + i] = Accumulator.init(c);
+    };
+    for (calls, 0..) |c, i| try updateOneGrouped(a, a, &accs, &gids, i, calls.len, c, &batch, &lookup, &sel);
+    try testing.expectEqual(@as(?i128, null), accs[0].sum_i);
+    try testing.expectEqual(@as(?i128, null), accs[1].min_i);
+    try testing.expectEqual(@as(?i128, 5), accs[2].sum_i);
+    try testing.expectEqual(@as(?i128, 5), accs[3].min_i);
+}
+
 // --- DECIMAL aggregate stats-fast-path (self-contained, no fixtures) ---
 // decimalStatBytesToF64 is how min/max/sum on a DECIMAL column are answered
 // from row-group Statistics without decoding values. It's pure (byte slice +
@@ -2540,7 +2727,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
                 else => return error.UnsupportedAggType,
             };
-            s.* += v;
+            s.* = (s.* orelse 0) + v;
         },
         .sum_f => |*s| {
             const v = switch (col) {
@@ -2548,7 +2735,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .f64 => |c| c.values[r],
                 else => return error.UnsupportedAggType,
             };
-            s.* += v;
+            s.* = (s.* orelse 0) + v;
         },
         else => return error.UnsupportedAggType,
     }

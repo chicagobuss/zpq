@@ -359,6 +359,130 @@ test "lambda handles back-to-back invocations" {
     }
 }
 
+test "lambda aggregate over no rows answers NULL for sum/avg/min/max, 0 for count" {
+    const fixture_path = "data/parquet-testing/data/alltypes_plain.parquet";
+    const probe = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    std.testing.allocator.free(probe);
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
+    defer std.testing.allocator.free(endpoint);
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    var poll = try server.acceptRequest(std.testing.allocator);
+    try poll.replyAndClose(
+        std.testing.allocator,
+        200,
+        "Lambda-Runtime-Aws-Request-Id: req-empty-agg\r\n" ++
+            "Content-Type: application/json\r\n",
+        "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"filter\":\"id < 0\"," ++
+            "\"aggregate\":\"sum(id) AS s, avg(id) AS a, min(string_col) AS m, max(double_col) AS x, " ++
+            "count(*) AS c, count(id) AS ci\"}",
+    );
+
+    var resp = try server.acceptRequest(std.testing.allocator);
+    const want = "\"agg\":{\"s\":null,\"a\":{\"sum\":null,\"count\":0},\"m\":null,\"x\":null,\"c\":0,\"ci\":0}";
+    if (std.mem.indexOf(u8, resp.body, want) == null) {
+        std.debug.print("[lambda empty agg] response: {s}\n", .{resp.body});
+        return error.TestUnexpectedResult;
+    }
+    try resp.replyAndClose(std.testing.allocator, 202, "", "");
+}
+
+test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI" {
+    // A string min/max and a group key carrying `"`, `\`, a newline and 0x01; a NaN sum and an +inf max.
+    const fixture_path = "ci/fixtures/parquet/json_escape.parquet";
+    const events = [_]struct { body: []const u8, want: []const u8 }{
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"]," ++
+                "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a\"}",
+            .want = "\"agg\":{\"m\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":\"NaN\",\"i\":\"Infinity\"," ++
+                "\"a\":{\"sum\":\"NaN\",\"count\":3}}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"s\",\"aggregate\":\"sum(x) AS n\"}",
+            .want = "{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2},{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1}",
+        },
+        .{
+            // Invalid UTF-8 becomes one U+FFFD per offending byte; U+2028 is escaped.
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"count(*) AS n\"}",
+            .want = "[{\"b\":\"\\u2028\",\"n\":1},{\"b\":\"\u{FFFD}\u{FFFD}\u{FFFD}\",\"n\":1}," ++
+                "{\"b\":\"\u{FFFD}\u{FFFD}A\u{FFFD}\u{FFFD}\",\"n\":1}]",
+        },
+    };
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
+    defer std.testing.allocator.free(endpoint);
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    for (events) |ev| {
+        var poll = try server.acceptRequest(std.testing.allocator);
+        try poll.replyAndClose(
+            std.testing.allocator,
+            200,
+            "Lambda-Runtime-Aws-Request-Id: req-json-escape\r\nContent-Type: application/json\r\n",
+            ev.body,
+        );
+        var resp = try server.acceptRequest(std.testing.allocator);
+        // The whole response must be valid JSON, not just contain the expected fragment.
+        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{}) catch |err| {
+            std.debug.print("[lambda json escape] invalid JSON ({s}): {s}\n", .{ @errorName(err), resp.body });
+            return err;
+        };
+        parsed.deinit();
+        if (std.mem.indexOf(u8, resp.body, ev.want) == null) {
+            std.debug.print("[lambda json escape] response: {s}\n", .{resp.body});
+            return error.TestUnexpectedResult;
+        }
+        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+    }
+}
+
+test "lambda rejects clashing output column names and names the column" {
+    const fixture_path = "ci/fixtures/parquet/json_escape.parquet";
+    const events = [_]struct { body: []const u8, want: []const u8 }{
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"s AS k\",\"aggregate\":\"sum(x) AS s\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"AmbiguousOutputColumn\",\"column\":\"s\"}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"aggregate\":\"sum(x) AS t, max(y) AS t\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"DuplicateOutputColumn\",\"column\":\"t\"}",
+        },
+    };
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
+    defer std.testing.allocator.free(endpoint);
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    for (events) |ev| {
+        var poll = try server.acceptRequest(std.testing.allocator);
+        try poll.replyAndClose(
+            std.testing.allocator,
+            200,
+            "Lambda-Runtime-Aws-Request-Id: req-name-clash\r\nContent-Type: application/json\r\n",
+            ev.body,
+        );
+        var resp = try server.acceptRequest(std.testing.allocator);
+        if (!std.mem.eql(u8, resp.body, ev.want)) {
+            std.debug.print("[lambda name clash] response: {s}\n", .{resp.body});
+            return error.TestUnexpectedResult;
+        }
+        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+    }
+}
+
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var path_z: [256]u8 = undefined;
     if (path.len + 1 > path_z.len) return error.PathTooLong;

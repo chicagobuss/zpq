@@ -21,7 +21,7 @@ import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
 ZPQ = "zig-out/bin/zpq"
 # Physical column order of the fixture (gen_fixture below). `--columns` projects
 # a subset in THIS order; `--select` projects in the requested order.
-SCHEMA_ORDER = ["id", "amt", "price", "name", "nname", "d", "flag"]
+SCHEMA_ORDER = ["id", "amt", "price", "name", "nname", "d", "flag", "ts"]
 
 # (label, zpq_filter | None, duckdb_where | None) — split because date literals
 # differ (ZPQ '2020-06-01' vs DuckDB DATE '2020-06-01').
@@ -36,10 +36,20 @@ FILTERS = [
     ("flag_true",     "flag = true",            "flag = true"),
     ("id_in",         "id IN (1, 5, 999)",      "id IN (1, 5, 999)"),
     ("id_between",    "id BETWEEN 100 AND 200", "id BETWEEN 100 AND 200"),
+    ("price_between", "price BETWEEN 100.5 AND 200", "price BETWEEN 100.5 AND 200"),
+    ("date_between",  "d BETWEEN '2020-06-01' AND '2020-07-01'",
+                      "d BETWEEN DATE '2020-06-01' AND DATE '2020-07-01'"),
     ("and",           "id > 500 AND name LIKE 'n9%'", "id > 500 AND name LIKE 'n9%'"),
     ("or",            "id < 100 OR id > 1900",  "id < 100 OR id > 1900"),
     ("date_ge",       "d >= '2020-06-01'",      "d >= DATE '2020-06-01'"),
     ("not_in",        "id NOT IN (1,2,3)",      "id NOT IN (1,2,3)"),
+    # Literals finer than the column's millisecond unit must compare exactly, not truncated to the unit.
+    ("ts_ge_sub_ms",  "ts >= '2020-01-01 00:00:00.0995'", "ts >= TIMESTAMP '2020-01-01 00:00:00.0995'"),
+    ("ts_lt_sub_ms",  "ts < '2020-01-01 00:00:00.0995'",  "ts < TIMESTAMP '2020-01-01 00:00:00.0995'"),
+    ("ts_eq_sub_ms",  "ts = '2020-01-01 00:00:00.0995'",  "ts = TIMESTAMP '2020-01-01 00:00:00.0995'"),
+    ("ts_ne_sub_ms",  "ts != '2020-01-01 00:00:00.0995'", "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"),
+    ("ts_between_sub_ms", "ts BETWEEN '2020-01-01 00:00:00.0995' AND '2020-01-01 00:00:00.2005'",
+                      "ts BETWEEN TIMESTAMP '2020-01-01 00:00:00.0995' AND TIMESTAMP '2020-01-01 00:00:00.2005'"),
     ("notnull_and_like", "nname IS NOT NULL AND name LIKE 'n5%'", "nname IS NOT NULL AND name LIKE 'n5%'"),
     ("id_neg",        "id < 0",                 "id < 0"),
     ("amt_isnull",    "amt IS NULL",            "amt IS NULL"),
@@ -66,6 +76,7 @@ AGGS = [
     ("decimal_sum", "sum(price) AS s", "sum(price)"),
     # count(*) alone needs no column at all in a row group statistics prove fully matching.
     ("count_star", "count(*) AS n, sum(amt) AS s", "count(*), sum(amt)"),
+    ("avg",       "avg(amt) AS a, min(name) AS mn", "avg(amt), min(name)"),
 ]
 # (label, columns_csv | None) — None = all columns (passthrough fast path).
 PROJECTIONS = [
@@ -89,7 +100,8 @@ def gen_fixture(con, path, n=4000):
         (CASE WHEN i % 13 = 0 THEN '' ELSE 'n' || i END) AS name,
         (CASE WHEN i % 7 = 0 THEN NULL ELSE 'v' || i END) AS nname,
         (DATE '2020-01-01' + i::INTEGER) AS d,
-        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag
+        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag,
+        (CASE WHEN i % 17 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + to_milliseconds(i) END)::TIMESTAMP_MS AS ts
       FROM range(1, {n}) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)""")
 
 
@@ -103,6 +115,13 @@ def norm(v):
         return "NaN"  # as zpq's jsonl prints it, and so NaN rows compare equal
     if isinstance(v, (float, Decimal)):
         return round(float(v), 4)
+    return v
+
+
+def fold_avg(v):
+    """avg arrives as its re-aggregatable {sum, count} pair; no values averaged means NULL."""
+    if isinstance(v, dict):
+        return v["sum"] / v["count"] if v["count"] else None
     return v
 
 
@@ -360,7 +379,7 @@ def main():
             # Value diff vs the DuckDB oracle. Order-independent (DuckDB doesn't
             # guarantee row order); row-order determinism is checked separately.
             canon = cols if cols is not None else \
-                ["amt", "d", "flag", "id", "name", "nname", "price"]
+                ["amt", "d", "flag", "id", "name", "nname", "price", "ts"]
             sel = ", ".join(canon)
             where = f" WHERE {dw}" if dw is not None else ""
             try:
@@ -414,7 +433,12 @@ def main():
     for alabel, za, ds in AGGS:
         for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500"),
                                ("notnull", "nname IS NOT NULL", "nname IS NOT NULL"),
-                               ("date_ge", "d >= '2020-06-01'", "d >= DATE '2020-06-01'")]:
+                               ("date_ge", "d >= '2020-06-01'", "d >= DATE '2020-06-01'"),
+                               ("ts_ne_sub_ms", "ts != '2020-01-01 00:00:00.0995'",
+                                "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"),
+                               # Over no rows / only nulls: sum, avg, min, max are NULL, count is 0.
+                               ("no_rows", "id < -100000", "id < -100000"),
+                               ("amt_isnull", "amt IS NULL", "amt IS NULL")]:
             total += 1
             cmd = [ZPQ, "query", fixture, "--aggregate", za]
             if zf is not None:
@@ -428,7 +452,7 @@ def main():
 
             try:
                 zout = json.loads(r.stdout)
-                zvals = [norm(v) for v in zout["agg"].values()]
+                zvals = [norm(fold_avg(v)) for v in zout["agg"].values()]
                 proven = zout.get("row_groups_full_match", 0)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
@@ -457,9 +481,24 @@ def main():
          "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{fixture}' GROUP BY concat"),
         ("gb_coalesce", "coalesce(nname, 'NA') AS coal", "count(id) AS c", "c,coal",
          "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{fixture}' GROUP BY coal"),
+        # Keys mixing integer and float operands compute in DOUBLE; reading the integer side's bits as a double
+        # used to turn 2 into 1e-323 and collapse distinct keys.
+        ("gb_int_plus_float", "id + 0.5 AS h", "count(*) AS n", None,
+         "SELECT (id + 0.5) AS h, count(*) AS n FROM '{fixture}' GROUP BY h"),
+        ("gb_float_times_int", "amt * 2 AS a2", "count(*) AS n", None,
+         "SELECT (amt * 2) AS a2, count(*) AS n FROM '{fixture}' GROUP BY a2"),
+        ("gb_int_times_float", "id * amt AS p", "count(*) AS n", None,
+         "SELECT (id * amt) AS p, count(*) AS n FROM '{fixture}' GROUP BY p"),
+        ("gb_decimal_plus_int", "price + id AS q", "count(*) AS n", None,
+         "SELECT (price + id) AS q, count(*) AS n FROM '{fixture}' GROUP BY q"),
+        ("gb_null_input", "flag", "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+         None, "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx "
+         "FROM '{fixture}' GROUP BY flag"),
     ]
     for glabel, gby, agg, order, d_sql in GROUP_BYS:
-        for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500")]:
+        for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500"),
+                               ("amt_isnull", "amt IS NULL", "amt IS NULL"),
+                               ("no_rows", "id < -100000", "id < -100000")]:
             total += 1
             cmd = [ZPQ, "query", fixture, "--group-by", gby]
             if agg:
@@ -495,7 +534,7 @@ def main():
                 
                 zrows_list = []
                 for row_dict in zrows_raw:
-                    row_tuple = tuple(norm(row_dict.get(c)) for c in col_names)
+                    row_tuple = tuple(norm(fold_avg(row_dict.get(c))) for c in col_names)
                     zrows_list.append(row_tuple)
                 zrows = sorted(zrows_list, key=repr)
             except Exception as e:
@@ -510,6 +549,148 @@ def main():
                 print(f"  FAIL  {label}  {detail}")
             else:
                 print(f"  OK    {label}  ({len(zrows)} rows)")
+
+            # `-o` writes the same groups as parquet: same column order, same values and row order as the JSON, avg
+            # split into <name>__sum / <name>__count. pyarrow is the strict reader.
+            total += 1
+            out = os.path.join(tmp, "zgroup.parquet")
+            if os.path.exists(out):
+                os.remove(out)
+            r = subprocess.run(cmd + ["-o", out], capture_output=True, text=True)
+            label = f"groupby-o:{glabel:13} × {flabel:6}"
+            want_cols, want_rows = [], []
+            for c, v in (zrows_raw[0].items() if zrows_raw else []):
+                want_cols += [f"{c}__sum", f"{c}__count"] if isinstance(v, dict) else [c]
+            for row_dict in zrows_raw:
+                vals = []
+                for v in row_dict.values():
+                    vals += [v["sum"], v["count"]] if isinstance(v, dict) else [v]
+                want_rows.append(tuple(norm(v) for v in vals))
+            try:
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+                tbl = pq.read_table(out)
+                got_rows = [tuple(norm(v.decode() if isinstance(v, bytes) else v) for v in row.values())
+                            for row in tbl.to_pylist()]
+                problem = None
+                if zrows_raw and list(tbl.column_names) != want_cols:
+                    problem = f"columns {tbl.column_names} want {want_cols}"
+                elif got_rows != want_rows:
+                    problem = (f"rows zpq-parquet={got_rows[:2]}.. ({len(got_rows)}) "
+                               f"json={want_rows[:2]}.. ({len(want_rows)})")
+            except Exception as e:
+                problem = f"error: {e}"
+            if problem:
+                fails += 1
+                print(f"  FAIL  {label}  {problem}")
+            else:
+                print(f"  OK    {label}  ({len(got_rows)} rows match the JSON)")
+    # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
+    # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
+    # stays DOUBLE (its f64 value); computed columns keep their computed type.
+    import datetime as dt
+    import decimal
+    import pyarrow as pa
+    typed = os.path.join(tmp, "typed.parquet")
+    k = range(6)
+    pq.write_table(pa.table({
+        "s": pa.array(["a", "b", "a", "b", "a", None], pa.string()),
+        "bin": pa.array([b"x", b"y"] * 3, pa.binary()),
+        "d": pa.array([dt.date(2024, 1, 1 + i % 2) for i in k], pa.date32()),
+        "ts": pa.array([dt.datetime(2024, 1, 1, 0, 0, i % 2) for i in k], pa.timestamp("ms")),
+        "tsz": pa.array([dt.datetime(2024, 1, 1, 0, 0, i % 2) for i in k], pa.timestamp("us", tz="UTC")),
+        "b": pa.array([i % 2 == 0 for i in k], pa.bool_()),
+        "i8": pa.array([i % 2 - 1 for i in k], pa.int8()),
+        "u32": pa.array([4294967295 if i % 2 else 1 for i in k], pa.uint32()),
+        "u64": pa.array([2**64 - 1 if i % 2 else 1 for i in k], pa.uint64()),
+        "f": pa.array([0.5 if i % 2 else 1.5 for i in k], pa.float32()),
+        "tm": pa.array([dt.time(1, i % 2) for i in k], pa.time32("ms")),
+        "dec": pa.array([decimal.Decimal("1.25") * (i % 2) for i in k], pa.decimal128(9, 2)),
+    }), typed)
+    src_types = pq.read_schema(typed)
+    for col in src_types.names:
+        total += 1
+        out = os.path.join(tmp, "ztyped.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", typed, "--group-by", col, "-o", out, "--aggregate",
+                            f"min({col}) AS lo, max({col}) AS hi, count(*) AS n, sum(i8) AS si"],
+                           capture_output=True, text=True)
+        label = f"typed-o:{col}"
+        want = pa.float64() if col == "dec" else src_types.field(col).type
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+            got = pq.read_table(out)
+            types = [got.schema.field(c).type for c in (col, "lo", "hi", "n", "si")]
+            if types != [want, want, want, pa.int64(), pa.int64()]:
+                raise RuntimeError(f"types {[str(t) for t in types]} want {want} x3, int64 x2")
+            # DuckDB hands back tz-aware timestamps only through pytz; compare them as naive UTC instead.
+            naive = lambda v: v.astimezone(dt.timezone.utc).replace(tzinfo=None) \
+                if isinstance(v, dt.datetime) and v.tzinfo else v
+            zrows = sorted((tuple(norm(naive(v)) for v in row.values()) for row in got.to_pylist()), key=repr)
+            c = f"timezone('UTC', {col})" if getattr(want, "tz", None) else col
+            drows = rows_sorted(con, f"SELECT {c}, min({c}), max({c}), count(*), sum(i8) FROM '{typed}' GROUP BY 1")
+            if col == "dec":  # zpq's DOUBLE vs DuckDB's DECIMAL: compare as numbers
+                drows = sorted((tuple(norm(None if v is None else float(v)) if j < 3 else v for j, v in enumerate(r_))
+                                for r_ in drows), key=repr)
+            if zrows != drows:
+                raise RuntimeError(f"rows zpq={zrows[:2]} duck={drows[:2]}")
+            print(f"  OK    {label}  ({want})")
+        except Exception as e:
+            fails += 1
+            print(f"  FAIL  {label}  {e}")
+
+    # Clashing output names fail loudly, naming the column, instead of one column showing another's values.
+    CLASHES = [
+        ("key_vs_alias", ["--group-by", "name AS k", "--aggregate", "sum(amt) AS name"], "name"),
+        ("dup_alias", ["--aggregate", "sum(amt) AS a, min(amt) AS a"], "a"),
+        ("dup_alias_gb", ["--group-by", "flag", "--aggregate", "count(*) AS c, sum(amt) AS C"], "C"),
+        ("sql_key_vs_alias", ["--query", "SELECT name AS k, sum(amt) AS name FROM '{fixture}' GROUP BY name"], "name"),
+        ("sql_dup_alias", ["--query", "SELECT flag, count(*) AS c, sum(amt) AS c FROM '{fixture}' GROUP BY flag"], "c"),
+    ]
+    for clabel, cargs, col in CLASHES:
+        total += 1
+        cargs = [a.format(fixture=fixture) for a in cargs]
+        cmd = [ZPQ, "query"] + ([] if cargs[0] == "--query" else [fixture]) + cargs
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        label = f"name-clash:{clabel}"
+        if r.returncode != 0 and not r.stdout and f"output column `{col}`" in r.stderr:
+            print(f"  OK    {label}  (rejected: `{col}`)")
+        else:
+            fails += 1
+            print(f"  FAIL  {label}  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr.strip()[:80]!r}")
+
+    # Unaliased aggregates: a unique function name stays the output name (as before); clashing ones take the call
+    # text, as DuckDB names them, instead of erroring or printing duplicate JSON keys.
+    NAMES = [
+        ("lone", ["--aggregate", "sum(amt)"], ["sum"]),
+        ("two_sums", ["--aggregate", "sum(amt), sum(id)"], ["sum(amt)", "sum(id)"]),
+        ("gb_two_mins", ["--group-by", "flag", "--aggregate", "min(amt), min(id)"], ["flag", "min(amt)", "min(id)"]),
+        ("sql_two_sums", ["--query", "SELECT sum(amt), sum(id) FROM '{fixture}'"], ["sum(amt)", "sum(id)"]),
+        ("sql_gb_unaliased", ["--query", "SELECT flag, count(*), sum(id) FROM '{fixture}' GROUP BY flag"],
+         ["flag", "count(*)", "sum(id)"]),
+    ]
+    for nlabel, nargs, want in NAMES:
+        total += 1
+        nargs = [a.format(fixture=fixture) for a in nargs]
+        cmd = [ZPQ, "query"] + ([] if nargs[0] == "--query" else [fixture]) + nargs
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        label = f"agg-names:{nlabel}"
+        try:
+            # object_pairs_hook keeps duplicate keys visible instead of letting the last one win.
+            class Pairs(list):
+                pass
+            agg = dict(json.loads(r.stdout, object_pairs_hook=Pairs))["agg"]
+            got = [k for k, _ in (agg if isinstance(agg, Pairs) else agg[0])]
+        except Exception as e:
+            got = f"error: {e}; {r.stderr.strip()[:60]}"
+        if got == want:
+            print(f"  OK    {label}  {got}")
+        else:
+            fails += 1
+            print(f"  FAIL  {label}  got {got} want {want}")
+
     # ZPQ must preserve INPUT row order through filter+write (Iceberg compaction /
     # S3-to-S3 passthrough expect determinism; parallel per-RG workers must not
     # scramble). Compared in FILE order vs the input filtered in file order — this

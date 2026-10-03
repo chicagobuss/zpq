@@ -965,19 +965,20 @@ fn cloneColumnMeta(
 /// caller has arranged to be the whole-RG bounding-box span) and
 /// shift every chunk by the same delta.
 ///
-/// Write a 1-row parquet file containing one column-chunk per
-/// `OutputCol` (avg-style aggs already split into two cols upstream).
-/// Used by both CLI and Lambda aggregate paths — the output of an
-/// aggregate workload is a tiny parquet that downstream consumers
-/// (Iceberg/Athena/Polars/another zpq invocation) read like any
-/// other file.
+/// Write an aggregate result — one row, or one per GROUP BY group — as a
+/// single-row-group parquet file with one column-chunk per `OutputCol`
+/// (avg-style aggs already split into two cols upstream), each holding
+/// `num_rows` values. The output of an aggregate workload is a tiny parquet
+/// that downstream consumers (Iceberg/Athena/Polars/another zpq invocation)
+/// read like any other file.
 ///
 /// Returns total bytes written. The sink may be an FdSink (CLI) or
 /// MultipartSink (Lambda) — same protocol either way.
-pub fn writeOneRowAggregate(
+pub fn writeAggregateRows(
     arena: std.mem.Allocator,
     sink: streaming.Sink,
     output_cols: []const expr_agg.OutputCol,
+    num_rows: i64,
     codec: schema.CompressionCodec,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
@@ -993,11 +994,11 @@ pub fn writeOneRowAggregate(
         const leaf_elem: schema.SchemaElement = .{
             .type = out_col.parquet_type,
             .type_length = null,
-            .repetition_type = .REQUIRED,
+            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
             .name = out_col.name,
             .num_children = 0,
-            .converted_type = null,
-            .logical_type = null,
+            .converted_type = out_col.converted_type,
+            .logical_type = out_col.logical_type,
             .scale = null,
             .precision = null,
             .field_id = null,
@@ -1012,6 +1013,13 @@ pub fn writeOneRowAggregate(
         var em = enc.meta;
         em.data_page_offset += col_start;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start;
+        // The encoder orders min/max signed; an unsigned column's type-defined order is not, so drop the bounds.
+        if (schema.isUnsignedInt(leaf_elem)) if (em.statistics) |*st| {
+            st.min = null;
+            st.max = null;
+            st.min_value = null;
+            st.max_value = null;
+        };
         try sink.write(enc.bytes);
         off += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
@@ -1039,11 +1047,11 @@ pub fn writeOneRowAggregate(
         try new_schema.append(arena, .{
             .type = out_col.parquet_type,
             .type_length = null,
-            .repetition_type = .REQUIRED,
+            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
             .name = out_col.name,
             .num_children = 0,
-            .converted_type = null,
-            .logical_type = null,
+            .converted_type = out_col.converted_type,
+            .logical_type = out_col.logical_type,
             .scale = null,
             .precision = null,
             .field_id = null,
@@ -1054,13 +1062,13 @@ pub fn writeOneRowAggregate(
     try new_row_groups.append(arena, .{
         .columns = rg_columns,
         .total_byte_size = rg_total,
-        .num_rows = 1,
+        .num_rows = num_rows,
     });
 
     const new_meta: schema.FileMetaData = .{
         .version = 1,
         .schema = new_schema,
-        .num_rows = 1,
+        .num_rows = num_rows,
         .created_by = null,
         .row_groups = new_row_groups,
         .column_orders = try schema.FileMetaData.outputColumnOrders(arena, rg_columns.items.len, null, &.{}),

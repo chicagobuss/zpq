@@ -334,6 +334,8 @@ fn parseBetween(arena: std.mem.Allocator, expr: []const u8, file: *const schema.
     const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
     const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
 
+    // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
+    // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
     const left = try arena.create(ast.Filter);
     const right = try arena.create(ast.Filter);
     left.* = try buildTypedComparison(col_idx, &elem, .GtEq, x_str);
@@ -445,26 +447,48 @@ fn buildUnsignedLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Erro
     return .{ .uint64 = .{ .col_idx = col_idx, .op = if (holds) .GtEq else .Lt, .value = 0 } };
 }
 
-/// A column whose INT32/INT64 storage carries a temporal logical type.
-const TemporalKind = union(enum) {
-    date, // INT32: days since 1970-01-01
-    timestamp: schema.TimeUnit, // INT64: ticks since epoch in `unit`
+/// A column whose INT32/INT64(/INT96) storage carries a temporal logical type. `ns_per_tick` is the stored unit
+/// (a whole day for DATE); `lane` is the leaf type its values decode to.
+const TemporalKind = struct {
+    literal: enum { date_time, time_of_day },
+    ns_per_tick: i128,
+    lane: Lane,
 };
+const Lane = enum { int32, int64 };
+
+const ns_per_s: i128 = 1_000_000_000;
+const ns_per_day: i128 = 86_400 * ns_per_s;
+
+fn unitNs(unit: schema.TimeUnit) i128 {
+    return switch (unit) {
+        .MILLIS => 1_000_000,
+        .MICROS => 1_000,
+        .NANOS => 1,
+    };
+}
 
 fn temporalKind(elem: *const schema.SchemaElement) ?TemporalKind {
+    const date: TemporalKind = .{ .literal = .date_time, .ns_per_tick = ns_per_day, .lane = .int32 };
     // INT96 is a legacy Spark/Impala timestamp — the consumer decodes it to
     // i64 epoch-nanoseconds, so filter literals parse as nanos regardless of
     // any (usually absent) logical type.
-    if (elem.type == .INT96) return .{ .timestamp = .{ .NANOS = .{} } };
+    if (elem.type == .INT96) return .{ .literal = .date_time, .ns_per_tick = 1, .lane = .int64 };
     if (elem.logical_type) |lt| switch (lt) {
-        .DATE => return .date,
-        .TIMESTAMP => |ts| return .{ .timestamp = ts.unit },
+        .DATE => return date,
+        .TIMESTAMP => |ts| return .{ .literal = .date_time, .ns_per_tick = unitNs(ts.unit), .lane = .int64 },
+        .TIME => |t| return .{
+            .literal = .time_of_day,
+            .ns_per_tick = unitNs(t.unit),
+            .lane = if (elem.type == .INT32) .int32 else .int64,
+        },
         else => {},
     };
     if (elem.converted_type) |ct| switch (ct) {
-        .DATE => return .date,
-        .TIMESTAMP_MILLIS => return .{ .timestamp = .{ .MILLIS = .{} } },
-        .TIMESTAMP_MICROS => return .{ .timestamp = .{ .MICROS = .{} } },
+        .DATE => return date,
+        .TIMESTAMP_MILLIS => return .{ .literal = .date_time, .ns_per_tick = 1_000_000, .lane = .int64 },
+        .TIMESTAMP_MICROS => return .{ .literal = .date_time, .ns_per_tick = 1_000, .lane = .int64 },
+        .TIME_MILLIS => return .{ .literal = .time_of_day, .ns_per_tick = 1_000_000, .lane = .int32 },
+        .TIME_MICROS => return .{ .literal = .time_of_day, .ns_per_tick = 1_000, .lane = .int64 },
         else => {},
     };
     return null;
@@ -472,25 +496,56 @@ fn temporalKind(elem: *const schema.SchemaElement) ?TemporalKind {
 
 fn buildTemporalLeaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8, tk: TemporalKind) Error!ast.Filter {
     const val_str = stripStringQuotes(val_str_raw);
-    switch (tk) {
-        .date => {
-            // Bare integer = raw days since epoch (back-compat); otherwise
-            // parse a YYYY-MM-DD literal.
-            const days: i32 = if (std.fmt.parseInt(i32, val_str, 10)) |v|
-                v
-            else |_|
-                std.math.cast(i32, try parseDateDays(val_str)) orelse return error.BadValue;
-            return .{ .int32 = .{ .col_idx = col_idx, .op = op, .value = days } };
-        },
-        .timestamp => |unit| {
-            const ticks: i64 = if (std.fmt.parseInt(i64, val_str, 10)) |v|
-                v
-            else |_|
-                try parseTimestampTicks(val_str, unit);
-            return .{ .int64 = .{ .col_idx = col_idx, .op = op, .value = ticks } };
-        },
-    }
+    // Bare integer = raw ticks in the column's unit (back-compat).
+    if (std.fmt.parseInt(i64, val_str, 10)) |ticks| {
+        return bindExact(col_idx, op, tk.lane, ticks, false);
+    } else |_| {}
+    const lit = switch (tk.literal) {
+        .date_time => try parseDateTimeNs(val_str),
+        .time_of_day => try parseTimeOfDayNs(val_str),
+    };
+    const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
+    return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact);
 }
+
+fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact: bool) ast.Filter {
+    return switch (lane) {
+        .int32 => .{ .int32 = exactLeaf(i32, col_idx, op, floor, inexact) },
+        .int64 => .{ .int64 = exactLeaf(i64, col_idx, op, floor, inexact) },
+    };
+}
+
+/// `col op v` as an equivalent comparison against a value of the column's type, where `v` is `floor` when exact and
+/// otherwise lies strictly between `floor` and `floor + 1` (or beyond the type's range). Rounding the literal to the
+/// column's unit changed answers (`>= 0.0995` s on a millisecond column matched 0.099 s), and because the rewrite is
+/// equivalent on every non-null value, eval, page/row-group pruning and the full-match proof stay exact unchanged.
+fn exactLeaf(comptime T: type, col_idx: usize, op: ast.Operator, floor: i128, inexact: bool) ast.Leaf(T) {
+    const lo = std.math.minInt(T);
+    const hi = std.math.maxInt(T);
+    // No stored value equals `v`: `=` matches nothing and `!=` every non-null row. `col > maxInt` and
+    // `col <= maxInt` say exactly that while still rejecting nulls, and negate into each other for NOT.
+    const never: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .Gt, .value = hi };
+    const always: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .LtEq, .value = hi };
+    const o: ast.Operator = if (!inexact) op else switch (op) {
+        .Eq => return never,
+        .NotEq => return always,
+        .Gt, .GtEq => .Gt,
+        .Lt, .LtEq => .LtEq,
+    };
+    if (floor > hi) return switch (o) {
+        .Gt, .GtEq, .Eq => never,
+        .Lt, .LtEq, .NotEq => always,
+    };
+    if (floor < lo) return switch (o) {
+        .Lt, .LtEq, .Eq => never,
+        .Gt, .GtEq, .NotEq => always,
+    };
+    return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
+}
+
+/// A literal as whole nanoseconds; `sub_ns` means a nonzero fraction digit past the ninth put it strictly between
+/// `ns` and `ns + 1`.
+const ExactNs = struct { ns: i128, sub_ns: bool };
 
 /// Days since 1970-01-01 for a proleptic-Gregorian (y, m, d). Howard
 /// Hinnant's days_from_civil — std has no civil-date conversion, and we
@@ -505,53 +560,60 @@ fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
     return era * 146097 + doe - 719468;
 }
 
+/// Unsigned decimal of 1..`max_len` digits. Stricter than parseInt: no sign, no `_`, and the length cap keeps
+/// every later product far from overflow.
+fn parseDigits(s: []const u8, max_len: usize) Error!i64 {
+    if (s.len == 0 or s.len > max_len) return error.BadValue;
+    var v: i64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return error.BadValue;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
 fn parseDateDays(s: []const u8) Error!i64 {
     var it = std.mem.splitScalar(u8, s, '-');
-    const y = std.fmt.parseInt(i64, it.next() orelse return error.BadValue, 10) catch return error.BadValue;
-    const mo = std.fmt.parseInt(i64, it.next() orelse return error.BadValue, 10) catch return error.BadValue;
-    const d = std.fmt.parseInt(i64, it.next() orelse return error.BadValue, 10) catch return error.BadValue;
+    const y = try parseDigits(it.next() orelse return error.BadValue, 6);
+    const mo = try parseDigits(it.next() orelse return error.BadValue, 2);
+    const d = try parseDigits(it.next() orelse return error.BadValue, 2);
     if (it.next() != null) return error.BadValue; // trailing junk
-    if (mo < 1 or mo > 12 or d < 1 or d > 31) return error.BadValue;
+    if (mo < 1 or mo > 12 or d < 1) return error.BadValue;
+    const leap = @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
+    const month_days = [12]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (d > month_days[@intCast(mo - 1)]) return error.BadValue;
     return daysFromCivil(y, mo, d);
 }
 
-fn parseTimestampTicks(s: []const u8, unit: schema.TimeUnit) Error!i64 {
-    // YYYY-MM-DD[ |T]HH:MM:SS[.fraction]; time part optional → midnight.
-    var date_part = s;
-    var time_part: []const u8 = "";
-    if (std.mem.indexOfAny(u8, s, " T")) |sep| {
-        date_part = s[0..sep];
-        time_part = s[sep + 1 ..];
-    }
-    const days = try parseDateDays(date_part);
+/// `YYYY-MM-DD[( |T)HH:MM:SS[.fraction]]` → nanoseconds since the epoch; no time part means midnight.
+fn parseDateTimeNs(s: []const u8) Error!ExactNs {
+    const sep = std.mem.indexOfAny(u8, s, " T");
+    const days = try parseDateDays(if (sep) |i| s[0..i] else s);
+    const tod: ExactNs = if (sep) |i| try parseTimeOfDayNs(s[i + 1 ..]) else .{ .ns = 0, .sub_ns = false };
+    return .{ .ns = days * ns_per_day + tod.ns, .sub_ns = tod.sub_ns };
+}
 
-    var secs: i64 = 0;
+/// `HH:MM:SS[.fraction]` → nanoseconds since midnight. Fraction digits past nanoseconds are kept as `sub_ns` rather
+/// than dropped: truncating them is what moved literals across stored values.
+fn parseTimeOfDayNs(s: []const u8) Error!ExactNs {
+    const dot = std.mem.indexOfScalar(u8, s, '.');
+    var it = std.mem.splitScalar(u8, if (dot) |d| s[0..d] else s, ':');
+    const hh = try parseDigits(it.next() orelse return error.BadValue, 2);
+    const mm = try parseDigits(it.next() orelse return error.BadValue, 2);
+    const ss = try parseDigits(it.next() orelse return error.BadValue, 2);
+    if (it.next() != null or hh > 23 or mm > 59 or ss > 59) return error.BadValue;
     var frac_ns: i64 = 0;
-    if (time_part.len > 0) {
-        const dot = std.mem.indexOfScalar(u8, time_part, '.');
-        const hms = if (dot) |di| time_part[0..di] else time_part;
-        var tit = std.mem.splitScalar(u8, hms, ':');
-        const hh = std.fmt.parseInt(i64, tit.next() orelse return error.BadValue, 10) catch return error.BadValue;
-        const mm = std.fmt.parseInt(i64, tit.next() orelse return error.BadValue, 10) catch return error.BadValue;
-        const ss = std.fmt.parseInt(i64, tit.next() orelse return error.BadValue, 10) catch return error.BadValue;
-        if (tit.next() != null) return error.BadValue;
-        secs = hh * 3600 + mm * 60 + ss;
-        if (dot) |di| {
-            // Fractional seconds → nanoseconds (right-pad/truncate to 9 digits).
-            var buf: [9]u8 = @splat('0');
-            const fr = time_part[di + 1 ..];
-            const n = @min(fr.len, 9);
-            @memcpy(buf[0..n], fr[0..n]);
-            frac_ns = std.fmt.parseInt(i64, &buf, 10) catch return error.BadValue;
+    var sub_ns = false;
+    if (dot) |d| {
+        const fr = s[d + 1 ..];
+        if (fr.len == 0) return error.BadValue;
+        for (fr, 0..) |c, i| {
+            if (c < '0' or c > '9') return error.BadValue;
+            if (i < 9) frac_ns = frac_ns * 10 + (c - '0') else if (c != '0') sub_ns = true;
         }
+        for (@min(fr.len, 9)..9) |_| frac_ns *= 10;
     }
-
-    const total_secs = days * 86400 + secs;
-    return switch (unit) {
-        .MILLIS => total_secs * 1_000 + @divTrunc(frac_ns, 1_000_000),
-        .MICROS => total_secs * 1_000_000 + @divTrunc(frac_ns, 1_000),
-        .NANOS => total_secs * 1_000_000_000 + frac_ns,
-    };
+    return .{ .ns = ((hh * 60 + mm) * 60 + ss) * ns_per_s + frac_ns, .sub_ns = sub_ns };
 }
 
 fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parquet_type: schema.Type) Error!ast.Filter {
@@ -633,7 +695,7 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .type_length = null,
         .repetition_type = .REQUIRED,
         .name = "root",
-        .num_children = 5,
+        .num_children = 10,
         .scale = null,
         .precision = null,
         .field_id = null,
@@ -689,6 +751,37 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .precision = null,
         .field_id = null,
         .logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } },
+    });
+    try meta.schema.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 9,
+        .repetition_type = .OPTIONAL,
+        .name = "dec",
+        .num_children = null,
+        .scale = 2,
+        .precision = 20,
+        .field_id = null,
+        .converted_type = .DECIMAL,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 20 } },
+    });
+    const ms: schema.TimeUnit = .{ .MILLIS = .{} };
+    const ns: schema.TimeUnit = .{ .NANOS = .{} };
+    const temporal = [_]struct { name: []const u8, type: schema.Type, lt: schema.LogicalType }{
+        .{ .name = "tsms", .type = .INT64, .lt = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = ms } } },
+        .{ .name = "tsns", .type = .INT64, .lt = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = ns } } },
+        .{ .name = "tm", .type = .INT32, .lt = .{ .TIME = .{ .isAdjustedToUTC = false, .unit = ms } } },
+        .{ .name = "tmn", .type = .INT64, .lt = .{ .TIME = .{ .isAdjustedToUTC = false, .unit = ns } } },
+    };
+    for (temporal) |t| try meta.schema.append(arena, .{
+        .type = t.type,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = t.name,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = t.lt,
     });
     return meta;
 }
@@ -760,6 +853,92 @@ test "parse DATE/TIMESTAMP literals → epoch ints" {
     try testing.expectEqual(@as(i64, 1_704_067_200_000_000), (try parse(a, "ts = '2024-01-01'", &meta)).int64.value);
     // Fractional seconds (micros precision).
     try testing.expectEqual(@as(i64, 1_704_067_200_000_000 + 500_000), (try parse(a, "ts = '2024-01-01 00:00:00.5'", &meta)).int64.value);
+}
+
+fn expectLeaf(comptime T: type, f: ast.Filter, op: ast.Operator, value: T) !void {
+    const leaf = switch (T) {
+        i32 => f.int32,
+        i64 => f.int64,
+        else => @compileError("int lanes only"),
+    };
+    try testing.expectEqual(op, leaf.op);
+    try testing.expectEqual(value, leaf.value);
+}
+
+test "parse binds temporal literals finer than the column's unit exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const max64 = std.math.maxInt(i64);
+    const max32 = std.math.maxInt(i32);
+    const ms: i64 = 1_704_067_200_000; // 2024-01-01 00:00:00 in each unit
+    const us: i64 = ms * 1_000;
+    const ns: i64 = us * 1_000;
+
+    // 99.5 ms on a millisecond column: one-sided ops round toward the side that keeps the answer.
+    try expectLeaf(i64, try parse(a, "tsms >= '2024-01-01 00:00:00.0995'", &meta), .Gt, ms + 99);
+    try expectLeaf(i64, try parse(a, "tsms > '2024-01-01 00:00:00.0995'", &meta), .Gt, ms + 99);
+    try expectLeaf(i64, try parse(a, "tsms < '2024-01-01 00:00:00.0995'", &meta), .LtEq, ms + 99);
+    try expectLeaf(i64, try parse(a, "tsms <= '2024-01-01 00:00:00.0995'", &meta), .LtEq, ms + 99);
+    // `=` against an unrepresentable value matches nothing, `!=` every non-null row.
+    try expectLeaf(i64, try parse(a, "tsms = '2024-01-01 00:00:00.0995'", &meta), .Gt, max64);
+    try expectLeaf(i64, try parse(a, "tsms != '2024-01-01 00:00:00.0995'", &meta), .LtEq, max64);
+    try expectLeaf(i64, try parse(a, "NOT tsms = '2024-01-01 00:00:00.0995'", &meta), .LtEq, max64);
+    // Trailing zeros are still exact.
+    try expectLeaf(i64, try parse(a, "tsms >= '2024-01-01 00:00:00.09900'", &meta), .GtEq, ms + 99);
+    try expectLeaf(i64, try parse(a, "tsms = '2024-01-01T00:00:00.099'", &meta), .Eq, ms + 99);
+    // Before the epoch the stored value still floors: -0.5 ms lies between -1 and 0.
+    try expectLeaf(i64, try parse(a, "tsms >= '1969-12-31 23:59:59.9995'", &meta), .Gt, -1);
+    try expectLeaf(i64, try parse(a, "tsms < '1969-12-31 23:59:59.9995'", &meta), .LtEq, -1);
+
+    try expectLeaf(i64, try parse(a, "ts >= '2024-01-01 00:00:00.0000015'", &meta), .Gt, us + 1);
+    try expectLeaf(i64, try parse(a, "ts = '2024-01-01 00:00:00.000001'", &meta), .Eq, us + 1);
+
+    // Digits past the ninth: nonzero ones make the literal inexact even at nanosecond resolution.
+    try expectLeaf(i64, try parse(a, "tsns >= '2024-01-01 00:00:00.0000000015'", &meta), .Gt, ns + 1);
+    try expectLeaf(i64, try parse(a, "tsns <= '2024-01-01 00:00:00.0000000015'", &meta), .LtEq, ns + 1);
+    try expectLeaf(i64, try parse(a, "tsns = '2024-01-01 00:00:00.000000001000'", &meta), .Eq, ns + 1);
+    try expectLeaf(i64, try parse(a, "tsms >= '2024-01-01 00:00:00.0990000001'", &meta), .Gt, ms + 99);
+    // Past the i64 nanosecond range (year 2262): every row compares the same way, no overflow.
+    try expectLeaf(i64, try parse(a, "tsns >= '2500-01-01'", &meta), .Gt, max64);
+    try expectLeaf(i64, try parse(a, "tsns < '2500-01-01'", &meta), .LtEq, max64);
+    try expectLeaf(i64, try parse(a, "tsns > '1600-01-01'", &meta), .LtEq, max64);
+    try expectLeaf(i64, try parse(a, "tsns <= '1600-01-01'", &meta), .Gt, max64);
+
+    // DATE vs a timestamp literal compares as a timestamp: noon is after the date's midnight.
+    try expectLeaf(i32, try parse(a, "d >= '2024-01-01 12:00:00'", &meta), .Gt, 19723);
+    try expectLeaf(i32, try parse(a, "d < '2024-01-01 12:00:00'", &meta), .LtEq, 19723);
+    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00.000000001'", &meta), .Gt, max32);
+    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00'", &meta), .Eq, 19723);
+
+    // TIME32 (millis, INT32) and TIME64 (nanos, INT64).
+    try expectLeaf(i32, try parse(a, "tm >= '00:01:40.0005'", &meta), .Gt, 100_000);
+    try expectLeaf(i32, try parse(a, "tm = '00:01:40'", &meta), .Eq, 100_000);
+    try expectLeaf(i32, try parse(a, "tm != '00:01:40.0005'", &meta), .LtEq, max32);
+    try expectLeaf(i32, try parse(a, "tm < 100000", &meta), .Lt, 100_000);
+    try expectLeaf(i64, try parse(a, "tmn < '00:00:01.0000000001'", &meta), .LtEq, 1_000_000_000);
+    try expectLeaf(i64, try parse(a, "tmn > '23:59:59.999999999'", &meta), .Gt, 86_399_999_999_999);
+
+    // BETWEEN and IN bind each bound/element the same way.
+    const btw = try parse(a, "tsms BETWEEN '2024-01-01 00:00:00.0005' AND '2024-01-01 00:00:00.0105'", &meta);
+    try expectLeaf(i64, btw.and_filter.left.*, .Gt, ms);
+    try expectLeaf(i64, btw.and_filter.right.*, .LtEq, ms + 10);
+    const in = try parse(a, "tsms IN ('2024-01-01 00:00:00.0995', '2024-01-01 00:00:00.100')", &meta);
+    try expectLeaf(i64, in.or_filter.left.*, .Gt, max64);
+    try expectLeaf(i64, in.or_filter.right.*, .Eq, ms + 100);
+    const nin = try parse(a, "tsms NOT IN ('2024-01-01 00:00:00.0995', '2024-01-01 00:00:00.100')", &meta);
+    try expectLeaf(i64, nin.and_filter.left.*, .LtEq, max64);
+    try expectLeaf(i64, nin.and_filter.right.*, .NotEq, ms + 100);
+
+    // Malformed literals fail loudly instead of binding something nearby.
+    const bad = [_][]const u8{
+        "tm >= '24:00:00'",            "tm >= '00:60:00'",         "tm >= '00:00:00.'",
+        "tm >= '00:00:00.5x'",         "d >= '2023-02-29'",        "d >= '2024-04-31'",
+        "ts >= '2024-01-01 +1:00:00'", "ts >= '2024-01-01 00:00'", "d >= '2024-1x-01'",
+    };
+    for (bad) |e| try testing.expectError(error.BadValue, parse(a, e, &meta));
 }
 
 test "parse IN / NOT IN / NOT" {
@@ -970,6 +1149,28 @@ test "parse BETWEEN expands to >= AND <= conjunction" {
     try testing.expectEqual(@as(i32, 10), f.and_filter.left.int32.value);
     try testing.expectEqual(ast.Operator.LtEq, f.and_filter.right.int32.op);
     try testing.expectEqual(@as(i32, 20), f.and_filter.right.int32.value);
+}
+
+test "parse BETWEEN binds its bounds like the comparison operators" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // DECIMAL bounds take the f64 lane, not a byte-string compare against the FLBA bytes.
+    const fd = try parse(a, "dec BETWEEN 1 AND 2.5", &meta);
+    try testing.expect(fd.and_filter.left.* == .double and fd.and_filter.right.* == .double);
+    try testing.expectEqual(@as(f64, 1), fd.and_filter.left.double.value);
+    try testing.expectEqual(@as(f64, 2.5), fd.and_filter.right.double.value);
+
+    // DATE/TIMESTAMP bounds accept the same SQL literals `>=`/`<=` do.
+    const fdt = try parse(a, "d BETWEEN '2024-01-01' AND '2024-01-31'", &meta);
+    try testing.expectEqual(@as(i32, 19723), fdt.and_filter.left.int32.value);
+    try testing.expectEqual(@as(i32, 19753), fdt.and_filter.right.int32.value);
+    const fts = try parse(a, "ts BETWEEN '2024-01-01' AND '2024-01-01 00:00:01'", &meta);
+    try testing.expectEqual(@as(i64, 1_704_067_200_000_000), fts.and_filter.left.int64.value);
+    try testing.expectEqual(@as(i64, 1_704_067_201_000_000), fts.and_filter.right.int64.value);
 }
 
 test "parse BETWEEN composes with outer AND" {

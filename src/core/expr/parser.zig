@@ -569,6 +569,7 @@ fn parseAggCall(
     // 1. Function name (sum, count, min, max, avg).
     const name_tok = try lex.next();
     if (name_tok.kind != .ident) return error.ExpectedAggFunc;
+    const call_start = @intFromPtr(name_tok.text.ptr) - @intFromPtr(lex.src.ptr);
     const func = resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
 
     // 2. Open paren.
@@ -628,14 +629,17 @@ fn parseAggCall(
         where = try filter_parser.parse(arena, pred_str, file);
     }
 
-    // 5. Optional AS alias. Default = function name (sum / count / ...).
+    // 5. Optional AS alias. Default = function name (sum / count / ...), with the call's text kept for when that
+    //    name is not unique (see `default_name`).
     var alias: []const u8 = name_tok.text;
+    var default_name: ?[]const u8 = std.mem.trim(u8, lex.src[call_start..lex.pos], " \t\r\n");
     const after_filter = try lex.peek();
     if (after_filter.kind == .ident and asciiEqIgnoreCase(after_filter.text, "AS")) {
         _ = try lex.next();
         const alias_tok = try lex.next();
         if (alias_tok.kind != .ident) return error.ExpectedIdentifier;
         alias = alias_tok.text;
+        default_name = null;
     }
 
     // 6. Resolve result shape from func + arg type.
@@ -646,6 +650,7 @@ fn parseAggCall(
         .arg = arg,
         .where = where,
         .alias = alias,
+        .default_name = default_name,
         .result = result,
     };
 }

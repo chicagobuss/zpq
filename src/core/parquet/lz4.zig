@@ -1,11 +1,13 @@
-//! LZ4 block-format decoder (LZ4_RAW codec in Parquet).
+//! LZ4 for Parquet: the block format (LZ4_RAW, codec 7) plus the two
+//! containers the deprecated LZ4 codec (codec 5) shows up in.
 //!
-//! Parquet's LZ4_RAW (codec 7) is the LZ4 block format directly —
-//! no frame headers, no checksums. The legacy Parquet LZ4 codec
-//! (codec 5) used Hadoop framing and is intentionally skipped: no
-//! modern writer emits it.
+//! Codec 5 is ambiguous in the wild (PARQUET-1241): parquet-mr wrote Hadoop's
+//! BlockCompressorStream framing, older parquet-cpp a bare block, older
+//! arrow-rs an LZ4 frame. `uncompressHadoop` and `uncompressFrame` parse the
+//! containers; compression.zig owns the order they are tried in.
 //!
 //! Block format reference: https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
+//! Frame format reference: https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md
 //!
 //! A block is a sequence of "sequences". Each sequence:
 //!   1. Token byte: high nibble = literal length (0..14, with 15
@@ -28,8 +30,15 @@ pub const Error = error{
 };
 
 pub fn uncompress(src: []const u8, dest: []u8) Error!usize {
+    return uncompressAt(src, dest, 0);
+}
+
+/// Decode one block into `dest[d_start..]`, with `dest[0..d_start]` as the match history (an LZ4 frame's linked
+/// blocks). Returns the end index in `dest`, not the byte count.
+pub fn uncompressAt(src: []const u8, dest: []u8, d_start: usize) Error!usize {
+    std.debug.assert(d_start <= dest.len);
     var s_idx: usize = 0;
-    var d_idx: usize = 0;
+    var d_idx: usize = d_start;
 
     while (s_idx < src.len) {
         // Token
@@ -93,6 +102,142 @@ pub fn uncompress(src: []const u8, dest: []u8) Error!usize {
     }
 
     return d_idx;
+}
+
+// ============================================================
+// Legacy codec 5 containers
+// ============================================================
+
+/// Hadoop BlockCompressorStream framing as parquet-mr writes it: back-to-back chunks of `[u32 BE uncompressed
+/// len]` followed by `[u32 BE compressed len][LZ4 block]` pieces until that length is produced. Usually one piece;
+/// a single write() larger than Hadoop's buffer is split into several, each compressed with no history from the
+/// last (BlockDecompressorStream reads the same way). Every chunk has at least one piece, which is Arrow C++'s
+/// `TryDecompressHadoop` (ARROW-9177) shape. The framing carries no magic, so it is only accepted when every length
+/// checks out and the chunks fill `dest` exactly; anything else is `NotHadoop` and the caller tries the next
+/// container.
+pub fn uncompressHadoop(src: []const u8, dest: []u8) error{NotHadoop}!void {
+    var s_idx: usize = 0;
+    var d_idx: usize = 0;
+    while (src.len - s_idx >= 8) {
+        const ulen = std.mem.readInt(u32, src[s_idx..][0..4], .big);
+        s_idx += 4;
+        if (ulen > dest.len - d_idx) return error.NotHadoop;
+        const chunk_end = d_idx + ulen;
+        // Each pass consumes at least the 4-byte length, so even zero-length pieces cannot spin.
+        while (true) {
+            if (src.len - s_idx < 4) return error.NotHadoop;
+            const clen = std.mem.readInt(u32, src[s_idx..][0..4], .big);
+            s_idx += 4;
+            if (clen > src.len - s_idx) return error.NotHadoop;
+            // Bounded by `chunk_end`, so a piece that overshoots the chunk's length is OutputTooSmall.
+            const n = uncompress(src[s_idx..][0..clen], dest[d_idx..chunk_end]) catch return error.NotHadoop;
+            s_idx += clen;
+            d_idx += n;
+            if (d_idx == chunk_end) break;
+        }
+    }
+    if (s_idx != src.len or d_idx != dest.len) return error.NotHadoop;
+}
+
+const frame_magic: u32 = 0x184D2204;
+const skippable_magic: u32 = 0x184D2A50; // low nibble is free: 0x184D2A50..5F
+const skippable_mask: u32 = 0xFFFFFFF0;
+
+/// True when `src` opens with an LZ4 frame or skippable-frame magic number.
+pub fn hasFrameMagic(src: []const u8) bool {
+    if (src.len < 4) return false;
+    const m = std.mem.readInt(u32, src[0..4], .little);
+    return m == frame_magic or m & skippable_mask == skippable_magic;
+}
+
+/// Decode one or more concatenated LZ4 frames (skippable frames are skipped)
+/// into `dest`. Returns the bytes written. Header, block and content checksums
+/// are verified when present; a declared content size must match. Frames that
+/// need an external dictionary are rejected — none can be supplied here.
+pub fn uncompressFrame(src: []const u8, dest: []u8) Error!usize {
+    var s_idx: usize = 0;
+    var d_idx: usize = 0;
+    if (src.len == 0) return error.CorruptInput;
+    while (s_idx < src.len) {
+        if (src.len - s_idx < 4) return error.CorruptInput;
+        const magic = std.mem.readInt(u32, src[s_idx..][0..4], .little);
+        s_idx += 4;
+        if (magic & skippable_mask == skippable_magic) {
+            if (src.len - s_idx < 4) return error.CorruptInput;
+            const skip = std.mem.readInt(u32, src[s_idx..][0..4], .little);
+            s_idx += 4;
+            if (skip > src.len - s_idx) return error.CorruptInput;
+            s_idx += skip;
+            continue;
+        }
+        if (magic != frame_magic) return error.CorruptInput;
+        d_idx = try decodeFrameBody(src, &s_idx, dest, d_idx);
+    }
+    return d_idx;
+}
+
+/// Decode the frame whose descriptor starts at `s_idx.*` into `dest[d_start..]`. Returns the new end of output.
+fn decodeFrameBody(src: []const u8, s_idx: *usize, dest: []u8, d_start: usize) Error!usize {
+    var s = s_idx.*;
+    if (src.len - s < 3) return error.CorruptInput;
+    const flg = src[s];
+    const bd = src[s + 1];
+    // Version must be 01; reserved bits must be zero.
+    if (flg >> 6 != 1 or flg & 0x02 != 0 or bd & 0x8F != 0) return error.CorruptInput;
+    const block_size_id = (bd >> 4) & 0x7;
+    if (block_size_id < 4) return error.CorruptInput;
+    const block_max: usize = @as(usize, 1) << @intCast(8 + 2 * @as(u32, block_size_id)); // 64 KiB .. 4 MiB
+    const independent = flg & 0x20 != 0;
+    const has_block_checksum = flg & 0x10 != 0;
+    const has_content_size = flg & 0x08 != 0;
+    const has_content_checksum = flg & 0x04 != 0;
+    if (flg & 0x01 != 0) return error.CorruptInput; // DictID: no dictionary to resolve it against.
+
+    const desc_len: usize = 2 + @as(usize, if (has_content_size) 8 else 0);
+    if (src.len - s < desc_len + 1) return error.CorruptInput;
+    const content_size: ?u64 = if (has_content_size) std.mem.readInt(u64, src[s + 2 ..][0..8], .little) else null;
+    const hc: u8 = @truncate(std.hash.XxHash32.hash(0, src[s..][0..desc_len]) >> 8);
+    if (hc != src[s + desc_len]) return error.CorruptInput;
+    s += desc_len + 1;
+
+    var d = d_start;
+    while (true) {
+        if (src.len - s < 4) return error.CorruptInput;
+        const word = std.mem.readInt(u32, src[s..][0..4], .little);
+        s += 4;
+        if (word == 0) break; // EndMark
+        const stored = word & 0x8000_0000 != 0;
+        const bsize: usize = word & 0x7FFF_FFFF;
+        if (bsize > block_max or bsize > src.len - s) return error.CorruptInput;
+        const block = src[s..][0..bsize];
+        s += bsize;
+        if (has_block_checksum) {
+            if (src.len - s < 4) return error.CorruptInput;
+            if (std.hash.XxHash32.hash(0, block) != std.mem.readInt(u32, src[s..][0..4], .little))
+                return error.CorruptInput;
+            s += 4;
+        }
+        const room = @min(dest.len - d, block_max);
+        if (stored) {
+            if (bsize > room) return error.OutputTooSmall;
+            @memcpy(dest[d..][0..bsize], block);
+            d += bsize;
+        } else if (independent) {
+            d += try uncompress(block, dest[d..][0..room]);
+        } else {
+            // Linked blocks may reach back into earlier blocks of this frame, never into a previous frame.
+            d = d_start + try uncompressAt(block, dest[d_start .. d + room], d - d_start);
+        }
+    }
+    if (has_content_checksum) {
+        if (src.len - s < 4) return error.CorruptInput;
+        if (std.hash.XxHash32.hash(0, dest[d_start..d]) != std.mem.readInt(u32, src[s..][0..4], .little))
+            return error.CorruptInput;
+        s += 4;
+    }
+    if (content_size) |cs| if (cs != d - d_start) return error.CorruptInput;
+    s_idx.* = s;
+    return d;
 }
 
 // ============================================================
@@ -329,4 +474,258 @@ test "uncompress canned LZ4 block" {
     const n = try uncompress(&src, &out);
     try testing.expectEqual(@as(usize, 20), n);
     for (out[0..20]) |b| try testing.expectEqual(@as(u8, 'a'), b);
+}
+
+// ----- Legacy codec 5 containers -----
+
+/// Append one Hadoop chunk (`[ulen BE][clen BE][block]`) holding `data`, compressed with our block encoder.
+fn appendHadoopChunk(list: *std.ArrayList(u8), data: []const u8) !void {
+    const table = try testing.allocator.alloc(u32, HASH_SIZE);
+    defer testing.allocator.free(table);
+    const block = try testing.allocator.alloc(u8, compressBound(data.len));
+    defer testing.allocator.free(block);
+    const clen = try compress(data, block, table);
+    var prefix: [8]u8 = undefined;
+    std.mem.writeInt(u32, prefix[0..4], @intCast(data.len), .big);
+    std.mem.writeInt(u32, prefix[4..8], @intCast(clen), .big);
+    try list.appendSlice(testing.allocator, &prefix);
+    try list.appendSlice(testing.allocator, block[0..clen]);
+}
+
+const hadoop_parts = [_][]const u8{
+    "the quick brown fox jumps over the quick brown fox jumps over the lazy dog",
+    "ababababababababababababababababab",
+    "z",
+};
+
+fn hadoopMultiChunk() !std.ArrayList(u8) {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(testing.allocator);
+    for (hadoop_parts) |p| try appendHadoopChunk(&list, p);
+    return list;
+}
+
+test "hadoop: multi-chunk page decodes in order" {
+    var src = try hadoopMultiChunk();
+    defer src.deinit(testing.allocator);
+    const want = hadoop_parts[0] ++ hadoop_parts[1] ++ hadoop_parts[2];
+    var out: [want.len]u8 = undefined;
+    try uncompressHadoop(src.items, &out);
+    try testing.expectEqualStrings(want, &out);
+}
+
+test "hadoop: zero-length chunks are valid framing" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try appendHadoopChunk(&src, "");
+    try appendHadoopChunk(&src, "hello hello hello hello");
+    // A bare [0][0] prefix: zero bytes in, zero bytes out.
+    try src.appendSlice(testing.allocator, &@as([8]u8, @splat(0)));
+    var out: [23]u8 = undefined;
+    try uncompressHadoop(src.items, &out);
+    try testing.expectEqualStrings("hello hello hello hello", &out);
+
+    // Empty input fills only an empty page; prefixes alone never fill a non-empty one.
+    try uncompressHadoop("", &[_]u8{});
+    var one: [1]u8 = undefined;
+    try testing.expectError(error.NotHadoop, uncompressHadoop(&@as([16]u8, @splat(0)), &one));
+}
+
+test "hadoop: truncated input is rejected at every cut" {
+    var src = try hadoopMultiChunk();
+    defer src.deinit(testing.allocator);
+    const total = hadoop_parts[0].len + hadoop_parts[1].len + hadoop_parts[2].len;
+    var out: [total]u8 = undefined;
+    var cut: usize = 0;
+    while (cut < src.items.len) : (cut += 1) {
+        try testing.expectError(error.NotHadoop, uncompressHadoop(src.items[0..cut], &out));
+    }
+    // Trailing bytes too short to be a prefix are not Hadoop framing either.
+    try src.appendSlice(testing.allocator, &.{ 0, 0, 0 });
+    try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, &out));
+}
+
+test "hadoop: lying lengths are rejected" {
+    const total = hadoop_parts[0].len + hadoop_parts[1].len + hadoop_parts[2].len;
+    var out: [total]u8 = undefined;
+    const Lie = struct { field: usize, value: u32 };
+    const lies = [_]Lie{
+        .{ .field = 0, .value = hadoop_parts[0].len + 1 }, // claims more than the block decodes to
+        .{ .field = 0, .value = hadoop_parts[0].len - 1 }, // claims less
+        .{ .field = 0, .value = 0xFFFF_FFFF }, // more than the page holds
+        .{ .field = 4, .value = 0xFFFF_FFFF }, // block runs past the input
+        .{ .field = 4, .value = 0 }, // block swallowed into the next prefix
+        .{ .field = 4, .value = 3 }, // block cut short
+    };
+    for (lies) |lie| {
+        var src = try hadoopMultiChunk();
+        defer src.deinit(testing.allocator);
+        std.mem.writeInt(u32, src.items[lie.field..][0..4], lie.value, .big);
+        try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, &out));
+    }
+
+    // Every chunk honest, but they sum to less (or more) than the page header's size.
+    var src = try hadoopMultiChunk();
+    defer src.deinit(testing.allocator);
+    var big: [total + 1]u8 = undefined;
+    try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, &big));
+    try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, out[0 .. total - 1]));
+}
+
+/// One Hadoop chunk the way BlockCompressorStream writes a single write() larger than its buffer: the total
+/// uncompressed length once, then a `[clen BE][block]` piece per `pieces` entry, each compressed on its own.
+fn appendHadoopMultiPiece(list: *std.ArrayList(u8), ulen: u32, pieces: []const []const u8) !void {
+    const table = try testing.allocator.alloc(u32, HASH_SIZE);
+    defer testing.allocator.free(table);
+    var prefix: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prefix, ulen, .big);
+    try list.appendSlice(testing.allocator, &prefix);
+    for (pieces) |p| {
+        const block = try testing.allocator.alloc(u8, compressBound(p.len));
+        defer testing.allocator.free(block);
+        const clen = try compress(p, block, table);
+        std.mem.writeInt(u32, &prefix, @intCast(clen), .big);
+        try list.appendSlice(testing.allocator, &prefix);
+        try list.appendSlice(testing.allocator, block[0..clen]);
+    }
+}
+
+test "hadoop: one length header over several blocks" {
+    const want = hadoop_parts[0] ++ hadoop_parts[1] ++ hadoop_parts[2];
+    var out: [want.len]u8 = undefined;
+    {
+        // [ulen][clen1][b1][clen2][b2][clen3][b3], then an ordinary single-block chunk after it.
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try appendHadoopMultiPiece(&src, hadoop_parts[0].len + hadoop_parts[1].len, hadoop_parts[0..2]);
+        try appendHadoopChunk(&src, hadoop_parts[2]);
+        try uncompressHadoop(src.items, &out);
+        try testing.expectEqualStrings(want, &out);
+    }
+    {
+        // A zero-length piece makes no progress but is still well-formed.
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try appendHadoopMultiPiece(&src, want.len, &.{ hadoop_parts[0], "", hadoop_parts[1], hadoop_parts[2] });
+        @memset(&out, 0);
+        try uncompressHadoop(src.items, &out);
+        try testing.expectEqualStrings(want, &out);
+    }
+    {
+        // A piece that decodes past the header's length.
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try appendHadoopMultiPiece(&src, want.len - 1, &hadoop_parts);
+        try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, out[0 .. want.len - 1]));
+        try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, &out));
+    }
+    {
+        // Pieces that stop short of the header's length, and every truncation of a valid chunk.
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try appendHadoopMultiPiece(&src, want.len + 1, &hadoop_parts);
+        var big: [want.len + 1]u8 = undefined;
+        try testing.expectError(error.NotHadoop, uncompressHadoop(src.items, &big));
+
+        src.clearRetainingCapacity();
+        try appendHadoopMultiPiece(&src, want.len, &hadoop_parts);
+        try uncompressHadoop(src.items, &out);
+        var cut: usize = 0;
+        while (cut < src.items.len) : (cut += 1) {
+            try testing.expectError(error.NotHadoop, uncompressHadoop(src.items[0..cut], &out));
+        }
+    }
+}
+
+/// `hello hello hello hello parquet lz4 frame` from python-lz4 4.4.5 (liblz4 1.10): content size, block and
+/// content checksums.
+pub const frame_all_checks = [_]u8{
+    0x04, 0x22, 0x4d, 0x18, 0x7c, 0x40, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x47, 0x1c,
+    0x00, 0x00, 0x00, 0x6e, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x06, 0x00, 0xf0, 0x02, 0x70, 0x61,
+    0x72, 0x71, 0x75, 0x65, 0x74, 0x20, 0x6c, 0x7a, 0x34, 0x20, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x92,
+    0xdb, 0xb8, 0xa6, 0x00, 0x00, 0x00, 0x00, 0x02, 0xe1, 0x0e, 0xc6,
+};
+/// The same text, no optional fields.
+pub const frame_plain = [_]u8{
+    0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82, 0x1c, 0x00, 0x00, 0x00, 0x6e, 0x68, 0x65, 0x6c, 0x6c,
+    0x6f, 0x20, 0x06, 0x00, 0xf0, 0x02, 0x70, 0x61, 0x72, 0x71, 0x75, 0x65, 0x74, 0x20, 0x6c, 0x7a,
+    0x34, 0x20, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x00, 0x00, 0x00, 0x00,
+};
+const frame_text = "hello hello hello hello parquet lz4 frame";
+/// Two linked blocks; the second is one match reaching back into the first. Hand-built, and checked to decode
+/// to `frame_linked_text` with liblz4's LZ4F_decompress.
+pub const frame_linked = [_]u8{
+    0x04, 0x22, 0x4d, 0x18, 0x40, 0x40, 0xc0, 0x12, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x61, 0x62, 0x63,
+    0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x09, 0x00, 0x00,
+    0x00, 0x0c, 0x10, 0x00, 0x50, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x00, 0x00, 0x00, 0x00,
+};
+const frame_linked_text = "abcdefghijklmnopabcdefghijklmnopVWXYZ";
+
+test "frame: canned liblz4 frames decode" {
+    var out: [frame_text.len]u8 = undefined;
+    try testing.expectEqual(frame_text.len, try uncompressFrame(&frame_all_checks, &out));
+    try testing.expectEqualStrings(frame_text, &out);
+    @memset(&out, 0);
+    try testing.expectEqual(frame_text.len, try uncompressFrame(&frame_plain, &out));
+    try testing.expectEqualStrings(frame_text, &out);
+    try testing.expect(hasFrameMagic(&frame_plain));
+}
+
+test "frame: linked blocks reach back into the previous block" {
+    var out: [frame_linked_text.len]u8 = undefined;
+    try testing.expectEqual(out.len, try uncompressFrame(&frame_linked, &out));
+    try testing.expectEqualStrings(frame_linked_text, &out);
+
+    // The same blocks declared independent: the back-reference has no history and must fail, as in liblz4.
+    var indep = frame_linked;
+    indep[4] = 0x60;
+    indep[6] = @truncate(std.hash.XxHash32.hash(0, indep[4..6]) >> 8);
+    try testing.expectError(error.CorruptInput, uncompressFrame(&indep, &out));
+}
+
+test "frame: skippable and concatenated frames" {
+    const skippable = [_]u8{ 0x53, 0x2a, 0x4d, 0x18, 0x04, 0x00, 0x00, 0x00, 's', 'k', 'i', 'p' };
+    const src = skippable ++ frame_plain ++ frame_all_checks;
+    try testing.expect(hasFrameMagic(&src));
+    var out: [2 * frame_text.len]u8 = undefined;
+    try testing.expectEqual(out.len, try uncompressFrame(&src, &out));
+    try testing.expectEqualStrings(frame_text ++ frame_text, &out);
+    // A skippable frame that claims more bytes than remain.
+    var lying = skippable;
+    lying[4] = 0x40;
+    try testing.expectError(error.CorruptInput, uncompressFrame(&lying, &out));
+}
+
+test "frame: corrupt headers, checksums and sizes are rejected" {
+    var out: [frame_text.len]u8 = undefined;
+    const Flip = struct { at: usize, xor: u8 };
+    const flips = [_]Flip{
+        .{ .at = 4, .xor = 0x80 }, // version bits
+        .{ .at = 4, .xor = 0x01 }, // DictID: nothing to resolve it against
+        .{ .at = 5, .xor = 0x40 }, // block size id 0
+        .{ .at = 6, .xor = 0x01 }, // header checksum
+        .{ .at = 7, .xor = 0x01 }, // content size no longer matches
+        .{ .at = 20, .xor = 0x01 }, // a literal: block checksum catches it
+        .{ .at = 47, .xor = 0x01 }, // block checksum itself
+        .{ .at = 55, .xor = 0x01 }, // content checksum
+    };
+    for (flips) |f| {
+        var bad = frame_all_checks;
+        bad[f.at] ^= f.xor;
+        // Header-field flips also break the header checksum; re-seal so the field check itself is exercised.
+        if (f.at == 4 or f.at == 5 or f.at == 7) {
+            const desc_len: usize = if (bad[4] & 0x08 != 0) 10 else 2;
+            bad[4 + desc_len] = @truncate(std.hash.XxHash32.hash(0, bad[4..][0..desc_len]) >> 8);
+        }
+        if (uncompressFrame(&bad, &out)) |_| {
+            std.debug.print("flip at {d} accepted\n", .{f.at});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    var cut: usize = 0;
+    while (cut < frame_all_checks.len) : (cut += 1) {
+        if (uncompressFrame(frame_all_checks[0..cut], &out)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    var small: [frame_text.len - 1]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, uncompressFrame(&frame_plain, &small));
 }

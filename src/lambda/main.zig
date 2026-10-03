@@ -167,11 +167,11 @@ fn handle(
             try input_urls.append(allocator, owned);
         }
 
-        // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw", or
-        // "uncompressed" — parity with the CLI's --codec. Absent, re-encoded
-        // output is snappy and byte copies keep the source codec. Anything else
-        // is treated as snappy with no error (strict validation can come with the
-        // API-versioning work).
+        // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw" (both LZ4_RAW;
+        // nothing compresses to the deprecated LZ4 codec), or "uncompressed" —
+        // parity with the CLI's --codec. Absent, re-encoded output is snappy and
+        // byte copies keep the source codec. Anything else is treated as snappy
+        // with no error (strict validation can come with the API-versioning work).
         const codec_str = extractField(trimmed, "output_codec") catch null;
         const output_codec: ?schema.CompressionCodec = if (codec_str) |s| blk: {
             if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;

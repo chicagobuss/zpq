@@ -13,7 +13,7 @@ name: Verify
 #   6. Conformance against the apache parquet-testing corpus, with a
 #      regression floor: hard failures (crash / wrong shape / wrong
 #      row counts) always fail; the full-pass count must not drop
-#      below the recorded baseline (69 @ 2026-06-14).
+#      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
 # Cross-platform compile (ARM64) is verified at release time, not on
 # every PR; macOS lands with the kqueue backend. This workflow guards
@@ -68,7 +68,7 @@ jobs:
         # *open* them ("Thrift LogicalType not recognized") — not a zpq issue,
         # but it dropped the conformance oracle below the floor. zpq reads all
         # 10 correctly (WKB as BYTE_ARRAY); a current pyarrow lets the floor
-        # (69) count them. Bump deliberately alongside the corpus SHA.
+        # (72) count them. Bump deliberately alongside the corpus SHA.
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --quiet --no-input "pyarrow==24.*"
@@ -185,4 +185,4 @@ jobs:
       - name: Conformance (apache/parquet-testing)
         run: |
           zig build -Doptimize=ReleaseFast
-          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 69
+          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 72

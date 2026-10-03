@@ -249,3 +249,36 @@ for src, out in (("in", "to_zstd"), ("pages", "pages_zstd")):
 
 print("All --codec copy checks passed")
 PY
+
+# The deprecated LZ4 codec (Hadoop-framed and bare-block) is readable, so
+# --codec can recompress it; zpq never compresses to it (`lz4` is LZ4_RAW).
+# Needs the parquet-testing corpus (`just fetch-corpus`); skipped without it.
+CORPUS="${CORPUS:-data/parquet-testing/data}"
+if [ -f "$CORPUS/hadoop_lz4_compressed_larger.parquet" ]; then
+  for f in hadoop_lz4_compressed hadoop_lz4_compressed_larger non_hadoop_lz4_compressed; do
+    for c in zstd lz4; do
+      "$ZPQ" query "$CORPUS/$f.parquet" -o "$DIR/$f.$c.parquet" --codec "$c" 2> /dev/null
+    done
+  done
+  "$ZPQ" query "$CORPUS/hadoop_lz4_compressed.parquet" -o "$DIR/lz4_filtered.parquet" \
+    --filter 'c0 > 1593604800' 2> /dev/null
+  "$PY" - "$DIR" "$CORPUS" <<'PY'
+import sys
+import pyarrow.compute as pc, pyarrow.parquet as pq
+d, corpus = sys.argv[1], sys.argv[2]
+for f in ("hadoop_lz4_compressed", "hadoop_lz4_compressed_larger", "non_hadoop_lz4_compressed"):
+    src = pq.read_table(f"{corpus}/{f}.parquet")
+    for c, want in (("zstd", "ZSTD"), ("lz4", "LZ4")):  # pyarrow names LZ4_RAW "LZ4"
+        out = f"{d}/{f}.{c}.parquet"
+        m = pq.ParquetFile(out).metadata
+        got = {m.row_group(r).column(i).compression for r in range(m.num_row_groups) for i in range(m.num_columns)}
+        assert got == {want}, f"{f} --codec {c}: chunks written as {got}"
+        assert pq.read_table(out).to_pydict() == src.to_pydict(), f"{f} --codec {c}: values differ"
+src = pq.read_table(f"{corpus}/hadoop_lz4_compressed.parquet")
+want = src.filter(pc.greater(src["c0"], 1593604800)).to_pydict()
+assert pq.read_table(f"{d}/lz4_filtered.parquet").to_pydict() == want, "filtered LZ4 re-encode differs"
+print("Legacy LZ4 recompression checks passed")
+PY
+else
+  echo "Legacy LZ4 recompression checks skipped: $CORPUS not present"
+fi

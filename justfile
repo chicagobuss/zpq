@@ -147,12 +147,12 @@ differential:
     {{python}} tools/differential.py
 
 # Conformance against apache/parquet-testing (Tier 3). Clones the corpus on
-# first run. Floor of 69 full-passes = the 2026-06-14 baseline (was 64;
-# +5: RLE-BOOLEAN, multi-member GZIP, empty datapage, dict-page-offset-zero); hard failures always fail.
+# first run. Floor of 72 full-passes (was 64; +5: RLE-BOOLEAN, multi-member GZIP, empty datapage,
+# dict-page-offset-zero; +3: the legacy LZ4 files); hard failures always fail.
 conform corpus="/tmp/parquet-testing":
     @test -d {{corpus}} || git clone --depth 1 https://github.com/apache/parquet-testing {{corpus}}
     zig build -Doptimize=ReleaseFast
-    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 69
+    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 72
 
 # `tools/fetch_hardwood.sh --from-source DIR` builds a JVM launcher from a Hardwood checkout instead.
 # Fetch the pinned Hardwood CLI + test fixtures (triangulation's strict-reader oracle) into tools/hardwood/.

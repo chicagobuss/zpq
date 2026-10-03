@@ -52,6 +52,8 @@ const usage_text =
     \\                 plain copy recompresses chunks stored in another one.
     \\                 The summary's "codec" is the one every written chunk
     \\                 uses, or "MIXED" when a copy keeps several.
+    \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
+    \\                 deprecated LZ4 codec but never compresses to it.
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
     \\                 (row-group pruning, stats-as-answer). Slower but
     \\                 thorough — use when you don't trust a file's stats.

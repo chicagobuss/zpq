@@ -17,16 +17,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-# Known, deliberate decode_partial gaps as of the 69-pass baseline
-# (2026-06-14). These are documented decisions, not unexamined failures —
-# the CI floor (--min-pass) guards against *regression*, while these stay
-# parked on purpose:
+# Known, deliberate decode_partial gaps under the 72-pass floor. These are
+# documented decisions, not unexamined failures — the CI floor (--min-pass)
+# guards against *regression*, while these stay parked on purpose:
 #
-#   hadoop_lz4_compressed / non_hadoop_lz4_compressed /
-#   hadoop_lz4_compressed_larger  — codec LZ4 (legacy Hadoop framing).
-#       Deprecated in favour of LZ4_RAW, which ZPQ decodes. The legacy
-#       wire format has two incompatible variants (PARQUET-1241) that need
-#       a detection heuristic; not worth it for a dead codec.
 #   large_string_map.brotli       — codec BROTLI. Exotic; would mean
 #       vendoring a whole new C library for binary bloat we won't pay.
 #   nation.dict-malformed         — total_compressed_size undercounts the

@@ -1173,6 +1173,10 @@ test "a file whose schema root carries a physical type decodes its columns" {
     }
 }
 
+fn DecodedChunkForTest(comptime T: type) type {
+    return struct { values: []T, defs: []u32 };
+}
+
 /// Whole chunk through one reader: values plus def levels (empty when the column is REQUIRED).
 fn decodeChunkForTest(
     comptime T: type,
@@ -1182,7 +1186,7 @@ fn decodeChunkForTest(
     levels: schema.Levels,
     num_values: usize,
     options: DecodeOptions,
-) !struct { values: []T, defs: []u32 } {
+) !DecodedChunkForTest(T) {
     var reader = ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, options);
     const values = try arena.alloc(T, num_values);
     const defs = try arena.alloc(u32, if (levels.max_def > 0) num_values else 0);
@@ -1573,5 +1577,80 @@ test "decode string_nullable column (with actual nulls) from the bench fixture" 
     );
 }
 
-// ----- File-read helper -----
+// ----- Legacy LZ4 (codec 5) corpus files -----
 
+/// Open a parquet-testing fixture (bytes + footer), or skip the test when the corpus is absent.
+fn openLz4Fixture(arena: std.mem.Allocator, path: []const u8) !struct { bytes: []const u8, meta: schema.FileMetaData } {
+    const bytes = readFileSlice(path, arena) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{path});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    return .{ .bytes = bytes, .meta = try metadata.open(arena, bytes) };
+}
+
+/// Decode column `col` of row group 0, asserting it really is stored with the deprecated LZ4 codec.
+fn lz4FixtureChunk(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    f: anytype,
+    col: usize,
+) !DecodedChunkForTest(T) {
+    const cm = f.meta.row_groups.items[0].columns.items[col].meta_data.?;
+    try testing.expectEqual(schema.CompressionCodec.LZ4, cm.codec);
+    const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+    const chunk = f.bytes[start..][0..@intCast(cm.total_compressed_size)];
+    const levels = f.meta.getColumnLevels(cm.path_in_schema.items);
+    return decodeChunkForTest(T, arena, chunk, cm.codec, levels, @intCast(cm.num_values), .{});
+}
+
+test "legacy LZ4 (codec 5) corpus files decode to pyarrow's values" {
+    // parquet-mr's Hadoop framing and old parquet-cpp's bare block hold the same table; expected values are
+    // pyarrow 25's reading of each file.
+    const paths = [_][]const u8{
+        "data/parquet-testing/data/hadoop_lz4_compressed.parquet",
+        "data/parquet-testing/data/non_hadoop_lz4_compressed.parquet",
+    };
+    for (paths) |path| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const f = try openLz4Fixture(a, path);
+
+        const c0 = try lz4FixtureChunk(i64, a, f, 0);
+        try testing.expectEqualSlices(i64, &.{ 1593604800, 1593604800, 1593604801, 1593604801 }, c0.values);
+        const c1 = try lz4FixtureChunk([]const u8, a, f, 1);
+        for ([_][]const u8{ "abc", "def", "abc", "def" }, c1.values) |w, g| try testing.expectEqualStrings(w, g);
+        const v11 = try lz4FixtureChunk(f64, a, f, 2);
+        try testing.expectEqualSlices(f64, &.{ 42.0, 7.7, 42.125, 7.7 }, v11.values);
+        try testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, v11.defs);
+    }
+}
+
+test "legacy LZ4 (codec 5): a multi-chunk Hadoop page decodes to pyarrow's values" {
+    // One 400000-byte page split into three Hadoop chunks.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try openLz4Fixture(a, "data/parquet-testing/data/hadoop_lz4_compressed_larger.parquet");
+    const col = try lz4FixtureChunk([]const u8, a, f, 0);
+    try testing.expectEqual(@as(usize, 10000), col.values.len);
+    try testing.expectEqualStrings("c7ce6bef-d5b0-4863-b199-8ea8c7fb117b", col.values[0]);
+    try testing.expectEqualStrings("e8fb9197-cb9f-4118-b67f-fbfa65f61843", col.values[1]);
+    try testing.expectEqualStrings("85440778-460a-41ac-aa2e-ac3ee41696bf", col.values[9999]);
+    // sha256 over every value, each followed by '\n', as pyarrow reads them.
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (col.values) |v| {
+        h.update(v);
+        h.update("\n");
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "b5e0165eb228bae9d5102e1fefa9d135f58f09b82c3bfe5afb7f7e196aca5c2a");
+    try testing.expectEqualSlices(u8, &want, &digest);
+}
+
+// ----- File-read helper -----

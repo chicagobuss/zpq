@@ -28,7 +28,8 @@ Numbers and trade-offs are dated and contextualised as they're captured. Harness
 
 **Read** standard Parquet — V1 + V2 data pages; PLAIN / RLE / RLE_DICTIONARY / DELTA_BINARY_PACKED /
 DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED
-codecs; all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
+codecs, plus the deprecated LZ4 codec in each container writers used for it (parquet-mr's Hadoop framing, a bare LZ4
+block, an LZ4 frame); all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
 
 **Filter** with `= != < <= > >=`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and Hive-partition
 pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals (`'2024-01-01'`,
@@ -49,8 +50,9 @@ opt into trusting file statistics — see [Statistics: trust is opt-in](#statist
 limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
 entry budget, so leave headroom.
 
-**Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output; RLE_DICTIONARY for low-cardinality byte arrays;
-DELTA_BINARY_PACKED for INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL columns re-encode
+**Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
+to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
+arrays; DELTA_BINARY_PACKED for INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL columns re-encode
 losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never a lossy detour through
 DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes currently omit them and
 readers fall back to row-group pruning.

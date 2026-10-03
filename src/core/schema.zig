@@ -736,6 +736,8 @@ pub const Statistics = struct {
     /// written back, so byte-copied output loses them, which only makes later readers more conservative.
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Read-only, like the exactness flags.
+    nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
         const saved_id = reader.last_field_id;
@@ -761,6 +763,9 @@ pub const Statistics = struct {
                 } else try reader.skip(field.type),
                 8 => if (boolField(field.type)) |b| {
                     stats.is_min_value_exact = b;
+                } else try reader.skip(field.type),
+                9 => if (field.type == .I64) {
+                    stats.nan_count = try reader.readZigZag(i64);
                 } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
@@ -1249,7 +1254,7 @@ pub const FileMetaData = struct {
     created_by: ?[]const u8,
     row_groups: std.ArrayListUnmanaged(RowGroup),
     /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
-    /// column_orders. Read-only: zpq's writer does not emit it.
+    /// column_orders. Written from `outputColumnOrders`.
     column_orders: ?std.ArrayListUnmanaged(i16) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
@@ -1363,7 +1368,69 @@ pub const FileMetaData = struct {
             try rg.write(writer);
         }
         if (self.created_by) |cb| try writer.writeFieldString(6, cb);
+        // Field 7: column_orders, one ColumnOrder union per leaf. Each member zpq knows is an empty struct, so a member
+        // id round-trips as itself; 0 writes an empty union, which declares no order.
+        if (self.column_orders) |co| {
+            try writer.writeFieldListBegin(7, .Struct, co.items.len);
+            for (co.items) |member| {
+                writer.writeStructBegin();
+                if (member != 0) {
+                    try writer.writeFieldBegin(.Struct, member);
+                    writer.writeStructBegin();
+                    try writer.writeStructEnd();
+                }
+                try writer.writeStructEnd();
+            }
+        }
         try writer.writeStructEnd();
+    }
+
+    /// Column orders for an output whose leaf `j` holds source leaf `kept[j]` (or `j` without projection), given the
+    /// footers of the sources whose row groups were byte-copied into it. zpq's encoder writes every bound in
+    /// TYPE_DEFINED_ORDER, so with nothing copied each leaf declares that. A copied chunk keeps its source's bounds and
+    /// can only be declared what its source declared, so the copied sources must agree leaf by leaf, on an order the
+    /// spec can express (an empty union is invalid). A source that declared no orders leaves the output undeclared,
+    /// which only holds if every other source's kept leaves are type-defined too. Anything else is
+    /// `error.ColumnOrderMismatch`: no single footer is truthful for every row group, so the caller must re-encode.
+    pub fn outputColumnOrders(
+        allocator: std.mem.Allocator,
+        n_leaves: usize,
+        kept: ?[]const usize,
+        copied_from: []const *const FileMetaData,
+    ) !?std.ArrayListUnmanaged(i16) {
+        var undeclared = false;
+        for (copied_from) |m| undeclared = undeclared or m.column_orders == null;
+        var out: std.ArrayListUnmanaged(i16) = .empty;
+        errdefer out.deinit(allocator);
+        try out.ensureTotalCapacityPrecise(allocator, n_leaves);
+        for (0..n_leaves) |j| {
+            const src = if (kept) |k| k[j] else j;
+            var member: ?i16 = null;
+            for (copied_from) |m| {
+                const co = (m.column_orders orelse continue).items;
+                const declared: i16 = if (src < co.len) co[src] else 0;
+                if (declared == 0 or (member != null and member.? != declared)) return error.ColumnOrderMismatch;
+                member = declared;
+            }
+            const order = member orelse COLUMN_ORDER_TYPE_DEFINED;
+            if (undeclared and order != COLUMN_ORDER_TYPE_DEFINED) return error.ColumnOrderMismatch;
+            out.appendAssumeCapacity(order);
+        }
+        if (undeclared) {
+            out.deinit(allocator);
+            return null;
+        }
+        return out;
+    }
+
+    /// Whether this file's bounds for the given leaves are in TYPE_DEFINED_ORDER, or undeclared (read as such), so its
+    /// row groups can be byte-copied into an output whose re-encoded row groups declare that order.
+    pub fn keptLeavesTypeDefined(self: *const FileMetaData, kept: []const bool) bool {
+        const co = (self.column_orders orelse return true).items;
+        for (kept, 0..) |k, i| {
+            if (k and (i >= co.len or co[i] != COLUMN_ORDER_TYPE_DEFINED)) return false;
+        }
+        return true;
     }
 
     pub fn getColumnLevels(self: *const FileMetaData, path: []const []const u8) Levels {
@@ -1683,4 +1750,69 @@ test "ColumnChunk write emits page-index pointers" {
     try std.testing.expectEqual(@as(?i32, 40), decoded.offset_index_length);
     try std.testing.expectEqual(@as(?i64, 5040), decoded.column_index_offset);
     try std.testing.expectEqual(@as(?i32, 64), decoded.column_index_length);
+}
+
+test "FileMetaData writes column_orders and reads them back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    try orders.appendSlice(a, &.{ COLUMN_ORDER_TYPE_DEFINED, 3, 0 });
+    const meta: FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+        .column_orders = orders,
+    };
+    var w: thrift.Writer = .init(a);
+    defer w.deinit();
+    try meta.write(&w);
+    var r = thrift.Reader.init(w.bytes());
+    const back = try FileMetaData.read(a, &r);
+    try std.testing.expectEqualSlices(i16, &.{ COLUMN_ORDER_TYPE_DEFINED, 3, 0 }, back.column_orders.?.items);
+}
+
+test "outputColumnOrders: zpq's own bounds are type-defined, copied bounds keep their source's order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const td = COLUMN_ORDER_TYPE_DEFINED;
+
+    const encoded = (try FileMetaData.outputColumnOrders(a, 3, null, &.{})).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, td, td }, encoded.items);
+
+    const blank: FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    var x = blank;
+    x.column_orders = .empty;
+    try x.column_orders.?.appendSlice(a, &.{ td, 3, td });
+    var y = blank;
+    y.column_orders = .empty;
+    try y.column_orders.?.appendSlice(a, &.{ td, 3, 2 });
+
+    const one = (try FileMetaData.outputColumnOrders(a, 3, null, &.{&x})).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, 3, td }, one.items);
+    // Projection maps output leaves to source leaves; sources agreeing on every kept leaf can be declared.
+    const agree = (try FileMetaData.outputColumnOrders(a, 2, &.{ 0, 1 }, &.{ &x, &y })).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, 3 }, agree.items);
+    // Sources disagreeing on a leaf have no truthful declaration, and an empty union is never written.
+    try std.testing.expectError(error.ColumnOrderMismatch, FileMetaData.outputColumnOrders(a, 3, null, &.{ &x, &y }));
+    var z = blank;
+    z.column_orders = .empty;
+    try z.column_orders.?.appendSlice(a, &.{ td, 0, td });
+    try std.testing.expectError(error.ColumnOrderMismatch, FileMetaData.outputColumnOrders(a, 3, null, &.{&z}));
+    // A copied source that declared nothing leaves the output undeclared, which holds only beside type-defined leaves.
+    try std.testing.expect((try FileMetaData.outputColumnOrders(a, 2, &.{ 0, 2 }, &.{ &x, &blank })) == null);
+    const mixed = FileMetaData.outputColumnOrders(a, 3, null, &.{ &x, &blank });
+    try std.testing.expectError(error.ColumnOrderMismatch, mixed);
+    try std.testing.expect(x.keptLeavesTypeDefined(&.{ true, false, true }));
+    try std.testing.expect(!x.keptLeavesTypeDefined(&.{ true, true, true }));
+    try std.testing.expect(blank.keptLeavesTypeDefined(&.{ true, true, true }));
 }

@@ -132,6 +132,12 @@ pub fn main(init: std.process.Init) !void {
                         "can exhaust memory; split the expression or precompute part of it.\n",
                     .{zpq.core.expr.parser.MAX_EXPR_DEPTH},
                 ),
+                error.Unsigned64Operand => std.debug.print(
+                    "zpq query: arithmetic and functions over a UINT64 column are not\n" ++
+                        "supported (values >= 2^63 do not fit the signed 64-bit expression\n" ++
+                        "type). Select, filter, group by or aggregate the column directly.\n",
+                    .{},
+                ),
                 error.ExpectedIdentifier => std.debug.print("zpq query: expected column identifier in expression\n", .{}),
                 error.ExpectedWhere => std.debug.print("zpq query: expected WHERE keyword in expression\n", .{}),
                 error.ExpectedAggFunc => std.debug.print("zpq query: expected aggregate function\n", .{}),

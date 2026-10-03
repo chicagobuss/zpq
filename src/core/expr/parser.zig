@@ -45,7 +45,15 @@ pub const Error = error{
     TrailingTokens,
     ExpressionTooDeep,
     UnsupportedAggType,
+    /// A UINT64 column used as an operand. Expressions compute in i64, where values >= 2^63 have no representation,
+    /// so arithmetic and functions over such a column are refused rather than answered wrongly.
+    Unsigned64Operand,
 } || std.mem.Allocator.Error || filter_parser.Error;
+
+/// A bare UINT64 reference is fine on its own (selected, grouped by, aggregated); as an operand it is not.
+fn rejectUnsigned64Operand(e: ast.Expr) Error!void {
+    if (e == .col_ref and e.col_ref.unsigned_64) return error.Unsigned64Operand;
+}
 
 const TokenKind = enum {
     number_int,
@@ -333,6 +341,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     .str => return error.TypeMismatch,
                 },
                 else => {
+                    try rejectUnsigned64Operand(inner);
                     const lp = try arena.create(ast.Expr);
                     lp.* = .{ .literal = .{ .i64 = 0 } };
                     const rp = try arena.create(ast.Expr);
@@ -401,6 +410,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     // INT64-physical unsigned: the agg fold reads the i64 lane as u64 (≤32-bit unsigned already
                     // zero-extends at decode).
                     .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
+                    .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
                 },
             };
         },
@@ -441,6 +451,7 @@ fn parseCall(
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             arg.* = try parseExpr(arena, lex, file);
             lex.depth -= 1;
+            try rejectUnsigned64Operand(arg.*);
             try args.append(arena, arg);
             const sep = try lex.next();
             switch (sep.kind) {
@@ -487,6 +498,8 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
 }
 
 fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
+    try rejectUnsigned64Operand(l);
+    try rejectUnsigned64Operand(r);
     const result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
     // Op/type compatibility: `concat` is string-only, arithmetic ops
     // are numeric-only.
@@ -1015,4 +1028,24 @@ test "group-by: bare column and AS alias" {
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expectEqual(@as(?[]const u8, null), items[0].alias);
     try testing.expectEqualStrings("k", items[1].alias.?);
+}
+
+test "parse: a UINT64 column may stand alone but is refused as an operand" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try fakeFile(a, &.{ "u", "w" }, &.{ .INT64, .INT32 });
+    file.schema.items[1].logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+    file.schema.items[2].converted_type = .UINT_32;
+
+    const bare = try parseSelect(a, "u AS b", &file);
+    try testing.expect(bare[0].expr.col_ref.unsigned_64);
+    _ = try parseAggList(a, "sum(u) AS s, max(u) AS m", &file);
+    _ = try parseExprOnly(a, "w + 1", &file); // UINT32 zero-extends into i64 exactly
+
+    for ([_][]const u8{ "u + 1", "1 * u", "-u", "coalesce(u, 0)", "(u) - 2" }) |src| {
+        try testing.expectError(error.Unsigned64Operand, parseExprOnly(a, src, &file));
+    }
+    try testing.expectError(error.Unsigned64Operand, parseAggList(a, "sum(u + 1) AS s", &file));
+    try testing.expectError(error.Unsigned64Operand, parseGroupBy(a, "u * 2 AS k", &file));
 }

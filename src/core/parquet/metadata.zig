@@ -108,12 +108,11 @@ pub fn findColumnIndex(
 /// `unknown` if the stats are missing/insufficient to decide.
 pub const Decision = enum { keep, skip, unknown };
 
-/// Equality pruner: returns `skip` iff the column's `[min, max]` stats
-/// range doesn't include `needle`. Comparison is bytewise — correct for
-/// `min_value`/`max_value` (which use the column's natural ordering)
-/// but not for the deprecated unsigned `min`/`max`. We prefer
-/// `min_value`/`max_value` and fall back to the deprecated fields only
-/// for backward compatibility.
+/// Equality pruner: returns `skip` iff the column's `[min_value, max_value]`
+/// range doesn't include `needle`. Comparison is unsigned bytewise, the
+/// type-defined order of a byte-array column. The deprecated `min`/`max`
+/// are never read: they were written with a signed comparison, which
+/// misorders any byte at or above 0x80.
 pub fn pruneEqual(
     rg: *const schema.RowGroup,
     column_index: usize,
@@ -123,16 +122,17 @@ pub fn pruneEqual(
     const meta = rg.columns.items[column_index].meta_data orelse return .unknown;
     const stats = meta.statistics orelse return .unknown;
 
-    const min = stats.min_value orelse stats.min orelse return .unknown;
-    const max = stats.max_value orelse stats.max orelse return .unknown;
+    const min = stats.min_value orelse return .unknown;
+    const max = stats.max_value orelse return .unknown;
 
     if (std.mem.lessThan(u8, needle, min)) return .skip;
     if (std.mem.lessThan(u8, max, needle)) return .skip;
     return .keep;
 }
 
-/// Range pruner: returns `skip` iff the column's `[min, max]` doesn't
-/// overlap the half-open interval `[lo, hi)`.
+/// Range pruner: returns `skip` iff the column's `[min_value, max_value]`
+/// doesn't overlap the half-open interval `[lo, hi)`. Same bytewise order,
+/// and the same refusal of the deprecated pair, as `pruneEqual`.
 pub fn pruneRange(
     rg: *const schema.RowGroup,
     column_index: usize,
@@ -143,8 +143,8 @@ pub fn pruneRange(
     const meta = rg.columns.items[column_index].meta_data orelse return .unknown;
     const stats = meta.statistics orelse return .unknown;
 
-    const min = stats.min_value orelse stats.min orelse return .unknown;
-    const max = stats.max_value orelse stats.max orelse return .unknown;
+    const min = stats.min_value orelse return .unknown;
+    const max = stats.max_value orelse return .unknown;
 
     // Disjoint if max < lo OR min >= hi.
     if (std.mem.lessThan(u8, max, lo)) return .skip;
@@ -290,6 +290,11 @@ test "pruneEqual skips when stats range excludes the value" {
     try testing.expectEqual(Decision.skip, pruneEqual(&rg, 0, "Z"));
     try testing.expectEqual(Decision.skip, pruneEqual(&rg, 0, "0"));
     try testing.expectEqual(Decision.unknown, pruneEqual(&rg, 99, "X")); // bad index
+
+    // The deprecated pair alone is signed-ordered: for {"a", "b", "é"} it reads min "é" (0xC3 is negative), max "b".
+    rg.columns.items[0].meta_data.?.statistics = .{ .min = "\xc3\xa9", .max = "b" };
+    try testing.expectEqual(Decision.unknown, pruneEqual(&rg, 0, "a"));
+    try testing.expectEqual(Decision.unknown, pruneRange(&rg, 0, "a", "aa"));
 }
 
 // Read a file fully into memory using raw syscalls. Std.Io.Dir would

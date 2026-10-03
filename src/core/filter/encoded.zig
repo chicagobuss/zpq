@@ -108,11 +108,14 @@ fn rangeIntersectsSigned(comptime T: type, op: ast.Operator, min: []const u8, ma
         // Real files sometimes contain NaN statistics despite the spec.
         // Unordered bounds cannot safely prove that a page misses the filter.
         if (std.math.isNan(min_v) or std.math.isNan(max_v)) return true;
+        // Bounds leave NaN out, and NaN != x holds, so `lo == hi == x` does not rule out a match. Only a nan_count
+        // of zero does; callers that have one decide that case themselves.
+        if (op == .NotEq) return true;
     }
     return rangeOverlapsValue(T, op, min_v, max_v, needle_v);
 }
 
-fn rangeOverlapsValue(comptime T: type, op: ast.Operator, lo: T, hi: T, needle: T) bool {
+pub fn rangeOverlapsValue(comptime T: type, op: ast.Operator, lo: T, hi: T, needle: T) bool {
     return switch (op) {
         // [lo, hi] intersects {x : x == needle} iff lo <= needle <= hi
         .Eq => !(needle < lo or needle > hi),
@@ -308,6 +311,21 @@ test "rangeIntersects FLOAT keeps pages with NaN bounds" {
 
     try testing.expect(ev.rangeIntersects(.Lt, &nan_buf, &real_buf));
     try testing.expect(ev.rangeIntersects(.Gt, &real_buf, &nan_buf));
+}
+
+test "rangeIntersects float != keeps a constant range equal to the literal: NaN rows sit outside the bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ev = try encode(arena.allocator(), "0", .DOUBLE);
+    var zero: [8]u8 = undefined;
+    std.mem.writeInt(u64, &zero, @bitCast(@as(f64, 0.0)), .little);
+    try testing.expect(ev.rangeIntersects(.NotEq, &zero, &zero));
+    try testing.expect(!ev.rangeIntersects(.Lt, &zero, &zero));
+    // Integers have no NaN: a constant chunk equal to the literal still fails `!=` everywhere.
+    const iv = try encode(arena.allocator(), "0", .INT64);
+    var izero: [8]u8 = undefined;
+    std.mem.writeInt(i64, &izero, 0, .little);
+    try testing.expect(!iv.rangeIntersects(.NotEq, &izero, &izero));
 }
 
 test "rangeIntersects DOUBLE still prunes real disjoint bounds" {

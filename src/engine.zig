@@ -717,6 +717,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var rg_kept: usize = 0;
     var bytes_in: u64 = 0;
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    // Footers of inputs with row groups byte-copied into the output: their bounds decide the declared column orders.
+    var copied_from: std.ArrayListUnmanaged(*const schema.FileMetaData) = .empty;
     // `--select` always re-encodes: the byte-copy fastpath copies every column
     // chunk in leaf order with `kept_set == null`, but a select builds the
     // footer schema from only the selected/reordered columns — so a pure
@@ -724,7 +726,19 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // copied row-group data (N chunks, M<N columns). Routing it through the
     // encoder makes the footer match what's written. (`--columns` keeps the
     // fast lossless subset path via `kept_set`.)
-    const need_encoder = filter_opt != null or any_computed or select_items != null;
+    var need_encoder = filter_opt != null or any_computed or select_items != null;
+    // Byte-copied bounds keep their source's column order. Inputs that disagree on one leave no footer that is
+    // truthful for every row group, so re-encode, which writes every bound in TYPE_DEFINED_ORDER.
+    if (!need_encoder) {
+        const all = try arena.alloc(*const schema.FileMetaData, metas.len);
+        for (metas, all) |*m, *p| p.* = m;
+        const kept_map: ?[]const usize = if (kept_set != null) kept_in_order.items else null;
+        const n_out = if (kept_map) |k| k.len else invariant.footerLeafCount(meta0.schema.items);
+        _ = schema.FileMetaData.outputColumnOrders(arena, n_out, kept_map, all) catch |err| switch (err) {
+            error.ColumnOrderMismatch => need_encoder = true,
+            else => return err,
+        };
+    }
 
     // Re-encoding a nested (repeated) column would drop its rep-levels — the
     // OutputAggregator carries only values/def-levels — yielding pages whose
@@ -789,6 +803,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 if (out.surviving_rows > 0) rg_kept += 1;
             }
         }
+        for (metas) |*m| try copied_from.append(arena, m);
     } else {
         // Windowed re-encode: one path for all environments. Concurrency is
         // bounded by the Io's async_limit (Lambda-aware vCPU budget); in-flight
@@ -832,10 +847,14 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     // Byte-copy preserves the source codec, so it may only stand
                     // in for a re-encode when the requested --codec already
                     // matches every kept column (else re-encode to honor it).
+                    // ...and only when its bounds are in the TYPE_DEFINED_ORDER the re-encoded row groups declare.
                     if (bytecopy_ok and d == .always_match and
-                        keptColumnsUseCodec(src_rg, kept_arr, args.codec))
+                        keptColumnsUseCodec(src_rg, kept_arr, args.codec) and
+                        meta_p.keptLeavesTypeDefined(kept_arr))
                         passthrough = true;
                 };
+                if (passthrough and (copied_from.items.len == 0 or copied_from.getLast() != meta_p))
+                    try copied_from.append(arena, meta_p);
                 try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg, .passthrough = passthrough });
             }
         }
@@ -925,20 +944,22 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         coerceFloat16LeavesToDouble(&new_schema_items);
     }
 
-    const new_meta: schema.FileMetaData = .{
-        .version = meta0.version,
-        .schema = new_schema_items,
-        .num_rows = rows_kept,
-        .created_by = meta0.created_by,
-        .row_groups = new_row_groups,
-    };
-
     // Output structural invariant — ALWAYS ON, even under ReleaseFast.
     // Every row group must carry exactly one column chunk per footer
     // leaf. If the footer leaf count and emitted chunks disagree, strict
     // readers reject the file. This guard must survive ReleaseFast, so it
     // is an error instead of a debug assert.
     const footer_leaves = invariant.footerLeafCount(new_schema_items.items);
+    const kept_map: ?[]const usize = if (select_items == null and kept_set != null) kept_in_order.items else null;
+    const new_meta: schema.FileMetaData = .{
+        .version = meta0.version,
+        .schema = new_schema_items,
+        .num_rows = rows_kept,
+        .created_by = meta0.created_by,
+        .row_groups = new_row_groups,
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, footer_leaves, kept_map, copied_from.items),
+    };
+
     for (new_row_groups.items) |rg_chk| {
         if (rg_chk.columns.items.len != footer_leaves) return error.FooterSchemaChunkMismatch;
     }
@@ -1063,21 +1084,7 @@ fn buildSelectSchema(
                 copy.num_children = 0;
                 try out.append(arena, copy);
             },
-            .computed => |c| {
-                const expr_type = c.expr.typeOf();
-                try out.append(arena, .{
-                    .type = expr_type.toParquet(),
-                    .type_length = null,
-                    .repetition_type = .REQUIRED,
-                    .name = c.alias,
-                    .num_children = 0,
-                    .converted_type = if (expr_type == .str) .UTF8 else null,
-                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
-                    .scale = null,
-                    .precision = null,
-                    .field_id = null,
-                });
-            },
+            .computed => |c| try out.append(arena, consumer.computedSchemaElem(c)),
         }
     }
 
@@ -2106,20 +2113,31 @@ fn writeColName(writer: anytype, paths: [][]const []const u8, schemas: []const s
     }
 }
 
-fn printCell(writer: anytype, col: consumer.OutputAggregator.ColumnBuf, row_idx: usize, scale: i32, is_jsonl: bool) !void {
+fn printCell(
+    writer: anytype,
+    col: consumer.OutputAggregator.ColumnBuf,
+    row_idx: usize,
+    elem: schema.SchemaElement,
+    is_jsonl: bool,
+) !void {
+    const scale = elem.scale orelse 0;
+    // An unsigned column's lane holds its bits in a signed integer; print the stored value, not the sign bit.
+    const unsigned = schema.isUnsignedInt(elem);
     switch (col) {
         .i32 => |tb| {
             if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {
-                try writer.print("{d}", .{tb.values.items[row_idx]});
+                const v = tb.values.items[row_idx];
+                if (unsigned) try writer.print("{d}", .{@as(u32, @bitCast(v))}) else try writer.print("{d}", .{v});
             }
         },
         .i64 => |tb| {
             if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {
-                try writer.print("{d}", .{tb.values.items[row_idx]});
+                const v = tb.values.items[row_idx];
+                if (unsigned) try writer.print("{d}", .{@as(u64, @bitCast(v))}) else try writer.print("{d}", .{v});
             }
         },
         .f32 => |tb| {
@@ -2189,15 +2207,13 @@ fn flushAggregator(
                 try writer.writeByte('"');
                 try writeColName(writer, agg.paths, agg.schema_elems, col_idx);
                 try writer.writeAll("\":");
-                const scale = agg.schema_elems[col_idx].scale orelse 0;
-                try printCell(writer, col, row_idx, scale, true);
+                try printCell(writer, col, row_idx, agg.schema_elems[col_idx], true);
             }
             try writer.writeAll("}\n");
         } else {
             for (agg.cols, 0..) |col, col_idx| {
                 if (col_idx > 0) try writer.writeAll(",");
-                const scale = agg.schema_elems[col_idx].scale orelse 0;
-                try printCell(writer, col, row_idx, scale, false);
+                try printCell(writer, col, row_idx, agg.schema_elems[col_idx], false);
             }
             try writer.writeAll("\n");
         }
@@ -2590,4 +2606,41 @@ test "rebaseFetchedOffsets poisons filter-only chunks it left unfetched in prove
     try std.testing.expectEqual(UNFETCHED_CHUNK_OFFSET, rg1[0].meta_data.?.data_page_offset);
     try std.testing.expectEqual(UNFETCHED_CHUNK_OFFSET, rg1[0].file_offset);
     try std.testing.expectEqual(@as(i64, 128), rg1[1].meta_data.?.data_page_offset);
+}
+
+test "printCell prints an unsigned column's stored value, not its sign bit" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var c32: consumer.OutputAggregator.TypedBuf(i32) = .{};
+    try c32.values.append(a, @bitCast(@as(u32, 3_000_000_000)));
+    var c64: consumer.OutputAggregator.TypedBuf(i64) = .{};
+    try c64.values.append(a, @bitCast(@as(u64, 18_000_000_000_000_000_000)));
+
+    const plain: schema.SchemaElement = .{
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "c",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var u32_elem = plain;
+    u32_elem.converted_type = .UINT_32;
+    var u64_elem = plain;
+    u64_elem.type = .INT64;
+    u64_elem.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try printCell(&w, .{ .i32 = c32 }, 0, u32_elem, true);
+    try w.writeByte(' ');
+    try printCell(&w, .{ .i64 = c64 }, 0, u64_elem, false);
+    try w.writeByte(' ');
+    try printCell(&w, .{ .i32 = c32 }, 0, plain, true);
+    try testing.expectEqualStrings("3000000000 18000000000000000000 -1294967296", w.buffered());
 }

@@ -24,6 +24,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
+const filter_prune = @import("../filter/prune.zig");
 const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
@@ -302,35 +303,15 @@ pub fn statsCoverageComplete(
         for (m.row_groups.items) |rg| {
             if (ci >= rg.columns.items.len) return false;
             const cm = rg.columns.items[ci].meta_data orelse return false;
-            const levels = columnLevelsForStats(&m, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats_opt = cm.statistics;
             switch (call.func) {
                 .count => {
-                    _ = statPresentCount(&rg, &cm, stats_opt, &m) orelse return false;
+                    const levels = columnLevelsForStats(&m, &cm) orelse return false;
+                    if (levels.max_rep > 0) return false;
+                    _ = statPresentCount(&rg, &cm, cm.statistics, &m) orelse return false;
                 },
-                .min => {
-                    const stats = stats_opt orelse return false;
-                    if (stats.min_value == null and stats.min == null) return false;
-                },
-                .max => {
-                    const stats = stats_opt orelse return false;
-                    if (stats.max_value == null and stats.max == null) return false;
-                },
-                .sum => {
-                    // Strict precondition for fetch-skip: every RG must
-                    // be a constant column (min == max) AND both stat
-                    // fields must be present. If any RG has variable
-                    // values, we'll still need to fetch+decode for that
-                    // RG — so we can't drop the column from the fetch
-                    // set. Per-RG `updateOneFromStats` handles the
-                    // mixed case at scan time.
-                    const stats = stats_opt orelse return false;
-                    const min_bytes = stats.min_value orelse stats.min orelse return false;
-                    const max_bytes = stats.max_value orelse stats.max orelse return false;
-                    if (!std.mem.eql(u8, min_bytes, max_bytes)) return false;
-                    _ = statPresentCount(&rg, &cm, stats_opt, &m) orelse return false;
-                },
+                // The same plan `updateOneFromStats` folds from: any row group it would decode instead keeps the
+                // column in the fetch set. Sum needs every row group constant (min == max) to drop the column.
+                .min, .max, .sum => if (planStatFold(call, &rg, ci, &m) == null) return false,
                 else => unreachable,
             }
         }
@@ -370,129 +351,87 @@ pub fn updateOneFromStats(
             return true;
         },
         .min, .max => {
-            // Need to find the column-chunk. The arg must be a bare
-            // col_ref for stat-eligibility (we don't try to compute
-            // min/max of an expression like `cost * qty` from stats).
-            const arg = call.arg orelse return error.BadAggArg;
-            const col_idx = switch (arg) {
-                .col_ref => |c| c.col_idx,
-                else => return false, // expression args fall back to decode
-            };
-            if (col_idx >= rg.columns.items.len) return false;
-            const cm = rg.columns.items[col_idx].meta_data orelse return false;
-            const levels = columnLevelsForStats(file_meta, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats = cm.statistics orelse return false;
-            // Prefer the newer min_value/max_value (post-2.0 stat
-            // fields) over legacy min/max. For numeric columns the
-            // semantics match in the cases we support.
-            const bytes_opt = if (call.func == .min)
-                (stats.min_value orelse stats.min)
-            else
-                (stats.max_value orelse stats.max);
-            const bytes = bytes_opt orelse return false;
-
-            // DECIMAL columns: the accumulator is .min_f / .max_f
-            // (col_ref's expr_type is .f64) but the on-disk physical
-            // type is INT32 / INT64 / FLBA, and the stats bytes are
-            // in the physical wire format. Decode them through the
-            // same byte → i128 → f64-with-scale pipeline the value
-            // path uses, then fold.
-            const elem_opt = file_meta.getColumnSchema(cm.path_in_schema.items);
-
-            // Unsigned ints: the stat min/max bytes are in unsigned order, but
-            // this signed-int path would read 0xFF..FF as -1. Bail to decode,
-            // which handles unsigned correctly (zero-extend ≤32 / u64-fold 64).
-            if (elem_opt) |se| if (schema.isUnsignedInt(se)) return false;
-
-            const dec_kind: ?decimal_mod.Kind = if (elem_opt) |se|
-                decimal_mod.kindFromSchema(&se)
-            else
-                null;
-            if (dec_kind) |k| {
-                try foldDecimalStatBytes(state, call, k, bytes);
-                return true;
+            // Only a bare col_ref is stat-eligible; an expression like `cost * qty` decodes.
+            const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
+            const bytes = if (call.func == .min) plan.bounds.min else plan.bounds.max;
+            switch (plan.lane) {
+                // DECIMAL stat bytes are in the physical wire format: decode them through the same
+                // byte → i128 → f64-with-scale pipeline the value path uses, then fold into .min_f / .max_f.
+                .decimal => |k| try foldDecimalStatBytes(state, call, k, bytes),
+                .int, .float => try foldStatBytes(state, call, plan.physical, bytes),
             }
-
-            // Non-DECIMAL accumulator/parquet-type mismatch: bail to
-            // the decode path. This was a hidden bug before — e.g.
-            // a future float-accum vs int-physical mismatch would
-            // have errored out of foldStatBytes.
-            const accum_is_float = switch (state.*) {
-                .min_f, .max_f => true,
-                else => false,
-            };
-            const phys_is_float = switch (cm.type) {
-                .FLOAT, .DOUBLE => true,
-                else => false,
-            };
-            if (accum_is_float != phys_is_float) return false;
-
-            try foldStatBytes(state, call, cm.type, bytes);
             return true;
         },
         .sum => {
-            // Constant-column case: when this RG's min == max, every
-            // value in the RG equals that constant, so this RG
-            // contributes num_rows × min to the sum. Return false
-            // (decode-fallback) for any RG that isn't constant; the
-            // mixed case still works — the constant RGs fold from
-            // stats, the rest decode normally.
-            const arg = call.arg orelse return error.BadAggArg;
-            const col_idx = switch (arg) {
-                .col_ref => |c| c.col_idx,
-                else => return false,
-            };
-            if (col_idx >= rg.columns.items.len) return false;
-            const cm = rg.columns.items[col_idx].meta_data orelse return false;
-            const levels = columnLevelsForStats(file_meta, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats = cm.statistics orelse return false;
-            const min_bytes = stats.min_value orelse stats.min orelse return false;
-            const max_bytes = stats.max_value orelse stats.max orelse return false;
-            if (!std.mem.eql(u8, min_bytes, max_bytes)) return false;
-
-            // Non-null row count. REQUIRED columns can use row count;
-            // nullable columns need null_count or we would count null
-            // slots as the constant value.
-            const present = statPresentCount(rg, &cm, stats, file_meta) orelse return false;
-            if (present == 0) return true; // nothing to add
-
-            // DECIMAL columns fold through decimal_mod (same as min/max).
-            const elem_opt = file_meta.getColumnSchema(cm.path_in_schema.items);
-            // Unsigned ints: stat bytes are unsigned-ordered; the signed
-            // constant-sum fold would misread them. Decode instead.
-            if (elem_opt) |se| if (schema.isUnsignedInt(se)) return false;
-            const dec_kind: ?decimal_mod.Kind = if (elem_opt) |se|
-                decimal_mod.kindFromSchema(&se)
-            else
-                null;
-            if (dec_kind) |k| {
-                const v_f = decimalStatBytesToF64(min_bytes, k) orelse return false;
-                switch (state.*) {
-                    .sum_f => |*s| s.* += v_f * @as(f64, @floatFromInt(present)),
-                    else => return false,
-                }
-                return true;
+            // Constant-column case: when this RG's min == max, every value in it equals that constant, so it
+            // contributes present × min. A non-constant RG decodes; the constant ones still fold from stats.
+            const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
+            if (plan.present == 0) return true; // nothing to add
+            switch (plan.lane) {
+                .decimal => |k| state.sum_f += decimalStatBytesToF64(plan.bounds.min, k).? *
+                    @as(f64, @floatFromInt(plan.present)),
+                .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
             }
-
-            // Type-mismatch guard mirrors the min/max path.
-            const accum_is_float = switch (state.*) {
-                .sum_f => true,
-                .sum_i => false,
-                else => return false,
-            };
-            const phys_is_float = switch (cm.type) {
-                .FLOAT, .DOUBLE => true,
-                else => false,
-            };
-            if (accum_is_float != phys_is_float) return false;
-
-            try foldConstantSumStatBytes(state, cm.type, min_bytes, present);
             return true;
         },
         .avg => return false, // never short-circuitable
     }
+}
+
+const StatLane = union(enum) { decimal: decimal_mod.Kind, int, float };
+
+/// Everything `updateOneFromStats` needs to answer `call` from one row group's statistics.
+const StatFold = struct {
+    lane: StatLane,
+    physical: schema.Type,
+    bounds: filter_prune.Bounds,
+    /// Non-null rows; only computed (and required) for sum.
+    present: i64 = 0,
+};
+
+/// Whether, and how, `call`'s column can be folded from this row group's statistics; null means decode it. The one
+/// decision both `updateOneFromStats` and `statsCoverageComplete` act on: if coverage accepted a row group the fold
+/// then declined, the column would already be dropped from the fetch set with nothing left to decode.
+fn planStatFold(
+    call: AggCall,
+    rg: *const schema.RowGroup,
+    col_idx: usize,
+    file_meta: *const schema.FileMetaData,
+) ?StatFold {
+    if (col_idx >= rg.columns.items.len) return null;
+    const cm = rg.columns.items[col_idx].meta_data orelse return null;
+    const levels = columnLevelsForStats(file_meta, &cm) orelse return null;
+    if (levels.max_rep > 0) return null;
+    // Bounds in the column's own order: the deprecated pair only where signed is that order.
+    const bounds = filter_prune.chunkBounds(rg, col_idx, file_meta) orelse return null;
+    const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
+    var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
+    if (call.func == .sum) {
+        if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
+        // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
+        // constant.
+        plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
+        if (lane == .decimal and decimalStatBytesToF64(bounds.min, lane.decimal) == null) return null;
+    }
+    return plan;
+}
+
+/// The stat-bytes lane for `call`, which must match the accumulator `call.result` gives it.
+fn statFoldLane(call: AggCall, physical: schema.Type, elem_opt: ?schema.SchemaElement) ?StatLane {
+    const accum_is_float = call.result == .f64;
+    if (elem_opt) |se| {
+        // Unsigned bounds are unsigned-ordered; the int fold would read 0xFF..FF as -1. Decode instead, which
+        // zero-extends (<=32) or folds as u64.
+        if (schema.isUnsignedInt(se)) return null;
+        if (decimal_mod.kindFromSchema(&se)) |k| return if (accum_is_float) .{ .decimal = k } else null;
+        // FLOAT16 decodes to the f64 lane, but its bounds are 2-byte halves no fold here reads.
+        if (schema.isFloat16(se)) return null;
+    }
+    return switch (physical) {
+        .INT32, .INT64 => if (accum_is_float) null else .int,
+        .FLOAT, .DOUBLE => if (accum_is_float) .float else null,
+        else => null,
+    };
 }
 
 fn statArgColumn(call: AggCall) ?usize {
@@ -526,8 +465,7 @@ fn statPresentCount(
 }
 
 /// Decode a DECIMAL stat bytes slice to f64. Mirrors the helper in
-/// `filter/prune.zig`. Inlined here to avoid the cross-module
-/// dependency direction (agg → prune would be wrong).
+/// `filter/prune.zig`.
 fn decimalStatBytesToF64(bytes: []const u8, kind: decimal_mod.Kind) ?f64 {
     return switch (kind.physical) {
         .INT32 => blk: {
@@ -859,7 +797,7 @@ fn colRefForAgg(
     }
 
     return switch (c.expr_type) {
-        .i64 => .{ .i64 = .{ .values = try expr_eval.widenToI64(arena, raw) } },
+        .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, raw, c) } },
         .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, raw) } },
         // String columns pass through unwidened; foldMinMaxBytes compares the
         // borrowed slices and dups the winner into `persist`. (Null rows are
@@ -1998,6 +1936,25 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
     try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, true));
     try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, false));
     try testing.expect(statsCoverageComplete(star_call, &.{meta_partial}, 0, false));
+
+    // `updateOneFromStats` never folds an unsigned column, so its stats cannot let the column go unfetched.
+    meta_complete.schema.items[1].converted_type = .UINT_64;
+    try testing.expect(!statsCoverageComplete(max_call, &.{meta_complete}, 0, true));
+    try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, true));
+
+    // FLOAT16 decodes to the f64 lane, but no fold reads its 2-byte bounds: it too must stay fetched.
+    const leaf = &meta_complete.schema.items[1];
+    leaf.converted_type = null;
+    leaf.type = .FIXED_LEN_BYTE_ARRAY;
+    leaf.type_length = 2;
+    leaf.logical_type = .{ .FLOAT16 = .{} };
+    const half: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .f64,
+    } };
+    const half_max: AggCall = .{ .func = .max, .arg = half, .where = null, .alias = "hi", .result = .f64 };
+    try testing.expect(!statsCoverageComplete(half_max, &.{meta_complete}, 0, true));
 }
 
 test "simdSumI64 widens correctly across positive and negative i64 extremes" {

@@ -95,6 +95,9 @@ pub const ColRef = struct {
     /// as u64 so sum/min/max are correct (a signed read makes 2^64-1 read -1).
     /// ≤32-bit unsigned ints don't need this — they zero-extend at decode.
     unsigned_64: bool = false,
+    /// INT32-physical column annotated UNSIGNED at <=32 bits. Decoders that keep such a column in the i32 lane
+    /// store its raw bits, so widening must zero-extend rather than sign-extend.
+    unsigned_32: bool = false,
 };
 
 pub const BinOp = struct {

@@ -293,6 +293,7 @@ fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
         .int32 => |l| .{ .int32 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
         .int64 => |l| .{ .int64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
+        .uint64 => |l| .{ .uint64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
         .float => |l| .{ .float = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
         .double => |l| .{ .double = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
         .string => |l| .{ .string = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
@@ -332,12 +333,11 @@ fn parseBetween(arena: std.mem.Allocator, expr: []const u8, file: *const schema.
 
     const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
     const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
-    const ptype = elem.type orelse return error.UnsupportedType;
 
     const left = try arena.create(ast.Filter);
     const right = try arena.create(ast.Filter);
-    left.* = try buildLeafFilter(col_idx, .GtEq, x_str, ptype);
-    right.* = try buildLeafFilter(col_idx, .LtEq, y_str, ptype);
+    left.* = try buildTypedComparison(col_idx, &elem, .GtEq, x_str);
+    right.* = try buildTypedComparison(col_idx, &elem, .LtEq, y_str);
     return .{ .and_filter = .{ .left = left, .right = right } };
 }
 
@@ -411,6 +411,7 @@ fn buildTypedComparison(
     if (decimal_mod.kindFromSchema(elem) != null) {
         return buildLeafFilter(col_idx, op, val_str, .DOUBLE);
     }
+    if (schema.isUnsignedInt(elem.*)) return buildUnsignedLeaf(col_idx, op, val_str);
     if (temporalKind(elem)) |tk| {
         return buildTemporalLeaf(col_idx, op, val_str, tk);
     }
@@ -426,6 +427,22 @@ fn buildTypedComparison(
     }
     const ptype = elem.type orelse return error.UnsupportedType;
     return buildLeafFilter(col_idx, op, val_str, ptype);
+}
+
+/// Unsigned columns compare as u64. They hold only 0..2^64-1, so a literal outside that range has a constant answer
+/// for every non-null row (`u > -1` holds, `u = -1` never does); fold it into a leaf that is always true (`>= 0`) or
+/// always false (`< 0`) so evaluation and pruning need no out-of-range case.
+fn buildUnsignedLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Error!ast.Filter {
+    const v = std.fmt.parseInt(i128, val_str, 10) catch return error.BadValue;
+    if (std.math.cast(u64, v)) |in_range| return .{ .uint64 = .{ .col_idx = col_idx, .op = op, .value = in_range } };
+    const below = v < 0;
+    const holds = switch (op) {
+        .Eq => false,
+        .NotEq => true,
+        .Lt, .LtEq => !below,
+        .Gt, .GtEq => below,
+    };
+    return .{ .uint64 = .{ .col_idx = col_idx, .op = if (holds) .GtEq else .Lt, .value = 0 } };
 }
 
 /// A column whose INT32/INT64 storage carries a temporal logical type.
@@ -983,4 +1000,64 @@ test "parse BETWEEN is case-insensitive" {
 
     const f = try parse(a, "id between 1 and 5", &meta);
     try testing.expect(f == .and_filter);
+}
+
+test "parse unsigned literals: in-range compares as u64, out-of-range folds to a constant leaf" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    const root: schema.SchemaElement = .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = null,
+        .name = "schema",
+        .num_children = 2,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    try items.append(a, root);
+    var u32_elem = root;
+    u32_elem.type = .INT32;
+    u32_elem.name = "u";
+    u32_elem.num_children = null;
+    u32_elem.converted_type = .UINT_32;
+    try items.append(a, u32_elem);
+    var u64_elem = u32_elem;
+    u64_elem.type = .INT64;
+    u64_elem.name = "w";
+    u64_elem.converted_type = null;
+    u64_elem.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+    try items.append(a, u64_elem);
+    const fm: schema.FileMetaData = .{
+        .version = 1,
+        .schema = items,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+
+    const big = try parse(a, "u = 3000000000", &fm);
+    try testing.expectEqual(@as(u64, 3_000_000_000), big.uint64.value);
+    const top = try parse(a, "w >= 18446744073709551615", &fm);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), top.uint64.value);
+    try testing.expectEqual(@as(usize, 1), top.uint64.col_idx);
+
+    // Below zero: `>`/`>=`/`!=` hold for every row, `=`/`<`/`<=` for none. Above 2^64-1 the reverse.
+    const cases = [_]struct { expr: []const u8, holds: bool }{
+        .{ .expr = "u > -1", .holds = true },
+        .{ .expr = "u != -1", .holds = true },
+        .{ .expr = "u = -1", .holds = false },
+        .{ .expr = "u <= -1", .holds = false },
+        .{ .expr = "w < 18446744073709551616", .holds = true },
+        .{ .expr = "w = 18446744073709551616", .holds = false },
+        .{ .expr = "w > 99999999999999999999999", .holds = false },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.expr, &fm);
+        try testing.expectEqual(@as(u64, 0), f.uint64.value);
+        try testing.expectEqual(if (c.holds) ast.Operator.GtEq else ast.Operator.Lt, f.uint64.op);
+    }
+    try testing.expectError(error.BadValue, parse(a, "u = 1.5", &fm));
 }

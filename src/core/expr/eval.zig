@@ -101,7 +101,7 @@ fn colRefAsGroupKeyColumn(
 
     return switch (c.expr_type) {
         .i64 => .{ .i64 = .{
-            .values = try widenToI64(arena, col),
+            .values = try widenColRefToI64(arena, col, c),
             .def_levels = nulls.def_levels,
             .max_def = nulls.max_def,
             .rep_levels = switch (col) {
@@ -307,7 +307,7 @@ fn colRefAsColumn(
     try rejectNullableOrNested(col);
 
     return switch (c.expr_type) {
-        .i64 => .{ .i64 = .{ .values = try widenToI64(arena, col) } },
+        .i64 => .{ .i64 = .{ .values = try widenColRefToI64(arena, col, c) } },
         .f64 => .{ .f64 = .{ .values = try widenToF64(arena, col) } },
         .str => .{ .string = .{ .values = try borrowStr(col) } },
     };
@@ -783,6 +783,16 @@ fn rejectNullableOrNested(col: Batch.Column) Error!void {
             }
         },
     }
+}
+
+/// `widenToI64` for a column reference: an unsigned column in the i32 lane zero-extends.
+pub fn widenColRefToI64(arena: std.mem.Allocator, col: Batch.Column, c: ast.ColRef) Error![]i64 {
+    if (c.unsigned_32 and col == .i32) {
+        const out = try arena.alloc(i64, col.i32.values.len);
+        for (col.i32.values, 0..) |v, i| out[i] = @as(u32, @bitCast(v));
+        return out;
+    }
+    return widenToI64(arena, col);
 }
 
 pub fn widenToI64(arena: std.mem.Allocator, col: Batch.Column) Error![]i64 {

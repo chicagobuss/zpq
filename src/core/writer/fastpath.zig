@@ -42,6 +42,8 @@ pub const Error = error{
     InvalidColumnOffsets,
     NestedSchemaUnsupported,
     BadColumnIndex,
+    /// The inputs declare different column orders for a copied leaf; a byte copy cannot be declared truthfully.
+    ColumnOrderMismatch,
 } || std.mem.Allocator.Error;
 
 /// Build the fast-path output. When `kept_columns` is null, every
@@ -153,6 +155,7 @@ pub fn buildMulti(
         .num_rows = total_rows,
         .created_by = meta0.created_by,
         .row_groups = new_row_groups,
+        .column_orders = try copiedColumnOrders(arena, files, kept_columns),
     };
 
     var w: thrift.Writer = .init(arena);
@@ -250,6 +253,11 @@ pub fn build(
         .num_rows = total_rows,
         .created_by = meta.created_by,
         .row_groups = new_row_groups,
+        .column_orders = try copiedColumnOrders(arena, &.{.{
+            .bytes = input,
+            .meta = meta,
+            .survivors = survivors,
+        }}, kept_columns),
     };
 
     var w: thrift.Writer = .init(arena);
@@ -345,6 +353,21 @@ pub fn projectSchema(
         try out.append(arena, src.items[idx + 1]);
     }
     return out;
+}
+
+/// Column orders of an all-byte-copy output: every row group keeps its source's bounds, so the sources decide them.
+pub fn copiedColumnOrders(
+    arena: std.mem.Allocator,
+    files: []const FileSpec,
+    kept_columns: ?[]const usize,
+) Error!?std.ArrayListUnmanaged(i16) {
+    const metas = try arena.alloc(*const schema.FileMetaData, files.len);
+    for (files, metas) |f, *m| m.* = f.meta;
+    var n_leaves: usize = 0;
+    if (kept_columns) |kc| n_leaves = kc.len else for (files[0].meta.schema.items) |el| {
+        if (el.type != null) n_leaves += 1;
+    }
+    return schema.FileMetaData.outputColumnOrders(arena, n_leaves, kept_columns, metas);
 }
 
 const ByteRange = struct { start: usize, len: usize };
@@ -852,4 +875,38 @@ fn errIs(r: usize) bool {
 fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
     if (errIs(r)) return error.SyscallFailed;
     return @intCast(@as(isize, @bitCast(r)));
+}
+
+test "byte-copied output declares its source's column orders" {
+    const path = "ci/fixtures/parquet/column_order.parquet";
+    const file_bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, file_bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    const specs = [_]FileSpec{.{ .bytes = file_bytes, .meta = &meta, .survivors = survivors }};
+
+    // Source: `s` in an order zpq does not implement (3), `i` type-defined.
+    const all = try metadata.open(arena, try buildMulti(arena, &specs, null));
+    try testing.expectEqualSlices(i16, &.{ 3, schema.COLUMN_ORDER_TYPE_DEFINED }, all.column_orders.?.items);
+    const projected = try metadata.open(arena, try buildMulti(arena, &specs, &.{1}));
+    try testing.expectEqualSlices(i16, &.{schema.COLUMN_ORDER_TYPE_DEFINED}, projected.column_orders.?.items);
+
+    // A second input declaring `s` type-defined: no one order is true of both inputs' `s` bounds, so the copy is
+    // refused rather than written with an invalid empty union or a false declaration.
+    var other = meta;
+    other.column_orders = .empty;
+    const td = schema.COLUMN_ORDER_TYPE_DEFINED;
+    try other.column_orders.?.appendSlice(arena, &.{ td, td });
+    const mixed = [_]FileSpec{ specs[0], .{ .bytes = file_bytes, .meta = &other, .survivors = survivors } };
+    try testing.expectError(error.ColumnOrderMismatch, buildMulti(arena, &mixed, null));
+    // Leaving `s` out leaves only the leaf both declare type-defined.
+    const just_i = try metadata.open(arena, try buildMulti(arena, &mixed, &.{1}));
+    try testing.expectEqualSlices(i16, &.{schema.COLUMN_ORDER_TYPE_DEFINED}, just_i.column_orders.?.items);
 }

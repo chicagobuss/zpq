@@ -15,6 +15,7 @@ is the oracle (same role Hardwood gives it).
 Usage: .venv/bin/python tools/differential.py
 """
 import duckdb, subprocess, os, sys, tempfile, json
+import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
 
 ZPQ = "zig-out/bin/zpq"
@@ -98,6 +99,8 @@ from decimal import Decimal
 def norm(v):
     if isinstance(v, bool):
         return 1 if v else 0
+    if isinstance(v, float) and v != v:
+        return "NaN"  # as zpq's jsonl prints it, and so NaN rows compare equal
     if isinstance(v, (float, Decimal)):
         return round(float(v), 4)
     return v
@@ -106,6 +109,208 @@ def norm(v):
 def rows_sorted(con, sql):
     rs = con.execute(sql).fetchall()
     return sorted([tuple(norm(c) for c in row) for row in rs], key=repr)
+
+
+# --- statistics order: columns whose stats order differs from the signed order of their bytes ---
+# (label, fixture, zpq_filter | None, oracle). Fixtures come from tools/gen_stats_order_fixtures.py. Each case diffs
+# jsonl rows, written parquet, and aggregates. The oracle is a DuckDB WHERE clause, or, where DuckDB itself trusts
+# statistics it should not, a Python predicate over every row decoded by pyarrow, which reads no statistics at all.
+UNSIGNED_FIXTURE = "ci/fixtures/parquet/unsigned_order.parquet"
+DEPRECATED_FIXTURE = "ci/fixtures/parquet/deprecated_stats.parquet"
+COLUMN_ORDER_FIXTURE = "ci/fixtures/parquet/column_order.parquet"
+NAN_FIXTURE = "ci/fixtures/parquet/nan_stats.parquet"
+STATS_ORDER = [
+    ("u_all",          UNSIGNED_FIXTURE, None,                          None),
+    ("u32_ge_2^31",    UNSIGNED_FIXTURE, "u32 >= 2147483648",           "u32 >= 2147483648"),
+    ("u32_eq_2^31",    UNSIGNED_FIXTURE, "u32 = 2147483648",            "u32 = 2147483648"),
+    ("u32_in",         UNSIGNED_FIXTURE, "u32 IN (0, 4294967295)",      "u32 IN (0, 4294967295)"),
+    ("u32_gt_neg",     UNSIGNED_FIXTURE, "u32 > -1",                    "u32 > -1"),
+    ("u64_gt_2^63-1",  UNSIGNED_FIXTURE, "u64 > 9223372036854775807",   "u64 > 9223372036854775807"),
+    ("u64_eq_max",     UNSIGNED_FIXTURE, "u64 = 18446744073709551615",  "u64 = 18446744073709551615"),
+    ("u8_ge_128",      UNSIGNED_FIXTURE, "u8 >= 128",                   "u8 >= 128"),
+    ("u16_between",    UNSIGNED_FIXTURE, "u16 BETWEEN 32768 AND 65535", "u16 BETWEEN 32768 AND 65535"),
+    ("n32_gt_2^31-1",  UNSIGNED_FIXTURE, "n32 > 2147483647",            "n32 > 2147483647"),
+    # DuckDB prunes these on the signed-ordered deprecated min/max and returns no rows.
+    ("depr_s_eq",      DEPRECATED_FIXTURE, "s = 'a'",        lambda r: r["s"] == "a"),
+    ("depr_s_lt",      DEPRECATED_FIXTURE, "s < 'b'",        lambda r: r["s"].encode() < b"b"),
+    ("depr_dec_eq",    DEPRECATED_FIXTURE, "dec = 1.00",     lambda r: r["dec"] == Decimal("1.00")),
+    ("depr_u_eq",      DEPRECATED_FIXTURE, "u = 1",          lambda r: r["u"] == 1),
+    # Signed order is these columns' own order; DuckDB is right and the deprecated pair still prunes.
+    ("depr_i_gt",      DEPRECATED_FIXTURE, "i > 100",        "i > 100"),
+    ("depr_d_lt",      DEPRECATED_FIXTURE, "d < 1",          "d < 1"),
+    # `s` declares a column order neither reader implements; DuckDB prunes on its bounds anyway.
+    ("order_s_eq",     COLUMN_ORDER_FIXTURE, "s = 'B'",      lambda r: r["s"] == "B"),
+    ("order_s_lt",     COLUMN_ORDER_FIXTURE, "s < 'a'",      lambda r: r["s"].encode() < b"a"),
+    ("order_i_gt",     COLUMN_ORDER_FIXTURE, "i > 100",      "i > 100"),
+    # Bounds leave NaN out of [0, 0]; DuckDB trusts them both ways, dropping NaN rows from `!= 0` and keeping them
+    # for `= 0`.
+    ("nan_ne",         NAN_FIXTURE,          "d != 0",       lambda r: r["d"] != 0),
+    ("nan_eq",         NAN_FIXTURE,          "d = 0",        lambda r: r["d"] == 0),
+]
+# fixture → (zpq aggregate, DuckDB select, the same aggregate over pyarrow rows)
+STATS_ORDER_AGGS = {
+    UNSIGNED_FIXTURE: ("count(*) AS n, sum(u32) AS s32, min(u64) AS mn, max(u64) AS mx, sum(u64) AS s64",
+                       "count(*), sum(u32), min(u64), max(u64), sum(u64)", None),
+    DEPRECATED_FIXTURE: ("count(*) AS n, sum(i) AS si, min(dec) AS lo, max(dec) AS hi, max(u) AS mu",
+                         "count(*), sum(i), min(dec), max(dec), max(u)",
+                         lambda rows: [len(rows), sum(r["i"] for r in rows) if rows else None,
+                                       min((r["dec"] for r in rows), default=None),
+                                       max((r["dec"] for r in rows), default=None),
+                                       max((r["u"] for r in rows), default=None)]),
+    NAN_FIXTURE: ("count(*) AS n, sum(i) AS si", "count(*), sum(i)",
+                  lambda rows: [len(rows), sum(r["i"] for r in rows) if rows else None]),
+    COLUMN_ORDER_FIXTURE: ("count(*) AS n, sum(i) AS si, min(s) AS lo", "count(*), sum(i), min(s)",
+                           lambda rows: [len(rows), sum(r["i"] for r in rows) if rows else None,
+                                         min((r["s"].encode() for r in rows), default=b"").decode() or None]),
+}
+
+
+def declared_column_orders(path):
+    """FileMetaData.column_orders as ColumnOrder union member ids (0 = an empty union), or None when absent."""
+    from gen_stats_order_fixtures import Reader, T_STRUCT, field
+    data = open(path, "rb").read()
+    n = int.from_bytes(data[-8:-4], "little")
+    orders = field(Reader(data[-8 - n:-8]).value(T_STRUCT), 7)
+    return None if orders is None else [u[0][0] if u else 0 for u in orders[2][1]]
+
+
+def stats_order_checks(con, tmp):
+    """Rows (jsonl), written parquet, and aggregates per case. Returns (total, fails)."""
+    total = fails = 0
+
+    def report(ok, label, detail):
+        nonlocal fails
+        if not ok:
+            fails += 1
+        print(f"  {'OK  ' if ok else 'FAIL'}  stats-order:{label:28} {detail}")
+
+    for label, fixture, zf, oracle in STATS_ORDER:
+        cols = [d[0] for d in con.execute(f"SELECT * FROM '{fixture}' LIMIT 0").description]
+        za, da, py_agg = STATS_ORDER_AGGS[fixture]
+        if callable(oracle):
+            truth = [r for r in pq.read_table(fixture).to_pylist() if oracle(r)]
+            want = sorted([tuple(norm(r[c]) for c in cols) for r in truth], key=repr)
+            want_agg = [norm(v) for v in py_agg(truth)]
+            src = "truth"
+        else:
+            where = f" WHERE {oracle}" if oracle is not None else ""
+            want = rows_sorted(con, f"SELECT {', '.join(cols)} FROM '{fixture}'{where}")
+            want_agg = [norm(v) for v in con.execute(f"SELECT {da} FROM '{fixture}'{where}").fetchone()]
+            src = "duck"
+        filt = ["--filter", zf] if zf is not None else []
+
+        total += 1
+        r = subprocess.run([ZPQ, "query", fixture, "--format", "jsonl"] + filt, capture_output=True, text=True)
+        if r.returncode != 0:
+            report(False, f"{label} × jsonl", f"ZPQ error: {r.stderr.strip()[:70]}")
+        else:
+            got = sorted([tuple(norm(json.loads(l)[c]) for c in cols) for l in r.stdout.splitlines() if l.strip()],
+                         key=repr)
+            report(got == want, f"{label} × jsonl", f"zpq={len(got)} {src}={len(want)} rows")
+
+        total += 1
+        out = os.path.join(tmp, "zstats.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", fixture, "-o", out] + filt, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(out):
+            report(False, f"{label} × parquet", f"ZPQ error: {r.stderr.strip()[:70]}")
+        else:
+            tbl = pq.read_table(out)
+            got = sorted([tuple(norm(row[c]) for c in cols) for row in tbl.to_pylist()], key=repr)
+            report(got == want, f"{label} × parquet", f"zpq={len(got)} {src}={len(want)} rows")
+
+        # Unfiltered aggregates may be answered from statistics under --trust-stats; check that path too.
+        for flags in ([[]] if zf is not None else [[], ["--trust-stats"]]):
+            total += 1
+            tag = f"{label} × agg{' trust' if flags else ''}"
+            cmd = [ZPQ, "query", fixture, "--aggregate", za] + filt + flags
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                report(False, tag, f"ZPQ error: {r.stderr.strip()[:70]}")
+                continue
+            # An empty input sums to 0 in zpq and NULL in SQL; compare everything else exactly.
+            zvals = [norm(v) for v in json.loads(r.stdout)["agg"].values()]
+            ok = len(zvals) == len(want_agg) and all(
+                z == w or (w is None and z in (0, None)) for z, w in zip(zvals, want_agg))
+            report(ok, tag, f"zpq={zvals} {src}={want_agg}")
+
+    # Aliased unsigned references keep their values through --select; arithmetic on UINT64 is refused, not wrapped.
+    where = "u64 >= 9223372036854775806 AND i < 400"
+    want = rows_sorted(con, f"SELECT u64 AS b, u32 AS c, u32 + 1 AS d FROM '{UNSIGNED_FIXTURE}' WHERE {where}")
+    sel = ["--select", "u64 AS b, u32 AS c, u32 + 1 AS d", "--filter", where]
+    for fmt in ("jsonl", "parquet"):
+        total += 1
+        out = os.path.join(tmp, "zsel_u.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        cmd = [ZPQ, "query", UNSIGNED_FIXTURE] + sel + (["--format", "jsonl"] if fmt == "jsonl" else ["-o", out])
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            report(False, f"select_u64_alias × {fmt}", f"ZPQ error: {r.stderr.strip()[:70]}")
+            continue
+        if fmt == "jsonl":
+            rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+        else:
+            rows = pq.read_table(out).to_pylist()
+        got = sorted([(row["b"], row["c"], row["d"]) for row in rows], key=repr)
+        report(got == want, f"select_u64_alias × {fmt}", f"zpq={len(got)} duck={len(want)} rows")
+    # zpq's own output declares TYPE_DEFINED_ORDER, so a strict reader trusts its unsigned and string bounds and its
+    # pushdown still answers right; a byte copy keeps its source's declared orders.
+    for olabel, args in [("reencode", ["--filter", "u32 >= 2147483648"]), ("bytecopy", []),
+                         ("project", ["--columns", "u32,u64"])]:
+        out = os.path.join(tmp, f"zorder_{olabel}.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", UNSIGNED_FIXTURE, "-o", out] + args, capture_output=True, text=True)
+        total += 1
+        if r.returncode != 0:
+            report(False, f"output_orders × {olabel}", f"ZPQ error: {r.stderr.strip()[:70]}")
+            continue
+        md = pq.ParquetFile(out).metadata
+        usable = all(md.row_group(g).column(c).statistics.has_min_max
+                     for g in range(md.num_row_groups) for c in range(md.num_columns)
+                     if md.schema.column(c).name in ("u32", "u64"))
+        rows = pq.read_table(out).to_pylist()
+        pushed = [pq.read_table(out, filters=[("u64", ">=", pa.scalar(2**63, pa.uint64()))]).num_rows,
+                  pq.read_table(out, filters=[("u32", "<", 2**31)]).num_rows]
+        truth = [sum(r["u64"] >= 2**63 for r in rows), sum(r["u32"] < 2**31 for r in rows)]
+        report(usable and pushed == truth, f"output_orders × {olabel}",
+               f"has_min_max={usable} pushdown={pushed} truth={truth}")
+    total += 1
+    out = os.path.join(tmp, "zorder_str.parquet")
+    r = subprocess.run([ZPQ, "query", DEPRECATED_FIXTURE, "-o", out, "--filter", "i > 0"], capture_output=True)
+    md = pq.ParquetFile(out).metadata
+    usable = all(md.row_group(g).column(0).statistics.has_min_max for g in range(md.num_row_groups))
+    pushed = pq.read_table(out, filters=[("s", "==", "a")]).num_rows
+    report(r.returncode == 0 and usable and pushed == 1, "output_orders × string",
+           f"has_min_max={usable} s='a' -> {pushed}")
+
+    # Inputs declaring different orders for one leaf: the merged output must declare one order true of every row
+    # group (zpq re-encodes rather than byte-copying), never an empty union, and still prune right.
+    normalized = os.path.join(tmp, "zorder_norm.parquet")
+    mixed = os.path.join(tmp, "zorder_mixed.parquet")
+    for p in (normalized, mixed):
+        if os.path.exists(p):
+            os.remove(p)
+    subprocess.run([ZPQ, "query", COLUMN_ORDER_FIXTURE, "-o", normalized, "--filter", "i > -1"], capture_output=True)
+    r = subprocess.run([ZPQ, "query", COLUMN_ORDER_FIXTURE, normalized, "-o", mixed], capture_output=True, text=True)
+    total += 1
+    if r.returncode != 0:
+        report(False, "output_orders × mixed inputs", f"ZPQ error: {r.stderr.strip()[:70]}")
+    else:
+        orders = declared_column_orders(mixed)
+        rows = pq.read_table(mixed).to_pylist()
+        pushed = pq.read_table(mixed, filters=[("s", "==", "B")]).num_rows
+        truth = sum(r["s"] == "B" for r in rows)
+        report(0 not in (orders or []) and pushed == truth == 2, "output_orders × mixed inputs",
+               f"column_orders={orders} s='B' -> {pushed} truth={truth}")
+
+    total += 1
+    r = subprocess.run([ZPQ, "query", UNSIGNED_FIXTURE, "--select", "u64 + 1 AS x", "--format", "jsonl"],
+                       capture_output=True, text=True)
+    report(r.returncode != 0 and "UINT64" in r.stderr, "select_u64_arith refused", r.stderr.strip()[:60])
+    return total, fails
 
 
 def main():
@@ -344,6 +549,10 @@ def main():
     # No nested (struct/list/map) coverage here. ZPQ decodes nested but rejects
     # nested re-encode, so a write-based differential cannot exercise it. Nested
     # read coverage belongs in a read/aggregate harness.
+
+    so_total, so_fails = stats_order_checks(con, tmp)
+    total += so_total
+    fails += so_fails
 
     print(f"\ndifferential: {total - fails}/{total} checks match (strict pyarrow read + DuckDB value diff + order)")
     sys.exit(1 if fails else 0)

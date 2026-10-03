@@ -58,10 +58,11 @@ pub fn pruneRowGroup(
     return switch (filter) {
         .int32 => |leaf| pruneNumeric(i32, rg, leaf.col_idx, leaf.op, leaf.value, .INT32, arena, file_meta),
         .int64 => |leaf| pruneNumeric(i64, rg, leaf.col_idx, leaf.op, leaf.value, .INT64, arena, file_meta),
+        .uint64 => |leaf| pruneUnsigned(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
         .float => |leaf| pruneNumeric(f32, rg, leaf.col_idx, leaf.op, leaf.value, .FLOAT, arena, file_meta),
         .double => |leaf| pruneNumeric(f64, rg, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, arena, file_meta),
         .string => |leaf| pruneBytes(rg, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, file_meta),
-        .boolean => |leaf| pruneBoolean(rg, leaf.col_idx, leaf.op, leaf.value),
+        .boolean => |leaf| pruneBoolean(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
         .null_check => |nc| pruneNullCheck(rg, nc.col_idx, nc.is_not, file_meta),
         // LIKE: prefix patterns are stat-prunable via min/max (a future
         // win); conservatively keep for now. Correctness is in eval.
@@ -87,8 +88,8 @@ pub fn pruneRowGroup(
 //   - deprecated `min`/`max` (signed-ordered for every type) never count; only `min_value`/`max_value` do,
 //   - a declared column order other than TYPE_DEFINED_ORDER,
 //   - repeated columns, where null_count and num_values count leaf values rather than rows,
-//   - unsigned integers (zpq compares their stats signed), floats (NaN), DECIMAL, FLBA, INT96, and any annotation
-//     not on the allow-lists below,
+//   - unsigned integers (skipped in unsigned order, but no proof reads them yet), floats (NaN), DECIMAL, FLBA, INT96,
+//     and any annotation not on the allow-lists below,
 //   - a missing null_count when the predicate needs nulls absent.
 // Missing file metadata disables the proof: none of the schema checks can run.
 // ------------------------------------------------------------
@@ -121,9 +122,7 @@ fn comparisonProof(
     file_meta: ?*const schema.FileMetaData,
 ) ?ComparisonProof {
     const elem = flatLeaf(rg, col_idx, file_meta) orelse return null;
-    if (file_meta.?.column_orders) |co| {
-        if (col_idx >= co.items.len or co.items[col_idx] != schema.COLUMN_ORDER_TYPE_DEFINED) return null;
-    }
+    if (!boundsReadable(rg, col_idx, file_meta)) return null;
     const stats = rg.columns.items[col_idx].meta_data.?.statistics orelse return null;
     if ((stats.null_count orelse return null) != 0) return null;
     return .{
@@ -132,6 +131,61 @@ fn comparisonProof(
         .max = stats.max_value orelse return null,
         .max_exact = stats.is_max_value_exact orelse false,
     };
+}
+
+pub const Bounds = struct { min: []const u8, max: []const u8 };
+
+/// A column chunk's bounds for ruling rows out, in the column's type-defined order, or null when the file gives none
+/// zpq can read in that order. `min_value`/`max_value` are written in it. The deprecated `min`/`max` were written
+/// with a signed comparison whatever the type, so they stand in only where that is the type-defined order too; for
+/// byte arrays (unsigned bytewise), DECIMAL over FLBA or BYTE_ARRAY (numeric, but compared as signed bytes) and
+/// unsigned integers they misorder values, so are never read. DECIMAL over INT32/INT64 compares as its signed
+/// unscaled integer, which is the numeric order, so it reads them like any signed integer (parquet-mr: SIGNED).
+/// Without file metadata there is no schema to check, and the deprecated pair is not read either.
+pub fn chunkBounds(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) ?Bounds {
+    if (!boundsReadable(rg, col_idx, file_meta)) return null;
+    const cm = rg.columns.items[col_idx].meta_data orelse return null;
+    const stats = cm.statistics orelse return null;
+    if (stats.min_value) |min| if (stats.max_value) |max| return .{ .min = min, .max = max };
+    const min = stats.min orelse return null;
+    const max = stats.max orelse return null;
+    const elem = (file_meta orelse return null).getColumnSchema(cm.path_in_schema.items) orelse return null;
+    if (elem.type == null or elem.type.? != cm.type) return null;
+    if (!deprecatedOrderIsTypeOrder(elem)) return null;
+    return .{ .min = min, .max = max };
+}
+
+/// Whether a column's bounds, chunk statistics or page index alike, are in an order zpq reads. The file may declare
+/// an order other than TYPE_DEFINED_ORDER, one zpq does not implement, and the spec says to ignore min and max then;
+/// an absent column_orders list is read as type-defined, as parquet-mr does. An annotation zpq does not recognise
+/// (read as UNKNOWN) or INTERVAL has no order at all. Without file metadata nothing can be checked, so nothing is
+/// refused: those callers already accept what the chunk's own min_value/max_value say.
+fn boundsReadable(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) bool {
+    if (col_idx >= rg.columns.items.len) return false;
+    const fm = file_meta orelse return true;
+    if (fm.column_orders) |co| {
+        if (col_idx >= co.items.len or co.items[col_idx] != schema.COLUMN_ORDER_TYPE_DEFINED) return false;
+    }
+    const cm = rg.columns.items[col_idx].meta_data orelse return false;
+    const elem = fm.getColumnSchema(cm.path_in_schema.items) orelse return true;
+    if (elem.logical_type) |lt| if (lt == .UNKNOWN) return false;
+    if (elem.converted_type) |ct| if (ct == .INTERVAL) return false;
+    return true;
+}
+
+/// The types whose type-defined order is the signed order the deprecated min/max were written in.
+fn deprecatedOrderIsTypeOrder(elem: schema.SchemaElement) bool {
+    return switch (elem.type orelse return false) {
+        .INT32, .INT64 => signedIntOrder(elem) or intBackedDecimal(elem),
+        .FLOAT, .DOUBLE => elem.logical_type == null and elem.converted_type == null,
+        .BOOLEAN => true,
+        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => false,
+    };
+}
+
+fn intBackedDecimal(elem: schema.SchemaElement) bool {
+    const kind = decimal_mod.kindFromSchema(&elem) orelse return false;
+    return kind.physical == .INT32 or kind.physical == .INT64;
 }
 
 /// INT32/INT64 whose type-defined order is signed: plain, signed INTEGER, DATE, TIME, TIMESTAMP.
@@ -214,7 +268,7 @@ fn pruneNumeric(
         if (file_meta) |fm| {
             if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
                 if (decimal_mod.kindFromSchema(&elem)) |kind| {
-                    return pruneDecimal(rg, col_idx, op, value, kind);
+                    return pruneDecimal(rg, col_idx, op, value, kind, file_meta);
                 }
             }
         }
@@ -227,18 +281,58 @@ fn pruneNumeric(
     // silently produce wrong pruning decisions. Bail to .unknown.
     if (meta.type != parquet_type) return .unknown;
 
-    const stats = meta.statistics orelse return .unknown;
-    const min = stats.min_value orelse stats.min orelse return .unknown;
-    const max = stats.max_value orelse stats.max orelse return .unknown;
+    const b = chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
 
     // Encode `value` once, then compare against min/max bytes.
     const encoded_val = encoded.encode(arena, valueToString(T, value, arena) catch return .unknown, parquet_type) catch return .unknown;
-    if (!encoded_val.rangeIntersects(op, min, max)) return .skip;
-    // The positive assertion reads only the bounds `comparisonProof` vouches for, not the `min`/`max` fallback above.
+    if (!encoded_val.rangeIntersects(op, b.min, b.max)) return .skip;
+    if (comptime @typeInfo(T) == .float) {
+        // `!=` on a constant chunk: the bounds exclude NaN rows, which pass it, so only a nan_count of zero skips.
+        if (op == .NotEq and meta.statistics.?.nan_count == 0) {
+            const lo = encoded.readFixedLE(T, b.min) orelse return .keep;
+            const hi = encoded.readFixedLE(T, b.max) orelse return .keep;
+            if (lo == hi and lo == value) return .skip;
+        }
+    }
+    // The positive assertion reads only the bounds `comparisonProof` vouches for, never the deprecated pair.
     if (comparisonProof(rg, col_idx, file_meta)) |p| {
         if (signedIntOrder(p.elem) and encoded_val.rangeAlwaysMatches(op, p.min, p.max)) return .always_match;
     }
     return .keep;
+}
+
+/// Unsigned columns compare bounds as unsigned. `chunkBounds` never hands back the signed-ordered deprecated pair,
+/// whose bounds are swapped for a chunk spanning 2^31 (or 2^63).
+fn pruneUnsigned(
+    rg: *const schema.RowGroup,
+    col_idx: usize,
+    op: ast.Operator,
+    value: u64,
+    file_meta: ?*const schema.FileMetaData,
+) Decision {
+    const b = chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    return unsignedRangeDecision(rg.columns.items[col_idx].meta_data.?.type, b.min, b.max, op, value);
+}
+
+fn unsignedRangeDecision(
+    physical: schema.Type,
+    min: []const u8,
+    max: []const u8,
+    op: ast.Operator,
+    value: u64,
+) Decision {
+    const lo = readUnsignedBound(physical, min) orelse return .unknown;
+    const hi = readUnsignedBound(physical, max) orelse return .unknown;
+    if (lo > hi) return .unknown; // corrupt, or written in signed order by a non-conforming writer
+    return if (encoded.rangeOverlapsValue(u64, op, lo, hi, value)) .keep else .skip;
+}
+
+fn readUnsignedBound(physical: schema.Type, bytes: []const u8) ?u64 {
+    return switch (physical) {
+        .INT32 => if (bytes.len == 4) std.mem.readInt(u32, bytes[0..4], .little) else null,
+        .INT64 => if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else null,
+        else => null,
+    };
 }
 
 /// Pruning for DECIMAL columns: stat min/max bytes are in the
@@ -252,14 +346,11 @@ fn pruneDecimal(
     op: ast.Operator,
     value: f64,
     kind: decimal_mod.Kind,
+    file_meta: ?*const schema.FileMetaData,
 ) Decision {
-    const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
-    const stats = meta.statistics orelse return .unknown;
-    const min_bytes = stats.min_value orelse stats.min orelse return .unknown;
-    const max_bytes = stats.max_value orelse stats.max orelse return .unknown;
-
-    const min_f = decimalStatBytesToF64(min_bytes, kind) orelse return .unknown;
-    const max_f = decimalStatBytesToF64(max_bytes, kind) orelse return .unknown;
+    const b = chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    const min_f = decimalStatBytesToF64(b.min, kind) orelse return .unknown;
+    const max_f = decimalStatBytesToF64(b.max, kind) orelse return .unknown;
     if (min_f > max_f) return .unknown; // corrupt stats — be safe
 
     return switch (op) {
@@ -315,13 +406,11 @@ fn pruneBytes(
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
     _ = parquet_type;
-    const stats = getStats(rg, col_idx) orelse return .unknown;
-    const min = stats.min_value orelse stats.min orelse return .unknown;
-    const max = stats.max_value orelse stats.max orelse return .unknown;
+    const b = chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
 
     // BYTE_ARRAY uses lexicographic byte comparison directly.
     const ev: encoded.EncodedValue = .{ .bytes = value, .parquet_type = .BYTE_ARRAY };
-    if (!ev.rangeIntersects(op, min, max)) return .skip;
+    if (!ev.rangeIntersects(op, b.min, b.max)) return .skip;
     if (comparisonProof(rg, col_idx, file_meta)) |p| {
         if (bytewiseOrder(p.elem) and encoded.rangeAlwaysMatchesBytes(op, p.min, p.max, p.max_exact, value))
             return .always_match;
@@ -334,14 +423,13 @@ fn pruneBoolean(
     col_idx: usize,
     op: ast.Operator,
     value: bool,
+    file_meta: ?*const schema.FileMetaData,
 ) Decision {
-    const stats = getStats(rg, col_idx) orelse return .unknown;
-    const min = stats.min_value orelse stats.min orelse return .unknown;
-    const max = stats.max_value orelse stats.max orelse return .unknown;
-    if (min.len != 1 or max.len != 1) return .unknown;
+    const b = chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    if (b.min.len != 1 or b.max.len != 1) return .unknown;
 
-    const min_b = min[0] != 0;
-    const max_b = max[0] != 0;
+    const min_b = b.min[0] != 0;
+    const max_b = b.max[0] != 0;
     const v = value;
 
     return switch (op) {
@@ -354,12 +442,6 @@ fn pruneBoolean(
         .NotEq => if (min_b == max_b and min_b == v) .skip else .keep,
         else => .unknown, // range ops on bool aren't meaningful
     };
-}
-
-fn getStats(rg: *const schema.RowGroup, col_idx: usize) ?schema.Statistics {
-    if (col_idx >= rg.columns.items.len) return null;
-    const meta = rg.columns.items[col_idx].meta_data orelse return null;
-    return meta.statistics;
 }
 
 /// Helper: turn a typed value back into its decimal string so we can
@@ -702,10 +784,11 @@ test "full-match proof: INT64 needs trusted min_value/max_value and zero nulls" 
     try testing.expectEqual(Decision.keep, try pruneRowGroup(&ok.rg, ge10, a, null));
 
     // A declared order other than TYPE_DEFINED_ORDER; an absent list is read as type-defined, like parquet-mr does.
+    // Bounds in an order zpq cannot read neither prove nor rule out anything.
     var orders: std.ArrayListUnmanaged(i16) = .empty;
     try orders.append(a, 0);
     ok.fm.column_orders = orders;
-    try testing.expectEqual(Decision.keep, try ok.decide(a, ge10));
+    try testing.expectEqual(Decision.unknown, try ok.decide(a, ge10));
 
     // Deprecated min/max are signed-ordered for every type: they may skip, never prove.
     const legacy = try ProofFixture.init(a, leafElem(.INT64), .{ .min = lo, .max = hi, .null_count = 0 });
@@ -803,6 +886,95 @@ test "full-match proof: IS [NOT] NULL from null_count" {
     try testing.expectEqual(Decision.keep, try repeated.decide(a, not_null));
 }
 
+test "chunkBounds reads the deprecated pair only where signed is the type-defined order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const legacy: schema.Statistics = .{ .min = "lo", .max = "hi" };
+
+    var date = leafElem(.INT32);
+    date.logical_type = .{ .DATE = .{} };
+    var dec = leafElem(.INT32);
+    dec.logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 9 } };
+    var flba_dec = leafElem(.FIXED_LEN_BYTE_ARRAY);
+    flba_dec.type_length = 4;
+    flba_dec.logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 9 } };
+    var bytes_dec = leafElem(.BYTE_ARRAY);
+    bytes_dec.converted_type = .DECIMAL;
+    bytes_dec.scale = 2;
+    bytes_dec.precision = 9;
+    var u64_conv = leafElem(.INT64);
+    u64_conv.converted_type = .UINT_64;
+    var str = leafElem(.BYTE_ARRAY);
+    str.logical_type = .{ .STRING = .{} };
+    const cases = [_]struct { elem: schema.SchemaElement, usable: bool }{
+        .{ .elem = leafElem(.INT64), .usable = true },
+        .{ .elem = date, .usable = true },
+        .{ .elem = leafElem(.DOUBLE), .usable = true },
+        .{ .elem = leafElem(.BOOLEAN), .usable = true },
+        .{ .elem = dec, .usable = true },
+        .{ .elem = flba_dec, .usable = false },
+        .{ .elem = bytes_dec, .usable = false },
+        .{ .elem = u64_conv, .usable = false },
+        .{ .elem = str, .usable = false },
+        .{ .elem = leafElem(.BYTE_ARRAY), .usable = false },
+        .{ .elem = leafElem(.FIXED_LEN_BYTE_ARRAY), .usable = false },
+        .{ .elem = leafElem(.INT96), .usable = false },
+    };
+    for (cases) |c| {
+        const fx = try ProofFixture.init(a, c.elem, legacy);
+        try testing.expectEqual(c.usable, chunkBounds(&fx.rg, 0, &fx.fm) != null);
+        // No schema, no way to tell the order: never.
+        try testing.expect(chunkBounds(&fx.rg, 0, null) == null);
+    }
+
+    // min_value/max_value are type-ordered for every type, and the two pairs are never mixed.
+    const modern = try ProofFixture.init(a, str, .{ .min_value = "a", .max_value = "z", .min = "x", .max = "y" });
+    try testing.expectEqualStrings("a", chunkBounds(&modern.rg, 0, &modern.fm).?.min);
+    const half = try ProofFixture.init(a, leafElem(.INT64), .{ .min_value = "a", .min = "lo", .max = "hi" });
+    try testing.expectEqualStrings("lo", chunkBounds(&half.rg, 0, &half.fm).?.min);
+}
+
+test "bounds are unreadable under an undeclared column order or an unordered annotation, for chunks and pages" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var str = leafElem(.BYTE_ARRAY);
+    str.logical_type = .{ .STRING = .{} };
+    var fx = try ProofFixture.init(a, str, .{ .min_value = "a", .max_value = "c", .null_count = 1 });
+    var ci: schema.ColumnIndex = .{};
+    try ci.null_pages.append(a, false);
+    try ci.min_values.append(a, "a");
+    try ci.max_values.append(a, "c");
+    const cis = [_]?schema.ColumnIndex{ci};
+    const eq_b: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "B" } };
+
+    try testing.expectEqual(Decision.skip, try fx.decide(a, eq_b));
+    try testing.expectEqual(Decision.skip, try prunePage(&fx.rg, 0, eq_b, &cis, a, &fx.fm, false));
+
+    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    try orders.append(a, 3); // an order this reader does not implement
+    fx.fm.column_orders = orders;
+    try testing.expectEqual(Decision.unknown, try fx.decide(a, eq_b));
+    try testing.expectEqual(Decision.unknown, try prunePage(&fx.rg, 0, eq_b, &cis, a, &fx.fm, false));
+    fx.fm.column_orders.?.items[0] = schema.COLUMN_ORDER_TYPE_DEFINED;
+    try testing.expectEqual(Decision.skip, try fx.decide(a, eq_b));
+
+    // INTERVAL, and annotations zpq reads as UNKNOWN, define no order even under TYPE_DEFINED_ORDER.
+    fx.fm.schema.items[1].converted_type = .INTERVAL;
+    fx.fm.schema.items[1].logical_type = null;
+    try testing.expectEqual(Decision.unknown, try fx.decide(a, eq_b));
+    try testing.expectEqual(Decision.unknown, try prunePage(&fx.rg, 0, eq_b, &cis, a, &fx.fm, false));
+    fx.fm.schema.items[1].converted_type = null;
+    fx.fm.schema.items[1].logical_type = .{ .UNKNOWN = .{} };
+    try testing.expectEqual(Decision.unknown, try fx.decide(a, eq_b));
+
+    // IS NULL reads null counts, which carry no order.
+    const is_null: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = false } };
+    fx.fm.column_orders.?.items[0] = 3;
+    try testing.expectEqual(Decision.keep, try fx.decide(a, is_null));
+}
+
 /// Walk the filter AST against a specific page's ColumnIndex metadata.
 pub fn prunePage(
     rg: *const schema.RowGroup,
@@ -813,9 +985,14 @@ pub fn prunePage(
     file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) !Decision {
+    switch (filter) {
+        .null_check, .like, .and_filter, .or_filter => {},
+        inline else => |leaf| if (!boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
+    }
     return switch (filter) {
         .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, arena, file_meta, trust_stats),
         .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, arena, file_meta, trust_stats),
+        .uint64 => |leaf| prunePageUnsigned(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, arena, file_meta, trust_stats),
         .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, arena, file_meta, trust_stats),
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
@@ -908,6 +1085,23 @@ fn prunePageNumeric(
     }
 
     return .keep;
+}
+
+fn prunePageUnsigned(
+    rg: *const schema.RowGroup,
+    page_idx: usize,
+    col_idx: usize,
+    op: ast.Operator,
+    value: u64,
+    col_indexes: []const ?schema.ColumnIndex,
+) Decision {
+    if (col_idx >= col_indexes.len or col_idx >= rg.columns.items.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
+    if (page_idx >= ci.null_pages.items.len) return .unknown;
+    if (ci.null_pages.items[page_idx]) return .skip;
+    if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
+    return unsignedRangeDecision(meta.type, ci.min_values.items[page_idx], ci.max_values.items[page_idx], op, value);
 }
 
 fn prunePageDecimal(

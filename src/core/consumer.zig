@@ -240,18 +240,7 @@ pub fn initOutputAggregator(
             },
             .computed => |c| blk: {
                 const expr_type = c.expr.typeOf();
-                schemas[i] = .{
-                    .type = expr_type.toParquet(),
-                    .type_length = null,
-                    .repetition_type = .REQUIRED,
-                    .name = c.alias,
-                    .num_children = 0,
-                    .converted_type = if (expr_type == .str) .UTF8 else null,
-                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
-                    .scale = null,
-                    .precision = null,
-                    .field_id = null,
-                };
+                schemas[i] = computedSchemaElem(c);
                 const path_buf = try arena.alloc([]const u8, 1);
                 path_buf[0] = c.alias;
                 paths[i] = path_buf;
@@ -877,6 +866,31 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
     }
 }
 
+/// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
+pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
+    const expr_type = c.expr.typeOf();
+    // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
+    // are printed and written as the unsigned values they are.
+    const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
+    return .{
+        .type = expr_type.toParquet(),
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = c.alias,
+        .num_children = 0,
+        .converted_type = if (expr_type == .str) .UTF8 else if (unsigned_64) .UINT_64 else null,
+        .logical_type = if (expr_type == .str)
+            .{ .STRING = .{} }
+        else if (unsigned_64)
+            .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } }
+        else
+            null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+}
+
 /// One output column. `passthrough` re-encodes a kept input column;
 /// `computed` evaluates an expression against the (post-filter) decoded
 /// batch and encodes the result as a new flat leaf.
@@ -1049,6 +1063,7 @@ pub fn writeOneRowAggregate(
         .num_rows = 1,
         .created_by = null,
         .row_groups = new_row_groups,
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, rg_columns.items.len, null, &.{}),
     };
 
     var w: thrift.Writer = .init(arena);
@@ -1084,6 +1099,7 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
             const col_idx = switch (f) {
                 .int32 => |l| l.col_idx,
                 .int64 => |l| l.col_idx,
+                .uint64 => |l| l.col_idx,
                 .float => |l| l.col_idx,
                 .double => |l| l.col_idx,
                 .string => |l| l.col_idx,
@@ -2736,4 +2752,20 @@ test "fast-levels: all-present pages on both sides of a null page" {
     try testing.expectEqualSlices(u32, off.def_levels.?, on.def_levels.?);
     try testing.expectEqualSlices(i32, &present, on.values[per_page * 2 ..]);
     for (on.def_levels.?[per_page * 2 ..]) |d| try testing.expectEqual(@as(u32, 1), d);
+}
+
+test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 reference" {
+    const ref: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+        .unsigned_64 = true,
+    } };
+    const elem = computedSchemaElem(.{ .expr = ref, .alias = "b" });
+    try std.testing.expect(schema.isUnsignedInt64(elem));
+    try std.testing.expectEqualStrings("b", elem.name);
+
+    var signed = ref;
+    signed.col_ref.unsigned_64 = false;
+    try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
 }

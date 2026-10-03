@@ -1047,7 +1047,8 @@ fn freeOwnedAccumulatorStrings(
 /// BOOLEAN column evaluates to i64 (8 bytes) while the physical type said
 /// `boolean` (1 byte) — silently truncating every later column in a
 /// composite key.
-const KeyType = enum { i64, f64, string };
+/// `u64` frames exactly like `i64`; only the reported value differs, read as the unsigned column it came from.
+const KeyType = enum { i64, u64, f64, string };
 
 fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
     if (item.alias) |a| return a;
@@ -1104,6 +1105,7 @@ fn resolveGroupSelectCols(
 /// serialize as an 8-byte i64, f32 and f64 as an 8-byte f64, so these three cover every column variant.
 /// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
 fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
+    if (expr == .col_ref and expr.col_ref.unsigned_64) return .u64;
     return switch (expr.typeOf()) {
         .i64 => .i64,
         .f64 => .f64,
@@ -1175,13 +1177,14 @@ pub fn deserializeKeyColumn(
         }
 
         switch (key_types[current_idx]) {
-            .i64, .f64 => {
+            .i64, .u64, .f64 => {
                 if (cursor + 8 > key_bytes.len) return error.BadGroupKey;
                 const raw = std.mem.readInt(u64, key_bytes[cursor..][0..8], .little);
                 cursor += 8;
                 if (current_idx == target_idx) {
                     return switch (key_types[current_idx]) {
                         .i64 => .{ .i = @as(i64, @bitCast(raw)) },
+                        .u64 => .{ .i = raw },
                         .f64 => .{ .f = @bitCast(raw) },
                         .string => unreachable,
                     };
@@ -1967,8 +1970,7 @@ test "full match: proven row groups answer like --scan-all" {
 }
 
 test "full match: per-row-group decisions on a real footer" {
-    // Unsigned columns sit here rather than in the --scan-all comparison: evaluating any filter on a UINT_32 column
-    // fails with TypeMismatch, so the only observable is that the proof refuses them.
+    // Unsigned columns prune in unsigned order but are never proven fully matching.
     const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2115,5 +2117,243 @@ test "full match: filter-only chunks of proven row groups are never read" {
             std.debug.print("full match: poisoned column {d} decoded cleanly under --scan-all\n", .{c.col});
             return error.TestUnexpectedResult;
         } else |_| {}
+    }
+}
+
+// ------------------------------------------------------------
+// Statistics order: filters and pruning on columns whose order is not the signed one their bytes suggest.
+// Fixtures from tools/gen_stats_order_fixtures.py; expected answers are hand-computed from the generator's formulas.
+// ------------------------------------------------------------
+
+const unsigned_order_fixture = "ci/fixtures/parquet/unsigned_order.parquet";
+
+fn loadFixture(path: []const u8) !?[]u8 {
+    return metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{path});
+            return null;
+        }
+        return err;
+    };
+}
+
+const CountSumCase = struct { filter: []const u8, n: i128, sum_i: i128 };
+
+/// `count(*)` and `sum(i)` for each filter, with statistics (pruning, page index) and under --scan-all, at -j1 and -j4.
+fn expectCountSum(path: []const u8, cases: []const CountSumCase) !void {
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |scan_all| for ([_]usize{ 1, 4 }) |parallelism| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .filter = c.filter,
+                .aggregate = "count(*) AS n, sum(i) AS s",
+                .parallelism = parallelism,
+                .scan_all = scan_all,
+            }) catch |err| {
+                std.debug.print("{s}: filter {s} failed: {s}\n", .{ path, c.filter, @errorName(err) });
+                return err;
+            };
+            defer freeGroupResult(res);
+            const got_sum: i128 = switch (res.aggs[1].value) {
+                .i => |v| v,
+                else => 0, // sum over no rows
+            };
+            if (res.aggs[0].value.i != c.n or got_sum != c.sum_i) {
+                std.debug.print("{s}: filter {s} (scan_all={}, -j{d}) gave n={d} sum={d}, want n={d} sum={d}\n", .{
+                    path, c.filter, scan_all, parallelism, res.aggs[0].value.i, got_sum, c.n, c.sum_i,
+                });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+}
+
+test "unsigned columns filter and prune in unsigned order" {
+    try expectCountSum(unsigned_order_fixture, &.{
+        .{ .filter = "u32 >= 2147483648", .n = 640, .sum_i = 450240 },
+        .{ .filter = "u32 = 2147483648", .n = 1, .sum_i = 384 },
+        .{ .filter = "u32 < 2147483648", .n = 384, .sum_i = 73536 },
+        .{ .filter = "u32 != 3000000000", .n = 1023, .sum_i = 523264 },
+        .{ .filter = "u32 IN (0, 4294967295)", .n = 2, .sum_i = 1023 },
+        .{ .filter = "u64 > 9223372036854775807", .n = 640, .sum_i = 450240 },
+        .{ .filter = "u64 = 18446744073709551615", .n = 1, .sum_i = 1023 },
+        .{ .filter = "u8 >= 128", .n = 512, .sum_i = 294656 },
+        .{ .filter = "u16 BETWEEN 32768 AND 65535", .n = 512, .sum_i = 293888 },
+        .{ .filter = "n32 > 2147483647", .n = 256, .sum_i = 147456 },
+        // Literals outside the column's range have a constant answer.
+        .{ .filter = "u32 > -1", .n = 1024, .sum_i = 523776 },
+        .{ .filter = "u32 = -5", .n = 0, .sum_i = 0 },
+        .{ .filter = "u64 < 18446744073709551616", .n = 1024, .sum_i = 523776 },
+        .{ .filter = "NOT u64 <= 18446744073709551615", .n = 0, .sum_i = 0 },
+    });
+}
+
+test "unsigned columns: row-group decisions read bounds unsigned" {
+    const bytes = (try loadFixture(unsigned_order_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, bytes);
+
+    const D = filter_prune.Decision;
+    const cases = [_]struct { filter: []const u8, want: [4]D }{
+        .{ .filter = "u32 >= 3000000000", .want = .{ .skip, .skip, .keep, .keep } },
+        .{ .filter = "u32 < 256", .want = .{ .keep, .skip, .skip, .skip } },
+        .{ .filter = "u64 >= 18446744073709551360", .want = .{ .skip, .skip, .skip, .keep } },
+        .{ .filter = "u64 = 9223372036854775808", .want = .{ .skip, .keep, .skip, .skip } },
+        .{ .filter = "n32 IS NULL", .want = .{ .keep, .keep, .keep, .always_match } },
+    };
+    for (cases) |c| {
+        const f = try filter_parser.parse(arena, c.filter, &meta);
+        for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
+            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            testing.expectEqual(want, got) catch |err| {
+                std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
+                    c.filter, i, @tagName(got), @tagName(want),
+                });
+                return err;
+            };
+        }
+    }
+}
+
+const deprecated_stats_fixture = "ci/fixtures/parquet/deprecated_stats.parquet";
+
+test "deprecated min/max prune only where their signed order is the column's order" {
+    try expectCountSum(deprecated_stats_fixture, &.{
+        // Byte arrays, DECIMAL and unsigned: the signed pair excludes a stored value from its own row group.
+        .{ .filter = "s = 'a'", .n = 1, .sum_i = 3 },
+        .{ .filter = "s < 'b'", .n = 1, .sum_i = 3 },
+        .{ .filter = "dec = 1.00", .n = 1, .sum_i = 1 },
+        .{ .filter = "dec < 1.28", .n = 1, .sum_i = 1 },
+        .{ .filter = "u = 1", .n = 1, .sum_i = 1 },
+        .{ .filter = "u = 3000000000", .n = 1, .sum_i = 3 },
+        // Signed integers and doubles: the pair is in their order and still prunes.
+        .{ .filter = "i = 2", .n = 1, .sum_i = 2 },
+        .{ .filter = "d >= 2.5", .n = 4, .sum_i = 309 },
+        .{ .filter = "idec = 1.28", .n = 1, .sum_i = 2 },
+    });
+
+    const bytes = (try loadFixture(deprecated_stats_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const D = filter_prune.Decision;
+    const cases = [_]struct { filter: []const u8, want: [2]D }{
+        .{ .filter = "s = 'a'", .want = .{ .unknown, .unknown } },
+        .{ .filter = "dec = 6.00", .want = .{ .unknown, .unknown } },
+        .{ .filter = "u = 11", .want = .{ .unknown, .unknown } },
+        .{ .filter = "i > 100", .want = .{ .skip, .keep } },
+        .{ .filter = "d < 1", .want = .{ .keep, .skip } },
+        // DECIMAL over INT32 compares as its signed unscaled integer: the pair is in numeric order.
+        .{ .filter = "idec > 6.50", .want = .{ .skip, .keep } },
+        .{ .filter = "idec < 3", .want = .{ .keep, .skip } },
+    };
+    for (cases) |c| {
+        const f = try filter_parser.parse(arena, c.filter, &meta);
+        for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
+            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            testing.expectEqual(want, got) catch |err| {
+                std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
+                    c.filter, i, @tagName(got), @tagName(want),
+                });
+                return err;
+            };
+        }
+    }
+}
+
+test "deprecated min/max never answer a DECIMAL aggregate under --trust-stats" {
+    const bytes = (try loadFixture(deprecated_stats_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = deprecated_stats_fixture, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "min(dec) AS lo, max(dec) AS hi, max(i) AS mi",
+        .parallelism = 1,
+        .trust_stats = true,
+    });
+    defer freeGroupResult(res);
+    try testing.expectEqual(@as(f64, 1.0), res.aggs[0].value.f);
+    try testing.expectEqual(@as(f64, 7.0), res.aggs[1].value.f);
+    try testing.expectEqual(@as(i128, 103), res.aggs[2].value.i);
+}
+
+const column_order_fixture = "ci/fixtures/parquet/column_order.parquet";
+
+test "bounds in a declared column order zpq does not implement never prune" {
+    // `s` declares an unknown order whose bounds, read bytewise, exclude 'B' and 'Y' from their row groups and pages.
+    try expectCountSum(column_order_fixture, &.{
+        .{ .filter = "s = 'B'", .n = 1, .sum_i = 1 },
+        .{ .filter = "s = 'Y'", .n = 1, .sum_i = 102 },
+        .{ .filter = "s < 'a'", .n = 2, .sum_i = 103 },
+        .{ .filter = "s >= 'a'", .n = 4, .sum_i = 209 },
+        .{ .filter = "i > 100", .n = 3, .sum_i = 306 },
+    });
+
+    const bytes = (try loadFixture(column_order_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const D = filter_prune.Decision;
+    const cases = [_]struct { filter: []const u8, want: [2]D }{
+        .{ .filter = "s = 'B'", .want = .{ .unknown, .unknown } },
+        .{ .filter = "s >= 'zz'", .want = .{ .unknown, .unknown } },
+        // `i` keeps TYPE_DEFINED_ORDER.
+        .{ .filter = "i > 100", .want = .{ .skip, .always_match } },
+    };
+    for (cases) |c| {
+        const f = try filter_parser.parse(arena, c.filter, &meta);
+        for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
+            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            testing.expectEqual(want, got) catch |err| {
+                std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
+                    c.filter, i, @tagName(got), @tagName(want),
+                });
+                return err;
+            };
+        }
+    }
+}
+
+const nan_stats_fixture = "ci/fixtures/parquet/nan_stats.parquet";
+
+test "!= on a float chunk whose bounds are the literal skips only when nan_count proves no NaN" {
+    // Every row group records [-0, 0]; row groups 0 and 2 hold a NaN, which `!= 0` keeps.
+    try expectCountSum(nan_stats_fixture, &.{
+        .{ .filter = "d != 0", .n = 2, .sum_i = 8 },
+        .{ .filter = "NOT d = 0", .n = 2, .sum_i = 8 },
+        .{ .filter = "d = 0", .n = 7, .sum_i = 28 },
+    });
+
+    const bytes = (try loadFixture(nan_stats_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const rgs = meta.row_groups.items;
+    try testing.expectEqual(@as(?i64, null), rgs[0].columns.items[0].meta_data.?.statistics.?.nan_count);
+    try testing.expectEqual(@as(?i64, 0), rgs[1].columns.items[0].meta_data.?.statistics.?.nan_count);
+    const f = try filter_parser.parse(arena, "d != 0", &meta);
+    const D = filter_prune.Decision;
+    for (meta.row_groups.items, [_]D{ .keep, .skip, .keep }, 0..) |*rg, want, i| {
+        const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+        testing.expectEqual(want, got) catch |err| {
+            std.debug.print("d != 0: row group {d} decided {s}, want {s}\n", .{ i, @tagName(got), @tagName(want) });
+            return err;
+        };
     }
 }

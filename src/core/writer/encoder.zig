@@ -179,7 +179,7 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     //    be dupe'd onto a stable arena (the source values may live on
     //    a row-group-scoped arena that's freed before the file footer
     //    is written; borrowing the slice into the footer would dangle).
-    var stats = computeStats(arena, in.values, src_def_levels, src_max_def);
+    var stats = computeStats(arena, in.values, src_def_levels, src_max_def, in.schema_elem);
     _ = &stats;
 
     // 4a. Concatenate the V1 data-page payload: rep_prefix (if
@@ -568,7 +568,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     offset += data_thrift_bytes.len;
     @memcpy(total[offset..], data_compressed);
 
-    const stats = computeStats(arena, in.values, def_levels, max_def);
+    const stats = computeStats(arena, in.values, def_levels, max_def, in.schema_elem);
 
     var encodings: schema.EncodingList = .empty;
     try encodings.append(arena, .RLE);
@@ -748,7 +748,7 @@ fn tryEncodeDictInt(
     offset += data_thrift_bytes.len;
     @memcpy(total[offset..], data_compressed);
 
-    const stats = computeStats(arena, in.values, def_levels, max_def);
+    const stats = computeStats(arena, in.values, def_levels, max_def, in.schema_elem);
 
     var encodings: schema.EncodingList = .empty;
     try encodings.append(arena, .RLE);
@@ -937,7 +937,7 @@ fn tryEncodeDictFloat(
     offset += data_thrift_bytes.len;
     @memcpy(total[offset..], data_compressed);
 
-    const stats = computeStats(arena, in.values, def_levels, max_def);
+    const stats = computeStats(arena, in.values, def_levels, max_def, in.schema_elem);
 
     var encodings: schema.EncodingList = .empty;
     try encodings.append(arena, .RLE);
@@ -1430,7 +1430,31 @@ fn valueCount(c: filter_eval.Batch.Column) usize {
 // Statistics — min/max over surviving non-null values
 // ============================================================
 
-fn computeStats(arena: std.mem.Allocator, c: filter_eval.Batch.Column, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
+fn computeStats(
+    arena: std.mem.Allocator,
+    c: filter_eval.Batch.Column,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    elem: *const schema.SchemaElement,
+) ?schema.Statistics {
+    // An unsigned column's bounds are ordered unsigned. The deprecated min/max pair is signed-ordered by definition,
+    // so it is left unset rather than written in the wrong order.
+    if (schema.isUnsignedInt(elem.*)) {
+        const lane_fits = switch (c) {
+            .i32 => elem.type == .INT32,
+            .i64 => elem.type == .INT64,
+            else => false,
+        };
+        if (!lane_fits) return null;
+        var stats = switch (c) {
+            .i32 => |x| statsTyped(arena, u32, @ptrCast(x.values), def_levels, max_def),
+            .i64 => |x| statsTyped(arena, u64, @ptrCast(x.values), def_levels, max_def),
+            else => unreachable,
+        } orelse return null;
+        stats.min = null;
+        stats.max = null;
+        return stats;
+    }
     return switch (c) {
         .i32 => |x| statsTyped(arena, i32, x.values, def_levels, max_def),
         .i64 => |x| statsTyped(arena, i64, x.values, def_levels, max_def),
@@ -1577,9 +1601,9 @@ fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: 
     // the footer write later sees stable bytes.
     const lo_owned = arena.dupe(u8, lo) catch return null;
     const hi_owned = arena.dupe(u8, hi) catch return null;
+    // Bytewise unsigned is a byte array's type-defined order. The deprecated min/max are defined as signed, so they
+    // are left unset rather than written in an order a legacy reader would misread.
     return .{
-        .min = lo_owned,
-        .max = hi_owned,
         .min_value = lo_owned,
         .max_value = hi_owned,
         .null_count = null_count,
@@ -1631,7 +1655,7 @@ fn expectMirroredStats(stats: schema.Statistics) !void {
     try testing.expectEqualSlices(u8, stats.max.?, stats.max_value.?);
 }
 
-test "statistics populate legacy and modern bounds" {
+test "statistics populate legacy bounds only where their signed order is the type order" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1642,8 +1666,11 @@ test "statistics populate legacy and modern bounds" {
     const floats = [_]f64{ 3.5, -1.25, 9.0 };
     try expectMirroredStats(statsTypedFloat(arena, f64, &floats, null, 0) orelse return error.MissingStats);
 
-    const bytes = [_][]const u8{ "bravo", "alpha", "charlie" };
-    try expectMirroredStats(statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats);
+    const bytes = [_][]const u8{ "bravo", "alpha", "charlie", "\xc3\xa9" };
+    const byte_stats = statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats;
+    try testing.expect(byte_stats.min == null and byte_stats.max == null);
+    try testing.expectEqualStrings("alpha", byte_stats.min_value.?);
+    try testing.expectEqualStrings("\xc3\xa9", byte_stats.max_value.?);
 
     const bools = [_]bool{ true, true, false };
     try expectMirroredStats(statsBool(arena, &bools, null, 0) orelse return error.MissingStats);

@@ -37,6 +37,8 @@ pub const Error = error{
     InvalidColumnOffsets,
     NestedSchemaUnsupported,
     BadColumnIndex,
+    /// The inputs declare different column orders for a copied leaf; a byte copy cannot be declared truthfully.
+    ColumnOrderMismatch,
 } || std.mem.Allocator.Error;
 
 /// Streaming counterpart of `fastpath.buildMulti`. Same input shape,
@@ -102,6 +104,7 @@ pub fn build(
         .num_rows = total_rows,
         .created_by = meta0.created_by,
         .row_groups = new_row_groups,
+        .column_orders = try fastpath.copiedColumnOrders(arena, files, kept_columns),
     };
 
     var w: thrift.Writer = .init(arena);

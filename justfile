@@ -154,6 +154,12 @@ conform corpus="/tmp/parquet-testing":
     zig build -Doptimize=ReleaseFast
     {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 69
 
+# `tools/fetch_hardwood.sh --from-source DIR` builds a JVM launcher from a Hardwood checkout instead.
+# Fetch the pinned Hardwood CLI + test fixtures (triangulation's strict-reader oracle) into tools/hardwood/.
+fetch-hardwood:
+    tools/fetch_hardwood.sh
+
+# Without `just fetch-hardwood` (run once) the harness degrades to ZPQ vs DuckDB.
 # Heavy correctness triangulation (ZPQ vs Hardwood vs DuckDB) (Tier 3).
 triangulate: fetch-corpus
     zig build -Doptimize=ReleaseFast

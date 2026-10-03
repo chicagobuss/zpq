@@ -4,8 +4,8 @@
 //! `AWS_LAMBDA_RUNTIME_API`. Blocking-socket implementation — the
 //! runtime API is a low-frequency control plane (one round-trip per
 //! invocation), so non-blocking I/O would add complexity without moving
-//! the data-path latency.
-//! The data plane (S3, decode, sink) goes through the epoll Loop.
+//! the data-path latency. The S3 data plane blocks too, on its own
+//! sockets, made concurrent by `std.Io` workers (see `engine.zig`).
 //!
 //! Endpoints used (per AWS Lambda runtime API spec, version 2018-06-01):
 //!
@@ -120,13 +120,10 @@ pub const Client = struct {
         try self.postTo(request_id, "response", "application/json", body);
     }
 
-    /// Posts an error. Builds a minimal JSON envelope around `message`.
+    /// Posts an error. Builds a minimal JSON envelope around `message`, escaped.
     pub fn postError(self: *Client, request_id: []const u8, error_type: []const u8, message: []const u8) Error!void {
-        const json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"errorType\":\"{s}\",\"errorMessage\":\"{s}\"}}",
-            .{ error_type, message },
-        ) catch return error.OutOfMemory;
+        const envelope = .{ .errorType = error_type, .errorMessage = message };
+        const json = std.json.Stringify.valueAlloc(self.allocator, envelope, .{}) catch return error.OutOfMemory;
         defer self.allocator.free(json);
         try self.postTo(request_id, "error", "application/json", json);
     }

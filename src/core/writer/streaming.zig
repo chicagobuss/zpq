@@ -44,9 +44,9 @@ pub fn build(
     return out.offset;
 }
 
-/// `fastpath.assemble` output over a `Sink`, which is opaque about how
+/// `fastpath`'s output protocol over a `Sink`, which is opaque about how
 /// far it has got, so the output offset is tracked here.
-const SinkOut = struct {
+pub const SinkOut = struct {
     sink: Sink,
     offset: usize = 0,
 

@@ -467,6 +467,17 @@ fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, w
     }
 }
 
+test "lambda write response escapes an output name holding a quote and a backslash" {
+    const esc = "ci/fixtures/parquet/json_escape.parquet";
+    const out = "zig-out/lambda \"q\" \\ out.parquet";
+    defer _ = linux.unlink(out);
+    try expectResponses("lambda write escape", &.{.{
+        .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"columns\":[\"s\"]," ++
+            "\"output_url\":\"zig-out/lambda \\\"q\\\" \\\\ out.parquet\"}",
+        .want = "{\"ok\":true,\"output\":\"zig-out/lambda \\\"q\\\" \\\\ out.parquet\",\"files_in\":1,",
+    }});
+}
+
 test "lambda decodes JSON escapes in request strings" {
     const twin = "ci/fixtures/parquet/dotted_twin.parquet";
     const esc = "ci/fixtures/parquet/json_escape.parquet";
@@ -582,6 +593,20 @@ test "lambda rejects clashing or unknown column names and names the column" {
         } else |_| {}
         try resp.replyAndClose(std.testing.allocator, 202, "", "");
     }
+}
+
+test "lambda names the input file a query could not read, and why" {
+    try expectResponses("lambda bad input", &.{
+        .{
+            .body = "{\"inputs\":[\"zig-out/no such \\\"file\\\".parquet\"],\"aggregate\":\"count(*) AS n\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"OpenFailed\"," ++
+                "\"input\":\"zig-out/no such \\\"file\\\".parquet\",\"cause\":\"FileNotFound\"}",
+        },
+        .{
+            .body = "{\"inputs\":[\"build.zig\"],\"aggregate\":\"count(*) AS n\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"NotParquet\",\"input\":\"build.zig\",\"cause\":",
+        },
+    });
 }
 
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

@@ -30,6 +30,7 @@ const request = @import("request.zig");
 // agg pipeline both the CLI and Lambda call into.
 const scan = @import("scan.zig");
 const core_scan = zpq.core.scan;
+const Diag = zpq.core.diag.Diag;
 const engine = zpq.engine;
 
 const schema = zpq.core.schema;
@@ -151,11 +152,7 @@ fn handle(
         var bad_field: []const u8 = "";
         var req = request.Request.parse(allocator, trimmed, &bad_field) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (err == error.BadFieldType) return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"bad_json\",\"reason\":\"{s}\",\"field\":\"{s}\"}}",
-                .{ @errorName(err), bad_field },
-            );
+            if (err == error.BadFieldType) return rejectResponse(allocator, "bad_json", @errorName(err), "field", bad_field);
             return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}", .{@errorName(err)});
         };
         defer req.deinit();
@@ -215,20 +212,20 @@ fn handle(
     return try aggregateInt8(allocator, inv.body, null);
 }
 
-/// The response for a failed query: the error, and the column it is about when `diag` names one.
-fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const zpq.core.scan.Diag) ![]u8 {
+/// The response for a failed query: the error, and the column or input file it is about when `diag` names one.
+fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(err)});
-    switch (err) {
-        error.DuplicateOutputColumn, error.AmbiguousOutputColumn, error.UnknownColumn, error.AmbiguousColumn => {
-            if (diag.len > 0) {
-                try w.writeAll(",\"column\":");
-                try engine.writeJsonQuoted(w, diag.column());
-            }
-        },
-        else => {},
+    if (diag.column.len > 0) {
+        try w.writeAll(",\"column\":");
+        try engine.writeJsonQuoted(w, diag.column.get());
+    }
+    if (diag.input) |input| {
+        try w.writeAll(",\"input\":");
+        try engine.writeJsonQuoted(w, input);
+        if (diag.cause) |cause| try w.print(",\"cause\":\"{s}\"", .{@errorName(cause)});
     }
     try w.writeByte('}');
     return aw.toOwnedSlice();
@@ -269,48 +266,26 @@ fn lambdaAggregate(
     const t_start = nowMonoNs();
 
     var registry = persistentPoolAdapter(pool);
-    var diag: zpq.core.scan.Diag = .{};
+    var diag: Diag = .{};
     var args = qa;
     args.diag = &diag;
 
-    const result = engine.runQuery(.{
+    var result = engine.runQuery(.{
         .gpa = allocator,
         .env = env,
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
     }, args) catch |err| return engineError(allocator, err, &diag);
+    defer result.deinit(allocator);
     const ar = result.aggregate;
-    defer allocator.free(ar.aggs);
-    defer for (ar.aggs) |item| {
-        allocator.free(item.alias);
-        switch (item.value) {
-            .s => |s| allocator.free(s),
-            else => {},
-        }
-    };
-    defer if (ar.group_rows) |rows| {
-        for (rows) |r| {
-            for (r) |v| {
-                switch (v) {
-                    .s => |s| allocator.free(s),
-                    else => {},
-                }
-            }
-            allocator.free(r);
-        }
-        allocator.free(rows);
-    };
-    defer if (ar.group_cols) |cols| {
-        for (cols) |c| allocator.free(c);
-        allocator.free(cols);
-    };
+    const answer = ar.output;
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    if (ar.group_rows) |rows| {
+    if (answer.group_rows) |rows| {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
@@ -318,7 +293,7 @@ fn lambdaAggregate(
         for (rows, 0..) |row_vals, row_idx| {
             if (row_idx > 0) try w.writeByte(',');
             try w.writeByte('{');
-            for (ar.group_cols.?, 0..) |col_name, col_idx| {
+            for (answer.group_cols.?, 0..) |col_name, col_idx| {
                 if (col_idx > 0) try w.writeByte(',');
                 try engine.writeJsonQuoted(w, col_name);
                 try w.writeByte(':');
@@ -332,7 +307,7 @@ fn lambdaAggregate(
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
-        for (ar.aggs, 0..) |item, i| {
+        for (answer.aggs, 0..) |item, i| {
             if (i > 0) try w.writeByte(',');
             try engine.writeJsonQuoted(w, item.alias);
             try w.writeByte(':');
@@ -364,7 +339,7 @@ fn lambdaWrite(
     const t_start = nowMonoNs();
 
     var registry = persistentPoolAdapter(pool);
-    var diag: zpq.core.scan.Diag = .{};
+    var diag: Diag = .{};
     var args = qa;
     args.diag = &diag;
 
@@ -396,11 +371,27 @@ fn lambdaWrite(
         // container. Inserts/evictions are LRU-state, not per-invoke.
         break :blk s;
     } else .{};
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"ok\":true,\"output\":\"{s}\",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}}}}",
+    return writeResponse(allocator, output_url_str, wr, total_ms, stats, cache_stats);
+}
+
+/// The success response for a write. `output` is the caller's URL or path, so it is escaped like every other string
+/// the response echoes back.
+fn writeResponse(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    wr: engine.WriteResult,
+    total_ms: i64,
+    stats: s3.Pool(POOL_SIZE).Stats,
+    cache_stats: zpq.io.meta_cache.Stats,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"ok\":true,\"output\":");
+    try engine.writeJsonQuoted(w, output);
+    try w.print(
+        ",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}}}}",
         .{
-            output_url_str,
             wr.files_in,
             wr.rows_in,
             wr.rows_kept,
@@ -432,6 +423,19 @@ fn lambdaWrite(
             cache_stats.evictions,
         },
     );
+    return aw.toOwnedSlice();
+}
+
+/// `{"error":kind,"reason":reason,"<key>":value}`: an early-exit response naming the field or text it rejects. `kind`
+/// and `reason` are fixed names; `value` comes from the request, so it is escaped.
+fn rejectResponse(allocator: std.mem.Allocator, kind: []const u8, reason: []const u8, key: []const u8, value: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"error\":\"{s}\",\"reason\":\"{s}\",\"{s}\":", .{ kind, reason, key });
+    try engine.writeJsonQuoted(w, value);
+    try w.writeByte('}');
+    return aw.toOwnedSlice();
 }
 
 fn handleS3(
@@ -498,12 +502,8 @@ fn handleS3(
     var filter: ?filter_ast.Filter = null;
     if (filter_str) |fs| {
         if (fs.len > 0) {
-            filter = filter_parser.parse(a, fs, &meta) catch |err| {
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{{\"error\":\"filter_parse\",\"reason\":\"{s}\",\"expr\":\"{s}\"}}",
-                    .{ @errorName(err), fs },
-                );
+            filter = filter_parser.parse(a, fs, &meta, null) catch |err| {
+                return rejectResponse(allocator, "filter_parse", @errorName(err), "expr", fs);
             };
         }
     }
@@ -741,6 +741,43 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
         "{{\"ok\":true,\"column\":\"{s}\",\"rows\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"row_groups\":{d}}}",
         .{ TARGET_COLUMN, total_rows, min_v, max_v, sum, meta.row_groups.items.len },
     );
+}
+
+/// Parse `body` as one JSON object and return its string field `key`, failing unless both hold.
+fn expectStringField(body: []const u8, key: []const u8, want: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const got = parsed.value.object.get(key) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(want, got.string);
+}
+
+test "the write response escapes the output name" {
+    const a = std.testing.allocator;
+    const wr: engine.WriteResult = .{
+        .codec = .SNAPPY,
+        .files_in = 1,
+        .rows_in = 3,
+        .rows_kept = 2,
+        .bytes_in = 10,
+        .bytes_out = 8,
+        .row_groups_in = 1,
+        .row_groups_kept = 1,
+        .timings = .{},
+    };
+    for ([_][]const u8{ "out.parquet", "s3://b/a \"q\" c:\\d\n.parquet" }) |name| {
+        const body = try writeResponse(a, name, wr, 5, .{}, .{});
+        defer a.free(body);
+        try expectStringField(body, "output", name);
+    }
+}
+
+test "a rejected filter echoes its expression escaped" {
+    const a = std.testing.allocator;
+    const expr = "\"a\".\"b\" = 'x\\y'";
+    const body = try rejectResponse(a, "filter_parse", "AmbiguousColumn", "expr", expr);
+    defer a.free(body);
+    try expectStringField(body, "expr", expr);
+    try expectStringField(body, "reason", "AmbiguousColumn");
 }
 
 test {

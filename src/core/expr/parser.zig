@@ -21,6 +21,7 @@ const metadata = @import("../parquet/metadata.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_parser = @import("../filter/parser.zig");
+const Diag = @import("../diag.zig").Diag;
 
 pub const Error = error{
     EmptyExpr,
@@ -91,6 +92,8 @@ const Lexer = struct {
     pos: usize = 0,
     /// Lives on the Lexer because it is already threaded through every parse function.
     depth: u32 = 0,
+    /// Receives what a failure was about. On the Lexer for the same reason.
+    diag: ?*Diag = null,
 
     fn peek(self: *Lexer) Error!Token {
         const save = self.pos;
@@ -224,12 +227,13 @@ pub fn parseSelect(
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
+    diag: ?*Diag,
 ) Error![]ast.SelectItem {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
 
     var items: std.ArrayList(ast.SelectItem) = .empty;
-    var lex: Lexer = .{ .src = trimmed };
+    var lex: Lexer = .{ .src = trimmed, .diag = diag };
 
     while (true) {
         const e = try parseExpr(arena, &lex, file);
@@ -257,12 +261,13 @@ pub fn parseGroupBy(
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
+    diag: ?*Diag,
 ) Error![]ast.SelectItem {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
 
     var items: std.ArrayList(ast.SelectItem) = .empty;
-    var lex: Lexer = .{ .src = trimmed };
+    var lex: Lexer = .{ .src = trimmed, .diag = diag };
 
     while (true) {
         const e = try parseExpr(arena, &lex, file);
@@ -292,10 +297,11 @@ pub fn parseExprOnly(
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
+    diag: ?*Diag,
 ) Error!ast.Expr {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
-    var lex: Lexer = .{ .src = trimmed };
+    var lex: Lexer = .{ .src = trimmed, .diag = diag };
     const e = try parseExpr(arena, &lex, file);
     const tail = try lex.next();
     if (tail.kind != .eof) return error.TrailingTokens;
@@ -397,9 +403,10 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                 return parseCall(arena, lex, file, tk.text);
             }
             const col_idx = metadata.resolveColumn(file, tk.text) catch |err| {
-                if (err == error.AmbiguousColumn) {
-                    std.debug.print("expression: column `{s}` is ambiguous: {s}\n", .{ tk.text, metadata.ambiguityHint(file, tk.text) });
-                }
+                if (err == error.AmbiguousColumn) Diag.set(lex.diag, tk.text, .{ .ambiguous_column = .{
+                    .parser = .expression,
+                    .hint = metadata.ambiguityHint(file, tk.text),
+                } });
                 return err;
             };
             const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
@@ -564,10 +571,11 @@ pub fn parseAggList(
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
+    diag: ?*Diag,
 ) Error![]agg.AggCall {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyAggregate;
-    var lex: Lexer = .{ .src = trimmed };
+    var lex: Lexer = .{ .src = trimmed, .diag = diag };
     var items: std.ArrayList(agg.AggCall) = .empty;
     while (true) {
         const call = try parseAggCall(arena, &lex, file);
@@ -647,7 +655,7 @@ fn parseAggCall(
 
         if (body.len < 6 or !asciiEqIgnoreCase(body[0..5], "WHERE")) return error.ExpectedWhere;
         const pred_str = std.mem.trim(u8, body[5..], " \t\r\n");
-        where = try filter_parser.parse(arena, pred_str, file);
+        where = try filter_parser.parse(arena, pred_str, file, lex.diag);
     }
 
     // 5. Optional AS alias. Default = function name (sum / count / ...), with the call's text kept for when that
@@ -739,26 +747,26 @@ test "parse: nesting past MAX_EXPR_DEPTH is rejected" {
     @memset(parens[0..n], '(');
     parens[n] = '1';
     @memset(parens[n + 1 ..], ')');
-    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, parens, &file));
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, parens, &file, null));
 
     // A left-associative chain is parsed by a loop, not recursion, so only the tree-height check catches it.
     var chain: std.ArrayList(u8) = .empty;
     try chain.appendSlice(a, "1");
     for (0..n) |_| try chain.appendSlice(a, " + 1");
-    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, chain.items, &file));
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, chain.items, &file, null));
 
     // A run of unary minus is self-recursive and hits the same guard.
     const minuses = try a.alloc(u8, n + 1);
     @memset(minuses[0..n], '-');
     minuses[n] = '1';
-    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, minuses, &file));
+    try testing.expectError(error.ExpressionTooDeep, parseExprOnly(a, minuses, &file, null));
 
     // Just inside the cap still parses.
     const ok_parens = try a.alloc(u8, (MAX_EXPR_DEPTH - 1) * 2 + 1);
     @memset(ok_parens[0 .. MAX_EXPR_DEPTH - 1], '(');
     ok_parens[MAX_EXPR_DEPTH - 1] = '1';
     @memset(ok_parens[MAX_EXPR_DEPTH ..], ')');
-    _ = try parseExprOnly(a, ok_parens, &file);
+    _ = try parseExprOnly(a, ok_parens, &file, null);
 }
 
 test "parse: literal int" {
@@ -766,7 +774,7 @@ test "parse: literal int" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
-    const e = try parseExprOnly(a, "42", &file);
+    const e = try parseExprOnly(a, "42", &file, null);
     try testing.expectEqual(ast.Type.i64, e.typeOf());
     try testing.expectEqual(@as(i64, 42), e.literal.i64);
 }
@@ -776,7 +784,7 @@ test "parse: literal float" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
-    const e = try parseExprOnly(a, "3.14", &file);
+    const e = try parseExprOnly(a, "3.14", &file, null);
     try testing.expectEqual(ast.Type.f64, e.typeOf());
     try testing.expect(@abs(e.literal.f64 - 3.14) < 1e-9);
 }
@@ -786,10 +794,10 @@ test "parse: column ref resolves" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "x", "y" }, &.{ .INT32, .DOUBLE });
-    const ex = try parseExprOnly(a, "x", &file);
+    const ex = try parseExprOnly(a, "x", &file, null);
     try testing.expectEqual(ast.Type.i64, ex.typeOf()); // INT32 promoted
     try testing.expectEqual(@as(usize, 0), ex.col_ref.col_idx);
-    const ey = try parseExprOnly(a, "y", &file);
+    const ey = try parseExprOnly(a, "y", &file, null);
     try testing.expectEqual(ast.Type.f64, ey.typeOf());
     try testing.expectEqual(@as(usize, 1), ey.col_ref.col_idx);
 }
@@ -799,7 +807,7 @@ test "parse: precedence — mul before add" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "x", "y", "z" }, &.{ .INT64, .INT64, .INT64 });
-    const e = try parseExprOnly(a, "x + y * z", &file);
+    const e = try parseExprOnly(a, "x + y * z", &file, null);
     // Should parse as `x + (y * z)`.
     try testing.expectEqual(ast.Op.add, e.binop.op);
     try testing.expectEqual(ast.Op.mul, e.binop.right.binop.op);
@@ -810,7 +818,7 @@ test "parse: parens override precedence" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "x", "y", "z" }, &.{ .INT64, .INT64, .INT64 });
-    const e = try parseExprOnly(a, "(x + y) * z", &file);
+    const e = try parseExprOnly(a, "(x + y) * z", &file, null);
     try testing.expectEqual(ast.Op.mul, e.binop.op);
     try testing.expectEqual(ast.Op.add, e.binop.left.binop.op);
 }
@@ -820,7 +828,7 @@ test "parse: select list with alias" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "x", "y" }, &.{ .INT64, .INT64 });
-    const items = try parseSelect(a, "x AS first, x + y AS sum", &file);
+    const items = try parseSelect(a, "x AS first, x + y AS sum", &file, null);
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expectEqualStrings("first", items[0].alias.?);
     try testing.expectEqualStrings("sum", items[1].alias.?);
@@ -832,7 +840,7 @@ test "parse: type promotion in binop" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "i", "f" }, &.{ .INT64, .DOUBLE });
-    const e = try parseExprOnly(a, "i + f", &file);
+    const e = try parseExprOnly(a, "i + f", &file, null);
     try testing.expectEqual(ast.Type.f64, e.typeOf());
 }
 
@@ -841,7 +849,7 @@ test "parse: unknown column errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "y + 1", &file));
+    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "y + 1", &file, null));
 }
 
 test "parse: string literal" {
@@ -849,7 +857,7 @@ test "parse: string literal" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
-    const e = try parseExprOnly(a, "'hello'", &file);
+    const e = try parseExprOnly(a, "'hello'", &file, null);
     try testing.expectEqual(ast.Type.str, e.typeOf());
     try testing.expectEqualStrings("hello", e.literal.str);
 }
@@ -859,7 +867,7 @@ test "parse: string column ref" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
-    const e = try parseExprOnly(a, "name", &file);
+    const e = try parseExprOnly(a, "name", &file, null);
     try testing.expectEqual(ast.Type.str, e.typeOf());
 }
 
@@ -868,7 +876,7 @@ test "parse: || string concat" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "first", "last" }, &.{ .BYTE_ARRAY, .BYTE_ARRAY });
-    const e = try parseExprOnly(a, "first || ' ' || last", &file);
+    const e = try parseExprOnly(a, "first || ' ' || last", &file, null);
     try testing.expectEqual(ast.Type.str, e.typeOf());
     try testing.expectEqual(ast.Op.concat, e.binop.op);
 }
@@ -878,7 +886,7 @@ test "parse: type mismatch — string + number errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
-    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "name + 1", &file));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "name + 1", &file, null));
 }
 
 test "parse: coalesce(col, default)" {
@@ -886,7 +894,7 @@ test "parse: coalesce(col, default)" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    const e = try parseExprOnly(a, "coalesce(x, 0)", &file);
+    const e = try parseExprOnly(a, "coalesce(x, 0)", &file, null);
     try testing.expectEqual(ast.Type.i64, e.typeOf());
     try testing.expectEqual(ast.Func.coalesce, e.call.func);
     try testing.expectEqual(@as(usize, 2), e.call.args.len);
@@ -897,7 +905,7 @@ test "parse: coalesce is case-insensitive" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    const e = try parseExprOnly(a, "COALESCE(x, 0)", &file);
+    const e = try parseExprOnly(a, "COALESCE(x, 0)", &file, null);
     try testing.expectEqual(ast.Func.coalesce, e.call.func);
 }
 
@@ -906,7 +914,7 @@ test "parse: coalesce promotes int+float arg types to f64" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "i", "f" }, &.{ .INT64, .DOUBLE });
-    const e = try parseExprOnly(a, "coalesce(i, f)", &file);
+    const e = try parseExprOnly(a, "coalesce(i, f)", &file, null);
     try testing.expectEqual(ast.Type.f64, e.typeOf());
 }
 
@@ -915,7 +923,7 @@ test "parse: coalesce arity error" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.WrongArity, parseExprOnly(a, "coalesce(x)", &file));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "coalesce(x)", &file, null));
 }
 
 test "parse: unknown function errors" {
@@ -923,7 +931,7 @@ test "parse: unknown function errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "abs(x)", &file));
+    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "abs(x)", &file, null));
 }
 
 test "parse: incomplete trailing operator fails" {
@@ -931,7 +939,7 @@ test "parse: incomplete trailing operator fails" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnexpectedEnd, parseExprOnly(a, "x +", &file));
+    try testing.expectError(error.UnexpectedEnd, parseExprOnly(a, "x +", &file, null));
 }
 
 test "parse: extra trailing token fails" {
@@ -939,7 +947,7 @@ test "parse: extra trailing token fails" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.TrailingTokens, parseExprOnly(a, "x 1", &file));
+    try testing.expectError(error.TrailingTokens, parseExprOnly(a, "x 1", &file, null));
 }
 
 test "agg: count(*) with default alias" {
@@ -947,7 +955,7 @@ test "agg: count(*) with default alias" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
-    const items = try parseAggList(a, "count(*)", &file);
+    const items = try parseAggList(a, "count(*)", &file, null);
     try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expectEqual(agg.AggFunc.count, items[0].func);
     try testing.expectEqualStrings("count", items[0].alias);
@@ -960,7 +968,7 @@ test "agg: sum with column ref + alias" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"cost"}, &.{.DOUBLE});
-    const items = try parseAggList(a, "sum(cost) AS total", &file);
+    const items = try parseAggList(a, "sum(cost) AS total", &file, null);
     try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expectEqual(agg.AggFunc.sum, items[0].func);
     try testing.expectEqualStrings("total", items[0].alias);
@@ -972,7 +980,7 @@ test "agg: avg result shape is avg_f64 (split-output)" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"cost"}, &.{.DOUBLE});
-    const items = try parseAggList(a, "avg(cost) AS mean", &file);
+    const items = try parseAggList(a, "avg(cost) AS mean", &file, null);
     try testing.expectEqual(agg.ResultShape.avg_f64, items[0].result);
 }
 
@@ -981,7 +989,7 @@ test "agg: FILTER (WHERE pred) attaches a predicate" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "service", "cost" }, &.{ .BYTE_ARRAY, .DOUBLE });
-    const items = try parseAggList(a, "sum(cost) FILTER (WHERE service = ec2) AS ec2_cost", &file);
+    const items = try parseAggList(a, "sum(cost) FILTER (WHERE service = ec2) AS ec2_cost", &file, null);
     try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expect(items[0].where != null);
     try testing.expect(items[0].where.? == .string);
@@ -997,6 +1005,7 @@ test "agg: multiple FILTER aggs in one list" {
         a,
         "sum(cost) FILTER (WHERE svc = ec2) AS ec2, sum(cost) FILTER (WHERE svc = s3) AS s3, count(*) AS rows",
         &file,
+        null,
     );
     try testing.expectEqual(@as(usize, 3), items.len);
     try testing.expectEqualStrings("ec2", items[0].alias);
@@ -1012,7 +1021,7 @@ test "agg: star only valid in count" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
-    try testing.expectError(error.StarOnlyValidInCount, parseAggList(a, "sum(*)", &file));
+    try testing.expectError(error.StarOnlyValidInCount, parseAggList(a, "sum(*)", &file, null));
 }
 
 test "agg: unknown agg function errors" {
@@ -1020,7 +1029,7 @@ test "agg: unknown agg function errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownAggFunc, parseAggList(a, "median(x)", &file));
+    try testing.expectError(error.UnknownAggFunc, parseAggList(a, "median(x)", &file, null));
 }
 
 test "agg: case-insensitive keywords" {
@@ -1028,7 +1037,7 @@ test "agg: case-insensitive keywords" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "service", "cost" }, &.{ .BYTE_ARRAY, .DOUBLE });
-    const items = try parseAggList(a, "SUM(cost) filter (where service = ec2) as total", &file);
+    const items = try parseAggList(a, "SUM(cost) filter (where service = ec2) as total", &file, null);
     try testing.expectEqual(@as(usize, 1), items.len);
     try testing.expectEqualStrings("total", items[0].alias);
     try testing.expect(items[0].where != null);
@@ -1040,7 +1049,7 @@ test "agg: double-quoted column identifier resolves like bare" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "service", "cost" }, &.{ .BYTE_ARRAY, .DOUBLE });
     // `"cost"` (SQL-standard quoting) must parse identically to bare `cost`.
-    const items = try parseAggList(a, "sum(\"cost\") AS c, max(\"cost\") AS m", &file);
+    const items = try parseAggList(a, "sum(\"cost\") AS c, max(\"cost\") AS m", &file, null);
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expectEqualStrings("c", items[0].alias);
     try testing.expectEqualStrings("m", items[1].alias);
@@ -1051,7 +1060,7 @@ test "group-by: bare column and AS alias" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "region", "kind" }, &.{ .INT32, .BYTE_ARRAY });
-    const items = try parseGroupBy(a, "region, kind AS k", &file);
+    const items = try parseGroupBy(a, "region, kind AS k", &file, null);
     try testing.expectEqual(@as(usize, 2), items.len);
     try testing.expectEqual(@as(?[]const u8, null), items[0].alias);
     try testing.expectEqualStrings("k", items[1].alias.?);
@@ -1065,16 +1074,16 @@ test "parse: a UINT64 column may stand alone but is refused as an operand" {
     file.schema.items[1].logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
     file.schema.items[2].converted_type = .UINT_32;
 
-    const bare = try parseSelect(a, "u AS b", &file);
+    const bare = try parseSelect(a, "u AS b", &file, null);
     try testing.expect(bare[0].expr.col_ref.unsigned_64);
-    _ = try parseAggList(a, "sum(u) AS s, max(u) AS m", &file);
-    _ = try parseExprOnly(a, "w + 1", &file); // UINT32 zero-extends into i64 exactly
+    _ = try parseAggList(a, "sum(u) AS s, max(u) AS m", &file, null);
+    _ = try parseExprOnly(a, "w + 1", &file, null); // UINT32 zero-extends into i64 exactly
 
     for ([_][]const u8{ "u + 1", "1 * u", "-u", "coalesce(u, 0)", "(u) - 2" }) |src| {
-        try testing.expectError(error.Unsigned64Operand, parseExprOnly(a, src, &file));
+        try testing.expectError(error.Unsigned64Operand, parseExprOnly(a, src, &file, null));
     }
-    try testing.expectError(error.Unsigned64Operand, parseAggList(a, "sum(u + 1) AS s", &file));
-    try testing.expectError(error.Unsigned64Operand, parseGroupBy(a, "u * 2 AS k", &file));
+    try testing.expectError(error.Unsigned64Operand, parseAggList(a, "sum(u + 1) AS s", &file, null));
+    try testing.expectError(error.Unsigned64Operand, parseGroupBy(a, "u * 2 AS k", &file, null));
 }
 
 test "parse: bare names bind top-level columns, dotted paths nested leaves" {
@@ -1083,24 +1092,35 @@ test "parse: bare names bind top-level columns, dotted paths nested leaves" {
     const a = arena.allocator();
     const file = try test_fixtures.sharedLeafNameMeta(a);
 
-    const aggs = try parseAggList(a, "sum(key) AS s, sum(r.key) AS t, count(*) FILTER (WHERE key > 1005) AS n", &file);
+    const aggs = try parseAggList(
+        a,
+        "sum(key) AS s, sum(r.key) AS t, count(*) FILTER (WHERE key > 1005) AS n",
+        &file,
+        null,
+    );
     try testing.expectEqual(@as(usize, 2), aggs[0].arg.?.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 0), aggs[1].arg.?.col_ref.col_idx);
 
-    const sel = try parseSelect(a, "key + r.key AS both, \"r.name\" AS n", &file);
+    const sel = try parseSelect(a, "key + r.key AS both, \"r.name\" AS n", &file, null);
     try testing.expectEqual(@as(usize, 2), sel[0].expr.binop.left.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 0), sel[0].expr.binop.right.col_ref.col_idx);
     try testing.expectEqual(ast.Type.str, sel[1].expr.typeOf());
 
-    const keys = try parseGroupBy(a, "key, r.key", &file);
+    const keys = try parseGroupBy(a, "key, r.key", &file, null);
     try testing.expectEqual(@as(usize, 2), keys[0].expr.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 0), keys[1].expr.col_ref.col_idx);
 
-    try testing.expectError(error.AmbiguousColumn, parseExprOnly(a, "x", &file));
-    try testing.expectError(error.AmbiguousColumn, parseAggList(a, "sum(x) AS s", &file));
-    try testing.expectEqual(@as(usize, 5), (try parseExprOnly(a, "b.x", &file)).col_ref.col_idx);
+    try testing.expectError(error.AmbiguousColumn, parseExprOnly(a, "x", &file, null));
+    var diag: Diag = .{};
+    try testing.expectError(error.AmbiguousColumn, parseAggList(a, "sum(x) AS s", &file, &diag));
+    try testing.expectEqualStrings("x", diag.column.get());
+    try testing.expect(diag.detail.ambiguous_column.parser == .expression);
+    // A per-aggregate FILTER is the filter parser's.
+    try testing.expectError(error.AmbiguousColumn, parseAggList(a, "count(*) FILTER (WHERE x = 1) AS n", &file, &diag));
+    try testing.expect(diag.detail.ambiguous_column.parser == .filter);
+    try testing.expectEqual(@as(usize, 5), (try parseExprOnly(a, "b.x", &file, null)).col_ref.col_idx);
     // A dot that does not continue an identifier is still an error, not part of the name.
-    try testing.expectError(error.UnexpectedChar, parseExprOnly(a, "key.", &file));
+    try testing.expectError(error.UnexpectedChar, parseExprOnly(a, "key.", &file, null));
 }
 
 test "parse: a quoted path binds the nested leaf a top-level column's dotted name hides" {
@@ -1110,16 +1130,16 @@ test "parse: a quoted path binds the nested leaf a top-level column's dotted nam
     var file = try test_fixtures.sharedLeafNameMeta(a);
     file.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`, beside the group r's field key
 
-    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "r.key", &file)).col_ref.col_idx);
-    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "\"r.key\"", &file)).col_ref.col_idx);
-    try testing.expectEqual(@as(usize, 0), (try parseExprOnly(a, "\"r\".\"key\"", &file)).col_ref.col_idx);
-    const sel = try parseSelect(a, "\"r\".\"key\" + \"r.key\" AS s, \"r\".\"name\"", &file);
+    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "r.key", &file, null)).col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "\"r.key\"", &file, null)).col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 0), (try parseExprOnly(a, "\"r\".\"key\"", &file, null)).col_ref.col_idx);
+    const sel = try parseSelect(a, "\"r\".\"key\" + \"r.key\" AS s, \"r\".\"name\"", &file, null);
     try testing.expectEqual(@as(usize, 0), sel[0].expr.binop.left.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 2), sel[0].expr.binop.right.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 1), sel[1].expr.col_ref.col_idx);
-    const keys = try parseGroupBy(a, "\"r\".\"key\", \"r.key\"", &file);
+    const keys = try parseGroupBy(a, "\"r\".\"key\", \"r.key\"", &file, null);
     try testing.expectEqual(@as(usize, 0), keys[0].expr.col_ref.col_idx);
     try testing.expectEqual(@as(usize, 2), keys[1].expr.col_ref.col_idx);
-    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "\"r\".\"nope\"", &file));
-    try testing.expectError(error.UnterminatedString, parseExprOnly(a, "\"r\".\"key", &file));
+    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "\"r\".\"nope\"", &file, null));
+    try testing.expectError(error.UnterminatedString, parseExprOnly(a, "\"r\".\"key", &file, null));
 }

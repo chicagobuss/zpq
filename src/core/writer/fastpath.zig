@@ -260,13 +260,24 @@ fn offsetDelta(new_start: usize, src_start: usize) i64 {
 /// moved, and its page index carried forward into `out`. Inner slices
 /// (encodings, paths, stats) are borrowed from the source; bloom-filter
 /// offsets are dropped.
-fn rebaseChunk(
+pub fn rebaseChunk(
     arena: std.mem.Allocator,
     out: anytype,
     input: []const u8,
     src: *const schema.ColumnChunk,
     delta: i64,
 ) !schema.ColumnChunk {
+    var chunk = shiftChunk(src, delta);
+    const idx = try carryPageIndex(arena, out, input, src, delta);
+    chunk.offset_index_offset = idx.offset_index_offset;
+    chunk.offset_index_length = idx.offset_index_length;
+    chunk.column_index_offset = idx.column_index_offset;
+    chunk.column_index_length = idx.column_index_length;
+    return chunk;
+}
+
+/// `rebaseChunk` without the page index, for output that carries none.
+pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
     var chunk = src.*;
     if (chunk.meta_data) |*m| {
         m.data_page_offset += delta;
@@ -278,11 +289,10 @@ fn rebaseChunk(
         // consistent costs nothing.
         chunk.file_offset = m.data_page_offset;
     }
-    const idx = try carryPageIndex(arena, out, input, src, delta);
-    chunk.offset_index_offset = idx.offset_index_offset;
-    chunk.offset_index_length = idx.offset_index_length;
-    chunk.column_index_offset = idx.column_index_offset;
-    chunk.column_index_length = idx.column_index_length;
+    chunk.offset_index_offset = null;
+    chunk.offset_index_length = null;
+    chunk.column_index_offset = null;
+    chunk.column_index_length = null;
     return chunk;
 }
 
@@ -324,12 +334,12 @@ pub fn copiedColumnOrders(
     return schema.FileMetaData.outputColumnOrders(arena, n_leaves, kept_columns, metas);
 }
 
-const ByteRange = struct { start: usize, len: usize };
+pub const ByteRange = struct { start: usize, len: usize };
 
 /// The contiguous span of bytes in the source file that holds all of
 /// this row group's column-chunk data. Returns null if no column has
 /// readable metadata (shouldn't happen on real files but we don't panic).
-fn rowGroupByteRange(rg: *const schema.RowGroup, input_len: usize) Error!?ByteRange {
+pub fn rowGroupByteRange(rg: *const schema.RowGroup, input_len: usize) Error!?ByteRange {
     var min_start: usize = std.math.maxInt(usize);
     var max_end: usize = 0;
     for (rg.columns.items) |*chunk| if (chunk.meta_data) |*m| {
@@ -353,7 +363,7 @@ fn projectedChunkRange(rg: *const schema.RowGroup, col_idx: usize, input_len: us
 /// negative, or the range overflows or runs past the input:
 /// `metadata.open` rejects the first two, but the builders take any
 /// FileMetaData, and only the code holding the bytes knows their length.
-fn chunkRange(m: *const schema.ColumnMetaData, input_len: usize) ?ByteRange {
+pub fn chunkRange(m: *const schema.ColumnMetaData, input_len: usize) ?ByteRange {
     const start = std.math.cast(usize, m.dictionary_page_offset orelse m.data_page_offset) orelse return null;
     const len = std.math.cast(usize, m.total_compressed_size) orelse return null;
     const end = std.math.add(usize, start, len) catch return null;

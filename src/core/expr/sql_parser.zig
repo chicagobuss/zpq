@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("liteparser_c");
+const ast = @import("ast.zig");
 
 pub const ParsedQuery = struct {
     table_name: []const u8,
@@ -8,7 +9,8 @@ pub const ParsedQuery = struct {
     aggregate_str: ?[]const u8,
     filter_str: ?[]const u8,
     group_by_str: ?[]const u8 = null,
-    select_cols: []const []const u8 = &[_][]const u8{},
+    /// The result columns, expression and alias apart, for GROUP BY output binding.
+    select_cols: []const ast.SelectColumn = &.{},
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
         allocator.free(self.table_name);
@@ -16,10 +18,17 @@ pub const ParsedQuery = struct {
         if (self.aggregate_str) |a| allocator.free(a);
         if (self.filter_str) |f| allocator.free(f);
         if (self.group_by_str) |g| allocator.free(g);
-        for (self.select_cols) |col| allocator.free(col);
-        allocator.free(self.select_cols);
+        freeSelectCols(allocator, self.select_cols);
     }
 };
+
+fn freeSelectCols(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
+    for (cols) |col| {
+        allocator.free(col.expr);
+        if (col.alias) |a| allocator.free(a);
+    }
+    allocator.free(cols);
+}
 
 fn stripQuotes(name: []const u8) []const u8 {
     if (name.len >= 2 and ((name[0] == '\'' and name[name.len - 1] == '\'') or (name[0] == '"' and name[name.len - 1] == '"'))) {
@@ -193,6 +202,18 @@ fn unparseResultColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.A
     return allocator.dupe(u8, std.mem.span(expr_c));
 }
 
+/// `rc` as a `SelectColumn`: its expression unparsed, its alias as written. Fills `out` field by field, so a caller
+/// freeing `out` on failure frees only what was allocated.
+fn selectColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocator, out: *ast.SelectColumn) !void {
+    const expr_node = if (rc.kind == c.LP_RESULT_COLUMN) rc.u.result_column.expr else rc;
+    const expr_c = c.lp_ast_to_sql(expr_node, lp_arena);
+    if (expr_c == null) return error.UnparseError;
+    out.expr = try allocator.dupe(u8, std.mem.span(expr_c));
+    if (rc.kind == c.LP_RESULT_COLUMN and rc.u.result_column.alias != null) {
+        out.alias = try allocator.dupe(u8, std.mem.span(rc.u.result_column.alias));
+    }
+}
+
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
@@ -308,13 +329,15 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         try columns_list.append(allocator, col_sql);
     }
 
-    const select_cols = try allocator.alloc([]const u8, columns_list.items.len);
-    errdefer {
-        for (select_cols) |col| allocator.free(col);
-        allocator.free(select_cols);
-    }
-    for (columns_list.items, 0..) |col, idx| {
-        select_cols[idx] = try allocator.dupe(u8, col);
+    const select_cols = try allocator.alloc(ast.SelectColumn, columns_list.items.len);
+    @memset(select_cols, .{ .expr = "" });
+    errdefer freeSelectCols(allocator, select_cols);
+    i = 0;
+    var col_idx: usize = 0;
+    while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
+        const rc = root.*.u.select.result_columns.items[i] orelse continue;
+        try selectColumn(rc, lp_arena, allocator, &select_cols[col_idx]);
+        col_idx += 1;
     }
 
     // Join result columns with ", "
@@ -411,15 +434,13 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // A bare star can't be an aggregate, so this only reaches the plain path.
     if (std.mem.eql(u8, std.mem.trim(u8, columns_str, " "), "*")) {
         allocator.free(columns_str);
-        for (select_cols) |col| allocator.free(col);
-        allocator.free(select_cols);
+        freeSelectCols(allocator, select_cols);
         return .{
             .table_name = table_name,
             .is_aggregate = false,
             .select_str = null,
             .aggregate_str = null,
             .filter_str = filter_str,
-            .select_cols = &[_][]const u8{},
         };
     }
     return .{
@@ -531,8 +552,10 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     defer q_gb_mixed.deinit(a);
     try std.testing.expectEqualStrings("sum(x) AS s", q_gb_mixed.aggregate_str.?);
     try std.testing.expectEqual(@as(usize, 2), q_gb_mixed.select_cols.len);
-    try std.testing.expectEqualStrings("y", q_gb_mixed.select_cols[0]);
-    try std.testing.expectEqualStrings("sum(x) AS s", q_gb_mixed.select_cols[1]);
+    try std.testing.expectEqualStrings("y", q_gb_mixed.select_cols[0].expr);
+    try std.testing.expect(q_gb_mixed.select_cols[0].alias == null);
+    try std.testing.expectEqualStrings("sum(x)", q_gb_mixed.select_cols[1].expr);
+    try std.testing.expectEqualStrings("s", q_gb_mixed.select_cols[1].alias.?);
 
     try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x"));
     try std.testing.expectError(error.LimitNotSupported, parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5"));
@@ -603,7 +626,7 @@ test "sql_parser hands identifiers on as the flag forms spell them" {
         const g = try parseSqlQuery(a, grouped);
         defer g.deinit(a);
         try std.testing.expectEqualStrings(case.group_by, g.group_by_str.?);
-        try std.testing.expectEqualStrings(case.select, g.select_cols[0]);
+        try std.testing.expectEqualStrings(case.select, g.select_cols[0].expr);
     }
 }
 

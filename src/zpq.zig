@@ -10,6 +10,7 @@ pub const core = struct {
     pub const consumer = @import("core/consumer.zig");
     pub const invariant = @import("core/invariant.zig");
     pub const scan = @import("core/scan.zig");
+    pub const diag = @import("core/diag.zig");
     pub const spawn = @import("core/spawn.zig");
     pub const huge_pages = @import("core/huge_pages.zig");
     pub const filter = struct {
@@ -88,6 +89,7 @@ test {
     _ = @import("core/thrift.zig");
     _ = @import("core/consumer.zig");
     _ = @import("core/scan.zig");
+    _ = @import("core/agg_plan.zig");
     _ = @import("core/huge_pages.zig");
     _ = @import("core/spawn.zig");
     _ = @import("core/invariant.zig");

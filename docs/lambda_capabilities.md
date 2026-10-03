@@ -135,8 +135,8 @@ These findings should drive the current architecture, not be appended to it:
 
 1. **Compile-time backend selection is mandatory.** The Lambda build must not link the io_uring code path at all.
    Smaller binary, faster cold start, no risk of accidental ENOSYS panic if a runtime auto-detect ever guesses wrong.
-   When the io_uring backend lands (it doesn't exist yet), `build_options.lambda` must exclude it from the Lambda
-   binary's import graph.
+   When the io_uring backend lands (it doesn't exist yet), a per-binary build option, as `enable_sql` is, must exclude
+   it from the Lambda binary's import graph.
 2. **Treat io_uring as a workstation-only optimization.** Hot-path performance reasoning should stay grounded in
    epoll-readiness terms because that's the lowest common denominator across our targets.
 3. **Own the event loop.** We don't depend on libxev (or any other event-loop library). Lambda needs an epoll wrapper

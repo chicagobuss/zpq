@@ -12,7 +12,7 @@ const zon = @import("build.zig.zon");
 /// Both run the same engine (src/zpq.zig): blocking sockets over BoringSSL
 /// for S3 and `std.Io` for concurrency, with no event-loop library. Each
 /// binary compiles its own instance of that module so its `build_options`
-/// (`lambda`, `enable_sql`, `version`) resolve at comptime.
+/// (`enable_sql`, `version`) resolve at comptime.
 pub fn build(b: *std.Build) void {
     const builtin = @import("builtin");
     if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
@@ -64,22 +64,18 @@ pub fn build(b: *std.Build) void {
     //   const zpq = b.dependency("zpq", .{ .target = t, .optimize = o })
     //       .module("zpq");
     //
-    // Configuration is the workstation one (lambda=false).
     // The SQL frontend stays out: it's a CLI concern, and excluding it means
     // consumers never link the liteparser C sources. Everything else (codecs,
     // TLS, S3) comes along — the module is the same surface the binaries use.
     _ = addCoreModule(b, deps, target, optimize, .{
-        .lambda = false,
         .sql = false,
         .export_as = "zpq",
     });
 
     // ----- Tests -----
-    // Tests compile the Lambda configuration (lambda=true) with the SQL
-    // frontend switched on: no binary ships that combination, but it lets one
-    // test build cover the Lambda-only sources and the SQL parser.
+    // Tests compile the SQL frontend in, as the CLI does, and also root the
+    // Lambda's own sources (src/lambda/main.zig), so one test build covers both.
     const test_core = addCoreModule(b, deps, target, optimize, .{
-        .lambda = true,
         .sql = true, // tests exercise the SQL parser
     });
     const test_zpq_mod = test_core.zpq;
@@ -292,10 +288,6 @@ const CoreDeps = struct {
 };
 
 const CoreOptions = struct {
-    /// Which binary the module is compiled for. No source branches on it
-    /// yet; it is the switch that will keep a future io_uring backend out of
-    /// the Lambda binary (docs/lambda_capabilities.md).
-    lambda: bool,
     /// Compile the SQL frontend (`build_options.enable_sql`) and link
     /// liteparser.
     sql: bool,
@@ -322,7 +314,6 @@ fn addCoreModule(
     options: CoreOptions,
 ) Core {
     const opts = b.addOptions();
-    opts.addOption(bool, "lambda", options.lambda);
     opts.addOption(bool, "enable_sql", options.sql);
     opts.addOption([]const u8, "version", zon.version);
     const opts_mod = opts.createModule();
@@ -383,10 +374,7 @@ fn addBinaryModules(
     // it unless `-Dsql=false` asks for a minimal binary. Gated via
     // build_options so the sql_parser module simply isn't compiled when off.
     const enable_sql = !is_lambda and sql;
-    const core = addCoreModule(b, deps, target, optimize, .{
-        .lambda = is_lambda,
-        .sql = enable_sql,
-    });
+    const core = addCoreModule(b, deps, target, optimize, .{ .sql = enable_sql });
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path(if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig"),

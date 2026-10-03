@@ -593,22 +593,11 @@ fn foldStatBytes(
     }
 }
 
-/// Update one accumulator using one RG's decoded batch. Builds the
-/// per-aggregate SelectionVector by cloning `outer_sel` and ANDing
-/// in the agg's own `where` predicate (if any), then folds the
-/// active rows into the accumulator.
+/// Update one accumulator using one RG's decoded batch: fold the rows
+/// the call selects (`PreparedAggInput`) into it in bulk.
 ///
 /// `outer_sel` is the SelectionVector after the outer query
 /// `--filter` ran. `arena` is a per-RG scratch arena.
-///
-/// Null handling: when `call.arg` is a bare `col_ref` to an OPTIONAL
-/// column, we AND the column's present-mask into the per-call sel
-/// before folding. That lets `sum/min/max/avg/count(col)` produce
-/// the correct answer over real-world parquet (writers like Spark /
-/// DuckDB emit columns OPTIONAL even when actual nulls are present).
-/// Computed args over nullable columns (e.g. `sum(cost * 2)` where
-/// cost is OPTIONAL) still error via `expr_eval.evalExpr`'s reject —
-/// null-aware arithmetic in the binop kernel is a separate slice.
 pub fn updateOne(
     arena: std.mem.Allocator,
     /// Long-lived allocator for owned results that must outlive `arena`
@@ -621,40 +610,12 @@ pub fn updateOne(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    // 1. Build per-agg selection vector. Start from outer_sel; AND in
-    //    the agg's WHERE predicate (if present) and the col_ref's
-    //    null mask (if the arg is a nullable bare col_ref).
-    var sel_owned: ?filter_selection.SelectionVector = null;
-    defer if (sel_owned) |*s| s.deinit();
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    defer input.deinit(arena);
+    const sel = input.selection();
+    const values = input.values;
+    const u64_col = input.unsigned_64;
 
-    if (call.where) |pred| {
-        sel_owned = try outer_sel.cloneAlloc(arena);
-        try filter_eval.evaluate(pred, batch, &sel_owned.?, column_lookup, arena);
-    }
-
-    // 2. Compute the value column (skip for count(*)). For a bare
-    //    col_ref we go through `colRefForAgg`, which tolerates
-    //    OPTIONAL columns (rejecting nested LIST/MAP) and AND-masks
-    //    the per-call sel. For computed args we delegate to the
-    //    general evaluator (which still rejects nullable inputs).
-    var values: ?filter_eval.Batch.Column = null;
-    if (call.arg) |arg| {
-        if (arg == .col_ref) {
-            values = try colRefForAgg(arena, batch, column_lookup, arg.col_ref, outer_sel, &sel_owned);
-        } else {
-            values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
-        }
-    }
-    defer if (values) |v| if (call.arg.? == .col_ref) freeWidened(arena, batch, column_lookup, call.arg.?.col_ref, v);
-
-    const sel: *const filter_selection.SelectionVector =
-        if (sel_owned) |*s| s else outer_sel;
-
-    // Unsigned INT64 column: the i64 lane holds raw bits; the numeric folds
-    // must reinterpret them as u64 (see ColRef.unsigned_64).
-    const u64_col = if (call.arg) |a| (a == .col_ref and a.col_ref.unsigned_64) else false;
-
-    // 3. Fold into accumulator.
     switch (call.func) {
         .count => state.count += sel.count(),
         .sum => try foldSum(state, values.?, sel, u64_col),
@@ -711,71 +672,108 @@ fn foldMinMaxBytes(
     slot.* = try persist.dupe(u8, cand);
 }
 
-/// Borrow values for a bare col_ref agg arg, handling type widening
-/// (i32→i64, f32→f64) and null-aware sel-mask intersection. Rejects
-/// nested (LIST/MAP) columns — flat-fold semantics over a nested
-/// column aren't well-defined here.
+/// One aggregate's input over one row group's batch: the rows it folds and the values it folds them from. The scalar
+/// bulk fold (`updateOne`) and the grouped per-row fold (`updateOneGrouped`) prepare it the same way.
 ///
-/// If the column is OPTIONAL with any actual nulls, lazily clones
-/// `outer_sel` into `*sel_owned` (if not already cloned for a WHERE
-/// clause) and clears bits where def_levels[i] < max_def. The
-/// returned Batch.Column carries placeholder values at null
-/// positions, which the caller never reads because the sel mask
-/// has cleared the corresponding bits.
-fn colRefForAgg(
-    arena: std.mem.Allocator,
-    batch: *const filter_eval.Batch,
-    column_lookup: []const ?usize,
-    c: expr_ast.ColRef,
+/// Null handling: when `call.arg` is a bare `col_ref` to an OPTIONAL
+/// column, the column's present-mask is ANDed into the call's selection.
+/// That lets `sum/min/max/avg/count(col)` produce the correct answer over
+/// real-world parquet (writers like Spark / DuckDB emit columns OPTIONAL
+/// even when actual nulls are present). Computed args over nullable
+/// columns (e.g. `sum(cost * 2)` where cost is OPTIONAL) still error via
+/// `expr_eval.evalExpr`'s reject — null-aware arithmetic in the binop
+/// kernel is a separate slice.
+const PreparedAggInput = struct {
     outer_sel: *const filter_selection.SelectionVector,
-    sel_owned: *?filter_selection.SelectionVector,
-) Error!filter_eval.Batch.Column {
-    const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
-    const raw = batch.cols[pos];
-    switch (raw) {
-        inline else => |x| if (x.max_rep > 0) return error.UnsupportedAggType,
-    }
+    /// The call's own copy of the selection, narrowed by its FILTER and its argument's nulls; null when neither
+    /// applies. Owned, in the arena.
+    own_sel: ?filter_selection.SelectionVector = null,
+    /// The argument's values; null for count(*). Placeholder values sit at null positions, which the selection has
+    /// already cleared.
+    values: ?filter_eval.Batch.Column = null,
+    /// `values` is a widened copy (i32/bool -> i64, f32 -> f64) owned in the arena, not a borrow of the batch.
+    values_owned: bool = false,
+    /// Unsigned INT64 column: the i64 lane holds raw bits; the numeric folds
+    /// must reinterpret them as u64 (see ColRef.unsigned_64).
+    unsigned_64: bool = false,
 
-    // Intersect the present-mask only if the column actually carries
-    // null entries (a no-op for REQUIRED columns and for OPTIONAL
-    // columns whose every row happens to be present).
-    if (columnHasNulls(raw)) {
-        if (sel_owned.* == null) {
-            sel_owned.* = try outer_sel.cloneAlloc(arena);
+    fn init(
+        arena: std.mem.Allocator,
+        call: AggCall,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        outer_sel: *const filter_selection.SelectionVector,
+    ) Error!PreparedAggInput {
+        var in: PreparedAggInput = .{ .outer_sel = outer_sel };
+        errdefer in.deinit(arena);
+        if (call.where) |pred| {
+            in.own_sel = try outer_sel.cloneAlloc(arena);
+            try filter_eval.evaluate(pred, batch, &in.own_sel.?, column_lookup, arena);
         }
-        intersectPresentMask(&sel_owned.*.?, raw);
+        // A bare col_ref tolerates OPTIONAL columns and narrows the selection by their nulls; a computed argument goes
+        // to the general evaluator, which still rejects nullable inputs.
+        if (call.arg) |arg| switch (arg) {
+            .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
+            else => in.values = try expr_eval.evalExpr(arena, batch, column_lookup, arg),
+        };
+        return in;
     }
 
-    return switch (c.expr_type) {
-        .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, raw, c) } },
-        .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, raw) } },
-        // String columns pass through unwidened; foldMinMaxBytes compares the
-        // borrowed slices and dups the winner into `persist`. (Null rows are
-        // already cleared from `sel` by the present-mask intersection above.)
-        .str => raw,
-    };
-}
-
-/// Hand back a copy `colRefForAgg` widened (i32/bool -> i64, f32 -> f64) once it has been folded. The per-RG arena
-/// rolls its bump pointer back, so the next aggregate's widen lands on bytes already faulted in instead of fresh
-/// pages. Borrowed (unwidened) columns are left alone. Arena frees only reclaim the newest allocation, so this must
-/// run before anything allocated earlier is freed; out of order it is a harmless no-op.
-fn freeWidened(
-    arena: std.mem.Allocator,
-    batch: *const filter_eval.Batch,
-    column_lookup: []const ?usize,
-    c: expr_ast.ColRef,
-    values: filter_eval.Batch.Column,
-) void {
-    const pos = column_lookup[c.col_idx] orelse return;
-    const raw_ptr: usize = switch (batch.cols[pos]) {
-        inline else => |x| @intFromPtr(x.values.ptr),
-    };
-    switch (values) {
-        inline .i64, .f64 => |x| if (@intFromPtr(x.values.ptr) != raw_ptr) arena.free(x.values),
-        else => {},
+    fn selection(self: *const PreparedAggInput) *const filter_selection.SelectionVector {
+        return if (self.own_sel) |*s| s else self.outer_sel;
     }
-}
+
+    /// Free the temporaries newest first. The per-RG arena only reclaims its newest allocation, so handing the widened
+    /// copy back lets the next aggregate's widen land on bytes already faulted in instead of fresh pages.
+    fn deinit(self: *PreparedAggInput, arena: std.mem.Allocator) void {
+        if (self.values_owned) switch (self.values.?) {
+            inline .i64, .f64 => |x| arena.free(x.values),
+            else => unreachable,
+        };
+        if (self.own_sel) |*s| s.deinit();
+        self.* = undefined;
+    }
+
+    /// Bind a bare col_ref argument, widening it to its aggregate lane. Rejects nested (LIST/MAP) columns: flat-fold
+    /// semantics over a nested column aren't well-defined here.
+    fn bindColRef(
+        self: *PreparedAggInput,
+        arena: std.mem.Allocator,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        c: expr_ast.ColRef,
+    ) Error!void {
+        const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
+        const raw = batch.cols[pos];
+        switch (raw) {
+            inline else => |x| if (x.max_rep > 0) return error.UnsupportedAggType,
+        }
+
+        // Intersect the present-mask only if the column actually carries
+        // null entries (a no-op for REQUIRED columns and for OPTIONAL
+        // columns whose every row happens to be present).
+        if (columnHasNulls(raw)) {
+            if (self.own_sel == null) self.own_sel = try self.outer_sel.cloneAlloc(arena);
+            intersectPresentMask(&self.own_sel.?, raw);
+        }
+
+        self.unsigned_64 = c.unsigned_64;
+        switch (c.expr_type) {
+            // Already the lane's type: borrowed, not copied.
+            .i64 => {
+                self.values = .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, raw, c) } };
+                self.values_owned = raw != .i64;
+            },
+            .f64 => {
+                self.values = .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, raw) } };
+                self.values_owned = raw != .f64;
+            },
+            // String columns pass through unwidened; foldMinMaxBytes compares the
+            // borrowed slices and dups the winner into `persist`.
+            .str => self.values = raw,
+        }
+    }
+};
 
 inline fn columnHasNulls(col: filter_eval.Batch.Column) bool {
     return switch (col) {
@@ -1488,6 +1486,44 @@ test "aggregates over a bool column (widened to 0/1)" {
     try testing.expectEqual(@as(i128, 3), s.sum_i); // sum = #trues
     try testing.expectEqual(@as(i64, 0), mn.min_i.?); // min = 0 (a false present)
     try testing.expectEqual(@as(i64, 1), mx.max_i.?); // max = 1 (a true present)
+}
+
+test "prepared aggregate input owns its widened copy and nothing it borrows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const narrow = [_]i32{ 1, 2, 3 };
+    const wide = [_]i64{ 4, 5, 6 };
+    const defs = [_]u32{ 1, 0, 1 };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .i32 = .{ .values = &narrow } },
+        .{ .i64 = .{ .values = &wide, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1 };
+    var sel = try filter_selection.SelectionVector.init(a, 3);
+
+    const narrow_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const sum_narrow: AggCall = .{ .func = .sum, .arg = narrow_arg, .where = null, .alias = "s", .result = .i64 };
+    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel);
+    try testing.expect(widened.values_owned);
+    try testing.expect(widened.own_sel == null);
+    try testing.expectEqual(&sel, widened.selection());
+    const copy = widened.values.?.i64.values.ptr;
+    widened.deinit(a);
+    // Freed newest first, so the arena hands the same bytes to the next row group's widen.
+    try testing.expectEqual(copy, (try a.alloc(i64, 3)).ptr);
+
+    const wide_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const sum_wide: AggCall = .{ .func = .sum, .arg = wide_arg, .where = null, .alias = "s", .result = .i64 };
+    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel);
+    defer borrowed.deinit(a);
+    try testing.expect(!borrowed.values_owned);
+    try testing.expectEqual(@as([*]const i64, &wide), borrowed.values.?.i64.values.ptr);
+    // The null row leaves the call's own selection, not the shared one.
+    try testing.expect(!borrowed.selection().isActive(1));
+    try testing.expect(sel.isActive(1));
 }
 
 test "avg emits sum + count pair" {
@@ -2554,6 +2590,8 @@ pub const GroupTable = struct {
     }
 };
 
+/// Grouped counterpart of `updateOne`: fold each row the call selects into its group's accumulator,
+/// `accs[group_id_arr[row] * agg_len + agg_idx]`.
 pub fn updateOneGrouped(
     arena: std.mem.Allocator,
     persist: std.mem.Allocator,
@@ -2566,28 +2604,11 @@ pub fn updateOneGrouped(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    var sel_owned: ?filter_selection.SelectionVector = null;
-    defer if (sel_owned) |*s| s.deinit();
-
-    if (call.where) |pred| {
-        sel_owned = try outer_sel.cloneAlloc(arena);
-        try filter_eval.evaluate(pred, batch, &sel_owned.?, column_lookup, arena);
-    }
-
-    var values: ?filter_eval.Batch.Column = null;
-    if (call.arg) |arg| {
-        if (arg == .col_ref) {
-            values = try colRefForAgg(arena, batch, column_lookup, arg.col_ref, outer_sel, &sel_owned);
-        } else {
-            values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
-        }
-    }
-    defer if (values) |v| if (call.arg.? == .col_ref) freeWidened(arena, batch, column_lookup, call.arg.?.col_ref, v);
-
-    const sel: *const filter_selection.SelectionVector =
-        if (sel_owned) |*s| s else outer_sel;
-
-    const u64_col = if (call.arg) |a| (a == .col_ref and a.col_ref.unsigned_64) else false;
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    defer input.deinit(arena);
+    const sel = input.selection();
+    const values = input.values;
+    const u64_col = input.unsigned_64;
 
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {

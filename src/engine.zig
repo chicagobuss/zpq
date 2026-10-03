@@ -29,6 +29,8 @@ const decimal_mod = @import("core/parquet/decimal.zig");
 const consumer = @import("core/consumer.zig");
 const invariant = @import("core/invariant.zig");
 const scan = @import("core/scan.zig");
+const Diag = @import("core/diag.zig").Diag;
+const agg_plan = @import("core/agg_plan.zig");
 const system = @import("core/system.zig");
 const metadata = @import("core/parquet/metadata.zig");
 const schema_tree = @import("core/parquet/schema_tree.zig");
@@ -92,7 +94,10 @@ pub const Error = error{
     SchemaMismatch,
     NestedReencodeNotSupported,
     INT96ReencodeNotSupported,
-    AlreadyReported,
+    /// A row output column is a nested LIST/MAP leaf, or an expression over one.
+    NestedRowOutputNotSupported,
+    /// A nested leaf to output under its label has none: a top-level column takes even its quoted path.
+    UnlabelledColumn,
     FooterSchemaChunkMismatch,
     CrossBucketNotSupported,
     BadInputUrl,
@@ -120,11 +125,12 @@ pub const QueryArgs = struct {
     group_by: ?[]const u8 = null,
     columns: ?[]const []const u8 = null,
     select: ?[]const u8 = null,
-    select_cols: ?[]const []const u8 = null,
+    /// GROUP BY output columns as a select list writes them (SQL).
+    select_cols: ?[]const expr_ast.SelectColumn = null,
     /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
     column_order: ?[]const u8 = null,
-    /// Receives the column name behind an output-naming error, or an unknown or ambiguous --columns name.
-    diag: ?*scan.Diag = null,
+    /// Receives what a failure was about; see `core/diag.zig`.
+    diag: ?*Diag = null,
     /// Requested output codec. Null when none was asked for: re-encoded
     /// output is then SNAPPY and byte copies keep each chunk's own codec.
     codec: ?schema.CompressionCodec = null,
@@ -180,6 +186,13 @@ pub const PoolRegistry = struct {
 pub const QueryResult = union(enum) {
     aggregate: AggResult,
     write: WriteResult,
+
+    pub fn deinit(self: *QueryResult, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .aggregate => |*ar| ar.deinit(gpa),
+            .write => {},
+        }
+    }
 };
 
 pub const WriteResult = struct {
@@ -206,10 +219,13 @@ pub const AggResult = struct {
     row_groups_pruned: usize,
     row_groups_full_match: usize,
     cols_stat_pruned: usize,
-    aggs: []scan.AggOutputItem,
     timings: Timings,
-    group_cols: ?[]const []const u8 = null,
-    group_rows: ?[]const []const scan.AggValue = null,
+    /// The answer, owned in `Context.gpa`.
+    output: scan.AggOutput,
+
+    pub fn deinit(self: *AggResult, gpa: std.mem.Allocator) void {
+        self.output.deinit(gpa);
+    }
 };
 
 pub const Timings = struct {
@@ -267,9 +283,9 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     // 2. Run the orchestrator. (Yes, this re-parses the aggregate —
     //    cheap, microseconds. Easier than threading the parsed AST
     //    through the open step + the scan step.)
-    const r = try scan.runMultiAggregate(ctx.gpa, arena, .{
+    var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
         .inputs = opened.inputs,
-        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened) else null,
+        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened, args.diag) else null,
         .filter = args.filter,
         .aggregate = agg_str,
         .group_by = args.group_by,
@@ -286,13 +302,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     t.core = r.timings.core;
     t.decode_wall_ns = r.timings.decode_wall_ns;
 
-    defer for (r.accumulators) |acc| {
-        switch (acc) {
-            .min_bytes => |mb| if (mb) |s| ctx.gpa.free(s),
-            .max_bytes => |mb| if (mb) |s| ctx.gpa.free(s),
-            else => {},
-        }
-    };
+    defer r.state.deinit(ctx.gpa);
+    errdefer r.output.deinit(ctx.gpa);
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.
@@ -302,10 +313,11 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
             return error.BadOutputUrl;
         }
         const t_footer = nowMonoNs();
-        bytes_out = if (r.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, r.group_cols.?, r.group_col_types.?, rows, args.codec orelse .SNAPPY)
+        const st = r.state;
+        bytes_out = if (r.output.group_rows) |rows|
+            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, args.codec orelse .SNAPPY)
         else
-            try writeOneRowParquet(arena, out_path, r.agg_calls, r.accumulators, r.agg_sources, args.codec orelse .SNAPPY);
+            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, args.codec orelse .SNAPPY);
         t.footer_ns += @intCast(nowMonoNs() - t_footer);
     }
 
@@ -319,10 +331,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .row_groups_pruned = r.row_groups_pruned,
         .row_groups_full_match = r.row_groups_full_match,
         .cols_stat_pruned = r.cols_stat_pruned,
-        .aggs = r.aggs,
         .timings = t,
-        .group_cols = r.group_cols,
-        .group_rows = r.group_rows,
+        .output = r.output,
     };
 }
 
@@ -564,16 +574,16 @@ fn markColumns(
     meta: *const schema.FileMetaData,
     names: []const []const u8,
     set: []bool,
-    diag: ?*scan.Diag,
+    diag: ?*Diag,
 ) !void {
     if (names.len == 0) return error.EmptyColumnList;
     for (names) |name| {
         const indices = metadata.resolveProjection(arena, meta, name) catch |err| {
-            if (err == error.AmbiguousColumn) scan.Diag.setColumn(diag, name);
+            if (err == error.AmbiguousColumn) Diag.setColumn(diag, name);
             return err;
         };
         if (indices.len == 0) {
-            scan.Diag.setColumn(diag, name);
+            Diag.setColumn(diag, name);
             return error.UnknownColumn;
         }
         for (indices) |idx| if (idx < set.len) {
@@ -587,6 +597,7 @@ fn markColumns(
 const Labels = struct {
     arena: std.mem.Allocator,
     meta: *const schema.FileMetaData,
+    diag: ?*Diag,
     all: ?metadata.LeafLabels = null,
 
     fn get(self: *Labels) !metadata.LeafLabels {
@@ -601,12 +612,8 @@ const Labels = struct {
         if (leaf_idx >= all.names.len) return error.SchemaMismatch;
         return all.names[leaf_idx] orelse {
             const segments = (try metadata.leafPathSegments(self.arena, self.meta, leaf_idx)).?;
-            std.debug.print(
-                "zpq query: nested column {s} has no output name of its own:\n" ++
-                    "  a top-level column is named like it; name it with --select and AS\n",
-                .{try metadata.quotePath(self.arena, segments)},
-            );
-            return error.BadArgs;
+            Diag.setColumn(self.diag, try metadata.quotePath(self.arena, segments));
+            return error.UnlabelledColumn;
         };
     }
 
@@ -631,6 +638,107 @@ fn outputColumnNames(
         .computed => |c| c.alias,
     };
     return names;
+}
+
+/// What a write or print outputs and reads, parsed from --columns / --select / --filter against the first file's
+/// footer. Output-format restrictions, nested printing, and sink and codec choice stay with each consumer.
+const ProjectionPlan = struct {
+    /// Null without --select.
+    select_items: ?[]expr_ast.SelectItem,
+    filter: ?filter_ast.Filter,
+    /// The --columns selection; null when no --columns narrows the leaves.
+    kept_set: ?[]const bool,
+    /// The leaves kept: `kept_set`, or every leaf.
+    kept: []const bool,
+    output_specs: []const consumer.OutputCol,
+    /// Some output column is an expression or a renamed leaf rather than a leaf copied under its own name.
+    any_computed: bool,
+    /// Leaves to decode: those the output references plus the filter's.
+    fetch: []const bool,
+    labels: Labels,
+
+    /// The name each output column is printed under.
+    fn names(self: *ProjectionPlan, arena: std.mem.Allocator) ![]const []const u8 {
+        return outputColumnNames(arena, &self.labels, self.output_specs);
+    }
+};
+
+fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schema.FileMetaData) !ProjectionPlan {
+    const num_leaves = metadata.leafCount(meta0);
+
+    // --columns resolves to leaf indices; --select is mutually exclusive with it (checked by the callers).
+    var kept_set: ?[]bool = null;
+    if (args.columns) |cols_list| {
+        const set = try arena.alloc(bool, num_leaves);
+        @memset(set, false);
+        try markColumns(arena, meta0, cols_list, set, args.diag);
+        kept_set = set;
+    }
+    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
+        try expr_parser.parseSelect(arena, s, meta0, args.diag)
+    else
+        null;
+    var filter: ?filter_ast.Filter = null;
+    if (args.filter) |fs| if (fs.len > 0) {
+        filter = try filter_parser.parse(arena, fs, meta0, args.diag);
+    };
+
+    const kept = try arena.alloc(bool, num_leaves);
+    if (kept_set) |s| @memcpy(kept, s) else @memset(kept, true);
+    const fetch = try arena.alloc(bool, num_leaves);
+    @memset(fetch, false);
+
+    var labels: Labels = .{ .arena = arena, .meta = meta0, .diag = args.diag };
+    var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
+    var any_computed = false;
+    if (select_items) |items| {
+        for (items) |item| {
+            switch (item.expr) {
+                .col_ref => |c| {
+                    // The select output is flat, so a nested leaf is written under its label (its dotted path)
+                    // rather than its leaf name, which a top-level column may share.
+                    const nested_name: ?[]const u8 =
+                        if (item.alias == null) try labels.ofNested(c.col_idx) else null;
+                    if (item.alias orelse nested_name) |alias| {
+                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                        any_computed = true;
+                    } else {
+                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
+                    }
+                    if (c.col_idx < num_leaves) fetch[c.col_idx] = true;
+                },
+                else => {
+                    const alias = item.alias orelse return error.MissingOutputOrAggregate; // alias required
+                    try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                    any_computed = true;
+                    item.expr.collectColumns(fetch);
+                },
+            }
+        }
+    } else {
+        for (kept, 0..) |b, i| if (b) {
+            try output_specs.append(arena, .{ .passthrough = i });
+            fetch[i] = true;
+        };
+    }
+    if (filter) |f| {
+        var filter_cols: std.ArrayList(usize) = .empty;
+        try f.collectColumns(&filter_cols, arena);
+        for (filter_cols.items) |ci| {
+            if (ci < num_leaves) fetch[ci] = true;
+        }
+    }
+
+    return .{
+        .select_items = select_items,
+        .filter = filter,
+        .kept_set = kept_set,
+        .kept = kept,
+        .output_specs = output_specs.items,
+        .any_computed = any_computed,
+        .fetch = fetch,
+        .labels = labels,
+    };
 }
 
 /// The one codec the written column chunks share, `none_written` when there
@@ -665,7 +773,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // 2. Parse meta of every file (cheap; serial), validate schemas
     //    against meta[0].
     const t_parse_start = nowMonoNs();
-    const metas = try materializeMetas(arena, opened);
+    const metas = try materializeMetas(arena, opened, args.diag);
     const meta0 = &metas[0];
     for (metas[1..], 1..) |*m, i| {
         if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
@@ -687,82 +795,22 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     }
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
 
-    // 3. Resolve projection columns (--columns) to leaf indices.
-    var kept_set: ?[]bool = null;
-    if (args.columns) |cols_list| {
-        const set = try arena.alloc(bool, tree0.leaves.len);
-        @memset(set, false);
-        try markColumns(arena, meta0, cols_list, set, args.diag);
-        kept_set = set;
-    }
-
-    // 4. Parse --select if given. Mutually exclusive with --columns
-    //    (already checked).
-    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
-        try expr_parser.parseSelect(arena, s, meta0)
-    else
-        null;
-
-    // 5. Parse --filter against meta0.
-    var filter_opt: ?filter_ast.Filter = null;
-    if (args.filter) |fs| if (fs.len > 0) {
-        filter_opt = try filter_parser.parse(arena, fs, meta0);
-    };
+    // 3. Parse --columns / --select / --filter against meta0 into the output columns and the leaves they read.
+    const proj = try planProjection(arena, args, meta0);
+    const kept_set = proj.kept_set;
+    const kept_arr = proj.kept;
+    const fetch_arr = proj.fetch;
+    const select_items = proj.select_items;
+    const filter_opt = proj.filter;
+    const output_specs = proj.output_specs;
+    const any_computed = proj.any_computed;
+    const num_leaves = kept_arr.len;
     t.parse_ns = @intCast(nowMonoNs() - t_parse_start);
-
-    // 6. Build kept_arr + fetch_arr + output_specs (same shape as
-    //    cli/query.zig:run did — lifted).
-    const num_leaves = metadata.leafCount(meta0);
-    const kept_arr = try arena.alloc(bool, num_leaves);
-    if (kept_set) |s| @memcpy(kept_arr, s) else @memset(kept_arr, true);
-    const fetch_arr = try arena.alloc(bool, num_leaves);
-    @memset(fetch_arr, false);
-
-    var labels: Labels = .{ .arena = arena, .meta = meta0 };
-    var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
-    var any_computed = false;
-    if (select_items) |items| {
-        for (items) |item| {
-            switch (item.expr) {
-                .col_ref => |c| {
-                    // The select output is flat, so a nested leaf is written under its label (its dotted path)
-                    // rather than its leaf name, which a top-level column may share.
-                    const nested_name: ?[]const u8 =
-                        if (item.alias == null) try labels.ofNested(c.col_idx) else null;
-                    if (item.alias orelse nested_name) |alias| {
-                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
-                        any_computed = true;
-                    } else {
-                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
-                    }
-                    if (c.col_idx < num_leaves) fetch_arr[c.col_idx] = true;
-                },
-                else => {
-                    const alias = item.alias orelse return error.MissingOutputOrAggregate; // alias required
-                    try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
-                    any_computed = true;
-                    item.expr.collectColumns(fetch_arr);
-                },
-            }
-        }
-    } else {
-        for (kept_arr, 0..) |b, i| if (b) {
-            try output_specs.append(arena, .{ .passthrough = i });
-            fetch_arr[i] = true;
-        };
-    }
-    if (filter_opt) |f| {
-        var filter_cols: std.ArrayList(usize) = .empty;
-        try f.collectColumns(&filter_cols, arena);
-        for (filter_cols.items) |ci| {
-            if (ci < num_leaves) fetch_arr[ci] = true;
-        }
-    }
 
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
-    // 7. Open output sink: local fd or s3 multipart.
+    // 4. Open output sink: local fd or s3 multipart.
     const out_is_s3 = std.mem.startsWith(u8, out_path, "s3://");
     var fd_sink: FdSink = .{ .fd = 0 };
     var mp_sink: ?multipart_sink.MultipartSink = null;
@@ -815,7 +863,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         };
     }
 
-    // 8. Stream output. PAR1 magic, then per-file × per-RG
+    // 5. Stream output. PAR1 magic, then per-file × per-RG
     //    encodeRG/copyRG, then footer.
     var out_offset: u64 = 0;
     try sink.write(&PAR1);
@@ -857,7 +905,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // (Pure SELECT * / `--columns` byte-copy nested columns intact via the
     // fastpath, which never decodes.)
     if (need_encoder) {
-        for (output_specs.items) |spec| switch (spec) {
+        for (output_specs) |spec| switch (spec) {
             .passthrough => |ci| {
                 if (ci >= num_leaves or meta0.row_groups.items.len == 0) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
@@ -1012,7 +1060,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .jobs = jobs.items,
                 .filter = filter_opt,
                 .fetch_arr = fetch_arr,
-                .output_specs = output_specs.items,
+                .output_specs = output_specs,
                 .kept_set = kept_set,
                 .codec = args.codec orelse .SNAPPY,
                 .decode_options = .{ .fast_levels = args.fast_levels },
@@ -1032,13 +1080,13 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         }
     }
 
-    // 9. Build footer.
+    // 6. Build footer.
     const t_footer = nowMonoNs();
     var new_schema_items = meta0.schema;
     if (select_items != null) {
         // Build a flat schema for --select. Each output_spec produces
         // one leaf in the output. (Lifted from cli/query.zig.)
-        new_schema_items = try buildSelectSchema(arena, meta0, output_specs.items);
+        new_schema_items = try buildSelectSchema(arena, meta0, output_specs);
     } else if (kept_set) |_| {
         const kept_u32 = try arena.alloc(u32, kept_in_order.items.len);
         for (kept_in_order.items, 0..) |idx, i| kept_u32[i] = @intCast(idx);
@@ -1092,7 +1140,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     out_offset += PAR1.len;
     t.footer_ns += @intCast(nowMonoNs() - t_footer);
 
-    // 10. Close s3 multipart upload (commits the parts). Local fd
+    // 7. Close s3 multipart upload (commits the parts). Local fd
     //     closes via defer.
     if (mp_sink) |*ms| {
         try ms.close();
@@ -1234,15 +1282,15 @@ const OpenedInputs = struct {
     }
 };
 
-fn materializeMetas(arena: std.mem.Allocator, opened: OpenedInputs) ![]const schema.FileMetaData {
+fn materializeMetas(arena: std.mem.Allocator, opened: OpenedInputs, diag: ?*Diag) ![]const schema.FileMetaData {
     var metas = try arena.alloc(schema.FileMetaData, opened.inputs.len);
     for (opened.inputs, 0..) |in, i| {
         metas[i] = if (opened.meta_ready[i])
             opened.metas[i]
         else
             metadata.open(arena, in.bytes) catch |err| {
-                std.debug.print("zpq query: input file {s} is not a valid Parquet file ({s})\n", .{ in.name, @errorName(err) });
-                return error.AlreadyReported;
+                Diag.setInput(diag, in.name, err);
+                return error.NotParquet;
             };
     }
     return metas;
@@ -1311,12 +1359,12 @@ fn openInputs(
     // Local: mmap each, slice into bytes.
     for (local_indices.items) |i| {
         const m = local_fs.mapFile(paths[i]) catch |err| {
-            switch (err) {
-                error.EmptyFile => std.debug.print("zpq query: input file {s} is empty\n", .{paths[i]}),
-                error.NameTooLong => std.debug.print("zpq query: input file path {s} too long\n", .{paths[i]}),
-                else => std.debug.print("zpq query: failed to open input file {s} ({s})\n", .{ paths[i], @errorName(err) }),
-            }
-            return error.AlreadyReported;
+            Diag.setInput(args.diag, paths[i], err);
+            return switch (err) {
+                error.EmptyFile => error.EmptyFile,
+                error.NameTooLong => error.PathTooLong,
+                else => error.OpenFailed,
+            };
         };
         mmaps[i] = m;
         inputs[i] = .{ .name = paths[i], .bytes = m.bytes, .logical_size = m.bytes.len };
@@ -1378,132 +1426,11 @@ fn openInputs(
             }
         };
 
-        // Compute fetch_set from whatever args are set: aggregate,
-        // filter, columns, select. Same path for both aggregate and
-        // write modes. (Yes, this re-parses arg strings that scan
-        // and runWrite will parse again — microseconds, not worth
-        // plumbing the parsed AST through.)
-        //
-        // Default: write-mode passthrough (no aggregate, no projection)
-        // outputs every column, so every column needs to be fetched.
-        // Aggregate / --columns / --select narrow this. Filter columns
-        // are always added on top.
-        const meta0 = &specs[0].meta;
-        const num_leaves = metadata.leafCount(meta0);
-        const fetch_arr = try arena.alloc(bool, num_leaves);
-        const is_aggregate = args.aggregate != null;
-        const has_projection = args.columns != null or args.select != null;
-        if (!is_aggregate and !has_projection) {
-            @memset(fetch_arr, true);
-        } else {
-            @memset(fetch_arr, false);
-        }
-        const filter_for_plan: ?filter_ast.Filter = if (args.filter) |fs|
-            (if (fs.len > 0) try filter_parser.parse(arena, fs, meta0) else null)
-        else
-            null;
-        if (filter_for_plan) |f| {
-            var cols: std.ArrayList(usize) = .empty;
-            try f.collectColumns(&cols, arena);
-            for (cols.items) |ci| {
-                if (ci < num_leaves) fetch_arr[ci] = true;
-            }
-        }
-        // GROUP BY keys are needed bytes: without them the remote plan hits MissingChunkBytes/ShortDecode, a bug local
-        // mmap hides by handing over the whole file. The stats-drop below cannot strip them again: it is gated on
-        // `args.group_by == null`.
-        const group_cols = try arena.alloc(bool, num_leaves);
-        @memset(group_cols, false);
-        if (args.group_by) |gb| {
-            const items = try expr_parser.parseGroupBy(arena, gb, meta0);
-            for (items) |item| item.expr.collectColumns(group_cols);
-            for (group_cols, 0..) |needed, ci| if (needed) {
-                fetch_arr[ci] = true;
-            };
-        }
-        const agg_calls_for_plan: ?[]const expr_agg.AggCall = if (args.aggregate) |agg_str|
-            try expr_parser.parseAggList(arena, agg_str, meta0)
-        else
-            null;
-        if (agg_calls_for_plan) |calls| {
-            for (calls) |call| {
-                if (call.arg) |arg_expr| arg_expr.collectColumns(fetch_arr);
-                if (call.where) |w_expr| {
-                    var cols: std.ArrayList(usize) = .empty;
-                    try w_expr.collectColumns(&cols, arena);
-                    for (cols.items) |ci| {
-                        if (ci < num_leaves) fetch_arr[ci] = true;
-                    }
-                }
-            }
-        }
-        // A whole-file statistic cannot answer a per-group aggregate, so under grouping no column is stats-answerable
-        // — mirrors the gate in `scan.runMultiAggregate`. Dropping one left grouped decode without its bytes.
-        if (filter_for_plan == null and args.group_by == null and !args.scan_all) {
-            if (agg_calls_for_plan) |calls| {
-                const metas_for_stats = try arena.alloc(schema.FileMetaData, specs.len);
-                for (specs, 0..) |sp, i| metas_for_stats[i] = sp.meta;
-
-                var per_agg_cols = try arena.alloc(bool, num_leaves);
-                for (fetch_arr, 0..) |needed, ci| {
-                    if (!needed) continue;
-
-                    var prunable = true;
-                    for (calls) |call| {
-                        @memset(per_agg_cols, false);
-                        if (call.arg) |arg_expr| arg_expr.collectColumns(per_agg_cols);
-                        if (call.where) |w_expr| {
-                            var cols: std.ArrayList(usize) = .empty;
-                            try w_expr.collectColumns(&cols, arena);
-                            for (cols.items) |wci| {
-                                if (wci < num_leaves) per_agg_cols[wci] = true;
-                            }
-                        }
-                        if (!per_agg_cols[ci]) continue;
-                        if (!expr_agg.statsCoverageComplete(call, metas_for_stats, ci, args.trust_stats)) {
-                            prunable = false;
-                            break;
-                        }
-                    }
-                    if (prunable) fetch_arr[ci] = false;
-                }
-            }
-        }
-        if (args.select) |sel| {
-            const items = try expr_parser.parseSelect(arena, sel, meta0);
-            for (items) |item| item.expr.collectColumns(fetch_arr);
-        }
-        if (args.columns) |cols_list| {
-            try markColumns(arena, meta0, cols_list, fetch_arr, args.diag);
-        }
-
-        // Columns only the filter reads. Where statistics prove a row group fully matching, the aggregate scan never
-        // reads them (scan.zig makes the same pruneRowGroup call on the same footer), so they are not fetched there.
-        // Aggregates only: the write and print paths still evaluate the filter in such row groups.
-        var proven_skip: ?[]bool = null;
-        if (filter_for_plan) |f| if (!args.scan_all and (is_aggregate or args.group_by != null)) {
-            const skip = try arena.alloc(bool, num_leaves);
-            @memset(skip, false);
-            var cols: std.ArrayList(usize) = .empty;
-            try f.collectColumns(&cols, arena);
-            for (cols.items) |ci| if (ci < num_leaves) {
-                skip[ci] = true;
-            };
-            const consumed = try arena.alloc(bool, num_leaves);
-            @memcpy(consumed, group_cols);
-            if (agg_calls_for_plan) |calls| for (calls) |call| {
-                if (call.arg) |arg_expr| arg_expr.collectColumns(consumed);
-                if (call.where) |w_expr| {
-                    var wcols: std.ArrayList(usize) = .empty;
-                    try w_expr.collectColumns(&wcols, arena);
-                    for (wcols.items) |wci| if (wci < num_leaves) {
-                        consumed[wci] = true;
-                    };
-                }
-            };
-            for (skip, consumed) |*sk, c| sk.* = sk.* and !c;
-            proven_skip = skip;
-        };
+        // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
+        // — microseconds, not worth plumbing the parsed AST through.)
+        const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
+        for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
+        const plan = try planRanges(arena, args, metas_for_plan);
 
         // Per file: stat-prune RGs, collect raw byte ranges for every
         // (surviving RG) × (needed col), coalesce within the file, and
@@ -1519,27 +1446,15 @@ fn openInputs(
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
         for (specs) |*sp| {
             const meta = &sp.meta;
-            sp.survivors = try arena.alloc(bool, meta.row_groups.items.len);
-            sp.proven = try arena.alloc(bool, meta.row_groups.items.len);
-            @memset(sp.proven, false);
+            sp.rg_columns = try arena.alloc(?[]const bool, meta.row_groups.items.len);
 
             var ranges: std.ArrayList(coalescer.Range) = .empty;
-            for (meta.row_groups.items, 0..) |rg, rg_i| {
-                if (filter_for_plan) |f| if (!args.scan_all) {
-                    switch (filter_prune.pruneRowGroup(&rg, f, meta)) {
-                        .skip => {
-                            sp.survivors[rg_i] = false;
-                            continue;
-                        },
-                        .always_match => sp.proven[rg_i] = proven_skip != null,
-                        .keep, .unknown => {},
-                    }
-                };
-                sp.survivors[rg_i] = true;
-                for (fetch_arr, 0..) |needed, ci| {
+            for (meta.row_groups.items, sp.rg_columns) |*rg, *rg_cols| {
+                rg_cols.* = plan.rowGroupColumns(rg, meta);
+                const cols = rg_cols.* orelse continue;
+                for (cols, 0..) |needed, ci| {
                     if (!needed) continue;
                     if (ci >= rg.columns.items.len) continue;
-                    if (sp.proven[rg_i] and proven_skip.?[ci]) continue;
                     const cm = rg.columns.items[ci].meta_data orelse continue;
                     const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
                     const len: u64 = @intCast(cm.total_compressed_size);
@@ -1571,7 +1486,7 @@ fn openInputs(
                 compact_len += len;
             }
             sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
-            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges, sp.survivors, sp.proven, proven_skip);
+            try rebaseFetchedOffsets(&sp.meta, plan.columns(), sp.compact_ranges, sp.rg_columns);
 
             for (sp.compact_ranges) |r| {
                 const source_len: usize = @intCast(r.end - r.start);
@@ -1641,6 +1556,68 @@ fn openInputs(
     };
 }
 
+/// What the S3 planner fetches from each row group.
+const RangePlan = union(enum) {
+    /// Aggregates and GROUP BY: the very plan the scan workers follow, made from the same footers, so a chunk left
+    /// unfetched is one no worker reads.
+    aggregate: agg_plan.Plan,
+    /// Write and print evaluate the filter in every row group they keep, so a kept row group needs all of `columns`.
+    projection: struct { filter: ?filter_ast.Filter, columns: []const bool },
+
+    /// Every column some row group may fetch.
+    fn columns(self: *const RangePlan) []const bool {
+        return switch (self.*) {
+            .aggregate => |*p| p.columns.read,
+            .projection => |p| p.columns,
+        };
+    }
+
+    /// The columns to fetch from `rg`, or null when statistics prune it.
+    fn rowGroupColumns(self: *const RangePlan, rg: *const schema.RowGroup, meta: *const schema.FileMetaData) ?[]const bool {
+        switch (self.*) {
+            .aggregate => |*p| {
+                const decision = p.decide(rg, meta);
+                return if (decision == .skip) null else p.columns.forRowGroup(decision);
+            },
+            .projection => |p| {
+                if (p.filter) |f| if (filter_prune.pruneRowGroup(rg, f, meta) == .skip) return null;
+                return p.columns;
+            },
+        }
+    }
+};
+
+/// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
+fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.FileMetaData) !RangePlan {
+    const meta0 = &metas[0];
+    if (args.aggregate != null or args.group_by != null) {
+        const filter: ?filter_ast.Filter = if (args.filter) |fs|
+            (if (fs.len > 0) try filter_parser.parse(arena, fs, meta0, args.diag) else null)
+        else
+            null;
+        const group_keys: ?[]const expr_ast.Expr = if (args.group_by) |gb| blk: {
+            const items = try expr_parser.parseGroupBy(arena, gb, meta0, args.diag);
+            const keys = try arena.alloc(expr_ast.Expr, items.len);
+            for (items, keys) |item, *key| key.* = item.expr;
+            break :blk keys;
+        } else null;
+        const agg_str = args.aggregate orelse "";
+        const calls: []const expr_agg.AggCall = if (args.group_by != null and agg_str.len == 0)
+            &.{}
+        else
+            try expr_parser.parseAggList(arena, agg_str, meta0, args.diag);
+        return .{ .aggregate = try .init(arena, .{
+            .filter = filter,
+            .calls = calls,
+            .group_keys = group_keys,
+        }, metas, .fromFlags(args.scan_all, args.trust_stats)) };
+    }
+
+    // The write and print paths decode exactly these leaves.
+    const proj = try planProjection(arena, args, meta0);
+    return .{ .projection = .{ .filter = if (args.scan_all) null else proj.filter, .columns = proj.fetch } };
+}
+
 const CompactRange = struct {
     start: u64,
     end: u64,
@@ -1661,9 +1638,8 @@ const FetchSpec = struct {
     footer_offset: u64 = 0,
     total_size: u64 = 0,
     tail_start: u64 = 0,
-    survivors: []bool = &.{},
-    /// Row groups statistics prove fully matching for an aggregate; their filter-only chunks are not fetched.
-    proven: []bool = &.{},
+    /// Per row group, the columns fetched from it; null where statistics prune it.
+    rg_columns: []?[]const bool = &.{},
     err: ?anyerror = null,
 };
 
@@ -1863,14 +1839,15 @@ fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
 /// anyway fails its bounds check (MissingChunkBytes) instead of decoding whatever bytes a stale offset lands on.
 const UNFETCHED_CHUNK_OFFSET: i64 = std.math.maxInt(i64) / 4;
 
+/// Point `meta`'s chunk offsets into the compact buffer `ranges` describe. `fetched` is every column some row group
+/// fetched (`RangePlan.columns`) and `rg_columns` what each row group fetched (null where statistics pruned it).
 fn rebaseFetchedOffsets(
     meta: *schema.FileMetaData,
-    fetch_arr: []const bool,
+    fetched: []const bool,
     ranges: []const CompactRange,
-    survivors: []const bool,
-    proven: []const bool,
-    proven_skip: ?[]const bool,
+    rg_columns: []const ?[]const bool,
 ) !void {
+    std.debug.assert(rg_columns.len == meta.row_groups.items.len);
     // Page-index blocks are never fetched, so their offsets have nothing to rebase onto — yet consumers bounds-check
     // them against the compact buffer, not the file. In a noncanonical file a stale offset can land inside that buffer,
     // where unrelated bytes may decode as a ColumnIndex whose foreign min/max prune pages on read and get copied into
@@ -1884,16 +1861,16 @@ fn rebaseFetchedOffsets(
         }
     }
 
-    for (meta.row_groups.items, 0..) |*rg, rg_i| {
+    for (meta.row_groups.items, rg_columns) |*rg, rg_cols_opt| {
         // Pruned row groups contributed no fetch ranges, so their chunk
         // offsets can't be rebased — and never need to be: the scan
         // workers re-prune with the same stats predicate before touching
         // any offset in these groups.
-        if (rg_i < survivors.len and !survivors[rg_i]) continue;
-        const rg_proven = rg_i < proven.len and proven[rg_i];
+        const rg_cols = rg_cols_opt orelse continue;
         for (rg.columns.items, 0..) |*chunk, ci| {
-            if (ci >= fetch_arr.len or !fetch_arr[ci]) continue;
-            if (rg_proven and proven_skip.?[ci]) {
+            if (ci >= fetched.len or !fetched[ci]) continue;
+            // Fetched elsewhere but not in this row group: the filter-only chunk of one proven fully matching.
+            if (!rg_cols[ci]) {
                 if (chunk.meta_data) |*cm| {
                     cm.data_page_offset = UNFETCHED_CHUNK_OFFSET;
                     cm.dictionary_page_offset = null;
@@ -2466,7 +2443,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     var opened = try openInputs(ctx, arena, args);
     defer opened.deinit();
 
-    const metas = try materializeMetas(arena, opened);
+    const metas = try materializeMetas(arena, opened, args.diag);
     if (metas.len == 0) return;
     const meta0 = &metas[0];
 
@@ -2485,83 +2462,22 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
 
-    var kept_set: ?[]bool = null;
-    if (args.columns) |cols_list| {
-        const set = try arena.alloc(bool, tree0.leaves.len);
-        @memset(set, false);
-        try markColumns(arena, meta0, cols_list, set, args.diag);
-        kept_set = set;
-    }
-
-    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
-        try expr_parser.parseSelect(arena, s, meta0)
-    else
-        null;
-
-    var filter_opt: ?filter_ast.Filter = null;
-    if (args.filter) |fs| if (fs.len > 0) {
-        filter_opt = try filter_parser.parse(arena, fs, meta0);
-    };
+    var proj = try planProjection(arena, args, meta0);
+    const filter_opt = proj.filter;
+    const fetch_arr = proj.fetch;
+    const output_specs = proj.output_specs;
 
     // Check nested columns
     const list_map_cols = try arena.alloc(bool, tree0.leaves.len);
     @memset(list_map_cols, false);
     checkNestedListMap(.{ .group = tree0.root }, false, list_map_cols);
 
-    const num_leaves = metadata.leafCount(meta0);
-    const kept_arr = try arena.alloc(bool, num_leaves);
-    if (kept_set) |s| @memcpy(kept_arr, s) else @memset(kept_arr, true);
-    const fetch_arr = try arena.alloc(bool, num_leaves);
-    @memset(fetch_arr, false);
-
-    var labels: Labels = .{ .arena = arena, .meta = meta0 };
-    var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
-    var any_computed = false;
-    if (select_items) |items| {
-        for (items) |item| {
-            switch (item.expr) {
-                .col_ref => |c| {
-                    // The select output is flat, so a nested leaf is written under its label (its dotted path)
-                    // rather than its leaf name, which a top-level column may share.
-                    const nested_name: ?[]const u8 =
-                        if (item.alias == null) try labels.ofNested(c.col_idx) else null;
-                    if (item.alias orelse nested_name) |alias| {
-                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
-                        any_computed = true;
-                    } else {
-                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
-                    }
-                    if (c.col_idx < num_leaves) fetch_arr[c.col_idx] = true;
-                },
-                else => {
-                    const alias = item.alias orelse return error.MissingOutputOrAggregate;
-                    try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
-                    any_computed = true;
-                    item.expr.collectColumns(fetch_arr);
-                },
-            }
-        }
-    } else {
-        for (kept_arr, 0..) |b, i| if (b) {
-            try output_specs.append(arena, .{ .passthrough = i });
-            fetch_arr[i] = true;
-        };
-    }
-    if (filter_opt) |f| {
-        var filter_cols: std.ArrayList(usize) = .empty;
-        try f.collectColumns(&filter_cols, arena);
-        for (filter_cols.items) |ci| {
-            if (ci < num_leaves) fetch_arr[ci] = true;
-        }
-    }
-
     // Fail loud on nested LIST/MAP columns in output
-    for (output_specs.items) |spec| {
+    for (output_specs) |spec| {
         switch (spec) {
             .passthrough => |ci| {
                 if (ci < list_map_cols.len and list_map_cols[ci]) {
-                    std.debug.print("zpq query: nested LIST/MAP columns are not supported in row output yet\n", .{});
-                    return error.BadArgs;
+                    return error.NestedRowOutputNotSupported;
                 }
             },
             .computed => |comp| {
@@ -2570,20 +2486,19 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 comp.expr.collectColumns(comp_cols);
                 for (comp_cols, 0..) |referenced, ci| {
                     if (referenced and ci < list_map_cols.len and list_map_cols[ci]) {
-                        std.debug.print("zpq query: nested LIST/MAP columns are not supported in row output yet\n", .{});
-                        return error.BadArgs;
+                        return error.NestedRowOutputNotSupported;
                     }
                 }
             },
         }
     }
 
-    var agg = try consumer.initOutputAggregator(arena, meta0, output_specs.items);
+    var agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
 
     var stdout_writer = StdoutWriter{ .fd = 1 };
     defer stdout_writer.flush() catch {};
 
-    const names = try outputColumnNames(arena, &labels, output_specs.items);
+    const names = try proj.names(arena);
     const is_jsonl = (format == .jsonl);
     if (!is_jsonl) {
         for (names, 0..) |name, col_idx| {
@@ -2620,7 +2535,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 rg_src,
                 filter_opt,
                 fetch_arr,
-                output_specs.items,
+                output_specs,
                 &t.core,
                 .{ .fast_levels = args.fast_levels },
             );
@@ -2739,9 +2654,9 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
         .{ .start = 2_000_000, .end = 2_000_064, .dst_start = 64 },
     };
     const fetch_arr = [_]bool{true};
-    const survivors = [_]bool{ true, true };
+    const rg_columns = [_]?[]const bool{ &fetch_arr, &fetch_arr };
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &.{}, null);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
 
     for (meta.row_groups.items, 0..) |rg, i| {
         const chunk = rg.columns.items[0];
@@ -2785,9 +2700,9 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
 
     const ranges = [_]CompactRange{};
     const fetch_arr = [_]bool{true};
-    const survivors = [_]bool{false};
+    const rg_columns = [_]?[]const bool{null};
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &.{}, null);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
 
     const out = meta.row_groups.items[0].columns.items[0];
     try std.testing.expectEqual(@as(?i64, null), out.column_index_offset);
@@ -2822,11 +2737,10 @@ test "rebaseFetchedOffsets poisons filter-only chunks it left unfetched in prove
         .{ .start = 4_000, .end = 4_064, .dst_start = 128 },
     };
     const fetch_arr = [_]bool{ true, true };
-    const survivors = [_]bool{ true, true };
-    const proven = [_]bool{ false, true };
-    const proven_skip = [_]bool{ true, false };
+    const consumed = [_]bool{ false, true };
+    const rg_columns = [_]?[]const bool{ &fetch_arr, &consumed };
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &proven, &proven_skip);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
 
     const rg0 = meta.row_groups.items[0].columns.items;
     try std.testing.expectEqual(@as(i64, 0), rg0[0].meta_data.?.data_page_offset);
@@ -2893,4 +2807,25 @@ test "writeJsonString: escapes, and replaces invalid UTF-8 with U+FFFD per byte"
         try std.testing.expectEqualStrings(c.want, aw.written());
         try std.testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
     }
+}
+
+test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
+    // The CLI passes `--group-by` alone as an empty aggregate list. The scan accepts that; the S3 planner used to
+    // parse the empty list itself and fail with EmptyAggregate, so the same query answered locally and errored on S3.
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", std.testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer std.testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const metas = [_]schema.FileMetaData{try metadata.open(arena, bytes)};
+
+    const plan = try planRanges(arena, .{ .inputs = &.{}, .aggregate = "", .group_by = "b", .filter = "ts >= 500" }, &metas);
+    // ts (0) is filter-only; b (1) is the key.
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false, false, false }, plan.columns());
+    const rgs = metas[0].row_groups.items;
+    try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
 }

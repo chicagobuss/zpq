@@ -179,6 +179,24 @@ pub const SelectItem = struct {
     alias: ?[]const u8,
 };
 
+/// One output column as a select list writes it, before binding: the expression's text and its `AS` alias. GROUP BY
+/// binding matches the text against key and aggregate names, so it is never parsed into an `Expr`; keeping the alias
+/// apart means no layer has to find it again in the text.
+pub const SelectColumn = struct {
+    expr: []const u8,
+    alias: ?[]const u8 = null,
+
+    /// `name` or `expr AS name`, as a `--column-order` entry spells it. Splits at the last ` AS `.
+    pub fn parse(text: []const u8) SelectColumn {
+        const clean = std.mem.trim(u8, text, " ");
+        const as_idx = std.mem.lastIndexOf(u8, clean, " AS ") orelse return .{ .expr = clean };
+        return .{
+            .expr = std.mem.trim(u8, clean[0..as_idx], " "),
+            .alias = std.mem.trim(u8, clean[as_idx + 4 ..], " "),
+        };
+    }
+};
+
 // ============================================================
 // Tests
 // ============================================================

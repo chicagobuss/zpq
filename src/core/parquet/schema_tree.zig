@@ -111,10 +111,6 @@ pub const SchemaTree = struct {
     /// All leaves in column-chunk order. `leaves[i]` is the
     /// PrimitiveNode for column chunk `i` in any row group.
     leaves: []const PrimitiveNode,
-    /// Joined-path → leaf-index map. Keys use `.` as the separator
-    /// and are arena-owned. Lookup is O(1). Distinct paths can join to
-    /// one key; see `recordLeafPath` for which leaf it then names.
-    path_to_leaf: std.StringHashMapUnmanaged(u32),
     /// Captures whether the source thrift had `repetition_type = null`
     /// or some explicit value on the root element. Round-trip lossless.
     root_source_repetition: ?schema.FieldRepetitionType = null,
@@ -157,7 +153,6 @@ pub const SchemaTree = struct {
                 .kind = .struct_,
             },
             .leaves = try b.leaves.toOwnedSlice(arena),
-            .path_to_leaf = b.path_to_leaf,
         };
 
         if (b.pos != flat.len) return error.TruncatedFlat;
@@ -192,7 +187,6 @@ pub const SchemaTree = struct {
             .keep_mask = keep_mask,
             .next_column_index = 0,
             .leaves_out = .empty,
-            .path_to_leaf_out = .{},
             .path_stack = .empty,
         };
         defer pp.path_stack.deinit(arena);
@@ -209,7 +203,6 @@ pub const SchemaTree = struct {
                 .kind = .struct_,
             },
             .leaves = try pp.leaves_out.toOwnedSlice(arena),
-            .path_to_leaf = pp.path_to_leaf_out,
         };
     }
 
@@ -257,7 +250,8 @@ const Builder = struct {
     flat: []const schema.SchemaElement,
     pos: usize = 0,
     leaves: std.ArrayList(PrimitiveNode) = .empty,
-    path_to_leaf: std.StringHashMapUnmanaged(u32) = .{},
+    /// `.`-joined path of every leaf so far, to find a duplicate without comparing every pair.
+    joined_paths: std.StringHashMapUnmanaged(void) = .empty,
     /// Active path during DFS; `path_stack.items` is a snapshot of
     /// the path from root down to the current cursor.
     path_stack: std.ArrayList([]const u8) = .empty,
@@ -318,7 +312,7 @@ const Builder = struct {
                 .max_rep = here_rep,
             };
             try self.leaves.append(self.arena, leaf);
-            try recordLeafPath(self.arena, &self.path_to_leaf, self.leaves.items, column_index);
+            try checkLeafPath(self.arena, &self.joined_paths, self.leaves.items, column_index);
 
             return .{ .primitive = leaf };
         }
@@ -355,54 +349,25 @@ fn classifyGroupKind(
     return .struct_;
 }
 
-/// `path_to_leaf` value for a joined key that names no single leaf.
-const ambiguous_path: u32 = std.math.maxInt(u32);
-
-/// Record `leaves[idx]` in `map` under its `.`-joined path. Distinct paths can join to the same key: a top-level
-/// column named `a.b` and the field `b` of a group `a` both join to `a.b`. As in `metadata.resolveColumn`, the key
-/// then names the top-level column, or no leaf (`ambiguous_path`) when none of them is one. Only identical paths,
-/// segment for segment, are duplicate fields.
-fn recordLeafPath(
+/// Reject `leaves[idx]` if an earlier leaf has its path, segment for segment: a duplicate field. `seen` holds the
+/// `.`-joined paths so far. Distinct paths can join alike (a top-level column `a.b` and the field `b` of a group `a`),
+/// so only a joined collision, which is rare, costs a rescan.
+fn checkLeafPath(
     arena: std.mem.Allocator,
-    map: *std.StringHashMapUnmanaged(u32),
+    seen: *std.StringHashMapUnmanaged(void),
     leaves: []const PrimitiveNode,
     idx: u32,
 ) Error!void {
     const path = leaves[idx].path;
-    const joined = try joinPath(arena, path);
-    const gop = try map.getOrPut(arena, joined);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = idx;
-        return;
-    }
-    // Rare: rescan every leaf so far that joins to this key.
-    var top: ?u32 = null;
-    for (leaves[0 .. idx + 1], 0..) |l, i| {
-        if (!joinsTo(l.path, joined)) continue;
-        if (i != idx and pathsEql(l.path, path)) return error.DuplicatePath;
-        if (l.path.len == 1) top = @intCast(i); // at most one: two would be identical paths
-    }
-    gop.value_ptr.* = top orelse ambiguous_path;
+    const gop = try seen.getOrPut(arena, try joinPath(arena, path));
+    if (!gop.found_existing) return;
+    for (leaves[0..idx]) |l| if (pathsEql(l.path, path)) return error.DuplicatePath;
 }
 
 fn pathsEql(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
     return true;
-}
-
-/// Whether `parts` joined with `.` spell exactly `key`.
-fn joinsTo(parts: []const []const u8, key: []const u8) bool {
-    var rest = key;
-    for (parts, 0..) |p, i| {
-        if (i > 0) {
-            if (rest.len == 0 or rest[0] != '.') return false;
-            rest = rest[1..];
-        }
-        if (!std.mem.startsWith(u8, rest, p)) return false;
-        rest = rest[p.len..];
-    }
-    return rest.len == 0;
 }
 
 fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) Error![]const u8 {
@@ -432,7 +397,6 @@ const Projector = struct {
     keep_mask: []const bool,
     next_column_index: u32,
     leaves_out: std.ArrayList(PrimitiveNode),
-    path_to_leaf_out: std.StringHashMapUnmanaged(u32),
     path_stack: std.ArrayList([]const u8),
 
     fn projectChildren(self: *Projector, children: []const Node) Error![]const Node {
@@ -459,8 +423,8 @@ const Projector = struct {
                 var new_leaf = p;
                 new_leaf.path = path_copy;
                 new_leaf.column_index = new_idx;
+                // A subset of a built tree's leaves, so no path repeats.
                 try self.leaves_out.append(self.arena, new_leaf);
-                try recordLeafPath(self.arena, &self.path_to_leaf_out, self.leaves_out.items, new_idx);
 
                 return .{ .primitive = new_leaf };
             },
@@ -678,22 +642,20 @@ test "leaf paths that join to the same dotted name" {
         }
     };
 
-    // A top-level `a.b` beside a group `a` with a field `b`: both are columns, and `a.b` names the top-level one
-    // (as `metadata.resolveColumn` binds it) in either schema order.
+    // A top-level `a.b` beside a group `a` with a field `b`: both are columns, in either schema order.
     for ([_][]const schema.SchemaElement{
         &.{ E.root(2), E.leaf("a.b"), E.group("a", 1), E.leaf("b") },
         &.{ E.root(2), E.group("a", 1), E.leaf("b"), E.leaf("a.b") },
-    }, [_]u32{ 0, 1 }) |flat, top| {
+    }) |flat| {
         const tree = try SchemaTree.build(arena, flat);
         try testing.expectEqual(@as(usize, 2), tree.leaves.len);
-        try testing.expectEqual(top, tree.path_to_leaf.get("a.b").?);
         const kept = try tree.projectSubset(arena, &.{ 0, 1 });
-        try testing.expectEqual(top, kept.path_to_leaf.get("a.b").?);
+        try testing.expectEqual(@as(usize, 2), kept.leaves.len);
     }
 
-    // Two nested leaves that join alike name neither.
+    // So are two nested leaves that join alike.
     const nested = try SchemaTree.build(arena, &.{ E.root(2), E.group("x", 1), E.leaf("y.z"), E.group("x.y", 1), E.leaf("z") });
-    try testing.expectEqual(ambiguous_path, nested.path_to_leaf.get("x.y.z").?);
+    try testing.expectEqual(@as(usize, 2), nested.leaves.len);
 
     // The same path twice is still a duplicate field.
     try testing.expectError(error.DuplicatePath, SchemaTree.build(arena, &.{ E.root(2), E.leaf("k"), E.leaf("k") }));

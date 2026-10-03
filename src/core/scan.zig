@@ -483,7 +483,11 @@ pub fn runMultiAggregate(
         if (m.schema.items.len != meta0.schema.items.len)
             return error.SchemaMismatch;
         for (m.schema.items, meta0.schema.items) |a_elem, b_elem| {
-            if (!std.ascii.eqlIgnoreCase(a_elem.name, b_elem.name)) {
+            // Columns are bound by leaf index against file 0, so the nesting must match too: the same names in the
+            // same order can still put a leaf under a group in one file and at the top level in another.
+            if (!std.ascii.eqlIgnoreCase(a_elem.name, b_elem.name) or
+                (a_elem.num_children orelse 0) != (b_elem.num_children orelse 0))
+            {
                 std.debug.print(
                     "schema mismatch: file 0 ({s}) vs file {d} ({s}): '{s}' vs '{s}'\n",
                     .{ args.inputs[0].name, i, args.inputs[i].name, b_elem.name, a_elem.name },
@@ -858,7 +862,7 @@ pub fn runMultiAggregate(
         const col_sources = try gpa.alloc(ColSource, select_cols.len);
         defer gpa.free(col_sources);
         for (select_cols, col_sources) |col_name, *src| {
-            src.* = try resolveOutputColumn(group_by_items.?, agg_calls, meta0, col_name, args.diag);
+            src.* = try resolveOutputColumn(arena, group_by_items.?, agg_calls, meta0, col_name, args.diag);
         }
 
         var key_types = try gpa.alloc(KeyType, keys.len);
@@ -876,7 +880,7 @@ pub fn runMultiAggregate(
                     .f64 => .f64,
                     .string => .string,
                 },
-                .source = if (keys[k_idx] == .col_ref) leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx).* else null,
+                .source = if (keys[k_idx] == .col_ref) leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx) else null,
             },
             .agg => |a_idx| .{
                 .nullable = agg_calls[a_idx].func != .count,
@@ -1040,7 +1044,7 @@ fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
     if (arg != .col_ref) return null;
-    return leafSchemaElem(meta, arg.col_ref.col_idx).*;
+    return leafSchemaElem(meta, arg.col_ref.col_idx);
 }
 
 /// Merge an accumulator while transferring ownership of any string winner
@@ -1085,10 +1089,10 @@ fn freeOwnedAccumulatorStrings(
 /// `u64` frames exactly like `i64`; only the reported value differs, read as the unsigned column it came from.
 const KeyType = enum { i64, u64, f64, string };
 
-fn groupKeyLabel(item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
+fn groupKeyLabel(arena: std.mem.Allocator, item: expr_ast.SelectItem, meta: *const schema.FileMetaData) Error![]const u8 {
     if (item.alias) |a| return a;
     switch (item.expr) {
-        .col_ref => |ref| return leafSchemaElem(meta, ref.col_idx).name,
+        .col_ref => |ref| return leafLabel(arena, meta, ref.col_idx),
         else => return error.GroupKeyAliasRequired,
     }
 }
@@ -1124,7 +1128,7 @@ fn resolveGroupSelectCols(
     const owned = try arena.alloc([]const u8, group_items.len + agg_calls.len);
     var idx: usize = 0;
     for (group_items) |item| {
-        owned[idx] = try arena.dupe(u8, try groupKeyLabel(item, meta));
+        owned[idx] = try arena.dupe(u8, try groupKeyLabel(arena, item, meta));
         idx += 1;
     }
     for (agg_calls) |call| {
@@ -1156,8 +1160,8 @@ fn nameUnaliasedAggs(
             if (i != j and std.ascii.eqlIgnoreCase(call.alias, other.alias)) t.* = true;
         }
         for (group_items orelse &.{}) |item| {
-            const label = try groupKeyLabel(item, meta);
-            const source = if (item.expr == .col_ref) leafSchemaElem(meta, item.expr.col_ref.col_idx).name else label;
+            const label = try groupKeyLabel(arena, item, meta);
+            const source = if (item.expr == .col_ref) try leafLabel(arena, meta, item.expr.col_ref.col_idx) else label;
             if (std.ascii.eqlIgnoreCase(call.alias, label) or std.ascii.eqlIgnoreCase(call.alias, source)) t.* = true;
         }
     }
@@ -1194,15 +1198,17 @@ fn checkGroupOutputNames(
             Diag.setColumn(args.diag, name);
             return error.DuplicateOutputColumn;
         };
-        _ = try resolveOutputColumn(group_items, agg_calls, meta, col, args.diag);
+        _ = try resolveOutputColumn(arena, group_items, agg_calls, meta, col, args.diag);
     }
     return cols;
 }
 
 /// Which GROUP BY key or aggregate an output column names. A key matches by its output label or, for a bare column
-/// key, its source column name; an aggregate by its alias. A name matching both is an error rather than a guess:
-/// with `--group-by 's AS k'` and `... AS s`, the key used to win and `s` silently showed the key's values.
+/// key, its source column path (`r.key` for a nested leaf); an aggregate by its alias. A name matching both is an
+/// error rather than a guess: with `--group-by 's AS k'` and `... AS s`, the key used to win and `s` silently showed
+/// the key's values.
 fn resolveOutputColumn(
+    arena: std.mem.Allocator,
     group_items: []const expr_ast.SelectItem,
     agg_calls: []const expr_agg.AggCall,
     meta: *const schema.FileMetaData,
@@ -1213,8 +1219,8 @@ fn resolveOutputColumn(
     const alias_name = selectColumnName(col_name);
     var key: ?usize = null;
     for (group_items, 0..) |item, k_idx| {
-        const label = try groupKeyLabel(item, meta);
-        const source = if (item.expr == .col_ref) leafSchemaElem(meta, item.expr.col_ref.col_idx).name else label;
+        const label = try groupKeyLabel(arena, item, meta);
+        const source = if (item.expr == .col_ref) try leafLabel(arena, meta, item.expr.col_ref.col_idx) else label;
         if (std.ascii.eqlIgnoreCase(expr_name, label) or std.ascii.eqlIgnoreCase(alias_name, label) or
             std.ascii.eqlIgnoreCase(expr_name, source) or std.ascii.eqlIgnoreCase(alias_name, source))
         {
@@ -1249,7 +1255,7 @@ fn resolveOutputColumn(
 ///
 /// Must agree with the lane `evalGroupKeyExpr` produces and `expr_agg.serializeRowKey` then writes: i32 and i64 both
 /// serialize as an 8-byte i64, f32 and f64 as an 8-byte f64, so these three cover every column variant.
-/// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafSchemaElem`).
+/// Deliberately does NOT consult the Parquet schema — a leaf index does not address it (see `leafLabel`).
 /// An unsigned 64-bit column rides the i64 lane as raw bits, so a bare one is read back as `u64`: as `i64`, values of
 /// 2^63 and up came out negative.
 fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
@@ -1261,22 +1267,24 @@ fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
     };
 }
 
-/// The schema element for the `leaf_idx`-th primitive column.
+/// The output column name for the `leaf_idx`-th primitive column: its dot-joined path, so a nested leaf (`r.key`)
+/// is not labelled like a top-level column that shares its leaf name (`key`).
 ///
 /// `col_idx` counts LEAVES, but `meta.schema` is a flattened DFS including group nodes, so `leaf_idx + 1` is correct
 /// only for files with no nested types. Used for output column NAMES; key framing must not depend on it.
-fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) *const schema.SchemaElement {
-    var seen: usize = 0;
-    // Element 0 is the root, which is always a group.
-    for (meta.schema.items[1..]) |*elem| {
-        const is_leaf = elem.num_children == null or elem.num_children.? == 0;
-        if (!is_leaf) continue;
-        if (seen == leaf_idx) return elem;
-        seen += 1;
-    }
+fn leafLabel(arena: std.mem.Allocator, meta: *const schema.FileMetaData, leaf_idx: usize) Error![]const u8 {
     // Callers resolved `leaf_idx` from this same schema. Falling back to
-    // the last element would just print the wrong column name.
-    std.debug.panic("leaf_idx {d} not in schema ({d} leaves)", .{ leaf_idx, seen });
+    // another element would just print the wrong column name.
+    return (try metadata.leafPath(arena, meta, leaf_idx)) orelse
+        std.debug.panic("leaf_idx {d} not in schema", .{leaf_idx});
+}
+
+/// The schema element for the `leaf_idx`-th primitive column, for the type an output column carries over from its
+/// source. Names come from `leafLabel`; key framing must not depend on this.
+fn leafSchemaElem(meta: *const schema.FileMetaData, leaf_idx: usize) schema.SchemaElement {
+    // Callers resolved `leaf_idx` from this same schema.
+    return metadata.leafSchemaElement(meta, leaf_idx) orelse
+        std.debug.panic("leaf_idx {d} not in schema", .{leaf_idx});
 }
 
 fn selectColumnName(col_name: []const u8) []const u8 {
@@ -1806,7 +1814,7 @@ test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns 
 // ============================================================ Group-key framing.
 //
 // Leaf-indexed framing read the wrong schema element for every column after the first nested one (see
-// `leafSchemaElem`). The fixture puts a MAP ahead of ordinary scalars to reproduce that shape.
+// `leafLabel`). The fixture puts a MAP ahead of ordinary scalars to reproduce that shape.
 // ============================================================
 
 const nested_key_fixture = "ci/fixtures/parquet/nested_key_shape.parquet";
@@ -2619,4 +2627,140 @@ test "unaliased aggregates keep the function name unless it clashes, then take t
             for (c.want, res.aggs) |w, g| try testing.expectEqualStrings(w, g.alias);
         }
     }
+}
+
+test "page index: null pages a footer contradicts do not drop rows" {
+    // These files flag every page of their two REQUIRED columns all-null in the ColumnIndex, while every page holds
+    // values. Pruning on that claim answered 0 for filters every other row satisfies.
+    const files = [_][]const u8{
+        "data/parquet-testing/data/datapage_v1-snappy-compressed-checksum.parquet",
+        "data/parquet-testing/data/datapage_v1-uncompressed-checksum.parquet",
+        "data/parquet-testing/data/datapage_v1-corrupt-checksum.parquet",
+    };
+    const Query = struct { filter: []const u8, want: i128 };
+    const queries = [_]Query{
+        .{ .filter = "a > -66052", .want = 2560 },
+        .{ .filter = "a IS NOT NULL", .want = 5120 },
+        .{ .filter = "b < 0 OR b >= 0", .want = 5120 },
+    };
+    for (files) |fixture| {
+        const bytes = metadata.readFileSlice(fixture, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{fixture});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = fixture, .bytes = bytes }};
+        for (queries) |q| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .filter = q.filter,
+                .aggregate = "count(*) AS n",
+                .parallelism = 1,
+            });
+            defer {
+                for (res.aggs) |a| testing.allocator.free(a.alias);
+                testing.allocator.free(res.aggs);
+            }
+            testing.expectEqual(q.want, res.aggs[0].value.i) catch |err| {
+                std.debug.print("{s}: filter {s}\n", .{ fixture, q.filter });
+                return err;
+            };
+        }
+    }
+}
+
+test "runMultiAggregate: inputs whose nesting differs are a schema mismatch" {
+    // Columns bind by leaf index against file 0. Here file 1 has the same element names in the same order, but
+    // `name` is a top-level column rather than a field of `r`, so leaf 1 means different columns in the two files.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const m0 = try metadata.sharedLeafNameMetaForTest(a);
+    var m1 = try metadata.sharedLeafNameMetaForTest(a);
+    m1.schema.items[0].num_children = 6;
+    m1.schema.items[1].num_children = 1;
+
+    const inputs = [_]Input{ .{ .name = "f0", .bytes = "" }, .{ .name = "f1", .bytes = "" } };
+    const metas = [_]schema.FileMetaData{ m0, m1 };
+    try testing.expectError(error.SchemaMismatch, runMultiAggregate(testing.allocator, a, .{
+        .inputs = &inputs,
+        .metas = &metas,
+        .aggregate = "sum(key) AS s",
+        .parallelism = 1,
+    }));
+}
+
+// ============================================================ All-null pages.
+//
+// The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/gen_null_pages_fixture.py). A
+// null check proves such a page always-match; its rows must still read as null wherever the filter is evaluated.
+// ============================================================
+
+const null_pages_fixture = "ci/fixtures/parquet/null_pages.parquet";
+
+test "all-null pages: null checks and their combinations answer like --scan-all" {
+    const bytes = metadata.readFileSlice(null_pages_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{null_pages_fixture});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = null_pages_fixture, .bytes = bytes }};
+
+    const Q = struct { filter: []const u8, aggregate: []const u8 = "count(*) AS n, sum(id) AS si", group_by: ?[]const u8 = null };
+    const queries = [_]Q{
+        .{ .filter = "v IS NULL" },
+        .{ .filter = "v IS NOT NULL" },
+        .{ .filter = "NOT v IS NULL" },
+        .{ .filter = "NOT v IS NOT NULL" },
+        .{ .filter = "s.b IS NULL" },
+        .{ .filter = "s.b IS NOT NULL" },
+        .{ .filter = "s.a IS NULL" },
+        .{ .filter = "v IS NULL AND id >= 700" },
+        .{ .filter = "id >= 700 AND v IS NULL" },
+        .{ .filter = "s.b IS NULL AND id < 1500" },
+        .{ .filter = "v IS NULL OR v > 1500" },
+        .{ .filter = "v IS NOT NULL AND v > 1200" },
+        .{ .filter = "v IS NULL", .aggregate = "count(*) AS n, count(v) AS c, sum(v) AS s, min(v) AS mn, max(v) AS mx" },
+        .{ .filter = "v IS NOT NULL", .aggregate = "count(v) AS c, sum(v) AS s, min(v) AS mn, max(v) AS mx" },
+        .{ .filter = "s.b IS NULL", .aggregate = "count(s.b) AS c, count(s.a) AS ca, sum(s.a) AS sa" },
+        .{ .filter = "v IS NULL", .aggregate = "count(*) AS n", .group_by = "v" },
+        .{ .filter = "v IS NOT NULL AND v < 50", .aggregate = "count(*) AS n", .group_by = "v" },
+    };
+    for ([_]bool{ false, true }) |trust_stats| for (queries) |q| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .filter = q.filter,
+            .aggregate = q.aggregate,
+            .group_by = q.group_by,
+            .parallelism = 1,
+            .trust_stats = trust_stats,
+        };
+        var oracle_args = args;
+        oracle_args.scan_all = true;
+        const oracle = try runMultiAggregate(testing.allocator, arena_state.allocator(), oracle_args);
+        defer freeGroupResult(oracle);
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), args);
+        defer freeGroupResult(got);
+        expectSameAnswer(oracle, got) catch |err| {
+            std.debug.print("all-null pages: filter={s} agg={s} trust_stats={} disagrees with --scan-all\n", .{
+                q.filter, q.aggregate, trust_stats,
+            });
+            return err;
+        };
+        // Hand-known counts, so agreement is not agreement on a shared mistake.
+        if (q.group_by == null and std.mem.eql(u8, q.aggregate, "count(*) AS n, sum(id) AS si")) {
+            const want: ?i128 = if (std.mem.eql(u8, q.filter, "v IS NULL")) 650 else if (std.mem.eql(u8, q.filter, "s.b IS NULL")) 997 else null;
+            if (want) |w| try testing.expectEqual(w, got.aggs[0].value.i);
+        }
+    };
 }

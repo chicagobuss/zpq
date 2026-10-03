@@ -46,6 +46,11 @@ const usage_text =
     \\  zpq schema <file.parquet>
     \\  zpq conform <file.parquet>
     \\
+    \\  --codec        output codec. Without it, re-encoded output is snappy
+    \\                 and a plain copy keeps each chunk's codec; with it, a
+    \\                 plain copy recompresses chunks stored in another one.
+    \\                 The summary's "codec" is the one every written chunk
+    \\                 uses, or "MIXED" when a copy keeps several.
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
     \\                 (row-group pruning, stats-as-answer). Slower but
     \\                 thorough — use when you don't trust a file's stats.
@@ -131,7 +136,9 @@ pub fn main(init: std.process.Init) !void {
                 error.UnexpectedChar => std.debug.print("zpq query: unexpected character in expression\n", .{}),
                 error.UnexpectedEnd => std.debug.print("zpq query: unexpected end of expression\n", .{}),
                 error.BadNumber => std.debug.print("zpq query: invalid number in expression\n", .{}),
+                error.UnsupportedCodec => std.debug.print("zpq query: input uses a compression codec zpq cannot decompress\n", .{}),
                 error.UnknownColumn => std.debug.print("zpq query: unknown column referenced in expression\n", .{}),
+                error.AmbiguousColumn => std.debug.print("zpq query: ambiguous column name\n", .{}),
                 error.UnsupportedColumnType => std.debug.print("zpq query: unsupported column type\n", .{}),
                 error.UnterminatedString => std.debug.print("zpq query: unterminated string literal in expression\n", .{}),
                 error.TypeMismatch => std.debug.print("zpq query: type mismatch in expression\n", .{}),
@@ -206,7 +213,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var select: ?[]const u8 = null;
     var aggregate: ?[]const u8 = null;
     var query: ?[]const u8 = null;
-    var codec: schema.CompressionCodec = .SNAPPY;
+    var codec: ?schema.CompressionCodec = null;
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
@@ -611,7 +618,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
         \\
     , .{
-        @tagName(codec),
+        if (result.codec) |c| @tagName(c) else "MIXED",
         result.rows_in,
         result.rows_kept,
         result.bytes_in,

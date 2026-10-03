@@ -55,6 +55,11 @@ losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled int
 DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes currently omit them and
 readers fall back to row-group pruning.
 
+`--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
+codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names
+the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one
+(for example, inputs written with different codecs).
+
 **Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
 produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
 

@@ -29,6 +29,8 @@ pub const Error = error{
     UnexpectedEnd,
     BadNumber,
     UnknownColumn,
+    /// A bare name with no top-level match names leaves in several groups.
+    AmbiguousColumn,
     UnsupportedColumnType,
     UnterminatedString,
     TypeMismatch,
@@ -184,6 +186,11 @@ const Lexer = struct {
         if (isIdentStart(c)) {
             const start = self.pos;
             while (self.pos < self.src.len and isIdentCont(self.src[self.pos])) self.pos += 1;
+            // A dotted path (`r.key`) names a nested leaf: one identifier.
+            while (self.pos + 1 < self.src.len and self.src[self.pos] == '.' and isIdentStart(self.src[self.pos + 1])) {
+                self.pos += 1;
+                while (self.pos < self.src.len and isIdentCont(self.src[self.pos])) self.pos += 1;
+            }
             return .{ .kind = .ident, .text = self.src[start..self.pos] };
         }
         return error.UnexpectedChar;
@@ -380,8 +387,13 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                 _ = try lex.next(); // consume '('
                 return parseCall(arena, lex, file, tk.text);
             }
-            const col_idx = metadata.findColumnIndex(file, tk.text) orelse return error.UnknownColumn;
-            const elem = file.getColumnSchema(&[_][]const u8{tk.text}) orelse return error.UnknownColumn;
+            const col_idx = metadata.resolveColumn(file, tk.text) catch |err| {
+                if (err == error.AmbiguousColumn) {
+                    std.debug.print("expression: column `{s}` is ambiguous: {s}\n", .{ tk.text, metadata.ambiguityHint(file, tk.text) });
+                }
+                return err;
+            };
+            const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
             const phys = elem.type orelse return error.UnsupportedColumnType;
             // DECIMAL columns are decoded to f64 by the consumer
             // (see core/parquet/decimal.zig) regardless of their
@@ -1053,4 +1065,30 @@ test "parse: a UINT64 column may stand alone but is refused as an operand" {
     }
     try testing.expectError(error.Unsigned64Operand, parseAggList(a, "sum(u + 1) AS s", &file));
     try testing.expectError(error.Unsigned64Operand, parseGroupBy(a, "u * 2 AS k", &file));
+}
+
+test "parse: bare names bind top-level columns, dotted paths nested leaves" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try metadata.sharedLeafNameMetaForTest(a);
+
+    const aggs = try parseAggList(a, "sum(key) AS s, sum(r.key) AS t, count(*) FILTER (WHERE key > 1005) AS n", &file);
+    try testing.expectEqual(@as(usize, 2), aggs[0].arg.?.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 0), aggs[1].arg.?.col_ref.col_idx);
+
+    const sel = try parseSelect(a, "key + r.key AS both, \"r.name\" AS n", &file);
+    try testing.expectEqual(@as(usize, 2), sel[0].expr.binop.left.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 0), sel[0].expr.binop.right.col_ref.col_idx);
+    try testing.expectEqual(ast.Type.str, sel[1].expr.typeOf());
+
+    const keys = try parseGroupBy(a, "key, r.key", &file);
+    try testing.expectEqual(@as(usize, 2), keys[0].expr.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 0), keys[1].expr.col_ref.col_idx);
+
+    try testing.expectError(error.AmbiguousColumn, parseExprOnly(a, "x", &file));
+    try testing.expectError(error.AmbiguousColumn, parseAggList(a, "sum(x) AS s", &file));
+    try testing.expectEqual(@as(usize, 5), (try parseExprOnly(a, "b.x", &file)).col_ref.col_idx);
+    // A dot that does not continue an identifier is still an error, not part of the name.
+    try testing.expectError(error.UnexpectedChar, parseExprOnly(a, "key.", &file));
 }

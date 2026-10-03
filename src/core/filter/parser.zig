@@ -23,6 +23,8 @@ const decimal_mod = @import("../parquet/decimal.zig");
 pub const Error = error{
     EmptyExpr,
     UnknownColumn,
+    /// A bare name with no top-level match names leaves in several groups.
+    AmbiguousColumn,
     BadOperator,
     BadValue,
     UnsupportedType,
@@ -133,9 +135,16 @@ fn unquoteIdent(name: []const u8) []const u8 {
     return t;
 }
 
-/// Resolve a (possibly double-quoted) column name to its leaf index.
-fn resolveCol(file: *const schema.FileMetaData, name: []const u8) ?usize {
-    return metadata.findColumnIndex(file, unquoteIdent(name));
+/// Resolve a (possibly double-quoted) column name to its leaf index. See
+/// `metadata.resolveColumn` for how bare and dotted names bind.
+fn resolveCol(file: *const schema.FileMetaData, name: []const u8) Error!usize {
+    const ident = unquoteIdent(name);
+    return metadata.resolveColumn(file, ident) catch |err| {
+        if (err == error.AmbiguousColumn) {
+            std.debug.print("filter: column `{s}` is ambiguous: {s}\n", .{ ident, metadata.ambiguityHint(file, ident) });
+        }
+        return err;
+    };
 }
 
 fn parseLeaf(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData) Error!ast.Filter {
@@ -196,7 +205,7 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData) Error!?
     }
     const col_name = std.mem.trim(u8, col_part, " ");
     if (col_name.len == 0) return error.BadOperator;
-    const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
+    const col_idx = try resolveCol(file, col_name);
     return ast.Filter{ .null_check = .{ .col_idx = col_idx, .is_not = is_not } };
 }
 
@@ -208,8 +217,8 @@ fn parseLike(col_part: []const u8, pat_part: []const u8, negate: bool, file: *co
     const col_name = std.mem.trim(u8, col_part, " ");
     if (col_name.len == 0) return error.BadOperator;
     const pattern = stripStringQuotes(std.mem.trim(u8, pat_part, " "));
-    const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
-    const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
+    const col_idx = try resolveCol(file, col_name);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
         std.debug.print("filter: LIKE applies only to string columns (got {s} for `{s}`)\n", .{ @tagName(elem.type orelse .BYTE_ARRAY), col_name });
         return error.UnsupportedType;
@@ -261,8 +270,8 @@ fn parseInList(arena: std.mem.Allocator, expr: []const u8, inc: InClause, file: 
     vals = std.mem.trim(u8, vals[1 .. vals.len - 1], " ");
     if (vals.len == 0) return error.BadValue; // empty list
 
-    const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
-    const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
+    const col_idx = try resolveCol(file, col_name);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
 
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
@@ -331,8 +340,8 @@ fn parseBetween(arena: std.mem.Allocator, expr: []const u8, file: *const schema.
     const y_str = std.mem.trim(u8, expr[after_between + and_at + " AND ".len ..], " ");
     if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
 
-    const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
-    const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
+    const col_idx = try resolveCol(file, col_name);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
 
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
     // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
@@ -395,8 +404,8 @@ fn parseComparisonLeaf(arena: std.mem.Allocator, expr: []const u8, file: *const 
     const val_str = std.mem.trim(u8, expr[found_at + found_len ..], " ");
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
 
-    const col_idx = resolveCol(file, col_name) orelse return error.UnknownColumn;
-    const elem = file.getColumnSchema(&[_][]const u8{unquoteIdent(col_name)}) orelse return error.UnknownColumn;
+    const col_idx = try resolveCol(file, col_name);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     return try buildTypedComparison(col_idx, &elem, op, val_str);
 }
 
@@ -1261,4 +1270,29 @@ test "parse unsigned literals: in-range compares as u64, out-of-range folds to a
         try testing.expectEqual(if (c.holds) ast.Operator.GtEq else ast.Operator.Lt, f.uint64.op);
     }
     try testing.expectError(error.BadValue, parse(a, "u = 1.5", &fm));
+}
+
+test "parse binds a bare name to the top-level column, not a nested leaf sharing it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const meta = try metadata.sharedLeafNameMetaForTest(a);
+
+    const top = try parse(a, "key > 1005", &meta);
+    try testing.expect(top == .int64);
+    try testing.expectEqual(@as(usize, 2), top.int64.col_idx);
+    const nested = try parse(a, "r.key = 5", &meta);
+    try testing.expectEqual(@as(usize, 0), nested.int64.col_idx);
+    const quoted = try parse(a, "\"r.key\" BETWEEN 1 AND 9", &meta);
+    try testing.expectEqual(@as(usize, 0), quoted.and_filter.left.int64.col_idx);
+    const like = try parse(a, "r.name LIKE 'a%'", &meta);
+    try testing.expectEqual(@as(usize, 1), like.like.col_idx);
+    const in_list = try parse(a, "key IN (1005, 1006)", &meta);
+    try testing.expectEqual(@as(usize, 2), in_list.or_filter.left.int64.col_idx);
+    const nc = try parse(a, "key IS NOT NULL", &meta);
+    try testing.expectEqual(@as(usize, 2), nc.null_check.col_idx);
+
+    try testing.expectError(error.AmbiguousColumn, parse(a, "x = 1", &meta));
+    try testing.expectError(error.AmbiguousColumn, parse(a, "x IS NULL", &meta));
+    try testing.expectEqual(@as(usize, 4), (try parse(a, "a.x = 1", &meta)).int32.col_idx);
 }

@@ -167,18 +167,19 @@ fn handle(
             try input_urls.append(allocator, owned);
         }
 
-        // Output codec: "snappy" (default), "zstd", "gzip", "lz4"/"lz4_raw",
-        // or "uncompressed" — parity with the CLI's --codec. Anything else is
-        // treated as snappy with no error (strict validation can come with the
+        // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw", or
+        // "uncompressed" — parity with the CLI's --codec. Absent, re-encoded
+        // output is snappy and byte copies keep the source codec. Anything else
+        // is treated as snappy with no error (strict validation can come with the
         // API-versioning work).
         const codec_str = extractField(trimmed, "output_codec") catch null;
-        const output_codec: schema.CompressionCodec = if (codec_str) |s| blk: {
+        const output_codec: ?schema.CompressionCodec = if (codec_str) |s| blk: {
             if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;
             if (std.ascii.eqlIgnoreCase(s, "uncompressed")) break :blk .UNCOMPRESSED;
             if (std.ascii.eqlIgnoreCase(s, "gzip")) break :blk .GZIP;
             if (std.ascii.eqlIgnoreCase(s, "lz4") or std.ascii.eqlIgnoreCase(s, "lz4_raw")) break :blk .LZ4_RAW;
             break :blk .SNAPPY;
-        } else .SNAPPY;
+        } else null;
 
         // columns: JSON array → engine's list form. (extractStringArray
         // joins to CSV for the lambda API; split it back to a slice list.)

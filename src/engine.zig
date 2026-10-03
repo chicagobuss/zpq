@@ -124,7 +124,9 @@ pub const QueryArgs = struct {
     column_order: ?[]const u8 = null,
     /// Receives the column name behind an aggregate output-naming error.
     diag: ?*scan.Diag = null,
-    codec: schema.CompressionCodec = .SNAPPY,
+    /// Requested output codec. Null when none was asked for: re-encoded
+    /// output is then SNAPPY and byte copies keep each chunk's own codec.
+    codec: ?schema.CompressionCodec = null,
     parallelism: usize = 0,
     /// `--scan-all`: disable every stats shortcut (row-group pruning,
     /// stats-driven column drop, aggregate stat short-circuit) and decode
@@ -180,6 +182,9 @@ pub const QueryResult = union(enum) {
 };
 
 pub const WriteResult = struct {
+    /// The codec every written column chunk uses; null when they differ (a
+    /// byte copy, with no codec requested, of inputs stored in several).
+    codec: ?schema.CompressionCodec,
     files_in: usize,
     rows_in: i64,
     rows_kept: i64,
@@ -297,9 +302,9 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         }
         const t_footer = nowMonoNs();
         bytes_out = if (r.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, r.group_cols.?, r.group_col_types.?, rows, args.codec)
+            try writeGroupedParquet(arena, out_path, r.group_cols.?, r.group_col_types.?, rows, args.codec orelse .SNAPPY)
         else
-            try writeOneRowParquet(arena, out_path, r.agg_calls, r.accumulators, r.agg_sources, args.codec);
+            try writeOneRowParquet(arena, out_path, r.agg_calls, r.accumulators, r.agg_sources, args.codec orelse .SNAPPY);
         t.footer_ns += @intCast(nowMonoNs() - t_footer);
     }
 
@@ -427,7 +432,7 @@ fn copyRGToBuffer(
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
     var timings: consumer.Timings = .{};
-    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings, false);
+    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings, false, null);
     const owned = try buf.toOwnedSlice(gpa);
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
 }
@@ -550,6 +555,27 @@ fn keptColumnsUseCodec(rg: *const schema.RowGroup, kept: []const bool, codec: sc
     return true;
 }
 
+/// The dotted path of a nested leaf, or null for a top-level column — whose
+/// path is its own name, dots in that name included.
+fn nestedLeafPath(arena: std.mem.Allocator, meta: *const schema.FileMetaData, leaf_idx: usize) !?[]const u8 {
+    const path = (try metadata.leafPath(arena, meta, leaf_idx)) orelse return null;
+    const elem = metadata.leafSchemaElement(meta, leaf_idx) orelse return null;
+    return if (std.mem.eql(u8, path, elem.name)) null else path;
+}
+
+/// The one codec the written column chunks share, `none_written` when there
+/// are none, or null when they differ.
+fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCodec) ?schema.CompressionCodec {
+    var seen: ?schema.CompressionCodec = null;
+    for (rgs) |rg| for (rg.columns.items) |chunk| {
+        const md = chunk.meta_data orelse continue;
+        if (seen) |c| {
+            if (c != md.codec) return null;
+        } else seen = md.codec;
+    };
+    return seen orelse none_written;
+}
+
 fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
@@ -580,6 +606,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             // footer that lies about the copied bytes, or a wrong union access on
             // re-encode.
             if (!std.ascii.eqlIgnoreCase(a_e.name, b_e.name)) return error.SchemaMismatch;
+            if ((a_e.num_children orelse 0) != (b_e.num_children orelse 0)) return error.SchemaMismatch;
             if (a_e.type != b_e.type) return error.SchemaMismatch;
             if (a_e.repetition_type != b_e.repetition_type) return error.SchemaMismatch;
             if (a_e.converted_type != b_e.converted_type) return error.SchemaMismatch;
@@ -630,7 +657,10 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         for (items) |item| {
             switch (item.expr) {
                 .col_ref => |c| {
-                    if (item.alias) |alias| {
+                    // The select output is flat, so a nested leaf is written under its dotted path rather than
+                    // its leaf name, which a top-level column may share.
+                    const nested_name: ?[]const u8 = if (item.alias == null) try nestedLeafPath(arena, meta0, c.col_idx) else null;
+                    if (item.alias orelse nested_name) |alias| {
                         try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
                         any_computed = true;
                     } else {
@@ -679,6 +709,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         ms.deinit();
     };
 
+    // A failed write must not leave a truncated local file that looks like output.
+    var remove_on_error = false;
+    errdefer if (remove_on_error) removeFile(out_path);
     if (out_is_s3) {
         const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
         const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
@@ -707,6 +740,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         };
     } else {
         fd_sink.fd = try createFile(out_path);
+        remove_on_error = true;
         sink_owns_fd = true;
         sink = .{
             .ctx = @ptrCast(&fd_sink),
@@ -780,7 +814,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 
     if (!need_encoder) {
         // Byte-copy fastpath: copy kept column chunks verbatim (serial;
-        // memcpy-bound and already faster than every other engine).
+        // memcpy-bound and already faster than every other engine). A chunk
+        // stored in another codec than the one requested is recompressed.
+        const recompress: ?consumer.Recompress = if (args.codec) |c| .{ .codec = c, .scratch = ctx.gpa } else null;
         for (opened.inputs, metas) |in, meta_i| {
             bytes_in += in.bytes.len;
             const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
@@ -797,6 +833,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     &out_offset,
                     &t.core,
                     true,
+                    recompress,
                 ) else try consumer.copyRG(
                     arena,
                     src_rg,
@@ -806,6 +843,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     &out_offset,
                     &t.core,
                     true,
+                    recompress,
                 );
                 if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
                 rows_kept += out.surviving_rows;
@@ -858,7 +896,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     // matches every kept column (else re-encode to honor it).
                     // ...and only when its bounds are in the TYPE_DEFINED_ORDER the re-encoded row groups declare.
                     if (bytecopy_ok and d == .always_match and
-                        keptColumnsUseCodec(src_rg, kept_arr, args.codec) and
+                        keptColumnsUseCodec(src_rg, kept_arr, args.codec orelse .SNAPPY) and
                         meta_p.keptLeavesTypeDefined(kept_arr))
                         passthrough = true;
                 };
@@ -909,7 +947,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .fetch_arr = fetch_arr,
                 .output_specs = output_specs.items,
                 .kept_set = kept_set,
-                .codec = args.codec,
+                .codec = args.codec orelse .SNAPPY,
                 .decode_options = .{ .fast_levels = args.fast_levels },
                 .slots = slots,
                 .window = &window_sem,
@@ -997,6 +1035,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     }
 
     return .{
+        .codec = writtenCodec(new_row_groups.items, args.codec orelse .SNAPPY),
         .files_in = opened.inputs.len,
         .rows_in = rows_in,
         .rows_kept = rows_kept,
@@ -1899,6 +1938,7 @@ fn writeOneRowParquet(
 ) !u64 {
     const fd = try createFile(out_path);
     defer _ = std.os.linux.close(fd);
+    errdefer removeFile(out_path);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
 
@@ -2070,6 +2110,16 @@ const FdSink = struct {
         self.written += bytes.len;
     }
 };
+
+/// Best-effort unlink of a partly written output; `createFile` already
+/// accepted the path, so it fits.
+fn removeFile(path: []const u8) void {
+    var path_z: [4096]u8 = undefined;
+    if (path.len + 1 > path_z.len) return;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    _ = std.os.linux.unlinkat(std.os.linux.AT.FDCWD, @ptrCast(&path_z[0]), 0);
+}
 
 fn createFile(path: []const u8) !std.os.linux.fd_t {
     const linux = std.os.linux;
@@ -2454,6 +2504,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
         if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
         for (m.schema.items, meta0.schema.items) |a_e, b_e| {
             if (!std.ascii.eqlIgnoreCase(a_e.name, b_e.name)) return error.SchemaMismatch;
+            if ((a_e.num_children orelse 0) != (b_e.num_children orelse 0)) return error.SchemaMismatch;
             if (a_e.type != b_e.type) return error.SchemaMismatch;
             if (a_e.repetition_type != b_e.repetition_type) return error.SchemaMismatch;
             if (a_e.converted_type != b_e.converted_type) return error.SchemaMismatch;
@@ -2502,7 +2553,10 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
         for (items) |item| {
             switch (item.expr) {
                 .col_ref => |c| {
-                    if (item.alias) |alias| {
+                    // The select output is flat, so a nested leaf is written under its dotted path rather than
+                    // its leaf name, which a top-level column may share.
+                    const nested_name: ?[]const u8 = if (item.alias == null) try nestedLeafPath(arena, meta0, c.col_idx) else null;
+                    if (item.alias orelse nested_name) |alias| {
                         try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
                         any_computed = true;
                     } else {

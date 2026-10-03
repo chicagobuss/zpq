@@ -15,9 +15,9 @@
 //!     <bit-packed mini-blocks>
 //!
 //! Per-block min_delta is subtracted from each delta before bit-packing,
-//! so all bit-packed values are non-negative. Mini-blocks are separately
-//! bit-aligned — the bit accumulator is reset at each mini-block
-//! boundary.
+//! so all bit-packed values are non-negative. Each mini-block holds a
+//! whole number of 32-value groups, so every mini-block and every group
+//! starts on a byte boundary.
 //!
 //! The first value lives in the header and is emitted directly. Each
 //! subsequent value is `prev + delta`, where `delta` is unpacked from
@@ -48,6 +48,15 @@ pub fn Decoder(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// Values per bit-packed group. The spec makes every miniblock a whole number of these, and 32
+        /// values of `bw` bits are exactly 4*bw bytes, so every group starts byte-aligned and can be
+        /// unpacked with fixed shifts.
+        const GROUP: u32 = 32;
+        const max_bw: u8 = @bitSizeOf(asUnsigned(T));
+        /// Stack copy for a group too close to the end of `bytes` to read wide from: the group itself
+        /// plus the 16-byte window `paddedGroup` reads at its last value.
+        const PAD_BYTES: usize = 4 * @as(usize, max_bw) + 16;
+
         bytes: []const u8,
         pos: usize,
 
@@ -59,6 +68,7 @@ pub fn Decoder(comptime T: type) type {
 
         // Running state
         prev_value: T,
+        /// Values taken off the stream, including any still parked in `ahead`.
         values_emitted: u64,
         first_emitted: bool,
 
@@ -66,6 +76,7 @@ pub fn Decoder(comptime T: type) type {
         block_min_delta: T,
         mini_block_bit_widths: [MAX_MINI_BLOCKS]u8,
         current_mini_block: u32,
+        /// Values consumed from the current mini-block; always a multiple of GROUP.
         mini_block_pos: u32,
         /// Byte offset where the current block's bit-packed data
         /// starts (right after the bit_widths header bytes). Used by
@@ -76,14 +87,11 @@ pub fn Decoder(comptime T: type) type {
         /// value of the last block.
         block_data_start: usize,
 
-        // Bit accumulator for the current mini-block. Must be u128, not u64:
-        // unpacking a `bw`-bit value can transiently need up to `bw-1 + 8` bits
-        // staged (we refill a byte at a time until `bits_in_buffer >= bw`). For
-        // bw 59..64 that exceeds 64, so a u64 buffer silently dropped the high
-        // bits of the last byte loaded — and bw==64 also did an illegal
-        // shift-by-64 in the mask/consume. u128 has the headroom for bw≤64.
-        bit_buffer: u128,
-        bits_in_buffer: u8,
+        /// One group decoded ahead for callers whose `dest` ends mid-group; drained before the stream
+        /// is touched again, so the group loop only ever sees whole groups.
+        ahead: [GROUP]T,
+        ahead_pos: u8,
+        ahead_len: u8,
 
         pub fn init(encoded: []const u8) Error!Self {
             var s = Self{
@@ -101,8 +109,9 @@ pub fn Decoder(comptime T: type) type {
                 .current_mini_block = MAX_MINI_BLOCKS, // forces a block read on first decode
                 .mini_block_pos = 0,
                 .block_data_start = 0,
-                .bit_buffer = 0,
-                .bits_in_buffer = 0,
+                .ahead = undefined,
+                .ahead_pos = 0,
+                .ahead_len = 0,
             };
 
             s.block_size = try s.readUVarint();
@@ -114,6 +123,9 @@ pub fn Decoder(comptime T: type) type {
             if (s.num_mini_blocks > MAX_MINI_BLOCKS) return error.TooManyMiniBlocks;
             if (s.block_size == 0 or s.block_size % s.num_mini_blocks != 0) return error.InvalidHeader;
             s.mini_block_size = s.block_size / s.num_mini_blocks;
+            // Spec requirement, and what lets decode work in byte-aligned 32-value groups. Arrow
+            // rejects the same headers.
+            if (s.mini_block_size % GROUP != 0) return error.InvalidHeader;
 
             // current_mini_block starts at num_mini_blocks so the first
             // decode() call reads block 0 lazily. (Avoids reading a
@@ -123,10 +135,26 @@ pub fn Decoder(comptime T: type) type {
             return s;
         }
 
-        fn unpack32(comptime bw: u8, dest: []T, src: []const u8, min_delta: T, prev_val: *T) void {
+        /// Bytes past a group's start that `unpack32(bw)` may read: the last value's byte offset
+        /// plus one 8-byte (or, above 57 bits, 16-byte) load.
+        fn readSpan(comptime bw: u8) usize {
+            if (bw == 0) return 0;
+            return (31 * @as(usize, bw)) / 8 + @as(usize, if (bw <= 57) 8 else 16);
+        }
+
+        /// Unpack one 32-value group and run the prefix sum through it. `src` must hold
+        /// `readSpan(bw)` bytes.
+        inline fn unpack32(comptime bw: u8, dest: *[GROUP]T, src: []const u8, min_delta: T, prev_in: T) T {
+            var prev = prev_in;
+            if (bw == 0) {
+                inline for (0..GROUP) |k| {
+                    prev +%= min_delta;
+                    dest[k] = prev;
+                }
+                return prev;
+            }
             const mask = comptime if (bw == 64) std.math.maxInt(u64) else (@as(u64, 1) << bw) - 1;
-            var prev = prev_val.*;
-            inline for (0..32) |k| {
+            inline for (0..GROUP) |k| {
                 const start_bit: usize = k * bw;
                 const byte_off = start_bit / 8;
                 const bit_off: u6 = @intCast(start_bit % 8);
@@ -141,14 +169,67 @@ pub fn Decoder(comptime T: type) type {
                 prev +%= delta;
                 dest[k] = prev;
             }
-            prev_val.* = prev;
+            return prev;
         }
 
-        fn unpack32Dispatch(bw: u8, dest: []T, src: []const u8, min_delta: T, prev_val: *T) void {
-            switch (bw) {
-                inline 1...64 => |b| unpack32(b, dest, src, min_delta, prev_val),
-                else => unreachable,
+        /// Decode up to `groups` whole groups straight from `bytes` into `dest`, stopping at the
+        /// first group whose wide reads would run past the end of `bytes`. Returns groups decoded.
+        fn fastGroups(self: *Self, comptime bw: u8, dest: []T, groups: usize) usize {
+            const group_bytes: usize = 4 * @as(usize, bw);
+            const span = comptime readSpan(bw);
+            var pos = self.pos;
+            const n: usize = if (bw == 0)
+                groups
+            else if (self.bytes.len >= pos + span)
+                @min(groups, (self.bytes.len - pos - span) / group_bytes + 1)
+            else
+                0;
+            // Locals, not fields: through `self` the compiler must assume `dest` stores alias them.
+            const md = self.block_min_delta;
+            var prev = self.prev_value;
+            var g: usize = 0;
+            while (g < n) : (g += 1) {
+                prev = unpack32(bw, dest[g * GROUP ..][0..GROUP], self.bytes[pos..], md, prev);
+                pos += group_bytes;
             }
+            self.prev_value = prev;
+            self.pos = pos;
+            return n;
+        }
+
+        /// One copy of the unrolled group loop per bit width, shared by both call sites in decode.
+        noinline fn fastGroupsDispatch(self: *Self, bw: u8, dest: []T, groups: usize) usize {
+            return switch (bw) {
+                inline 0...max_bw => |b| self.fastGroups(b, dest, groups),
+                else => unreachable,
+            };
+        }
+
+        /// Decode one group whose bytes end too close to the end of `bytes` for `fastGroups`, via a
+        /// zero-padded copy. Only `count` values need to be backed by real bytes: the writer pads the
+        /// final miniblock, but a stream cut short after its last real value still decodes. Runs at
+        /// most a couple of times per page, so `bw` stays a runtime value rather than adding another
+        /// unrolled copy per width to the binary.
+        fn paddedGroup(self: *Self, bw: u8, dest: *[GROUP]T, count: usize) Error!void {
+            const group_bytes: usize = 4 * @as(usize, bw);
+            const avail = self.bytes.len - self.pos;
+            if (avail < (count * bw + 7) / 8) return error.UnexpectedEndOfStream;
+            const n = @min(avail, group_bytes);
+            var buf: [PAD_BYTES]u8 = @splat(0);
+            @memcpy(buf[0..n], self.bytes[self.pos..][0..n]);
+
+            const mask: u64 = if (bw == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bw)) - 1;
+            const md = self.block_min_delta;
+            var prev = self.prev_value;
+            for (dest, 0..) |*d, k| {
+                const bit = k * bw;
+                const word = readLe(u128, buf[bit / 8 ..][0..16]);
+                const raw: u64 = @as(u64, @truncate(word >> @intCast(bit % 8))) & mask;
+                prev +%= @as(T, @bitCast(@as(asUnsigned(T), @truncate(raw)))) +% md;
+                d.* = prev;
+            }
+            self.prev_value = prev;
+            self.pos += n;
         }
 
         pub fn decode(self: *Self, dest: []T) Error!usize {
@@ -164,88 +245,51 @@ pub fn Decoder(comptime T: type) type {
                 self.first_emitted = true;
             }
 
-            while (written < dest.len and self.values_emitted < self.total_value_count) {
-                // Time to read a new block?
+            while (written < dest.len) {
+                if (self.ahead_pos < self.ahead_len) {
+                    const n = @min(self.ahead_len - self.ahead_pos, dest.len - written);
+                    @memcpy(dest[written..][0..n], self.ahead[self.ahead_pos..][0..n]);
+                    self.ahead_pos += @intCast(n);
+                    written += n;
+                    continue;
+                }
+                if (self.values_emitted >= self.total_value_count) break;
+
                 if (self.current_mini_block >= self.num_mini_blocks) {
                     try self.readNextBlock();
                 }
 
                 const bw = self.mini_block_bit_widths[self.current_mini_block];
-                const want = dest.len - written;
-                const max_in_minilock = self.mini_block_size - self.mini_block_pos;
-                const max_total = self.total_value_count - self.values_emitted;
-                const take = @min(@min(want, max_in_minilock), max_total);
+                const left: u64 = self.total_value_count - self.values_emitted;
+                const groups_in_mini_block: usize = (self.mini_block_size - self.mini_block_pos) / GROUP;
+                const whole: usize = @min(groups_in_mini_block, @min(dest.len - written, left) / GROUP);
 
-                if (self.mini_block_size == 32 and take == 32 and self.mini_block_pos == 0) {
-                    if (bw == 0) {
-                        var prev = self.prev_value;
-                        for (0..32) |k| {
-                            prev +%= self.block_min_delta;
-                            dest[written + k] = prev;
-                        }
-                        self.prev_value = prev;
-
-                        written += 32;
-                        self.values_emitted += 32;
-                        self.current_mini_block += 1;
-                        self.mini_block_pos = 0;
-                        self.bit_buffer = 0;
-                        self.bits_in_buffer = 0;
-                        continue;
-                    } else {
-                        const needed_bytes = 4 * @as(usize, bw);
-                        const safety_margin: usize = if (bw <= 57) 8 else 16;
-                        if (self.pos + needed_bytes + safety_margin <= self.bytes.len) {
-                            unpack32Dispatch(
-                                bw,
-                                dest[written..][0..32],
-                                self.bytes[self.pos..],
-                                self.block_min_delta,
-                                &self.prev_value,
-                            );
-                            self.pos += needed_bytes;
-
-                            written += 32;
-                            self.values_emitted += 32;
-                            self.current_mini_block += 1;
-                            self.mini_block_pos = 0;
-                            self.bit_buffer = 0;
-                            self.bits_in_buffer = 0;
-                            continue;
-                        }
+                var done: usize = 0;
+                if (whole > 0) {
+                    done = self.fastGroupsDispatch(bw, dest[written..][0 .. whole * GROUP], whole);
+                    if (done == 0) {
+                        try self.paddedGroup(bw, dest[written..][0..GROUP], GROUP);
+                        done = 1;
                     }
+                    written += done * GROUP;
+                    self.values_emitted += done * GROUP;
+                } else {
+                    // `dest` or the stream ends inside this group: decode it whole into `ahead`.
+                    const count: usize = @intCast(@min(GROUP, left));
+                    if (count < GROUP or self.fastGroupsDispatch(bw, &self.ahead, 1) == 0) {
+                        try self.paddedGroup(bw, &self.ahead, count);
+                    }
+                    done = 1;
+                    self.ahead_pos = 0;
+                    self.ahead_len = @intCast(count);
+                    self.values_emitted += count;
                 }
 
-                var i: usize = 0;
-                while (i < take) : (i += 1) {
-                    while (self.bits_in_buffer < bw) {
-                        if (self.pos >= self.bytes.len) return error.UnexpectedEndOfStream;
-                        self.bit_buffer |= @as(u128, self.bytes[self.pos]) << @intCast(self.bits_in_buffer);
-                        self.bits_in_buffer += 8;
-                        self.pos += 1;
-                    }
-                    const mask: u128 = if (bw == 0) 0 else (@as(u128, 1) << @intCast(bw)) - 1;
-                    const raw = self.bit_buffer & mask;
-                    self.bit_buffer >>= @intCast(bw);
-                    self.bits_in_buffer -= bw;
-
-                    const delta: T = @as(T, @bitCast(@as(asUnsigned(T), @truncate(raw)))) +% self.block_min_delta;
-                    self.prev_value +%= delta;
-                    dest[written + i] = self.prev_value;
-                }
-
-                written += take;
-                self.values_emitted += take;
-                self.mini_block_pos += @intCast(take);
-
+                // Per spec, mini-blocks are byte-aligned — bytes from the previous one don't carry.
+                self.mini_block_pos += @intCast(done * GROUP);
                 if (self.mini_block_pos >= self.mini_block_size) {
-                    // Advance to the next mini-block. Per spec, the
-                    // bit accumulator is reset at mini-block boundaries
-                    // — bytes from the previous mini-block don't carry.
                     self.current_mini_block += 1;
                     self.mini_block_pos = 0;
-                    self.bit_buffer = 0;
-                    self.bits_in_buffer = 0;
                 }
             }
 
@@ -267,15 +311,13 @@ pub fn Decoder(comptime T: type) type {
             var i: u32 = 0;
             while (i < self.num_mini_blocks) : (i += 1) {
                 const bw = self.bytes[self.pos];
-                if (bw > @bitSizeOf(asUnsigned(T))) return error.InvalidHeader;
+                if (bw > max_bw) return error.InvalidHeader;
                 self.mini_block_bit_widths[i] = bw;
                 self.pos += 1;
             }
             self.block_data_start = self.pos;
             self.current_mini_block = 0;
             self.mini_block_pos = 0;
-            self.bit_buffer = 0;
-            self.bits_in_buffer = 0;
         }
 
         /// Advance `pos` to the end of the current block's bit-packed
@@ -296,8 +338,7 @@ pub fn Decoder(comptime T: type) type {
             // miniblocks is exactly how far we'd walked: every fully-consumed
             // miniblock plus the partial one we stopped inside.
             //
-            // mini_block_size is divisible by 8 (block_size is a multiple of
-            // 128, num_mini_blocks divides it), so `mini_block_size * bw / 8`
+            // mini_block_size is a multiple of 32 (checked in init), so `mini_block_size * bw / 8`
             // is exact. Each emitted miniblock is full-width (the writer pads
             // values within it), so the partial one still counts full bytes.
             const emitted_mini_blocks: u32 =
@@ -308,10 +349,9 @@ pub fn Decoder(comptime T: type) type {
                 total_bytes += @as(usize, self.mini_block_size) *
                     self.mini_block_bit_widths[i] / 8;
             }
-            self.pos = self.block_data_start + total_bytes;
+            // Clamped: paddedGroup accepts a final miniblock cut short after its last real value.
+            self.pos = @min(self.block_data_start + total_bytes, self.bytes.len);
             self.current_mini_block = self.num_mini_blocks;
-            self.bit_buffer = 0;
-            self.bits_in_buffer = 0;
         }
 
         fn readUVarint(self: *Self) Error!u32 {
@@ -322,15 +362,15 @@ pub fn Decoder(comptime T: type) type {
 
         fn readUVarintLong(self: *Self) Error!u64 {
             var result: u64 = 0;
-            var shift: u6 = 0;
+            var shift: u7 = 0;
             while (true) {
+                if (shift >= 64) return error.VarintOverflow;
                 if (self.pos >= self.bytes.len) return error.UnexpectedEndOfStream;
                 const b = self.bytes[self.pos];
                 self.pos += 1;
-                result |= @as(u64, b & 0x7f) << shift;
+                result |= @as(u64, b & 0x7f) << @intCast(shift);
                 if ((b & 0x80) == 0) return result;
                 shift += 7;
-                if (shift >= 64) return error.VarintOverflow;
             }
         }
 
@@ -625,4 +665,155 @@ test "partial decode preserves state across calls" {
         got += n;
     }
     try testing.expectEqual(values.len, got);
+}
+
+/// Fill `out` with a sequence whose deltas need roughly `bits` bits (0 = arithmetic progression).
+fn fillPattern(comptime T: type, out: []T, bits: u7, seed0: u64) void {
+    var seed: u64 = seed0 | 1;
+    var v: T = @truncate(@as(i64, @bitCast(seed)));
+    for (out) |*o| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        const step: T = if (bits == 0)
+            -3
+        else if (bits >= @bitSizeOf(T))
+            @bitCast(@as(@Int(.unsigned, @bitSizeOf(T)), @truncate(seed)))
+        else
+            @intCast(@as(u64, seed) & ((@as(u64, 1) << @intCast(bits)) - 1));
+        v +%= step;
+        o.* = v;
+    }
+}
+
+/// Decode `enc` handing the decoder `take`-sized slices (cycling through `takes`) and compare.
+fn expectDecodes(comptime T: type, enc: []const u8, want: []const T, takes: []const usize) !void {
+    var dec = try Decoder(T).init(enc);
+    const out = try testing.allocator.alloc(T, want.len + 64);
+    defer testing.allocator.free(out);
+    var got: usize = 0;
+    var t: usize = 0;
+    while (true) : (t += 1) {
+        const take = @min(takes[t % takes.len], out.len - got);
+        const n = try dec.decode(out[got..][0..take]);
+        if (n == 0 and take > 0) break;
+        got += n;
+    }
+    try testing.expectEqual(want.len, got);
+    try testing.expectEqualSlices(T, want, out[0..got]);
+    // The decoder leaves `pos` at the stream end, which chained streams depend on.
+    try testing.expectEqual(enc.len, dec.pos);
+}
+
+test "miniblock sizes 32/64/128/256 x odd counts x bit widths x take patterns" {
+    const layouts = [_][2]u32{ .{ 128, 4 }, .{ 128, 2 }, .{ 256, 2 }, .{ 256, 1 }, .{ 1024, 4 }, .{ 2048, 16 } };
+    const counts = [_]usize{ 1, 2, 31, 32, 33, 65, 129, 257, 1000, 4097 };
+    const takes = [_][]const usize{
+        &.{100000}, &.{1},        &.{ 3, 7 }, &.{31},
+        &.{32},     &.{ 33, 95 }, &.{1000},   &.{ 1, 255, 64, 17 },
+    };
+    inline for (.{ i32, i64 }) |T| {
+        const bit_choices = [_]u7{ 0, 1, 5, 13, 31, 32, 40, 57, 58, 63, 64 };
+        for (bit_choices) |bits| {
+            if (bits > @bitSizeOf(T)) continue;
+            for (layouts) |lay| for (counts) |count| {
+                const values = try testing.allocator.alloc(T, count);
+                defer testing.allocator.free(values);
+                fillPattern(T, values, bits, count *% 0x9E37 +% bits);
+                const enc = try encode(T, testing.allocator, values, lay[0], lay[1]);
+                defer testing.allocator.free(enc);
+                for (takes) |tk| try expectDecodes(T, enc, values, tk);
+            };
+        }
+    }
+}
+
+test "bw=0 miniblocks across every miniblock size" {
+    inline for (.{ i32, i64 }) |T| {
+        for ([_][2]u32{ .{ 128, 4 }, .{ 128, 2 }, .{ 256, 2 }, .{ 256, 1 } }) |lay| {
+            var values: [777]T = undefined;
+            for (&values, 0..) |*v, i| v.* = 5 - 3 * @as(T, @intCast(i));
+            const enc = try encode(T, testing.allocator, &values, lay[0], lay[1]);
+            defer testing.allocator.free(enc);
+            // Header (4 varints) then per block: min_delta + width bytes, no data bytes.
+            try testing.expect(enc.len < 64);
+            try expectDecodes(T, enc, &values, &.{ 7, 100000 });
+        }
+    }
+}
+
+test "bw=64 i64 at miniblock size 256" {
+    var values: [600]i64 = undefined;
+    fillPattern(i64, &values, 64, 42);
+    const enc = try encode(i64, testing.allocator, &values, 256, 1);
+    defer testing.allocator.free(enc);
+    var probe = try Decoder(i64).init(enc);
+    var two: [2]i64 = undefined;
+    _ = try probe.decode(&two);
+    try testing.expectEqual(@as(u8, 64), probe.mini_block_bit_widths[0]);
+    try expectDecodes(i64, enc, &values, &.{100000});
+    try expectDecodes(i64, enc, &values, &.{ 5, 31, 33 });
+}
+
+test "i32 deltas wrap around" {
+    // Full-range i32 values: deltas overflow i32 and must wrap mod 2^32, exactly as the writer did.
+    var values: [513]i32 = undefined;
+    for (&values, 0..) |*v, i| {
+        const k: i32 = @intCast(i);
+        v.* = if (i % 2 == 0) std.math.maxInt(i32) - k else std.math.minInt(i32) + k;
+    }
+    for ([_][2]u32{ .{ 128, 4 }, .{ 128, 2 }, .{ 256, 1 } }) |lay| {
+        const enc = try encode(i32, testing.allocator, &values, lay[0], lay[1]);
+        defer testing.allocator.free(enc);
+        try expectDecodes(i32, enc, &values, &.{100000});
+        try expectDecodes(i32, enc, &values, &.{ 1, 30, 70 });
+    }
+}
+
+test "stream cut short after the last value's bytes still decodes; cut further errors" {
+    // 40 values = first + 39 deltas: one 256-value miniblock of which only 39 are real.
+    var values: [40]i64 = undefined;
+    fillPattern(i64, &values, 13, 7);
+    const enc = try encode(i64, testing.allocator, &values, 256, 1);
+    defer testing.allocator.free(enc);
+    const full_mb = 256 * 13 / 8;
+    const needed = (39 * 13 + 7) / 8;
+    const trimmed = enc[0 .. enc.len - full_mb + needed];
+
+    var dec = try Decoder(i64).init(trimmed);
+    var out: [64]i64 = undefined;
+    try testing.expectEqual(@as(usize, 40), try dec.decode(&out));
+    try testing.expectEqualSlices(i64, &values, out[0..40]);
+    try testing.expectEqual(trimmed.len, dec.pos);
+
+    var short = try Decoder(i64).init(trimmed[0 .. trimmed.len - 1]);
+    try testing.expectError(error.UnexpectedEndOfStream, short.decode(&out));
+}
+
+test "pos lands at end of stream when followed by more bytes" {
+    var values: [300]i32 = undefined;
+    fillPattern(i32, &values, 9, 3);
+    const enc = try encode(i32, testing.allocator, &values, 256, 2);
+    defer testing.allocator.free(enc);
+    const tail: [40]u8 = @splat(0xAB);
+    const chained = try std.mem.concat(testing.allocator, u8, &.{ enc, &tail });
+    defer testing.allocator.free(chained);
+    var dec = try Decoder(i32).init(chained);
+    var out: [300]i32 = undefined;
+    try testing.expectEqual(@as(usize, 300), try dec.decode(&out));
+    try testing.expectEqualSlices(i32, &values, &out);
+    try testing.expectEqual(enc.len, dec.pos);
+}
+
+test "miniblock size not a multiple of 32 is rejected" {
+    var values: [10]i32 = undefined;
+    fillPattern(i32, &values, 4, 1);
+    const enc = try encode(i32, testing.allocator, &values, 128, 8); // 16-value miniblocks
+    defer testing.allocator.free(enc);
+    try testing.expectError(error.InvalidHeader, Decoder(i32).init(enc));
+}
+
+test "overlong header varint is rejected, not overflowed" {
+    const enc = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+    try testing.expectError(error.VarintOverflow, Decoder(i64).init(&enc));
 }

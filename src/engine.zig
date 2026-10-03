@@ -956,7 +956,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 rows_in += src_rg.num_rows;
                 var passthrough = false;
                 if (filter_opt) |f| if (!args.scan_all) {
-                    const d = try filter_prune.pruneRowGroup(src_rg, f, arena, meta_p);
+                    const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
                     if (d == .skip) continue;
                     // Byte-copy preserves the source codec, so it may only stand
                     // in for a re-encode when the requested --codec already
@@ -1193,8 +1193,7 @@ fn buildSelectSchema(
     for (specs) |spec| {
         switch (spec) {
             .passthrough => |ci| {
-                const path = try metadata.leafPathSegments(arena, meta, ci) orelse return error.SchemaMismatch;
-                const elem = meta.getColumnSchema(path) orelse return error.SchemaMismatch;
+                const elem = metadata.leafSchemaElement(meta, ci) orelse return error.SchemaMismatch;
                 var copy = elem;
                 copy.num_children = 0;
                 try out.append(arena, copy);
@@ -1527,7 +1526,7 @@ fn openInputs(
             var ranges: std.ArrayList(coalescer.Range) = .empty;
             for (meta.row_groups.items, 0..) |rg, rg_i| {
                 if (filter_for_plan) |f| if (!args.scan_all) {
-                    switch (try filter_prune.pruneRowGroup(&rg, f, arena, meta)) {
+                    switch (filter_prune.pruneRowGroup(&rg, f, meta)) {
                         .skip => {
                             sp.survivors[rg_i] = false;
                             continue;
@@ -2610,7 +2609,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
             rows_in += @intCast(src_rg.num_rows);
 
             if (filter_opt) |f| if (!args.scan_all) {
-                if ((try filter_prune.pruneRowGroup(src_rg, f, arena, &meta_const)) == .skip) continue;
+                if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) continue;
             };
 
             _ = try consumer.appendProjectedRGWithOptions(

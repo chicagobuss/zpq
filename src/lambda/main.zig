@@ -537,7 +537,7 @@ fn handleS3(
 
     for (meta.row_groups.items) |rg| {
         if (filter) |f| {
-            const decision = try filter_prune.pruneRowGroup(&rg, f, a, &meta);
+            const decision = filter_prune.pruneRowGroup(&rg, f, &meta);
             if (decision == .skip) {
                 rg_pruned += 1;
                 continue;

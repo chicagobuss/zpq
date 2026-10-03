@@ -142,6 +142,33 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
     return applyScaleI128(@intCast(raw), scale);
 }
 
+/// A DECIMAL min/max statistic as f64, or null when the bytes cannot be one of `kind`'s values. Statistics hold a
+/// bare value in the physical representation: INT32/INT64 little-endian, FLBA and BYTE_ARRAY big-endian two's
+/// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
+/// all is the caller's decision.
+pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
+    return switch (kind.physical) {
+        .INT32 => {
+            if (bytes.len < 4) return null;
+            return applyScaleInt(i32, std.mem.readInt(i32, bytes[0..4], .little), kind.scale);
+        },
+        .INT64 => {
+            if (bytes.len < 8) return null;
+            return applyScaleInt(i64, std.mem.readInt(i64, bytes[0..8], .little), kind.scale);
+        },
+        .FIXED_LEN_BYTE_ARRAY => {
+            if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH) return null;
+            if (bytes.len < kind.byte_width) return null;
+            return applyScaleI128(flbaToI128(bytes[0..kind.byte_width]), kind.scale);
+        },
+        .BYTE_ARRAY => {
+            if (bytes.len == 0 or bytes.len > MAX_FLBA_BYTE_WIDTH) return null;
+            return applyScaleI128(flbaToI128(bytes), kind.scale);
+        },
+        else => null,
+    };
+}
+
 /// Vectorized `applyScaleInt` over a whole buffer. For the common case
 /// (0 < scale < pow10 table — i.e. every real-world DECIMAL) this is a
 /// SIMD vector divide: `@floatFromInt` widens 8 raw ints to f64 lanes,
@@ -768,6 +795,58 @@ test "applyScaleInt converts known values" {
     try testing.expectApproxEqAbs(@as(f64, 1e-8), applyScaleInt(i64, 1, 8), 1e-12);
     // 0 always 0.
     try testing.expectEqual(@as(f64, 0.0), applyScaleInt(i64, 0, 18));
+}
+
+test "statToF64: INT32/INT64 backings apply scale (signed)" {
+    var b32: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b32, 12345, .little);
+    const k32 = Kind{ .scale = 2, .precision = 9, .physical = .INT32, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&b32, k32).?, 1e-9);
+
+    std.mem.writeInt(i32, &b32, -6789, .little); // negative
+    try testing.expectApproxEqAbs(@as(f64, -67.89), statToF64(&b32, k32).?, 1e-9);
+
+    var b64: [8]u8 = undefined;
+    std.mem.writeInt(i64, &b64, 100000, .little);
+    const k64 = Kind{ .scale = 3, .precision = 18, .physical = .INT64, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, 100.0), statToF64(&b64, k64).?, 1e-9);
+}
+
+test "statToF64: FLBA backing sign-extends + scales" {
+    var be: [8]u8 = undefined;
+    const kpos = Kind{ .scale = 2, .precision = 20, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 8 };
+    std.mem.writeInt(i64, &be, 12345, .big);
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&be, kpos).?, 1e-9);
+    std.mem.writeInt(i64, &be, -12345, .big); // high byte 0xFF must sign-extend
+    try testing.expectApproxEqAbs(@as(f64, -123.45), statToF64(&be, kpos).?, 1e-9);
+
+    // narrow 2-byte FLBA, scale 0: -100 = 0xFF9C big-endian
+    var be2: [2]u8 = undefined;
+    std.mem.writeInt(i16, &be2, -100, .big);
+    const k2 = Kind{ .scale = 0, .precision = 4, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 2 };
+    try testing.expectApproxEqAbs(@as(f64, -100.0), statToF64(&be2, k2).?, 1e-9);
+
+    // BYTE_ARRAY: the bound is as wide as its value needs, with no length prefix.
+    const kba = Kind{ .scale = 2, .precision = 9, .physical = .BYTE_ARRAY, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, -1.28), statToF64(&.{0x80}, kba).?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&.{ 0x30, 0x39 }, kba).?, 1e-9);
+}
+
+test "statToF64: malformed inputs return null (no UB)" {
+    const short = [_]u8{ 0x01, 0x02 }; // < 4 bytes for INT32
+    try testing.expect(statToF64(&short, .{ .scale = 0, .precision = 9, .physical = .INT32, .byte_width = 0 }) == null);
+
+    const some: [8]u8 = @splat(0);
+    // FLBA byte_width 0 → reject; byte_width 17 (> MAX_FLBA_BYTE_WIDTH) → reject
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);
+    // BYTE_ARRAY: empty, or wider than i128.
+    const ba: Kind = .{ .scale = 0, .precision = 9, .physical = .BYTE_ARRAY, .byte_width = 0 };
+    try testing.expect(statToF64(&.{}, ba) == null);
+    const wide: [17]u8 = @splat(0);
+    try testing.expect(statToF64(&wide, ba) == null);
+    // A physical type no DECIMAL has.
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 9, .physical = .DOUBLE, .byte_width = 0 }) == null);
 }
 
 test "kindFromSchema recognises Decimal columns" {

@@ -1,91 +1,47 @@
-//! EncodedFilter — pre-encode the filter value once into Parquet's
-//! binary representation so row-group / page stats (also stored as
-//! Parquet bytes in metadata) become byte-comparable.
+//! Range predicates over Parquet statistics: whether a chunk or page whose bounds are `[min, max]` could hold, or
+//! must hold only, values satisfying `value op needle`.
 //!
-//! Comparison strategy:
-//!   - INT32/INT64/FLOAT/DOUBLE: decode both sides with `readFixedLE`
-//!     and compare numerically. Raw little-endian byte order does not
-//!     match numeric order for multi-byte values.
+//! Bounds arrive as Parquet bytes; the needle arrives typed, as the filter parser built it.
+//!   - INT32/INT64/FLOAT/DOUBLE: decode the bounds with `readFixedLE` and compare numerically. Raw little-endian
+//!     byte order does not match numeric order for multi-byte values.
 //!   - BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY: compare lexicographically.
-//!   - FLOAT/DOUBLE bounds containing NaN are unusable. Ordered
-//!     comparisons with NaN are false, which callers would otherwise
-//!     interpret as permission to prune the page.
-//!
-//! We encode once per filter rather than per row group; a typical
-//! query touches dozens of row groups so the savings compound.
+//!   - FLOAT/DOUBLE bounds containing NaN are unusable. Ordered comparisons with NaN are false, which callers would
+//!     otherwise interpret as permission to prune the page.
 
 const std = @import("std");
-const schema = @import("../schema.zig");
 const ast = @import("ast.zig");
 
-pub const Error = error{
-    UnsupportedType,
-    BadValue,
-} || std.mem.Allocator.Error;
-
-pub const EncodedValue = struct {
-    bytes: []const u8,
-    parquet_type: schema.Type,
-
-    /// True iff a row whose stats range is `[min, max]` could possibly
-    /// satisfy `column op self.bytes`. Returns conservatively false-
-    /// negatives are not allowed (would lose data); false-positives
-    /// are fine (we'll re-evaluate value-level).
-    pub fn rangeIntersects(self: EncodedValue, op: ast.Operator, min: []const u8, max: []const u8) bool {
-        switch (self.parquet_type) {
-            // Fixed-width numeric types compare decoded values because
-            // little-endian byte order does not match numeric order.
-            .INT32 => return rangeIntersectsSigned(i32, op, min, max, self.bytes),
-            .INT64 => return rangeIntersectsSigned(i64, op, min, max, self.bytes),
-            .FLOAT => return rangeIntersectsSigned(f32, op, min, max, self.bytes),
-            .DOUBLE => return rangeIntersectsSigned(f64, op, min, max, self.bytes),
-            // BYTE_ARRAY + FIXED_LEN_BYTE_ARRAY use lexicographic byte
-            // comparison natively.
-            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => return rangeIntersectsBytes(op, min, max, self.bytes),
-            .BOOLEAN => {
-                // Booleans only really do equality. Parquet stats for
-                // a bool column with mixed values have min=0 max=1.
-                if (op == .Eq) return rangeIntersectsBytes(.Eq, min, max, self.bytes);
-                if (op == .NotEq) return true; // can't prune
-                return true;
-            },
-            .INT96 => return true, // legacy / deprecated; conservative
-        }
+/// True iff a chunk bounded by `[min, max]` could hold a value satisfying `value op needle`. False negatives would
+/// lose rows; false positives only cost a decode, so bounds that do not read as `T` intersect everything.
+pub fn rangeIntersects(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: T) bool {
+    const min_v = readFixedLE(T, min) orelse return true;
+    const max_v = readFixedLE(T, max) orelse return true;
+    if (comptime @typeInfo(T) == .float) {
+        // Real files sometimes contain NaN statistics despite the spec.
+        // Unordered bounds cannot safely prove that a page misses the filter.
+        if (std.math.isNan(min_v) or std.math.isNan(max_v)) return true;
+        // Bounds leave NaN out, and NaN != x holds, so `lo == hi == x` does not rule out a match. Only a nan_count
+        // of zero does; callers that have one decide that case themselves.
+        if (op == .NotEq) return true;
     }
+    return rangeOverlapsValue(T, op, min_v, max_v, needle);
+}
 
-    /// True iff ALL values in `[min, max]` satisfy `column op self.bytes`.
-    /// Used for `.always_match` positive assertion page pruning.
-    pub fn rangeAlwaysMatches(self: EncodedValue, op: ast.Operator, min: []const u8, max: []const u8) bool {
-        switch (self.parquet_type) {
-            .INT32 => return rangeAlwaysMatchesSigned(i32, op, min, max, self.bytes),
-            .INT64 => return rangeAlwaysMatchesSigned(i64, op, min, max, self.bytes),
-            // FLOAT/DOUBLE: a positive assertion from min/max is UNSAFE. NaNs
-            // may be excluded from (legacy) bounds, so [min,max] can look like
-            // it covers every value while NaN rows silently fail the predicate.
-            // Proving NaN absence needs `nan_count`, which zpq does not parse;
-            // per Apache Parquet's IEEE-754 total-order guidance a missing
-            // nan_count must be treated as unknown. Never claim always_match.
-            .FLOAT, .DOUBLE => return false,
-            // Byte arrays need to know whether max was truncated: see `rangeAlwaysMatchesBytes`.
-            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => return false,
-            .BOOLEAN => return false,
-            .INT96 => return false,
-        }
-    }
-};
-
-fn rangeAlwaysMatchesSigned(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: []const u8) bool {
+/// True iff every value in `[min, max]` satisfies `value op needle`: the positive assertion behind `.always_match`.
+pub fn rangeAlwaysMatches(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: T) bool {
+    // FLOAT/DOUBLE: a positive assertion from min/max is UNSAFE. NaNs may be excluded from (legacy) bounds, so
+    // [min,max] can look like it covers every value while NaN rows silently fail the predicate.
+    if (comptime @typeInfo(T) == .float) return false;
     const min_v = readFixedLE(T, min) orelse return false;
     const max_v = readFixedLE(T, max) orelse return false;
-    const needle_v = readFixedLE(T, needle) orelse return false;
     if (min_v > max_v) return false; // corrupt stats
     return switch (op) {
-        .Eq => min_v == max_v and min_v == needle_v,
-        .NotEq => needle_v < min_v or needle_v > max_v,
-        .Lt => max_v < needle_v,
-        .LtEq => max_v <= needle_v,
-        .Gt => min_v > needle_v,
-        .GtEq => min_v >= needle_v,
+        .Eq => min_v == max_v and min_v == needle,
+        .NotEq => needle < min_v or needle > max_v,
+        .Lt => max_v < needle,
+        .LtEq => max_v <= needle,
+        .Gt => min_v > needle,
+        .GtEq => min_v >= needle,
     };
 }
 
@@ -98,21 +54,6 @@ pub fn readFixedLE(comptime T: type, bytes: []const u8) ?T {
         f64 => @bitCast(std.mem.readInt(u64, bytes[0..8], .little)),
         else => @compileError("readFixedLE: unsupported type"),
     };
-}
-
-fn rangeIntersectsSigned(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: []const u8) bool {
-    const min_v = readFixedLE(T, min) orelse return true;
-    const max_v = readFixedLE(T, max) orelse return true;
-    const needle_v = readFixedLE(T, needle) orelse return true;
-    if (comptime @typeInfo(T) == .float) {
-        // Real files sometimes contain NaN statistics despite the spec.
-        // Unordered bounds cannot safely prove that a page misses the filter.
-        if (std.math.isNan(min_v) or std.math.isNan(max_v)) return true;
-        // Bounds leave NaN out, and NaN != x holds, so `lo == hi == x` does not rule out a match. Only a nan_count
-        // of zero does; callers that have one decide that case themselves.
-        if (op == .NotEq) return true;
-    }
-    return rangeOverlapsValue(T, op, min_v, max_v, needle_v);
 }
 
 pub fn rangeOverlapsValue(comptime T: type, op: ast.Operator, lo: T, hi: T, needle: T) bool {
@@ -163,192 +104,91 @@ pub fn rangeIntersectsBytes(op: ast.Operator, min: []const u8, max: []const u8, 
     };
 }
 
-/// Parse a string filter value into Parquet's on-the-wire byte
-/// representation for the column's type.
-pub fn encode(allocator: std.mem.Allocator, value_str: []const u8, parquet_type: schema.Type) Error!EncodedValue {
-    switch (parquet_type) {
-        .INT32 => {
-            const v = std.fmt.parseInt(i32, value_str, 10) catch return error.BadValue;
-            const bytes = try allocator.alloc(u8, 4);
-            std.mem.writeInt(i32, bytes[0..4], v, .little);
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .INT64 => {
-            const v = std.fmt.parseInt(i64, value_str, 10) catch return error.BadValue;
-            const bytes = try allocator.alloc(u8, 8);
-            std.mem.writeInt(i64, bytes[0..8], v, .little);
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .FLOAT => {
-            const v = std.fmt.parseFloat(f32, value_str) catch return error.BadValue;
-            const bytes = try allocator.alloc(u8, 4);
-            std.mem.writeInt(u32, bytes[0..4], @bitCast(v), .little);
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .DOUBLE => {
-            const v = std.fmt.parseFloat(f64, value_str) catch return error.BadValue;
-            const bytes = try allocator.alloc(u8, 8);
-            std.mem.writeInt(u64, bytes[0..8], @bitCast(v), .little);
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
-            const bytes = try allocator.dupe(u8, value_str);
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .BOOLEAN => {
-            const truthy = std.mem.eql(u8, value_str, "true") or std.mem.eql(u8, value_str, "1");
-            const falsy = std.mem.eql(u8, value_str, "false") or std.mem.eql(u8, value_str, "0");
-            if (!truthy and !falsy) return error.BadValue;
-            const bytes = try allocator.alloc(u8, 1);
-            bytes[0] = if (truthy) 1 else 0;
-            return .{ .bytes = bytes, .parquet_type = parquet_type };
-        },
-        .INT96 => return error.UnsupportedType,
-    }
-}
-
 // ============================================================
 // Tests
 // ============================================================
 
 const testing = std.testing;
 
-test "encode INT64 then byte-compare" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "12345", .INT64);
-    try testing.expectEqual(@as(usize, 8), ev.bytes.len);
-    const decoded = std.mem.readInt(i64, ev.bytes[0..8], .little);
-    try testing.expectEqual(@as(i64, 12345), decoded);
+fn le(comptime T: type, v: T) [@sizeOf(T)]u8 {
+    var b: [@sizeOf(T)]u8 = undefined;
+    const U = @Int(.unsigned, @bitSizeOf(T));
+    std.mem.writeInt(U, &b, @bitCast(v), .little);
+    return b;
 }
 
-test "encode BYTE_ARRAY copies the bytes" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "active", .BYTE_ARRAY);
-    try testing.expectEqualStrings("active", ev.bytes);
-}
-
-test "encode BOOLEAN accepts true/false/1/0" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const t1 = try encode(arena.allocator(), "true", .BOOLEAN);
-    try testing.expectEqual(@as(u8, 1), t1.bytes[0]);
-    const t0 = try encode(arena.allocator(), "false", .BOOLEAN);
-    try testing.expectEqual(@as(u8, 0), t0.bytes[0]);
-    try testing.expectError(error.BadValue, encode(arena.allocator(), "yes", .BOOLEAN));
-}
-
-test "rangeIntersects with INT64 stats — Eq inside range" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "100", .INT64);
-
-    var min_buf: [8]u8 = undefined;
-    var max_buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &min_buf, 50, .little);
-    std.mem.writeInt(i64, &max_buf, 200, .little);
-
-    try testing.expect(ev.rangeIntersects(.Eq, &min_buf, &max_buf));
-}
-
-test "rangeIntersects with INT64 stats — Eq outside range" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "300", .INT64);
-
-    var min_buf: [8]u8 = undefined;
-    var max_buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &min_buf, 50, .little);
-    std.mem.writeInt(i64, &max_buf, 200, .little);
-
-    try testing.expect(!ev.rangeIntersects(.Eq, &min_buf, &max_buf));
+test "rangeIntersects INT64: Eq inside and outside the range" {
+    const min = le(i64, 50);
+    const max = le(i64, 200);
+    try testing.expect(rangeIntersects(i64, .Eq, &min, &max, 100));
+    try testing.expect(!rangeIntersects(i64, .Eq, &min, &max, 300));
 }
 
 test "rangeIntersects negative INT32 (sign-bit edge)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
     // Range [-100, 100], filter Eq -50 → should match.
-    const ev = try encode(arena.allocator(), "-50", .INT32);
+    const min = le(i32, -100);
+    const max = le(i32, 100);
+    try testing.expect(rangeIntersects(i32, .Eq, &min, &max, -50));
+    try testing.expect(rangeIntersects(i32, .Lt, &min, &max, -50)); // -100 < -50
+    try testing.expect(rangeIntersects(i32, .Gt, &min, &max, -50)); // 100 > -50
+}
 
-    var min_buf: [4]u8 = undefined;
-    var max_buf: [4]u8 = undefined;
-    std.mem.writeInt(i32, &min_buf, -100, .little);
-    std.mem.writeInt(i32, &max_buf, 100, .little);
-
-    try testing.expect(ev.rangeIntersects(.Eq, &min_buf, &max_buf));
-    try testing.expect(ev.rangeIntersects(.Lt, &min_buf, &max_buf)); // -100 < -50
-    try testing.expect(ev.rangeIntersects(.Gt, &min_buf, &max_buf)); // 100 > -50
+test "rangeIntersects keeps bounds that do not read as the column type" {
+    const short = [_]u8{ 1, 2, 3 };
+    const max = le(i64, 0);
+    try testing.expect(rangeIntersects(i64, .Eq, &short, &max, 1_000));
+    try testing.expect(!rangeAlwaysMatches(i64, .GtEq, &short, &max, -1_000));
 }
 
 test "rangeIntersects DOUBLE keeps pages with NaN bounds" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "5.0", .DOUBLE);
-
-    var nan_buf: [8]u8 = undefined;
-    var real_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &nan_buf, @bitCast(std.math.nan(f64)), .little);
-    std.mem.writeInt(u64, &real_buf, @bitCast(@as(f64, 100.0)), .little);
-
+    const nan = le(f64, std.math.nan(f64));
+    const real = le(f64, 100.0);
     const ops = [_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq };
     for (ops) |op| {
-        try testing.expect(ev.rangeIntersects(op, &nan_buf, &real_buf));
-        try testing.expect(ev.rangeIntersects(op, &real_buf, &nan_buf));
-        try testing.expect(ev.rangeIntersects(op, &nan_buf, &nan_buf));
+        try testing.expect(rangeIntersects(f64, op, &nan, &real, 5.0));
+        try testing.expect(rangeIntersects(f64, op, &real, &nan, 5.0));
+        try testing.expect(rangeIntersects(f64, op, &nan, &nan, 5.0));
     }
 }
 
 test "rangeIntersects FLOAT keeps pages with NaN bounds" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "5.0", .FLOAT);
-
-    var nan_buf: [4]u8 = undefined;
-    var real_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &nan_buf, @bitCast(std.math.nan(f32)), .little);
-    std.mem.writeInt(u32, &real_buf, @bitCast(@as(f32, 100.0)), .little);
-
-    try testing.expect(ev.rangeIntersects(.Lt, &nan_buf, &real_buf));
-    try testing.expect(ev.rangeIntersects(.Gt, &real_buf, &nan_buf));
+    const nan = le(f32, std.math.nan(f32));
+    const real = le(f32, 100.0);
+    try testing.expect(rangeIntersects(f32, .Lt, &nan, &real, 5.0));
+    try testing.expect(rangeIntersects(f32, .Gt, &real, &nan, 5.0));
 }
 
 test "rangeIntersects float != keeps a constant range equal to the literal: NaN rows sit outside the bounds" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "0", .DOUBLE);
-    var zero: [8]u8 = undefined;
-    std.mem.writeInt(u64, &zero, @bitCast(@as(f64, 0.0)), .little);
-    try testing.expect(ev.rangeIntersects(.NotEq, &zero, &zero));
-    try testing.expect(!ev.rangeIntersects(.Lt, &zero, &zero));
+    const zero = le(f64, 0.0);
+    try testing.expect(rangeIntersects(f64, .NotEq, &zero, &zero, 0.0));
+    try testing.expect(!rangeIntersects(f64, .Lt, &zero, &zero, 0.0));
     // Integers have no NaN: a constant chunk equal to the literal still fails `!=` everywhere.
-    const iv = try encode(arena.allocator(), "0", .INT64);
-    var izero: [8]u8 = undefined;
-    std.mem.writeInt(i64, &izero, 0, .little);
-    try testing.expect(!iv.rangeIntersects(.NotEq, &izero, &izero));
+    const izero = le(i64, 0);
+    try testing.expect(!rangeIntersects(i64, .NotEq, &izero, &izero, 0));
 }
 
 test "rangeIntersects DOUBLE still prunes real disjoint bounds" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "5.0", .DOUBLE);
-
-    var min_buf: [8]u8 = undefined;
-    var max_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &min_buf, @bitCast(@as(f64, 10.0)), .little);
-    std.mem.writeInt(u64, &max_buf, @bitCast(@as(f64, 100.0)), .little);
-
-    try testing.expect(!ev.rangeIntersects(.Lt, &min_buf, &max_buf));
-    try testing.expect(!ev.rangeIntersects(.Eq, &min_buf, &max_buf));
-    try testing.expect(ev.rangeIntersects(.Gt, &min_buf, &max_buf));
+    const min = le(f64, 10.0);
+    const max = le(f64, 100.0);
+    try testing.expect(!rangeIntersects(f64, .Lt, &min, &max, 5.0));
+    try testing.expect(!rangeIntersects(f64, .Eq, &min, &max, 5.0));
+    try testing.expect(rangeIntersects(f64, .Gt, &min, &max, 5.0));
 }
 
-test "rangeIntersects BYTE_ARRAY — Eq" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const ev = try encode(arena.allocator(), "category_5", .BYTE_ARRAY);
+test "rangeAlwaysMatches: integers prove a full match, floats never do" {
+    const min = le(i32, 10);
+    const max = le(i32, 20);
+    try testing.expect(rangeAlwaysMatches(i32, .GtEq, &min, &max, 10));
+    try testing.expect(!rangeAlwaysMatches(i32, .Gt, &min, &max, 10));
+    try testing.expect(rangeAlwaysMatches(i32, .NotEq, &min, &max, 21));
+    try testing.expect(!rangeAlwaysMatches(i32, .Lt, &max, &min, 30)); // corrupt: min > max
+    const fmin = le(f64, 10.0);
+    const fmax = le(f64, 20.0);
+    try testing.expect(!rangeAlwaysMatches(f64, .GtEq, &fmin, &fmax, 0.0));
+}
 
-    try testing.expect(ev.rangeIntersects(.Eq, "category_0", "category_9"));
-    try testing.expect(!ev.rangeIntersects(.Eq, "category_a", "category_z"));
-    try testing.expect(!ev.rangeIntersects(.Eq, "alpha", "beta"));
+test "rangeIntersectsBytes — Eq" {
+    try testing.expect(rangeIntersectsBytes(.Eq, "category_0", "category_9", "category_5"));
+    try testing.expect(!rangeIntersectsBytes(.Eq, "category_a", "category_z", "category_5"));
+    try testing.expect(!rangeIntersectsBytes(.Eq, "alpha", "beta", "category_5"));
 }

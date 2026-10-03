@@ -276,6 +276,23 @@ pub fn build(b: *std.Build) void {
     });
     const microbench_step = b.step("microbench", "Build the decode-path microbenchmark");
     microbench_step.dependOn(&b.addInstallArtifact(microbench, .{}).step);
+
+    // bench-labels: time output labelling on wide schemas, with and without colliding names. Opt-in, so wall-clock
+    // limits stay out of the unit tests. See benchmarks/labels/.
+    const bench_labels = b.addExecutable(.{
+        .name = "bench_labels",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/labels/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "zpq", .module = cli_zpq.zpq },
+            },
+        }),
+    });
+    const bench_labels_step = b.step("bench-labels", "Time output labelling on wide and colliding schemas");
+    bench_labels_step.dependOn(&b.addRunArtifact(bench_labels).step);
 }
 
 /// Bundle the per-binary modules. We give each binary its own zpq module

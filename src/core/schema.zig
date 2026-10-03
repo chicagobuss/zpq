@@ -1436,126 +1436,127 @@ pub const FileMetaData = struct {
         return true;
     }
 
+    /// Levels of the first leaf whose path is exactly `path`, or {0, 0} when no leaf has it.
     pub fn getColumnLevels(self: *const FileMetaData, path: []const []const u8) Levels {
-        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
-        return iter.find(path) catch .{ .max_def = 0, .max_rep = 0 };
+        const leaf = self.leafAtPath(path) orelse return .{ .max_def = 0, .max_rep = 0 };
+        return .{ .max_def = leaf.max_def, .max_rep = leaf.max_rep };
     }
 
+    /// Schema element of the first leaf whose path is exactly `path`.
     pub fn getColumnSchema(self: *const FileMetaData, path: []const []const u8) ?SchemaElement {
-        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
-        return iter.findSchema(path) catch null;
+        const leaf = self.leafAtPath(path) orelse return null;
+        return leaf.element.*;
+    }
+
+    fn leafAtPath(self: *const FileMetaData, path: []const []const u8) ?LeafIterator.Leaf {
+        var it: LeafIterator = .init(self.schema.items);
+        while (it.next()) |leaf| {
+            if (pathEql(leaf.path, path)) return leaf;
+        }
+        return null;
     }
 };
 
-const SchemaIterator = struct {
+/// Deepest group nesting a schema walk accepts. `LeafIterator` keeps the open groups in fixed arrays and counts levels
+/// in a u8, so footer open rejects anything deeper (`metadata.checkFooterFields`). Real schemas stay far below.
+pub const max_schema_depth = 200;
+
+/// The primitive leaves of a flat schema list in column-chunk order, so leaf `index` is every row group's
+/// `columns[index]`. The one schema walk behind leaf counting, path lookup, name resolution and labelling: each
+/// applies its own policy to what this yields, and all of them agree on which element is leaf N and on its path.
+///
+/// A group is an element with children. The walk covers the root's children only, and stops at a group nested deeper
+/// than `max_schema_depth`; footer open rejects a schema either rule would cut short.
+pub const LeafIterator = struct {
     items: []const SchemaElement,
-    pos: usize,
+    pos: usize = 1,
+    index: usize = 0,
+    /// Open groups below the root.
+    depth: usize = 0,
+    /// Children still to visit: the root's at 0, open group `d`'s at `d + 1`.
+    left: [max_schema_depth + 1]usize = undefined,
+    /// Definition / repetition levels down to open group `d`, itself included.
+    group_levels: [max_schema_depth][2]u8 = undefined,
+    /// Schema index of the top-level field the open groups sit in.
+    top: usize = 0,
+    /// Names of the open groups, then of the leaf just yielded: what `Leaf.path` borrows.
+    names: [max_schema_depth + 1][]const u8 = undefined,
 
-    fn find(self: *SchemaIterator, path: []const []const u8) !Levels {
-        if (self.pos >= self.items.len) return error.NotFound;
+    pub const Leaf = struct {
+        /// Leaf ordinal: the column chunk's position in each row group.
+        index: usize,
+        element: *const SchemaElement,
+        /// Names from the top-level field down to the leaf, root excluded. Borrows the iterator, so is valid until
+        /// its next `next`.
+        path: []const []const u8,
+        /// Schema index of the top-level field the leaf sits in; its own for a top-level leaf.
+        top: usize,
+        max_def: u8,
+        max_rep: u8,
+    };
 
-        // Consume root
-        const root = self.items[self.pos];
-        self.pos += 1;
-
-        const num_children = root.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            if (try self.visit(path, 0, 0, 0)) |res| return res;
-        }
-        return error.NotFound;
+    pub fn init(items: []const SchemaElement) LeafIterator {
+        var it: LeafIterator = .{ .items = items };
+        it.left[0] = if (items.len == 0) 0 else childCount(items[0]);
+        return it;
     }
 
-    fn findSchema(self: *SchemaIterator, path: []const []const u8) !SchemaElement {
-        if (self.pos >= self.items.len) return error.NotFound;
+    pub fn next(self: *LeafIterator) ?Leaf {
+        while (self.pos < self.items.len) {
+            while (self.left[self.depth] == 0) {
+                if (self.depth == 0) return null;
+                self.depth -= 1;
+            }
+            self.left[self.depth] -= 1;
+            const schema_index = self.pos;
+            const elem = &self.items[schema_index];
+            self.pos += 1;
+            if (self.depth == 0) self.top = schema_index;
 
-        // Consume root
-        const root = self.items[self.pos];
-        self.pos += 1;
+            // Per Parquet, every non-REQUIRED element adds a definition level and every REPEATED one a repetition
+            // level. A missing repetition type reads as REQUIRED.
+            const rt = elem.repetition_type orelse .REQUIRED;
+            const parent: [2]u8 = if (self.depth == 0) .{ 0, 0 } else self.group_levels[self.depth - 1];
+            const def = parent[0] + @intFromBool(rt != .REQUIRED);
+            const rep = parent[1] + @intFromBool(rt == .REPEATED);
+            self.names[self.depth] = elem.name;
 
-        const num_children = root.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            if (try self.visitSchema(path, 0)) |res| return res;
-        }
-        return error.NotFound;
-    }
-
-    fn visitSchema(self: *SchemaIterator, target_path: []const []const u8, depth: usize) !?SchemaElement {
-        if (self.pos >= self.items.len) return null;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-
-        if (std.mem.eql(u8, elem.name, target_path[depth])) {
-            if (depth == target_path.len - 1) {
-                return elem;
-            } else {
-                const num_children = elem.num_children orelse 0;
-                var i: i32 = 0;
-                while (i < num_children) : (i += 1) {
-                    if (try self.visitSchema(target_path, depth + 1)) |res| return res;
+            const n = childCount(elem.*);
+            if (n > 0) {
+                if (self.depth == max_schema_depth) {
+                    self.pos = self.items.len;
+                    return null;
                 }
+                self.group_levels[self.depth] = .{ def, rep };
+                self.depth += 1;
+                self.left[self.depth] = n;
+                continue;
             }
-        } else {
-            // Not the node we're looking for, skip its children
-            const num_children = elem.num_children orelse 0;
-            var i: i32 = 0;
-            while (i < num_children) : (i += 1) {
-                _ = try self.skip();
-            }
+            defer self.index += 1;
+            return .{
+                .index = self.index,
+                .element = elem,
+                .path = self.names[0 .. self.depth + 1],
+                .top = self.top,
+                .max_def = def,
+                .max_rep = rep,
+            };
         }
         return null;
     }
 
-    fn visit(self: *SchemaIterator, target_path: []const []const u8, depth: usize, current_def: i32, current_rep: i32) !?Levels {
-        if (self.pos >= self.items.len) return null;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-
-        var def = current_def;
-        var rep = current_rep;
-
-        if (elem.repetition_type) |rt| {
-            if (rt == .OPTIONAL) {
-                def += 1;
-            } else if (rt == .REPEATED) {
-                def += 1;
-                rep += 1;
-            }
-        }
-
-        if (std.mem.eql(u8, elem.name, target_path[depth])) {
-            if (depth == target_path.len - 1) {
-                return Levels{ .max_def = def, .max_rep = rep };
-            } else {
-                const num_children = elem.num_children orelse 0;
-                var i: i32 = 0;
-                while (i < num_children) : (i += 1) {
-                    if (try self.visit(target_path, depth + 1, def, rep)) |res| return res;
-                }
-            }
-        } else {
-            // Not the node we're looking for, skip its children
-            const num_children = elem.num_children orelse 0;
-            var i: i32 = 0;
-            while (i < num_children) : (i += 1) {
-                _ = try self.skip();
-            }
-        }
-        return null;
-    }
-
-    fn skip(self: *SchemaIterator) !void {
-        if (self.pos >= self.items.len) return;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-        const num_children = elem.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            try self.skip();
-        }
+    fn childCount(elem: SchemaElement) usize {
+        return @intCast(@max(elem.num_children orelse 0, 0));
     }
 };
+
+/// Whether two schema paths name the same field, segment by segment. Never compare paths by a dot-joined form: a
+/// top-level column named `a.b` and the field `b` of a group `a` join to the same string.
+pub fn pathEql(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
 
 pub const Levels = struct {
     max_def: i32,

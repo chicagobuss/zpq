@@ -1,11 +1,13 @@
-//! Parquet file metadata: open the footer, expose row groups, prune.
+//! Parquet file metadata: open the footer and bind column names to leaves.
 //!
 //! Schema parsing already lives in `src/core/schema.zig` (the Thrift-
 //! encoded structs). This file is the thin layer that:
 //!   1. Validates the leading + trailing PAR1 magic.
 //!   2. Reads the 4-byte little-endian footer length.
 //!   3. Slices the footer bytes and hands them to schema.FileMetaData.read.
-//!   4. Exposes a stats-based row-group pruner for predicate pushdown.
+//!   4. Resolves user-supplied column names to leaves, and labels leaves for output.
+//!
+//! Reading the statistics the footer carries is `statistics.zig`'s job.
 //!
 //! Input is a `[]const u8` covering the whole file. The caller decides
 //! how those bytes got there (mmap, S3 GET, in-memory). For the Lambda
@@ -44,9 +46,8 @@ pub const Error = error{
     ColumnChunkTypeMismatch,
 };
 
-/// Deepest group nesting accepted. The schema walkers recurse once per level and count definition / repetition
-/// levels in a u8, so an unbounded depth is a stack overflow or an integer overflow. Real schemas stay far below.
-pub const max_schema_depth = 200;
+/// Deepest group nesting a footer may have: `schema.max_schema_depth`.
+pub const max_schema_depth = schema.max_schema_depth;
 
 /// Parse the file footer and return a fully-realized FileMetaData.
 /// Caller owns the result and must call `deinit`. The metadata holds
@@ -113,18 +114,25 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
     if (meta.schema.items.len > 1) for (meta.schema.items[1..]) |elem| {
         if (elem.type == null and (elem.num_children orelse 0) == 0) return error.BadSchemaElement;
     };
-    // Nesting depth, counted the way the recursive walkers descend: into any element with children.
-    var remaining: [max_schema_depth]usize = undefined;
-    var depth: usize = 0;
-    if (meta.schema.items.len > 1) for (meta.schema.items[1..]) |elem| {
-        while (depth > 0 and remaining[depth - 1] == 0) depth -= 1;
-        if (depth > 0) remaining[depth - 1] -= 1;
+    // The tree shape, walked as `schema.LeafIterator` walks it: descending into any element with children, no deeper
+    // than it goes, and finding exactly the elements the root's and each group's child counts promise. Otherwise
+    // the walk would end early and leave elements out.
+    var remaining: [max_schema_depth + 1]usize = undefined;
+    remaining[0] = @intCast(meta.schema.items[0].num_children orelse 0);
+    var depth: usize = 0; // open groups below the root
+    for (meta.schema.items[1..]) |elem| {
+        while (remaining[depth] == 0) {
+            if (depth == 0) return error.BadSchemaElement; // past the root's last child
+            depth -= 1;
+        }
+        remaining[depth] -= 1;
         const children: usize = @intCast(elem.num_children orelse 0);
         if (children == 0) continue;
         if (depth == max_schema_depth) return error.SchemaTooDeep;
-        remaining[depth] = children;
         depth += 1;
-    };
+        remaining[depth] = children;
+    }
+    for (remaining[0 .. depth + 1]) |left| if (left > 0) return error.BadSchemaElement; // children past the end
     for (meta.row_groups.items) |*rg| {
         if (rg.num_rows < 0) return error.NegativeRowCount;
         for (rg.columns.items) |*cc| {
@@ -175,38 +183,21 @@ pub fn reconcileChunkPaths(allocator: std.mem.Allocator, meta: *schema.FileMetaD
     defer repeated.deinit(allocator);
     var types: std.ArrayList(schema.Type) = .empty;
     defer types.deinit(allocator);
-    const Group = struct { name: []const u8, remaining: usize, repeated: bool };
-    var groups: std.ArrayList(Group) = .empty;
-    defer groups.deinit(allocator);
-    for (meta.schema.items[1..]) |elem| {
-        while (groups.items.len > 0 and groups.items[groups.items.len - 1].remaining == 0) _ = groups.pop();
-        if (groups.items.len > 0) groups.items[groups.items.len - 1].remaining -= 1;
-        const parent_repeated = groups.items.len > 0 and groups.items[groups.items.len - 1].repeated;
-        const here_repeated = parent_repeated or elem.repetition_type == .REPEATED;
-        if (elem.type == null) { // group node; `checkFooterFields` makes this agree with `resolveColumn`'s child count
-            try groups.append(allocator, .{
-                .name = elem.name,
-                .remaining = @intCast(@max(elem.num_children orelse 0, 0)),
-                .repeated = here_repeated,
-            });
-            continue;
-        }
-        for (groups.items) |g| try names.append(allocator, g.name);
-        try names.append(allocator, elem.name);
+    var it: schema.LeafIterator = .init(meta.schema.items);
+    while (it.next()) |l| {
+        try names.appendSlice(allocator, l.path);
         try ends.append(allocator, names.items.len);
-        try repeated.append(allocator, here_repeated);
-        try types.append(allocator, elem.type.?); // non-null: groups were handled above
+        try repeated.append(allocator, l.max_rep > 0);
+        // `checkFooterFields` gives every leaf below the root a type.
+        try types.append(allocator, l.element.type orelse return error.BadSchemaElement);
     }
     const leaf = struct {
         fn path(n: []const []const u8, e: []const usize, i: usize) []const []const u8 {
             return n[if (i == 0) 0 else e[i - 1]..e[i]];
         }
-        fn eql(a: []const []const u8, b: []const []const u8, comptime ignore_case: bool) bool {
+        fn eqlIgnoreCase(a: []const []const u8, b: []const []const u8) bool {
             if (a.len != b.len) return false;
-            for (a, b) |x, y| {
-                const same = if (ignore_case) std.ascii.eqlIgnoreCase(x, y) else std.mem.eql(u8, x, y);
-                if (!same) return false;
-            }
+            for (a, b) |x, y| if (!std.ascii.eqlIgnoreCase(x, y)) return false;
             return true;
         }
     };
@@ -222,13 +213,13 @@ pub fn reconcileChunkPaths(allocator: std.mem.Allocator, meta: *schema.FileMetaD
             if (cm.type != types.items[i]) return error.ColumnChunkTypeMismatch;
             const want = leaf.path(names.items, ends.items, i);
             const got = cm.path_in_schema.items;
-            if (leaf.eql(got, want, false)) continue;
+            if (schema.pathEql(got, want)) continue;
             if (got.len > 0) {
                 // Only reached for paths that are not already exact, so well-formed files never pay for this scan.
                 for (0..ends.items.len) |j| {
-                    if (leaf.eql(got, leaf.path(names.items, ends.items, j), false)) return error.ColumnChunkPathMismatch;
+                    if (schema.pathEql(got, leaf.path(names.items, ends.items, j))) return error.ColumnChunkPathMismatch;
                 }
-                if (!leaf.eql(got, want, true)) return error.ColumnChunkPathMismatch;
+                if (!leaf.eqlIgnoreCase(got, want)) return error.ColumnChunkPathMismatch;
             }
             cm.path_in_schema.clearRetainingCapacity();
             try cm.path_in_schema.appendSlice(allocator, want);
@@ -261,22 +252,15 @@ pub fn resolveColumn(
     file: *const schema.FileMetaData,
     column_name: []const u8,
 ) ColumnLookupError!usize {
-    const walk = walkColumns(file, column_name);
-    if (walk.top_hits == 1) return walk.top_hit.?;
-    if (walk.top_hits > 1) return error.AmbiguousColumn;
+    const hits: ColumnHits = .find(file, column_name, false);
+    if (try hits.top.only()) |leaf| return leaf;
     if (isQuotedPath(column_name)) {
-        var quoted: ColumnWalk = .{ .items = file.schema.items, .name = column_name, .quoted = true };
-        quoted.walkAll();
-        if (quoted.path_hits == 1) return quoted.path_hit.?;
-        if (quoted.path_hits > 1) return error.AmbiguousColumn;
-        return error.UnknownColumn;
+        const quoted: ColumnHits = .find(file, column_name, true);
+        return (try quoted.path.only()) orelse error.UnknownColumn;
     }
-    if (walk.path_hits == 1) return walk.path_hit.?;
-    if (walk.path_hits > 1) return error.AmbiguousColumn;
+    if (try hits.path.only()) |leaf| return leaf;
     if (std.mem.indexOfScalar(u8, column_name, '.') != null) return error.UnknownColumn;
-    if (walk.leaf_hits == 1) return walk.leaf_hit.?;
-    if (walk.leaf_hits > 1) return error.AmbiguousColumn;
-    return error.UnknownColumn;
+    return (try hits.leaf.only()) orelse error.UnknownColumn;
 }
 
 /// The leaves a --columns name selects, in schema order. A top-level column or group whose name is exactly `name`
@@ -305,30 +289,21 @@ pub fn resolveProjection(
 
 /// Leaves of the top-level column or group named exactly `name`, or null when there is none.
 fn topLevelLeaves(arena: std.mem.Allocator, items: []const schema.SchemaElement, name: []const u8) !?[]const u32 {
-    if (items.len == 0) return null;
-    const root_children: usize = @intCast(@max(items[0].num_children orelse 0, 0));
-    var pos: usize = 1;
-    var leaf: u32 = 0;
-    var hit: ?[2]u32 = null;
-    var hits: usize = 0;
-    var i: usize = 0;
-    while (i < root_children and pos < items.len) : (i += 1) {
-        const first = leaf;
-        const is_hit = std.mem.eql(u8, items[pos].name, name);
-        // Skip the child's subtree, counting its leaves.
-        var pending: usize = 1;
-        while (pending > 0 and pos < items.len) : (pos += 1) {
-            pending -= 1;
-            const n: usize = @intCast(@max(items[pos].num_children orelse 0, 0));
-            if (n == 0) leaf += 1 else pending += n;
+    // A field's leaves are contiguous, so one top-level field is one range of leaf ordinals.
+    var hit_top: ?usize = null;
+    var range: [2]u32 = undefined;
+    var it: schema.LeafIterator = .init(items);
+    while (it.next()) |leaf| {
+        if (!std.mem.eql(u8, leaf.path[0], name)) continue;
+        if (hit_top == leaf.top) {
+            range[1] += 1;
+            continue;
         }
-        if (is_hit) {
-            hit = .{ first, leaf };
-            hits += 1;
-        }
+        if (hit_top != null) return error.AmbiguousColumn;
+        hit_top = leaf.top;
+        range = .{ @intCast(leaf.index), @intCast(leaf.index + 1) };
     }
-    if (hits > 1) return error.AmbiguousColumn;
-    const range = hit orelse return null;
+    if (hit_top == null) return null;
     const out = try arena.alloc(u32, range[1] - range[0]);
     for (out, range[0]..) |*o, l| o.* = @intCast(l);
     return out;
@@ -337,16 +312,10 @@ fn topLevelLeaves(arena: std.mem.Allocator, items: []const schema.SchemaElement,
 /// For a name `resolveColumn` found ambiguous, what the candidates are and
 /// how to name one of them.
 pub fn ambiguityHint(file: *const schema.FileMetaData, column_name: []const u8) []const u8 {
-    const walk = walkColumns(file, column_name);
-    if (walk.top_hits > 1) return "several top-level columns have this name";
-    if (walk.path_hits > 1) return "several nested fields have this path; quote each segment (\"a\".\"b\") to pick one";
+    const hits: ColumnHits = .find(file, column_name, false);
+    if (hits.top.n > 1) return "several top-level columns have this name";
+    if (hits.path.n > 1) return "several nested fields have this path; quote each segment (\"a\".\"b\") to pick one";
     return "several nested fields have this name; use the dotted path of the one you mean";
-}
-
-fn walkColumns(file: *const schema.FileMetaData, column_name: []const u8) ColumnWalk {
-    var walk: ColumnWalk = .{ .items = file.schema.items, .name = column_name };
-    walk.walkAll();
-    return walk;
 }
 
 /// `resolveColumn` for callers that only distinguish found / not found.
@@ -361,12 +330,9 @@ pub fn findColumnIndex(
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
-    if (file.schema.items.len == 0) return null;
-    var seen: usize = 0;
-    for (file.schema.items[1..]) |elem| {
-        if ((elem.num_children orelse 0) > 0) continue;
-        if (seen == leaf_idx) return elem;
-        seen += 1;
+    var it: schema.LeafIterator = .init(file.schema.items);
+    while (it.next()) |leaf| {
+        if (leaf.index == leaf_idx) return leaf.element.*;
     }
     return null;
 }
@@ -375,33 +341,9 @@ pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?sch
 /// top-level column, `r.key` for a nested one): the name that binds back
 /// to it through `resolveColumn`. Null when the schema has fewer leaves.
 pub fn leafPath(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const u8 {
-    if (file.schema.items.len == 0) return null;
-    // Open groups on the way down, each with the children it has yet to visit.
-    const Open = struct { name: []const u8, left: usize };
-    var stack: std.ArrayList(Open) = .empty;
-    defer stack.deinit(arena);
-    var seen: usize = 0;
-    for (file.schema.items[1..]) |elem| {
-        while (stack.items.len > 0 and stack.items[stack.items.len - 1].left == 0) _ = stack.pop();
-        if (stack.items.len > 0) stack.items[stack.items.len - 1].left -= 1;
-        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
-        if (n_children > 0) {
-            try stack.append(arena, .{ .name = elem.name, .left = n_children });
-            continue;
-        }
-        if (seen == leaf_idx) {
-            if (stack.items.len == 0) return elem.name;
-            var out: std.ArrayList(u8) = .empty;
-            for (stack.items) |g| {
-                try out.appendSlice(arena, g.name);
-                try out.append(arena, '.');
-            }
-            try out.appendSlice(arena, elem.name);
-            return try out.toOwnedSlice(arena);
-        }
-        seen += 1;
-    }
-    return null;
+    const segments = (try leafPathSegments(arena, file, leaf_idx)) orelse return null;
+    if (segments.len == 1) return segments[0];
+    return try std.mem.join(arena, ".", segments);
 }
 
 /// The output name of the `leaf_idx`-th primitive leaf, and the name that binds back to it through `resolveColumn`:
@@ -410,6 +352,8 @@ pub fn leafPath(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf
 /// quoted-path form (`"a"."b"`). Flat output (row formats, GROUP BY keys, a flat --select) must not print two columns
 /// under one name. `DuplicateOutputColumn` when even the quoted form binds elsewhere, which only a top-level column
 /// literally named `"a"."b"`, quotes included, can cause. Null when the schema has fewer leaves.
+///
+/// Walks the schema up to three times per call; `leafLabels` labels every leaf in one walk.
 pub fn leafLabel(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const u8 {
     const segments = (try leafPathSegments(arena, file, leaf_idx)) orelse return null;
     if (segments.len == 1) return segments[0];
@@ -426,62 +370,74 @@ pub const LeafLabels = struct {
     nested: []const bool,
 };
 
-/// `leafLabel` of every leaf, null for a leaf that has none (`DuplicateOutputColumn` from `leafLabel`), in time
-/// linear in the schema: labelling leaf by leaf walks the whole schema per leaf.
+/// `leafLabel` of every leaf, null for a leaf that has none (`DuplicateOutputColumn` from `leafLabel`). One schema
+/// walk and a few hash lookups per leaf: time linear in the total length of the leaves' paths, however many of them
+/// collide.
 ///
-/// A nested leaf whose dot-joined path no other leaf shares, and which does not read as a quoted path, is labelled
-/// by that path without a walk: `resolveColumn` binds it to this leaf, since no top-level leaf is named it (that
-/// leaf's path would be the same string) and this leaf is the one nested path hit. Any other nested leaf, which
-/// takes a clash of dotted paths, gets `leafLabel`'s own answer.
+/// `leafLabel` asks `resolveColumn` which leaf each candidate name binds. The walk counts the spellings `resolveColumn`
+/// matches instead, and answers from the counts. A top-level leaf is labelled by its name. A nested leaf's dotted
+/// path binds back to it when no other leaf spells that string (a top-level leaf by name, a nested one by dotted
+/// path), or, when the string reads as a quoted path, when no top-level leaf is named it and it quotes this leaf's
+/// path and no other leaf's. Failing that, its quoted path binds back when no top-level leaf is named that and no
+/// other leaf has this path.
 pub fn leafLabels(arena: std.mem.Allocator, file: *const schema.FileMetaData) !LeafLabels {
-    const n = leafCount(file);
-    const dotted = try arena.alloc([]const u8, n);
-    const depths = try arena.alloc(usize, n);
-    var uses: std.StringHashMapUnmanaged(u32) = .empty;
-    try uses.ensureTotalCapacity(arena, @intCast(n));
+    const PathUse = struct { n: u32, leaf: usize };
+    // Leaves per spelling: top-level leaves by name; every leaf by dotted path (a top-level leaf's is its name); and
+    // every leaf by its path, segment by segment, which is what a quoted path binds.
+    var tops: std.StringHashMapUnmanaged(u32) = .empty;
+    var spelled: std.StringHashMapUnmanaged(u32) = .empty;
+    const PathUses = std.HashMapUnmanaged([]const []const u8, PathUse, PathContext, std.hash_map.default_max_load_percentage);
+    var paths: PathUses = .empty;
+    var segments: std.ArrayList([]const []const u8) = .empty;
+    var dotted: std.ArrayList([]const u8) = .empty;
+    var it: schema.LeafIterator = .init(file.schema.items);
+    while (it.next()) |leaf| {
+        const path = try arena.dupe([]const u8, leaf.path);
+        const joined = if (path.len == 1) path[0] else try std.mem.join(arena, ".", path);
+        try segments.append(arena, path);
+        try dotted.append(arena, joined);
+        if (path.len == 1) (try tops.getOrPutValue(arena, joined, 0)).value_ptr.* += 1;
+        (try spelled.getOrPutValue(arena, joined, 0)).value_ptr.* += 1;
+        const use = try paths.getOrPutValue(arena, path, .{ .n = 0, .leaf = leaf.index });
+        use.value_ptr.* = .{ .n = use.value_ptr.n + 1, .leaf = leaf.index };
+    }
 
-    // One pass over the schema: each leaf's dotted path, from the open groups above it.
-    const Open = struct { name: []const u8, left: usize };
-    var stack: std.ArrayList(Open) = .empty;
-    var joined: std.ArrayList(u8) = .empty;
-    var leaf: usize = 0;
-    if (file.schema.items.len > 0) for (file.schema.items[1..]) |elem| {
-        while (stack.items.len > 0 and stack.items[stack.items.len - 1].left == 0) _ = stack.pop();
-        if (stack.items.len > 0) stack.items[stack.items.len - 1].left -= 1;
-        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
-        if (n_children > 0) {
-            try stack.append(arena, .{ .name = elem.name, .left = n_children });
-            continue;
-        }
-        if (leaf == n) break;
-        joined.clearRetainingCapacity();
-        for (stack.items) |g| {
-            try joined.appendSlice(arena, g.name);
-            try joined.append(arena, '.');
-        }
-        try joined.appendSlice(arena, elem.name);
-        dotted[leaf] = if (stack.items.len == 0) elem.name else try arena.dupe(u8, joined.items);
-        depths[leaf] = stack.items.len + 1;
-        const gop = uses.getOrPutAssumeCapacity(dotted[leaf]);
-        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
-        leaf += 1;
-    };
-
-    const labels = try arena.alloc(?[]const u8, n);
-    const nested = try arena.alloc(bool, n);
-    for (labels, nested, dotted, depths, 0..) |*label, *in_group, path, depth, i| {
-        in_group.* = depth > 1;
-        if (depth == 1 or (uses.get(path).? == 1 and !isQuotedPath(path))) {
-            label.* = path;
-            continue;
-        }
-        label.* = leafLabel(arena, file, i) catch |err| switch (err) {
-            error.DuplicateOutputColumn => null,
-            else => return err,
+    const labels = try arena.alloc(?[]const u8, segments.items.len);
+    const nested = try arena.alloc(bool, segments.items.len);
+    for (labels, nested, segments.items, dotted.items, 0..) |*label, *in_group, path, joined, i| {
+        in_group.* = path.len > 1;
+        label.* = label: {
+            if (path.len == 1) break :label joined;
+            if (!isQuotedPath(joined)) {
+                if (spelled.get(joined).? == 1) break :label joined;
+            } else if (!tops.contains(joined)) {
+                if (paths.get(try quotedPathSegments(arena, joined))) |use| {
+                    if (use.n == 1 and use.leaf == i) break :label joined;
+                }
+            }
+            const quoted = try quotePath(arena, path);
+            if (!tops.contains(quoted) and paths.get(path).?.n == 1) break :label quoted;
+            break :label null;
         };
     }
     return .{ .names = labels, .nested = nested };
 }
+
+/// Hashes a schema path segment by segment, so paths that join alike stay distinct.
+const PathContext = struct {
+    pub fn hash(_: PathContext, path: []const []const u8) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        for (path) |seg| {
+            h.update(std.mem.asBytes(&seg.len));
+            h.update(seg);
+        }
+        return h.final();
+    }
+
+    pub fn eql(_: PathContext, a: []const []const u8, b: []const []const u8) bool {
+        return schema.pathEql(a, b);
+    }
+};
 
 /// `segments` as a quoted path: each segment in SQL double quotes, embedded quotes doubled, joined by `.`.
 pub fn quotePath(arena: std.mem.Allocator, segments: []const []const u8) ![]const u8 {
@@ -553,6 +509,19 @@ pub fn unquoteIdent(name: []const u8) []const u8 {
     return t[1 .. t.len - 1];
 }
 
+/// The segments the quoted path `name` (`isQuotedPath`) spells, embedded quotes undoubled.
+fn quotedPathSegments(arena: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var rest = name;
+    while (true) {
+        const n = quotedSegmentLen(rest).?;
+        try out.append(arena, try std.mem.replaceOwned(u8, arena, rest[1 .. n - 1], "\"\"", "\""));
+        rest = rest[n..];
+        if (rest.len == 0) return out.toOwnedSlice(arena);
+        rest = rest[1..];
+    }
+}
+
 /// Whether the quoted path `name` spells exactly `segments`.
 pub fn quotedPathEql(name: []const u8, segments: []const []const u8) bool {
     var rest = name;
@@ -569,12 +538,9 @@ pub fn quotedPathEql(name: []const u8, segments: []const []const u8) bool {
 /// Number of leaf columns in the schema: the column-chunk count of every row group (enforced at footer open), and
 /// still defined for a file with no row groups at all, which is a valid empty table.
 pub fn leafCount(file: *const schema.FileMetaData) usize {
-    if (file.schema.items.len == 0) return 0;
-    var n: usize = 0;
-    for (file.schema.items[1..]) |elem| {
-        if ((elem.num_children orelse 0) == 0) n += 1;
-    }
-    return n;
+    var it: schema.LeafIterator = .init(file.schema.items);
+    while (it.next()) |_| {}
+    return it.index;
 }
 
 /// Full schema path (root excluded) of leaf `leaf_idx` as its segments, or null past the last leaf. Equal to that
@@ -582,150 +548,67 @@ pub fn leafCount(file: *const schema.FileMetaData) usize {
 /// Compare paths by these segments, never by `leafPath`'s dot-joined form: a top-level column named `a.b` and the
 /// field `b` of a group `a` join to the same string.
 pub fn leafPathSegments(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const []const u8 {
-    if (file.schema.items.len == 0) return null;
-    const Group = struct { name: []const u8, remaining: usize };
-    var groups: std.ArrayList(Group) = .empty;
-    defer groups.deinit(arena);
-    var leaf: usize = 0;
-    for (file.schema.items[1..]) |elem| {
-        while (groups.items.len > 0 and groups.items[groups.items.len - 1].remaining == 0) _ = groups.pop();
-        if (groups.items.len > 0) groups.items[groups.items.len - 1].remaining -= 1;
-        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
-        if (n_children > 0) {
-            try groups.append(arena, .{ .name = elem.name, .remaining = n_children });
-            continue;
-        }
-        if (leaf == leaf_idx) {
-            const path = try arena.alloc([]const u8, groups.items.len + 1);
-            for (groups.items, 0..) |g, i| path[i] = g.name;
-            path[groups.items.len] = elem.name;
-            return path;
-        }
-        leaf += 1;
+    var it: schema.LeafIterator = .init(file.schema.items);
+    while (it.next()) |leaf| {
+        if (leaf.index == leaf_idx) return try arena.dupe([]const u8, leaf.path);
     }
     return null;
 }
 
-/// DFS over the flat schema that counts leaves and matches `name` against
-/// top-level leaf names, nested leaves' dot-joined paths, and nested leaves'
-/// own names.
-const ColumnWalk = struct {
-    items: []const schema.SchemaElement,
-    name: []const u8,
-    pos: usize = 0,
-    leaf_idx: usize = 0,
-    top_hit: ?usize = null,
-    top_hits: usize = 0,
-    path_hit: ?usize = null,
-    path_hits: usize = 0,
-    leaf_hit: ?usize = null,
-    leaf_hits: usize = 0,
-    /// `name` is a quoted path: segments match quoted, and a full match at any depth is a path hit.
-    quoted: bool = false,
+/// The leaves a name matches at each step of `resolveColumn`: top-level leaves named exactly `name`; nested leaves
+/// whose dot-joined path is `name`, or with `quoted`, leaves at any depth whose path the quoted path `name` spells;
+/// and nested leaves whose own name is `name`.
+const ColumnHits = struct {
+    top: Hits = .{},
+    path: Hits = .{},
+    leaf: Hits = .{},
 
-    fn walkAll(self: *ColumnWalk) void {
-        if (self.items.len == 0) return;
-        const root_children: usize = @intCast(@max(self.items[0].num_children orelse 0, 0));
-        self.pos = 1;
-        var i: usize = 0;
-        while (i < root_children and self.pos < self.items.len) : (i += 1) self.visit(0);
-    }
+    const Hits = struct {
+        n: usize = 0,
+        last: usize = 0,
 
-    /// `matched` is how many bytes of `name` the ancestors' path consumed
-    /// (including the trailing `.`), or null once they diverged.
-    fn visitAt(self: *ColumnWalk, depth: usize, matched: ?usize) void {
-        const elem = self.items[self.pos];
-        self.pos += 1;
-
-        var here: ?usize = null;
-        if (matched) |m| {
-            const rest = self.name[m..];
-            if (self.quoted) {
-                if (matchQuotedSegment(rest, elem.name)) |n| here = m + n;
-            } else if (std.mem.startsWith(u8, rest, elem.name)) here = m + elem.name.len;
+        fn add(self: *Hits, leaf_idx: usize) void {
+            self.n += 1;
+            self.last = leaf_idx;
         }
 
-        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
-        if (n_children == 0) {
-            if (self.quoted) {
-                if (here != null and here.? == self.name.len) {
-                    self.path_hit = self.leaf_idx;
-                    self.path_hits += 1;
-                }
-            } else if (depth == 0 and std.mem.eql(u8, elem.name, self.name)) {
-                self.top_hit = self.leaf_idx;
-                self.top_hits += 1;
-            } else if (depth > 0 and here != null and here.? == self.name.len) {
-                self.path_hit = self.leaf_idx;
-                self.path_hits += 1;
-            } else if (depth > 0 and std.mem.eql(u8, elem.name, self.name)) {
-                self.leaf_hit = self.leaf_idx;
-                self.leaf_hits += 1;
+        /// The one leaf hit, null for none, `AmbiguousColumn` for several.
+        fn only(self: Hits) ColumnLookupError!?usize {
+            if (self.n > 1) return error.AmbiguousColumn;
+            return if (self.n == 1) self.last else null;
+        }
+    };
+
+    fn find(file: *const schema.FileMetaData, name: []const u8, quoted: bool) ColumnHits {
+        var hits: ColumnHits = .{};
+        var it: schema.LeafIterator = .init(file.schema.items);
+        while (it.next()) |leaf| {
+            if (quoted) {
+                if (quotedPathEql(name, leaf.path)) hits.path.add(leaf.index);
+            } else if (leaf.path.len == 1) {
+                if (std.mem.eql(u8, leaf.path[0], name)) hits.top.add(leaf.index);
+            } else if (dottedPathEql(name, leaf.path)) {
+                hits.path.add(leaf.index);
+            } else if (std.mem.eql(u8, leaf.path[leaf.path.len - 1], name)) {
+                hits.leaf.add(leaf.index);
             }
-            self.leaf_idx += 1;
-            return;
         }
-
-        const child_matched: ?usize = if (here) |h|
-            (if (h < self.name.len and self.name[h] == '.') h + 1 else null)
-        else
-            null;
-        var i: usize = 0;
-        while (i < n_children and self.pos < self.items.len) : (i += 1) self.visitAt(depth + 1, child_matched);
-    }
-
-    fn visit(self: *ColumnWalk, depth: usize) void {
-        self.visitAt(depth, 0);
+        return hits;
     }
 };
 
-/// Decision returned by the row-group pruner. `keep` if the row group
-/// might contain matching rows; `skip` if its stats prove it can't.
-/// `unknown` if the stats are missing/insufficient to decide.
-pub const Decision = enum { keep, skip, unknown };
-
-/// Equality pruner: returns `skip` iff the column's `[min_value, max_value]`
-/// range doesn't include `needle`. Comparison is unsigned bytewise, the
-/// type-defined order of a byte-array column. The deprecated `min`/`max`
-/// are never read: they were written with a signed comparison, which
-/// misorders any byte at or above 0x80.
-pub fn pruneEqual(
-    rg: *const schema.RowGroup,
-    column_index: usize,
-    needle: []const u8,
-) Decision {
-    if (column_index >= rg.columns.items.len) return .unknown;
-    const meta = rg.columns.items[column_index].meta_data orelse return .unknown;
-    const stats = meta.statistics orelse return .unknown;
-
-    const min = stats.min_value orelse return .unknown;
-    const max = stats.max_value orelse return .unknown;
-
-    if (std.mem.lessThan(u8, needle, min)) return .skip;
-    if (std.mem.lessThan(u8, max, needle)) return .skip;
-    return .keep;
-}
-
-/// Range pruner: returns `skip` iff the column's `[min_value, max_value]`
-/// doesn't overlap the half-open interval `[lo, hi)`. Same bytewise order,
-/// and the same refusal of the deprecated pair, as `pruneEqual`.
-pub fn pruneRange(
-    rg: *const schema.RowGroup,
-    column_index: usize,
-    lo: []const u8,
-    hi: []const u8,
-) Decision {
-    if (column_index >= rg.columns.items.len) return .unknown;
-    const meta = rg.columns.items[column_index].meta_data orelse return .unknown;
-    const stats = meta.statistics orelse return .unknown;
-
-    const min = stats.min_value orelse return .unknown;
-    const max = stats.max_value orelse return .unknown;
-
-    // Disjoint if max < lo OR min >= hi.
-    if (std.mem.lessThan(u8, max, lo)) return .skip;
-    if (!std.mem.lessThan(u8, min, hi)) return .skip;
-    return .keep;
+/// Whether `segments` joined by `.` spell exactly `name`, without joining them.
+fn dottedPathEql(name: []const u8, segments: []const []const u8) bool {
+    var rest = name;
+    for (segments, 0..) |seg, i| {
+        if (i > 0) {
+            if (rest.len == 0 or rest[0] != '.') return false;
+            rest = rest[1..];
+        }
+        if (!std.mem.startsWith(u8, rest, seg)) return false;
+        rest = rest[seg.len..];
+    }
+    return rest.len == 0;
 }
 
 // ============================================================
@@ -960,6 +843,22 @@ test "chunk paths compare by segment: a top-level column named a.b is not the fi
     }
 }
 
+test "a chunk's path finds its leaf, not a group that shares the path" {
+    // Two top-level fields named `g`, an OPTIONAL group and a REQUIRED leaf. Looking the leaf's levels up by path
+    // used to stop at the group and hand the leaf the group's definition level.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var group = groupForTest("g", 1);
+    group.repetition_type = .OPTIONAL;
+    const elems = [_]schema.SchemaElement{ group, leafForTest("x"), leafForTest("g") };
+    const meta = try openFooter(arena, try chunkPathFooterForTest(arena, &elems, &.{ &.{ "g", "x" }, &.{"g"} }));
+    try testing.expectEqual(schema.Levels{ .max_def = 0, .max_rep = 0 }, meta.getColumnLevels(&.{"g"}));
+    try testing.expectEqual(@as(?schema.Type, .INT64), meta.getColumnSchema(&.{"g"}).?.type);
+    try testing.expectEqual(schema.Levels{ .max_def = 1, .max_rep = 0 }, meta.getColumnLevels(&.{ "g", "x" }));
+    try testing.expect(meta.getColumnSchema(&.{ "g", "x", "y" }) == null);
+}
+
 test "footer open rejects counts, offsets and sizes no valid file can have" {
     // Hardwood's fixture: a negative data_page_offset, which every chunk reader cast straight to usize.
     const bytes = try readFileSlice("ci/fixtures/parquet/negative_data_page_offset.parquet", testing.allocator);
@@ -1008,6 +907,18 @@ test "footer open rejects counts, offsets and sizes no valid file can have" {
         .{ .err = error.BadSchemaElement, .apply = struct {
             fn f(m: *schema.FileMetaData) void {
                 m.schema.items[1].type = null; // neither a type nor children
+            }
+        }.f },
+        // `b` lies past the root's last child.
+        .{ .err = error.BadSchemaElement, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.schema.items[0].num_children = 1;
+            }
+        }.f },
+        // The root promises a child the list never reaches.
+        .{ .err = error.BadSchemaElement, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.schema.items[0].num_children = 3;
             }
         }.f },
         .{ .err = error.ColumnChunkRowCountMismatch, .apply = struct {
@@ -1085,48 +996,6 @@ test "footer open rejects counts, offsets and sizes no valid file can have" {
     try testing.expectEqual(@as(usize, 2), leafCount(&opened));
     try testing.expectEqualStrings("b", (try leafPathSegments(arena, &opened, 1)).?[0]);
     try testing.expect((try leafPathSegments(arena, &opened, 2)) == null);
-}
-
-test "pruneEqual skips when stats range excludes the value" {
-    // Build a synthetic RowGroup with one column whose stats say min='A', max='C'.
-    var rg: schema.RowGroup = .{
-        .columns = .empty,
-        .total_byte_size = 0,
-        .num_rows = 0,
-    };
-    defer rg.columns.deinit(testing.allocator);
-
-    const meta: schema.ColumnMetaData = .{
-        .type = .BYTE_ARRAY,
-        .encodings = .empty,
-        .path_in_schema = .empty,
-        .codec = .UNCOMPRESSED,
-        .num_values = 100,
-        .total_uncompressed_size = 1024,
-        .total_compressed_size = 1024,
-        .data_page_offset = 0,
-        .index_page_offset = null,
-        .dictionary_page_offset = null,
-        .statistics = .{
-            .min_value = "A",
-            .max_value = "C",
-        },
-    };
-    try rg.columns.append(testing.allocator, .{
-        .file_path = null,
-        .file_offset = 0,
-        .meta_data = meta,
-    });
-
-    try testing.expectEqual(Decision.keep, pruneEqual(&rg, 0, "B"));
-    try testing.expectEqual(Decision.skip, pruneEqual(&rg, 0, "Z"));
-    try testing.expectEqual(Decision.skip, pruneEqual(&rg, 0, "0"));
-    try testing.expectEqual(Decision.unknown, pruneEqual(&rg, 99, "X")); // bad index
-
-    // The deprecated pair alone is signed-ordered: for {"a", "b", "é"} it reads min "é" (0xC3 is negative), max "b".
-    rg.columns.items[0].meta_data.?.statistics = .{ .min = "\xc3\xa9", .max = "b" };
-    try testing.expectEqual(Decision.unknown, pruneEqual(&rg, 0, "a"));
-    try testing.expectEqual(Decision.unknown, pruneRange(&rg, 0, "a", "aa"));
 }
 
 /// Read a whole file for tests: `pub` so other modules' tests can load parquet-testing fixtures. A missing file is
@@ -1373,25 +1242,99 @@ test "resolveProjection: an exact top-level name first, then the names resolveCo
     try testing.expectError(error.AmbiguousColumn, resolveProjection(arena, &meta, "\"x\""));
 }
 
-test "leafLabels takes time linear in the leaf count" {
-    // 10k structs of two fields each: labelling leaf by leaf walked the schema per leaf.
+/// Shapes of `wideSchemaForTest`: the labelling cases that cost differently.
+pub const WideShape = enum {
+    /// Structs `s<i>{x, y}`: every leaf labelled by its own dotted path.
+    ordinary,
+    /// Structs `s<i>{x}`, each beside a top-level column named `s<i>.x`: every nested label is a quoted path.
+    colliding,
+    /// Structs `"s<i>"{"x"}`: every dotted path reads as a quoted path naming other segments.
+    quoted,
+};
+
+/// A schema of `structs` top-level structs in the given shape, for tests and the label benchmark.
+pub fn wideSchemaForTest(arena: std.mem.Allocator, structs: usize, shape: WideShape) !schema.FileMetaData {
+    var meta = emptyMetaForTest();
+    const top: i32 = @intCast(if (shape == .colliding) 2 * structs else structs);
+    try meta.schema.append(arena, groupForTest("root", top));
+    for (0..structs) |i| switch (shape) {
+        .ordinary => try meta.schema.appendSlice(arena, &.{
+            groupForTest(try std.fmt.allocPrint(arena, "s{d}", .{i}), 2), leafForTest("x"), leafForTest("y"),
+        }),
+        .colliding => try meta.schema.appendSlice(arena, &.{
+            leafForTest(try std.fmt.allocPrint(arena, "s{d}.x", .{i})),
+            groupForTest(try std.fmt.allocPrint(arena, "s{d}", .{i}), 1),
+            leafForTest("x"),
+        }),
+        .quoted => try meta.schema.appendSlice(arena, &.{
+            groupForTest(try std.fmt.allocPrint(arena, "\"s{d}\"", .{i}), 1), leafForTest("\"x\""),
+        }),
+    };
+    return meta;
+}
+
+test "leafLabels on wide schemas, with and without colliding names" {
+    // Timing lives in `zig build bench-labels`; this checks the labels and that a sample binds back.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const structs = 10_000;
-    var meta = emptyMetaForTest();
-    try meta.schema.append(arena, groupForTest("root", structs));
-    for (0..structs) |i| {
-        try meta.schema.append(arena, groupForTest(try std.fmt.allocPrint(arena, "s{d}", .{i}), 2));
-        try meta.schema.appendSlice(arena, &.{ leafForTest("x"), leafForTest("y") });
-    }
-    const start = nowNs();
-    const labels = (try leafLabels(arena, &meta)).names;
-    const elapsed_ms = @divTrunc(nowNs() - start, std.time.ns_per_ms);
-    try testing.expectEqualStrings("s9999.y", labels[2 * structs - 1].?);
-    // Generous: linear labelling takes milliseconds even in a debug build; per-leaf walks took tens of seconds.
-    testing.expect(elapsed_ms < 2_000) catch |err| {
-        std.debug.print("labelling {d} leaves took {d} ms\n", .{ 2 * structs, elapsed_ms });
-        return err;
+    const structs = 2_000;
+    const Case = struct { shape: WideShape, leaf: usize, label: []const u8 };
+    const cases = [_]Case{
+        .{ .shape = .ordinary, .leaf = 2 * structs - 1, .label = "s1999.y" },
+        .{ .shape = .colliding, .leaf = 2 * structs - 2, .label = "s1999.x" },
+        .{ .shape = .colliding, .leaf = 2 * structs - 1, .label = "\"s1999\".\"x\"" },
+        .{ .shape = .quoted, .leaf = structs - 1, .label = "\"\"\"s1999\"\"\".\"\"\"x\"\"\"" },
     };
+    for (cases) |c| {
+        const meta = try wideSchemaForTest(arena, structs, c.shape);
+        const labels = (try leafLabels(arena, &meta)).names;
+        try testing.expectEqualStrings(c.label, labels[c.leaf].?);
+        var i: usize = c.leaf % 97;
+        while (i < labels.len) : (i += 97) try testing.expectEqual(i, try resolveColumn(&meta, labels[i].?));
+    }
+}
+
+test "leafLabels agrees with leafLabel on random schemas of colliding names" {
+    // `leafLabels` answers from counts what `leafLabel` asks `resolveColumn`; names drawn from a pool of dotted,
+    // quoted and repeated spellings make the two cover every rule.
+    const pool = [_][]const u8{
+        "a", "b", "a.b", "b.c", "a.b.c", "\"a\"", "\"a\".\"b\"", "a\"b", "\"\"\"a\"\"\"", "\"a.b\"",
+    };
+    var prng = std.Random.DefaultPrng.init(0x1abe1);
+    const rand = prng.random();
+    for (0..300) |_| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var meta = emptyMetaForTest();
+        const top = 1 + rand.uintLessThan(u8, 4);
+        try meta.schema.append(arena, groupForTest("root", top));
+        // Depth-first, with the children each open group still expects.
+        var pending: std.ArrayList(usize) = .empty;
+        try pending.append(arena, top);
+        while (pending.items.len > 0) {
+            const last = &pending.items[pending.items.len - 1];
+            if (last.* == 0) {
+                _ = pending.pop();
+                continue;
+            }
+            last.* -= 1;
+            const name = pool[rand.uintLessThan(usize, pool.len)];
+            if (pending.items.len < 4 and rand.boolean()) {
+                const n = 1 + rand.uintLessThan(u8, 3);
+                try meta.schema.append(arena, groupForTest(name, n));
+                try pending.append(arena, n);
+            } else try meta.schema.append(arena, leafForTest(name));
+        }
+        const all = (try leafLabels(arena, &meta)).names;
+        try testing.expectEqual(leafCount(&meta), all.len);
+        for (all, 0..) |got, i| {
+            const want = leafLabel(arena, &meta, i) catch |err| switch (err) {
+                error.DuplicateOutputColumn => null,
+                else => return err,
+            };
+            if (want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
+        }
+    }
 }

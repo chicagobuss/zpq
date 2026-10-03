@@ -370,11 +370,7 @@ fn workerRunErr(w: *Worker) !void {
         var rg_filter = w.filter_opt;
         var fetch_arr = item.fetch_arr;
         if (w.filter_opt) |f| if (!w.scan_all) {
-            // pruneRowGroup needs a transient allocator; per-RG arena
-            // keeps the working set small. Skipped under --scan-all.
-            var rg_arena = std.heap.ArenaAllocator.init(w.gpa);
-            defer rg_arena.deinit();
-            switch (try filter_prune.pruneRowGroup(rg, f, rg_arena.allocator(), meta)) {
+            switch (filter_prune.pruneRowGroup(rg, f, meta)) {
                 .skip => {
                     if (item.agg_start == 0) {
                         w.rgs_pruned += 1;
@@ -1099,6 +1095,18 @@ fn groupKeyLabel(arena: std.mem.Allocator, item: expr_ast.SelectItem, meta: *con
     }
 }
 
+/// The label of the column a bare column key reads, given the key's own `label`; `label` itself for any other key.
+/// Each label walks the schema, and an unaliased column key's label already is its column's.
+fn keySourceLabel(
+    arena: std.mem.Allocator,
+    item: expr_ast.SelectItem,
+    meta: *const schema.FileMetaData,
+    label: []const u8,
+) Error![]const u8 {
+    if (item.expr != .col_ref or item.alias == null) return label;
+    return leafLabel(arena, meta, item.expr.col_ref.col_idx);
+}
+
 fn splitColumnList(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, csv, ',');
@@ -1163,7 +1171,7 @@ fn nameUnaliasedAggs(
         }
         for (group_items orelse &.{}) |item| {
             const label = try groupKeyLabel(arena, item, meta);
-            const source = if (item.expr == .col_ref) try leafLabel(arena, meta, item.expr.col_ref.col_idx) else label;
+            const source = try keySourceLabel(arena, item, meta, label);
             if (std.ascii.eqlIgnoreCase(call.alias, label) or std.ascii.eqlIgnoreCase(call.alias, source)) t.* = true;
         }
     }
@@ -1249,7 +1257,7 @@ fn resolveOutputColumn(
     var key: ?usize = null;
     for (group_items, 0..) |item, k_idx| {
         const label = try groupKeyLabel(arena, item, meta);
-        const source = if (item.expr == .col_ref) try leafLabel(arena, meta, item.expr.col_ref.col_idx) else label;
+        const source = try keySourceLabel(arena, item, meta, label);
         if (std.ascii.eqlIgnoreCase(expr_name, label) or std.ascii.eqlIgnoreCase(alias_name, label) or
             std.ascii.eqlIgnoreCase(expr_name, source) or std.ascii.eqlIgnoreCase(alias_name, source))
         {
@@ -2226,7 +2234,7 @@ test "full match: per-row-group decisions on a real footer" {
     for (cases) |c| {
         const f = try filter_parser.parse(arena, c.filter, &meta);
         for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
-            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            const got = filter_prune.pruneRowGroup(rg, f, &meta);
             testing.expectEqual(want, got) catch |err| {
                 std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
                     c.filter, i, @tagName(got), @tagName(want),
@@ -2441,7 +2449,7 @@ test "unsigned columns: row-group decisions read bounds unsigned" {
     for (cases) |c| {
         const f = try filter_parser.parse(arena, c.filter, &meta);
         for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
-            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            const got = filter_prune.pruneRowGroup(rg, f, &meta);
             testing.expectEqual(want, got) catch |err| {
                 std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
                     c.filter, i, @tagName(got), @tagName(want),
@@ -2489,7 +2497,7 @@ test "deprecated min/max prune only where their signed order is the column's ord
     for (cases) |c| {
         const f = try filter_parser.parse(arena, c.filter, &meta);
         for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
-            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            const got = filter_prune.pruneRowGroup(rg, f, &meta);
             testing.expectEqual(want, got) catch |err| {
                 std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
                     c.filter, i, @tagName(got), @tagName(want),
@@ -2546,7 +2554,7 @@ test "bounds in a declared column order zpq does not implement never prune" {
     for (cases) |c| {
         const f = try filter_parser.parse(arena, c.filter, &meta);
         for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
-            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            const got = filter_prune.pruneRowGroup(rg, f, &meta);
             testing.expectEqual(want, got) catch |err| {
                 std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
                     c.filter, i, @tagName(got), @tagName(want),
@@ -2579,7 +2587,7 @@ test "!= on a float chunk whose bounds are the literal skips only when nan_count
     const f = try filter_parser.parse(arena, "d != 0", &meta);
     const D = filter_prune.Decision;
     for (meta.row_groups.items, [_]D{ .keep, .skip, .keep }, 0..) |*rg, want, i| {
-        const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+        const got = filter_prune.pruneRowGroup(rg, f, &meta);
         testing.expectEqual(want, got) catch |err| {
             std.debug.print("d != 0: row group {d} decided {s}, want {s}\n", .{ i, @tagName(got), @tagName(want) });
             return err;

@@ -1292,7 +1292,7 @@ pub fn scanRGForAgg(
             }
 
             for (locs, 0..) |loc, page_idx| {
-                const dec = try filter_prune.prunePage(rg, page_idx, leaf.filter, ci_list, ra, meta, trust_stats);
+                const dec = filter_prune.prunePage(rg, page_idx, leaf.filter, ci_list, meta, trust_stats);
                 const start: usize = @intCast(loc.first_row_index);
                 const end: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
 

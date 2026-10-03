@@ -49,6 +49,7 @@ pub const core = struct {
         pub const page = @import("core/parquet/page.zig");
         pub const column = @import("core/parquet/column.zig");
         pub const decimal = @import("core/parquet/decimal.zig");
+        pub const statistics = @import("core/parquet/statistics.zig");
         pub const int96 = @import("core/parquet/int96.zig");
         pub const fuzz_decode = @import("core/parquet/fuzz_decode.zig");
         pub const encoding = struct {
@@ -116,6 +117,7 @@ test {
     _ = @import("core/parquet/page.zig");
     _ = @import("core/parquet/column.zig");
     _ = @import("core/parquet/decimal.zig");
+    _ = @import("core/parquet/statistics.zig");
     _ = @import("core/parquet/int96.zig");
     _ = @import("core/parquet/fuzz_decode.zig");
     _ = @import("core/parquet/encoding/plain.zig");

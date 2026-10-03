@@ -24,11 +24,11 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
-const filter_prune = @import("../filter/prune.zig");
 const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
+const statistics = @import("../parquet/statistics.zig");
 
 pub const Error = error{
     BadAggArg,
@@ -380,7 +380,7 @@ pub fn updateOneFromStats(
             const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
             if (plan.present == 0) return true; // nothing to add; an all-null sum stays NULL
             switch (plan.lane) {
-                .decimal => |k| state.sum_f = (state.sum_f orelse 0) + decimalStatBytesToF64(plan.bounds.min, k).? *
+                .decimal => |k| state.sum_f = (state.sum_f orelse 0) + decimal_mod.statToF64(plan.bounds.min, k).? *
                     @as(f64, @floatFromInt(plan.present)),
                 .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
             }
@@ -396,7 +396,7 @@ const StatLane = union(enum) { decimal: decimal_mod.Kind, int, float };
 const StatFold = struct {
     lane: StatLane,
     physical: schema.Type,
-    bounds: filter_prune.Bounds,
+    bounds: statistics.Bounds,
     /// Non-null rows; only computed (and required) for sum.
     present: i64 = 0,
 };
@@ -415,7 +415,7 @@ fn planStatFold(
     const levels = columnLevelsForStats(file_meta, &cm) orelse return null;
     if (levels.max_rep > 0) return null;
     // Bounds in the column's own order: the deprecated pair only where signed is that order.
-    const bounds = filter_prune.chunkBounds(rg, col_idx, file_meta) orelse return null;
+    const bounds = statistics.chunkBounds(rg, col_idx, file_meta) orelse return null;
     const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
     var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
     if (call.func == .sum) {
@@ -423,7 +423,7 @@ fn planStatFold(
         // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
         // constant.
         plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
-        if (lane == .decimal and decimalStatBytesToF64(bounds.min, lane.decimal) == null) return null;
+        if (lane == .decimal and decimal_mod.statToF64(bounds.min, lane.decimal) == null) return null;
     }
     return plan;
 }
@@ -476,36 +476,6 @@ fn statPresentCount(
     return if (levels.max_def == 0) rg.num_rows else null;
 }
 
-/// Decode a DECIMAL stat bytes slice to f64. Mirrors the helper in
-/// `filter/prune.zig`.
-fn decimalStatBytesToF64(bytes: []const u8, kind: decimal_mod.Kind) ?f64 {
-    return switch (kind.physical) {
-        .INT32 => blk: {
-            if (bytes.len < 4) break :blk null;
-            const i = std.mem.readInt(i32, bytes[0..4], .little);
-            break :blk decimal_mod.applyScaleInt(i32, i, kind.scale);
-        },
-        .INT64 => blk: {
-            if (bytes.len < 8) break :blk null;
-            const i = std.mem.readInt(i64, bytes[0..8], .little);
-            break :blk decimal_mod.applyScaleInt(i64, i, kind.scale);
-        },
-        .FIXED_LEN_BYTE_ARRAY => blk: {
-            if (kind.byte_width == 0 or kind.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH) break :blk null;
-            if (bytes.len < kind.byte_width) break :blk null;
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes[0..kind.byte_width]),
-                kind.scale,
-            );
-        },
-        .BYTE_ARRAY => blk: {
-            if (bytes.len == 0 or bytes.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) break :blk null;
-            break :blk decimal_mod.applyScaleI128(decimal_mod.flbaToI128(bytes), kind.scale);
-        },
-        else => null,
-    };
-}
-
 /// Decode a non-DECIMAL stat min/max bytes slice as the column's
 /// physical type and add `present × value` into the accumulator.
 fn foldConstantSumStatBytes(
@@ -549,49 +519,17 @@ fn foldConstantSumStatBytes(
     }
 }
 
-/// Fold a DECIMAL column's stat min/max bytes into an .min_f /
-/// .max_f accumulator. The bytes are in the column's physical wire
-/// format (INT32/INT64 little-endian, FLBA big-endian two's-comp).
-/// We decode through decimal_mod's helpers so it matches what the
-/// value-decode path produced — same answer, no per-RG decode.
+/// Fold a DECIMAL column's stat min/max bytes into an .min_f / .max_f accumulator, decoded the way the value path
+/// decodes them so the answer is the same without a per-RG decode.
 fn foldDecimalStatBytes(
     state: *Accumulator,
     call: AggCall,
     kind: decimal_mod.Kind,
     bytes: []const u8,
 ) !void {
-    const v: f64 = switch (kind.physical) {
-        .INT32 => blk: {
-            if (bytes.len < 4) return error.BadAggArg;
-            const i = std.mem.readInt(i32, bytes[0..4], .little);
-            break :blk decimal_mod.applyScaleInt(i32, i, kind.scale);
-        },
-        .INT64 => blk: {
-            if (bytes.len < 8) return error.BadAggArg;
-            const i = std.mem.readInt(i64, bytes[0..8], .little);
-            break :blk decimal_mod.applyScaleInt(i64, i, kind.scale);
-        },
-        .FIXED_LEN_BYTE_ARRAY => blk: {
-            if (kind.byte_width == 0 or kind.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH) {
-                return error.BadAggArg;
-            }
-            if (bytes.len < kind.byte_width) return error.BadAggArg;
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes[0..kind.byte_width]),
-                kind.scale,
-            );
-        },
-        // BYTE_ARRAY stat: raw variable-width bytes (no length prefix).
-        .BYTE_ARRAY => blk: {
-            if (bytes.len == 0 or bytes.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) {
-                return error.BadAggArg;
-            }
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes),
-                kind.scale,
-            );
-        },
-        else => return error.UnsupportedAggType,
+    const v = decimal_mod.statToF64(bytes, kind) orelse return switch (kind.physical) {
+        .INT32, .INT64, .FIXED_LEN_BYTE_ARRAY, .BYTE_ARRAY => error.BadAggArg,
+        else => error.UnsupportedAggType,
     };
     switch (state.*) {
         .min_f => |*slot| {
@@ -2332,52 +2270,6 @@ test "grouped sum/min over a group with only null values stays NULL" {
     try testing.expectEqual(@as(?i128, null), accs[1].min_i);
     try testing.expectEqual(@as(?i128, 5), accs[2].sum_i);
     try testing.expectEqual(@as(?i128, 5), accs[3].min_i);
-}
-
-// --- DECIMAL aggregate stats-fast-path (self-contained, no fixtures) ---
-// decimalStatBytesToF64 is how min/max/sum on a DECIMAL column are answered
-// from row-group Statistics without decoding values. It's pure (byte slice +
-// Kind → f64), so it's testable directly; the fixture-based decode tests in
-// decimal.zig skip without the corpus, but these always run in CI.
-
-test "decimalStatBytesToF64: INT32/INT64 backings apply scale (signed)" {
-    var b32: [4]u8 = undefined;
-    std.mem.writeInt(i32, &b32, 12345, .little);
-    const k32 = decimal_mod.Kind{ .scale = 2, .precision = 9, .physical = .INT32, .byte_width = 0 };
-    try testing.expectApproxEqAbs(@as(f64, 123.45), decimalStatBytesToF64(&b32, k32).?, 1e-9);
-
-    std.mem.writeInt(i32, &b32, -6789, .little); // negative
-    try testing.expectApproxEqAbs(@as(f64, -67.89), decimalStatBytesToF64(&b32, k32).?, 1e-9);
-
-    var b64: [8]u8 = undefined;
-    std.mem.writeInt(i64, &b64, 100000, .little);
-    const k64 = decimal_mod.Kind{ .scale = 3, .precision = 18, .physical = .INT64, .byte_width = 0 };
-    try testing.expectApproxEqAbs(@as(f64, 100.0), decimalStatBytesToF64(&b64, k64).?, 1e-9);
-}
-
-test "decimalStatBytesToF64: FLBA backing sign-extends + scales" {
-    var be: [8]u8 = undefined;
-    const kpos = decimal_mod.Kind{ .scale = 2, .precision = 20, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 8 };
-    std.mem.writeInt(i64, &be, 12345, .big);
-    try testing.expectApproxEqAbs(@as(f64, 123.45), decimalStatBytesToF64(&be, kpos).?, 1e-9);
-    std.mem.writeInt(i64, &be, -12345, .big); // high byte 0xFF must sign-extend
-    try testing.expectApproxEqAbs(@as(f64, -123.45), decimalStatBytesToF64(&be, kpos).?, 1e-9);
-
-    // narrow 2-byte FLBA, scale 0: -100 = 0xFF9C big-endian
-    var be2: [2]u8 = undefined;
-    std.mem.writeInt(i16, &be2, -100, .big);
-    const k2 = decimal_mod.Kind{ .scale = 0, .precision = 4, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 2 };
-    try testing.expectApproxEqAbs(@as(f64, -100.0), decimalStatBytesToF64(&be2, k2).?, 1e-9);
-}
-
-test "decimalStatBytesToF64: malformed inputs return null (no UB)" {
-    const short = [_]u8{ 0x01, 0x02 }; // < 4 bytes for INT32
-    try testing.expect(decimalStatBytesToF64(&short, .{ .scale = 0, .precision = 9, .physical = .INT32, .byte_width = 0 }) == null);
-
-    const some: [8]u8 = @splat(0);
-    // FLBA byte_width 0 → reject; byte_width 17 (> MAX_FLBA_BYTE_WIDTH) → reject
-    try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
-    try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);
 }
 
 pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {

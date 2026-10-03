@@ -423,11 +423,19 @@ LpNode *lp_make_literal_bool(LpParseContext *ctx, int value) {
     return n;
 }
 
+/* Whether an identifier token is quoted ("x", `x`, [x] or 'x'). */
+static unsigned int tok_quoted(LpToken *tok, unsigned int bit) {
+    if (!tok || !tok->z || tok->n == 0) return 0;
+    char q = tok->z[0];
+    return (q == '"' || q == '`' || q == '[' || q == '\'') ? bit : 0;
+}
+
 LpNode *lp_make_column_ref(LpParseContext *ctx, LpToken *name) {
     LpNode *n = lp_node_new(ctx, LP_EXPR_COLUMN_REF);
     if (!n) return NULL;
     node_pos_tok(n, name);
     n->u.column_ref.column = lp_token_dequote(ctx, name);
+    n->u.column_ref.quoted = tok_quoted(name, LP_QUOTED_COLUMN);
     return n;
 }
 
@@ -437,6 +445,7 @@ LpNode *lp_make_column_ref2(LpParseContext *ctx, LpToken *table, LpToken *column
     node_pos_tok(n, table);
     n->u.column_ref.table = lp_token_dequote(ctx, table);
     n->u.column_ref.column = lp_token_dequote(ctx, column);
+    n->u.column_ref.quoted = tok_quoted(table, LP_QUOTED_TABLE) | tok_quoted(column, LP_QUOTED_COLUMN);
     return n;
 }
 
@@ -448,6 +457,8 @@ LpNode *lp_make_column_ref3(LpParseContext *ctx, LpToken *schema,
     n->u.column_ref.schema = lp_token_dequote(ctx, schema);
     n->u.column_ref.table = lp_token_dequote(ctx, table);
     n->u.column_ref.column = lp_token_dequote(ctx, column);
+    n->u.column_ref.quoted = tok_quoted(schema, LP_QUOTED_SCHEMA) | tok_quoted(table, LP_QUOTED_TABLE) |
+                             tok_quoted(column, LP_QUOTED_COLUMN);
     return n;
 }
 
@@ -2610,6 +2621,7 @@ LpNode *lp_node_clone(arena_t *arena, const LpNode *node) {
             n->u.column_ref.schema = CS(node->u.column_ref.schema);
             n->u.column_ref.table = CS(node->u.column_ref.table);
             n->u.column_ref.column = CS(node->u.column_ref.column);
+            n->u.column_ref.quoted = node->u.column_ref.quoted;
             break;
 
         case LP_EXPR_BINARY_OP:

@@ -126,19 +126,10 @@ fn caseInsensitiveIndexOf(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
-/// Strip SQL double-quote identifier quoting: `"col"` → `col`. Unquoted
-/// names pass through untouched. (Real schema names and our generators
-/// don't embed quotes via `""` doubling, so the outer-pair strip suffices.)
-fn unquoteIdent(name: []const u8) []const u8 {
-    const t = std.mem.trim(u8, name, " \t");
-    if (t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"') return t[1 .. t.len - 1];
-    return t;
-}
-
 /// Resolve a (possibly double-quoted) column name to its leaf index. See
 /// `metadata.resolveColumn` for how bare and dotted names bind.
 fn resolveCol(file: *const schema.FileMetaData, name: []const u8) Error!usize {
-    const ident = unquoteIdent(name);
+    const ident = metadata.unquoteIdent(name);
     return metadata.resolveColumn(file, ident) catch |err| {
         if (err == error.AmbiguousColumn) {
             std.debug.print("filter: column `{s}` is ambiguous: {s}\n", .{ ident, metadata.ambiguityHint(file, ident) });
@@ -1295,4 +1286,20 @@ test "parse binds a bare name to the top-level column, not a nested leaf sharing
     try testing.expectError(error.AmbiguousColumn, parse(a, "x = 1", &meta));
     try testing.expectError(error.AmbiguousColumn, parse(a, "x IS NULL", &meta));
     try testing.expectEqual(@as(usize, 4), (try parse(a, "a.x = 1", &meta)).int32.col_idx);
+}
+
+test "parse binds a quoted path to the nested leaf a top-level column's dotted name hides" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try metadata.sharedLeafNameMetaForTest(a);
+    meta.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`, beside the group r's field key
+
+    try testing.expectEqual(@as(usize, 2), (try parse(a, "r.key > 1005", &meta)).int64.col_idx);
+    try testing.expectEqual(@as(usize, 2), (try parse(a, "\"r.key\" > 1005", &meta)).int64.col_idx);
+    try testing.expectEqual(@as(usize, 0), (try parse(a, "\"r\".\"key\" > 1005", &meta)).int64.col_idx);
+    try testing.expectEqual(@as(usize, 0), (try parse(a, "\"r\".\"key\" IS NULL", &meta)).null_check.col_idx);
+    const in_list = try parse(a, "\"r\".\"key\" IN (1, 2)", &meta);
+    try testing.expectEqual(@as(usize, 0), in_list.or_filter.left.int64.col_idx);
+    try testing.expectEqual(@as(usize, 1), (try parse(a, "\"r\".\"name\" LIKE 'a%'", &meta)).like.col_idx);
 }

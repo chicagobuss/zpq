@@ -118,6 +118,7 @@ pub fn main(init: std.process.Init) !void {
                     .{query_diag.column()},
                 ),
                 error.EmptyAggregate => std.debug.print("zpq query: empty aggregate expression\n", .{}),
+                error.EmptyColumnList => std.debug.print("zpq query: --columns names no column\n", .{}),
                 error.AggregateMutexWithSelect => std.debug.print("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
                 error.MissingOutputOrAggregate => std.debug.print("zpq query: missing --output or --aggregate\n", .{}),
                 error.SchemaMismatch => std.debug.print("zpq query: schema mismatch across inputs\n", .{}),
@@ -140,8 +141,14 @@ pub fn main(init: std.process.Init) !void {
                 error.UnexpectedEnd => std.debug.print("zpq query: unexpected end of expression\n", .{}),
                 error.BadNumber => std.debug.print("zpq query: invalid number in expression\n", .{}),
                 error.UnsupportedCodec => std.debug.print("zpq query: input uses a compression codec zpq cannot decompress\n", .{}),
-                error.UnknownColumn => std.debug.print("zpq query: unknown column referenced in expression\n", .{}),
-                error.AmbiguousColumn => std.debug.print("zpq query: ambiguous column name\n", .{}),
+                error.UnknownColumn => if (query_diag.len > 0)
+                    std.debug.print("zpq query: unknown column `{s}`\n", .{query_diag.column()})
+                else
+                    std.debug.print("zpq query: unknown column referenced in expression\n", .{}),
+                error.AmbiguousColumn => if (query_diag.len > 0)
+                    std.debug.print("zpq query: ambiguous column name `{s}`\n", .{query_diag.column()})
+                else
+                    std.debug.print("zpq query: ambiguous column name\n", .{}),
                 error.UnsupportedColumnType => std.debug.print("zpq query: unsupported column type\n", .{}),
                 error.UnterminatedString => std.debug.print("zpq query: unterminated string literal in expression\n", .{}),
                 error.TypeMismatch => std.debug.print("zpq query: type mismatch in expression\n", .{}),
@@ -454,6 +461,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             .group_by = group_by,
             .select_cols = select_cols,
             .column_order = column_order,
+            .diag = &query_diag,
         }, fmt, limit);
         return;
     }
@@ -602,6 +610,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         .trust_stats = trust_stats,
         .fast_levels = fast_levels,
         .max_memory = max_mem_limit,
+        .diag = &query_diag,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);

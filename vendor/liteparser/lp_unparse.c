@@ -72,6 +72,21 @@ static void sql_ident(LpBuf *out, const char *s) {
     }
 }
 
+/* An identifier, quoted when the source quoted it even if it need not be. */
+static void sql_ident_q(LpBuf *out, const char *s, int force) {
+    if (!s) return;
+    if (!force) {
+        sql_ident(out, s);
+        return;
+    }
+    lp_buf_putc(out, '"');
+    for (const char *p = s; *p; p++) {
+        if (*p == '"') lp_buf_putc(out, '"');
+        lp_buf_putc(out, *p);
+    }
+    lp_buf_putc(out, '"');
+}
+
 /* schema.name */
 static void sql_schema_name(LpBuf *out, const char *schema, const char *name) {
     if (schema) {
@@ -228,17 +243,19 @@ static void sql_expr(LpNode *node, LpBuf *out, int parent_prec) {
             lp_buf_puts(out, node->u.literal.value);
             break;
 
-        case LP_EXPR_COLUMN_REF:
+        case LP_EXPR_COLUMN_REF: {
+            unsigned int q = node->u.column_ref.quoted;
             if (node->u.column_ref.schema) {
-                sql_ident(out, node->u.column_ref.schema);
+                sql_ident_q(out, node->u.column_ref.schema, q & LP_QUOTED_SCHEMA);
                 lp_buf_putc(out, '.');
             }
             if (node->u.column_ref.table) {
-                sql_ident(out, node->u.column_ref.table);
+                sql_ident_q(out, node->u.column_ref.table, q & LP_QUOTED_TABLE);
                 lp_buf_putc(out, '.');
             }
-            sql_ident(out, node->u.column_ref.column);
+            sql_ident_q(out, node->u.column_ref.column, q & LP_QUOTED_COLUMN);
             break;
+        }
 
         case LP_EXPR_BINARY_OP: {
             int prec = binop_prec(node->u.binary.op);

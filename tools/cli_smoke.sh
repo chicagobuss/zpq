@@ -143,6 +143,166 @@ assert t.to_pylist() == [{"a.b": None, "a": {"b": 20}}], t.to_pylist()
 print("Dotted top-level beside nested field checks passed")
 PY
 
+# Flat output (rows, GROUP BY keys, a flat --select) names the nested field by
+# the quoted path "a"."b" rather than a second "a.b": one name per column, and
+# each name binds back through --columns, --filter and expressions.
+"$PY" - "$ZPQ" "$DIR" <<'PY'
+import csv, io, json, subprocess, sys
+import pyarrow as pa, pyarrow.parquet as pq
+zpq, d = sys.argv[1], sys.argv[2]
+src = f"{d}/dotted_twin.parquet"
+Q = '"a"."b"'
+
+def run(*args):
+    return subprocess.run([zpq, "query", *args], check=True, capture_output=True, text=True).stdout
+
+def no_dup_keys(pairs):
+    keys = [k for k, _ in pairs]
+    assert len(keys) == len(set(keys)), f"duplicate JSON keys: {keys}"
+    return dict(pairs)
+
+def jsonl(*args):
+    out = run(src, "--format", "jsonl", *args)
+    return [json.loads(line, object_pairs_hook=no_dup_keys) for line in out.splitlines()]
+
+rows = jsonl()
+assert rows == [{"a.b": 1, Q: 10}, {"a.b": None, Q: 20}, {"a.b": 3, Q: None}], rows
+assert [list(r) for r in rows] == [["a.b", Q]] * 3
+table = list(csv.reader(io.StringIO(run(src, "--format", "csv"))))
+assert table == [["a.b", Q], ["1", "10"], ["", "20"], ["3", ""]], table
+
+# Every printed name selects, and filters on, the column printed under it.
+for name, values in (("a.b", [1, None, 3]), (Q, [10, 20, None])):
+    assert jsonl("--columns", name) == [{name: v} for v in values], name
+    kept = jsonl("--columns", name, "--filter", f"{name} IS NOT NULL")
+    assert kept == [{name: v} for v in values if v is not None], (name, kept)
+assert jsonl("--filter", f"{Q} > 10") == [{"a.b": None, Q: 20}]
+
+# GROUP BY on each column, and on both: the aggregate JSON keys and the grouped parquet.
+def agg(*args):
+    return json.loads(run(src, *args), object_pairs_hook=no_dup_keys)["agg"]
+assert agg("--group-by", "b", "--aggregate", "count(*) AS n") == [{Q: None, "n": 1}, {Q: 10, "n": 1}, {Q: 20, "n": 1}]
+assert agg("--group-by", Q, "--aggregate", 'max("a.b") AS m') == [
+    {Q: None, "m": 3}, {Q: 10, "m": 1}, {Q: 20, "m": None}]
+assert agg("--group-by", '"a.b"', "--aggregate", f"max({Q}) AS m") == [
+    {"a.b": None, "m": 20}, {"a.b": 1, "m": 10}, {"a.b": 3, "m": None}]
+got = agg("--group-by", 'b, "a.b"', "--aggregate", "count(*) AS n")
+assert got == [{Q: None, "a.b": 3, "n": 1}, {Q: 10, "a.b": 1, "n": 1}, {Q: 20, "a.b": None, "n": 1}], got
+run(src, "-o", f"{d}/dotted_twin_gb.parquet", "--group-by", 'b, "a.b"', "--aggregate", "count(*) AS n")
+t = pq.read_table(f"{d}/dotted_twin_gb.parquet")
+assert t.schema.names == [Q, "a.b", "n"], t.schema.names
+
+# Parquet output keeps the struct; a flat --select names the field like the row formats.
+run(src, "-o", f"{d}/dotted_twin_q.parquet", "--columns", Q)
+t = pq.read_table(f"{d}/dotted_twin_q.parquet")
+assert t.to_pylist() == [{"a": {"b": 10}}, {"a": {"b": 20}}, {"a": {"b": None}}], t.to_pylist()
+pq.write_table(pa.table({"a.b": pa.array([1, None, 3], type=pa.int64()),
+                         "a": pa.array([{"b": 10}, {"b": 20}, {"b": 30}], type=pa.struct([("b", pa.int64())]))}),
+               f"{d}/dotted_twin_nn.parquet")
+run(f"{d}/dotted_twin_nn.parquet", "-o", f"{d}/dotted_twin_sel.parquet", "--select", f'"a.b", {Q}')
+t = pq.read_table(f"{d}/dotted_twin_sel.parquet")
+assert t.to_pylist() == [{"a.b": 1, Q: 10}, {"a.b": None, Q: 20}, {"a.b": 3, Q: 30}], t.to_pylist()
+
+# Only a top-level column literally named "a"."b", quotes included, leaves the field no name: refuse, naming it.
+pq.write_table(pa.table({"a.b": [1], Q: [2], "a": pa.array([{"b": 3}], type=pa.struct([("b", pa.int64())]))}),
+               f"{d}/dotted_triplet.parquet")
+for args in (["--format", "jsonl"], ["--group-by", "b", "--aggregate", "count(*) AS n"]):
+    p = subprocess.run([zpq, "query", f"{d}/dotted_triplet.parquet", *args], capture_output=True, text=True)
+    assert p.returncode != 0 and not p.stdout and Q in p.stderr, (args, p)
+out = run(f"{d}/dotted_triplet.parquet", "--format", "jsonl", "--select", 'b AS ab, "a.b"')
+assert json.loads(out) == {"ab": 3, "a.b": 1}, out
+print("Dotted top-level beside nested field output naming checks passed")
+PY
+
+# --query binds identifiers as the flag forms do: b and "a"."b" the nested
+# field, a.b and "a.b" the top-level column.
+"$PY" - "$ZPQ" "$DIR" <<'PY'
+import json, subprocess, sys
+import pyarrow as pa, pyarrow.parquet as pq
+zpq, d = sys.argv[1], sys.argv[2]
+src, nn = f"{d}/dotted_twin.parquet", f"{d}/dotted_twin_nn.parquet"
+
+def run(*args):
+    return subprocess.run([zpq, "query", *args], check=True, capture_output=True, text=True).stdout
+
+def written(*args):
+    out = f"{d}/dotted_sql.parquet"
+    run(*args, "-o", out)
+    t = pq.read_table(out)
+    return t.schema.names, t.to_pylist()
+
+nested, top = [None, 10, 20], [None, 1, 3]
+for name, keys in (("b", nested), ('"a"."b"', nested), ("a.b", top), ('"a.b"', top)):
+    # The key is named by its label however the reference is spelled, in SQL and with the flag.
+    sql = json.loads(run("--query", f"SELECT {name}, count(*) AS n FROM '{src}' GROUP BY {name}"))["agg"]
+    flag = json.loads(run(src, "--group-by", name, "--aggregate", "count(*) AS n"))["agg"]
+    label = '"a"."b"' if keys == nested else "a.b"
+    assert sql == flag and [r[label] for r in sql] == keys, (name, sql, flag)
+    sql = written("--query", f"SELECT * FROM '{src}' WHERE {name} IS NOT NULL")
+    assert sql == written(src, "--filter", f"{name} IS NOT NULL"), (name, sql)
+    sql = written("--query", f"SELECT {name} FROM '{nn}'")
+    assert sql == written(nn, "--select", name), (name, sql)
+# On an ordinary nested file every spelling of the field labels it r.v, as before quoted paths.
+pq.write_table(pa.table({"r": pa.array([{"v": 1}, {"v": 2}, {"v": 1}], type=pa.struct([("v", pa.int64())]))}),
+               f"{d}/plain_nested.parquet")
+want = [{"r.v": 1, "n": 2}, {"r.v": 2, "n": 1}]
+for name in ("v", "r.v", '"r"."v"', '"r".v'):
+    sql = json.loads(run("--query", f"SELECT {name}, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY {name}"))
+    assert sql["agg"] == want, (name, sql["agg"])
+    if name != '"r".v':  # SQL's mixed spelling; the flag forms quote every segment or none
+        flag = json.loads(run(f"{d}/plain_nested.parquet", "--group-by", name, "--aggregate", "count(*) AS n"))
+        assert flag["agg"] == want, (name, flag["agg"])
+sql = json.loads(run("--query", f"SELECT \"r\".\"v\" AS k, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY r.v"))
+assert sql["agg"] == [{"k": 1, "n": 2}, {"k": 2, "n": 1}], sql["agg"]
+print("SQL identifier binding checks passed")
+PY
+
+# An unknown --columns name is an error naming it, on every path, and writes
+# nothing; it used to be dropped, leaving a file with fewer columns or none.
+"$PY" - "$ZPQ" "$DIR" <<'PY'
+import os, subprocess, sys
+zpq, d = sys.argv[1], sys.argv[2]
+src, out = f"{d}/dotted_twin.parquet", f"{d}/unknown_cols.parquet"
+for cols in ("nope", "a.b,nope", '"a"."c"', "a.c"):
+    for args in (["-o", out], ["--format", "jsonl"], ["--format", "csv"]):
+        p = subprocess.run([zpq, "query", src, "--columns", cols, *args], capture_output=True, text=True)
+        bad = cols.split(",")[-1]
+        assert p.returncode != 0 and not p.stdout and f"unknown column `{bad}`" in p.stderr, (cols, args, p)
+        assert not os.path.exists(out), (cols, args)
+# Nor does a list that names nothing select nothing.
+for cols in (" ", ",", " , ,"):
+    for args in (["-o", out], ["--format", "jsonl"]):
+        p = subprocess.run([zpq, "query", src, "--columns", cols, *args], capture_output=True, text=True)
+        assert p.returncode != 0 and not p.stdout and "--columns names no column" in p.stderr, (cols, args, p)
+        assert not os.path.exists(out), (cols, args)
+print("Unknown --columns checks passed")
+PY
+
+# --columns binds names like --filter and --select: an exact top-level name
+# first (quotes in it included), then a quoted or dotted path, then the bare
+# name of the one nested field that has it.
+"$PY" - "$ZPQ" "$DIR" <<'PY'
+import json, subprocess, sys
+import pyarrow as pa, pyarrow.parquet as pq
+zpq, d = sys.argv[1], sys.argv[2]
+src = f"{d}/odd_names.parquet"
+pq.write_table(pa.table({'"x"': [1, 2], '"a"."b"': [3, 4], "x": [5, 6],
+                         "a": pa.array([{"b": 7}, {"b": 8}], type=pa.struct([("b", pa.int64())])),
+                         "r": pa.array([{"v": None}, {"v": 9}], type=pa.struct([("v", pa.int64())]))}), src)
+
+def jsonl(*args):
+    out = subprocess.run([zpq, "query", src, "--format", "jsonl", *args], check=True, capture_output=True, text=True)
+    return [json.loads(line) for line in out.stdout.splitlines()]
+
+assert jsonl("--columns", '"x"') == [{'"x"': 1}, {'"x"': 2}]
+assert jsonl("--columns", '"a"."b"') == [{'"a"."b"': 3}, {'"a"."b"': 4}]
+assert jsonl("--columns", "x") == [{"x": 5}, {"x": 6}]
+assert jsonl("--columns", "a.b") == [{"a.b": 7}, {"a.b": 8}]
+assert jsonl("--columns", "v") == [{"r.v": None}, {"r.v": 9}]
+assert jsonl("--columns", "v", "--filter", "v IS NULL") == [{"r.v": None}]
+print("--columns name binding checks passed")
+PY
+
 # A write that fails partway leaves no output file behind, and a codec zpq
 # cannot decompress is named in the error.
 "$PY" - "$DIR" <<'PY'

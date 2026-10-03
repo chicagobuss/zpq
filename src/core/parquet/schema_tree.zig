@@ -164,37 +164,6 @@ pub const SchemaTree = struct {
         return tree;
     }
 
-    /// Resolve a user-supplied projection path to a set of column-
-    /// chunk indices. Accepts:
-    ///
-    ///   - A single top-level field name (`"events"`) — returns all
-    ///     descendant leaf indices. For a top-level primitive, that's
-    ///     just one. For a group, all descendants in DFS order.
-    ///   - A dotted full path (`"events.list.element.ts"`) — returns
-    ///     a single index via the path_to_leaf map.
-    ///
-    /// Returns an empty slice when nothing matches; the caller decides
-    /// whether that's an error.
-    pub fn resolveTopLevel(
-        self: *const SchemaTree,
-        arena: std.mem.Allocator,
-        path_or_name: []const u8,
-    ) Error![]const u32 {
-        // Try direct path first — fastest, handles dotted full paths.
-        if (self.path_to_leaf.get(path_or_name)) |idx| {
-            if (idx == ambiguous_path) return arena.alloc(u32, 0) catch &.{};
-            const out = try arena.alloc(u32, 1);
-            out[0] = idx;
-            return out;
-        }
-        // Top-level group lookup: walk root.children.
-        for (self.root.children) |child| {
-            if (!std.mem.eql(u8, child.name(), path_or_name)) continue;
-            return try collectLeafIndices(arena, child);
-        }
-        return arena.alloc(u32, 0) catch &.{};
-    }
-
     /// Build a new SchemaTree containing only the kept leaves and
     /// every node on a path from root to those leaves. Output
     /// preserves `repetition_type`, `logical_type`, `converted_type`
@@ -455,27 +424,6 @@ fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) Error![]const u
 }
 
 // ============================================================
-// Lookup helpers
-// ============================================================
-
-fn collectLeafIndices(arena: std.mem.Allocator, node: Node) Error![]const u32 {
-    var acc: std.ArrayList(u32) = .empty;
-    try collectLeafIndicesInto(&acc, arena, node);
-    return acc.toOwnedSlice(arena);
-}
-
-fn collectLeafIndicesInto(
-    acc: *std.ArrayList(u32),
-    arena: std.mem.Allocator,
-    node: Node,
-) Error!void {
-    switch (node) {
-        .primitive => |p| try acc.append(arena, p.column_index),
-        .group => |g| for (g.children) |c| try collectLeafIndicesInto(acc, arena, c),
-    }
-}
-
-// ============================================================
 // Projector — builds a new tree from a kept-leaves mask
 // ============================================================
 
@@ -686,32 +634,31 @@ test "build tree from nested fixture (nested_edges.parquet)" {
     try testing.expectEqual(@as(u8, 1), counts_key.max_rep);
 }
 
-test "resolveTopLevel returns set of leaves under top-level group" {
+test "resolveProjection returns set of leaves under top-level group" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const file_bytes = readFile(arena, "data/nested_edges.parquet") catch return;
     const meta = try metadata.open(arena, file_bytes);
-    const tree = try SchemaTree.build(arena, meta.schema.items);
 
     // Top-level "events" should yield two leaves (ts, code).
-    const events_leaves = try tree.resolveTopLevel(arena, "events");
+    const events_leaves = try metadata.resolveProjection(arena, &meta, "events");
     try testing.expectEqualSlices(u32, &.{ 5, 6 }, events_leaves);
 
     // Top-level "id" is a single primitive leaf.
-    const id_leaves = try tree.resolveTopLevel(arena, "id");
+    const id_leaves = try metadata.resolveProjection(arena, &meta, "id");
     try testing.expectEqualSlices(u32, &.{0}, id_leaves);
 
     // Top-level "counts" (MAP) yields key + value.
-    const counts_leaves = try tree.resolveTopLevel(arena, "counts");
+    const counts_leaves = try metadata.resolveProjection(arena, &meta, "counts");
     try testing.expectEqualSlices(u32, &.{ 7, 8 }, counts_leaves);
 
     // Dotted full path resolves to a single leaf.
-    const ts_leaves = try tree.resolveTopLevel(arena, "events.list.element.ts");
+    const ts_leaves = try metadata.resolveProjection(arena, &meta, "events.list.element.ts");
     try testing.expectEqualSlices(u32, &.{5}, ts_leaves);
 
     // Unknown path → empty.
-    const empty = try tree.resolveTopLevel(arena, "nonexistent");
+    const empty = try metadata.resolveProjection(arena, &meta, "nonexistent");
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
@@ -739,15 +686,14 @@ test "leaf paths that join to the same dotted name" {
     }, [_]u32{ 0, 1 }) |flat, top| {
         const tree = try SchemaTree.build(arena, flat);
         try testing.expectEqual(@as(usize, 2), tree.leaves.len);
-        try testing.expectEqualSlices(u32, &.{top}, try tree.resolveTopLevel(arena, "a.b"));
-        try testing.expectEqualSlices(u32, &.{1 - top}, try tree.resolveTopLevel(arena, "a"));
+        try testing.expectEqual(top, tree.path_to_leaf.get("a.b").?);
         const kept = try tree.projectSubset(arena, &.{ 0, 1 });
-        try testing.expectEqualSlices(u32, &.{top}, try kept.resolveTopLevel(arena, "a.b"));
+        try testing.expectEqual(top, kept.path_to_leaf.get("a.b").?);
     }
 
     // Two nested leaves that join alike name neither.
     const nested = try SchemaTree.build(arena, &.{ E.root(2), E.group("x", 1), E.leaf("y.z"), E.group("x.y", 1), E.leaf("z") });
-    try testing.expectEqual(@as(usize, 0), (try nested.resolveTopLevel(arena, "x.y.z")).len);
+    try testing.expectEqual(ambiguous_path, nested.path_to_leaf.get("x.y.z").?);
 
     // The same path twice is still a duplicate field.
     try testing.expectError(error.DuplicatePath, SchemaTree.build(arena, &.{ E.root(2), E.leaf("k"), E.leaf("k") }));

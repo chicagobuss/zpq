@@ -250,6 +250,11 @@ pub const ColumnLookupError = error{ UnknownColumn, AmbiguousColumn };
 ///   3. Otherwise a bare name (no `.`) binds to the one nested leaf whose
 ///      own name it is.
 ///
+/// A name in quoted-path form (`"a"."b"`, see `isQuotedPath`) that is not a
+/// top-level name binds by segments instead: to the leaf whose path is exactly
+/// those segments. It names a leaf that `a.b` cannot reach, such as the field
+/// `b` of a group `a` beside a top-level column named `a.b`.
+///
 /// Two candidates at the step that decides are `AmbiguousColumn`, never a
 /// guess; `ambiguityHint` says what would tell them apart.
 pub fn resolveColumn(
@@ -259,6 +264,13 @@ pub fn resolveColumn(
     const walk = walkColumns(file, column_name);
     if (walk.top_hits == 1) return walk.top_hit.?;
     if (walk.top_hits > 1) return error.AmbiguousColumn;
+    if (isQuotedPath(column_name)) {
+        var quoted: ColumnWalk = .{ .items = file.schema.items, .name = column_name, .quoted = true };
+        quoted.walkAll();
+        if (quoted.path_hits == 1) return quoted.path_hit.?;
+        if (quoted.path_hits > 1) return error.AmbiguousColumn;
+        return error.UnknownColumn;
+    }
     if (walk.path_hits == 1) return walk.path_hit.?;
     if (walk.path_hits > 1) return error.AmbiguousColumn;
     if (std.mem.indexOfScalar(u8, column_name, '.') != null) return error.UnknownColumn;
@@ -267,22 +279,73 @@ pub fn resolveColumn(
     return error.UnknownColumn;
 }
 
+/// The leaves a --columns name selects, in schema order. A top-level column or group whose name is exactly `name`
+/// (quotes in it included) comes first, as in `resolveColumn`; then one quoted identifier names the top-level column
+/// or group it quotes, as the filter and expression lexers unquote it; anything else is the one leaf
+/// `resolveColumn` binds: a quoted or dotted path, or the bare name of the one nested field carrying it. An empty
+/// slice when nothing matches.
+pub fn resolveProjection(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    name: []const u8,
+) (ColumnLookupError || std.mem.Allocator.Error)![]const u32 {
+    if (try topLevelLeaves(arena, file.schema.items, name)) |leaves| return leaves;
+    const unquoted = unquoteIdent(name);
+    if (unquoted.len != name.len) {
+        if (try topLevelLeaves(arena, file.schema.items, unquoted)) |leaves| return leaves;
+    }
+    const leaf = resolveColumn(file, unquoted) catch |err| switch (err) {
+        error.UnknownColumn => return &.{},
+        else => return err,
+    };
+    const out = try arena.alloc(u32, 1);
+    out[0] = @intCast(leaf);
+    return out;
+}
+
+/// Leaves of the top-level column or group named exactly `name`, or null when there is none.
+fn topLevelLeaves(arena: std.mem.Allocator, items: []const schema.SchemaElement, name: []const u8) !?[]const u32 {
+    if (items.len == 0) return null;
+    const root_children: usize = @intCast(@max(items[0].num_children orelse 0, 0));
+    var pos: usize = 1;
+    var leaf: u32 = 0;
+    var hit: ?[2]u32 = null;
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i < root_children and pos < items.len) : (i += 1) {
+        const first = leaf;
+        const is_hit = std.mem.eql(u8, items[pos].name, name);
+        // Skip the child's subtree, counting its leaves.
+        var pending: usize = 1;
+        while (pending > 0 and pos < items.len) : (pos += 1) {
+            pending -= 1;
+            const n: usize = @intCast(@max(items[pos].num_children orelse 0, 0));
+            if (n == 0) leaf += 1 else pending += n;
+        }
+        if (is_hit) {
+            hit = .{ first, leaf };
+            hits += 1;
+        }
+    }
+    if (hits > 1) return error.AmbiguousColumn;
+    const range = hit orelse return null;
+    const out = try arena.alloc(u32, range[1] - range[0]);
+    for (out, range[0]..) |*o, l| o.* = @intCast(l);
+    return out;
+}
+
 /// For a name `resolveColumn` found ambiguous, what the candidates are and
 /// how to name one of them.
 pub fn ambiguityHint(file: *const schema.FileMetaData, column_name: []const u8) []const u8 {
     const walk = walkColumns(file, column_name);
     if (walk.top_hits > 1) return "several top-level columns have this name";
-    if (walk.path_hits > 1) return "several nested fields have this path";
+    if (walk.path_hits > 1) return "several nested fields have this path; quote each segment (\"a\".\"b\") to pick one";
     return "several nested fields have this name; use the dotted path of the one you mean";
 }
 
 fn walkColumns(file: *const schema.FileMetaData, column_name: []const u8) ColumnWalk {
     var walk: ColumnWalk = .{ .items = file.schema.items, .name = column_name };
-    if (file.schema.items.len == 0) return walk;
-    const root_children: usize = @intCast(@max(file.schema.items[0].num_children orelse 0, 0));
-    walk.pos = 1;
-    var i: usize = 0;
-    while (i < root_children and walk.pos < walk.items.len) : (i += 1) walk.visit(0);
+    walk.walkAll();
     return walk;
 }
 
@@ -341,6 +404,168 @@ pub fn leafPath(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf
     return null;
 }
 
+/// The output name of the `leaf_idx`-th primitive leaf, and the name that binds back to it through `resolveColumn`:
+/// a top-level column's own name; a nested leaf's dot-joined path (`r.key`); or, when that path is taken (a top-level
+/// column literally named `a.b` beside the field `b` of a group `a`, or two nested paths that join alike), its
+/// quoted-path form (`"a"."b"`). Flat output (row formats, GROUP BY keys, a flat --select) must not print two columns
+/// under one name. `DuplicateOutputColumn` when even the quoted form binds elsewhere, which only a top-level column
+/// literally named `"a"."b"`, quotes included, can cause. Null when the schema has fewer leaves.
+pub fn leafLabel(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const u8 {
+    const segments = (try leafPathSegments(arena, file, leaf_idx)) orelse return null;
+    if (segments.len == 1) return segments[0];
+    const dotted = try std.mem.join(arena, ".", segments);
+    if ((resolveColumn(file, dotted) catch null) == leaf_idx) return dotted;
+    const quoted = try quotePath(arena, segments);
+    if ((resolveColumn(file, quoted) catch null) == leaf_idx) return quoted;
+    return error.DuplicateOutputColumn;
+}
+
+pub const LeafLabels = struct {
+    names: []const ?[]const u8,
+    /// Whether each leaf sits in a group, so is not a top-level column.
+    nested: []const bool,
+};
+
+/// `leafLabel` of every leaf, null for a leaf that has none (`DuplicateOutputColumn` from `leafLabel`), in time
+/// linear in the schema: labelling leaf by leaf walks the whole schema per leaf.
+///
+/// A nested leaf whose dot-joined path no other leaf shares, and which does not read as a quoted path, is labelled
+/// by that path without a walk: `resolveColumn` binds it to this leaf, since no top-level leaf is named it (that
+/// leaf's path would be the same string) and this leaf is the one nested path hit. Any other nested leaf, which
+/// takes a clash of dotted paths, gets `leafLabel`'s own answer.
+pub fn leafLabels(arena: std.mem.Allocator, file: *const schema.FileMetaData) !LeafLabels {
+    const n = leafCount(file);
+    const dotted = try arena.alloc([]const u8, n);
+    const depths = try arena.alloc(usize, n);
+    var uses: std.StringHashMapUnmanaged(u32) = .empty;
+    try uses.ensureTotalCapacity(arena, @intCast(n));
+
+    // One pass over the schema: each leaf's dotted path, from the open groups above it.
+    const Open = struct { name: []const u8, left: usize };
+    var stack: std.ArrayList(Open) = .empty;
+    var joined: std.ArrayList(u8) = .empty;
+    var leaf: usize = 0;
+    if (file.schema.items.len > 0) for (file.schema.items[1..]) |elem| {
+        while (stack.items.len > 0 and stack.items[stack.items.len - 1].left == 0) _ = stack.pop();
+        if (stack.items.len > 0) stack.items[stack.items.len - 1].left -= 1;
+        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
+        if (n_children > 0) {
+            try stack.append(arena, .{ .name = elem.name, .left = n_children });
+            continue;
+        }
+        if (leaf == n) break;
+        joined.clearRetainingCapacity();
+        for (stack.items) |g| {
+            try joined.appendSlice(arena, g.name);
+            try joined.append(arena, '.');
+        }
+        try joined.appendSlice(arena, elem.name);
+        dotted[leaf] = if (stack.items.len == 0) elem.name else try arena.dupe(u8, joined.items);
+        depths[leaf] = stack.items.len + 1;
+        const gop = uses.getOrPutAssumeCapacity(dotted[leaf]);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        leaf += 1;
+    };
+
+    const labels = try arena.alloc(?[]const u8, n);
+    const nested = try arena.alloc(bool, n);
+    for (labels, nested, dotted, depths, 0..) |*label, *in_group, path, depth, i| {
+        in_group.* = depth > 1;
+        if (depth == 1 or (uses.get(path).? == 1 and !isQuotedPath(path))) {
+            label.* = path;
+            continue;
+        }
+        label.* = leafLabel(arena, file, i) catch |err| switch (err) {
+            error.DuplicateOutputColumn => null,
+            else => return err,
+        };
+    }
+    return .{ .names = labels, .nested = nested };
+}
+
+/// `segments` as a quoted path: each segment in SQL double quotes, embedded quotes doubled, joined by `.`.
+pub fn quotePath(arena: std.mem.Allocator, segments: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (segments, 0..) |seg, i| {
+        if (i > 0) try out.append(arena, '.');
+        try out.append(arena, '"');
+        for (seg) |c| {
+            if (c == '"') try out.append(arena, '"');
+            try out.append(arena, c);
+        }
+        try out.append(arena, '"');
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Bytes of `rest` that spell `segment` as one double-quoted segment (embedded quotes doubled), or null.
+fn matchQuotedSegment(rest: []const u8, segment: []const u8) ?usize {
+    if (rest.len == 0 or rest[0] != '"') return null;
+    var pos: usize = 1;
+    for (segment) |c| {
+        if (pos >= rest.len or rest[pos] != c) return null;
+        pos += 1;
+        if (c == '"') {
+            if (pos >= rest.len or rest[pos] != '"') return null;
+            pos += 1;
+        }
+    }
+    if (pos >= rest.len or rest[pos] != '"') return null;
+    return pos + 1;
+}
+
+/// Length of the double-quoted segment `s` starts with (embedded quotes doubled), or null when it does not.
+fn quotedSegmentLen(s: []const u8) ?usize {
+    if (s.len == 0 or s[0] != '"') return null;
+    var pos: usize = 1;
+    while (pos < s.len) : (pos += 1) {
+        if (s[pos] != '"') continue;
+        if (pos + 1 < s.len and s[pos + 1] == '"') {
+            pos += 1;
+            continue;
+        }
+        return pos + 1;
+    }
+    return null;
+}
+
+/// Whether `name` is a quoted path: double-quoted segments joined by `.` (`"a"."b"`), embedded quotes doubled.
+/// The form `leafLabel` renders, so its labels bind back through --columns, --filter and expressions.
+pub fn isQuotedPath(name: []const u8) bool {
+    var rest = name;
+    while (true) {
+        const n = quotedSegmentLen(rest) orelse return false;
+        rest = rest[n..];
+        if (rest.len == 0) return true;
+        if (rest[0] != '.') return false;
+        rest = rest[1..];
+    }
+}
+
+/// Strip SQL double-quote identifier quoting from one identifier: `"col"` → `col`. A quoted path of several
+/// segments, or one with a doubled quote, stays whole for `resolveColumn` to bind by segments; anything else passes
+/// through trimmed.
+pub fn unquoteIdent(name: []const u8) []const u8 {
+    const t = std.mem.trim(u8, name, " \t");
+    if (t.len < 2 or t[0] != '"' or t[t.len - 1] != '"') return t;
+    const one_plain_segment = quotedSegmentLen(t) == t.len and std.mem.indexOf(u8, t[1 .. t.len - 1], "\"\"") == null;
+    if (isQuotedPath(t) and !one_plain_segment) return t;
+    return t[1 .. t.len - 1];
+}
+
+/// Whether the quoted path `name` spells exactly `segments`.
+pub fn quotedPathEql(name: []const u8, segments: []const []const u8) bool {
+    var rest = name;
+    for (segments, 0..) |seg, i| {
+        if (i > 0) {
+            if (rest.len == 0 or rest[0] != '.') return false;
+            rest = rest[1..];
+        }
+        rest = rest[matchQuotedSegment(rest, seg) orelse return false ..];
+    }
+    return rest.len == 0;
+}
+
 /// Number of leaf columns in the schema: the column-chunk count of every row group (enforced at footer open), and
 /// still defined for a file with no row groups at all, which is a valid empty table.
 pub fn leafCount(file: *const schema.FileMetaData) usize {
@@ -395,6 +620,16 @@ const ColumnWalk = struct {
     path_hits: usize = 0,
     leaf_hit: ?usize = null,
     leaf_hits: usize = 0,
+    /// `name` is a quoted path: segments match quoted, and a full match at any depth is a path hit.
+    quoted: bool = false,
+
+    fn walkAll(self: *ColumnWalk) void {
+        if (self.items.len == 0) return;
+        const root_children: usize = @intCast(@max(self.items[0].num_children orelse 0, 0));
+        self.pos = 1;
+        var i: usize = 0;
+        while (i < root_children and self.pos < self.items.len) : (i += 1) self.visit(0);
+    }
 
     /// `matched` is how many bytes of `name` the ancestors' path consumed
     /// (including the trailing `.`), or null once they diverged.
@@ -405,12 +640,19 @@ const ColumnWalk = struct {
         var here: ?usize = null;
         if (matched) |m| {
             const rest = self.name[m..];
-            if (std.mem.startsWith(u8, rest, elem.name)) here = m + elem.name.len;
+            if (self.quoted) {
+                if (matchQuotedSegment(rest, elem.name)) |n| here = m + n;
+            } else if (std.mem.startsWith(u8, rest, elem.name)) here = m + elem.name.len;
         }
 
         const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
         if (n_children == 0) {
-            if (depth == 0 and std.mem.eql(u8, elem.name, self.name)) {
+            if (self.quoted) {
+                if (here != null and here.? == self.name.len) {
+                    self.path_hit = self.leaf_idx;
+                    self.path_hits += 1;
+                }
+            } else if (depth == 0 and std.mem.eql(u8, elem.name, self.name)) {
                 self.top_hit = self.leaf_idx;
                 self.top_hits += 1;
             } else if (depth > 0 and here != null and here.? == self.name.len) {
@@ -975,4 +1217,181 @@ test "resolveColumn: an exact top-level name wins over a nested path it spells" 
     meta.schema.items[5].name = "r.key"; // `amount` too: two top-level columns named `r.key`
     try testing.expectError(error.AmbiguousColumn, resolveColumn(&meta, "r.key"));
     try testing.expect(std.mem.indexOf(u8, ambiguityHint(&meta, "r.key"), "top-level") != null);
+}
+
+fn emptyMetaForTest() schema.FileMetaData {
+    return .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+}
+
+test "leafLabel: a nested leaf whose dotted path is taken prints as a quoted path that binds back to it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Fixture = struct { elems: []const schema.SchemaElement, labels: []const []const u8 };
+    const fixtures = [_]Fixture{
+        // A top-level column literally named `a.b` beside the field `b` of a group `a`.
+        .{
+            .elems = &.{ leafForTest("a.b"), groupForTest("a", 1), leafForTest("b") },
+            .labels = &.{ "a.b", "\"a\".\"b\"" },
+        },
+        // Same, nested side first.
+        .{
+            .elems = &.{ groupForTest("a", 1), leafForTest("b"), leafForTest("a.b") },
+            .labels = &.{ "\"a\".\"b\"", "a.b" },
+        },
+        // Two nested paths that join alike and no top-level column: neither takes `a.b.c`.
+        .{
+            .elems = &.{ groupForTest("a", 1), leafForTest("b.c"), groupForTest("a.b", 1), leafForTest("c") },
+            .labels = &.{ "\"a\".\"b.c\"", "\"a.b\".\"c\"" },
+        },
+        // An embedded quote is doubled.
+        .{
+            .elems = &.{ leafForTest("q\"x.y"), groupForTest("q\"x", 1), leafForTest("y") },
+            .labels = &.{ "q\"x.y", "\"q\"\"x\".\"y\"" },
+        },
+        // A dotted path that reads as a quoted path names other segments, so the leaf is quoted.
+        .{
+            .elems = &.{ groupForTest("\"x\"", 1), leafForTest("\"y\"") },
+            .labels = &.{"\"\"\"x\"\"\".\"\"\"y\"\"\""},
+        },
+        // No clash: dotted paths, as before.
+        .{
+            .elems = &.{
+                groupForTest("r", 2), leafForTest("key"), leafForTest("v"), leafForTest("key"), leafForTest("a.b"),
+            },
+            .labels = &.{ "r.key", "r.v", "key", "a.b" },
+        },
+    };
+    for (fixtures) |f| {
+        var meta = emptyMetaForTest();
+        var top: i32 = 0;
+        var left: i32 = 0;
+        for (f.elems) |e| {
+            if (left == 0) top += 1 else left -= 1;
+            left += e.num_children orelse 0;
+        }
+        try meta.schema.append(arena, groupForTest("root", top));
+        try meta.schema.appendSlice(arena, f.elems);
+        const all = (try leafLabels(arena, &meta)).names;
+        for (f.labels, all, 0..) |want, from_all, i| {
+            const label = (try leafLabel(arena, &meta, i)).?;
+            try testing.expectEqualStrings(want, label);
+            try testing.expectEqualStrings(want, from_all.?);
+            try testing.expectEqual(i, try resolveColumn(&meta, label));
+        }
+    }
+
+    // Only a top-level column literally named like the quoted path leaves the nested leaf no name of its own.
+    var meta = emptyMetaForTest();
+    try meta.schema.appendSlice(arena, &.{
+        groupForTest("root", 3), leafForTest("a.b"), leafForTest("\"a\".\"b\""), groupForTest("a", 1), leafForTest("b"),
+    });
+    try testing.expectError(error.DuplicateOutputColumn, leafLabel(arena, &meta, 2));
+    try testing.expectEqualStrings("\"a\".\"b\"", (try leafLabel(arena, &meta, 1)).?);
+    const all = (try leafLabels(arena, &meta)).names;
+    try testing.expectEqualStrings("a.b", all[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), all[2]);
+}
+
+test "quoted paths: parse, unquote, and bind by segments" {
+    try testing.expect(isQuotedPath("\"a\""));
+    try testing.expect(isQuotedPath("\"a\".\"b\""));
+    try testing.expect(isQuotedPath("\"a.b\".\"c\"\"d\""));
+    try testing.expect(!isQuotedPath("a.b"));
+    try testing.expect(!isQuotedPath("\"a\".b"));
+    try testing.expect(!isQuotedPath("\"a\"."));
+    try testing.expect(!isQuotedPath("\"a"));
+    try testing.expect(!isQuotedPath("\"a\"\"b"));
+
+    // One quoted identifier unquotes, as it always has; a quoted path stays whole.
+    try testing.expectEqualStrings("a.b", unquoteIdent(" \"a.b\" "));
+    try testing.expectEqualStrings("my col", unquoteIdent("\"my col\""));
+    try testing.expectEqualStrings("x", unquoteIdent("x"));
+    try testing.expectEqualStrings("\"a\".\"b\"", unquoteIdent("\"a\".\"b\""));
+    try testing.expectEqualStrings("\"q\"\"x\"", unquoteIdent("\"q\"\"x\""));
+
+    try testing.expect(quotedPathEql("\"a\".\"b\"", &.{ "a", "b" }));
+    try testing.expect(quotedPathEql("\"q\"\"x\".\"y\"", &.{ "q\"x", "y" }));
+    try testing.expect(!quotedPathEql("\"a\".\"b\"", &.{"a.b"}));
+    try testing.expect(!quotedPathEql("\"a\".\"b\"", &.{ "a", "b", "c" }));
+    try testing.expect(!quotedPathEql("\"a\"", &.{ "a", "b" }));
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try sharedLeafNameMetaForTest(arena);
+    try testing.expectEqual(@as(usize, 0), try resolveColumn(&meta, "\"r\".\"key\""));
+    try testing.expectEqual(@as(usize, 2), try resolveColumn(&meta, "\"key\""));
+    try testing.expectEqual(@as(usize, 5), try resolveColumn(&meta, "\"b\".\"x\""));
+    // Exact segments only: no bare-name fallback, no partial or over-long path, no group.
+    try testing.expectError(error.UnknownColumn, resolveColumn(&meta, "\"x\""));
+    try testing.expectError(error.UnknownColumn, resolveColumn(&meta, "\"r\""));
+    try testing.expectError(error.UnknownColumn, resolveColumn(&meta, "\"r.key\""));
+    try testing.expectError(error.UnknownColumn, resolveColumn(&meta, "\"r\".\"key\".\"z\""));
+}
+
+test "resolveProjection: an exact top-level name first, then the names resolveColumn binds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = emptyMetaForTest();
+    // Leaves: `"x"` 0, `"a"."b"` 1, x 2, a.b (in group a) 3, r.v 4, r.w 5, `a.b` 6.
+    try meta.schema.appendSlice(arena, &.{
+        groupForTest("root", 6), leafForTest("\"x\""), leafForTest("\"a\".\"b\""), leafForTest("x"),
+        groupForTest("a", 1),    leafForTest("b"),     groupForTest("r", 2),       leafForTest("v"),
+        leafForTest("w"),        leafForTest("a.b"),
+    });
+    const Case = struct { name: []const u8, want: []const u32 };
+    const cases = [_]Case{
+        // Quotes in a top-level name match it exactly before they are read as quoting.
+        .{ .name = "\"x\"", .want = &.{0} },
+        .{ .name = "\"a\".\"b\"", .want = &.{1} },
+        .{ .name = "x", .want = &.{2} },
+        // A top-level group, by name or quoted name, is all its leaves.
+        .{ .name = "r", .want = &.{ 4, 5 } },
+        .{ .name = "\"r\"", .want = &.{ 4, 5 } },
+        // A top-level column named `a.b` wins over the path; the path's leaf by quoted path.
+        .{ .name = "a.b", .want = &.{6} },
+        .{ .name = "\"a.b\"", .want = &.{6} },
+        .{ .name = "\"r\".\"v\"", .want = &.{4} },
+        // A dotted path, and the bare name of the one nested field carrying it, as --filter binds them.
+        .{ .name = "r.w", .want = &.{5} },
+        .{ .name = "v", .want = &.{4} },
+        .{ .name = "nope", .want = &.{} },
+        .{ .name = "r.nope", .want = &.{} },
+    };
+    for (cases) |c| {
+        const got = try resolveProjection(arena, &meta, c.name);
+        testing.expectEqualSlices(u32, c.want, got) catch |err| {
+            std.debug.print("resolveProjection({s})\n", .{c.name});
+            return err;
+        };
+    }
+    // The bare `b` binds the one field carrying it; two top-level columns of one name bind neither.
+    try testing.expectEqualSlices(u32, &.{3}, try resolveProjection(arena, &meta, "b"));
+    meta.schema.items[3].name = "\"x\"";
+    try testing.expectError(error.AmbiguousColumn, resolveProjection(arena, &meta, "\"x\""));
+}
+
+test "leafLabels takes time linear in the leaf count" {
+    // 10k structs of two fields each: labelling leaf by leaf walked the schema per leaf.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const structs = 10_000;
+    var meta = emptyMetaForTest();
+    try meta.schema.append(arena, groupForTest("root", structs));
+    for (0..structs) |i| {
+        try meta.schema.append(arena, groupForTest(try std.fmt.allocPrint(arena, "s{d}", .{i}), 2));
+        try meta.schema.appendSlice(arena, &.{ leafForTest("x"), leafForTest("y") });
+    }
+    const start = nowNs();
+    const labels = (try leafLabels(arena, &meta)).names;
+    const elapsed_ms = @divTrunc(nowNs() - start, std.time.ns_per_ms);
+    try testing.expectEqualStrings("s9999.y", labels[2 * structs - 1].?);
+    // Generous: linear labelling takes milliseconds even in a debug build; per-leaf walks took tens of seconds.
+    testing.expect(elapsed_ms < 2_000) catch |err| {
+        std.debug.print("labelling {d} leaves took {d} ms\n", .{ 2 * structs, elapsed_ms });
+        return err;
+    };
 }

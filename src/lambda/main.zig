@@ -24,6 +24,7 @@ const std = @import("std");
 const zpq = @import("zpq");
 const nowMonoNs = zpq.clock.monoNs;
 const runtime = @import("runtime.zig");
+const request = @import("request.zig");
 // Lambda's per-file fetch+scan helper; distinct from the core
 // multi-file orchestrator at `core.scan` which does the SHARED
 // agg pipeline both the CLI and Lambda call into.
@@ -147,33 +148,24 @@ fn handle(
     if (trimmed.len > 0 and trimmed[0] == '{') {
         // Inputs: either {"inputs": ["s3://...", ...]} (multi-file)
         // or {"s3_url": "s3://..."} (single-file shorthand).
-        var input_urls = std.ArrayList([]const u8).empty;
-        defer {
-            for (input_urls.items) |s| allocator.free(s);
-            input_urls.deinit(allocator);
-        }
-        if (extractStringArrayItems(trimmed, "inputs", allocator)) |items| {
-            for (items) |s| input_urls.append(allocator, s) catch {};
-            allocator.free(items);
-        } else |_| {
-            const url = extractField(trimmed, "s3_url") catch |err| {
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}",
-                    .{@errorName(err)},
-                );
-            };
-            const owned = try allocator.dupe(u8, url);
-            try input_urls.append(allocator, owned);
-        }
+        var bad_field: []const u8 = "";
+        var req = request.Request.parse(allocator, trimmed, &bad_field) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (err == error.BadFieldType) return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"bad_json\",\"reason\":\"{s}\",\"field\":\"{s}\"}}",
+                .{ @errorName(err), bad_field },
+            );
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}", .{@errorName(err)});
+        };
+        defer req.deinit();
 
         // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw" (both LZ4_RAW;
         // nothing compresses to the deprecated LZ4 codec), or "uncompressed" —
         // parity with the CLI's --codec. Absent, re-encoded output is snappy and
         // byte copies keep the source codec. Anything else is treated as snappy
         // with no error (strict validation can come with the API-versioning work).
-        const codec_str = extractField(trimmed, "output_codec") catch null;
-        const output_codec: ?schema.CompressionCodec = if (codec_str) |s| blk: {
+        const output_codec: ?schema.CompressionCodec = if (req.output_codec) |s| blk: {
             if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;
             if (std.ascii.eqlIgnoreCase(s, "uncompressed")) break :blk .UNCOMPRESSED;
             if (std.ascii.eqlIgnoreCase(s, "gzip")) break :blk .GZIP;
@@ -181,19 +173,14 @@ fn handle(
             break :blk .SNAPPY;
         } else null;
 
-        // columns: JSON array → engine's list form. (extractStringArray
-        // joins to CSV for the lambda API; split it back to a slice list.)
-        const columns_csv = extractStringArray(trimmed, "columns", allocator) catch null;
-        defer if (columns_csv) |c| allocator.free(c);
-        var cols_list: std.ArrayList([]const u8) = .empty;
-        defer cols_list.deinit(allocator);
-        if (columns_csv) |csv| {
-            var it = std.mem.splitScalar(u8, csv, ',');
-            while (it.next()) |name| {
-                const c = std.mem.trim(u8, name, " \t");
-                if (c.len > 0) try cols_list.append(allocator, c);
-            }
-        }
+        const max_memory: ?usize = if (req.max_memory) |m| switch (m) {
+            .bytes => |n| n,
+            .text => |t| zpq.core.system.parseSizeString(t) catch return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"max_memory\"}}",
+                .{},
+            ),
+        } else null;
 
         // Single source of query options: the JSON event maps onto the
         // SAME `engine.QueryArgs` the CLI's flags populate (src/cli/main.zig).
@@ -202,25 +189,25 @@ fn handle(
         // surface — the handlers below pass `qa` straight through to the
         // engine, so options like `scan_all` flow without touching them.
         const qa: engine.QueryArgs = .{
-            .inputs = input_urls.items,
-            .filter = extractField(trimmed, "filter") catch null,
-            .output = extractField(trimmed, "output_url") catch null,
-            .columns = if (cols_list.items.len > 0) cols_list.items else null,
-            .select = extractField(trimmed, "select") catch null,
-            .aggregate = extractField(trimmed, "aggregate") catch null,
+            .inputs = req.inputs,
+            .filter = req.filter,
+            .output = req.output_url,
+            .columns = req.columns,
+            .select = req.select,
+            .aggregate = req.aggregate,
             .codec = output_codec,
-            .scan_all = extractBool(trimmed, "scan_all"),
-            .trust_stats = extractBool(trimmed, "trust_stats"),
-            .max_memory = extractMaxMemory(trimmed) orelse zpq.core.system.discoverAvailableMemory(env),
-            .group_by = extractField(trimmed, "group_by") catch null,
-            .column_order = extractField(trimmed, "column_order") catch null,
+            .scan_all = req.scan_all,
+            .trust_stats = req.trust_stats,
+            .max_memory = max_memory orelse zpq.core.system.discoverAvailableMemory(env),
+            .group_by = req.group_by,
+            .column_order = req.column_order,
         };
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
         if (qa.aggregate != null or qa.group_by != null) return try lambdaAggregate(io, allocator, env, pool, qa);
         if (qa.output != null) return try lambdaWrite(io, allocator, env, pool, qa);
-        if (input_urls.items.len > 0)
-            return try handleS3(allocator, env, input_urls.items[0], qa.filter);
+        if (req.inputs.len > 0)
+            return try handleS3(allocator, env, req.inputs[0], qa.filter);
         return try aggregateInt8(allocator, inv.body, null);
     }
 
@@ -228,147 +215,23 @@ fn handle(
     return try aggregateInt8(allocator, inv.body, null);
 }
 
-/// Extract a JSON string-array field as a comma-separated list (we
-/// don't need a full JSON parser for this). Returns an allocator-
-/// owned `name1,name2,name3` string. Caller frees.
-fn extractStringArray(
-    body: []const u8,
-    name: []const u8,
-    allocator: std.mem.Allocator,
-) ![]u8 {
-    var key_buf: [64]u8 = undefined;
-    if (name.len + 2 > key_buf.len) return error.NameTooLong;
-    key_buf[0] = '"';
-    @memcpy(key_buf[1 .. 1 + name.len], name);
-    key_buf[1 + name.len] = '"';
-    const key = key_buf[0 .. 2 + name.len];
-
-    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
-    var i = pos + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
-    if (i >= body.len or body[i] != '[') return error.BadJson;
-    i += 1;
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var first = true;
-    while (i < body.len) {
-        while (i < body.len and (body[i] == ' ' or body[i] == ',' or body[i] == '\t' or body[i] == '\n')) : (i += 1) {}
-        if (i >= body.len) return error.BadJson;
-        if (body[i] == ']') break;
-        if (body[i] != '"') return error.BadJson;
-        i += 1;
-        const start = i;
-        while (i < body.len and body[i] != '"') : (i += 1) {}
-        if (i >= body.len) return error.BadJson;
-        if (!first) try out.append(allocator, ',');
-        try out.appendSlice(allocator, body[start..i]);
-        first = false;
-        i += 1;
+/// The response for a failed query: the error, and the column it is about when `diag` names one.
+fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const zpq.core.scan.Diag) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(err)});
+    switch (err) {
+        error.DuplicateOutputColumn, error.AmbiguousOutputColumn, error.UnknownColumn, error.AmbiguousColumn => {
+            if (diag.len > 0) {
+                try w.writeAll(",\"column\":");
+                try engine.writeJsonQuoted(w, diag.column());
+            }
+        },
+        else => {},
     }
-    return out.toOwnedSlice(allocator);
-}
-
-/// Extract a JSON string-array as a list of owned strings (caller
-/// frees each item AND the outer slice). Used for the multi-file
-/// `inputs: [...]` field where the order matters.
-fn extractStringArrayItems(
-    body: []const u8,
-    name: []const u8,
-    allocator: std.mem.Allocator,
-) ![][]const u8 {
-    var key_buf: [64]u8 = undefined;
-    if (name.len + 2 > key_buf.len) return error.NameTooLong;
-    key_buf[0] = '"';
-    @memcpy(key_buf[1 .. 1 + name.len], name);
-    key_buf[1 + name.len] = '"';
-    const key = key_buf[0 .. 2 + name.len];
-
-    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
-    var i = pos + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
-    if (i >= body.len or body[i] != '[') return error.BadJson;
-    i += 1;
-
-    var items: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (items.items) |s| allocator.free(s);
-        items.deinit(allocator);
-    }
-
-    while (i < body.len) {
-        while (i < body.len and (body[i] == ' ' or body[i] == ',' or body[i] == '\t' or body[i] == '\n')) : (i += 1) {}
-        if (i >= body.len) return error.BadJson;
-        if (body[i] == ']') break;
-        if (body[i] != '"') return error.BadJson;
-        i += 1;
-        const start = i;
-        while (i < body.len and body[i] != '"') : (i += 1) {}
-        if (i >= body.len) return error.BadJson;
-        const owned = try allocator.dupe(u8, body[start..i]);
-        try items.append(allocator, owned);
-        i += 1;
-    }
-    return items.toOwnedSlice(allocator);
-}
-
-fn extractField(body: []const u8, name: []const u8) ![]const u8 {
-    var key_buf: [64]u8 = undefined;
-    if (name.len + 2 > key_buf.len) return error.NameTooLong;
-    key_buf[0] = '"';
-    @memcpy(key_buf[1 .. 1 + name.len], name);
-    key_buf[1 + name.len] = '"';
-    const key = key_buf[0 .. 2 + name.len];
-
-    const pos = std.mem.indexOf(u8, body, key) orelse return error.MissingField;
-    var i = pos + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':')) : (i += 1) {}
-    if (i >= body.len or body[i] != '"') return error.BadJson;
-    i += 1;
-    const start = i;
-    while (i < body.len and body[i] != '"') : (i += 1) {}
-    if (i >= body.len) return error.BadJson;
-    return body[start..i];
-}
-
-/// Extract a JSON boolean field. `"name": true` → true; missing or any
-/// other value → false. Boolean event flags default off, so there's no
-/// error case to surface — mirrors how the CLI treats a valueless flag.
-fn extractBool(body: []const u8, name: []const u8) bool {
-    var key_buf: [64]u8 = undefined;
-    if (name.len + 2 > key_buf.len) return false;
-    key_buf[0] = '"';
-    @memcpy(key_buf[1 .. 1 + name.len], name);
-    key_buf[1 + name.len] = '"';
-    const key = key_buf[0 .. 2 + name.len];
-    const pos = std.mem.indexOf(u8, body, key) orelse return false;
-    var i = pos + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
-    return std.mem.startsWith(u8, body[i..], "true");
-}
-
-fn extractMaxMemory(body: []const u8) ?usize {
-    const key = "\"max_memory\"";
-    const pos = std.mem.indexOf(u8, body, key) orelse return null;
-    var i = pos + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) : (i += 1) {}
-    if (i >= body.len) return null;
-
-    if (body[i] == '"') {
-        i += 1;
-        const start = i;
-        while (i < body.len and body[i] != '"') : (i += 1) {}
-        if (i >= body.len) return null;
-        const val_str = body[start..i];
-        return zpq.core.system.parseSizeString(val_str) catch null;
-    } else {
-        const start = i;
-        while (i < body.len and ((body[i] >= '0' and body[i] <= '9') or body[i] == '.')) : (i += 1) {}
-        const val_str = body[start..i];
-        const val_float = std.fmt.parseFloat(f64, val_str) catch return null;
-        return @intFromFloat(val_float);
-    }
+    try w.writeByte('}');
+    return aw.toOwnedSlice();
 }
 
 /// Adapter that lets engine.runQuery use the lambda's PersistentPool
@@ -416,18 +279,7 @@ fn lambdaAggregate(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
-    }, args) catch |err| switch (err) {
-        error.DuplicateOutputColumn, error.AmbiguousOutputColumn => {
-            var aw: std.Io.Writer.Allocating = .init(allocator);
-            defer aw.deinit();
-            const w = &aw.writer;
-            try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\",\"column\":", .{@errorName(err)});
-            try engine.writeJsonQuoted(w, diag.column());
-            try w.writeByte('}');
-            return aw.toOwnedSlice();
-        },
-        else => return std.fmt.allocPrint(allocator, "{{\"error\":\"engine\",\"reason\":\"{s}\"}}", .{@errorName(err)}),
-    };
+    }, args) catch |err| return engineError(allocator, err, &diag);
     const ar = result.aggregate;
     defer allocator.free(ar.aggs);
     defer for (ar.aggs) |item| {
@@ -512,6 +364,9 @@ fn lambdaWrite(
     const t_start = nowMonoNs();
 
     var registry = persistentPoolAdapter(pool);
+    var diag: zpq.core.scan.Diag = .{};
+    var args = qa;
+    args.diag = &diag;
 
     const result = engine.runQuery(.{
         .gpa = allocator,
@@ -519,9 +374,7 @@ fn lambdaWrite(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
-    }, qa) catch |err| {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"engine\",\"reason\":\"{s}\"}}", .{@errorName(err)});
-    };
+    }, args) catch |err| return engineError(allocator, err, &diag);
     const wr = result.write;
     const output_url_str = qa.output.?; // dispatch only routes here when set
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
@@ -891,6 +744,7 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
 }
 
 test {
+    _ = @import("request.zig");
     _ = @import("runtime.zig");
     _ = @import("scan.zig");
 }

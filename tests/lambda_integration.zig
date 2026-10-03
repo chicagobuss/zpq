@@ -446,7 +446,155 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
     }
 }
 
-test "lambda rejects clashing output column names and names the column" {
+test "lambda labels a nested GROUP BY key by its quoted path when a top-level column takes its dotted name" {
+    // Top-level `a.b` (1, null, 3) beside the group `a`'s field `b` (10, 20, null): two key names, not one. Named
+    // unquoted here (`b` binds the nested field, `a.b` the top-level column); quoted in the escapes test.
+    const fixture_path = "ci/fixtures/parquet/dotted_twin.parquet";
+    const q = "\"\\\"a\\\".\\\"b\\\"\""; // the JSON key "\"a\".\"b\""
+    const events = [_]struct { body: []const u8, want: []const u8 }{
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b, a.b\",\"aggregate\":\"count(*) AS n\"}",
+            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
+                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"max(a.b) AS m\"}",
+            .want = "\"agg\":[{" ++ q ++ ":null,\"m\":3},{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null}]",
+        },
+    };
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
+    defer std.testing.allocator.free(endpoint);
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    for (events) |ev| {
+        var poll = try server.acceptRequest(std.testing.allocator);
+        try poll.replyAndClose(
+            std.testing.allocator,
+            200,
+            "Lambda-Runtime-Aws-Request-Id: req-dotted-twin\r\nContent-Type: application/json\r\n",
+            ev.body,
+        );
+        var resp = try server.acceptRequest(std.testing.allocator);
+        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{}) catch |err| {
+            std.debug.print("[lambda dotted twin] invalid JSON ({s}): {s}\n", .{ @errorName(err), resp.body });
+            return err;
+        };
+        parsed.deinit();
+        if (std.mem.indexOf(u8, resp.body, ev.want) == null) {
+            std.debug.print("[lambda dotted twin] response: {s}\n", .{resp.body});
+            return error.TestUnexpectedResult;
+        }
+        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+    }
+}
+
+/// Send each event in turn to one lambda process and require every response to be valid JSON containing `want`.
+fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, want: []const u8 }) !void {
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
+    defer std.testing.allocator.free(endpoint);
+    var child = try spawnLambda(std.testing.allocator, endpoint);
+    defer killChild(&child);
+
+    for (events) |ev| {
+        var poll = try server.acceptRequest(std.testing.allocator);
+        try poll.replyAndClose(
+            std.testing.allocator,
+            200,
+            "Lambda-Runtime-Aws-Request-Id: req-escapes\r\nContent-Type: application/json\r\n",
+            ev.body,
+        );
+        var resp = try server.acceptRequest(std.testing.allocator);
+        const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{}) catch |err| {
+            std.debug.print("[{s}] invalid JSON ({s}) for {s}: {s}\n", .{ tag, @errorName(err), ev.body, resp.body });
+            return err;
+        };
+        parsed.deinit();
+        if (!std.mem.endsWith(u8, resp.path, "/response") or std.mem.indexOf(u8, resp.body, ev.want) == null) {
+            const fmt = "[{s}] request {s}\n  response {s} {s}\n  want {s}\n";
+            std.debug.print(fmt, .{ tag, ev.body, resp.path, resp.body, ev.want });
+            return error.TestUnexpectedResult;
+        }
+        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+    }
+}
+
+test "lambda decodes JSON escapes in request strings" {
+    const twin = "ci/fixtures/parquet/dotted_twin.parquet";
+    const esc = "ci/fixtures/parquet/json_escape.parquet";
+    const q = "\"\\\"a\\\".\\\"b\\\"\""; // the response key "\"a\".\"b\""
+    try expectResponses("lambda escapes", &.{
+        .{
+            // Quoted column names: the nested field b of group a, then the top-level column `a.b`.
+            .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\\"a\\\".\\\"b\\\", \\\"a.b\\\"\"," ++
+                "\"aggregate\":\"count(*) AS n\"}",
+            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
+                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+        },
+        .{
+            // \u escapes, and a surrogate pair decoded into one UTF-8 sequence (no row holds it).
+            .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\u0062\"," ++
+                "\"aggregate\":\"count(*) AS n\",\"filter\":\"\\\"a.b\\\" IS NOT NULL\"}",
+            .want = "\"agg\":[{" ++ q ++ ":null,\"n\":1},{" ++ q ++ ":10,\"n\":1}]",
+        },
+        .{
+            // A string literal holding an escaped quote, a backslash, a newline and a control byte.
+            .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"filter\":\"s = 'a \\\"q\\\" c:\\\\d\\nnext\\u0001end'\"," ++
+                "\"aggregate\":\"count(*) AS n\"}",
+            .want = "\"agg\":{\"n\":1}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ esc ++ "\"]," ++
+                "\"filter\":\"s != '\\ud83d\\ude00' AND s != '\\/\\b\\f\\r\\t'\"," ++
+                "\"aggregate\":\"count(*) AS n\",\"mode\":\"ignored\"}",
+            .want = "\"agg\":{\"n\":3}",
+        },
+    });
+}
+
+test "lambda rejects malformed requests with a clean error and keeps serving" {
+    const esc = "ci/fixtures/parquet/json_escape.parquet";
+    const head = "{\"inputs\":[\"" ++ esc ++ "\"]";
+    const bad = "{\"error\":\"bad_json\",\"reason\":\"";
+    try expectResponses("lambda malformed", &.{
+        .{ .body = "{\"inputs\":[", .want = bad },
+        .{ .body = head ++ ",\"filter\":\"x}", .want = bad },
+        .{ .body = head ++ ",\"filter\":\"\\q\"}", .want = bad },
+        .{ .body = head ++ ",\"filter\":\"\\ud800\"}", .want = bad },
+        .{ .body = head ++ ",\"filter\":\"\xff\"}", .want = bad },
+        .{ .body = head ++ "} trailing", .want = bad },
+        .{
+            .body = head ++ ",\"aggregate\":\"count(*) AS n\",\"aggregate\":\"sum(x) AS n\"}",
+            .want = "{\"error\":\"bad_json\",\"reason\":\"DuplicateField\"}",
+        },
+        .{
+            .body = head ++ ",\"aggregate\":\"count(*) AS n\",\"filter\":5}",
+            .want = "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"filter\"}",
+        },
+        .{
+            .body = "{\"inputs\":\"" ++ esc ++ "\",\"aggregate\":\"count(*) AS n\"}",
+            .want = "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"inputs\"}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ esc ++ "\", 7],\"aggregate\":\"count(*) AS n\"}",
+            .want = "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"inputs\"}",
+        },
+        .{
+            .body = head ++ ",\"aggregate\":\"count(*) AS n\",\"scan_all\":\"yes\"}",
+            .want = "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"scan_all\"}",
+        },
+        .{ .body = "{\"aggregate\":\"count(*) AS n\"}", .want = "{\"error\":\"bad_json\",\"reason\":\"MissingField\"" },
+        // Still serving: a well-formed request after all of the above.
+        .{ .body = head ++ ",\"aggregate\":\"count(*) AS n\"}", .want = "\"agg\":{\"n\":3}" },
+    });
+}
+
+test "lambda rejects clashing or unknown column names and names the column" {
     const fixture_path = "ci/fixtures/parquet/json_escape.parquet";
     const events = [_]struct { body: []const u8, want: []const u8 }{
         .{
@@ -456,6 +604,12 @@ test "lambda rejects clashing output column names and names the column" {
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"aggregate\":\"sum(x) AS t, max(y) AS t\"}",
             .want = "{\"error\":\"engine\",\"reason\":\"DuplicateOutputColumn\",\"column\":\"t\"}",
+        },
+        .{
+            // An unknown projection column is named too, and nothing is written.
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"columns\":[\"s\",\"nope\"]," ++
+                "\"output_url\":\"zig-out/lambda_unknown_columns.parquet\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"UnknownColumn\",\"column\":\"nope\"}",
         },
     };
 
@@ -479,6 +633,10 @@ test "lambda rejects clashing output column names and names the column" {
             std.debug.print("[lambda name clash] response: {s}\n", .{resp.body});
             return error.TestUnexpectedResult;
         }
+        if (readFileSlice(std.testing.allocator, "zig-out/lambda_unknown_columns.parquet")) |bytes| {
+            std.testing.allocator.free(bytes);
+            return error.TestUnexpectedResult;
+        } else |_| {}
         try resp.replyAndClose(std.testing.allocator, 202, "", "");
     }
 }

@@ -123,7 +123,7 @@ pub const QueryArgs = struct {
     select_cols: ?[]const []const u8 = null,
     /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
     column_order: ?[]const u8 = null,
-    /// Receives the column name behind an aggregate output-naming error.
+    /// Receives the column name behind an output-naming error, or an unknown or ambiguous --columns name.
     diag: ?*scan.Diag = null,
     /// Requested output codec. Null when none was asked for: re-encoded
     /// output is then SNAPPY and byte copies keep each chunk's own codec.
@@ -556,12 +556,81 @@ fn keptColumnsUseCodec(rg: *const schema.RowGroup, kept: []const bool, codec: sc
     return true;
 }
 
-/// The dotted path of a nested leaf, or null for a top-level column — whose
-/// path is its own name, dots in that name included.
-fn nestedLeafPath(arena: std.mem.Allocator, meta: *const schema.FileMetaData, leaf_idx: usize) !?[]const u8 {
-    const path = (try metadata.leafPath(arena, meta, leaf_idx)) orelse return null;
-    const elem = metadata.leafSchemaElement(meta, leaf_idx) orelse return null;
-    return if (std.mem.eql(u8, path, elem.name)) null else path;
+/// Set `set[i]` for each leaf a `--columns` name selects. A name that selects nothing is `UnknownColumn`, named
+/// through `diag`, as in --select and --filter: dropping it wrote a file short of that column, or of every column.
+/// A list naming no column at all (`--columns ','`) is `EmptyColumnList`, not a file with no columns.
+fn markColumns(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    names: []const []const u8,
+    set: []bool,
+    diag: ?*scan.Diag,
+) !void {
+    if (names.len == 0) return error.EmptyColumnList;
+    for (names) |name| {
+        const indices = metadata.resolveProjection(arena, meta, name) catch |err| {
+            if (err == error.AmbiguousColumn) scan.Diag.setColumn(diag, name);
+            return err;
+        };
+        if (indices.len == 0) {
+            scan.Diag.setColumn(diag, name);
+            return error.UnknownColumn;
+        }
+        for (indices) |idx| if (idx < set.len) {
+            set[idx] = true;
+        };
+    }
+}
+
+/// Output names of a file's leaves (`metadata.leafLabels`), computed once per query on first use: labelling a
+/// leaf at a time walks the schema per leaf.
+const Labels = struct {
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    all: ?metadata.LeafLabels = null,
+
+    fn get(self: *Labels) !metadata.LeafLabels {
+        if (self.all == null) self.all = try metadata.leafLabels(self.arena, self.meta);
+        return self.all.?;
+    }
+
+    /// The label of leaf `leaf_idx`, reporting a leaf that has none: one a top-level column takes even the quoted
+    /// path of.
+    fn of(self: *Labels, leaf_idx: usize) ![]const u8 {
+        const all = try self.get();
+        if (leaf_idx >= all.names.len) return error.SchemaMismatch;
+        return all.names[leaf_idx] orelse {
+            const segments = (try metadata.leafPathSegments(self.arena, self.meta, leaf_idx)).?;
+            std.debug.print(
+                "zpq query: nested column {s} has no output name of its own:\n" ++
+                    "  a top-level column is named like it; name it with --select and AS\n",
+                .{try metadata.quotePath(self.arena, segments)},
+            );
+            return error.BadArgs;
+        };
+    }
+
+    /// The label of a nested leaf, or null for a top-level column — whose label is its own name, dots included.
+    fn ofNested(self: *Labels, leaf_idx: usize) !?[]const u8 {
+        const all = try self.get();
+        if (leaf_idx >= all.nested.len or !all.nested[leaf_idx]) return null;
+        return try self.of(leaf_idx);
+    }
+};
+
+/// The name each output column of a flat row result is printed under: an alias, or `metadata.leafLabel` of a
+/// passthrough leaf, which no other leaf prints as.
+fn outputColumnNames(
+    arena: std.mem.Allocator,
+    labels: *Labels,
+    specs: []const consumer.OutputCol,
+) ![]const []const u8 {
+    const names = try arena.alloc([]const u8, specs.len);
+    for (specs, names) |spec, *name| name.* = switch (spec) {
+        .passthrough => |ci| try labels.of(ci),
+        .computed => |c| c.alias,
+    };
+    return names;
 }
 
 /// The one codec the written column chunks share, `none_written` when there
@@ -623,10 +692,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     if (args.columns) |cols_list| {
         const set = try arena.alloc(bool, tree0.leaves.len);
         @memset(set, false);
-        for (cols_list) |name| {
-            const indices = try tree0.resolveTopLevel(arena, name);
-            for (indices) |idx| set[idx] = true;
-        }
+        try markColumns(arena, meta0, cols_list, set, args.diag);
         kept_set = set;
     }
 
@@ -652,15 +718,17 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const fetch_arr = try arena.alloc(bool, num_leaves);
     @memset(fetch_arr, false);
 
+    var labels: Labels = .{ .arena = arena, .meta = meta0 };
     var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
     var any_computed = false;
     if (select_items) |items| {
         for (items) |item| {
             switch (item.expr) {
                 .col_ref => |c| {
-                    // The select output is flat, so a nested leaf is written under its dotted path rather than
-                    // its leaf name, which a top-level column may share.
-                    const nested_name: ?[]const u8 = if (item.alias == null) try nestedLeafPath(arena, meta0, c.col_idx) else null;
+                    // The select output is flat, so a nested leaf is written under its label (its dotted path)
+                    // rather than its leaf name, which a top-level column may share.
+                    const nested_name: ?[]const u8 =
+                        if (item.alias == null) try labels.ofNested(c.col_idx) else null;
                     if (item.alias orelse nested_name) |alias| {
                         try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
                         any_computed = true;
@@ -1407,13 +1475,7 @@ fn openInputs(
             for (items) |item| item.expr.collectColumns(fetch_arr);
         }
         if (args.columns) |cols_list| {
-            const tree = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
-            for (cols_list) |name| {
-                const indices = try tree.resolveTopLevel(arena, name);
-                for (indices) |idx| {
-                    if (idx < num_leaves) fetch_arr[idx] = true;
-                }
-            }
+            try markColumns(arena, meta0, cols_list, fetch_arr, args.diag);
         }
 
         // Columns only the filter reads. Where statistics prove a row group fully matching, the aggregate scan never
@@ -2277,17 +2339,6 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     }
 }
 
-fn writeColName(writer: anytype, paths: [][]const []const u8, schemas: []const schema.SchemaElement, col_idx: usize) !void {
-    if (col_idx < paths.len and paths[col_idx].len > 0) {
-        for (paths[col_idx], 0..) |seg, i| {
-            if (i > 0) try writer.writeAll(".");
-            try writer.writeAll(seg);
-        }
-    } else {
-        try writer.writeAll(schemas[col_idx].name);
-    }
-}
-
 fn printCell(
     writer: anytype,
     col: consumer.OutputAggregator.ColumnBuf,
@@ -2362,6 +2413,7 @@ fn printCell(
 
 fn flushAggregator(
     agg: *consumer.OutputAggregator,
+    names: []const []const u8,
     writer: anytype,
     is_jsonl: bool,
     limit: ?usize,
@@ -2379,9 +2431,8 @@ fn flushAggregator(
             try writer.writeAll("{");
             for (agg.cols, 0..) |col, col_idx| {
                 if (col_idx > 0) try writer.writeAll(",");
-                try writer.writeByte('"');
-                try writeColName(writer, agg.paths, agg.schema_elems, col_idx);
-                try writer.writeAll("\":");
+                try writeJsonQuoted(writer, names[col_idx]);
+                try writer.writeByte(':');
                 try printCell(writer, col, row_idx, agg.schema_elems[col_idx], true);
             }
             try writer.writeAll("}\n");
@@ -2439,10 +2490,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     if (args.columns) |cols_list| {
         const set = try arena.alloc(bool, tree0.leaves.len);
         @memset(set, false);
-        for (cols_list) |name| {
-            const indices = try tree0.resolveTopLevel(arena, name);
-            for (indices) |idx| set[idx] = true;
-        }
+        try markColumns(arena, meta0, cols_list, set, args.diag);
         kept_set = set;
     }
 
@@ -2467,15 +2515,17 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     const fetch_arr = try arena.alloc(bool, num_leaves);
     @memset(fetch_arr, false);
 
+    var labels: Labels = .{ .arena = arena, .meta = meta0 };
     var output_specs: std.ArrayList(consumer.OutputCol) = .empty;
     var any_computed = false;
     if (select_items) |items| {
         for (items) |item| {
             switch (item.expr) {
                 .col_ref => |c| {
-                    // The select output is flat, so a nested leaf is written under its dotted path rather than
-                    // its leaf name, which a top-level column may share.
-                    const nested_name: ?[]const u8 = if (item.alias == null) try nestedLeafPath(arena, meta0, c.col_idx) else null;
+                    // The select output is flat, so a nested leaf is written under its label (its dotted path)
+                    // rather than its leaf name, which a top-level column may share.
+                    const nested_name: ?[]const u8 =
+                        if (item.alias == null) try labels.ofNested(c.col_idx) else null;
                     if (item.alias orelse nested_name) |alias| {
                         try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
                         any_computed = true;
@@ -2534,11 +2584,12 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     var stdout_writer = StdoutWriter{ .fd = 1 };
     defer stdout_writer.flush() catch {};
 
+    const names = try outputColumnNames(arena, &labels, output_specs.items);
     const is_jsonl = (format == .jsonl);
     if (!is_jsonl) {
-        for (agg.cols, 0..) |_, col_idx| {
+        for (names, 0..) |name, col_idx| {
             if (col_idx > 0) try stdout_writer.writeAll(",");
-            try writeColName(&stdout_writer, agg.paths, agg.schema_elems, col_idx);
+            try writeCsvString(&stdout_writer, name);
         }
         try stdout_writer.writeAll("\n");
     }
@@ -2575,7 +2626,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 .{ .fast_levels = args.fast_levels },
             );
 
-            try flushAggregator(&agg, &stdout_writer, is_jsonl, limit, &total_printed);
+            try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
             consumer.resetAggregator(&agg);
         }
     }

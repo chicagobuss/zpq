@@ -155,14 +155,23 @@ const Lexer = struct {
                 // Double-quoted identifier (SQL-standard): `"id"`, `"my col"`,
                 // a column named like a keyword. The quotes are syntax; the
                 // text is the column name, emitted as a plain ident token so
-                // resolution treats it identically to a bare identifier.
-                self.pos += 1;
+                // resolution treats it identically to a bare identifier. A
+                // quoted path (`"a"."b"`, or a doubled quote) keeps its quotes:
+                // resolveColumn binds it by segments.
                 const start = self.pos;
-                while (self.pos < self.src.len and self.src[self.pos] != '"') self.pos += 1;
-                if (self.pos >= self.src.len) return error.UnterminatedString;
-                const text = self.src[start..self.pos];
-                self.pos += 1; // consume closing quote
-                return .{ .kind = .ident, .text = text };
+                while (true) {
+                    self.pos += 1;
+                    while (self.pos < self.src.len and self.src[self.pos] != '"') self.pos += 1;
+                    if (self.pos >= self.src.len) return error.UnterminatedString;
+                    self.pos += 1; // consume closing quote
+                    if (self.pos < self.src.len and self.src[self.pos] == '"') continue; // doubled quote
+                    if (self.pos + 1 < self.src.len and self.src[self.pos] == '.' and self.src[self.pos + 1] == '"') {
+                        self.pos += 1;
+                        continue;
+                    }
+                    break;
+                }
+                return .{ .kind = .ident, .text = metadata.unquoteIdent(self.src[start..self.pos]) };
             },
             else => {},
         }
@@ -1091,4 +1100,25 @@ test "parse: bare names bind top-level columns, dotted paths nested leaves" {
     try testing.expectEqual(@as(usize, 5), (try parseExprOnly(a, "b.x", &file)).col_ref.col_idx);
     // A dot that does not continue an identifier is still an error, not part of the name.
     try testing.expectError(error.UnexpectedChar, parseExprOnly(a, "key.", &file));
+}
+
+test "parse: a quoted path binds the nested leaf a top-level column's dotted name hides" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try metadata.sharedLeafNameMetaForTest(a);
+    file.schema.items[4].name = "r.key"; // the top-level `key` becomes `r.key`, beside the group r's field key
+
+    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "r.key", &file)).col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 2), (try parseExprOnly(a, "\"r.key\"", &file)).col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 0), (try parseExprOnly(a, "\"r\".\"key\"", &file)).col_ref.col_idx);
+    const sel = try parseSelect(a, "\"r\".\"key\" + \"r.key\" AS s, \"r\".\"name\"", &file);
+    try testing.expectEqual(@as(usize, 0), sel[0].expr.binop.left.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 2), sel[0].expr.binop.right.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 1), sel[1].expr.col_ref.col_idx);
+    const keys = try parseGroupBy(a, "\"r\".\"key\", \"r.key\"", &file);
+    try testing.expectEqual(@as(usize, 0), keys[0].expr.col_ref.col_idx);
+    try testing.expectEqual(@as(usize, 2), keys[1].expr.col_ref.col_idx);
+    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "\"r\".\"nope\"", &file));
+    try testing.expectError(error.UnterminatedString, parseExprOnly(a, "\"r\".\"key", &file));
 }

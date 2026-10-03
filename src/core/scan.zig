@@ -50,7 +50,8 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 /// The output column an error is about, for callers that report it. Only meaningful after a
-/// `DuplicateOutputColumn` / `AmbiguousOutputColumn` / `UnknownColumn` error from `runMultiAggregate`.
+/// `DuplicateOutputColumn` / `AmbiguousOutputColumn` / `UnknownColumn` error from `runMultiAggregate`, or an
+/// `UnknownColumn` / `AmbiguousColumn` error for a --columns name from `engine`.
 pub const Diag = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
@@ -59,7 +60,7 @@ pub const Diag = struct {
         return self.buf[0..self.len];
     }
 
-    fn setColumn(diag: ?*Diag, name: []const u8) void {
+    pub fn setColumn(diag: ?*Diag, name: []const u8) void {
         const d = diag orelse return;
         d.len = @min(name.len, d.buf.len);
         @memcpy(d.buf[0..d.len], name[0..d.len]);
@@ -969,8 +970,8 @@ pub fn runMultiAggregate(
             for (cols[0..cols_built]) |c| gpa.free(c);
             gpa.free(cols);
         }
-        for (select_cols, 0..) |col, idx| {
-            cols[idx] = try gpa.dupe(u8, selectColumnName(col));
+        for (select_cols, col_sources, 0..) |col, src, idx| {
+            cols[idx] = try gpa.dupe(u8, try groupOutputName(arena, group_by_items.?, meta0, col, src));
             cols_built += 1;
         }
         group_cols = cols;
@@ -1192,16 +1193,43 @@ fn checkGroupOutputNames(
     args: MultiAggArgs,
 ) Error![]const []const u8 {
     try checkAggAliases(agg_calls, args.diag);
+    for (group_items) |item| if (item.alias == null and item.expr == .col_ref) {
+        _ = leafLabel(arena, meta, item.expr.col_ref.col_idx) catch |err| {
+            if (err == error.DuplicateOutputColumn) {
+                const segments = (try metadata.leafPathSegments(arena, meta, item.expr.col_ref.col_idx)).?;
+                Diag.setColumn(args.diag, try metadata.quotePath(arena, segments));
+            }
+            return err;
+        };
+    };
     const cols = try resolveGroupSelectCols(arena, group_items, agg_calls, meta, args.select_cols, args.column_order);
-    for (cols, 0..) |col, i| {
-        const name = selectColumnName(col);
-        for (cols[0..i]) |prev| if (std.ascii.eqlIgnoreCase(name, selectColumnName(prev))) {
-            Diag.setColumn(args.diag, name);
+    const names = try arena.alloc([]const u8, cols.len);
+    for (cols, names, 0..) |col, *name, i| {
+        const src = try resolveOutputColumn(arena, group_items, agg_calls, meta, col, args.diag);
+        name.* = try groupOutputName(arena, group_items, meta, col, src);
+        for (names[0..i]) |prev| if (std.ascii.eqlIgnoreCase(name.*, prev)) {
+            Diag.setColumn(args.diag, name.*);
             return error.DuplicateOutputColumn;
         };
-        _ = try resolveOutputColumn(arena, group_items, agg_calls, meta, col, args.diag);
     }
     return cols;
+}
+
+/// The name output column `col` prints under: an `AS` alias it gives; else a GROUP BY key's label, however `col`
+/// spells the key (`SELECT "r"."v"` and `--group-by v` both print `r.v`, see `metadata.leafLabel`); else the
+/// aggregate's name as `col` gives it.
+fn groupOutputName(
+    arena: std.mem.Allocator,
+    group_items: []const expr_ast.SelectItem,
+    meta: *const schema.FileMetaData,
+    col: []const u8,
+    src: ColSource,
+) Error![]const u8 {
+    const renamed = std.mem.lastIndexOf(u8, std.mem.trim(u8, col, " "), " AS ") != null;
+    return switch (src) {
+        .key => |k| if (renamed) selectColumnName(col) else groupKeyLabel(arena, group_items[k], meta),
+        .agg => selectColumnName(col),
+    };
 }
 
 /// Which GROUP BY key or aggregate an output column names. A key matches by its output label or, for a bare column
@@ -1241,6 +1269,16 @@ fn resolveOutputColumn(
             break;
         };
     }
+    if (key == null and agg == null) {
+        // A select-list column (SQL `SELECT b ... GROUP BY b`) names a bare key by any name that binds its column, as
+        // the key itself was bound; its label may be a path (`r.b`) or quoted path the select list does not spell.
+        if (metadata.resolveColumn(meta, expr_name) catch null) |leaf| {
+            for (group_items, 0..) |item, k_idx| if (item.expr == .col_ref and item.expr.col_ref.col_idx == leaf) {
+                key = k_idx;
+                break;
+            };
+        }
+    }
     if (key != null and agg != null) {
         // Name the aggregate alias: it is the clashing name whichever side of `AS` matched, and the one to rename.
         Diag.setColumn(diag, agg_calls[agg.?].alias);
@@ -1268,15 +1306,16 @@ fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
     };
 }
 
-/// The output column name for the `leaf_idx`-th primitive column: its dot-joined path, so a nested leaf (`r.key`)
-/// is not labelled like a top-level column that shares its leaf name (`key`).
+/// The output column name for the `leaf_idx`-th primitive column: `metadata.leafLabel`, the name the row formats
+/// print it under, so a nested leaf (`r.key`) is not labelled like a top-level column that shares its leaf name
+/// (`key`) or its dotted path (a top-level `r.key`; the nested one is then `"r"."key"`).
 ///
 /// `col_idx` counts LEAVES, but `meta.schema` is a flattened DFS including group nodes, so `leaf_idx + 1` is correct
 /// only for files with no nested types. Used for output column NAMES; key framing must not depend on it.
 fn leafLabel(arena: std.mem.Allocator, meta: *const schema.FileMetaData, leaf_idx: usize) Error![]const u8 {
     // Callers resolved `leaf_idx` from this same schema. Falling back to
     // another element would just print the wrong column name.
-    return (try metadata.leafPath(arena, meta, leaf_idx)) orelse
+    return (try metadata.leafLabel(arena, meta, leaf_idx)) orelse
         std.debug.panic("leaf_idx {d} not in schema", .{leaf_idx});
 }
 
@@ -1304,7 +1343,9 @@ fn selectColumnExpr(col_name: []const u8) []const u8 {
     return stripQuotes(clean_col);
 }
 
+/// A quoted path (`"a"."b"`, a nested leaf's label) is a name in its own right and keeps its quotes.
 fn stripQuotes(name: []const u8) []const u8 {
+    if (name.len >= 2 and name[0] == '"' and metadata.unquoteIdent(name).len == name.len) return name;
     if (name.len >= 2 and ((name[0] == '\'' and name[name.len - 1] == '\'') or (name[0] == '"' and name[name.len - 1] == '"'))) {
         return name[1 .. name.len - 1];
     }
@@ -2784,4 +2825,71 @@ test "all-null pages: null checks and their combinations answer like --scan-all"
             if (want) |w| try testing.expectEqual(w, got.aggs[0].value.i);
         }
     };
+}
+
+test "GROUP BY labels a nested leaf whose dotted path a top-level column takes by its quoted path" {
+    // Top-level `a.b` (1, null, 3) beside the group `a`'s field `b` (10, 20, null).
+    const fixture = "ci/fixtures/parquet/dotted_twin.parquet";
+    const bytes = (try loadFixture(fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = fixture, .bytes = bytes }};
+
+    const Case = struct {
+        group_by: []const u8,
+        aggregate: []const u8 = "count(*) AS n",
+        select_cols: ?[]const []const u8 = null,
+        want: []const []const u8,
+    };
+    const cases = [_]Case{
+        .{ .group_by = "b", .want = &.{ "\"a\".\"b\"", "n" } },
+        .{ .group_by = "\"a\".\"b\"", .want = &.{ "\"a\".\"b\"", "n" } },
+        .{ .group_by = "\"a.b\"", .want = &.{ "a.b", "n" } },
+        // Both keys at once used to be one name twice.
+        .{ .group_by = "b, \"a.b\"", .want = &.{ "\"a\".\"b\"", "a.b", "n" } },
+        // The label binds back as an output column name, and is not mistaken for a quoted `a"."b`.
+        .{
+            .group_by = "b, a.b",
+            .select_cols = &.{ "n", "\"a\".\"b\"", "a.b" },
+            .want = &.{ "n", "\"a\".\"b\"", "a.b" },
+        },
+        .{ .group_by = "b AS k", .want = &.{ "k", "n" } },
+        // A select list (SQL) names a bare key by any name that binds its column; the output keeps the label
+        // unless the select list renames it.
+        .{ .group_by = "b", .select_cols = &.{ "b", "n" }, .want = &.{ "\"a\".\"b\"", "n" } },
+        .{ .group_by = "b", .select_cols = &.{ "b AS k", "n" }, .want = &.{ "k", "n" } },
+        .{
+            .group_by = "\"a\".\"b\", \"a.b\"",
+            .select_cols = &.{ "\"a.b\"", "b" },
+            .want = &.{ "a.b", "\"a\".\"b\"" },
+        },
+    };
+    for (cases) |c| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .select_cols = c.select_cols,
+            .parallelism = 1,
+        });
+        defer freeGroupResult(res);
+        const cols = res.group_cols.?;
+        try testing.expectEqual(c.want.len, cols.len);
+        for (c.want, cols) |w, g| try testing.expectEqualStrings(w, g);
+    }
+
+    // The duplicate-name check sees the label, not the dotted path both columns share.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = .{};
+    const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n",
+        .group_by = "b, \"a\".\"b\" AS \"a\".\"b\"",
+        .parallelism = 1,
+        .diag = &diag,
+    });
+    try testing.expectError(error.DuplicateOutputColumn, res);
+    try testing.expectEqualStrings("\"a\".\"b\"", diag.column());
 }

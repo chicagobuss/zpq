@@ -128,6 +128,9 @@ pub const MultiAggResult = struct {
     bytes_in: u64,
     row_groups_in: usize,
     row_groups_pruned: usize,
+    /// Row groups whose statistics proved every row matches the filter, so it was never evaluated there and
+    /// columns only the filter reads were neither fetched nor decoded.
+    row_groups_full_match: usize = 0,
     /// Columns dropped from the fetch set because every aggregate
     /// referencing them was provably stats-answerable across every RG.
     /// 0 when no aggs are stat-eligible, an outer filter is present,
@@ -156,6 +159,9 @@ const WorkItem = struct {
     agg_start: usize,
     agg_len: usize,
     fetch_arr: []const bool,
+    /// Fetch set for a row group statistics prove fully matching: `fetch_arr` minus the columns only the filter
+    /// reads. Anything an aggregate argument, per-agg FILTER, or GROUP BY key reads stays, and is decoded in full.
+    proven_fetch_arr: []const bool,
     accumulators: []expr_agg.Accumulator,
 };
 
@@ -285,6 +291,7 @@ const Worker = struct {
     rows_kept: i64 = 0,
     rgs_in: usize = 0,
     rgs_pruned: usize = 0,
+    rgs_full_match: usize = 0,
     group_by_keys: ?[]const expr_ast.Expr = null,
     group_table: ?expr_agg.GroupTable = null,
     err: ?anyerror = null,
@@ -323,16 +330,28 @@ fn workerRunErr(w: *Worker) !void {
             w.rgs_in += 1;
             w.rows_in += rg.num_rows;
         }
+        var rg_filter = w.filter_opt;
+        var fetch_arr = item.fetch_arr;
         if (w.filter_opt) |f| if (!w.scan_all) {
             // pruneRowGroup needs a transient allocator; per-RG arena
             // keeps the working set small. Skipped under --scan-all.
             var rg_arena = std.heap.ArenaAllocator.init(w.gpa);
             defer rg_arena.deinit();
-            if ((try filter_prune.pruneRowGroup(rg, f, rg_arena.allocator(), meta)) == .skip) {
-                if (item.agg_start == 0) {
-                    w.rgs_pruned += 1;
-                }
-                continue;
+            switch (try filter_prune.pruneRowGroup(rg, f, rg_arena.allocator(), meta)) {
+                .skip => {
+                    if (item.agg_start == 0) {
+                        w.rgs_pruned += 1;
+                    }
+                    continue;
+                },
+                // Every row matches, so the row group is scanned as if unfiltered. The S3 planner makes this same
+                // call from the same footer and leaves filter-only chunks unfetched, so the two must not diverge.
+                .always_match => {
+                    rg_filter = null;
+                    fetch_arr = item.proven_fetch_arr;
+                    if (item.agg_start == 0) w.rgs_full_match += 1;
+                },
+                .keep, .unknown => {},
             }
         };
         if (item.agg_start == 0) {
@@ -345,11 +364,11 @@ fn workerRunErr(w: *Worker) !void {
                 rg,
                 meta,
                 rg_src,
-                w.filter_opt,
+                rg_filter,
                 w.scan_all,
                 w.trust_stats,
                 decode_options,
-                item.fetch_arr,
+                fetch_arr,
                 sub_agg_calls,
                 &[_]expr_agg.Accumulator{},
                 w.group_by_keys,
@@ -363,11 +382,11 @@ fn workerRunErr(w: *Worker) !void {
                 rg,
                 meta,
                 rg_src,
-                w.filter_opt,
+                rg_filter,
                 w.scan_all,
                 w.trust_stats,
                 decode_options,
-                item.fetch_arr,
+                fetch_arr,
                 sub_agg_calls,
                 item.accumulators,
                 null,
@@ -575,24 +594,27 @@ pub fn runMultiAggregate(
             const agg_start = chunk_idx * base_chunk_size + @min(chunk_idx, remainder);
             const agg_len = base_chunk_size + if (chunk_idx < remainder) @as(usize, 1) else @as(usize, 0);
 
-            // Build specialized fetch_arr for this chunk
-            const chunk_fetch_arr = try arena.alloc(bool, num_leaves);
-            @memset(chunk_fetch_arr, false);
+            // Build specialized fetch_arr for this chunk. `proven_fetch_arr` is what it reads when the outer filter is
+            // proven to pass every row: only its own aggregates' and the GROUP BY's columns.
+            const proven_fetch_arr = try arena.alloc(bool, num_leaves);
+            @memset(proven_fetch_arr, false);
             for (agg_calls[agg_start .. agg_start + agg_len]) |call| {
-                if (call.arg) |arg_expr| arg_expr.collectColumns(chunk_fetch_arr);
+                if (call.arg) |arg_expr| arg_expr.collectColumns(proven_fetch_arr);
                 if (call.where) |w_expr| {
                     var wcols: std.ArrayList(usize) = .empty;
                     try w_expr.collectColumns(&wcols, arena);
                     for (wcols.items) |wci| if (wci < num_leaves) {
-                        chunk_fetch_arr[wci] = true;
+                        proven_fetch_arr[wci] = true;
                     };
                 }
             }
             if (group_by_keys) |keys| {
-                for (keys) |key_expr| key_expr.collectColumns(chunk_fetch_arr);
+                for (keys) |key_expr| key_expr.collectColumns(proven_fetch_arr);
             }
+            const chunk_fetch_arr = try arena.alloc(bool, num_leaves);
             for (0..num_leaves) |ci| {
-                chunk_fetch_arr[ci] = fetch_arr[ci] and (filter_cols[ci] or chunk_fetch_arr[ci]);
+                chunk_fetch_arr[ci] = fetch_arr[ci] and (filter_cols[ci] or proven_fetch_arr[ci]);
+                proven_fetch_arr[ci] = fetch_arr[ci] and proven_fetch_arr[ci];
             }
 
             // Initialize accumulators for this chunk
@@ -612,6 +634,7 @@ pub fn runMultiAggregate(
                 .agg_start = agg_start,
                 .agg_len = agg_len,
                 .fetch_arr = chunk_fetch_arr,
+                .proven_fetch_arr = proven_fetch_arr,
                 .accumulators = sub_accs,
             });
         }
@@ -709,6 +732,7 @@ pub fn runMultiAggregate(
     var rows_kept: i64 = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
+    var rgs_full_match: usize = 0;
 
     var group_cols: ?[]const []const u8 = null;
     var group_rows: ?[]const []const AggValue = null;
@@ -719,6 +743,7 @@ pub fn runMultiAggregate(
             rows_kept += w.rows_kept;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
+            rgs_full_match += w.rgs_full_match;
             t.core.decode_ns += w.timings.decode_ns;
             t.core.eval_ns += w.timings.eval_ns;
             t.core.encode_ns += w.timings.encode_ns;
@@ -941,6 +966,7 @@ pub fn runMultiAggregate(
             rows_kept += w.rows_kept;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
+            rgs_full_match += w.rgs_full_match;
             t.core.decode_ns += w.timings.decode_ns;
             t.core.eval_ns += w.timings.eval_ns;
             t.core.encode_ns += w.timings.encode_ns;
@@ -971,6 +997,7 @@ pub fn runMultiAggregate(
         .bytes_in = bytes_in,
         .row_groups_in = rgs_in,
         .row_groups_pruned = rgs_pruned,
+        .row_groups_full_match = rgs_full_match,
         .cols_stat_pruned = cols_stat_pruned,
         .aggs = items,
         .accumulators = accumulators,
@@ -1781,5 +1808,312 @@ test "parseFooters: serial path reports the lowest bad index too" {
     switch (res) {
         .ok => return error.TestUnexpectedResult,
         .failed => |f| try testing.expectEqual(@as(usize, 0), f.index),
+    }
+}
+
+// ============================================================ Full-match row groups.
+//
+// Where statistics prove every row of a row group passes the filter, the scan neither evaluates the filter there nor
+// fetches/decodes columns only the filter reads. Every answer is checked against `--scan-all`, which disables all
+// statistics use and evaluates the filter on every row, so the two paths share nothing but the decoders and folds.
+// Fixture layout (tools/gen_full_match_fixture.py): 8 row groups x 200 rows, `ts` = 0..1599 sorted, so `ts >= 500`
+// skips row groups 0-1, leaves 2 partial and proves 3-7.
+// ============================================================
+
+const full_match_fixture = "ci/fixtures/parquet/full_match.parquet";
+
+const FullMatchQuery = struct {
+    filter: ?[]const u8,
+    aggregate: []const u8,
+    group_by: ?[]const u8 = null,
+    /// Row groups the proof must claim; checked so a silently disabled optimization cannot pass as a correct answer.
+    full_match: usize,
+};
+
+fn runFullMatchQuery(
+    arena: std.mem.Allocator,
+    inputs: []const Input,
+    q: FullMatchQuery,
+    parallelism: usize,
+    scan_all: bool,
+) !MultiAggResult {
+    return runMultiAggregate(testing.allocator, arena, .{
+        .inputs = inputs,
+        .filter = q.filter,
+        .aggregate = q.aggregate,
+        .group_by = q.group_by,
+        .parallelism = parallelism,
+        .scan_all = scan_all,
+    });
+}
+
+fn expectSameAggValue(want: AggValue, got: AggValue) !void {
+    try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+    switch (want) {
+        .i => |v| try testing.expectEqual(v, got.i),
+        // Fixture doubles are multiples of 0.5 with small sums, so every summation order is exact.
+        .f => |v| try testing.expectEqual(v, got.f),
+        .avg => |v| {
+            try testing.expectEqual(v.sum, got.avg.sum);
+            try testing.expectEqual(v.count, got.avg.count);
+        },
+        .s => |v| try testing.expectEqualStrings(v, got.s),
+        .null_val => {},
+    }
+}
+
+fn expectSameAnswer(want: MultiAggResult, got: MultiAggResult) !void {
+    try testing.expectEqual(want.aggs.len, got.aggs.len);
+    for (want.aggs, got.aggs) |w, g| try expectSameAggValue(w.value, g.value);
+    const want_rows = want.group_rows orelse &.{};
+    const got_rows = got.group_rows orelse &.{};
+    try testing.expectEqual(want_rows.len, got_rows.len);
+    for (want_rows, got_rows) |wr, gr| {
+        try testing.expectEqual(wr.len, gr.len);
+        for (wr, gr) |w, g| try expectSameAggValue(w, g);
+    }
+}
+
+/// Runs `q` with and without statistics at several -j (16 splits each row group's aggregates across work items, each
+/// with its own proven fetch set) and requires identical answers plus the expected number of proven row groups.
+fn checkFullMatchQuery(inputs: []const Input, q: FullMatchQuery) !MultiAggResult {
+    var oracle_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer oracle_arena.deinit();
+    const oracle = runFullMatchQuery(oracle_arena.allocator(), inputs, q, 1, true) catch |err| {
+        std.debug.print("full match: --scan-all failed for filter={?s} agg={s}: {s}\n", .{
+            q.filter, q.aggregate, @errorName(err),
+        });
+        return err;
+    };
+    defer freeGroupResult(oracle);
+    try testing.expectEqual(@as(usize, 0), oracle.row_groups_full_match);
+
+    var last: ?MultiAggResult = null;
+    errdefer if (last) |r| freeGroupResult(r);
+    for ([_]usize{ 1, 4, 16 }) |parallelism| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const got = try runFullMatchQuery(arena_state.allocator(), inputs, q, parallelism, false);
+        if (last) |r| freeGroupResult(r);
+        last = got;
+        expectSameAnswer(oracle, got) catch |err| {
+            std.debug.print("full match: -j{d} disagrees with --scan-all for filter={?s} agg={s} group_by={?s}\n", .{
+                parallelism, q.filter, q.aggregate, q.group_by,
+            });
+            return err;
+        };
+        testing.expectEqual(q.full_match, got.row_groups_full_match) catch |err| {
+            std.debug.print("full match: filter={?s} proved {d} row groups, want {d}\n", .{
+                q.filter, got.row_groups_full_match, q.full_match,
+            });
+            return err;
+        };
+    }
+    return last.?;
+}
+
+fn loadFullMatchFixture() !?[]u8 {
+    return metadata.readFileSlice(full_match_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{full_match_fixture});
+            return null;
+        }
+        return err;
+    };
+}
+
+test "full match: proven row groups answer like --scan-all" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+
+    const queries = [_]FullMatchQuery{
+        // count(*) alone: proven row groups need no column at all.
+        .{ .filter = "ts >= 500", .aggregate = "count(*) AS n", .full_match = 5 },
+        .{ .filter = "ts >= 500", .aggregate = "count(*) AS n, sum(x) AS sx, min(x) AS mn", .full_match = 5 },
+        // The filter column is also an aggregate argument / per-agg FILTER input, so it must still be decoded.
+        .{ .filter = "ts >= 500", .aggregate = "sum(ts) AS st, max(ts) AS mt, count(*) AS n", .full_match = 5 },
+        .{
+            .filter = "ts >= 500",
+            .aggregate = "count(*) AS n, sum(x) FILTER (WHERE ts < 1000) AS sx",
+            .full_match = 5,
+        },
+        .{ .filter = "ts >= 500", .aggregate = "avg(x) AS a, count(x) AS cx", .full_match = 5 },
+        // Strings: a min-side proof needs no exactness flag; a max-side one relies on is_max_value_exact.
+        .{ .filter = "s >= 'k000500'", .aggregate = "count(*) AS n, sum(x) AS sx", .full_match = 5 },
+        .{ .filter = "s < 'k000500'", .aggregate = "count(*) AS n, sum(x) AS sx", .full_match = 2 },
+        // Nullable: group 1 is all null (skip), 0/2/3 have nulls (partial), 4-7 have none (proven).
+        .{ .filter = "n IS NOT NULL", .aggregate = "count(*) AS c, sum(x) AS sx, count(n) AS cn", .full_match = 4 },
+        .{ .filter = "n IS NULL", .aggregate = "count(*) AS c, sum(x) AS sx", .full_match = 1 },
+        .{ .filter = "n >= 0", .aggregate = "count(*) AS c, sum(x) AS sx", .full_match = 4 },
+        .{ .filter = "ts >= 500 AND n IS NOT NULL", .aggregate = "count(*) AS c, sum(n) AS sn", .full_match = 4 },
+        .{ .filter = "ts >= 1400 OR x > 1000", .aggregate = "count(*) AS c, sum(x) AS sx", .full_match = 1 },
+        .{ .filter = "NOT ts < 500", .aggregate = "count(*) AS c, sum(x) AS sx", .full_match = 5 },
+        // Floats: NaN could hide outside [min, max].
+        .{ .filter = "x >= -3", .aggregate = "count(*) AS n", .full_match = 0 },
+    };
+    for (queries) |q| {
+        const res = try checkFullMatchQuery(&inputs, q);
+        freeGroupResult(res);
+    }
+
+    // Hand-known values, so agreement with --scan-all is not agreement on a shared mistake.
+    const res = try checkFullMatchQuery(&inputs, queries[2]);
+    defer freeGroupResult(res);
+    try testing.expectEqual(@as(i128, (500 + 1599) * 1100 / 2), res.aggs[0].value.i);
+    try testing.expectEqual(@as(i128, 1599), res.aggs[1].value.i);
+    try testing.expectEqual(@as(i128, 1100), res.aggs[2].value.i);
+    try testing.expectEqual(@as(usize, 2), res.row_groups_pruned);
+}
+
+test "full match: per-row-group decisions on a real footer" {
+    // Unsigned columns sit here rather than in the --scan-all comparison: evaluating any filter on a UINT_32 column
+    // fails with TypeMismatch, so the only observable is that the proof refuses them.
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, bytes);
+
+    // pyarrow declares TYPE_DEFINED_ORDER for every leaf and marks untruncated string bounds exact.
+    const orders = meta.column_orders orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 6), orders.items.len);
+    for (orders.items) |o| try testing.expectEqual(schema.COLUMN_ORDER_TYPE_DEFINED, o);
+    const s_stats = meta.row_groups.items[0].columns.items[2].meta_data.?.statistics.?;
+    try testing.expectEqual(@as(?bool, true), s_stats.is_max_value_exact);
+    try testing.expectEqual(@as(?bool, true), s_stats.is_min_value_exact);
+
+    const D = filter_prune.Decision;
+    const all: D = .always_match;
+    const cases = [_]struct { filter: []const u8, want: [8]D }{
+        .{ .filter = "ts >= 600", .want = .{ .skip, .skip, .skip, all, all, all, all, all } },
+        .{ .filter = "u >= 600", .want = .{ .skip, .skip, .skip, .keep, .keep, .keep, .keep, .keep } },
+        .{ .filter = "x >= -3", .want = .{ .keep, .keep, .keep, .keep, .keep, .keep, .keep, .keep } },
+        .{ .filter = "n IS NOT NULL", .want = .{ .keep, .skip, .keep, .keep, all, all, all, all } },
+    };
+    for (cases) |c| {
+        const f = try filter_parser.parse(arena, c.filter, &meta);
+        for (meta.row_groups.items, c.want, 0..) |*rg, want, i| {
+            const got = try filter_prune.pruneRowGroup(rg, f, arena, &meta);
+            testing.expectEqual(want, got) catch |err| {
+                std.debug.print("{s}: row group {d} decided {s}, want {s}\n", .{
+                    c.filter, i, @tagName(got), @tagName(want),
+                });
+                return err;
+            };
+        }
+    }
+}
+
+test "full match: GROUP BY on the filter column" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+
+    // b = ts / 100: group 2 holds b = 4, 5 (partial); groups 3-7 hold b = 6..15 (proven).
+    const res = try checkFullMatchQuery(&inputs, .{
+        .filter = "b >= 5",
+        .aggregate = "count(*) AS n, sum(x) AS sx",
+        .group_by = "b",
+        .full_match = 5,
+    });
+    defer freeGroupResult(res);
+    const rows = res.group_rows orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 11), rows.len);
+    for (rows) |r| try testing.expectEqual(@as(i128, 100), r[1].i);
+
+    const keyed = try checkFullMatchQuery(&inputs, .{
+        .filter = "ts >= 500",
+        .aggregate = "count(*) AS n, sum(x) AS sx",
+        .group_by = "b",
+        .full_match = 5,
+    });
+    freeGroupResult(keyed);
+}
+
+test "full match: several files keep their own decisions" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{
+        .{ .name = full_match_fixture, .bytes = bytes },
+        .{ .name = full_match_fixture, .bytes = bytes },
+        .{ .name = full_match_fixture, .bytes = bytes },
+    };
+    const res = try checkFullMatchQuery(&inputs, .{
+        .filter = "ts >= 500",
+        .aggregate = "count(*) AS n, sum(ts) AS st",
+        .full_match = 15,
+    });
+    defer freeGroupResult(res);
+    try testing.expectEqual(@as(i128, 3 * 1100), res.aggs[0].value.i);
+}
+
+/// Overwrite column `col`'s chunk in each listed row group with bytes no decoder accepts.
+fn poisonChunks(bytes: []u8, meta: *const schema.FileMetaData, col: usize, rgs: []const usize) void {
+    for (rgs) |rg_i| {
+        const cm = meta.row_groups.items[rg_i].columns.items[col].meta_data.?;
+        const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+        const len: usize = @intCast(cm.total_compressed_size);
+        @memset(bytes[start .. start + len], 0xA5);
+    }
+}
+
+test "full match: filter-only chunks of proven row groups are never read" {
+    const clean = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(clean);
+
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    const meta = try metadata.open(meta_arena.allocator(), clean);
+
+    const cases = [_]struct { col: usize, rgs: []const usize, q: FullMatchQuery }{
+        .{ .col = 0, .rgs = &.{ 3, 4, 5, 6, 7 }, .q = .{
+            .filter = "ts >= 500",
+            .aggregate = "count(*) AS n, sum(x) AS sx",
+            .full_match = 5,
+        } },
+        .{ .col = 2, .rgs = &.{ 3, 4, 5, 6, 7 }, .q = .{
+            .filter = "s >= 'k000500'",
+            .aggregate = "count(*) AS n, sum(x) AS sx",
+            .full_match = 5,
+        } },
+        .{ .col = 4, .rgs = &.{ 4, 5, 6, 7 }, .q = .{
+            .filter = "n IS NOT NULL",
+            .aggregate = "count(*) AS n, sum(x) AS sx",
+            .full_match = 4,
+        } },
+    };
+    for (cases) |c| {
+        const poisoned = try testing.allocator.dupe(u8, clean);
+        defer testing.allocator.free(poisoned);
+        poisonChunks(poisoned, &meta, c.col, c.rgs);
+        const poisoned_in = [_]Input{.{ .name = "poisoned", .bytes = poisoned }};
+
+        var want_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer want_arena.deinit();
+        const clean_in = [_]Input{.{ .name = "clean", .bytes = clean }};
+        const want = try runFullMatchQuery(want_arena.allocator(), &clean_in, c.q, 1, false);
+        defer freeGroupResult(want);
+
+        for ([_]usize{ 1, 16 }) |parallelism| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const got = try runFullMatchQuery(arena_state.allocator(), &poisoned_in, c.q, parallelism, false);
+            defer freeGroupResult(got);
+            try expectSameAnswer(want, got);
+            try testing.expectEqual(c.q.full_match, got.row_groups_full_match);
+        }
+
+        // Control: the poison is detectable once the column is read, or the checks above prove nothing.
+        var ctl_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer ctl_arena.deinit();
+        var ctl_q = c.q;
+        ctl_q.aggregate = "count(*) AS n";
+        if (runFullMatchQuery(ctl_arena.allocator(), &poisoned_in, ctl_q, 1, true)) |r| {
+            freeGroupResult(r);
+            std.debug.print("full match: poisoned column {d} decoded cleanly under --scan-all\n", .{c.col});
+            return error.TestUnexpectedResult;
+        } else |_| {}
     }
 }

@@ -444,8 +444,9 @@ fn lambdaAggregate(
 
     var buf: std.ArrayList(u8) = .empty;
     if (ar.group_rows) |rows| {
-        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
-            ar.files_in, ar.rows_in, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned, ar.bytes_in,
+        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
+            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
+            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
         for (rows, 0..) |row_vals, row_idx| {
             if (row_idx > 0) try buf.appendSlice(allocator, ",");
@@ -465,8 +466,9 @@ fn lambdaAggregate(
         }
         try buf.appendSlice(allocator, "]");
     } else {
-        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
-            ar.files_in, ar.rows_in, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned, ar.bytes_in,
+        try buf.print(allocator, "{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
+            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
+            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
         for (ar.aggs, 0..) |item, i| {
             if (i > 0) try buf.appendSlice(allocator, ",");

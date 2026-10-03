@@ -716,6 +716,15 @@ pub const PageHeader = struct {
     }
 };
 
+/// Compact protocol carries a bool struct field's value in the field header's type nibble.
+fn boolField(t: thrift.Type) ?bool {
+    return switch (t) {
+        .True => true,
+        .False => false,
+        else => null,
+    };
+}
+
 pub const Statistics = struct {
     max: ?[]const u8 = null,
     min: ?[]const u8 = null,
@@ -723,6 +732,10 @@ pub const Statistics = struct {
     distinct_count: ?i64 = null,
     max_value: ?[]const u8 = null,
     min_value: ?[]const u8 = null,
+    /// False means `max_value` is a truncated upper bound rather than a value present in the chunk. Read-only: not
+    /// written back, so byte-copied output loses them, which only makes later readers more conservative.
+    is_max_value_exact: ?bool = null,
+    is_min_value_exact: ?bool = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
         const saved_id = reader.last_field_id;
@@ -742,6 +755,13 @@ pub const Statistics = struct {
                 4 => stats.distinct_count = try reader.readZigZag(i64),
                 5 => stats.max_value = try reader.readString(),
                 6 => stats.min_value = try reader.readString(),
+                // A malformed (non-bool) flag is left unset, which callers read as "not known exact".
+                7 => if (boolField(field.type)) |b| {
+                    stats.is_max_value_exact = b;
+                } else try reader.skip(field.type),
+                8 => if (boolField(field.type)) |b| {
+                    stats.is_min_value_exact = b;
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
@@ -1219,12 +1239,18 @@ pub const RowGroup = struct {
     }
 };
 
+/// `ColumnOrder` union member id for TYPE_DEFINED_ORDER, the only order the full-match proof reads stats in.
+pub const COLUMN_ORDER_TYPE_DEFINED: i16 = 1;
+
 pub const FileMetaData = struct {
     version: i32,
     schema: std.ArrayListUnmanaged(SchemaElement),
     num_rows: i64,
     created_by: ?[]const u8,
     row_groups: std.ArrayListUnmanaged(RowGroup),
+    /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
+    /// column_orders. Read-only: zpq's writer does not emit it.
+    column_orders: ?std.ArrayListUnmanaged(i16) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
@@ -1240,6 +1266,7 @@ pub const FileMetaData = struct {
         };
         errdefer meta.schema.deinit(allocator);
         errdefer meta.row_groups.deinit(allocator);
+        errdefer if (meta.column_orders) |*co| co.deinit(allocator);
 
         reader.readStructBegin();
         while (true) {
@@ -1276,13 +1303,43 @@ pub const FileMetaData = struct {
                     }
                 },
                 6 => meta.created_by = try reader.readString(),
+                7 => if (field.type == .List) {
+                    if (meta.column_orders) |*co| co.deinit(allocator);
+                    meta.column_orders = try readColumnOrders(allocator, reader);
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
         return meta;
     }
 
+    fn readColumnOrders(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i16) {
+        const header = try reader.readByte();
+        var size = @as(usize, header >> 4);
+        if (size == 0xF) size = try reader.readVarInt(usize);
+        if (header & 0x0f != @intFromEnum(thrift.Type.Struct)) return error.InvalidThriftType;
+        var orders: std.ArrayListUnmanaged(i16) = .empty;
+        errdefer orders.deinit(allocator);
+        try orders.ensureTotalCapacityPrecise(allocator, safeListReserve(i16, size, reader.remaining()));
+        var i: usize = 0;
+        while (i < size) : (i += 1) {
+            const saved_id = reader.last_field_id;
+            defer reader.last_field_id = saved_id;
+            reader.readStructBegin();
+            var member: i16 = 0;
+            while (true) {
+                const f = try reader.readFieldBegin();
+                if (f.type == .Stop) break;
+                if (member == 0) member = f.id;
+                try reader.skip(f.type);
+            }
+            try orders.append(allocator, member);
+        }
+        return orders;
+    }
+
     pub fn deinit(self: *FileMetaData, allocator: std.mem.Allocator) void {
+        if (self.column_orders) |*co| co.deinit(allocator);
         self.schema.deinit(allocator);
         for (self.row_groups.items) |*rg| {
             rg.deinit(allocator);

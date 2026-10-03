@@ -193,6 +193,7 @@ pub const AggResult = struct {
     bytes_out: u64,
     row_groups_in: usize,
     row_groups_pruned: usize,
+    row_groups_full_match: usize,
     cols_stat_pruned: usize,
     aggs: []scan.AggOutputItem,
     timings: Timings,
@@ -301,6 +302,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .bytes_out = bytes_out,
         .row_groups_in = r.row_groups_in,
         .row_groups_pruned = r.row_groups_pruned,
+        .row_groups_full_match = r.row_groups_full_match,
         .cols_stat_pruned = r.cols_stat_pruned,
         .aggs = r.aggs,
         .timings = t,
@@ -1365,6 +1367,34 @@ fn openInputs(
             }
         }
 
+        // Columns only the filter reads. Where statistics prove a row group fully matching, the aggregate scan never
+        // reads them (scan.zig makes the same pruneRowGroup call on the same footer), so they are not fetched there.
+        // Aggregates only: the write and print paths still evaluate the filter in such row groups.
+        var proven_skip: ?[]bool = null;
+        if (filter_for_plan) |f| if (!args.scan_all and (is_aggregate or args.group_by != null)) {
+            const skip = try arena.alloc(bool, num_leaves);
+            @memset(skip, false);
+            var cols: std.ArrayList(usize) = .empty;
+            try f.collectColumns(&cols, arena);
+            for (cols.items) |ci| if (ci < num_leaves) {
+                skip[ci] = true;
+            };
+            const consumed = try arena.alloc(bool, num_leaves);
+            @memcpy(consumed, group_cols);
+            if (agg_calls_for_plan) |calls| for (calls) |call| {
+                if (call.arg) |arg_expr| arg_expr.collectColumns(consumed);
+                if (call.where) |w_expr| {
+                    var wcols: std.ArrayList(usize) = .empty;
+                    try w_expr.collectColumns(&wcols, arena);
+                    for (wcols.items) |wci| if (wci < num_leaves) {
+                        consumed[wci] = true;
+                    };
+                }
+            };
+            for (skip, consumed) |*sk, c| sk.* = sk.* and !c;
+            proven_skip = skip;
+        };
+
         // Per file: stat-prune RGs, collect raw byte ranges for every
         // (surviving RG) × (needed col), coalesce within the file, and
         // emit one FetchJob per coalesced span. Coalescing matters
@@ -1380,19 +1410,26 @@ fn openInputs(
         for (specs) |*sp| {
             const meta = &sp.meta;
             sp.survivors = try arena.alloc(bool, meta.row_groups.items.len);
+            sp.proven = try arena.alloc(bool, meta.row_groups.items.len);
+            @memset(sp.proven, false);
 
             var ranges: std.ArrayList(coalescer.Range) = .empty;
             for (meta.row_groups.items, 0..) |rg, rg_i| {
                 if (filter_for_plan) |f| if (!args.scan_all) {
-                    if ((try filter_prune.pruneRowGroup(&rg, f, arena, meta)) == .skip) {
-                        sp.survivors[rg_i] = false;
-                        continue;
+                    switch (try filter_prune.pruneRowGroup(&rg, f, arena, meta)) {
+                        .skip => {
+                            sp.survivors[rg_i] = false;
+                            continue;
+                        },
+                        .always_match => sp.proven[rg_i] = proven_skip != null,
+                        .keep, .unknown => {},
                     }
                 };
                 sp.survivors[rg_i] = true;
                 for (fetch_arr, 0..) |needed, ci| {
                     if (!needed) continue;
                     if (ci >= rg.columns.items.len) continue;
+                    if (sp.proven[rg_i] and proven_skip.?[ci]) continue;
                     const cm = rg.columns.items[ci].meta_data orelse continue;
                     const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
                     const len: u64 = @intCast(cm.total_compressed_size);
@@ -1424,7 +1461,7 @@ fn openInputs(
                 compact_len += len;
             }
             sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
-            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges, sp.survivors);
+            try rebaseFetchedOffsets(&sp.meta, fetch_arr, sp.compact_ranges, sp.survivors, sp.proven, proven_skip);
 
             for (sp.compact_ranges) |r| {
                 const source_len: usize = @intCast(r.end - r.start);
@@ -1515,6 +1552,8 @@ const FetchSpec = struct {
     total_size: u64 = 0,
     tail_start: u64 = 0,
     survivors: []bool = &.{},
+    /// Row groups statistics prove fully matching for an aggregate; their filter-only chunks are not fetched.
+    proven: []bool = &.{},
     err: ?anyerror = null,
 };
 
@@ -1710,11 +1749,17 @@ fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
     };
 }
 
+/// Offset given to a chunk deliberately left unfetched. Far past any compact buffer, so a consumer that reads the chunk
+/// anyway fails its bounds check (MissingChunkBytes) instead of decoding whatever bytes a stale offset lands on.
+const UNFETCHED_CHUNK_OFFSET: i64 = std.math.maxInt(i64) / 4;
+
 fn rebaseFetchedOffsets(
     meta: *schema.FileMetaData,
     fetch_arr: []const bool,
     ranges: []const CompactRange,
     survivors: []const bool,
+    proven: []const bool,
+    proven_skip: ?[]const bool,
 ) !void {
     // Page-index blocks are never fetched, so their offsets have nothing to rebase onto — yet consumers bounds-check
     // them against the compact buffer, not the file. In a noncanonical file a stale offset can land inside that buffer,
@@ -1735,8 +1780,18 @@ fn rebaseFetchedOffsets(
         // workers re-prune with the same stats predicate before touching
         // any offset in these groups.
         if (rg_i < survivors.len and !survivors[rg_i]) continue;
+        const rg_proven = rg_i < proven.len and proven[rg_i];
         for (rg.columns.items, 0..) |*chunk, ci| {
             if (ci >= fetch_arr.len or !fetch_arr[ci]) continue;
+            if (rg_proven and proven_skip.?[ci]) {
+                if (chunk.meta_data) |*cm| {
+                    cm.data_page_offset = UNFETCHED_CHUNK_OFFSET;
+                    cm.dictionary_page_offset = null;
+                    cm.index_page_offset = null;
+                }
+                chunk.file_offset = UNFETCHED_CHUNK_OFFSET;
+                continue;
+            }
             if (chunk.meta_data) |*cm| {
                 cm.data_page_offset = try rebaseOneOffset(cm.data_page_offset, ranges);
                 if (cm.dictionary_page_offset) |d| {
@@ -2441,7 +2496,7 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
     const fetch_arr = [_]bool{true};
     const survivors = [_]bool{ true, true };
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &.{}, null);
 
     for (meta.row_groups.items, 0..) |rg, i| {
         const chunk = rg.columns.items[0];
@@ -2487,10 +2542,52 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
     const fetch_arr = [_]bool{true};
     const survivors = [_]bool{false};
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &.{}, null);
 
     const out = meta.row_groups.items[0].columns.items[0];
     try std.testing.expectEqual(@as(?i64, null), out.column_index_offset);
     try std.testing.expectEqual(@as(?i64, null), out.offset_index_offset);
     try std.testing.expectEqual(@as(i64, 9_000_000), out.meta_data.?.data_page_offset);
+}
+
+test "rebaseFetchedOffsets poisons filter-only chunks it left unfetched in proven row groups" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two row groups x two columns (0 = filter-only, 1 = aggregate input). Only row group 1 is proven, so its column-0
+    // chunk was never fetched: a rebase would fail on it, and a stale source offset could land inside the compact
+    // buffer and decode unrelated bytes.
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    for ([_][2]i64{ .{ 1_000, 2_000 }, .{ 3_000, 4_000 } }) |offs| {
+        var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 0 };
+        for (offs) |o| try rg.columns.append(arena, pageIndexTestChunk(o));
+        try meta.row_groups.append(arena, rg);
+    }
+    const ranges = [_]CompactRange{
+        .{ .start = 1_000, .end = 1_064, .dst_start = 0 },
+        .{ .start = 2_000, .end = 2_064, .dst_start = 64 },
+        .{ .start = 4_000, .end = 4_064, .dst_start = 128 },
+    };
+    const fetch_arr = [_]bool{ true, true };
+    const survivors = [_]bool{ true, true };
+    const proven = [_]bool{ false, true };
+    const proven_skip = [_]bool{ true, false };
+
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &survivors, &proven, &proven_skip);
+
+    const rg0 = meta.row_groups.items[0].columns.items;
+    try std.testing.expectEqual(@as(i64, 0), rg0[0].meta_data.?.data_page_offset);
+    try std.testing.expectEqual(@as(i64, 64), rg0[1].meta_data.?.data_page_offset);
+    const rg1 = meta.row_groups.items[1].columns.items;
+    try std.testing.expectEqual(UNFETCHED_CHUNK_OFFSET, rg1[0].meta_data.?.data_page_offset);
+    try std.testing.expectEqual(UNFETCHED_CHUNK_OFFSET, rg1[0].file_offset);
+    try std.testing.expectEqual(@as(i64, 128), rg1[1].meta_data.?.data_page_offset);
 }

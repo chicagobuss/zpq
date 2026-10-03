@@ -63,6 +63,8 @@ AGGS = [
     ("sum_count", "sum(id) AS s, count(id) AS c", "sum(id), count(id)"),
     ("minmax",    "min(amt) AS mn, max(amt) AS mx", "min(amt), max(amt)"),
     ("decimal_sum", "sum(price) AS s", "sum(price)"),
+    # count(*) alone needs no column at all in a row group statistics prove fully matching.
+    ("count_star", "count(*) AS n, sum(amt) AS s", "count(*), sum(amt)"),
 ]
 # (label, columns_csv | None) — None = all columns (passthrough fast path).
 PROJECTIONS = [
@@ -206,7 +208,8 @@ def main():
     # --- filter × aggregate (scalars, tolerant) ---
     for alabel, za, ds in AGGS:
         for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500"),
-                               ("notnull", "nname IS NOT NULL", "nname IS NOT NULL")]:
+                               ("notnull", "nname IS NOT NULL", "nname IS NOT NULL"),
+                               ("date_ge", "d >= '2020-06-01'", "d >= DATE '2020-06-01'")]:
             total += 1
             cmd = [ZPQ, "query", fixture, "--aggregate", za]
             if zf is not None:
@@ -219,7 +222,9 @@ def main():
                 continue
 
             try:
-                zvals = [norm(v) for v in json.loads(r.stdout)["agg"].values()]
+                zout = json.loads(r.stdout)
+                zvals = [norm(v) for v in zout["agg"].values()]
+                proven = zout.get("row_groups_full_match", 0)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
                 fails += 1
@@ -232,7 +237,7 @@ def main():
                 else str(a) == str(b)
                 for a, b in zip(zvals, dvals))
             if ok:
-                print(f"  OK    {label}  {zvals}")
+                print(f"  OK    {label}  {zvals}  (full-match row groups: {proven})")
             else:
                 fails += 1
                 print(f"  FAIL  {label}  zpq={zvals} duck={dvals}")

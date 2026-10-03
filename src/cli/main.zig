@@ -492,8 +492,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         }
         if (ar.group_rows) |rows| {
             try ws.print(
-                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"agg\":[",
-                .{ ar.rows_in, ar.rows_kept, ar.bytes_in, ar.bytes_out, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned },
+                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"agg\":[",
+                .{
+                    ar.rows_in,       ar.rows_kept,         ar.bytes_in,              ar.bytes_out,
+                    ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
+                },
             );
             for (rows, 0..) |row_vals, row_idx| {
                 if (row_idx > 0) try ws.print(",", .{});
@@ -524,8 +527,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             try ws.writeAll("],");
         } else {
             try ws.print(
-                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"cols_stat_pruned\":{d},\"agg\":{{",
-                .{ ar.rows_in, ar.rows_kept, ar.bytes_in, ar.bytes_out, ar.row_groups_in, ar.row_groups_pruned, ar.cols_stat_pruned },
+                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"agg\":{{",
+                .{
+                    ar.rows_in,       ar.rows_kept,         ar.bytes_in,              ar.bytes_out,
+                    ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
+                },
             );
             for (ar.aggs, 0..) |item, i| {
                 if (i > 0) try ws.print(",", .{});

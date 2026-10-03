@@ -258,8 +258,9 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
     return switch (call.func) {
         .count => true,
         // String min/max can't trust row-group stats: `min_value`/`max_value`
-        // may be TRUNCATED (a rounded bound, not a present value), and we
-        // don't parse the `is_*_value_exact` flags — so always decode.
+        // may be TRUNCATED (a rounded bound, not a present value), and this
+        // stats path doesn't consult the `is_*_value_exact` flags — so
+        // always decode.
         .min, .max => call.result != .bytes,
         // `sum` is short-circuitable per-RG only when min == max for
         // that RG (constant-column case): the RG contributes

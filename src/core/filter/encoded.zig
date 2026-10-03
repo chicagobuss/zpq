@@ -66,8 +66,7 @@ pub const EncodedValue = struct {
             // per Apache Parquet's IEEE-754 total-order guidance a missing
             // nan_count must be treated as unknown. Never claim always_match.
             .FLOAT, .DOUBLE => return false,
-            // Truncated bounds makes BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY always_match unsafe,
-            // so we return false for these in v1.
+            // Byte arrays need to know whether max was truncated: see `rangeAlwaysMatchesBytes`.
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => return false,
             .BOOLEAN => return false,
             .INT96 => return false,
@@ -125,6 +124,28 @@ fn rangeOverlapsValue(comptime T: type, op: ast.Operator, lo: T, hi: T, needle: 
         .LtEq => lo <= needle,
         .Gt => hi > needle,
         .GtEq => hi >= needle,
+    };
+}
+
+/// True iff every value of a chunk bounded by `[min, max]` satisfies `value op needle` in unsigned bytewise order.
+/// A truncated `min` is a prefix of the true minimum, so still a lower bound, and proofs needing only `min` always
+/// hold. A truncated `max` is an upper bound only if the writer rounded it up, so proofs needing `max` require the
+/// writer's `is_max_value_exact`.
+pub fn rangeAlwaysMatchesBytes(
+    op: ast.Operator,
+    min: []const u8,
+    max: []const u8,
+    max_exact: bool,
+    needle: []const u8,
+) bool {
+    if (std.mem.lessThan(u8, max, min)) return false; // corrupt stats
+    return switch (op) {
+        .Gt => std.mem.lessThan(u8, needle, min),
+        .GtEq => !std.mem.lessThan(u8, min, needle),
+        .Lt => max_exact and std.mem.lessThan(u8, max, needle),
+        .LtEq => max_exact and !std.mem.lessThan(u8, needle, max),
+        .Eq => max_exact and std.mem.eql(u8, min, needle) and std.mem.eql(u8, max, needle),
+        .NotEq => std.mem.lessThan(u8, needle, min) or (max_exact and std.mem.lessThan(u8, max, needle)),
     };
 }
 

@@ -57,10 +57,10 @@ jobs:
       # and hung the runner for the full job budget. anyzig downloads
       # the *exact* tarball from ziglang.org with no fallback; setup-zig
       # has redundancy.
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Create Python test environment
         # pyarrow>=21 recognizes the GEOMETRY/GEOGRAPHY logical type. The

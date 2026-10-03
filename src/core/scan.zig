@@ -19,6 +19,7 @@
 //!   - 1-row parquet output (cli/query.zig's writeOneRowParquet)
 
 const std = @import("std");
+const nowMonoNs = @import("../clock.zig").monoNs;
 
 const spawn_util = @import("spawn.zig");
 const schema = @import("schema.zig");
@@ -1196,12 +1197,6 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
     };
 }
 
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
-}
-
 // ============================================================
 // Compile-time API check. Behavioral coverage is via the CLI
 // regression suite + lambda integration tests.
@@ -1230,7 +1225,7 @@ const SPAWN_FIXTURE_AGG =
 const spawn_test_fixture_rows: i64 = 2;
 
 /// 64 bytes that are definitively not parquet, so `metadata.open` rejects them at the magic check.
-const not_parquet = [_]u8{'x'} ** 64;
+const not_parquet: [64]u8 = @splat('x');
 
 test "parseFooters: every file is parsed even when spawns fail partway" {
     const bytes = metadata.readFileSlice(spawn_test_fixture, testing.allocator) catch |err| {

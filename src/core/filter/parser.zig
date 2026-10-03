@@ -521,7 +521,7 @@ fn parseTimestampTicks(s: []const u8, unit: schema.TimeUnit) Error!i64 {
         secs = hh * 3600 + mm * 60 + ss;
         if (dot) |di| {
             // Fractional seconds → nanoseconds (right-pad/truncate to 9 digits).
-            var buf = [_]u8{'0'} ** 9;
+            var buf: [9]u8 = @splat('0');
             const fr = time_part[di + 1 ..];
             const n = @min(fr.len, 9);
             @memcpy(buf[0..n], fr[0..n]);

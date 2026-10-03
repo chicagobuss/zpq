@@ -1,13 +1,7 @@
 const std = @import("std");
 
 // Force update
-pub const c = @cImport({
-    @cDefine("_FORTIFY_SOURCE", "0");
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/bio.h");
-    @cInclude("openssl/x509v3.h");
-});
+pub const c = @import("openssl_c");
 
 pub const TlsError = error{
     TlsContextFailed,

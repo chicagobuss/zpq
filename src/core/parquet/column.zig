@@ -25,6 +25,7 @@
 //! max_def == 0 (REQUIRED columns only) so callers can't silently alias nulls.
 
 const std = @import("std");
+const nowNs = @import("../../clock.zig").monoNs;
 const schema = @import("../schema.zig");
 const page_mod = @import("page.zig");
 const plain = @import("encoding/plain.zig");
@@ -1262,8 +1263,3 @@ fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
     return @intCast(@as(isize, @bitCast(r)));
 }
 
-fn nowNs() i128 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-}

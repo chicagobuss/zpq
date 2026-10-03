@@ -13,6 +13,7 @@
 //! keeping HTTP/SigV4 details in one place.
 
 const std = @import("std");
+const nowMonoNs = @import("../clock.zig").monoNs;
 const Io = std.Io;
 const s3 = @import("s3.zig");
 const tls = @import("tls.zig");
@@ -37,12 +38,6 @@ fn uriEncodeQueryValue(arena: std.mem.Allocator, s: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(arena);
-}
-
-inline fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 pub const RETRY_LIMIT = 8;

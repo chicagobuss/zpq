@@ -44,7 +44,7 @@ test "AtomicWorkCursor gives disjoint items to concurrent workers" {
     for (&items, 0..) |*it, i| it.* = i;
 
     // A double claim would show up as a count of two in `hits`.
-    var hits = [_]std.atomic.Value(u32){.init(0)} ** N;
+    var hits: [N]std.atomic.Value(u32) = @splat(.init(0));
     var cur: AtomicWorkCursor(usize) = .{ .items = &items };
 
     const Worker = struct {

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const zpq = @import("zpq");
+const nowMonoNs = zpq.clock.monoNs;
 const build_options = @import("build_options");
 
 const metadata = zpq.core.parquet.metadata;
@@ -803,12 +804,6 @@ fn matchSimpleGlob(pat: []const u8, name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, prefix)) return false;
     if (!std.mem.endsWith(u8, name, suffix)) return false;
     return true;
-}
-
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 /// Open a parquet file via ZPQ and emit a JSON report describing what

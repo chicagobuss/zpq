@@ -251,7 +251,7 @@ const testing = std.testing;
 
 test "int96ToEpochNanos matches duckdb's reference math" {
     // 1970-01-01 00:00:00 → julian 2440588, 0 nanos-of-day → 0.
-    var b = [_]u8{0} ** 12;
+    var b: [12]u8 = @splat(0);
     std.mem.writeInt(u32, b[8..12], 2440588, .little);
     try testing.expectEqual(@as(i64, 0), int96ToEpochNanos(&b));
 

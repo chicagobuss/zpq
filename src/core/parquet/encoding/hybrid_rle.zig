@@ -29,6 +29,7 @@
 //! Wider widths would need a different decoder.
 
 const std = @import("std");
+const readLe = @import("../../bytes.zig").readLe;
 
 pub const Error = error{
     InvalidBitWidth,
@@ -358,7 +359,7 @@ inline fn unpackFastFixed(
             const start_bit: usize = k * bw;
             const byte_off = start_bit / 8;
             const bit_off: u6 = @intCast(start_bit % 8);
-            const word = std.mem.readInt(u64, src[batch_start_byte + byte_off ..][0..8], .little);
+            const word = readLe(u64, src[batch_start_byte + byte_off ..][0..8]);
             dest[i + k] = @as(u32, @intCast((word >> bit_off) & mask));
         }
     }
@@ -367,7 +368,7 @@ inline fn unpackFastFixed(
         const start_bit = src_off * 8 + i * @as(usize, bw);
         const byte_off = start_bit / 8;
         const bit_off: u6 = @intCast(start_bit % 8);
-        const word = std.mem.readInt(u64, src[byte_off..][0..8], .little);
+        const word = readLe(u64, src[byte_off..][0..8]);
         dest[i] = @as(u32, @intCast((word >> bit_off) & mask));
     }
 }

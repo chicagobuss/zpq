@@ -33,6 +33,7 @@ pub const core = struct {
             struct {};
     };
     pub const system = @import("core/system.zig");
+    pub const bytes = @import("core/bytes.zig");
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");
@@ -60,6 +61,7 @@ pub const core = struct {
 };
 
 pub const engine = @import("engine.zig");
+pub const clock = @import("clock.zig");
 
 pub const io = struct {
     pub const strategy = @import("io/strategy.zig");
@@ -101,6 +103,7 @@ test {
     _ = @import("core/writer/encoder.zig");
     _ = @import("core/writer/streaming.zig");
     _ = @import("core/system.zig");
+    _ = @import("core/bytes.zig");
     _ = @import("core/parquet/metadata.zig");
     _ = @import("core/parquet/schema_tree.zig");
     _ = @import("core/parquet/snappy.zig");
@@ -117,6 +120,7 @@ test {
     _ = @import("core/parquet/encoding/delta_binary_packed.zig");
     _ = @import("core/parquet/encoding/delta_byte_array.zig");
     _ = @import("engine.zig");
+    _ = @import("clock.zig");
     _ = @import("io/strategy.zig");
     _ = @import("io/loop.zig");
     _ = @import("io/epoll.zig");

@@ -13,6 +13,7 @@
 //! + ranged GET, but the metadata layer itself stays I/O-agnostic.
 
 const std = @import("std");
+const nowNs = @import("../../clock.zig").monoNs;
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
 
@@ -338,10 +339,3 @@ fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
     return @intCast(@as(isize, @bitCast(r)));
 }
 
-/// Monotonic nanoseconds. std.time.nanoTimestamp moved to std.Io.Clock
-/// in 0.16; for tests we go direct to clock_gettime.
-fn nowNs() i128 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-}

@@ -9,9 +9,7 @@ const schema = @import("../schema.zig");
 const snappy = @import("snappy.zig");
 const lz4 = @import("lz4.zig");
 
-const c_zstd = @cImport({
-    @cInclude("zstd.h");
-});
+const c_zstd = @import("zstd_c");
 
 pub const Error = error{
     UnsupportedCodec,

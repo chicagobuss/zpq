@@ -13,6 +13,7 @@
 //! module adds the *pacing* and the *status* classification.
 
 const std = @import("std");
+const clock = @import("../clock.zig");
 const Io = std.Io;
 
 /// Pacing only — attempt *budgets* stay with the call sites, whose
@@ -44,9 +45,7 @@ pub fn backoffMs(policy: Policy, attempt: u8) u64 {
     const shift: u6 = @intCast(@min(attempt, 16));
     const ceiling = @min(policy.cap_ms, policy.base_ms << shift);
     if (ceiling == 0) return 0;
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    var prng = std.Random.DefaultPrng.init(@bitCast(@as(i64, ts.nsec) ^ (@as(i64, ts.sec) << 20)));
+    var prng = std.Random.DefaultPrng.init(@bitCast(clock.monoNs()));
     return prng.random().uintAtMost(u64, ceiling);
 }
 

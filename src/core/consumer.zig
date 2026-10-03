@@ -20,6 +20,7 @@
 //! any I/O. The `Sink` is opaque; the source is a borrowed slice.
 
 const std = @import("std");
+const nowMonoNs = @import("../clock.zig").monoNs;
 
 /// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
 /// scan.zig, which imports this module.
@@ -2166,12 +2167,6 @@ fn decodeWithReader(
     }
     if (written != num_leaves) return error.ShortDecode;
     return .{ .values = values };
-}
-
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 // ============================================================

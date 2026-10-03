@@ -334,7 +334,7 @@ pub fn compress(src: []const u8, dest: []u8) CompressError!usize {
     const table_bits = 14;
     const table_size = 1 << table_bits;
     const table_mask = table_size - 1;
-    var table: [table_size]u32 = [_]u32{0} ** table_size;
+    var table: [table_size]u32 = @splat(0);
 
     var s_idx: usize = 0; // Current position in source
     var literal_start: usize = 0; // Start of current literal run

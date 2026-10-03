@@ -35,11 +35,15 @@ pub fn build(b: *std.Build) !void {
     );
     const prebuilt_path = b.path(b.fmt("prebuilt/{s}", .{triple}));
 
-    const crypto_abs = b.path(b.fmt("prebuilt/{s}/libcrypto.a", .{triple})).getPath(b);
-    const ssl_abs = b.path(b.fmt("prebuilt/{s}/libssl.a", .{triple})).getPath(b);
+    // Configure-time file probes must be declared so the configure cache
+    // reruns when the prebuilt archives appear or vanish.
+    b.dependOnFileMetadata(prebuilt_path.path(b, "libcrypto.a"));
+    b.dependOnFileMetadata(prebuilt_path.path(b, "libssl.a"));
+    const crypto_rel = b.fmt("prebuilt/{s}/libcrypto.a", .{triple});
+    const ssl_rel = b.fmt("prebuilt/{s}/libssl.a", .{triple});
 
-    const have_locally = (std.Io.Dir.accessAbsolute(b.graph.io, crypto_abs, .{}) catch null) != null and
-        (std.Io.Dir.accessAbsolute(b.graph.io, ssl_abs, .{}) catch null) != null;
+    const have_locally = (b.root.access(b.graph.io, crypto_rel, .{}) catch null) != null and
+        (b.root.access(b.graph.io, ssl_rel, .{}) catch null) != null;
 
     if (!have_locally) {
         if (!fetch_prebuilt) {
@@ -68,13 +72,37 @@ pub fn build(b: *std.Build) !void {
         boring_tls_mod.addCMacro("__AARCH64EL__", "1");
     }
 
+    const openssl_h = b.addWriteFiles().add("openssl_c.h",
+        \\#include <openssl/ssl.h>
+        \\#include <openssl/err.h>
+        \\#include <openssl/bio.h>
+        \\#include <openssl/x509v3.h>
+        \\
+    );
+    const openssl_c = b.addTranslateC(.{
+        .root_source_file = openssl_h,
+        .target = target,
+        .optimize = optimize,
+    });
+    openssl_c.defineCMacro("_FORTIFY_SOURCE", "0");
+    openssl_c.defineCMacro("OPENSSL_64_BIT", "1");
+    if (target.result.cpu.arch == .x86_64) {
+        openssl_c.defineCMacro("__x86_64", "1");
+    } else if (target.result.cpu.arch == .aarch64) {
+        openssl_c.defineCMacro("__AARCH64EL__", "1");
+    }
+    openssl_c.addIncludePath(boringssl_dep.path("include"));
+    boring_tls_mod.addImport("openssl_c", openssl_c.createModule());
+
     boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libcrypto.a"));
     boring_tls_mod.addObjectFile(prebuilt_path.path(b, "libssl.a"));
     boring_tls_mod.linkSystemLibrary("c++", .{});
 }
 
 fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
-    const prebuilt_abs = b.path(b.fmt("prebuilt/{s}", .{triple})).getPath(b);
+    // Fetching is a configure-time side effect the cache cannot track.
+    b.graph.poisonCache();
+    const prebuilt_dir = try b.root.joinString(b.allocator, b.fmt("prebuilt/{s}", .{triple}));
 
     // No pre-create: `curl --create-dirs` below builds the full path,
     // including missing parents. (A non-recursive createDir here used
@@ -82,7 +110,7 @@ fn fetchFromR2(b: *std.Build, triple: []const u8) !void {
     const files = [_][]const u8{ "libcrypto.a", "libssl.a" };
     for (files) |filename| {
         const url = b.fmt("{s}/boring_tls/{s}/{s}", .{ R2_PUBLIC_URL, triple, filename });
-        const full_dest = b.fmt("{s}/{s}", .{ prebuilt_abs, filename });
+        const full_dest = b.fmt("{s}/{s}", .{ prebuilt_dir, filename });
 
         const result = std.process.run(b.allocator, b.graph.io, .{
             .argv = &[_][]const u8{ "curl", "-fSL", "--create-dirs", "-o", full_dest, url },

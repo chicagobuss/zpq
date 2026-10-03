@@ -280,7 +280,7 @@ fn parseTransferEncodingChunked(headers_bytes: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
             // Chunked is the de-facto value S3 sends; tolerate "chunked" mixed
             // with other tokens.
-            return std.ascii.indexOfIgnoreCase(value, "chunked") != null;
+            return std.ascii.findIgnoreCase(value, "chunked") != null;
         }
     }
     return false;

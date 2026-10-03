@@ -1,4 +1,5 @@
 const std = @import("std");
+const clock = @import("../clock.zig");
 
 /// Minimal AWS SigV4 implementation for S3.
 /// This implementation is Sans-I/O and does not perform any syscalls directly,
@@ -41,12 +42,7 @@ pub const SigV4 = struct {
         payload: []const u8,
         options: Options,
     ) ![]Header {
-        const now = if (options.timestamp) |ts| ts else blk: {
-            // 0.16 dropped std.posix.clock_gettime; go to the linux syscall.
-            var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-            _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-            break :blk @as(i64, ts.sec) + options.clock_offset;
-        };
+        const now = options.timestamp orelse (clock.realtimeS() + options.clock_offset);
         var date_buf: [16]u8 = undefined;
         const iso_date = try fmtIso8601(now, &date_buf);
         const date_short = iso_date[0..8];

@@ -26,6 +26,7 @@
 //! Phase 2 surface: i32 and i64.
 
 const std = @import("std");
+const readLe = @import("../../bytes.zig").readLe;
 
 pub const Error = error{
     UnexpectedEndOfStream,
@@ -130,10 +131,10 @@ pub fn Decoder(comptime T: type) type {
                 const byte_off = start_bit / 8;
                 const bit_off: u6 = @intCast(start_bit % 8);
                 const raw = if (bw <= 57) blk: {
-                    const word = std.mem.readInt(u64, src[byte_off..][0..8], .little);
+                    const word = readLe(u64, src[byte_off..][0..8]);
                     break :blk (word >> bit_off) & mask;
                 } else blk: {
-                    const word = std.mem.readInt(u128, src[byte_off..][0..16], .little);
+                    const word = readLe(u128, src[byte_off..][0..16]);
                     break :blk @as(u64, @truncate((word >> bit_off) & mask));
                 };
                 const delta = @as(T, @bitCast(@as(asUnsigned(T), @truncate(raw)))) +% min_delta;
@@ -531,7 +532,7 @@ test "single block, simple ascending sequence i32" {
 }
 
 test "constant sequence (all-zero deltas)" {
-    const values = [_]i32{42} ** 32;
+    const values: [32]i32 = @splat(42);
     const enc = try encode(i32, testing.allocator, &values, 128, 4);
     defer testing.allocator.free(enc);
 

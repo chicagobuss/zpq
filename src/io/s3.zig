@@ -1206,7 +1206,7 @@ pub fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
 }
 
 pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
-    const host_z = try arena.dupeZ(u8, host);
+    const host_z = try arena.dupeSentinel(u8, host, 0);
 
     var hints = std.mem.zeroes(c.addrinfo);
     hints.family = c.AF_INET;

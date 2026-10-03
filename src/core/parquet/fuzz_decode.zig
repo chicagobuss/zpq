@@ -125,7 +125,7 @@ test "footer framing: degenerate inputs return clean errors" {
 
     // Frame-sized but wrong magic.
     {
-        const bad = [_]u8{0} ** 12;
+        const bad: [12]u8 = @splat(0);
         try std.testing.expectError(error.BadMagic, metadata.open(a, &bad));
     }
 
@@ -133,7 +133,7 @@ test "footer framing: degenerate inputs return clean errors" {
     // exceeds the available bytes — the guard at metadata.zig:51 must
     // reject this before the slice underflows.
     {
-        var b = [_]u8{0} ** 16;
+        var b: [16]u8 = @splat(0);
         @memcpy(b[0..4], "PAR1");
         @memcpy(b[8..12], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
         @memcpy(b[12..16], "PAR1");

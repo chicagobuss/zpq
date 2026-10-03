@@ -2207,7 +2207,7 @@ test "decimalStatBytesToF64: malformed inputs return null (no UB)" {
     const short = [_]u8{ 0x01, 0x02 }; // < 4 bytes for INT32
     try testing.expect(decimalStatBytesToF64(&short, .{ .scale = 0, .precision = 9, .physical = .INT32, .byte_width = 0 }) == null);
 
-    const some = [_]u8{0} ** 8;
+    const some: [8]u8 = @splat(0);
     // FLBA byte_width 0 → reject; byte_width 17 (> MAX_FLBA_BYTE_WIDTH) → reject
     try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
     try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);

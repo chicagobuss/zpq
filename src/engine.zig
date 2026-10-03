@@ -21,6 +21,7 @@
 //! decoded through `core.scan.runMultiAggregate`."
 
 const std = @import("std");
+const nowMonoNs = @import("clock.zig").monoNs;
 
 const schema = @import("core/schema.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
@@ -1870,12 +1871,6 @@ fn createFile(path: []const u8) !std.os.linux.fd_t {
     const r_signed: isize = @bitCast(r);
     if (r_signed < 0) return error.OpenFailed;
     return @intCast(r_signed);
-}
-
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 // ============================================================

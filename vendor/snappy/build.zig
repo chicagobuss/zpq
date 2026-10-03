@@ -56,4 +56,10 @@ pub fn build(b: *std.Build) !void {
     });
     mod.addIncludePath(b.path("."));
     mod.linkLibrary(lib);
+    const snappy_c = b.addTranslateC(.{
+        .root_source_file = b.path("snappy-c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("snappy_c", snappy_c.createModule());
 }

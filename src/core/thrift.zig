@@ -55,7 +55,7 @@ pub const Reader = struct {
         switch (@typeInfo(T)) {
             .int => |info| {
                 if (info.signedness == .signed) {
-                    return @as(T, @bitCast(@as(std.meta.Int(.unsigned, @bitSizeOf(T)), @truncate(result))));
+                    return @as(T, @bitCast(@as(@Int(.unsigned, @bitSizeOf(T)), @truncate(result))));
                 } else {
                     return @as(T, @truncate(result));
                 }
@@ -66,7 +66,7 @@ pub const Reader = struct {
 
     pub fn readZigZag(self: *Reader, comptime T: type) !T {
         // Read as unsigned equivalent
-        const UT = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const UT = @Int(.unsigned, @bitSizeOf(T));
         const n = try self.readVarInt(UT);
 
         // (n >> 1) ^ -(n & 1)
@@ -261,7 +261,7 @@ pub const Writer = struct {
         var v: u64 = switch (@typeInfo(@TypeOf(value))) {
             .int => |info| blk: {
                 if (info.signedness == .signed) {
-                    break :blk @bitCast(@as(std.meta.Int(.unsigned, info.bits), @bitCast(value)));
+                    break :blk @bitCast(@as(@Int(.unsigned, info.bits), @bitCast(value)));
                 } else {
                     break :blk @intCast(value);
                 }
@@ -280,7 +280,7 @@ pub const Writer = struct {
     pub fn writeZigZag(self: *Writer, value: anytype) !void {
         const T = @TypeOf(value);
         const info = @typeInfo(T).int;
-        const UT = std.meta.Int(.unsigned, info.bits);
+        const UT = @Int(.unsigned, info.bits);
 
         // ZigZag encoding: (n << 1) ^ (n >> (bits - 1))
         const v: UT = @bitCast(value);

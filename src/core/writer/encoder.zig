@@ -1354,7 +1354,7 @@ fn encodePlainTyped(
         switch (@typeInfo(T)) {
             .int => std.mem.writeInt(T, out[pos..][0..item_size], v, .little),
             .float => {
-                const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+                const Bits = @Int(.unsigned, @bitSizeOf(T));
                 const bits: Bits = @bitCast(v);
                 std.mem.writeInt(Bits, out[pos..][0..item_size], bits, .little);
             },
@@ -1532,7 +1532,7 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
             if (v > hi) hi = v;
         }
     }
-    const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
     const item_size = @sizeOf(T);
     const min_buf = arena.alloc(u8, item_size) catch return null;
     const max_buf = arena.alloc(u8, item_size) catch return null;

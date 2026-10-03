@@ -2,9 +2,9 @@
 # source tree. Don't ship recipes that fail when invoked; they're noise in
 # `just --list`.
 
-# Ensure we use Zig 0.16.0 release. If it's not on the PATH but is installed
-# under ~/.zvm/0.16.0, add that directory to PATH.
-export PATH := `[ -d ~/.zvm/0.16.0 ] && echo "$HOME/.zvm/0.16.0:$PATH" || echo "$PATH"`
+# Ensure we use Zig 0.17.0 release. If it's not on the PATH but is installed
+# under ~/.zvm/0.17.0, add that directory to PATH.
+export PATH := `[ -d ~/.zvm/0.17.0 ] && echo "$HOME/.zvm/0.17.0:$PATH" || echo "$PATH"`
 
 # Python for tooling (conformance / regression / smoke): zpq's in-project uv
 # .venv if present (it has pyarrow — system python3 is 3.14, no wheel), else
@@ -58,7 +58,7 @@ lambda-build:
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    ZV=0.16.0
+    ZV=0.17.0
     if ! ~/.zvm/$ZV/zig version >/dev/null 2>&1; then
       echo "installing zig $ZV -> ~/.zvm/$ZV"
       mkdir -p ~/.zvm

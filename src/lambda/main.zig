@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const zpq = @import("zpq");
+const nowMonoNs = zpq.clock.monoNs;
 const runtime = @import("runtime.zig");
 // Lambda's per-file fetch+scan helper; distinct from the core
 // multi-file orchestrator at `core.scan` which does the SHARED
@@ -787,12 +788,6 @@ fn handleS3(
         "{{\"ok\":true,\"column\":\"{s}\",\"rows_seen\":{d},\"rows_matched\":{d},\"min\":{d},\"max\":{d},\"sum\":{d},\"row_groups_pruned\":{d},\"row_groups\":{d}}}",
         .{ TARGET_COLUMN, rows_seen, rows_matched, min_v, max_v, sum, rg_pruned, meta.row_groups.items.len },
     );
-}
-
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 const POOL_SIZE: usize = s3.MAX_PARTS;

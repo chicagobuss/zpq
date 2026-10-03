@@ -13,14 +13,9 @@
 //! whole pool down.
 
 const std = @import("std");
+const nowMonoNs = @import("../clock.zig").monoNs;
 const Io = std.Io;
 const tls = @import("tls.zig");
-
-inline fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
-}
 
 pub const Error = error{
     QueueClosed,

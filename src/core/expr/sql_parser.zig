@@ -1,8 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("liteparser.h");
-    @cInclude("arena.h");
-});
+const c = @import("liteparser_c");
 
 pub const ParsedQuery = struct {
     table_name: []const u8,
@@ -181,7 +178,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const sql_c = try allocator.dupeZ(u8, sql);
+    const sql_c = try allocator.dupeSentinel(u8, sql, 0);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses

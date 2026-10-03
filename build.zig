@@ -14,8 +14,8 @@ const zon = @import("build.zig.zon");
 /// any other event-loop library; the in-tree loop is part of the product.
 pub fn build(b: *std.Build) void {
     const builtin = @import("builtin");
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
-        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. ZPQ requires exactly the 0.16.0 release version to prevent standard library drift.", .{builtin.zig_version}));
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
+        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. ZPQ requires exactly the 0.17.0 release version to prevent standard library drift.", .{builtin.zig_version}));
     }
 
     const target = b.standardTargetOptions(.{});
@@ -119,11 +119,13 @@ pub fn build(b: *std.Build) void {
             },
         },
     });
-    pub_zpq.linkLibrary(b.dependency("zstd", .{
+    const pub_zstd_lib = b.dependency("zstd", .{
         .target = target,
         .optimize = optimize,
         .dictbuilder = false,
-    }).artifact("zstd"));
+    }).artifact("zstd");
+    pub_zpq.linkLibrary(pub_zstd_lib);
+    pub_zpq.addImport("zstd_c", zstdCModule(b, target, optimize, pub_zstd_lib));
 
     // ----- Tests -----
     // Tests pin lambda=true since epoll is the only backend implemented;
@@ -164,8 +166,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     test_zpq_mod.linkLibrary(test_zstd_lib);
+    test_zpq_mod.addImport("zstd_c", zstdCModule(b, target, optimize, test_zstd_lib));
     test_zpq_mod.linkLibrary(liteparser_lib);
     test_zpq_mod.addIncludePath(b.path("vendor/liteparser"));
+    test_zpq_mod.addImport("liteparser_c", liteparserCModule(b, target, optimize));
 
     // Sans-IO + io tests (live in src/zpq.zig and what it imports).
     const lib_tests = b.addTest(.{
@@ -216,11 +220,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test-integration`.
     const integration_opts = b.addOptions();
     const lambda_install = b.addInstallArtifact(lambda, .{});
-    integration_opts.addOption(
-        []const u8,
-        "lambda_bin",
-        b.getInstallPath(.bin, "zpq-lambda"),
-    );
+    integration_opts.addOptionPath("lambda_bin", lambda.getEmittedBin());
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -237,8 +237,6 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run Lambda integration tests");
     integration_step.dependOn(&run_integration_tests.step);
-
-
 
     // probe_simd_decoders: compare zigzag, bit-unpacking, and gather performance
     const probe_simd_decoders = b.addExecutable(.{
@@ -283,10 +281,54 @@ const Bundle = struct {
     zpq: *std.Build.Module,
 };
 
+/// Translates a one-off C header into a module. Replaces `@cImport`, which
+/// Zig 0.17 removed.
+fn cHeaderModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    name: []const u8,
+    contents: []const u8,
+) *std.Build.Step.TranslateC {
+    const header = b.addWriteFiles().add(name, contents);
+    return b.addTranslateC(.{
+        .root_source_file = header,
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn zstdCModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    zstd_lib: *std.Build.Step.Compile,
+) *std.Build.Module {
+    const tc = cHeaderModule(b, target, optimize, "zstd_c.h", "#include <zstd.h>\n");
+    // The header tree is a WriteFile step the library step does not depend on; addIncludePath orders
+    // translate-c after it. An `.other_step` include dir skipped that edge and raced the maker into a panic.
+    tc.addIncludePath(zstd_lib.getEmittedIncludeTree());
+    return tc.createModule();
+}
+
+fn liteparserCModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) *std.Build.Module {
+    const tc = cHeaderModule(b, target, optimize, "liteparser_c.h",
+        \\#include "liteparser.h"
+        \\#include "arena.h"
+        \\
+    );
+    tc.addIncludePath(b.path("vendor/liteparser"));
+    return tc.createModule();
+}
+
 fn makeZpqModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     is_lambda: bool,
     liteparser_lib: *std.Build.Step.Compile,
     sql: bool,
@@ -348,12 +390,14 @@ fn makeZpqModule(
             .{ .name = "build_options", .module = opts_mod },
             .{ .name = "boring_tls", .module = boring_tls_mod },
             .{ .name = "snappy", .module = snappy_mod },
+            .{ .name = "zstd_c", .module = zstdCModule(b, target, optimize, zstd_lib) },
         },
     });
     zpq_mod.linkLibrary(zstd_lib);
     if (enable_sql) {
         zpq_mod.linkLibrary(liteparser_lib);
         zpq_mod.addIncludePath(b.path("vendor/liteparser"));
+        zpq_mod.addImport("liteparser_c", liteparserCModule(b, target, optimize));
     }
 
     const root_path = if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig";

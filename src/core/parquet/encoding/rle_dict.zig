@@ -25,6 +25,8 @@ const hybrid_rle = @import("hybrid_rle.zig");
 pub const Error = error{
     EmptyPage,
     BitWidthTooLarge,
+    /// An index points past the end of the dictionary.
+    IndexOutOfRange,
 } || hybrid_rle.Error;
 
 pub fn Decoder(comptime T: type) type {
@@ -33,6 +35,8 @@ pub fn Decoder(comptime T: type) type {
 
         indices: hybrid_rle.HybridRleDecoder,
         dictionary: []const T,
+        /// Every index the bit width can express is inside the dictionary, so no index needs checking.
+        covers_all: bool,
 
         pub fn init(data_page_bytes: []const u8, dictionary: []const T) Error!Self {
             if (data_page_bytes.len == 0) return error.EmptyPage;
@@ -41,49 +45,67 @@ pub fn Decoder(comptime T: type) type {
             return .{
                 .indices = hybrid_rle.HybridRleDecoder.init(data_page_bytes[1..], bit_width),
                 .dictionary = dictionary,
+                .covers_all = dictionary.len >= (@as(u64, 1) << @intCast(bit_width)),
             };
         }
 
         pub fn decode(self: *Self, dest: []T) Error!usize {
-            // Stage indices into a small buffer to keep the inner
-            // index→value lookup loop tight (and to amortize the
-            // HybridRle decode call overhead). 256 is enough to keep
-            // call overhead below decode cost without burning much
-            // stack.
+            // Indices come from the file, and one past the dictionary is an out-of-bounds read in ReleaseFast.
+            // Checking costs nothing when the bit width can't express such an index (`covers_all`), once per run
+            // for RLE runs, and a branch-free clamp plus an OR-ed flag in the gather for bit-packed ones.
+            //
+            // Bit-packed indices are staged into a small buffer to keep the gather tight and amortize the
+            // HybridRle call overhead; 256 keeps call overhead below decode cost without burning much stack.
             var idx_buf: [256]u32 = undefined;
             var written: usize = 0;
             while (written < dest.len) {
+                if (try self.indices.takeRleRun(dest.len - written)) |run| {
+                    if (run.value >= self.dictionary.len) return error.IndexOutOfRange;
+                    @memset(dest[written..][0..run.count], self.dictionary[run.value]);
+                    written += run.count;
+                    continue;
+                }
                 const want = @min(dest.len - written, idx_buf.len);
                 const n = try self.indices.decode(idx_buf[0..want]);
                 if (n == 0) break;
-
-                // Unrolled inner gather. For i64/f64 the eight scalar
-                // loads + eight scalar stores LLVM coalesces into two
-                // 256-bit (AVX2 ymm) writes, so we commit 64 bytes per
-                // iteration instead of 8. For i32/f32 it's one ymm
-                // write per iteration. Microbench (2026-05-07) showed
-                // the numeric decode path is memory-write-bandwidth-
-                // bound — ~1.2 GB/s for f64/i64, ~4% of the machine's
-                // sequential write capacity. Coalesced stores close
-                // most of that gap.
-                //
-                // Bounds checks in dest[..] are Zig safe-mode panics on
-                // bad data; ReleaseFast trusts the file. Right tradeoff:
-                // dev catches corruption, prod runs fast.
-                var i: usize = 0;
-                const N: usize = 8;
-                while (i + N <= n) {
-                    inline for (0..N) |k| {
-                        dest[written + i + k] = self.dictionary[idx_buf[i + k]];
-                    }
-                    i += N;
-                }
-                while (i < n) : (i += 1) {
-                    dest[written + i] = self.dictionary[idx_buf[i]];
+                if (self.covers_all) {
+                    _ = gather(dest[written..][0..n], self.dictionary, idx_buf[0..n], false);
+                } else {
+                    if (self.dictionary.len == 0) return error.IndexOutOfRange;
+                    if (gather(dest[written..][0..n], self.dictionary, idx_buf[0..n], true)) return error.IndexOutOfRange;
                 }
                 written += n;
             }
             return written;
+        }
+
+        /// `dest[i] = dict[idx[i]]`. With `clamp`, an index past the dictionary reads its last entry instead and
+        /// the return value reports that one did, so the loop stays branch-free; the caller rejects the batch.
+        ///
+        /// Unrolled by 8: for i64/f64 LLVM coalesces the eight scalar stores into two 256-bit writes, for i32/f32
+        /// into one. The numeric decode path is write-bandwidth-bound and coalesced stores close most of the gap.
+        inline fn gather(dest: []T, dict: []const T, idx: []const u32, comptime clamp: bool) bool {
+            const last: u32 = if (clamp) @intCast(@min(dict.len - 1, std.math.maxInt(u32))) else 0;
+            var oob: u32 = 0;
+            var i: usize = 0;
+            const N: usize = 8;
+            while (i + N <= idx.len) : (i += N) {
+                inline for (0..N) |k| {
+                    const x = idx[i + k];
+                    if (clamp) {
+                        oob |= @intFromBool(x > last);
+                        dest[i + k] = dict[@min(x, last)];
+                    } else dest[i + k] = dict[x];
+                }
+            }
+            while (i < idx.len) : (i += 1) {
+                const x = idx[i];
+                if (clamp) {
+                    oob |= @intFromBool(x > last);
+                    dest[i] = dict[@min(x, last)];
+                } else dest[i] = dict[x];
+            }
+            return oob != 0;
         }
     };
 }
@@ -134,6 +156,30 @@ test "Decoder(BYTE_ARRAY) yields zero-copy slices through the dictionary" {
     for (out) |v| try testing.expectEqualStrings("beta", v);
     // Zero-copy: same pointer as the dict entry.
     try testing.expectEqual(@intFromPtr(dict[1].ptr), @intFromPtr(out[0].ptr));
+}
+
+test "Decoder rejects an index past the dictionary instead of reading beyond it" {
+    const dict = [_]i32{ 10, 20, 30 };
+    // bit_width=2, RLE run of 4 copies of index 3: one past the end.
+    var dec = try Decoder(i32).init(&[_]u8{ 2, 0x08, 0x03 }, &dict);
+    var out: [4]i32 = undefined;
+    try testing.expectError(error.IndexOutOfRange, dec.decode(&out));
+
+    // bit_width=0 means every index is 0, which an empty dictionary can't serve.
+    var empty = try Decoder(i32).init(&[_]u8{0}, &[_]i32{});
+    try testing.expectError(error.IndexOutOfRange, empty.decode(&out));
+}
+
+test "Decoder checks bit-packed indices against a dictionary the bit width overshoots" {
+    const dict = [_]i32{ 10, 20, 30 }; // bit width 2 can say 3
+    // One bit-packed group of 8 at bw 2: indices 0,1,2,0,1,2,0,1 → bytes 0x24 0x49 (LSB first)
+    var ok = try Decoder(i32).init(&[_]u8{ 2, 0x03, 0b00_10_01_00, 0b01_00_10_01 }, &dict);
+    var out: [8]i32 = undefined;
+    try testing.expectEqual(@as(usize, 8), try ok.decode(&out));
+    try testing.expectEqualSlices(i32, &.{ 10, 20, 30, 10, 20, 30, 10, 20 }, &out);
+    // Same group with index 3 in the last slot.
+    var bad = try Decoder(i32).init(&[_]u8{ 2, 0x03, 0b00_10_01_00, 0b11_00_10_01 }, &dict);
+    try testing.expectError(error.IndexOutOfRange, bad.decode(&out));
 }
 
 test "empty data page yields error" {

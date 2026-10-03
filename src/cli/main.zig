@@ -948,6 +948,7 @@ fn decodeOne(
 ) []const u8 {
     var rdr = column.ColumnChunkReader(T).init(chunk_bytes, codec, levels, arena);
     rdr.type_length = type_length;
+    rdr.value_budget = num_rows;
     const values = arena.alloc(T, num_rows) catch return "alloc_failed";
     if (levels.max_rep > 0) {
         const def_levels = arena.alloc(u32, num_rows) catch return "alloc_failed";

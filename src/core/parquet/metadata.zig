@@ -26,7 +26,27 @@ pub const Error = error{
     BadMagic,
     FooterTooLarge,
     BadMetadata,
+    /// A column chunk's `path_in_schema` names a different column than the schema leaf at its position.
+    ColumnChunkPathMismatch,
+    /// A row group lists a different number of column chunks than the schema has leaves.
+    ColumnChunkCountMismatch,
+    /// The file or a row group claims a negative row count.
+    NegativeRowCount,
+    /// A schema element claims a negative child count or type length.
+    BadSchemaElement,
+    /// A column chunk's value count, offsets or sizes are negative, or its byte range overflows.
+    BadColumnChunkRange,
+    /// The schema nests groups deeper than `max_schema_depth`.
+    SchemaTooDeep,
+    /// A non-repeated column's chunk holds a different number of values than its row group has rows.
+    ColumnChunkRowCountMismatch,
+    /// A column chunk's physical type differs from its schema leaf's.
+    ColumnChunkTypeMismatch,
 };
+
+/// Deepest group nesting accepted. The schema walkers recurse once per level and count definition / repetition
+/// levels in a u8, so an unbounded depth is a stack overflow or an integer overflow. Real schemas stay far below.
+pub const max_schema_depth = 200;
 
 /// Parse the file footer and return a fully-realized FileMetaData.
 /// Caller owns the result and must call `deinit`. The metadata holds
@@ -54,8 +74,7 @@ pub fn open(
     const footer_start = footer_len_start - footer_len;
     const footer_bytes = file_bytes[footer_start..footer_len_start];
 
-    var reader = thrift.Reader.init(footer_bytes);
-    return schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
+    return openFooter(allocator, footer_bytes);
 }
 
 /// Parse a parquet footer thrift payload that was fetched separately from
@@ -66,7 +85,155 @@ pub fn openFooter(
     footer_bytes: []const u8,
 ) !schema.FileMetaData {
     var reader = thrift.Reader.init(footer_bytes);
-    return schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
+    var meta = schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
+    errdefer meta.deinit(allocator);
+    try checkFooterFields(&meta);
+    try reconcileChunkPaths(allocator, &meta);
+    return meta;
+}
+
+/// Reject footer counts, offsets and sizes no valid file can have, where they enter. Every reader downstream casts
+/// these i32 / i64 fields to usize or adds them together, which on a hostile value is a panic in safe builds and
+/// undefined behaviour in ReleaseFast. Bounds against the actual file length stay with the code that slices, since
+/// a footer fetched on its own (S3) doesn't know the file's length.
+pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
+    if (meta.num_rows < 0) return error.NegativeRowCount;
+    // Every schema has a root element; code throughout walks `schema.items[1..]`.
+    if (meta.schema.items.len == 0) return error.BadSchemaElement;
+    for (meta.schema.items, 0..) |elem, i| {
+        if (elem.num_children) |n| if (n < 0) return error.BadSchemaElement;
+        if (elem.type_length) |n| if (n < 0) return error.BadSchemaElement;
+        // A primitive can't have children. Some walkers find leaves by type, others by child count; this keeps
+        // them agreeing on which element is leaf N. Not the root: every walker starts below it, and some writers
+        // (segmentio/parquet-go) give the root a type anyway.
+        if (i > 0 and elem.type != null and (elem.num_children orelse 0) > 0) return error.BadSchemaElement;
+    }
+    // ...and below the root an element with neither a type nor children is the other way they'd disagree: a leaf
+    // with no physical type to one, an empty group with no chunk to the other.
+    if (meta.schema.items.len > 1) for (meta.schema.items[1..]) |elem| {
+        if (elem.type == null and (elem.num_children orelse 0) == 0) return error.BadSchemaElement;
+    };
+    // Nesting depth, counted the way the recursive walkers descend: into any element with children.
+    var remaining: [max_schema_depth]usize = undefined;
+    var depth: usize = 0;
+    if (meta.schema.items.len > 1) for (meta.schema.items[1..]) |elem| {
+        while (depth > 0 and remaining[depth - 1] == 0) depth -= 1;
+        if (depth > 0) remaining[depth - 1] -= 1;
+        const children: usize = @intCast(elem.num_children orelse 0);
+        if (children == 0) continue;
+        if (depth == max_schema_depth) return error.SchemaTooDeep;
+        remaining[depth] = children;
+        depth += 1;
+    };
+    for (meta.row_groups.items) |*rg| {
+        if (rg.num_rows < 0) return error.NegativeRowCount;
+        for (rg.columns.items) |*cc| {
+            // The page index is optional, and an unusable one is ignored wherever it's read; a negative location
+            // drops the chunk's page index (both halves, which pruning uses together) rather than the file.
+            const bad_index = for ([_]?i64{ cc.offset_index_offset, cc.column_index_offset }, [_]?i32{ cc.offset_index_length, cc.column_index_length }) |off, len| {
+                if ((off orelse 0) < 0 or (len orelse 0) < 0) break true;
+            } else false;
+            if (bad_index) {
+                cc.offset_index_offset = null;
+                cc.offset_index_length = null;
+                cc.column_index_offset = null;
+                cc.column_index_length = null;
+            }
+            const cm = cc.meta_data orelse continue;
+            if (cm.num_values < 0 or cm.total_compressed_size < 0 or cm.total_uncompressed_size < 0)
+                return error.BadColumnChunkRange;
+            if (cm.data_page_offset < 0) return error.BadColumnChunkRange;
+            if (cm.dictionary_page_offset) |d| if (d < 0) return error.BadColumnChunkRange;
+            const start = cm.dictionary_page_offset orelse cm.data_page_offset;
+            _ = std.math.add(i64, start, cm.total_compressed_size) catch return error.BadColumnChunkRange;
+        }
+    }
+}
+
+/// Check each column chunk against the schema leaf at its position, before anything reads it.
+///
+/// zpq picks a column's chunk by leaf ordinal but resolves that chunk's schema element and levels through the chunk's
+/// own `path_in_schema`. The two are independent statements of the same alignment, so when they disagree the file is
+/// internally inconsistent and decoding would silently pair one column's bytes with another column's name and type.
+/// Rejected, as Hardwood does:
+///   - a path that names a different leaf (swapped or misordered chunks),
+///   - a path that names no leaf at all,
+///   - a row group whose chunk count differs from the leaf count.
+/// Tolerated, rewritten to the schema leaf's path so later path lookups resolve:
+///   - an omitted (empty) path, which some writers leave out despite the format requiring it,
+///   - a path that differs from its own leaf only in ASCII case and names no other leaf.
+pub fn reconcileChunkPaths(allocator: std.mem.Allocator, meta: *schema.FileMetaData) (Error || std.mem.Allocator.Error)!void {
+    if (meta.row_groups.items.len == 0 or meta.schema.items.len == 0) return;
+
+    // Every leaf's full path (root excluded), flattened: leaf i is `names[ends[i-1]..ends[i]]`. `repeated[i]`: the
+    // leaf or one of its ancestors is REPEATED, so its value count may exceed the row count.
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(allocator);
+    var repeated: std.ArrayList(bool) = .empty;
+    defer repeated.deinit(allocator);
+    var types: std.ArrayList(schema.Type) = .empty;
+    defer types.deinit(allocator);
+    const Group = struct { name: []const u8, remaining: usize, repeated: bool };
+    var groups: std.ArrayList(Group) = .empty;
+    defer groups.deinit(allocator);
+    for (meta.schema.items[1..]) |elem| {
+        while (groups.items.len > 0 and groups.items[groups.items.len - 1].remaining == 0) _ = groups.pop();
+        if (groups.items.len > 0) groups.items[groups.items.len - 1].remaining -= 1;
+        const parent_repeated = groups.items.len > 0 and groups.items[groups.items.len - 1].repeated;
+        const here_repeated = parent_repeated or elem.repetition_type == .REPEATED;
+        if (elem.type == null) { // group node; `checkFooterFields` makes this agree with `resolveColumn`'s child count
+            try groups.append(allocator, .{
+                .name = elem.name,
+                .remaining = @intCast(@max(elem.num_children orelse 0, 0)),
+                .repeated = here_repeated,
+            });
+            continue;
+        }
+        for (groups.items) |g| try names.append(allocator, g.name);
+        try names.append(allocator, elem.name);
+        try ends.append(allocator, names.items.len);
+        try repeated.append(allocator, here_repeated);
+        try types.append(allocator, elem.type.?); // non-null: groups were handled above
+    }
+    const leaf = struct {
+        fn path(n: []const []const u8, e: []const usize, i: usize) []const []const u8 {
+            return n[if (i == 0) 0 else e[i - 1]..e[i]];
+        }
+        fn eql(a: []const []const u8, b: []const []const u8, comptime ignore_case: bool) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| {
+                const same = if (ignore_case) std.ascii.eqlIgnoreCase(x, y) else std.mem.eql(u8, x, y);
+                if (!same) return false;
+            }
+            return true;
+        }
+    };
+
+    for (meta.row_groups.items) |*rg| {
+        if (rg.columns.items.len != ends.items.len) return error.ColumnChunkCountMismatch;
+        for (rg.columns.items, 0..) |*cc, i| {
+            const cm = if (cc.meta_data) |*m| m else continue;
+            // A flat column holds one value (or null) per row. Readers size its values from num_values and its row
+            // selection from num_rows, then walk both together.
+            if (!repeated.items[i] and cm.num_values != rg.num_rows) return error.ColumnChunkRowCountMismatch;
+            // Readers pick the decoder from the chunk's type and the logical type from the schema leaf.
+            if (cm.type != types.items[i]) return error.ColumnChunkTypeMismatch;
+            const want = leaf.path(names.items, ends.items, i);
+            const got = cm.path_in_schema.items;
+            if (leaf.eql(got, want, false)) continue;
+            if (got.len > 0) {
+                // Only reached for paths that are not already exact, so well-formed files never pay for this scan.
+                for (0..ends.items.len) |j| {
+                    if (leaf.eql(got, leaf.path(names.items, ends.items, j), false)) return error.ColumnChunkPathMismatch;
+                }
+                if (!leaf.eql(got, want, true)) return error.ColumnChunkPathMismatch;
+            }
+            cm.path_in_schema.clearRetainingCapacity();
+            try cm.path_in_schema.appendSlice(allocator, want);
+        }
+    }
 }
 
 pub const ColumnLookupError = error{ UnknownColumn, AmbiguousColumn };
@@ -170,6 +337,46 @@ pub fn leafPath(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf
             return try out.toOwnedSlice(arena);
         }
         seen += 1;
+    }
+    return null;
+}
+
+/// Number of leaf columns in the schema: the column-chunk count of every row group (enforced at footer open), and
+/// still defined for a file with no row groups at all, which is a valid empty table.
+pub fn leafCount(file: *const schema.FileMetaData) usize {
+    if (file.schema.items.len == 0) return 0;
+    var n: usize = 0;
+    for (file.schema.items[1..]) |elem| {
+        if ((elem.num_children orelse 0) == 0) n += 1;
+    }
+    return n;
+}
+
+/// Full schema path (root excluded) of leaf `leaf_idx` as its segments, or null past the last leaf. Equal to that
+/// leaf's chunk `path_in_schema` (enforced at footer open) but needs no row group. Strings borrow the schema's names.
+/// Compare paths by these segments, never by `leafPath`'s dot-joined form: a top-level column named `a.b` and the
+/// field `b` of a group `a` join to the same string.
+pub fn leafPathSegments(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const []const u8 {
+    if (file.schema.items.len == 0) return null;
+    const Group = struct { name: []const u8, remaining: usize };
+    var groups: std.ArrayList(Group) = .empty;
+    defer groups.deinit(arena);
+    var leaf: usize = 0;
+    for (file.schema.items[1..]) |elem| {
+        while (groups.items.len > 0 and groups.items[groups.items.len - 1].remaining == 0) _ = groups.pop();
+        if (groups.items.len > 0) groups.items[groups.items.len - 1].remaining -= 1;
+        const n_children: usize = @intCast(@max(elem.num_children orelse 0, 0));
+        if (n_children > 0) {
+            try groups.append(arena, .{ .name = elem.name, .remaining = n_children });
+            continue;
+        }
+        if (leaf == leaf_idx) {
+            const path = try arena.alloc([]const u8, groups.items.len + 1);
+            for (groups.items, 0..) |g, i| path[i] = g.name;
+            path[groups.items.len] = elem.name;
+            return path;
+        }
+        leaf += 1;
     }
     return null;
 }
@@ -380,6 +587,262 @@ test "open the bench fixture" {
             );
         }
     }
+}
+
+/// Serialized footer for a schema of `elems` (root prepended) and one row group whose chunks carry `chunk_paths`.
+fn chunkPathFooterForTest(
+    arena: std.mem.Allocator,
+    elems: []const schema.SchemaElement,
+    chunk_paths: []const []const []const u8,
+) ![]const u8 {
+    var top: i32 = 0;
+    var depth_left: i32 = 0;
+    for (elems) |e| {
+        if (depth_left == 0) top += 1 else depth_left -= 1;
+        depth_left += e.num_children orelse 0;
+    }
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+    try meta.schema.append(arena, .{ .type = null, .type_length = null, .repetition_type = null, .name = "root", .num_children = top, .scale = null, .precision = null, .field_id = null });
+    try meta.schema.appendSlice(arena, elems);
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 0 };
+    for (chunk_paths) |p| {
+        var path: schema.StringList = .empty;
+        try path.appendSlice(arena, p);
+        try rg.columns.append(arena, .{ .file_path = null, .file_offset = 4, .meta_data = .{
+            .type = .INT64,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 0,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 4,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = null,
+        } });
+    }
+    try meta.row_groups.append(arena, rg);
+    var w: thrift.Writer = .init(arena);
+    try meta.write(&w);
+    return w.bytes();
+}
+
+fn leafForTest(name: []const u8) schema.SchemaElement {
+    return .{ .type = .INT64, .type_length = null, .repetition_type = .REQUIRED, .name = name, .num_children = 0, .scale = null, .precision = null, .field_id = null };
+}
+
+fn groupForTest(name: []const u8, children: i32) schema.SchemaElement {
+    return .{ .type = null, .type_length = null, .repetition_type = .REQUIRED, .name = name, .num_children = children, .scale = null, .precision = null, .field_id = null };
+}
+
+test "footer open rejects column chunks whose path_in_schema disagrees with the schema leaf" {
+    // Chunks are picked by leaf ordinal but resolved through their own path, so a footer whose chunk paths are
+    // swapped relative to the schema used to decode each column under the other's name. Omitted paths and
+    // case-only differences are tolerated and rewritten to the schema's spelling.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const flat = [_]schema.SchemaElement{ leafForTest("a"), leafForTest("b") };
+    const nested = [_]schema.SchemaElement{ groupForTest("s", 2), leafForTest("x"), leafForTest("y"), leafForTest("z") };
+    const twins = [_]schema.SchemaElement{ leafForTest("id"), leafForTest("ID") };
+
+    const Case = struct {
+        elems: []const schema.SchemaElement,
+        chunks: []const []const []const u8,
+        /// Paths every chunk must carry after open; null when open must fail with `err`.
+        resolved: ?[]const []const []const u8 = null,
+        err: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .elems = &flat, .chunks = &.{ &.{"a"}, &.{"b"} }, .resolved = &.{ &.{"a"}, &.{"b"} } },
+        .{ .elems = &flat, .chunks = &.{ &.{"b"}, &.{"a"} }, .err = error.ColumnChunkPathMismatch },
+        .{ .elems = &flat, .chunks = &.{ &.{"a"}, &.{"c"} }, .err = error.ColumnChunkPathMismatch },
+        .{ .elems = &flat, .chunks = &.{ &.{}, &.{} }, .resolved = &.{ &.{"a"}, &.{"b"} } },
+        .{ .elems = &flat, .chunks = &.{ &.{"A"}, &.{"B"} }, .resolved = &.{ &.{"a"}, &.{"b"} } },
+        .{ .elems = &flat, .chunks = &.{&.{"a"}}, .err = error.ColumnChunkCountMismatch },
+        .{ .elems = &twins, .chunks = &.{ &.{"ID"}, &.{"id"} }, .err = error.ColumnChunkPathMismatch },
+        .{ .elems = &nested, .chunks = &.{ &.{ "s", "x" }, &.{ "s", "y" }, &.{"z"} }, .resolved = &.{ &.{ "s", "x" }, &.{ "s", "y" }, &.{"z"} } },
+        .{ .elems = &nested, .chunks = &.{ &.{ "s", "y" }, &.{ "s", "x" }, &.{"z"} }, .err = error.ColumnChunkPathMismatch },
+        .{ .elems = &nested, .chunks = &.{ &.{"x"}, &.{"y"}, &.{"z"} }, .err = error.ColumnChunkPathMismatch },
+    };
+
+    for (cases) |case| {
+        const footer = try chunkPathFooterForTest(arena, case.elems, case.chunks);
+        if (case.err) |want| {
+            try testing.expectError(want, openFooter(testing.allocator, footer));
+            continue;
+        }
+        var meta = try openFooter(testing.allocator, footer);
+        defer meta.deinit(testing.allocator);
+        const resolved = case.resolved.?;
+        const cols = meta.row_groups.items[0].columns.items;
+        try testing.expectEqual(resolved.len, cols.len);
+        for (resolved, cols) |want, cc| {
+            const got = cc.meta_data.?.path_in_schema.items;
+            try testing.expectEqual(want.len, got.len);
+            for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+        }
+    }
+}
+
+test "chunk paths compare by segment: a top-level column named a.b is not the field b of a group a" {
+    // Both leaves dot-join to `a.b`; path_in_schema validation must tell them apart by segments, and the resolver
+    // binds `a.b` to the top-level column and the bare `b` to the nested field.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const elems = [_]schema.SchemaElement{ leafForTest("a.b"), groupForTest("a", 1), leafForTest("b") };
+
+    var meta = try openFooter(arena, try chunkPathFooterForTest(arena, &elems, &.{ &.{"a.b"}, &.{ "a", "b" } }));
+    const cols = meta.row_groups.items[0].columns.items;
+    try testing.expectEqual(@as(usize, 1), cols[0].meta_data.?.path_in_schema.items.len);
+    try testing.expectEqual(@as(usize, 2), cols[1].meta_data.?.path_in_schema.items.len);
+    try testing.expectEqual(@as(usize, 2), leafCount(&meta));
+    try testing.expectEqualStrings((try leafPath(arena, &meta, 0)).?, (try leafPath(arena, &meta, 1)).?);
+    try testing.expectEqual(@as(usize, 1), (try leafPathSegments(arena, &meta, 0)).?.len);
+    try testing.expectEqual(@as(usize, 2), (try leafPathSegments(arena, &meta, 1)).?.len);
+    try testing.expectEqual(@as(usize, 0), try resolveColumn(&meta, "a.b"));
+    try testing.expectEqual(@as(usize, 1), try resolveColumn(&meta, "b"));
+    try testing.expectEqualStrings("b", meta.getColumnSchema((try leafPathSegments(arena, &meta, 1)).?).?.name);
+
+    // Swapped, or both chunks claiming one of the two: each path names the other leaf.
+    const bad = [_][]const []const []const u8{
+        &.{ &.{ "a", "b" }, &.{"a.b"} },
+        &.{ &.{"a.b"}, &.{"a.b"} },
+        &.{ &.{ "a", "b" }, &.{ "a", "b" } },
+    };
+    for (bad) |paths| {
+        try testing.expectError(error.ColumnChunkPathMismatch, openFooter(arena, try chunkPathFooterForTest(arena, &elems, paths)));
+    }
+}
+
+test "footer open rejects counts, offsets and sizes no valid file can have" {
+    // Hardwood's fixture: a negative data_page_offset, which every chunk reader cast straight to usize.
+    const bytes = try readFileSlice("ci/fixtures/parquet/negative_data_page_offset.parquet", testing.allocator);
+    defer testing.allocator.free(bytes);
+    try testing.expectError(error.BadColumnChunkRange, open(testing.allocator, bytes));
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const good = try chunkPathFooterForTest(arena, &.{ leafForTest("a"), leafForTest("b") }, &.{ &.{"a"}, &.{"b"} });
+    var base = try openFooter(arena, good);
+
+    const Mutation = struct { err: anyerror, apply: *const fn (*schema.FileMetaData) void };
+    const mutations = [_]Mutation{
+        .{ .err = error.NegativeRowCount, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.num_rows = -1;
+            }
+        }.f },
+        .{ .err = error.NegativeRowCount, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].num_rows = -5;
+            }
+        }.f },
+        .{ .err = error.BadColumnChunkRange, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].columns.items[1].meta_data.?.total_compressed_size = -1;
+            }
+        }.f },
+        .{ .err = error.BadColumnChunkRange, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].columns.items[0].meta_data.?.data_page_offset = std.math.maxInt(i64);
+                m.row_groups.items[0].columns.items[0].meta_data.?.total_compressed_size = 1;
+            }
+        }.f },
+        .{ .err = error.BadSchemaElement, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.schema.items[1].type_length = -16;
+            }
+        }.f },
+        .{ .err = error.BadSchemaElement, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.schema.items[2].num_children = 3; // a primitive with children
+            }
+        }.f },
+        .{ .err = error.BadSchemaElement, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.schema.items[1].type = null; // neither a type nor children
+            }
+        }.f },
+        .{ .err = error.ColumnChunkRowCountMismatch, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].columns.items[0].meta_data.?.num_values = 7;
+            }
+        }.f },
+        .{ .err = error.ColumnChunkTypeMismatch, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].columns.items[1].meta_data.?.type = .DOUBLE;
+            }
+        }.f },
+    };
+    for (mutations) |mut| {
+        var meta = base;
+        meta.schema = try base.schema.clone(arena);
+        meta.row_groups = .empty;
+        var rg = base.row_groups.items[0];
+        rg.columns = try rg.columns.clone(arena);
+        try meta.row_groups.append(arena, rg);
+        mut.apply(&meta);
+        var w: thrift.Writer = .init(arena);
+        try meta.write(&w);
+        try testing.expectError(mut.err, openFooter(arena, w.bytes()));
+    }
+
+    // A typed root with children is tolerated: segmentio/parquet-go writes one (tools/gen_typed_root_fixture.py).
+    {
+        const root_bytes = try readFileSlice("ci/fixtures/parquet/typed_root.parquet", testing.allocator);
+        defer testing.allocator.free(root_bytes);
+        const meta = try open(arena, root_bytes);
+        try testing.expect(meta.schema.items[0].type != null);
+        try testing.expect((meta.schema.items[0].num_children orelse 0) > 0);
+        try testing.expect(findColumnIndex(&meta, "mint") != null);
+    }
+
+    // A negative page-index location drops that chunk's page index, not the file.
+    {
+        var meta = base;
+        meta.row_groups = .empty;
+        var rg = base.row_groups.items[0];
+        rg.columns = try rg.columns.clone(arena);
+        rg.columns.items[0].column_index_offset = 100;
+        rg.columns.items[0].column_index_length = 10;
+        rg.columns.items[0].offset_index_offset = 110;
+        rg.columns.items[0].offset_index_length = -1;
+        rg.columns.items[1].offset_index_offset = 120;
+        rg.columns.items[1].offset_index_length = 8;
+        try meta.row_groups.append(arena, rg);
+        var w: thrift.Writer = .init(arena);
+        try meta.write(&w);
+        const opened = try openFooter(arena, w.bytes());
+        const cols = opened.row_groups.items[0].columns.items;
+        try testing.expect(cols[0].offset_index_offset == null and cols[0].column_index_offset == null);
+        try testing.expect(cols[0].offset_index_length == null and cols[0].column_index_length == null);
+        try testing.expectEqual(@as(?i32, 8), cols[1].offset_index_length);
+    }
+
+    // Deeper nesting than max_schema_depth.
+    var deep: std.ArrayList(schema.SchemaElement) = .empty;
+    for (0..max_schema_depth + 1) |_| try deep.append(arena, groupForTest("g", 1));
+    try deep.append(arena, leafForTest("x"));
+    var path: std.ArrayList([]const u8) = .empty;
+    for (0..max_schema_depth + 1) |_| try path.append(arena, "g");
+    try path.append(arena, "x");
+    const deep_footer = try chunkPathFooterForTest(arena, deep.items, &.{path.items});
+    try testing.expectError(error.SchemaTooDeep, openFooter(arena, deep_footer));
+
+    // A file with no row groups is a valid empty table, and its leaves are still known.
+    var empty = base;
+    empty.row_groups = .empty;
+    var w: thrift.Writer = .init(arena);
+    try empty.write(&w);
+    const opened = try openFooter(arena, w.bytes());
+    try testing.expectEqual(@as(usize, 2), leafCount(&opened));
+    try testing.expectEqualStrings("b", (try leafPathSegments(arena, &opened, 1)).?[0]);
+    try testing.expect((try leafPathSegments(arena, &opened, 2)) == null);
 }
 
 test "pruneEqual skips when stats range excludes the value" {

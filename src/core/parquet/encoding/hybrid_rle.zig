@@ -85,7 +85,8 @@ pub const HybridRleDecoder = struct {
             .bytes = bytes,
             .pos = 0,
             .bit_width = bit_width,
-            .mask = if (bit_width == 0) 0 else (@as(u32, 1) << @intCast(bit_width)) - 1,
+            // 32 is a legal width whose shift doesn't fit a u5.
+            .mask = if (bit_width == 0) 0 else if (bit_width >= 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(bit_width)) - 1,
             .remaining_in_run = 0,
             .in_rle = false,
             .rle_value = 0,
@@ -169,6 +170,24 @@ pub const HybridRleDecoder = struct {
         return written;
     }
 
+    /// If the stream is positioned on an RLE run (no bit-packed values pending), consume up to `max` of its values
+    /// and return the run's value and how many were taken. Null when the next values are bit-packed or the stream
+    /// is exhausted; `decode` handles both. Lets a caller that maps each value (dictionary lookup) do it once per run.
+    pub fn takeRleRun(self: *HybridRleDecoder, max: usize) Error!?struct { value: u32, count: usize } {
+        if (max == 0) return null;
+        if (self.bit_width == 0) return .{ .value = 0, .count = max }; // every value is 0; see `decode`
+        if (self.bp_carry_count > 0) return null;
+        if (self.remaining_in_run == 0) {
+            if (self.pos >= self.bytes.len) return null;
+            try self.readNextRun();
+            if (self.remaining_in_run == 0) return null;
+        }
+        if (!self.in_rle) return null;
+        const n = @min(max, self.remaining_in_run);
+        self.remaining_in_run -= n;
+        return .{ .value = self.rle_value, .count = n };
+    }
+
     /// Peek the stream's opening run without expanding a single value.
     ///
     /// Returns null when the stream is empty/truncated or opens with a
@@ -203,22 +222,24 @@ pub const HybridRleDecoder = struct {
             // groups. Stateless decode reads bytes directly from
             // `self.bytes` by computed offsets — no accumulator to
             // reset, no carry state.
-            self.remaining_in_run = @as(usize, @intCast(count_field)) * 8;
+            // A header claiming more groups than any address space
+            // holds is corrupt, not a run to start decoding.
+            self.remaining_in_run = std.math.mul(usize, @intCast(count_field), 8) catch return error.UnexpectedEndOfStream;
         }
     }
 
     /// Read a ULEB128-encoded varint. Used for the run header.
     fn readVarint(self: *HybridRleDecoder) Error!u64 {
         var result: u64 = 0;
-        var shift: u6 = 0;
+        var shift: u32 = 0;
         while (true) {
+            if (shift >= 64) return error.UnexpectedEndOfStream;
             if (self.pos >= self.bytes.len) return error.UnexpectedEndOfStream;
             const b = self.bytes[self.pos];
             self.pos += 1;
-            result |= @as(u64, b & 0x7f) << shift;
+            result |= @as(u64, b & 0x7f) << @intCast(shift);
             if ((b & 0x80) == 0) return result;
             shift += 7;
-            if (shift >= 64) return error.UnexpectedEndOfStream;
         }
     }
 
@@ -248,7 +269,7 @@ pub const HybridRleDecoder = struct {
             inline 1...32 => |bw| self.decodeBitPackedFixed(bw, dest),
             // bit_width=0 short-circuits in `decode()` before reaching
             // here; widths >32 are rejected at init().
-            else => unreachable,
+            else => error.InvalidBitWidth,
         };
     }
 
@@ -289,16 +310,26 @@ pub const HybridRleDecoder = struct {
         if (self.pos + bytes_needed + 8 <= self.bytes.len) {
             unpackFastFixed(bw, mask, self.bytes, self.pos, dest);
         } else {
-            // Slow path: copy bytes into a stack-pad with 8 trailing
-            // zeros so the u64 reads at the end of the dest sequence
-            // are safe. Bound: caller never asks for >256 values per
-            // call (rle_dict.Decoder's idx_buf cap), so worst-case
-            // bytes_needed = 256 * 32 / 8 = 1024.
-            var pad_buf: [1024 + 8]u8 = undefined;
-            std.debug.assert(bytes_needed <= 1024);
-            @memcpy(pad_buf[0..bytes_needed], self.bytes[self.pos .. self.pos + bytes_needed]);
-            @memset(pad_buf[bytes_needed .. bytes_needed + 8], 0);
-            unpackFastFixed(bw, mask, &pad_buf, 0, dest);
+            // Slow path, near the end of the stream: copy bytes into a
+            // stack pad with 8 trailing zeros so the u64 reads at the
+            // end of the dest sequence are safe. Level decoding asks for
+            // a whole page's levels in one call, so `dest` is unbounded;
+            // unpack in chunks of `pad_values` (1024 bytes at bw 32).
+            // Chunks are a multiple of 8 values, so each starts
+            // byte-aligned.
+            const pad_values = 256;
+            var pad_buf: [pad_values * 4 + 8]u8 = undefined;
+            var done: usize = 0;
+            var pos = self.pos;
+            while (done < dest.len) {
+                const n = @min(dest.len - done, pad_values);
+                const n_bytes = (n * @as(usize, bw) + 7) / 8;
+                @memcpy(pad_buf[0..n_bytes], self.bytes[pos..][0..n_bytes]);
+                @memset(pad_buf[n_bytes..][0..8], 0);
+                unpackFastFixed(bw, mask, &pad_buf, 0, dest[done..][0..n]);
+                done += n;
+                pos += n_bytes;
+            }
         }
         self.pos += bytes_needed;
     }
@@ -516,6 +547,38 @@ fn writeBitPackedRun(
 // ============================================================
 
 const testing = std.testing;
+
+
+test "a long bit-packed run ending the stream decodes in one call" {
+    // Level decoding asks for a whole page at once. A run this close to the end of the bytes takes the padded
+    // slow path, which used to assume at most 1024 bytes (256 values at bw 32) and overran its stack pad.
+    const n = 2048; // 256 groups at bw 8: 2048 bytes
+    var bytes: [3 + n]u8 = undefined;
+    // header = (groups << 1) | 1 = 513 as ULEB128
+    bytes[0] = 0x81;
+    bytes[1] = 0x04;
+    for (0..n) |i| bytes[2 + i] = @truncate(i *% 7);
+    var dec = HybridRleDecoder.init(bytes[0 .. 2 + n], 8);
+    var out: [n]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, n), try dec.decode(&out));
+    for (out, 0..) |v, i| try std.testing.expectEqual(@as(u32, @as(u8, @truncate(i *% 7))), v);
+}
+
+test "bit width 32 and hostile run headers are handled, not trapped on" {
+    // 32 is a legal width; its mask used to be built with a shift that doesn't fit a u5.
+    var dec = HybridRleDecoder.init(&[_]u8{ 0x06, 0xff, 0xff, 0xff, 0xff }, 32); // RLE run of 3 x 0xffffffff
+    var out: [3]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try dec.decode(&out));
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), out[2]);
+
+    // Eleven continuation bytes: longer than any u64 varint.
+    var overlong = HybridRleDecoder.init(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }, 4);
+    try std.testing.expectError(error.UnexpectedEndOfStream, overlong.decode(&out));
+
+    // A bit-packed header whose group count times 8 overflows usize.
+    var huge = HybridRleDecoder.init(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }, 4);
+    try std.testing.expectError(error.UnexpectedEndOfStream, huge.decode(&out));
+}
 
 test "BooleanRleDecoder decodes a bit-width-1 RLE run" {
     // RLE run header: count<<1 | 0 = (5<<1)=10 (varint 0x0A), value byte 0x01.

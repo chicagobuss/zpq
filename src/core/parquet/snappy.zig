@@ -16,15 +16,15 @@ pub const Error = error{
 /// Returns the length and the number of bytes read from src.
 pub fn decodedLen(src: []const u8) !struct { u64, usize } {
     var len: u64 = 0;
-    var shift: u6 = 0;
+    var shift: u32 = 0;
     var count: usize = 0;
 
     for (src) |b| {
+        if (shift >= 64) return error.CorruptInput;
         count += 1;
-        len |= @as(u64, b & 0x7f) << shift;
+        len |= @as(u64, b & 0x7f) << @intCast(shift);
         if (b & 0x80 == 0) return .{ len, count };
         shift += 7;
-        if (shift >= 64) return error.CorruptInput;
     }
     return error.CorruptInput;
 }

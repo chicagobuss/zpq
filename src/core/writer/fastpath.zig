@@ -474,7 +474,8 @@ pub fn reserializeColumnIndex(arena: std.mem.Allocator, bytes: []const u8) ?[]co
 pub fn reserializeOffsetIndexShifted(arena: std.mem.Allocator, bytes: []const u8, delta: i64) ?[]const u8 {
     var r = thrift.Reader.init(bytes);
     var oi = schema.OffsetIndex.read(arena, &r) catch return null;
-    for (oi.page_locations.items) |*pl| pl.offset += delta;
+    // Offsets come from the source file; a hostile one must drop the index, not overflow.
+    for (oi.page_locations.items) |*pl| pl.offset = std.math.add(i64, pl.offset, delta) catch return null;
     var w = thrift.Writer.init(arena);
     oi.write(&w) catch return null;
     return w.bytes();

@@ -626,6 +626,8 @@ fn handleS3(
     const tail = tail_resp.body;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
+    // The length is the file's claim; one longer than the object would underflow the start below.
+    if (footer_len + 8 > total_size) return error.NotParquet;
     const footer_actual_start = total_size - 8 - footer_len;
     if (footer_actual_start < tail_start) {
         const need = try client.get(a, url.key, s3.Range.span(footer_actual_start, tail_start - 1));
@@ -732,6 +734,7 @@ fn handleS3(
             const col_meta = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
             const chunk_start: usize = if (col_meta.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col_meta.data_page_offset);
             const chunk_len: usize = @intCast(col_meta.total_compressed_size);
+            if (chunk_start + chunk_len > file_buf.len) return error.InvalidColumnOffsets;
             const chunk = file_buf[chunk_start .. chunk_start + chunk_len];
 
             // Use the column-chunk's full path_in_schema so nested
@@ -760,6 +763,7 @@ fn handleS3(
                 .FIXED_LEN_BYTE_ARRAY => .{ .string = try consumer.decodeFlbaColumn(ra, chunk, col_meta.codec, levels, n_leaves, consumer.flbaWidth(meta.getColumnSchema(col_meta.path_in_schema.items))) },
                 else => return error.UnsupportedColumnType,
             };
+            try consumer.checkRowShape(decoded, num_rows);
             try batch_cols.append(ra, decoded);
             lookup[ci] = batch_pos;
         }
@@ -854,9 +858,11 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
         const col = rg.columns.items[target_idx].meta_data orelse return error.ColumnMetaMissing;
         const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
         const chunk_len: usize = @intCast(col.total_compressed_size);
+        if (chunk_start + chunk_len > file_bytes.len) return error.InvalidColumnOffsets;
         const chunk = file_bytes[chunk_start .. chunk_start + chunk_len];
 
         var reader = column_mod.ColumnChunkReader(i32).init(chunk, col.codec, levels, arena.allocator());
+        reader.value_budget = @intCast(col.num_values);
         var batch: [4096]i32 = undefined;
         var def_batch: [4096]u32 = undefined;
         const max_def: u32 = @intCast(levels.max_def);

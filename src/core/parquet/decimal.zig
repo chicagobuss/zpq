@@ -70,7 +70,8 @@ pub const Kind = struct {
 /// payload (newer writers set both for compat; the LogicalType wins).
 pub fn kindFromSchema(elem: *const schema.SchemaElement) ?Kind {
     const phys = elem.type orelse return null;
-    const tl: u8 = if (elem.type_length) |v| @intCast(v) else 0;
+    // A width no decimal can have (precision 38 needs 16 bytes) is not decoded as one.
+    const tl: u8 = if (elem.type_length) |v| std.math.cast(u8, v) orelse return null else 0;
 
     if (elem.logical_type) |lt| switch (lt) {
         .DECIMAL => |d| return Kind{
@@ -259,6 +260,7 @@ fn decodeIntBackedI128(
     // integers (widened to i128) — no scale divide.
     const raw_values = try arena.alloc(T, num_leaves);
     var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
+    reader.value_budget = num_leaves;
 
     var def_levels_buf: ?[]u32 = null;
     if (levels.max_def > 0) {
@@ -313,6 +315,7 @@ fn decodeIntBacked(
     // in a second pass.
     const raw_values = try arena.alloc(T, num_leaves);
     var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
+    reader.value_budget = num_leaves;
 
     var def_levels_buf: ?[]u32 = null;
     var rep_levels_buf: ?[]u32 = null;
@@ -389,6 +392,7 @@ fn decodeByteArrayBacked(
         arena,
         decode_options,
     );
+    reader.value_budget = num_leaves;
 
     var def_levels_buf: ?[]u32 = null;
     var rep_levels_buf: ?[]u32 = null;
@@ -577,6 +581,9 @@ fn decodeFlbaDataPage(
         page_num_values = @intCast(dph.num_values);
         encoding = dph.encoding;
     }
+    // The output buffers are sized from the chunk's num_values; a page claiming more than is left would write past
+    // them.
+    if (page_num_values > values_out.len - written.*) return error.ShortDecode;
 
     // Extract rep/def level slices (if any) and the values payload.
     var values_bytes = pg.bytes;
@@ -611,6 +618,9 @@ fn decodeFlbaDataPage(
         if (levels.max_rep > 0 and rep_len > 0) {
             try decodeLevels(values_bytes[0..rep_len], @as(u32, @intCast(levels.max_rep)), page_num_values, rep_levels_buf, written.*);
         }
+        // Without level bytes the def levels would be left unwritten; an empty page is the only legitimate case.
+        if (levels.max_def > 0 and def_len == 0 and page_num_values > 0) return error.ShortDecode;
+        if (levels.max_rep > 0 and rep_len == 0 and page_num_values > 0) return error.ShortDecode;
         if (levels.max_def > 0 and def_len > 0) {
             try decodeLevels(values_bytes[rep_len .. rep_len + def_len], @as(u32, @intCast(levels.max_def)), page_num_values, def_levels_buf, written.*);
         }

@@ -22,6 +22,8 @@ pub const Error = error{
     UnexpectedEndOfChunk,
     BadPageHeader,
     NegativeSize,
+    /// A page header's value / null / row count is negative, or claims more nulls than values.
+    BadPageCount,
 } || compression.Error;
 
 pub const Page = struct {
@@ -39,6 +41,8 @@ pub const Page = struct {
 /// Not thread-safe, and at most one ColumnChunkReader may draw on a scratch at a time. Lifetimes: `page` and the
 /// level buffers are overwritten by the next page; `dict` by the next dictionary page. Only readers whose decoded
 /// values are copies may route page bytes here — `[]const u8` values are slices into the page bytes and would dangle.
+///
+/// Safe builds enforce the one-reader rule (see `hold`); ReleaseFast compiles the check out.
 pub const DecodeScratch = struct {
     gpa: std.mem.Allocator,
     page: []u8 = &.{},
@@ -46,8 +50,31 @@ pub const DecodeScratch = struct {
     dict: []align(dict_align) u8 = &.{},
     def_levels: []u32 = &.{},
     rep_levels: []u32 = &.{},
+    /// Ticket of the reader whose turn it is, and the last ticket issued. Safe builds only.
+    owner: Ticket = no_ticket,
+    issued: Ticket = no_ticket,
 
     pub const dict_align = 16;
+
+    /// A reader's claim on a scratch. Zero-sized outside safe builds.
+    pub const Ticket = if (std.debug.runtime_safety) u32 else void;
+    pub const no_ticket: Ticket = if (std.debug.runtime_safety) 0 else {};
+
+    /// Called on every reader entry point. A reader's first call takes the scratch, ending the previous reader's
+    /// turn; each later call fails if another reader has taken it since, because this reader's page, levels or
+    /// dictionary may then have been overwritten under it. Readers carry no deinit, so a turn ends when the next
+    /// reader starts rather than at a release call, and a reader abandoned mid-chunk never blocks the next one.
+    pub fn hold(self: *DecodeScratch, ticket: *Ticket) error{DecodeScratchInterleaved}!void {
+        if (!std.debug.runtime_safety) return;
+        if (ticket.* == no_ticket) {
+            self.issued +%= 1;
+            if (self.issued == no_ticket) self.issued +%= 1;
+            ticket.* = self.issued;
+            self.owner = ticket.*;
+        } else if (self.owner != ticket.*) {
+            return error.DecodeScratchInterleaved;
+        }
+    }
 
     pub fn init(gpa: std.mem.Allocator) DecodeScratch {
         return .{ .gpa = gpa };
@@ -134,6 +161,7 @@ pub const PageReader = struct {
         if (header.compressed_page_size < 0 or header.uncompressed_page_size < 0) {
             return error.NegativeSize;
         }
+        try checkCounts(header);
         const csize: usize = @intCast(header.compressed_page_size);
         const usize_: usize = @intCast(header.uncompressed_page_size);
 
@@ -185,6 +213,24 @@ pub const PageReader = struct {
         return .{ .header = header, .bytes = out };
     }
 
+    /// Every decoder downstream casts these counts to usize (and V2 subtracts nulls from values), so a header
+    /// that is negative or inconsistent here is rejected before any of them sees it.
+    fn checkCounts(header: schema.PageHeader) Error!void {
+        switch (header.type) {
+            .DATA_PAGE => if (header.data_page_header) |h| {
+                if (h.num_values < 0) return error.BadPageCount;
+            },
+            .DICTIONARY_PAGE => if (header.dictionary_page_header) |h| {
+                if (h.num_values < 0) return error.BadPageCount;
+            },
+            .DATA_PAGE_V2 => if (header.data_page_header_v2) |h| {
+                if (h.num_values < 0 or h.num_rows < 0 or h.num_nulls < 0) return error.BadPageCount;
+                if (h.num_nulls > h.num_values) return error.BadPageCount;
+            },
+            .INDEX_PAGE => {},
+        }
+    }
+
     fn pageBuffer(self: *PageReader, len: usize) Error![]u8 {
         if (self.scratch) |s| return s.ensure(u8, 1, &s.page, len);
         return self.arena.alloc(u8, len);
@@ -193,7 +239,8 @@ pub const PageReader = struct {
     /// Reposition the reader's cursor to an absolute file offset.
     pub fn seekToPage(self: *PageReader, absolute_offset: i64, chunk_file_offset: i64) !void {
         if (absolute_offset < chunk_file_offset) return error.UnexpectedEndOfChunk;
-        const off: usize = @intCast(absolute_offset - chunk_file_offset);
+        // Both come from the file (page index / column metadata); the difference of two hostile i64s can overflow.
+        const off: usize = @intCast(std.math.sub(i64, absolute_offset, chunk_file_offset) catch return error.UnexpectedEndOfChunk);
         if (off > self.chunk.len) return error.UnexpectedEndOfChunk;
         self.pos = off;
     }
@@ -254,6 +301,39 @@ test "iterate pages of one column from the bench fixture" {
         "[page] col[0] ({s}): {d} pages, {d} bytes decompressed total\n",
         .{ @tagName(col0.type), page_count, total_decompressed },
     );
+}
+
+test "page headers with negative or inconsistent counts are rejected before any decoder casts them" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const Case = struct { header: schema.PageHeader };
+    const v1 = schema.DataPageHeader{ .num_values = -3, .encoding = .PLAIN, .definition_level_encoding = .RLE, .repetition_level_encoding = .RLE };
+    const v2 = schema.DataPageHeaderV2{
+        .num_values = 2,
+        .num_nulls = 5, // more nulls than values: V2 PLAIN BOOLEAN decodes num_values - num_nulls
+        .num_rows = 2,
+        .encoding = .PLAIN,
+        .definition_levels_byte_length = 0,
+        .repetition_levels_byte_length = 0,
+        .is_compressed = false,
+    };
+    const cases = [_]Case{
+        .{ .header = .{ .type = .DATA_PAGE, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = v1, .dictionary_page_header = null, .data_page_header_v2 = null } },
+        .{ .header = .{ .type = .DATA_PAGE_V2, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = null, .dictionary_page_header = null, .data_page_header_v2 = v2 } },
+        .{ .header = .{ .type = .DICTIONARY_PAGE, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = null, .dictionary_page_header = .{ .num_values = -1, .encoding = .PLAIN, .is_sorted = null }, .data_page_header_v2 = null } },
+    };
+    for (cases) |case| {
+        var w = thrift.Writer.init(arena);
+        try case.header.write(&w);
+        var pr = PageReader.init(w.bytes(), .UNCOMPRESSED, arena);
+        try testing.expectError(error.BadPageCount, pr.next());
+    }
+
+    // Two hostile i64 offsets whose difference overflows.
+    var pr = PageReader.init("", .UNCOMPRESSED, arena);
+    try testing.expectError(error.UnexpectedEndOfChunk, pr.seekToPage(std.math.maxInt(i64), -10));
 }
 
 // ----- File-read helper duplicated from metadata.zig tests -----

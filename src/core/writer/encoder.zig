@@ -1734,7 +1734,7 @@ test "DELTA_BYTE_ARRAY encode round-trips through the decoder (incl. nulls)" {
     const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &dls, .max_def = 1 } };
 
     const enc = (try tryEncodeValuesDeltaByteArray(a, col, &dls, 1)) orelse return error.ExpectedEncoding;
-    var dec = try dba.DeltaByteArrayDecoder.init(enc, a);
+    var dec = try dba.DeltaByteArrayDecoder.init(enc, a, std.math.maxInt(usize));
     var out: [5][]const u8 = undefined; // 5 present values
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, 5), n);

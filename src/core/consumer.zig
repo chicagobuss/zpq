@@ -43,6 +43,7 @@ const decimal_mod = @import("parquet/decimal.zig");
 const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
+const metadata = @import("parquet/metadata.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
@@ -174,16 +175,12 @@ pub fn initOutputAggregator(
     for (output_specs, 0..) |spec, i| {
         const phys_type: schema.Type = switch (spec) {
             .passthrough => |kept_ci| blk: {
-                // Find which leaf-column slot has this path. row_groups[*].columns[kept_ci]
-                // gives us the path; meta.getColumnSchema returns the SchemaElement.
-                // We use the first RG's metadata to look up the leaf — every RG of
-                // the same file shares the same schema.
-                if (meta.row_groups.items.len == 0) return error.ColumnMetaMissing;
-                const cm = meta.row_groups.items[0].columns.items[kept_ci].meta_data orelse
-                    return error.ColumnMetaMissing;
-                const src_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse
+                // The leaf's path comes from the schema, which every chunk's path_in_schema matches (footer open
+                // enforces it), so a file with no row groups still builds its output schema.
+                const path = try metadata.leafPathSegments(arena, meta, kept_ci) orelse return error.ColumnMetaMissing;
+                const src_elem = meta.getColumnSchema(path) orelse
                     return error.SchemaLookupFailed;
-                paths[i] = cm.path_in_schema.items;
+                paths[i] = path;
 
                 // DECIMAL source columns. INT32/INT64/FLBA-backed take the
                 // lossless integer lane: decode to unscaled i128, keep the
@@ -237,7 +234,7 @@ pub fn initOutputAggregator(
                 }
 
                 schemas[i] = src_elem;
-                break :blk cm.type;
+                break :blk src_elem.type orelse return error.SchemaLookupFailed;
             },
             .computed => |c| blk: {
                 const expr_type = c.expr.typeOf();
@@ -423,6 +420,7 @@ pub fn appendProjectedRGWithOptions(
                 decode_options,
             ) },
         };
+        try checkRowShape(decoded, num_rows);
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -1240,6 +1238,8 @@ pub fn scanRGForAgg(
 
             var off_reader = thrift.Reader.init(off_bytes);
             const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
+            // Like an unparseable index, an inconsistent one is ignored and the row group is scanned whole.
+            if (!pageIndexUsable(col_index, offset_index, num_rows)) continue;
 
             const cm = chunk_meta.meta_data orelse continue;
             const levels = meta.getColumnLevels(cm.path_in_schema.items);
@@ -1515,6 +1515,7 @@ pub fn scanRGForAgg(
             ) },
         };
         lookup[ci] = batch_cols.items.len;
+        try checkRowShape(decoded, num_rows);
         try batch_cols.append(ra, decoded);
     }
     const t_decode_end = nowMonoNs();
@@ -1579,7 +1580,8 @@ pub fn scanRGForAgg(
 /// ones are unmapped mid-scan) before reuse starts at the third. The used nodes go onto the arena's own free list,
 /// which `alloc` already searches before asking the child allocator for more.
 ///
-/// Reaches into ArenaAllocator.State (Zig 0.16 layout); the "rewind reuses nodes" test pins the behaviour.
+/// Reaches into ArenaAllocator.State (Zig 0.17 layout); the "rewind reuses nodes" and "rewound arena tolerates" tests
+/// pin the behaviour.
 pub fn rewindArena(arena: *std.heap.ArenaAllocator) void {
     // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
     // them in the order this one did and touches the same pages, not a scatter across every node's tail.
@@ -1591,8 +1593,20 @@ pub fn rewindArena(arena: *std.heap.ArenaAllocator) void {
         node.next = reversed;
         reversed = node;
     }
-    arena.state.free_list = reversed;
-    arena.state.used_list = null;
+    // Keep the oldest node as the arena's (empty) current node instead of leaving no current node. ArenaAllocator's
+    // free and resize unwrap the current node unconditionally, so with none, freeing or resizing pre-rewind memory
+    // before the next allocation unwraps null: a panic in safe builds, UB in ReleaseFast. Against an empty current
+    // node they are the ordinary not-most-recent no-ops. Fill order is unchanged: this is the node the free-list
+    // search would have handed the next allocation first.
+    const first = reversed orelse {
+        arena.state.free_list = null;
+        arena.state.used_list = null;
+        return;
+    };
+    arena.state.free_list = first.next;
+    first.end_index = 0;
+    first.next = null;
+    arena.state.used_list = first;
 }
 
 test "rewind reuses nodes: a repeat of the same allocation pattern never reaches the child allocator" {
@@ -1639,6 +1653,39 @@ test "rewind reuses nodes: a repeat of the same allocation pattern never reaches
     }
     try std.testing.expectEqual(@as(usize, 0), counting.allocs);
     try std.testing.expectEqual(@as(usize, 0), counting.frees);
+}
+
+test "rewound arena tolerates freeing and resizing memory from before the rewind" {
+    // Code that releases a previous row group's buffers after the rewind, before allocating anything new, must not
+    // reach a null current node inside ArenaAllocator.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const small = try a.alloc(u8, 100);
+    const large = try a.alloc(u8, 300_000); // past the first node: the rewind has more than one node to hand back
+    rewindArena(&arena);
+
+    a.free(large);
+    try std.testing.expect(!a.resize(small, 200));
+    try std.testing.expect(a.resize(small, 50));
+    a.free(small);
+
+    // Still a working arena that reuses its nodes: both allocations land in memory it already owned.
+    const before = arena.queryCapacity();
+    const again_small = try a.alloc(u8, 100);
+    const again_large = try a.alloc(u8, 300_000);
+    @memset(again_small, 1);
+    @memset(again_large, 2);
+    try std.testing.expectEqual(before, arena.queryCapacity());
+    try std.testing.expectEqual(@as(u8, 1), again_small[99]);
+
+    // A rewind of an arena that never allocated leaves it empty and usable.
+    var empty = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer empty.deinit();
+    rewindArena(&empty);
+    try std.testing.expect(empty.state.used_list == null);
+    _ = try empty.allocator().alloc(u8, 8);
 }
 
 /// `kept_set != null`: per-column copy. Only chunks where
@@ -2087,6 +2134,153 @@ pub fn pageIndexIsPlausible(
 /// Slice the source page-index bytes for a chunk out of `src.bytes`,
 /// accounting for `byte_origin` (the buffer may start partway into the
 /// file). Null when the index isn't present in the fetched bytes.
+/// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
+/// page's `first_row_index` slices the row selection, so the arrays must agree in length and the row starts must be
+/// in range and non-decreasing. Page offsets and sizes are checked again where the pages are read.
+fn pageIndexUsable(ci: schema.ColumnIndex, oi: schema.OffsetIndex, num_rows: usize) bool {
+    const locs = oi.page_locations.items;
+    if (ci.null_pages.items.len != locs.len) return false;
+    if (ci.min_values.items.len != locs.len or ci.max_values.items.len != locs.len) return false;
+    if (ci.null_counts) |nc| if (nc.items.len != locs.len) return false;
+    var prev: i64 = 0;
+    for (locs) |loc| {
+        if (loc.offset < 0 or loc.compressed_page_size < 0) return false;
+        if (loc.first_row_index < prev) return false;
+        if (loc.first_row_index > num_rows) return false;
+        prev = loc.first_row_index;
+    }
+    return true;
+}
+
+test "pageIndexUsable rejects page indexes whose arrays or row starts disagree" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var ci: schema.ColumnIndex = .{};
+    var oi: schema.OffsetIndex = .{};
+    for ([_]i64{ 0, 10, 20 }) |first| {
+        try ci.null_pages.append(a, false);
+        try ci.min_values.append(a, "");
+        try ci.max_values.append(a, "");
+        try oi.page_locations.append(a, .{ .offset = 4 + first, .compressed_page_size = 8, .first_row_index = first });
+    }
+    try testing.expect(pageIndexUsable(ci, oi, 30));
+    try testing.expect(!pageIndexUsable(ci, oi, 19)); // a page starts past the row group
+
+    oi.page_locations.items[2].first_row_index = 5; // goes backwards
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+    oi.page_locations.items[2].first_row_index = 20;
+
+    oi.page_locations.items[0].first_row_index = -1;
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+    oi.page_locations.items[0].first_row_index = 0;
+
+    _ = ci.min_values.pop(); // ColumnIndex shorter than OffsetIndex
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+}
+
+/// A decoded column must describe exactly its row group's rows: a flat column one value per row, a repeated one
+/// `num_rows` record starts (repetition level 0), the first entry among them. Filters, the selection vector and the
+/// output aggregator all walk every column against `num_rows`, so a chunk whose counts or levels disagree is corrupt.
+/// O(1) for flat columns; a pass over the levels for repeated ones.
+pub fn checkRowShape(col: filter_eval.Batch.Column, num_rows: usize) error{ColumnRowCountMismatch}!void {
+    switch (col) {
+        inline else => |c| {
+            if (c.rep_levels) |rl| {
+                if (rl.len > 0 and rl[0] != 0) return error.ColumnRowCountMismatch;
+                var starts: usize = 0;
+                for (rl) |r| starts += @intFromBool(r == 0);
+                if (starts != num_rows) return error.ColumnRowCountMismatch;
+            } else if (c.values.len != num_rows) return error.ColumnRowCountMismatch;
+            if (c.def_levels) |dl| if (dl.len != c.values.len) return error.ColumnRowCountMismatch;
+        },
+    }
+}
+
+/// One uncompressed page: header + body.
+fn pageForTest(arena: std.mem.Allocator, header: schema.PageHeader, body: []const u8) ![]u8 {
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, w.bytes());
+    try out.appendSlice(arena, body);
+    return out.items;
+}
+
+test "a page claiming more values than its chunk is rejected before sizing buffers from the claim" {
+    // A few bytes can claim any count: one RLE def-level run of N present values. The level buffer used to be
+    // sized from that claim, so a one-row chunk could make the reader allocate gigabytes.
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const claimed: u32 = 1 << 24;
+    var body: std.ArrayList(u8) = .empty;
+    var run: [8]u8 = undefined; // ULEB128 run header (claimed << 1), then the 1-byte value
+    var n: u32 = claimed << 1;
+    var len: usize = 0;
+    while (true) : (len += 1) {
+        run[len] = @truncate(n & 0x7f);
+        n >>= 7;
+        if (n == 0) break;
+        run[len] |= 0x80;
+    }
+    len += 1;
+    run[len] = 1;
+    len += 1;
+    var prefix: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prefix, @intCast(len), .little);
+    try body.appendSlice(a, &prefix);
+    try body.appendSlice(a, run[0..len]);
+    try body.appendSlice(a, &[_]u8{ 42, 0, 0, 0 });
+    const page = try pageForTest(a, .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = .{ .num_values = claimed, .encoding = .PLAIN, .definition_level_encoding = .RLE, .repetition_level_encoding = .RLE },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    }, body.items);
+    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    try testing.expectError(error.PageValueCountExceedsChunk, decodeColumnT(i32, a, page, .UNCOMPRESSED, optional, 1));
+
+    // A dictionary page claiming far more entries than its bytes can hold.
+    const dict_body = [_]u8{ 1, 0, 0, 0, 'a' };
+    const dict_page = try pageForTest(a, .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = dict_body.len,
+        .compressed_page_size = dict_body.len,
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = .{ .num_values = 1 << 20, .encoding = .PLAIN, .is_sorted = null },
+        .data_page_header_v2 = null,
+    }, &dict_body);
+    const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    try testing.expectError(error.DictionaryLargerThanPage, decodeColumnT([]const u8, a, dict_page, .UNCOMPRESSED, required, 1));
+}
+
+test "checkRowShape ties flat and repeated columns to the row count" {
+    const testing = std.testing;
+    try checkRowShape(.{ .i32 = .{ .values = &.{ 1, 2, 3 } } }, 3);
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(.{ .i32 = .{ .values = &.{ 1, 2 } } }, 3));
+    // Repeated: three records, the second holding two entries.
+    const rep = filter_eval.Batch.Column{ .i32 = .{
+        .values = &.{ 1, 2, 3, 4 },
+        .def_levels = &.{ 1, 1, 1, 1 },
+        .max_def = 1,
+        .rep_levels = &.{ 0, 0, 1, 0 },
+        .max_rep = 1,
+    } };
+    try checkRowShape(rep, 3);
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(rep, 4));
+    const no_start = filter_eval.Batch.Column{ .i32 = .{ .values = &.{1}, .rep_levels = &.{1}, .max_rep = 1 } };
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(no_start, 1));
+}
+
 fn originSlice(src: RGSrc, file_off: i64, len: i32) ?[]const u8 {
     if (file_off < 0 or len < 0) return null;
     const fo: u64 = @intCast(file_off);
@@ -2168,6 +2362,7 @@ fn decodeWithReaderPruned(
     num_leaves: usize,
     prune: PruningInfo,
 ) !filter_eval.ColumnT(T) {
+    reader.value_budget = num_leaves;
     const values = try arena.alloc(T, num_leaves);
     @memset(values, defaultVal(T));
 
@@ -2213,6 +2408,10 @@ fn decodeWithReaderPruned(
     if (possible_dict_offset) |dict_off| {
         _ = try reader.seekAndInstallDictionaryPage(dict_off, prune.chunk_file_offset);
     }
+
+    // Page row starts slice `values`, which is sized from the chunk's value count, not the row group's row count
+    // the index was checked against.
+    for (prune.locations) |loc| if (loc.first_row_index > num_leaves) return error.ShortDecode;
 
     // 2. Loop over pages and decode or skip
     for (prune.locations, 0..) |loc, pi| {
@@ -2496,13 +2695,15 @@ fn decodeWithReader(
     levels: schema.Levels,
     num_leaves: usize,
 ) !filter_eval.ColumnT(T) {
+    // Pages may claim no more values between them than the chunk holds.
+    reader.value_budget = num_leaves;
     const values = try arena.alloc(T, num_leaves);
     if (levels.max_rep > 0) {
         const def_levels = try arena.alloc(u32, num_leaves);
         const rep_levels = try arena.alloc(u32, num_leaves);
         var written: usize = 0;
         while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(values[written..], def_levels[written..], rep_levels[written..]) catch return error.ShortDecode;
+            const n = try reader.decodeWithRepLevels(values[written..], def_levels[written..], rep_levels[written..]);
             if (n == 0) break;
             written += n;
         }
@@ -2534,7 +2735,7 @@ fn decodeWithReader(
         // get the per-page half of this in `decodePageSlice`.
         const skip_levels = reader.options.fast_levels and levels.max_rep == 0 and levels.max_def == 1;
         if (skip_levels) {
-            written = reader.decodeAllPresent(values) catch return error.ShortDecode;
+            written = try reader.decodeAllPresent(values);
             if (written == num_leaves) {
                 return .{
                     .values = values,
@@ -2551,7 +2752,7 @@ fn decodeWithReader(
         const def_levels = try arena.alloc(u32, num_leaves);
         @memset(def_levels[0..written], @intCast(levels.max_def));
         while (written < num_leaves) {
-            const n = reader.decodeWithLevels(values[written..], def_levels[written..]) catch return error.ShortDecode;
+            const n = try reader.decodeWithLevels(values[written..], def_levels[written..]);
             if (n == 0) break;
             written += n;
         }
@@ -2565,7 +2766,7 @@ fn decodeWithReader(
     }
     var written: usize = 0;
     while (written < num_leaves) {
-        const n = reader.decode(values[written..]) catch return error.ShortDecode;
+        const n = try reader.decode(values[written..]);
         if (n == 0) break;
         written += n;
     }
@@ -3096,7 +3297,6 @@ test "pageIndexIsPlausible: corpus page indexes are kept except the ones their f
     // Every parquet-testing file that carries a page index. The datapage_v1 trio flags every page of two REQUIRED
     // columns null (with -1 null counts) while the pages hold values; the rest, int32_with_null_pages's genuine null
     // pages included, must keep their index so page pruning still applies to them.
-    const metadata = @import("parquet/metadata.zig");
     const Case = struct { path: []const u8, plausible: bool };
     const cases = [_]Case{
         .{ .path = "alltypes_tiny_pages.parquet", .plausible = true },
@@ -3236,7 +3436,6 @@ test "pageIndexIsPlausible: each contradiction drops the index on its own" {
 test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
     // tiny_pages: uncompressed v1 pages, dictionaries, no CRCs, so UNCOMPRESSED -> ZSTD -> UNCOMPRESSED must reproduce
     // every header field and payload exactly. datapage_v2: v2 pages, whose levels stay outside the compressed values.
-    const metadata = @import("parquet/metadata.zig");
     const testing = std.testing;
     const Case = struct { path: []const u8, via: schema.CompressionCodec };
     const cases = [_]Case{

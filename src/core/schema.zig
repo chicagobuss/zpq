@@ -210,18 +210,21 @@ pub const LogicalType = union(enum) {
         const saved_id = reader.last_field_id;
         reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
-        var res: TimeType = .{ .isAdjustedToUTC = false, .unit = undefined };
+        var adjusted = false;
+        // Required by the format. Left unset it would be an undefined union tag that a later footer write
+        // switches on, so a footer without it is rejected here.
+        var unit: ?TimeUnit = null;
         reader.readStructBegin();
         while (true) {
             const field = try reader.readFieldBegin();
             if (field.type == .Stop) break;
             switch (field.id) {
-                1 => res.isAdjustedToUTC = (field.type == .True),
-                2 => res.unit = try TimeUnit.read(reader),
+                1 => adjusted = (field.type == .True),
+                2 => unit = try TimeUnit.read(reader),
                 else => try reader.skip(field.type),
             }
         }
-        return res;
+        return .{ .isAdjustedToUTC = adjusted, .unit = unit orelse return error.MissingTimeUnit };
     }
 
     fn readTimestamp(reader: *thrift.Reader) !TimestampType {
@@ -245,7 +248,7 @@ pub const LogicalType = union(enum) {
                 1 => res.bitWidth = if (field.type == .Byte)
                     @as(i8, @bitCast(try reader.readByte()))
                 else
-                    @as(i8, @intCast(try reader.readZigZag(i16))),
+                    std.math.cast(i8, try reader.readZigZag(i16)) orelse return error.InvalidBitWidth,
                 2 => res.isSigned = (field.type == .True),
                 else => try reader.skip(field.type),
             }
@@ -1558,6 +1561,35 @@ pub const Levels = struct {
     max_def: i32,
     max_rep: i32,
 };
+
+test "logical-type fields a footer leaves out or overflows are rejected, not left undefined" {
+    const a = std.testing.allocator;
+    { // TIME with no unit: the union tag would stay undefined until a footer write switched on it.
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldBegin(.Struct, 7); // LogicalType.TIME
+        w.writeStructBegin();
+        try w.writeFieldBool(1, true); // isAdjustedToUTC, but no unit (field 2)
+        try w.writeStructEnd();
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        try std.testing.expectError(error.MissingTimeUnit, LogicalType.read(&r));
+    }
+    { // INTEGER bitWidth sent as an i16 that doesn't fit the i8 field.
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldBegin(.Struct, 10); // LogicalType.INTEGER
+        w.writeStructBegin();
+        try w.writeFieldBegin(.I16, 1);
+        try w.writeZigZag(@as(i16, 300));
+        try w.writeStructEnd();
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        try std.testing.expectError(error.InvalidBitWidth, LogicalType.read(&r));
+    }
+}
 
 test "safeListReserve caps initial allocation bytes" {
     try std.testing.expectEqual(@as(usize, 100), safeListReserve(u8, 100, 1000));

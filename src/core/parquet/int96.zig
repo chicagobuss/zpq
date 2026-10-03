@@ -119,6 +119,9 @@ fn decodeDataPage(
         page_num_values = @intCast(dph.num_values);
         encoding = dph.encoding;
     }
+    // The output buffers are sized from the chunk's num_values; a page claiming more than is left would write past
+    // them.
+    if (page_num_values > values_out.len - written.*) return error.ShortDecode;
 
     // Strip rep/def level prefixes (V1: u32-len-prefixed RLE; V2: fixed
     // byte lengths from the page header), leaving the values payload.
@@ -146,6 +149,9 @@ fn decodeDataPage(
         if (levels.max_rep > 0 and rep_len > 0) {
             try decodeLevels(values_bytes[0..rep_len], @as(u32, @intCast(levels.max_rep)), page_num_values, rep_levels_buf, written.*);
         }
+        // Without level bytes the def levels would be left unwritten; an empty page is the only legitimate case.
+        if (levels.max_def > 0 and def_len == 0 and page_num_values > 0) return error.ShortDecode;
+        if (levels.max_rep > 0 and rep_len == 0 and page_num_values > 0) return error.ShortDecode;
         if (levels.max_def > 0 and def_len > 0) {
             try decodeLevels(values_bytes[rep_len .. rep_len + def_len], @as(u32, @intCast(levels.max_def)), page_num_values, def_levels_buf, written.*);
         }

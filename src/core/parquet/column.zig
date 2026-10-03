@@ -43,6 +43,12 @@ pub const Error = error{
     DefLevelsMismatch,
     LevelsArgMissing,
     OutOfMemory,
+    /// Safe builds: two readers took turns on one `DecodeScratch` (see `DecodeScratch.hold`).
+    DecodeScratchInterleaved,
+    /// A data page claims more values than are left of the chunk's `value_budget`.
+    PageValueCountExceedsChunk,
+    /// A dictionary page claims more entries than its bytes can hold.
+    DictionaryLargerThanPage,
 } || page_mod.Error;
 
 /// Choose the right decoder shape for T at comptime.
@@ -192,6 +198,14 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// instead of copying and counting a materialised array.
         current_def_all_present: bool = false,
 
+        /// This reader's claim on `options.scratch`.
+        scratch_ticket: DecodeScratch.Ticket = DecodeScratch.no_ticket,
+
+        /// Values the chunk has left for pages not yet installed: set by the caller to the chunk's num_values,
+        /// charged by each data page's header count before its level buffers are sized from it. RLE runs and bit
+        /// width 0 let a few bytes claim any count, so the page's own size can't bound it. Unlimited by default.
+        value_budget: usize = std.math.maxInt(usize),
+
         pub fn init(
             chunk_bytes: []const u8,
             codec: schema.CompressionCodec,
@@ -284,6 +298,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// Only meaningful under `fast_levels`; with it off, no page is
         /// ever marked all-present and this returns 0 immediately.
         pub fn decodeAllPresent(self: *Self, values: []T) Error!usize {
+            try self.holdScratch();
             var written: usize = 0;
             while (written < values.len) {
                 const remaining_in_page = if (self.hasActivePage())
@@ -307,6 +322,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn decodeInner(self: *Self, values: []T, def_levels_opt: ?[]u32, rep_levels_opt: ?[]u32) Error!usize {
+            try self.holdScratch();
             var written: usize = 0;
             while (written < values.len) {
                 // If we have an active page, drain it first.
@@ -337,6 +353,16 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (!try self.advancePage()) break;
             }
             return written;
+        }
+
+        /// Entry check for every public decode / seek path; a no-op without a scratch or outside safe builds.
+        fn holdScratch(self: *Self) Error!void {
+            if (self.options.scratch) |s| try s.hold(&self.scratch_ticket);
+        }
+
+        fn chargePage(self: *Self, num_values: usize) Error!void {
+            if (num_values > self.value_budget) return error.PageValueCountExceedsChunk;
+            self.value_budget -= num_values;
         }
 
         fn hasActivePage(self: *const Self) bool {
@@ -518,6 +544,22 @@ pub fn ColumnChunkReader(comptime T: type) type {
             }
         }
 
+        /// PLAIN values, shared by the V1 and V2 installers so the two can't disagree on a type's layout.
+        /// FIXED_LEN_BYTE_ARRAY (`type_length > 0`) has no per-value length prefix, so it must not go through the
+        /// length-prefixed BYTE_ARRAY decoder. `bool_count` bounds the bit-packed BOOLEAN stream.
+        fn installPlain(self: *Self, values_bytes: []const u8, bool_count: usize) void {
+            if (T == []const u8 and self.type_length > 0) {
+                self.current_flba = plain.FixedLenByteArrayDecoder.init(values_bytes, self.type_length);
+                return;
+            }
+            self.current_plain = switch (T) {
+                i32, i64, f32, f64 => plain.Decoder(T).init(values_bytes),
+                []const u8 => plain.ByteArrayDecoder.init(values_bytes),
+                bool => plain.BooleanDecoder.init(values_bytes, bool_count),
+                else => unreachable,
+            };
+        }
+
         /// RLE-encoded BOOLEAN values. The values region opens with a 4-byte
         /// little-endian length prefix (the RLE stream's byte length), in both
         /// V1 and V2 data pages, followed by the bit-width-1 hybrid stream.
@@ -542,6 +584,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// Reposition the page reader to the page at `absolute_offset`, then advance
         /// and install its decoder.
         pub fn seekAndInstallPage(self: *Self, absolute_offset: i64, chunk_file_offset: i64) !bool {
+            try self.holdScratch();
             self.resetPageState();
             try self.pages.seekToPage(absolute_offset, chunk_file_offset);
             return self.advancePage();
@@ -557,6 +600,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             absolute_offset: i64,
             chunk_file_offset: i64,
         ) !bool {
+            try self.holdScratch();
             self.resetPageState();
             try self.pages.seekToPage(absolute_offset, chunk_file_offset);
             while (try self.pages.next()) |pg| {
@@ -576,6 +620,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// loop to the next page. Returns true iff a data-page decoder
         /// was set up for use; false if the chunk is exhausted.
         pub fn advancePage(self: *Self) Error!bool {
+            try self.holdScratch();
             while (try self.pages.next()) |pg| {
                 switch (pg.header.type) {
                     .DICTIONARY_PAGE => {
@@ -621,6 +666,15 @@ pub fn ColumnChunkReader(comptime T: type) type {
             // BOOLEAN never gets dictionary encoding in practice — the
             // type's tiny cardinality makes it pointless. Reject early.
             if (T == bool) return error.UnsupportedEncoding;
+            // Dictionary entries are PLAIN, so each takes at least its fixed width (a BYTE_ARRAY its 4-byte length).
+            // Checked before the count sizes an allocation.
+            const min_entry: usize = switch (T) {
+                i32, f32 => 4,
+                i64, f64 => 8,
+                []const u8 => if (self.type_length > 0) self.type_length else 4,
+                else => unreachable,
+            };
+            if (num > pg.bytes.len / min_entry) return error.DictionaryLargerThanPage;
             const buf = try self.dictBuffer(num);
             switch (T) {
                 i32, i64, f32, f64 => {
@@ -648,6 +702,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const dph = pg.header.data_page_header orelse return error.UnexpectedPage;
 
             const num_values: usize = @intCast(dph.num_values);
+            try self.chargePage(num_values);
             self.current_def_levels = null;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -702,19 +757,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_delta_ba = null;
 
             switch (dph.encoding) {
-                .PLAIN => {
-                    if (T == []const u8 and self.type_length > 0) {
-                        // FIXED_LEN_BYTE_ARRAY: no length prefixes, fixed-width slices.
-                        self.current_flba = plain.FixedLenByteArrayDecoder.init(values_bytes, self.type_length);
-                    } else {
-                        self.current_plain = switch (T) {
-                            i32, i64, f32, f64 => plain.Decoder(T).init(values_bytes),
-                            []const u8 => plain.ByteArrayDecoder.init(values_bytes),
-                            bool => plain.BooleanDecoder.init(values_bytes, @intCast(dph.num_values)),
-                            else => unreachable,
-                        };
-                    }
-                },
+                .PLAIN => self.installPlain(values_bytes, num_values),
                 .PLAIN_DICTIONARY, .RLE_DICTIONARY => {
                     if (T == bool) return error.UnsupportedEncoding;
                     const dict = self.dictionary orelse return error.DictionaryMissing;
@@ -726,11 +769,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_LENGTH_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    self.current_delta_len_ba = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
+                    self.current_delta_len_ba = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values) catch return error.UnexpectedPage;
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    self.current_delta_ba = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
+                    self.current_delta_ba = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values) catch return error.UnexpectedPage;
                 },
                 .RLE => try self.installRleBoolean(values_bytes),
                 .BYTE_STREAM_SPLIT => try self.installByteStreamSplit(values_bytes),
@@ -751,6 +794,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const dph = pg.header.data_page_header_v2 orelse return error.UnexpectedPage;
 
             const num_values: usize = @intCast(dph.num_values);
+            try self.chargePage(num_values);
             self.current_def_levels = null;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -812,18 +856,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_delta_ba = null;
 
             switch (dph.encoding) {
-                .PLAIN => {
-                    // V2 with nullable cols: PLAIN body holds only the
-                    // non-null values. PlainDecoder is a stream that
-                    // consumes only what's asked for; the chunk
-                    // reader's spread logic handles the count.
-                    self.current_plain = switch (T) {
-                        i32, i64, f32, f64 => plain.Decoder(T).init(values_bytes),
-                        []const u8 => plain.ByteArrayDecoder.init(values_bytes),
-                        bool => plain.BooleanDecoder.init(values_bytes, @intCast(dph.num_values - dph.num_nulls)),
-                        else => unreachable,
-                    };
-                },
+                // V2 with nullable cols: PLAIN body holds only the non-null values. The decoders are streams that
+                // consume only what's asked for; the chunk reader's spread logic handles the count.
+                .PLAIN => self.installPlain(values_bytes, @intCast(dph.num_values - dph.num_nulls)),
                 .PLAIN_DICTIONARY, .RLE_DICTIONARY => {
                     if (T == bool) return error.UnsupportedEncoding;
                     const dict = self.dictionary orelse return error.DictionaryMissing;
@@ -835,11 +870,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_LENGTH_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    self.current_delta_len_ba = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
+                    self.current_delta_len_ba = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values) catch return error.UnexpectedPage;
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    self.current_delta_ba = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena) catch return error.UnexpectedPage;
+                    self.current_delta_ba = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values) catch return error.UnexpectedPage;
                 },
                 .RLE => try self.installRleBoolean(values_bytes),
                 .BYTE_STREAM_SPLIT => try self.installByteStreamSplit(values_bytes),
@@ -855,6 +890,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
 const testing = std.testing;
 const metadata = @import("metadata.zig");
+const thrift = @import("../thrift.zig");
 
 test "unsplitByteStreamSplit transposes byte-planes back to PLAIN" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
@@ -935,6 +971,204 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
             // installed as a dictionary.
             try testing.expect(reader.dictionary == null);
         }
+    }
+}
+
+/// One uncompressed PLAIN FIXED_LEN_BYTE_ARRAY data page (V1 or V2) holding `values`; a null entry is a null slot.
+/// With `nullable`, def levels are one bit-packed run at bit width 1 (RLE/bit-packed hybrid), which both page
+/// versions share; V1 prefixes them with their u32 length, V2 reports the length in the header.
+fn flbaPageForTest(
+    arena: std.mem.Allocator,
+    v2: bool,
+    width: usize,
+    nullable: bool,
+    values: []const ?[]const u8,
+) ![]u8 {
+    std.debug.assert(values.len <= 8); // a single bit-packed group of def levels
+    var levels_buf: [2]u8 = undefined;
+    var levels_bytes: []const u8 = &.{};
+    var num_nulls: i32 = 0;
+    if (nullable) {
+        var bits: u8 = 0;
+        for (values, 0..) |v, i| {
+            if (v != null) bits |= @as(u8, 1) << @intCast(i) else num_nulls += 1;
+        }
+        levels_buf = .{ (1 << 1) | 1, bits }; // one bit-packed group of 8, then the bits LSB-first
+        levels_bytes = &levels_buf;
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    if (nullable and !v2) {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(levels_bytes.len), .little);
+        try body.appendSlice(arena, &len);
+    }
+    try body.appendSlice(arena, levels_bytes);
+    for (values) |v| if (v) |bytes| {
+        std.debug.assert(bytes.len == width);
+        try body.appendSlice(arena, bytes);
+    };
+
+    const n: i32 = @intCast(values.len);
+    const header = schema.PageHeader{
+        .type = if (v2) .DATA_PAGE_V2 else .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = if (v2) null else .{
+            .num_values = n,
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = if (!v2) null else .{
+            .num_values = n,
+            .num_nulls = num_nulls,
+            .num_rows = n,
+            .encoding = .PLAIN,
+            .definition_levels_byte_length = @intCast(levels_bytes.len),
+            .repetition_levels_byte_length = 0,
+            .is_compressed = false,
+        },
+    };
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    var chunk: std.ArrayList(u8) = .empty;
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, body.items);
+    return chunk.items;
+}
+
+test "PLAIN FIXED_LEN_BYTE_ARRAY decodes the same from V1 and V2 data pages" {
+    // FLBA has no per-value length prefix. A V2 page routed through the length-prefixed BYTE_ARRAY decoder reads
+    // the first value's bytes as a length: a short decode at best, silently wrong slices at worst. Covers the
+    // float16 (2), UUID / fixed binary (16) and an odd width, each REQUIRED and OPTIONAL with real nulls.
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const Case = struct { width: usize, values: []const ?[]const u8 };
+    const cases = [_]Case{
+        .{ .width = 2, .values = &.{ "\x00\x3c", null, "\x00\xc0", "\x00\x38", null } },
+        .{ .width = 16, .values = &.{ "0123456789abcdef", "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f", null, "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4\xf3\xf2\xf1\xf0" } },
+        .{ .width = 3, .values = &.{ null, "abc", "def", null, "ghi", "jkl" } },
+    };
+
+    for (cases) |case| for ([_]bool{ false, true }) |nullable| for ([_]bool{ false, true }) |v2| {
+        var present: std.ArrayList(?[]const u8) = .empty;
+        for (case.values) |v| if (nullable or v != null) try present.append(arena, v);
+        const want = present.items;
+
+        const chunk = try flbaPageForTest(arena, v2, case.width, nullable, want);
+        const levels: schema.Levels = .{ .max_def = if (nullable) 1 else 0, .max_rep = 0 };
+        var reader = ColumnChunkReader([]const u8).init(chunk, .UNCOMPRESSED, levels, arena);
+        reader.type_length = case.width;
+
+        const got = try arena.alloc([]const u8, want.len);
+        const defs = try arena.alloc(u32, want.len);
+        const n = if (nullable) try reader.decodeWithLevels(got, defs) else try reader.decode(got);
+        try testing.expectEqual(want.len, n);
+        for (want, got, 0..) |w, g, i| {
+            if (w) |bytes| {
+                try testing.expectEqualSlices(u8, bytes, g);
+                if (nullable) try testing.expectEqual(@as(u32, 1), defs[i]);
+            } else {
+                try testing.expectEqual(@as(u32, 0), defs[i]);
+                try testing.expectEqual(@as(usize, 0), g.len);
+            }
+        }
+    };
+}
+
+test "a reader whose scratch another reader took over fails instead of decoding overwritten buffers" {
+    // The scratch's level buffer is shared, so reader A resuming after B installed a page would read B's levels as
+    // its own. Safe builds must catch the interleave at A's next entry; handing the scratch to a fresh reader after
+    // one is abandoned mid-chunk is the normal sequential pattern and must keep working.
+    if (!std.debug.runtime_safety) return error.SkipZigTest;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var scratch = DecodeScratch.init(testing.allocator);
+    defer scratch.deinit();
+
+    const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    const chunk_a = try flbaPageForTest(arena, false, 3, true, &.{ "aaa", null, "bbb", "ccc" });
+    const chunk_b = try flbaPageForTest(arena, true, 3, true, &.{ null, null, "zzz", null });
+
+    var values: [4][]const u8 = undefined;
+    var defs: [4]u32 = undefined;
+
+    var a = ColumnChunkReader([]const u8).initWithOptions(chunk_a, .UNCOMPRESSED, levels, arena, .{ .scratch = &scratch });
+    a.type_length = 3;
+    try testing.expectEqual(@as(usize, 2), try a.decodeWithLevels(values[0..2], defs[0..2]));
+
+    var b = ColumnChunkReader([]const u8).initWithOptions(chunk_b, .UNCOMPRESSED, levels, arena, .{ .scratch = &scratch });
+    b.type_length = 3;
+    try testing.expectEqual(@as(usize, 4), try b.decodeWithLevels(&values, &defs));
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 0 }, &defs);
+
+    try testing.expectError(error.DecodeScratchInterleaved, a.decodeWithLevels(values[2..4], defs[2..4]));
+    try testing.expectError(error.DecodeScratchInterleaved, a.advancePage());
+
+    // B is abandoned here; a fresh reader takes the scratch and decodes A's chunk from the start.
+    var c = ColumnChunkReader([]const u8).initWithOptions(chunk_a, .UNCOMPRESSED, levels, arena, .{ .scratch = &scratch });
+    c.type_length = 3;
+    try testing.expectEqual(@as(usize, 4), try c.decodeWithLevels(&values, &defs));
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 1 }, &defs);
+    try testing.expectEqualStrings("ccc", values[3]);
+}
+
+test "malformed-file fixtures decode or fail cleanly instead of trapping" {
+    // Each used to reach a safety trap (undefined behaviour in ReleaseFast). See THIRD_PARTY_NOTICES.md for sources.
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    { // A bit-packed level run near the end of a page, asked for in one call, overran the 1024-byte unpack pad.
+        // pyarrow reads all 21186 values as 0.
+        const bytes = try metadata.readFileSlice("ci/fixtures/parquet/ARROW-GH-43605.parquet", arena);
+        var meta = try metadata.open(arena, bytes);
+        const cm = meta.row_groups.items[0].columns.items[0].meta_data.?;
+        const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+        const chunk = bytes[start..][0..@intCast(cm.total_compressed_size)];
+        const got = try decodeChunkForTest(i32, arena, chunk, cm.codec, meta.getColumnLevels(cm.path_in_schema.items), @intCast(cm.num_values), .{});
+        try testing.expectEqual(@as(usize, 21186), got.values.len);
+        for (got.values, got.defs) |v, d| {
+            try testing.expectEqual(@as(i32, 0), v);
+            try testing.expectEqual(@as(u32, 1), d);
+        }
+    }
+    { // A dictionary page header with a negative value count was cast straight to usize.
+        const bytes = try metadata.readFileSlice("ci/fixtures/parquet/ARROW-RS-GH-6229-DICTHEADER.parquet", arena);
+        var meta = try metadata.open(arena, bytes);
+        const cm = meta.row_groups.items[0].columns.items[1].meta_data.?;
+        const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+        const chunk = bytes[start..][0..@intCast(cm.total_compressed_size)];
+        var reader = ColumnChunkReader([]const u8).init(chunk, cm.codec, meta.getColumnLevels(cm.path_in_schema.items), arena);
+        var values: [25][]const u8 = undefined;
+        var defs: [25]u32 = undefined;
+        try testing.expectError(error.BadPageCount, reader.decodeWithLevels(&values, &defs));
+    }
+}
+
+test "a file whose schema root carries a physical type decodes its columns" {
+    // segmentio/parquet-go types the root as well as giving it children; see tools/gen_typed_root_fixture.py.
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/typed_root.parquet", arena);
+    var meta = try metadata.open(arena, bytes);
+    try testing.expect(meta.schema.items[0].type != null);
+    const cols = meta.row_groups.items[0].columns.items;
+    const want = [_][3]i64{ .{ 1000, 2000, 3000 }, .{ 1999, 2999, 3999 } };
+    for (want, cols[0..2]) |w, col| {
+        const cm = col.meta_data.?;
+        const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+        const chunk = bytes[start..][0..@intCast(cm.total_compressed_size)];
+        const got = try decodeChunkForTest(i64, arena, chunk, cm.codec, meta.getColumnLevels(cm.path_in_schema.items), @intCast(cm.num_values), .{});
+        try testing.expectEqualSlices(i64, &w, got.values);
     }
 }
 

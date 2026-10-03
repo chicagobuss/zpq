@@ -645,7 +645,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 
     // 6. Build kept_arr + fetch_arr + output_specs (same shape as
     //    cli/query.zig:run did — lifted).
-    const num_leaves = meta0.row_groups.items[0].columns.items.len;
+    const num_leaves = metadata.leafCount(meta0);
     const kept_arr = try arena.alloc(bool, num_leaves);
     if (kept_set) |s| @memcpy(kept_arr, s) else @memset(kept_arr, true);
     const fetch_arr = try arena.alloc(bool, num_leaves);
@@ -792,7 +792,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     if (need_encoder) {
         for (output_specs.items) |spec| switch (spec) {
             .passthrough => |ci| {
-                if (ci >= num_leaves) continue;
+                if (ci >= num_leaves or meta0.row_groups.items.len == 0) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
                 if (cm.type == .INT96)
                     return error.INT96ReencodeNotSupported;
@@ -866,7 +866,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         var has_widened_output = false;
         if (select_items == null and filter_opt != null) {
             for (0..num_leaves) |ci| {
-                if (!kept_arr[ci]) continue;
+                if (!kept_arr[ci] or meta0.row_groups.items.len == 0) continue;
                 const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
                 if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem_val| {
                     var e = elem_val;
@@ -1126,8 +1126,8 @@ fn buildSelectSchema(
     for (specs) |spec| {
         switch (spec) {
             .passthrough => |ci| {
-                const cm = meta.row_groups.items[0].columns.items[ci].meta_data orelse return error.SchemaMismatch;
-                const elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaMismatch;
+                const path = try metadata.leafPathSegments(arena, meta, ci) orelse return error.SchemaMismatch;
+                const elem = meta.getColumnSchema(path) orelse return error.SchemaMismatch;
                 var copy = elem;
                 copy.num_children = 0;
                 try out.append(arena, copy);
@@ -1328,7 +1328,7 @@ fn openInputs(
         // Aggregate / --columns / --select narrow this. Filter columns
         // are always added on top.
         const meta0 = &specs[0].meta;
-        const num_leaves = meta0.row_groups.items[0].columns.items.len;
+        const num_leaves = metadata.leafCount(meta0);
         const fetch_arr = try arena.alloc(bool, num_leaves);
         const is_aggregate = args.aggregate != null;
         const has_projection = args.columns != null or args.select != null;
@@ -2541,7 +2541,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     @memset(list_map_cols, false);
     checkNestedListMap(.{ .group = tree0.root }, false, list_map_cols);
 
-    const num_leaves = meta0.row_groups.items[0].columns.items.len;
+    const num_leaves = metadata.leafCount(meta0);
     const kept_arr = try arena.alloc(bool, num_leaves);
     if (kept_set) |s| @memcpy(kept_arr, s) else @memset(kept_arr, true);
     const fetch_arr = try arena.alloc(bool, num_leaves);

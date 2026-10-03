@@ -533,7 +533,7 @@ pub fn runMultiAggregate(
     // 3. fetch_set: union of outer-filter columns + each agg's arg
     //    columns + each agg's per-agg WHERE columns + GROUP BY columns. Same set applies
     //    to every file (schemas match).
-    const num_leaves = meta0.row_groups.items[0].columns.items.len;
+    const num_leaves = metadata.leafCount(meta0);
     const fetch_arr = try arena.alloc(bool, num_leaves);
     @memset(fetch_arr, false);
     if (filter_opt) |f| {
@@ -617,7 +617,8 @@ pub fn runMultiAggregate(
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const requested = if (args.parallelism == 0) cpu_count else args.parallelism;
 
-    var chunks_per_rg = if (total_rgs >= requested) @as(usize, 1) else (requested + total_rgs - 1) / total_rgs;
+    // No row groups (a valid empty file) is `total_rgs == 0`: no work items, and nothing to divide by.
+    var chunks_per_rg = if (total_rgs == 0 or total_rgs >= requested) @as(usize, 1) else (requested + total_rgs - 1) / total_rgs;
     if (group_by_keys != null) {
         chunks_per_rg = 1;
     } else {
@@ -2134,6 +2135,26 @@ test "full match: proven row groups answer like --scan-all" {
     try testing.expectEqual(@as(i128, 1599), res.aggs[1].value.i);
     try testing.expectEqual(@as(i128, 1100), res.aggs[2].value.i);
     try testing.expectEqual(@as(usize, 2), res.row_groups_pruned);
+}
+
+test "a file with no row groups aggregates to the empty answer" {
+    // A valid empty table (pyarrow's ParquetWriter closed without writing). Splitting aggregates across workers
+    // divided by the row-group count, and the leaf count was read from row group 0.
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/no_row_groups.parquet", testing.allocator);
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const inputs = [_]Input{.{ .name = "no_row_groups.parquet", .bytes = bytes }};
+    for ([_]usize{ 1, 4 }) |parallelism| {
+        const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = "a > 1",
+            .aggregate = "count(*) AS n",
+            .parallelism = parallelism,
+        });
+        defer freeGroupResult(res);
+        try testing.expectEqual(@as(i128, 0), res.aggs[0].value.i);
+    }
 }
 
 test "full match: per-row-group decisions on a real footer" {

@@ -22,6 +22,7 @@ const std = @import("std");
 const nowMonoNs = @import("../clock.zig").monoNs;
 
 const spawn_util = @import("spawn.zig");
+const huge_pages = @import("huge_pages.zig");
 const schema = @import("schema.zig");
 const consumer = @import("consumer.zig");
 const metadata = @import("parquet/metadata.zig");
@@ -299,9 +300,15 @@ fn workerRun(w: *Worker) void {
 }
 
 fn workerRunErr(w: *Worker) !void {
-    // One decode arena for the whole run: scanRGForAgg resets it per row group instead of regrowing a fresh one.
-    var rg_decode_arena = std.heap.ArenaAllocator.init(w.gpa);
+    // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
+    // Both it and the scratch are written front to back and reused, the case huge pages pay off for.
+    var thp: huge_pages.HugePageAdvisor = .{ .child = w.gpa };
+    var rg_decode_arena = std.heap.ArenaAllocator.init(thp.allocator());
     defer rg_decode_arena.deinit();
+    var scratch = consumer.DecodeScratch.init(thp.allocator());
+    defer scratch.deinit();
+    var decode_options = w.decode_options;
+    decode_options.scratch = &scratch;
 
     while (true) {
         const idx = w.cursor.fetchAdd(1, .monotonic);
@@ -341,7 +348,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
-                w.decode_options,
+                decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 &[_]expr_agg.Accumulator{},
@@ -359,7 +366,7 @@ fn workerRunErr(w: *Worker) !void {
                 w.filter_opt,
                 w.scan_all,
                 w.trust_stats,
-                w.decode_options,
+                decode_options,
                 item.fetch_arr,
                 sub_agg_calls,
                 item.accumulators,

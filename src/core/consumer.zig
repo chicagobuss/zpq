@@ -44,6 +44,7 @@ const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
+pub const DecodeScratch = column_mod.DecodeScratch;
 
 /// Error set the consumer functions can return. Inferred from the
 /// underlying decoders/encoders/sinks; unioned here for documentation.
@@ -1178,9 +1179,9 @@ pub fn scanRGForAgg(
     if (!any_decode_required) return;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
-    // Reset, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
+    // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
     // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
-    _ = rg_arena_state.reset(.retain_capacity);
+    rewindArena(rg_arena_state);
     const ra = rg_arena_state.allocator();
 
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
@@ -1542,6 +1543,73 @@ pub fn scanRGForAgg(
         }
     }
     timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
+}
+
+/// Make every byte of `arena` reusable while keeping all of its nodes. `reset(.retain_capacity)` instead merges the
+/// nodes into one freshly allocated block, so the second row group a worker decodes lands on new pages (and the old
+/// ones are unmapped mid-scan) before reuse starts at the third. The used nodes go onto the arena's own free list,
+/// which `alloc` already searches before asking the child allocator for more.
+///
+/// Reaches into ArenaAllocator.State (Zig 0.16 layout); the "rewind reuses nodes" test pins the behaviour.
+pub fn rewindArena(arena: *std.heap.ArenaAllocator) void {
+    // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
+    // them in the order this one did and touches the same pages, not a scatter across every node's tail.
+    var reversed = arena.state.free_list;
+    var it = arena.state.used_list;
+    while (it) |node| {
+        it = node.next;
+        node.end_index = 0;
+        node.next = reversed;
+        reversed = node;
+    }
+    arena.state.free_list = reversed;
+    arena.state.used_list = null;
+}
+
+test "rewind reuses nodes: a repeat of the same allocation pattern never reaches the child allocator" {
+    const Counting = struct {
+        child: std.mem.Allocator,
+        allocs: usize = 0,
+        frees: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocs += 1;
+            return self.child.rawAlloc(n, a, ra);
+        }
+        fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.frees += 1;
+            self.child.rawFree(mem, a, ra);
+        }
+    };
+    var counting: Counting = .{ .child = std.testing.allocator };
+    var arena = std.heap.ArenaAllocator.init(counting.allocator());
+    defer arena.deinit();
+
+    // Mixed small and large requests force several nodes, like a row group's metadata plus column buffers.
+    const sizes = [_]usize{ 64, 300_000, 17, 1_200_000, 4096, 800_000, 3 };
+    for (0..3) |round| {
+        rewindArena(&arena);
+        for (sizes) |n| {
+            const buf = try arena.allocator().alloc(u8, n);
+            @memset(buf, @intCast(round));
+        }
+        if (round == 0) {
+            try std.testing.expect(counting.allocs > 1);
+            counting.allocs = 0;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.allocs);
+    try std.testing.expectEqual(@as(usize, 0), counting.frees);
 }
 
 /// `kept_set != null`: per-column copy. Only chunks where

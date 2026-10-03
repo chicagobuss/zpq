@@ -756,6 +756,7 @@ pub fn updateOne(
             values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
         }
     }
+    defer if (values) |v| if (call.arg.? == .col_ref) freeWidened(arena, batch, column_lookup, call.arg.?.col_ref, v);
 
     const sel: *const filter_selection.SelectionVector =
         if (sel_owned) |*s| s else outer_sel;
@@ -864,6 +865,27 @@ fn colRefForAgg(
         // already cleared from `sel` by the present-mask intersection above.)
         .str => raw,
     };
+}
+
+/// Hand back a copy `colRefForAgg` widened (i32/bool -> i64, f32 -> f64) once it has been folded. The per-RG arena
+/// rolls its bump pointer back, so the next aggregate's widen lands on bytes already faulted in instead of fresh
+/// pages. Borrowed (unwidened) columns are left alone. Arena frees only reclaim the newest allocation, so this must
+/// run before anything allocated earlier is freed; out of order it is a harmless no-op.
+fn freeWidened(
+    arena: std.mem.Allocator,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    c: expr_ast.ColRef,
+    values: filter_eval.Batch.Column,
+) void {
+    const pos = column_lookup[c.col_idx] orelse return;
+    const raw_ptr: usize = switch (batch.cols[pos]) {
+        inline else => |x| @intFromPtr(x.values.ptr),
+    };
+    switch (values) {
+        inline .i64, .f64 => |x| if (@intFromPtr(x.values.ptr) != raw_ptr) arena.free(x.values),
+        else => {},
+    }
 }
 
 inline fn columnHasNulls(col: filter_eval.Batch.Column) bool {
@@ -2523,6 +2545,7 @@ pub fn updateOneGrouped(
             values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
         }
     }
+    defer if (values) |v| if (call.arg.? == .col_ref) freeWidened(arena, batch, column_lookup, call.arg.?.col_ref, v);
 
     const sel: *const filter_selection.SelectionVector =
         if (sel_owned) |*s| s else outer_sel;

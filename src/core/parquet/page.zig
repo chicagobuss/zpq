@@ -33,12 +33,61 @@ pub const Page = struct {
     bytes: []const u8,
 };
 
+/// Grow-only decode buffers owned by one worker and reused across pages, column chunks, row groups and files, so a
+/// worker faults its decode working set in once instead of once per page from a fresh arena chunk.
+///
+/// Not thread-safe, and at most one ColumnChunkReader may draw on a scratch at a time. Lifetimes: `page` and the
+/// level buffers are overwritten by the next page; `dict` by the next dictionary page. Only readers whose decoded
+/// values are copies may route page bytes here — `[]const u8` values are slices into the page bytes and would dangle.
+pub const DecodeScratch = struct {
+    gpa: std.mem.Allocator,
+    page: []u8 = &.{},
+    /// Decoded dictionary values for a fixed-width T, viewed as bytes.
+    dict: []align(dict_align) u8 = &.{},
+    def_levels: []u32 = &.{},
+    rep_levels: []u32 = &.{},
+
+    pub const dict_align = 16;
+
+    pub fn init(gpa: std.mem.Allocator) DecodeScratch {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *DecodeScratch) void {
+        self.gpa.free(self.page);
+        self.gpa.free(self.dict);
+        self.gpa.free(self.def_levels);
+        self.gpa.free(self.rep_levels);
+        self.* = undefined;
+    }
+
+    /// First `n` elements of `buf`, regrown (contents discarded) when too short. 1.5x headroom so a run of slightly
+    /// larger pages doesn't trade one buffer of fresh pages for another every time.
+    pub fn ensure(
+        self: *DecodeScratch,
+        comptime T: type,
+        comptime alignment: usize,
+        buf: *[]align(alignment) T,
+        n: usize,
+    ) std.mem.Allocator.Error![]align(alignment) T {
+        if (buf.len < n) {
+            const fresh = try self.gpa.alignedAlloc(T, .fromByteUnits(alignment), @max(n, buf.len + buf.len / 2));
+            self.gpa.free(buf.*);
+            buf.* = fresh;
+        }
+        return buf.*[0..n];
+    }
+};
+
 pub const PageReader = struct {
     /// The full column chunk bytes (compressed pages back-to-back).
     chunk: []const u8,
     pos: usize,
     codec: schema.CompressionCodec,
     arena: std.mem.Allocator,
+    /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
+    /// next `next()`. Null keeps the arena behaviour: page bytes live as long as `arena`.
+    scratch: ?*DecodeScratch = null,
 
     pub fn init(
         chunk: []const u8,
@@ -111,21 +160,14 @@ pub const PageReader = struct {
             else
                 return error.UnexpectedEndOfChunk;
 
-            const out = try self.arena.alloc(u8, usize_);
+            const out = try self.pageBuffer(usize_);
             @memcpy(out[0..rep_len], payload[0..rep_len]);
             @memcpy(out[rep_len..][0..def_len], payload[rep_len..][0..def_len]);
 
             const value_src = payload[rep_len + def_len ..][0..compressed_value_len];
             const values_dst = out[rep_len + def_len ..][0..value_uncompressed_len];
             if (v2.is_compressed and self.codec != .UNCOMPRESSED) {
-                const decompressed = try compression.decompress(
-                    self.arena,
-                    value_src,
-                    self.codec,
-                    value_uncompressed_len,
-                );
-                if (decompressed.len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
-                @memcpy(values_dst, decompressed);
+                try compression.decompressInto(self.arena, value_src, self.codec, values_dst);
             } else {
                 if (compressed_value_len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
                 @memcpy(values_dst, value_src);
@@ -134,8 +176,18 @@ pub const PageReader = struct {
             return .{ .header = header, .bytes = out };
         }
 
-        const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
-        return .{ .header = header, .bytes = decompressed };
+        if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
+            const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
+            return .{ .header = header, .bytes = decompressed };
+        }
+        const out = try self.pageBuffer(usize_);
+        try compression.decompressInto(self.arena, payload, self.codec, out);
+        return .{ .header = header, .bytes = out };
+    }
+
+    fn pageBuffer(self: *PageReader, len: usize) Error![]u8 {
+        if (self.scratch) |s| return s.ensure(u8, 1, &s.page, len);
+        return self.arena.alloc(u8, len);
     }
 
     /// Reposition the reader's cursor to an absolute file offset.

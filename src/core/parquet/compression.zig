@@ -111,33 +111,46 @@ pub fn decompress(
     codec: schema.CompressionCodec,
     uncompressed_size: usize,
 ) Error![]const u8 {
+    if (uncompressed_size == 0) return src[0..0];
+    if (codec == .UNCOMPRESSED) {
+        // Sanity check: header should agree with the slice length.
+        if (src.len != uncompressed_size) return error.SizeMismatch;
+        return src;
+    }
+    const out = try arena.alloc(u8, uncompressed_size);
+    errdefer arena.free(out);
+    try decompressInto(arena, src, codec, out);
+    return out;
+}
+
+/// `decompress` into a caller-owned buffer of exactly the uncompressed size, so callers can reuse one buffer
+/// across pages. UNCOMPRESSED copies. `arena` is only touched for codec working state (the flate window).
+pub fn decompressInto(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    codec: schema.CompressionCodec,
+    out: []u8,
+) Error!void {
     // An empty page (0 values) decompresses to nothing regardless of codec.
     // Several codecs' decoders choke on a zero-length input (snappy reads a
     // varint length header first); short-circuit before dispatch. See
     // datapage_v2_empty_datapage.snappy.parquet.
-    if (uncompressed_size == 0) return src[0..0];
+    if (out.len == 0) return;
 
     switch (codec) {
         .UNCOMPRESSED => {
-            // Sanity check: header should agree with the slice length.
-            if (src.len != uncompressed_size) return error.SizeMismatch;
-            return src;
+            if (src.len != out.len) return error.SizeMismatch;
+            @memcpy(out, src);
         },
         .SNAPPY => {
-            const out = try arena.alloc(u8, uncompressed_size);
-            errdefer arena.free(out);
             const n = snappy.uncompress(src, out) catch return error.DecompressionFailed;
-            if (n != uncompressed_size) return error.SizeMismatch;
-            return out[0..n];
+            if (n != out.len) return error.SizeMismatch;
         },
-        .GZIP => return decompressFlate(arena, src, uncompressed_size, .gzip),
-        .ZSTD => return decompressZstd(arena, src, uncompressed_size),
+        .GZIP => try decompressFlate(arena, src, out, .gzip),
+        .ZSTD => try decompressZstd(src, out),
         .LZ4_RAW => {
-            const out = try arena.alloc(u8, uncompressed_size);
-            errdefer arena.free(out);
             const n = lz4.uncompress(src, out) catch return error.DecompressionFailed;
-            if (n != uncompressed_size) return error.SizeMismatch;
-            return out[0..n];
+            if (n != out.len) return error.SizeMismatch;
         },
         else => return error.UnsupportedCodec,
     }
@@ -146,12 +159,10 @@ pub fn decompress(
 fn decompressFlate(
     arena: std.mem.Allocator,
     src: []const u8,
-    uncompressed_size: usize,
+    out: []u8,
     container: std.compress.flate.Container,
-) Error![]const u8 {
-    const out = try arena.alloc(u8, uncompressed_size);
-    errdefer arena.free(out);
-
+) Error!void {
+    const uncompressed_size = out.len;
     var input = std.Io.Reader.fixed(src);
     // The flate decoder asserts buffer.len >= max_window_len (64 KB).
     // Arena-allocated; lives until the row-group arena resets.
@@ -174,17 +185,9 @@ fn decompressFlate(
         written += n;
     }
     if (written != uncompressed_size) return error.DecompressionFailed;
-    return out;
 }
 
-fn decompressZstd(
-    arena: std.mem.Allocator,
-    src: []const u8,
-    uncompressed_size: usize,
-) Error![]const u8 {
-    const out = try arena.alloc(u8, uncompressed_size);
-    errdefer arena.free(out);
-
+fn decompressZstd(src: []const u8, out: []u8) Error!void {
     // Use libzstd's `ZSTD_decompress` directly. Zig's stdlib zstd
     // decoder is correct but ~10× slower than libzstd on the
     // dict-encoded numeric column-chunks Parquet writers produce —
@@ -198,8 +201,7 @@ fn decompressZstd(
         src.len,
     );
     if (c_zstd.ZSTD_isError(n) != 0) return error.DecompressionFailed;
-    if (n != uncompressed_size) return error.SizeMismatch;
-    return out;
+    if (n != out.len) return error.SizeMismatch;
 }
 
 // ============================================================

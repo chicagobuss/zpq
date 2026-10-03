@@ -85,11 +85,16 @@ fn bitWidthFor(max: u32) u8 {
     return @intCast(32 - @clz(max));
 }
 
+pub const DecodeScratch = page_mod.DecodeScratch;
+
 pub const DecodeOptions = struct {
     /// Skip materialising definition levels for pages whose level stream
     /// proves every value present. Kept on each reader so concurrent queries
     /// can choose independently without process-global mutable state.
     fast_levels: bool = false,
+    /// Reusable per-page buffers (see `DecodeScratch` for the lifetime rules). Must belong to the calling thread: set
+    /// it on a worker-local copy of the options, never on options shared between threads.
+    scratch: ?*DecodeScratch = null,
 };
 
 /// Hardwood's definition-level test, ported: a page has no nulls iff its
@@ -203,8 +208,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
             arena: std.mem.Allocator,
             options: DecodeOptions,
         ) Self {
+            var pages = page_mod.PageReader.init(chunk_bytes, codec, arena);
+            // Byte-array values are slices into the page bytes, so those pages must outlive the reader.
+            if (T != []const u8) pages.scratch = options.scratch;
             return .{
-                .pages = page_mod.PageReader.init(chunk_bytes, codec, arena),
+                .pages = pages,
                 .arena = arena,
                 .levels = levels,
                 .options = options,
@@ -588,13 +596,32 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return false;
         }
 
+        /// Page-lifetime level buffer: `decodePageSlice` copies levels out before the next page is installed.
+        fn levelBuffer(self: *Self, comptime which: enum { def, rep }, n: usize) Error![]u32 {
+            const s = self.options.scratch orelse return self.arena.alloc(u32, n);
+            return s.ensure(u32, @alignOf(u32), if (which == .def) &s.def_levels else &s.rep_levels, n);
+        }
+
+        /// Chunk-lifetime dictionary buffer. Scratch only for fixed-width T, whose decoded values are copies;
+        /// byte-array dictionary entries are handed out as-is and must live in the arena.
+        fn dictBuffer(self: *Self, n: usize) Error![]T {
+            switch (T) {
+                i32, i64, f32, f64 => if (self.options.scratch) |s| {
+                    const bytes = try s.ensure(u8, DecodeScratch.dict_align, &s.dict, n * @sizeOf(T));
+                    return @as([*]T, @ptrCast(bytes.ptr))[0..n];
+                },
+                else => {},
+            }
+            return self.arena.alloc(T, n);
+        }
+
         fn installDictionary(self: *Self, pg: page_mod.Page) Error!void {
             const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
             const num: usize = @intCast(dh.num_values);
             // BOOLEAN never gets dictionary encoding in practice — the
             // type's tiny cardinality makes it pointless. Reject early.
             if (T == bool) return error.UnsupportedEncoding;
-            const buf = try self.arena.alloc(T, num);
+            const buf = try self.dictBuffer(num);
             switch (T) {
                 i32, i64, f32, f64 => {
                     var d = plain.Decoder(T).init(pg.bytes);
@@ -638,7 +665,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (4 + rep_len > values_bytes.len) return error.UnexpectedPage;
 
                 const rep_bytes = values_bytes[4 .. 4 + rep_len];
-                const buf = try self.arena.alloc(u32, num_values);
+                const buf = try self.levelBuffer(.rep, num_values);
                 const bit_width = bitWidthFor(@intCast(self.levels.max_rep));
                 var dec = hybrid_rle.HybridRleDecoder.init(rep_bytes, bit_width);
                 const got = dec.decode(buf) catch return error.UnexpectedPage;
@@ -657,7 +684,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
                     self.current_def_all_present = true;
                 } else {
-                    const buf = try self.arena.alloc(u32, num_values);
+                    const buf = try self.levelBuffer(.def, num_values);
                     var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
                     const got = dec.decode(buf) catch return error.UnexpectedPage;
                     if (got != num_values) return error.DefLevelsMismatch;
@@ -738,7 +765,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (self.levels.max_rep > 0) {
                 if (rep_len == 0) return error.UnexpectedPage;
                 const rep_bytes = pg.bytes[cursor..][0..rep_len];
-                const buf = try self.arena.alloc(u32, num_values);
+                const buf = try self.levelBuffer(.rep, num_values);
                 const bit_width = bitWidthFor(@intCast(self.levels.max_rep));
                 var dec = hybrid_rle.HybridRleDecoder.init(rep_bytes, bit_width);
                 const got = dec.decode(buf) catch return error.UnexpectedPage;
@@ -764,7 +791,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
                     self.current_def_all_present = true;
                 } else {
-                    const buf = try self.arena.alloc(u32, num_values);
+                    const buf = try self.levelBuffer(.def, num_values);
                     var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
                     const got = dec.decode(buf) catch return error.UnexpectedPage;
                     if (got != num_values) return error.DefLevelsMismatch;
@@ -909,6 +936,97 @@ test "chunk-start seek installs a dictionary only when one actually leads the ch
             try testing.expect(reader.dictionary == null);
         }
     }
+}
+
+/// Whole chunk through one reader: values plus def levels (empty when the column is REQUIRED).
+fn decodeChunkForTest(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_values: usize,
+    options: DecodeOptions,
+) !struct { values: []T, defs: []u32 } {
+    var reader = ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, options);
+    const values = try arena.alloc(T, num_values);
+    const defs = try arena.alloc(u32, if (levels.max_def > 0) num_values else 0);
+    var written: usize = 0;
+    while (written < num_values) {
+        const n = if (levels.max_def > 0)
+            try reader.decodeWithLevels(values[written..], defs[written..])
+        else
+            try reader.decode(values[written..]);
+        if (n == 0) break;
+        written += n;
+    }
+    try testing.expectEqual(num_values, written);
+    return .{ .values = values, .defs = defs };
+}
+
+test "scratch-backed decode matches arena decode across chunks sharing one scratch" {
+    // One scratch serves every chunk of every file in turn, the way a scan worker reuses it, so a page, level or
+    // dictionary buffer that leaks state from the previous chunk shows up as a value mismatch. tiny_pages covers
+    // many pages plus dictionaries per chunk, datapage_v2 the V2 in-place decompress, nulls_snappy def levels.
+    const paths = [_][]const u8{
+        "data/parquet-testing/data/alltypes_tiny_pages.parquet",
+        "data/parquet-testing/data/datapage_v2.snappy.parquet",
+        "data/parquet-testing/data/alltypes_plain.snappy.parquet",
+        "data/parquet-testing/data/nulls.snappy.parquet",
+    };
+    var scratch = DecodeScratch.init(testing.allocator);
+    defer scratch.deinit();
+    var checked: usize = 0;
+
+    for (paths) |path| {
+        const file_bytes = readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{path});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(file_bytes);
+        var meta = try metadata.open(testing.allocator, file_bytes);
+        defer meta.deinit(testing.allocator);
+
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |cc| {
+            const cm = cc.meta_data orelse continue;
+            const levels = meta.getColumnLevels(cm.path_in_schema.items);
+            if (levels.max_rep > 0) continue;
+            const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+            const chunk = file_bytes[start..][0..@intCast(cm.total_compressed_size)];
+            const n: usize = @intCast(cm.num_values);
+
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            switch (cm.type) {
+                inline .INT32, .INT64, .FLOAT, .DOUBLE, .BOOLEAN, .BYTE_ARRAY => |pt| {
+                    const T = switch (pt) {
+                        .INT32 => i32,
+                        .INT64 => i64,
+                        .FLOAT => f32,
+                        .DOUBLE => f64,
+                        .BOOLEAN => bool,
+                        .BYTE_ARRAY => []const u8,
+                        else => unreachable,
+                    };
+                    const want = try decodeChunkForTest(T, a, chunk, cm.codec, levels, n, .{});
+                    const got = try decodeChunkForTest(T, a, chunk, cm.codec, levels, n, .{ .scratch = &scratch });
+                    try testing.expectEqualSlices(u32, want.defs, got.defs);
+                    if (T == []const u8) {
+                        for (want.values, got.values) |w, g| try testing.expectEqualStrings(w, g);
+                    } else {
+                        try testing.expectEqualSlices(T, want.values, got.values);
+                    }
+                    checked += 1;
+                },
+                else => {},
+            }
+        };
+    }
+    try testing.expect(checked >= 20);
 }
 
 test "decode int8 column from the bench fixture" {

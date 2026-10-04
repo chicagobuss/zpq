@@ -59,6 +59,11 @@ pub const Error = error{
     NoRegion,
     BadS3Url,
     DnsFailed,
+    /// The endpoint host is an IPv4 address in a spelling other than a canonical dotted quad (`127.1`, `0x7f.0.0.1`,
+    /// `010.0.0.1`), which the resolver and the certificate check would read differently.
+    NonCanonicalIpEndpoint,
+    /// The endpoint host is an IPv6 address; connections are IPv4-only.
+    Ipv6EndpointUnsupported,
     BadResponse,
     SignFailed,
 } || tls.Error || http.Error || std.mem.Allocator.Error;
@@ -100,6 +105,8 @@ pub const Credentials = struct {
     /// `/bucket/key` rather than `bucket.host/key`) and SigV4 signs
     /// against the endpoint's hostname. AWS S3 stays virtual-hosted-
     /// style. Read from `S3_ENDPOINT_URL` env var by `fromEnv`.
+    /// The host may be a DNS name or an IPv4 address written as a dotted
+    /// quad; IPv6 endpoints (`https://[::1]:9000`) are not supported.
     endpoint: ?[]const u8 = null,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
@@ -142,6 +149,10 @@ pub const Credentials = struct {
     /// the input. `http://minio:9000/` -> `minio`.
     pub fn endpointHost(self: Credentials) ?[]const u8 {
         var h = self.endpointAuthority() orelse return null;
+        if (h.len > 0 and h[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, h, ']') orelse return h;
+            return h[1..close];
+        }
         if (std.mem.lastIndexOfScalar(u8, h, ':')) |colon| {
             h = h[0..colon];
         }
@@ -164,7 +175,8 @@ pub const Credentials = struct {
     }
 
     pub fn endpointPort(self: Credentials) u16 {
-        const authority = self.endpointAuthority() orelse return 443;
+        var authority = self.endpointAuthority() orelse return 443;
+        if (std.mem.lastIndexOfScalar(u8, authority, ']')) |close| authority = authority[close + 1 ..];
         if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
             return std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch defaultPort(self.endpointUseTls());
         }
@@ -176,20 +188,33 @@ fn defaultPort(use_tls: bool) u16 {
     return if (use_tls) 443 else 80;
 }
 
+/// Whether requests name `bucket` in the host (virtual-hosted) rather than in the path. Only on AWS, and only for a
+/// bucket without dots: AWS's certificate covers `*.s3.<region>.amazonaws.com`, one label, so `my.bucket.s3...` fails
+/// hostname verification and dotted buckets go path-style, as the AWS SDKs send them.
+pub fn virtualHosted(creds: Credentials, bucket: []const u8) bool {
+    return creds.endpoint == null and std.mem.indexOfScalar(u8, bucket, '.') == null;
+}
+
 /// Construct the request hostname for `bucket` under these creds.
-/// AWS S3: `<bucket>.s3.<region>.amazonaws.com` (virtual-hosted).
+/// AWS S3: `<bucket>.s3.<region>.amazonaws.com` (virtual-hosted), or
+/// `s3.<region>.amazonaws.com` for a dotted bucket (path-style).
 /// Custom endpoint: the endpoint host (path-style; bucket is in the path).
 pub fn hostFor(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
     if (creds.endpointAuthority()) |h| {
         return arena.dupe(u8, h);
     }
-    return std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
+    return awsHost(arena, creds, bucket);
 }
 
 pub fn connectHostFor(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
     if (creds.endpointHost()) |h| {
         return arena.dupe(u8, h);
     }
+    return awsHost(arena, creds, bucket);
+}
+
+fn awsHost(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
+    if (!virtualHosted(creds, bucket)) return std.fmt.allocPrint(arena, "s3.{s}.amazonaws.com", .{creds.region});
     return std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
 }
 
@@ -204,18 +229,24 @@ pub fn useTls(creds: Credentials) bool {
 pub fn poolCriteria(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) !PoolCriteria {
     const host = try hostFor(arena, creds, bucket);
     const connect_host = try connectHostFor(arena, creds, bucket);
-    const addr = try resolveIpv4(arena, connect_host);
-    return .{ .host = host, .addr_v4 = addr, .port = portFor(creds), .use_tls = useTls(creds) };
+    const addrs = try resolveIpv4(arena, connect_host);
+    return .{ .host = host, .addrs = addrs, .port = portFor(creds), .use_tls = useTls(creds) };
 }
 
-pub fn connect(arena: std.mem.Allocator, creds: Credentials, addr_v4: []const u8, host: []const u8) Error!tls.Connection {
-    const port = portFor(creds);
-    if (useTls(creds)) return try tls.Connection.connect(arena, addr_v4, port, host);
-    return try tls.Connection.connectPlain(arena, addr_v4, port);
+/// A one-off connection to `host`, at the first of `addrs` that accepts.
+pub fn connect(
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    addrs: []const tls.Ipv4,
+    host: []const u8,
+) Error!tls.Connection {
+    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds) };
+    if (useTls(creds)) return try tls.Connection.connect(arena, peer, host);
+    return try tls.Connection.connectPlain(arena, peer);
 }
 
-/// Construct the HTTP request path. AWS S3 (virtual-hosted): `/<key>`.
-/// Custom endpoint (path-style): `/<bucket>/<key>`. Both URI-encode the
+/// Construct the HTTP request path. Virtual-hosted: `/<key>`.
+/// Path-style (custom endpoint, dotted bucket): `/<bucket>/<key>`. Both URI-encode the
 /// key per RFC 3986 — both the path component and the SigV4 canonical
 /// URI MUST use this same encoding.
 pub fn pathFor(
@@ -225,7 +256,7 @@ pub fn pathFor(
     key: []const u8,
 ) ![]u8 {
     const encoded_key = try buildEncodedPath(arena, key);
-    if (creds.endpoint == null) return encoded_key;
+    if (virtualHosted(creds, bucket)) return encoded_key;
     // Path-style: prefix with /<bucket>. encoded_key already starts with `/`.
     return std.fmt.allocPrint(arena, "/{s}{s}", .{ bucket, encoded_key });
 }
@@ -265,7 +296,7 @@ pub const Client = struct {
     creds: Credentials,
     bucket: []const u8,
     host: []u8, // owned, in client_arena
-    addr_v4: []const u8, // owned, in client_arena
+    addrs: []const tls.Ipv4, // owned, in client_arena
     conn: ?tls.Connection,
 
     pub fn init(
@@ -275,13 +306,13 @@ pub const Client = struct {
     ) Error!Client {
         const host = try hostFor(client_arena, creds, bucket);
         const connect_host = try connectHostFor(client_arena, creds, bucket);
-        const addr_v4 = try resolveIpv4(client_arena, connect_host);
+        const addrs = try resolveIpv4(client_arena, connect_host);
         return .{
             .client_arena = client_arena,
             .creds = creds,
             .bucket = bucket,
             .host = host,
-            .addr_v4 = addr_v4,
+            .addrs = addrs,
             .conn = null,
         };
     }
@@ -323,7 +354,7 @@ pub const Client = struct {
         range: ?Range,
     ) Error!http.Response {
         if (self.conn == null) {
-            self.conn = try connect(self.client_arena, self.creds, self.addr_v4, self.host);
+            self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
         return try buildAndSend(
             req_arena,
@@ -349,7 +380,7 @@ pub const Client = struct {
         continuation_token: ?[]const u8,
     ) Error!ListPage {
         if (self.conn == null) {
-            self.conn = try connect(self.client_arena, self.creds, self.addr_v4, self.host);
+            self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
         return try sendListV2(
             req_arena,
@@ -422,8 +453,8 @@ pub fn put(
 ) Error!http.Response {
     const host = try hostFor(arena, creds, url.bucket);
     const connect_host = try connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try resolveIpv4(arena, connect_host);
-    var conn = try connect(arena, creds, addr_v4, host);
+    const addrs = try resolveIpv4(arena, connect_host);
+    var conn = try connect(arena, creds, addrs, host);
     defer conn.deinit();
     return try sendPut(arena, &conn, creds, host, url.bucket, url.key, body);
 }
@@ -655,7 +686,8 @@ pub fn fetchJobs(
 
     // 2. Resolve host+addr once per bucket. `Pool(N)` gates in-flight
     // requests globally, but idle TLS sessions are keyed by this criteria.
-    var hosts: std.StringHashMapUnmanaged(struct { host: []const u8, addr: []const u8, port: u16, use_tls: bool }) = .empty;
+    const HostInfo = struct { host: []const u8, addrs: []const tls.Ipv4, port: u16, use_tls: bool };
+    var hosts: std.StringHashMapUnmanaged(HostInfo) = .empty;
     defer hosts.deinit(arena);
     for (split.items) |j| {
         if (hosts.get(j.bucket) != null) continue;
@@ -664,7 +696,7 @@ pub fn fetchJobs(
         const a = try resolveIpv4(arena, connect_host);
         try hosts.put(arena, j.bucket, .{
             .host = h,
-            .addr = a,
+            .addrs = a,
             .port = portFor(creds),
             .use_tls = useTls(creds),
         });
@@ -681,7 +713,7 @@ pub fn fetchJobs(
             .bucket = j.bucket,
             .key = j.key,
             .host = hi.host,
-            .addr_v4 = hi.addr,
+            .addrs = hi.addrs,
             .port = hi.port,
             .use_tls = hi.use_tls,
             .range = j.range,
@@ -746,7 +778,7 @@ const FetchCtx = struct {
     bucket: []const u8,
     key: []const u8,
     host: []const u8,
-    addr_v4: []const u8,
+    addrs: []const tls.Ipv4,
     port: u16,
     use_tls: bool,
     range: Range,
@@ -761,7 +793,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     defer arena_state.deinit();
     const criteria: PoolCriteria = .{
         .host = ctx.host,
-        .addr_v4 = ctx.addr_v4,
+        .addrs = ctx.addrs,
         .port = ctx.port,
         .use_tls = ctx.use_tls,
     };
@@ -929,9 +961,9 @@ fn sendListV2(
     max_keys: u32,
     continuation_token: ?[]const u8,
 ) Error!ListPage {
-    // Path: virtual-hosted (AWS) is "/"; path-style (R2 / endpoint
-    // override) is "/<bucket>". Same logic as `pathFor` for an empty key.
-    const list_path: []const u8 = if (creds.endpoint == null)
+    // Path: virtual-hosted is "/"; path-style (R2 / endpoint override /
+    // dotted bucket) is "/<bucket>". Same logic as `pathFor` for an empty key.
+    const list_path: []const u8 = if (virtualHosted(creds, bucket))
         "/"
     else
         try std.fmt.allocPrint(req_arena, "/{s}", .{bucket});
@@ -1043,6 +1075,28 @@ fn extractTag(haystack: []const u8, open_tag: []const u8, close_tag: []const u8)
 // `std.c.addrinfo` follows each OS's layout: Darwin orders `canonname` before `addr`, the reverse of Linux.
 const c = std.c;
 
+/// Refuse a host the resolver would take as an address but the TLS layer would not: an IPv6 literal (connections are
+/// IPv4-only), or IPv4 in a legacy spelling getaddrinfo still accepts (`127.1`, `0x7f.0.0.1`, `2130706433`, `010.0.0.1`
+/// in octal). Such a host would be dialled as one address and verified as a DNS name, so it is an error, not something
+/// to normalise behind the user's back.
+fn checkNumericHost(host_z: [:0]const u8) Error!void {
+    if (std.mem.indexOfScalar(u8, host_z, ':') != null) {
+        std.log.warn("S3 endpoint host '{s}' is an IPv6 address; IPv6 endpoints are not supported", .{host_z});
+        return error.Ipv6EndpointUnsupported;
+    }
+    var hints = std.mem.zeroes(c.addrinfo);
+    hints.family = c.AF.INET;
+    hints.socktype = c.SOCK.STREAM;
+    hints.flags = .{ .NUMERICHOST = true };
+    var result: ?*c.addrinfo = null;
+    if (@backingInt(c.getaddrinfo(host_z, null, &hints, &result)) != 0) return; // not numeric: a DNS name
+    if (result) |r| c.freeaddrinfo(r);
+    _ = std.Io.net.Ip4Address.parse(host_z, 0) catch {
+        std.log.warn("S3 endpoint host '{s}' is a non-canonical IPv4 address; write it as a dotted quad", .{host_z});
+        return error.NonCanonicalIpEndpoint;
+    };
+}
+
 /// URI-encode an S3 key for use in path + SigV4 canonical URI. Both
 /// the HTTP request line and the SigV4 signature canonical-URI must
 /// use the SAME encoding, otherwise S3 returns 403 SignatureDoesNotMatch.
@@ -1071,25 +1125,31 @@ pub fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
+/// Every IPv4 address of `host`, in the resolver's order, without duplicates.
+pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const tls.Ipv4 {
     const host_z = try arena.dupeSentinel(u8, host, 0);
+    try checkNumericHost(host_z);
 
     var hints = std.mem.zeroes(c.addrinfo);
     hints.family = c.AF.INET;
+    hints.socktype = c.SOCK.STREAM;
     var result: ?*c.addrinfo = null;
     const rc = c.getaddrinfo(host_z, null, &hints, &result);
     if (@backingInt(rc) != 0 or result == null) return error.DnsFailed;
     defer c.freeaddrinfo(result.?);
 
-    const sa = result.?.addr orelse return error.DnsFailed;
-    const sin: *align(1) const c.sockaddr.in = @ptrCast(sa);
-    const ip = std.mem.bigToNative(u32, sin.addr);
-    return std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{
-        (ip >> 24) & 0xff,
-        (ip >> 16) & 0xff,
-        (ip >> 8) & 0xff,
-        ip & 0xff,
-    });
+    var addrs: std.ArrayList(tls.Ipv4) = .empty;
+    var it = result;
+    while (it) |ai| : (it = ai.next) {
+        const sa = ai.addr orelse continue;
+        const sin: *align(1) const c.sockaddr.in = @ptrCast(sa);
+        const ip: tls.Ipv4 = @bitCast(sin.addr);
+        for (addrs.items) |seen| {
+            if (std.mem.eql(u8, &seen, &ip)) break;
+        } else try addrs.append(arena, ip);
+    }
+    if (addrs.items.len == 0) return error.DnsFailed;
+    return addrs.items;
 }
 
 // ============================================================
@@ -1108,6 +1168,76 @@ test "parse s3 url rejects malformed" {
     try testing.expectError(error.BadS3Url, Url.parse("https://foo/bar"));
     try testing.expectError(error.BadS3Url, Url.parse("s3://bucket"));
     try testing.expectError(error.BadS3Url, Url.parse("s3:///key"));
+}
+
+test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS's wildcard certificate" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const aws: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-west-2" };
+
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs.example"));
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try connectHostFor(a, aws, "logs.example"));
+    try testing.expectEqualStrings("/logs.example/k%3D1.parquet", try pathFor(a, aws, "logs.example", "k=1.parquet"));
+
+    try testing.expectEqualStrings("logs.s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs"));
+    try testing.expectEqualStrings("/k.parquet", try pathFor(a, aws, "logs", "k.parquet"));
+
+    const r2: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "auto",
+        .endpoint = "https://acct.r2.example:8443",
+    };
+    try testing.expectEqualStrings("acct.r2.example:8443", try hostFor(a, r2, "logs"));
+    try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, r2, "logs", "k.parquet"));
+}
+
+fn endpointCreds(endpoint: []const u8) Credentials {
+    return .{ .access_key = "ak", .secret_key = "sk", .region = "auto", .endpoint = endpoint };
+}
+
+test "an endpoint written as a non-canonical IPv4 address is refused, not quietly reinterpreted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The resolver reads each of these as a number (`010.0.0.1` in octal, as 8.0.0.1), while the certificate check
+    // would take it for a DNS name.
+    for ([_][]const u8{
+        "https://127.1:9000",
+        "https://0x7f.0.0.1:9000",
+        "https://2130706433",
+        "https://010.0.0.1",
+        "https://127.0.0.01:9000",
+    }) |ep| {
+        if (poolCriteria(a, endpointCreds(ep), "bkt")) |_| {
+            std.debug.print("accepted endpoint {s}\n", .{ep});
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.NonCanonicalIpEndpoint, err);
+    }
+    const crit = try poolCriteria(a, endpointCreds("https://127.0.0.1:9"), "bkt");
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &crit.addrs[0]);
+    try testing.expectEqual(@as(u16, 9), crit.port);
+}
+
+test "an IPv6 endpoint is refused as unsupported" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{ "https://[::1]:9000", "https://[::1]", "http://[2001:db8::1]:9000/" }) |ep| {
+        try testing.expectError(error.Ipv6EndpointUnsupported, poolCriteria(a, endpointCreds(ep), "bkt"));
+    }
+    const v6 = endpointCreds("https://[::1]:9");
+    try testing.expectEqualStrings("::1", v6.endpointHost().?);
+    try testing.expectEqual(@as(u16, 9), v6.endpointPort());
+}
+
+test "resolveIpv4 returns every address once" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const one = try resolveIpv4(arena_state.allocator(), "127.0.0.1");
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &one[0]);
 }
 
 test "Range.span formats inclusive byte range" {
@@ -1258,7 +1388,7 @@ test "getViaPool retries a connection that fails its handshake, including the fr
 test "requestViaPool retries a dead reused connection at once only for an idempotent request" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const criteria: PoolCriteria = .{ .host = "h", .addr_v4 = "127.0.0.1", .port = 9, .use_tls = false };
+    const criteria: PoolCriteria = .{ .host = "h", .addrs = &.{.{ 127, 0, 0, 1 }}, .port = 9, .use_tls = false };
     const Post = struct {
         fn send(_: void, a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
             return http.sendRequest(a, conn, .{ .method = .POST, .host = "h", .path = "/k?uploads=", .headers = &.{} });

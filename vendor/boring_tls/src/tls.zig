@@ -65,9 +65,9 @@ pub fn handleSslReadError(ssl: *c.SSL, bytes_read: c_int) !?[]const u8 {
     return switch (ssl_error) {
         c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => null,
         c.SSL_ERROR_ZERO_RETURN => TlsError.TlsConnectionClosed,
+        // A stream that does not decrypt is a network event the caller handles, not a local fault worth an error log.
         else => {
-            std.log.err("SSL_read failed with error: {}", .{ssl_error});
-            logOpenSslError();
+            c.ERR_clear_error();
             return TlsError.TlsReadFailed;
         },
     };

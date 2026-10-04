@@ -173,6 +173,9 @@ aws lambda update-function-configuration \
   }"
 ```
 
+The endpoint host may be a DNS name or an IPv4 dotted quad. IPv6 endpoints (`https://[::1]:9000`) are not
+supported, and legacy IPv4 spellings such as `127.1` or `010.0.0.1` are refused rather than reinterpreted.
+
 ### Single-file aggregate
 
 ```bash

@@ -121,6 +121,26 @@ const Request = struct {
     }
 };
 
+/// Answer a next-invocation poll with `body` framed `Transfer-Encoding: chunked`, as the real runtime API
+/// sends events above a few KiB: 4000-byte chunks, the first carrying a chunk extension.
+fn replyChunkedAndClose(req: *Request, allocator: std.mem.Allocator, headers: []const u8, body: []const u8) !void {
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(allocator);
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n{s}\r\n";
+    try resp.print(allocator, head, .{headers});
+    var off: usize = 0;
+    while (off < body.len) {
+        const n = @min(4000, body.len - off);
+        try resp.print(allocator, "{x}{s}\r\n", .{ n, if (off == 0) ";ext=1" else "" });
+        try resp.appendSlice(allocator, body[off..][0..n]);
+        try resp.appendSlice(allocator, "\r\n");
+        off += n;
+    }
+    try resp.appendSlice(allocator, "0\r\n\r\n");
+    try writeAllFd(req.conn, resp.items);
+    req.deinit();
+}
+
 const ParsedRequest = struct {
     method: []const u8,
     path: []const u8,
@@ -759,6 +779,40 @@ test "lambda rejects malformed requests with a clean error and keeps serving" {
         // Still serving: a well-formed request after all of the above.
         .{ .body = head ++ ",\"aggregate\":\"count(*) AS n\"}", .want = "\"agg\":{\"n\":3}" },
     });
+}
+
+test "lambda answers a ~50 KB event the runtime API sends chunked" {
+    // Events of about 5 KB and up arrive chunked; they used to reach the JSON parser still framed (UnexpectedToken).
+    const a = std.testing.allocator;
+    const fixture_path = "ci/fixtures/parquet/json_escape.parquet";
+    const pad = try a.alloc(u8, 50 * 1024);
+    defer a.free(pad);
+    for (pad, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+    const body = try std.mem.concat(a, u8, &.{
+        "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"aggregate\":\"count(*) AS n\",\"filter\":\"s != '",
+        pad,
+        "'\"}",
+    });
+    defer a.free(body);
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambda(a, endpoint);
+    defer killChild(&child);
+
+    var poll = try server.acceptRequest(a);
+    const headers = "Lambda-Runtime-Aws-Request-Id: req-chunked\r\nContent-Type: application/json\r\n";
+    try replyChunkedAndClose(&poll, a, headers, body);
+    var resp = try server.acceptRequest(a);
+    const ok = std.mem.eql(u8, resp.path, "/2018-06-01/runtime/invocation/req-chunked/response") and
+        std.mem.indexOf(u8, resp.body, "\"agg\":{\"n\":3}") != null;
+    if (!ok) {
+        std.debug.print("[lambda chunked event] {s}: {s}\n", .{ resp.path, resp.body });
+        return error.TestUnexpectedResult;
+    }
+    try resp.replyAndClose(a, 202, "", "");
 }
 
 test "lambda rejects clashing or unknown column names and names the column" {

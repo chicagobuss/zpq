@@ -485,8 +485,8 @@ fn createMultipartUpload(arena: std.mem.Allocator, creds: s3.Credentials, url: s
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addr_v4, host);
+    const addrs = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -537,8 +537,8 @@ fn completeMultipartUpload(
     try body.appendSlice(arena, "</CompleteMultipartUpload>");
 
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addr_v4, host);
+    const addrs = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -568,7 +568,12 @@ fn completeMultipartUpload(
 fn outcomeUnknown(err: anyerror, definite: anyerror) bool {
     if (err == definite) return false;
     return switch (err) {
-        error.DnsFailed, error.SocketFailed, error.ConnectFailed, error.HandshakeFailed => false,
+        error.DnsFailed,
+        error.SocketFailed,
+        error.ConnectFailed,
+        error.HandshakeFailed,
+        error.CertificateRejected,
+        => false,
         else => true,
     };
 }
@@ -600,13 +605,16 @@ const ListedUpload = struct { key: []const u8, upload_id: []const u8, initiated:
 /// ListMultipartUploads with `prefix` = the key; the first page only (up to 1000 uploads under that prefix).
 fn listMultipartUploads(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) ![]const ListedUpload {
     const host = try s3.hostFor(arena, creds, url.bucket);
-    const list_path: []const u8 = if (creds.endpoint == null) "/" else try std.fmt.allocPrint(arena, "/{s}", .{url.bucket});
+    const list_path: []const u8 = if (s3.virtualHosted(creds, url.bucket))
+        "/"
+    else
+        try std.fmt.allocPrint(arena, "/{s}", .{url.bucket});
     const query = try std.fmt.allocPrint(arena, "prefix={s}&uploads=", .{try uriEncodeQueryValue(arena, url.key)});
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ list_path, query });
 
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addr_v4, host);
+    const addrs = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -728,8 +736,8 @@ fn headObject(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) !htt
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addr_v4, host);
+    const addrs = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -756,8 +764,8 @@ fn abortMultipartUpload(
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addr_v4, host);
+    const addrs = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{

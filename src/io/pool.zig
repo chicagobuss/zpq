@@ -41,7 +41,9 @@ pub const AcquireOptions = struct {
 
 pub const Criteria = struct {
     host: []const u8,
-    addr_v4: []const u8,
+    /// The host's addresses. New connections start at each in turn, so a pool spreads over all of them: S3's DNS
+    /// answer names several front ends, and K connections to one of them share its limits.
+    addrs: []const tls.Ipv4,
     port: u16,
     use_tls: bool = true,
 };
@@ -57,7 +59,6 @@ pub fn Pool(comptime N: usize) type {
         pub const Node = struct {
             conn: tls.Connection,
             host: []u8,
-            addr_v4: []u8,
             port: u16,
             use_tls: bool,
             /// `clock.bootNs` when the connection was last released to the idle list.
@@ -102,6 +103,8 @@ pub fn Pool(comptime N: usize) type {
         free_len: usize = 0,
         free_size: usize = 32,
         idle_timeout_ns: i64 = IDLE_TIMEOUT_NS,
+        /// Index into `Criteria.addrs` the next new connection starts at; guarded by `mutex`.
+        next_addr: usize = 0,
 
         stats: Stats = .{},
 
@@ -119,6 +122,7 @@ pub fn Pool(comptime N: usize) type {
                 .free_len = 0,
                 .free_size = 32,
                 .idle_timeout_ns = IDLE_TIMEOUT_NS,
+                .next_addr = 0,
                 .stats = .{},
             };
             self.permits = Io.Queue(usize).init(self.permits_buffer[0..]);
@@ -182,6 +186,8 @@ pub fn Pool(comptime N: usize) type {
             self.stats.acquire_wait_ns +%= @intCast(t_after_permit - t_wait_start);
             self.stats.acquire_lock_ns +%= @intCast(nowMonoNs() - t_lock_start);
             if (reused != null) self.stats.reuses += 1;
+            const first_addr = self.next_addr;
+            if (reused == null) self.next_addr +%= 1;
             self.mutex.unlock(io);
 
             while (expired.popFirst()) |n| self.destroyNode(@alignCast(@fieldParentPtr("pool_node", n)));
@@ -195,27 +201,16 @@ pub fn Pool(comptime N: usize) type {
 
             const host_owned = try self.allocator.dupe(u8, criteria.host);
             errdefer self.allocator.free(host_owned);
-            const addr_owned = try self.allocator.dupe(u8, criteria.addr_v4);
-            errdefer self.allocator.free(addr_owned);
 
+            const peer: tls.Peer = .{ .addrs = criteria.addrs, .first = first_addr, .port = criteria.port };
             const conn = if (criteria.use_tls)
-                try tls.Connection.connect(
-                    self.allocator,
-                    criteria.addr_v4,
-                    criteria.port,
-                    criteria.host,
-                )
+                try tls.Connection.connect(self.allocator, peer, criteria.host)
             else
-                try tls.Connection.connectPlain(
-                    self.allocator,
-                    criteria.addr_v4,
-                    criteria.port,
-                );
+                try tls.Connection.connectPlain(self.allocator, peer);
 
             slot.* = .{
                 .conn = conn,
                 .host = host_owned,
-                .addr_v4 = addr_owned,
                 .port = criteria.port,
                 .use_tls = criteria.use_tls,
                 .pool_node = .{},
@@ -280,7 +275,6 @@ pub fn Pool(comptime N: usize) type {
         fn destroyNode(self: *Self, slot: *Node) void {
             slot.conn.deinit();
             self.allocator.free(slot.host);
-            self.allocator.free(slot.addr_v4);
             self.allocator.destroy(slot);
         }
     };
@@ -363,12 +357,18 @@ const TestListener = struct {
     port: u16,
 
     fn open() !TestListener {
+        return openOn(.{ 127, 0, 0, 1 }, 0);
+    }
+
+    /// Listen on `ip`:`port` (0: any free port). Skips the test where `ip` is not a local address (on macOS only
+    /// 127.0.0.1 is).
+    fn openOn(ip: tls.Ipv4, port: u16) !TestListener {
         const posix = std.posix;
         const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
         const fd: posix.fd_t = @intCast(rc);
         errdefer _ = posix.system.close(fd);
-        var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        var addr: posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) };
         if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
         if (posix.errno(posix.system.listen(fd, 16)) != .SUCCESS) return error.SkipZigTest;
         var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
@@ -381,7 +381,7 @@ const TestListener = struct {
     }
 
     fn criteria(self: TestListener) Criteria {
-        return .{ .host = "127.0.0.1", .addr_v4 = "127.0.0.1", .port = self.port, .use_tls = false };
+        return .{ .host = "127.0.0.1", .addrs = &.{.{ 127, 0, 0, 1 }}, .port = self.port, .use_tls = false };
     }
 };
 
@@ -455,6 +455,51 @@ test "acquire evicts expired connections of every host and opens fresh on reques
     try testing.expectEqual(@as(u64, 1), s.stale_retries);
     try testing.expectEqual(@as(u64, 1), s.backoff_retries);
     try testing.expectEqual(@as(u64, 1), s.discards);
+}
+
+/// The address `conn` is connected to.
+fn peerOf(conn: *const tls.Connection) !tls.Ipv4 {
+    var addr: std.posix.sockaddr.in = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getpeername(conn.fd, @ptrCast(&addr), &len)) != .SUCCESS)
+        return error.TestUnexpectedResult;
+    return @bitCast(addr.addr);
+}
+
+test "new connections take the host's addresses in turn, and skip one that refuses" {
+    const io = testing.io;
+    const a = try TestListener.open();
+    defer a.close();
+    const b = try TestListener.openOn(.{ 127, 0, 0, 2 }, a.port);
+    defer b.close();
+    const c = try TestListener.openOn(.{ 127, 0, 0, 3 }, a.port);
+    defer c.close();
+    const addrs = [_]tls.Ipv4{ .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 }, .{ 127, 0, 0, 3 } };
+
+    var p: Pool(8) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+
+    // Six connections held at once: two on each address.
+    var held: [6]Pool(8).Handle = undefined;
+    var per_addr: [3]usize = @splat(0);
+    for (&held) |*h| {
+        h.* = try p.acquire(io, .{ .host = "s3.test", .addrs = &addrs, .port = a.port, .use_tls = false }, .{});
+        const peer = try peerOf(h.conn);
+        per_addr[peer[3] - 1] += 1;
+    }
+    for (held) |h| p.release(io, h);
+    try testing.expectEqualSlices(usize, &.{ 2, 2, 2 }, &per_addr);
+
+    // 127.0.0.4 has no listener on this port: a connection starting there moves on to the next address.
+    const flaky = [_]tls.Ipv4{ .{ 127, 0, 0, 4 }, .{ 127, 0, 0, 1 } };
+    for (0..2) |_| {
+        const h = try p.acquire(io, .{ .host = "s3.test", .addrs = &flaky, .port = a.port, .use_tls = false }, .{
+            .fresh = true,
+        });
+        defer p.release(io, h);
+        try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &(try peerOf(h.conn)));
+    }
 }
 
 test "Pool init fills permit queue with N permits" {

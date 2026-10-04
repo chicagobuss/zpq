@@ -140,11 +140,11 @@ pub const FakeS3 = struct {
                 if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |i| break i;
                 if (!readMore(self.allocator, fd, &buf)) return;
             };
-            const head = buf.items[0..head_end];
-            const body_len = contentLength(head);
+            const body_len = contentLength(buf.items[0..head_end]);
             while (buf.items.len < head_end + 4 + body_len) if (!readMore(self.allocator, fd, &buf)) return;
+            // Sliced only now: reading the body may have moved `buf`.
             const request = buf.items[0 .. head_end + 4 + body_len];
-            const keep = self.handle(fd, head, request[head_end + 4 ..]) catch false;
+            const keep = self.handle(fd, request[0..head_end], request[head_end + 4 ..]) catch false;
             if (!keep) {
                 // Reset rather than close: the client sees ECONNRESET or EOF with no response byte.
                 const linger: extern struct { on: c_int, secs: c_int } = .{ .on = 1, .secs = 0 };

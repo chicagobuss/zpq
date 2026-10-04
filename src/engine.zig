@@ -49,6 +49,7 @@ const tls = @import("io/tls.zig");
 const http = @import("io/http.zig");
 const sigv4 = @import("io/sigv4.zig");
 const multipart_sink = @import("io/multipart_sink.zig");
+const pool_mod = @import("io/pool.zig");
 const coalescer = @import("io/coalescer.zig");
 const work_cursor = @import("io/work_cursor.zig");
 const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
@@ -65,6 +66,11 @@ const COALESCE_GAP: u64 = 64 * 1024;
 
 pub const POOL_SIZE: usize = 8;
 pub const TAIL_SIZE: u64 = 64 * 1024;
+
+/// Permits for an S3 output's part uploads, apart from the input reads' so neither waits for the other, over the same
+/// pool so uploads reuse the connections reads leave idle. As many as uploads had while they shared the read permits.
+pub const OUTPUT_POOL_SIZE: usize = s3.MAX_PARTS;
+pub const OutputLane = pool_mod.Lane(s3.Pool(POOL_SIZE), OUTPUT_POOL_SIZE);
 
 /// Zig's 16 MiB default makes short-lived worker creation expensive, but this is deliberately not tuned to the minimum:
 /// a real fetch descends into BoringSSL and libc `getaddrinfo`/NSS, whose stack use nothing here bounds.
@@ -182,6 +188,13 @@ pub const PoolRegistry = struct {
         creds: s3.Credentials,
         bucket: []const u8,
     ) anyerror!*s3.Pool(POOL_SIZE),
+    /// Upload permits over the pool `ensure_for_bucket` returns for `bucket`.
+    ensure_output: *const fn (
+        ctx: *anyopaque,
+        gpa: std.mem.Allocator,
+        creds: s3.Credentials,
+        bucket: []const u8,
+    ) anyerror!*OutputLane,
 };
 
 pub const QueryResult = union(enum) {
@@ -344,8 +357,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
 const PAR1: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
 // ── Windowed parallel re-encode (Io.Group.async + sliding window) ─────
-// Producers decode+filter+encode whole row groups concurrently, bounded by the
-// Io's `async_limit`; a single in-order writer drains their buffers to the
+// Producers decode+filter+encode whole row groups concurrently, bounded by a
+// CPU budget; a single in-order writer drains their buffers to the
 // sink, rebasing each row group's file offsets. A sliding window (an
 // Io.Semaphore of W permits) caps how many encoded row groups may be in flight
 // at once, so peak memory = W × rg_bytes regardless of total output size. W is
@@ -450,8 +463,11 @@ fn copyRGToBuffer(
 }
 
 const WinCtx = struct {
+    const writer = winWriter;
+    const producer = winProducer;
+
     gpa: std.mem.Allocator,
-    io: std.Io = undefined, // set in runWindowedReencode once the runtime exists
+    io: std.Io = undefined, // set in runWindowed once the runtime exists
     jobs: []const RGJob,
     filter: ?filter_ast.Filter,
     fetch_arr: []const bool,
@@ -462,6 +478,7 @@ const WinCtx = struct {
     slots: []Slot,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
+    cpu: std.Io.Semaphore = .{}, // producers running at once; sized in runWindowed
 
     // Writer-owned (single writer → no races); read back after the fan-out.
     sink: streaming.Sink,
@@ -537,19 +554,38 @@ fn winWriter(w: *WinCtx) void {
     }
 }
 
-/// Drive the fan-out: a dedicated concurrent writer plus async producers,
-/// admitting new producers only as the window has room (back-pressure).
 fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
-    var threaded = std.Io.Threaded.init(w.gpa, .{ .async_limit = .limited(async_budget) });
+    return runWindowed(WinCtx, w, w.jobs.len, async_budget);
+}
+
+/// Drive the fan-out: `Ctx.writer` on a dedicated thread plus `async_budget` concurrent `Ctx.producer` calls on pool
+/// threads, admitting a new producer only once the window has room (memory back-pressure) and a running one has
+/// finished (CPU budget).
+///
+/// The writer's thread counts against the executor's `async_limit`, and a producer submitted at that limit runs inline
+/// on this dispatching thread, which then admits nothing until it finishes, idling every other slot. So the CPU budget
+/// is the `cpu` semaphore, and the limit leaves room for the writer and for as many producers again that have released
+/// their permit but not yet their thread. Exceeding that takes more than `async_budget` producers finishing within the
+/// moment a thread takes to return, which only near-empty row groups do, and their inline run is as short.
+fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) !void {
+    var threaded = std.Io.Threaded.init(w.gpa, .{ .async_limit = .limited(1 + 2 * async_budget) });
     defer threaded.deinit();
     w.io = threaded.io();
+    w.cpu = .{ .permits = async_budget };
 
+    const Run = struct {
+        fn producer(ctx: *Ctx, i: usize) void {
+            defer ctx.cpu.post(ctx.io);
+            Ctx.producer(ctx, i);
+        }
+    };
     var group: std.Io.Group = .init;
     defer group.cancel(w.io);
-    try group.concurrent(w.io, winWriter, .{w}); // dedicated in-order writer
-    for (0..w.jobs.len) |i| {
-        w.window.waitUncancelable(w.io); // back-pressure: block until window has room
-        group.async(w.io, winProducer, .{ w, i });
+    try group.concurrent(w.io, Ctx.writer, .{w});
+    for (0..n_jobs) |i| {
+        w.window.waitUncancelable(w.io);
+        w.cpu.waitUncancelable(w.io);
+        group.async(w.io, Run.producer, .{ w, i });
     }
     try group.await(w.io);
     if (w.first_err) |e| return e;
@@ -832,13 +868,15 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
         const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
         const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
-        const out_pool: *s3.Pool(POOL_SIZE) = if (ctx.pool_registry) |reg|
-            try reg.ensure_for_bucket(reg.ctx, ctx.gpa, creds, out_url.bucket)
+        const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
+            try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
         else blk: {
             const p = try arena.create(s3.Pool(POOL_SIZE));
             try p.init(ctx.gpa);
             out_owned_pool = p;
-            break :blk p;
+            const lane = try arena.create(OutputLane);
+            lane.init(p);
+            break :blk lane;
         };
         mp_sink = multipart_sink.MultipartSink.init(
             ctx.io,
@@ -969,7 +1007,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         for (metas) |*m| try copied_from.append(arena, m);
     } else {
         // Windowed re-encode: one path for all environments. Concurrency is
-        // bounded by the Io's async_limit (Lambda-aware vCPU budget); in-flight
+        // bounded by the CPU budget (quota- and Lambda-aware); in-flight
         // memory is bounded by a sliding window (W row groups). No env gate —
         // the two knobs below size themselves from the environment.
 
@@ -2827,4 +2865,92 @@ test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     const rgs = metas[0].row_groups.items;
     try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
+}
+
+test "windowed fan-out runs budget producers at once on pool threads beside a writer that holds its thread" {
+    const Fake = struct {
+        const Self = @This();
+        const writer = fakeWriter;
+        const producer = fakeProducer;
+
+        gpa: std.mem.Allocator,
+        io: std.Io = undefined,
+        window: *std.Io.Semaphore,
+        cpu: std.Io.Semaphore = .{},
+        first_err: ?anyerror = null,
+        budget: usize,
+        n: usize,
+        dispatcher: std.Thread.Id,
+        finished: std.Io.Semaphore = .{},
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        inline_runs: std.atomic.Value(usize) = .init(0),
+
+        fn fakeWriter(self: *Self) void {
+            for (0..self.n) |_| {
+                self.finished.waitUncancelable(self.io);
+                self.window.post(self.io);
+            }
+        }
+
+        fn fakeProducer(self: *Self, i: usize) void {
+            if (std.Thread.getCurrentId() == self.dispatcher) _ = self.inline_runs.fetchAdd(1, .monotonic);
+            _ = self.peak.fetchMax(self.active.fetchAdd(1, .acq_rel) + 1, .monotonic);
+            // The first `budget` producers wait to see one another: one run inline on the dispatching thread stops
+            // admission, so the rest never start and the wait times out short of the budget. The rest stand for real
+            // row groups, which take far longer than a pool thread does to come back after releasing its permit.
+            if (i < self.budget) {
+                var waited: usize = 0;
+                while (self.active.load(.acquire) < self.budget and waited < 2000) : (waited += 1)
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            } else self.io.sleep(.fromMilliseconds(10), .awake) catch {};
+            _ = self.active.fetchSub(1, .acq_rel);
+            self.finished.post(self.io);
+        }
+    };
+
+    for ([_]usize{ 1, 2, 3 }) |budget| {
+        var window: std.Io.Semaphore = .{ .permits = 4 };
+        var f: Fake = .{
+            .gpa = std.testing.allocator,
+            .window = &window,
+            .budget = budget,
+            .n = 12,
+            .dispatcher = std.Thread.getCurrentId(),
+        };
+        try runWindowed(Fake, &f, f.n, budget);
+        try std.testing.expectEqual(@as(usize, 0), f.inline_runs.load(.monotonic));
+        try std.testing.expectEqual(budget, f.peak.load(.monotonic));
+    }
+}
+
+test "windowed re-encode writes the same bytes at every parallelism" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    // "ts >= 500" prunes two row groups, filters one and byte-copies the rest; "x > 0" re-encodes all eight.
+    for ([_][]const u8{ "ts >= 500", "x > 0" }) |filter| {
+        var first: ?[]u8 = null;
+        defer if (first) |b| gpa.free(b);
+        for ([_]usize{ 1, 2, 3, 8 }) |j| {
+            var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+                .inputs = &.{fixture},
+                .output = out,
+                .filter = filter,
+                .parallelism = j,
+            });
+            defer r.deinit(gpa);
+            const bytes = try metadata.readFileSlice(out, gpa);
+            if (first) |b| {
+                defer gpa.free(bytes);
+                try std.testing.expectEqualSlices(u8, b, bytes);
+            } else first = bytes;
+        }
+    }
 }

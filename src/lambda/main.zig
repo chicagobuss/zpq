@@ -62,8 +62,10 @@ const TARGET_COLUMN: []const u8 = "int8";
 /// container (across invocations): connection pool + metadata cache.
 /// `s3.Pool` keeps a bounded request permit queue plus a host-keyed
 /// idle LRU, so changing input/output buckets no longer tears down
-/// the whole warm pool. `meta_cache` caches parquet footers keyed by
-/// (bucket, key) and revalidates with `If-None-Match`.
+/// the whole warm pool. Output uploads take permits of their own over
+/// the same connections (`engine.OutputLane`). `meta_cache` caches
+/// parquet footers keyed by (bucket, key) and revalidates with
+/// `If-None-Match`.
 const PersistentPool = struct {
     const Inner = s3.Pool(POOL_SIZE);
     /// Capacity tuned for typical Lambda fan-out (up to a few dozen
@@ -75,6 +77,8 @@ const PersistentPool = struct {
     inner: Inner = undefined,
     cache: zpq.io.meta_cache.MetaCache = undefined,
     initialized: bool = false,
+    output: engine.OutputLane = undefined,
+    output_initialized: bool = false,
 
     pub fn ensureForBucket(
         self: *PersistentPool,
@@ -90,6 +94,20 @@ const PersistentPool = struct {
         self.cache.init(gpa, META_CACHE_CAPACITY);
         self.initialized = true;
         return &self.inner;
+    }
+
+    pub fn ensureOutput(
+        self: *PersistentPool,
+        gpa: std.mem.Allocator,
+        creds: s3.Credentials,
+        bucket: []const u8,
+    ) !*engine.OutputLane {
+        const inner = try self.ensureForBucket(gpa, creds, bucket);
+        if (!self.output_initialized) {
+            self.output.init(inner);
+            self.output_initialized = true;
+        }
+        return &self.output;
     }
 
     pub fn metaCache(self: *PersistentPool) ?*zpq.io.meta_cache.MetaCache {
@@ -253,10 +271,20 @@ fn persistentPoolAdapter(pool: *PersistentPool) engine.PoolRegistry {
             const self: *PersistentPool = @ptrCast(@alignCast(ctx));
             return self.ensureForBucket(gpa, creds, bucket);
         }
+        fn ensureOutput(
+            ctx: *anyopaque,
+            gpa: std.mem.Allocator,
+            creds: s3.Credentials,
+            bucket: []const u8,
+        ) anyerror!*engine.OutputLane {
+            const self: *PersistentPool = @ptrCast(@alignCast(ctx));
+            return self.ensureOutput(gpa, creds, bucket);
+        }
     };
     return .{
         .ctx = @ptrCast(pool),
         .ensure_for_bucket = Wrapper.ensure,
+        .ensure_output = Wrapper.ensureOutput,
     };
 }
 
@@ -788,6 +816,26 @@ test "the write response escapes the output name" {
         defer a.free(body);
         try expectStringField(body, "output", name);
     }
+}
+
+test "uploads take permits of their own over the warm pool's connections" {
+    const io = std.testing.io;
+    var pool: PersistentPool = .{};
+    var registry = persistentPoolAdapter(&pool);
+    const creds: s3.Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1" };
+    const out = try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt");
+    defer pool.inner.deinit();
+    defer pool.cache.deinit();
+    try std.testing.expectEqual(&pool.inner, out.pool);
+    const in = try registry.ensure_for_bucket(registry.ctx, std.testing.allocator, creds, "bkt");
+    try std.testing.expectEqual(&pool.inner, in);
+    try std.testing.expectEqual(out, try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt"));
+
+    // Reads holding every input permit leave every upload permit free.
+    var permits: [PersistentPool.Inner.capacity]usize = undefined;
+    try std.testing.expectEqual(permits.len, try pool.inner.permits.get(io, &permits, 0));
+    var up: [engine.OutputLane.capacity]usize = undefined;
+    try std.testing.expectEqual(up.len, try out.permits.get(io, &up, 0));
 }
 
 test "a rejected filter echoes its expression escaped" {

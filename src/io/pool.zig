@@ -150,10 +150,19 @@ pub fn Pool(comptime N: usize) type {
         pub fn acquire(self: *Self, io: Io, criteria: Criteria, opts: AcquireOptions) Error!Handle {
             const t_wait_start = nowMonoNs();
             const permit = try self.permits.getOne(io);
-            const t_after_permit = nowMonoNs();
-
             errdefer self.permits.putOne(io, permit) catch {};
+            return self.acquireWithPermit(io, permit, nowMonoNs() - t_wait_start, criteria, opts);
+        }
 
+        /// `acquire` for a caller holding `permit` from permits of its own (a `Lane`), after waiting `wait_ns` for it.
+        pub fn acquireWithPermit(
+            self: *Self,
+            io: Io,
+            permit: usize,
+            wait_ns: i64,
+            criteria: Criteria,
+            opts: AcquireOptions,
+        ) Error!Handle {
             const t_lock_start = nowMonoNs();
             const now = clock.bootNs();
             self.mutex.lockUncancelable(io);
@@ -183,7 +192,7 @@ pub fn Pool(comptime N: usize) type {
                 reused = slot;
             }
             self.stats.acquires += 1;
-            self.stats.acquire_wait_ns +%= @intCast(t_after_permit - t_wait_start);
+            self.stats.acquire_wait_ns +%= @intCast(wait_ns);
             self.stats.acquire_lock_ns +%= @intCast(nowMonoNs() - t_lock_start);
             if (reused != null) self.stats.reuses += 1;
             const first_addr = self.next_addr;
@@ -225,6 +234,12 @@ pub fn Pool(comptime N: usize) type {
         }
 
         pub fn release(self: *Self, io: Io, h: Handle) void {
+            self.releaseConnection(io, h);
+            self.permits.putOneUncancelable(io, h.permit) catch {};
+        }
+
+        /// `release` without returning the permit, which a `Lane` returns to its own permits.
+        pub fn releaseConnection(self: *Self, io: Io, h: Handle) void {
             var evicted: ?*Node = null;
 
             h.node.idle_since_ns = clock.bootNs();
@@ -240,17 +255,21 @@ pub fn Pool(comptime N: usize) type {
             self.mutex.unlock(io);
 
             if (evicted) |slot| self.destroyNode(slot);
-            self.permits.putOneUncancelable(io, h.permit) catch {};
         }
 
         pub fn discard(self: *Self, io: Io, h: Handle) void {
+            self.discardConnection(io, h);
+            self.permits.putOneUncancelable(io, h.permit) catch {};
+        }
+
+        /// `discard` without returning the permit, which a `Lane` returns to its own permits.
+        pub fn discardConnection(self: *Self, io: Io, h: Handle) void {
             self.mutex.lockUncancelable(io);
             self.used.remove(&h.node.pool_node);
             self.stats.discards += 1;
             self.mutex.unlock(io);
 
             self.destroyNode(h.node);
-            self.permits.putOneUncancelable(io, h.permit) catch {};
         }
 
         /// Count a retry in `stats`; a `.fatal` failure is not one.
@@ -348,6 +367,50 @@ pub const AnyPool = struct {
         self.vtable.noteRetry(self.ptr, io, failure);
     }
 };
+
+/// A share of pool `P`'s connections with `M` permits of its own: requests through it neither wait for the pool's
+/// permits nor hold them, yet take and leave connections in the pool's idle cache. So uploads that follow reads reuse
+/// the sockets the reads just warmed, and neither kind of request can queue behind the other.
+pub fn Lane(comptime P: type, comptime M: usize) type {
+    return struct {
+        const Self = @This();
+
+        pub const capacity: usize = M;
+        pub const Handle = P.Handle;
+
+        pool: *P,
+        permits_buffer: [M]usize,
+        permits: Io.Queue(usize),
+
+        /// Pointer-init only, as `Pool.init`; `pool` must outlive the lane.
+        pub fn init(self: *Self, pool: *P) void {
+            self.* = .{ .pool = pool, .permits_buffer = undefined, .permits = undefined };
+            self.permits = Io.Queue(usize).init(self.permits_buffer[0..]);
+            for (0..M) |i| self.permits.putOneUncancelable(undefined, i) catch unreachable;
+        }
+
+        pub fn acquire(self: *Self, io: Io, criteria: Criteria, opts: AcquireOptions) Error!Handle {
+            const t_wait_start = nowMonoNs();
+            const permit = try self.permits.getOne(io);
+            errdefer self.permits.putOneUncancelable(io, permit) catch {};
+            return self.pool.acquireWithPermit(io, permit, nowMonoNs() - t_wait_start, criteria, opts);
+        }
+
+        pub fn release(self: *Self, io: Io, h: Handle) void {
+            self.pool.releaseConnection(io, h);
+            self.permits.putOneUncancelable(io, h.permit) catch {};
+        }
+
+        pub fn discard(self: *Self, io: Io, h: Handle) void {
+            self.pool.discardConnection(io, h);
+            self.permits.putOneUncancelable(io, h.permit) catch {};
+        }
+
+        pub fn noteRetry(self: *Self, io: Io, failure: retry.Failure) void {
+            self.pool.noteRetry(io, failure);
+        }
+    };
+}
 
 const testing = std.testing;
 
@@ -507,4 +570,39 @@ test "Pool init fills permit queue with N permits" {
     try p.init(testing.allocator);
     defer p.deinit();
     try testing.expectEqual(@as(usize, 4), p.permits.capacity());
+}
+
+test "a lane neither waits for nor holds the pool's permits, and shares its idle connections" {
+    const io = testing.io;
+    const listener = try TestListener.open();
+    defer listener.close();
+
+    var p: Pool(2) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    var lane: Lane(Pool(2), 1) = undefined;
+    lane.init(&p);
+
+    // A read leaves a connection idle; the lane's request reuses it.
+    const read = try p.acquire(io, listener.criteria(), .{});
+    p.release(io, read);
+    const up = try lane.acquire(io, listener.criteria(), .{});
+    try testing.expect(up.reused);
+    try testing.expectEqual(read.node, up.node);
+
+    // While the lane's request runs, every pool permit is still free; with the pool's permits all taken, the lane's
+    // request still gets through.
+    var permits: [2]usize = undefined;
+    try testing.expectEqual(@as(usize, 2), try p.permits.get(io, &permits, 0));
+    lane.release(io, up);
+    const again = try AnyPool.of(&lane).acquire(io, listener.criteria(), .{});
+    try testing.expect(again.reused);
+    AnyPool.of(&lane).discard(io, again);
+    for (permits) |permit| try p.permits.putOne(io, permit);
+
+    try testing.expectEqual(@as(usize, 1), try lane.permits.get(io, &permits, 0));
+    const s = p.snapshotStats();
+    try testing.expectEqual(@as(u64, 3), s.acquires);
+    try testing.expectEqual(@as(u64, 1), s.opens);
+    try testing.expectEqual(@as(u64, 1), s.discards);
 }

@@ -50,7 +50,8 @@ const http = @import("io/http.zig");
 const sigv4 = @import("io/sigv4.zig");
 const multipart_sink = @import("io/multipart_sink.zig");
 const coalescer = @import("io/coalescer.zig");
-const AtomicWorkCursor = @import("io/work_cursor.zig").AtomicWorkCursor;
+const work_cursor = @import("io/work_cursor.zig");
+const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
 const meta_cache_mod = @import("io/meta_cache.zig");
 
 /// Range-coalesce gap. Adjacent column-chunk ranges within a file are
@@ -76,9 +77,9 @@ pub const READ_CONCURRENCY: usize = POOL_SIZE;
 
 /// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
 /// `Io.Group.concurrent` spawns a fresh OS thread whenever every worker is busy — including one parked on a blocking
-/// socket read — so pool permits alone bound sockets only. The limit is a backstop, not a throttle: submissions past it
-/// are rejected with `error.ConcurrencyUnavailable` rather than queued, and both fetch sites submit under `try` inside
-/// a `defer group.cancel`, so exceeding it aborts the query. Raising `READ_CONCURRENCY` must raise this limit too.
+/// socket read — so pool permits alone bound sockets only. Both fetch sites start workers through `startWorkers`, so a
+/// submission at the limit waits rather than failing the query; that matters because the metadata stage's workers can
+/// still count as busy when the column stage starts. `deinit` joins every worker before the caller returns.
 fn readExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(gpa, .{
         .concurrent_limit = .limited(READ_CONCURRENCY),
@@ -1676,16 +1677,14 @@ fn fetchMetaBatch(
     // submission that finds all workers busy, so a thousand-file glob spawned a thousand.
     {
         var shared: AtomicWorkCursor(TaskCtx) = .{ .items = task_ctxs };
-        const Worker = struct {
-            fn run(sh: *AtomicWorkCursor(TaskCtx)) std.Io.Cancelable!void {
-                while (sh.next()) |tc| try Task.run(tc);
+        const Item = struct {
+            fn run(_: void, tc: *TaskCtx) std.Io.Cancelable!void {
+                return Task.run(tc);
             }
         };
         var group: std.Io.Group = .init;
         defer group.cancel(ctx.io);
-        for (0..@min(READ_CONCURRENCY, task_ctxs.len)) |_| {
-            try group.concurrent(ctx.io, Worker.run, .{&shared});
-        }
+        try work_cursor.startWorkers(TaskCtx, &group, ctx.io, &shared, @min(READ_CONCURRENCY, task_ctxs.len), {}, Item.run);
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| return err;

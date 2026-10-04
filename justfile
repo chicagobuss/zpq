@@ -40,13 +40,14 @@ cross-check:
     @echo "[aarch64-macos]" ; zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
     @echo "All targets OK."
 
-# Just the Lambda binary (musl static, ReleaseSmall) for both archs.
+# The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
+# tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small
+# build started no faster and ran up to 2x slower cold, and the ~10 MB zip is
+# far inside the 50 MB direct-upload limit.
 lambda-build:
-    zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall lambda
-    @cp zig-out/bin/zpq-lambda zig-out/zpq-lambda-arm64
-    zig build -Dtarget=x86_64-linux-musl  -Doptimize=ReleaseSmall lambda
-    @cp zig-out/bin/zpq-lambda zig-out/zpq-lambda-x86_64
-    @echo "zig-out/zpq-lambda-{arm64,x86_64} ready."
+    ./tools/serverless/aws.sh build arm64
+    ./tools/serverless/aws.sh build x86_64
+    @echo "zig-out/lambda/zpq-lambda-{arm64,x86_64}.zip ready."
 
 # === Setup ===
 
@@ -214,7 +215,7 @@ microbench fixture="data/benchmark_100mb.parquet" runs="7" warmup="2":
 
 # Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.
 lambda-deploy fn arch="arm64":
-    @./tools/serverless/aws.sh deploy {{fn}} zig-out/zpq-lambda-{{arch}}.zip {{arch}}
+    @./tools/serverless/aws.sh deploy {{fn}} zig-out/lambda/zpq-lambda-{{arch}}.zip {{arch}}
 
 # Invoke a Lambda function with a JSON payload.
 lambda-invoke fn payload="{}":

@@ -13,7 +13,8 @@
 //! keeping HTTP/SigV4 details in one place.
 
 const std = @import("std");
-const nowMonoNs = @import("../clock.zig").monoNs;
+const clock = @import("../clock.zig");
+const nowMonoNs = clock.monoNs;
 const Io = std.Io;
 const s3 = @import("s3.zig");
 const tls = @import("tls.zig");
@@ -40,7 +41,6 @@ fn uriEncodeQueryValue(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-pub const RETRY_LIMIT = 8;
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Smaller parts with high concurrency. The narrow per-part wall
 /// time (8 MB / ~100 MB-per-second effective ≈ 80 ms) lets many
@@ -92,57 +92,11 @@ const PartTaskCtx = struct {
     etag_slot: *EtagSlot,
 };
 
-/// Type-erased pool dispatch. Mirrors the existing `s3.PoolHandle`
-/// pattern in s3.zig so callers can hand us any `*Pool(N)` regardless
-/// of the comptime size.
-const PoolDispatch = struct {
-    ptr: *anyopaque,
-    acquireFn: *const fn (*anyopaque, Io, s3.PoolCriteria) anyerror!s3.PoolHandle,
-    releaseFn: *const fn (*anyopaque, Io, s3.PoolHandle) void,
-    discardFn: *const fn (*anyopaque, Io, s3.PoolHandle) void,
-};
-
-fn acquireFnFor(comptime P: type) *const fn (*anyopaque, Io, s3.PoolCriteria) anyerror!s3.PoolHandle {
-    return struct {
-        fn f(p: *anyopaque, io: Io, criteria: s3.PoolCriteria) anyerror!s3.PoolHandle {
-            const typed: *P = @ptrCast(@alignCast(p));
-            const h = try typed.acquire(io, criteria);
-            return .{ .conn = h.conn, .node = @ptrCast(h.node), .permit = h.permit };
-        }
-    }.f;
-}
-
-fn releaseFnFor(comptime P: type) *const fn (*anyopaque, Io, s3.PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: s3.PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.release(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
-fn discardFnFor(comptime P: type) *const fn (*anyopaque, Io, s3.PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: s3.PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.discard(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
 pub const MultipartSink = struct {
     // S3 session
     creds: s3.Credentials,
     url: s3.Url,
-    pool: PoolDispatch,
+    pool: s3.AnyPool,
     criteria: s3.PoolCriteria,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator, // for ephemeral per-control-message allocs
@@ -183,7 +137,7 @@ pub const MultipartSink = struct {
     await_ns: u64 = 0,
 
     /// `pool_ptr` is `*Pool(N)` for any comptime N — type-erased here
-    /// via `PoolDispatch` so the sink struct itself is not generic.
+    /// via `AnyPool` so the sink struct itself is not generic.
     pub fn init(
         io: Io,
         gpa: std.mem.Allocator,
@@ -194,16 +148,10 @@ pub const MultipartSink = struct {
         criteria: s3.PoolCriteria,
         options: Options,
     ) MultipartSink {
-        const P = @TypeOf(pool_ptr.*);
         return .{
             .creds = creds,
             .url = url,
-            .pool = .{
-                .ptr = @ptrCast(pool_ptr),
-                .acquireFn = acquireFnFor(P),
-                .releaseFn = releaseFnFor(P),
-                .discardFn = discardFnFor(P),
-            },
+            .pool = s3.AnyPool.of(pool_ptr),
             .criteria = criteria,
             .gpa = gpa,
             .arena = arena,
@@ -290,8 +238,12 @@ pub const MultipartSink = struct {
         // Lazy-create on first part. Some outputs are small enough to
         // stay below target_part_size and never flush — they go via
         // single PutObject in close().
-        self.upload_id = createMultipartUpload(self.arena, self.creds, self.url) catch
+        const started_s = clock.realtimeS();
+        self.upload_id = createMultipartUpload(self.arena, self.creds, self.url) catch |err| {
+            // The upload may exist even though its id never reached us; nothing else could ever abort it.
+            if (outcomeUnknown(err, error.CreateMultipartFailed)) abortUploadsStartedSince(self.arena, self.creds, self.url, started_s);
             return error.CreateMultipartFailed;
+        };
     }
 
     /// Common machinery: register the etag slot, reserve the byte
@@ -403,8 +355,15 @@ pub const MultipartSink = struct {
         const t_complete_start = nowMonoNs();
         if (self.upload_id) |id| {
             completeMultipartUpload(self.arena, self.creds, self.url, id, self.etags.items) catch |err| {
-                self.abortOpenUpload();
-                return err;
+                // A Complete whose answer was lost may have committed the object: accept it only if the key now holds
+                // exactly this upload.
+                if (!outcomeUnknown(err, error.CompleteMultipartFailed) or
+                    !completedObjectMatches(self.arena, self.creds, self.url, self.etags.items))
+                {
+                    self.abortOpenUpload();
+                    return err;
+                }
+                std.log.warn("multipart sink: CompleteMultipartUpload answer lost ({s}); the object carries this upload's ETag", .{@errorName(err)});
             };
             self.upload_id = null;
         } else {
@@ -460,46 +419,32 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
     defer ctx.sink.gpa.free(ctx.body);
     defer ctx.sink.releaseBytes(ctx.body_len);
 
-    var attempts: u8 = 0;
-    while (attempts <= RETRY_LIMIT) : (attempts += 1) {
-        if (attempts > 0) try retry.sleepBackoff(io, retry.default_policy, attempts - 1);
-        var arena_state = std.heap.ArenaAllocator.init(ctx.sink.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const dispatch = ctx.sink.pool;
-        const handle = dispatch.acquireFn(dispatch.ptr, io, ctx.sink.criteria) catch {
-            ctx.sink.recordError("pool_acquire_failed");
-            return;
-        };
-
-        const ok = doUploadPart(arena, ctx, handle.conn) catch |err| {
-            dispatch.discardFn(dispatch.ptr, io, handle);
-            switch (err) {
-                error.RecvFailed,
-                error.SendFailed,
-                error.BodyTruncated,
-                error.BadStatusLine,
-                error.RetryableStatus, // throttle (429/5xx) — paced by sleepBackoff above
-                => continue,
-                else => {
-                    ctx.sink.recordError(@errorName(err));
-                    return;
-                },
-            }
-        };
-        if (!ok) {
-            dispatch.discardFn(dispatch.ptr, io, handle);
-            ctx.sink.recordError("part_upload_bad_status");
-            return;
-        }
-        dispatch.releaseFn(dispatch.ptr, io, handle);
+    var arena_state = std.heap.ArenaAllocator.init(ctx.sink.gpa);
+    defer arena_state.deinit();
+    // UploadPart replaces the whole part, so it is idempotent: a dead pooled connection retries at once; connect
+    // failures, throttling (429/5xx) and the rest back off.
+    const resp = s3.requestViaPool(io, ctx.sink.pool, arena_state.allocator(), ctx.sink.criteria, .{ .idempotent = true }, ctx, doUploadPart) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        ctx.sink.recordError(@errorName(err));
         return;
-    }
-    ctx.sink.recordError("part_upload_exhausted_retries");
+    };
+    if (!storePartEtag(ctx, resp)) ctx.sink.recordError("part_upload_bad_status");
 }
 
-fn doUploadPart(arena: std.mem.Allocator, ctx: *PartTaskCtx, conn: *tls.Connection) !bool {
+/// Record the part's ETag from a successful UploadPart response; false for any other answer.
+fn storePartEtag(ctx: *PartTaskCtx, resp: http.Response) bool {
+    if (resp.status != 200) return false;
+    var etag = resp.header("ETag") orelse return false;
+    if (etag.len >= 2 and etag[0] == '"' and etag[etag.len - 1] == '"') {
+        etag = etag[1 .. etag.len - 1];
+    }
+    if (etag.len > ctx.etag_slot.buf.len) return false;
+    @memcpy(ctx.etag_slot.buf[0..etag.len], etag);
+    ctx.etag_slot.len = etag.len;
+    return true;
+}
+
+fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connection) !http.Response {
     const url = ctx.sink.url;
     const creds = ctx.sink.creds;
     const upload_id = ctx.sink.upload_id.?;
@@ -520,24 +465,13 @@ fn doUploadPart(arena: std.mem.Allocator, ctx: *PartTaskCtx, conn: *tls.Connecti
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = try http.sendRequest(arena, conn, .{
+    return http.sendRequest(arena, conn, .{
         .method = .PUT,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = ctx.body,
     });
-    if (retry.retryableStatus(resp.status)) return error.RetryableStatus;
-    if (resp.status != 200) return false;
-
-    var etag = resp.header("ETag") orelse return false;
-    if (etag.len >= 2 and etag[0] == '"' and etag[etag.len - 1] == '"') {
-        etag = etag[1 .. etag.len - 1];
-    }
-    if (etag.len > ctx.etag_slot.buf.len) return false;
-    @memcpy(ctx.etag_slot.buf[0..etag.len], etag);
-    ctx.etag_slot.len = etag.len;
-    return true;
 }
 
 // ============================================================
@@ -629,6 +563,187 @@ fn completeMultipartUpload(
     if (std.mem.indexOf(u8, resp.body, "<Error>") != null) return error.CompleteMultipartFailed;
 }
 
+/// Whether a control-plane request that failed with `err` may still have taken effect on the server. `definite` is
+/// the error for an answer that said no; failing to connect means nothing was sent.
+fn outcomeUnknown(err: anyerror, definite: anyerror) bool {
+    if (err == definite) return false;
+    return switch (err) {
+        error.DnsFailed, error.SocketFailed, error.ConnectFailed, error.HandshakeFailed => false,
+        else => true,
+    };
+}
+
+/// Best effort, after a CreateMultipartUpload whose answer was lost: abort the in-progress uploads of exactly this key
+/// that were initiated no earlier than `since_s` (wall-clock seconds when the Create was sent), which are the ones it
+/// could have started. Older uploads, and uploads of keys this one is only a prefix of, are never touched. An upload
+/// another writer starts on the same key in the same window cannot be told apart from ours; a bucket lifecycle rule
+/// that aborts incomplete multipart uploads is the backstop for anything this misses.
+fn abortUploadsStartedSince(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url, since_s: i64) void {
+    const uploads = listMultipartUploads(arena, creds, url) catch |err| {
+        std.log.warn("multipart sink: could not list uploads to clean up after a lost Create: {s}", .{@errorName(err)});
+        return;
+    };
+    for (uploads) |u| {
+        if (!std.mem.eql(u8, u.key, url.key)) continue;
+        const initiated = parseIso8601Seconds(u.initiated) orelse continue;
+        if (initiated < since_s) continue;
+        abortMultipartUpload(arena, creds, url, u.upload_id) catch |err| {
+            std.log.warn("multipart sink: abort of orphaned upload failed: {s}", .{@errorName(err)});
+            continue;
+        };
+        std.log.warn("multipart sink: aborted an upload orphaned by a lost CreateMultipartUpload", .{});
+    }
+}
+
+const ListedUpload = struct { key: []const u8, upload_id: []const u8, initiated: []const u8 };
+
+/// ListMultipartUploads with `prefix` = the key; the first page only (up to 1000 uploads under that prefix).
+fn listMultipartUploads(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) ![]const ListedUpload {
+    const host = try s3.hostFor(arena, creds, url.bucket);
+    const list_path: []const u8 = if (creds.endpoint == null) "/" else try std.fmt.allocPrint(arena, "/{s}", .{url.bucket});
+    const query = try std.fmt.allocPrint(arena, "prefix={s}&uploads=", .{try uriEncodeQueryValue(arena, url.key)});
+    const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ list_path, query });
+
+    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
+    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addr_v4, host);
+    defer conn.deinit();
+
+    const signer: sigv4.SigV4 = .{
+        .region = creds.region,
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+    const signed = try signer.sign(arena, "GET", host, list_path, query, &.{}, "", .{ .use_unsigned_payload = true });
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+
+    const resp = try http.sendRequest(arena, &conn, .{
+        .method = .GET,
+        .host = host,
+        .path = path_with_query,
+        .headers = headers.items,
+    });
+    if (resp.status != 200) return error.BadResponse;
+    return parseListedUploads(arena, resp.body);
+}
+
+fn parseListedUploads(arena: std.mem.Allocator, xml: []const u8) ![]const ListedUpload {
+    var out: std.ArrayList(ListedUpload) = .empty;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, xml, pos, "<Upload>")) |start| {
+        const end = std.mem.indexOfPos(u8, xml, start, "</Upload>") orelse break;
+        const block = xml[start..end];
+        pos = end;
+        const key = xmlText(block, "Key") orelse continue;
+        const id = xmlText(block, "UploadId") orelse continue;
+        const initiated = xmlText(block, "Initiated") orelse continue;
+        try out.append(arena, .{ .key = try xmlUnescape(arena, key), .upload_id = try xmlUnescape(arena, id), .initiated = initiated });
+    }
+    return out.items;
+}
+
+fn xmlText(block: []const u8, comptime tag: []const u8) ?[]const u8 {
+    const open = "<" ++ tag ++ ">";
+    const start = (std.mem.indexOf(u8, block, open) orelse return null) + open.len;
+    const end = std.mem.indexOfPos(u8, block, start, "</" ++ tag ++ ">") orelse return null;
+    return block[start..end];
+}
+
+fn xmlUnescape(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
+    const entities = [_]struct { []const u8, u8 }{ .{ "&amp;", '&' }, .{ "&lt;", '<' }, .{ "&gt;", '>' }, .{ "&quot;", '"' }, .{ "&apos;", '\'' } };
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    outer: while (i < s.len) {
+        if (s[i] == '&') for (entities) |e| if (std.mem.startsWith(u8, s[i..], e[0])) {
+            try out.append(arena, e[1]);
+            i += e[0].len;
+            continue :outer;
+        };
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// Seconds since the epoch of an S3 timestamp such as `2026-10-03T22:21:03.000Z` (fraction ignored); null when it
+/// does not parse.
+fn parseIso8601Seconds(s: []const u8) ?i64 {
+    if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
+    if (s[s.len - 1] != 'Z') return null;
+    const num = struct {
+        fn f(t: []const u8) ?i64 {
+            return std.fmt.parseInt(i64, t, 10) catch null;
+        }
+    }.f;
+    const y = num(s[0..4]) orelse return null;
+    const m = num(s[5..7]) orelse return null;
+    const d = num(s[8..10]) orelse return null;
+    const hh = num(s[11..13]) orelse return null;
+    const mm = num(s[14..16]) orelse return null;
+    const ss = num(s[17..19]) orelse return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    // Days from 1970-01-01 to y-m-d in the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+/// The ETag S3 gives an object completed from `parts`: the MD5 of the parts' binary MD5s, then `-` and the part count.
+/// Null when a part ETag is not a plain MD5 (SSE-KMS, for one), since then the object's ETag cannot be predicted.
+fn multipartEtag(arena: std.mem.Allocator, parts: []const *EtagSlot) !?[]const u8 {
+    const Md5 = std.crypto.hash.Md5;
+    var h = Md5.init(.{});
+    for (parts) |slot| {
+        const hex = slot.slice();
+        if (hex.len != 2 * Md5.digest_length) return null;
+        var md5: [Md5.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&md5, hex) catch return null;
+        h.update(&md5);
+    }
+    var digest: [Md5.digest_length]u8 = undefined;
+    h.final(&digest);
+    return try std.fmt.allocPrint(arena, "{x}-{d}", .{ &digest, parts.len });
+}
+
+/// After a CompleteMultipartUpload whose answer was lost: whether `url` now holds the object those parts complete to,
+/// by HEAD and ETag. Any doubt (a request failing, an unpredictable ETag) answers no.
+fn completedObjectMatches(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url, parts: []const *EtagSlot) bool {
+    const want = (multipartEtag(arena, parts) catch return false) orelse return false;
+    const resp = headObject(arena, creds, url) catch return false;
+    if (resp.status != 200) return false;
+    var got = resp.header("ETag") orelse return false;
+    if (got.len >= 2 and got[0] == '"' and got[got.len - 1] == '"') got = got[1 .. got.len - 1];
+    return std.ascii.eqlIgnoreCase(got, want);
+}
+
+fn headObject(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) !http.Response {
+    const host = try s3.hostFor(arena, creds, url.bucket);
+    const path = try s3.pathFor(arena, creds, url.bucket, url.key);
+    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
+    const addr_v4 = try s3.resolveIpv4(arena, connect_host);
+    var conn = try s3.connect(arena, creds, addr_v4, host);
+    defer conn.deinit();
+
+    const signer: sigv4.SigV4 = .{
+        .region = creds.region,
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+    const signed = try signer.sign(arena, "HEAD", host, path, null, &.{}, "", .{ .use_unsigned_payload = true });
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+    return http.sendRequest(arena, &conn, .{ .method = .HEAD, .host = host, .path = path, .headers = headers.items });
+}
+
 fn abortMultipartUpload(
     arena: std.mem.Allocator,
     creds: s3.Credentials,
@@ -689,4 +804,131 @@ test "multipart_sink: API is well-typed" {
     _ = completeMultipartUpload;
     _ = abortMultipartUpload;
     _ = singlePut;
+}
+
+const testing = std.testing;
+const fake_s3 = @import("fake_s3.zig");
+
+/// Push `payload` through a sink with 1 KiB parts to `fake`'s bucket `bkt`, then close it.
+fn writeThroughSink(fake: *fake_s3.FakeS3, key: []const u8, payload: []const u8) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: s3.Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+    };
+    const url: s3.Url = .{ .bucket = "bkt", .key = key };
+    var pool: s3.Pool(4) = undefined;
+    try pool.init(testing.allocator);
+    defer pool.deinit();
+    const criteria = try s3.poolCriteria(arena, creds, url.bucket);
+
+    var sink = MultipartSink.init(io, testing.allocator, arena, creds, url, &pool, criteria, .{ .target_part_size = 1024 });
+    defer {
+        if (!sink.isClosed()) sink.abort();
+        sink.deinit();
+    }
+    try sink.push(payload);
+    try sink.close();
+}
+
+const test_payload: [2500]u8 = blk: {
+    @setEvalBranchQuota(10_000);
+    var b: [2500]u8 = undefined;
+    for (&b, 0..) |*c, i| c.* = @truncate(i *% 31 +% 7);
+    break :blk b;
+};
+
+test "a CreateMultipartUpload whose response is lost leaves no upload of ours behind" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    // Not ours: another writer's upload of the same key from an hour ago, and a newer one of a key it is a prefix of.
+    try fake.addUpload("out.parquet", 3600);
+    try fake.addUpload("out.parquet.bak", 0);
+    fake.drop = "POST /bkt/out.parquet?uploads";
+
+    try testing.expectError(error.CreateMultipartFailed, writeThroughSink(&fake, "out.parquet", &test_payload));
+    try testing.expectEqual(@as(u32, 1), fake.dropped);
+    try testing.expectEqual(@as(usize, 1), fake.openUploadsFor("out.parquet"));
+    try testing.expectEqual(@as(usize, 1), fake.openUploadsFor("out.parquet.bak"));
+}
+
+test "a CompleteMultipartUpload whose response is lost succeeds when the object carries the upload's ETag" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.drop = "POST /bkt/out.parquet?uploadId";
+
+    try writeThroughSink(&fake, "out.parquet", &test_payload);
+    try testing.expectEqual(@as(u32, 1), fake.dropped);
+    try testing.expect(fake.object("out.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+test "a lost CompleteMultipartUpload that did not take effect still fails and aborts the upload" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.drop = "POST /bkt/out.parquet?uploadId";
+    fake.apply_dropped = false;
+
+    try testing.expectError(error.ClosedBeforeResponse, writeThroughSink(&fake, "out.parquet", &test_payload));
+    try testing.expect(fake.object("out.parquet") == null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+test "parseIso8601Seconds reads S3 timestamps with and without a fraction" {
+    try testing.expectEqual(@as(?i64, 0), parseIso8601Seconds("1970-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, 1_791_066_063), parseIso8601Seconds("2026-10-03T22:21:03.000Z"));
+    try testing.expectEqual(@as(?i64, 951_782_400), parseIso8601Seconds("2000-02-29T00:00:00.5Z"));
+    try testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-10-03 22:21:03"));
+    try testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-13-03T22:21:03Z"));
+}
+
+test "parseListedUploads decodes keys and keeps every upload's id and start time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const xml = "<ListMultipartUploadsResult><Bucket>b</Bucket>" ++
+        "<Upload><Key>a&amp;b.parquet</Key><UploadId>u1</UploadId><Initiated>2026-10-03T22:21:03.000Z</Initiated></Upload>" ++
+        "<Upload><Key>a&amp;b.parquet.bak</Key><UploadId>u2</UploadId><Initiated>2026-10-03T22:21:04.000Z</Initiated></Upload>" ++
+        "</ListMultipartUploadsResult>";
+    const ups = try parseListedUploads(arena.allocator(), xml);
+    try testing.expectEqual(@as(usize, 2), ups.len);
+    try testing.expectEqualStrings("a&b.parquet", ups[0].key);
+    try testing.expectEqualStrings("u2", ups[1].upload_id);
+    try testing.expectEqualStrings("2026-10-03T22:21:04.000Z", ups[1].initiated);
+}
+
+test "multipartEtag is the MD5 of the part MD5s and the part count, and refuses ETags that are not MD5s" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Md5 = std.crypto.hash.Md5;
+    var a: EtagSlot = .{};
+    var b: EtagSlot = .{};
+    var ma: [16]u8 = undefined;
+    var mb: [16]u8 = undefined;
+    Md5.hash("part one", &ma, .{});
+    Md5.hash("part two", &mb, .{});
+    a.len = (try std.fmt.bufPrint(&a.buf, "{x}", .{&ma})).len;
+    b.len = (try std.fmt.bufPrint(&b.buf, "{x}", .{&mb})).len;
+    var cat: [32]u8 = undefined;
+    @memcpy(cat[0..16], &ma);
+    @memcpy(cat[16..], &mb);
+    var want: [16]u8 = undefined;
+    Md5.hash(&cat, &want, .{});
+    const got = (try multipartEtag(arena.allocator(), &.{ &a, &b })).?;
+    try testing.expectEqualStrings(try std.fmt.allocPrint(arena.allocator(), "{x}-2", .{&want}), got);
+
+    var kms: EtagSlot = .{};
+    kms.len = (try std.fmt.bufPrint(&kms.buf, "not-an-md5", .{})).len;
+    try testing.expectEqual(@as(?[]const u8, null), try multipartEtag(arena.allocator(), &.{ &a, &kms }));
 }

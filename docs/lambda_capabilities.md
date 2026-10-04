@@ -86,6 +86,19 @@ outbound writes (e.g. S3 multipart upload payloads).
 `TCP_FASTOPEN` allowed at the setsockopt level doesn't mean the *kernel* will actually do TFO — that depends on
 `/proc/sys/net/ipv4/tcp_fastopen` which we didn't probe. But the option sets without error.
 
+### Warm containers (measured 2026-10-03, us-west-2, 3008 MB, x86_64 and arm64)
+
+- **Pooled S3 connections do not survive a freeze.** After about 5 s between invocations, every pooled keep-alive
+  connection failed on its next request. `src/io/pool.zig` therefore closes connections idle for more than 4 s instead
+  of reusing them, and a request that still finds a reused connection dead before any response byte is retried at once
+  on a new one (`retry.Failure.stale`). Idle age is measured on CLOCK_BOOTTIME: the pool's `max_idle_ms` matched the
+  caller-side gap (13.5 s median for 13.0 s gaps), so it keeps counting while the sandbox is frozen.
+- **Read throughput depends on how long the sandbox rested.** A 174.8 MB full scan read in about 1.95 s back-to-back
+  (~90 MB/s), 0.93 s after 1 s idle, and 0.34–0.44 s after 2–3 s idle (~450 MB/s), on both architectures, on reused and
+  fresh connections alike, with decode time unchanged. Polars in the same configuration slows the same way (2.25 s
+  back-to-back, 0.53–0.61 s after at least 2 s idle), so this is a per-sandbox network allowance, not engine state.
+  Back-to-back full scans measure that allowance, not the engine.
+
 ## Memory
 
 | Probe | Result |

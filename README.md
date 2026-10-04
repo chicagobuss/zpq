@@ -117,7 +117,7 @@ just build           # ReleaseFast — both binaries
 just test            # unit tests (fixture-dependent ones report as
                      # skipped unless the parquet-testing corpus is present)
 just test-integration  # Lambda integration tests
-just lambda-build    # static musl Lambda binary, both archs
+just lambda-build    # static musl Lambda zips (ReleaseFast), both archs
 just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 ```
 

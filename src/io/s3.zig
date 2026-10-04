@@ -24,7 +24,8 @@
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls.zig");
-const AtomicWorkCursor = @import("work_cursor.zig").AtomicWorkCursor;
+const work_cursor = @import("work_cursor.zig");
+const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
@@ -33,6 +34,7 @@ const retry = @import("retry.zig");
 
 pub const Pool = pool_mod.Pool;
 pub const PoolCriteria = pool_mod.Criteria;
+pub const AnyPool = pool_mod.AnyPool;
 
 /// Maximum concurrent in-flight requests against S3 (multipart parts
 /// or split sub-range fetches). Larger pools increase memory and TLS
@@ -303,7 +305,7 @@ pub const Client = struct {
         return self.sendOnce(req_arena, key, range) catch |err| switch (err) {
             // Stale-connection signals: server closed our idle socket
             // since the last request. Retry once with a fresh conn.
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
+            error.ClosedBeforeResponse, error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
                 if (self.conn) |*conn| {
                     conn.deinit();
                     self.conn = null;
@@ -428,9 +430,8 @@ pub fn put(
 
 /// Same as `get`, but acquires a connection from the supplied pool
 /// instead of opening a fresh one. Caller is responsible for the
-/// pool's host matching `url.bucket`. Retries once on stale-connection
-/// errors (S3 closes idle connections after ~30s; the pool can hand
-/// out a closed slot when warm-container reuse spans that gap).
+/// pool's host matching `url.bucket`. A pooled connection found dead
+/// is retried at once on a new one; server errors back off (`retry`).
 pub fn getViaPool(
     io: Io,
     p: anytype,
@@ -461,53 +462,70 @@ pub fn getViaPoolWithOpts(
     url: Url,
     opts: GetOpts,
 ) !http.Response {
-    var throttled: ?http.Response = null;
-    var attempt: u8 = 0;
-    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
-        if (attempt > 0) try retry.sleepBackoff(io, retry.default_policy, attempt - 1);
-        const resp = getViaPoolOnce(io, p, arena, creds, url, opts) catch |err| switch (err) {
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
-            else => return err,
-        };
-        // Throttle/transient statuses (429/5xx) retry with backoff; any
-        // other status — including 304/403/404 — is a real answer the
-        // caller must interpret.
-        if (retry.retryableStatus(resp.status)) {
-            throttled = resp;
-            continue;
+    const host = try hostFor(arena, creds, url.bucket);
+    const criteria = try poolCriteria(arena, creds, url.bucket);
+    const Get = struct {
+        creds: Credentials,
+        host: []const u8,
+        url: Url,
+        opts: GetOpts,
+        fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return buildAndSend(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.opts);
         }
-        return resp;
-    }
-    // Budget exhausted on throttle: surface the last response so the
-    // caller sees the actual status instead of a connection error.
-    if (throttled) |r| return r;
-    return error.RecvFailed;
+    };
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
-fn getViaPoolOnce(
+pub const RequestOpts = struct {
+    /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the request.
+    idempotent: bool,
+};
+
+/// One request over pooled connections under the retry policy: `send(context, arena, conn)` performs one exchange and
+/// returns the response. Failing to get a connection (connect, TLS handshake) counts as a failed attempt on a fresh
+/// connection and backs off like one; a reused connection found dead retries at once on a new one; a throttle or
+/// server-error status backs off, and is returned as is once the budget runs out. Every other status is the answer.
+pub fn requestViaPool(
     io: Io,
     p: anytype,
     arena: std.mem.Allocator,
-    creds: Credentials,
-    url: Url,
-    opts: GetOpts,
+    criteria: PoolCriteria,
+    opts: RequestOpts,
+    context: anytype,
+    comptime send: fn (@TypeOf(context), std.mem.Allocator, *tls.Connection) anyerror!http.Response,
 ) !http.Response {
-    const host = try hostFor(arena, creds, url.bucket);
-    const criteria = try poolCriteria(arena, creds, url.bucket);
-    const handle = try p.acquire(io, criteria);
-    var released = false;
-    errdefer if (!released) p.discard(io, handle);
-
-    const resp = try buildAndSend(arena, handle.conn, creds, host, url.bucket, url.key, opts);
-
-    p.release(io, handle);
-    released = true;
-    return resp;
+    var throttled: ?http.Response = null;
+    var attempts: retry.Attempts = .{};
+    while (true) {
+        var last_err: anyerror = error.RetryableStatus;
+        const failure: retry.Failure = blk: {
+            const handle = p.acquire(io, criteria, .{ .fresh = attempts.fresh }) catch |err| {
+                last_err = err;
+                break :blk retry.classifyConnect(err);
+            };
+            if (send(context, arena, handle.conn)) |resp| {
+                p.release(io, handle);
+                if (!retry.retryableStatus(resp.status)) return resp;
+                throttled = resp;
+                break :blk .transient;
+            } else |err| {
+                p.discard(io, handle);
+                last_err = err;
+                break :blk retry.classify(err, .{ .idempotent = opts.idempotent, .reused = handle.reused });
+            }
+        };
+        if (failure == .fatal) return last_err;
+        if (!try attempts.retryAfter(io, failure)) {
+            // Out of budget: a throttled answer tells the caller more than the connection error does.
+            if (throttled) |r| return r;
+            return last_err;
+        }
+        p.noteRetry(io, failure);
+    }
 }
 
 /// Same as `put`, but acquires a connection from the supplied pool
-/// instead of opening a fresh one. Retries once on stale-connection
-/// errors (see getViaPool).
+/// instead of opening a fresh one, retrying as `getViaPool` does.
 pub fn putViaPool(
     io: Io,
     p: anytype,
@@ -516,43 +534,18 @@ pub fn putViaPool(
     url: Url,
     body: []const u8,
 ) !http.Response {
-    var throttled: ?http.Response = null;
-    var attempt: u8 = 0;
-    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
-        if (attempt > 0) try retry.sleepBackoff(io, retry.default_policy, attempt - 1);
-        const resp = putViaPoolOnce(io, p, arena, creds, url, body) catch |err| switch (err) {
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
-            else => return err,
-        };
-        if (retry.retryableStatus(resp.status)) {
-            throttled = resp;
-            continue;
-        }
-        return resp;
-    }
-    if (throttled) |r| return r;
-    return error.SendFailed;
-}
-
-fn putViaPoolOnce(
-    io: Io,
-    p: anytype,
-    arena: std.mem.Allocator,
-    creds: Credentials,
-    url: Url,
-    body: []const u8,
-) !http.Response {
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
-    const handle = try p.acquire(io, criteria);
-    var released = false;
-    errdefer if (!released) p.discard(io, handle);
-
-    const resp = try sendPut(arena, handle.conn, creds, host, url.bucket, url.key, body);
-
-    p.release(io, handle);
-    released = true;
-    return resp;
+    const Put = struct {
+        creds: Credentials,
+        host: []const u8,
+        url: Url,
+        body: []const u8,
+        fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return sendPut(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.body);
+        }
+    };
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .creds = creds, .host = host, .url = url, .body = body }, Put.send);
 }
 
 fn sendPut(
@@ -619,9 +612,8 @@ pub const FetchJob = struct {
 /// interchangeably through the same bounded pool, so multi-file scans
 /// share one global connection budget.
 ///
-/// `workers` is clamped to pool capacity and to the job count, but must not exceed the `Io`'s concurrency limit:
-/// `Io.Group.concurrent` rejects submissions past its limit rather than queueing them, and dispatch runs under `try`
-/// inside a `defer group.cancel`, so an over-large count cancels the batch.
+/// `workers` is clamped to pool capacity and to the job count. Workers start through `startWorkers`, so an `Io`
+/// whose concurrency limit is reached delays the batch instead of failing it.
 pub fn fetchJobs(
     io: Io,
     p: anytype, // *Pool(N) for some comptime N
@@ -683,10 +675,7 @@ pub fn fetchJobs(
     for (split.items, 0..) |j, i| {
         const hi = hosts.get(j.bucket).?;
         ctxs[i] = .{
-            .pool_ptr = @ptrCast(p),
-            .pool_acquire_fn = poolAcquireFn(@TypeOf(p.*)),
-            .pool_release_fn = poolReleaseFn(@TypeOf(p.*)),
-            .pool_discard_fn = poolDiscardFn(@TypeOf(p.*)),
+            .pool = AnyPool.of(p),
             .gpa = gpa,
             .creds = creds,
             .bucket = j.bucket,
@@ -705,22 +694,12 @@ pub fn fetchJobs(
     //    busy, and a worker parked on a blocking socket read is busy, so submitting every sub-job at once created far
     //    more threads than permits. Completion order is arbitrary either way — nothing may depend on it.
     var shared: AtomicWorkCursor(FetchCtx) = .{ .items = ctxs };
-    const Worker = struct {
-        fn run(loop_io: Io, sh: *AtomicWorkCursor(FetchCtx)) Io.Cancelable!void {
-            while (sh.next()) |ctx_ptr| try fetchOneTask(loop_io, ctx_ptr);
-        }
-    };
     var group: Io.Group = .init;
     defer group.cancel(io);
     // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
     // rather than as the bad argument it is.
-    const n_workers = if (ctxs.len == 0)
-        0
-    else
-        @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
-    for (0..n_workers) |_| {
-        try group.concurrent(io, Worker.run, .{ io, &shared });
-    }
+    const n_workers = @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
+    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
     try group.await(io);
 
     // 5. Tally + check for failures.
@@ -760,22 +739,8 @@ pub fn fetchManyRanges(
     return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
 }
 
-/// Type-erased view of `Pool(N).Handle` so the dispatch glue between
-/// `fetchManyRanges` / `uploadMultipart` and any `Pool(N)` instance
-/// can speak a common shape regardless of the comptime size.
-pub const PoolHandle = struct {
-    conn: *tls.Connection,
-    node: *anyopaque,
-    permit: usize,
-};
-
 const FetchCtx = struct {
-    /// Type-erased pool handle so this works for any Pool(N).
-    pool_ptr: *anyopaque,
-    pool_acquire_fn: *const fn (*anyopaque, Io, PoolCriteria) anyerror!PoolHandle,
-    pool_release_fn: *const fn (*anyopaque, Io, PoolHandle) void,
-    pool_discard_fn: *const fn (*anyopaque, Io, PoolHandle) void,
-
+    pool: AnyPool,
     gpa: std.mem.Allocator,
     creds: Credentials,
     bucket: []const u8,
@@ -790,89 +755,26 @@ const FetchCtx = struct {
     ok: bool,
 };
 
-fn poolAcquireFn(comptime P: type) *const fn (*anyopaque, Io, PoolCriteria) anyerror!PoolHandle {
-    return struct {
-        fn f(p: *anyopaque, io: Io, criteria: PoolCriteria) anyerror!PoolHandle {
-            const typed: *P = @ptrCast(@alignCast(p));
-            const h = try typed.acquire(io, criteria);
-            return .{ .conn = h.conn, .node = @ptrCast(h.node), .permit = h.permit };
-        }
-    }.f;
-}
-
-fn poolReleaseFn(comptime P: type) *const fn (*anyopaque, Io, PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.release(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
-fn poolDiscardFn(comptime P: type) *const fn (*anyopaque, Io, PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.discard(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
+/// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
-    // Retry up to POOL_SIZE+1 times on stale-connection errors. After
-    // idle, S3 may have closed every pooled connection; each failed
-    // acquire discards-and-recycles its slot to the queue tail, so
-    // worst case we burn through all 8 stale slots before getting a
-    // freshly-init'd one.
-    var attempts: u8 = 0;
-    while (attempts < MAX_PARTS + 1) : (attempts += 1) {
-        if (attempts > 0) try retry.sleepBackoff(io, retry.default_policy, attempts - 1);
-        var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const criteria: PoolCriteria = .{
-            .host = ctx.host,
-            .addr_v4 = ctx.addr_v4,
-            .port = ctx.port,
-            .use_tls = ctx.use_tls,
-        };
-        const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io, criteria) catch return;
-        const ok = doFetch(arena, ctx, handle.conn) catch |err| {
-            ctx.pool_discard_fn(ctx.pool_ptr, io, handle);
-            switch (err) {
-                error.RecvFailed,
-                error.SendFailed,
-                error.BodyTruncated,
-                error.BadStatusLine,
-                error.RetryableStatus,
-                => continue,
-                else => return,
-            }
-        };
-        if (!ok) {
-            ctx.pool_discard_fn(ctx.pool_ptr, io, handle);
-            return;
-        }
-        ctx.ok = true;
-        ctx.pool_release_fn(ctx.pool_ptr, io, handle);
-        return;
-    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const criteria: PoolCriteria = .{
+        .host = ctx.host,
+        .addr_v4 = ctx.addr_v4,
+        .port = ctx.port,
+        .use_tls = ctx.use_tls,
+    };
+    const resp = requestViaPool(io, ctx.pool, arena_state.allocator(), criteria, .{ .idempotent = true }, ctx, doFetch) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+    // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
+    ctx.ok = (resp.status == 206 or resp.status == 200) and resp.body.len == ctx.target.len;
 }
 
-/// Issue one ranged GET on the given connection and copy the bytes
-/// into ctx.into. Returns true on success, false on a non-error
-/// failure (e.g. wrong status, length mismatch). Errors propagate so
-/// the caller can decide whether to retry.
-fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !bool {
+/// Issue one ranged GET on `conn`, streaming the body into `ctx.target`.
+fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !http.Response {
     const path = try pathFor(arena, ctx.creds, ctx.bucket, ctx.key);
 
     var range_buf: [64]u8 = undefined;
@@ -894,21 +796,12 @@ fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !boo
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = try http.sendRequestInto(arena, conn, .{
+    return http.sendRequestInto(arena, conn, .{
         .method = .GET,
         .host = ctx.host,
         .path = path,
         .headers = headers.items,
     }, ctx.target);
-
-    // Throttle/transient statuses retry with backoff via fetchOneTask's
-    // loop; any other unexpected status (or a short body on a good
-    // status) is a hard failure for this fetch.
-    if (retry.retryableStatus(resp.status)) return error.RetryableStatus;
-    if (resp.status != 206 and resp.status != 200) return false;
-
-    if (resp.body.len != ctx.target.len) return false;
-    return true;
 }
 
 /// Parallel multipart upload of `body` to `url`. Thin wrapper around
@@ -1262,4 +1155,132 @@ test "fetchManyRanges instantiates and short-circuits on an empty range list" {
         &.{},
     );
     try testing.expectEqual(@as(u64, 0), n);
+}
+
+/// A stand-in for `Pool(N)` that scripts what each `acquire` yields, for driving the retry loops without a network.
+/// A live connection is a socketpair whose peer has the response already queued; a dead one's peer has shut down
+/// writing, so the request goes out and EOF comes back before any response byte.
+const ScriptedPool = struct {
+    pub const capacity: usize = 1;
+    pub const Step = union(enum) {
+        fail: anyerror,
+        live: struct { reused: bool, response: []const u8 },
+        dead: struct { reused: bool },
+    };
+    pub const Slot = struct { conn: tls.Connection, peer: std.posix.fd_t };
+    pub const Handle = struct { conn: *tls.Connection, node: *Slot, permit: usize, reused: bool };
+
+    steps: []const Step,
+    next: usize = 0,
+    fresh_requests: usize = 0,
+    stale_retries: usize = 0,
+    backoff_retries: usize = 0,
+    slots: [8]Slot = undefined,
+
+    fn deinit(self: *ScriptedPool) void {
+        for (self.slots[0..self.next], self.steps[0..self.next]) |*slot, step| switch (step) {
+            .fail => {},
+            else => {
+                slot.conn.deinit();
+                _ = std.posix.system.close(slot.peer);
+            },
+        };
+    }
+
+    pub fn acquire(self: *ScriptedPool, io: Io, criteria: PoolCriteria, opts: pool_mod.AcquireOptions) !Handle {
+        _ = io;
+        _ = criteria;
+        if (opts.fresh) self.fresh_requests += 1;
+        const i = self.next;
+        self.next += 1;
+        const slot = &self.slots[i];
+        const reused, const response: ?[]const u8 = switch (self.steps[i]) {
+            .fail => |err| return err,
+            .live => |l| .{ l.reused, l.response },
+            .dead => |d| .{ d.reused, null },
+        };
+        var fds: [2]std.posix.fd_t = undefined;
+        if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+            return error.SkipZigTest;
+        slot.* = .{ .conn = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true }, .peer = fds[1] };
+        if (response) |r| {
+            _ = std.posix.system.write(fds[1], r.ptr, r.len);
+        } else {
+            _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+        }
+        return .{ .conn = &slot.conn, .node = slot, .permit = 0, .reused = reused };
+    }
+    pub fn release(_: *ScriptedPool, _: Io, _: Handle) void {}
+    pub fn discard(_: *ScriptedPool, _: Io, _: Handle) void {}
+    pub fn noteRetry(self: *ScriptedPool, _: Io, failure: retry.Failure) void {
+        switch (failure) {
+            .stale => self.stale_retries += 1,
+            .transient => self.backoff_retries += 1,
+            .fatal => {},
+        }
+    }
+};
+
+const test_creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1", .endpoint = "http://127.0.0.1:9" };
+const ok_206 = "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/2\r\n\r\nok";
+
+test "getViaPool retries a connection that fails its handshake, including the fresh one after a stale failure" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const url: Url = .{ .bucket = "b", .key = "k" };
+
+    // Thawed sandbox: the pooled connection is dead, and the fresh one forced after it fails its TLS handshake.
+    var p: ScriptedPool = .{ .steps = &.{
+        .{ .dead = .{ .reused = true } },
+        .{ .fail = error.HandshakeFailed },
+        .{ .live = .{ .reused = false, .response = ok_206 } },
+    } };
+    defer p.deinit();
+    const resp = try getViaPool(testing.io, &p, arena_state.allocator(), test_creds, url, Range.span(0, 1));
+    try testing.expectEqual(@as(u16, 206), resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+    try testing.expectEqual(@as(usize, 1), p.stale_retries);
+    try testing.expectEqual(@as(usize, 1), p.backoff_retries);
+    try testing.expectEqual(@as(usize, 1), p.fresh_requests);
+
+    // A ClientHello that cannot be written surfaces from acquire as SendFailed; it is still only a connect failure.
+    var q: ScriptedPool = .{ .steps = &.{
+        .{ .fail = error.SendFailed },
+        .{ .fail = error.ConnectFailed },
+        .{ .live = .{ .reused = false, .response = ok_206 } },
+    } };
+    defer q.deinit();
+    const put_resp = try putViaPool(testing.io, &q, arena_state.allocator(), test_creds, url, "ok");
+    try testing.expectEqual(@as(u16, 206), put_resp.status);
+    try testing.expectEqual(@as(usize, 2), q.backoff_retries);
+}
+
+test "requestViaPool retries a dead reused connection at once only for an idempotent request" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const criteria: PoolCriteria = .{ .host = "h", .addr_v4 = "127.0.0.1", .port = 9, .use_tls = false };
+    const Post = struct {
+        fn send(_: void, a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return http.sendRequest(a, conn, .{ .method = .POST, .host = "h", .path = "/k?uploads=", .headers = &.{} });
+        }
+    };
+    const steps: []const ScriptedPool.Step = &.{
+        .{ .dead = .{ .reused = true } },
+        .{ .live = .{ .reused = false, .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" } },
+    };
+
+    // POST-style: the dead connection fails the request; nothing is sent again.
+    var post_pool: ScriptedPool = .{ .steps = steps };
+    defer post_pool.deinit();
+    try testing.expectError(error.ClosedBeforeResponse, requestViaPool(testing.io, &post_pool, arena_state.allocator(), criteria, .{ .idempotent = false }, {}, Post.send));
+    try testing.expectEqual(@as(usize, 1), post_pool.next);
+    try testing.expectEqual(@as(usize, 0), post_pool.stale_retries);
+
+    // The same exchange declared idempotent goes again at once on a fresh connection.
+    var put_pool: ScriptedPool = .{ .steps = steps };
+    defer put_pool.deinit();
+    const resp = try requestViaPool(testing.io, &put_pool, arena_state.allocator(), criteria, .{ .idempotent = true }, {}, Post.send);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqual(@as(usize, 1), put_pool.stale_retries);
+    try testing.expectEqual(@as(usize, 1), put_pool.fresh_requests);
 }

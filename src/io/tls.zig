@@ -24,6 +24,8 @@ pub const Error = error{
     HandshakeFailed,
     SendFailed,
     RecvFailed,
+    /// The peer reset or aborted the connection (ECONNRESET, ECONNABORTED, ETIMEDOUT on a read).
+    ConnectionReset,
     Closed,
 } || std.mem.Allocator.Error;
 
@@ -117,7 +119,7 @@ pub const Connection = struct {
 
     /// Read up to `dest.len` plaintext bytes. Returns 0 on clean EOF.
     pub fn recv(self: *Connection, dest: []u8) Error!usize {
-        if (self.plain) return readSome(self.fd, dest) catch return error.RecvFailed;
+        if (self.plain) return readSome(self.fd, dest) catch |err| return recvError(err);
 
         // Drain anything we previously buffered.
         if (self.pending.items.len > 0) {
@@ -126,7 +128,7 @@ pub const Connection = struct {
         // Otherwise pull from the socket and decrypt.
         var rx_buf: [16 * 1024]u8 = undefined;
         while (true) {
-            const n = readSome(self.fd, &rx_buf) catch return error.RecvFailed;
+            const n = readSome(self.fd, &rx_buf) catch |err| return recvError(err);
             if (n == 0) return 0; // socket closed
             if (self.tls.processIncoming(rx_buf[0..n], null) catch null) |plain| {
                 if (plain.len > 0) {
@@ -200,8 +202,18 @@ fn writeAll(fd: posix.fd_t, buf: []const u8) Error!void {
     }
 }
 
-fn readSome(fd: posix.fd_t, buf: []u8) error{ReadFailed}!usize {
+fn readSome(fd: posix.fd_t, buf: []u8) error{ ReadFailed, ConnectionReset }!usize {
     const r = posix.system.read(fd, buf.ptr, buf.len);
-    if (posix.errno(r) != .SUCCESS) return error.ReadFailed;
-    return @intCast(r);
+    return switch (posix.errno(r)) {
+        .SUCCESS => @intCast(r),
+        .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
+        else => error.ReadFailed,
+    };
+}
+
+fn recvError(err: error{ ReadFailed, ConnectionReset }) Error {
+    return switch (err) {
+        error.ConnectionReset => error.ConnectionReset,
+        error.ReadFailed => error.RecvFailed,
+    };
 }

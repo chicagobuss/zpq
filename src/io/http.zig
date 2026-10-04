@@ -19,6 +19,10 @@ const tls = @import("tls.zig");
 
 pub const Error = error{
     SendFailed,
+    /// The peer closed or reset the connection before sending any of the response: on a pooled keep-alive connection,
+    /// the mark of one the server dropped while it sat idle. Distinct from `RecvFailed`/`BodyTruncated`, which mean the
+    /// response had started.
+    ClosedBeforeResponse,
     RecvFailed,
     BadStatusLine,
     BadHeader,
@@ -76,7 +80,7 @@ pub fn sendRequest(
 ) Error!Response {
     try sendRequestBytes(arena, conn, req);
 
-    return try drainResponse(arena, conn);
+    return try drainResponse(arena, conn, req.method == .HEAD);
 }
 
 /// Send a request and stream the response body directly into `target`.
@@ -147,7 +151,8 @@ fn buildRequestHead(arena: std.mem.Allocator, req: Request, buf: *std.ArrayList(
 
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 
-fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response {
+/// `head_only`: the response to a HEAD, whose Content-Length describes a body that is never sent.
+fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: bool) Error!Response {
     // Read until \r\n\r\n appears, then keep reading the body.
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(arena);
@@ -159,7 +164,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
 
     while (true) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) break;
         try stream.appendSlice(arena, tmp[0..n]);
         if (headers_end == null) {
@@ -176,7 +181,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
                 // check the no-CL/no-chunked path falls through to
                 // "read until conn closes," which on a keep-alive
                 // connection hangs until the TCP idle timeout fires.
-                if (status) |s| if (statusIsBodyless(s)) {
+                if (status) |s| if (head_only or statusIsBodyless(s)) {
                     return .{
                         .status = s,
                         .headers = try parseHeaders(arena, stream.items[0..i]),
@@ -235,7 +240,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     var headers_end: ?usize = null;
     while (headers_end == null) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) return error.BodyTruncated;
         try stream.appendSlice(arena, tmp[0..n]);
         if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
@@ -260,7 +265,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
 
     while (written < content_length) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, he + 4 + written);
         if (n == 0) return error.BodyTruncated;
         const take = @min(n, content_length - written);
         @memcpy(target[written..][0..take], tmp[0..take]);
@@ -268,6 +273,18 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     }
 
     return .{ .status = status, .headers = headers, .body = target[0..written] };
+}
+
+/// `conn.recv` for a response of which `received` bytes have arrived. The peer closing (EOF, which is also how a TLS
+/// close_notify ends) or resetting the connection before the first byte is `error.ClosedBeforeResponse`; a reset later
+/// is `error.RecvFailed`. Every other error, local ones such as running out of memory included, passes through.
+fn recvResponseBytes(conn: *tls.Connection, dest: []u8, received: usize) Error!usize {
+    const n = conn.recv(dest) catch |err| switch (err) {
+        error.ConnectionReset => return if (received == 0) error.ClosedBeforeResponse else error.RecvFailed,
+        else => return err,
+    };
+    if (n == 0 and received == 0) return error.ClosedBeforeResponse;
+    return n;
 }
 
 fn parseTransferEncodingChunked(headers_bytes: []const u8) bool {
@@ -443,4 +460,80 @@ test "buildRequestHead emits headers without copying body" {
     try testing.expect(std.mem.indexOf(u8, head.items, "Content-Length: 7\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, head.items, "\r\n\r\n"));
     try testing.expect(std.mem.indexOf(u8, head.items, "payload") == null);
+}
+
+test "a connection closed before any response byte is told apart from a truncated response" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var target: [16]u8 = undefined;
+
+    // A response that starts and stops short is truncated...
+    const partial = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n\r\nabc";
+    _ = std.posix.system.write(fds[1], partial.ptr, partial.len);
+    _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+    try testing.expectError(error.BodyTruncated, drainResponseInto(arena.allocator(), &conn, &target));
+    // ...while EOF with nothing received is a connection the peer had already closed.
+    try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+    try testing.expectError(error.ClosedBeforeResponse, drainResponse(arena.allocator(), &conn, false));
+}
+
+test "only a closed or reset connection counts as closed before the response; local read errors propagate" {
+    const posix = std.posix;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var target: [16]u8 = undefined;
+
+    // A peer that resets the connection before answering.
+    {
+        const ls = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        if (posix.errno(ls) != .SUCCESS) return error.SkipZigTest;
+        const lfd: posix.fd_t = @intCast(ls);
+        defer _ = posix.system.close(lfd);
+        var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+        _ = posix.system.listen(lfd, 1);
+        _ = posix.system.getsockname(lfd, @ptrCast(&addr), &len);
+        var conn = try tls.Connection.connectPlain(testing.allocator, "127.0.0.1", std.mem.bigToNative(u16, addr.port));
+        defer conn.deinit();
+        const peer: posix.fd_t = @intCast(posix.system.accept(lfd, null, null));
+        const linger: extern struct { on: c_int, secs: c_int } = .{ .on = 1, .secs = 0 };
+        _ = posix.system.setsockopt(peer, posix.SOL.SOCKET, posix.SO.LINGER, @ptrCast(&linger), @sizeOf(@TypeOf(linger)));
+        _ = posix.system.close(peer);
+        try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+    }
+
+    // A read that fails for a local reason (here: the descriptor is a directory) is not a dropped connection.
+    {
+        const rc = posix.system.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(posix.mode_t, 0));
+        if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        var conn: tls.Connection = .{ .fd = @intCast(rc), .tls = undefined, .allocator = testing.allocator, .plain = true };
+        defer conn.deinit();
+        try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target));
+        try testing.expectError(error.RecvFailed, drainResponse(arena.allocator(), &conn, false));
+    }
+}
+
+test "a HEAD response ends at its headers whatever Content-Length says" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The peer stays open: reading for the advertised body would block forever.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nETag: \"abc-2\"\r\n\r\n";
+    _ = std.posix.system.write(fds[1], resp.ptr, resp.len);
+    const r = try sendRequest(arena.allocator(), &conn, .{ .method = .HEAD, .host = "h", .path = "/k", .headers = &.{} });
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("\"abc-2\"", r.header("etag").?);
+    try testing.expectEqual(@as(usize, 0), r.body.len);
 }

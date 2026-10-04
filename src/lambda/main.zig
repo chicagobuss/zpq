@@ -95,6 +95,15 @@ const PersistentPool = struct {
     pub fn metaCache(self: *PersistentPool) ?*zpq.io.meta_cache.MetaCache {
         return if (self.initialized) &self.cache else null;
     }
+
+    /// Zero the connection-pool counters, so `stats` after a query reports that invocation alone.
+    pub fn resetStats(self: *PersistentPool) void {
+        if (self.initialized) self.inner.resetStats();
+    }
+
+    pub fn stats(self: *PersistentPool) Inner.Stats {
+        return if (self.initialized) self.inner.snapshotStats() else .{};
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -270,6 +279,7 @@ fn lambdaAggregate(
     var args = qa;
     args.diag = &diag;
 
+    pool.resetStats();
     var result = engine.runQuery(.{
         .gpa = allocator,
         .env = env,
@@ -315,13 +325,15 @@ fn lambdaAggregate(
         }
         try w.writeByte('}');
     }
-    try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}", .{
+    try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}},", .{
         total_ms,
         ar.timings.read_ns / std.time.ns_per_ms,
         ar.timings.core.decode_ns / std.time.ns_per_ms,
         ar.timings.core.eval_ns / std.time.ns_per_ms,
         ar.timings.core.encode_ns / std.time.ns_per_ms,
     });
+    try writePoolStats(w, pool.stats());
+    try w.writeByte('}');
     return aw.toOwnedSlice();
 }
 
@@ -343,6 +355,7 @@ fn lambdaWrite(
     var args = qa;
     args.diag = &diag;
 
+    pool.resetStats();
     const result = engine.runQuery(.{
         .gpa = allocator,
         .env = env,
@@ -354,24 +367,13 @@ fn lambdaWrite(
     const output_url_str = qa.output.?; // dispatch only routes here when set
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
-    // Pool stats — captured *after* the engine call so they reflect
-    // the work this invocation did. Cold TLS handshakes vs warm
-    // reuse, plus aggregate acquire-wait time, are the first signals
-    // we want when warm-path latency changes. The pool is one
-    // bounded multi-host LRU for the whole warm container. Reset after
-    // read so each invocation reports its own deltas.
-    const stats: s3.Pool(POOL_SIZE).Stats = if (pool.initialized) blk: {
-        const s = pool.inner.snapshotStats();
-        pool.inner.resetStats();
-        break :blk s;
-    } else .{};
     const cache_stats: zpq.io.meta_cache.Stats = if (pool.metaCache()) |c| blk: {
         const s = c.snapshotStats();
         // Don't reset — cache stats are cumulative for the warm
         // container. Inserts/evictions are LRU-state, not per-invoke.
         break :blk s;
     } else .{};
-    return writeResponse(allocator, output_url_str, wr, total_ms, stats, cache_stats);
+    return writeResponse(allocator, output_url_str, wr, total_ms, pool.stats(), cache_stats);
 }
 
 /// The success response for a write. `output` is the caller's URL or path, so it is escaped like every other string
@@ -390,7 +392,7 @@ fn writeResponse(
     try w.writeAll("{\"ok\":true,\"output\":");
     try engine.writeJsonQuoted(w, output);
     try w.print(
-        ",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}}}}",
+        ",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}},",
         .{
             wr.files_in,
             wr.rows_in,
@@ -409,12 +411,6 @@ fn writeResponse(
             wr.timings.footer_ns / std.time.ns_per_ms,
             wr.timings.mp_await_ns / std.time.ns_per_ms,
             wr.timings.mp_complete_ns / std.time.ns_per_ms,
-            stats.acquires,
-            stats.opens,
-            stats.reuses,
-            stats.discards,
-            stats.acquire_wait_ns / std.time.ns_per_ms,
-            stats.acquire_lock_ns / std.time.ns_per_ms,
             cache_stats.hits,
             cache_stats.misses,
             cache_stats.revalidations,
@@ -423,7 +419,30 @@ fn writeResponse(
             cache_stats.evictions,
         },
     );
+    try writePoolStats(w, stats);
+    try w.writeByte('}');
     return aw.toOwnedSlice();
+}
+
+/// The `"pool"` member: this invocation's connection reuse, idle evictions and retries. Cold TLS handshakes against
+/// warm reuse, and stale or backed-off retries, are the first things to read when warm-path latency changes.
+fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
+    try w.print(
+        "\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"idle_evictions\":{d}," ++
+            "\"stale_retries\":{d},\"backoff_retries\":{d},\"max_idle_ms\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}}",
+        .{
+            stats.acquires,
+            stats.opens,
+            stats.reuses,
+            stats.discards,
+            stats.idle_evictions,
+            stats.stale_retries,
+            stats.backoff_retries,
+            stats.max_idle_ns / std.time.ns_per_ms,
+            stats.acquire_wait_ns / std.time.ns_per_ms,
+            stats.acquire_lock_ns / std.time.ns_per_ms,
+        },
+    );
 }
 
 /// `{"error":kind,"reason":reason,"<key>":value}`: an early-exit response naming the field or text it rejects. `kind`

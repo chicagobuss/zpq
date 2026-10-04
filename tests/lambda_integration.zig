@@ -197,12 +197,225 @@ fn readUntilHeadersOrBody(allocator: std.mem.Allocator, fd: linux.fd_t) ![]u8 {
 }
 
 // ============================================================
+// Fake S3 endpoint
+// ============================================================
+
+/// Plain-HTTP, path-style S3 stand-in that serves one object under every key: ranged and conditional GETs on
+/// keep-alive connections, one thread per connection. With `idle_close_ms` > 0 it drops a connection left idle that
+/// long, the way S3 and the network path drop a pooled keep-alive socket while a Lambda sandbox is frozen.
+const FakeS3 = struct {
+    const MAX_CONNS = 256;
+    const ETAG = "fake-etag";
+
+    listen_fd: linux.fd_t,
+    port: u16,
+    object: []const u8,
+    idle_close_ms: i32,
+    accept_thread: std.Thread = undefined,
+    conn_fds: [MAX_CONNS]linux.fd_t = @splat(-1),
+    conn_threads: [MAX_CONNS]?std.Thread = @splat(null),
+    /// Written only by the accept thread; read by `deinit` after joining it.
+    conns: usize = 0,
+    requests: std.atomic.Value(u32) = .init(0),
+    idle_closes: std.atomic.Value(u32) = .init(0),
+
+    fn start(self: *FakeS3, object: []const u8, idle_close_ms: i32) !void {
+        const fd = try sysSocket();
+        errdefer sysClose(fd);
+        const yes: i32 = 1;
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&yes).ptr, @sizeOf(i32));
+        var addr = std.mem.zeroes(linux.sockaddr.in);
+        addr.family = linux.AF.INET;
+        addr.addr = std.mem.nativeToBig(u32, 0x7f000001);
+        if (errIs(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)))) return error.BindFailed;
+        if (errIs(linux.listen(fd, 64))) return error.ListenFailed;
+        var bound = std.mem.zeroes(linux.sockaddr.in);
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (errIs(linux.getsockname(fd, @ptrCast(&bound), &len))) return error.GetsocknameFailed;
+
+        self.* = .{
+            .listen_fd = fd,
+            .port = std.mem.bigToNative(u16, bound.port),
+            .object = object,
+            .idle_close_ms = idle_close_ms,
+        };
+        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    }
+
+    /// Call after the Lambda child is gone, so every connection thread has seen its peer close.
+    fn deinit(self: *FakeS3) void {
+        _ = linux.shutdown(self.listen_fd, linux.SHUT.RDWR);
+        self.accept_thread.join();
+        for (self.conn_fds[0..self.conns], self.conn_threads[0..self.conns]) |fd, thread| {
+            _ = linux.shutdown(fd, linux.SHUT.RDWR);
+            if (thread) |t| t.join();
+            sysClose(fd);
+        }
+        sysClose(self.listen_fd);
+    }
+
+    fn acceptLoop(self: *FakeS3) void {
+        while (self.conns < MAX_CONNS) {
+            const fd = sysAccept(self.listen_fd) catch return;
+            self.conn_fds[self.conns] = fd;
+            self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
+            self.conns += 1;
+        }
+    }
+
+    fn serveConn(self: *FakeS3, fd: linux.fd_t) void {
+        var buf: [16 * 1024]u8 = undefined;
+        var len: usize = 0;
+        while (true) {
+            if (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n")) |head_end| {
+                self.respond(fd, buf[0..head_end]) catch return;
+                const used = head_end + 4;
+                std.mem.copyForwards(u8, buf[0 .. len - used], buf[used..len]);
+                len -= used;
+                continue;
+            }
+            if (len == buf.len) return;
+            if (self.idle_close_ms > 0 and len == 0) {
+                var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+                const r = linux.poll(&pfd, 1, self.idle_close_ms);
+                if (errIs(r)) return;
+                if (r == 0) {
+                    // FIN now; `deinit` closes the descriptor.
+                    _ = self.idle_closes.fetchAdd(1, .monotonic);
+                    _ = linux.shutdown(fd, linux.SHUT.RDWR);
+                    return;
+                }
+            }
+            const r = linux.read(fd, buf[len..].ptr, buf.len - len);
+            if (errIs(r) or r == 0) return;
+            len += r;
+        }
+    }
+
+    fn respond(self: *FakeS3, fd: linux.fd_t, head: []const u8) !void {
+        _ = self.requests.fetchAdd(1, .monotonic);
+        const obj = self.object;
+        var range: ?[]const u8 = null;
+        var if_none_match: ?[]const u8 = null;
+        var lines = std.mem.splitSequence(u8, head, "\r\n");
+        _ = lines.next();
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "range")) range = value;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) if_none_match = value;
+        }
+        var hdr_buf: [256]u8 = undefined;
+        if (if_none_match) |v| if (std.mem.eql(u8, std.mem.trim(u8, v, "\""), ETAG)) {
+            return writeAllFd(fd, "HTTP/1.1 304 Not Modified\r\nETag: \"" ++ ETAG ++ "\"\r\n\r\n");
+        };
+        var first: usize = 0;
+        var end: usize = obj.len; // exclusive
+        if (range) |r| {
+            const spec = if (std.mem.startsWith(u8, r, "bytes=")) r["bytes=".len..] else return error.BadRange;
+            const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.BadRange;
+            if (dash == 0) {
+                first = obj.len - @min(obj.len, try std.fmt.parseInt(usize, spec[1..], 10));
+            } else {
+                first = @min(obj.len, try std.fmt.parseInt(usize, spec[0..dash], 10));
+                if (dash + 1 < spec.len) end = @min(obj.len, try std.fmt.parseInt(usize, spec[dash + 1 ..], 10) + 1);
+            }
+            const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 206 Partial Content\r\nContent-Length: {d}\r\n" ++
+                "Content-Range: bytes {d}-{d}/{d}\r\nETag: \"" ++ ETAG ++ "\"\r\n\r\n", .{ end - first, first, end - 1, obj.len });
+            try writeAllFd(fd, hdr);
+        } else {
+            const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n" ++
+                "ETag: \"" ++ ETAG ++ "\"\r\n\r\n", .{obj.len});
+            try writeAllFd(fd, hdr);
+        }
+        try writeAllFd(fd, obj[first..end]);
+    }
+};
+
+fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const r = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (errIs(r) or r == 0) return error.WriteFailed;
+        off += r;
+    }
+}
+
+/// `path` with `pad` zero bytes spliced in before its footer. Column-chunk offsets are absolute, so they still point at
+/// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the 64 KiB tail zpq reads
+/// first, so a query also runs the parallel range-fetch stage.
+fn paddedParquet(allocator: std.mem.Allocator, path: []const u8, pad: usize) ![]u8 {
+    const raw = try readFileSlice(allocator, path);
+    defer allocator.free(raw);
+    const footer_len = std.mem.readInt(u32, raw[raw.len - 8 ..][0..4], .little);
+    const footer_start = raw.len - 8 - footer_len;
+    const out = try allocator.alloc(u8, raw.len + pad);
+    @memcpy(out[0..footer_start], raw[0..footer_start]);
+    @memset(out[footer_start..][0..pad], 0);
+    @memcpy(out[footer_start + pad ..], raw[footer_start..]);
+    return out;
+}
+
+/// A Lambda child whose `s3://` inputs resolve to `s3`.
+fn spawnLambdaForS3(allocator: std.mem.Allocator, runtime_endpoint: []const u8, s3: *const FakeS3) !std.process.Child {
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    return spawnLambdaWithEnv(allocator, runtime_endpoint, &.{
+        .{ "S3_ENDPOINT_URL", url },
+        .{ "S3_ACCESS_KEY_ID", "fake" },
+        .{ "S3_SECRET_ACCESS_KEY", "fake" },
+        .{ "S3_REGION", "us-east-1" },
+    });
+}
+
+/// Pin `pid` (and the threads it starts afterwards) to one CPU. The read stage's worker hand-off races are easiest to
+/// lose on a single CPU, which is also what a small Lambda gets.
+fn pinToOneCpu(pid: linux.pid_t) void {
+    var set: linux.cpu_set_t = @splat(0);
+    if (errIs(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set))) return;
+    for (set, 0..) |word, i| if (word != 0) {
+        var one: linux.cpu_set_t = @splat(0);
+        one[i] = @as(usize, 1) << @intCast(@ctz(word));
+        linux.sched_setaffinity(pid, &one) catch {};
+        return;
+    };
+}
+
+/// Serve one invocation of `body` and return the response body (caller frees).
+fn invoke(server: *FakeServer, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var poll = try server.acceptRequest(allocator);
+    try poll.replyAndClose(allocator, 200, "Lambda-Runtime-Aws-Request-Id: req-s3\r\nContent-Type: application/json\r\n", body);
+    var resp = try server.acceptRequest(allocator);
+    const out = try allocator.dupe(u8, resp.body);
+    errdefer allocator.free(out);
+    if (!std.mem.endsWith(u8, resp.path, "/response")) return error.TestUnexpectedResult;
+    try resp.replyAndClose(allocator, 202, "", "");
+    return out;
+}
+
+/// The `"agg":{...}` member of an aggregate response.
+fn aggMember(resp: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, resp, "\"agg\":{") orelse return null;
+    const end = std.mem.indexOfScalarPos(u8, resp, start, '}') orelse return null;
+    return resp[start .. end + 1];
+}
+
+// ============================================================
 // Process spawning
 // ============================================================
 
 fn spawnLambda(allocator: std.mem.Allocator, runtime_endpoint: []const u8) !std.process.Child {
+    return spawnLambdaWithEnv(allocator, runtime_endpoint, &.{});
+}
+
+fn spawnLambdaWithEnv(
+    allocator: std.mem.Allocator,
+    runtime_endpoint: []const u8,
+    extra_env: []const [2][]const u8,
+) !std.process.Child {
     var env_map: std.process.Environ.Map = .{ .allocator = allocator, .array_hash_map = .empty };
     defer env_map.deinit();
+    for (extra_env) |kv| try env_map.put(kv[0], kv[1]);
     try env_map.put("AWS_LAMBDA_RUNTIME_API", runtime_endpoint);
     try env_map.put("AWS_LAMBDA_FUNCTION_NAME", "test-fn");
     try env_map.put("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST");
@@ -607,6 +820,100 @@ test "lambda names the input file a query could not read, and why" {
             .want = "{\"error\":\"engine\",\"reason\":\"NotParquet\",\"input\":\"build.zig\",\"cause\":",
         },
     });
+}
+
+const S3_AGG = "\"aggregate\":\"count(*) AS c, sum(x) AS sx, min(s) AS ms, max(n) AS mn, sum(u) AS su\"";
+const S3_FIXTURE = "ci/fixtures/parquet/full_match.parquet";
+
+test "lambda answers back-to-back S3 queries without running out of read workers" {
+    // Eight inputs fill both read stages to the worker limit: eight metadata fetches, then eight range fetches, on one
+    // executor. The fetch stage used to be rejected with ConcurrencyUnavailable whenever a metadata worker had finished
+    // but was still counted busy.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+    if (child.id) |pid| pinToOneCpu(pid);
+
+    const f = "\"" ++ S3_FIXTURE ++ "\"";
+    const local = try invoke(&server, a, "{\"inputs\":[" ++ f ++ "," ++ f ++ "," ++ f ++ "," ++ f ++ "," ++ f ++ "," ++
+        f ++ "," ++ f ++ "," ++ f ++ "]," ++ S3_AGG ++ "}");
+    defer a.free(local);
+    const want = aggMember(local) orelse {
+        std.debug.print("[s3 back-to-back] local reference failed: {s}\n", .{local});
+        return error.TestUnexpectedResult;
+    };
+
+    const body = "{\"inputs\":[\"s3://bkt/f0.parquet\",\"s3://bkt/f1.parquet\",\"s3://bkt/f2.parquet\"," ++
+        "\"s3://bkt/f3.parquet\",\"s3://bkt/f4.parquet\",\"s3://bkt/f5.parquet\",\"s3://bkt/f6.parquet\"," ++
+        "\"s3://bkt/f7.parquet\"]," ++ S3_AGG ++ "}";
+    for (0..60) |i| {
+        const resp = try invoke(&server, a, body);
+        defer a.free(resp);
+        const got = aggMember(resp) orelse "";
+        if (!std.mem.eql(u8, got, want)) {
+            std.debug.print("[s3 back-to-back] invocation {d}: {s}\n  want {s}\n", .{ i, resp, want });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "lambda reopens S3 connections the server dropped while it sat idle, without backing off" {
+    // The server drops a connection after 150 ms idle. A second query 400 ms later finds every pooled connection dead
+    // (younger than the pool's idle timeout, so still offered for reuse) and must retry each at once on a new
+    // connection. A third query after more than the idle timeout must not try them at all.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 150);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+
+    const body = "{\"inputs\":[\"s3://bkt/f0.parquet\",\"s3://bkt/f1.parquet\",\"s3://bkt/f2.parquet\"," ++
+        "\"s3://bkt/f3.parquet\"]," ++ S3_AGG ++ "}";
+    const first = try invoke(&server, a, body);
+    defer a.free(first);
+    const want = aggMember(first) orelse {
+        std.debug.print("[s3 idle] first query failed: {s}\n", .{first});
+        return error.TestUnexpectedResult;
+    };
+
+    const Step = struct { idle_ms: u64, stale: bool };
+    for ([_]Step{ .{ .idle_ms = 400, .stale = true }, .{ .idle_ms = 4300, .stale = false } }) |step| {
+        const ts: linux.timespec = .{ .sec = @intCast(step.idle_ms / 1000), .nsec = @intCast((step.idle_ms % 1000) * std.time.ns_per_ms) };
+        _ = linux.nanosleep(&ts, null);
+        const resp = try invoke(&server, a, body);
+        defer a.free(resp);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+        defer parsed.deinit();
+        const pool = parsed.value.object.get("pool") orelse return error.TestUnexpectedResult;
+        const stale = pool.object.get("stale_retries").?.integer;
+        const evicted = pool.object.get("idle_evictions").?.integer;
+        const backoff = pool.object.get("backoff_retries").?.integer;
+        const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and backoff == 0 and
+            if (step.stale) stale > 0 and evicted == 0 else stale == 0 and evicted > 0;
+        if (!ok) {
+            std.debug.print("[s3 idle] after {d} ms idle: {s}\n  want {s}\n", .{ step.idle_ms, resp, want });
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expect(s3.idle_closes.load(.monotonic) > 0);
 }
 
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

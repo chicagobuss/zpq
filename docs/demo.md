@@ -28,7 +28,9 @@ in-process invocation:
 Cold-start init: **12 ms**. Whole runtime is a 3.3 MB static musl
 binary (measured 2026-06-12, ReleaseSmall x86_64 — grew from 1.5 MB
 with the vendored snappy/zstd encoders) — no AWS SDK, no system
-OpenSSL, no event-loop dependency.
+OpenSSL, no event-loop dependency. The deploy build (`just lambda-build`)
+is ReleaseFast, a ~10 MB zip: measured on Lambda in October 2026, the
+ReleaseSmall build started no faster and ran up to 2× slower cold.
 
 ## Why these numbers exist
 

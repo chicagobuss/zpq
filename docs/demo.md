@@ -8,8 +8,8 @@ Cloudflare R2.
 
 ## The headlines
 
-**Local CLI** (workstation, 13th-gen i7-13700HX, 24 threads), one
-in-process invocation:
+**Local CLI** on one 24-thread workstation, one in-process
+invocation:
 
 | Query | Wall | Notes |
 |-------|------|-------|
@@ -25,12 +25,14 @@ in-process invocation:
 | Per-file fan-out, 24 lambdas in parallel | 6.15 s | ~$0.01 |
 | 4-file compaction: filter + project + write one Parquet | 31 s | ~$0.003 |
 
-Cold-start init: **12 ms**. Whole runtime is a 3.3 MB static musl
-binary (measured 2026-06-12, ReleaseSmall x86_64 — grew from 1.5 MB
-with the vendored snappy/zstd encoders) — no AWS SDK, no system
-OpenSSL, no event-loop dependency. The deploy build (`just lambda-build`)
-is ReleaseFast, a ~10 MB zip: measured on Lambda in October 2026, the
-ReleaseSmall build started no faster and ran up to 2× slower cold.
+Every one of those invocations can be a cold start, and that is the
+intended way to run it: the fan-out above runs 24 sandboxes at once
+rather than leaning on a warm one. The runtime is one static binary —
+no AWS SDK, no system OpenSSL, no event-loop dependency — deployed by
+`just lambda-build` as a ReleaseFast zip of about 10 MB. On 2026-10-05
+(zpq 0.4.0, us-west-2, 3008 MB) its median Lambda `Init Duration` was
+18–22 ms on arm64 and 26–35 ms on x86_64; see
+[Comparison](#comparison-cold-lambda-invocations) below.
 
 ## Why these numbers exist
 
@@ -151,11 +153,12 @@ for year in 2023 2024; do
 done
 ```
 
-Build and deploy:
+Build and deploy, under a function name of your choosing:
 
 ```bash
+FN=zpq-filter-r2   # example name; use your own
 just lambda-build
-just lambda-deploy zpq-filter-r2 x86_64
+just lambda-deploy "$FN" x86_64
 ```
 
 For R2 (or any non-AWS S3-compatible endpoint), use `S3_*`-prefixed
@@ -164,7 +167,7 @@ runtime and pair with the execution role:
 
 ```bash
 aws lambda update-function-configuration \
-  --function-name zpq-filter-r2 \
+  --function-name "$FN" \
   --environment "Variables={
     S3_ACCESS_KEY_ID=<r2-key>,
     S3_SECRET_ACCESS_KEY=<r2-secret>,
@@ -180,7 +183,7 @@ supported, and legacy IPv4 spellings such as `127.1` or `010.0.0.1` are refused 
 
 ```bash
 URL="s3://$BUCKET/demo/nyc-taxi/yellow/yellow_tripdata_2024-01.parquet"
-just lambda-invoke zpq-filter-r2 \
+just lambda-invoke "$FN" \
   "$(jq -nc --arg u "$URL" '{s3_url:$u, aggregate:"count(*)"}')"
 ```
 
@@ -189,14 +192,16 @@ handshake + tail GET to R2; ZPQ's internal time is ~1 ms.
 
 ### 24-file fan-out (per-file)
 
-Fan out one Lambda per file:
+Fan out one Lambda per file. This is the shape zpq-lambda is built
+for: a burst of short invocations, most of them landing in new
+sandboxes, with nothing to keep warm in between.
 
 ```bash
 mkdir -p /tmp/results
 for f in yellow_tripdata_{2023,2024}-{01..12}.parquet; do
   payload=$(jq -nc --arg u "s3://$BUCKET/demo/nyc-taxi/yellow/$f" \
     '{s3_url:$u, aggregate:"count(*),max(tip_amount),sum(fare_amount)"}')
-  aws lambda invoke --function-name zpq-filter-r2 \
+  aws lambda invoke --function-name "$FN" \
     --payload "$(echo -n "$payload" | base64 -w 0)" \
     --cli-binary-format base64 "/tmp/results/$f.json" \
     --region us-west-2 >/dev/null &
@@ -218,7 +223,7 @@ INPUTS=$(jq -nc --arg b "$BUCKET" '[
 ]')
 OUT="s3://$BUCKET/demo/output/big-tippers-2024-q1.parquet"
 
-just lambda-invoke zpq-filter-r2 "$(jq -nc \
+just lambda-invoke "$FN" "$(jq -nc \
   --argjson inputs "$INPUTS" --arg out "$OUT" \
   '{inputs: $inputs,
     filter: "tip_amount > 50",
@@ -229,49 +234,52 @@ just lambda-invoke zpq-filter-r2 "$(jq -nc \
 
 13 M rows → 2 387 surviving, 63 KB written. ~31 s, ~$0.003.
 
-## Comparison
+## Comparison: cold Lambda invocations
 
-Local CLI head-to-head, same 24 files / 79.5 M rows / 1.3 GB
-warm-cache, same workstation (i7-13700HX, 24 threads):
+zpq on Lambda is meant to be invoked cold, so that is the comparison
+that matters. Measured 2026-10-05 in us-west-2, every function at
+3008 MB and x86_64: zpq 0.4.0 as a `provided.al2023` zip, DuckDB 1.5.6
+as a Python 3.12 container image with its S3 extensions bundled. Median
+of three forced cold starts per scenario, Lambda-reported
+`Init Duration` + `Duration` in ms. Inputs: a 174.8 MB synthetic file
+(B), TPC-H `lineitem` SF1 in 207.1 MB of Snappy Parquet (LS), and an
+868 MB Overture Places file filtered and written back to S3 (OV).
 
-| Query | ZPQ | DuckDB v1.2.2 |
-|-------|-----|---------------|
-| `count(*)` | **6 ms** | 29 ms |
-| `count(*), max(tip), sum(fare)` | 254 ms | **148 ms** |
-| With `WHERE tip > 50` | 215 ms | **128 ms** |
-| 6 aggregates (4 sums + count + avg) | 404 ms | **206 ms** |
+| Scenario | zpq 0.4.0 | DuckDB 1.5.6 |
+|----------|----------:|-------------:|
+| B1 full scan | 27 + 667 | 536 + 1,954 |
+| B2 3-column projection | 27 + 365 | 668 + 1,431 |
+| B3 broad filter | 27 + 379 | 448 + 1,512 |
+| B4 selective filter | 27 + 373 | 532 + 1,550 |
+| B5 simple aggregates | 26 + 346 | 462 + 1,371 |
+| B6 string equality | 27 + 271 | 518 + 1,153 |
+| LS1 full scan | 27 + 1,356 | 505 + 2,811 |
+| LS2 TPC-H Q6 | 26 + 838 | 832 + 3,831 |
+| LS3 Q1-like GROUP BY | 26 + 819 | 499 + 3,475 |
+| LS4 key range | 26 + 204 | 535 + 762 |
+| OV filter + write | 35 + 1,726 | 738 + 4,063 |
 
-ZPQ wins on metadata-only queries (`count(*)` is 5× faster — it
-answers from row-group footers; DuckDB pays at minimum to open files
-and build a plan). DuckDB wins on full-decode aggregates by ~2× —
-years of vectorized-column SIMD optimization on the value-decode
-inner loop that ZPQ doesn't have yet. Future decode work should be
-driven by flamegraphs, not by the demo headline.
+In these runs DuckDB's cold total was 2.4× to 5.6× zpq's. DuckDB's
+`Init Duration` includes starting Python and importing the engine,
+which is part of what a cold DuckDB Lambda costs. The full tables,
+arm64 figures, memory use and warm figures (where Polars 1.44.2 was
+faster than zpq x86_64 in 9 of 11 scenarios) are in
+[`measurements/lambda_cold_start_2026-10-05.md`](measurements/lambda_cold_start_2026-10-05.md).
 
-vs. AWS Athena on the same `count + max + sum` workload (warm,
-estimated):
+What zpq is for:
 
-| Engine | Wall | Cost | Where data has to live |
-|--------|------|------|------------------------|
-| ZPQ CLI (workstation) | **254 ms** | $0 | local disk or any S3-compat |
-| DuckDB CLI (workstation) | 148 ms | $0 | local disk |
-| ZPQ Lambda (24-way fan-out) | 6.15 s | ~$0.01 | any S3-compatible |
-| Athena (warm-path) | 2–6 s | ~$0.001 | AWS S3 + Glue table |
-
-The pitch isn't "ZPQ beats DuckDB on a workstation." It's:
-
-* **ZPQ runs where DuckDB doesn't.** A 3.3 MB static binary that
-  boots in 12 ms on AWS Lambda. DuckDB is a 50+ MB shared library
-  that pays seconds of cold-start. Different category.
+* **Cold, bursty, fan-out Lambda work.** Initialisation in tens of
+  milliseconds means each file, partition or compaction unit can get
+  its own invocation, fired when the work arrives; there is nothing to
+  keep warm.
 * **No catalog required.** Drop a Parquet file anywhere — local
   disk, R2, MinIO, S3 — and query it. No Glue, no DDL, no partition
   registration. Same UX as `duckdb 'data/*.parquet'`.
 * **The data doesn't have to be in S3.** Cloudflare R2, MinIO,
   GCS-compat — same code, same speed envelope, no migration to AWS.
-* **Write workloads invert the cost gap.** Athena's CTAS / INSERT
-  charges for scan AND for what it writes back through the engine.
-  ZPQ Lambda streams S3-to-S3 directly; multi-file compaction is the
-  iceberg-maintenance shape it was designed for.
+* **Writes stream S3-to-S3.** ZPQ Lambda filters, projects and
+  re-encodes straight into a multipart upload; multi-file compaction
+  is the iceberg-maintenance shape it was designed for.
 
 ## Caveats
 

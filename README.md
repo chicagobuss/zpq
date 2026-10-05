@@ -13,6 +13,30 @@ Workloads it's intended for:
 Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
 vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
 
+## On AWS Lambda: built for cold starts
+
+`zpq-lambda` is a static binary for the `provided.al2023` runtime, and its cold start is the point. On 2026-10-05 in
+us-west-2, with every function at 3008 MB, zpq 0.4.0's median Lambda `Init Duration` was 18–22 ms on arm64 and
+26–35 ms on x86_64 across eleven scenarios (three forced cold starts each). DuckDB 1.5.6 in a Python 3.12 container
+image, same region and memory, measured 448–832 ms, and its cold Init + Duration was 2.4× to 5.6× zpq's (x86_64 against
+x86_64) in every scenario. Polars 1.44.2, packaged the same way, measured 478–806 ms. The full tables, inputs and
+method are in [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
+
+So the intended pattern is cold, bursty and wide: one invocation per file, partition or compaction unit, fanned out
+in parallel when the work arrives, with each sandbox free to be thrown away afterwards. Nothing from an earlier
+invocation is needed for a correct answer, and concurrency, not sandbox reuse, is how it scales.
+
+Keeping sandboxes warm is not the intended use: keep-warm pings, provisioned concurrency bought to hide
+initialisation, or designs that count on a sandbox's connections and caches surviving between calls pay for idle
+capacity to save tens of milliseconds. When Lambda reuses a sandbox on its own, zpq handles it: connections idle for
+more than 4 s are closed rather than reused (they do not survive a frozen sandbox), and a reused connection found dead
+is retried at once on a new one. See [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md) and the request and
+response format in [`docs/lambda_requests.md`](docs/lambda_requests.md).
+
+S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
+role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible
+stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads.
+
 ## Performance
 
 Numbers and trade-offs are dated and contextualised as they're captured. Harnesses:
@@ -21,7 +45,8 @@ Numbers and trade-offs are dated and contextualised as they're captured. Harness
   R2.
 * `benchmarks/run_selectivity.sh` — Lambda S3-to-S3 sweep across selectivity levels (zpq vs Python lambda running polars
   + duckdb).
-* `benchmarks/run_coldstart.sh` — cold-start comparison.
+* `benchmarks/run_coldstart.sh` — cold-start comparison; the latest cold-start figures are in
+  [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
 * `benchmarks/regression/runner.py` — golden-output regression net.
 
 ## What it can do
@@ -123,8 +148,8 @@ just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 
 `zpq --version` reports the release the binary was built from.
 
-The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases (Linux x86_64 + aarch64;
-macOS lands with the kqueue backend) ship to `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/` and
+The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases (CLI for Linux and
+macOS, each x86_64 + aarch64) ship to `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/` and
 a matching GitHub Release.
 
 ## Use as a library

@@ -45,7 +45,10 @@ Every response is one JSON object. Durations are whole milliseconds; `pool` and 
 container's cumulative footer-cache counters `hits`, `misses`, `revalidations`, `invalidations`, `inserts`,
 `evictions`; and `pool`.
 
-**`pool`** (both responses), for the container's S3 connection pool during this invocation:
+**`pool`** (both responses), for the sandbox's S3 connection pool during this invocation. On a cold invocation, the
+intended pattern, the pool starts empty: `reuses` counts only connections reused within this invocation,
+`idle_evictions` is 0, and the `meta_cache` counters cover only this invocation. Idle evictions, stale retries and
+cache hits from earlier invocations appear only when Lambda reuses a sandbox, which zpq handles but does not rely on.
 
 | Field | Meaning |
 |-------|---------|

@@ -428,7 +428,7 @@ test "SNI carries the bare host name, and nothing for an IP literal" {
         try server.start(&leaf, 1);
         var conn = Connection.connectWithContext(testing.allocator, &context, .loopback(server.port), case.host);
         if (conn) |*cn| cn.deinit() else |_| {}
-        server.finish();
+        try server.finish();
         _ = try conn;
         try testing.expect(server.handshake_ok);
         if (case.sni) |want| {
@@ -450,7 +450,7 @@ fn handshakeVerdict(ca: *boring.tls.c.X509, leaf: *const test_server.Leaf, host:
     defer context.deinit();
     var conn = Connection.connectWithContext(testing.allocator, &context, .loopback(server.port), host);
     if (conn) |*cn| cn.deinit() else |_| {}
-    server.finish();
+    try server.finish();
     _ = conn catch |err| switch (err) {
         error.CertificateRejected => return .rejected,
         else => return err,
@@ -584,7 +584,7 @@ test "a certificate the preferred roots reject is verified again against the sys
         try server.start(&leaf, 1);
         var conn = Connection.connectPreferring(testing.allocator, &pref, &fallback, .loopback(server.port), host);
         if (conn) |*cn| cn.deinit() else |_| {}
-        server.finish();
+        try server.finish();
         _ = try conn;
         try testing.expect(!pref.abandoned.load(.monotonic));
         try testing.expect(!fallback.ready.load(.monotonic));
@@ -603,7 +603,7 @@ test "a certificate the preferred roots reject is verified again against the sys
             conn.deinit();
             try testing.expect(pref.abandoned.load(.monotonic));
         }
-        server.finish();
+        try server.finish();
         try testing.expect(server.handshake_ok);
     }
     // A certificate neither trusts, or one naming another host, still fails.
@@ -617,7 +617,7 @@ test "a certificate the preferred roots reject is verified again against the sys
         var server: test_server.Server = undefined;
         try server.start(&leaf, 2);
         const conn = Connection.connectPreferring(testing.allocator, &pref, &fallback, .loopback(server.port), host);
-        server.finish();
+        try server.finish();
         try testing.expectError(error.CertificateRejected, conn);
     }
 }
@@ -643,8 +643,9 @@ test "a handshake that fails before any certificate is a retryable failure, not 
         .loopback(server.port),
         "bkt.s3.us-west-2.amazonaws.com",
     );
-    server.finish();
+    try server.finish();
     try testing.expectError(error.HandshakeFailed, conn);
+    try testing.expectEqual(@as(usize, 1), server.accepted);
     try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(error.HandshakeFailed));
     // Nothing was learnt about the Amazon roots.
     try testing.expect(!pref.abandoned.load(.monotonic));

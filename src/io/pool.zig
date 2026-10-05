@@ -423,8 +423,7 @@ const TestListener = struct {
         return openOn(.{ 127, 0, 0, 1 }, 0);
     }
 
-    /// Listen on `ip`:`port` (0: any free port). Skips the test where `ip` is not a local address (on macOS only
-    /// 127.0.0.1 is).
+    /// Listen on `ip`:`port` (0: any free port). Skips the test where `ip` is not a local address.
     fn openOn(ip: tls.Ipv4, port: u16) !TestListener {
         const posix = std.posix;
         const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
@@ -530,6 +529,9 @@ fn peerOf(conn: *const tls.Connection) !tls.Ipv4 {
 }
 
 test "new connections take the host's addresses in turn, and skip one that refuses" {
+    // Linux answers on all of 127.0.0.0/8; macOS only on 127.0.0.1, so the other addresses this test listens on and
+    // connects to do not exist there.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const io = testing.io;
     const a = try TestListener.open();
     defer a.close();

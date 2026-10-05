@@ -426,6 +426,7 @@ const FakeRuntimeApi = struct {
 };
 
 test "nextInvocation reads a large event the runtime API sends chunked" {
+    // The client makes Linux syscalls directly, as Lambda runs only on Linux.
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
 
@@ -454,7 +455,12 @@ test "nextInvocation reads a large event the runtime API sends chunked" {
     var api = try FakeRuntimeApi.start(resp.items);
     defer close(api.fd);
     const server = try std.Thread.spawn(.{}, FakeRuntimeApi.serveOne, .{&api});
-    defer server.join();
+    // A client that fails before connecting would leave the server in accept; shutting the listener down wakes it
+    // (on Linux, which this test runs on only).
+    defer {
+        _ = linux.shutdown(api.fd, linux.SHUT.RDWR);
+        server.join();
+    }
 
     var buf: [32]u8 = undefined;
     var c = try Client.fromHostPort(a, try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{api.port}));

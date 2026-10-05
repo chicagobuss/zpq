@@ -16,13 +16,23 @@
 # Bundle layout (relative to this script): bin/<arch>-macos/{zpq,zpq-test,
 # zpq-lambda-test}, data/ and ci/ (unit-test fixtures), smoke/ (CLI fixtures),
 # expected/ (golden outputs recorded from the Linux build of the same commit),
-# MANIFEST.
+# skips/ (each test binary's skips on Linux, and its Linux-only tests), MANIFEST.
 #
 # CLI outputs are compared against expected/, so the check needs nothing but
 # bash; with python3 + pyarrow it also validates every written parquet file
 # independently. macos_bundle.sh runs this script on Linux with --record --bin
 # to produce expected/.
 set -u
+
+# The tests a Zig test runner log reports skipped, one name per line. The runner prints `N/M name...` and then the
+# outcome; a test that logs first puts `SKIP` on a line of its own instead of after the `...`.
+skip_names() {
+  awk '
+    match($0, /^[0-9]+\/[0-9]+ /) { name = substr($0, RLENGTH + 1); sub(/\.\.\..*$/, "", name) }
+    /(^|\.\.\.)SKIP$/ && name != "" { print name; name = "" }
+  ' "$1"
+}
+if [ "${1:-}" = --skips ]; then skip_names "$2"; exit; fi   # for macos_bundle.sh
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ARCH="" BIN="" RECORD=0 NETWORK=0 USE_PY=1 KEEP=0
@@ -34,7 +44,7 @@ while [ $# -gt 0 ]; do
     --network) NETWORK=1; shift ;;
     --no-python) USE_PY=0; shift ;;
     --keep) KEEP=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -146,15 +156,20 @@ if [ "$RECORD" = 0 ]; then
       fail "unit:$t" "exit $rc${summary:+, $summary}" "$WORK/log/unit-$t.fail"
       continue
     fi
-    # Every skip the Linux run of this bundle did not have must be a known Linux-only test.
+    # Every skip must be one the Linux run of this bundle had too, or a test that is Linux-only by design.
     skipped="$(printf '%s' "$summary" | sed -n 's/.*passed; \([0-9]*\) skipped.*/\1/p')"
-    linux_skipped="$(sed -n "s/^linux_skipped_$t=//p" "$ROOT/MANIFEST" 2> /dev/null)"
-    linux_only="$(sed -n "s/^linux_only_tests_$t=//p" "$ROOT/MANIFEST" 2> /dev/null)"
-    if [ -n "$skipped" ] && [ -n "$linux_skipped" ] && [ "$skipped" -gt $((linux_skipped + ${linux_only:-0})) ]; then
-      grep -B1 '^SKIP' "$WORK/log/unit-$t.log" | grep -v '^SKIP\|^--' > "$WORK/log/unit-$t.skips"
-      fail "unit:$t" "$skipped skipped here vs $linux_skipped on Linux (+${linux_only:-0} Linux-only)" "$WORK/log/unit-$t.skips"
+    skip_names "$WORK/log/unit-$t.log" > "$WORK/log/unit-$t.skips"
+    cat "$ROOT/skips/$t.linux" "$ROOT/skips/$t.linux-only" > "$WORK/log/unit-$t.allowed" 2> /dev/null
+    grep -vxF -f "$WORK/log/unit-$t.allowed" "$WORK/log/unit-$t.skips" > "$WORK/log/unit-$t.extra"
+    named="$(wc -l < "$WORK/log/unit-$t.skips" | tr -d ' ')"
+    if [ ! -f "$ROOT/skips/$t.linux" ]; then
+      fail "unit:$t" "no skips/$t.linux in bundle"
+    elif [ "${skipped:-0}" != "$named" ]; then
+      fail "unit:$t" "the summary counts ${skipped:-0} skipped, but $named skipped tests were found in the log" "$WORK/log/unit-$t.skips"
+    elif [ -s "$WORK/log/unit-$t.extra" ]; then
+      fail "unit:$t" "$(wc -l < "$WORK/log/unit-$t.extra" | tr -d ' ') skipped here, not on Linux, and not Linux-only" "$WORK/log/unit-$t.extra"
     else
-      pass "unit:$t (${summary:-ok})"
+      pass "unit:$t (${summary%.}; $(wc -l < "$ROOT/skips/$t.linux-only" | tr -d ' ') Linux-only)"
     fi
   done
 fi

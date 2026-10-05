@@ -27,6 +27,8 @@ pub const FakeS3 = struct {
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t,
     port: u16,
+    /// `deinit` writes to `stop[0]`; the accept thread polls `stop[1]`, and writes to it once it has stopped.
+    stop: [2]posix.fd_t,
     accept_thread: std.Thread = undefined,
     conn_fds: [MAX_CONNS]posix.fd_t = @splat(-1),
     conn_threads: [MAX_CONNS]?std.Thread = @splat(null),
@@ -43,6 +45,12 @@ pub const FakeS3 = struct {
     dropped: u32 = 0,
 
     pub fn start(self: *FakeS3, allocator: std.mem.Allocator) !void {
+        var stop: [2]posix.fd_t = undefined;
+        if (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &stop)) != .SUCCESS)
+            return error.SkipZigTest;
+        errdefer for (stop) |fd| {
+            _ = posix.system.close(fd);
+        };
         const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
         const fd: posix.fd_t = @intCast(rc);
@@ -52,13 +60,20 @@ pub const FakeS3 = struct {
         if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
         if (posix.errno(posix.system.listen(fd, 64)) != .SUCCESS) return error.SkipZigTest;
         if (posix.errno(posix.system.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
-        self.* = .{ .allocator = allocator, .listen_fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
+        self.* = .{ .allocator = allocator, .listen_fd = fd, .port = std.mem.bigToNative(u16, addr.port), .stop = stop };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
     /// Call once the client side has closed its connections.
+    ///
+    /// The accept thread is stopped by a byte on a socketpair it polls alongside the listening socket: shutting that
+    /// socket down wakes a blocked accept on Linux but not on macOS. Connection threads are woken by shutting their
+    /// sockets down, which does work everywhere. A thread that still has not stopped after `stop_timeout_ms` is a
+    /// panic naming the server, not a test run that never ends; it cannot be abandoned, since it points into `self`.
     pub fn deinit(self: *FakeS3) void {
-        _ = posix.system.shutdown(self.listen_fd, posix.SHUT.RDWR);
+        _ = posix.system.write(self.stop[0], "s", 1);
+        if (!waitReadable(self.stop[0], stop_timeout_ms))
+            std.debug.panic("fake_s3 on port {d}: the accept thread has not stopped {d} ms after deinit()", .{ self.port, stop_timeout_ms });
         self.accept_thread.join();
         for (self.conn_fds[0..self.conns], self.conn_threads[0..self.conns]) |fd, thread| {
             _ = posix.system.shutdown(fd, posix.SHUT.RDWR);
@@ -66,6 +81,7 @@ pub const FakeS3 = struct {
             _ = posix.system.close(fd);
         }
         _ = posix.system.close(self.listen_fd);
+        for (self.stop) |fd| _ = posix.system.close(fd);
         for (self.uploads.items) |*u| self.freeUpload(u);
         self.uploads.deinit(self.allocator);
         for (self.objects.items) |o| {
@@ -121,9 +137,25 @@ pub const FakeS3 = struct {
     }
 
     fn acceptLoop(self: *FakeS3) void {
+        defer _ = posix.system.write(self.stop[1], "d", 1);
         while (self.conns < MAX_CONNS) {
+            var pfd = [_]posix.pollfd{
+                .{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.stop[1], .events = posix.POLL.IN, .revents = 0 },
+            };
+            switch (posix.errno(posix.system.poll(&pfd, pfd.len, -1))) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return,
+            }
+            // Stopped, and no connection waiting.
+            if (pfd[0].revents & posix.POLL.IN == 0) return;
             const rc = posix.system.accept(self.listen_fd, null, null);
-            if (posix.errno(rc) != .SUCCESS) return;
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .CONNABORTED, .AGAIN => continue,
+                else => return,
+            }
             const fd: posix.fd_t = @intCast(rc);
             self.conn_fds[self.conns] = fd;
             self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
@@ -292,6 +324,22 @@ pub const FakeS3 = struct {
         try self.objects.append(self.allocator, .{ .key = try self.allocator.dupe(u8, key), .etag = etag, .len = len });
     }
 };
+
+/// How long `deinit` waits for the accept thread. A test that works never gets near it.
+const stop_timeout_ms = 20_000;
+
+/// Whether `fd` becomes readable within `timeout_ms`.
+fn waitReadable(fd: posix.fd_t, timeout_ms: i32) bool {
+    while (true) {
+        var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const n = posix.system.poll(&pfd, pfd.len, timeout_ms);
+        switch (posix.errno(n)) {
+            .SUCCESS => return n > 0,
+            .INTR => continue,
+            else => return false,
+        }
+    }
+}
 
 fn realtimeS() i64 {
     return @import("../clock.zig").realtimeS();

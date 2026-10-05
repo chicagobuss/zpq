@@ -586,7 +586,7 @@ test "a TLS response cut short is an error whether or not the server sent close_
     }) |case| {
         var server: test_server.Server = undefined;
         try server.startWith(&leaf, 1, .{ .respond = .{ .response = case.response, .end = case.end } });
-        defer server.finish();
+        defer server.finish() catch {};
         const peer: tls.Peer = .loopback(server.port);
         var conn = try tls.Connection.connectWithContext(testing.allocator, &context, peer, "good.test");
         defer conn.deinit();

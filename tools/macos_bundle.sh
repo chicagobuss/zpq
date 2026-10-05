@@ -95,6 +95,25 @@ cp tools/macos_check.sh "$STAGE/"
 echo "== recording expected outputs with the Linux build" >&2
 "$STAGE/macos_check.sh" --record --bin "$TMP/build-native/bin" > "$TMP/record.log" 2>&1 || {
   cat "$TMP/record.log" >&2; echo "recording goldens failed" >&2; exit 1; }
+# Tests that skip off Linux by design: the ones that open with `if (builtin.os.tag != .linux) return error.SkipZigTest`
+# (or `@import("builtin").os.tag`). Printed as the test runner names them: the module's path below the test root,
+# dotted, then `.test.<name>`.
+linux_only_tests() { # <test root dir> [subdir of it to leave out]
+  local root="$1" skip="${2:-}" f mod
+  find "$root" -name '*.zig' | sort | while read -r f; do
+    if [ -n "$skip" ] && [ "${f#"$root/$skip/"}" != "$f" ]; then continue; fi
+    mod="${f#"$root/"}"; mod="${mod%.zig}"; mod="${mod//\//.}"
+    awk -v mod="$mod" '
+      /^test "/ { name = $0; sub(/^test "/, "", name); sub(/" *\{ *$/, "", name) }
+      /os\.tag != \.linux\) return error\.SkipZigTest/ && name != "" { print mod ".test." name; name = "" }
+    ' "$f"
+  done
+}
+
+# Each unit-test binary's skips on Linux, and its Linux-only tests: macos_check.sh accepts no other skip on the Mac.
+mkdir -p "$STAGE/skips"
+linux_only_tests src lambda > "$STAGE/skips/zpq-test.linux-only"
+linux_only_tests src/lambda > "$STAGE/skips/zpq-lambda-test.linux-only"
 {
   echo "commit=$REV"
   echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -102,11 +121,10 @@ echo "== recording expected outputs with the Linux build" >&2
   for t in zpq-test zpq-lambda-test; do
     log="$TMP/linux-$t.log"
     (cd "$STAGE" && "$TMP/build-native/bin/$t") > "$log" 2>&1 || { cat "$log" >&2; echo "Linux $t failed" >&2; exit 1; }
-    echo "linux_skipped_$t=$(sed -n 's/.*passed; \([0-9]*\) skipped.*/\1/p' "$log" | tail -n 1 | grep . || echo 0)"
+    "$STAGE/macos_check.sh" --skips "$log" > "$STAGE/skips/$t.linux"
+    echo "linux_skipped_$t=$(wc -l < "$STAGE/skips/$t.linux" | tr -d ' ')"
+    echo "linux_only_tests_$t=$(wc -l < "$STAGE/skips/$t.linux-only" | tr -d ' ')"
   done
-  # Tests that skip off Linux by design (the epoll loop).
-  echo "linux_only_tests_zpq-test=$(grep -c 'builtin.os.tag != .linux) return error.SkipZigTest' src/io/epoll.zig)"
-  echo "linux_only_tests_zpq-lambda-test=0"
   if [ -n "$OBJDUMP" ]; then
     for t in $TARGETS; do
       echo "minos_$t=$("$OBJDUMP" --macho --private-headers "$STAGE/bin/$t/zpq" | sed -n 's/^ *minos //p' | head -n 1)"

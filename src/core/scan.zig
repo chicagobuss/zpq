@@ -2762,6 +2762,34 @@ fn runAndFree(
     res.deinit(gpa);
 }
 
+/// Forwards to `child` but never grows, shrinks or moves an allocation in place. `testing.allocator` resizes in place
+/// only while the allocation is the newest in its bucket and the bucket has room, which depends on everything the
+/// thread allocated before; a refused resize makes the caller allocate instead, so the allocation count
+/// `checkAllAllocationFailures` replays would change from run to run (on Apple silicon's 16 KiB pages, every time).
+/// Refusing them all makes every growth an allocation of its own, and so one more failure the check injects.
+const NoInPlaceResize = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *NoInPlaceResize) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *NoInPlaceResize = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *NoInPlaceResize = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 test "runMultiAggregate: the result destructors free a partly built answer" {
     // Strings are what own memory: string min/max winners, string group keys, output names. Every allocation is
     // failed in turn, so each partial state the answer passes through must be one `deinit` frees.
@@ -2772,10 +2800,9 @@ test "runMultiAggregate: the result destructors free a partly built answer" {
     defer meta_arena.deinit();
     const meta = try metadata.open(meta_arena.allocator(), bytes);
     const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
-    // The first scan in a process makes one allocation later ones skip; the check needs every run to count alike.
-    try runAndFree(testing.allocator, &inputs, &meta, "count(*) AS n", null);
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     const args = .{ &inputs, &meta, "min(s) AS m, max(s) AS x, count(*) AS n", null };
-    try testing.checkAllAllocationFailures(testing.allocator, runAndFree, args);
+    try testing.checkAllAllocationFailures(fixed.allocator(), runAndFree, args);
     const grouped = .{ &inputs, &meta, "min(s) AS m, count(*) AS n", @as(?[]const u8, "s") };
-    try testing.checkAllAllocationFailures(testing.allocator, runAndFree, grouped);
+    try testing.checkAllAllocationFailures(fixed.allocator(), runAndFree, grouped);
 }

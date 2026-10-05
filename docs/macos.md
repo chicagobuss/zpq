@@ -39,6 +39,7 @@ fail without leaving a file. Every output is compared with the Linux golden; wri
 own CSV dump, and, when `python3` can import pyarrow, independently checked for codec and values. It prints one
 `PASS`/`FAIL`/`SKIP` line per check and a summary, and exits 1 on any failure.
 
-Options: `--network` runs the real-S3 checks: with real credentials in the environment and
-`ZPQ_CHECK_S3_URL=s3://bucket/key.parquet` it reads that file (the reachability probe, which needs an unsigned request,
-reports SKIP). `--no-python` skips the pyarrow checks, `--keep` keeps the scratch directory.
+Options: `--network` also resolves, connects and TLS-handshakes to real S3 with an anonymous request
+(`S3_NO_SIGN_REQUEST=1`, passing on S3's refusal); with real credentials in the environment and
+`ZPQ_CHECK_S3_URL=s3://bucket/key.parquet` it reads that file too. `--no-python` skips the pyarrow checks, `--keep` keeps
+the scratch directory.

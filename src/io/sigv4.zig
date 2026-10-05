@@ -64,6 +64,14 @@ pub const SigV4 = struct {
 
         try signed_headers_list.append(allocator, .{ .name = try allocator.dupe(u8, "x-amz-content-sha256"), .value = try allocator.dupe(u8, payload_hash) });
 
+        // No access key means an anonymous request: send the headers, but no token and no Authorization.
+        if (self.access_key.len == 0) {
+            for (headers) |h| {
+                try signed_headers_list.append(allocator, .{ .name = try allocator.dupe(u8, h.name), .value = try allocator.dupe(u8, h.value) });
+            }
+            return signed_headers_list.toOwnedSlice(allocator);
+        }
+
         if (self.session_token) |token| {
             try signed_headers_list.append(allocator, .{ .name = try allocator.dupe(u8, "X-Amz-Security-Token"), .value = try allocator.dupe(u8, token) });
         }
@@ -343,6 +351,30 @@ test "sign accepts a 64-char secret (R2 key length)" {
         }
     }
     try testing.expect(found_auth);
+}
+
+test "sign with an empty access key sends the request anonymously" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const signer: SigV4 = .{ .region = "us-east-1", .access_key = "", .secret_key = "", .session_token = "token-xyz" };
+    const headers = try signer.sign(
+        arena.allocator(),
+        "GET",
+        "bucket.s3.us-east-1.amazonaws.com",
+        "/key",
+        null,
+        &.{.{ .name = "Range", .value = "bytes=0-7" }},
+        "",
+        .{ .timestamp = 1369353600, .use_unsigned_payload = true },
+    );
+    var saw_range = false;
+    for (headers) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "Authorization"));
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "X-Amz-Security-Token"));
+        if (std.ascii.eqlIgnoreCase(h.name, "Range")) saw_range = true;
+    }
+    try testing.expect(saw_range);
 }
 
 test "sign with unsigned payload sets x-amz-content-sha256 to UNSIGNED-PAYLOAD" {

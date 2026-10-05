@@ -16,6 +16,7 @@
 //! Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
 //! optional `AWS_SESSION_TOKEN` are read from the environment.
 //! Lambda always sets these from the execution role.
+//! `S3_NO_SIGN_REQUEST=1` sends requests unsigned instead (public buckets).
 //!
 //! DNS: getaddrinfo via libc. Linking libc adds ~150 KB to the
 //! ReleaseSmall musl binary; rolling our own resolver is a future
@@ -110,6 +111,20 @@ pub const Credentials = struct {
     endpoint: ?[]const u8 = null,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
+        // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
+        // requests: no keys are read, and the empty access key tells the
+        // signer to leave the Authorization header off. Only buckets that
+        // allow public access answer these.
+        if (env.getPosix("S3_NO_SIGN_REQUEST")) |v| {
+            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+                return .{
+                    .access_key = "",
+                    .secret_key = "",
+                    .region = env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion,
+                    .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+                };
+            }
+        }
         // `S3_*`-prefixed vars override `AWS_*`. This lets a Lambda
         // function target a non-AWS S3-compatible endpoint (R2, MinIO,
         // GCS in compat mode) without colliding with Lambda's
@@ -1191,6 +1206,35 @@ test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS'
     };
     try testing.expectEqualStrings("acct.r2.example:8443", try hostFor(a, r2, "logs"));
     try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, r2, "logs", "k.parquet"));
+}
+
+fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
+    const slice = comptime blk: {
+        var a: [entries.len:null]?[*:0]const u8 = undefined;
+        for (entries, 0..) |e, i| a[i] = e;
+        const final = a;
+        break :blk &final;
+    };
+    return .{ .block = .{ .slice = slice } };
+}
+
+test "S3_NO_SIGN_REQUEST yields anonymous credentials instead of NoCredentials" {
+    const anon = try Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=1" }));
+    try testing.expectEqualStrings("", anon.access_key);
+    try testing.expectEqualStrings("", anon.secret_key);
+    try testing.expectEqual(@as(?[]const u8, null), anon.session_token);
+    try testing.expectEqualStrings("us-east-1", anon.region);
+
+    const r2 = try Credentials.fromEnv(testEnviron(&.{
+        "S3_REGION=auto", "S3_ENDPOINT_URL=https://acct.r2.example", "S3_NO_SIGN_REQUEST=yes",
+    }));
+    try testing.expectEqualStrings("auto", r2.region);
+    try testing.expectEqualStrings("https://acct.r2.example", r2.endpoint.?);
+
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{"AWS_REGION=us-east-1"})));
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=0" })));
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=" })));
+    try testing.expectError(error.NoRegion, Credentials.fromEnv(testEnviron(&.{"S3_NO_SIGN_REQUEST=1"})));
 }
 
 fn endpointCreds(endpoint: []const u8) Credentials {

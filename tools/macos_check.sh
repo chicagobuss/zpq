@@ -6,8 +6,8 @@
 #
 #   --arch      which bundled build to run (default: this Mac's, from uname -m;
 #               --arch x86_64 on Apple silicon runs the Intel build under Rosetta)
-#   --network   also run the real-S3 checks. The DNS + TCP + TLS + HTTP probe
-#               needs an unsigned request and reports SKIP for now.
+#   --network   also check DNS + TCP + TLS + HTTP against real S3 with an
+#               anonymous request (expects S3's refusal, not a connection failure).
 #               With real AWS_*/S3_* credentials in the environment and
 #               ZPQ_CHECK_S3_URL=s3://bucket/key.parquet, also reads that file.
 #   --no-python skip the pyarrow cross-checks even if pyarrow is importable
@@ -281,9 +281,16 @@ fi
 
 # ---------------------------------------------------------------- network (opt-in)
 if [ "$RECORD" = 0 ] && [ "$NETWORK" = 1 ]; then
-  # The reachability probe needs a request S3 answers without credentials; until zpq can send one
-  # unsigned it is not run.
-  skip s3_reach "needs an unsigned S3 request"
+  # An anonymous request (S3_NO_SIGN_REQUEST: no keys, no Authorization header) for a bucket that does not exist:
+  # S3 answers 403/404 (BadResponse), and getting that answer takes working DNS, TCP, TLS (certificate and hostname
+  # checks) and HTTP. DnsFailed / ConnectFailed / HandshakeFailed mean the resolver, socket or TLS layer is broken
+  # on this platform; NoCredentials means the binary never tried the network.
+  (cd "$WORK" && env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u S3_ACCESS_KEY_ID \
+    -u S3_SECRET_ACCESS_KEY -u S3_SESSION_TOKEN -u S3_REGION -u S3_ENDPOINT_URL S3_NO_SIGN_REQUEST=1 AWS_REGION=us-east-1 \
+    "$ZPQ" schema s3://zpq-macos-check-no-such-bucket/x.parquet) > "$WORK/log/s3_reach.out" 2>&1
+  if grep -q 'BadResponse' "$WORK/log/s3_reach.out"; then pass "s3_reach (DNS + TCP + TLS + HTTP)"; else
+    fail s3_reach "expected S3 to refuse an anonymous request" "$WORK/log/s3_reach.out"
+  fi
   if [ -n "${ZPQ_CHECK_S3_URL:-}" ]; then
     if (cd "$WORK" && "$ZPQ" schema "$ZPQ_CHECK_S3_URL" && "$ZPQ" query "$ZPQ_CHECK_S3_URL" -a 'count(*) AS n') \
       > "$WORK/log/s3_read.out" 2>&1; then pass "s3_read $ZPQ_CHECK_S3_URL"; else

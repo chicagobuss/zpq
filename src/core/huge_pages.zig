@@ -90,6 +90,13 @@ pub const Region = struct {
         self.* = .{ .child = self.child };
     }
 
+    /// Make the whole region free again for the next phase of work, keeping its pages. Everything carved from it
+    /// must be dead (an arena over it deinitialised); blocks spilled to `child` are not affected.
+    pub fn rewind(self: *Region) void {
+        self.end = 0;
+        self.last = 0;
+    }
+
     pub fn allocator(self: *Region) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{
             .alloc = regionAlloc,
@@ -195,6 +202,11 @@ test "Region carves blocks in order, grows the newest in place, and spills past 
     try std.testing.expect(!region.owns(big));
     big[big.len - 1] = 1;
     a.free(big);
+
+    // A rewind makes the region's pages reusable from the start.
+    region.rewind();
+    const again = try a.alloc(u8, 10);
+    try std.testing.expectEqual(@intFromPtr(region.buf.ptr), @intFromPtr(again.ptr));
 
     // An arena over it grows one node in place rather than chaining new ones.
     var arena = std.heap.ArenaAllocator.init(a);

@@ -27,6 +27,7 @@ const local_fs = @import("local_fs.zig");
 
 const schema = @import("core/schema.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
+const huge_pages = @import("core/huge_pages.zig");
 const consumer = @import("core/consumer.zig");
 const invariant = @import("core/invariant.zig");
 const scan = @import("core/scan.zig");
@@ -448,6 +449,10 @@ const BufSink = struct {
     }
 };
 
+/// Address space one re-encoded row group reserves for its working memory (committed only as touched; past it, the
+/// general allocator).
+const ENCODE_REGION_RESERVE: usize = 4 << 30;
+
 const RGJob = struct {
     bytes: []const u8, // source file bytes containing this RG
     meta: *const schema.FileMetaData, // owning file's metadata (shared, read-only)
@@ -481,6 +486,11 @@ const Slot = struct {
 
 /// Encode one row group into a gpa-owned byte buffer with offsets relative to
 /// 0; footer metadata is allocated on `meta_alloc` (the slot's private arena).
+/// The working memory lives in two huge-page regions released at return: the
+/// projected rows in one, and in the other first the decoded columns, then,
+/// once those are dead, the encoded chunks. A row group's working set is
+/// hundreds of MiB of short-lived buffers, which on the general allocator cost
+/// a page fault per 4 KiB on every thread.
 fn encodeRGToBuffer(
     gpa: std.mem.Allocator,
     meta_alloc: std.mem.Allocator,
@@ -493,13 +503,19 @@ fn encodeRGToBuffer(
     prof: ?*profile.Thread,
     bloom: consumer.BloomWrite,
 ) !EncodedRG {
-    var scratch = std.heap.ArenaAllocator.init(gpa);
+    var rows_region = huge_pages.Region.init(gpa, ENCODE_REGION_RESERVE);
+    defer rows_region.deinit();
+    var work_region = huge_pages.Region.init(gpa, ENCODE_REGION_RESERVE);
+    defer work_region.deinit();
+    const work = work_region.allocator();
+    var scratch = std.heap.ArenaAllocator.init(rows_region.allocator());
     defer scratch.deinit();
     var timings: consumer.Timings = .{ .prof = prof };
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
+    // Decodes on an arena of its own over `work`, deinitialised before it returns.
     _ = try consumer.appendProjectedRGWithOptions(
         &agg,
-        gpa,
+        work,
         job.rg,
         job.meta,
         .{ .bytes = job.bytes, .byte_origin = 0 },
@@ -512,19 +528,9 @@ fn encodeRGToBuffer(
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
+    work_region.rewind();
     var local_off: u64 = 0;
-    const out = try consumer.encodeAggregator(
-        &agg,
-        meta_alloc,
-        gpa,
-        sink,
-        &local_off,
-        codec,
-        &timings,
-        1,
-        false,
-        bloom,
-    );
+    const out = try consumer.encodeAggregator(&agg, meta_alloc, work, sink, &local_off, codec, &timings, 1, false, bloom);
     const owned = try buf.toOwnedSlice(gpa);
     timings.prof = null;
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };

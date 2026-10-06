@@ -2065,30 +2065,30 @@ const S3Membership = struct {
 
     const vtable: membership.Source.VTable = .{ .read = read, .cached = cached, .retain = retain, .measured = measured };
 
-    /// A request's fixed cost as the bytes a connection moves meanwhile, from what this query has timed.
+    /// A request's fixed cost as the bytes a connection moves meanwhile, from what this query has timed. A round trip
+    /// no slower than the calibration's means an in-region client, and the calibration stands: there the first reads
+    /// also pay for new connections, which a few hundred kilobytes cannot tell apart from slow bandwidth. A slower one
+    /// means a distant link, where what was measured beats any constant.
     fn measured(ctx: *anyopaque) ?membership.Cost {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
-        if (self.rtt_ns == null and self.bytes_per_s == null) return null;
-        const rtt_s = @as(f64, @floatFromInt(self.rtt_ns orelse default_rtt_ns)) / std.time.ns_per_s;
+        const rtt = self.rtt_ns orelse return null;
+        if (rtt <= default_rtt_ns) return null;
+        const rtt_s = @as(f64, @floatFromInt(rtt)) / std.time.ns_per_s;
         var c = cost;
         c.request_bytes = @intFromFloat(@max(4096.0, rtt_s * (self.bytes_per_s orelse default_bytes_per_s)));
         return c;
     }
 
-    /// Learn from one batch of `n` requests moving `bytes` in `ns`: small requests time the round trip, large ones the
-    /// bandwidth left once the round trips are paid.
+    /// Learn one connection's bandwidth from a batch of `n` requests moving `bytes` in `ns`, once the round trips are
+    /// paid; a batch of small requests shows none.
     fn observe(self: *S3Membership, n: usize, bytes: u64, ns: u64) void {
         if (n == 0) return;
         const lanes = @min(n, READ_CONCURRENCY);
         const rounds = std.math.divCeil(usize, n, READ_CONCURRENCY) catch unreachable;
         const per_lane = bytes / lanes;
-        if (per_lane < 128 << 10) {
-            self.rtt_ns = @min(self.rtt_ns orelse ns, std.math.clamp(ns / rounds, std.time.ns_per_ms, std.time.ns_per_s));
-            return;
-        }
-        const rtt = self.rtt_ns orelse default_rtt_ns;
-        const transfer = ns -| rounds * rtt;
-        if (transfer < ns / 4) return; // round trips dominated; the bandwidth is not visible here
+        if (per_lane < 128 << 10) return;
+        const transfer = ns -| rounds * @max(self.rtt_ns orelse default_rtt_ns, default_rtt_ns);
+        if (transfer < ns / 4) return;
         const bw = @as(f64, @floatFromInt(per_lane * rounds)) / (@as(f64, @floatFromInt(transfer)) / std.time.ns_per_s);
         self.bytes_per_s = std.math.clamp(bw, 1e6, 2e9);
     }
@@ -3902,19 +3902,22 @@ test "BloomSpec.parse: a column, optionally with a probability" {
     }
 }
 
-test "S3 Bloom reads learn the round trip from small requests and the bandwidth from large ones" {
+test "S3 Bloom reads keep the Lambda calibration in-region and measure a distant link" {
     var m: S3Membership = .{ .ctx = undefined, .creds = undefined, .pool = undefined, .specs = &.{} };
     try std.testing.expect(S3Membership.measured(&m) == null);
-    // Eight 32-byte blocks in 60 ms: one round of round trips.
-    m.observe(8, 256, 60 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(?u64, 60 * std.time.ns_per_ms), m.rtt_ns);
-    // 80 MB over eight connections in 60 ms of round trip plus 1 s: 10 MB/s a connection.
-    m.observe(8, 80_000_000, 1060 * std.time.ns_per_ms);
-    try std.testing.expectApproxEqRel(@as(f64, 10e6), m.bytes_per_s.?, 0.01);
-    // A request then costs what one connection moves in 60 ms: 600 KB, not the Lambda default of 2 MiB.
+    // An in-region round trip: the calibration stands whatever the first reads suggest.
+    m.rtt_ns = 12 * std.time.ns_per_ms;
+    m.observe(8, 8 * 260_000, 40 * std.time.ns_per_ms);
+    try std.testing.expect(S3Membership.measured(&m) == null);
+    // A 50 ms round trip: eight 256 KiB filters in 275 ms is ~1.2 MB/s a connection, so a request costs what a
+    // connection moves in 50 ms, about 60 KB.
+    m = .{ .ctx = undefined, .creds = undefined, .pool = undefined, .specs = &.{} };
+    m.rtt_ns = 50 * std.time.ns_per_ms;
+    m.observe(8, 8 * 262_144, 275 * std.time.ns_per_ms);
+    try std.testing.expectApproxEqRel(@as(f64, 262_144.0 / 0.225), m.bytes_per_s.?, 0.01);
     const c = S3Membership.measured(&m).?;
-    try std.testing.expectApproxEqRel(@as(f64, 600e3), @as(f64, @floatFromInt(c.request_bytes)), 0.01);
-    // A batch its round trips account for says nothing about bandwidth.
-    m.observe(16, 4 << 20, 125 * std.time.ns_per_ms);
-    try std.testing.expectApproxEqRel(@as(f64, 10e6), m.bytes_per_s.?, 0.01);
+    try std.testing.expect(c.request_bytes > 50_000 and c.request_bytes < 70_000);
+    // Small requests show no bandwidth.
+    m.observe(115, 115 * 32, 900 * std.time.ns_per_ms);
+    try std.testing.expectApproxEqRel(@as(f64, 262_144.0 / 0.225), m.bytes_per_s.?, 0.01);
 }

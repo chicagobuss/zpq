@@ -101,7 +101,9 @@ pub const Summary = struct {
     idle_ns: u64 = 0,
     threads: usize = 0,
     events: u64 = 0,
+    /// Events lost to the event cap (`profile.Options.max_events`): the later spans of a run that hit it.
     dropped: u64 = 0,
+    event_cap: u64 = 0,
     phases: [Phase.count]PhaseStat = @splat(.{}),
     top: [top_n]ChunkStat = undefined,
     n_top: usize = 0,
@@ -141,6 +143,7 @@ pub fn compute(gpa: std.mem.Allocator, p: *const profile.Profiler) !Summary {
     var s: Summary = .{};
     s.usage = p.usage_end.sub(p.usage_start);
     s.dropped = p.dropped();
+    s.event_cap = p.options.max_events;
     s.peak_rss = p.peak_rss;
     s.peak_requests_in_flight = @intCast(@max(0, p.peak(.requests_in_flight)));
     s.peak_bytes_in_flight = @intCast(@max(0, p.peak(.bytes_in_flight)));
@@ -464,7 +467,10 @@ fn shortEncoding(v: u64) []const u8 {
 pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !void {
     const cores = ratio(s.usage.user_ns + s.usage.sys_ns, s.total_ns);
     try w.print("zpq profile: {d:.2} ms wall, {d} threads, {d} events", .{ ms(s.total_ns), s.threads, s.events });
-    if (s.dropped > 0) try w.print(" ({d} DROPPED)", .{s.dropped});
+    if (s.dropped > 0) {
+        try w.print("\n  {d} EVENTS DROPPED at the cap of {d}, which scales with the memory budget;\n" ++
+            "  the figures below miss the later spans", .{ s.dropped, s.event_cap });
+    }
     try w.print("\n  cpu user {d:.1} ms, sys {d:.1} ms ({d:.1} cores); {d} minor faults\n", .{
         ms(s.usage.user_ns), ms(s.usage.sys_ns), cores, s.usage.minor_faults,
     });
@@ -609,6 +615,7 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     try o.int("threads", s.threads);
     try o.int("events", s.events);
     try o.int("dropped", s.dropped);
+    try o.int("event_cap", s.event_cap);
     {
         var cpu = try o.object("cpu");
         try cpu.ints(s.usage);
@@ -759,4 +766,27 @@ test "overlapping phases on two threads split the wall by thread count" {
     try testing.expectEqual(@as(u64, 100), s.phases[@backingInt(Phase.io)].wall_ns);
     try testing.expectEqual(@as(u64, 0), s.phases[@backingInt(Phase.io)].alone_ns);
     try testing.expectEqual(@as(u64, 200), s.phases[@backingInt(Phase.decode)].busy_ns);
+}
+
+test "the summary reports events dropped at the cap" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const p = try profile.Profiler.create(testing.allocator, .{ .sample_interval_ns = 0, .max_events = 100 }, .{});
+    defer p.destroy();
+    const t = p.thread(.main).?;
+    for (0..1000) |i| t.record(.filter, @intCast(i), @intCast(i + 1), profile.args(.{}));
+    p.finish();
+    const s = try compute(testing.allocator, p);
+    try testing.expect(s.dropped >= 900);
+    try testing.expectEqual(@as(u64, 100), s.event_cap);
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeText(s, p, &aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "EVENTS DROPPED at the cap of 100") != null);
+    aw.clearRetainingCapacity();
+    try writeJson(s, p, &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, @intCast(s.dropped)), parsed.value.object.get("dropped").?.integer);
+    try testing.expectEqual(@as(i64, 100), parsed.value.object.get("event_cap").?.integer);
 }

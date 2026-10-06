@@ -212,12 +212,15 @@ fn handle(
         // A new option is one field on QueryArgs + one parse line on each
         // surface — the handlers below pass `qa` straight through to the
         // engine, so options like `scan_all` flow without touching them.
+        const budget = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
+        // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
+        const prof_opts = zpq.profile.Options.forBudget(budget);
         var profiler: ?*zpq.profile.Profiler = null;
         defer if (profiler) |p| p.destroy();
         if (req.profile and zpq.profile.enabled) {
             var meta = zpq.profile.Meta.discover(env);
             meta.query = zpq.profile.utf8Prefix(trimmed, MAX_PROFILE_QUERY);
-            profiler = try zpq.profile.Profiler.create(allocator, .{}, meta);
+            profiler = try zpq.profile.Profiler.create(allocator, prof_opts, meta);
         }
 
         var qa: engine.QueryArgs = .{
@@ -230,7 +233,7 @@ fn handle(
             .codec = output_codec,
             .scan_all = req.scan_all,
             .trust_stats = req.trust_stats,
-            .max_memory = max_memory orelse zpq.core.system.discoverAvailableMemory(env),
+            .max_memory = if (profiler != null) budget -| prof_opts.reservedBytes() else budget,
             .group_by = req.group_by,
             .column_order = req.column_order,
         };
@@ -240,12 +243,12 @@ fn handle(
         if (qa.aggregate != null or qa.group_by != null) {
             const response = try lambdaAggregate(io, allocator, env, pool, qa);
             const p = profiler orelse return response;
-            return attachProfile(io, allocator, env, pool, p, req.profile_url, response);
+            return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
         if (qa.output != null) {
             const response = try lambdaWrite(io, allocator, env, pool, qa);
             const p = profiler orelse return response;
-            return attachProfile(io, allocator, env, pool, p, req.profile_url, response);
+            return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
         if (req.inputs.len > 0)
             return try handleS3(allocator, env, req.inputs[0], qa.filter);
@@ -259,10 +262,11 @@ fn handle(
 /// Bytes of the request echoed into a profile's metadata.
 const MAX_PROFILE_QUERY: usize = 4096;
 
-/// `response` (a JSON object) with the profile summary added as `"profile"`, and, given `profile_url`, the full
-/// trace uploaded there and reported as `"profile_trace"`. The summary is bounded (see `profile_summary.writeJson`),
-/// a few KB against Lambda's 6 MB response limit; the trace, which grows with the query, never rides in the response.
-/// Consumes `response`.
+/// `response` (a JSON object) with the profile summary added as `"profile"`, and, given `profile_url`, the trace
+/// uploaded there and reported as `"profile_trace"`. The summary is bounded (see `profile_summary.writeJson`), a few KB
+/// against Lambda's 6 MB response limit; the trace, which grows with the query, never rides in the response and is
+/// capped at `profile.traceBytesFor(budget)`. Profiling never fails the query: whatever goes wrong here is reported
+/// in the response, or at worst the answer goes back without its profile. Consumes `response`.
 fn attachProfile(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -270,34 +274,62 @@ fn attachProfile(
     pool: *PersistentPool,
     p: *zpq.profile.Profiler,
     profile_url: ?[]const u8,
+    budget: usize,
     response: []u8,
-) ![]u8 {
-    defer allocator.free(response);
+) []u8 {
     p.finish();
     const body = std.mem.trimEnd(u8, response, " \r\n\t");
-    if (body.len == 0 or body[body.len - 1] != '}') return allocator.dupe(u8, response);
+    if (body.len == 0 or body[body.len - 1] != '}') return response;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const w = &aw.writer;
+    writeProfiled(io, allocator, env, pool, p, profile_url, budget, body, &aw.writer) catch return response;
+    const out = aw.toOwnedSlice() catch return response;
+    allocator.free(response);
+    return out;
+}
+
+fn writeProfiled(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    p: *zpq.profile.Profiler,
+    profile_url: ?[]const u8,
+    budget: usize,
+    body: []const u8,
+    w: *std.Io.Writer,
+) !void {
     try w.writeAll(body[0 .. body.len - 1]);
     try w.writeAll(",\"profile\":");
-    const summary = try zpq.profile_summary.compute(allocator, p);
-    try zpq.profile_summary.writeJson(summary, p, w);
+    {
+        // Into a buffer of its own, so a failure part way leaves no half-written member behind.
+        var sw: std.Io.Writer.Allocating = .init(allocator);
+        defer sw.deinit();
+        if (summaryJson(allocator, p, &sw.writer)) {
+            try w.writeAll(sw.written());
+        } else |err| {
+            try w.print("{{\"error\":\"{s}\"}}", .{@errorName(err)});
+        }
+    }
     if (profile_url) |url_str| {
         try w.writeAll(",\"profile_trace\":{\"url\":");
         try engine.writeJsonQuoted(w, url_str);
-        if (uploadTrace(io, allocator, env, pool, p, url_str)) |bytes| {
-            try w.print(",\"bytes\":{d}}}", .{bytes});
+        if (uploadTrace(io, allocator, env, pool, p, url_str, zpq.profile.traceBytesFor(budget))) |st| {
+            try w.print(",\"bytes\":{d},\"omitted_events\":{d}}}", .{ st.bytes, st.omitted });
         } else |err| {
             try w.print(",\"error\":\"{s}\"}}", .{@errorName(err)});
         }
     }
     try w.writeByte('}');
-    return aw.toOwnedSlice();
 }
 
-/// PUT the Chrome trace to `url_str` over the warm pool. Returns the bytes uploaded.
+fn summaryJson(allocator: std.mem.Allocator, p: *zpq.profile.Profiler, w: *std.Io.Writer) !void {
+    const summary = try zpq.profile_summary.compute(allocator, p);
+    try zpq.profile_summary.writeJson(summary, p, w);
+}
+
+/// PUT the Chrome trace, cut at `max_bytes`, to `url_str` over the warm pool.
 fn uploadTrace(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -305,18 +337,19 @@ fn uploadTrace(
     pool: *PersistentPool,
     p: *zpq.profile.Profiler,
     url_str: []const u8,
-) !usize {
+    max_bytes: usize,
+) !zpq.profile.TraceStats {
     const url = s3.Url.parse(url_str) catch return error.BadProfileUrl;
     const creds = s3.Credentials.fromEnv(env) catch return error.NoCredentials;
     var trace: std.Io.Writer.Allocating = .init(allocator);
     defer trace.deinit();
-    try p.writeTrace(allocator, &trace.writer);
+    const st = try p.writeTraceCapped(allocator, &trace.writer, max_bytes);
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const inner = try pool.ensureForBucket(allocator, creds, url.bucket);
     const resp = try s3.putViaPool(io, inner, arena_state.allocator(), creds, url, trace.written());
     if (resp.status != 200) return error.TraceUploadFailed;
-    return trace.written().len;
+    return st;
 }
 
 /// The response for a failed query: the error, and the column or input file it is about when `diag` names one.

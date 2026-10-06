@@ -63,6 +63,9 @@ every 2 ms by the `sampler` thread, and at the start and end). The sampler keeps
 outside the event cap; when it fills, every other sample is dropped and the period doubles, so a long query's series
 still covers the whole run.
 
+The trace ends with a `zpq` member: `event_cap`, `dropped_events` (lost to the cap during the query) and
+`omitted_events` (left out to keep the Lambda's trace under its size cap; see [What it costs](#what-it-costs)).
+
 The trace's `otherData` holds the run's metadata: zpq version, build mode, target triple, CPU count, the parallelism
 and memory budget the engine sized itself from, whether it ran on Lambda (and the memory tier), the start time, and
 the query as typed.
@@ -149,8 +152,15 @@ the query. See [lambda_requests.md](lambda_requests.md).
 Profiling is compiled in by default and switched on per query. Off, a span site costs one branch on a null pointer;
 `-Dprofile=false` compiles the sites out. On, a span is two monotonic clock reads (`src/clock.zig`) and a store into the
 recording thread's own buffer: no locks or atomics on the hot path. The in-flight counters take one atomic add per S3
-request. Events are capped at 2^20 per query (about 72 MB); past that they are counted as dropped, and the summary
-says so.
+request.
+
+Memory. The event buffers take at most 1/32 of the query's memory budget (`--max-memory`, else the Lambda tier or the
+cgroup or machine memory), never more than 2^20 events (about 72 MB), and that share is taken out of the budget the
+engine plans with, so a query that fits its budget still fits with profiling on. Past the cap, events are counted as
+dropped: the summary says so (`dropped` and `event_cap` in JSON), and so does the trace. The CLI streams the trace to
+its file. The Lambda builds it in memory before uploading it, after the query has released its own memory, and stops
+at 1/16 of the budget (between 1 and 256 MiB); the events left out are counted. Nothing in profiling fails the query:
+a summary or upload that cannot be made is reported in the response instead.
 
 Measured 2026-10-06 on a 16-core Ryzen AI Max+ 395 (`taskset -c 0-15`, the `compare_oct2026` harness and
 fixtures, page cache warm, a shared and busy machine, so best-of-runs is the statistic), ReleaseFast, against the same

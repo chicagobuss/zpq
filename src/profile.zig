@@ -314,10 +314,68 @@ const block_events: usize = 4096;
 const sampler_events: usize = 4096;
 
 pub const Options = struct {
-    /// Events kept across all threads; later ones are counted as dropped. 72 bytes each.
-    max_events: usize = 1 << 20,
+    /// Events kept across all threads; later ones are counted as dropped.
+    max_events: usize = max_events_cap,
     /// RSS sampling period; 0 disables the sampler thread (RSS is still read at start and finish).
     sample_interval_ns: u64 = 2 * std.time.ns_per_ms,
+
+    /// The most events any run keeps, whatever its budget: 72 MB.
+    pub const max_events_cap: usize = 1 << 20;
+    /// The share of the memory budget the event buffers may take.
+    const budget_divisor = 32;
+
+    /// Options for a query whose memory budget (`--max-memory`, the Lambda tier, the cgroup limit) is
+    /// `budget_bytes`: the event buffers take at most 1/32 of it, so profiling cannot push a query that fits its
+    /// budget out of memory. Give the engine `budget_bytes - reservedBytes()`.
+    pub fn forBudget(budget_bytes: usize) Options {
+        return .{ .max_events = @min(max_events_cap, budget_bytes / budget_divisor / @sizeOf(Event)) };
+    }
+
+    /// The most memory the profiler's buffers hold while the query runs: the event cap and the sampler's ring.
+    pub fn reservedBytes(self: Options) usize {
+        const ring: usize = if (self.sample_interval_ns > 0) sampler_events else 0;
+        return (self.max_events + ring) * @sizeOf(Event);
+    }
+};
+
+/// The largest trace to build in memory for a query with this memory budget: 1/16 of it, between 1 and 256 MiB. The
+/// trace is built after the query has released its own memory; past the cap, events are left out and counted
+/// (`TraceStats.omitted`) rather than risk the process.
+pub fn traceBytesFor(budget_bytes: usize) usize {
+    return std.math.clamp(budget_bytes / 16, 1 << 20, 256 << 20);
+}
+
+/// What `Profiler.writeTraceCapped` wrote.
+pub const TraceStats = struct {
+    bytes: usize = 0,
+    events: u64 = 0,
+    /// Events left out because the trace reached its byte cap.
+    omitted: u64 = 0,
+};
+
+/// Forwards to `inner`, counting bytes, so a trace can stop at a size cap whatever it is written to.
+const CountingWriter = struct {
+    inner: *std.Io.Writer,
+    forwarded: usize = 0,
+    writer: std.Io.Writer,
+
+    fn init(inner: *std.Io.Writer, buffer: []u8) CountingWriter {
+        return .{ .inner = inner, .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn count(self: *const CountingWriter) usize {
+        return self.forwarded + self.writer.end;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *CountingWriter = @alignCast(@fieldParentPtr("writer", w));
+        try self.inner.writeAll(w.buffered());
+        self.forwarded += w.end;
+        w.end = 0;
+        const n = try self.inner.writeSplat(data, splat);
+        self.forwarded += n;
+        return n;
+    }
 };
 
 /// Run metadata written into the trace and the summary.
@@ -653,8 +711,18 @@ pub const Profiler = struct {
 
     /// Chrome Trace Event JSON (object form). Call after `finish`.
     pub fn writeTrace(self: *Profiler, gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
+        _ = try self.writeTraceCapped(gpa, w, std.math.maxInt(usize));
+    }
+
+    /// `writeTrace`, stopping before the event that would take it past about `max_bytes` (one event may overshoot).
+    /// The trace stays valid JSON either way, and its trailing `zpq` member counts what was dropped and left out.
+    pub fn writeTraceCapped(self: *Profiler, gpa: std.mem.Allocator, out: *std.Io.Writer, max_bytes: usize) !TraceStats {
         const ts = try self.threads(gpa);
         defer gpa.free(ts);
+        var buf: [4096]u8 = undefined;
+        var cw: CountingWriter = .init(out, &buf);
+        const w = &cw.writer;
+        var stats: TraceStats = .{};
 
         try w.writeAll("{\"displayTimeUnit\":\"ns\",\"otherData\":");
         try self.writeMetaJson(w, std.math.maxInt(usize));
@@ -678,9 +746,21 @@ pub const Profiler = struct {
         }
         for (ts) |t| {
             var blocks = t.eventBlocks();
-            while (blocks.next()) |evs| for (evs) |ev| try self.writeEvent(w, t.tid, ev);
+            while (blocks.next()) |evs| for (evs) |ev| {
+                if (cw.count() >= max_bytes) {
+                    stats.omitted += 1;
+                    continue;
+                }
+                try self.writeEvent(w, t.tid, ev);
+                stats.events += 1;
+            };
         }
-        try w.writeAll("\n]}\n");
+        try w.print("\n],\"zpq\":{{\"event_cap\":{d},\"dropped_events\":{d},\"omitted_events\":{d}}}}}\n", .{
+            self.options.max_events, self.dropped(), stats.omitted,
+        });
+        try w.flush();
+        stats.bytes = cw.count();
+        return stats;
     }
 
     fn writeEvent(self: *const Profiler, w: *std.Io.Writer, tid: u64, ev: Event) !void {
@@ -1043,4 +1123,44 @@ test "peak RSS is this run's, not the process's: a later run does not inherit an
     // The second, warm run must not report the first one's peak; the first saw the buffer when the reset works.
     try testing.expect(peaks[1] < currentRss() + big / 2);
     if (peaks[1] < peaks[0]) try testing.expect(peaks[0] - peaks[1] > big / 2);
+}
+
+test "the event cap scales with the memory budget and is reserved out of it" {
+    const small = Options.forBudget(128 << 20);
+    try testing.expectEqual(@as(usize, (128 << 20) / 32 / @sizeOf(Event)), small.max_events);
+    try testing.expect(small.reservedBytes() <= (128 << 20) / 32 + sampler_events * @sizeOf(Event));
+    try testing.expectEqual(Options.max_events_cap, Options.forBudget(64 << 30).max_events);
+    try testing.expectEqual(@as(usize, 0), Options.forBudget(800).max_events);
+    try testing.expectEqual(@as(usize, 1 << 20), traceBytesFor(1 << 20));
+    try testing.expectEqual(@as(usize, 16 << 20), traceBytesFor(256 << 20));
+    try testing.expectEqual(@as(usize, 256 << 20), traceBytesFor(64 << 30));
+}
+
+test "a capped trace stops near its cap, stays valid JSON and counts what it left out" {
+    if (!enabled) return error.SkipZigTest;
+    const p = try Profiler.create(testing.allocator, .{ .sample_interval_ns = 0, .max_events = 5000 }, .{});
+    defer p.destroy();
+    p.setFiles(&.{"s3://bucket/a/long/key/name.parquet"});
+    const t = p.thread(.main).?;
+    for (0..6000) |i| record(t, .open_file, @intCast(i), @intCast(i + 1), args(.{ 0, i }));
+    p.finish();
+
+    for ([_]usize{ 64 << 10, std.math.maxInt(usize) }) |cap| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        const st = try p.writeTraceCapped(testing.allocator, &aw.writer, cap);
+        try testing.expectEqual(aw.written().len, st.bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+        defer parsed.deinit();
+        const zpq = parsed.value.object.get("zpq").?.object;
+        try testing.expectEqual(@as(i64, 5000), zpq.get("event_cap").?.integer);
+        try testing.expect(zpq.get("dropped_events").?.integer >= 1000);
+        try testing.expectEqual(@as(i64, @intCast(st.omitted)), zpq.get("omitted_events").?.integer);
+        if (cap == std.math.maxInt(usize)) {
+            try testing.expectEqual(@as(u64, 0), st.omitted);
+        } else {
+            try testing.expect(st.omitted > 0 and st.events > 0);
+            try testing.expect(st.bytes < cap + 1024);
+        }
+    }
 }

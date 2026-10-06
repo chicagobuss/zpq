@@ -710,6 +710,8 @@ test "lambda returns a bounded profile summary inline when asked" {
     const straddle = note ++ @as([511 - note.len]u8, @splat('a')) ++ "\u{e9}\"}";
     try expectResponses("lambda profile", &.{
         .{ .body = straddle, .want = "aaaa\"},\"phases\":{" },
+        // The event cap is 1/32 of the memory budget, in 72-byte events.
+        .{ .body = agg ++ ",\"max_memory\":\"64MB\"}", .want = "\"dropped\":0,\"event_cap\":29127," },
         // The answer is untouched; the summary joins it, phases and engine sums included.
         .{ .body = agg ++ "}", .want = "\"agg\":{\"n\":3," },
         .{ .body = agg ++ "}", .want = "\"profile\":{\"total_ns\":" },

@@ -84,7 +84,8 @@ difference does not mask real decode errors.
 Majority voting accepts a wrong answer when ZPQ and DuckDB share a bug — DuckDB is lenient where the spec is strict
 (for example, it reads files whose column chunks contradict the schema), and it can share a statistics-handling bug
 with ZPQ. `REFEREE_OVERRIDES` at the top of `tools/triangulate.py` takes such a file out of the vote, keyed by its
-label:
+label. Its entries have this shape (the second is an illustration of an `expected` entry; the shipped table holds
+`authority` entries only):
 
 ```python
 REFEREE_OVERRIDES = {
@@ -92,9 +93,9 @@ REFEREE_OVERRIDES = {
         "authority": "hardwood",   # Hardwood alone decides, including whether the file must be rejected
         "why": "chunk path_in_schema contradicts the schema's leaf order; a reader must reject, not guess",
     },
-    "parquet-testing:example.parquet": {
+    "zpq-ci:some_fixture.parquet": {
         "expected": {"total_rows": 10, "x_gt_count": 4},  # hand-verified answers; beat every engine
-        "why": "deprecated min/max stats are signed-ordered; DuckDB prunes on them",
+        "why": "why no engine can be trusted on this file",
     },
 }
 ```
@@ -111,7 +112,9 @@ REFEREE_OVERRIDES = {
 Numbers compare under the policy in `tools/oracle_compare.py`, shared with `tools/differential.py` (its docstring is the
 reference; `python tools/oracle_compare.py` checks it). Hardwood 1.1's JSON export is typed for numbers and booleans and
 renders the rest as text; when one side of a pair is text, it is coerced toward the other side's type before comparing:
-- **Nulls:** SQL NULL equals only NULL. An aggregate over no values is NULL on every engine, never 0.
+- **Nulls:** SQL NULL equals only NULL. An aggregate over no values is NULL on every engine, never 0. Hardwood's
+  JSON export spells null `null`; its CSV export writes an empty field for null (`--null-string` overrides), which CSV
+  cannot tell apart from an empty string, so the harness reads JSON.
 - **Integers:** exact, including integral results DuckDB widens to `DECIMAL`/`HUGEINT` (its integer `SUM`s).
 - **Decimals:** exact against each other. ZPQ answers `sum`/`min`/`max` of a DECIMAL column in `f64`, so those results
   compare as floats; Hardwood prints plain decimal strings and DuckDB returns `Decimal`.
@@ -121,8 +124,6 @@ renders the rest as text; when one side of a pair is text, it is coerced toward 
   renders INT96 and UTC-adjusted timestamps as instants with a trailing `Z`; DuckDB runs with `TimeZone='UTC'`.
 - **Binary:** rendered the way Hardwood does (strict UTF-8 without control characters is text, otherwise `0x` hex).
 - **Nested:** compared structurally; Hardwood emits native JSON lists and objects.
-- **Nulls:** JSON `null`. Hardwood's CSV export writes an empty field for null (`--null-string` overrides), which CSV
-  itself cannot tell apart from an empty string, so the harness reads JSON, where null has its own spelling.
 
 ## Soft Hardwood Dependency
 Hardwood is treated as a soft dependency to maintain project philosophy ("if we can't fix it, we don't use it"). If the

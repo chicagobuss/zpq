@@ -33,7 +33,12 @@ pub fn build(b: *std.Build) void {
     // `-Dfetch-prebuilt=false` turns a missing local copy into an error.
     const fetch_prebuilt = b.option(bool, "fetch-prebuilt", "Download pinned BoringSSL prebuilts that vendor/boring_tls/prebuilt lacks (default true)") orelse true;
 
-    const deps = CoreDeps.init(b, target, optimize, fetch_prebuilt);
+    // Profiling (`zpq query --profile`, the Lambda's `"profile"`) costs one branch per span site when not asked for;
+    // `-Dprofile=false` compiles the span sites out entirely.
+    const profile = b.option(bool, "profile", "Compile in query profiling (--profile; default true)") orelse true;
+
+    var deps = CoreDeps.init(b, target, optimize, fetch_prebuilt);
+    deps.profile = profile;
 
     // ----- CLI binary -----
     const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql);
@@ -228,6 +233,8 @@ const CoreDeps = struct {
     /// `sql = true`; an unreferenced library step is never compiled.
     liteparser: *std.Build.Step.Compile,
     liteparser_c: *std.Build.Module,
+    /// `build_options.enable_profile` for every module instance.
+    profile: bool = true,
 
     fn init(
         b: *std.Build,
@@ -315,6 +322,7 @@ fn addCoreModule(
 ) Core {
     const opts = b.addOptions();
     opts.addOption(bool, "enable_sql", options.sql);
+    opts.addOption(bool, "enable_profile", deps.profile);
     opts.addOption([]const u8, "version", zon.version);
     const opts_mod = opts.createModule();
 

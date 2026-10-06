@@ -65,6 +65,8 @@ pub const core = struct {
 
 pub const engine = @import("engine.zig");
 pub const clock = @import("clock.zig");
+pub const profile = @import("profile.zig");
+pub const profile_summary = @import("profile_summary.zig");
 pub const local_fs = @import("local_fs.zig");
 
 pub const io = struct {
@@ -129,6 +131,8 @@ test {
     _ = @import("core/parquet/encoding/delta_byte_array.zig");
     _ = @import("engine.zig");
     _ = @import("clock.zig");
+    _ = @import("profile.zig");
+    _ = @import("profile_summary.zig");
     _ = @import("local_fs.zig");
     _ = @import("io/strategy.zig");
     _ = @import("io/loop.zig");

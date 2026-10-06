@@ -1,0 +1,832 @@
+//! Query profiling: spans, counters and run metadata recorded into per-thread buffers, exported as a Chrome Trace
+//! Event JSON trace (open it at https://ui.perfetto.dev) and condensed by `profile_summary.zig`.
+//!
+//! Cost. A span site holds an optional `*Thread`. With profiling off it is null and the site costs one predictable
+//! branch; `-Dprofile=false` (`build_options.enable_profile`) compiles every site out. With profiling on, a span is two
+//! `clock.monoNs` reads and a store into the calling thread's own buffer: no lock, no atomic, and one allocation per
+//! `block_events` events. Several spans reuse the timestamps the engine already takes for its phase timings, so those
+//! sums reconcile with `Timings` exactly rather than approximately.
+//!
+//! Threading. A `Thread` buffer is written only by the OS thread `Profiler.thread` returned it to, and read by the
+//! exporter only after that thread's work is joined (the engine joins every worker before `runQuery` returns). Buffers
+//! hang off a lock-free, append-only list keyed by OS thread id, so a thread that profiles several stages keeps one
+//! buffer and its spans nest by construction.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const clock = @import("clock.zig");
+const schema = @import("core/schema.zig");
+const system = @import("core/system.zig");
+
+/// Comptime switch: false compiles every span site to nothing.
+pub const enabled: bool = build_options.enable_profile;
+
+/// Where a span's exclusive time is charged in the summary.
+pub const Phase = enum(u8) {
+    open,
+    footer,
+    plan,
+    prune,
+    io,
+    decompress,
+    decode,
+    filter,
+    project,
+    aggregate,
+    encode,
+    write,
+    merge,
+    other,
+    /// A thread parked on other threads' work (a join, a semaphore). Not work: the summary leaves it out of busy time
+    /// and the critical path, so a waiting coordinator does not compete with the workers it waits on.
+    wait,
+
+    pub const count = @typeInfo(Phase).@"enum".field_names.len;
+};
+
+/// What a span measures. Each kind has a fixed phase and fixed argument names (`argNames`).
+pub const Kind = enum(u8) {
+    query,
+    open_inputs,
+    open_file,
+    footer_batch,
+    footer_fetch,
+    footer_parse,
+    parse_query,
+    plan,
+    plan_ranges,
+    fetch,
+    http_get,
+    http_put,
+    scan,
+    scan_worker,
+    worker_release,
+    row_group,
+    prune_pages,
+    decode,
+    column_chunk,
+    decompress,
+    filter,
+    project,
+    stats_fold,
+    aggregate,
+    merge,
+    finalize,
+    reencode,
+    encode_rg,
+    encode,
+    encode_chunk,
+    copy_rg,
+    sink_write,
+    upload_create,
+    upload_wait,
+    upload_complete,
+    footer_write,
+    counter,
+
+    pub fn phase(k: Kind) Phase {
+        return switch (k) {
+            .query, .scan_worker, .worker_release, .row_group, .encode_rg, .counter => .other,
+            .open_inputs, .open_file => .open,
+            .footer_fetch, .footer_parse => .footer,
+            .parse_query, .plan, .plan_ranges => .plan,
+            .prune_pages => .prune,
+            .http_get, .http_put, .upload_create, .upload_complete => .io,
+            .decode, .column_chunk => .decode,
+            .decompress => .decompress,
+            .filter => .filter,
+            .project => .project,
+            .stats_fold, .aggregate => .aggregate,
+            .encode, .encode_chunk => .encode,
+            .copy_rg, .sink_write, .footer_write => .write,
+            .merge, .finalize => .merge,
+            .footer_batch, .fetch, .scan, .reencode, .upload_wait => .wait,
+        };
+    }
+
+    /// Names of `Event.args[0..]`; arguments past the list's end are unused. `http_*.flags` packs the status (bits
+    /// 0-15), attempts (16-23) and whether the final attempt reused a pooled connection (bit 24); `http_*.timing` the
+    /// final attempt's time to first byte (low 32 bits, ns) and its pool wait plus connect (high 32);
+    /// `column_chunk.types` packs codec (bits 0-7), encoding (8-15) and physical type (16-23); `decompress.types`
+    /// codec, page type and page encoding the same way. `row_group.decision` is 0 skip, 1 full match, 2 filtered;
+    /// `reason` the leaf index + 1 of the filter column whose statistics skipped it (0 none).
+    pub fn argNames(k: Kind) []const []const u8 {
+        return switch (k) {
+            .query, .parse_query, .merge, .finalize => &.{},
+            .open_inputs, .footer_batch => &.{"files"},
+            .open_file, .footer_parse => &.{ "file", "bytes" },
+            .footer_fetch => &.{ "file", "cache" },
+            .plan => &.{ "work_items", "workers", "row_groups" },
+            .plan_ranges => &.{ "ranges", "merged", "fetch_jobs", "bytes", "row_groups", "row_groups_pruned" },
+            .fetch => &.{ "jobs", "bytes" },
+            .http_get => &.{ "range_start", "range_end", "bytes", "flags", "timing", "body_ns" },
+            .http_put => &.{ "part", "unused", "bytes", "flags", "timing", "body_ns" },
+            .scan => &.{"workers"},
+            .worker_release => &.{"worker"},
+            .scan_worker => &.{ "worker", "items", "user_ns", "sys_ns", "minor_faults", "major_faults" },
+            .row_group => &.{ "file", "rg", "decision", "rows", "reason", "columns" },
+            .prune_pages => &.{ "pages", "pages_skipped" },
+            .decode => &.{ "file", "rg", "columns" },
+            .column_chunk => &.{ "file", "rg", "col", "types", "bytes_in", "bytes_out" },
+            .decompress => &.{ "types", "bytes_in", "bytes_out" },
+            .filter => &.{ "rows", "selected" },
+            .project => &.{ "rows", "columns" },
+            .stats_fold => &.{"answered"},
+            .aggregate => &.{ "rows", "calls" },
+            .reencode => &.{ "row_groups", "workers", "window" },
+            .encode_rg => &.{ "file", "rg", "passthrough" },
+            .encode => &.{ "columns", "rows" },
+            .encode_chunk => &.{ "col", "codec", "bytes_in", "bytes_out", "values" },
+            .copy_rg, .sink_write, .footer_write => &.{"bytes"},
+            .upload_create, .upload_wait, .upload_complete => &.{"parts"},
+            .counter => &.{ "gauge", "value" },
+        };
+    }
+};
+
+pub const Args = [6]u64;
+
+/// `xs` (a tuple of integers, at most six) as `Args`, zero-padded.
+pub fn args(xs: anytype) Args {
+    var a: Args = @splat(0);
+    inline for (xs, 0..) |x, i| a[i] = toU64(x);
+    return a;
+}
+
+fn toU64(x: anytype) u64 {
+    return switch (@typeInfo(@TypeOf(x))) {
+        .bool => @intFromBool(x),
+        .@"enum" => @intCast(@backingInt(x)),
+        .comptime_int => x,
+        .int => |info| if (info.signedness == .signed) @bitCast(@as(i64, @intCast(x))) else @intCast(x),
+        else => @compileError("profile.args takes integers, bools and enums"),
+    };
+}
+
+/// One recorded span or counter sample. `start` is a `clock.monoNs` reading; a counter has `dur == 0` and its gauge
+/// and value in `args`.
+pub const Event = struct {
+    start: i64,
+    dur: i64,
+    args: Args,
+    kind: Kind,
+};
+
+/// Values tracked across threads. Updated where they change, so the trace has exact steps rather than samples, except
+/// `rss_bytes`, which the sampler thread reads.
+pub const Gauge = enum(u8) {
+    requests_in_flight,
+    bytes_in_flight,
+    buffered_bytes,
+    rss_bytes,
+
+    pub const count = @typeInfo(Gauge).@"enum".field_names.len;
+};
+
+/// The role a thread's buffer was created for; names the thread in the trace.
+pub const Label = enum(u8) { main, parse, scan, fetch, encode, writer, upload, sampler };
+
+/// One OS thread's event buffer. Written only by that thread; see the file comment.
+pub const Thread = struct {
+    profiler: *Profiler,
+    tid: u64,
+    label: Label,
+    /// Creation order, for stable thread naming.
+    seq: u32,
+    next: ?*Thread = null,
+    blocks: std.ArrayList(Block) = .empty,
+    /// Fill of the last block; earlier blocks record their own in `Block.len`.
+    len: usize = 0,
+    dropped: u64 = 0,
+
+    const Block = struct { buf: []Event, len: usize = 0 };
+
+    /// Out of line so a span site stays a branch and a call: the sites are many and the Lambda ships them all.
+    pub noinline fn record(self: *Thread, kind: Kind, start_ns: i64, end_ns: i64, a: Args) void {
+        self.push(.{ .kind = kind, .start = start_ns, .dur = @max(0, end_ns - start_ns), .args = a });
+    }
+
+    /// Add `delta` to `g` and record the new value.
+    pub noinline fn gauge(self: *Thread, g: Gauge, delta: i64) void {
+        const p = self.profiler;
+        const now = p.gauges[@backingInt(g)].fetchAdd(delta, .monotonic) + delta;
+        _ = p.gauge_peaks[@backingInt(g)].fetchMax(now, .monotonic);
+        self.push(.{ .kind = .counter, .start = clock.monoNs(), .dur = 0, .args = args(.{ g, now }) });
+    }
+
+    /// Set `g` to `value` and record it.
+    pub fn gaugeSet(self: *Thread, g: Gauge, value: i64) void {
+        const p = self.profiler;
+        p.gauges[@backingInt(g)].store(value, .monotonic);
+        _ = p.gauge_peaks[@backingInt(g)].fetchMax(value, .monotonic);
+        self.push(.{ .kind = .counter, .start = clock.monoNs(), .dur = 0, .args = args(.{ g, value }) });
+    }
+
+    fn push(self: *Thread, ev: Event) void {
+        const items = self.blocks.items;
+        if (items.len == 0 or self.len == items[items.len - 1].buf.len) {
+            if (!self.grow()) {
+                self.dropped += 1;
+                return;
+            }
+        }
+        self.blocks.items[self.blocks.items.len - 1].buf[self.len] = ev;
+        self.len += 1;
+    }
+
+    /// A fresh block, drawn from the profiler's event budget. False once the budget or memory runs out: profiling
+    /// degrades to counting drops and never fails the query.
+    fn grow(self: *Thread) bool {
+        @branchHint(.cold);
+        const p = self.profiler;
+        const n: usize = if (self.blocks.items.len == 0) first_block_events else block_events;
+        if (p.events_left.fetchSub(@intCast(n), .monotonic) < n) return false;
+        const buf = p.gpa.alloc(Event, n) catch return false;
+        self.blocks.append(p.gpa, .{ .buf = buf }) catch {
+            p.gpa.free(buf);
+            return false;
+        };
+        const items = self.blocks.items;
+        if (items.len > 1) items[items.len - 2].len = self.len;
+        self.len = 0;
+        return true;
+    }
+
+    /// Every recorded event, block by block. Valid once the thread's work is joined.
+    pub fn eventBlocks(self: *const Thread) EventIterator {
+        return .{ .t = self };
+    }
+
+    fn deinit(self: *Thread, gpa: std.mem.Allocator) void {
+        for (self.blocks.items) |b| gpa.free(b.buf);
+        self.blocks.deinit(gpa);
+    }
+};
+
+pub const EventIterator = struct {
+    t: *const Thread,
+    i: usize = 0,
+
+    pub fn next(self: *EventIterator) ?[]const Event {
+        const blocks = self.t.blocks.items;
+        if (self.i >= blocks.len) return null;
+        defer self.i += 1;
+        const b = blocks[self.i];
+        return b.buf[0..if (self.i + 1 == blocks.len) self.t.len else b.len];
+    }
+};
+
+/// Small first block: most threads (a fetch worker, a parse worker) record a handful of spans.
+const first_block_events: usize = 64;
+const block_events: usize = 4096;
+
+pub const Options = struct {
+    /// Events kept across all threads; later ones are counted as dropped. 72 bytes each.
+    max_events: usize = 1 << 20,
+    /// RSS sampling period; 0 disables the sampler thread (RSS is still read at start and finish).
+    sample_interval_ns: u64 = 2 * std.time.ns_per_ms,
+};
+
+/// Run metadata written into the trace and the summary.
+pub const Meta = struct {
+    version: []const u8 = build_options.version,
+    build_mode: []const u8 = @tagName(builtin.mode),
+    target: []const u8 = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi),
+    cpu_count: usize = 0,
+    /// `system.discoverAvailableParallelism`: what the engine sizes its workers from.
+    parallelism: usize = 0,
+    /// `system.discoverAvailableMemory`: the memory tier the engine budgets against.
+    memory_bytes: usize = 0,
+    on_lambda: bool = false,
+    lambda_memory_mb: ?usize = null,
+    /// The query as the caller expressed it (argv or the request), for the reader.
+    query: []const u8 = "",
+
+    pub fn discover(env: ?std.process.Environ) Meta {
+        const mb: ?usize = if (env) |e|
+            (if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |s| std.fmt.parseInt(usize, s, 10) catch null else null)
+        else
+            null;
+        return .{
+            .cpu_count = std.Thread.getCpuCount() catch 1,
+            .parallelism = system.discoverAvailableParallelism(env),
+            .memory_bytes = system.discoverAvailableMemory(env),
+            .on_lambda = system.onLambda(env),
+            .lambda_memory_mb = mb,
+        };
+    }
+};
+
+/// Process resource usage at one instant.
+pub const Usage = struct {
+    user_ns: u64 = 0,
+    sys_ns: u64 = 0,
+    minor_faults: u64 = 0,
+    major_faults: u64 = 0,
+    /// Peak resident set, bytes.
+    max_rss: u64 = 0,
+
+    pub fn sub(a: Usage, b: Usage) Usage {
+        return .{
+            .user_ns = a.user_ns -| b.user_ns,
+            .sys_ns = a.sys_ns -| b.sys_ns,
+            .minor_faults = a.minor_faults -| b.minor_faults,
+            .major_faults = a.major_faults -| b.major_faults,
+            .max_rss = a.max_rss,
+        };
+    }
+};
+
+/// This process's usage, or (Linux only) the calling thread's.
+pub fn usage(comptime who: enum { process, thread }) Usage {
+    if (builtin.os.tag == .windows) return .{};
+    if (who == .thread and builtin.os.tag != .linux) return .{};
+    const ru = std.posix.getrusage(if (who == .thread) 1 else 0);
+    const tvNs = struct {
+        fn f(tv: anytype) u64 {
+            const sec: u64 = @intCast(@max(0, tv.sec));
+            const usec: u64 = @intCast(@max(0, tv.usec));
+            return sec * std.time.ns_per_s + usec * std.time.ns_per_us;
+        }
+    }.f;
+    // Linux reports maxrss in KiB, macOS in bytes.
+    const rss_unit: u64 = if (builtin.os.tag == .linux) 1024 else 1;
+    return .{
+        .user_ns = tvNs(ru.utime),
+        .sys_ns = tvNs(ru.stime),
+        .minor_faults = @intCast(@max(0, ru.minflt)),
+        .major_faults = @intCast(@max(0, ru.majflt)),
+        .max_rss = @as(u64, @intCast(@max(0, ru.maxrss))) * rss_unit,
+    };
+}
+
+/// Current resident set from /proc/self/statm; 0 where that does not exist.
+pub fn currentRss() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [128]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return 0;
+    var fields = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+    _ = fields.next() orelse return 0;
+    const pages = std.fmt.parseInt(u64, fields.next() orelse return 0, 10) catch return 0;
+    return pages * std.heap.pageSize();
+}
+
+pub const Profiler = struct {
+    gpa: std.mem.Allocator,
+    options: Options,
+    epoch_ns: i64,
+    end_ns: i64 = 0,
+    /// Wall-clock start, seconds since the Unix epoch.
+    epoch_real_s: i64,
+    head: std.atomic.Value(?*Thread) = .init(null),
+    threads_created: std.atomic.Value(u32) = .init(0),
+    events_left: std.atomic.Value(i64),
+    gauges: [Gauge.count]std.atomic.Value(i64) = @splat(.init(0)),
+    gauge_peaks: [Gauge.count]std.atomic.Value(i64) = @splat(.init(0)),
+    /// Owner-thread only: names and metadata are set before workers start and read after they finish.
+    arena: std.heap.ArenaAllocator,
+    files: []const []const u8 = &.{},
+    columns: []const []const u8 = &.{},
+    meta: Meta = .{},
+    usage_start: Usage = .{},
+    usage_end: Usage = .{},
+    sampler: ?std.Thread = null,
+    /// Nonzero once `finish` runs; the sampler sleeps on it as a futex so finishing never waits out a period.
+    stop: std.atomic.Value(u32) = .init(0),
+
+    /// A started profiler: the epoch is now, and the sampler (when enabled) is running. `finish` before reading.
+    pub fn create(gpa: std.mem.Allocator, options: Options, meta: Meta) !*Profiler {
+        const p = try gpa.create(Profiler);
+        p.* = .{
+            .gpa = gpa,
+            .options = options,
+            .epoch_ns = clock.monoNs(),
+            .epoch_real_s = clock.realtimeS(),
+            .events_left = .init(@intCast(options.max_events)),
+            .arena = .init(gpa),
+        };
+        p.meta = meta;
+        p.meta.query = p.arena.allocator().dupe(u8, meta.query) catch "";
+        p.usage_start = usage(.process);
+        if (p.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(currentRss()));
+        if (options.sample_interval_ns > 0) {
+            // Not smaller: glibc carves static TLS out of the stack and rejects a stack too small to hold it.
+            p.sampler = std.Thread.spawn(.{ .stack_size = 1 << 20 }, samplerRun, .{p}) catch null;
+        }
+        return p;
+    }
+
+    /// Stop the sampler and close the run. Idempotent.
+    pub fn finish(self: *Profiler) void {
+        if (self.end_ns != 0) return;
+        self.stop.store(1, .release);
+        if (builtin.os.tag == .linux) _ = std.os.linux.futex_3arg(&self.stop.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        if (self.sampler) |t| t.join();
+        self.sampler = null;
+        self.end_ns = clock.monoNs();
+        self.usage_end = usage(.process);
+        if (self.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(currentRss()));
+    }
+
+    pub fn destroy(self: *Profiler) void {
+        self.finish();
+        var it = self.head.load(.acquire);
+        while (it) |t| {
+            it = t.next;
+            t.deinit(self.gpa);
+            self.gpa.destroy(t);
+        }
+        self.arena.deinit();
+        self.gpa.destroy(self);
+    }
+
+    /// The calling OS thread's buffer, created on first use. Null when out of memory.
+    pub fn thread(self: *Profiler, label: Label) ?*Thread {
+        const tid: u64 = @intCast(std.Thread.getCurrentId());
+        var it = self.head.load(.acquire);
+        while (it) |t| : (it = t.next) {
+            if (t.tid == tid) return t;
+        }
+        const t = self.gpa.create(Thread) catch return null;
+        t.* = .{
+            .profiler = self,
+            .tid = tid,
+            .label = label,
+            .seq = self.threads_created.fetchAdd(1, .monotonic),
+        };
+        var old = self.head.load(.monotonic);
+        while (true) {
+            t.next = old;
+            old = self.head.cmpxchgWeak(old, t, .release, .monotonic) orelse return t;
+        }
+    }
+
+    /// Display names for input file indexes. Owner thread only, before workers start.
+    pub fn setFiles(self: *Profiler, names: []const []const u8) void {
+        self.files = self.dupeNames(names) catch &.{};
+    }
+
+    /// Display names for leaf column indexes. Owner thread only, before workers start.
+    pub fn setColumns(self: *Profiler, names: []const []const u8) void {
+        self.columns = self.dupeNames(names) catch &.{};
+    }
+
+    /// Leaf names from a footer's first row group (`a.b.c` paths), when no names are set yet.
+    pub fn setColumnsFromMeta(self: *Profiler, meta: *const schema.FileMetaData) void {
+        if (self.columns.len > 0 or meta.row_groups.items.len == 0) return;
+        const a = self.arena.allocator();
+        const chunks = meta.row_groups.items[0].columns.items;
+        const names = a.alloc([]const u8, chunks.len) catch return;
+        for (chunks, names) |c, *n| {
+            const md = c.meta_data orelse {
+                n.* = "?";
+                continue;
+            };
+            n.* = std.mem.join(a, ".", md.path_in_schema.items) catch "?";
+        }
+        self.columns = names;
+    }
+
+    fn dupeNames(self: *Profiler, names: []const []const u8) ![]const []const u8 {
+        const a = self.arena.allocator();
+        const out = try a.alloc([]const u8, names.len);
+        for (names, out) |n, *o| o.* = try a.dupe(u8, n);
+        return out;
+    }
+
+    pub fn fileName(self: *const Profiler, i: u64) []const u8 {
+        return if (i < self.files.len) self.files[@intCast(i)] else "?";
+    }
+
+    pub fn columnName(self: *const Profiler, i: u64) []const u8 {
+        return if (i < self.columns.len) self.columns[@intCast(i)] else "?";
+    }
+
+    pub fn peak(self: *const Profiler, g: Gauge) i64 {
+        return self.gauge_peaks[@backingInt(g)].load(.monotonic);
+    }
+
+    /// Events dropped once the budget ran out, over every thread.
+    pub fn dropped(self: *const Profiler) u64 {
+        var n: u64 = 0;
+        var it = self.head.load(.acquire);
+        while (it) |t| : (it = t.next) n += t.dropped;
+        return n;
+    }
+
+    /// Every thread buffer, in creation order. Caller frees the slice.
+    pub fn threads(self: *const Profiler, gpa: std.mem.Allocator) ![]*const Thread {
+        var list: std.ArrayList(*const Thread) = .empty;
+        errdefer list.deinit(gpa);
+        var it = self.head.load(.acquire);
+        while (it) |t| : (it = t.next) try list.append(gpa, t);
+        std.mem.sortUnstable(*const Thread, list.items, {}, struct {
+            fn lt(_: void, a: *const Thread, b: *const Thread) bool {
+                return a.seq < b.seq;
+            }
+        }.lt);
+        return list.toOwnedSlice(gpa);
+    }
+
+    fn samplerRun(self: *Profiler) void {
+        const t = self.thread(.sampler) orelse return;
+        const interval: u64 = self.options.sample_interval_ns;
+        const ts: std.posix.timespec = .{
+            .sec = @intCast(interval / std.time.ns_per_s),
+            .nsec = @intCast(interval % std.time.ns_per_s),
+        };
+        while (self.stop.load(.acquire) == 0) {
+            if (builtin.os.tag == .linux) {
+                // Returns early on the wake from `finish` (or spuriously); either way the loop re-checks.
+                _ = std.os.linux.futex_4arg(&self.stop.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
+            } else {
+                _ = std.posix.system.nanosleep(&ts, null);
+            }
+            if (self.stop.load(.acquire) != 0) break;
+            t.gaugeSet(.rss_bytes, @intCast(currentRss()));
+        }
+    }
+
+    /// Chrome Trace Event JSON (object form). Call after `finish`.
+    pub fn writeTrace(self: *Profiler, gpa: std.mem.Allocator, w: *std.Io.Writer) !void {
+        const ts = try self.threads(gpa);
+        defer gpa.free(ts);
+
+        try w.writeAll("{\"displayTimeUnit\":\"ns\",\"otherData\":");
+        try self.writeMetaJson(w, std.math.maxInt(usize));
+        try w.writeAll(",\"traceEvents\":[\n");
+        try w.writeAll("{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,\"args\":{\"name\":\"zpq\"}}");
+
+        // One name per OS thread: its first buffer's label, numbered within the label.
+        var label_counts: [@typeInfo(Label).@"enum".field_names.len]u32 = @splat(0);
+        for (ts) |t| {
+            const n = label_counts[@backingInt(t.label)];
+            label_counts[@backingInt(t.label)] += 1;
+            try w.print(
+                ",\n{{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":{d},\"args\":{{\"name\":\"{s} {d}\"}}}}",
+                .{ t.tid, @tagName(t.label), n },
+            );
+            try w.print(
+                ",\n{{\"name\":\"thread_sort_index\",\"ph\":\"M\",\"pid\":1,\"tid\":{d}," ++
+                    "\"args\":{{\"sort_index\":{d}}}}}",
+                .{ t.tid, t.seq },
+            );
+        }
+        for (ts) |t| {
+            var blocks = t.eventBlocks();
+            while (blocks.next()) |evs| for (evs) |ev| try self.writeEvent(w, t.tid, ev);
+        }
+        try w.writeAll("\n]}\n");
+    }
+
+    fn writeEvent(self: *const Profiler, w: *std.Io.Writer, tid: u64, ev: Event) !void {
+        const ts_us = @as(f64, @floatFromInt(ev.start - self.epoch_ns)) / 1000.0;
+        if (ev.kind == .counter) {
+            const g = std.enums.fromInt(Gauge, ev.args[0]) orelse return;
+            // Perfetto names a counter track "<name> <arg>".
+            const name, const arg = switch (g) {
+                .requests_in_flight => .{ "requests", "in_flight" },
+                .bytes_in_flight => .{ "bytes", "in_flight" },
+                .buffered_bytes => .{ "buffered", "bytes" },
+                .rss_bytes => .{ "rss", "bytes" },
+            };
+            try w.print(",\n{{\"name\":\"{s}\",\"ph\":\"C\",\"ts\":{d:.3},\"pid\":1,\"args\":{{\"{s}\":{d}}}}}", .{
+                name, ts_us, arg, @as(i64, @bitCast(ev.args[1])),
+            });
+            return;
+        }
+        try w.print(",\n{{\"name\":\"{s}\",\"cat\":\"{s}\",\"ph\":\"X\",\"ts\":{d:.3},\"dur\":{d:.3}," ++
+            "\"pid\":1,\"tid\":{d},\"args\":{{", .{
+            @tagName(ev.kind),
+            @tagName(ev.kind.phase()),
+            ts_us,
+            @as(f64, @floatFromInt(ev.dur)) / 1000.0,
+            tid,
+        });
+        try self.writeArgs(w, ev);
+        try w.writeAll("}}");
+    }
+
+    fn writeArgs(self: *const Profiler, w: *std.Io.Writer, ev: Event) !void {
+        const names = ev.kind.argNames();
+        var first = true;
+        for (names, 0..) |name, i| {
+            if (std.mem.eql(u8, name, "unused")) continue;
+            const v = ev.args[i];
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"{s}\":", .{if (std.mem.eql(u8, name, "timing")) "ttfb_ns" else name});
+            if (std.mem.eql(u8, name, "types")) {
+                const page = ev.kind == .decompress;
+                const b1 = (v >> 8) & 0xff;
+                const b2 = (v >> 16) & 0xff;
+                try w.print("\"{s}/{s}/{s}\"", .{
+                    enumName(schema.CompressionCodec, v & 0xff),
+                    if (page) enumName(schema.PageType, b1) else enumName(schema.Encoding, b1),
+                    if (page) enumName(schema.Encoding, b2) else enumName(schema.Type, b2),
+                });
+            } else if (std.mem.eql(u8, name, "timing")) {
+                try w.print("{d},\"acquire_ns\":{d}", .{ v & 0xffff_ffff, v >> 32 });
+            } else if (std.mem.eql(u8, name, "flags")) {
+                const reused = (v >> 24) & 1 == 1;
+                try w.print("{d},\"attempts\":{d},\"reused\":{}", .{ v & 0xffff, (v >> 16) & 0xff, reused });
+            } else if (std.mem.eql(u8, name, "codec")) {
+                try w.print("\"{s}\"", .{enumName(schema.CompressionCodec, v)});
+            } else if (std.mem.eql(u8, name, "file")) {
+                try w.print("{d},\"file_name\":", .{v});
+                try writeJsonString(w, self.fileName(v));
+            } else if (std.mem.eql(u8, name, "col")) {
+                try w.print("{d},\"column\":", .{v});
+                try writeJsonString(w, self.columnName(v));
+            } else if (std.mem.eql(u8, name, "reason")) {
+                if (v == 0) try w.writeAll("null") else try writeJsonString(w, self.columnName(v - 1));
+            } else if (std.mem.eql(u8, name, "decision")) {
+                try w.print("\"{s}\"", .{switch (v) {
+                    0 => "skip",
+                    1 => "full_match",
+                    else => "filter",
+                }});
+            } else {
+                try w.print("{d}", .{v});
+            }
+        }
+    }
+
+    /// The run metadata as a JSON object, the query cut to `max_query` bytes.
+    pub fn writeMetaJson(self: *const Profiler, w: *std.Io.Writer, max_query: usize) !void {
+        const m = self.meta;
+        try w.writeAll("{\"zpq_version\":");
+        try writeJsonString(w, m.version);
+        try w.print(",\"build_mode\":\"{s}\",\"target\":\"{s}\",\"cpu_count\":{d},\"parallelism\":{d}," ++
+            "\"memory_bytes\":{d},\"on_lambda\":{},\"lambda_memory_mb\":", .{
+            m.build_mode, m.target, m.cpu_count, m.parallelism, m.memory_bytes, m.on_lambda,
+        });
+        if (m.lambda_memory_mb) |mb| try w.print("{d}", .{mb}) else try w.writeAll("null");
+        try w.print(",\"start_unix_s\":{d},\"query\":", .{self.epoch_real_s});
+        try writeJsonString(w, m.query[0..@min(m.query.len, max_query)]);
+        try w.writeByte('}');
+    }
+};
+
+pub fn enumName(comptime E: type, v: u64) []const u8 {
+    const e = std.enums.fromInt(E, v) orelse return "?";
+    return @tagName(e);
+}
+
+/// `s` as a JSON string: quotes, backslashes and control bytes escaped; other bytes pass through.
+pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        0...0x1f => try w.print("\\u{x:0>4}", .{c}),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
+// ---------------------------------------------------------------- span sites
+
+/// The calling thread's buffer under `p`, or null when not profiling.
+pub inline fn threadOf(p: ?*Profiler, label: Label) ?*Thread {
+    if (comptime !enabled) return null;
+    const pp = p orelse return null;
+    return pp.thread(label);
+}
+
+/// A span in progress. `begin` reads the clock only when `t` is set.
+pub const Span = struct {
+    t: ?*Thread,
+    start: i64,
+
+    pub inline fn begin(t: ?*Thread) Span {
+        if (comptime !enabled) return .{ .t = null, .start = 0 };
+        const tt = t orelse return .{ .t = null, .start = 0 };
+        return .{ .t = tt, .start = clock.monoNs() };
+    }
+
+    pub inline fn end(self: Span, kind: Kind, a: Args) void {
+        if (comptime !enabled) return;
+        if (self.t) |t| t.record(kind, self.start, clock.monoNs(), a);
+    }
+};
+
+/// A span from timestamps the caller already took.
+pub inline fn record(t: ?*Thread, kind: Kind, start_ns: i64, end_ns: i64, a: Args) void {
+    if (comptime !enabled) return;
+    if (t) |tt| tt.record(kind, start_ns, end_ns, a);
+}
+
+pub inline fn gauge(t: ?*Thread, g: Gauge, delta: i64) void {
+    if (comptime !enabled) return;
+    if (t) |tt| tt.gauge(g, delta);
+}
+
+/// The encoding a column chunk's values mostly use: its dictionary encoding when it has one, else the first that is
+/// not a level encoding.
+pub fn chunkEncoding(encodings: []const schema.Encoding) schema.Encoding {
+    for (encodings) |e| if (e == .RLE_DICTIONARY or e == .PLAIN_DICTIONARY) return e;
+    for (encodings) |e| if (e != .RLE and e != .BIT_PACKED) return e;
+    return if (encodings.len > 0) encodings[0] else .PLAIN;
+}
+
+pub fn chunkTypes(codec: schema.CompressionCodec, encoding: schema.Encoding, physical: schema.Type) u64 {
+    return @as(u64, @intCast(@backingInt(codec))) |
+        (@as(u64, @intCast(@backingInt(encoding))) << 8) |
+        (@as(u64, @intCast(@backingInt(physical))) << 16);
+}
+
+pub fn pageTypes(codec: schema.CompressionCodec, page_type: schema.PageType, encoding: ?schema.Encoding) u64 {
+    return @as(u64, @intCast(@backingInt(codec))) |
+        (@as(u64, @intCast(@backingInt(page_type))) << 8) |
+        (@as(u64, if (encoding) |e| @intCast(@backingInt(e)) else 0xff) << 16);
+}
+
+pub fn httpFlags(status: u16, attempts: u8, reused: bool) u64 {
+    return @as(u64, status) | (@as(u64, attempts) << 16) | (@as(u64, @intFromBool(reused)) << 24);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "spans from many threads land in per-thread buffers and nest" {
+    if (!enabled) return error.SkipZigTest;
+    const p = try Profiler.create(testing.allocator, .{ .sample_interval_ns = 0 }, .{ .query = "test" });
+    defer p.destroy();
+
+    const Worker = struct {
+        fn run(prof: *Profiler, n: usize) void {
+            const t = prof.thread(.scan).?;
+            for (0..n) |i| {
+                const outer = Span.begin(t);
+                const inner = Span.begin(t);
+                inner.end(.decompress, args(.{ 1, i, i * 2 }));
+                outer.end(.column_chunk, args(.{ 0, 0, i }));
+            }
+        }
+    };
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*th| th.* = try std.Thread.spawn(.{}, Worker.run, .{ p, 5000 });
+    for (threads) |th| th.join();
+    p.finish();
+
+    const ts = try p.threads(testing.allocator);
+    defer testing.allocator.free(ts);
+    var total: usize = 0;
+    var seen_tids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen_tids.deinit(testing.allocator);
+    for (ts) |t| {
+        try testing.expect(!seen_tids.contains(t.tid));
+        try seen_tids.put(testing.allocator, t.tid, {});
+        var blocks = t.eventBlocks();
+        var prev_outer_end: i64 = 0;
+        var pending_inner: ?Event = null;
+        while (blocks.next()) |evs| for (evs) |ev| {
+            total += 1;
+            switch (ev.kind) {
+                .decompress => pending_inner = ev,
+                .column_chunk => {
+                    const inner = pending_inner.?;
+                    try testing.expect(inner.start >= ev.start and inner.start + inner.dur <= ev.start + ev.dur);
+                    try testing.expect(ev.start >= prev_outer_end);
+                    prev_outer_end = ev.start + ev.dur;
+                    pending_inner = null;
+                },
+                else => {},
+            }
+        };
+    }
+    // Each worker recorded 10000 spans; the main thread one RSS counter.
+    try testing.expect(total >= 8 * 10_000);
+    try testing.expectEqual(@as(u64, 0), p.dropped());
+}
+
+test "the event budget caps memory and counts drops" {
+    if (!enabled) return error.SkipZigTest;
+    const p = try Profiler.create(testing.allocator, .{ .sample_interval_ns = 0, .max_events = 100 }, .{});
+    defer p.destroy();
+    const t = p.thread(.main).?;
+    for (0..10_000) |_| record(t, .filter, 1, 2, args(.{}));
+    try testing.expect(p.dropped() > 9_000);
+    var kept: usize = 0;
+    var blocks = t.eventBlocks();
+    while (blocks.next()) |evs| kept += evs.len;
+    try testing.expect(kept <= 100);
+}
+
+test "args packs integers, bools and enums" {
+    const a = args(.{ @as(u32, 7), true, schema.CompressionCodec.ZSTD, @as(i64, -1) });
+    try testing.expectEqual(@as(u64, 7), a[0]);
+    try testing.expectEqual(@as(u64, 1), a[1]);
+    try testing.expectEqual(@as(u64, 6), a[2]);
+    try testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(a[3])));
+    try testing.expectEqual(@as(u64, 0), a[5]);
+}

@@ -404,6 +404,33 @@ for src, out in (("in", "to_zstd"), ("pages", "pages_zstd")):
 print("All --codec copy checks passed")
 PY
 
+# Profiling: the answer comes before the summary, the trace path is checked before the query runs, and a failed
+# query leaves no trace behind.
+"$ZPQ" query "$DIR/in.parquet" --aggregate 'count(*) AS n' --profile "$DIR/trace.json" --profile-summary \
+  > "$DIR/prof_both.txt" 2>&1
+if "$ZPQ" query "$DIR/in.parquet" -o "$DIR/prof_never.parquet" --profile "$DIR/no/such/dir/t.json" \
+  > "$DIR/prof_bad.out" 2> "$DIR/prof_bad.err"; then
+  echo "an unwritable --profile path did not fail" >&2; exit 1
+fi
+if "$ZPQ" query "$DIR/in.parquet" --aggregate 'sum(nope) AS n' --profile "$DIR/prof_failed.json" 2> /dev/null; then
+  echo "a query over a missing column did not fail" >&2; exit 1
+fi
+"$PY" - "$DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+both = open(f"{d}/prof_both.txt").read()
+answer, summary = both.find('{"ok":true'), both.find("zpq profile:")
+assert 0 <= answer < summary, f"the summary came before the answer:\n{both}"
+assert "rss peak" in both, both
+trace = json.load(open(f"{d}/trace.json"))
+assert trace["traceEvents"] and trace["zpq"]["omitted_events"] == 0, trace["zpq"]
+assert not os.path.exists(f"{d}/prof_never.parquet"), "the query ran before the --profile path was checked"
+assert open(f"{d}/prof_bad.out").read() == "", "the query answered before the --profile path was checked"
+assert "cannot write profile" in open(f"{d}/prof_bad.err").read()
+assert not os.path.exists(f"{d}/prof_failed.json"), "a failed query left an empty trace"
+print("Profiling checks passed")
+PY
+
 # The deprecated LZ4 codec (Hadoop-framed and bare-block) is readable, so
 # --codec can recompress it; zpq never compresses to it (`lz4` is LZ4_RAW).
 # Needs the parquet-testing corpus (`just fetch-corpus`); skipped without it.

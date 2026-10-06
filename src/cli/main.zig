@@ -490,15 +490,24 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
 
     var profiler: ?*zpq.profile.Profiler = null;
     defer if (profiler) |p| p.destroy();
+    // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
+    var engine_max_mem = max_mem_limit;
     if (profile_out.wanted()) {
         if (comptime !zpq.profile.enabled) {
             std.debug.print("zpq query: this build has no profiler (built with -Dprofile=false)\n", .{});
             return error.BadArgs;
         }
+        // Before the query, so an unwritable path costs nothing and a query that succeeds exits 0.
+        try profile_out.open();
         var meta = zpq.profile.Meta.discover(env);
         meta.query = try commandLine(arena, init.minimal.args);
-        profiler = try zpq.profile.Profiler.create(gpa, .{}, meta);
+        const opts = zpq.profile.Options.forBudget(max_mem_limit);
+        profiler = try zpq.profile.Profiler.create(gpa, opts, meta);
+        engine_max_mem = max_mem_limit -| opts.reservedBytes();
     }
+    defer profile_out.close();
+    // A failed query leaves no empty trace behind.
+    errdefer profile_out.discard();
 
     if (format) |fmt| {
         const cols = if (columns_csv) |csv|
@@ -520,14 +529,14 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .scan_all = scan_all,
             .trust_stats = trust_stats,
             .fast_levels = fast_levels,
-            .max_memory = max_mem_limit,
+            .max_memory = engine_max_mem,
             .group_by = group_by,
             .select_cols = select_cols,
             .column_order = column_order,
             .diag = diag,
             .profiler = profiler,
         }, fmt, limit);
-        if (profiler) |p| try profile_out.emit(gpa, p);
+        if (profiler) |p| try profile_out.emit(gpa, io, p);
         return;
     }
 
@@ -549,7 +558,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .scan_all = scan_all,
             .trust_stats = trust_stats,
             .fast_levels = fast_levels,
-            .max_memory = max_mem_limit,
+            .max_memory = engine_max_mem,
             .group_by = group_by,
             .select_cols = select_cols,
             .column_order = column_order,
@@ -624,7 +633,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 ar.timings.core.encode_ns / std.time.ns_per_ms,
             },
         );
-        if (profiler) |p| try profile_out.emit(gpa, p);
+        // The answer first, then the profile (stderr): flush stdout before the summary goes out.
+        ws.flush();
+        if (profiler) |p| try profile_out.emit(gpa, io, p);
         return;
     }
 
@@ -654,7 +665,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .scan_all = scan_all,
         .trust_stats = trust_stats,
         .fast_levels = fast_levels,
-        .max_memory = max_mem_limit,
+        .max_memory = engine_max_mem,
         .diag = diag,
         .profiler = profiler,
     })).write;
@@ -694,7 +705,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     });
     if (profiler) |p| {
         w.flush();
-        try profile_out.emit(gpa, p);
+        try profile_out.emit(gpa, io, p);
     }
 }
 
@@ -702,6 +713,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
 const ProfileOut = struct {
     trace_path: ?[]const u8 = null,
     summary: ?Format = null,
+    /// The trace file, created by `open` before the query runs.
+    trace_fd: ?local_fs.fd_t = null,
 
     const Format = enum { text, json };
 
@@ -709,21 +722,42 @@ const ProfileOut = struct {
         return self.trace_path != null or self.summary != null;
     }
 
-    fn emit(self: ProfileOut, gpa: std.mem.Allocator, p: *zpq.profile.Profiler) !void {
+    fn open(self: *ProfileOut) !void {
+        const path = self.trace_path orelse return;
+        self.trace_fd = local_fs.createFile(path) catch |err| {
+            std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+            return error.BadArgs;
+        };
+    }
+
+    fn close(self: *ProfileOut) void {
+        if (self.trace_fd) |fd| local_fs.close(fd);
+        self.trace_fd = null;
+    }
+
+    fn discard(self: *ProfileOut) void {
+        if (self.trace_fd == null) return;
+        self.close();
+        local_fs.removeFile(self.trace_path.?);
+    }
+
+    /// The trace streams to its file, never held whole in memory; the summary, a few KB, goes to stderr.
+    fn emit(self: ProfileOut, gpa: std.mem.Allocator, io: std.Io, p: *zpq.profile.Profiler) !void {
         p.finish();
-        var aw: std.Io.Writer.Allocating = .init(gpa);
-        defer aw.deinit();
-        if (self.trace_path) |path| {
-            try p.writeTrace(gpa, &aw.writer);
-            const fd = local_fs.createFile(path) catch |err| {
-                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+        if (self.trace_fd) |fd| {
+            const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+            var buf: [64 * 1024]u8 = undefined;
+            var fw = file.writerStreaming(io, &buf);
+            const wrote = if (p.writeTrace(gpa, &fw.interface)) fw.interface.flush() else |err| err;
+            wrote catch |err| {
+                const why = if (fw.err) |e| @errorName(e) else @errorName(err);
+                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, why });
                 return error.BadArgs;
             };
-            defer local_fs.close(fd);
-            try local_fs.writeAll(fd, aw.written());
-            aw.clearRetainingCapacity();
         }
         if (self.summary) |fmt| {
+            var aw: std.Io.Writer.Allocating = .init(gpa);
+            defer aw.deinit();
             const summary = try zpq.profile_summary.compute(gpa, p);
             switch (fmt) {
                 .text => try zpq.profile_summary.writeText(summary, p, &aw.writer),

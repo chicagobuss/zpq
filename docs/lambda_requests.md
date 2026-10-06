@@ -74,7 +74,7 @@ described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`,
 resident memory, and `peak_rss_scope`, how it was measured: `run`, `sampled` or `process`, see
 [profiling.md](profiling.md)); `meta` (`zpq_version`, `build_mode`, `target`, `cpu_count`, `parallelism`,
 `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the request cut to 512 bytes); `phases` (per
-phase: `wall_ns`, `busy_ns`, `crit_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the ten costliest
+phase: `wall_ns`, `busy_ns`, `share_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the ten costliest
 column chunks: `file`, `rg`, `column`, `codec`, `encoding`, `bytes_in`, `bytes_out`, `ns`, `decompress_ns`, `pages`);
 `io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`, `acquire_ns`, `reused`, `retries`, `errors`, `ranges`, `merged`,
 `fetch_jobs`, `mapped_files`, `mapped_bytes`, `peak_in_flight`, `peak_bytes_in_flight`); `prune` (`row_groups`,

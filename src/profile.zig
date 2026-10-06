@@ -40,7 +40,7 @@ pub const Phase = enum(u8) {
     merge,
     other,
     /// A thread parked on other threads' work (a join, a semaphore). Not work: the summary leaves it out of busy time
-    /// and the critical path, so a waiting coordinator does not compete with the workers it waits on.
+    /// and the wall shares, so a waiting coordinator does not compete with the workers it waits on.
     wait,
 
     pub const count = @typeInfo(Phase).@"enum".field_names.len;

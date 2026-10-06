@@ -3324,10 +3324,10 @@ test "a profiled aggregate records every phase, nests per thread, and reconciles
             try std.testing.expectEqual(@as(usize, 1), s.prune.n_reasons);
             try std.testing.expectEqualStrings("ts", p.columnName(s.prune.reasons[0].col));
         }
-        // The critical path accounts for every nanosecond of the query.
-        var crit: u64 = s.idle_ns;
-        for (s.phases) |ph| crit += ph.crit_ns;
-        try std.testing.expect(crit + 16 >= s.total_ns and crit <= s.total_ns + 16);
+        // The wall shares account for every nanosecond of the query.
+        var share: u64 = s.idle_ns;
+        for (s.phases) |ph| share += ph.share_ns;
+        try std.testing.expect(share + 16 >= s.total_ns and share <= s.total_ns + 16);
         try std.testing.expectEqual(@as(u64, 0), s.dropped);
     }
 }

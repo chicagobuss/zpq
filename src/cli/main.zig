@@ -79,8 +79,8 @@ const usage_text =
     \\                 (open it at https://ui.perfetto.dev): per-thread spans
     \\                 for every phase, in-flight counters, RSS.
     \\  --profile-summary
-    \\                 print a compact profile summary to stderr: time per
-    \\                 phase, critical path, costliest column chunks, I/O and
+    \\                 print a compact profile summary to stderr: time and
+    \\                 wall share per phase, costliest column chunks, I/O and
     \\                 pruning counts. `=json` prints it as one JSON line.
     \\
 ;

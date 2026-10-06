@@ -1,12 +1,13 @@
-//! The terminal-sized digest of a profile: wall and busy time per phase, the critical path through overlapping
-//! phases, the costliest column chunks, I/O and pruning counts, and the engine's own phase sums for cross-checking.
+//! The terminal-sized digest of a profile: wall and busy time per phase, each phase's share of the wall time where
+//! phases overlap, the costliest column chunks, I/O and pruning counts, and the engine's own phase sums for
+//! cross-checking.
 //!
 //! Exclusive time. A span's own time is its duration minus its children's, so nested spans (a column chunk around
 //! its page decompressions) are charged once. Each thread's spans nest (they come from stack-disciplined code on
 //! that thread; see `profile.zig`), which lets one sort and a stack recover the exclusive segments.
 //!
-//! Critical path. Wall time is swept once over every thread's exclusive segments. Each instant is split across the
-//! phases running then, in proportion to how many threads run each, so `crit` sums to the query's wall time and says
+//! Wall share. Wall time is swept once over every thread's exclusive segments. Each instant is split across the
+//! phases running then, in proportion to how many threads run each, so `share` sums to the query's wall time and says
 //! where it went; `alone` is the time a phase ran with no other, the serial part no extra parallelism can hide. Time
 //! a thread spends parked on others (`Phase.wait`) counts for nothing; an instant with no phase running is `idle`.
 
@@ -21,9 +22,11 @@ const Event = profile.Event;
 pub const PhaseStat = struct {
     /// Time at least one thread ran this phase.
     wall_ns: u64 = 0,
-    /// Exclusive span time summed over threads: CPU time for compute phases, time blocked on the network for `io`.
+    /// Exclusive span time summed over threads: time a thread spent inside the phase's spans, not CPU time. It
+    /// includes page-fault stalls and time descheduled, and for `io`, time blocked on the network.
     busy_ns: u64 = 0,
-    crit_ns: u64 = 0,
+    /// The phase's share of the wall time: see the file comment. Not a critical path.
+    share_ns: u64 = 0,
     alone_ns: u64 = 0,
     spans: u64 = 0,
 };
@@ -388,7 +391,7 @@ fn sweep(gpa: std.mem.Allocator, s: *Summary, segments: []const Segment, w0: i64
     }.lt);
 
     var active: [Phase.count]i32 = @splat(0);
-    var crit: [Phase.count]f64 = @splat(0);
+    var share: [Phase.count]f64 = @splat(0);
     var prev = w0;
     var i: usize = 0;
     while (true) {
@@ -408,7 +411,7 @@ fn sweep(gpa: std.mem.Allocator, s: *Summary, segments: []const Segment, w0: i64
             } else {
                 for (active, 0..) |c, ph| if (c > 0) {
                     s.phases[ph].wall_ns += dt;
-                    crit[ph] += @as(f64, @floatFromInt(dt)) * ratio(@intCast(c), @intCast(total));
+                    share[ph] += @as(f64, @floatFromInt(dt)) * ratio(@intCast(c), @intCast(total));
                 };
                 if (distinct == 1) s.phases[only].alone_ns += dt;
             }
@@ -418,7 +421,7 @@ fn sweep(gpa: std.mem.Allocator, s: *Summary, segments: []const Segment, w0: i64
         active[@backingInt(bounds.items[i].phase)] += bounds.items[i].delta;
         i += 1;
     }
-    for (crit, &s.phases) |c, *ph| ph.crit_ns = @intFromFloat(@round(c));
+    for (share, &s.phases) |c, *ph| ph.share_ns = @intFromFloat(@round(c));
 }
 
 // ---------------------------------------------------------------- rendering
@@ -481,19 +484,20 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
         m.version, m.build_mode, m.target, m.cpu_count, m.parallelism, lambda,
     });
 
-    try w.writeAll("\nphase          wall ms   busy ms   crit ms  alone ms    spans\n");
+    try w.writeAll("\nphase          wall ms   busy ms  share ms  alone ms    spans\n");
     for (s.phases, 0..) |ph, i| {
         const phase: Phase = @fromBackingInt(@intCast(i));
         if (phase == .wait or (ph.spans == 0 and ph.busy_ns == 0)) continue;
         try w.print("  {s:<11} {d:>8.2}  {d:>8.2}  {d:>8.2}  {d:>8.2}  {d:>7}\n", .{
-            @tagName(phase), ms(ph.wall_ns), ms(ph.busy_ns), ms(ph.crit_ns), ms(ph.alone_ns), ph.spans,
+            @tagName(phase), ms(ph.wall_ns), ms(ph.busy_ns), ms(ph.share_ns), ms(ph.alone_ns), ph.spans,
         });
     }
     if (s.idle_ns > 0) {
         try w.print("  {s:<11} {d:>8.2}  {s:>8}  {d:>8.2}\n", .{ "(idle)", ms(s.idle_ns), "", ms(s.idle_ns) });
     }
-    try w.writeAll("  crit: each phase's share of wall time while phases overlap (sums to\n" ++
-        "  wall); alone: wall time it ran with no other phase (the serial part)\n");
+    try w.writeAll("  busy: time in the phase summed over threads (page-fault stalls included);\n" ++
+        "  share: its share of wall time while phases overlap (sums to wall);\n" ++
+        "  alone: wall time it ran with no other phase (the serial part)\n");
 
     if (s.n_top > 0) {
         try w.print("\ntop column chunks by time ({d} chunks, {d:.2} ms in all)\n", .{ s.chunks, ms(s.chunk_ns) });
@@ -533,13 +537,16 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     }
     if (io.mapped_files == 0 and io.requests() == 0) try w.writeAll("io     none recorded\n");
 
+    // Only scans record row-group decisions; a write has none to report rather than zero pruned.
     const pr = s.prune;
-    try w.print("prune  row groups: {d} total, {d} skipped, {d} full match, {d} filtered\n", .{
-        pr.row_groups, pr.skipped, pr.full_match, pr.filtered,
-    });
-    try w.print("       pages: {d} of {d} skipped by page index; {d} aggregates from stats\n", .{
-        pr.pages_skipped, pr.pages, pr.stats_answered,
-    });
+    if (pr.row_groups > 0) {
+        try w.print("prune  row groups: {d} total, {d} skipped, {d} full match, {d} filtered\n", .{
+            pr.row_groups, pr.skipped, pr.full_match, pr.filtered,
+        });
+        try w.print("       pages: {d} of {d} skipped by page index; {d} aggregates from stats\n", .{
+            pr.pages_skipped, pr.pages, pr.stats_answered,
+        });
+    }
     if (pr.n_reasons > 0) {
         try w.writeAll("       skipped by statistics of:");
         for (pr.reasons[0..pr.n_reasons]) |r| try w.print(" {s} ({d})", .{ tail(p.columnName(r.col), 24), r.count });
@@ -699,7 +706,7 @@ fn fakeProfiler() !*profile.Profiler {
     return p;
 }
 
-test "exclusive time and the critical path add up to the wall time" {
+test "exclusive time and the wall shares add up to the wall time" {
     if (!profile.enabled) return error.SkipZigTest;
     const p = try fakeProfiler();
     defer p.destroy();
@@ -730,9 +737,9 @@ test "exclusive time and the critical path add up to the wall time" {
     // query's own time: [0,10) and [90,100); the scan wait counts for nothing.
     try testing.expectEqual(@as(u64, 20), ph[@backingInt(Phase.other)].busy_ns);
     try testing.expectEqual(@as(u64, 0), ph[@backingInt(Phase.wait)].busy_ns);
-    var crit_sum: u64 = s.idle_ns;
-    for (ph) |x| crit_sum += x.crit_ns;
-    try testing.expectEqual(s.total_ns, crit_sum);
+    var share_sum: u64 = s.idle_ns;
+    for (ph) |x| share_sum += x.share_ns;
+    try testing.expectEqual(s.total_ns, share_sum);
     // [80,90) nobody works.
     try testing.expectEqual(@as(u64, 10), s.idle_ns);
     try testing.expectEqual(@as(usize, 1), s.n_top);
@@ -761,8 +768,8 @@ test "overlapping phases on two threads split the wall by thread count" {
     }
     const s = try compute(testing.allocator, p);
     // The threads ran one after another, but their spans overlap in time: two decoding, one fetching.
-    try testing.expectEqual(@as(u64, 67), s.phases[@backingInt(Phase.decode)].crit_ns);
-    try testing.expectEqual(@as(u64, 33), s.phases[@backingInt(Phase.io)].crit_ns);
+    try testing.expectEqual(@as(u64, 67), s.phases[@backingInt(Phase.decode)].share_ns);
+    try testing.expectEqual(@as(u64, 33), s.phases[@backingInt(Phase.io)].share_ns);
     try testing.expectEqual(@as(u64, 100), s.phases[@backingInt(Phase.io)].wall_ns);
     try testing.expectEqual(@as(u64, 0), s.phases[@backingInt(Phase.io)].alone_ns);
     try testing.expectEqual(@as(u64, 200), s.phases[@backingInt(Phase.decode)].busy_ns);
@@ -789,4 +796,25 @@ test "the summary reports events dropped at the cap" {
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, @intCast(s.dropped)), parsed.value.object.get("dropped").?.integer);
     try testing.expectEqual(@as(i64, 100), parsed.value.object.get("event_cap").?.integer);
+}
+
+test "the text summary says busy, not CPU, and leaves out pruning a write does not record" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const p = try fakeProfiler();
+    defer p.destroy();
+    const t0 = p.epoch_ns;
+    const main = p.thread(.main).?;
+    main.record(.encode, t0 + 10, t0 + 50, profile.args(.{}));
+    main.record(.encode_rg, t0 + 5, t0 + 60, profile.args(.{ 0, 0, 0 }));
+    main.record(.query, t0, t0 + 100, profile.args(.{}));
+    const s = try compute(testing.allocator, p);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeText(s, p, &aw.writer);
+    const text = aw.written();
+    try testing.expect(std.mem.indexOf(u8, text, "prune") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "crit") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "share ms") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try testing.expect(line.len <= 80);
 }

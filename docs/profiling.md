@@ -94,22 +94,24 @@ that can miss a spike shorter than the sampling period); where there is neither,
 (`process lifetime`).
 
 ```
-phase          wall ms   busy ms   crit ms  alone ms    spans
+phase          wall ms   busy ms  share ms  alone ms    spans
   decompress      ...
 ```
 
 - **wall**: time at least one thread was in the phase.
-- **busy**: the phase's exclusive time (a span's duration minus its children's) summed over threads. For compute
-  phases this is CPU time, unless the machine was oversubscribed; for `io` it is time blocked on the network.
-- **crit**: the critical path. Every instant of the query's wall time is split across the phases running then, in
-  proportion to how many threads ran each, so the column sums to the wall time (with `(idle)`, when no thread was
-  doing tracked work) and says where the wall time went when phases overlap. A phase whose `crit` is small next to its
-  `busy` ran in parallel with others and made little difference to the wall time.
+- **busy**: the phase's exclusive time (a span's duration minus its children's) summed over threads. This is time on
+  the thread, not CPU time: it includes page-fault stalls and any time the thread was descheduled, and for `io` it is
+  time blocked on the network. Compare it with the `cpu` and `scan` lines (from `getrusage`) for CPU.
+- **share**: the phase's share of the wall time. Every instant of the query's wall time is split across the phases
+  running then, in proportion to how many threads ran each, so the column sums to the wall time (with `(idle)`, when no
+  thread was doing tracked work) and says where the wall time went when phases overlap. It is not a critical path: it
+  does not follow dependencies between threads. A phase whose `share` is small next to its `busy` ran in parallel
+  with others and made little difference to the wall time.
 - **alone**: wall time the phase ran with no other phase running: the serial part, which more threads cannot hide.
 
-Waiting (a coordinator joining its workers, the dispatcher waiting on its window) is neither busy nor on the critical
-path. Exclusive time of the container spans (`query`, `scan_worker`, `row_group`, `encode_rg`) is `other`: per-row-group
-bookkeeping, thread start-up and the like.
+Waiting (a coordinator joining its workers, the dispatcher waiting on its window) is neither busy nor given a share of
+the wall time. Exclusive time of the container spans (`query`, `scan_worker`, `row_group`, `encode_rg`) is `other`:
+per-row-group bookkeeping, thread start-up and the like.
 
 ```
 top column chunks by time (48 chunks, 70.45 ms in all)
@@ -132,8 +134,11 @@ engine read 0.03 parse 0.12 decode 70.46 (wall 13.53) eval 0.01 ms
        agg 5.88 encode 0.00 ms (the sources of the JSON phase fields)
 ```
 
+The `prune` lines cover scans: the write path records no row-group decisions, so a write's summary leaves them out (its
+JSON `prune` counts are zero).
+
 `engine` repeats the sums behind the response's `phase` fields, in nanoseconds rather than whole milliseconds. They
-are taken from the very timestamps the engine uses, so they match exactly; `decode` is CPU summed over workers and
+are taken from the very timestamps the engine uses, so they match exactly; `decode` is time summed over workers and
 `wall` the scan's elapsed time.
 
 `--profile-summary=json` prints the same as one JSON object (`total_ns`, `idle_ns`, `cpu`, `meta`, `phases`,
@@ -216,7 +221,7 @@ zpq profile: 21.40 ms wall, 18 threads, 885 events
   rss peak 253 MB (this run)
   0.4.0 fast x86_64-linux-gnu, 16 cpus, parallelism 16
 
-phase          wall ms   busy ms   crit ms  alone ms    spans
+phase          wall ms   busy ms  share ms  alone ms    spans
   open            0.01      0.01      0.01      0.01        2
   footer          0.27      0.27      0.27      0.27        1
   plan            0.04      0.04      0.04      0.04        2
@@ -241,12 +246,12 @@ scan   16 workers: user 165.6 ms, sys 34.5 ms, 25296 minor faults
 Reading it top down:
 
 - 9.8 cores busy for 21 ms, and a fifth of the CPU in the kernel: 25k minor page faults in the workers.
-- `filter` is the largest busy phase (90 ms of CPU for 6M rows), ahead of decoding. No row group is pruned (the dates
-  are spread through every row group), so every row of all four columns is decoded and tested, though about 2%
+- `filter` is the largest busy phase (90 ms on the workers for 6M rows), ahead of decoding. No row group is pruned (the
+  dates are spread through every row group), so every row of all four columns is decoded and tested, though about 2%
   survive.
 - The DECIMAL dictionary columns `l_quantity` and `l_discount` decode at under 40 MB/s with almost no decompression:
   the time is the conversion to f64, not snappy. `l_extendedprice` is the opposite: three quarters snappy.
-- `other` holds 6 ms of the critical path and 4 ms that ran with nothing else. The trace shows where: workers start
+- `other` holds 6 ms of the wall share and 4 ms that ran with nothing else. The trace shows where: workers start
   over the first 2 ms of the scan (threads are spawned one after another), and after its last row group each worker
   spends 0.1–5 ms in `worker_release` freeing its decode memory, the last of them ending 2.6 ms after the last row
   group did.

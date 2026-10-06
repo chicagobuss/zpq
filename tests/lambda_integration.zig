@@ -700,6 +700,30 @@ fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, w
     }
 }
 
+test "lambda returns a bounded profile summary inline when asked" {
+    const esc = "ci/fixtures/parquet/json_escape.parquet";
+    const agg = "{\"inputs\":[\"" ++ esc ++ "\"],\"aggregate\":\"count(*) AS n, sum(x) AS sx\",\"profile\":true";
+    const out = "zig-out/lambda_profile_out.parquet";
+    defer _ = linux.unlink(out);
+    try expectResponses("lambda profile", &.{
+        // The answer is untouched; the summary joins it, phases and engine sums included.
+        .{ .body = agg ++ "}", .want = "\"agg\":{\"n\":3," },
+        .{ .body = agg ++ "}", .want = "\"profile\":{\"total_ns\":" },
+        .{ .body = agg ++ "}", .want = "\"engine\":{\"read_ns\":" },
+        .{ .body = agg ++ "}", .want = "\"zpq_version\":" },
+        // A trace URL that is not S3 is reported, not fatal.
+        .{
+            .body = agg ++ ",\"profile_url\":\"nope\"}",
+            .want = "\"profile_trace\":{\"url\":\"nope\",\"error\":\"BadProfileUrl\"}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"columns\":[\"s\"],\"output_url\":\"" ++ out ++
+                "\",\"profile\":true}",
+            .want = "\"phases\":{",
+        },
+    });
+}
+
 test "lambda write response escapes an output name holding a quote and a backslash" {
     const esc = "ci/fixtures/parquet/json_escape.parquet";
     const out = "zig-out/lambda \"q\" \\ out.parquet";
@@ -1035,4 +1059,41 @@ fn sysClose(fd: linux.fd_t) void {
 fn errIs(r: usize) bool {
     const signed: isize = @bitCast(r);
     return signed >= -4095 and signed < 0;
+}
+
+test "lambda profiles an S3 query: requests, coalescing and footer fetches land in the summary" {
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+
+    const body = "{\"inputs\":[\"s3://bkt/f0.parquet\",\"s3://bkt/f1.parquet\"]," ++ S3_AGG ++ ",\"profile\":true}";
+    // Cold, then warm: the second revalidates its cached footers.
+    for (0..2) |_| {
+        const resp = try invoke(&server, a, body);
+        defer a.free(resp);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+        defer parsed.deinit();
+        const prof = parsed.value.object.get("profile") orelse {
+            std.debug.print("[s3 profile] no profile member: {s}\n", .{resp});
+            return error.TestUnexpectedResult;
+        };
+        const io = prof.object.get("io").?.object;
+        // Two footers (tail + head each, cold) and at least one coalesced range per file.
+        try std.testing.expect(io.get("gets").?.integer >= 4);
+        try std.testing.expect(io.get("bytes").?.integer > 0);
+        try std.testing.expect(io.get("merged").?.integer >= 2);
+        try std.testing.expect(io.get("ranges").?.integer >= io.get("merged").?.integer);
+        try std.testing.expect(prof.object.get("phases").?.object.get("io") != null);
+        try std.testing.expect(resp.len < 64 * 1024);
+    }
 }

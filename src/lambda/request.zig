@@ -28,6 +28,8 @@ const Wire = struct {
     scan_all: ?std.json.Value = null,
     trust_stats: ?std.json.Value = null,
     max_memory: ?std.json.Value = null,
+    profile: ?std.json.Value = null,
+    profile_url: ?std.json.Value = null,
 };
 
 pub const Request = struct {
@@ -47,6 +49,10 @@ pub const Request = struct {
     trust_stats: bool = false,
     /// `max_memory`: a byte count, or a size string the caller parses (`"512MB"`).
     max_memory: ?MaxMemory = null,
+    /// `profile`: return a profile summary in the response.
+    profile: bool = false,
+    /// `profile_url`: also upload the full Chrome trace to this S3 URL. Implies `profile`.
+    profile_url: ?[]const u8 = null,
 
     pub const MaxMemory = union(enum) { bytes: usize, text: []const u8 };
 
@@ -78,6 +84,8 @@ pub const Request = struct {
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");
+        req.profile_url = try f.string("profile_url");
+        req.profile = try f.boolean("profile") or req.profile_url != null;
         if (parsed.value.max_memory) |v| req.max_memory = switch (v) {
             .null => null,
             .integer => |n| if (n >= 0) .{ .bytes = @intCast(n) } else return f.bad("max_memory"),
@@ -165,6 +173,7 @@ test "request strings decode every JSON escape" {
     try testing.expectEqualStrings("\"a.b\"", req.columns.?[0]);
     try testing.expectEqualStrings("x,y", req.columns.?[1]);
     try testing.expect(req.scan_all and !req.trust_stats);
+    try testing.expect(!req.profile and req.profile_url == null);
     try testing.expectEqualStrings("512MB", req.max_memory.?.text);
     try testing.expectEqual(@as(?[]const u8, null), req.select);
 }
@@ -185,6 +194,13 @@ test "request: s3_url shorthand, numeric max_memory, nulls as absent" {
     , &bad);
     defer nulls.deinit();
     try testing.expect(nulls.max_memory == null and !nulls.scan_all and nulls.columns == null and nulls.select == null);
+
+    var prof = try Request.parse(testing.allocator,
+        \\{"s3_url":"s3://b/k","profile_url":"s3://b/trace.json"}
+    , &bad);
+    defer prof.deinit();
+    try testing.expect(prof.profile);
+    try testing.expectEqualStrings("s3://b/trace.json", prof.profile_url.?);
 }
 
 test "malformed requests are errors, wrong-typed fields named" {
@@ -205,6 +221,8 @@ test "malformed requests are errors, wrong-typed fields named" {
         .{ .body = "{\"inputs\":[\"a\"],\"filter\":5}", .err = error.BadFieldType, .field = "filter" },
         .{ .body = "{\"inputs\":[\"a\"],\"columns\":\"x\"}", .err = error.BadFieldType, .field = "columns" },
         .{ .body = "{\"inputs\":[\"a\"],\"scan_all\":1}", .err = error.BadFieldType, .field = "scan_all" },
+        .{ .body = "{\"inputs\":[\"a\"],\"profile\":\"yes\"}", .err = error.BadFieldType, .field = "profile" },
+        .{ .body = "{\"inputs\":[\"a\"],\"profile_url\":7}", .err = error.BadFieldType, .field = "profile_url" },
         .{ .body = "{\"inputs\":[\"a\"],\"max_memory\":-1}", .err = error.BadFieldType, .field = "max_memory" },
         .{ .body = "{\"inputs\":[\"a\"],\"max_memory\":[]}", .err = error.BadFieldType, .field = "max_memory" },
     };

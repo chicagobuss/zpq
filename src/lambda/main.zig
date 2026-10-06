@@ -212,7 +212,15 @@ fn handle(
         // A new option is one field on QueryArgs + one parse line on each
         // surface — the handlers below pass `qa` straight through to the
         // engine, so options like `scan_all` flow without touching them.
-        const qa: engine.QueryArgs = .{
+        var profiler: ?*zpq.profile.Profiler = null;
+        defer if (profiler) |p| p.destroy();
+        if (req.profile and zpq.profile.enabled) {
+            var meta = zpq.profile.Meta.discover(env);
+            meta.query = trimmed[0..@min(trimmed.len, MAX_PROFILE_QUERY)];
+            profiler = try zpq.profile.Profiler.create(allocator, .{}, meta);
+        }
+
+        var qa: engine.QueryArgs = .{
             .inputs = req.inputs,
             .filter = req.filter,
             .output = req.output_url,
@@ -226,10 +234,19 @@ fn handle(
             .group_by = req.group_by,
             .column_order = req.column_order,
         };
+        qa.profiler = profiler;
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
-        if (qa.aggregate != null or qa.group_by != null) return try lambdaAggregate(io, allocator, env, pool, qa);
-        if (qa.output != null) return try lambdaWrite(io, allocator, env, pool, qa);
+        if (qa.aggregate != null or qa.group_by != null) {
+            const response = try lambdaAggregate(io, allocator, env, pool, qa);
+            const p = profiler orelse return response;
+            return attachProfile(io, allocator, env, pool, p, req.profile_url, response);
+        }
+        if (qa.output != null) {
+            const response = try lambdaWrite(io, allocator, env, pool, qa);
+            const p = profiler orelse return response;
+            return attachProfile(io, allocator, env, pool, p, req.profile_url, response);
+        }
         if (req.inputs.len > 0)
             return try handleS3(allocator, env, req.inputs[0], qa.filter);
         return try aggregateInt8(allocator, inv.body, null);
@@ -237,6 +254,69 @@ fn handle(
 
     // Raw-byte fallback used by the in-process integration test.
     return try aggregateInt8(allocator, inv.body, null);
+}
+
+/// Bytes of the request echoed into a profile's metadata.
+const MAX_PROFILE_QUERY: usize = 4096;
+
+/// `response` (a JSON object) with the profile summary added as `"profile"`, and, given `profile_url`, the full
+/// trace uploaded there and reported as `"profile_trace"`. The summary is bounded (see `profile_summary.writeJson`),
+/// a few KB against Lambda's 6 MB response limit; the trace, which grows with the query, never rides in the response.
+/// Consumes `response`.
+fn attachProfile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    p: *zpq.profile.Profiler,
+    profile_url: ?[]const u8,
+    response: []u8,
+) ![]u8 {
+    defer allocator.free(response);
+    p.finish();
+    const body = std.mem.trimEnd(u8, response, " \r\n\t");
+    if (body.len == 0 or body[body.len - 1] != '}') return allocator.dupe(u8, response);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll(body[0 .. body.len - 1]);
+    try w.writeAll(",\"profile\":");
+    const summary = try zpq.profile_summary.compute(allocator, p);
+    try zpq.profile_summary.writeJson(summary, p, w);
+    if (profile_url) |url_str| {
+        try w.writeAll(",\"profile_trace\":{\"url\":");
+        try engine.writeJsonQuoted(w, url_str);
+        if (uploadTrace(io, allocator, env, pool, p, url_str)) |bytes| {
+            try w.print(",\"bytes\":{d}}}", .{bytes});
+        } else |err| {
+            try w.print(",\"error\":\"{s}\"}}", .{@errorName(err)});
+        }
+    }
+    try w.writeByte('}');
+    return aw.toOwnedSlice();
+}
+
+/// PUT the Chrome trace to `url_str` over the warm pool. Returns the bytes uploaded.
+fn uploadTrace(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    p: *zpq.profile.Profiler,
+    url_str: []const u8,
+) !usize {
+    const url = s3.Url.parse(url_str) catch return error.BadProfileUrl;
+    const creds = s3.Credentials.fromEnv(env) catch return error.NoCredentials;
+    var trace: std.Io.Writer.Allocating = .init(allocator);
+    defer trace.deinit();
+    try p.writeTrace(allocator, &trace.writer);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const inner = try pool.ensureForBucket(allocator, creds, url.bucket);
+    const resp = try s3.putViaPool(io, inner, arena_state.allocator(), creds, url, trace.written());
+    if (resp.status != 200) return error.TraceUploadFailed;
+    return trace.written().len;
 }
 
 /// The response for a failed query: the error, and the column or input file it is about when `diag` names one.

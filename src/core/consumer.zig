@@ -350,89 +350,27 @@ pub fn appendProjectedRGWithOptions(
     var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
     @memset(batch_pos_for_col, null);
 
+    // Late materialisation: decode what the filter and computed outputs read, evaluate the filter, then decode each
+    // remaining output column only to append its surviving rows, on an arena freed before the next, so a row
+    // group never holds more than its filter columns and one other column decoded at once.
+    const early = try ra.alloc(bool, num_leaves);
+    @memset(early, false);
+    if (filter) |f| {
+        var cols: std.ArrayList(usize) = .empty;
+        try f.collectColumns(&cols, ra);
+        for (cols.items) |ci| if (ci < num_leaves) {
+            early[ci] = true;
+        };
+    }
+    for (output_specs) |spec| switch (spec) {
+        .computed => |c| c.expr.collectColumns(early),
+        .passthrough => {},
+    };
+
     const t_decode_start = nowMonoNs();
     for (fetch_set, 0..) |needed, ci| {
-        if (!needed) continue;
-        const chunk_span = profile.Span.begin(timings.prof);
-        const col = &rg.columns.items[ci];
-        const cm = col.meta_data orelse return error.ColumnMetaMissing;
-        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-        const len: usize = @intCast(cm.total_compressed_size);
-        // Programmer invariant: the chunk's absolute start is at or past
-        // this byte window's origin, so the subtraction below can't
-        // underflow. A malformed file is caught by the bounds error on
-        // the next line; this guards our own RGSrc/byte_origin math.
-        invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
-        const buf_off = start - @as(usize, @intCast(src.byte_origin));
-        if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-        const chunk = src.bytes[buf_off .. buf_off + len];
-
-        const levels = meta.getColumnLevels(cm.path_in_schema.items);
-        const n_leaves: usize = @intCast(cm.num_values);
-
-        // DECIMAL columns: regardless of physical backing (INT32, INT64,
-        // FLBA), decode to f64 with scale applied. Reuses the existing
-        // f64 column lane through filter / agg / expression.
-        const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-        const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
-
-        const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-            .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                k,
-                decode_options,
-                null,
-            ),
-        } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
-            // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
-            .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        } else switch (cm.type) {
-            .INT32 => .{
-                .i32 = try decodeColumnTWithOptions(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-            },
-            .INT64 => .{
-                .i64 = try decodeColumnTWithOptions(i64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-            },
-            .FLOAT => .{
-                .f32 = try decodeColumnTWithOptions(f32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-            },
-            .DOUBLE => .{
-                .f64 = try decodeColumnTWithOptions(f64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-            },
-            .BYTE_ARRAY => .{
-                .string = try decodeColumnTWithOptions(
-                    []const u8,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    decode_options,
-                ),
-            },
-            .BOOLEAN => .{
-                .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-            },
-            // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
-            .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
-            // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
-            // fixed-width bytes (UUID / Float16 / fixed binary).
-            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                flbaWidth(schema_elem),
-                decode_options,
-            ) },
-        };
-        try checkRowShape(decoded, num_rows);
-        if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
+        if (!needed or !early[ci]) continue;
+        const decoded = try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -474,23 +412,126 @@ pub fn appendProjectedRGWithOptions(
             continue;
         }
 
-        var filtered: filter_eval.Batch.Column = undefined;
-        switch (spec) {
-            .passthrough => |kept_ci| {
-                const batch_pos = batch_pos_for_col[kept_ci] orelse return error.MissingDecodedColumn;
-                filtered = try encoder.applySelection(ra, batch.cols[batch_pos], &sel);
-            },
-            .computed => |c| {
-                const result = try expr_eval.evalExpr(ra, &batch, lookup, c.expr);
-                filtered = try encoder.applySelection(ra, result, &sel);
-            },
+        // A column read only here decodes on an arena of its own, released once its rows are appended.
+        var late = std.heap.ArenaAllocator.init(gpa);
+        defer late.deinit();
+        const col: filter_eval.Batch.Column = switch (spec) {
+            .passthrough => |kept_ci| if (batch_pos_for_col[kept_ci]) |pos|
+                batch.cols[pos]
+            else if (kept_ci < fetch_set.len and fetch_set[kept_ci]) blk: {
+                const t0 = nowMonoNs();
+                const la = late.allocator();
+                const decoded = try decodeWriteColumn(la, rg, meta, src, kept_ci, decode_options, timings.prof);
+                const t1 = nowMonoNs();
+                timings.decode_ns += @intCast(t1 - t0);
+                profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
+                break :blk decoded;
+            } else return error.MissingDecodedColumn,
+            .computed => |c| try expr_eval.evalExpr(ra, &batch, lookup, c.expr),
+        };
+        if (col.nullInfo().max_rep == 0) {
+            try appendSelected(&agg.cols[i], col, &sel, surviving, agg.arena);
+            continue;
         }
-
-        try appendIntoBuf(&agg.cols[i], filtered, agg.arena);
+        try appendIntoBuf(&agg.cols[i], try encoder.applySelection(late.allocator(), col, &sel), agg.arena);
     }
 
     agg.num_rows += surviving;
     return surviving;
+}
+
+/// Decode column `ci` of a row group into the batch lane the write path keeps it in.
+fn decodeWriteColumn(
+    ra: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    ci: usize,
+    decode_options: DecodeOptions,
+    prof: ?*profile.Thread,
+) !filter_eval.Batch.Column {
+    const num_rows: usize = @intCast(rg.num_rows);
+    const chunk_span = profile.Span.begin(prof);
+    const col = &rg.columns.items[ci];
+    const cm = col.meta_data orelse return error.ColumnMetaMissing;
+    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+    const len: usize = @intCast(cm.total_compressed_size);
+    // Programmer invariant: the chunk's absolute start is at or past
+    // this byte window's origin, so the subtraction below can't
+    // underflow. A malformed file is caught by the bounds error on
+    // the next line; this guards our own RGSrc/byte_origin math.
+    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
+    const buf_off = start - @as(usize, @intCast(src.byte_origin));
+    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
+    const chunk = src.bytes[buf_off .. buf_off + len];
+
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n_leaves: usize = @intCast(cm.num_values);
+
+    // DECIMAL columns: regardless of physical backing (INT32, INT64,
+    // FLBA), decode to f64 with scale applied. Reuses the existing
+    // f64 column lane through filter / agg / expression.
+    const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+
+    const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
+        .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            k,
+            decode_options,
+            null,
+        ),
+    } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
+        // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
+        .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
+    } else switch (cm.type) {
+        .INT32 => .{
+            .i32 = try decodeColumnTWithOptions(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+        },
+        .INT64 => .{
+            .i64 = try decodeColumnTWithOptions(i64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+        },
+        .FLOAT => .{
+            .f32 = try decodeColumnTWithOptions(f32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+        },
+        .DOUBLE => .{
+            .f64 = try decodeColumnTWithOptions(f64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+        },
+        .BYTE_ARRAY => .{
+            .string = try decodeColumnTWithOptions(
+                []const u8,
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                decode_options,
+            ),
+        },
+        .BOOLEAN => .{
+            .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
+        },
+        // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
+        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
+        // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
+        // fixed-width bytes (UUID / Float16 / fixed binary).
+        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            flbaWidth(schema_elem),
+            decode_options,
+        ) },
+    };
+    try checkRowShape(decoded, num_rows);
+    if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
+    return decoded;
 }
 
 /// Decode one DECIMAL column's chunk to unscaled i128 integers (the
@@ -585,6 +626,47 @@ fn synthPageIndexToSink(
         ptrs.offset_index_length = @intCast(bytes.len);
     }
     return ptrs;
+}
+
+/// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
+/// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
+/// with the row group.
+fn appendSelected(
+    buf: *OutputAggregator.ColumnBuf,
+    src: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    surviving: usize,
+    arena: std.mem.Allocator,
+) !void {
+    switch (src) {
+        inline else => |c, tag| {
+            const T = @TypeOf(c.values[0]);
+            const tb = &@field(buf.*, @tagName(tag));
+            // Exact sizing: the aggregator usually holds one row group, and ArrayList growth would leave half again
+            // as much unused (and, being arena memory, never reclaimed).
+            try tb.values.ensureTotalCapacityPrecise(arena, tb.values.items.len + surviving);
+            const out = tb.values.addManyAsSliceAssumeCapacity(surviving);
+            encoder.compactByMask(T, c.values, sel.mask, out);
+            if (T == []const u8) {
+                var total: usize = 0;
+                for (out) |v| total += v.len;
+                const block = try arena.alloc(u8, total);
+                var pos: usize = 0;
+                for (out) |*v| {
+                    @memcpy(block[pos..][0..v.len], v.*);
+                    v.* = block[pos..][0..v.len];
+                    pos += v.len;
+                }
+            }
+            if (c.max_def == 0) return;
+            tb.max_def = c.max_def;
+            try tb.def_levels.ensureTotalCapacityPrecise(arena, tb.def_levels.items.len + surviving);
+            const dl_out = tb.def_levels.addManyAsSliceAssumeCapacity(surviving);
+            if (c.def_levels) |dl| {
+                encoder.compactByMask(u32, dl, sel.mask, dl_out);
+            } else @memset(dl_out, c.max_def);
+        },
+    }
 }
 
 fn appendIntoBuf(
@@ -755,24 +837,48 @@ pub fn encodeAggregator(
         }
     }
 
+    var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try rg_columns.ensureTotalCapacity(out_arena, n_specs);
+    var rg_total: i64 = 0;
+    const placer: ChunkPlacer = .{
+        .out_arena = out_arena,
+        .sink = sink,
+        .out_offset = out_offset,
+        .timings = timings,
+        .emit_page_index = emit_page_index,
+        .columns = &rg_columns,
+        .total = &rg_total,
+    };
+
     const t_enc_start = nowMonoNs();
     if (num_workers <= 1) {
+        // Serial: write each chunk as soon as it is encoded and drop its working memory (hash tables, index and
+        // payload buffers, the compressor's output), so a row group holds one column's encoding at a time.
         for (0..n_specs) |i| {
-            if (results[i] != null) continue; // FLBA decimal done in pre-pass
-            const span = profile.Span.begin(timings.prof);
-            results[i] = try encoder.encodeColumn(ra, .{
-                .values = batch_cols[i],
-                .schema_elem = &agg.schema_elems[i],
-                .path_in_schema = agg.paths[i],
-                .codec = output_codec,
-                .bloom_fpp = bloom_write.at(i),
-            });
-            if (span.t != null) {
-                const em = results[i].?.meta;
-                span.end(.encode_chunk, profile.args(.{
-                    i, output_codec, em.total_uncompressed_size, em.total_compressed_size, em.num_values,
-                }));
-            }
+            var col_arena = std.heap.ArenaAllocator.init(gpa);
+            defer col_arena.deinit();
+            const enc = results[i] orelse blk: { // FLBA decimals were encoded in the pre-pass
+                const t0 = nowMonoNs();
+                const span = profile.Span.begin(timings.prof);
+                const e = try encoder.encodeColumn(col_arena.allocator(), .{
+                    .values = batch_cols[i],
+                    .schema_elem = &agg.schema_elems[i],
+                    .path_in_schema = agg.paths[i],
+                    .codec = output_codec,
+                    .bloom_fpp = bloom_write.at(i),
+                });
+                if (span.t != null) {
+                    const em = e.meta;
+                    span.end(.encode_chunk, profile.args(.{
+                        i, output_codec, em.total_uncompressed_size, em.total_compressed_size, em.num_values,
+                    }));
+                }
+                const t1 = nowMonoNs();
+                timings.encode_ns += @intCast(t1 - t0);
+                profile.record(timings.prof, .encode, t0, t1, profile.args(.{ 1, agg.num_rows }));
+                break :blk e;
+            };
+            try placer.place(enc);
         }
     } else {
         const arenas = try ra.alloc(std.heap.ArenaAllocator, num_workers);
@@ -810,53 +916,11 @@ pub fn encodeAggregator(
         for (spawned..num_workers) |w| aggEncodeWorker(&ctxs[w]);
         for (threads[0..spawned]) |t| t.join();
         for (ctxs) |c| if (c.err) |err| return err;
-    }
-    const t_enc_end = nowMonoNs();
-    timings.encode_ns += @intCast(t_enc_end - t_enc_start);
-    profile.record(timings.prof, .encode, t_enc_start, t_enc_end, profile.args(.{ n_specs, agg.num_rows }));
-
-    // Sequential write phase — same ordering guarantees as the per-RG
-    // path. Deep-clone column metadata into out_arena (which outlives
-    // the task arenas).
-    var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-    try rg_columns.ensureTotalCapacity(out_arena, n_specs);
-    var rg_total: i64 = 0;
-
-    for (results) |maybe_enc| {
-        const enc = maybe_enc orelse return error.MissingEncodeResult;
-        const col_start_in_file: i64 = @intCast(out_offset.*);
-        var em = try cloneColumnMeta(out_arena, enc.meta);
-        em.data_page_offset += col_start_in_file;
-        if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
-        const t_sink_start = nowMonoNs();
-        try sink.write(enc.bytes);
-        const t_sink_end = nowMonoNs();
-        timings.sink_ns += @intCast(t_sink_end - t_sink_start);
-        profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.bytes.len}));
-        out_offset.* += enc.bytes.len;
-        rg_total += @intCast(enc.bytes.len);
-
-        // Synthesize the page index for this freshly-encoded chunk (one
-        // data page → one OffsetIndex + ColumnIndex entry, built from the
-        // stats the encoder already computed), written right after the
-        // chunk data. Mirrors the byte-copy carry-forward so a filtered
-        // re-encode keeps page-level pruning too. (2b)
-        const idx = if (emit_page_index)
-            try synthPageIndexToSink(out_arena, sink, out_offset, &enc.meta, em.data_page_offset)
-        else
-            fastpath.PageIndexPtrs{};
-
-        try rg_columns.append(out_arena, .{
-            .file_path = null,
-            .file_offset = col_start_in_file,
-            .meta_data = em,
-            .offset_index_offset = idx.offset_index_offset,
-            .offset_index_length = idx.offset_index_length,
-            .column_index_offset = idx.column_index_offset,
-            .column_index_length = idx.column_index_length,
-            // Placed after the last row group, so it must outlive this row group's arena.
-            .bloom_out = if (enc.bloom.len > 0) try out_arena.dupe(u8, enc.bloom) else &.{},
-        });
+        const t_enc_end = nowMonoNs();
+        timings.encode_ns += @intCast(t_enc_end - t_enc_start);
+        profile.record(timings.prof, .encode, t_enc_start, t_enc_end, profile.args(.{ n_specs, agg.num_rows }));
+        // Sequential write phase, in output order.
+        for (results) |maybe_enc| try placer.place(maybe_enc orelse return error.MissingEncodeResult);
     }
 
     return .{
@@ -868,6 +932,51 @@ pub fn encodeAggregator(
         },
     };
 }
+
+/// Writes encoded chunks to the sink in output order: metadata deep-cloned into `out_arena` (which outlives the
+/// encoders' arenas) with offsets made absolute, and, direct to a file, a synthesised page index after each chunk.
+const ChunkPlacer = struct {
+    out_arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    out_offset: *u64,
+    timings: *Timings,
+    emit_page_index: bool,
+    columns: *std.ArrayListUnmanaged(schema.ColumnChunk),
+    total: *i64,
+
+    fn place(self: ChunkPlacer, enc: encoder.EncodedColumn) !void {
+        const col_start_in_file: i64 = @intCast(self.out_offset.*);
+        var em = try cloneColumnMeta(self.out_arena, enc.meta);
+        em.data_page_offset += col_start_in_file;
+        if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
+        const t_sink_start = nowMonoNs();
+        try self.sink.write(enc.bytes);
+        const t_sink_end = nowMonoNs();
+        self.timings.sink_ns += @intCast(t_sink_end - t_sink_start);
+        profile.record(self.timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.bytes.len}));
+        self.out_offset.* += enc.bytes.len;
+        self.total.* += @intCast(enc.bytes.len);
+
+        // One data page per freshly encoded chunk → one OffsetIndex + ColumnIndex entry, from the stats the
+        // encoder already computed, so a filtered re-encode keeps page-level pruning too.
+        const idx = if (self.emit_page_index)
+            try synthPageIndexToSink(self.out_arena, self.sink, self.out_offset, &enc.meta, em.data_page_offset)
+        else
+            fastpath.PageIndexPtrs{};
+
+        try self.columns.append(self.out_arena, .{
+            .file_path = null,
+            .file_offset = col_start_in_file,
+            .meta_data = em,
+            .offset_index_offset = idx.offset_index_offset,
+            .offset_index_length = idx.offset_index_length,
+            .column_index_offset = idx.column_index_offset,
+            .column_index_length = idx.column_index_length,
+            // Placed after the last row group, so it must outlive this row group's arena and the encoder's.
+            .bloom_out = if (enc.bloom.len > 0) try self.out_arena.dupe(u8, enc.bloom) else &.{},
+        });
+    }
+};
 
 const AggEncodeCtx = struct {
     arena: std.mem.Allocator,

@@ -825,7 +825,7 @@ fn filterColumn(
 /// `dst.len` must equal `popcount(mask)` over the relevant prefix.
 /// Walks `mask` 64 rows at a time — empty word skipped, full word
 /// bulk-copied, mixed word iterated via @ctz.
-fn compactByMask(
+pub fn compactByMask(
     comptime T: type,
     src: []const T,
     mask: []const u64,

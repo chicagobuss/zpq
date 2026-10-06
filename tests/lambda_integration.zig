@@ -1009,6 +1009,67 @@ test "lambda reopens S3 connections the server dropped while it sat idle, withou
     try std.testing.expect(s3.idle_closes.load(.monotonic) > 0);
 }
 
+const BLOOM_FIXTURE = "ci/fixtures/parquet/bloom_keys.parquet";
+
+test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" {
+    // The fixture's statistics prune no equality (tools/gen_bloom_fixture.py); its Bloom filters prune all but the
+    // group holding the key. The padding moves the filters out of the prefetched tail, so they are fetched.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, BLOOM_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+
+    const Case = struct { filter: []const u8, kept: i64 };
+    for ([_]Case{
+        .{ .filter = "id = 1000", .kept = 1 },
+        .{ .filter = "id = 1001", .kept = 0 },
+        .{ .filter = "s = 'key-001000'", .kept = 1 },
+        .{ .filter = "id IN (1001, 1003, 1000)", .kept = 1 },
+    }, 0..) |c, ci| {
+        const agg = "\"aggregate\":\"count(*) AS n, sum(x) AS sx\"";
+        const local_body = try std.fmt.allocPrint(
+            a,
+            "{{\"inputs\":[\"" ++ BLOOM_FIXTURE ++ "\"],\"filter\":\"{s}\"," ++ agg ++ "}}",
+            .{c.filter},
+        );
+        defer a.free(local_body);
+        const local = try invoke(&server, a, local_body);
+        defer a.free(local);
+        const want = aggMember(local) orelse return error.TestUnexpectedResult;
+        const s3_body = try std.fmt.allocPrint(
+            a,
+            "{{\"inputs\":[\"s3://bkt/bloom.parquet\"],\"filter\":\"{s}\"," ++ agg ++ "}}",
+            .{c.filter},
+        );
+        defer a.free(s3_body);
+        // The very first invocation builds the warm cache and the next fills it; by a case's third no filter is read.
+        for (0..3) |i| {
+            const resp = try invoke(&server, a, s3_body);
+            defer a.free(resp);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+            defer parsed.deinit();
+            const bloom = parsed.value.object.get("bloom") orelse return error.TestUnexpectedResult;
+            const pruned = bloom.object.get("row_groups_pruned").?.integer;
+            const requests = bloom.object.get("requests").?.integer;
+            const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and pruned == 8 - c.kept and
+                (i < 2 or requests == 0) and (ci > 0 or i > 0 or requests > 0);
+            if (!ok) {
+                std.debug.print("[s3 bloom] {s} invocation {d}: {s}\n  want {s}\n", .{ c.filter, i, resp, want });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var path_z: [256]u8 = undefined;
     if (path.len + 1 > path_z.len) return error.PathTooLong;

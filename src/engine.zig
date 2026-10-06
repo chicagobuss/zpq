@@ -1548,6 +1548,7 @@ fn openInputs(
     // batch in parallel via Io.Group.
     var owned_pools: std.ArrayList(*s3.Pool(POOL_SIZE)) = .empty;
     var s3_buffers: std.ArrayList([]u8) = .empty;
+    var membership_stats: membership.Stats = .{};
     if (s3_indices.items.len > 0) {
         const creds = try credentialsFromEnv(ctx.env);
 
@@ -1602,6 +1603,17 @@ fn openInputs(
             }
         };
 
+        const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
+        for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
+
+        // Bloom filters first: what they prove lands on the footers' chunks, so the plan below and the scan workers
+        // after it prune the same row groups.
+        if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
+            const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
+            var src: S3Membership = .{ .ctx = read_ctx, .creds = creds, .pool = pool, .specs = specs };
+            membership_stats = try membership.load(arena, f, metas_for_plan, src.source(), .{});
+        };
+
         // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
         // — microseconds, not worth plumbing the parsed AST through.)
         const plan_span = profile.Span.begin(prof);
@@ -1609,8 +1621,6 @@ fn openInputs(
         var n_merged: usize = 0;
         var n_rgs: usize = 0;
         var n_rgs_pruned: usize = 0;
-        const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
-        for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
         const plan = try planRanges(arena, args, metas_for_plan);
 
         // Per file: stat-prune RGs, collect raw byte ranges for every
@@ -1759,6 +1769,7 @@ fn openInputs(
         .mmaps = mmaps,
         .owned_pools = try owned_pools.toOwnedSlice(arena),
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
+        .membership = membership_stats,
     };
 }
 
@@ -1848,7 +1859,101 @@ const FetchSpec = struct {
     tail_start: u64 = 0,
     /// Per row group, the columns fetched from it; null where statistics prune it.
     rg_columns: []?[]const bool = &.{},
+    /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
+    etag_buf: [96]u8 = undefined,
+    etag_len: usize = 0,
     err: ?anyerror = null,
+
+    fn etag(self: *const FetchSpec) []const u8 {
+        return self.etag_buf[0..self.etag_len];
+    }
+
+    fn noteEtag(self: *FetchSpec, raw: ?[]const u8) void {
+        var e = raw orelse return;
+        if (e.len >= 2 and e[0] == '"' and e[e.len - 1] == '"') e = e[1 .. e.len - 1];
+        if (e.len > self.etag_buf.len) return;
+        @memcpy(self.etag_buf[0..e.len], e);
+        self.etag_len = e.len;
+    }
+};
+
+/// Bloom filter reads for S3 inputs, the range fetcher behind `membership.Source`. Ranges inside the prefetched tail
+/// are copied from it; the rest go out at once as ranged GETs through the query's pool. Whole filters are kept in the
+/// warm metadata cache under the object's ETag.
+const S3Membership = struct {
+    ctx: Context,
+    creds: s3.Credentials,
+    pool: *s3.Pool(POOL_SIZE),
+    specs: []const FetchSpec,
+
+    /// A GET's fixed cost as the bytes one connection moves meanwhile (first byte ~25 ms at ~80 MB/s, measured on
+    /// Lambda against S3 in-region), over the permits a fetch runs on, each request no longer than `fetchJobs` keeps
+    /// whole.
+    const cost: membership.Cost = .{
+        .request_bytes = 2 << 20,
+        .concurrency = READ_CONCURRENCY,
+        .max_request = s3.SPLIT_THRESHOLD,
+    };
+
+    fn source(self: *S3Membership) membership.Source {
+        return .{ .ctx = self, .vtable = &vtable, .cost = cost };
+    }
+
+    const vtable: membership.Source.VTable = .{ .read = read, .cached = cached, .retain = retain };
+
+    fn read(
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        spans: []const membership.Span,
+        out: [][]const u8,
+    ) anyerror!void {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        var jobs: std.ArrayList(s3.FetchJob) = .empty;
+        for (spans, out) |s, *o| {
+            const sp = &self.specs[s.file];
+            const end = @min(s.end, sp.total_size);
+            if (s.start >= end) {
+                o.* = &.{};
+                continue;
+            }
+            const buf = try arena.alloc(u8, @intCast(end - s.start));
+            const fetch_end = @min(end, sp.tail_start);
+            if (s.start < fetch_end) try jobs.append(arena, .{
+                .bucket = sp.url.bucket,
+                .key = sp.url.key,
+                .range = .{ .start = s.start, .end = fetch_end },
+                .target = buf[0..@intCast(fetch_end - s.start)],
+            });
+            if (end > sp.tail_start) {
+                const from = @max(s.start, sp.tail_start);
+                const tail_off: usize = @intCast(from - sp.tail_start);
+                const n: usize = @intCast(end - from);
+                if (tail_off + n > sp.tail.len) return error.BadResponse;
+                @memcpy(buf[@intCast(from - s.start)..][0..n], sp.tail[tail_off..][0..n]);
+            }
+            o.* = buf;
+        }
+        if (jobs.items.len > 0) {
+            _ = try s3.fetchJobs(self.ctx.io, self.pool, self.ctx.gpa, arena, self.creds, jobs.items, READ_CONCURRENCY);
+        }
+    }
+
+    fn cached(ctx: *anyopaque, arena: std.mem.Allocator, s: membership.Span) ?[]const u8 {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        const cache = self.ctx.meta_cache orelse return null;
+        const sp = &self.specs[s.file];
+        if (sp.etag_len == 0) return null;
+        const len: usize = @intCast(s.end - s.start);
+        return cache.getBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, len, arena);
+    }
+
+    fn retain(ctx: *anyopaque, s: membership.Span, bytes: []const u8) void {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        const cache = self.ctx.meta_cache orelse return;
+        const sp = &self.specs[s.file];
+        if (sp.etag_len == 0) return;
+        cache.putBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, bytes);
+    }
 };
 
 fn fetchMetaBatch(
@@ -1936,6 +2041,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             });
             t.cache = if (cond.status == 304) 1 else 2;
             if (cond.status == 304) {
+                sp.noteEtag(entry.etag);
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
                 sp.tail_start = entry.footer_offset;
@@ -1951,6 +2057,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             // and continue with the response we already have.
             cache.invalidate(t.ctx.io, sp.url.bucket, sp.url.key);
             if (cond.status == 206 or cond.status == 200) {
+                sp.noteEtag(cond.header("ETag"));
                 try populateFromTailResponse(t, scratch, cond);
                 try maybeCacheMeta(t.ctx, sp, cond.header("ETag"));
                 return;
@@ -1965,6 +2072,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         .prof = t.prof,
     });
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
+    sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
     try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
 }

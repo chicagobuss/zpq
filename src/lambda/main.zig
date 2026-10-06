@@ -76,6 +76,8 @@ const PersistentPool = struct {
 
     inner: Inner = undefined,
     cache: zpq.io.meta_cache.MetaCache = undefined,
+    /// What the cache may hold of Bloom filters across warm invocations.
+    blob_budget: usize = zpq.io.meta_cache.MetaCache.default_blob_budget,
     initialized: bool = false,
     output: engine.OutputLane = undefined,
     output_initialized: bool = false,
@@ -92,6 +94,7 @@ const PersistentPool = struct {
 
         try self.inner.init(gpa);
         self.cache.init(gpa, META_CACHE_CAPACITY);
+        self.cache.blob_budget = self.blob_budget;
         self.initialized = true;
         return &self.inner;
     }
@@ -135,7 +138,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
-    var pool: PersistentPool = .{};
+    // A sixteenth of the function's memory for warm Bloom filters: 188 MB at 3008 MB.
+    var pool: PersistentPool = .{ .blob_budget = @min(256 << 20, zpq.core.system.discoverAvailableMemory(env) / 16) };
 
     while (true) {
         var inv = client.nextInvocation() catch |err| {

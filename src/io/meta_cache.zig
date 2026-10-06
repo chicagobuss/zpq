@@ -50,8 +50,16 @@ pub const Entry = struct {
     /// `[footer_offset, total_size)` — i.e. the thrift footer plus
     /// the trailing 4-byte length and PAR1 magic.
     footer_bytes: []u8,
+    /// Owned. Byte ranges of this version of the object kept for reuse (whole Bloom filters), keyed by offset. The
+    /// ETag that revalidates the footer vouches for them too.
+    blobs: std.ArrayListUnmanaged(Blob) = .empty,
     /// LRU ordering — appended to the tail on insert/touch.
     lru_node: std.DoublyLinkedList.Node = .{},
+};
+
+pub const Blob = struct {
+    offset: u64,
+    bytes: []u8,
 };
 
 pub const MetaCache = struct {
@@ -65,6 +73,11 @@ pub const MetaCache = struct {
     len: usize = 0,
     capacity: usize,
     stats: Stats = .{},
+    /// Bytes all entries' blobs may hold together. Footers are not counted: they are tiny and bounded by `capacity`.
+    blob_budget: usize = default_blob_budget,
+    blob_bytes: usize = 0,
+
+    pub const default_blob_budget: usize = 64 << 20;
 
     pub fn init(self: *MetaCache, allocator: std.mem.Allocator, capacity: usize) void {
         self.* = .{
@@ -98,6 +111,7 @@ pub const MetaCache = struct {
     }
 
     fn destroyEntry(self: *MetaCache, e: *Entry) void {
+        self.dropBlobs(e);
         self.allocator.free(e.bucket);
         self.allocator.free(e.key);
         self.allocator.free(e.etag);
@@ -251,6 +265,74 @@ pub const MetaCache = struct {
         }
     }
 
+    fn dropBlobs(self: *MetaCache, e: *Entry) void {
+        for (e.blobs.items) |b| {
+            self.blob_bytes -= b.bytes.len;
+            self.allocator.free(b.bytes);
+        }
+        e.blobs.deinit(self.allocator);
+        e.blobs = .empty;
+    }
+
+    fn entryFor(self: *MetaCache, bucket: []const u8, key: []const u8, etag: []const u8) ?*Entry {
+        var key_buf: [4096]u8 = undefined;
+        const ck = cacheKey(&key_buf, bucket, key) orelse return null;
+        const e = self.by_key.get(ck) orelse return null;
+        return if (std.mem.eql(u8, e.etag, etag)) e else null;
+    }
+
+    /// A copy, in `out`, of the `len` bytes at `offset` kept for this version (`etag`) of the object, or null.
+    pub fn getBlob(
+        self: *MetaCache,
+        io: Io,
+        bucket: []const u8,
+        key: []const u8,
+        etag: []const u8,
+        offset: u64,
+        len: usize,
+        out: std.mem.Allocator,
+    ) ?[]u8 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const e = self.entryFor(bucket, key, etag) orelse return null;
+        for (e.blobs.items) |b| {
+            if (b.offset == offset and b.bytes.len == len) return out.dupe(u8, b.bytes) catch null;
+        }
+        return null;
+    }
+
+    /// Keep `bytes`, read at `offset` from this version (`etag`) of an object whose footer is cached, for later
+    /// queries. Best effort: past the budget, blobs of the least recently used objects go first, and a blob that
+    /// would need more than a quarter of the budget is not kept.
+    pub fn putBlob(
+        self: *MetaCache,
+        io: Io,
+        bucket: []const u8,
+        key: []const u8,
+        etag: []const u8,
+        offset: u64,
+        bytes: []const u8,
+    ) void {
+        if (bytes.len > self.blob_budget / 4) return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const e = self.entryFor(bucket, key, etag) orelse return;
+        for (e.blobs.items) |b| if (b.offset == offset) return;
+        var node = self.entries.first;
+        while (self.blob_bytes + bytes.len > self.blob_budget) {
+            const n = node orelse return;
+            node = n.next;
+            const victim: *Entry = @alignCast(@fieldParentPtr("lru_node", n));
+            if (victim != e) self.dropBlobs(victim);
+        }
+        const owned = self.allocator.dupe(u8, bytes) catch return;
+        e.blobs.append(self.allocator, .{ .offset = offset, .bytes = owned }) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.blob_bytes += owned.len;
+    }
+
     pub fn snapshotStats(self: *MetaCache) Stats {
         // No lock — Stats is POD and slightly stale reads are fine
         // for telemetry. Atomics aren't used elsewhere in pool.zig
@@ -315,4 +397,42 @@ test "MetaCache invalidate drops entry" {
     try testing.expect(cache.get(io, "b", "k") != null);
     cache.invalidate(io, "b", "k");
     try testing.expect(cache.get(io, "b", "k") == null);
+}
+
+test "MetaCache blobs: kept per version, dropped with their entry, bounded by the budget" {
+    var cache: MetaCache = undefined;
+    cache.init(testing.allocator, 4);
+    defer cache.deinit();
+    cache.blob_budget = 64;
+    const io = Io.Threaded.global_single_threaded.io();
+
+    // No footer cached, nothing kept.
+    cache.putBlob(io, "b", "k", "e1", 10, "0123456789");
+    try testing.expect(cache.getBlob(io, "b", "k", "e1", 10, 10, testing.allocator) == null);
+
+    try cache.put(io, "b", "k", "e1", 100, 90, "f");
+    cache.putBlob(io, "b", "k", "e1", 10, "0123456789");
+    const got = cache.getBlob(io, "b", "k", "e1", 10, 10, testing.allocator) orelse return error.TestUnexpectedNull;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("0123456789", got);
+    // Another version of the object, another offset or length: no hit.
+    try testing.expect(cache.getBlob(io, "b", "k", "e2", 10, 10, testing.allocator) == null);
+    try testing.expect(cache.getBlob(io, "b", "k", "e1", 11, 10, testing.allocator) == null);
+    try testing.expect(cache.getBlob(io, "b", "k", "e1", 10, 9, testing.allocator) == null);
+    // Too big for a quarter of the budget.
+    cache.putBlob(io, "b", "k", "e1", 50, &@as([17]u8, @splat(0)));
+    try testing.expectEqual(@as(usize, 10), cache.blob_bytes);
+
+    // Past the budget, the least recently used object's blobs go first.
+    try cache.put(io, "b", "k2", "x", 100, 90, "f");
+    cache.putBlob(io, "b", "k2", "x", 0, &@as([16]u8, @splat(1)));
+    cache.putBlob(io, "b", "k2", "x", 16, &@as([16]u8, @splat(1)));
+    cache.putBlob(io, "b", "k2", "x", 32, &@as([16]u8, @splat(1)));
+    cache.putBlob(io, "b", "k2", "x", 48, &@as([16]u8, @splat(1)));
+    try testing.expect(cache.blob_bytes <= 64);
+    try testing.expect(cache.getBlob(io, "b", "k", "e1", 10, 10, testing.allocator) == null);
+
+    // Replacing an entry frees its blobs.
+    try cache.put(io, "b", "k2", "y", 100, 90, "f");
+    try testing.expectEqual(@as(usize, 0), cache.blob_bytes);
 }

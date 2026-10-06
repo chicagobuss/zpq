@@ -630,13 +630,14 @@ const Probing = struct {
             if (cached(self.src.ctx, a, sp)) |bytes| f.* = .{ .bytes = bytes };
         };
 
-        // Whole filters, or just the blocks the keys select: whichever the source's cost model says reads faster.
+        // Whole filters, or just the blocks the keys select, by the source's cost model. A whole filter can serve later
+        // queries from the warm cache, blocks only this one, so blocks must save a quarter of the time to be chosen.
         var plan = try self.wholePlan(wave, spans, fetch);
         if (self.src.cost.remote()) {
             if (try self.sparsePlan(wave, spans, fetch)) |sparse| {
                 const cost = self.src.cost;
                 const t_sparse = try estimateReqs(a, sparse.reqs.items, cost);
-                if (t_sparse < try estimateReqs(a, plan.reqs.items, cost)) plan = sparse;
+                if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) plan = sparse;
             }
         }
         try readAll(a, self.src, plan.reqs.items, self.stats);

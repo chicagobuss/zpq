@@ -453,6 +453,34 @@ const BufSink = struct {
 /// general allocator).
 const ENCODE_REGION_RESERVE: usize = 4 << 30;
 
+/// A re-encode producer's working memory, two huge-page regions kept from one row group to the next so their pages
+/// are faulted once per write rather than once per row group: the projected rows in `rows`, and in `work` first the
+/// decoded columns, then, once those are dead, the encoded chunks. A row group's working set is tens to hundreds of
+/// MiB of short-lived buffers, which on the general allocator cost a page fault per 4 KiB on every thread.
+const WorkRegions = struct {
+    rows: huge_pages.Region,
+    work: huge_pages.Region,
+    /// Claimed by one producer at a time; there are as many as producers can run at once.
+    busy: std.atomic.Value(bool) = .init(false),
+
+    fn init(gpa: std.mem.Allocator) WorkRegions {
+        return .{
+            .rows = .init(gpa, ENCODE_REGION_RESERVE),
+            .work = .init(gpa, ENCODE_REGION_RESERVE),
+        };
+    }
+
+    fn deinit(self: *WorkRegions) void {
+        self.rows.deinit();
+        self.work.deinit();
+    }
+
+    fn claim(all: []WorkRegions) ?*WorkRegions {
+        for (all) |*r| if (r.busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return r;
+        return null;
+    }
+};
+
 const RGJob = struct {
     bytes: []const u8, // source file bytes containing this RG
     meta: *const schema.FileMetaData, // owning file's metadata (shared, read-only)
@@ -486,14 +514,11 @@ const Slot = struct {
 
 /// Encode one row group into a gpa-owned byte buffer with offsets relative to
 /// 0; footer metadata is allocated on `meta_alloc` (the slot's private arena).
-/// The working memory lives in two huge-page regions released at return: the
-/// projected rows in one, and in the other first the decoded columns, then,
-/// once those are dead, the encoded chunks. A row group's working set is
-/// hundreds of MiB of short-lived buffers, which on the general allocator cost
-/// a page fault per 4 KiB on every thread.
+/// The working memory is `regions`, emptied again before returning.
 fn encodeRGToBuffer(
     gpa: std.mem.Allocator,
     meta_alloc: std.mem.Allocator,
+    regions: *WorkRegions,
     job: RGJob,
     filter: ?filter_ast.Filter,
     fetch_arr: []const bool,
@@ -503,12 +528,11 @@ fn encodeRGToBuffer(
     prof: ?*profile.Thread,
     bloom: consumer.BloomWrite,
 ) !EncodedRG {
-    var rows_region = huge_pages.Region.init(gpa, ENCODE_REGION_RESERVE);
-    defer rows_region.deinit();
-    var work_region = huge_pages.Region.init(gpa, ENCODE_REGION_RESERVE);
-    defer work_region.deinit();
+    const work_region = &regions.work;
     const work = work_region.allocator();
-    var scratch = std.heap.ArenaAllocator.init(rows_region.allocator());
+    defer work_region.rewind();
+    defer regions.rows.rewind();
+    var scratch = std.heap.ArenaAllocator.init(regions.rows.allocator());
     defer scratch.deinit();
     var timings: consumer.Timings = .{ .prof = prof };
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
@@ -580,6 +604,8 @@ const WinCtx = struct {
     bloom_outputs: []const ?f64 = &.{},
     bloom_leaves: []const ?f64 = &.{},
     slots: []Slot,
+    /// One per producer that can run at once.
+    regions: []WorkRegions,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
     cpu: std.Io.Semaphore = .{}, // producers running at once; sized in runWindowed
@@ -606,12 +632,22 @@ fn winProducer(w: *WinCtx, i: usize) void {
     const prof = profile.threadOf(w.profiler, .encode);
     const span = profile.Span.begin(prof);
     defer span.end(.encode_rg, profile.args(.{ w.jobs[i].file_index, w.jobs[i].rg_index, w.jobs[i].passthrough }));
+    // `cpu` admits no more producers than there are regions, so a claim fails only if that invariant breaks; then
+    // the job pays for fresh ones.
+    var spare: ?WorkRegions = null;
+    defer if (spare) |*r| r.deinit();
+    const regions = WorkRegions.claim(w.regions) orelse blk: {
+        spare = .init(w.gpa);
+        break :blk &spare.?;
+    };
+    defer regions.busy.store(false, .release);
     const enc = (if (w.jobs[i].passthrough)
         copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set, prof, w.bloom_leaves)
     else
         encodeRGToBuffer(
             w.gpa,
             ma,
+            regions,
             w.jobs[i],
             w.filter,
             w.fetch_arr,
@@ -1466,6 +1502,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(ctx.gpa) };
             win_slots = slots;
 
+            const regions = try arena.alloc(WorkRegions, @max(effective_async_budget, 1));
+            for (regions) |*r| r.* = .init(ctx.gpa);
+            defer for (regions) |*r| r.deinit();
             var window_sem: std.Io.Semaphore = .{ .permits = window };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
             var w = WinCtx{
@@ -1480,6 +1519,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .bloom_outputs = blooms.outputs,
                 .bloom_leaves = blooms.leaves,
                 .slots = slots,
+                .regions = regions,
                 .window = &window_sem,
                 .completions = &completions_sem,
                 .sink = sink,

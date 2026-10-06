@@ -1597,3 +1597,121 @@ test "zpq's own dictionary chunks say they cover their values" {
     try testing.expect(scanDictionary(values.bytes, values.count, slot, &want, &found));
     try testing.expectEqualSlices(bool, &.{ true, true, false, true }, &found);
 }
+
+fn eqLeaf(comptime tag: std.meta.Tag(ast.Filter), v: anytype) ast.Filter {
+    return @unionInit(ast.Filter, @tagName(tag), .{ .col_idx = 0, .op = .Eq, .value = v, .stored = true });
+}
+
+test "fuzz: random values of every filterable type, written with filters, read back, never a false negative" {
+    const encoder = @import("../writer/encoder.zig");
+    const filter_eval = @import("eval.zig");
+    var prng = std.Random.DefaultPrng.init(0xb100f);
+    const r = prng.random();
+    for (0..60) |round| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const n = 1 + r.uintLessThan(usize, 3000);
+        // Low cardinality some rounds (the encoder then writes a dictionary), unique values others.
+        const card = if (r.boolean()) 1 + r.uintLessThan(usize, 40) else n;
+        const nullable = r.boolean();
+        const def = try a.alloc(u32, n);
+        for (def) |*d| d.* = if (nullable and r.uintLessThan(u8, 5) == 0) 0 else 1;
+        const fpp = ([_]f64{ 0.001, 0.01, 0.1, 0.3 })[r.uintLessThan(usize, 4)];
+        const width = 1 + r.uintLessThan(usize, 24);
+        const kind = round % 6;
+        const physical: schema.Type = switch (kind) {
+            0 => .INT32,
+            1 => .INT64,
+            2 => .FLOAT,
+            3 => .DOUBLE,
+            4 => .BYTE_ARRAY,
+            else => .FIXED_LEN_BYTE_ARRAY,
+        };
+        var elem = plain(physical);
+        if (physical == .FIXED_LEN_BYTE_ARRAY) elem.type_length = @intCast(width);
+        const pool = try a.alloc(u64, card);
+        for (pool) |*p| p.* = r.int(u64);
+        const pick = struct {
+            fn f(rr: std.Random, ps: []const u64) u64 {
+                return ps[rr.uintLessThan(usize, ps.len)];
+            }
+        }.f;
+        var col: filter_eval.Batch.Column = undefined;
+        var leaves: std.ArrayList(ast.Filter) = .empty;
+        switch (physical) {
+            .INT32 => {
+                const v = try a.alloc(i32, n);
+                for (v) |*x| x.* = @truncate(@as(i64, @bitCast(pick(r, pool))));
+                col = .{ .i32 = .{ .values = v, .def_levels = def, .max_def = 1 } };
+                for (v, def) |x, d| if (d == 1) try leaves.append(a, eqLeaf(.int32, x));
+            },
+            .INT64 => {
+                const v = try a.alloc(i64, n);
+                for (v) |*x| x.* = @bitCast(pick(r, pool));
+                col = .{ .i64 = .{ .values = v, .def_levels = def, .max_def = 1 } };
+                for (v, def) |x, d| if (d == 1) try leaves.append(a, eqLeaf(.int64, x));
+            },
+            .FLOAT => {
+                const v = try a.alloc(f32, n);
+                for (v) |*x| {
+                    const bits: u32 = @truncate(pick(r, pool));
+                    // Signed zeros on purpose; NaN never (no reader probes it).
+                    const signed_zero: f32 = if (bits % 2 == 0) 0.0 else -0.0;
+                    x.* = if (bits % 7 == 0) signed_zero else @floatFromInt(@as(i32, @bitCast(bits)) >> 8);
+                }
+                col = .{ .f32 = .{ .values = v, .def_levels = def, .max_def = 1 } };
+                for (v, def) |x, d| if (d == 1) try leaves.append(a, eqLeaf(.float, x));
+            },
+            .DOUBLE => {
+                const v = try a.alloc(f64, n);
+                for (v) |*x| {
+                    const bits = pick(r, pool);
+                    const signed_zero: f64 = if (bits % 2 == 0) 0.0 else -0.0;
+                    const finite = @as(f64, @floatFromInt(@as(i64, @bitCast(bits)) >> 12)) / 1024.0;
+                    x.* = if (bits % 7 == 0) signed_zero else finite;
+                }
+                col = .{ .f64 = .{ .values = v, .def_levels = def, .max_def = 1 } };
+                for (v, def) |x, d| if (d == 1) try leaves.append(a, eqLeaf(.double, x));
+            },
+            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => {
+                const v = try a.alloc([]const u8, n);
+                for (v) |*x| {
+                    const seed = pick(r, pool);
+                    const len = if (physical == .FIXED_LEN_BYTE_ARRAY) width else @as(usize, @intCast(seed % 40));
+                    const buf = try a.alloc(u8, len);
+                    var sp = std.Random.DefaultPrng.init(seed);
+                    sp.random().bytes(buf);
+                    x.* = buf;
+                }
+                col = .{ .string = .{ .values = v, .def_levels = def, .max_def = 1 } };
+                for (v, def) |x, d| if (d == 1) try leaves.append(a, eqLeaf(.string, x));
+            },
+            else => unreachable,
+        }
+        const enc = try encoder.encodeColumn(a, .{
+            .values = col,
+            .schema_elem = &elem,
+            .path_in_schema = &.{"c"},
+            .codec = .SNAPPY,
+            .bloom_fpp = fpp,
+        });
+        // Read side: the filter as a reader parses it, each written value keyed the way the reader keys a literal.
+        const bits = bloom.bitset(enc.bloom) orelse return error.TestUnexpectedResult;
+        try testing.expect(std.math.isPowerOfTwo(bits.len));
+        for (leaves.items) |leaf| {
+            const k = storedForm(leaf, physical, elem.type_length) orelse return error.TestUnexpectedResult;
+            const present = for (0..k.n) |i| {
+                if (bloom.Probe.init(bloom.hashBytes(k.form(i))).mightContain(bits)) break true;
+            } else false;
+            testing.expect(present) catch |err| {
+                std.debug.print("round {d} {s}: a written value tests absent\n", .{ round, @tagName(physical) });
+                return err;
+            };
+        }
+        // And the filter is no bigger than the probability needs: fresh random hashes pass at about `fpp`.
+        var fp: usize = 0;
+        for (0..4000) |_| fp += @intFromBool(bloom.Probe.init(r.int(u64)).mightContain(bits));
+        try testing.expect(@as(f64, @floatFromInt(fp)) / 4000.0 < @max(3.0 * fpp, 0.02));
+    }
+}

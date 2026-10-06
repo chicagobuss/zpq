@@ -651,6 +651,7 @@ pub fn encodeAggregator(
     // serialized PageLocation.offset would stay buffer-relative and mislead
     // readers. Direct-to-file callers (absolute out_offset) pass true.
     emit_page_index: bool,
+    bloom_write: BloomWrite,
 ) !RGOut {
     if (agg.num_rows == 0) return .{ .surviving_rows = 0, .rg = null };
 
@@ -763,6 +764,7 @@ pub fn encodeAggregator(
                 .schema_elem = &agg.schema_elems[i],
                 .path_in_schema = agg.paths[i],
                 .codec = output_codec,
+                .bloom_fpp = bloom_write.at(i),
             });
             if (span.t != null) {
                 const em = results[i].?.meta;
@@ -789,6 +791,7 @@ pub fn encodeAggregator(
                 .schema_elems = agg.schema_elems,
                 .paths = agg.paths,
                 .codec = output_codec,
+                .bloom_write = bloom_write,
                 .results = results,
                 .err = null,
             };
@@ -850,6 +853,8 @@ pub fn encodeAggregator(
             .offset_index_length = idx.offset_index_length,
             .column_index_offset = idx.column_index_offset,
             .column_index_length = idx.column_index_length,
+            // Placed after the last row group, so it must outlive this row group's arena.
+            .bloom_out = if (enc.bloom.len > 0) try out_arena.dupe(u8, enc.bloom) else &.{},
         });
     }
 
@@ -871,6 +876,7 @@ const AggEncodeCtx = struct {
     schema_elems: []const schema.SchemaElement,
     paths: []const []const []const u8,
     codec: schema.CompressionCodec,
+    bloom_write: BloomWrite,
     results: []?encoder.EncodedColumn,
     err: ?anyerror,
 };
@@ -884,6 +890,7 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
             .schema_elem = &ctx.schema_elems[i],
             .path_in_schema = ctx.paths[i],
             .codec = ctx.codec,
+            .bloom_fpp = ctx.bloom_write.at(i),
         }) catch |err| {
             ctx.err = err;
             return;
@@ -1726,6 +1733,7 @@ pub fn copyRG(
     /// A requested output codec. Chunks already in it are copied verbatim;
     /// the rest have their pages recompressed. Null keeps every chunk's codec.
     recompress: ?Recompress,
+    bloom_write: BloomWrite,
 ) !RGOut {
     invariant.assert(src.byte_origin == 0);
     // A chunk that must change codec changes size, so the whole-group copy
@@ -1759,7 +1767,7 @@ pub fn copyRG(
             const slice = try sourceBytes(src, range);
 
             if (recompress) |rc| if (m.codec != rc.codec) {
-                const written = try copyChunkRecompressed(
+                var written = try copyChunkRecompressed(
                     rc,
                     src,
                     src_chunk.*,
@@ -1769,6 +1777,7 @@ pub fn copyRG(
                     timings,
                     emit_page_index,
                 );
+                try requestedFilter(out_arena, &written, rg, ci, src, bloom_write);
                 try new_cols.append(out_arena, written);
                 rg_total += written.meta_data.?.total_compressed_size;
                 continue;
@@ -1776,7 +1785,9 @@ pub fn copyRG(
             const delta = offsetDelta(out.pos(), range.start);
             try timedWrite(&out, slice, timings);
             // Carry the page index forward, written right after this chunk's data.
-            try new_cols.append(out_arena, try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index));
+            var copied = try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index);
+            try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+            try new_cols.append(out_arena, copied);
             rg_total += @intCast(range.len);
         }
 
@@ -1810,8 +1821,10 @@ pub fn copyRG(
     try cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
     // Whole-RG copy: one delta for the group. Index bytes for each
     // chunk are appended after the RG data block, in column order.
-    for (rg.columns.items) |*chunk| {
-        try cols.append(out_arena, try carryChunk(out_arena, &out, src, chunk, delta, emit_page_index));
+    for (rg.columns.items, 0..) |*chunk, ci| {
+        var copied = try carryChunk(out_arena, &out, src, chunk, delta, emit_page_index);
+        try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+        try cols.append(out_arena, copied);
     }
 
     return .{
@@ -1822,6 +1835,48 @@ pub fn copyRG(
             .num_rows = rg.num_rows,
         },
     };
+}
+
+/// Give a copied chunk the Bloom filter the write asks of column `ci`, when it carries none from its source: decode
+/// the source chunk and build one from its values.
+fn requestedFilter(
+    out_arena: std.mem.Allocator,
+    copied: *schema.ColumnChunk,
+    rg: *const schema.RowGroup,
+    ci: usize,
+    src: RGSrc,
+    bloom_write: BloomWrite,
+) !void {
+    if (copied.bloom_out.len > 0) return;
+    const fpp = bloom_write.at(ci) orelse return;
+    const meta = bloom_write.meta orelse return;
+    var scratch = std.heap.ArenaAllocator.init(bloom_write.scratch orelse return);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const chunk = &rg.columns.items[ci];
+    const cm = chunk.meta_data orelse return;
+    const range = fastpath.chunkRange(&cm, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
+    const bytes = try sourceBytes(src, range);
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n: usize = @intCast(cm.num_values);
+    const col: filter_eval.Batch.Column = switch (cm.type) {
+        .INT32 => .{ .i32 = try decodeColumnT(i32, a, bytes, cm.codec, levels, n) },
+        .INT64 => .{ .i64 = try decodeColumnT(i64, a, bytes, cm.codec, levels, n) },
+        .FLOAT => .{ .f32 = try decodeColumnT(f32, a, bytes, cm.codec, levels, n) },
+        .DOUBLE => .{ .f64 = try decodeColumnT(f64, a, bytes, cm.codec, levels, n) },
+        .BYTE_ARRAY => .{ .string = try decodeColumnT([]const u8, a, bytes, cm.codec, levels, n) },
+        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumn(
+            a,
+            bytes,
+            cm.codec,
+            levels,
+            n,
+            flbaWidth(meta.getColumnSchema(cm.path_in_schema.items)),
+        ) },
+        else => return,
+    };
+    const filter = try encoder.bloomFilter(a, col, cm.type, fpp) orelse return;
+    copied.bloom_out = try out_arena.dupe(u8, filter);
 }
 
 /// The bytes of `range`, a span of the source file, in `src`. An S3 input holds only the chunks its plan fetched, so
@@ -1861,6 +1916,19 @@ fn carryChunk(
     else
         fastpath.copiedChunk(src.bytes, chunk, delta);
 }
+
+/// The Bloom filters a write builds: the false-positive probability of each column's filter, null for none. Indexed
+/// by output column for `encodeAggregator`, by source leaf for `copyRG`, where a copied chunk that carries no filter
+/// of its own is decoded (through `meta`, on `scratch`) to build one.
+pub const BloomWrite = struct {
+    fpp: []const ?f64 = &.{},
+    meta: ?*const schema.FileMetaData = null,
+    scratch: ?std.mem.Allocator = null,
+
+    fn at(self: BloomWrite, i: usize) ?f64 {
+        return if (i < self.fpp.len) self.fpp[i] else null;
+    }
+};
 
 /// A codec change requested of a byte copy. `scratch` backs the per-chunk
 /// working memory, released once the chunk is written.
@@ -2868,6 +2936,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
         &timings,
         true, // direct-to-file: emit page index
         null,
+        .{},
     );
 
     // Bounding box for RG0 is [100, 160) = 60 bytes. Anything more

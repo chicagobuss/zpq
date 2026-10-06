@@ -127,6 +127,11 @@ pub const Error = error{
     GroupKeyAliasRequired,
     DuplicateOutputColumn,
     AmbiguousOutputColumn,
+    /// `--bloom-filter` names a column no reader filters on (BOOLEAN) or zpq cannot hash as stored (a nested column,
+    /// a FIXED_LEN_BYTE_ARRAY DECIMAL); `Diag.column` names it.
+    BloomFilterUnsupportedColumn,
+    /// `--bloom-filter` on a query that writes no rows (an aggregate).
+    BloomFilterNeedsRows,
 } || std.mem.Allocator.Error;
 
 pub const QueryArgs = struct {
@@ -167,6 +172,31 @@ pub const QueryArgs = struct {
     max_memory: usize = 512 * 1024 * 1024,
     /// Records the query's spans when set (`--profile`, the Lambda's `"profile"`); see `profile.zig`.
     profiler: ?*profile.Profiler = null,
+    /// Output columns to write split-block Bloom filters for (`--bloom-filter`). A copied chunk keeps the filter it
+    /// has; one without is decoded to build one.
+    bloom_filters: []const BloomSpec = &.{},
+};
+
+/// One `--bloom-filter col[:fpp]`: a written column and its filter's false-positive probability.
+pub const BloomSpec = struct {
+    column: []const u8,
+    fpp: f64 = default_fpp,
+
+    /// What parquet-java, Arrow and Hardwood default to.
+    pub const default_fpp = 0.01;
+
+    /// `col`, or `col:fpp` with fpp strictly between 0 and 1. A suffix that is no number is part of the name.
+    pub fn parse(text: []const u8) error{BadBloomFilter}!BloomSpec {
+        const name = std.mem.trim(u8, text, " ");
+        if (std.mem.lastIndexOfScalar(u8, name, ':')) |colon| {
+            if (std.fmt.parseFloat(f64, name[colon + 1 ..])) |fpp| {
+                if (!(fpp > 0 and fpp < 1) or colon == 0) return error.BadBloomFilter;
+                return .{ .column = name[0..colon], .fpp = fpp };
+            } else |_| {}
+        }
+        if (name.len == 0) return error.BadBloomFilter;
+        return .{ .column = name };
+    }
 };
 
 pub const Context = struct {
@@ -277,6 +307,7 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
         return error.AggregateMutexWithSelect;
     }
     if (args.aggregate != null or args.group_by != null) {
+        if (args.bloom_filters.len > 0) return error.BloomFilterNeedsRows;
         const agg_str = args.aggregate orelse "";
         return .{ .aggregate = try runAggregate(ctx, args, agg_str) };
     }
@@ -455,6 +486,7 @@ fn encodeRGToBuffer(
     codec: schema.CompressionCodec,
     decode_options: consumer.DecodeOptions,
     prof: ?*profile.Thread,
+    bloom: consumer.BloomWrite,
 ) !EncodedRG {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -476,7 +508,18 @@ fn encodeRGToBuffer(
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
-    const out = try consumer.encodeAggregator(&agg, meta_alloc, gpa, sink, &local_off, codec, &timings, 1, false);
+    const out = try consumer.encodeAggregator(
+        &agg,
+        meta_alloc,
+        gpa,
+        sink,
+        &local_off,
+        codec,
+        &timings,
+        1,
+        false,
+        bloom,
+    );
     const owned = try buf.toOwnedSlice(gpa);
     timings.prof = null;
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
@@ -491,13 +534,19 @@ fn copyRGToBuffer(
     job: RGJob,
     kept_set: ?[]const bool,
     prof: ?*profile.Thread,
+    bloom_leaves: []const ?f64,
 ) !EncodedRG {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
     var timings: consumer.Timings = .{ .prof = prof };
-    const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings, false, null);
+    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
+    const out = try consumer.copyRG(meta_alloc, job.rg, src, kept_set, sink, &local_off, &timings, false, null, .{
+        .fpp = bloom_leaves,
+        .meta = job.meta,
+        .scratch = gpa,
+    });
     const owned = try buf.toOwnedSlice(gpa);
     timings.prof = null;
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
@@ -516,6 +565,9 @@ const WinCtx = struct {
     kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
     decode_options: consumer.DecodeOptions,
+    /// The Bloom filters asked for: per output column for re-encoded row groups, per source leaf for copied ones.
+    bloom_outputs: []const ?f64 = &.{},
+    bloom_leaves: []const ?f64 = &.{},
     slots: []Slot,
     window: *std.Io.Semaphore, // W permits = max row groups in flight
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
@@ -544,7 +596,7 @@ fn winProducer(w: *WinCtx, i: usize) void {
     const span = profile.Span.begin(prof);
     defer span.end(.encode_rg, profile.args(.{ w.jobs[i].file_index, w.jobs[i].rg_index, w.jobs[i].passthrough }));
     const enc = (if (w.jobs[i].passthrough)
-        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set, prof)
+        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set, prof, w.bloom_leaves)
     else
         encodeRGToBuffer(
             w.gpa,
@@ -556,6 +608,7 @@ fn winProducer(w: *WinCtx, i: usize) void {
             w.codec,
             w.decode_options,
             prof,
+            .{ .fpp = w.bloom_outputs },
         )) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
@@ -849,6 +902,65 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
     };
 }
 
+/// The `--bloom-filter` columns of a write: false-positive probability by output column (re-encoded row groups) and by
+/// source leaf (copied ones), null where none was asked for.
+const BloomPlan = struct {
+    outputs: []const ?f64 = &.{},
+    leaves: []const ?f64 = &.{},
+};
+
+fn resolveBlooms(
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    proj: *ProjectionPlan,
+    meta0: *const schema.FileMetaData,
+) !BloomPlan {
+    if (args.bloom_filters.len == 0) return .{};
+    const names = try proj.names(arena);
+    const outputs = try arena.alloc(?f64, names.len);
+    @memset(outputs, null);
+    const leaves = try arena.alloc(?f64, metadata.leafCount(meta0));
+    @memset(leaves, null);
+    for (args.bloom_filters) |spec| {
+        const i = outputIndex(names, spec.column) orelse {
+            Diag.setColumn(args.diag, spec.column);
+            return error.UnknownColumn;
+        };
+        switch (proj.output_specs[i]) {
+            .passthrough => |ci| {
+                var it: schema.LeafIterator = .init(meta0.schema.items);
+                const leaf = while (it.next()) |l| {
+                    if (l.index == ci) break l;
+                } else return error.UnknownColumn;
+                const elem = leaf.element.*;
+                const flba_decimal = elem.type == .FIXED_LEN_BYTE_ARRAY and decimal_mod.kindFromSchema(&elem) != null;
+                if (elem.type == .BOOLEAN or elem.type == .INT96 or leaf.max_rep > 0 or flba_decimal) {
+                    Diag.setColumn(args.diag, spec.column);
+                    return error.BloomFilterUnsupportedColumn;
+                }
+                leaves[ci] = spec.fpp;
+            },
+            .computed => |c| if (c.expr.typeOf().toParquet() == .BOOLEAN) {
+                Diag.setColumn(args.diag, spec.column);
+                return error.BloomFilterUnsupportedColumn;
+            },
+        }
+        outputs[i] = spec.fpp;
+    }
+    return .{ .outputs = outputs, .leaves = leaves };
+}
+
+/// The output column `name` names: its exact name, else the one name equal to it ignoring ASCII case.
+fn outputIndex(names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |n, i| if (std.mem.eql(u8, n, name)) return i;
+    var found: ?usize = null;
+    for (names, 0..) |n, i| if (std.ascii.eqlIgnoreCase(n, name)) {
+        if (found != null) return null;
+        found = i;
+    };
+    return found;
+}
+
 /// The one codec the written column chunks share, `none_written` when there
 /// are none, or null when they differ.
 fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCodec) ?schema.CompressionCodec {
@@ -908,7 +1020,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
 
     // 3. Parse --columns / --select / --filter against meta0 into the output columns and the leaves they read.
-    const proj = try planProjection(arena, args, meta0);
+    var proj = try planProjection(arena, args, meta0);
+    const blooms = try resolveBlooms(arena, args, &proj, meta0);
     const kept_set = proj.kept_set;
     const kept_arr = proj.kept;
     const fetch_arr = proj.fetch;
@@ -1060,26 +1173,18 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 rows_in += src_rg.num_rows;
                 const rg_span = profile.Span.begin(prof);
                 defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
-                const out = if (kept_set != null) try consumer.copyRG(
+                const bloom_write: consumer.BloomWrite = .{ .fpp = blooms.leaves, .meta = &meta_i, .scratch = ctx.gpa };
+                const out = try consumer.copyRG(
                     arena,
                     src_rg,
                     rg_src,
-                    kept_arr,
+                    if (kept_set != null) kept_arr else null,
                     sink,
                     &out_offset,
                     &t.core,
                     true,
                     recompress,
-                ) else try consumer.copyRG(
-                    arena,
-                    src_rg,
-                    rg_src,
-                    null,
-                    sink,
-                    &out_offset,
-                    &t.core,
-                    true,
-                    recompress,
+                    bloom_write,
                 );
                 if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
                 rows_kept += out.surviving_rows;
@@ -1192,6 +1297,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .kept_set = kept_set,
                 .codec = args.codec orelse .SNAPPY,
                 .decode_options = .{ .fast_levels = args.fast_levels },
+                .bloom_outputs = blooms.outputs,
+                .bloom_leaves = blooms.leaves,
                 .slots = slots,
                 .window = &window_sem,
                 .completions = &completions_sem,
@@ -3621,5 +3728,125 @@ test "profiling stays well-formed and complete under -j N, run after run" {
         try std.testing.expectEqual(@as(u64, 24), s.prune.row_groups);
         try std.testing.expectEqual(r.aggregate.timings.core.decode_ns, s.reconcile.decode_ns);
         try std.testing.expectEqual(@as(u64, 0), s.dropped);
+    }
+}
+
+test "rebaseFetchedOffsets moves a fetched Bloom filter into the compact buffer and clears any other" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    // Row group 0's filter was fetched whole; row group 1's was not; row group 2's half was, and it is pruned.
+    for ([_]i64{ 1_000_000, 2_000_000, 3_000_000 }, [_]i64{ 9_000_016, 9_500_000, 9_000_040 }) |dpo, bfo| {
+        var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 0 };
+        var chunk = pageIndexTestChunk(dpo);
+        chunk.meta_data.?.bloom_filter_offset = bfo;
+        chunk.meta_data.?.bloom_filter_length = 16;
+        try rg.columns.append(arena, chunk);
+        try meta.row_groups.append(arena, rg);
+    }
+    const ranges = [_]CompactRange{
+        .{ .start = 1_000_000, .end = 1_000_064, .dst_start = 0 },
+        .{ .start = 2_000_000, .end = 2_000_064, .dst_start = 64 },
+        .{ .start = 9_000_000, .end = 9_000_048, .dst_start = 128 },
+    };
+    const fetch_arr = [_]bool{true};
+    const rg_columns = [_]?[]const bool{ &fetch_arr, &fetch_arr, null };
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
+    const got = [_]?i64{ 144, null, null };
+    for (meta.row_groups.items, got) |rg, want| {
+        const cm = rg.columns.items[0].meta_data.?;
+        try std.testing.expectEqual(want, cm.bloom_filter_offset);
+        try std.testing.expectEqual(@as(?i32, if (want != null) 16 else null), cm.bloom_filter_length);
+    }
+}
+
+test "a write builds the Bloom filters asked for, in re-encoded and copied row groups alike" {
+    const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    // `id >= 2` re-encodes row group 0 (it holds id 0) and copies the rest, which carry `id` and `s` filters of their
+    // own; `cat` and `x` have none anywhere. The bytes must not depend on parallelism.
+    var first: ?[]u8 = null;
+    defer if (first) |b| gpa.free(b);
+    for ([_]usize{ 1, 4 }) |j| {
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fixture},
+            .output = out,
+            .filter = "id >= 2",
+            .parallelism = j,
+            .bloom_filters = &.{ .{ .column = "cat" }, .{ .column = "X", .fpp = 0.001 } },
+        });
+        defer r.deinit(gpa);
+        const bytes = try metadata.readFileSlice(out, gpa);
+        if (first) |b| {
+            defer gpa.free(bytes);
+            try std.testing.expectEqualSlices(u8, b, bytes);
+        } else first = bytes;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bytes = first.?;
+    const meta = try metadata.open(arena, bytes);
+    const bloom = @import("core/parquet/bloom.zig");
+    var key_buf: [32]u8 = undefined;
+    for (meta.row_groups.items, 0..) |rg, g| {
+        const has = [_]bool{ g > 0, g > 0, true, true }; // id, s carried where copied; cat, x built everywhere
+        for (rg.columns.items, has) |c, want| {
+            try std.testing.expectEqual(want, c.meta_data.?.bloom_filter_offset != null);
+        }
+        const cat_bits = bloom.bitset(bytes[@intCast(rg.columns.items[2].meta_data.?.bloom_filter_offset.?)..]).?;
+        for ([_]u8{ 'a', 'm', 'z' }) |p| {
+            const v = try std.fmt.bufPrint(&key_buf, "{c}-{d}", .{ p, g });
+            try std.testing.expect(bloom.Probe.init(bloom.hashBytes(v)).mightContain(cat_bits));
+        }
+        const x_bits = bloom.bitset(bytes[@intCast(rg.columns.items[3].meta_data.?.bloom_filter_offset.?)..]).?;
+        for (0..500) |jj| {
+            const id = 2 * (8 * jj + g);
+            if (id < 2) continue;
+            const x: f64 = @floatFromInt(id / 2);
+            const xb = std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(x)));
+            try std.testing.expect(bloom.Probe.init(bloom.hashBytes(&xb)).mightContain(x_bits));
+        }
+    }
+
+    // Asking for a filter on a column the output lacks, or on an aggregate, is an error.
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnknownColumn, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .output = out,
+        .columns = &.{"id"},
+        .bloom_filters = &.{.{ .column = "cat" }},
+        .diag = &diag,
+    }));
+    try std.testing.expectEqualStrings("cat", diag.column.get());
+    try std.testing.expectError(error.BloomFilterNeedsRows, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .aggregate = "count(*) AS n",
+        .bloom_filters = &.{.{ .column = "id" }},
+    }));
+}
+
+test "BloomSpec.parse: a column, optionally with a probability" {
+    try std.testing.expectEqualDeep(BloomSpec{ .column = "id" }, try BloomSpec.parse("id"));
+    try std.testing.expectEqualDeep(BloomSpec{ .column = "id", .fpp = 0.05 }, try BloomSpec.parse(" id:0.05 "));
+    // A suffix that is no number belongs to the name.
+    try std.testing.expectEqualDeep(BloomSpec{ .column = "a:b" }, try BloomSpec.parse("a:b"));
+    for ([_][]const u8{ "", "id:0", "id:1", "id:-0.1", "id:1.5", ":0.1" }) |bad| {
+        try std.testing.expectError(error.BadBloomFilter, BloomSpec.parse(bad));
     }
 }

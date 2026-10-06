@@ -41,6 +41,7 @@ const usage_text =
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats] [--fast-levels]
+    \\            [--bloom-filter COL[:FPP] ...]
     \\            [--format csv|jsonl] [--limit N]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
@@ -63,6 +64,11 @@ const usage_text =
     \\  --trust-stats  answer min/max/sum from file statistics instead of
     \\                 decoding (fast, but trusts the writer's stats — off
     \\                 by default; count(*) is always answered from metadata).
+    \\  --bloom-filter write a split-block Bloom filter for output column COL
+    \\                 (repeatable), at false-positive probability FPP
+    \\                 (default 0.01). Readers then skip row groups an `=`
+    \\                 or `IN` on COL cannot match. A copied chunk keeps the
+    \\                 filter its source has. Not for BOOLEAN columns.
     \\  --fast-levels  skip materializing definition levels for data pages
     \\                 whose level stream proves every value is present.
     \\                 Helps supported flat OPTIONAL primitive columns that
@@ -224,6 +230,15 @@ pub fn main(init: std.process.Init) !void {
                 error.BadOperator => std.debug.print("zpq query: invalid operator in filter\n", .{}),
                 error.BadValue => std.debug.print("zpq query: invalid value in filter\n", .{}),
                 error.UnsupportedType => std.debug.print("zpq query: unsupported type in filter\n", .{}),
+                error.BloomFilterUnsupportedColumn => std.debug.print(
+                    "zpq query: --bloom-filter cannot apply to `{s}`: BOOLEAN, INT96, nested\n" ++
+                        "  and FIXED_LEN_BYTE_ARRAY DECIMAL columns take no Bloom filter\n",
+                    .{diag.column.get()},
+                ),
+                error.BloomFilterNeedsRows => std.debug.print(
+                    "zpq query: --bloom-filter applies to written rows, not to an aggregate\n",
+                    .{},
+                ),
                 else => return err,
             }
             std.process.exit(1);
@@ -274,6 +289,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null;
     var column_order: ?[]const u8 = null;
     var profile_out: ProfileOut = .{};
+    var bloom_filters: std.ArrayList(engine.BloomSpec) = .empty;
+    defer bloom_filters.deinit(gpa);
 
     while (iter.next()) |tok| {
         if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
@@ -339,6 +356,15 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 std.debug.print("zpq query: invalid threads value: {s}\n", .{v});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--bloom-filter")) {
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --bloom-filter requires a value\n", .{});
+                return error.BadArgs;
+            };
+            try bloom_filters.append(gpa, engine.BloomSpec.parse(v) catch {
+                std.debug.print("zpq query: invalid --bloom-filter: {s} (want COL or COL:FPP, 0 < FPP < 1)\n", .{v});
+                return error.BadArgs;
+            });
         } else if (std.mem.eql(u8, tok, "--scan-all")) {
             scan_all = true; // valueless: disable all stats shortcuts, decode everything
         } else if (std.mem.eql(u8, tok, "--trust-stats")) {
@@ -439,6 +465,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             std.debug.print("zpq query: --limit is only supported with --format\n", .{});
             return error.BadArgs;
         }
+    }
+
+    if (bloom_filters.items.len > 0 and output == null) {
+        std.debug.print("zpq query: --bloom-filter requires --output\n", .{});
+        return error.BadArgs;
     }
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -561,6 +592,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .group_by = group_by,
             .select_cols = select_cols,
             .column_order = column_order,
+            .bloom_filters = bloom_filters.items,
             .diag = diag,
             .profiler = profiler,
         });
@@ -666,6 +698,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .trust_stats = trust_stats,
         .fast_levels = fast_levels,
         .max_memory = engine_max_mem,
+        .bloom_filters = bloom_filters.items,
         .diag = diag,
         .profiler = profiler,
     })).write;

@@ -30,6 +30,7 @@ const Wire = struct {
     max_memory: ?std.json.Value = null,
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
+    bloom_filters: ?std.json.Value = null,
 };
 
 pub const Request = struct {
@@ -53,6 +54,8 @@ pub const Request = struct {
     profile: bool = false,
     /// `profile_url`: also upload the full Chrome trace to this S3 URL. Implies `profile`.
     profile_url: ?[]const u8 = null,
+    /// `bloom_filters`: `"col"` or `"col:fpp"` per written column, as the CLI's `--bloom-filter` takes them.
+    bloom_filters: []const []const u8 = &.{},
 
     pub const MaxMemory = union(enum) { bytes: usize, text: []const u8 };
 
@@ -86,6 +89,7 @@ pub const Request = struct {
         req.trust_stats = try f.boolean("trust_stats");
         req.profile_url = try f.string("profile_url");
         req.profile = try f.boolean("profile") or req.profile_url != null;
+        if (try f.strings(arena, "bloom_filters", true)) |b| req.bloom_filters = b;
         if (parsed.value.max_memory) |v| req.max_memory = switch (v) {
             .null => null,
             .integer => |n| if (n >= 0) .{ .bytes = @intCast(n) } else return f.bad("max_memory"),

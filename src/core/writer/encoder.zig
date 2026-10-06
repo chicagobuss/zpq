@@ -19,6 +19,7 @@ const hybrid_rle = @import("../parquet/encoding/hybrid_rle.zig");
 const snappy = @import("../parquet/snappy.zig");
 const compression = @import("../parquet/compression.zig");
 const delta_binary_packed = @import("../parquet/encoding/delta_binary_packed.zig");
+const bloom = @import("../parquet/bloom.zig");
 
 pub const Error = error{
     NullableNotSupported,
@@ -35,6 +36,8 @@ pub const EncodedColumn = struct {
     /// to the start of `bytes`; the caller adds the column's absolute
     /// position in the output file.
     meta: schema.ColumnMetaData,
+    /// The chunk's Bloom filter (header and bitset) when `ColumnInput.bloom_fpp` asked for one.
+    bloom: []const u8 = &.{},
 };
 
 pub const ColumnInput = struct {
@@ -51,6 +54,8 @@ pub const ColumnInput = struct {
     /// (~30% smaller output, ~400 MB/s encode at level 3).
     /// UNCOMPRESSED is supported but discouraged outside diagnostics.
     codec: schema.CompressionCodec = .SNAPPY,
+    /// Build a split-block Bloom filter of the chunk at this false-positive probability.
+    bloom_fpp: ?f64 = null,
 };
 
 /// Encode one column chunk: header + (optional def-level prefix) + data + ColumnMetaData.
@@ -68,6 +73,62 @@ pub const ColumnInput = struct {
 ///    PLAIN bytes carry only the non-null values (parquet PLAIN
 ///    encoding for OPTIONAL columns excludes null slots).
 pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
+    var enc = try encodeValues(arena, in);
+    if (in.bloom_fpp) |fpp| enc.bloom = try bloomFilter(arena, in.values, enc.meta.type, fpp) orelse &.{};
+    return enc;
+}
+
+/// The split-block Bloom filter (header and bitset) of a column's present values at false-positive probability
+/// `fpp`, hashed as the PLAIN bytes `physical` stores them as. Sized as if every present value were distinct, then
+/// folded down to what the values actually set: the size their distinct count calls for. Null for a lane that is not
+/// `physical`'s stored form, and for BOOLEAN, which no reader filters.
+pub fn bloomFilter(
+    arena: std.mem.Allocator,
+    col: filter_eval.Batch.Column,
+    physical: schema.Type,
+    fpp: f64,
+) Error!?[]u8 {
+    const stored: schema.Type = switch (col) {
+        .i32 => .INT32,
+        .i64 => .INT64,
+        .f32 => .FLOAT,
+        .f64 => .DOUBLE,
+        .string => if (physical == .FIXED_LEN_BYTE_ARRAY) .FIXED_LEN_BYTE_ARRAY else .BYTE_ARRAY,
+        .boolean => return null,
+    };
+    if (stored != physical) return null;
+    return switch (col) {
+        .boolean => unreachable,
+        inline else => |c| try bloomOf(@TypeOf(c.values[0]), arena, c.values, c.def_levels, c.max_def, fpp),
+    };
+}
+
+fn bloomOf(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    values: []const T,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    fpp: f64,
+) Error![]u8 {
+    var b = try bloom.Builder.init(arena, countPresent(values.len, def_levels, max_def), fpp);
+    defer b.deinit(arena);
+    for (values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) continue;
+        b.insert(switch (@typeInfo(T)) {
+            .int => bloom.hashBytes(&std.mem.toBytes(std.mem.nativeToLittle(T, v))),
+            .float => blk: {
+                const Bits = @Int(.unsigned, @bitSizeOf(T));
+                break :blk bloom.hashBytes(&std.mem.toBytes(std.mem.nativeToLittle(Bits, @bitCast(v))));
+            },
+            else => bloom.hashBytes(v),
+        });
+    }
+    b.foldToFpp(fpp);
+    return b.serialize(arena);
+}
+
+fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     const elem = in.schema_elem;
     if (elem.type == null) return error.UnsupportedType;
     const phys = elem.type.?;

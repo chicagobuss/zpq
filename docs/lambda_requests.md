@@ -19,6 +19,7 @@ the CLI flags of the same name.
 | `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. |
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
+| `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
@@ -40,13 +41,25 @@ Every response is one JSON object. Durations are whole milliseconds; `pool` and 
 | `agg` | The answer: an object of alias → value, or with `group_by` an array of such objects, one per group. |
 | `total_ms` | Time inside the handler. |
 | `phase` | `read_ms`, `decode_ms`, `eval_ms`, `encode_ms`. |
+| `membership` | Bloom filter and dictionary pruning, below. |
 | `pool` | Connection pool counters, below. |
 
 **Write** (`output_url` set, no aggregate): `ok`, `output` (the URL, escaped), `files_in`, `rows_in`, `rows_kept`,
 `bytes_in`, `bytes_out`, `row_groups_in`, `row_groups_kept`, `total_ms`; `phase` with `read_ms`, `parse_ms`,
 `decode_ms`, `eval_ms`, `encode_ms`, `sink_ms`, `footer_ms`, `mp_await_ms`, `mp_complete_ms`; `meta_cache` with the
 container's cumulative footer-cache counters `hits`, `misses`, `revalidations`, `invalidations`, `inserts`,
-`evictions`; and `pool`.
+`evictions`; `membership`; and `pool`.
+
+**`membership`** (both responses), for row groups an `=` or `IN` filter ruled out beyond their statistics (they are
+also counted in `row_groups_pruned`):
+
+| Field | Meaning |
+|-------|---------|
+| `bloom_pruned`, `dict_pruned` | Row groups a Bloom filter, or failing that a fully dictionary-encoded chunk's dictionary, proved free of every literal. |
+| `filters`, `dictionaries` | Filters and dictionaries probed. |
+| `requests`, `bytes` | S3 requests made, and bytes read, to fetch them (0 for local files and for filters the warm cache held). |
+| `bloom_stopped`, `dict_stopped` | The first eight row groups probed pruned too few to pay for reading the rest of that kind. |
+| `us` | Time spent, in microseconds. |
 
 **`pool`** (both responses), for the sandbox's S3 connection pool during this invocation. On a cold invocation, the
 intended pattern, the pool starts empty: `reuses` counts only connections reused within this invocation,

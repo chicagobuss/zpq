@@ -210,6 +210,11 @@ fn handle(
             ),
         } else null;
 
+        const bloom_filters = try allocator.alloc(engine.BloomSpec, req.bloom_filters.len);
+        defer allocator.free(bloom_filters);
+        for (req.bloom_filters, bloom_filters) |text, *spec| spec.* = engine.BloomSpec.parse(text) catch
+            return rejectResponse(allocator, "bad_json", "BadBloomFilter", "bloom_filters", text);
+
         // Single source of query options: the JSON event maps onto the
         // SAME `engine.QueryArgs` the CLI's flags populate (src/cli/main.zig).
         // Convention: CLI `--scan-all` ↔ JSON `"scan_all"` ↔ field `scan_all`.
@@ -240,6 +245,7 @@ fn handle(
             .max_memory = if (profiler != null) budget -| prof_opts.reservedBytes() else budget,
             .group_by = req.group_by,
             .column_order = req.column_order,
+            .bloom_filters = bloom_filters,
         };
         qa.profiler = profiler;
 

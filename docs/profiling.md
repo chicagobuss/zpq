@@ -59,7 +59,9 @@ JSON file. Open it at <https://ui.perfetto.dev> (Open trace file) or load it wit
 
 Counter tracks: `requests in_flight` and `bytes in_flight` (S3 requests and the bytes they move, stepped exactly where
 they change), `buffered bytes` (encoded row groups waiting for the writer), and `rss bytes` (resident memory, sampled
-every 2 ms by the `sampler` thread, and at the start and end).
+every 2 ms by the `sampler` thread, and at the start and end). The sampler keeps 4096 samples in a buffer of its own,
+outside the event cap; when it fills, every other sample is dropped and the period doubles, so a long query's series
+still covers the whole run.
 
 The trace's `otherData` holds the run's metadata: zpq version, build mode, target triple, CPU count, the parallelism
 and memory budget the engine sized itself from, whether it ran on Lambda (and the memory tier), the start time, and

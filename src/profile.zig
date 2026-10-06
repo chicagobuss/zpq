@@ -200,6 +200,8 @@ pub const Thread = struct {
     /// Fill of the last block; earlier blocks record their own in `Block.len`.
     len: usize = 0,
     dropped: u64 = 0,
+    /// Sampler only: how many times its ring was halved, each doubling the sampling period.
+    decimations: u6 = 0,
 
     const Block = struct { buf: []Event, len: usize = 0 };
 
@@ -241,6 +243,7 @@ pub const Thread = struct {
     fn grow(self: *Thread) bool {
         @branchHint(.cold);
         const p = self.profiler;
+        if (self.label == .sampler) return self.decimate();
         const n: usize = if (self.blocks.items.len == 0) first_block_events else block_events;
         if (p.events_left.fetchSub(@intCast(n), .monotonic) < n) return false;
         const buf = p.gpa.alloc(Event, n) catch return false;
@@ -251,6 +254,32 @@ pub const Thread = struct {
         const items = self.blocks.items;
         if (items.len > 1) items[items.len - 2].len = self.len;
         self.len = 0;
+        return true;
+    }
+
+    /// The sampler's one block, `sampler_events` long and outside the event budget, so a long query's RSS samples
+    /// cannot crowd out its spans. When the block fills, every other sample goes and the period doubles: the series
+    /// stays evenly spaced from start to end in constant memory, and `gauge_peaks` still holds the exact peak.
+    fn decimate(self: *Thread) bool {
+        const p = self.profiler;
+        if (self.blocks.items.len == 0) {
+            const buf = p.gpa.alloc(Event, sampler_events) catch return false;
+            self.blocks.append(p.gpa, .{ .buf = buf }) catch {
+                p.gpa.free(buf);
+                return false;
+            };
+            self.len = 0;
+            return true;
+        }
+        const buf = self.blocks.items[0].buf;
+        var kept: usize = 0;
+        var i: usize = 0;
+        while (i < self.len) : (i += 2) {
+            buf[kept] = buf[i];
+            kept += 1;
+        }
+        self.len = kept;
+        self.decimations +|= 1;
         return true;
     }
 
@@ -281,6 +310,8 @@ pub const EventIterator = struct {
 /// Small first block: most threads (a fetch worker, a parse worker) record a handful of spans.
 const first_block_events: usize = 64;
 const block_events: usize = 4096;
+/// The sampler's ring: 8 s of samples at the default period before the first halving.
+const sampler_events: usize = 4096;
 
 pub const Options = struct {
     /// Events kept across all threads; later ones are counted as dropped. 72 bytes each.
@@ -538,12 +569,12 @@ pub const Profiler = struct {
 
     fn samplerRun(self: *Profiler) void {
         const t = self.thread(.sampler) orelse return;
-        const interval: u64 = self.options.sample_interval_ns;
-        const ts: std.posix.timespec = .{
-            .sec = @intCast(interval / std.time.ns_per_s),
-            .nsec = @intCast(interval % std.time.ns_per_s),
-        };
         while (self.stop.load(.acquire) == 0) {
+            const interval: u64 = self.options.sample_interval_ns << @min(t.decimations, 20);
+            const ts: std.posix.timespec = .{
+                .sec = @intCast(interval / std.time.ns_per_s),
+                .nsec = @intCast(interval % std.time.ns_per_s),
+            };
             if (builtin.os.tag == .linux) {
                 // Returns early on the wake from `finish` (or spuriously); either way the loop re-checks.
                 _ = std.os.linux.futex_4arg(&self.stop.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
@@ -883,4 +914,43 @@ test "JSON output stays valid UTF-8: cuts land on character boundaries, bad byte
             try testing.expect(std.mem.endsWith(u8, q, "b\u{fffd}\"}"));
         }
     }
+}
+
+test "the RSS sampler keeps its own ring: it never spends the event budget and thins out instead of dropping" {
+    if (!enabled) return error.SkipZigTest;
+    const p = try Profiler.create(testing.allocator, .{ .sample_interval_ns = 0, .max_events = 64 }, .{});
+    defer p.destroy();
+    const budget = p.events_left.load(.monotonic);
+    // A thread of its own stands in for the sampler (this one already has a buffer, labelled `main`).
+    const Fake = struct {
+        t: *Thread = undefined,
+        last: i64 = 0,
+        fn run(self: *@This(), prof: *Profiler) void {
+            self.t = prof.thread(.sampler).?;
+            // Timestamps step by the period the sampler would be using, which doubles at each halving.
+            var now: i64 = 0;
+            for (0..5 * sampler_events) |i| {
+                self.last = now;
+                self.t.push(.{ .kind = .counter, .start = now, .dur = 0, .args = args(.{ Gauge.rss_bytes, i }) });
+                now += @as(i64, 1) << self.t.decimations;
+            }
+        }
+    };
+    var fake: Fake = .{};
+    const th = try std.Thread.spawn(.{}, Fake.run, .{ &fake, p });
+    th.join();
+    const t = fake.t;
+    const last = fake.last;
+    try testing.expectEqual(budget, p.events_left.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), p.dropped());
+    try testing.expectEqual(@as(usize, 1), t.blocks.items.len);
+    try testing.expect(t.decimations >= 2);
+    // Still evenly spaced, oldest first, spanning the whole run.
+    var blocks = t.eventBlocks();
+    const evs = blocks.next().?;
+    try testing.expect(evs.len > sampler_events / 4 and evs.len <= sampler_events);
+    try testing.expectEqual(@as(i64, 0), evs[0].start);
+    const step = evs[1].start - evs[0].start;
+    for (evs[1..], evs[0 .. evs.len - 1]) |b, a| try testing.expectEqual(step, b.start - a.start);
+    try testing.expectEqual(last, evs[evs.len - 1].start);
 }

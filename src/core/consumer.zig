@@ -1658,7 +1658,8 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !Code
         if (call.where) |w| markFilter(u, w);
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
-            else => markExprValues(u, arg),
+            // A scalar fold evaluates a computed argument itself, gathering coded columns (`agg_coded.gatherSelected`).
+            else => if (target == .scalar) arg.collectColumns(u.code) else markExprValues(u, arg),
         };
     }
     switch (target) {

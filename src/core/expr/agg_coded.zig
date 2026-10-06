@@ -592,6 +592,39 @@ inline fn forEachActive(sel: *const Sel, n: usize, comptime f: anytype, ctx: any
     }
 }
 
+/// The rows `sel` keeps of a flat column, `active` of them, as a column of their own: values (looked up in the
+/// dictionary for a coded column) and levels compacted. Nested columns are not gathered.
+pub fn gatherSelected(ra: std.mem.Allocator, col: Column, sel: *const Sel, active: usize) !Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            if (c.max_rep > 0) return error.UnsupportedAggType;
+            const T = @TypeOf(c.dict[0]);
+            const vals = try ra.alloc(T, active);
+            const dl: ?[]u32 = if (c.def_levels != null) try ra.alloc(u32, active) else null;
+            const Ctx = struct { c: @TypeOf(c), vals: []T, dl: ?[]u32, j: usize = 0 };
+            var ctx: Ctx = .{ .c = c, .vals = vals, .dl = dl };
+            forEachActive(sel, sel.len, struct {
+                fn f(x: *Ctx, r: usize) void {
+                    const present = if (x.c.def_levels) |d| d[r] == x.c.max_def else true;
+                    x.vals[x.j] = if (x.c.codes) |k|
+                        (if (present) x.c.dict[k[r]] else std.mem.zeroes(T))
+                    else
+                        x.c.values[r];
+                    if (x.dl) |d| d[x.j] = x.c.def_levels.?[r];
+                    x.j += 1;
+                }
+            }.f, &ctx);
+            std.debug.assert(ctx.j == active);
+            break :blk @unionInit(Column, @tagName(tag), .{
+                .values = vals,
+                .def_levels = dl,
+                .max_def = c.max_def,
+                .has_nulls = c.has_nulls,
+            });
+        },
+    };
+}
+
 /// Values for a column that may hold only codes: gathered from the dictionary when they were never materialized.
 pub fn materialize(ra: std.mem.Allocator, col: Column) !Column {
     return switch (col) {
@@ -689,5 +722,40 @@ test "aggregates over a coded column match the row folds over its values, histog
         const hist_cols = [_]Column{histogram_col};
         try agg.updateOne(a, a, &got, call, &.{ .cols = &hist_cols, .num_rows = n }, &lookup, &all);
         try testing.expectEqualDeep(want, got);
+    }
+}
+
+test "gatherSelected keeps the selected rows of a coded or plain column, in order, with their levels" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dict = [_]f64{ 1.5, -2.0, 8.25 };
+    const n = 130;
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var vals: [n]f64 = undefined;
+    var sel = try Sel.init(a, n);
+    var want: std.ArrayList(f64) = .empty;
+    var want_defs: std.ArrayList(u32) = .empty;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 5 != 2);
+        codes[i] = if (defs[i] == 1) @intCast(i % 3) else 0;
+        vals[i] = if (defs[i] == 1) dict[codes[i]] else 0;
+        const keep = i % 7 == 0 or i == n - 1;
+        sel.set(i, keep);
+        if (keep) {
+            try want.append(a, vals[i]);
+            try want_defs.append(a, defs[i]);
+        }
+    }
+    const active = sel.count();
+    for ([_]Column{
+        .{ .f64 = .{ .values = &.{}, .codes = &codes, .dict = &dict, .def_levels = &defs, .max_def = 1 } },
+        .{ .f64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1 } },
+    }) |col| {
+        const got = try gatherSelected(a, col, &sel, active);
+        try testing.expectEqualSlices(f64, want.items, got.f64.values);
+        try testing.expectEqualSlices(u32, want_defs.items, got.f64.def_levels.?);
     }
 }

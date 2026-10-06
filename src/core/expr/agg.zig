@@ -612,7 +612,7 @@ pub fn updateOne(
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
     if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel)) return;
-    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, true);
     defer input.deinit(arena);
     const sel = input.selection();
     const values = input.values;
@@ -705,6 +705,8 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         outer_sel: *const filter_selection.SelectionVector,
+        /// A fold over the selected values alone (not by row, as a grouped fold is) lets `evalArg` gather rows.
+        rowless: bool,
     ) Error!PreparedAggInput {
         var in: PreparedAggInput = .{ .outer_sel = outer_sel };
         errdefer in.deinit(arena);
@@ -716,9 +718,50 @@ const PreparedAggInput = struct {
         // to the general evaluator, which still rejects nullable inputs.
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
-            else => in.values = try expr_eval.evalExpr(arena, batch, column_lookup, arg),
+            else => in.values = if (rowless)
+                try in.evalArg(arena, batch, column_lookup, arg)
+            else
+                try expr_eval.evalExpr(arena, batch, column_lookup, arg),
         };
         return in;
+    }
+
+    /// Evaluate a computed argument. Under a sparse selection only the selected rows are evaluated: the columns it
+    /// reads are gathered to them (`agg_coded.gatherSelected`) and the selection becomes all of the gathered rows,
+    /// so a filter that keeps 2% of a row group computes 2% of the products. Coded columns are gathered either way.
+    fn evalArg(
+        self: *PreparedAggInput,
+        arena: std.mem.Allocator,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        arg: expr_ast.Expr,
+    ) Error!filter_eval.Batch.Column {
+        const refs = try arena.alloc(bool, column_lookup.len);
+        defer arena.free(refs);
+        @memset(refs, false);
+        arg.collectColumns(refs);
+        var any_coded = false;
+        for (refs, column_lookup) |r, pos| if (r) if (pos) |p| {
+            any_coded = any_coded or batch.cols[p].codes() != null;
+        };
+        const sel = self.selection();
+        const active = sel.count();
+        const sparse = active * 4 <= batch.num_rows;
+        if (!sparse and !any_coded) return expr_eval.evalExpr(arena, batch, column_lookup, arg);
+
+        const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
+        for (refs, column_lookup) |r, pos| if (r) if (pos) |p| {
+            cols[p] = if (sparse)
+                try agg_coded.gatherSelected(arena, batch.cols[p], sel, active)
+            else
+                try agg_coded.materialize(arena, batch.cols[p]);
+        };
+        const rows = if (sparse) active else batch.num_rows;
+        const values = try expr_eval.evalExpr(arena, &.{ .cols = cols, .num_rows = rows }, column_lookup, arg);
+        if (!sparse) return values;
+        if (self.own_sel) |*s| s.deinit();
+        self.own_sel = try filter_selection.SelectionVector.init(arena, active);
+        return values;
     }
 
     fn selection(self: *const PreparedAggInput) *const filter_selection.SelectionVector {
@@ -1508,7 +1551,7 @@ test "prepared aggregate input owns its widened copy and nothing it borrows" {
 
     const narrow_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
     const sum_narrow: AggCall = .{ .func = .sum, .arg = narrow_arg, .where = null, .alias = "s", .result = .i64 };
-    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel);
+    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel, true);
     try testing.expect(widened.values_owned);
     try testing.expect(widened.own_sel == null);
     try testing.expectEqual(&sel, widened.selection());
@@ -1519,7 +1562,7 @@ test "prepared aggregate input owns its widened copy and nothing it borrows" {
 
     const wide_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
     const sum_wide: AggCall = .{ .func = .sum, .arg = wide_arg, .where = null, .alias = "s", .result = .i64 };
-    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel);
+    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel, true);
     defer borrowed.deinit(a);
     try testing.expect(!borrowed.values_owned);
     try testing.expectEqual(@as([*]const i64, &wide), borrowed.values.?.i64.values.ptr);
@@ -2606,7 +2649,7 @@ pub fn updateOneGrouped(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false);
     defer input.deinit(arena);
     return updateOneGroupedValues(
         arena,

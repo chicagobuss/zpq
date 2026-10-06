@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 error.DuplicateOutputColumn => std.debug.print(
                     "zpq query: output column `{s}` is defined more than once;\n" ++
-                        "  give each aggregate and GROUP BY key a distinct name\n",
+                        "  give each output column (aggregate, GROUP BY key or select item) a distinct name\n",
                     .{diag.column.get()},
                 ),
                 error.AmbiguousOutputColumn => std.debug.print(

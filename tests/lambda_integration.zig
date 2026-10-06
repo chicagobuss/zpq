@@ -832,6 +832,13 @@ test "lambda rejects clashing or unknown column names and names the column" {
                 "\"output_url\":\"zig-out/lambda_unknown_columns.parquet\"}",
             .want = "{\"error\":\"engine\",\"reason\":\"UnknownColumn\",\"column\":\"nope\"}",
         },
+        .{
+            // A select naming one output twice (case-insensitively) is rejected like an aggregate's, and nothing is
+            // written.
+            .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"select\":\"x AS v, y AS V\"," ++
+                "\"output_url\":\"zig-out/lambda_duplicate_select.parquet\"}",
+            .want = "{\"error\":\"engine\",\"reason\":\"DuplicateOutputColumn\",\"column\":\"V\"}",
+        },
     };
 
     var server = try FakeServer.start();
@@ -854,10 +861,12 @@ test "lambda rejects clashing or unknown column names and names the column" {
             std.debug.print("[lambda name clash] response: {s}\n", .{resp.body});
             return error.TestUnexpectedResult;
         }
-        if (readFileSlice(std.testing.allocator, "zig-out/lambda_unknown_columns.parquet")) |bytes| {
-            std.testing.allocator.free(bytes);
-            return error.TestUnexpectedResult;
-        } else |_| {}
+        for ([_][]const u8{ "zig-out/lambda_unknown_columns.parquet", "zig-out/lambda_duplicate_select.parquet" }) |out| {
+            if (readFileSlice(std.testing.allocator, out)) |bytes| {
+                std.testing.allocator.free(bytes);
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
         try resp.replyAndClose(std.testing.allocator, 202, "", "");
     }
 }

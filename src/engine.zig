@@ -677,6 +677,10 @@ fn outputColumnNames(
     return names;
 }
 
+fn sameName(name: []const u8) []const u8 {
+    return name;
+}
+
 /// What a write or print outputs and reads, parsed from --columns / --select / --filter against the first file's
 /// footer. Output-format restrictions, nested printing, and sink and codec choice stay with each consumer.
 const ProjectionPlan = struct {
@@ -764,6 +768,12 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         for (filter_cols.items) |ci| {
             if (ci < num_leaves) fetch[ci] = true;
         }
+    }
+    // A --select names its outputs, so two may clash, as aggregate and GROUP BY outputs may; a plain copy keeps the
+    // source's own names and is not checked.
+    if (select_items != null) {
+        const names = try outputColumnNames(arena, &labels, output_specs.items);
+        try scan.checkDistinctOutputNames([]const u8, names, sameName, args.diag);
     }
 
     return .{
@@ -2953,4 +2963,59 @@ test "windowed re-encode writes the same bytes at every parallelism" {
             } else first = bytes;
         }
     }
+}
+
+test "a select output naming one column twice is rejected and named, like aggregate outputs" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    const Case = struct { select: []const u8, column: []const u8 };
+    const cases = [_]Case{
+        .{ .select = "x AS v, ts AS v", .column = "v" },
+        // Case-insensitive, as the aggregate rule is; a passthrough column keeps its own name.
+        .{ .select = "x AS v, ts AS V", .column = "V" },
+        .{ .select = "s, x AS S", .column = "S" },
+    };
+    for (cases) |c| {
+        // The write, and both printed formats.
+        var diag: Diag = .{};
+        try std.testing.expectError(error.DuplicateOutputColumn, runQuery(ctx, .{
+            .inputs = &.{fixture},
+            .output = out,
+            .select = c.select,
+            .diag = &diag,
+        }));
+        try std.testing.expectEqualStrings(c.column, diag.column.get());
+        for ([_]PrintFormat{ .csv, .jsonl }) |fmt| {
+            var print_diag: Diag = .{};
+            try std.testing.expectError(error.DuplicateOutputColumn, runPrint(ctx, .{
+                .inputs = &.{fixture},
+                .select = c.select,
+                .diag = &print_diag,
+            }, fmt, 0));
+            try std.testing.expectEqualStrings(c.column, print_diag.column.get());
+        }
+    }
+    // Nothing was written.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, out, .{}));
+
+    // The SQL front end's SELECT list reaches the same check.
+    const sql_parser = if (@import("build_options").enable_sql) @import("core/expr/sql_parser.zig") else return;
+    const q = try sql_parser.parseSqlQuery(gpa, "SELECT x AS v, ts AS v FROM 't.parquet'");
+    defer q.deinit(gpa);
+    var diag: Diag = .{};
+    try std.testing.expectError(error.DuplicateOutputColumn, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .output = out,
+        .select = q.select_str,
+        .diag = &diag,
+    }));
+    try std.testing.expectEqualStrings("v", diag.column.get());
 }

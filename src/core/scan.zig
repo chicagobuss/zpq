@@ -1070,14 +1070,34 @@ fn nameUnaliasedAggs(arena: std.mem.Allocator, agg_calls: []expr_agg.AggCall, ke
     };
 }
 
-/// Reject two aggregates sharing an alias: both would land under one output name.
-fn checkAggAliases(agg_calls: []const expr_agg.AggCall, diag: ?*Diag) Error!void {
-    for (agg_calls, 0..) |call, i| for (agg_calls[0..i]) |prev| {
-        if (std.ascii.eqlIgnoreCase(call.alias, prev.alias)) {
-            Diag.setColumn(diag, call.alias);
+/// Reject two output columns sharing a name, compared case-insensitively: both would land under one output name.
+/// Names the later of the pair. Every output that names its columns (aggregates, GROUP BY rows, `--select`) checks
+/// through this one rule.
+pub fn checkDistinctOutputNames(
+    comptime T: type,
+    items: []const T,
+    comptime nameOf: fn (T) []const u8,
+    diag: ?*Diag,
+) error{DuplicateOutputColumn}!void {
+    for (items, 0..) |item, i| for (items[0..i]) |prev| {
+        if (std.ascii.eqlIgnoreCase(nameOf(item), nameOf(prev))) {
+            Diag.setColumn(diag, nameOf(item));
             return error.DuplicateOutputColumn;
         }
     };
+}
+
+fn aggAlias(call: expr_agg.AggCall) []const u8 {
+    return call.alias;
+}
+
+fn boundName(col: BoundOutputColumn) []const u8 {
+    return col.name;
+}
+
+/// Reject two aggregates sharing an alias: both would land under one output name.
+fn checkAggAliases(agg_calls: []const expr_agg.AggCall, diag: ?*Diag) Error!void {
+    return checkDistinctOutputNames(expr_agg.AggCall, agg_calls, aggAlias, diag);
 }
 
 /// Bind the GROUP BY output columns and check their names up front, before any scanning: no aggregate alias twice,
@@ -1102,14 +1122,11 @@ fn bindGroupOutputs(
     };
     const specs = try groupOutputSpecs(arena, keys, agg_calls, args.select_cols, args.column_order);
     const bound = try arena.alloc(BoundOutputColumn, specs.len);
-    for (specs, bound, 0..) |spec, *out, i| {
+    for (specs, bound) |spec, *out| {
         const src = try resolveOutputColumn(keys, agg_calls, spec, args.diag);
         out.* = .{ .source = src, .name = try groupOutputName(keys, spec, src) };
-        for (bound[0..i]) |prev| if (std.ascii.eqlIgnoreCase(out.name, prev.name)) {
-            Diag.setColumn(args.diag, out.name);
-            return error.DuplicateOutputColumn;
-        };
     }
+    try checkDistinctOutputNames(BoundOutputColumn, bound, boundName, args.diag);
     return bound;
 }
 

@@ -59,7 +59,8 @@ Lambda was invoked at 1024 MB cold + warm, then memory-swept for CPU/throughput 
 considered but skipped — the host kernel determines syscall availability and Lambda is running 5.10 (an older AL2-class
 kernel), so AL2023 docker on a 6.x host wouldn't be apples-to-apples.
 
-Raw outputs: `output/probe/zpq-probe-caps-{arm64,x86_64}_{cold,warm}.json`.
+The raw JSON outputs of that run were written to `output/probe/`, which is gitignored and not committed; re-run the
+probe (below) to regenerate them.
 
 ## Syscall reachability
 
@@ -206,8 +207,8 @@ zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
   -target aarch64-linux-musl \
   -femit-bin=zig-out/probe_lambda_caps_arm64
 
-# Local CLI run
-./zig-out/probe_lambda_caps_native | jq
+# Local CLI run (builds the native probe first)
+just probe-local
 
 # Lambda deploy + invoke (functions exist in sandbox account)
 source .env

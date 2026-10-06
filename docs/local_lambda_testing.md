@@ -106,14 +106,10 @@ Caveats:
 
 ### macOS
 
-`brew install qemu`. No binfmt auto-trigger — invoke explicitly:
-
-```bash
-qemu-aarch64 ./zig-out/bin/zpq-lambda
-```
-
-Slower than Linux's binfmt path. macOS users primarily run native ARM64 builds; this is for testing the x86_64 Lambda
-binary if you ship both.
+QEMU's user-mode emulation (`qemu-aarch64`, `qemu-x86_64`) runs Linux binaries on a Linux kernel only; Homebrew's
+`qemu` on macOS provides full-system emulators, not user mode. `zpq-lambda` is a Linux binary (its runtime client and
+event loop make Linux system calls directly), so on a Mac run it inside a Linux VM (any Linux guest, with the qemu-user
+setup above for the other architecture) or test against a real Lambda.
 
 ## What's intentionally *not* here
 

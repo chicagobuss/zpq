@@ -482,3 +482,6 @@ PY
 else
   echo "Legacy LZ4 recompression checks skipped: $CORPUS not present"
 fi
+
+# Bloom filters: writer oracle (pyarrow- and zpq-written), lookup parity, and a fuzz pass (tools/bloom/check.py).
+"$PY" tools/bloom/check.py "$ZPQ"

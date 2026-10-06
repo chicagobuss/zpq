@@ -75,8 +75,12 @@ With a power-of-two block count, halving by OR-ing adjacent block pairs gives ex
 have filled at half the size, so the result is the size their distinct count calls for. Sizes are powers of two from 32
 bytes to 128 MiB, which every reader accepts.
 
-Filters are written after the last row group, row group by row group in column order, with `bloom_filter_offset` and
-`bloom_filter_length` both set. They are held until then: about 1.2 bytes per distinct value per chunk at 0.01.
+Filters are written after the last row group, one column's after another, with `bloom_filter_offset` and
+`bloom_filter_length` both set. Other writers go row group by row group, so an equality on one column finds its
+filters scattered among the others'; in a zpq-written file they are contiguous and a reader fetches them in one ranged
+read (split for parallelism). Readers locate each filter through its own offset, so the order is invisible to them.
+Filters are held in memory until then: about 1.2 bytes per distinct value per chunk at 0.01, so a write with filters on
+a unique key holds about 1.2 bytes per row of that column until it closes.
 
 A byte copy keeps each copied chunk's filter, whatever probability it was written at; a requested column whose source
 chunk has none is decoded to build one. A re-encoded row group gets filters only for requested columns. Dropped columns

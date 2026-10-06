@@ -26,8 +26,8 @@
 //!     S3 fast path may hold just the column-chunk + footer ranges).
 //!   - Bloom filters are **carried forward** too: a copied chunk's rows are
 //!     its source's, so its filter still holds. Each is written after the
-//!     row groups (`placeFilters`), where the spec puts them, with fields
-//!     14 and 15 pointing at it; a dropped column drops its filter.
+//!     row groups (`placeFilters`), one column's together, with fields 14
+//!     and 15 pointing at it; a dropped column drops its filter.
 //!   - The schema, statistics, encodings, and per-row-group metadata are
 //!     all copied through unchanged. Strings (paths, stats min/max) are
 //!     borrowed from `meta` — caller must keep `meta` alive until the
@@ -305,10 +305,15 @@ pub fn carriedFilter(input: []const u8, src: *const schema.ColumnChunk) []const 
 }
 
 /// Write the Bloom filter each chunk of `row_groups` carries (`bloom_out`) to `out`, which must be past the last row
-/// group, and point the chunk's fields 14 and 15 at it. Row group by row group, columns in schema order: the layout
-/// the spec describes and readers expect.
+/// group, and point the chunk's fields 14 and 15 at it. Column by column, then row group: an `=` reads one column's
+/// filters, and laid out together they come back in one ranged read rather than one per row group. (The spec places
+/// filters only as "after the row groups"; readers locate each through its own offset.)
 pub fn placeFilters(out: anytype, row_groups: []schema.RowGroup) !void {
-    for (row_groups) |*rg| for (rg.columns.items) |*c| {
+    var cols: usize = 0;
+    for (row_groups) |rg| cols = @max(cols, rg.columns.items.len);
+    for (0..cols) |ci| for (row_groups) |*rg| {
+        if (ci >= rg.columns.items.len) continue;
+        const c = &rg.columns.items[ci];
         if (c.bloom_out.len == 0) continue;
         const m = if (c.meta_data) |*m| m else continue;
         m.bloom_filter_offset = @intCast(out.pos());
@@ -908,7 +913,8 @@ test "byte copies carry each kept chunk's Bloom filter, after the row groups, an
         const copied = try metadata.open(arena, out);
         try testing.expectEqual(@as(usize, 7), copied.row_groups.items.len);
         var last_chunk_end: i64 = 0;
-        var next_filter: i64 = 0;
+        var first_filter: i64 = std.math.maxInt(i64);
+        var filters_end: i64 = 0;
         for (copied.row_groups.items, 0..) |rg, ri| {
             const src_rg = meta.row_groups.items[if (ri < 2) ri else ri + 1];
             for (rg.columns.items, 0..) |c, ci| {
@@ -921,18 +927,27 @@ test "byte copies carry each kept chunk's Bloom filter, after the row groups, an
                     try testing.expect(m.bloom_filter_offset == null);
                     continue;
                 }
-                // Laid out row group by row group, in column order, the bytes unchanged.
+                // One column's filters back to back, row group after row group, the bytes unchanged.
                 const off = m.bloom_filter_offset.?;
                 const len = m.bloom_filter_length.?;
-                if (next_filter != 0) try testing.expectEqual(next_filter, off);
-                next_filter = off + len;
+                if (ri > 0) {
+                    const prev = copied.row_groups.items[ri - 1].columns.items[ci].meta_data.?;
+                    try testing.expectEqual(prev.bloom_filter_offset.? + prev.bloom_filter_length.?, off);
+                }
+                first_filter = @min(first_filter, off);
+                filters_end = @max(filters_end, off + len);
                 const src_off: usize = @intCast(src.meta_data.?.bloom_filter_offset.?);
                 const n: usize = @intCast(len);
                 try testing.expectEqualSlices(u8, bytes[src_off..][0..n], out[@intCast(off)..][0..n]);
             }
         }
-        // After every row group.
-        try testing.expect(next_filter > last_chunk_end);
+        // After every row group, and nothing but filters in between.
+        try testing.expect(first_filter >= last_chunk_end);
+        var total: i64 = 0;
+        for (copied.row_groups.items) |rg| for (rg.columns.items) |c| {
+            total += c.meta_data.?.bloom_filter_length orelse 0;
+        };
+        try testing.expectEqual(total, filters_end - first_filter);
     }
 
     // The filters hold in the copy: an absent key prunes every group there as in the source.

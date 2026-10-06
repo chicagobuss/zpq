@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const clock = @import("clock.zig");
+const engine = @import("engine.zig");
 const schema = @import("core/schema.zig");
 const system = @import("core/system.zig");
 
@@ -659,7 +660,7 @@ pub const Profiler = struct {
         }
     }
 
-    /// The run metadata as a JSON object, the query cut to `max_query` bytes.
+    /// The run metadata as a JSON object, the query cut to at most `max_query` bytes on a character boundary.
     pub fn writeMetaJson(self: *const Profiler, w: *std.Io.Writer, max_query: usize) !void {
         const m = self.meta;
         try w.writeAll("{\"zpq_version\":");
@@ -670,7 +671,7 @@ pub const Profiler = struct {
         });
         if (m.lambda_memory_mb) |mb| try w.print("{d}", .{mb}) else try w.writeAll("null");
         try w.print(",\"start_unix_s\":{d},\"query\":", .{self.epoch_real_s});
-        try writeJsonString(w, m.query[0..@min(m.query.len, max_query)]);
+        try writeJsonString(w, utf8Prefix(m.query, max_query));
         try w.writeByte('}');
     }
 };
@@ -680,16 +681,36 @@ pub fn enumName(comptime E: type, v: u64) []const u8 {
     return @tagName(e);
 }
 
-/// `s` as a JSON string: quotes, backslashes and control bytes escaped; other bytes pass through.
+/// `s` as a quoted JSON string under the Lambda's JSON policy (`engine.writeJsonString`): escapes, and every byte
+/// that does not start valid UTF-8 written as U+FFFD. Names and the request echo are arbitrary bytes; the output
+/// must still parse.
 pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        0...0x1f => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
-    };
+    try engine.writeJsonString(w, s);
     try w.writeByte('"');
+}
+
+fn isContinuation(c: u8) bool {
+    return c & 0xc0 == 0x80;
+}
+
+/// The longest prefix of `s` of at most `n` bytes that does not end inside a UTF-8 sequence. Backs off at most three
+/// bytes: a longer run of continuation bytes is not UTF-8, and `writeJsonString` replaces it anyway.
+pub fn utf8Prefix(s: []const u8, n: usize) []const u8 {
+    if (s.len <= n) return s;
+    var end = n;
+    var k: usize = 0;
+    while (end > 0 and k < 3 and isContinuation(s[end])) : (k += 1) end -= 1;
+    return s[0..end];
+}
+
+/// The longest suffix of `s` of at most `n` bytes that does not start inside a UTF-8 sequence.
+pub fn utf8Suffix(s: []const u8, n: usize) []const u8 {
+    if (s.len <= n) return s;
+    var start = s.len - n;
+    var k: usize = 0;
+    while (start < s.len and k < 3 and isContinuation(s[start])) : (k += 1) start += 1;
+    return s[start..];
 }
 
 // ---------------------------------------------------------------- span sites
@@ -829,4 +850,37 @@ test "args packs integers, bools and enums" {
     try testing.expectEqual(@as(u64, 6), a[2]);
     try testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(a[3])));
     try testing.expectEqual(@as(u64, 0), a[5]);
+}
+
+test "JSON output stays valid UTF-8: cuts land on character boundaries, bad bytes become U+FFFD" {
+    // `é` (C3 A9) straddles byte 512, the response's cut.
+    const query = "{\"note\":\"" ++ @as([502]u8, @splat('a')) ++ "\u{e9}" ++ @as([20]u8, @splat('b')) ++ "\xff\"}";
+    try testing.expectEqual(@as(u8, 0xc3), query[511]);
+    const cut = utf8Prefix(query, 512);
+    try testing.expectEqual(@as(usize, 511), cut.len);
+    try testing.expectEqualStrings("\u{e9}b", utf8Prefix(query[511..], 3));
+    try testing.expectEqualStrings("", utf8Prefix(query[511..], 1));
+    try testing.expectEqualStrings("b", utf8Suffix("\u{e9}b", 2));
+    try testing.expectEqualStrings("\u{e9}b", utf8Suffix("\u{e9}b", 3));
+    try testing.expectEqualStrings("\u{20ac}", utf8Suffix("x\u{20ac}", 3));
+    try testing.expectEqualStrings("", utf8Suffix("x\u{20ac}", 2));
+
+    var p: Profiler = undefined;
+    p.meta = .{ .query = query };
+    p.epoch_real_s = 0;
+    for ([_]usize{ 512, std.math.maxInt(usize) }) |max| {
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        try p.writeMetaJson(&aw.writer, max);
+        try testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+        defer parsed.deinit();
+        const q = parsed.value.object.get("query").?.string;
+        if (max == 512) {
+            try testing.expectEqualStrings(query[0..511], q);
+        } else {
+            // The stray 0xff is replaced, not passed through.
+            try testing.expect(std.mem.endsWith(u8, q, "b\u{fffd}\"}"));
+        }
+    }
 }

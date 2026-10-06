@@ -432,9 +432,9 @@ fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-/// At most `n` bytes of `s`, keeping the tail (the distinctive end of a path).
+/// At most `n` bytes of `s`, keeping the tail (the distinctive end of a path) and whole characters.
 fn tail(s: []const u8, n: usize) []const u8 {
-    return if (s.len <= n) s else s[s.len - n ..];
+    return profile.utf8Suffix(s, n);
 }
 
 /// An encoding's name short enough for the chunk table.

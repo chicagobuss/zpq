@@ -705,7 +705,11 @@ test "lambda returns a bounded profile summary inline when asked" {
     const agg = "{\"inputs\":[\"" ++ esc ++ "\"],\"aggregate\":\"count(*) AS n, sum(x) AS sx\",\"profile\":true";
     const out = "zig-out/lambda_profile_out.parquet";
     defer _ = linux.unlink(out);
+    // The request is echoed cut to 512 bytes; put an `é` across that byte. The cut must fall before it.
+    const note = agg ++ ",\"note\":\"";
+    const straddle = note ++ @as([511 - note.len]u8, @splat('a')) ++ "\u{e9}\"}";
     try expectResponses("lambda profile", &.{
+        .{ .body = straddle, .want = "aaaa\"},\"phases\":{" },
         // The answer is untouched; the summary joins it, phases and engine sums included.
         .{ .body = agg ++ "}", .want = "\"agg\":{\"n\":3," },
         .{ .body = agg ++ "}", .want = "\"profile\":{\"total_ns\":" },

@@ -216,7 +216,7 @@ fn handle(
         defer if (profiler) |p| p.destroy();
         if (req.profile and zpq.profile.enabled) {
             var meta = zpq.profile.Meta.discover(env);
-            meta.query = trimmed[0..@min(trimmed.len, MAX_PROFILE_QUERY)];
+            meta.query = zpq.profile.utf8Prefix(trimmed, MAX_PROFILE_QUERY);
             profiler = try zpq.profile.Profiler.create(allocator, .{}, meta);
         }
 

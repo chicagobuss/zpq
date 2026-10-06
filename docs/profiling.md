@@ -81,7 +81,7 @@ DECIMAL or an INT96 column records no page spans either.
 ```
 zpq profile: 13.21 ms wall, 18 threads, 590 events
   cpu user 80.2 ms, sys 31.8 ms (8.5 cores); 14100 minor faults
-  rss peak 97 MB (this run)
+  rss peak 97 MB (this run), 3 MB at start
   0.4.0 fast x86_64-linux-gnu, 16 cpus, parallelism 16
 ```
 
@@ -90,8 +90,9 @@ Wall time is the `query` span. `cores` is process CPU over wall: how much of the
 `rss peak` is this run's peak resident memory, not the process's: a warm Lambda would otherwise report an earlier
 invocation's peak. On Linux the kernel's high-water mark is reset when profiling starts (`/proc/self/clear_refs`) and
 read when it ends (`this run`). Where that reset is refused, the highest RSS sample stands in (`sampled`, a lower bound
-that can miss a spike shorter than the sampling period); where there is neither, the process's lifetime peak
-(`process lifetime`).
+that can miss a spike shorter than the sampling period); where there is neither, the process's lifetime peak (`process
+lifetime`). A warm process still holds memory from earlier runs, and the peak includes it; `at start` (JSON `start_rss`)
+is the resident memory when the run began, so the difference is what this run added.
 
 ```
 phase          wall ms   busy ms  share ms  alone ms    spans
@@ -227,7 +228,7 @@ zpq query lineitem_snappy.parquet \
 ```
 zpq profile: 21.40 ms wall, 18 threads, 885 events
   cpu user 171.6 ms, sys 37.8 ms (9.8 cores); 26544 minor faults
-  rss peak 253 MB (this run)
+  rss peak 253 MB (this run), 3 MB at start
   0.4.0 fast x86_64-linux-gnu, 16 cpus, parallelism 16
 
 phase          wall ms   busy ms  share ms  alone ms    spans

@@ -71,19 +71,19 @@ and `max_idle_ms`.
 **`profile`** (aggregate and write responses, when the request set `profile` or `profile_url`): the profile summary
 described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`, `threads`, `events`, `dropped`,
 `event_cap`; `cpu` (this run's `user_ns`, `sys_ns`, `minor_faults`, `major_faults`; `peak_rss`, this invocation's peak
-resident memory, and `peak_rss_scope`, how it was measured: `run`, `sampled` or `process`, see
-[profiling.md](profiling.md)); `meta` (`zpq_version`, `build_mode`, `target`, `cpu_count`, `parallelism`,
-`memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the request cut to 512 bytes); `phases` (per
-phase: `wall_ns`, `busy_ns`, `share_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the ten costliest
-column chunks: `file`, `rg`, `column`, `codec`, `encoding`, `bytes_in`, `bytes_out`, `ns`, `decompress_ns`, `pages`);
-`io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`, `acquire_ns`, `reused`, `retries`, `errors`, `ranges`, `merged`,
-`fetch_jobs`, `mapped_files`, `mapped_bytes`, `peak_in_flight`, `peak_bytes_in_flight`); `prune` (`row_groups`,
-`skipped`, `full_match`, `filtered`, `pages`, `pages_skipped`, `stats_answered`, `skipped_by`: filter column → row
-groups its statistics skipped); `workers` (`count`, `user_ns`, `sys_ns`, `minor_faults`); `engine` (`read_ns`,
-`parse_ns`, `decode_ns`, `decode_wall_ns`, `eval_ns`, `agg_ns`, `encode_ns`: the sums behind `phase`, in nanoseconds);
-and `peak_buffered_bytes`. Times are nanoseconds. The member's size does not grow with the query (names are cut to 128
-bytes, and only ten chunks and five skip reasons are listed), so it stays a few KB, far under Lambda's 6 MB response
-limit; the trace itself never rides in the response.
+resident memory, `start_rss`, the resident memory when it began, and `peak_rss_scope`, how it was measured: `run`,
+`sampled` or `process`, see [profiling.md](profiling.md)); `meta` (`zpq_version`, `build_mode`, `target`, `cpu_count`,
+`parallelism`, `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the request cut to 512 bytes);
+`phases` (per phase: `wall_ns`, `busy_ns`, `share_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the
+ten costliest column chunks: `file`, `rg`, `column`, `codec`, `encoding`, `bytes_in`, `bytes_out`, `ns`,
+`decompress_ns`, `pages`); `io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`, `acquire_ns`, `reused`, `retries`,
+`errors`, `ranges`, `merged`, `fetch_jobs`, `mapped_files`, `mapped_bytes`, `peak_in_flight`, `peak_bytes_in_flight`);
+`prune` (`row_groups`, `skipped`, `full_match`, `filtered`, `pages`, `pages_skipped`, `stats_answered`, `skipped_by`:
+filter column → row groups its statistics skipped); `workers` (`count`, `user_ns`, `sys_ns`, `minor_faults`); `engine`
+(`read_ns`, `parse_ns`, `decode_ns`, `decode_wall_ns`, `eval_ns`, `agg_ns`, `encode_ns`: the sums behind `phase`, in
+nanoseconds); and `peak_buffered_bytes`. Times are nanoseconds. The member's size does not grow with the query (names
+are cut to 128 bytes, and only ten chunks and five skip reasons are listed), so it stays a few KB, far under Lambda's 6
+MB response limit; the trace itself never rides in the response.
 
 **`profile_trace`** (when the request set `profile_url`): `{"url": U, "bytes": N, "omitted_events": K}` after uploading
 the Chrome trace to `U` with one PUT over the invocation's connection pool, or `{"url": U, "error": E}` when the upload

@@ -477,7 +477,9 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     try w.print("\n  cpu user {d:.1} ms, sys {d:.1} ms ({d:.1} cores); {d} minor faults\n", .{
         ms(s.usage.user_ns), ms(s.usage.sys_ns), cores, s.usage.minor_faults,
     });
-    try w.print("  rss peak {d:.0} MB ({s})\n", .{ mb(s.peak_rss), rssLabel(p.peak_rss_scope) });
+    try w.print("  rss peak {d:.0} MB ({s})", .{ mb(s.peak_rss), rssLabel(p.peak_rss_scope) });
+    if (p.start_rss > 0) try w.print(", {d:.0} MB at start", .{mb(p.start_rss)});
+    try w.writeByte('\n');
     const m = p.meta;
     const lambda = if (m.on_lambda) ", on Lambda" else "";
     try w.print("  {s} {s} {s}, {d} cpus, parallelism {d}{s}\n", .{
@@ -627,6 +629,7 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
         var cpu = try o.object("cpu");
         try cpu.ints(s.usage);
         try cpu.int("peak_rss", s.peak_rss);
+        try cpu.int("start_rss", p.start_rss);
         try cpu.str("peak_rss_scope", @tagName(p.peak_rss_scope));
         try cpu.end();
     }

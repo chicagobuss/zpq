@@ -539,6 +539,8 @@ pub const Profiler = struct {
     peak_rss: u64 = 0,
     peak_rss_scope: RssScope = .process,
     rss_reset: bool = false,
+    /// RSS when the run started: a warm process holds memory from earlier runs, which the peak includes.
+    start_rss: u64 = 0,
     sampler: ?std.Thread = null,
     /// Nonzero once `finish` runs; the sampler sleeps on it as a futex so finishing never waits out a period.
     stop: std.atomic.Value(u32) = .init(0),
@@ -558,7 +560,8 @@ pub const Profiler = struct {
         p.meta.query = p.arena.allocator().dupe(u8, meta.query) catch "";
         p.usage_start = usage(.process);
         p.rss_reset = resetPeakRss();
-        if (p.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(currentRss()));
+        p.start_rss = currentRss();
+        if (p.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(p.start_rss));
         if (options.sample_interval_ns > 0) {
             // Not smaller: glibc carves static TLS out of the stack and rejects a stack too small to hold it.
             p.sampler = std.Thread.spawn(.{ .stack_size = 1 << 20 }, samplerRun, .{p}) catch null;
@@ -1118,6 +1121,7 @@ test "peak RSS is this run's, not the process's: a later run does not inherit an
         try testing.expect(p.peak_rss > 0);
         if (p.peak_rss_scope == .process) return error.SkipZigTest;
         if (run == 0 and p.peak_rss_scope == .run) try testing.expect(p.peak_rss >= big);
+        try testing.expect(p.start_rss > 0 and p.start_rss <= p.peak_rss);
         peak.* = p.peak_rss;
     }
     // The second, warm run must not report the first one's peak; the first saw the buffer when the reset works.

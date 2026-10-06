@@ -468,6 +468,8 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     defer lookup.deinit();
     var dict_values: std.ArrayList([]const u8) = .empty;
     var indices = try arena.alloc(u32, num_present);
+    // Sized for the most entries the cap admits, so the table never rehashes on the way.
+    try lookup.ensureTotalCapacity(@intCast(@min(num_present / 10 + 1, num_present)));
 
     // Bail when the dictionary would grow past 10% of values. The
     // 25% threshold this replaced mostly wasted CPU on
@@ -501,14 +503,17 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
 
     if (dict_values.items.len == 0) return null;
 
-    var dict_plain: std.ArrayList(u8) = .empty;
+    var plain_len: usize = 0;
+    for (dict_values.items) |v| plain_len += 4 + v.len;
+    const dict_plain = try arena.alloc(u8, plain_len);
+    var pos: usize = 0;
     for (dict_values.items) |v| {
-        var len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len_bytes, @intCast(v.len), .little);
-        try dict_plain.appendSlice(arena, &len_bytes);
-        try dict_plain.appendSlice(arena, v);
+        std.mem.writeInt(u32, dict_plain[pos..][0..4], @intCast(v.len), .little);
+        @memcpy(dict_plain[pos + 4 ..][0..v.len], v);
+        pos += 4 + v.len;
     }
-    return try finishDictionaryColumn(arena, in, num_values, dict_plain.items, dict_values.items.len, indices);
+    const dict_col: filter_eval.Batch.Column = .{ .string = .{ .values = dict_values.items } };
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
 
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
@@ -541,6 +546,7 @@ fn tryEncodeDictInt(
     var indices = try arena.alloc(u32, num_present);
 
     const max_cardinality = num_present / 10;
+    try lookup.ensureTotalCapacity(@intCast(@min(max_cardinality + 1, num_present)));
 
     var idx_pos: usize = 0;
     for (values, 0..) |v, i| {
@@ -563,7 +569,12 @@ fn tryEncodeDictInt(
     for (dict_values.items, 0..) |v, i| {
         std.mem.writeInt(T, dict_plain[i * value_size ..][0..value_size], v, .little);
     }
-    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_values.items.len, indices);
+    const dict_col: filter_eval.Batch.Column = @unionInit(
+        filter_eval.Batch.Column,
+        if (T == i32) "i32" else "i64",
+        .{ .values = dict_values.items },
+    );
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
 
 /// FLOAT/DOUBLE dictionary encoder. Mirrors `tryEncodeDictInt` —
@@ -604,6 +615,7 @@ fn tryEncodeDictFloat(
     var indices = try arena.alloc(u32, num_present);
 
     const max_cardinality = num_present / 10;
+    try lookup.ensureTotalCapacity(@intCast(@min(max_cardinality + 1, num_present)));
 
     var idx_pos: usize = 0;
     for (values, 0..) |v, i| {
@@ -628,7 +640,13 @@ fn tryEncodeDictFloat(
     for (dict_values.items, 0..) |k, i| {
         std.mem.writeInt(KeyT, dict_plain[i * value_size ..][0..value_size], k, .little);
     }
-    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_values.items.len, indices);
+    const dict_floats: []const T = @ptrCast(dict_values.items);
+    const dict_col: filter_eval.Batch.Column = @unionInit(
+        filter_eval.Batch.Column,
+        if (T == f32) "f32" else "f64",
+        .{ .values = dict_floats },
+    );
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
 
 /// The two pages every dictionary encoder emits once it has interned its values (the encoders differ only in how
@@ -640,11 +658,17 @@ fn finishDictionaryColumn(
     in: ColumnInput,
     num_values: i64,
     dict_plain: []const u8,
-    dict_count: usize,
+    /// The entries in first-occurrence order, every one present at least once.
+    dict: filter_eval.Batch.Column,
     indices: []const u32,
 ) Error!EncodedColumn {
     const def_levels = sourceDefLevels(in.values);
     const max_def = sourceMaxDef(in.values);
+    const dict_count = valueCount(dict);
+    // Statistics over the distinct values, not every row: the dictionary holds exactly the present values, first
+    // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
+    var stats = computeStats(arena, dict, null, 0, in.schema_elem);
+    if (stats) |*st| st.null_count = num_values - @as(i64, @intCast(indices.len));
 
     const dict_compressed = try compression.compress(arena, dict_plain, in.codec);
     const dict_header = try pageHeaderBytes(arena, .{
@@ -703,7 +727,7 @@ fn finishDictionaryColumn(
         .data_page_offset = @intCast(dict_header.len + dict_compressed.len),
         .dictionary_page_offset = 0,
         .index_page_offset = null,
-        .statistics = computeStats(arena, in.values, def_levels, max_def, in.schema_elem),
+        .statistics = stats,
         // Every value is in the dictionary: readers may prune row groups on it.
         .encoding_stats = try pageStats(arena, &.{
             .{ .page_type = .DICTIONARY_PAGE, .encoding = .PLAIN },
@@ -1280,12 +1304,22 @@ fn statsTyped(arena: std.mem.Allocator, comptime T: type, values: []const T, def
             if (v > hi) hi = v;
         }
     } else {
-        // Dense path. Single sweep, autovectorizes. null_count stays 0.
-        lo = values[0];
-        hi = values[0];
-        for (values[1..]) |v| {
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
+        // Dense path, null_count 0: explicit vector lanes, which the conditional-assignment loop did not become.
+        const L = 16;
+        const V = @Vector(L, T);
+        var vlo: V = @splat(values[0]);
+        var vhi: V = vlo;
+        var i: usize = 0;
+        while (i + L <= values.len) : (i += L) {
+            const v: V = values[i..][0..L].*;
+            vlo = @min(vlo, v);
+            vhi = @max(vhi, v);
+        }
+        lo = @reduce(.Min, vlo);
+        hi = @reduce(.Max, vhi);
+        for (values[i..]) |v| {
+            lo = @min(lo, v);
+            hi = @max(hi, v);
         }
     }
     const item_size = @sizeOf(T);
@@ -1710,4 +1744,51 @@ test "encodeDecimalFlba round-trips i128 through decodeColumnAsI128 (DECIMAL(38,
     const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
     const back = try decimal_mod_test.decodeColumnAsI128(arena, enc.bytes, .UNCOMPRESSED, levels, vals.len, kind);
     for (vals, 0..) |v, i| try testing.expectEqual(v, back.values[i]);
+}
+
+test "a dictionary chunk's statistics, taken over its entries, equal those of a scan over every row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const n = 400;
+    const strs = try a.alloc([]const u8, n);
+    const ints = try a.alloc(i64, n);
+    const floats = try a.alloc(f64, n);
+    const defs = try a.alloc(u32, n);
+    const words = [_][]const u8{ "pear", "apple", "zebra", "", "mango" };
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 7 != 3);
+        strs[i] = words[(i * 3) % words.len];
+        ints[i] = @as(i64, @intCast((i * 5) % 9)) - 4;
+        floats[i] = if (i % 11 == 0) -0.0 else @as(f64, @floatFromInt((i * 7) % 13)) / 4.0;
+    }
+    const opt = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var opt_i = opt;
+    opt_i.type = .INT64;
+    var opt_f = opt;
+    opt_f.type = .DOUBLE;
+    const Case = struct { col: filter_eval.Batch.Column, elem: *const schema.SchemaElement };
+    for ([_]Case{
+        .{ .col = .{ .string = .{ .values = strs, .def_levels = defs, .max_def = 1 } }, .elem = &opt },
+        .{ .col = .{ .i64 = .{ .values = ints, .def_levels = defs, .max_def = 1 } }, .elem = &opt_i },
+        .{ .col = .{ .f64 = .{ .values = floats, .def_levels = defs, .max_def = 1 } }, .elem = &opt_f },
+    }) |c| {
+        const enc = try encodeColumn(a, .{ .values = c.col, .schema_elem = c.elem, .path_in_schema = &.{"s"} });
+        try testing.expect(enc.meta.dictionary_page_offset != null);
+        const want = computeStats(a, c.col, defs, 1, c.elem).?;
+        const got = enc.meta.statistics.?;
+        try testing.expectEqual(want.null_count, got.null_count);
+        try testing.expectEqualSlices(u8, want.min_value.?, got.min_value.?);
+        try testing.expectEqualSlices(u8, want.max_value.?, got.max_value.?);
+    }
 }

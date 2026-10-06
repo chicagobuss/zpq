@@ -15,6 +15,7 @@
 //! to read, how to merge them and when to give up is decided here, from the source's `Cost`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 const prune = @import("prune.zig");
 const schema = @import("../schema.zig");
@@ -202,7 +203,14 @@ pub const Source = struct {
         cached: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, span: Span) ?[]const u8 = null,
         /// A whole filter this query read, offered for reuse by later queries.
         retain: ?*const fn (ctx: *anyopaque, span: Span, bytes: []const u8) void = null,
+        /// Start fetching `spans` in the background, so the reads after it overlap instead of waiting in turn: on a
+        /// mapping, one cold page fault per probe would otherwise be one disk read at a time.
+        prefetch: ?*const fn (ctx: *anyopaque, spans: []const Span) void = null,
     };
+
+    fn prefetch(self: Source, spans: []const Span) void {
+        if (spans.len > 0) if (self.vtable.prefetch) |f| f(self.ctx, spans);
+    }
 
     fn read(self: Source, arena: std.mem.Allocator, spans: []const Span, out: [][]const u8) !void {
         return self.vtable.read(self.ctx, arena, spans, out);
@@ -218,7 +226,23 @@ pub const MappedSource = struct {
         return .{ .ctx = @ptrCast(@constCast(self)), .vtable = &vtable, .cost = .mapped };
     }
 
-    const vtable: Source.VTable = .{ .read = readFn };
+    const vtable: Source.VTable = .{ .read = readFn, .prefetch = prefetchFn };
+
+    /// MADV_WILLNEED on the pages under each span: the kernel queues every read at once.
+    fn prefetchFn(ctx: *anyopaque, spans: []const Span) void {
+        if (builtin.os.tag != .linux) return;
+        const self: *const MappedSource = @ptrCast(@alignCast(ctx));
+        const page = std.heap.pageSize();
+        for (spans) |s| {
+            const bytes = if (s.file < self.files.len) self.files[s.file] else continue;
+            if (s.start >= bytes.len) continue;
+            const end: usize = @intCast(@min(s.end, bytes.len));
+            const lo = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + @as(usize, @intCast(s.start)), page);
+            const hi = std.mem.alignForward(usize, @intFromPtr(bytes.ptr) + end, page);
+            // Advice only: a failure leaves the pages to fault in on demand.
+            _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.WILLNEED);
+        }
+    }
 
     fn readFn(ctx: *anyopaque, _: std.mem.Allocator, spans: []const Span, out: [][]const u8) anyerror!void {
         const self: *const MappedSource = @ptrCast(@alignCast(ctx));
@@ -787,6 +811,17 @@ const Probing = struct {
         const fetch = try a.alloc(Fetch, wave.len);
         @memset(fetch, .none);
 
+        // Every filter's header first, all at once: where reads are cheap enough to skip planning, the headers then
+        // the blocks they locate are the only bytes touched (see `prefetchBlocks`).
+        if (!self.src.cost.remote()) {
+            const firsts = try a.alloc(Span, wave.len);
+            for (wave, firsts) |t, *f| {
+                const s = filterSpan(t, self.metas).?;
+                f.* = .{ .file = s.file, .start = s.start, .end = s.start + bloom.max_header_bytes };
+            }
+            self.src.prefetch(firsts);
+        }
+
         // A filter whose length the footer leaves out (older parquet-java) costs a header read first.
         var heads: std.ArrayList(Req) = .empty;
         var head_of: std.ArrayList(usize) = .empty;
@@ -834,6 +869,8 @@ const Probing = struct {
             self.verdicts[hv.file] = if (ok) .canonical else .other;
         }
 
+        if (!self.src.cost.remote()) try self.prefetchBlocks(wave, plan, spans);
+
         for (wave, plan.fetch) |t, f| {
             switch (f) {
                 .none => {},
@@ -858,6 +895,26 @@ const Probing = struct {
                 },
             }
         }
+    }
+
+    /// Prefetch the block every key selects in each whole filter of `plan`, located through its (prefetched) header.
+    fn prefetchBlocks(self: *Probing, wave: []const *Target, plan: ReadPlan, spans: []const ?Span) !void {
+        if (self.src.vtable.prefetch == null) return;
+        var blocks: std.ArrayList(Span) = .empty;
+        for (wave, plan.fetch, spans) |t, f, s| {
+            const bytes = switch (f) {
+                .whole => |ri| plan.reqs.items[ri].out,
+                else => continue,
+            };
+            const start = (s orelse continue).start;
+            const h = bloom.parseHeader(bytes) orelse continue;
+            const n = h.num_bytes / bloom.block_bytes;
+            for (t.keys.items) |*k| for (0..k.n) |i| {
+                const at = start + h.len + (try self.probes.get(self.scratch, k.form(i))).block(n) * bloom.block_bytes;
+                try blocks.append(self.scratch, .{ .file = t.file, .start = at, .end = at + bloom.block_bytes });
+            };
+        }
+        self.src.prefetch(blocks.items);
     }
 
     fn probeWhole(self: *Probing, t: *Target, bytes: []const u8) !void {
@@ -924,6 +981,9 @@ const Probing = struct {
             ri.* = reqs.items.len;
             try reqs.append(a, .{ .span = sp });
         }
+        const pages = try a.alloc(Span, reqs.items.len);
+        for (reqs.items, pages) |r, *p| p.* = r.span;
+        self.src.prefetch(pages);
         try readAll(a, self.src, reqs.items, self.stats);
 
         var want: std.ArrayList([]const u8) = .empty;

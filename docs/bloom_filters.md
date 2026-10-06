@@ -47,6 +47,8 @@ the medium moves in that time, the requests in flight at once, and the longest r
   of whole filters. Blocks are located through the header every known writer emits; they count only once a real
   header from the same file matched that shape. Blocks must save a quarter of the estimated time to be chosen, since
   whole filters can be kept warm and blocks cannot.
+- On a mapping, every header page and then every block page a probe needs is requested at once (`MADV_WILLNEED`),
+  so a cold page cache costs two rounds of parallel reads rather than one disk read per filter.
 - On a remote source, the filters of the first eight row groups are read first. If they prune fewer than a quarter of
   them, the rest are left unread, which bounds what filters cost a query they cannot help.
 - Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer.

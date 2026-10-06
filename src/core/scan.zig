@@ -247,6 +247,10 @@ const WorkItem = struct {
 /// every nesting path here is bounded.
 pub const WORKER_STACK_SIZE: usize = 1 << 20;
 
+/// Address space each scan worker reserves for its decode memory; only what a row group touches is committed, and a
+/// worker needing more spills to the general allocator.
+const WORKER_REGION_RESERVE: usize = 1 << 30;
+
 /// One footer-parsing worker. Files are claimed dynamically so wildly uneven file sizes don't leave threads idle.
 const ParseCtx = struct {
     inputs: []const Input,
@@ -409,11 +413,13 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     var release_span: profile.Span = .{ .t = null, .start = 0 };
     defer release_span.end(.worker_release, profile.args(.{w.index}));
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
-    // Both it and the scratch are written front to back and reused, the case huge pages pay off for.
-    var thp: huge_pages.HugePageAdvisor = .{ .child = w.gpa };
-    var rg_decode_arena = consumer.RowGroupArena.init(thp.allocator());
+    // Both it and the scratch are written front to back and reused, and both live in one huge-page region that a
+    // single unmap releases (see `huge_pages.Region`).
+    var region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+    defer region.deinit();
+    var rg_decode_arena = consumer.RowGroupArena.init(region.allocator());
     defer rg_decode_arena.deinit();
-    var scratch = consumer.DecodeScratch.init(thp.allocator());
+    var scratch = consumer.DecodeScratch.init(region.allocator());
     defer scratch.deinit();
     scratch.prof = prof;
 

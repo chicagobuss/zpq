@@ -173,6 +173,22 @@ exe.root_module.addImport("zpq", zpq);
 
 ## Profiling
 
+`--profile` writes a per-thread trace of a query that opens in [Perfetto](https://ui.perfetto.dev): spans for every
+phase (footer fetch and parse, planning and pruning, each S3 request with its time to first byte, each column chunk's
+decode and each page's decompression, filter, aggregation, encode and write), counters for requests and bytes in
+flight and RSS, and the run's metadata. `--profile-summary` prints the digest to stderr: time per phase, the critical
+path through overlapping phases, the costliest column chunks, I/O and pruning counts.
+
+```bash
+zpq query data/lineitem.parquet --aggregate 'sum(l_extendedprice * l_discount) AS revenue' \
+  --filter "l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01'" \
+  --profile trace.json --profile-summary
+```
+
+The Lambda takes `"profile": true` (summary in the response) and `"profile_url": "s3://..."` (full trace uploaded).
+Off, profiling costs a branch per span site; see [docs/profiling.md](docs/profiling.md) for what each span means,
+how the critical path is computed, the measured cost, and a walkthrough.
+
 Frame pointers are on by default (cost measured in the noise), which means flamegraphs are a one-liner.
 
 ```bash
@@ -194,6 +210,9 @@ src/
   zpq.zig                Public surface — exports core.* + io.*
   cli/main.zig           zpq binary entry (workstation)
   lambda/main.zig        zpq-lambda binary entry (AWS Lambda bootstrap)
+  engine.zig             runQuery: input dispatch, parallel fetch, scan, output
+  profile.zig            Query profiling: per-thread spans, counters, trace export
+  profile_summary.zig    Profile summary: phases, critical path, top chunks
   core/
     schema.zig           Parquet thrift types
     thrift.zig           In-tree thrift reader/writer

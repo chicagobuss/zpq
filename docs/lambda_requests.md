@@ -17,6 +17,8 @@ the CLI flags of the same name.
 | `output_codec` | string | `snappy`, `zstd`, `gzip`, `lz4`/`lz4_raw` or `uncompressed`; anything else is snappy. |
 | `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats`. |
 | `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. |
+| `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
+| `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
@@ -60,9 +62,34 @@ cache hits from earlier invocations appear only when Lambda reuses a sandbox, wh
 | `max_idle_ms` | The longest any idle connection had waited when a request looked at it. |
 | `acquire_wait_ms`, `acquire_lock_ms` | Time spent waiting for a connection permit, and holding the pool lock. |
 
-Response changes: the aggregate response gained `row_groups_full_match` and `pool`; in the write response `output` is
+Response changes: the aggregate and write responses gained `profile` and `profile_trace` when asked for; the write
+response's `decode_ms`, `eval_ms` and `encode_ms`, always 0 for a re-encoding write before, now sum the encode
+threads' time. The aggregate response gained `row_groups_full_match` and `pool`; in the write response `output` is
 now JSON-escaped, and `pool` moved after `meta_cache` and gained `idle_evictions`, `stale_retries`, `backoff_retries`
 and `max_idle_ms`.
+
+**`profile`** (aggregate and write responses, when the request set `profile` or `profile_url`): the profile summary
+described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`, `threads`, `events`, `dropped`; `cpu`
+(this process's `user_ns`, `sys_ns`, `minor_faults`, `major_faults`, `max_rss`, `peak_rss`); `meta` (`zpq_version`,
+`build_mode`, `target`, `cpu_count`, `parallelism`, `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`,
+`query`, the request cut to 512 bytes); `phases` (per phase: `wall_ns`, `busy_ns`, `crit_ns`, `alone_ns`, `spans`);
+`chunks`, `chunk_ns` and `top_chunks` (the ten costliest column chunks: `file`, `rg`, `column`, `codec`, `encoding`,
+`bytes_in`, `bytes_out`, `ns`, `decompress_ns`, `pages`); `io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`,
+`acquire_ns`, `reused`, `retries`, `errors`, `ranges`, `merged`, `fetch_jobs`, `mapped_files`, `mapped_bytes`,
+`peak_in_flight`, `peak_bytes_in_flight`); `prune` (`row_groups`, `skipped`, `full_match`, `filtered`, `pages`,
+`pages_skipped`, `stats_answered`, `skipped_by`: filter column → row groups its statistics skipped); `workers`
+(`count`, `user_ns`, `sys_ns`, `minor_faults`); `engine` (`read_ns`, `parse_ns`, `decode_ns`, `decode_wall_ns`,
+`eval_ns`, `agg_ns`, `encode_ns`: the sums behind `phase`, in nanoseconds); and `peak_buffered_bytes`. Times are
+nanoseconds. The member's size does not grow with the query (names are cut to 128 bytes, and only ten chunks and five
+skip reasons are listed), so it stays a few KB, far under Lambda's 6 MB response limit; the trace itself never rides
+in the response.
+
+**`profile_trace`** (when the request set `profile_url`): `{"url": U, "bytes": N}` after uploading the Chrome trace
+to `U` with one PUT over the invocation's connection pool, or `{"url": U, "error": E}` when the upload failed (`E` is
+`BadProfileUrl` for a URL that is not `s3://bucket/key`). A failed upload does not fail the query.
+
+Profiling a request costs its own time (a few hundred microseconds to start the RSS sampler and summarize, and the
+spans themselves; see [profiling.md](profiling.md)). A request without `profile` pays nothing for it.
 
 ### Multipart writes whose answer is lost
 

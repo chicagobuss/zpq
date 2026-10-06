@@ -8,8 +8,8 @@ used).
 ## What prunes
 
 A row group is skipped when an `=` leaf of the filter cannot match there. Statistics decide first; a leaf they leave
-open (neither ruled out nor proven to match every row) is then tested against the chunk's Bloom filter and, if that
-says "maybe", against the chunk's dictionary. Either can only add a skip: a leaf statistics prove fully matching keeps
+open (neither ruled out nor proven to match every row) is then tested against the chunk's Bloom filter or, for a
+chunk without one, against its dictionary. Either can only add a skip: a leaf statistics prove fully matching keeps
 its literal everywhere, so neither is consulted for it. `IN` is an OR of `=` leaves and `NOT IN` an AND of `!=` leaves,
 so `pruneRowGroup` composes them with AND, OR and NOT as before; `!=`, ranges and `LIKE` never use membership.
 
@@ -51,8 +51,9 @@ the medium moves in that time, the requests in flight at once, and the longest r
   them, the rest are left unread, which bounds what filters cost a query they cannot help.
 - Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer.
 
-Dictionaries are read only for literals the filters left open, in row groups still kept, through the same source and
-the same first-wave rule (on a mapping the wave bounds decode time instead). A dictionary covers its chunk when
+Dictionaries are read only for chunks without a filter, in row groups still kept, through the same source and the
+same first-wave rule (on a mapping the wave bounds decode time instead). Where a filter says "maybe", the literal is
+almost always there; its false positives are too rare to pay for reading the dictionary too. A dictionary covers its chunk when
 `encoding_stats` list a dictionary page and only dictionary-encoded data pages. Without `encoding_stats`, only
 parquet-java's v1 signature (PLAIN_DICTIONARY beside nothing but level encodings) is trusted; a v2 chunk may have
 fallen back to PLAIN pages without saying so.

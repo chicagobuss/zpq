@@ -6,11 +6,10 @@
 //! bounds cannot.
 //!
 //! Two halves. `load` runs once per query, before any row group is planned: it picks the chunks worth probing (row
-//! groups statistics keep, `=` leaves statistics leave open), reads their filters, then for what those leave open
-//! their dictionaries, through a `Source`, and records on each chunk the literals proven absent
-//! (`ColumnChunk.absent`). `provenAbsent` is what `prune.zig` asks at
-//! an `=` leaf. Pruning stays a function of the footer alone, so every caller of `pruneRowGroup` (the S3 planner, the
-//! scan workers, the write path) reaches the same answer.
+//! groups statistics keep, `=` leaves statistics leave open), reads their filters, or the dictionaries of chunks
+//! without one, through a `Source`, and records on each chunk the literals proven absent (`ColumnChunk.absent`).
+//! `provenAbsent` is what `prune.zig` asks at an `=` leaf. Pruning stays a function of the footer alone, so every
+//! caller of `pruneRowGroup` (the S3 planner, the scan workers, the write path) reaches the same answer.
 //!
 //! I/O stays behind `Source`: a mapping for local files, the S3 range fetcher, later an io_uring reader. Which bytes
 //! to read, how to merge them and when to give up is decided here, from the source's `Cost`.
@@ -732,8 +731,9 @@ const Probing = struct {
         for (targets) |*t| {
             const ok = switch (which) {
                 .bloom => filterSpan(t, self.metas) != null,
-                // A dictionary is read only for what the filter left open, in a row group still kept.
-                .dictionary => t.absent.items.len < t.keys.items.len and !self.rowGroupSkips(t) and
+                // A dictionary is read only for a chunk with no filter, in a row group still kept: where a filter
+                // said "maybe" the literal is almost always there; its false positives are too rare to pay a read.
+                .dictionary => filterSpan(t, self.metas) == null and !self.rowGroupSkips(t) and
                     dictSpan(t, self.metas) != null,
             };
             if (ok) try queue.append(self.scratch, t);

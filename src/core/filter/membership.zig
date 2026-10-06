@@ -1,12 +1,14 @@
-//! Row-group pruning by membership: a chunk's Bloom filter proving an `=` literal absent.
+//! Row-group pruning by membership: a chunk's Bloom filter, or its dictionary, proving an `=` literal absent.
 //!
 //! Statistics bound a chunk's values; for `=` on a column whose values span the domain in every row group (keys,
-//! UUIDs, trace ids) they prune nothing. A split-block Bloom filter records which values a chunk holds, so it can
-//! prove a literal absent where the bounds cannot.
+//! UUIDs, trace ids) they prune nothing. A split-block Bloom filter records which values a chunk holds, and so does
+//! the dictionary of a chunk whose every page is dictionary-encoded, so either can prove a literal absent where the
+//! bounds cannot.
 //!
 //! Two halves. `load` runs once per query, before any row group is planned: it picks the chunks worth probing (row
-//! groups statistics keep, `=` leaves statistics leave open), reads their filters through a `Source`, probes, and
-//! records on each chunk the literals proven absent (`ColumnChunk.absent`). `provenAbsent` is what `prune.zig` asks at
+//! groups statistics keep, `=` leaves statistics leave open), reads their filters, then for what those leave open
+//! their dictionaries, through a `Source`, and records on each chunk the literals proven absent
+//! (`ColumnChunk.absent`). `provenAbsent` is what `prune.zig` asks at
 //! an `=` leaf. Pruning stays a function of the footer alone, so every caller of `pruneRowGroup` (the S3 planner, the
 //! scan workers, the write path) reaches the same answer.
 //!
@@ -18,6 +20,8 @@ const ast = @import("ast.zig");
 const prune = @import("prune.zig");
 const schema = @import("../schema.zig");
 const bloom = @import("../parquet/bloom.zig");
+const compression = @import("../parquet/compression.zig");
+const thrift = @import("../thrift.zig");
 const nowMonoNs = @import("../../clock.zig").monoNs;
 
 // ============================================================
@@ -382,23 +386,29 @@ pub const Options = struct {
 };
 
 pub const Stats = struct {
-    /// Row groups statistics kept that a Bloom filter then ruled out.
+    /// Row groups statistics kept that a Bloom filter, or failing that a dictionary, then ruled out.
     row_groups_bloom: usize = 0,
-    /// Filters probed.
+    row_groups_dict: usize = 0,
+    /// Filters and dictionaries probed.
     filters: usize = 0,
-    /// Requests made, and bytes read by them.
+    dictionaries: usize = 0,
+    /// Requests made, and bytes read by them (remote sources only).
     requests: usize = 0,
     bytes: u64 = 0,
-    /// The first wave pruned too little to pay for reading the rest.
+    /// A first wave pruned too little to pay for reading the rest of its kind.
     bloom_stopped: bool = false,
+    dict_stopped: bool = false,
     ns: u64 = 0,
 
     pub fn add(self: *Stats, o: Stats) void {
         self.row_groups_bloom += o.row_groups_bloom;
+        self.row_groups_dict += o.row_groups_dict;
         self.filters += o.filters;
+        self.dictionaries += o.dictionaries;
         self.requests += o.requests;
         self.bytes += o.bytes;
         self.bloom_stopped = self.bloom_stopped or o.bloom_stopped;
+        self.dict_stopped = self.dict_stopped or o.dict_stopped;
         self.ns += o.ns;
     }
 };
@@ -416,10 +426,23 @@ const Target = struct {
         return &metas[self.file].row_groups.items[self.rg].columns.items[self.col];
     }
 
+    fn rowGroup(self: *const Target, metas: []const schema.FileMetaData) *const schema.RowGroup {
+        return &metas[self.file].row_groups.items[self.rg];
+    }
+
     fn sameRowGroup(self: *const Target, other: *const Target) bool {
         return self.file == other.file and self.rg == other.rg;
     }
 };
+
+fn isAbsent(t: *const Target, k: *const Key) bool {
+    for (t.absent.items) |a| if (std.mem.eql(u8, a, k.form(0))) return true;
+    return false;
+}
+
+fn orderBytes(want: []const u8, have: []const u8) std.math.Order {
+    return std.mem.order(u8, want, have);
+}
 
 /// Probes hoisted per literal form: the hash and its 8-lane mask, computed once however many chunks they test.
 const ProbeCache = struct {
@@ -433,55 +456,35 @@ const ProbeCache = struct {
     }
 };
 
-/// Prove `=` literals of `filter` absent from chunks of `metas` wherever their Bloom filters allow, and record each
-/// on its chunk for `prune.zig`. `metas` are this query's footers, all parsed against the schema `filter` was bound
-/// to, and file `i` of `src` is `metas[i]`. Nothing is recorded under any doubt.
+/// Prove `=` literals of `filter` absent from chunks of `metas` wherever their Bloom filters, then their dictionaries,
+/// allow, and record each on its chunk for `prune.zig`. `metas` are this query's footers, all parsed against the
+/// schema `filter` was bound to, and file `i` of `src` is `metas[i]`. What is recorded lives in `arena`; the filter
+/// and dictionary bytes read on the way only in a scratch arena over `gpa`, freed on return. Nothing is recorded under
+/// any doubt.
 pub fn load(
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     filter: ast.Filter,
     metas: []const schema.FileMetaData,
     src: Source,
     opts: Options,
 ) !Stats {
     const t0 = nowMonoNs();
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
     var stats: Stats = .{};
-    try loadInto(arena, filter, metas, src, opts, &stats);
+    var p: Probing = .{
+        .arena = arena,
+        .scratch = scratch.allocator(),
+        .metas = metas,
+        .src = src,
+        .stats = &stats,
+        .filter = filter,
+        .opts = opts,
+    };
+    try p.run();
     stats.ns = @intCast(nowMonoNs() - t0);
     return stats;
-}
-
-fn loadInto(
-    arena: std.mem.Allocator,
-    filter: ast.Filter,
-    metas: []const schema.FileMetaData,
-    src: Source,
-    opts: Options,
-    stats: *Stats,
-) !void {
-    var leaves: std.ArrayList(ast.Filter) = .empty;
-    try collectLeaves(arena, filter, &leaves);
-    if (leaves.items.len == 0) return;
-
-    const targets = try findTargets(arena, filter, leaves.items, metas);
-    // Only chunks with a filter, in file order, so the first wave is the first row groups.
-    var queue: std.ArrayList(*Target) = .empty;
-    for (targets.items) |*t| if (filterSpan(t, metas) != null) try queue.append(arena, t);
-    if (queue.items.len == 0) return;
-
-    var ctx: Probing = .{ .arena = arena, .metas = metas, .src = src, .stats = stats };
-    ctx.verdicts = try arena.alloc(Verdict, metas.len);
-    @memset(ctx.verdicts, .unknown);
-
-    const all = queue.items;
-    const first_end = if (src.cost.remote()) waveEnd(all, opts.wave) else all.len;
-    const first = try ctx.probe(all[0..first_end], filter);
-    if (first_end < all.len) {
-        if (@as(f64, @floatFromInt(first.pruned)) < opts.min_wave_prune * @as(f64, @floatFromInt(first.row_groups))) {
-            stats.bloom_stopped = true;
-        } else {
-            _ = try ctx.probe(all[first_end..], filter);
-        }
-    }
 }
 
 /// Every `=` leaf on a stored literal, anywhere in `f`: AND, OR and IN compose through `pruneRowGroup`.
@@ -561,6 +564,115 @@ fn waveEnd(ts: []const *Target, n: usize) usize {
     return ts.len;
 }
 
+/// Whether a chunk's dictionary page holds every value it stores, so a literal missing from it is missing from the
+/// chunk. A writer may start a chunk dictionary-encoded and fall back to PLAIN pages once the dictionary grows, and
+/// then the dictionary covers only part of it. With `encoding_stats`: a dictionary page, data pages, and every data
+/// page dictionary-encoded (the rule Hardwood applies). Without them, only parquet-java's v1 signature tells:
+/// PLAIN_DICTIONARY with nothing but level encodings beside it; a v2 RLE_DICTIONARY chunk could have fallen back to
+/// PLAIN without saying so.
+pub fn dictionaryCoversChunk(cm: *const schema.ColumnMetaData) bool {
+    const DICTIONARY_PAGE = @intFromEnum(schema.PageType.DICTIONARY_PAGE);
+    const plain_dictionary = @intFromEnum(schema.Encoding.PLAIN_DICTIONARY);
+    const rle_dictionary = @intFromEnum(schema.Encoding.RLE_DICTIONARY);
+    if (cm.encoding_stats) |es| {
+        var dict_page = false;
+        var data_page = false;
+        for (es.items) |e| {
+            if (e.count <= 0) continue;
+            switch (e.page_type) {
+                DICTIONARY_PAGE => dict_page = true,
+                @intFromEnum(schema.PageType.INDEX_PAGE) => {},
+                @intFromEnum(schema.PageType.DATA_PAGE), @intFromEnum(schema.PageType.DATA_PAGE_V2) => {
+                    if (e.encoding != plain_dictionary and e.encoding != rle_dictionary) return false;
+                    data_page = true;
+                },
+                else => return false,
+            }
+        }
+        return dict_page and data_page;
+    }
+    var v1_dictionary = false;
+    for (cm.encodings.items) |e| switch (e) {
+        .PLAIN_DICTIONARY => v1_dictionary = true,
+        .RLE, .BIT_PACKED => {},
+        else => return false,
+    };
+    return v1_dictionary;
+}
+
+/// Where a target's dictionary page lies, when it covers the chunk: from `dictionary_page_offset` to the first data
+/// page, or, from writers that leave the former out and start the chunk at the dictionary, an empty span at the
+/// chunk's start whose length the page header gives.
+fn dictSpan(t: *const Target, metas: []const schema.FileMetaData) ?Span {
+    const cm = &(t.chunk(metas).meta_data orelse return null);
+    if (!dictionaryCoversChunk(cm)) return null;
+    if (cm.data_page_offset < 4) return null;
+    const data: u64 = @intCast(cm.data_page_offset);
+    if (cm.dictionary_page_offset) |d| {
+        if (d < 4 or d >= cm.data_page_offset) return null;
+        return .{ .file = t.file, .start = @intCast(d), .end = data };
+    }
+    return .{ .file = t.file, .start = data, .end = data };
+}
+
+/// Bytes read to learn a dictionary page's length from its header.
+const page_header_probe = 256;
+
+/// Header plus payload length of the dictionary page `bytes` starts with, or null when it is no dictionary page.
+fn dictionaryPageLen(bytes: []const u8) ?u64 {
+    var r = thrift.Reader.init(bytes);
+    const h = schema.PageHeader.read(&r) catch return null;
+    if (h.type != .DICTIONARY_PAGE or h.compressed_page_size < 0) return null;
+    return r.pos + @as(u64, @intCast(h.compressed_page_size));
+}
+
+/// The PLAIN values of the dictionary page `page` holds, decompressed, or null for anything else (another page,
+/// another encoding, a truncated or corrupt page).
+fn dictionaryValues(
+    scratch: std.mem.Allocator,
+    page: []const u8,
+    codec: schema.CompressionCodec,
+) ?struct { bytes: []const u8, count: usize } {
+    var r = thrift.Reader.init(page);
+    const h = schema.PageHeader.read(&r) catch return null;
+    if (h.type != .DICTIONARY_PAGE) return null;
+    const dh = h.dictionary_page_header orelse return null;
+    if (dh.encoding != .PLAIN and dh.encoding != .PLAIN_DICTIONARY) return null;
+    if (dh.num_values < 0 or h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return null;
+    const csize: usize = @intCast(h.compressed_page_size);
+    if (csize > page.len - r.pos) return null;
+    const payload = page[r.pos..][0..csize];
+    const size: usize = @intCast(h.uncompressed_page_size);
+    const values = compression.decompress(scratch, payload, codec, size) catch return null;
+    return .{ .bytes = values, .count = @intCast(dh.num_values) };
+}
+
+/// Mark `found[i]` for every `want[i]` (sorted, distinct stored forms) among the `count` PLAIN values `values` holds.
+/// False when the values do not parse as `count` entries of the slot's type: then nothing can be concluded.
+fn scanDictionary(values: []const u8, count: usize, slot: Slot, want: []const []const u8, found: []bool) bool {
+    const width: usize = switch (slot.physical) {
+        .INT32, .FLOAT => 4,
+        .INT64, .DOUBLE => 8,
+        .FIXED_LEN_BYTE_ARRAY => std.math.cast(usize, slot.type_length orelse return false) orelse return false,
+        .BYTE_ARRAY => 0,
+        else => return false,
+    };
+    var pos: usize = 0;
+    for (0..count) |_| {
+        var len = width;
+        if (width == 0) {
+            if (values.len - pos < 4) return false;
+            len = std.mem.readInt(u32, values[pos..][0..4], .little);
+            pos += 4;
+        }
+        if (values.len - pos < len) return false;
+        const entry = values[pos..][0..len];
+        pos += len;
+        if (std.sort.binarySearch([]const u8, want, entry, orderBytes)) |i| found[i] = true;
+    }
+    return true;
+}
+
 /// Whether a file's writer emits the canonical header, which is what lets a block be located without its header.
 const Verdict = enum { unknown, canonical, other };
 
@@ -587,17 +699,91 @@ const ReadPlan = struct {
 
 const WaveResult = struct { row_groups: usize = 0, pruned: usize = 0 };
 
+const Stage = enum { bloom, dictionary };
+
 const Probing = struct {
+    /// Where what is proven is recorded: lives as long as the footers.
     arena: std.mem.Allocator,
+    /// Bytes read and decoded along the way.
+    scratch: std.mem.Allocator,
     metas: []const schema.FileMetaData,
     src: Source,
     stats: *Stats,
+    filter: ast.Filter,
+    opts: Options,
     verdicts: []Verdict = &.{},
     probes: ProbeCache = .{},
 
-    /// Read and probe `wave`, record what its filters prove, and count the row groups that now prune.
-    fn probe(self: *Probing, wave: []const *Target, filter: ast.Filter) !WaveResult {
-        const a = self.arena;
+    fn run(self: *Probing) !void {
+        var leaves: std.ArrayList(ast.Filter) = .empty;
+        try collectLeaves(self.scratch, self.filter, &leaves);
+        if (leaves.items.len == 0) return;
+        const targets = try findTargets(self.arena, self.filter, leaves.items, self.metas);
+        self.verdicts = try self.scratch.alloc(Verdict, self.metas.len);
+        @memset(self.verdicts, .unknown);
+        try self.stage(.bloom, targets.items);
+        try self.stage(.dictionary, targets.items);
+    }
+
+    /// Probe every target `stage` can still help, in file order. On a remote source the first `opts.wave` row groups
+    /// go first, and unless they prune often enough the rest are left unread.
+    fn stage(self: *Probing, comptime which: Stage, targets: []Target) !void {
+        var queue: std.ArrayList(*Target) = .empty;
+        for (targets) |*t| {
+            const ok = switch (which) {
+                .bloom => filterSpan(t, self.metas) != null,
+                // A dictionary is read only for what the filter left open, in a row group still kept.
+                .dictionary => t.absent.items.len < t.keys.items.len and !self.rowGroupSkips(t) and
+                    dictSpan(t, self.metas) != null,
+            };
+            if (ok) try queue.append(self.scratch, t);
+        }
+        const all = queue.items;
+        if (all.len == 0) return;
+        const first_end = if (self.src.cost.remote() or which == .dictionary) waveEnd(all, self.opts.wave) else all.len;
+        const first = try self.probeWave(which, all[0..first_end]);
+        if (first_end == all.len) return;
+        const want = self.opts.min_wave_prune * @as(f64, @floatFromInt(first.row_groups));
+        if (@as(f64, @floatFromInt(first.pruned)) < want) {
+            switch (which) {
+                .bloom => self.stats.bloom_stopped = true,
+                .dictionary => self.stats.dict_stopped = true,
+            }
+            return;
+        }
+        _ = try self.probeWave(which, all[first_end..]);
+    }
+
+    fn probeWave(self: *Probing, comptime which: Stage, targets: []const *Target) !WaveResult {
+        switch (which) {
+            .bloom => try self.probeBloom(targets),
+            .dictionary => try self.probeDictionaries(targets),
+        }
+        for (targets) |t| if (t.absent.items.len > 0) {
+            std.mem.sort([]const u8, t.absent.items, {}, bytesLess);
+            t.chunk(self.metas).absent = t.absent.items;
+        };
+        var res: WaveResult = .{};
+        for (targets, 0..) |t, i| {
+            if (i > 0 and targets[i - 1].sameRowGroup(t)) continue;
+            res.row_groups += 1;
+            if (self.rowGroupSkips(t)) res.pruned += 1;
+        }
+        switch (which) {
+            .bloom => self.stats.row_groups_bloom += res.pruned,
+            .dictionary => self.stats.row_groups_dict += res.pruned,
+        }
+        return res;
+    }
+
+    fn rowGroupSkips(self: *const Probing, t: *const Target) bool {
+        const fm = &self.metas[t.file];
+        return prune.pruneRowGroup(&fm.row_groups.items[t.rg], self.filter, fm) == .skip;
+    }
+
+    /// Read and probe the Bloom filters of `wave`, recording every key they prove absent.
+    fn probeBloom(self: *Probing, wave: []const *Target) !void {
+        const a = self.scratch;
         const fetch = try a.alloc(Fetch, wave.len);
         @memset(fetch, .none);
 
@@ -668,24 +854,10 @@ const Probing = struct {
                         .blocks = b.blocks,
                         .num_blocks = b.num_blocks,
                     };
-                    for (t.keys.items) |*k| if (try self.keyAbsent(k, set)) try t.absent.append(a, k.form(0));
+                    for (t.keys.items) |*k| if (try self.keyAbsent(k, set)) try t.absent.append(self.arena, k.form(0));
                 },
             }
-            if (t.absent.items.len > 0) {
-                std.mem.sort([]const u8, t.absent.items, {}, bytesLess);
-                t.chunk(self.metas).absent = t.absent.items;
-            }
         }
-
-        var res: WaveResult = .{};
-        for (wave, 0..) |t, i| {
-            if (i > 0 and wave[i - 1].sameRowGroup(t)) continue;
-            res.row_groups += 1;
-            const fm = &self.metas[t.file];
-            if (prune.pruneRowGroup(&fm.row_groups.items[t.rg], filter, fm) == .skip) res.pruned += 1;
-        }
-        self.stats.row_groups_bloom += res.pruned;
-        return res;
     }
 
     fn probeWhole(self: *Probing, t: *Target, bytes: []const u8) !void {
@@ -699,7 +871,7 @@ const Probing = struct {
 
     /// Whether no stored form of `k` can be in the filter `set` reads.
     fn keyAbsent(self: *Probing, k: *const Key, set: anytype) !bool {
-        for (0..k.n) |i| if (set.has(try self.probes.get(self.arena, k.form(i)))) return false;
+        for (0..k.n) |i| if (set.has(try self.probes.get(self.scratch, k.form(i)))) return false;
         return true;
     }
 
@@ -713,21 +885,88 @@ const Probing = struct {
     }
 
     fn wholePlan(self: *Probing, wave: []const *Target, spans: []const ?Span, fetch: []const Fetch) !ReadPlan {
-        var plan: ReadPlan = .{ .fetch = try self.arena.dupe(Fetch, fetch) };
+        var plan: ReadPlan = .{ .fetch = try self.scratch.dupe(Fetch, fetch) };
         for (wave, spans, plan.fetch) |_, s, *f| {
             if (f.* != .none) continue;
             const sp = s orelse continue;
             f.* = .{ .whole = plan.reqs.items.len };
-            try plan.reqs.append(self.arena, .{ .span = sp });
+            try plan.reqs.append(self.scratch, .{ .span = sp });
         }
         return plan;
+    }
+
+    /// Read the dictionary pages of `wave` and record every key none of them holds.
+    fn probeDictionaries(self: *Probing, wave: []const *Target) !void {
+        const a = self.scratch;
+        // A dictionary page whose length the footer does not give costs a header read first.
+        const spans = try a.alloc(?Span, wave.len);
+        var heads: std.ArrayList(Req) = .empty;
+        var head_of: std.ArrayList(usize) = .empty;
+        for (wave, spans, 0..) |t, *s, i| {
+            const ds = dictSpan(t, self.metas).?;
+            s.* = if (ds.end != ds.start) ds else null;
+            if (ds.end == ds.start) {
+                const head: Span = .{ .file = ds.file, .start = ds.start, .end = ds.start + page_header_probe };
+                try heads.append(a, .{ .span = head });
+                try head_of.append(a, i);
+            }
+        }
+        try readAll(a, self.src, heads.items, self.stats);
+        for (heads.items, head_of.items) |r, i| {
+            const len = dictionaryPageLen(r.out) orelse continue;
+            spans[i] = .{ .file = r.span.file, .start = r.span.start, .end = r.span.start + len };
+        }
+        var reqs: std.ArrayList(Req) = .empty;
+        const req_of = try a.alloc(?usize, wave.len);
+        for (spans, req_of) |s, *ri| {
+            ri.* = null;
+            const sp = s orelse continue;
+            ri.* = reqs.items.len;
+            try reqs.append(a, .{ .span = sp });
+        }
+        try readAll(a, self.src, reqs.items, self.stats);
+
+        var want: std.ArrayList([]const u8) = .empty;
+        for (wave, req_of) |t, ri| {
+            const page = reqs.items[ri orelse continue].out;
+            const cm = t.chunk(self.metas).meta_data.?;
+            const values = dictionaryValues(a, page, cm.codec) orelse continue;
+            self.stats.dictionaries += 1;
+            // Every form of every key still open, sorted so each entry costs one binary search.
+            want.clearRetainingCapacity();
+            for (t.keys.items) |*k| {
+                if (isAbsent(t, k)) continue;
+                for (0..k.n) |fi| try want.append(a, k.form(fi));
+            }
+            std.mem.sort([]const u8, want.items, {}, bytesLess);
+            // Distinct, so the entry a form is found at is the one it is looked up at.
+            var n: usize = 0;
+            for (want.items) |w| {
+                if (n > 0 and std.mem.eql(u8, want.items[n - 1], w)) continue;
+                want.items[n] = w;
+                n += 1;
+            }
+            want.shrinkRetainingCapacity(n);
+            const found = try a.alloc(bool, want.items.len);
+            @memset(found, false);
+            const slot = chunkSlot(t.rowGroup(self.metas), t.col, &self.metas[t.file]) orelse continue;
+            if (!scanDictionary(values.bytes, values.count, slot, want.items, found)) continue;
+            for (t.keys.items) |*k| {
+                if (isAbsent(t, k)) continue;
+                const held = for (0..k.n) |fi| {
+                    const at = std.sort.binarySearch([]const u8, want.items, k.form(fi), orderBytes).?;
+                    if (found[at]) break true;
+                } else false;
+                if (!held) try t.absent.append(self.arena, k.form(0));
+            }
+        }
     }
 
     /// The blocks the keys select in each filter of known length, located through the canonical header, plus one real
     /// header per file not yet verified to check that location by. Filters it cannot locate stay whole; null when it
     /// locates none.
     fn sparsePlan(self: *Probing, wave: []const *Target, spans: []const ?Span, fetch: []const Fetch) !?ReadPlan {
-        const a = self.arena;
+        const a = self.scratch;
         var plan: ReadPlan = .{ .fetch = try a.dupe(Fetch, fetch) };
         const header_asked = try a.alloc(bool, self.metas.len);
         @memset(header_asked, false);
@@ -1041,7 +1280,7 @@ test "parquet-testing bloom fixtures: present strings keep the row group, absent
         for ([_][]const u8{ "'Hello'", "'doing '", "'dog'", "'the lazy'" }) |v| {
             for (rg.columns.items) |*c| c.absent = &.{};
             const f = try parser.parse(a, try std.fmt.allocPrint(a, "String = {s}", .{v}), &metas[0], null);
-            const st = try load(a, f, &metas, mapped.source(), .{});
+            const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
             try testing.expectEqual(@as(usize, 1), st.filters);
             try testing.expect(prune.pruneRowGroup(rg, f, &metas[0]) != .skip);
         }
@@ -1049,7 +1288,7 @@ test "parquet-testing bloom fixtures: present strings keep the row group, absent
         for ([_][]const u8{ "'hello'", "'doing'", "'cat'", "'zzz'", "''", "'Hello '", "'brown'", "'fox'" }) |v| {
             for (rg.columns.items) |*c| c.absent = &.{};
             const f = try parser.parse(a, try std.fmt.allocPrint(a, "String = {s}", .{v}), &metas[0], null);
-            const st = try load(a, f, &metas, mapped.source(), .{});
+            const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
             if (prune.pruneRowGroup(rg, f, &metas[0]) == .skip) pruned += 1;
             try testing.expect(st.row_groups_bloom <= 1);
         }
@@ -1068,7 +1307,7 @@ test "parquet-testing bloom fixtures: present strings keep the row group, absent
         for (cases) |c| {
             for (rg.columns.items) |*ch| ch.absent = &.{};
             const f = try parser.parse(a, c.e, &metas[0], null);
-            _ = try load(a, f, &metas, mapped.source(), .{});
+            _ = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
             testing.expectEqual(c.skip, prune.pruneRowGroup(rg, f, &metas[0]) == .skip) catch |err| {
                 std.debug.print("{s}: {s}\n", .{ path, c.e });
                 return err;
@@ -1174,7 +1413,7 @@ test "remote: big filters are read by block, each file's layout verified, and ev
     // A medium where requests are cheap next to bytes (think local NVMe through io_uring).
     var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = .{ .request_bytes = 4 << 10, .concurrency = 8 } };
     const f = try parser.parse(a, "c = 'k7-123'", &metas[0], null);
-    const st = try load(a, f, &metas, remote.source(), .{});
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
     try testing.expect(!st.bloom_stopped);
     try testing.expect(remote.bytes < 64 << 10);
     // One block per filter, the first file header verified alongside (merged into a neighbouring block's request).
@@ -1194,7 +1433,7 @@ test "remote: big filters are read by block, each file's layout verified, and ev
         c.absent = &.{};
     };
     var s3ish: FakeRemote = .{ .files = &.{sf.bytes} };
-    _ = try load(a, f, &metas, s3ish.source(), .{});
+    _ = try load(a, testing.allocator, f, &metas, s3ish.source(), .{});
     try testing.expect(s3ish.requests <= 20 and s3ish.block_reads < 32);
 
     // The same through a mapped source: whole filters, the same answers.
@@ -1203,7 +1442,7 @@ test "remote: big filters are read by block, each file's layout verified, and ev
     const sf2 = try SynthFile.init(arena2.allocator(), 40, 200_000);
     const metas2 = [_]schema.FileMetaData{sf2.meta};
     const mapped: MappedSource = .{ .files = &.{sf2.bytes} };
-    _ = try load(arena2.allocator(), f, &metas2, mapped.source(), .{});
+    _ = try load(arena2.allocator(), testing.allocator, f, &metas2, mapped.source(), .{});
     for (metas[0].row_groups.items, metas2[0].row_groups.items) |*x, *y|
         try testing.expectEqual(prune.pruneRowGroup(x, f, &metas[0]), prune.pruneRowGroup(y, f, &metas2[0]));
 }
@@ -1218,7 +1457,7 @@ test "remote: a forged header layout voids the blocks it located" {
     const metas = [_]schema.FileMetaData{sf.meta};
     var remote: FakeRemote = .{ .files = &.{sf.bytes} };
     const f = try parser.parse(a, "c = 'zz-not-there'", &metas[0], null);
-    _ = try load(a, f, &metas, remote.source(), .{});
+    _ = try load(a, testing.allocator, f, &metas, remote.source(), .{});
     for (metas[0].row_groups.items) |*rg| try testing.expect(prune.pruneRowGroup(rg, f, &metas[0]) != .skip);
 }
 
@@ -1238,7 +1477,7 @@ test "remote: a first wave that prunes nothing leaves the other filters unread" 
     const metas = [_]schema.FileMetaData{sf.meta};
     var remote: FakeRemote = .{ .files = &.{sf.bytes} };
     const f = try parser.parse(a, "c = 'k1-1'", &metas[0], null);
-    const st = try load(a, f, &metas, remote.source(), .{});
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
     try testing.expect(st.bloom_stopped);
     try testing.expectEqual(@as(usize, 8), st.filters);
     // In memory, every filter is probed: there is nothing to save.
@@ -1248,7 +1487,113 @@ test "remote: a first wave that prunes nothing leaves the other filters unread" 
     for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*c| {
         c.absent = &.{};
     };
-    const st2 = try load(arena2.allocator(), f, &metas, mapped.source(), .{});
+    const st2 = try load(arena2.allocator(), testing.allocator, f, &metas, mapped.source(), .{});
     try testing.expect(!st2.bloom_stopped);
     try testing.expectEqual(@as(usize, 64), st2.filters);
+}
+
+fn pageStat(page: schema.PageType, enc: schema.Encoding, count: i32) schema.PageEncodingStats {
+    return .{ .page_type = @intFromEnum(page), .encoding = @intFromEnum(enc), .count = count };
+}
+
+test "dictionaryCoversChunk: encoding_stats decide; without them only the v1 signature does" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const S = schema.PageEncodingStats;
+    const dict = pageStat(.DICTIONARY_PAGE, .PLAIN, 1);
+    const Case = struct { stats: ?[]const S, encodings: []const schema.Encoding, covers: bool };
+    const cases = [_]Case{
+        .{ .stats = &.{ dict, pageStat(.DATA_PAGE, .RLE_DICTIONARY, 3) }, .encodings = &.{}, .covers = true },
+        .{ .stats = &.{ dict, pageStat(.DATA_PAGE_V2, .PLAIN_DICTIONARY, 3) }, .encodings = &.{}, .covers = true },
+        // Fell back to PLAIN partway: the dictionary covers only the first pages.
+        .{
+            .stats = &.{ dict, pageStat(.DATA_PAGE, .RLE_DICTIONARY, 3), pageStat(.DATA_PAGE, .PLAIN, 2) },
+            .encodings = &.{},
+            .covers = false,
+        },
+        // No dictionary page, no data page, or a page type from the future.
+        .{ .stats = &.{pageStat(.DATA_PAGE, .RLE_DICTIONARY, 3)}, .encodings = &.{}, .covers = false },
+        .{ .stats = &.{dict}, .encodings = &.{}, .covers = false },
+        .{
+            .stats = &.{ dict, .{ .page_type = 9, .encoding = 8, .count = 1 } },
+            .encodings = &.{},
+            .covers = false,
+        },
+        // No stats: parquet-java's v1 signature says it all, a v2 chunk cannot.
+        .{ .stats = null, .encodings = &.{ .PLAIN_DICTIONARY, .RLE, .BIT_PACKED }, .covers = true },
+        .{ .stats = null, .encodings = &.{ .PLAIN_DICTIONARY, .PLAIN, .RLE }, .covers = false },
+        .{ .stats = null, .encodings = &.{ .PLAIN, .RLE, .RLE_DICTIONARY }, .covers = false },
+    };
+    for (cases) |c| {
+        var cm = (try test_fixtures.StatsColumn.init(a, plain(.INT32), .{})).rg.columns.items[0].meta_data.?;
+        try cm.encodings.appendSlice(a, c.encodings);
+        if (c.stats) |st| {
+            var list: std.ArrayListUnmanaged(S) = .empty;
+            try list.appendSlice(a, st);
+            cm.encoding_stats = list;
+        }
+        try testing.expectEqual(c.covers, dictionaryCoversChunk(&cm));
+    }
+}
+
+test "dictionaries prune what statistics and Bloom filters cannot, and compose with them" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // tools/gen_bloom_fixture.py: group g's `cat` holds "a-g", "m-g", "z-g" (dictionary-encoded, no Bloom filter,
+    // bounds "a-g".."z-g" so statistics keep every group); `id` holds even numbers, with Bloom filters.
+    const fx = try openFixture(a, "ci/fixtures/parquet/bloom_keys.parquet");
+    const metas = [_]schema.FileMetaData{fx.meta};
+    const mapped: MappedSource = .{ .files = &.{fx.bytes} };
+    const Case = struct { e: []const u8, kept: []const usize, dict: usize };
+    const cases = [_]Case{
+        .{ .e = "cat = 'm-3'", .kept = &.{3}, .dict = 7 },
+        .{ .e = "cat = 'q-3'", .kept = &.{}, .dict = 8 },
+        .{ .e = "cat IN ('m-3', 'z-5')", .kept = &.{ 3, 5 }, .dict = 6 },
+        .{ .e = "cat = 'm-3' OR cat = 'a-6'", .kept = &.{ 3, 6 }, .dict = 6 },
+        // AND: the Bloom filter rules out every group for the odd id first; the dictionaries are never needed.
+        .{ .e = "cat = 'm-3' AND id = 1001", .kept = &.{}, .dict = 0 },
+        .{ .e = "cat != 'm-3'", .kept = &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, .dict = 0 },
+    };
+    for (cases) |c| {
+        for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*ch| {
+            ch.absent = &.{};
+        };
+        const f = try parser.parse(a, c.e, &metas[0], null);
+        const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
+        for (metas[0].row_groups.items, 0..) |*rg, i| {
+            const keep = std.mem.indexOfScalar(usize, c.kept, i) != null;
+            testing.expectEqual(keep, prune.pruneRowGroup(rg, f, &metas[0]) != .skip) catch |err| {
+                std.debug.print("{s}: row group {d}\n", .{ c.e, i });
+                return err;
+            };
+        }
+        try testing.expectEqual(c.dict, st.row_groups_dict);
+    }
+}
+
+test "zpq's own dictionary chunks say they cover their values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const encoder = @import("../writer/encoder.zig");
+    var vals: [1000][]const u8 = undefined;
+    for (&vals, 0..) |*v, i| v.* = ([_][]const u8{ "red", "green", "blue" })[i % 3];
+    const elem = plain(.BYTE_ARRAY);
+    const enc = try encoder.encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &vals } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"c"},
+        .codec = .SNAPPY,
+    });
+    try testing.expect(enc.meta.dictionary_page_offset != null);
+    try testing.expect(dictionaryCoversChunk(&enc.meta));
+    // And the page decodes back to exactly those three entries.
+    const values = dictionaryValues(a, enc.bytes, .SNAPPY) orelse return error.TestUnexpectedResult;
+    const want = [_][]const u8{ "blue", "green", "purple", "red" };
+    var found: [4]bool = @splat(false);
+    const slot: Slot = .{ .physical = .BYTE_ARRAY, .type_length = null };
+    try testing.expect(scanDictionary(values.bytes, values.count, slot, &want, &found));
+    try testing.expectEqualSlices(bool, &.{ true, true, false, true }, &found);
 }

@@ -1441,7 +1441,7 @@ fn loadLocalMembership(
     }
     if (local_metas.items.len == 0) return .{};
     const mapped: membership.MappedSource = .{ .files = local_bytes.items };
-    return membership.load(arena, f, local_metas.items, mapped.source(), .{});
+    return membership.load(arena, opened.gpa, f, local_metas.items, mapped.source(), .{});
 }
 
 fn materializeMetas(
@@ -1611,7 +1611,7 @@ fn openInputs(
         if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
             var src: S3Membership = .{ .ctx = read_ctx, .creds = creds, .pool = pool, .specs = specs };
-            membership_stats = try membership.load(arena, f, metas_for_plan, src.source(), .{});
+            membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
         };
 
         // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
@@ -2589,12 +2589,15 @@ pub fn writeJsonFloat(writer: anytype, f: f64) !void {
 
 /// One aggregate result as a JSON value. The CLI and Lambda responses both go through here so they escape strings and
 /// spell NULL and NaN the same way.
-/// `"bloom":{...}`: what Bloom filter probing read, and the row groups it ruled out beyond statistics (already counted
-/// in `row_groups_pruned`).
+/// `"membership":{...}`: what Bloom filter and dictionary probing read, and the row groups each ruled out beyond
+/// statistics (already counted in `row_groups_pruned`).
 pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
-        "\"bloom\":{{\"row_groups_pruned\":{d},\"filters\":{d},\"requests\":{d},\"bytes\":{d},\"stopped\":{},\"us\":{d}}}",
-        .{ s.row_groups_bloom, s.filters, s.requests, s.bytes, s.bloom_stopped, s.ns / std.time.ns_per_us },
+        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"us\":{d}}}",
+        .{
+            s.row_groups_bloom, s.row_groups_dict, s.filters,      s.dictionaries,               s.requests,
+            s.bytes,            s.bloom_stopped,   s.dict_stopped, s.ns / std.time.ns_per_us,
+        },
     );
 }
 

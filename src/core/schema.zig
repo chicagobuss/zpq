@@ -790,6 +790,41 @@ pub const Statistics = struct {
     }
 };
 
+/// One `PageEncodingStats` entry: how many pages of a type a chunk holds in an encoding. Kept as the raw values, so
+/// a page type or encoding this reader does not know cannot fail the footer.
+pub const PageEncodingStats = struct {
+    page_type: i32,
+    encoding: i32,
+    count: i32,
+
+    fn read(reader: *thrift.Reader) !PageEncodingStats {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+        var s: PageEncodingStats = .{ .page_type = -1, .encoding = -1, .count = 0 };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => s.page_type = try reader.readZigZag(i32),
+                2 => s.encoding = try reader.readZigZag(i32),
+                3 => s.count = try reader.readZigZag(i32),
+                else => try reader.skip(field.type),
+            }
+        }
+        return s;
+    }
+
+    fn write(self: *const PageEncodingStats, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        try writer.writeFieldI32(1, self.page_type);
+        try writer.writeFieldI32(2, self.encoding);
+        try writer.writeFieldI32(3, self.count);
+        try writer.writeStructEnd();
+    }
+};
+
 pub const ColumnMetaData = struct {
     type: Type,
     encodings: EncodingList,
@@ -802,6 +837,9 @@ pub const ColumnMetaData = struct {
     index_page_offset: ?i64,
     dictionary_page_offset: ?i64,
     statistics: ?Statistics = null,
+    /// Field 13: the chunk's pages by type and encoding. It is what tells a dictionary that covers every value from one
+    /// a writer abandoned partway; a byte copy keeps the pages, so it keeps these too.
+    encoding_stats: ?std.ArrayListUnmanaged(PageEncodingStats) = null,
     /// Fields 14/15: where the chunk's split-block Bloom filter (header and bitset) lies in the file. Older
     /// parquet-java leaves the length out. A copy that moves the chunk must move or drop these with it.
     bloom_filter_offset: ?i64 = null,
@@ -827,6 +865,7 @@ pub const ColumnMetaData = struct {
         };
         errdefer meta.encodings.deinit(allocator);
         errdefer meta.path_in_schema.deinit(allocator);
+        errdefer if (meta.encoding_stats) |*es| es.deinit(allocator);
 
         reader.readStructBegin();
         while (true) {
@@ -881,6 +920,20 @@ pub const ColumnMetaData = struct {
                     meta.dictionary_page_offset = if (dpo >= 4) dpo else null;
                 },
                 12 => meta.statistics = try Statistics.read(reader),
+                13 => {
+                    const header = try reader.readByte();
+                    var size = @as(usize, header >> 4);
+                    if (size == 0xF) size = try reader.readVarInt(usize);
+                    var list: std.ArrayListUnmanaged(PageEncodingStats) = .empty;
+                    errdefer list.deinit(allocator);
+                    try list.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(PageEncodingStats, size, reader.remaining()),
+                    );
+                    for (0..size) |_| try list.append(allocator, try PageEncodingStats.read(reader));
+                    if (meta.encoding_stats) |*old| old.deinit(allocator);
+                    meta.encoding_stats = list;
+                },
                 // A malformed location reads as no filter, never as a footer error.
                 14 => if (field.type == .I64) {
                     meta.bloom_filter_offset = try reader.readZigZag(i64);
@@ -896,6 +949,7 @@ pub const ColumnMetaData = struct {
 
     pub fn deinit(self: *ColumnMetaData, allocator: std.mem.Allocator) void {
         self.encodings.deinit(allocator);
+        if (self.encoding_stats) |*es| es.deinit(allocator);
         // Note: strings in path_in_schema are slices into the footer buffer, not owned.
         self.path_in_schema.deinit(allocator);
     }
@@ -923,6 +977,10 @@ pub const ColumnMetaData = struct {
         if (self.statistics) |*s| {
             try writer.writeFieldBegin(.Struct, 12);
             try s.write(writer);
+        }
+        if (self.encoding_stats) |es| {
+            try writer.writeFieldListBegin(13, .Struct, es.items.len);
+            for (es.items) |*e| try e.write(writer);
         }
         if (self.bloom_filter_offset) |v| try writer.writeFieldI64(14, v);
         if (self.bloom_filter_length) |v| try writer.writeFieldI32(15, v);

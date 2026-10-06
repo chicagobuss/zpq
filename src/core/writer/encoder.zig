@@ -245,9 +245,24 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .index_page_offset = null,
         .dictionary_page_offset = null,
         .statistics = stats,
+        .encoding_stats = try pageStats(arena, &.{.{ .page_type = .DATA_PAGE, .encoding = values_encoding }}),
     };
 
     return .{ .bytes = total, .meta = meta };
+}
+
+/// `encoding_stats` for a chunk of one page per entry.
+fn pageStats(
+    arena: std.mem.Allocator,
+    pages: []const struct { page_type: schema.PageType, encoding: schema.Encoding },
+) Error!std.ArrayListUnmanaged(schema.PageEncodingStats) {
+    var out: std.ArrayListUnmanaged(schema.PageEncodingStats) = .empty;
+    for (pages) |p| try out.append(arena, .{
+        .page_type = @intFromEnum(p.page_type),
+        .encoding = @intFromEnum(p.encoding),
+        .count = 1,
+    });
+    return out;
 }
 
 /// PLAIN-encode a FIXED_LEN_BYTE_ARRAY-backed DECIMAL column from its
@@ -370,6 +385,7 @@ pub fn encodeDecimalFlba(
         .index_page_offset = null,
         .dictionary_page_offset = null,
         .statistics = stats,
+        .encoding_stats = try pageStats(arena, &.{.{ .page_type = .DATA_PAGE, .encoding = .PLAIN }}),
     };
     return .{ .bytes = total, .meta = meta };
 }
@@ -627,6 +643,11 @@ fn finishDictionaryColumn(
         .dictionary_page_offset = 0,
         .index_page_offset = null,
         .statistics = computeStats(arena, in.values, def_levels, max_def, in.schema_elem),
+        // Every value is in the dictionary: readers may prune row groups on it.
+        .encoding_stats = try pageStats(arena, &.{
+            .{ .page_type = .DICTIONARY_PAGE, .encoding = .PLAIN },
+            .{ .page_type = .DATA_PAGE, .encoding = .PLAIN_DICTIONARY },
+        }),
     } };
 }
 

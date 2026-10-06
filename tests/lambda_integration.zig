@@ -1028,12 +1028,15 @@ test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" 
     var child = try spawnLambdaForS3(a, endpoint, &s3);
     defer killChild(&child);
 
-    const Case = struct { filter: []const u8, kept: i64 };
+    // `cat` has no Bloom filter but every chunk is dictionary-encoded: the dictionaries prune it, read afresh each
+    // time (only filters are kept warm).
+    const Case = struct { filter: []const u8, kept: i64, by: []const u8 = "bloom_pruned" };
     for ([_]Case{
         .{ .filter = "id = 1000", .kept = 1 },
         .{ .filter = "id = 1001", .kept = 0 },
         .{ .filter = "s = 'key-001000'", .kept = 1 },
         .{ .filter = "id IN (1001, 1003, 1000)", .kept = 1 },
+        .{ .filter = "cat = 'm-3'", .kept = 1, .by = "dict_pruned" },
     }, 0..) |c, ci| {
         const agg = "\"aggregate\":\"count(*) AS n, sum(x) AS sx\"";
         const local_body = try std.fmt.allocPrint(
@@ -1057,11 +1060,12 @@ test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" 
             defer a.free(resp);
             const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
             defer parsed.deinit();
-            const bloom = parsed.value.object.get("bloom") orelse return error.TestUnexpectedResult;
-            const pruned = bloom.object.get("row_groups_pruned").?.integer;
-            const requests = bloom.object.get("requests").?.integer;
+            const m = parsed.value.object.get("membership") orelse return error.TestUnexpectedResult;
+            const pruned = m.object.get(c.by).?.integer;
+            const requests = m.object.get("requests").?.integer;
+            const warm = std.mem.eql(u8, c.by, "bloom_pruned");
             const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and pruned == 8 - c.kept and
-                (i < 2 or requests == 0) and (ci > 0 or i > 0 or requests > 0);
+                (i < 2 or (requests == 0) == warm) and (ci > 0 or i > 0 or requests > 0);
             if (!ok) {
                 std.debug.print("[s3 bloom] {s} invocation {d}: {s}\n  want {s}\n", .{ c.filter, i, resp, want });
                 return error.TestUnexpectedResult;

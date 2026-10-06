@@ -979,6 +979,7 @@ fn cloneColumnMeta(
         .index_page_offset = src.index_page_offset,
         .dictionary_page_offset = src.dictionary_page_offset,
         .statistics = stats,
+        .encoding_stats = if (src.encoding_stats) |es| try es.clone(arena) else null,
     };
 }
 

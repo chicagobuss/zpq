@@ -141,7 +141,7 @@ pub fn compute(gpa: std.mem.Allocator, p: *const profile.Profiler) !Summary {
     var s: Summary = .{};
     s.usage = p.usage_end.sub(p.usage_start);
     s.dropped = p.dropped();
-    s.peak_rss = @intCast(@max(0, p.peak(.rss_bytes)));
+    s.peak_rss = p.peak_rss;
     s.peak_requests_in_flight = @intCast(@max(0, p.peak(.requests_in_flight)));
     s.peak_bytes_in_flight = @intCast(@max(0, p.peak(.bytes_in_flight)));
     s.peak_buffered_bytes = @intCast(@max(0, p.peak(.buffered_bytes)));
@@ -437,6 +437,14 @@ fn tail(s: []const u8, n: usize) []const u8 {
     return profile.utf8Suffix(s, n);
 }
 
+fn rssLabel(scope: profile.RssScope) []const u8 {
+    return switch (scope) {
+        .run => "this run",
+        .sampled => "sampled",
+        .process => "process lifetime",
+    };
+}
+
 /// An encoding's name short enough for the chunk table.
 fn shortEncoding(v: u64) []const u8 {
     const e = std.enums.fromInt(schema.Encoding, v) orelse return "?";
@@ -457,9 +465,10 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     const cores = ratio(s.usage.user_ns + s.usage.sys_ns, s.total_ns);
     try w.print("zpq profile: {d:.2} ms wall, {d} threads, {d} events", .{ ms(s.total_ns), s.threads, s.events });
     if (s.dropped > 0) try w.print(" ({d} DROPPED)", .{s.dropped});
-    try w.print("\n  cpu user {d:.1} ms, sys {d:.1} ms ({d:.1} cores); rss peak {d:.0} MB; {d} minor faults\n", .{
-        ms(s.usage.user_ns), ms(s.usage.sys_ns), cores, mb(@max(s.peak_rss, s.usage.max_rss)), s.usage.minor_faults,
+    try w.print("\n  cpu user {d:.1} ms, sys {d:.1} ms ({d:.1} cores); {d} minor faults\n", .{
+        ms(s.usage.user_ns), ms(s.usage.sys_ns), cores, s.usage.minor_faults,
     });
+    try w.print("  rss peak {d:.0} MB ({s})\n", .{ mb(s.peak_rss), rssLabel(p.peak_rss_scope) });
     const m = p.meta;
     const lambda = if (m.on_lambda) ", on Lambda" else "";
     try w.print("  {s} {s} {s}, {d} cpus, parallelism {d}{s}\n", .{
@@ -603,7 +612,8 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     {
         var cpu = try o.object("cpu");
         try cpu.ints(s.usage);
-        try cpu.int("peak_rss", @max(s.peak_rss, s.usage.max_rss));
+        try cpu.int("peak_rss", s.peak_rss);
+        try cpu.str("peak_rss_scope", @tagName(p.peak_rss_scope));
         try cpu.end();
     }
     try o.key("meta");

@@ -356,8 +356,6 @@ pub const Usage = struct {
     sys_ns: u64 = 0,
     minor_faults: u64 = 0,
     major_faults: u64 = 0,
-    /// Peak resident set, bytes.
-    max_rss: u64 = 0,
 
     pub fn sub(a: Usage, b: Usage) Usage {
         return .{
@@ -365,10 +363,54 @@ pub const Usage = struct {
             .sys_ns = a.sys_ns -| b.sys_ns,
             .minor_faults = a.minor_faults -| b.minor_faults,
             .major_faults = a.major_faults -| b.major_faults,
-            .max_rss = a.max_rss,
         };
     }
 };
+
+/// What a run's `peak_rss` measures. A process's own high-water mark (`getrusage`, `VmHWM`) spans its whole life, so
+/// on a warm Lambda it would report an earlier invocation's peak; only a reset makes it this run's.
+pub const RssScope = enum {
+    /// `VmHWM` after resetting it at the start of the run (`/proc/self/clear_refs`): this run's exact peak.
+    run,
+    /// The highest RSS sample of this run: a lower bound, which can miss a spike shorter than the sampling period.
+    sampled,
+    /// The process's lifetime peak (`getrusage`), where neither of the above is available.
+    process,
+};
+
+/// Reset this process's RSS high-water mark (`VmHWM`) to its current RSS. False where the kernel refuses or has no
+/// such file.
+fn resetPeakRss() bool {
+    if (builtin.os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/clear_refs", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.write(fd, "5", 1);
+    return linux.errno(n) == .SUCCESS and n == 1;
+}
+
+/// `VmHWM` from /proc/self/status, bytes; 0 where unavailable.
+fn peakRssSinceReset() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = linux.read(fd, buf[len..].ptr, buf.len - len);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        len += n;
+    }
+    const at = std.mem.indexOf(u8, buf[0..len], "VmHWM:") orelse return 0;
+    var fields = std.mem.tokenizeAny(u8, buf[at + "VmHWM:".len .. len], " \t\n");
+    const kb = std.fmt.parseInt(u64, fields.next() orelse return 0, 10) catch return 0;
+    return kb * 1024;
+}
 
 /// This process's usage, or (Linux only) the calling thread's.
 pub fn usage(comptime who: enum { process, thread }) Usage {
@@ -382,15 +424,21 @@ pub fn usage(comptime who: enum { process, thread }) Usage {
             return sec * std.time.ns_per_s + usec * std.time.ns_per_us;
         }
     }.f;
-    // Linux reports maxrss in KiB, macOS in bytes.
-    const rss_unit: u64 = if (builtin.os.tag == .linux) 1024 else 1;
     return .{
         .user_ns = tvNs(ru.utime),
         .sys_ns = tvNs(ru.stime),
         .minor_faults = @intCast(@max(0, ru.minflt)),
         .major_faults = @intCast(@max(0, ru.majflt)),
-        .max_rss = @as(u64, @intCast(@max(0, ru.maxrss))) * rss_unit,
     };
+}
+
+/// The process's lifetime peak RSS from `getrusage`, bytes.
+fn lifetimePeakRss() u64 {
+    if (builtin.os.tag == .windows) return 0;
+    const ru = std.posix.getrusage(0);
+    // Linux reports maxrss in KiB, macOS in bytes.
+    const rss_unit: u64 = if (builtin.os.tag == .linux) 1024 else 1;
+    return @as(u64, @intCast(@max(0, ru.maxrss))) * rss_unit;
 }
 
 /// Current resident set from /proc/self/statm; 0 where that does not exist.
@@ -429,6 +477,10 @@ pub const Profiler = struct {
     meta: Meta = .{},
     usage_start: Usage = .{},
     usage_end: Usage = .{},
+    /// Set by `finish`; see `RssScope`.
+    peak_rss: u64 = 0,
+    peak_rss_scope: RssScope = .process,
+    rss_reset: bool = false,
     sampler: ?std.Thread = null,
     /// Nonzero once `finish` runs; the sampler sleeps on it as a futex so finishing never waits out a period.
     stop: std.atomic.Value(u32) = .init(0),
@@ -447,6 +499,7 @@ pub const Profiler = struct {
         p.meta = meta;
         p.meta.query = p.arena.allocator().dupe(u8, meta.query) catch "";
         p.usage_start = usage(.process);
+        p.rss_reset = resetPeakRss();
         if (p.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(currentRss()));
         if (options.sample_interval_ns > 0) {
             // Not smaller: glibc carves static TLS out of the stack and rejects a stack too small to hold it.
@@ -465,6 +518,18 @@ pub const Profiler = struct {
         self.end_ns = clock.monoNs();
         self.usage_end = usage(.process);
         if (self.thread(.main)) |t| t.gaugeSet(.rss_bytes, @intCast(currentRss()));
+        const sampled: u64 = @intCast(@max(0, self.peak(.rss_bytes)));
+        const hwm = if (self.rss_reset) peakRssSinceReset() else 0;
+        if (hwm > 0) {
+            self.peak_rss = @max(hwm, sampled);
+            self.peak_rss_scope = .run;
+        } else if (sampled > 0) {
+            self.peak_rss = sampled;
+            self.peak_rss_scope = .sampled;
+        } else {
+            self.peak_rss = lifetimePeakRss();
+            self.peak_rss_scope = .process;
+        }
     }
 
     pub fn destroy(self: *Profiler) void {
@@ -953,4 +1018,29 @@ test "the RSS sampler keeps its own ring: it never spends the event budget and t
     const step = evs[1].start - evs[0].start;
     for (evs[1..], evs[0 .. evs.len - 1]) |b, a| try testing.expectEqual(step, b.start - a.start);
     try testing.expectEqual(last, evs[evs.len - 1].start);
+}
+
+test "peak RSS is this run's, not the process's: a later run does not inherit an earlier peak" {
+    if (!enabled or builtin.os.tag != .linux) return error.SkipZigTest;
+    const big = 96 << 20;
+    var peaks: [2]u64 = undefined;
+    for (&peaks, 0..) |*peak, run| {
+        const p = try Profiler.create(testing.allocator, .{ .sample_interval_ns = 0 }, .{});
+        defer p.destroy();
+        if (run == 0) {
+            // Touch every page so it is resident, then give it back before the run ends.
+            const buf = try std.heap.page_allocator.alloc(u8, big);
+            @memset(buf, 1);
+            std.mem.doNotOptimizeAway(buf.ptr);
+            std.heap.page_allocator.free(buf);
+        }
+        p.finish();
+        try testing.expect(p.peak_rss > 0);
+        if (p.peak_rss_scope == .process) return error.SkipZigTest;
+        if (run == 0 and p.peak_rss_scope == .run) try testing.expect(p.peak_rss >= big);
+        peak.* = p.peak_rss;
+    }
+    // The second, warm run must not report the first one's peak; the first saw the buffer when the reset works.
+    try testing.expect(peaks[1] < currentRss() + big / 2);
+    if (peaks[1] < peaks[0]) try testing.expect(peaks[0] - peaks[1] > big / 2);
 }

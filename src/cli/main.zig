@@ -42,9 +42,11 @@ const usage_text =
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats] [--fast-levels]
     \\            [--format csv|jsonl] [--limit N]
+    \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--scan-all] [--trust-stats]
+    \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq schema <file.parquet>
     \\  zpq conform <file.parquet>
     \\
@@ -73,6 +75,13 @@ const usage_text =
     \\                 shrink what a query may use. Partly-used blocks can
     \\                 collectively strand at most ~5% of the budget, so give
     \\                 it headroom rather than tuning to the exact byte.
+    \\  --profile      write a Chrome Trace Event JSON trace of the query
+    \\                 (open it at https://ui.perfetto.dev): per-thread spans
+    \\                 for every phase, in-flight counters, RSS.
+    \\  --profile-summary
+    \\                 print a compact profile summary to stderr: time per
+    \\                 phase, critical path, costliest column chunks, I/O and
+    \\                 pruning counts. `=json` prints it as one JSON line.
     \\
 ;
 
@@ -264,6 +273,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var group_by: ?[]const u8 = null;
     var select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null;
     var column_order: ?[]const u8 = null;
+    var profile_out: ProfileOut = .{};
 
     while (iter.next()) |tok| {
         if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
@@ -376,6 +386,17 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 std.debug.print("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--profile")) {
+            profile_out.trace_path = iter.next() orelse {
+                std.debug.print("zpq query: --profile requires a path\n", .{});
+                return error.BadArgs;
+            };
+        } else if (std.mem.eql(u8, tok, "--profile-summary") or std.mem.startsWith(u8, tok, "--profile-summary=")) {
+            const v = if (tok.len > "--profile-summary".len) tok["--profile-summary=".len..] else "text";
+            profile_out.summary = std.meta.stringToEnum(ProfileOut.Format, v) orelse {
+                std.debug.print("zpq query: invalid --profile-summary format: {s} (supported: text, json)\n", .{v});
+                return error.BadArgs;
+            };
         } else if (std.mem.startsWith(u8, tok, "-")) {
             std.debug.print("zpq query: unrecognized option: {s}\n", .{tok});
             return error.BadArgs;
@@ -467,6 +488,18 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     const inputs = inputs_list.items;
     const max_mem_limit = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
 
+    var profiler: ?*zpq.profile.Profiler = null;
+    defer if (profiler) |p| p.destroy();
+    if (profile_out.wanted()) {
+        if (comptime !zpq.profile.enabled) {
+            std.debug.print("zpq query: this build has no profiler (built with -Dprofile=false)\n", .{});
+            return error.BadArgs;
+        }
+        var meta = zpq.profile.Meta.discover(env);
+        meta.query = try commandLine(arena, init.minimal.args);
+        profiler = try zpq.profile.Profiler.create(gpa, .{}, meta);
+    }
+
     if (format) |fmt| {
         const cols = if (columns_csv) |csv|
             try splitCsv(arena, csv)
@@ -492,7 +525,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .select_cols = select_cols,
             .column_order = column_order,
             .diag = diag,
+            .profiler = profiler,
         }, fmt, limit);
+        if (profiler) |p| try profile_out.emit(gpa, p);
         return;
     }
 
@@ -519,6 +554,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .select_cols = select_cols,
             .column_order = column_order,
             .diag = diag,
+            .profiler = profiler,
         });
         defer result.deinit(gpa);
         const ar = result.aggregate;
@@ -588,6 +624,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 ar.timings.core.encode_ns / std.time.ns_per_ms,
             },
         );
+        if (profiler) |p| try profile_out.emit(gpa, p);
         return;
     }
 
@@ -619,6 +656,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .fast_levels = fast_levels,
         .max_memory = max_mem_limit,
         .diag = diag,
+        .profiler = profiler,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
@@ -654,6 +692,71 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         result.timings.core.sink_ns / std.time.ns_per_ms,
         result.timings.footer_ns / std.time.ns_per_ms,
     });
+    if (profiler) |p| {
+        w.flush();
+        try profile_out.emit(gpa, p);
+    }
+}
+
+/// Where `--profile` and `--profile-summary` send a finished profile.
+const ProfileOut = struct {
+    trace_path: ?[]const u8 = null,
+    summary: ?Format = null,
+
+    const Format = enum { text, json };
+
+    fn wanted(self: ProfileOut) bool {
+        return self.trace_path != null or self.summary != null;
+    }
+
+    fn emit(self: ProfileOut, gpa: std.mem.Allocator, p: *zpq.profile.Profiler) !void {
+        p.finish();
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        if (self.trace_path) |path| {
+            try p.writeTrace(gpa, &aw.writer);
+            const fd = local_fs.createFile(path) catch |err| {
+                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+                return error.BadArgs;
+            };
+            defer local_fs.close(fd);
+            try local_fs.writeAll(fd, aw.written());
+            aw.clearRetainingCapacity();
+        }
+        if (self.summary) |fmt| {
+            const summary = try zpq.profile_summary.compute(gpa, p);
+            switch (fmt) {
+                .text => try zpq.profile_summary.writeText(summary, p, &aw.writer),
+                .json => {
+                    try zpq.profile_summary.writeJson(summary, p, &aw.writer);
+                    try aw.writer.writeByte('\n');
+                },
+            }
+            var w: StdoutWriter = .{ .fd = 2 };
+            defer w.flush();
+            try w.writeAll(aw.written());
+        }
+    }
+};
+
+/// The command line as typed, arguments with spaces or quotes single-quoted, for the profile's metadata.
+fn commandLine(arena: std.mem.Allocator, args: std.process.Args) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.process.Args.Iterator.init(args);
+    var first = true;
+    while (it.next()) |a| {
+        if (!first) try out.append(arena, ' ');
+        first = false;
+        const plain = a.len > 0 and std.mem.indexOfAny(u8, a, " \t'\"*$\\") == null;
+        if (plain) {
+            try out.appendSlice(arena, a);
+            continue;
+        }
+        try out.append(arena, '\'');
+        for (a) |c| if (c == '\'') try out.appendSlice(arena, "'\\''") else try out.append(arena, c);
+        try out.append(arena, '\'');
+    }
+    return out.items;
 }
 
 fn splitCsv(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {

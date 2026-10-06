@@ -22,7 +22,7 @@ The Lambda integration test harness in `tests/lambda_integration.zig`:
 
 ```bash
 just test-integration
-# 2/2 tests pass in ~21 ms total.
+# 14 tests; two skip unless data/benchmark_100mb.parquet is present.
 ```
 
 **This is the default for TDD.** Iteration latency is single-digit milliseconds — comparable to unit tests. Use it for:
@@ -66,7 +66,7 @@ RIE_PID=$!
 
 curl -XPOST http://localhost:8080/2015-03-31/functions/function/invocations \
   -d '{"hello":"world"}'
-# {"ok":true,"loop":"epoll","request_id":"...","echo_bytes":17}
+# {"error":"bad_json","reason":"MissingField"}   (no inputs; see lambda_requests.md for real requests)
 
 kill $RIE_PID
 ```
@@ -100,7 +100,7 @@ zig build -Dtarget=aarch64-linux-musl test-integration
 
 Caveats:
 - Slower than native (~2–3× for compute, less for syscall-heavy code).
-- For correctness testing, perfect. For benchmarks, deploy to a real ARM host or use `bench/` infra.
+- For correctness testing, perfect. For benchmarks, deploy to a real ARM host or use `benchmarks/`.
 - The kernel still reports x86_64 in `uname -m` to the emulated binary's perspective is mostly fine, but anything that
   introspects via `/proc/cpuinfo` will see the host arch.
 
@@ -126,7 +126,8 @@ binary if you ship both.
 
 ## Adding new env vars to the fake
 
-If the binary starts depending on a new Lambda env var, add it to `spawnLambda` in `tests/lambda_integration.zig`.
+If the binary starts depending on a new Lambda env var, add it to `spawnLambdaWithEnv` in
+`tests/lambda_integration.zig`.
 Default to a plausible canned value:
 
 ```zig

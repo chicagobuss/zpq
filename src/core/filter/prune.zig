@@ -14,6 +14,7 @@ const encoded = @import("encoded.zig");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const statistics = @import("../parquet/statistics.zig");
+const membership = @import("membership.zig");
 
 pub const Decision = enum {
     keep,
@@ -56,12 +57,11 @@ pub fn pruneRowGroup(
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
     return switch (filter) {
-        .int32 => |leaf| pruneNumeric(i32, rg, leaf.col_idx, leaf.op, leaf.value, .INT32, file_meta),
-        .int64 => |leaf| pruneNumeric(i64, rg, leaf.col_idx, leaf.op, leaf.value, .INT64, file_meta),
-        .uint64 => |leaf| pruneUnsigned(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
-        .float => |leaf| pruneNumeric(f32, rg, leaf.col_idx, leaf.op, leaf.value, .FLOAT, file_meta),
-        .double => |leaf| pruneNumeric(f64, rg, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, file_meta),
-        .string => |leaf| pruneBytes(rg, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, file_meta),
+        .int32, .int64, .uint64, .float, .double, .string => withMembership(
+            rg,
+            filter,
+            valueStats(rg, filter, file_meta),
+        ),
         .boolean => |leaf| pruneBoolean(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
         .null_check => |nc| pruneNullCheck(rg, nc.col_idx, nc.is_not, file_meta),
         // LIKE: prefix patterns are stat-prunable via min/max (a future
@@ -76,6 +76,26 @@ pub fn pruneRowGroup(
             pruneRowGroup(rg, c.right.*, file_meta),
         ),
     };
+}
+
+/// A comparison leaf's decision from statistics alone.
+fn valueStats(rg: *const schema.RowGroup, leaf: ast.Filter, file_meta: ?*const schema.FileMetaData) Decision {
+    return switch (leaf) {
+        .int32 => |l| pruneNumeric(i32, rg, l.col_idx, l.op, l.value, .INT32, file_meta),
+        .int64 => |l| pruneNumeric(i64, rg, l.col_idx, l.op, l.value, .INT64, file_meta),
+        .uint64 => |l| pruneUnsigned(rg, l.col_idx, l.op, l.value, file_meta),
+        .float => |l| pruneNumeric(f32, rg, l.col_idx, l.op, l.value, .FLOAT, file_meta),
+        .double => |l| pruneNumeric(f64, rg, l.col_idx, l.op, l.value, .DOUBLE, file_meta),
+        .string => |l| pruneBytes(rg, l.col_idx, l.op, l.value, .BYTE_ARRAY, file_meta),
+        else => unreachable,
+    };
+}
+
+/// A leaf's statistics decision, sharpened by membership: a Bloom filter or dictionary can only rule a literal out, so
+/// it turns an open leaf into a skip and never touches one statistics skip or prove fully matching.
+fn withMembership(rg: *const schema.RowGroup, leaf: ast.Filter, stats: Decision) Decision {
+    if (stats != .keep and stats != .unknown) return stats;
+    return if (membership.provenAbsent(rg, leaf)) .skip else stats;
 }
 
 // ------------------------------------------------------------

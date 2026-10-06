@@ -288,7 +288,11 @@ pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk
         // Readers should use the structured offsets, but keeping this
         // consistent costs nothing.
         chunk.file_offset = m.data_page_offset;
+        // The filter is not part of the chunk's bytes; the copy has none until one is placed for it.
+        m.bloom_filter_offset = null;
+        m.bloom_filter_length = null;
     }
+    chunk.absent = &.{};
     chunk.offset_index_offset = null;
     chunk.offset_index_length = null;
     chunk.column_index_offset = null;

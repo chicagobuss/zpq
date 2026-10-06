@@ -43,6 +43,7 @@ const filter_eval = @import("core/filter/eval.zig");
 const filter_ast = @import("core/filter/ast.zig");
 const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
+const membership = @import("core/filter/membership.zig");
 const streaming = @import("core/writer/streaming.zig");
 
 const s3 = @import("io/s3.zig");
@@ -225,6 +226,8 @@ pub const WriteResult = struct {
     bytes_out: u64,
     row_groups_in: usize,
     row_groups_kept: usize,
+    /// Bloom filter probing: what it read and the row groups it ruled out beyond statistics.
+    membership: membership.Stats = .{},
     timings: Timings,
 };
 
@@ -238,6 +241,8 @@ pub const AggResult = struct {
     row_groups_pruned: usize,
     row_groups_full_match: usize,
     cols_stat_pruned: usize,
+    /// Bloom filter probing: what it read and the row groups it ruled out beyond statistics.
+    membership: membership.Stats = .{},
     timings: Timings,
     /// The answer, owned in `Context.gpa`.
     output: scan.AggOutput,
@@ -306,10 +311,21 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
 
     // 2. Run the orchestrator. (Yes, this re-parses the aggregate —
     //    cheap, microseconds. Easier than threading the parsed AST
-    //    through the open step + the scan step.)
+    //    through the open step + the scan step.) Footers parsed here are probed here; the scan probes the ones it
+    //    parses.
+    var probed = opened.membership;
+    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta) blk: {
+        const m = try materializeMetas(arena, opened, args.diag, prof);
+        const filter: ?filter_ast.Filter = if (args.filter) |fs|
+            (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
+        else
+            null;
+        probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
+        break :blk m;
+    } else null;
     var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
         .inputs = opened.inputs,
-        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened, args.diag, prof) else null,
+        .metas = metas,
         .filter = args.filter,
         .aggregate = agg_str,
         .group_by = args.group_by,
@@ -326,6 +342,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
     t.decode_wall_ns = r.timings.decode_wall_ns;
+    probed.add(r.membership);
 
     defer r.state.deinit(ctx.gpa);
     errdefer r.output.deinit(ctx.gpa);
@@ -358,6 +375,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .row_groups_pruned = r.row_groups_pruned,
         .row_groups_full_match = r.row_groups_full_match,
         .cols_stat_pruned = r.cols_stat_pruned,
+        .membership = probed,
         .timings = t,
         .output = r.output,
     };
@@ -898,6 +916,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const output_specs = proj.output_specs;
     const any_computed = proj.any_computed;
     const num_leaves = kept_arr.len;
+    var probed = opened.membership;
+    probed.add(try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all));
     const t_parse_end = nowMonoNs();
     t.parse_ns = @intCast(t_parse_end - t_parse_start);
     profile.record(prof, .parse_query, t_parse_start, t_parse_end, profile.args(.{}));
@@ -1273,6 +1293,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         .bytes_out = out_offset,
         .row_groups_in = rgs_in,
         .row_groups_kept = rg_kept,
+        .membership = probed,
         .timings = t,
     };
 }
@@ -1387,6 +1408,8 @@ const OpenedInputs = struct {
     /// S3 sparse file buffers are gpa-owned because they must outlive the
     /// per-task scratch arenas used during parallel metadata fetch.
     s3_buffers: []const []u8,
+    /// Bloom filter probing done while planning the S3 fetch.
+    membership: membership.Stats = .{},
 
     pub fn deinit(self: *OpenedInputs) void {
         for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
@@ -1396,6 +1419,30 @@ const OpenedInputs = struct {
         }
     }
 };
+
+/// Probe the Bloom filters of the inputs whose footers were parsed from their mapped bytes (`materializeMetas`); S3
+/// inputs were probed through the range fetcher while their fetch was planned.
+fn loadLocalMembership(
+    arena: std.mem.Allocator,
+    opened: OpenedInputs,
+    metas: []const schema.FileMetaData,
+    filter: ?filter_ast.Filter,
+    scan_all: bool,
+) !membership.Stats {
+    const f = filter orelse return .{};
+    if (scan_all) return .{};
+    var local_metas: std.ArrayList(schema.FileMetaData) = .empty;
+    var local_bytes: std.ArrayList([]const u8) = .empty;
+    for (opened.inputs, opened.meta_ready, metas) |in, ready, m| {
+        if (ready) continue;
+        // A copy of the footer shares its row groups, so what is recorded on its chunks lands in `metas`.
+        try local_metas.append(arena, m);
+        try local_bytes.append(arena, in.bytes);
+    }
+    if (local_metas.items.len == 0) return .{};
+    const mapped: membership.MappedSource = .{ .files = local_bytes.items };
+    return membership.load(arena, f, local_metas.items, mapped.source(), .{});
+}
 
 fn materializeMetas(
     arena: std.mem.Allocator,
@@ -2434,6 +2481,15 @@ pub fn writeJsonFloat(writer: anytype, f: f64) !void {
 
 /// One aggregate result as a JSON value. The CLI and Lambda responses both go through here so they escape strings and
 /// spell NULL and NaN the same way.
+/// `"bloom":{...}`: what Bloom filter probing read, and the row groups it ruled out beyond statistics (already counted
+/// in `row_groups_pruned`).
+pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
+    try writer.print(
+        "\"bloom\":{{\"row_groups_pruned\":{d},\"filters\":{d},\"requests\":{d},\"bytes\":{d},\"stopped\":{},\"us\":{d}}}",
+        .{ s.row_groups_bloom, s.filters, s.requests, s.bytes, s.bloom_stopped, s.ns / std.time.ns_per_us },
+    );
+}
+
 pub fn writeAggValueJson(writer: anytype, v: scan.AggValue) !void {
     switch (v) {
         .i => |x| try writer.print("{d}", .{x}),
@@ -2655,6 +2711,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     const filter_opt = proj.filter;
     const fetch_arr = proj.fetch;
     const output_specs = proj.output_specs;
+    _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all);
     parse_span.end(.parse_query, profile.args(.{}));
     if (args.profiler) |p| p.setColumnsFromMeta(meta0);
 

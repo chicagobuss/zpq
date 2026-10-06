@@ -620,8 +620,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             }
             try ws.writeAll("},");
         }
+        try engine.writeMembershipJson(&ws, ar.membership);
         try ws.print(
-            "\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
+            ",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
             .{
                 total_ms_a,
                 ar.timings.read_ns / std.time.ns_per_ms,
@@ -683,8 +684,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     , .{});
     try writeJsonString(&w, out);
     try w.print(
-        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
-        \\
+        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},
     , .{
         if (result.codec) |c| @tagName(c) else "MIXED",
         result.rows_in,
@@ -693,6 +693,12 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         result.bytes_out,
         result.row_groups_in,
         result.row_groups_kept,
+    });
+    try engine.writeMembershipJson(&w, result.membership);
+    try w.print(
+        \\,"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
+        \\
+    , .{
         total_ms,
         result.timings.read_ns / std.time.ns_per_ms,
         result.timings.parse_ns / std.time.ns_per_ms,

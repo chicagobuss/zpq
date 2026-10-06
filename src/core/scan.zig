@@ -34,6 +34,7 @@ const expr_agg = @import("expr/agg.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
+const membership = @import("filter/membership.zig");
 const Diag = @import("diag.zig").Diag;
 
 pub const Error = error{
@@ -97,6 +98,12 @@ pub const MultiAggArgs = struct {
     /// Records the scan's spans when set; see `profile.zig`.
     profiler: ?*profile.Profiler = null,
 };
+
+/// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
+/// input mapped), never for `metas` the caller passes, which the caller has probed through its own reader.
+fn probesMembership(args: MultiAggArgs) bool {
+    return args.metas == null and !args.scan_all;
+}
 
 pub const AggValue = union(enum) {
     /// Single integer result (count, integer sum/min/max). i128 so a sum that
@@ -203,6 +210,8 @@ pub const MultiAggResult = struct {
     /// 0 when no aggs are stat-eligible, an outer filter is present,
     /// or any RG lacks the relevant stat field.
     cols_stat_pruned: usize,
+    /// Bloom filter probing this call did (none when the caller passed `metas`).
+    membership: membership.Stats = .{},
     timings: Timings,
     /// The answer. A caller keeping it takes it and leaves `state` to `ScanState.deinit`.
     output: AggOutput,
@@ -599,6 +608,15 @@ pub fn runMultiAggregate(
         .group_keys = group_by_keys,
     }, metas, .fromFlags(args.scan_all, args.trust_stats));
 
+    // 3b. Bloom filters, before any worker decides a row group: every decision then reads the same footers.
+    var membership_stats: membership.Stats = .{};
+    if (filter_opt) |f| if (probesMembership(args)) {
+        const files = try arena.alloc([]const u8, args.inputs.len);
+        for (args.inputs, files) |in, *b| b.* = in.bytes;
+        const mapped: membership.MappedSource = .{ .files = files };
+        membership_stats = try membership.load(arena, f, metas, mapped.source(), .{});
+    };
+
     // 4. Build the flat row-group work list. If we have fewer row groups
     //    than the requested parallelism (e.g. wide scans on few large row groups),
     //    we split each row group's aggregates into chunks (horizontal scaling/sub-RG).
@@ -976,6 +994,7 @@ pub fn runMultiAggregate(
         .row_groups_pruned = rgs_pruned,
         .row_groups_full_match = rgs_full_match,
         .cols_stat_pruned = plan.cols_stat_pruned,
+        .membership = membership_stats,
         .timings = t,
         .output = output,
         .state = .{

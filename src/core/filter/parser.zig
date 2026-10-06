@@ -322,13 +322,12 @@ fn parseInList(
 /// (both `NOT (x > 5)` and `x <= 5` exclude null rows).
 fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
-        .int32 => |l| .{ .int32 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .int64 => |l| .{ .int64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .uint64 => |l| .{ .uint64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .float => |l| .{ .float = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .double => |l| .{ .double = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .string => |l| .{ .string = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .boolean => |l| .{ .boolean = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
+        // Negating keeps the value, so a stored literal stays one (`NOT x != 5` is `x = 5`).
+        inline .int32, .int64, .uint64, .float, .double, .string, .boolean => |l, tag| @unionInit(
+            ast.Filter,
+            @tagName(tag),
+            .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value, .stored = l.stored },
+        ),
         // NOT (x IS NULL) == x IS NOT NULL, and vice-versa.
         .null_check => |nc| .{ .null_check = .{ .col_idx = nc.col_idx, .is_not = !nc.is_not } },
         // NOT (x LIKE p) == x NOT LIKE p — flip the negate flag.
@@ -448,12 +447,17 @@ fn buildTypedComparison(
     val_str: []const u8,
     diag: ?*Diag,
 ) Error!ast.Filter {
+    // Every leaf that compares a stored value is marked `stored` here and nowhere else, so what membership pruning
+    // hashes (filter/membership.zig) can never drift from what evaluation compares.
     if (decimal_mod.kindFromSchema(elem) != null) {
+        // Compared after decoding to f64: the literal is no stored value.
         return buildLeafFilter(col_idx, op, val_str, .DOUBLE);
     }
-    if (schema.isUnsignedInt(elem.*)) return buildUnsignedLeaf(col_idx, op, val_str);
+    if (schema.isUnsignedInt(elem.*)) return markStored(try buildUnsignedLeaf(col_idx, op, val_str));
     if (temporalKind(elem)) |tk| {
-        return buildTemporalLeaf(col_idx, op, val_str, tk);
+        const leaf = try buildTemporalLeaf(col_idx, op, val_str, tk);
+        // INT96 decodes to nanoseconds; every other temporal lane holds the stored ticks.
+        return if (elem.type == .INT96) leaf else markStored(leaf);
     }
     // FLOAT16 is physically FIXED_LEN_BYTE_ARRAY(2); without an IEEE-half →
     // f64 lane in the filter/prune path, a numeric predicate falls through to
@@ -466,7 +470,16 @@ fn buildTypedComparison(
         return error.UnsupportedType;
     }
     const ptype = elem.type orelse return error.UnsupportedType;
-    return buildLeafFilter(col_idx, op, val_str, ptype);
+    return markStored(try buildLeafFilter(col_idx, op, val_str, ptype));
+}
+
+fn markStored(f: ast.Filter) ast.Filter {
+    var out = f;
+    switch (out) {
+        inline .int32, .int64, .uint64, .float, .double, .string, .boolean => |*l| l.stored = true,
+        else => {},
+    }
+    return out;
 }
 
 /// Unsigned columns compare as u64. They hold only 0..2^64-1, so a literal outside that range has a constant answer

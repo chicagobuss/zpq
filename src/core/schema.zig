@@ -802,6 +802,10 @@ pub const ColumnMetaData = struct {
     index_page_offset: ?i64,
     dictionary_page_offset: ?i64,
     statistics: ?Statistics = null,
+    /// Fields 14/15: where the chunk's split-block Bloom filter (header and bitset) lies in the file. Older
+    /// parquet-java leaves the length out. A copy that moves the chunk must move or drop these with it.
+    bloom_filter_offset: ?i64 = null,
+    bloom_filter_length: ?i32 = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnMetaData {
         const saved_id = reader.last_field_id;
@@ -877,6 +881,13 @@ pub const ColumnMetaData = struct {
                     meta.dictionary_page_offset = if (dpo >= 4) dpo else null;
                 },
                 12 => meta.statistics = try Statistics.read(reader),
+                // A malformed location reads as no filter, never as a footer error.
+                14 => if (field.type == .I64) {
+                    meta.bloom_filter_offset = try reader.readZigZag(i64);
+                } else try reader.skip(field.type),
+                15 => if (field.type == .I32) {
+                    meta.bloom_filter_length = try reader.readZigZag(i32);
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
@@ -913,6 +924,8 @@ pub const ColumnMetaData = struct {
             try writer.writeFieldBegin(.Struct, 12);
             try s.write(writer);
         }
+        if (self.bloom_filter_offset) |v| try writer.writeFieldI64(14, v);
+        if (self.bloom_filter_length) |v| try writer.writeFieldI32(15, v);
         try writer.writeStructEnd();
     }
 };
@@ -926,6 +939,13 @@ pub const ColumnChunk = struct {
     offset_index_length: ?i32 = null,
     column_index_offset: ?i64 = null,
     column_index_length: ?i32 = null,
+    /// Fields 8/9 (crypto_metadata, encrypted_column_metadata): the chunk is encrypted. Its Bloom filter is too, and is
+    /// never read.
+    encrypted: bool = false,
+    /// Runtime only, per query, never serialized: the PLAIN bytes of the `=` literals this chunk's Bloom filter or
+    /// dictionary proved absent. Written by `filter/membership.zig` before any row group is planned, read by
+    /// `filter/prune.zig` at `=` leaves, so the S3 planner and the scan workers see the same answer.
+    absent: []const []const u8 = &.{},
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
         const saved_id = reader.last_field_id;
@@ -951,6 +971,10 @@ pub const ColumnChunk = struct {
                 5 => chunk.offset_index_length = try reader.readZigZag(i32),
                 6 => chunk.column_index_offset = try reader.readZigZag(i64),
                 7 => chunk.column_index_length = try reader.readZigZag(i32),
+                8, 9 => {
+                    chunk.encrypted = true;
+                    try reader.skip(field.type);
+                },
                 else => try reader.skip(field.type),
             }
         }

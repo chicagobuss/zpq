@@ -2037,7 +2037,10 @@ fn copyChunkRecompressed(
 
     const src_base: i64 = @intCast(src_start);
     var chunk = src_chunk;
+    chunk.absent = &.{};
     var meta = m;
+    meta.bloom_filter_offset = null;
+    meta.bloom_filter_length = null;
     meta.codec = rc.codec;
     meta.total_compressed_size = @intCast(re.bytes.len);
     meta.total_uncompressed_size += re.header_delta;

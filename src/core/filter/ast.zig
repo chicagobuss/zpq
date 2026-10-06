@@ -60,6 +60,10 @@ pub fn Leaf(comptime T: type) type {
         col_idx: usize,
         op: Operator,
         value: T,
+        /// Set by the binder alone, when `value` is exactly a value the column stores in its physical type, so its
+        /// PLAIN bytes are what a Bloom filter hashed and a dictionary holds. Lanes that convert on the way in (DECIMAL
+        /// to f64, INT96 to nanoseconds, FLOAT16 to f64) leave it unset, and so does any leaf built elsewhere.
+        stored: bool = false,
     };
 }
 

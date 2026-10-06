@@ -473,6 +473,8 @@ fn lambdaAggregate(
         ar.timings.core.eval_ns / std.time.ns_per_ms,
         ar.timings.core.encode_ns / std.time.ns_per_ms,
     });
+    try engine.writeMembershipJson(w, ar.membership);
+    try w.writeByte(',');
     try writePoolStats(w, pool.stats());
     try w.writeByte('}');
     return aw.toOwnedSlice();
@@ -560,6 +562,8 @@ fn writeResponse(
             cache_stats.evictions,
         },
     );
+    try engine.writeMembershipJson(w, wr.membership);
+    try w.writeByte(',');
     try writePoolStats(w, stats);
     try w.writeByte('}');
     return aw.toOwnedSlice();

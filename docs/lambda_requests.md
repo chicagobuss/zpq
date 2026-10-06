@@ -85,11 +85,12 @@ and `peak_buffered_bytes`. Times are nanoseconds. The member's size does not gro
 bytes, and only ten chunks and five skip reasons are listed), so it stays a few KB, far under Lambda's 6 MB response
 limit; the trace itself never rides in the response.
 
-**`profile_trace`** (when the request set `profile_url`): `{"url": U, "bytes": N, "omitted_events": K}` after
-uploading the Chrome trace to `U` with one PUT over the invocation's connection pool, or `{"url": U, "error": E}` when
-the upload failed (`E` is `BadProfileUrl` for a URL that is not `s3://bucket/key`). The trace is cut at 1/16 of the
-memory budget (1 to 256 MiB); `K` counts the events left out. A failed upload does not fail the query, and neither
-does a summary that cannot be made: `profile` is then `{"error": E}`.
+**`profile_trace`** (when the request set `profile_url`): `{"url": U, "bytes": N, "omitted_events": K}` after uploading
+the Chrome trace to `U` with one PUT over the invocation's connection pool, or `{"url": U, "error": E}` when the upload
+failed (`E` is `BadProfileUrl` for a URL that is not `s3://bucket/key`). The trace is cut at 1/16 of the memory budget
+(1 to 256 MiB); `K` counts the events left out. A failed upload does not fail the query, and neither does a summary that
+cannot be made: `profile` is then `{"error": E}`. The trace holds the full `s3://` path of every input, the column names
+and the request body; see [What a profile contains](profiling.md#what-a-profile-contains).
 
 Profiling a request costs its own time (a few hundred microseconds to start the RSS sampler and summarize, and the
 spans themselves; see [profiling.md](profiling.md)). A request without `profile` pays nothing for it.

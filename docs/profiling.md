@@ -152,6 +152,15 @@ also upload the full trace there (it implies `profile`); the response then carri
 `"profile_trace": {"url": ..., "bytes": N}`, or `{"url": ..., "error": ...}` if the upload failed, which does not fail
 the query. See [lambda_requests.md](lambda_requests.md).
 
+## What a profile contains
+
+Treat a trace like the query that made it. It records every input's full path (`s3://bucket/key` or the local path) on
+each span that touches the file, every column name, the command line as typed (CLI) or the request body (Lambda, up to 4
+KB, including any filter literals), the zpq version and the machine's CPU count and memory. It reads no credentials and
+no row values, but anything written into a path or the query is recorded as given. The Lambda's `profile` summary
+carries the request cut to 512 bytes and the names of the columns it lists. Share or upload traces only where the paths,
+names and query may be seen, and point `profile_url` at a bucket with the same access controls as the data.
+
 ## What it costs
 
 Profiling is compiled in by default and switched on per query. Off, a span site costs one branch on a null pointer;

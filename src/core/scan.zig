@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const nowMonoNs = @import("../clock.zig").monoNs;
+const profile = @import("../profile.zig");
 
 const spawn_util = @import("spawn.zig");
 const huge_pages = @import("huge_pages.zig");
@@ -93,6 +94,8 @@ pub const MultiAggArgs = struct {
     fast_levels: bool = false,
     /// Receives what a failure was about; see `diag.zig`.
     diag: ?*Diag = null,
+    /// Records the scan's spans when set; see `profile.zig`.
+    profiler: ?*profile.Profiler = null,
 };
 
 pub const AggValue = union(enum) {
@@ -247,13 +250,17 @@ const ParseCtx = struct {
     /// Entries into `parseWorker` with this context; must never exceed 1. Asserted after join rather than watching for
     /// the race itself, which is UB and unreliable to observe.
     runs: std.atomic.Value(u32) = .init(0),
+    profiler: ?*profile.Profiler = null,
 };
 
 fn parseWorker(c: *ParseCtx) void {
     _ = c.runs.fetchAdd(1, .monotonic);
+    const prof = profile.threadOf(c.profiler, .parse);
     while (true) {
         const i = c.cursor.fetchAdd(1, .monotonic);
         if (i >= c.inputs.len) break;
+        const span = profile.Span.begin(prof);
+        defer span.end(.footer_parse, profile.args(.{ i, footerLen(c.inputs[i].bytes) }));
         c.out[i] = metadata.open(c.arena.allocator(), c.inputs[i].bytes) catch |e| {
             if (c.err == null) {
                 c.err = e;
@@ -282,6 +289,7 @@ fn parseFooters(
     inputs: []const Input,
     parallelism: usize,
     meta_arenas_out: *[]std.heap.ArenaAllocator,
+    profiler: ?*profile.Profiler,
 ) std.mem.Allocator.Error!FooterParse {
     const parsed = try arena.alloc(schema.FileMetaData, inputs.len);
     const parse_threads = @min(
@@ -290,7 +298,10 @@ fn parseFooters(
     );
 
     if (parse_threads <= 1) {
+        const prof = profile.threadOf(profiler, .main);
         for (inputs, 0..) |in, i| {
+            const span = profile.Span.begin(prof);
+            defer span.end(.footer_parse, profile.args(.{ i, footerLen(in.bytes) }));
             parsed[i] = metadata.open(arena, in.bytes) catch |err| {
                 return .{ .failed = .{ .err = err, .index = i } };
             };
@@ -309,8 +320,11 @@ fn parseFooters(
         .out = parsed,
         .cursor = &cursor,
         .arena = &meta_arenas[i],
+        .profiler = profiler,
     };
 
+    const batch_span = profile.Span.begin(profile.threadOf(profiler, .main));
+    defer batch_span.end(.footer_batch, profile.args(.{inputs.len}));
     const threads = try arena.alloc(std.Thread, parse_threads);
     var spawned: usize = 0;
     for (ctxs) |*c| {
@@ -359,10 +373,21 @@ const Worker = struct {
     group_by_keys: ?[]const expr_ast.Expr = null,
     group_table: ?expr_agg.GroupTable = null,
     err: ?anyerror = null,
+    profiler: ?*profile.Profiler = null,
+    index: usize = 0,
 };
 
 fn workerRun(w: *Worker) void {
-    workerRunErr(w) catch |e| {
+    const prof = profile.threadOf(w.profiler, .scan);
+    const span = profile.Span.begin(prof);
+    const usage0: profile.Usage = if (prof != null) profile.usage(.thread) else .{};
+    var items: usize = 0;
+    defer if (prof != null) {
+        const u = profile.usage(.thread).sub(usage0);
+        span.end(.scan_worker, profile.args(.{ w.index, items, u.user_ns, u.sys_ns, u.minor_faults, u.major_faults }));
+    };
+    w.timings.prof = prof;
+    workerRunErr(w, prof, &items) catch |e| {
         w.err = e;
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
@@ -370,7 +395,10 @@ fn workerRun(w: *Worker) void {
     if (w.group_table) |*gt| gt.releaseSlack();
 }
 
-fn workerRunErr(w: *Worker) !void {
+fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
+    // Declared first so it runs last: the release span covers freeing the arena and scratch below.
+    var release_span: profile.Span = .{ .t = null, .start = 0 };
+    defer release_span.end(.worker_release, profile.args(.{w.index}));
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
     // Both it and the scratch are written front to back and reused, the case huge pages pay off for.
     var thp: huge_pages.HugePageAdvisor = .{ .child = w.gpa };
@@ -378,10 +406,15 @@ fn workerRunErr(w: *Worker) !void {
     defer rg_decode_arena.deinit();
     var scratch = consumer.DecodeScratch.init(thp.allocator());
     defer scratch.deinit();
+    scratch.prof = prof;
 
     while (true) {
         const idx = w.cursor.fetchAdd(1, .monotonic);
-        if (idx >= w.work.len) break;
+        if (idx >= w.work.len) {
+            release_span = .begin(prof);
+            break;
+        }
+        items.* += 1;
         const item = w.work[idx];
         const meta = &w.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
@@ -392,7 +425,16 @@ fn workerRunErr(w: *Worker) !void {
             w.rgs_in += 1;
             w.rows_in += rg.num_rows;
         }
+        const rg_span = profile.Span.begin(prof);
         const decision = w.plan.decide(rg, meta);
+        defer if (rg_span.t != null) rg_span.end(.row_group, profile.args(.{
+            item.file,
+            item.rg,
+            @backingInt(decision),
+            rg.num_rows,
+            if (decision == .skip) skipReason(w.plan.query.filter.?, rg, meta) else 0,
+            if (decision == .skip) 0 else std.mem.count(bool, item.columns.forRowGroup(decision), &.{true}),
+        }));
         switch (decision) {
             .skip => {
                 if (item.agg_start == 0) w.rgs_pruned += 1;
@@ -413,6 +455,8 @@ fn workerRunErr(w: *Worker) !void {
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         try consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
+            .file_index = item.file,
+            .rg_index = item.rg,
             .meta = meta,
             .src = rg_src,
             .filter = w.plan.filterFor(decision),
@@ -424,6 +468,28 @@ fn workerRunErr(w: *Worker) !void {
             .timings = &w.timings,
         });
     }
+}
+
+/// The filter column whose statistics alone exclude `rg`, as leaf index + 1 (0 when only a combination does), for the
+/// profile's "skipped by" counts. Profiling only: it re-runs the pruning check per conjunct.
+fn skipReason(f: filter_ast.Filter, rg: *const schema.RowGroup, meta: *const schema.FileMetaData) usize {
+    switch (f) {
+        .and_filter => |c| {
+            const left = skipReason(c.left.*, rg, meta);
+            return if (left != 0) left else skipReason(c.right.*, rg, meta);
+        },
+        .or_filter => return 0,
+        inline else => |leaf| {
+            if (filter_prune.pruneRowGroup(rg, f, meta) != .skip) return 0;
+            return leaf.col_idx + 1;
+        },
+    }
+}
+
+/// Thrift footer length from a file's trailer, 0 when it has none.
+fn footerLen(bytes: []const u8) usize {
+    if (bytes.len < 8) return 0;
+    return std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
 }
 
 /// Run a multi-file aggregate.
@@ -441,6 +507,7 @@ pub fn runMultiAggregate(
     if (args.inputs.len == 0) return error.NoInputs;
 
     var t: Timings = .{};
+    const prof = profile.threadOf(args.profiler, .main);
 
     // Parallel because footer parsing scales with file count and schema width and can dominate short multi-file scans.
     // `meta_arenas` must outlive this call: `metas` points into them.
@@ -452,7 +519,7 @@ pub fn runMultiAggregate(
         if (m.len != args.inputs.len) return error.SchemaMismatch;
         break :blk m;
     } else blk: {
-        switch (try parseFooters(arena, gpa, args.inputs, args.parallelism, &meta_arenas)) {
+        switch (try parseFooters(arena, gpa, args.inputs, args.parallelism, &meta_arenas, args.profiler)) {
             .ok => |parsed| break :blk parsed,
             .failed => |f| {
                 Diag.setInput(args.diag, args.inputs[f.index].name, f.err);
@@ -518,7 +585,11 @@ pub fn runMultiAggregate(
         try checkAggAliases(agg_calls, args.diag);
         break :blk null;
     };
-    t.parse_ns = @intCast(nowMonoNs() - t_parse);
+    const t_parse_end = nowMonoNs();
+    t.parse_ns = @intCast(t_parse_end - t_parse);
+    profile.record(prof, .parse_query, t_parse, t_parse_end, profile.args(.{}));
+    if (args.profiler) |p| p.setColumnsFromMeta(meta0);
+    const plan_span = profile.Span.begin(prof);
 
     // 3. What the query reads, and which columns statistics answer outright. The S3 planner makes the same plan
     //    from the same footers, so every column read here was fetched.
@@ -611,6 +682,7 @@ pub fn runMultiAggregate(
     }
     const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / MIN_BYTES_PER_WORKER)));
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
+    plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
     var workers = try arena.alloc(Worker, n_workers);
     // One budget shared by every worker table, not per-worker quotas: work is claimed off a shared cursor, so which
@@ -624,7 +696,6 @@ pub fn runMultiAggregate(
 
     var work_cursor = std.atomic.Value(usize).init(0);
     for (workers, 0..) |*w, wi| {
-        _ = wi;
         w.* = .{
             .gpa = gpa,
             .inputs = args.inputs,
@@ -634,6 +705,8 @@ pub fn runMultiAggregate(
             .agg_calls = agg_calls,
             .plan = &plan,
             .decode_options = .{ .fast_levels = args.fast_levels },
+            .profiler = args.profiler,
+            .index = wi,
             .group_by_keys = group_by_keys,
             .group_table = if (group_by_keys != null) blk_gt: {
                 // Zero local ceiling: everything is drawn from the shared pool, so an idle worker reserves nothing
@@ -674,8 +747,11 @@ pub fn runMultiAggregate(
         // Single-threaded fast path. Avoids std.Thread overhead.
         workerRun(&workers[0]);
     }
-    t.decode_wall_ns = @intCast(nowMonoNs() - t_decode);
+    const t_decode_end = nowMonoNs();
+    t.decode_wall_ns = @intCast(t_decode_end - t_decode);
+    profile.record(prof, .scan, t_decode, t_decode_end, profile.args(.{n_workers}));
     for (workers) |w| if (w.err) |e| return e;
+    const merge_span = profile.Span.begin(prof);
 
     // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
@@ -873,7 +949,11 @@ pub fn runMultiAggregate(
         }
     }
 
+    merge_span.end(.merge, profile.args(.{}));
+
     // 7. Materialize into gpa, so the answer outlives the arena the caller will eventually deinit.
+    const finalize_span = profile.Span.begin(prof);
+    defer finalize_span.end(.finalize, profile.args(.{}));
     if (group_by_keys == null) {
         const items = try gpa.alloc(AggOutputItem, agg_calls.len);
         @memset(items, .{ .alias = "", .value = .null_val });
@@ -1397,6 +1477,7 @@ test "parseFooters: every file is parsed even when spawns fail partway" {
             &inputs,
             parse_threads,
             &meta_arenas,
+            null,
         );
 
         switch (res) {
@@ -1456,6 +1537,7 @@ test "parseFooters: lowest-index failure is reported whatever the spawn outcome"
             &inputs,
             parse_threads,
             &meta_arenas,
+            null,
         );
 
         switch (res) {
@@ -1850,7 +1932,7 @@ test "parseFooters: serial path reports the lowest bad index too" {
         .{ .name = "bad1", .bytes = &not_parquet },
     };
     // parallelism 1 takes the serial branch, which never spawns.
-    const res = try parseFooters(arena_state.allocator(), testing.allocator, &inputs, 1, &meta_arenas);
+    const res = try parseFooters(arena_state.allocator(), testing.allocator, &inputs, 1, &meta_arenas, null);
     switch (res) {
         .ok => return error.TestUnexpectedResult,
         .failed => |f| try testing.expectEqual(@as(usize, 0), f.index),

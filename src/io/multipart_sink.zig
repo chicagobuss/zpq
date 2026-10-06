@@ -21,6 +21,7 @@ const tls = @import("tls.zig");
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const retry = @import("retry.zig");
+const profile = @import("../profile.zig");
 
 /// Percent-encode an S3 query-parameter value (RFC 3986: keep the unreserved
 /// set A-Za-z0-9-._~, escape everything else as %XX). `sigv4.zig` signs the
@@ -73,6 +74,8 @@ pub const Error = error{
 pub const Options = struct {
     target_part_size: usize = TARGET_PART_SIZE,
     max_bytes_in_flight: usize = DEFAULT_MAX_BYTES_IN_FLIGHT,
+    /// Records the upload's requests when set.
+    profiler: ?*profile.Profiler = null,
 };
 
 const EtagSlot = struct {
@@ -239,6 +242,8 @@ pub const MultipartSink = struct {
         // stay below target_part_size and never flush — they go via
         // single PutObject in close().
         const started_s = clock.realtimeS();
+        const span = profile.Span.begin(profile.threadOf(self.options.profiler, .writer));
+        defer span.end(.upload_create, profile.args(.{0}));
         self.upload_id = createMultipartUpload(self.arena, self.creds, self.url) catch |err| {
             // The upload may exist even though its id never reached us; nothing else could ever abort it.
             if (outcomeUnknown(err, error.CreateMultipartFailed)) abortUploadsStartedSince(self.arena, self.creds, self.url, started_s);
@@ -336,12 +341,15 @@ pub const MultipartSink = struct {
         }
 
         // Drain. Long-lived group awaits all in-flight tasks.
+        const prof = profile.threadOf(self.options.profiler, .writer);
         const t_await_start = nowMonoNs();
         self.group.await(self.io) catch |err| {
             self.abortOpenUpload();
             return err;
         };
-        self.await_ns +%= @intCast(nowMonoNs() - t_await_start);
+        const t_await_end = nowMonoNs();
+        self.await_ns +%= @intCast(t_await_end - t_await_start);
+        profile.record(prof, .upload_wait, t_await_start, t_await_end, profile.args(.{self.next_part_number - 1}));
 
         if (self.first_error) |msg| {
             // Best-effort abort — we don't expose the abort error
@@ -370,7 +378,10 @@ pub const MultipartSink = struct {
             // No part ever flushed → single PutObject for the whole buffer.
             try singlePut(self.arena, self.creds, self.url, self.buffer.items);
         }
-        self.complete_ns +%= @intCast(nowMonoNs() - t_complete_start);
+        const t_complete_end = nowMonoNs();
+        self.complete_ns +%= @intCast(t_complete_end - t_complete_start);
+        const parts = self.next_part_number - 1;
+        profile.record(prof, .upload_complete, t_complete_start, t_complete_end, profile.args(.{parts}));
     }
 
     /// Best-effort cleanup for callers that hit an error after multipart
@@ -423,7 +434,15 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
     defer arena_state.deinit();
     // UploadPart replaces the whole part, so it is idempotent: a dead pooled connection retries at once; connect
     // failures, throttling (429/5xx) and the rest back off.
-    const resp = s3.requestViaPool(io, ctx.sink.pool, arena_state.allocator(), ctx.sink.criteria, .{ .idempotent = true }, ctx, doUploadPart) catch |err| {
+    const opts: s3.RequestOpts = .{
+        .idempotent = true,
+        .prof = profile.threadOf(ctx.sink.options.profiler, .upload),
+        .kind = .http_put,
+        .tag = .{ ctx.part_number, 0 },
+        .bytes = ctx.body_len,
+    };
+    const arena = arena_state.allocator();
+    const resp = s3.requestViaPool(io, ctx.sink.pool, arena, ctx.sink.criteria, opts, ctx, doUploadPart) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         ctx.sink.recordError(@errorName(err));
         return;

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const nowMonoNs = @import("../clock.zig").monoNs;
+const profile = @import("../profile.zig");
 
 /// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
 /// scan.zig, which imports this module.
@@ -87,6 +88,9 @@ pub const Timings = struct {
     eval_ns: u64 = 0,
     encode_ns: u64 = 0,
     sink_ns: u64 = 0,
+    /// The accumulating thread's profile buffer; spans reuse the timestamps these counters are taken from. A Timings
+    /// accumulates on one thread at a time, which is what makes handing it the buffer safe.
+    prof: ?*profile.Thread = null,
 };
 
 /// Per-RG result. `surviving_rows == 0` means the filter dropped
@@ -348,6 +352,7 @@ pub fn appendProjectedRGWithOptions(
     const t_decode_start = nowMonoNs();
     for (fetch_set, 0..) |needed, ci| {
         if (!needed) continue;
+        const chunk_span = profile.Span.begin(timings.prof);
         const col = &rg.columns.items[ci];
         const cm = col.meta_data orelse return error.ColumnMetaMissing;
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -426,12 +431,14 @@ pub fn appendProjectedRGWithOptions(
             ) },
         };
         try checkRowShape(decoded, num_rows);
+        if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
     }
     const t_decode_end = nowMonoNs();
     timings.decode_ns += @intCast(t_decode_end - t_decode_start);
+    profile.record(timings.prof, .decode, t_decode_start, t_decode_end, profile.args(.{ 0, 0, batch_cols.items.len }));
 
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
@@ -440,7 +447,10 @@ pub fn appendProjectedRGWithOptions(
     timings.eval_ns += @intCast(t_eval_end - t_decode_end);
 
     const surviving = sel.count();
+    profile.record(timings.prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, surviving }));
     if (surviving == 0) return 0;
+    const project_span = profile.Span.begin(timings.prof);
+    defer project_span.end(.project, profile.args(.{ surviving, output_specs.len }));
 
     // For each output spec: produce a post-selection Batch.Column and
     // copy values into the aggregator. BYTE_ARRAY content is duped into
@@ -747,12 +757,19 @@ pub fn encodeAggregator(
     if (num_workers <= 1) {
         for (0..n_specs) |i| {
             if (results[i] != null) continue; // FLBA decimal done in pre-pass
+            const span = profile.Span.begin(timings.prof);
             results[i] = try encoder.encodeColumn(ra, .{
                 .values = batch_cols[i],
                 .schema_elem = &agg.schema_elems[i],
                 .path_in_schema = agg.paths[i],
                 .codec = output_codec,
             });
+            if (span.t != null) {
+                const em = results[i].?.meta;
+                span.end(.encode_chunk, profile.args(.{
+                    i, output_codec, em.total_uncompressed_size, em.total_compressed_size, em.num_values,
+                }));
+            }
         }
     } else {
         const arenas = try ra.alloc(std.heap.ArenaAllocator, num_workers);
@@ -790,7 +807,9 @@ pub fn encodeAggregator(
         for (threads[0..spawned]) |t| t.join();
         for (ctxs) |c| if (c.err) |err| return err;
     }
-    timings.encode_ns += @intCast(nowMonoNs() - t_enc_start);
+    const t_enc_end = nowMonoNs();
+    timings.encode_ns += @intCast(t_enc_end - t_enc_start);
+    profile.record(timings.prof, .encode, t_enc_start, t_enc_end, profile.args(.{ n_specs, agg.num_rows }));
 
     // Sequential write phase — same ordering guarantees as the per-RG
     // path. Deep-clone column metadata into out_arena (which outlives
@@ -807,7 +826,9 @@ pub fn encodeAggregator(
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
         const t_sink_start = nowMonoNs();
         try sink.write(enc.bytes);
-        timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
+        const t_sink_end = nowMonoNs();
+        timings.sink_ns += @intCast(t_sink_end - t_sink_start);
+        profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.bytes.len}));
         out_offset.* += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
 
@@ -1120,6 +1141,9 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
 /// One row group as `scanRGForAgg` reads it. Everything is borrowed.
 pub const AggRowGroup = struct {
     rg: *const schema.RowGroup,
+    /// Input file and row-group index, for profile spans only.
+    file_index: usize = 0,
+    rg_index: usize = 0,
     meta: *const schema.FileMetaData,
     src: RGSrc,
     /// The outer filter; null when there is none or statistics prove every row passes it.
@@ -1199,11 +1223,15 @@ pub fn scanRGForAgg(
     ws.rg_arena.nextRowGroup();
     const ra = ws.rg_arena.allocator();
 
+    const prof = ws.timings.prof;
+    const prune_span = profile.Span.begin(prof);
     const page_indexes = try loadPageIndexes(ra, in, stats);
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
 
     const t_decode_start = nowMonoNs();
+    var pages_total: usize = 0;
+    var pages_skipped: usize = 0;
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
@@ -1218,6 +1246,7 @@ pub fn scanRGForAgg(
         if (buf_off + len > in.src.bytes.len) return error.MissingChunkBytes;
         const chunk = in.src.bytes[buf_off .. buf_off + len];
 
+        const chunk_span = profile.Span.begin(prof);
         const prune_info: ?PruningInfo = if (page_indexes[ci]) |pi|
             try pagePruning(ra, pi, filter_pages, ci, in.consumed[ci], &sel, num_rows, cm, start)
         else
@@ -1226,14 +1255,28 @@ pub fn scanRGForAgg(
         lookup[ci] = batch_cols.items.len;
         try checkRowShape(decoded, num_rows);
         try batch_cols.append(ra, decoded);
+        if (chunk_span.t != null) {
+            chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
+            if (prune_info) |pi| {
+                pages_total += pi.page_is_skipped.len;
+                pages_skipped += std.mem.count(bool, pi.page_is_skipped, &.{true});
+            }
+        }
     }
     const t_decode_end = nowMonoNs();
     ws.timings.decode_ns += @intCast(t_decode_end - t_decode_start);
+    if (prof) |t| {
+        t.record(.prune_pages, prune_span.start, t_decode_start, profile.args(.{ pages_total, pages_skipped }));
+        const decode_args = profile.args(.{ in.file_index, in.rg_index, batch_cols.items.len });
+        t.record(.decode, t_decode_start, t_decode_end, decode_args);
+    }
 
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
+    const selected: usize = if (prof != null) sel.count() else 0;
+    profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, selected }));
 
     switch (target) {
         .grouped => |g| {
@@ -1283,7 +1326,21 @@ pub fn scanRGForAgg(
             }
         },
     }
-    ws.timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
+    const t_agg_end = nowMonoNs();
+    ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
+    profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+}
+
+/// `column_chunk` span arguments for chunk `ci` of a row group.
+fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profile.Args {
+    return profile.args(.{
+        file,
+        rg,
+        ci,
+        profile.chunkTypes(cm.codec, profile.chunkEncoding(cm.encodings.items), cm.type),
+        cm.total_compressed_size,
+        cm.total_uncompressed_size,
+    });
 }
 
 /// Fold every call statistics can answer for this row group into its accumulator and mark it in `handled`. Returns
@@ -1298,7 +1355,12 @@ fn foldFromStats(
 ) !bool {
     std.debug.assert(calls.len == accumulators.len);
     const t_stats_start = nowMonoNs();
-    defer timings.eval_ns += @intCast(nowMonoNs() - t_stats_start);
+    var answered: usize = 0;
+    defer {
+        const t_stats_end = nowMonoNs();
+        timings.eval_ns += @intCast(t_stats_end - t_stats_start);
+        profile.record(timings.prof, .stats_fold, t_stats_start, t_stats_end, profile.args(.{answered}));
+    }
     var any_decode_required = false;
     for (calls, accumulators, handled) |call, *acc, *h| {
         if (stats == .ignore or !expr_agg.canStatShortCircuit(call, in.filter != null, stats == .trust)) {
@@ -1307,6 +1369,7 @@ fn foldFromStats(
         }
         if (try expr_agg.updateOneFromStats(acc, call, in.rg, in.meta)) {
             h.* = true;
+            answered += 1;
         } else {
             any_decode_required = true;
         }
@@ -1777,7 +1840,9 @@ fn offsetDelta(new_start: usize, src_start: usize) i64 {
 fn timedWrite(out: *streaming.SinkOut, bytes: []const u8, timings: *Timings) !void {
     const t_sink_start = nowMonoNs();
     try out.write(bytes);
-    timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
+    const t_sink_end = nowMonoNs();
+    timings.sink_ns += @intCast(t_sink_end - t_sink_start);
+    profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{bytes.len}));
 }
 
 /// A copied chunk's metadata, offsets moved by `delta`, with its page index carried into `out` when the output
@@ -1963,7 +2028,9 @@ fn copyChunkRecompressed(
         }
         return err;
     };
-    timings.encode_ns += @intCast(nowMonoNs() - t_encode);
+    const t_encode_end = nowMonoNs();
+    timings.encode_ns += @intCast(t_encode_end - t_encode);
+    profile.record(timings.prof, .encode, t_encode, t_encode_end, profile.args(.{ 1, m.num_values }));
 
     const new_start: i64 = @intCast(out.pos());
     try timedWrite(out, re.bytes, timings);

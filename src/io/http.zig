@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const tls = @import("tls.zig");
+const clock = @import("../clock.zig");
 
 pub const Error = error{
     SendFailed,
@@ -61,6 +62,9 @@ pub const Response = struct {
     status: u16,
     headers: []const Header,
     body: []const u8,
+    /// `clock.monoNs` when the first response byte arrived (0 when not read off a connection): splits a request's
+    /// time to first byte from its body transfer.
+    first_byte_ns: i64 = 0,
 
     pub fn header(self: *const Response, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -161,11 +165,13 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     var content_length: ?usize = null;
     var chunked: bool = false;
     var status: ?u16 = null;
+    var first_byte_ns: i64 = 0;
 
     while (true) {
         var tmp: [16 * 1024]u8 = undefined;
         const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) break;
+        if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
         try stream.appendSlice(arena, tmp[0..n]);
         if (headers_end == null) {
             if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
@@ -186,6 +192,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
                         .status = s,
                         .headers = try parseHeaders(arena, stream.items[0..i]),
                         .body = &.{},
+                        .first_byte_ns = first_byte_ns,
                     };
                 };
             }
@@ -221,7 +228,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     else
         try arena.dupe(u8, raw_body);
 
-    return .{ .status = final_status, .headers = headers, .body = body };
+    return .{ .status = final_status, .headers = headers, .body = body, .first_byte_ns = first_byte_ns };
 }
 
 /// Per RFC 7230 §3.3.3, these status codes MUST NOT carry a message
@@ -239,10 +246,12 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     defer stream.deinit(arena);
 
     var headers_end: ?usize = null;
+    var first_byte_ns: i64 = 0;
     while (headers_end == null) {
         var tmp: [16 * 1024]u8 = undefined;
         const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) return error.BodyTruncated;
+        if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
         try stream.appendSlice(arena, tmp[0..n]);
         if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
             if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
@@ -273,7 +282,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
         written += take;
     }
 
-    return .{ .status = status, .headers = headers, .body = target[0..written] };
+    return .{ .status = status, .headers = headers, .body = target[0..written], .first_byte_ns = first_byte_ns };
 }
 
 /// `conn.recv` for a response of which `received` bytes have arrived. The peer closing (EOF, which is also how a TLS

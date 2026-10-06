@@ -32,6 +32,8 @@ const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
 const multipart_sink = @import("multipart_sink.zig");
 const retry = @import("retry.zig");
+const clock = @import("../clock.zig");
+const profile = @import("../profile.zig");
 
 pub const Pool = pool_mod.Pool;
 pub const PoolCriteria = pool_mod.Criteria;
@@ -498,6 +500,8 @@ pub const GetOpts = struct {
     /// in that case. Used by the metadata cache to skip the
     /// data-page-bearing rounds when an object is unchanged.
     if_none_match: ?[]const u8 = null,
+    /// Records the request as an `http_get` span when set.
+    prof: ?*profile.Thread = null,
 };
 
 pub fn getViaPoolWithOpts(
@@ -519,12 +523,68 @@ pub fn getViaPoolWithOpts(
             return buildAndSend(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.opts);
         }
     };
-    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
+    // A suffix range has no start until the object's size is known: its span shows [0, n).
+    const r = opts.range;
+    const is_suffix = r != null and r.?.start == std.math.maxInt(u64);
+    const bytes: u64 = if (r) |rr| (if (is_suffix) rr.end else rr.end - rr.start + 1) else 0;
+    const tag: [2]u64 = if (r) |rr| (if (is_suffix) .{ 0, rr.end } else .{ rr.start, rr.end + 1 }) else .{ 0, 0 };
+    return requestViaPool(io, p, arena, criteria, .{
+        .idempotent = true,
+        .prof = opts.prof,
+        .tag = tag,
+        .bytes = bytes,
+    }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
 pub const RequestOpts = struct {
     /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the request.
     idempotent: bool,
+    /// Records the request, every attempt included, as one span of `kind` when set.
+    prof: ?*profile.Thread = null,
+    kind: profile.Kind = .http_get,
+    /// The span's first two arguments: a GET's byte range, a part upload's number.
+    tag: [2]u64 = .{ 0, 0 },
+    /// Bytes the request is expected to move, for the in-flight gauge; 0 when unknown.
+    bytes: u64 = 0,
+};
+
+/// One request's timing for its profile span: the final attempt's pool wait and connect, time to first byte, and
+/// body transfer.
+const RequestTrace = struct {
+    opts: RequestOpts,
+    start: profile.Span,
+    attempts: u8 = 0,
+    status: u16 = 0,
+    reused: bool = false,
+    body_len: u64 = 0,
+    acquire_ns: i64 = 0,
+    ttfb_ns: i64 = 0,
+    body_ns: i64 = 0,
+
+    fn begin(opts: RequestOpts) RequestTrace {
+        profile.gauge(opts.prof, .requests_in_flight, 1);
+        profile.gauge(opts.prof, .bytes_in_flight, @intCast(opts.bytes));
+        return .{ .opts = opts, .start = profile.Span.begin(opts.prof) };
+    }
+
+    fn end(self: *const RequestTrace) void {
+        const p = self.opts.prof orelse return;
+        p.gauge(.requests_in_flight, -1);
+        p.gauge(.bytes_in_flight, -@as(i64, @intCast(self.opts.bytes)));
+        const clamp = struct {
+            fn f(ns: i64) u64 {
+                return @intCast(std.math.clamp(ns, 0, std.math.maxInt(u32)));
+            }
+        }.f;
+        self.start.end(self.opts.kind, profile.args(.{
+            self.opts.tag[0],
+            self.opts.tag[1],
+            self.body_len,
+            profile.httpFlags(self.status, self.attempts, self.reused),
+            clamp(self.ttfb_ns) | (clamp(self.acquire_ns) << 32),
+            @as(u64, @intCast(@max(0, self.body_ns))),
+        }));
+    }
 };
 
 /// One request over pooled connections under the retry policy: `send(context, arena, conn)` performs one exchange and
@@ -542,15 +602,30 @@ pub fn requestViaPool(
 ) !http.Response {
     var throttled: ?http.Response = null;
     var attempts: retry.Attempts = .{};
+    var trace: RequestTrace = .begin(opts);
+    defer trace.end();
     while (true) {
         var last_err: anyerror = error.RetryableStatus;
         const failure: retry.Failure = blk: {
+            const t_acquire = if (opts.prof != null) clock.monoNs() else 0;
+            trace.attempts +|= 1;
             const handle = p.acquire(io, criteria, .{ .fresh = attempts.fresh }) catch |err| {
                 last_err = err;
                 break :blk retry.classifyConnect(err);
             };
+            const t_send = if (opts.prof != null) clock.monoNs() else 0;
+            trace.reused = handle.reused;
             if (send(context, arena, handle.conn)) |resp| {
                 p.release(io, handle);
+                if (opts.prof != null) {
+                    const t_done = clock.monoNs();
+                    const first = if (resp.first_byte_ns != 0) resp.first_byte_ns else t_done;
+                    trace.status = resp.status;
+                    trace.body_len = resp.body.len;
+                    trace.acquire_ns = t_send - t_acquire;
+                    trace.ttfb_ns = first - t_send;
+                    trace.body_ns = t_done - first;
+                }
                 if (!retry.retryableStatus(resp.status)) return resp;
                 throttled = resp;
                 break :blk .transient;
@@ -668,6 +743,8 @@ pub fn fetchJobs(
     creds: Credentials,
     jobs: []const FetchJob,
     workers: usize,
+    /// Records each request as a span on the fetching thread when set.
+    profiler: ?*profile.Profiler,
 ) !u64 {
     // 1. Pre-process: split big ranges into sub-jobs.
     var split: std.ArrayList(FetchJob) = .empty;
@@ -734,6 +811,7 @@ pub fn fetchJobs(
             .range = j.range,
             .target = j.target,
             .ok = false,
+            .profiler = profiler,
         };
     }
 
@@ -783,7 +861,7 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null);
 }
 
 const FetchCtx = struct {
@@ -800,6 +878,7 @@ const FetchCtx = struct {
     /// Pre-sized target buffer; `target.len == range.end - range.start`.
     target: []u8,
     ok: bool,
+    profiler: ?*profile.Profiler = null,
 };
 
 /// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
@@ -812,7 +891,14 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         .port = ctx.port,
         .use_tls = ctx.use_tls,
     };
-    const resp = requestViaPool(io, ctx.pool, arena_state.allocator(), criteria, .{ .idempotent = true }, ctx, doFetch) catch |err| switch (err) {
+    const opts: RequestOpts = .{
+        .idempotent = true,
+        .prof = profile.threadOf(ctx.profiler, .fetch),
+        .tag = .{ ctx.range.start, ctx.range.end },
+        .bytes = ctx.target.len,
+    };
+    const arena = arena_state.allocator();
+    const resp = requestViaPool(io, ctx.pool, arena, criteria, opts, ctx, doFetch) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
     };

@@ -211,6 +211,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             var pages = page_mod.PageReader.init(chunk_bytes, codec, arena);
             // Byte-array values are slices into the page bytes, so those pages must outlive the reader.
             if (T != []const u8) pages.scratch = scratch;
+            if (scratch) |s| pages.prof = s.prof;
             return .{
                 .pages = pages,
                 .arena = arena,

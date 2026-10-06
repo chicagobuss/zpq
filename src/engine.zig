@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const nowMonoNs = @import("clock.zig").monoNs;
+const profile = @import("profile.zig");
 const local_fs = @import("local_fs.zig");
 
 const schema = @import("core/schema.zig");
@@ -162,6 +163,8 @@ pub const QueryArgs = struct {
     /// (`fast_levels`) for what the detection actually proves.
     fast_levels: bool = false,
     max_memory: usize = 512 * 1024 * 1024,
+    /// Records the query's spans when set (`--profile`, the Lambda's `"profile"`); see `profile.zig`.
+    profiler: ?*profile.Profiler = null,
 };
 
 pub const Context = struct {
@@ -261,6 +264,8 @@ pub const Timings = struct {
 };
 
 pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
+    const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
+    defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
     if ((args.aggregate != null or args.group_by != null) and (args.select != null or args.columns != null)) {
         return error.AggregateMutexWithSelect;
@@ -291,17 +296,20 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    aggregate to know which leaves to fetch), so by the time we
     //    return, every Input.bytes contains exactly what the scan
     //    needs.
+    const prof = profile.threadOf(args.profiler, .main);
     const t_open = nowMonoNs();
     var opened = try openInputs(ctx, arena, args);
     defer opened.deinit();
-    t.read_ns = @intCast(nowMonoNs() - t_open);
+    const t_open_end = nowMonoNs();
+    t.read_ns = @intCast(t_open_end - t_open);
+    profile.record(prof, .open_inputs, t_open, t_open_end, profile.args(.{args.inputs.len}));
 
     // 2. Run the orchestrator. (Yes, this re-parses the aggregate —
     //    cheap, microseconds. Easier than threading the parsed AST
     //    through the open step + the scan step.)
     var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
         .inputs = opened.inputs,
-        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened, args.diag) else null,
+        .metas = if (opened.has_preparsed_meta) try materializeMetas(arena, opened, args.diag, prof) else null,
         .filter = args.filter,
         .aggregate = agg_str,
         .group_by = args.group_by,
@@ -313,6 +321,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         .diag = args.diag,
+        .profiler = args.profiler,
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -334,7 +343,9 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
             try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, args.codec orelse .SNAPPY)
         else
             try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, args.codec orelse .SNAPPY);
-        t.footer_ns += @intCast(nowMonoNs() - t_footer);
+        const t_footer_end = nowMonoNs();
+        t.footer_ns += @intCast(t_footer_end - t_footer);
+        profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
     }
 
     return .{
@@ -390,6 +401,9 @@ const RGJob = struct {
     /// query is byte-copy-eligible → copy the chunk verbatim instead of
     /// decode→filter→encode. Set only when safe (see bytecopy_ok in runWrite).
     passthrough: bool = false,
+    /// Input file and row group (counted across files), for profile spans.
+    file_index: usize = 0,
+    rg_index: usize = 0,
 };
 
 const EncodedRG = struct {
@@ -397,6 +411,8 @@ const EncodedRG = struct {
     rg: ?schema.RowGroup = null, // footer meta, offsets relative to 0 (meta_arena-owned)
     surviving: i64 = 0,
     err: ?anyerror = null,
+    /// The producer's decode/eval/encode time for this row group, summed by the writer.
+    timings: consumer.Timings = .{},
 };
 
 const Slot = struct {
@@ -419,10 +435,11 @@ fn encodeRGToBuffer(
     output_specs: []const consumer.OutputCol,
     codec: schema.CompressionCodec,
     decode_options: consumer.DecodeOptions,
+    prof: ?*profile.Thread,
 ) !EncodedRG {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
-    var timings: consumer.Timings = .{};
+    var timings: consumer.Timings = .{ .prof = prof };
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
     _ = try consumer.appendProjectedRGWithOptions(
         &agg,
@@ -442,7 +459,8 @@ fn encodeRGToBuffer(
     var local_off: u64 = 0;
     const out = try consumer.encodeAggregator(&agg, meta_alloc, gpa, sink, &local_off, codec, &timings, 1, false);
     const owned = try buf.toOwnedSlice(gpa);
-    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
+    timings.prof = null;
+    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
 }
 
 /// Byte-copy a fully-passing row group's kept columns into a buffer (no decode
@@ -453,15 +471,17 @@ fn copyRGToBuffer(
     meta_alloc: std.mem.Allocator,
     job: RGJob,
     kept_set: ?[]const bool,
+    prof: ?*profile.Thread,
 ) !EncodedRG {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
-    var timings: consumer.Timings = .{};
+    var timings: consumer.Timings = .{ .prof = prof };
     const out = try consumer.copyRG(meta_alloc, job.rg, .{ .bytes = job.bytes, .byte_origin = 0 }, kept_set, sink, &local_off, &timings, false, null);
     const owned = try buf.toOwnedSlice(gpa);
-    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows };
+    timings.prof = null;
+    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
 }
 
 const WinCtx = struct {
@@ -490,16 +510,22 @@ const WinCtx = struct {
     rows_kept: i64 = 0,
     rgs_kept: usize = 0,
     sink_ns: u64 = 0,
+    /// Producers' decode/eval/encode time, summed as their row groups drain.
+    core: consumer.Timings = .{},
     first_err: ?anyerror = null,
 
     inflight: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
+    profiler: ?*profile.Profiler = null,
 };
 
 fn winProducer(w: *WinCtx, i: usize) void {
     const ma = w.slots[i].meta_arena.allocator();
+    const prof = profile.threadOf(w.profiler, .encode);
+    const span = profile.Span.begin(prof);
+    defer span.end(.encode_rg, profile.args(.{ w.jobs[i].file_index, w.jobs[i].rg_index, w.jobs[i].passthrough }));
     const enc = (if (w.jobs[i].passthrough)
-        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set)
+        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set, prof)
     else
         encodeRGToBuffer(
             w.gpa,
@@ -510,12 +536,14 @@ fn winProducer(w: *WinCtx, i: usize) void {
             w.output_specs,
             w.codec,
             w.decode_options,
+            prof,
         )) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
         return;
     };
+    profile.gauge(prof, .buffered_bytes, @intCast(enc.bytes.len));
     const now = w.inflight.fetchAdd(enc.bytes.len, .acq_rel) + enc.bytes.len;
     var p = w.peak_bytes.load(.monotonic);
     while (now > p) p = w.peak_bytes.cmpxchgWeak(p, now, .monotonic, .monotonic) orelse break;
@@ -527,10 +555,14 @@ fn winProducer(w: *WinCtx, i: usize) void {
 /// In-order writer: drains slots 0..N, rebasing offsets, writing to the sink,
 /// then freeing the bulk bytes and posting a window permit (sliding forward).
 fn winWriter(w: *WinCtx) void {
+    const prof = profile.threadOf(w.profiler, .writer);
     var next: usize = 0;
     while (next < w.slots.len) : (next += 1) {
         while (!w.slots[next].done.load(.acquire)) w.completions.waitUncancelable(w.io);
         const enc = w.slots[next].enc;
+        w.core.decode_ns += enc.timings.decode_ns;
+        w.core.eval_ns += enc.timings.eval_ns;
+        w.core.encode_ns += enc.timings.encode_ns;
         if (enc.err) |e| {
             if (w.first_err == null) w.first_err = e;
         } else if (enc.rg) |rg| {
@@ -541,7 +573,9 @@ fn winWriter(w: *WinCtx) void {
                 w.sink.write(enc.bytes) catch |e| {
                     if (w.first_err == null) w.first_err = e;
                 };
-                w.sink_ns += @intCast(nowMonoNs() - t0);
+                const t1 = nowMonoNs();
+                w.sink_ns += @intCast(t1 - t0);
+                profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.bytes.len}));
                 w.out_offset += enc.bytes.len;
                 w.rows_kept += enc.surviving;
                 w.rgs_kept += 1;
@@ -551,6 +585,7 @@ fn winWriter(w: *WinCtx) void {
             }
         }
         if (enc.bytes.len > 0) w.gpa.free(enc.bytes);
+        profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(enc.bytes.len)));
         _ = w.inflight.fetchSub(enc.bytes.len, .acq_rel);
         w.window.post(w.io);
     }
@@ -819,15 +854,19 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 
     // 1. Open all inputs (mmap or parallel s3 range-fetch w/ column
     //    pruning — same path runAggregate uses).
+    const prof = profile.threadOf(args.profiler, .main);
+    t.core.prof = prof;
     const t_open = nowMonoNs();
     var opened = try openInputs(ctx, arena, args);
     defer opened.deinit();
-    t.read_ns = @intCast(nowMonoNs() - t_open);
+    const t_open_end = nowMonoNs();
+    t.read_ns = @intCast(t_open_end - t_open);
+    profile.record(prof, .open_inputs, t_open, t_open_end, profile.args(.{args.inputs.len}));
 
     // 2. Parse meta of every file (cheap; serial), validate schemas
     //    against meta[0].
     const t_parse_start = nowMonoNs();
-    const metas = try materializeMetas(arena, opened, args.diag);
+    const metas = try materializeMetas(arena, opened, args.diag, prof);
     const meta0 = &metas[0];
     for (metas[1..], 1..) |*m, i| {
         if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
@@ -859,7 +898,10 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const output_specs = proj.output_specs;
     const any_computed = proj.any_computed;
     const num_leaves = kept_arr.len;
-    t.parse_ns = @intCast(nowMonoNs() - t_parse_start);
+    const t_parse_end = nowMonoNs();
+    t.parse_ns = @intCast(t_parse_end - t_parse_start);
+    profile.record(prof, .parse_query, t_parse_start, t_parse_end, profile.args(.{}));
+    if (args.profiler) |p| p.setColumnsFromMeta(meta0);
 
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
@@ -903,7 +945,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             out_url,
             out_pool,
             out_criteria,
-            .{},
+            .{ .profiler = args.profiler },
         );
         sink = .{
             .ctx = @ptrCast(&mp_sink.?),
@@ -995,6 +1037,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             for (meta_const.row_groups.items) |*src_rg| {
                 rgs_in += 1;
                 rows_in += src_rg.num_rows;
+                const rg_span = profile.Span.begin(prof);
+                defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
                 const out = if (kept_set != null) try consumer.copyRG(
                     arena,
                     src_rg,
@@ -1073,7 +1117,14 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 };
                 if (passthrough and (copied_from.items.len == 0 or copied_from.getLast() != meta_p))
                     try copied_from.append(arena, meta_p);
-                try jobs.append(arena, .{ .bytes = in.bytes, .meta = meta_p, .rg = src_rg, .passthrough = passthrough });
+                try jobs.append(arena, .{
+                    .bytes = in.bytes,
+                    .meta = meta_p,
+                    .rg = src_rg,
+                    .passthrough = passthrough,
+                    .file_index = ii,
+                    .rg_index = rgs_in - 1,
+                });
             }
         }
 
@@ -1127,17 +1178,24 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .out_offset = out_offset,
                 .new_row_groups = &new_row_groups,
                 .arena = arena,
+                .profiler = args.profiler,
             };
+            const re_span = profile.Span.begin(prof);
+            defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
             try runWindowedReencode(&w, effective_async_budget);
             out_offset = w.out_offset;
             rows_kept += w.rows_kept;
             rg_kept += w.rgs_kept;
             t.core.sink_ns += w.sink_ns;
+            t.core.decode_ns += w.core.decode_ns;
+            t.core.eval_ns += w.core.eval_ns;
+            t.core.encode_ns += w.core.encode_ns;
         }
     }
 
     // 6. Build footer.
     const t_footer = nowMonoNs();
+    const footer_span = profile.Span.begin(prof);
     var new_schema_items = meta0.schema;
     if (select_items != null) {
         // Build a flat schema for --select. Each output_spec produces
@@ -1195,6 +1253,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     try sink.write(&PAR1);
     out_offset += PAR1.len;
     t.footer_ns += @intCast(nowMonoNs() - t_footer);
+    footer_span.end(.footer_write, profile.args(.{footer_bytes.len + 8}));
 
     // 7. Close s3 multipart upload (commits the parts). Local fd
     //     closes via defer.
@@ -1338,16 +1397,24 @@ const OpenedInputs = struct {
     }
 };
 
-fn materializeMetas(arena: std.mem.Allocator, opened: OpenedInputs, diag: ?*Diag) ![]const schema.FileMetaData {
+fn materializeMetas(
+    arena: std.mem.Allocator,
+    opened: OpenedInputs,
+    diag: ?*Diag,
+    prof: ?*profile.Thread,
+) ![]const schema.FileMetaData {
     var metas = try arena.alloc(schema.FileMetaData, opened.inputs.len);
     for (opened.inputs, 0..) |in, i| {
-        metas[i] = if (opened.meta_ready[i])
-            opened.metas[i]
-        else
-            metadata.open(arena, in.bytes) catch |err| {
-                Diag.setInput(diag, in.name, err);
-                return error.NotParquet;
-            };
+        if (opened.meta_ready[i]) {
+            metas[i] = opened.metas[i];
+            continue;
+        }
+        const span = profile.Span.begin(prof);
+        defer span.end(.footer_parse, profile.args(.{ i, in.bytes.len }));
+        metas[i] = metadata.open(arena, in.bytes) catch |err| {
+            Diag.setInput(diag, in.name, err);
+            return error.NotParquet;
+        };
     }
     return metas;
 }
@@ -1370,7 +1437,7 @@ pub fn fetchS3Schema(
     read_ctx.io = read_exec.io();
 
     var specs = [_]FetchSpec{.{ .url = url }};
-    try fetchMetaBatch(read_ctx, arena, creds, pool, &specs);
+    try fetchMetaBatch(read_ctx, arena, creds, pool, &specs, null);
 
     // fetchMetaBatch's parsed metadata borrows string bytes from the
     // gpa-owned footer_region (thrift readString borrows, never copies).
@@ -1392,6 +1459,8 @@ fn openInputs(
     args: QueryArgs,
 ) !OpenedInputs {
     const paths = args.inputs;
+    const prof = profile.threadOf(args.profiler, .main);
+    if (args.profiler) |p| p.setFiles(paths);
     var inputs = try arena.alloc(scan.Input, paths.len);
     var metas = try arena.alloc(schema.FileMetaData, paths.len);
     var meta_ready = try arena.alloc(bool, paths.len);
@@ -1414,6 +1483,7 @@ fn openInputs(
 
     // Local: mmap each, slice into bytes.
     for (local_indices.items) |i| {
+        const span = profile.Span.begin(prof);
         const m = local_fs.mapFile(paths[i]) catch |err| {
             Diag.setInput(args.diag, paths[i], err);
             return switch (err) {
@@ -1424,6 +1494,7 @@ fn openInputs(
         };
         mmaps[i] = m;
         inputs[i] = .{ .name = paths[i], .bytes = m.bytes, .logical_size = m.bytes.len };
+        span.end(.open_file, profile.args(.{ i, m.bytes.len }));
     }
 
     // S3: gather per-bucket batches, one pool per bucket, fetch each
@@ -1466,14 +1537,16 @@ fn openInputs(
         // parallel. After this the per-file meta is parsed and we know
         // total file size + tail_start.
         var specs = try arena.alloc(FetchSpec, s3_urls.len);
-        for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u };
-        fetchMetaBatch(read_ctx, arena, creds, pool, specs) catch |err| {
+        for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u, .file_index = s3_indices.items[k] };
+        const batch_span = profile.Span.begin(prof);
+        fetchMetaBatch(read_ctx, arena, creds, pool, specs, args.profiler) catch |err| {
             for (specs) |sp| {
                 if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
             }
             return err;
         };
+        batch_span.end(.footer_batch, profile.args(.{specs.len}));
         var specs_returned = false;
         errdefer if (!specs_returned) {
             for (specs) |sp| {
@@ -1484,6 +1557,11 @@ fn openInputs(
 
         // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
         // — microseconds, not worth plumbing the parsed AST through.)
+        const plan_span = profile.Span.begin(prof);
+        var n_ranges: usize = 0;
+        var n_merged: usize = 0;
+        var n_rgs: usize = 0;
+        var n_rgs_pruned: usize = 0;
         const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
         for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
         const plan = try planRanges(arena, args, metas_for_plan);
@@ -1507,7 +1585,11 @@ fn openInputs(
             var ranges: std.ArrayList(coalescer.Range) = .empty;
             for (meta.row_groups.items, sp.rg_columns) |*rg, *rg_cols| {
                 rg_cols.* = plan.rowGroupColumns(rg, meta);
-                const cols = rg_cols.* orelse continue;
+                n_rgs += 1;
+                const cols = rg_cols.* orelse {
+                    n_rgs_pruned += 1;
+                    continue;
+                };
                 for (cols, 0..) |needed, ci| {
                     if (!needed) continue;
                     if (ci >= rg.columns.items.len) continue;
@@ -1529,6 +1611,8 @@ fn openInputs(
                 continue;
             }
             const merged = try coalescer.Coalescer.coalesce(arena, ranges.items, COALESCE_GAP);
+            n_ranges += ranges.items.len;
+            n_merged += merged.len;
             var compact_len: usize = 0;
             sp.compact_ranges = try arena.alloc(CompactRange, merged.len);
             for (merged, 0..) |r, ri| {
@@ -1577,11 +1661,30 @@ fn openInputs(
             sp.tail = &.{};
         }
 
+        if (plan_span.t != null) {
+            var fetch_bytes: u64 = 0;
+            for (fetch_jobs.items) |j| fetch_bytes += j.target.len;
+            plan_span.end(.plan_ranges, profile.args(.{
+                n_ranges, n_merged, fetch_jobs.items.len, fetch_bytes, n_rgs, n_rgs_pruned,
+            }));
+        }
+
         // Parallel fetch all the column-chunk ranges across all files.
         // s3.fetchJobs handles the Io.Group fan-out + per-job pool
         // acquire/release.
         if (fetch_jobs.items.len > 0) {
-            _ = try s3.fetchJobs(read_ctx.io, pool, ctx.gpa, arena, creds, fetch_jobs.items, READ_CONCURRENCY);
+            const fetch_span = profile.Span.begin(prof);
+            const fetched = try s3.fetchJobs(
+                read_ctx.io,
+                pool,
+                ctx.gpa,
+                arena,
+                creds,
+                fetch_jobs.items,
+                READ_CONCURRENCY,
+                args.profiler,
+            );
+            fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
         }
 
         // Build scan.Inputs. bytes is the compact per-file buffer with
@@ -1686,6 +1789,8 @@ const CompactRange = struct {
 /// buffer before consumers see the input.
 const FetchSpec = struct {
     url: s3.Url,
+    /// Index into the query's inputs, for profile spans.
+    file_index: usize = 0,
     meta: schema.FileMetaData = undefined,
     file_buf: []u8 = &.{},
     compact_ranges: []CompactRange = &.{},
@@ -1705,18 +1810,27 @@ fn fetchMetaBatch(
     creds: s3.Credentials,
     pool: *s3.Pool(POOL_SIZE),
     specs: []FetchSpec,
+    profiler: ?*profile.Profiler,
 ) !void {
     const TaskCtx = struct {
         ctx: Context,
         creds: s3.Credentials,
         pool: *s3.Pool(POOL_SIZE),
         sp: *FetchSpec,
+        profiler: ?*profile.Profiler,
+        /// The fetching thread's profile buffer, set when the task runs.
+        prof: ?*profile.Thread = null,
+        /// 0 cold, 1 cached footer revalidated, 2 cached footer stale.
+        cache: u8 = 0,
     };
     const Task = struct {
         fn run(t: *TaskCtx) std.Io.Cancelable!void {
             var scratch_state = std.heap.ArenaAllocator.init(t.ctx.gpa);
             defer scratch_state.deinit();
-            doFetchMeta(t.*, scratch_state.allocator()) catch |err| {
+            t.prof = profile.threadOf(t.profiler, .fetch);
+            const span = profile.Span.begin(t.prof);
+            defer span.end(.footer_fetch, profile.args(.{ t.sp.file_index, t.cache }));
+            doFetchMeta(t, scratch_state.allocator()) catch |err| {
                 t.sp.err = err;
             };
         }
@@ -1727,6 +1841,7 @@ fn fetchMetaBatch(
         .creds = creds,
         .pool = pool,
         .sp = sp,
+        .profiler = profiler,
     };
     // One worker loop per permit rather than one task per file: `Io.Group.concurrent` grows the thread pool on every
     // submission that finds all workers busy, so a thousand-file glob spawned a thousand.
@@ -1743,9 +1858,12 @@ fn fetchMetaBatch(
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| return err;
+    const prof = profile.threadOf(profiler, .main);
     for (specs) |*sp| {
         if (sp.footer_region.len < 8) return error.BadResponse;
         const footer_len = sp.footer_region.len - 8;
+        const span = profile.Span.begin(prof);
+        defer span.end(.footer_parse, profile.args(.{ sp.file_index, footer_len }));
         sp.meta = try metadata.openFooter(arena, sp.footer_region[0..footer_len]);
     }
 }
@@ -1767,7 +1885,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
                 .range = s3.Range.suffix(TAIL_SIZE),
                 .if_none_match = entry.etag,
+                .prof = t.prof,
             });
+            t.cache = if (cond.status == 304) 1 else 2;
             if (cond.status == 304) {
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
@@ -1793,7 +1913,10 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     }
 
     // Cold path: normal tail/head/footer-prefix fetches.
-    const tail_resp = try s3.getViaPool(t.ctx.io, t.pool, scratch, t.creds, sp.url, s3.Range.suffix(TAIL_SIZE));
+    const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+        .range = s3.Range.suffix(TAIL_SIZE),
+        .prof = t.prof,
+    });
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
     try populateFromTailResponse(t, scratch, tail_resp);
     try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
@@ -1830,7 +1953,10 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     // S3 reads more lenient than the spec — a corrupt object with
     // a forged-looking header could pass our gate. Pay the RT and
     // validate honestly.
-    const head = try s3.getViaPool(t.ctx.io, t.pool, scratch, t.creds, sp.url, s3.Range.span(0, 7));
+    const head = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+        .range = s3.Range.span(0, 7),
+        .prof = t.prof,
+    });
     if (head.status != 206) return error.BadResponse;
     if (head.body.len < PAR1.len or !std.mem.eql(u8, head.body[0..PAR1.len], &PAR1)) return error.NotParquet;
 
@@ -1842,7 +1968,10 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     // Footer: if it doesn't all fit in the tail we just fetched, fetch
     // the part we're missing.
     if (footer_actual_start < sp.tail_start) {
-        const need = try s3.getViaPool(t.ctx.io, t.pool, scratch, t.creds, sp.url, s3.Range.span(footer_actual_start, sp.tail_start - 1));
+        const need = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+            .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
+            .prof = t.prof,
+        });
         if (need.status != 206) return error.BadResponse;
         const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
         if (need.body.len != missing_len) return error.BadResponse;
@@ -2488,16 +2617,22 @@ pub fn runPrint(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usiz
 
 fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
     const t_start = nowMonoNs();
+    const prof = profile.threadOf(args.profiler, .main);
+    const query_span = profile.Span.begin(prof);
+    defer query_span.end(.query, profile.args(.{}));
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     if (args.select != null and args.columns != null) return error.AggregateMutexWithSelect;
 
+    const open_span = profile.Span.begin(prof);
     var opened = try openInputs(ctx, arena, args);
     defer opened.deinit();
+    open_span.end(.open_inputs, profile.args(.{args.inputs.len}));
 
-    const metas = try materializeMetas(arena, opened, args.diag);
+    const parse_span = profile.Span.begin(prof);
+    const metas = try materializeMetas(arena, opened, args.diag, prof);
     if (metas.len == 0) return;
     const meta0 = &metas[0];
 
@@ -2520,6 +2655,8 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     const filter_opt = proj.filter;
     const fetch_arr = proj.fetch;
     const output_specs = proj.output_specs;
+    parse_span.end(.parse_query, profile.args(.{}));
+    if (args.profiler) |p| p.setColumnsFromMeta(meta0);
 
     // Check nested columns
     const list_map_cols = try arena.alloc(bool, tree0.leaves.len);
@@ -2566,19 +2703,29 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     var rows_in: usize = 0;
 
     var t: Timings = .{};
+    t.core.prof = prof;
 
-    for (opened.inputs, metas) |in, meta_i| {
+    for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
         const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
         const meta_const = meta_i;
-        for (meta_const.row_groups.items) |*src_rg| {
+        for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {
             if (limit) |lim| {
                 if (total_printed >= lim) break;
             }
 
             rows_in += @intCast(src_rg.num_rows);
 
+            const rg_span = profile.Span.begin(prof);
+            var skipped = false;
+            defer {
+                const decision: u8 = if (skipped) 0 else 2;
+                rg_span.end(.row_group, profile.args(.{ file_i, rg_i, decision, src_rg.num_rows }));
+            }
             if (filter_opt) |f| if (!args.scan_all) {
-                if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) continue;
+                if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
+                    skipped = true;
+                    continue;
+                }
             };
 
             _ = try consumer.appendProjectedRGWithOptions(
@@ -2594,7 +2741,9 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
                 .{ .fast_levels = args.fast_levels },
             );
 
+            const print_span = profile.Span.begin(prof);
             try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
+            print_span.end(.sink_write, profile.args(.{agg.num_rows}));
             consumer.resetAggregator(&agg);
         }
     }
@@ -3045,5 +3194,207 @@ test "an S3 query with no region says so rather than blaming the credentials" {
             .inputs = &.{"s3://bucket/key.parquet"},
             .aggregate = "count(*) AS n",
         }));
+    }
+}
+
+// ── Profiling ──
+
+const profile_summary = @import("profile_summary.zig");
+
+/// Check `p`'s trace the way a viewer reads it: valid JSON, every slice complete, and each thread's slices nested
+/// (each starts after the enclosing one ends, or ends within it). Returns how many slices each kind has.
+fn checkTraceNests(gpa: std.mem.Allocator, p: *profile.Profiler) !std.enums.EnumArray(profile.Kind, usize) {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try p.writeTrace(gpa, &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, aw.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("ns", root.get("displayTimeUnit").?.string);
+    try std.testing.expect(root.get("otherData").?.object.get("zpq_version") != null);
+
+    const Slice = struct { tid: i64, start: i64, end: i64 };
+    var slices: std.ArrayList(Slice) = .empty;
+    defer slices.deinit(gpa);
+    var counts: std.enums.EnumArray(profile.Kind, usize) = .initFill(0);
+    for (root.get("traceEvents").?.array.items) |ev| {
+        const o = ev.object;
+        const ph = o.get("ph").?.string;
+        try std.testing.expect(o.get("pid") != null);
+        if (!std.mem.eql(u8, ph, "X")) {
+            try std.testing.expect(std.mem.eql(u8, ph, "M") or std.mem.eql(u8, ph, "C"));
+            continue;
+        }
+        const kind = std.meta.stringToEnum(profile.Kind, o.get("name").?.string).?;
+        counts.getPtr(kind).* += 1;
+        try std.testing.expectEqualStrings(@tagName(kind.phase()), o.get("cat").?.string);
+        // Microseconds with three decimals: exact nanoseconds.
+        const ts: i64 = @intFromFloat(@round(jsonNumber(o.get("ts").?) * 1000));
+        const dur: i64 = @intFromFloat(@round(jsonNumber(o.get("dur").?) * 1000));
+        try std.testing.expect(dur >= 0);
+        try slices.append(gpa, .{ .tid = o.get("tid").?.integer, .start = ts, .end = ts + dur });
+    }
+    std.mem.sort(Slice, slices.items, {}, struct {
+        fn lt(_: void, a: Slice, b: Slice) bool {
+            if (a.tid != b.tid) return a.tid < b.tid;
+            if (a.start != b.start) return a.start < b.start;
+            return a.end > b.end;
+        }
+    }.lt);
+    var stack: std.ArrayList(Slice) = .empty;
+    defer stack.deinit(gpa);
+    for (slices.items) |sl| {
+        if (stack.items.len > 0 and stack.items[0].tid != sl.tid) stack.clearRetainingCapacity();
+        while (stack.items.len > 0 and stack.items[stack.items.len - 1].end <= sl.start) _ = stack.pop();
+        if (stack.items.len > 0) {
+            const top = stack.items[stack.items.len - 1];
+            std.testing.expect(sl.end <= top.end) catch |err| {
+                const fmt = "slice [{d},{d}) overlaps [{d},{d}) on tid {d}\n";
+                std.debug.print(fmt, .{ sl.start, sl.end, top.start, top.end, sl.tid });
+                return err;
+            };
+        }
+        try stack.append(gpa, sl);
+    }
+    return counts;
+}
+
+fn jsonNumber(v: std.json.Value) f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => std.math.nan(f64),
+    };
+}
+
+fn expectKinds(counts: std.enums.EnumArray(profile.Kind, usize), kinds: []const profile.Kind) !void {
+    for (kinds) |k| std.testing.expect(counts.get(k) > 0) catch |err| {
+        std.debug.print("no {s} span in the trace\n", .{@tagName(k)});
+        return err;
+    };
+}
+
+test "a profiled aggregate records every phase, nests per thread, and reconciles with its timings" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+
+    // Unfiltered, filtered (two row groups skipped by statistics, one filtered, five proven to match), grouped.
+    const Case = struct { filter: ?[]const u8, group_by: ?[]const u8 = null, aggregate: []const u8 };
+    for ([_]Case{
+        .{ .filter = null, .aggregate = "count(*) AS n, sum(x) AS sx, max(s) AS ms" },
+        .{ .filter = "ts >= 500", .aggregate = "count(*) AS n, sum(x) AS sx" },
+        .{ .filter = "x > 0", .group_by = "b", .aggregate = "sum(x) AS sx" },
+    }) |c| {
+        const p = try profile.Profiler.create(gpa, .{ .sample_interval_ns = 0 }, .{ .query = "test" });
+        defer p.destroy();
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fixture},
+            .filter = c.filter,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .parallelism = 4,
+            .profiler = p,
+        });
+        defer r.deinit(gpa);
+        p.finish();
+
+        const counts = try checkTraceNests(gpa, p);
+        try expectKinds(counts, &.{
+            .query,       .open_inputs, .open_file, .footer_parse, .parse_query, .plan,      .scan,
+            .scan_worker, .row_group,   .decode,    .column_chunk, .decompress,  .aggregate, .merge,
+            .finalize,
+        });
+        if (c.filter != null) try expectKinds(counts, &.{ .filter, .prune_pages });
+
+        const s = try profile_summary.compute(gpa, p);
+        const t = r.aggregate.timings;
+        // Same timestamps, so equal to the nanosecond.
+        try std.testing.expectEqual(t.read_ns, s.reconcile.read_ns);
+        try std.testing.expectEqual(t.parse_ns, s.reconcile.parse_ns);
+        try std.testing.expectEqual(t.core.decode_ns, s.reconcile.decode_ns);
+        try std.testing.expectEqual(t.core.eval_ns, s.reconcile.eval_ns);
+        try std.testing.expectEqual(t.core.encode_ns, s.reconcile.agg_ns);
+        try std.testing.expectEqual(t.decode_wall_ns, s.reconcile.decode_wall_ns);
+        try std.testing.expectEqual(@as(u64, 8), s.prune.row_groups);
+        try std.testing.expectEqual(@as(u64, r.aggregate.row_groups_pruned), s.prune.skipped);
+        try std.testing.expectEqual(@as(u64, r.aggregate.row_groups_full_match), s.prune.full_match);
+        if (r.aggregate.row_groups_pruned > 0) {
+            try std.testing.expectEqual(@as(usize, 1), s.prune.n_reasons);
+            try std.testing.expectEqualStrings("ts", p.columnName(s.prune.reasons[0].col));
+        }
+        // The critical path accounts for every nanosecond of the query.
+        var crit: u64 = s.idle_ns;
+        for (s.phases) |ph| crit += ph.crit_ns;
+        try std.testing.expect(crit + 16 >= s.total_ns and crit <= s.total_ns + 16);
+        try std.testing.expectEqual(@as(u64, 0), s.dropped);
+    }
+}
+
+test "a profiled write records encode and sink spans and reconciles with its timings" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    for ([_][]const u8{ "x > 0", "ts >= 500" }) |filter| {
+        const p = try profile.Profiler.create(gpa, .{ .sample_interval_ns = 0 }, .{});
+        defer p.destroy();
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fixture},
+            .output = out,
+            .filter = filter,
+            .parallelism = 3,
+            .profiler = p,
+        });
+        defer r.deinit(gpa);
+        p.finish();
+        const counts = try checkTraceNests(gpa, p);
+        try expectKinds(counts, &.{
+            .query, .open_inputs, .footer_parse, .parse_query, .reencode, .encode_rg, .footer_write, .sink_write,
+        });
+        if (std.mem.eql(u8, filter, "x > 0")) try expectKinds(counts, &.{
+            .decode, .column_chunk, .filter, .project, .encode, .encode_chunk,
+        });
+        const s = try profile_summary.compute(gpa, p);
+        const t = r.write.timings;
+        try std.testing.expectEqual(t.read_ns, s.reconcile.read_ns);
+        try std.testing.expectEqual(t.parse_ns, s.reconcile.parse_ns);
+        try std.testing.expectEqual(t.core.decode_ns, s.reconcile.decode_ns);
+        try std.testing.expectEqual(t.core.eval_ns, s.reconcile.eval_ns);
+        try std.testing.expectEqual(t.core.encode_ns, s.reconcile.encode_ns);
+    }
+}
+
+test "profiling stays well-formed and complete under -j N, run after run" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    for (0..50) |i| {
+        const p = try profile.Profiler.create(gpa, .{ .sample_interval_ns = if (i % 2 == 0) 100_000 else 0 }, .{});
+        defer p.destroy();
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{ fixture, fixture, fixture },
+            .filter = "x > 0",
+            .aggregate = "count(*) AS n, sum(x) AS sx, min(s) AS ms",
+            .parallelism = 2 + i % 7,
+            .profiler = p,
+        });
+        defer r.deinit(gpa);
+        p.finish();
+        const counts = try checkTraceNests(gpa, p);
+        // One row_group span per work item, one decode per row group a work item read.
+        try std.testing.expect(counts.get(.row_group) >= 24);
+        try std.testing.expectEqual(counts.get(.decode), counts.get(.aggregate));
+        const s = try profile_summary.compute(gpa, p);
+        try std.testing.expectEqual(@as(u64, 24), s.prune.row_groups);
+        try std.testing.expectEqual(r.aggregate.timings.core.decode_ns, s.reconcile.decode_ns);
+        try std.testing.expectEqual(@as(u64, 0), s.dropped);
     }
 }

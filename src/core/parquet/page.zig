@@ -17,6 +17,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
 const compression = @import("compression.zig");
+const profile = @import("../../profile.zig");
 
 pub const Error = error{
     UnexpectedEndOfChunk,
@@ -50,6 +51,8 @@ pub const DecodeScratch = struct {
     dict: []align(dict_align) u8 = &.{},
     def_levels: []u32 = &.{},
     rep_levels: []u32 = &.{},
+    /// The owning worker's profile buffer: readers drawing on this scratch record their page decompressions there.
+    prof: ?*profile.Thread = null,
     /// Ticket of the reader whose turn it is, and the last ticket issued. Safe builds only.
     owner: Ticket = no_ticket,
     issued: Ticket = no_ticket,
@@ -115,6 +118,9 @@ pub const PageReader = struct {
     /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
     /// next `next()`. Null keeps the arena behaviour: page bytes live as long as `arena`.
     scratch: ?*DecodeScratch = null,
+    /// Records a `decompress` span per compressed page when set. Separate from `scratch`, which byte-array readers
+    /// leave unset.
+    prof: ?*profile.Thread = null,
 
     pub fn init(
         chunk: []const u8,
@@ -195,7 +201,9 @@ pub const PageReader = struct {
             const value_src = payload[rep_len + def_len ..][0..compressed_value_len];
             const values_dst = out[rep_len + def_len ..][0..value_uncompressed_len];
             if (v2.is_compressed and self.codec != .UNCOMPRESSED) {
+                const span = profile.Span.begin(self.prof);
                 try compression.decompressInto(self.arena, value_src, self.codec, values_dst);
+                if (span.t != null) span.end(.decompress, self.pageArgs(header, value_src.len, values_dst.len));
             } else {
                 if (compressed_value_len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
                 @memcpy(values_dst, value_src);
@@ -204,6 +212,9 @@ pub const PageReader = struct {
             return .{ .header = header, .bytes = out };
         }
 
+        // An UNCOMPRESSED page is a slice, not a copy: nothing to time.
+        const span = profile.Span.begin(if (self.codec == .UNCOMPRESSED) null else self.prof);
+        defer if (span.t != null) span.end(.decompress, self.pageArgs(header, csize, usize_));
         if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
             const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
             return .{ .header = header, .bytes = decompressed };
@@ -211,6 +222,16 @@ pub const PageReader = struct {
         const out = try self.pageBuffer(usize_);
         try compression.decompressInto(self.arena, payload, self.codec, out);
         return .{ .header = header, .bytes = out };
+    }
+
+    fn pageArgs(self: *const PageReader, header: schema.PageHeader, in: usize, out: usize) profile.Args {
+        const encoding: ?schema.Encoding = switch (header.type) {
+            .DATA_PAGE => if (header.data_page_header) |h| h.encoding else null,
+            .DATA_PAGE_V2 => if (header.data_page_header_v2) |h| h.encoding else null,
+            .DICTIONARY_PAGE => if (header.dictionary_page_header) |h| h.encoding else null,
+            .INDEX_PAGE => null,
+        };
+        return profile.args(.{ profile.pageTypes(self.codec, header.type, encoding), in, out });
     }
 
     /// Every decoder downstream casts these counts to usize (and V2 subtracts nulls from values), so a header

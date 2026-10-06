@@ -1,6 +1,7 @@
 //! Parquet "fast path" writer: copy surviving row groups byte-for-byte
-//! from the input, rewrite the footer with shifted offsets, emit the
-//! result as a fresh contiguous buffer.
+//! from the input and rewrite the footer with shifted offsets. One
+//! assembly (`assemble`) writes every such file: `buildMulti` runs it
+//! into a fresh contiguous buffer, `streaming.build` into a sink.
 //!
 //! No decoding, no re-encoding. The trick that makes this fast: column
 //! chunks within a row group are contiguous in the input file, so a
@@ -42,134 +43,22 @@ pub const Error = error{
     InvalidColumnOffsets,
     NestedSchemaUnsupported,
     BadColumnIndex,
+    /// The inputs declare different column orders for a copied leaf; a byte copy cannot be declared truthfully.
+    ColumnOrderMismatch,
 } || std.mem.Allocator.Error;
 
-/// Build the fast-path output. When `kept_columns` is null, every
-/// column of every surviving row group is copied byte-for-byte (the
-/// original whole-RG fast path). When non-null, each surviving row
-/// group emits only the listed column chunks (in input order) — a
-/// column-projection writer. `kept_columns` indexes are positions in
-/// each row group's `columns` list, which for flat schemas equals
-/// schema-leaf index.
-///
-/// Nested schemas (struct/list/map) are not yet supported under
-/// projection — error.NestedSchemaUnsupported is returned in that
-/// case. Projection must preserve repetition-level semantics before
-/// nested schemas can use this byte-copy path.
-/// One input file for the multi-file build path. `bytes` covers
-/// (at minimum) the tail/head/footer plus the bytes of every kept
-/// column-chunk of every surviving row group — i.e., everything the
-/// builder needs to byte-copy. `meta` is the parsed FileMetaData;
-/// `survivors[i]` says whether row-group `i` survives.
+/// One input file. `bytes` covers (at minimum) the tail/head/footer
+/// plus the bytes of every kept column-chunk of every surviving row
+/// group — i.e., everything the builder needs to byte-copy. `meta` is
+/// the parsed FileMetaData; `survivors[i]` says whether row-group `i`
+/// survives.
 pub const FileSpec = struct {
     bytes: []const u8,
     meta: *const schema.FileMetaData,
     survivors: []const bool,
 };
 
-/// Multi-file fastpath: concatenate surviving row groups from N input
-/// files into one Parquet output. All files must have compatible
-/// schemas (the caller validates this). Falls through to the single-
-/// file path when len(files) == 1.
-pub fn buildMulti(
-    arena: std.mem.Allocator,
-    files: []const FileSpec,
-    kept_columns: ?[]const usize,
-) Error![]u8 {
-    if (files.len == 0) return error.SurvivorsLenMismatch;
-
-    // Use the first file's metadata as the source of truth for
-    // schema. Subsequent files are byte-copied; their schema is
-    // assumed to match (caller's responsibility to verify).
-    const meta0 = files[0].meta;
-
-    if (kept_columns) |kc| {
-        if (meta0.schema.items.len < 1) return error.NestedSchemaUnsupported;
-        const root = meta0.schema.items[0];
-        const expected_leaves: usize = if (root.num_children) |nc| @intCast(nc) else 0;
-        if (meta0.schema.items.len != 1 + expected_leaves) return error.NestedSchemaUnsupported;
-        for (kc) |idx| {
-            if (idx >= expected_leaves) return error.BadColumnIndex;
-        }
-    }
-
-    // Pre-size estimate: sum kept ranges across all files + footer.
-    var bytes_estimate: usize = MAGIC.len * 2 + 4;
-    for (files) |f| {
-        if (f.survivors.len != f.meta.row_groups.items.len) return error.SurvivorsLenMismatch;
-        for (f.survivors, 0..) |keep, i| {
-            if (!keep) continue;
-            const rg = &f.meta.row_groups.items[i];
-            if (kept_columns) |kc| {
-                for (kc) |col_idx| {
-                    if (col_idx >= rg.columns.items.len) continue;
-                    const m = rg.columns.items[col_idx].meta_data orelse continue;
-                    bytes_estimate += @intCast(m.total_compressed_size);
-                }
-            } else {
-                const range = rowGroupByteRange(rg) orelse continue;
-                bytes_estimate += range.len;
-            }
-        }
-    }
-    bytes_estimate += 64 * 1024;
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(arena);
-    try out.ensureTotalCapacity(arena, bytes_estimate);
-    try out.appendSlice(arena, &MAGIC);
-
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
-    errdefer new_row_groups.deinit(arena);
-    var total_rows: i64 = 0;
-
-    for (files) |f| {
-        for (f.survivors, 0..) |keep, i| {
-            if (!keep) continue;
-            const rg = &f.meta.row_groups.items[i];
-            if (kept_columns) |kc| {
-                const new_rg = try copyProjectedRowGroup(arena, &out, f.bytes, rg, kc);
-                try new_row_groups.append(arena, new_rg);
-            } else {
-                const range = rowGroupByteRange(rg) orelse continue;
-                if (range.start + range.len > f.bytes.len) return error.InvalidColumnOffsets;
-                const new_start: usize = out.items.len;
-                try out.appendSlice(arena, f.bytes[range.start .. range.start + range.len]);
-                const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(range.start));
-                const cloned = try cloneRowGroupShifted(arena, &out, f.bytes, rg, delta);
-                try new_row_groups.append(arena, cloned);
-            }
-            total_rows += rg.num_rows;
-        }
-    }
-
-    // Schema from first file (projected if applicable).
-    var new_schema = meta0.schema;
-    if (kept_columns) |kc| new_schema = try projectSchema(arena, meta0.schema, kc);
-
-    const new_meta: schema.FileMetaData = .{
-        .version = meta0.version,
-        .schema = new_schema,
-        .num_rows = total_rows,
-        .created_by = meta0.created_by,
-        .row_groups = new_row_groups,
-    };
-
-    var w: thrift.Writer = .init(arena);
-    defer w.deinit();
-    try new_meta.write(&w);
-
-    const footer_start: usize = out.items.len;
-    try out.appendSlice(arena, w.bytes());
-    const footer_len: u32 = @intCast(out.items.len - footer_start);
-    var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
-    try out.appendSlice(arena, &len_bytes);
-    try out.appendSlice(arena, &MAGIC);
-
-    return out.toOwnedSlice(arena);
-}
-
+/// Single-file build: `buildMulti` over one `FileSpec`.
 pub fn build(
     arena: std.mem.Allocator,
     input: []const u8,
@@ -177,144 +66,183 @@ pub fn build(
     survivors: []const bool,
     kept_columns: ?[]const usize,
 ) Error![]u8 {
-    if (survivors.len != meta.row_groups.items.len) return error.SurvivorsLenMismatch;
+    return buildMulti(arena, &.{.{ .bytes = input, .meta = meta, .survivors = survivors }}, kept_columns);
+}
 
-    if (kept_columns) |kc| {
-        // For flat schemas, schema is [root, leaf_0, leaf_1, ...] —
-        // total entries = 1 + N leaves, root has num_children = N. Any
-        // shape outside that means nested types we don't handle yet.
-        if (meta.schema.items.len < 1) return error.NestedSchemaUnsupported;
-        const root = meta.schema.items[0];
-        const expected_leaves: usize = if (root.num_children) |nc| @intCast(nc) else 0;
-        if (meta.schema.items.len != 1 + expected_leaves) return error.NestedSchemaUnsupported;
-        for (kc) |idx| {
-            if (idx >= expected_leaves) return error.BadColumnIndex;
-        }
+/// Concatenate the surviving row groups of N input files into one
+/// Parquet output held in memory. All files must have compatible
+/// schemas (the caller validates this); the first file's is written.
+///
+/// When `kept_columns` is null, every column of every surviving row
+/// group is copied byte-for-byte. When non-null, each surviving row
+/// group emits only the listed column chunks (in the listed order) — a
+/// column-projection writer. `kept_columns` indexes are positions in
+/// each row group's `columns` list, which for flat schemas equals
+/// schema-leaf index. Nested schemas (struct/list/map) are not yet
+/// supported under projection — error.NestedSchemaUnsupported is
+/// returned in that case. Projection must preserve repetition-level
+/// semantics before nested schemas can use this byte-copy path.
+pub fn buildMulti(
+    arena: std.mem.Allocator,
+    files: []const FileSpec,
+    kept_columns: ?[]const usize,
+) Error![]u8 {
+    var out: BufferOut = .{ .arena = arena };
+    errdefer out.bytes.deinit(arena);
+    try assemble(arena, &out, files, kept_columns);
+    return out.bytes.toOwnedSlice(arena);
+}
+
+/// `assemble` output collecting the whole file in one buffer.
+const BufferOut = struct {
+    arena: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn pos(self: *const BufferOut) usize {
+        return self.bytes.items.len;
     }
 
-    // Pre-size the output buffer.
-    var bytes_estimate: usize = MAGIC.len * 2 + 4;
-    for (survivors, 0..) |keep, i| {
-        if (!keep) continue;
-        const rg = &meta.row_groups.items[i];
-        if (kept_columns) |kc| {
-            for (kc) |col_idx| {
-                if (col_idx >= rg.columns.items.len) continue;
-                const m = rg.columns.items[col_idx].meta_data orelse continue;
-                bytes_estimate += @intCast(m.total_compressed_size);
-            }
-        } else {
-            const range = rowGroupByteRange(rg) orelse continue;
-            bytes_estimate += range.len;
-        }
+    fn reserve(self: *BufferOut, len: usize) Error!void {
+        try self.bytes.ensureTotalCapacity(self.arena, len);
     }
-    bytes_estimate += 64 * 1024;
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(arena);
-    try out.ensureTotalCapacity(arena, bytes_estimate);
+    fn write(self: *BufferOut, bytes: []const u8) Error!void {
+        try self.bytes.appendSlice(self.arena, bytes);
+    }
+};
 
-    try out.appendSlice(arena, &MAGIC);
+/// Write a complete byte-copy output to `out`, the one assembly behind
+/// both `buildMulti` (a buffer) and `streaming.build` (a sink). `out`
+/// provides `pos()`, the number of bytes written so far; `write(bytes)`;
+/// and `reserve(len)`, a hint of the total output length.
+///
+/// Inputs are validated, every chunk to be copied located inside its
+/// input, and the footer's column orders settled, before the first byte
+/// is written, so a refused build leaves a sink untouched.
+pub fn assemble(
+    arena: std.mem.Allocator,
+    out: anytype,
+    files: []const FileSpec,
+    kept_columns: ?[]const usize,
+) !void {
+    try validateInputs(files, kept_columns);
+    const copied_len = try copiedLen(files, kept_columns);
+    const column_orders = try copiedColumnOrders(arena, files, kept_columns);
+    // Room past the copied chunks for the magic, footer and page indexes.
+    try out.reserve(copied_len +| MAGIC.len * 2 + 4 + 64 * 1024);
 
+    try out.write(&MAGIC);
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     errdefer new_row_groups.deinit(arena);
-
     var total_rows: i64 = 0;
-    for (survivors, 0..) |keep, i| {
+    for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
         if (!keep) continue;
-        const rg = &meta.row_groups.items[i];
-
-        if (kept_columns) |kc| {
-            const new_rg = try copyProjectedRowGroup(arena, &out, input, rg, kc);
-            try new_row_groups.append(arena, new_rg);
-        } else {
-            const range = rowGroupByteRange(rg) orelse continue;
-            if (range.start + range.len > input.len) return error.InvalidColumnOffsets;
-            const new_start: usize = out.items.len;
-            try out.appendSlice(arena, input[range.start .. range.start + range.len]);
-            const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(range.start));
-            const cloned = try cloneRowGroupShifted(arena, &out, input, rg, delta);
-            try new_row_groups.append(arena, cloned);
-        }
+        const new_rg = if (kept_columns) |kc|
+            try copyProjectedRowGroup(arena, out, f.bytes, rg, kc)
+        else
+            try copyRowGroup(arena, out, f.bytes, rg) orelse continue;
+        try new_row_groups.append(arena, new_rg);
         total_rows += rg.num_rows;
-    }
-
-    // Build new FileMetaData. Schema is shared by reference unless
-    // we're projecting — projection requires a reduced schema list.
-    var new_schema = meta.schema;
-    if (kept_columns) |kc| new_schema = try projectSchema(arena, meta.schema, kc);
-
-    const new_meta: schema.FileMetaData = .{
-        .version = meta.version,
-        .schema = new_schema,
-        .num_rows = total_rows,
-        .created_by = meta.created_by,
-        .row_groups = new_row_groups,
     };
 
+    // The schema is shared by reference unless projecting, which needs a reduced list.
+    const meta0 = files[0].meta;
+    const new_meta: schema.FileMetaData = .{
+        .version = meta0.version,
+        .schema = if (kept_columns) |kc| try projectSchema(arena, meta0.schema, kc) else meta0.schema,
+        .num_rows = total_rows,
+        .created_by = meta0.created_by,
+        .row_groups = new_row_groups,
+        .column_orders = column_orders,
+    };
     var w: thrift.Writer = .init(arena);
     defer w.deinit();
     try new_meta.write(&w);
 
-    const footer_start: usize = out.items.len;
-    try out.appendSlice(arena, w.bytes());
-    const footer_len: u32 = @intCast(out.items.len - footer_start);
-
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, footer_len, .little);
-    try out.appendSlice(arena, &len_bytes);
-    try out.appendSlice(arena, &MAGIC);
-
-    return out.toOwnedSlice(arena);
+    std.mem.writeInt(u32, &len_bytes, @intCast(w.bytes().len), .little);
+    try out.write(w.bytes());
+    try out.write(&len_bytes);
+    try out.write(&MAGIC);
 }
 
-/// Copy only the kept column chunks of one row group to the output
-/// buffer, contiguously, and return a new RowGroup struct with shifted
-/// offsets. The new RG's `total_byte_size` is the sum of kept column
-/// sizes; `num_rows` is unchanged from the source.
+/// One survivor flag per row group; under projection, a flat schema
+/// whose leaves the kept indexes name. For flat schemas, the schema is
+/// [root, leaf_0, leaf_1, ...] — total entries = 1 + N leaves, root has
+/// num_children = N. Any other shape means nested types we don't handle
+/// yet. Subsequent files' schemas are assumed to match the first's.
+fn validateInputs(files: []const FileSpec, kept_columns: ?[]const usize) Error!void {
+    if (files.len == 0) return error.SurvivorsLenMismatch;
+    for (files) |f| if (f.survivors.len != f.meta.row_groups.items.len) return error.SurvivorsLenMismatch;
+    const kc = kept_columns orelse return;
+    const schema0 = files[0].meta.schema.items;
+    if (schema0.len < 1) return error.NestedSchemaUnsupported;
+    const expected_leaves = std.math.cast(usize, schema0[0].num_children orelse 0) orelse
+        return error.NestedSchemaUnsupported;
+    if (schema0.len != 1 + expected_leaves) return error.NestedSchemaUnsupported;
+    for (kc) |idx| if (idx >= expected_leaves) return error.BadColumnIndex;
+}
+
+/// The bytes of every chunk the build will copy, each checked to lie
+/// inside its input first.
+fn copiedLen(files: []const FileSpec, kept_columns: ?[]const usize) Error!usize {
+    var len: usize = 0;
+    for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
+        if (!keep) continue;
+        if (kept_columns) |kc| {
+            for (kc) |col_idx| len +|= (try projectedChunkRange(rg, col_idx, f.bytes.len)).len;
+        } else if (try rowGroupByteRange(rg, f.bytes.len)) |range| len +|= range.len;
+    };
+    return len;
+}
+
+/// Copy a whole row group's chunk bytes in one piece — column chunks
+/// within a row group are contiguous in the input — then its page
+/// indexes. Null when no chunk has metadata to locate it by.
+fn copyRowGroup(
+    arena: std.mem.Allocator,
+    out: anytype,
+    input: []const u8,
+    src: *const schema.RowGroup,
+) !?schema.RowGroup {
+    const range = try rowGroupByteRange(src, input.len) orelse return null;
+    const delta = offsetDelta(out.pos(), range.start);
+    try out.write(input[range.start .. range.start + range.len]);
+
+    var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    errdefer cols.deinit(arena);
+    try cols.ensureTotalCapacity(arena, src.columns.items.len);
+    // Every chunk in the group moved by the same delta; the rebased
+    // indexes follow the group's data.
+    for (src.columns.items) |*chunk| cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, chunk, delta));
+    return .{
+        .columns = cols,
+        .total_byte_size = src.total_byte_size,
+        .num_rows = src.num_rows,
+    };
+}
+
+/// Copy only the kept column chunks of one row group, contiguously,
+/// each followed by its page index. The new RG's `total_byte_size` is
+/// the sum of kept column sizes; `num_rows` is unchanged from the source.
 fn copyProjectedRowGroup(
     arena: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    out: anytype,
     input: []const u8,
     src_rg: *const schema.RowGroup,
     kept: []const usize,
-) Error!schema.RowGroup {
+) !schema.RowGroup {
     var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     errdefer new_cols.deinit(arena);
     try new_cols.ensureTotalCapacity(arena, kept.len);
 
     var rg_total: i64 = 0;
     for (kept) |col_idx| {
-        if (col_idx >= src_rg.columns.items.len) return error.BadColumnIndex;
-        const src_chunk = src_rg.columns.items[col_idx];
-        const m = src_chunk.meta_data orelse return error.InvalidColumnOffsets;
-
-        const src_start: usize = if (m.dictionary_page_offset) |d| @intCast(d) else @intCast(m.data_page_offset);
-        const src_len: usize = @intCast(m.total_compressed_size);
-        if (src_start + src_len > input.len) return error.InvalidColumnOffsets;
-
-        const new_col_start: usize = out.items.len;
-        try out.appendSlice(arena, input[src_start .. src_start + src_len]);
-
-        const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
-        var new_chunk = src_chunk;
-        if (new_chunk.meta_data) |*nm| {
-            nm.data_page_offset += delta;
-            if (nm.dictionary_page_offset) |d| nm.dictionary_page_offset = d + delta;
-            if (nm.index_page_offset) |d| nm.index_page_offset = d + delta;
-        }
-        if (new_chunk.meta_data) |nm| new_chunk.file_offset = nm.data_page_offset;
-
-        // Carry the page index forward — each projected chunk moved by
-        // its own delta. Dropped when absent/unfetched/unparseable.
-        const idx = carryPageIndex(arena, out, input, &src_chunk, delta);
-        new_chunk.offset_index_offset = idx.offset_index_offset;
-        new_chunk.offset_index_length = idx.offset_index_length;
-        new_chunk.column_index_offset = idx.column_index_offset;
-        new_chunk.column_index_length = idx.column_index_length;
-
-        try new_cols.append(arena, new_chunk);
-        rg_total += @intCast(src_len);
+        const range = try projectedChunkRange(src_rg, col_idx, input.len);
+        const delta = offsetDelta(out.pos(), range.start);
+        try out.write(input[range.start .. range.start + range.len]);
+        new_cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &src_rg.columns.items[col_idx], delta));
+        rg_total += @intCast(range.len);
     }
 
     return .{
@@ -324,9 +252,53 @@ fn copyProjectedRowGroup(
     };
 }
 
+fn offsetDelta(new_start: usize, src_start: usize) i64 {
+    return @as(i64, @intCast(new_start)) - @as(i64, @intCast(src_start));
+}
+
+/// `src` with every offset shifted by `delta`, the distance its data
+/// moved, and its page index carried forward into `out`. Inner slices
+/// (encodings, paths, stats) are borrowed from the source; bloom-filter
+/// offsets are dropped.
+pub fn rebaseChunk(
+    arena: std.mem.Allocator,
+    out: anytype,
+    input: []const u8,
+    src: *const schema.ColumnChunk,
+    delta: i64,
+) !schema.ColumnChunk {
+    var chunk = shiftChunk(src, delta);
+    const idx = try carryPageIndex(arena, out, input, src, delta);
+    chunk.offset_index_offset = idx.offset_index_offset;
+    chunk.offset_index_length = idx.offset_index_length;
+    chunk.column_index_offset = idx.column_index_offset;
+    chunk.column_index_length = idx.column_index_length;
+    return chunk;
+}
+
+/// `rebaseChunk` without the page index, for output that carries none.
+pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
+    var chunk = src.*;
+    if (chunk.meta_data) |*m| {
+        m.data_page_offset += delta;
+        if (m.dictionary_page_offset) |d| m.dictionary_page_offset = d + delta;
+        // index_page_offset is rarely set; treat the same way.
+        if (m.index_page_offset) |d| m.index_page_offset = d + delta;
+        // Parquet's older file_offset field mirrors data_page_offset.
+        // Readers should use the structured offsets, but keeping this
+        // consistent costs nothing.
+        chunk.file_offset = m.data_page_offset;
+    }
+    chunk.offset_index_offset = null;
+    chunk.offset_index_length = null;
+    chunk.column_index_offset = null;
+    chunk.column_index_length = null;
+    return chunk;
+}
+
 /// Build a new schema list: root (with adjusted num_children) + the
-/// listed leaf elements in input order. Caller is the projection path
-/// only; flat-schema invariant is checked by `build`.
+/// listed leaf elements in the listed order. Caller is the projection
+/// path only; the flat-schema invariant is checked by `validateInputs`.
 pub fn projectSchema(
     arena: std.mem.Allocator,
     src: std.ArrayListUnmanaged(schema.SchemaElement),
@@ -347,27 +319,56 @@ pub fn projectSchema(
     return out;
 }
 
-const ByteRange = struct { start: usize, len: usize };
+/// Column orders of an all-byte-copy output: every row group keeps its source's bounds, so the sources decide them.
+pub fn copiedColumnOrders(
+    arena: std.mem.Allocator,
+    files: []const FileSpec,
+    kept_columns: ?[]const usize,
+) Error!?std.ArrayListUnmanaged(i16) {
+    const metas = try arena.alloc(*const schema.FileMetaData, files.len);
+    for (files, metas) |f, *m| m.* = f.meta;
+    var n_leaves: usize = 0;
+    if (kept_columns) |kc| n_leaves = kc.len else for (files[0].meta.schema.items) |el| {
+        if (el.type != null) n_leaves += 1;
+    }
+    return schema.FileMetaData.outputColumnOrders(arena, n_leaves, kept_columns, metas);
+}
+
+pub const ByteRange = struct { start: usize, len: usize };
 
 /// The contiguous span of bytes in the source file that holds all of
 /// this row group's column-chunk data. Returns null if no column has
 /// readable metadata (shouldn't happen on real files but we don't panic).
-fn rowGroupByteRange(rg: *const schema.RowGroup) ?ByteRange {
-    if (rg.columns.items.len == 0) return null;
-    var min_start: u64 = std.math.maxInt(u64);
-    var max_end: u64 = 0;
-    for (rg.columns.items) |chunk| {
-        const m = chunk.meta_data orelse continue;
-        const start: u64 = if (m.dictionary_page_offset) |d|
-            @intCast(d)
-        else
-            @intCast(m.data_page_offset);
-        const end: u64 = start + @as(u64, @intCast(m.total_compressed_size));
-        if (start < min_start) min_start = start;
-        if (end > max_end) max_end = end;
-    }
-    if (min_start == std.math.maxInt(u64)) return null;
-    return .{ .start = @intCast(min_start), .len = @intCast(max_end - min_start) };
+pub fn rowGroupByteRange(rg: *const schema.RowGroup, input_len: usize) Error!?ByteRange {
+    var min_start: usize = std.math.maxInt(usize);
+    var max_end: usize = 0;
+    for (rg.columns.items) |*chunk| if (chunk.meta_data) |*m| {
+        const range = chunkRange(m, input_len) orelse return error.InvalidColumnOffsets;
+        min_start = @min(min_start, range.start);
+        max_end = @max(max_end, range.start + range.len);
+    };
+    if (min_start == std.math.maxInt(usize)) return null;
+    return .{ .start = min_start, .len = max_end - min_start };
+}
+
+/// Where kept column `col_idx` of `rg` lies in its input.
+fn projectedChunkRange(rg: *const schema.RowGroup, col_idx: usize, input_len: usize) Error!ByteRange {
+    if (col_idx >= rg.columns.items.len) return error.BadColumnIndex;
+    const m = if (rg.columns.items[col_idx].meta_data) |*m| m else return error.InvalidColumnOffsets;
+    return chunkRange(m, input_len) orelse error.InvalidColumnOffsets;
+}
+
+/// A chunk's bytes in its input, from the dictionary page (if any)
+/// through the last data page. Null when the footer's offset or size is
+/// negative, or the range overflows or runs past the input:
+/// `metadata.open` rejects the first two, but the builders take any
+/// FileMetaData, and only the code holding the bytes knows their length.
+pub fn chunkRange(m: *const schema.ColumnMetaData, input_len: usize) ?ByteRange {
+    const start = std.math.cast(usize, m.dictionary_page_offset orelse m.data_page_offset) orelse return null;
+    const len = std.math.cast(usize, m.total_compressed_size) orelse return null;
+    const end = std.math.add(usize, start, len) catch return null;
+    if (end > input_len) return null;
+    return .{ .start = start, .len = len };
 }
 
 /// Page-index pointers for one output chunk.
@@ -391,20 +392,19 @@ pub const PageIndexPtrs = struct {
 /// safe — readers fall back to row-group-level pruning.
 fn carryPageIndex(
     arena: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    out: anytype,
     input: []const u8,
     src: *const schema.ColumnChunk,
     delta: i64,
-) PageIndexPtrs {
+) !PageIndexPtrs {
     var ptrs = PageIndexPtrs{};
 
     if (src.column_index_offset) |co| if (src.column_index_length) |cl| {
         if (sliceInBounds(input, co, cl)) |bytes| {
             if (reserializeColumnIndex(arena, bytes)) |ser| {
-                const off = out.items.len;
-                out.appendSlice(arena, ser) catch return ptrs;
-                ptrs.column_index_offset = @intCast(off);
+                ptrs.column_index_offset = @intCast(out.pos());
                 ptrs.column_index_length = @intCast(ser.len);
+                try out.write(ser);
             }
         }
     };
@@ -412,10 +412,9 @@ fn carryPageIndex(
     if (src.offset_index_offset) |oo| if (src.offset_index_length) |ol| {
         if (sliceInBounds(input, oo, ol)) |bytes| {
             if (reserializeOffsetIndexShifted(arena, bytes, delta)) |ser| {
-                const off = out.items.len;
-                out.appendSlice(arena, ser) catch return ptrs;
-                ptrs.offset_index_offset = @intCast(off);
+                ptrs.offset_index_offset = @intCast(out.pos());
                 ptrs.offset_index_length = @intCast(ser.len);
+                try out.write(ser);
             }
         }
     };
@@ -436,8 +435,8 @@ pub fn sliceInBounds(input: []const u8, offset: i64, length: i32) ?[]const u8 {
 
 /// Re-serialize a ColumnIndex verbatim onto `arena` (the re-parse drops
 /// only fields we don't model — the level histograms, which are
-/// advisory). Null on any parse/encode failure. Shared by the buffered
-/// and streaming writers so both carry an identical index forward.
+/// advisory). Null on any parse/encode failure. Shared with the
+/// consumer's copy path so every writer carries an identical index forward.
 pub fn reserializeColumnIndex(arena: std.mem.Allocator, bytes: []const u8) ?[]const u8 {
     var r = thrift.Reader.init(bytes);
     var ci = schema.ColumnIndex.read(arena, &r) catch return null;
@@ -451,60 +450,11 @@ pub fn reserializeColumnIndex(arena: std.mem.Allocator, bytes: []const u8) ?[]co
 pub fn reserializeOffsetIndexShifted(arena: std.mem.Allocator, bytes: []const u8, delta: i64) ?[]const u8 {
     var r = thrift.Reader.init(bytes);
     var oi = schema.OffsetIndex.read(arena, &r) catch return null;
-    for (oi.page_locations.items) |*pl| pl.offset += delta;
+    // Offsets come from the source file; a hostile one must drop the index, not overflow.
+    for (oi.page_locations.items) |*pl| pl.offset = std.math.add(i64, pl.offset, delta) catch return null;
     var w = thrift.Writer.init(arena);
     oi.write(&w) catch return null;
     return w.bytes();
-}
-
-/// Build a new RowGroup whose column chunks have all offsets shifted by
-/// `delta`. The page index is carried forward into `out` (appended after
-/// the row-group data the caller already copied); bloom-filter offsets
-/// are still dropped. Inner slices (encodings, paths, stats) are borrowed
-/// from the source.
-fn cloneRowGroupShifted(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    input: []const u8,
-    src: *const schema.RowGroup,
-    delta: i64,
-) !schema.RowGroup {
-    var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-    errdefer cols.deinit(arena);
-    try cols.ensureTotalCapacity(arena, src.columns.items.len);
-
-    for (src.columns.items) |chunk| {
-        var new_chunk = chunk; // shallow copy
-
-        if (new_chunk.meta_data) |*m| {
-            m.data_page_offset += delta;
-            if (m.dictionary_page_offset) |d| m.dictionary_page_offset = d + delta;
-            // index_page_offset is rarely set; treat the same way.
-            if (m.index_page_offset) |d| m.index_page_offset = d + delta;
-        }
-        // Parquet's older file_offset field mirrors data_page_offset
-        // when present. Readers should use the structured offsets, but
-        // keeping this consistent costs nothing.
-        if (new_chunk.meta_data) |m| {
-            new_chunk.file_offset = m.data_page_offset;
-        }
-
-        // Carry the page index forward (whole-RG copy → one delta for
-        // every chunk in the group). Drops it when absent/unfetched.
-        const idx = carryPageIndex(arena, out, input, &chunk, delta);
-        new_chunk.offset_index_offset = idx.offset_index_offset;
-        new_chunk.offset_index_length = idx.offset_index_length;
-        new_chunk.column_index_offset = idx.column_index_offset;
-        new_chunk.column_index_length = idx.column_index_length;
-
-        try cols.append(arena, new_chunk);
-    }
-
-    return .{
-        .columns = cols,
-        .total_byte_size = src.total_byte_size,
-        .num_rows = src.num_rows,
-    };
 }
 
 // ============================================================
@@ -513,6 +463,7 @@ fn cloneRowGroupShifted(
 
 const testing = std.testing;
 const metadata = @import("../parquet/metadata.zig");
+const readFileSlice = metadata.readFileSlice;
 
 test "build with all survivors round-trips through metadata.open" {
     const fixture_path = "data/benchmark_100mb.parquet";
@@ -812,44 +763,82 @@ test "build rejects mismatched survivors length" {
     try testing.expectError(error.SurvivorsLenMismatch, build(arena, &empty_bytes, &meta, &wrong, null));
 }
 
-fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
+test "byte-copied output declares its source's column orders" {
+    const path = "ci/fixtures/parquet/column_order.parquet";
+    const file_bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta = try metadata.open(arena, file_bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    const specs = [_]FileSpec{.{ .bytes = file_bytes, .meta = &meta, .survivors = survivors }};
 
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = signedOrError(r_open) catch return error.FileNotFound;
-    defer _ = linux.close(fd);
+    // Source: `s` in an order zpq does not implement (3), `i` type-defined.
+    const all = try metadata.open(arena, try buildMulti(arena, &specs, null));
+    try testing.expectEqualSlices(i16, &.{ 3, schema.COLUMN_ORDER_TYPE_DEFINED }, all.column_orders.?.items);
+    const projected = try metadata.open(arena, try buildMulti(arena, &specs, &.{1}));
+    try testing.expectEqualSlices(i16, &.{schema.COLUMN_ORDER_TYPE_DEFINED}, projected.column_orders.?.items);
 
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    if (errIs(end_pos)) return error.SeekFailed;
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
+    // A second input declaring `s` type-defined: no one order is true of both inputs' `s` bounds, so the copy is
+    // refused rather than written with an invalid empty union or a false declaration.
+    var other = meta;
+    other.column_orders = .empty;
+    const td = schema.COLUMN_ORDER_TYPE_DEFINED;
+    try other.column_orders.?.appendSlice(arena, &.{ td, td });
+    const mixed = [_]FileSpec{ specs[0], .{ .bytes = file_bytes, .meta = &other, .survivors = survivors } };
+    try testing.expectError(error.ColumnOrderMismatch, buildMulti(arena, &mixed, null));
+    // Leaving `s` out leaves only the leaf both declare type-defined.
+    const just_i = try metadata.open(arena, try buildMulti(arena, &mixed, &.{1}));
+    try testing.expectEqualSlices(i16, &.{schema.COLUMN_ORDER_TYPE_DEFINED}, just_i.column_orders.?.items);
+}
 
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
+test "byte copy refuses chunk ranges outside its input" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        if (errIs(n)) return error.ReadFailed;
-        const bytes: usize = @intCast(n);
-        if (bytes == 0) break;
-        off += bytes;
+    // `metadata.open` rejects this footer's negative data_page_offset, but the builders take any FileMetaData: one
+    // read without that validation must be refused, not panic on the cast.
+    const hostile = metadata.readFileSlice("ci/fixtures/parquet/negative_data_page_offset.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const footer_len = std.mem.readInt(u32, hostile[hostile.len - 8 ..][0..4], .little);
+    var r = thrift.Reader.init(hostile[hostile.len - 8 - footer_len .. hostile.len - 8]);
+    const unchecked = try schema.FileMetaData.read(arena, &r);
+    const all = try arena.alloc(bool, unchecked.row_groups.items.len);
+    @memset(all, true);
+    try testing.expectError(error.InvalidColumnOffsets, build(arena, hostile, &unchecked, all, null));
+    try testing.expectError(error.InvalidColumnOffsets, build(arena, hostile, &unchecked, all, &.{0}));
+
+    // Ranges a footer can't be checked against on its own: past the end of the input, or past maxInt(i64).
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/column_order.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(arena, bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    const Bad = struct { start: i64, len: i64 };
+    for ([_]Bad{
+        .{ .start = @intCast(bytes.len - 1), .len = 100 },
+        .{ .start = std.math.maxInt(i64) - 1, .len = 10 },
+        .{ .start = 4, .len = -1 },
+    }) |bad| {
+        var broken = meta;
+        broken.row_groups = try meta.row_groups.clone(arena);
+        const rg = &broken.row_groups.items[0];
+        rg.columns = try rg.columns.clone(arena);
+        const m = &rg.columns.items[0].meta_data.?;
+        m.dictionary_page_offset = null;
+        m.data_page_offset = bad.start;
+        m.total_compressed_size = bad.len;
+        try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, null));
+        try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, &.{0}));
     }
-    return buf;
-}
-
-fn errIs(r: usize) bool {
-    const signed: isize = @bitCast(r);
-    return signed >= -4095 and signed < 0;
-}
-
-fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
-    if (errIs(r)) return error.SyscallFailed;
-    return @intCast(@as(isize, @bitCast(r)));
 }

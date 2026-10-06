@@ -47,8 +47,11 @@ pub const DeltaLengthByteArrayDecoder = struct {
     bytes: []const u8,
     bytes_pos: usize,
 
-    pub fn init(encoded: []const u8, arena: std.mem.Allocator) Error!DeltaLengthByteArrayDecoder {
+    /// `max_values`: the most values the stream may hold (the page's value count). Its header's count sizes the
+    /// lengths array, and a bit-width-0 stream can claim any count in a few bytes.
+    pub fn init(encoded: []const u8, arena: std.mem.Allocator, max_values: usize) Error!DeltaLengthByteArrayDecoder {
         var len_dec = try dbp.Decoder(i32).init(encoded);
+        if (len_dec.total_value_count > max_values) return error.InvalidStream;
         const total: usize = @intCast(len_dec.total_value_count);
         const lengths = try arena.alloc(i32, total);
         errdefer arena.free(lengths);
@@ -100,9 +103,11 @@ pub const DeltaByteArrayDecoder = struct {
     /// its prefix. arena-owned, replaced per value.
     last_value: []u8,
 
-    pub fn init(encoded: []const u8, arena: std.mem.Allocator) Error!DeltaByteArrayDecoder {
+    /// `max_values`: as for `DeltaLengthByteArrayDecoder.init`.
+    pub fn init(encoded: []const u8, arena: std.mem.Allocator, max_values: usize) Error!DeltaByteArrayDecoder {
         // First DELTA_BINARY_PACKED stream: prefix lengths.
         var prefix_dec = try dbp.Decoder(i32).init(encoded);
+        if (prefix_dec.total_value_count > max_values) return error.InvalidStream;
         const total: usize = @intCast(prefix_dec.total_value_count);
         const prefixes = try arena.alloc(i32, total);
         errdefer arena.free(prefixes);
@@ -117,7 +122,7 @@ pub const DeltaByteArrayDecoder = struct {
 
         // The remaining bytes are a DELTA_LENGTH_BYTE_ARRAY stream.
         const suffix_bytes = encoded[prefix_dec.pos..];
-        const suffixes = try DeltaLengthByteArrayDecoder.init(suffix_bytes, arena);
+        const suffixes = try DeltaLengthByteArrayDecoder.init(suffix_bytes, arena, total);
         if (suffixes.lengths.len != total) return error.InvalidStream;
 
         return .{
@@ -272,6 +277,17 @@ fn writeZigzagI32(buf: *std.ArrayList(u8), value: i32) !void {
     try writeUVarint(buf, u);
 }
 
+
+test "a delta stream claiming more values than its page holds is rejected before allocating for them" {
+    // Header: block 128, 4 miniblocks, 1<<24 values, first value 0; the stream ends there, which bit width 0
+    // would make a valid way to claim the whole count.
+    const stream = [_]u8{ 0x80, 0x01, 0x04, 0x80, 0x80, 0x80, 0x08, 0x00 };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.InvalidStream, DeltaLengthByteArrayDecoder.init(&stream, arena_state.allocator(), 4));
+    try testing.expectError(error.InvalidStream, DeltaByteArrayDecoder.init(&stream, arena_state.allocator(), 4));
+}
+
 test "DELTA_LENGTH_BYTE_ARRAY round-trip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -287,7 +303,7 @@ test "DELTA_LENGTH_BYTE_ARRAY round-trip" {
     try stream.appendSlice(testing.allocator, lens_enc);
     for (values) |v| try stream.appendSlice(testing.allocator, v);
 
-    var dec = try DeltaLengthByteArrayDecoder.init(stream.items, a);
+    var dec = try DeltaLengthByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize));
     var out: [4][]const u8 = undefined;
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, values.len), n);
@@ -322,7 +338,7 @@ test "DELTA_BYTE_ARRAY round-trip with shared prefixes" {
     try stream.appendSlice(testing.allocator, suf_lens_enc);
     for (suffixes) |s| try stream.appendSlice(testing.allocator, s);
 
-    var dec = try DeltaByteArrayDecoder.init(stream.items, a);
+    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize));
     var out: [4][]const u8 = undefined;
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, values.len), n);
@@ -337,7 +353,7 @@ test "DELTA_LENGTH_BYTE_ARRAY empty stream" {
     const lens_enc = try encodeDbp(&[_]i32{});
     defer testing.allocator.free(lens_enc);
 
-    var dec = try DeltaLengthByteArrayDecoder.init(lens_enc, a);
+    var dec = try DeltaLengthByteArrayDecoder.init(lens_enc, a, std.math.maxInt(usize));
     var out: [4][]const u8 = undefined;
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, 0), n);
@@ -365,7 +381,7 @@ test "DELTA_BYTE_ARRAY partial decode preserves last_value" {
     try stream.appendSlice(testing.allocator, suf_lens_enc);
     for (suffixes) |s| try stream.appendSlice(testing.allocator, s);
 
-    var dec = try DeltaByteArrayDecoder.init(stream.items, a);
+    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize));
     var out: [2][]const u8 = undefined;
 
     const n1 = try dec.decode(&out);

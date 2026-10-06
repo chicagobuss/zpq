@@ -4,8 +4,8 @@
 //! `AWS_LAMBDA_RUNTIME_API`. Blocking-socket implementation — the
 //! runtime API is a low-frequency control plane (one round-trip per
 //! invocation), so non-blocking I/O would add complexity without moving
-//! the data-path latency.
-//! The data plane (S3, decode, sink) goes through the epoll Loop.
+//! the data-path latency. The S3 data plane blocks too, on its own
+//! sockets, made concurrent by `std.Io` workers (see `engine.zig`).
 //!
 //! Endpoints used (per AWS Lambda runtime API spec, version 2018-06-01):
 //!
@@ -36,8 +36,16 @@ pub const Error = error{
     WriteFailed,
     ReadFailed,
     BadResponse,
+    /// The response body claimed `Transfer-Encoding: chunked` but its framing is broken or cut short.
+    BadChunkedBody,
+    /// The response exceeds `MAX_RESPONSE_BYTES`.
+    ResponseTooLarge,
     OutOfMemory,
 };
+
+/// Ceiling on a next-invocation response. Lambda caps a synchronous event at 6 MB; the margin covers headers and a
+/// raised limit while keeping a runaway response from taking the sandbox's memory.
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 pub const Invocation = struct {
     request_id: []u8,
@@ -120,13 +128,10 @@ pub const Client = struct {
         try self.postTo(request_id, "response", "application/json", body);
     }
 
-    /// Posts an error. Builds a minimal JSON envelope around `message`.
+    /// Posts an error. Builds a minimal JSON envelope around `message`, escaped.
     pub fn postError(self: *Client, request_id: []const u8, error_type: []const u8, message: []const u8) Error!void {
-        const json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"errorType\":\"{s}\",\"errorMessage\":\"{s}\"}}",
-            .{ error_type, message },
-        ) catch return error.OutOfMemory;
+        const envelope = .{ .errorType = error_type, .errorMessage = message };
+        const json = std.json.Stringify.valueAlloc(self.allocator, envelope, .{}) catch return error.OutOfMemory;
         defer self.allocator.free(json);
         try self.postTo(request_id, "error", "application/json", json);
     }
@@ -191,6 +196,7 @@ fn parseInvocation(allocator: std.mem.Allocator, raw: []const u8) Error!Invocati
     var deadline_ms: ?i64 = null;
     var invoked_function_arn: ?[]const u8 = null;
     var content_length: ?usize = null;
+    var chunked = false;
 
     const headers = status_and_headers[first_crlf + 2 ..];
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
@@ -207,23 +213,63 @@ fn parseInvocation(allocator: std.mem.Allocator, raw: []const u8) Error!Invocati
             invoked_function_arn = value;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            // The runtime API frames events above a few KiB this way. Chunked is always the last coding applied.
+            var codings = std.mem.splitBackwardsScalar(u8, value, ',');
+            chunked = std.ascii.eqlIgnoreCase(std.mem.trim(u8, codings.first(), " \t"), "chunked");
         }
     }
 
     const id = request_id orelse return error.BadResponse;
 
-    // Use Content-Length if present; otherwise trust the body slice.
-    const body_slice = if (content_length) |n|
-        body[0..@min(n, body.len)]
+    // Chunked framing overrides any Content-Length (RFC 9112 §6.3); without either, the body runs to the close.
+    const owned_body = if (chunked)
+        try decodeChunked(allocator, body)
     else
-        body;
+        try allocator.dupe(u8, if (content_length) |n| body[0..@min(n, body.len)] else body);
+    errdefer allocator.free(owned_body);
 
     return .{
         .request_id = try allocator.dupe(u8, id),
-        .body = try allocator.dupe(u8, body_slice),
+        .body = owned_body,
         .deadline_ms = deadline_ms,
         .invoked_function_arn = if (invoked_function_arn) |s| try allocator.dupe(u8, s) else null,
     };
+}
+
+/// Decode a complete chunked message body (RFC 9112 §7.1): size lines in hex with optional extensions, each chunk's
+/// data followed by CRLF, a zero-size last chunk, optional trailer lines, and a final CRLF. Anything else, including
+/// a body cut short, is `error.BadChunkedBody`. Chunk sizes are checked against the bytes actually received before
+/// anything is copied, so a lying size line cannot drive the allocation.
+fn decodeChunked(allocator: std.mem.Allocator, raw: []const u8) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, raw, i, "\r\n") orelse return error.BadChunkedBody;
+        const line = raw[i..line_end];
+        const size_text = std.mem.trimEnd(u8, line[0 .. std.mem.indexOfScalar(u8, line, ';') orelse line.len], " \t");
+        if (size_text.len == 0) return error.BadChunkedBody;
+        var size: usize = 0;
+        for (size_text) |ch| {
+            const digit = std.fmt.charToDigit(ch, 16) catch return error.BadChunkedBody;
+            size = std.math.mul(usize, size, 16) catch return error.BadChunkedBody;
+            size += digit;
+        }
+        i = line_end + 2;
+        if (size == 0) break;
+        if (size > raw.len - i or raw.len - i - size < 2) return error.BadChunkedBody;
+        if (!std.mem.eql(u8, raw[i + size ..][0..2], "\r\n")) return error.BadChunkedBody;
+        out.appendSlice(allocator, raw[i..][0..size]) catch return error.OutOfMemory;
+        i += size + 2;
+    }
+    // Trailer section: header lines up to an empty one.
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, raw, i, "\r\n") orelse return error.BadChunkedBody;
+        if (line_end == i) break;
+        i = line_end + 2;
+    }
+    return out.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
 // ============================================================
@@ -254,6 +300,7 @@ fn readAll(allocator: std.mem.Allocator, fd: linux.fd_t) Error![]u8 {
         if (isErr(r)) return error.ReadFailed;
         const n: usize = @intCast(r);
         if (n == 0) break;
+        if (n > MAX_RESPONSE_BYTES - list.items.len) return error.ResponseTooLarge;
         list.appendSlice(allocator, tmp[0..n]) catch return error.OutOfMemory;
     }
     return list.toOwnedSlice(allocator) catch return error.OutOfMemory;
@@ -304,4 +351,123 @@ test "parseInvocation extracts request id and body" {
     try std.testing.expectEqualStrings("abc-123", inv.request_id);
     try std.testing.expectEqualStrings("{\"hello\":1}\r\n", inv.body);
     try std.testing.expectEqual(@as(?i64, 1700000000000), inv.deadline_ms);
+}
+
+test "parseInvocation decodes a chunked body, with chunk extensions and trailers" {
+    const raw =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Lambda-Runtime-Aws-Request-Id: req-chunked\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\n{\"a\":\r\n" ++
+        "A;name=value\r\n\"0123456\"}\r\n" ++
+        "0\r\n" ++
+        "X-Trailer: t\r\n" ++
+        "\r\n";
+    var inv = try parseInvocation(std.testing.allocator, raw);
+    defer inv.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("req-chunked", inv.request_id);
+    try std.testing.expectEqualStrings("{\"a\":\"0123456\"}", inv.body);
+}
+
+test "parseInvocation rejects malformed chunked bodies" {
+    const head = "HTTP/1.1 200 OK\r\nLambda-Runtime-Aws-Request-Id: r\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for ([_][]const u8{
+        "", // no chunks at all
+        "5\r\nabc", // truncated chunk
+        "3\r\nabc\r\n", // no last chunk
+        "3\r\nabcX\r\n0\r\n\r\n", // data longer than its size line
+        "3\r\nabc\r\n0\r\n", // no final CRLF
+        "g\r\nabc\r\n0\r\n\r\n", // not hex
+        "+3\r\nabc\r\n0\r\n\r\n",
+        "1_0\r\nabc\r\n0\r\n\r\n",
+        "\r\nabc\r\n0\r\n\r\n", // empty size
+        "10000000000000000\r\nabc\r\n0\r\n\r\n", // overflows usize
+        "ffffffffffffffff\r\nabc\r\n0\r\n\r\n", // larger than anything received
+    }) |body| {
+        const raw = try std.mem.concat(std.testing.allocator, u8, &.{ head, body });
+        defer std.testing.allocator.free(raw);
+        if (parseInvocation(std.testing.allocator, raw)) |inv| {
+            var owned = inv;
+            owned.deinit(std.testing.allocator);
+            std.debug.print("accepted malformed chunked body: {s}\n", .{body});
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.BadChunkedBody, err);
+    }
+}
+
+/// A one-shot runtime API on 127.0.0.1 that answers the next poll with `response` and closes.
+const FakeRuntimeApi = struct {
+    fd: linux.fd_t,
+    port: u16,
+    response: []const u8,
+
+    fn start(response: []const u8) !FakeRuntimeApi {
+        const fd = fdOrErr(linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP)) catch
+            return error.SkipZigTest;
+        errdefer close(fd);
+        var addr = std.mem.zeroes(linux.sockaddr.in);
+        addr.family = linux.AF.INET;
+        addr.addr = std.mem.nativeToBig(u32, 0x7f000001);
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (isErr(linux.bind(fd, @ptrCast(&addr), len)) or isErr(linux.listen(fd, 1))) return error.SkipZigTest;
+        if (isErr(linux.getsockname(fd, @ptrCast(&addr), &len))) return error.SkipZigTest;
+        return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port), .response = response };
+    }
+
+    fn serveOne(self: *const FakeRuntimeApi) void {
+        const conn = fdOrErr(linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC)) catch return;
+        defer close(conn);
+        var req: [1024]u8 = undefined;
+        _ = linux.read(conn, &req, req.len);
+        writeAll(conn, self.response) catch {};
+    }
+};
+
+test "nextInvocation reads a large event the runtime API sends chunked" {
+    // The client makes Linux syscalls directly, as Lambda runs only on Linux.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+
+    // ~64 KiB of JSON in uneven chunks, the way the runtime API frames events above a few KiB.
+    var event: std.ArrayList(u8) = .empty;
+    defer event.deinit(a);
+    try event.appendSlice(a, "{\"pad\":\"");
+    for (0..64 * 1024) |i| try event.append(a, 'a' + @as(u8, @intCast(i % 26)));
+    try event.appendSlice(a, "\"}");
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(a);
+    try resp.appendSlice(a, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" ++
+        "Lambda-Runtime-Aws-Request-Id: req-big\r\nLambda-Runtime-Deadline-Ms: 1700000000000\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n");
+    var off: usize = 0;
+    var step: usize = 1;
+    while (off < event.items.len) : (step = step * 7 % 8191 + 1) {
+        const n = @min(step, event.items.len - off);
+        try resp.print(a, "{x}\r\n", .{n});
+        try resp.appendSlice(a, event.items[off..][0..n]);
+        try resp.appendSlice(a, "\r\n");
+        off += n;
+    }
+    try resp.appendSlice(a, "0\r\n\r\n");
+
+    var api = try FakeRuntimeApi.start(resp.items);
+    defer close(api.fd);
+    const server = try std.Thread.spawn(.{}, FakeRuntimeApi.serveOne, .{&api});
+    // A client that fails before connecting would leave the server in accept; shutting the listener down wakes it
+    // (on Linux, which this test runs on only).
+    defer {
+        _ = linux.shutdown(api.fd, linux.SHUT.RDWR);
+        server.join();
+    }
+
+    var buf: [32]u8 = undefined;
+    var c = try Client.fromHostPort(a, try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{api.port}));
+    defer c.deinit();
+    var inv = try c.nextInvocation();
+    defer inv.deinit(a);
+    try std.testing.expectEqualStrings("req-big", inv.request_id);
+    try std.testing.expectEqual(@as(?i64, 1700000000000), inv.deadline_ms);
+    try std.testing.expectEqualStrings(event.items, inv.body);
 }

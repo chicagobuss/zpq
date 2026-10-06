@@ -1,8 +1,6 @@
 //! Zig FFI bindings for vendor/snappy (google/snappy 1.2.1).
 
-const c = @cImport({
-    @cInclude("snappy-c.h");
-});
+const c = @import("snappy_c");
 
 pub const Status = enum(c_int) {
     ok = 0,

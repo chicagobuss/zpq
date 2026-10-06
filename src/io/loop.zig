@@ -1,16 +1,8 @@
-//! The event-loop seam.
+//! The event-loop seam: re-exports `epoll.zig`, the one backend, so call sites name the seam rather than the
+//! implementation. epoll because AWS seccomp blocks `io_uring_setup` on Lambda.
 //!
-//! One backend is built: **epoll** — mandatory on Lambda (AWS seccomp
-//! blocks `io_uring_setup`) and what the CLI runs on Linux today. The
-//! data plane (`tls.zig`, `lambda/runtime.zig`) sits directly on
-//! `epoll.zig`; this module re-exports it as the canonical alias so
-//! call sites name the seam rather than the implementation.
-//!
-//! Additional backends can slot in here, selected per target and
-//! `build_options.lambda`:
-//!   io_uring — Linux CLI hot path. Must be excluded from the Lambda
-//!              binary at compile time.
-//!   kqueue   — macOS CLI backend.
+//! Nothing in the query path runs on it: S3 requests use blocking sockets (`tls.zig`, `http.zig`), made concurrent by
+//! `std.Io` workers in `engine.zig`, and the Lambda runtime client blocks too.
 
 pub const Backend = enum { epoll };
 

@@ -67,6 +67,30 @@ pub fn evalLeaf(
     }
 }
 
+/// Unsigned predicate over a signed lane. `U` is the lane's unsigned twin: u32 for raw INT32 bits, u64 for an i64
+/// lane, which holds either a zero-extended u32 or raw u64 bits; either way the bitcast is the stored value.
+pub fn evalLeafUnsigned(
+    comptime U: type,
+    values: []const @Int(.signed, @bitSizeOf(U)),
+    def_levels: ?[]const u32,
+    max_def: u32,
+    op: ast.Operator,
+    needle: u64,
+    sel: *selection.SelectionVector,
+) void {
+    std.debug.assert(values.len == sel.len);
+    var i: usize = 0;
+    while (i < values.len) : (i += 1) {
+        if (!sel.isActive(i)) continue;
+        if (rowIsNull(def_levels, max_def, i)) {
+            sel.set(i, false);
+            continue;
+        }
+        const v: u64 = @as(U, @bitCast(values[i]));
+        if (!ast.applyOp(u64, v, op, needle)) sel.set(i, false);
+    }
+}
+
 /// `IS NULL` / `IS NOT NULL` against a column's definition levels.
 /// A row is null when `def_levels[i] < max_def`; a REQUIRED column
 /// (def_levels == null or max_def == 0) has no nulls, so IS NULL keeps
@@ -245,6 +269,20 @@ pub fn evaluate(
             if (col != .i64) return error.TypeMismatch;
             try rejectIfNested(col.i64);
             evalLeaf(i64, col.i64.values, col.i64.def_levels, col.i64.max_def, leaf.op, leaf.value, sel);
+        },
+        .uint64 => |leaf| {
+            const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
+            switch (batch.cols[col_pos]) {
+                .i32 => |c| {
+                    try rejectIfNested(c);
+                    evalLeafUnsigned(u32, c.values, c.def_levels, c.max_def, leaf.op, leaf.value, sel);
+                },
+                .i64 => |c| {
+                    try rejectIfNested(c);
+                    evalLeafUnsigned(u64, c.values, c.def_levels, c.max_def, leaf.op, leaf.value, sel);
+                },
+                else => return error.TypeMismatch,
+            }
         },
         .float => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
@@ -531,4 +569,29 @@ test "evaluate OR composite — union of branches" {
     try testing.expect(sv.isActive(0)); // 10
     try testing.expect(sv.isActive(3)); // 40
     try testing.expect(sv.isActive(4)); // 50
+}
+
+test "evaluate unsigned leaf over raw i32, zero-extended i64, and raw u64 lanes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw32 = [_]i32{ 1, @bitCast(@as(u32, 3_000_000_000)), 2 };
+    const wide32 = [_]i64{ 1, 3_000_000_000, 2 };
+    const raw64 = [_]i64{ 1, @bitCast(@as(u64, 18_000_000_000_000_000_000)), 2 };
+    const cols = [_]Batch.Column{
+        .{ .i32 = .{ .values = &raw32 } },
+        .{ .i64 = .{ .values = &wide32 } },
+        .{ .i64 = .{ .values = &raw64 } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const needles = [_]u64{ 2_147_483_648, 2_147_483_648, 9_223_372_036_854_775_808 };
+    for (needles, 0..) |needle, col| {
+        var sv = try selection.SelectionVector.init(testing.allocator, 3);
+        defer sv.deinit();
+        const f: ast.Filter = .{ .uint64 = .{ .col_idx = col, .op = .Gt, .value = needle } };
+        try evaluate(f, &batch, &sv, &lookup, a);
+        try testing.expectEqual(@as(usize, 1), sv.count());
+        try testing.expect(sv.isActive(1));
+    }
 }

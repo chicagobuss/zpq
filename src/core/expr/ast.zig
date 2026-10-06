@@ -95,6 +95,9 @@ pub const ColRef = struct {
     /// as u64 so sum/min/max are correct (a signed read makes 2^64-1 read -1).
     /// ≤32-bit unsigned ints don't need this — they zero-extend at decode.
     unsigned_64: bool = false,
+    /// INT32-physical column annotated UNSIGNED at <=32 bits. Decoders that keep such a column in the i32 lane
+    /// store its raw bits, so widening must zero-extend rather than sign-extend.
+    unsigned_32: bool = false,
 };
 
 pub const BinOp = struct {
@@ -174,6 +177,24 @@ pub const Expr = union(enum) {
 pub const SelectItem = struct {
     expr: Expr,
     alias: ?[]const u8,
+};
+
+/// One output column as a select list writes it, before binding: the expression's text and its `AS` alias. GROUP BY
+/// binding matches the text against key and aggregate names, so it is never parsed into an `Expr`; keeping the alias
+/// apart means no layer has to find it again in the text.
+pub const SelectColumn = struct {
+    expr: []const u8,
+    alias: ?[]const u8 = null,
+
+    /// `name` or `expr AS name`, as a `--column-order` entry spells it. Splits at the last ` AS `.
+    pub fn parse(text: []const u8) SelectColumn {
+        const clean = std.mem.trim(u8, text, " ");
+        const as_idx = std.mem.lastIndexOf(u8, clean, " AS ") orelse return .{ .expr = clean };
+        return .{
+            .expr = std.mem.trim(u8, clean[0..as_idx], " "),
+            .alias = std.mem.trim(u8, clean[as_idx + 4 ..], " "),
+        };
+    }
 };
 
 // ============================================================

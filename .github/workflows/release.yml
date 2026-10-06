@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g., v0.1.0)"
+        description: "Tag to release (e.g., v0.4.0)"
         required: true
         type: string
 
@@ -47,15 +47,8 @@ jobs:
             | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
-      - name: Fetch Pre-built BoringSSL
-        run: |
-          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/${{ matrix.target }}"
-          mkdir -p vendor/boring_tls/prebuilt/${{ matrix.target }}
-          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a
-          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a
-          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libcrypto.a) -gt 1024
-          test $(stat -c%s vendor/boring_tls/prebuilt/${{ matrix.target }}/libssl.a) -gt 1024
-
+      # The build downloads the target's pinned BoringSSL prebuilts and
+      # checks them against vendor/boring_tls/prebuilt.sha256.
       - name: Build CLI
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast cli --summary all
 

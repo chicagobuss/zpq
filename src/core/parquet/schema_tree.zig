@@ -111,9 +111,6 @@ pub const SchemaTree = struct {
     /// All leaves in column-chunk order. `leaves[i]` is the
     /// PrimitiveNode for column chunk `i` in any row group.
     leaves: []const PrimitiveNode,
-    /// Joined-path → leaf-index map. Keys use `.` as the separator
-    /// and are arena-owned. Lookup is O(1).
-    path_to_leaf: std.StringHashMapUnmanaged(u32),
     /// Captures whether the source thrift had `repetition_type = null`
     /// or some explicit value on the root element. Round-trip lossless.
     root_source_repetition: ?schema.FieldRepetitionType = null,
@@ -156,41 +153,10 @@ pub const SchemaTree = struct {
                 .kind = .struct_,
             },
             .leaves = try b.leaves.toOwnedSlice(arena),
-            .path_to_leaf = b.path_to_leaf,
         };
 
         if (b.pos != flat.len) return error.TruncatedFlat;
         return tree;
-    }
-
-    /// Resolve a user-supplied projection path to a set of column-
-    /// chunk indices. Accepts:
-    ///
-    ///   - A single top-level field name (`"events"`) — returns all
-    ///     descendant leaf indices. For a top-level primitive, that's
-    ///     just one. For a group, all descendants in DFS order.
-    ///   - A dotted full path (`"events.list.element.ts"`) — returns
-    ///     a single index via the path_to_leaf map.
-    ///
-    /// Returns an empty slice when nothing matches; the caller decides
-    /// whether that's an error.
-    pub fn resolveTopLevel(
-        self: *const SchemaTree,
-        arena: std.mem.Allocator,
-        path_or_name: []const u8,
-    ) Error![]const u32 {
-        // Try direct path first — fastest, handles dotted full paths.
-        if (self.path_to_leaf.get(path_or_name)) |idx| {
-            const out = try arena.alloc(u32, 1);
-            out[0] = idx;
-            return out;
-        }
-        // Top-level group lookup: walk root.children.
-        for (self.root.children) |child| {
-            if (!std.mem.eql(u8, child.name(), path_or_name)) continue;
-            return try collectLeafIndices(arena, child);
-        }
-        return arena.alloc(u32, 0) catch &.{};
     }
 
     /// Build a new SchemaTree containing only the kept leaves and
@@ -221,7 +187,6 @@ pub const SchemaTree = struct {
             .keep_mask = keep_mask,
             .next_column_index = 0,
             .leaves_out = .empty,
-            .path_to_leaf_out = .{},
             .path_stack = .empty,
         };
         defer pp.path_stack.deinit(arena);
@@ -238,7 +203,6 @@ pub const SchemaTree = struct {
                 .kind = .struct_,
             },
             .leaves = try pp.leaves_out.toOwnedSlice(arena),
-            .path_to_leaf = pp.path_to_leaf_out,
         };
     }
 
@@ -286,7 +250,8 @@ const Builder = struct {
     flat: []const schema.SchemaElement,
     pos: usize = 0,
     leaves: std.ArrayList(PrimitiveNode) = .empty,
-    path_to_leaf: std.StringHashMapUnmanaged(u32) = .{},
+    /// `.`-joined path of every leaf so far, to find a duplicate without comparing every pair.
+    joined_paths: std.StringHashMapUnmanaged(void) = .empty,
     /// Active path during DFS; `path_stack.items` is a snapshot of
     /// the path from root down to the current cursor.
     path_stack: std.ArrayList([]const u8) = .empty,
@@ -297,6 +262,8 @@ const Builder = struct {
         parent_def: u8,
         parent_rep: u8,
     ) Error![]const Node {
+        // A child count past the end of the flat list is truncated, whatever it claims; don't allocate for it.
+        if (n > self.flat.len - self.pos) return error.TruncatedFlat;
         const out = try self.arena.alloc(Node, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -313,8 +280,10 @@ const Builder = struct {
         // Accumulate def/rep from this element's own repetition type.
         // Per parquet: max_def += 1 unless REQUIRED; max_rep += 1 if REPEATED.
         const rt: schema.FieldRepetitionType = elem.repetition_type orelse .REQUIRED;
-        const here_def: u8 = parent_def + @as(u8, if (rt == .REQUIRED) 0 else 1);
-        const here_rep: u8 = parent_rep + @as(u8, if (rt == .REPEATED) 1 else 0);
+        // Footer open bounds the nesting depth (metadata.max_schema_depth); checked anyway, since a tree can be
+        // built from a schema list that never went through it.
+        const here_def: u8 = std.math.add(u8, parent_def, if (rt == .REQUIRED) 0 else 1) catch return error.TruncatedFlat;
+        const here_rep: u8 = std.math.add(u8, parent_rep, if (rt == .REPEATED) 1 else 0) catch return error.TruncatedFlat;
 
         try self.path_stack.append(self.arena, elem.name);
         defer _ = self.path_stack.pop();
@@ -343,13 +312,7 @@ const Builder = struct {
                 .max_rep = here_rep,
             };
             try self.leaves.append(self.arena, leaf);
-
-            // Record path → index. Join with '.' separator so the key
-            // is a flat string that hashes cheaply.
-            const joined = try joinPath(self.arena, path_copy);
-            const gop = try self.path_to_leaf.getOrPut(self.arena, joined);
-            if (gop.found_existing) return error.DuplicatePath;
-            gop.value_ptr.* = column_index;
+            try checkLeafPath(self.arena, &self.joined_paths, self.leaves.items, column_index);
 
             return .{ .primitive = leaf };
         }
@@ -386,6 +349,27 @@ fn classifyGroupKind(
     return .struct_;
 }
 
+/// Reject `leaves[idx]` if an earlier leaf has its path, segment for segment: a duplicate field. `seen` holds the
+/// `.`-joined paths so far. Distinct paths can join alike (a top-level column `a.b` and the field `b` of a group `a`),
+/// so only a joined collision, which is rare, costs a rescan.
+fn checkLeafPath(
+    arena: std.mem.Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    leaves: []const PrimitiveNode,
+    idx: u32,
+) Error!void {
+    const path = leaves[idx].path;
+    const gop = try seen.getOrPut(arena, try joinPath(arena, path));
+    if (!gop.found_existing) return;
+    for (leaves[0..idx]) |l| if (pathsEql(l.path, path)) return error.DuplicatePath;
+}
+
+fn pathsEql(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
 fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) Error![]const u8 {
     if (parts.len == 0) return "";
     var total: usize = 0;
@@ -405,27 +389,6 @@ fn joinPath(arena: std.mem.Allocator, parts: []const []const u8) Error![]const u
 }
 
 // ============================================================
-// Lookup helpers
-// ============================================================
-
-fn collectLeafIndices(arena: std.mem.Allocator, node: Node) Error![]const u32 {
-    var acc: std.ArrayList(u32) = .empty;
-    try collectLeafIndicesInto(&acc, arena, node);
-    return acc.toOwnedSlice(arena);
-}
-
-fn collectLeafIndicesInto(
-    acc: *std.ArrayList(u32),
-    arena: std.mem.Allocator,
-    node: Node,
-) Error!void {
-    switch (node) {
-        .primitive => |p| try acc.append(arena, p.column_index),
-        .group => |g| for (g.children) |c| try collectLeafIndicesInto(acc, arena, c),
-    }
-}
-
-// ============================================================
 // Projector — builds a new tree from a kept-leaves mask
 // ============================================================
 
@@ -434,7 +397,6 @@ const Projector = struct {
     keep_mask: []const bool,
     next_column_index: u32,
     leaves_out: std.ArrayList(PrimitiveNode),
-    path_to_leaf_out: std.StringHashMapUnmanaged(u32),
     path_stack: std.ArrayList([]const u8),
 
     fn projectChildren(self: *Projector, children: []const Node) Error![]const Node {
@@ -461,12 +423,8 @@ const Projector = struct {
                 var new_leaf = p;
                 new_leaf.path = path_copy;
                 new_leaf.column_index = new_idx;
+                // A subset of a built tree's leaves, so no path repeats.
                 try self.leaves_out.append(self.arena, new_leaf);
-
-                const joined = try joinPath(self.arena, path_copy);
-                const gop = try self.path_to_leaf_out.getOrPut(self.arena, joined);
-                if (gop.found_existing) return error.DuplicatePath;
-                gop.value_ptr.* = new_idx;
 
                 return .{ .primitive = new_leaf };
             },
@@ -568,29 +526,7 @@ const testing = std.testing;
 const metadata = @import("metadata.zig");
 
 fn readFile(arena: std.mem.Allocator, path: []const u8) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    if (@as(isize, @bitCast(r_open)) < 0) return error.FileNotFound;
-    defer _ = linux.close(fd);
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-    const buf = try arena.alloc(u8, size);
-    var off: usize = 0;
-    while (off < size) {
-        const r = linux.read(fd, buf[off..].ptr, size - off);
-        const n: isize = @bitCast(r);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-    return buf;
+    return metadata.readFileSlice(path, arena);
 }
 
 test "build tree from flat fixture (benchmark_100mb.parquet)" {
@@ -662,33 +598,68 @@ test "build tree from nested fixture (nested_edges.parquet)" {
     try testing.expectEqual(@as(u8, 1), counts_key.max_rep);
 }
 
-test "resolveTopLevel returns set of leaves under top-level group" {
+test "resolveProjection returns set of leaves under top-level group" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const file_bytes = readFile(arena, "data/nested_edges.parquet") catch return;
     const meta = try metadata.open(arena, file_bytes);
-    const tree = try SchemaTree.build(arena, meta.schema.items);
 
     // Top-level "events" should yield two leaves (ts, code).
-    const events_leaves = try tree.resolveTopLevel(arena, "events");
+    const events_leaves = try metadata.resolveProjection(arena, &meta, "events");
     try testing.expectEqualSlices(u32, &.{ 5, 6 }, events_leaves);
 
     // Top-level "id" is a single primitive leaf.
-    const id_leaves = try tree.resolveTopLevel(arena, "id");
+    const id_leaves = try metadata.resolveProjection(arena, &meta, "id");
     try testing.expectEqualSlices(u32, &.{0}, id_leaves);
 
     // Top-level "counts" (MAP) yields key + value.
-    const counts_leaves = try tree.resolveTopLevel(arena, "counts");
+    const counts_leaves = try metadata.resolveProjection(arena, &meta, "counts");
     try testing.expectEqualSlices(u32, &.{ 7, 8 }, counts_leaves);
 
     // Dotted full path resolves to a single leaf.
-    const ts_leaves = try tree.resolveTopLevel(arena, "events.list.element.ts");
+    const ts_leaves = try metadata.resolveProjection(arena, &meta, "events.list.element.ts");
     try testing.expectEqualSlices(u32, &.{5}, ts_leaves);
 
     // Unknown path → empty.
-    const empty = try tree.resolveTopLevel(arena, "nonexistent");
+    const empty = try metadata.resolveProjection(arena, &meta, "nonexistent");
     try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "leaf paths that join to the same dotted name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const E = struct {
+        fn root(n: i32) schema.SchemaElement {
+            return .{ .type = null, .type_length = null, .repetition_type = null, .name = "schema", .num_children = n, .scale = null, .precision = null, .field_id = null };
+        }
+        fn group(name: []const u8, n: i32) schema.SchemaElement {
+            return .{ .type = null, .type_length = null, .repetition_type = .OPTIONAL, .name = name, .num_children = n, .scale = null, .precision = null, .field_id = null };
+        }
+        fn leaf(name: []const u8) schema.SchemaElement {
+            return .{ .type = .INT64, .type_length = null, .repetition_type = .OPTIONAL, .name = name, .num_children = null, .scale = null, .precision = null, .field_id = null };
+        }
+    };
+
+    // A top-level `a.b` beside a group `a` with a field `b`: both are columns, in either schema order.
+    for ([_][]const schema.SchemaElement{
+        &.{ E.root(2), E.leaf("a.b"), E.group("a", 1), E.leaf("b") },
+        &.{ E.root(2), E.group("a", 1), E.leaf("b"), E.leaf("a.b") },
+    }) |flat| {
+        const tree = try SchemaTree.build(arena, flat);
+        try testing.expectEqual(@as(usize, 2), tree.leaves.len);
+        const kept = try tree.projectSubset(arena, &.{ 0, 1 });
+        try testing.expectEqual(@as(usize, 2), kept.leaves.len);
+    }
+
+    // So are two nested leaves that join alike.
+    const nested = try SchemaTree.build(arena, &.{ E.root(2), E.group("x", 1), E.leaf("y.z"), E.group("x.y", 1), E.leaf("z") });
+    try testing.expectEqual(@as(usize, 2), nested.leaves.len);
+
+    // The same path twice is still a duplicate field.
+    try testing.expectError(error.DuplicatePath, SchemaTree.build(arena, &.{ E.root(2), E.leaf("k"), E.leaf("k") }));
+    try testing.expectError(error.DuplicatePath, SchemaTree.build(arena, &.{ E.root(3), E.leaf("a.b"), E.group("a", 1), E.leaf("b"), E.leaf("a.b") }));
 }
 
 test "projectSubset preserves group ancestors and reindexes leaves" {

@@ -210,18 +210,21 @@ pub const LogicalType = union(enum) {
         const saved_id = reader.last_field_id;
         reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
-        var res: TimeType = .{ .isAdjustedToUTC = false, .unit = undefined };
+        var adjusted = false;
+        // Required by the format. Left unset it would be an undefined union tag that a later footer write
+        // switches on, so a footer without it is rejected here.
+        var unit: ?TimeUnit = null;
         reader.readStructBegin();
         while (true) {
             const field = try reader.readFieldBegin();
             if (field.type == .Stop) break;
             switch (field.id) {
-                1 => res.isAdjustedToUTC = (field.type == .True),
-                2 => res.unit = try TimeUnit.read(reader),
+                1 => adjusted = (field.type == .True),
+                2 => unit = try TimeUnit.read(reader),
                 else => try reader.skip(field.type),
             }
         }
-        return res;
+        return .{ .isAdjustedToUTC = adjusted, .unit = unit orelse return error.MissingTimeUnit };
     }
 
     fn readTimestamp(reader: *thrift.Reader) !TimestampType {
@@ -245,7 +248,7 @@ pub const LogicalType = union(enum) {
                 1 => res.bitWidth = if (field.type == .Byte)
                     @as(i8, @bitCast(try reader.readByte()))
                 else
-                    @as(i8, @intCast(try reader.readZigZag(i16))),
+                    std.math.cast(i8, try reader.readZigZag(i16)) orelse return error.InvalidBitWidth,
                 2 => res.isSigned = (field.type == .True),
                 else => try reader.skip(field.type),
             }
@@ -456,8 +459,8 @@ pub const SchemaElement = struct {
 /// Such a column's top bit is a value bit, not a sign bit, so decoding it — or
 /// reading its `Statistics` min/max — as a signed `i32` turns `0xFFFFFFFF` into
 /// `-1` and corrupts sum/min/max. Callers route these through the zero-extended
-/// i64 lane instead. uint64 is intentionally excluded: a u64 (or its sum)
-/// overflows i64, so it needs the wider-accumulator work tracked separately.
+/// i64 lane instead. uint64 is excluded: a u64 can't zero-extend into i64, so
+/// `isUnsignedInt64` gives it its own lane.
 pub fn isUnsignedIntTo32(se: SchemaElement) bool {
     if (se.logical_type) |lt| switch (lt) {
         .INTEGER => |it| return !it.isSigned and it.bitWidth <= 32,
@@ -486,8 +489,10 @@ pub fn isUnsignedInt64(se: SchemaElement) bool {
     return false;
 }
 
-/// Any unsigned integer column. Used to force the decode path (the stats
-/// short-circuit reads min/max bytes in signed order).
+/// Any unsigned integer column. Its statistics are unsigned-ordered, so the
+/// signed stat fold and signed pruning must not read them; its values sit in
+/// the signed physical lane as raw bits, so filters, output and the writer
+/// treat them as unsigned.
 pub fn isUnsignedInt(se: SchemaElement) bool {
     return isUnsignedIntTo32(se) or isUnsignedInt64(se);
 }
@@ -716,6 +721,15 @@ pub const PageHeader = struct {
     }
 };
 
+/// Compact protocol carries a bool struct field's value in the field header's type nibble.
+fn boolField(t: thrift.Type) ?bool {
+    return switch (t) {
+        .True => true,
+        .False => false,
+        else => null,
+    };
+}
+
 pub const Statistics = struct {
     max: ?[]const u8 = null,
     min: ?[]const u8 = null,
@@ -723,6 +737,12 @@ pub const Statistics = struct {
     distinct_count: ?i64 = null,
     max_value: ?[]const u8 = null,
     min_value: ?[]const u8 = null,
+    /// False means `max_value` is a truncated upper bound rather than a value present in the chunk. Read-only: not
+    /// written back, so byte-copied output loses them, which only makes later readers more conservative.
+    is_max_value_exact: ?bool = null,
+    is_min_value_exact: ?bool = null,
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Read-only, like the exactness flags.
+    nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
         const saved_id = reader.last_field_id;
@@ -742,6 +762,16 @@ pub const Statistics = struct {
                 4 => stats.distinct_count = try reader.readZigZag(i64),
                 5 => stats.max_value = try reader.readString(),
                 6 => stats.min_value = try reader.readString(),
+                // A malformed (non-bool) flag is left unset, which callers read as "not known exact".
+                7 => if (boolField(field.type)) |b| {
+                    stats.is_max_value_exact = b;
+                } else try reader.skip(field.type),
+                8 => if (boolField(field.type)) |b| {
+                    stats.is_min_value_exact = b;
+                } else try reader.skip(field.type),
+                9 => if (field.type == .I64) {
+                    stats.nan_count = try reader.readZigZag(i64);
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
@@ -1219,12 +1249,18 @@ pub const RowGroup = struct {
     }
 };
 
+/// `ColumnOrder` union member id for TYPE_DEFINED_ORDER, the only order the full-match proof reads stats in.
+pub const COLUMN_ORDER_TYPE_DEFINED: i16 = 1;
+
 pub const FileMetaData = struct {
     version: i32,
     schema: std.ArrayListUnmanaged(SchemaElement),
     num_rows: i64,
     created_by: ?[]const u8,
     row_groups: std.ArrayListUnmanaged(RowGroup),
+    /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
+    /// column_orders. Written from `outputColumnOrders`.
+    column_orders: ?std.ArrayListUnmanaged(i16) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
@@ -1240,6 +1276,7 @@ pub const FileMetaData = struct {
         };
         errdefer meta.schema.deinit(allocator);
         errdefer meta.row_groups.deinit(allocator);
+        errdefer if (meta.column_orders) |*co| co.deinit(allocator);
 
         reader.readStructBegin();
         while (true) {
@@ -1276,13 +1313,43 @@ pub const FileMetaData = struct {
                     }
                 },
                 6 => meta.created_by = try reader.readString(),
+                7 => if (field.type == .List) {
+                    if (meta.column_orders) |*co| co.deinit(allocator);
+                    meta.column_orders = try readColumnOrders(allocator, reader);
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
         return meta;
     }
 
+    fn readColumnOrders(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i16) {
+        const header = try reader.readByte();
+        var size = @as(usize, header >> 4);
+        if (size == 0xF) size = try reader.readVarInt(usize);
+        if (header & 0x0f != @intFromEnum(thrift.Type.Struct)) return error.InvalidThriftType;
+        var orders: std.ArrayListUnmanaged(i16) = .empty;
+        errdefer orders.deinit(allocator);
+        try orders.ensureTotalCapacityPrecise(allocator, safeListReserve(i16, size, reader.remaining()));
+        var i: usize = 0;
+        while (i < size) : (i += 1) {
+            const saved_id = reader.last_field_id;
+            defer reader.last_field_id = saved_id;
+            reader.readStructBegin();
+            var member: i16 = 0;
+            while (true) {
+                const f = try reader.readFieldBegin();
+                if (f.type == .Stop) break;
+                if (member == 0) member = f.id;
+                try reader.skip(f.type);
+            }
+            try orders.append(allocator, member);
+        }
+        return orders;
+    }
+
     pub fn deinit(self: *FileMetaData, allocator: std.mem.Allocator) void {
+        if (self.column_orders) |*co| co.deinit(allocator);
         self.schema.deinit(allocator);
         for (self.row_groups.items) |*rg| {
             rg.deinit(allocator);
@@ -1306,134 +1373,226 @@ pub const FileMetaData = struct {
             try rg.write(writer);
         }
         if (self.created_by) |cb| try writer.writeFieldString(6, cb);
+        // Field 7: column_orders, one ColumnOrder union per leaf. Each member zpq knows is an empty struct, so a member
+        // id round-trips as itself; 0 writes an empty union, which declares no order.
+        if (self.column_orders) |co| {
+            try writer.writeFieldListBegin(7, .Struct, co.items.len);
+            for (co.items) |member| {
+                writer.writeStructBegin();
+                if (member != 0) {
+                    try writer.writeFieldBegin(.Struct, member);
+                    writer.writeStructBegin();
+                    try writer.writeStructEnd();
+                }
+                try writer.writeStructEnd();
+            }
+        }
         try writer.writeStructEnd();
     }
 
+    /// Column orders for an output whose leaf `j` holds source leaf `kept[j]` (or `j` without projection), given the
+    /// footers of the sources whose row groups were byte-copied into it. zpq's encoder writes every bound in
+    /// TYPE_DEFINED_ORDER, so with nothing copied each leaf declares that. A copied chunk keeps its source's bounds and
+    /// can only be declared what its source declared, so the copied sources must agree leaf by leaf, on an order the
+    /// spec can express (an empty union is invalid). A source that declared no orders leaves the output undeclared,
+    /// which only holds if every other source's kept leaves are type-defined too. Anything else is
+    /// `error.ColumnOrderMismatch`: no single footer is truthful for every row group, so the caller must re-encode.
+    pub fn outputColumnOrders(
+        allocator: std.mem.Allocator,
+        n_leaves: usize,
+        kept: ?[]const usize,
+        copied_from: []const *const FileMetaData,
+    ) !?std.ArrayListUnmanaged(i16) {
+        var undeclared = false;
+        for (copied_from) |m| undeclared = undeclared or m.column_orders == null;
+        var out: std.ArrayListUnmanaged(i16) = .empty;
+        errdefer out.deinit(allocator);
+        try out.ensureTotalCapacityPrecise(allocator, n_leaves);
+        for (0..n_leaves) |j| {
+            const src = if (kept) |k| k[j] else j;
+            var member: ?i16 = null;
+            for (copied_from) |m| {
+                const co = (m.column_orders orelse continue).items;
+                const declared: i16 = if (src < co.len) co[src] else 0;
+                if (declared == 0 or (member != null and member.? != declared)) return error.ColumnOrderMismatch;
+                member = declared;
+            }
+            const order = member orelse COLUMN_ORDER_TYPE_DEFINED;
+            if (undeclared and order != COLUMN_ORDER_TYPE_DEFINED) return error.ColumnOrderMismatch;
+            out.appendAssumeCapacity(order);
+        }
+        if (undeclared) {
+            out.deinit(allocator);
+            return null;
+        }
+        return out;
+    }
+
+    /// Whether this file's bounds for the given leaves are in TYPE_DEFINED_ORDER, or undeclared (read as such), so its
+    /// row groups can be byte-copied into an output whose re-encoded row groups declare that order.
+    pub fn keptLeavesTypeDefined(self: *const FileMetaData, kept: []const bool) bool {
+        const co = (self.column_orders orelse return true).items;
+        for (kept, 0..) |k, i| {
+            if (k and (i >= co.len or co[i] != COLUMN_ORDER_TYPE_DEFINED)) return false;
+        }
+        return true;
+    }
+
+    /// Levels of the first leaf whose path is exactly `path`, or {0, 0} when no leaf has it.
     pub fn getColumnLevels(self: *const FileMetaData, path: []const []const u8) Levels {
-        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
-        return iter.find(path) catch .{ .max_def = 0, .max_rep = 0 };
+        const leaf = self.leafAtPath(path) orelse return .{ .max_def = 0, .max_rep = 0 };
+        return .{ .max_def = leaf.max_def, .max_rep = leaf.max_rep };
     }
 
+    /// Schema element of the first leaf whose path is exactly `path`.
     pub fn getColumnSchema(self: *const FileMetaData, path: []const []const u8) ?SchemaElement {
-        var iter = SchemaIterator{ .items = self.schema.items, .pos = 0 };
-        return iter.findSchema(path) catch null;
+        const leaf = self.leafAtPath(path) orelse return null;
+        return leaf.element.*;
+    }
+
+    fn leafAtPath(self: *const FileMetaData, path: []const []const u8) ?LeafIterator.Leaf {
+        var it: LeafIterator = .init(self.schema.items);
+        while (it.next()) |leaf| {
+            if (pathEql(leaf.path, path)) return leaf;
+        }
+        return null;
     }
 };
 
-const SchemaIterator = struct {
+/// Deepest group nesting a schema walk accepts. `LeafIterator` keeps the open groups in fixed arrays and counts levels
+/// in a u8, so footer open rejects anything deeper (`metadata.checkFooterFields`). Real schemas stay far below.
+pub const max_schema_depth = 200;
+
+/// The primitive leaves of a flat schema list in column-chunk order, so leaf `index` is every row group's
+/// `columns[index]`. The one schema walk behind leaf counting, path lookup, name resolution and labelling: each
+/// applies its own policy to what this yields, and all of them agree on which element is leaf N and on its path.
+///
+/// A group is an element with children. The walk covers the root's children only, and stops at a group nested deeper
+/// than `max_schema_depth`; footer open rejects a schema either rule would cut short.
+pub const LeafIterator = struct {
     items: []const SchemaElement,
-    pos: usize,
+    pos: usize = 1,
+    index: usize = 0,
+    /// Open groups below the root.
+    depth: usize = 0,
+    /// Children still to visit: the root's at 0, open group `d`'s at `d + 1`.
+    left: [max_schema_depth + 1]usize = undefined,
+    /// Definition / repetition levels down to open group `d`, itself included.
+    group_levels: [max_schema_depth][2]u8 = undefined,
+    /// Schema index of the top-level field the open groups sit in.
+    top: usize = 0,
+    /// Names of the open groups, then of the leaf just yielded: what `Leaf.path` borrows.
+    names: [max_schema_depth + 1][]const u8 = undefined,
 
-    fn find(self: *SchemaIterator, path: []const []const u8) !Levels {
-        if (self.pos >= self.items.len) return error.NotFound;
+    pub const Leaf = struct {
+        /// Leaf ordinal: the column chunk's position in each row group.
+        index: usize,
+        element: *const SchemaElement,
+        /// Names from the top-level field down to the leaf, root excluded. Borrows the iterator, so is valid until
+        /// its next `next`.
+        path: []const []const u8,
+        /// Schema index of the top-level field the leaf sits in; its own for a top-level leaf.
+        top: usize,
+        max_def: u8,
+        max_rep: u8,
+    };
 
-        // Consume root
-        const root = self.items[self.pos];
-        self.pos += 1;
-
-        const num_children = root.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            if (try self.visit(path, 0, 0, 0)) |res| return res;
-        }
-        return error.NotFound;
+    pub fn init(items: []const SchemaElement) LeafIterator {
+        var it: LeafIterator = .{ .items = items };
+        it.left[0] = if (items.len == 0) 0 else childCount(items[0]);
+        return it;
     }
 
-    fn findSchema(self: *SchemaIterator, path: []const []const u8) !SchemaElement {
-        if (self.pos >= self.items.len) return error.NotFound;
+    pub fn next(self: *LeafIterator) ?Leaf {
+        while (self.pos < self.items.len) {
+            while (self.left[self.depth] == 0) {
+                if (self.depth == 0) return null;
+                self.depth -= 1;
+            }
+            self.left[self.depth] -= 1;
+            const schema_index = self.pos;
+            const elem = &self.items[schema_index];
+            self.pos += 1;
+            if (self.depth == 0) self.top = schema_index;
 
-        // Consume root
-        const root = self.items[self.pos];
-        self.pos += 1;
+            // Per Parquet, every non-REQUIRED element adds a definition level and every REPEATED one a repetition
+            // level. A missing repetition type reads as REQUIRED.
+            const rt = elem.repetition_type orelse .REQUIRED;
+            const parent: [2]u8 = if (self.depth == 0) .{ 0, 0 } else self.group_levels[self.depth - 1];
+            const def = parent[0] + @intFromBool(rt != .REQUIRED);
+            const rep = parent[1] + @intFromBool(rt == .REPEATED);
+            self.names[self.depth] = elem.name;
 
-        const num_children = root.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            if (try self.visitSchema(path, 0)) |res| return res;
-        }
-        return error.NotFound;
-    }
-
-    fn visitSchema(self: *SchemaIterator, target_path: []const []const u8, depth: usize) !?SchemaElement {
-        if (self.pos >= self.items.len) return null;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-
-        if (std.mem.eql(u8, elem.name, target_path[depth])) {
-            if (depth == target_path.len - 1) {
-                return elem;
-            } else {
-                const num_children = elem.num_children orelse 0;
-                var i: i32 = 0;
-                while (i < num_children) : (i += 1) {
-                    if (try self.visitSchema(target_path, depth + 1)) |res| return res;
+            const n = childCount(elem.*);
+            if (n > 0) {
+                if (self.depth == max_schema_depth) {
+                    self.pos = self.items.len;
+                    return null;
                 }
+                self.group_levels[self.depth] = .{ def, rep };
+                self.depth += 1;
+                self.left[self.depth] = n;
+                continue;
             }
-        } else {
-            // Not the node we're looking for, skip its children
-            const num_children = elem.num_children orelse 0;
-            var i: i32 = 0;
-            while (i < num_children) : (i += 1) {
-                _ = try self.skip();
-            }
+            defer self.index += 1;
+            return .{
+                .index = self.index,
+                .element = elem,
+                .path = self.names[0 .. self.depth + 1],
+                .top = self.top,
+                .max_def = def,
+                .max_rep = rep,
+            };
         }
         return null;
     }
 
-    fn visit(self: *SchemaIterator, target_path: []const []const u8, depth: usize, current_def: i32, current_rep: i32) !?Levels {
-        if (self.pos >= self.items.len) return null;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-
-        var def = current_def;
-        var rep = current_rep;
-
-        if (elem.repetition_type) |rt| {
-            if (rt == .OPTIONAL) {
-                def += 1;
-            } else if (rt == .REPEATED) {
-                def += 1;
-                rep += 1;
-            }
-        }
-
-        if (std.mem.eql(u8, elem.name, target_path[depth])) {
-            if (depth == target_path.len - 1) {
-                return Levels{ .max_def = def, .max_rep = rep };
-            } else {
-                const num_children = elem.num_children orelse 0;
-                var i: i32 = 0;
-                while (i < num_children) : (i += 1) {
-                    if (try self.visit(target_path, depth + 1, def, rep)) |res| return res;
-                }
-            }
-        } else {
-            // Not the node we're looking for, skip its children
-            const num_children = elem.num_children orelse 0;
-            var i: i32 = 0;
-            while (i < num_children) : (i += 1) {
-                _ = try self.skip();
-            }
-        }
-        return null;
-    }
-
-    fn skip(self: *SchemaIterator) !void {
-        if (self.pos >= self.items.len) return;
-        const elem = self.items[self.pos];
-        self.pos += 1;
-        const num_children = elem.num_children orelse 0;
-        var i: i32 = 0;
-        while (i < num_children) : (i += 1) {
-            try self.skip();
-        }
+    fn childCount(elem: SchemaElement) usize {
+        return @intCast(@max(elem.num_children orelse 0, 0));
     }
 };
+
+/// Whether two schema paths name the same field, segment by segment. Never compare paths by a dot-joined form: a
+/// top-level column named `a.b` and the field `b` of a group `a` join to the same string.
+pub fn pathEql(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
 
 pub const Levels = struct {
     max_def: i32,
     max_rep: i32,
 };
+
+test "logical-type fields a footer leaves out or overflows are rejected, not left undefined" {
+    const a = std.testing.allocator;
+    { // TIME with no unit: the union tag would stay undefined until a footer write switched on it.
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldBegin(.Struct, 7); // LogicalType.TIME
+        w.writeStructBegin();
+        try w.writeFieldBool(1, true); // isAdjustedToUTC, but no unit (field 2)
+        try w.writeStructEnd();
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        try std.testing.expectError(error.MissingTimeUnit, LogicalType.read(&r));
+    }
+    { // INTEGER bitWidth sent as an i16 that doesn't fit the i8 field.
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldBegin(.Struct, 10); // LogicalType.INTEGER
+        w.writeStructBegin();
+        try w.writeFieldBegin(.I16, 1);
+        try w.writeZigZag(@as(i16, 300));
+        try w.writeStructEnd();
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        try std.testing.expectError(error.InvalidBitWidth, LogicalType.read(&r));
+    }
+}
 
 test "safeListReserve caps initial allocation bytes" {
     try std.testing.expectEqual(@as(usize, 100), safeListReserve(u8, 100, 1000));
@@ -1626,4 +1785,69 @@ test "ColumnChunk write emits page-index pointers" {
     try std.testing.expectEqual(@as(?i32, 40), decoded.offset_index_length);
     try std.testing.expectEqual(@as(?i64, 5040), decoded.column_index_offset);
     try std.testing.expectEqual(@as(?i32, 64), decoded.column_index_length);
+}
+
+test "FileMetaData writes column_orders and reads them back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    try orders.appendSlice(a, &.{ COLUMN_ORDER_TYPE_DEFINED, 3, 0 });
+    const meta: FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+        .column_orders = orders,
+    };
+    var w: thrift.Writer = .init(a);
+    defer w.deinit();
+    try meta.write(&w);
+    var r = thrift.Reader.init(w.bytes());
+    const back = try FileMetaData.read(a, &r);
+    try std.testing.expectEqualSlices(i16, &.{ COLUMN_ORDER_TYPE_DEFINED, 3, 0 }, back.column_orders.?.items);
+}
+
+test "outputColumnOrders: zpq's own bounds are type-defined, copied bounds keep their source's order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const td = COLUMN_ORDER_TYPE_DEFINED;
+
+    const encoded = (try FileMetaData.outputColumnOrders(a, 3, null, &.{})).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, td, td }, encoded.items);
+
+    const blank: FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    var x = blank;
+    x.column_orders = .empty;
+    try x.column_orders.?.appendSlice(a, &.{ td, 3, td });
+    var y = blank;
+    y.column_orders = .empty;
+    try y.column_orders.?.appendSlice(a, &.{ td, 3, 2 });
+
+    const one = (try FileMetaData.outputColumnOrders(a, 3, null, &.{&x})).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, 3, td }, one.items);
+    // Projection maps output leaves to source leaves; sources agreeing on every kept leaf can be declared.
+    const agree = (try FileMetaData.outputColumnOrders(a, 2, &.{ 0, 1 }, &.{ &x, &y })).?;
+    try std.testing.expectEqualSlices(i16, &.{ td, 3 }, agree.items);
+    // Sources disagreeing on a leaf have no truthful declaration, and an empty union is never written.
+    try std.testing.expectError(error.ColumnOrderMismatch, FileMetaData.outputColumnOrders(a, 3, null, &.{ &x, &y }));
+    var z = blank;
+    z.column_orders = .empty;
+    try z.column_orders.?.appendSlice(a, &.{ td, 0, td });
+    try std.testing.expectError(error.ColumnOrderMismatch, FileMetaData.outputColumnOrders(a, 3, null, &.{&z}));
+    // A copied source that declared nothing leaves the output undeclared, which holds only beside type-defined leaves.
+    try std.testing.expect((try FileMetaData.outputColumnOrders(a, 2, &.{ 0, 2 }, &.{ &x, &blank })) == null);
+    const mixed = FileMetaData.outputColumnOrders(a, 3, null, &.{ &x, &blank });
+    try std.testing.expectError(error.ColumnOrderMismatch, mixed);
+    try std.testing.expect(x.keptLeavesTypeDefined(&.{ true, false, true }));
+    try std.testing.expect(!x.keptLeavesTypeDefined(&.{ true, true, true }));
+    try std.testing.expect(blank.keptLeavesTypeDefined(&.{ true, true, true }));
 }

@@ -20,6 +20,7 @@
 //! slice values are valid only as long as the encoded page payload is.
 
 const std = @import("std");
+const readLe = @import("../../bytes.zig").readLe;
 
 pub const Error = error{
     UnexpectedEndOfPage,
@@ -155,7 +156,7 @@ pub const ByteArrayDecoder = struct {
             if (self.pos >= self.bytes.len) break;
             if (self.pos + 4 > self.bytes.len) return error.UnexpectedEndOfPage;
 
-            const len = std.mem.readInt(u32, self.bytes[self.pos..][0..4], .little);
+            const len = readLe(u32, self.bytes[self.pos..][0..4]);
             self.pos += 4;
 
             const ulen: usize = len;

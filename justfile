@@ -2,9 +2,9 @@
 # source tree. Don't ship recipes that fail when invoked; they're noise in
 # `just --list`.
 
-# Ensure we use Zig 0.16.0 release. If it's not on the PATH but is installed
-# under ~/.zvm/0.16.0, add that directory to PATH.
-export PATH := `[ -d ~/.zvm/0.16.0 ] && echo "$HOME/.zvm/0.16.0:$PATH" || echo "$PATH"`
+# Ensure we use Zig 0.17.0 release. If it's not on the PATH but is installed
+# under ~/.zvm/0.17.0, add that directory to PATH.
+export PATH := `[ -d ~/.zvm/0.17.0 ] && echo "$HOME/.zvm/0.17.0:$PATH" || echo "$PATH"`
 
 # Python for tooling (conformance / regression / smoke): zpq's in-project uv
 # .venv if present (it has pyarrow — system python3 is 3.14, no wheel), else
@@ -19,12 +19,10 @@ default:
 
 # Build (ReleaseFast) — produces zpq + zpq-lambda.
 build:
-    @./tools/r2-fetch-artifacts.sh
     zig build -Doptimize=ReleaseFast
 
 # Build with debug symbols.
 build-debug:
-    @./tools/r2-fetch-artifacts.sh
     zig build
 
 # Build the lean-core CLI — no SQL frontend (`-Dsql=false`), so liteparser
@@ -32,7 +30,6 @@ build-debug:
 # never includes SQL regardless; this is the minimal *CLI*. CI builds this
 # variant too, so the lean path can't bit-rot.
 build-minimal:
-    @./tools/r2-fetch-artifacts.sh
     zig build -Dsql=false -Doptimize=ReleaseFast cli
 
 # Verify all release targets compile (CLI + Lambda, x86_64 + arm64).
@@ -43,13 +40,14 @@ cross-check:
     @echo "[aarch64-macos]" ; zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
     @echo "All targets OK."
 
-# Just the Lambda binary (musl static, ReleaseSmall) for both archs.
+# The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
+# tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small
+# build started no faster and ran up to 2x slower cold, and the ~10 MB zip is
+# far inside the 50 MB direct-upload limit.
 lambda-build:
-    zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall lambda
-    @cp zig-out/bin/zpq-lambda zig-out/zpq-lambda-arm64
-    zig build -Dtarget=x86_64-linux-musl  -Doptimize=ReleaseSmall lambda
-    @cp zig-out/bin/zpq-lambda zig-out/zpq-lambda-x86_64
-    @echo "zig-out/zpq-lambda-{arm64,x86_64} ready."
+    ./tools/serverless/aws.sh build arm64
+    ./tools/serverless/aws.sh build x86_64
+    @echo "zig-out/lambda/zpq-lambda-{arm64,x86_64}.zip ready."
 
 # === Setup ===
 
@@ -58,7 +56,7 @@ lambda-build:
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    ZV=0.16.0
+    ZV=0.17.0
     if ! ~/.zvm/$ZV/zig version >/dev/null 2>&1; then
       echo "installing zig $ZV -> ~/.zvm/$ZV"
       mkdir -p ~/.zvm
@@ -147,13 +145,19 @@ differential:
     {{python}} tools/differential.py
 
 # Conformance against apache/parquet-testing (Tier 3). Clones the corpus on
-# first run. Floor of 69 full-passes = the 2026-06-14 baseline (was 64;
-# +5: RLE-BOOLEAN, multi-member GZIP, empty datapage, dict-page-offset-zero); hard failures always fail.
+# first run. Floor of 72 full-passes (was 64; +5: RLE-BOOLEAN, multi-member GZIP, empty datapage,
+# dict-page-offset-zero; +3: the legacy LZ4 files); hard failures always fail.
 conform corpus="/tmp/parquet-testing":
     @test -d {{corpus}} || git clone --depth 1 https://github.com/apache/parquet-testing {{corpus}}
     zig build -Doptimize=ReleaseFast
-    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 69
+    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 72
 
+# `tools/fetch_hardwood.sh --from-source DIR` builds a JVM launcher from a Hardwood checkout instead.
+# Fetch the pinned Hardwood CLI + test fixtures (triangulation's strict-reader oracle) into tools/hardwood/.
+fetch-hardwood:
+    tools/fetch_hardwood.sh
+
+# Without `just fetch-hardwood` (run once) the harness degrades to ZPQ vs DuckDB.
 # Heavy correctness triangulation (ZPQ vs Hardwood vs DuckDB) (Tier 3).
 triangulate: fetch-corpus
     zig build -Doptimize=ReleaseFast
@@ -211,7 +215,7 @@ microbench fixture="data/benchmark_100mb.parquet" runs="7" warmup="2":
 
 # Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.
 lambda-deploy fn arch="arm64":
-    @./tools/serverless/aws.sh deploy {{fn}} zig-out/zpq-lambda-{{arch}}.zip {{arch}}
+    @./tools/serverless/aws.sh deploy {{fn}} zig-out/lambda/zpq-lambda-{{arch}}.zip {{arch}}
 
 # Invoke a Lambda function with a JSON payload.
 lambda-invoke fn payload="{}":
@@ -295,6 +299,7 @@ flamegraph-bpf duration="5":
 clean:
     rm -rf zig-out .zig-cache
 
-# Pre-fetch BoringSSL prebuilt artifacts.
+# Fill vendor/boring_tls/prebuilt/ with verified BoringSSL prebuilts so later
+# builds need no network (a normal build fetches them into .zig-cache itself).
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh

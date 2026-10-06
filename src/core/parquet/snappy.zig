@@ -1,4 +1,5 @@
 const std = @import("std");
+const readUleb128 = @import("../bytes.zig").readUleb128;
 
 /// FFI to vendor/snappy (google/snappy 1.2.1 source-built). Used for
 /// the COMPRESS path. Decompression still uses the hand-rolled
@@ -15,18 +16,8 @@ pub const Error = error{
 /// Decodes the length of the uncompressed data from the preamble.
 /// Returns the length and the number of bytes read from src.
 pub fn decodedLen(src: []const u8) !struct { u64, usize } {
-    var len: u64 = 0;
-    var shift: u6 = 0;
-    var count: usize = 0;
-
-    for (src) |b| {
-        count += 1;
-        len |= @as(u64, b & 0x7f) << shift;
-        if (b & 0x80 == 0) return .{ len, count };
-        shift += 7;
-        if (shift >= 64) return error.CorruptInput;
-    }
-    return error.CorruptInput;
+    const d = readUleb128(src) catch return error.CorruptInput;
+    return .{ d.value, d.len };
 }
 
 /// Decompress raw snappy data.
@@ -159,6 +150,15 @@ test "snappy basic" {
     const len = try uncompress(&input, &buf);
     try std.testing.expectEqual(@as(usize, 4), len);
     try std.testing.expectEqualStrings("Wiki", buf[0..len]);
+}
+
+test "decodedLen bounds the length varint" {
+    const nine_cont = @as([9]u8, @splat(0x80));
+    const max = try decodedLen(&(@as([9]u8, @splat(0xff)) ++ [_]u8{0x01}));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), max[0]);
+    try std.testing.expectEqual(@as(usize, 10), max[1]);
+    try std.testing.expectError(error.CorruptInput, decodedLen(&(nine_cont ++ [_]u8{0x02})));
+    try std.testing.expectError(error.CorruptInput, decodedLen(&nine_cont));
 }
 
 test "snappy repeat" {
@@ -334,7 +334,7 @@ pub fn compress(src: []const u8, dest: []u8) CompressError!usize {
     const table_bits = 14;
     const table_size = 1 << table_bits;
     const table_mask = table_size - 1;
-    var table: [table_size]u32 = [_]u32{0} ** table_size;
+    var table: [table_size]u32 = @splat(0);
 
     var s_idx: usize = 0; // Current position in source
     var literal_start: usize = 0; // Start of current literal run

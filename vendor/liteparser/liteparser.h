@@ -473,6 +473,10 @@ struct LpNode {
             char         *schema;
             char         *table;
             char         *column;
+            /* Which parts were quoted in the source (LP_QUOTED_*): unparse
+            ** keeps them quoted, since "a"."b" and a.b can name different
+            ** columns to a consumer that reads dots inside names. */
+            unsigned int  quoted;
         } column_ref;
 
         struct {
@@ -778,6 +782,10 @@ const char *lp_error_code_name(LpErrorCode code);
 **   0 = continue
 **   2 = abort
 */
+#define LP_QUOTED_SCHEMA 1u
+#define LP_QUOTED_TABLE  2u
+#define LP_QUOTED_COLUMN 4u
+
 struct LpVisitor {
     void *user_data;
     int (*enter)(LpVisitor *v, LpNode *node);

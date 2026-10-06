@@ -1,17 +1,15 @@
 //! Codec dispatch for Parquet pages.
 //!
-//! UNCOMPRESSED and SNAPPY are handled in-tree; ZSTD and GZIP use the
-//! Zig stdlib; LZ4_RAW uses the local Parquet block decoder. Legacy
-//! Hadoop LZ4 framing is intentionally rejected.
+//! UNCOMPRESSED, SNAPPY and the LZ4s are handled in-tree; ZSTD uses libzstd
+//! and GZIP the Zig stdlib. The deprecated LZ4 codec (5) is read, never written:
+//! the spec replaced it with LZ4_RAW, which is what `--codec lz4` writes.
 
 const std = @import("std");
 const schema = @import("../schema.zig");
 const snappy = @import("snappy.zig");
 const lz4 = @import("lz4.zig");
 
-const c_zstd = @cImport({
-    @cInclude("zstd.h");
-});
+const c_zstd = @import("zstd_c");
 
 pub const Error = error{
     UnsupportedCodec,
@@ -113,47 +111,77 @@ pub fn decompress(
     codec: schema.CompressionCodec,
     uncompressed_size: usize,
 ) Error![]const u8 {
+    if (uncompressed_size == 0) return src[0..0];
+    if (codec == .UNCOMPRESSED) {
+        // Sanity check: header should agree with the slice length.
+        if (src.len != uncompressed_size) return error.SizeMismatch;
+        return src;
+    }
+    const out = try arena.alloc(u8, uncompressed_size);
+    errdefer arena.free(out);
+    try decompressInto(arena, src, codec, out);
+    return out;
+}
+
+/// `decompress` into a caller-owned buffer of exactly the uncompressed size, so callers can reuse one buffer
+/// across pages. UNCOMPRESSED copies. `arena` is only touched for codec working state (the flate window).
+pub fn decompressInto(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    codec: schema.CompressionCodec,
+    out: []u8,
+) Error!void {
     // An empty page (0 values) decompresses to nothing regardless of codec.
     // Several codecs' decoders choke on a zero-length input (snappy reads a
     // varint length header first); short-circuit before dispatch. See
     // datapage_v2_empty_datapage.snappy.parquet.
-    if (uncompressed_size == 0) return src[0..0];
+    if (out.len == 0) return;
 
     switch (codec) {
         .UNCOMPRESSED => {
-            // Sanity check: header should agree with the slice length.
-            if (src.len != uncompressed_size) return error.SizeMismatch;
-            return src;
+            if (src.len != out.len) return error.SizeMismatch;
+            @memcpy(out, src);
         },
         .SNAPPY => {
-            const out = try arena.alloc(u8, uncompressed_size);
-            errdefer arena.free(out);
             const n = snappy.uncompress(src, out) catch return error.DecompressionFailed;
-            if (n != uncompressed_size) return error.SizeMismatch;
-            return out[0..n];
+            if (n != out.len) return error.SizeMismatch;
         },
-        .GZIP => return decompressFlate(arena, src, uncompressed_size, .gzip),
-        .ZSTD => return decompressZstd(arena, src, uncompressed_size),
+        .GZIP => try decompressFlate(arena, src, out, .gzip),
+        .ZSTD => try decompressZstd(src, out),
         .LZ4_RAW => {
-            const out = try arena.alloc(u8, uncompressed_size);
-            errdefer arena.free(out);
             const n = lz4.uncompress(src, out) catch return error.DecompressionFailed;
-            if (n != uncompressed_size) return error.SizeMismatch;
-            return out[0..n];
+            if (n != out.len) return error.SizeMismatch;
         },
+        .LZ4 => try decompressLz4Legacy(src, out),
         else => return error.UnsupportedCodec,
     }
+}
+
+/// Codec 5 carries no marker for which of its historical containers a page uses, so try them in Arrow C++'s
+/// order (ARROW-9177): Hadoop framing (parquet-mr) only if every length validates, else a bare block (older
+/// parquet-cpp); then, as arrow-rs also does, an LZ4 frame (older arrow-rs) when its magic announces one. A bare
+/// block cannot parse a standard frame (its first token matches at offset 0x4D22 into empty output), so trying
+/// the block first costs nothing. Every attempt writes `out` from the start, so the one that succeeds overwrites a failed one's bytes.
+fn decompressLz4Legacy(src: []const u8, out: []u8) Error!void {
+    if (lz4.uncompressHadoop(src, out)) |_| return else |_| {}
+    if (lz4.uncompress(src, out)) |n| {
+        if (n == out.len) return;
+    } else |_| {}
+    if (lz4.hasFrameMagic(src)) {
+        const n = lz4.uncompressFrame(src, out) catch return error.DecompressionFailed;
+        if (n != out.len) return error.SizeMismatch;
+        return;
+    }
+    return error.DecompressionFailed;
 }
 
 fn decompressFlate(
     arena: std.mem.Allocator,
     src: []const u8,
-    uncompressed_size: usize,
+    out: []u8,
     container: std.compress.flate.Container,
-) Error![]const u8 {
-    const out = try arena.alloc(u8, uncompressed_size);
-    errdefer arena.free(out);
-
+) Error!void {
+    const uncompressed_size = out.len;
     var input = std.Io.Reader.fixed(src);
     // The flate decoder asserts buffer.len >= max_window_len (64 KB).
     // Arena-allocated; lives until the row-group arena resets.
@@ -176,17 +204,9 @@ fn decompressFlate(
         written += n;
     }
     if (written != uncompressed_size) return error.DecompressionFailed;
-    return out;
 }
 
-fn decompressZstd(
-    arena: std.mem.Allocator,
-    src: []const u8,
-    uncompressed_size: usize,
-) Error![]const u8 {
-    const out = try arena.alloc(u8, uncompressed_size);
-    errdefer arena.free(out);
-
+fn decompressZstd(src: []const u8, out: []u8) Error!void {
     // Use libzstd's `ZSTD_decompress` directly. Zig's stdlib zstd
     // decoder is correct but ~10× slower than libzstd on the
     // dict-encoded numeric column-chunks Parquet writers produce —
@@ -200,8 +220,7 @@ fn decompressZstd(
         src.len,
     );
     if (c_zstd.ZSTD_isError(n) != 0) return error.DecompressionFailed;
-    if (n != uncompressed_size) return error.SizeMismatch;
-    return out;
+    if (n != out.len) return error.SizeMismatch;
 }
 
 // ============================================================
@@ -233,7 +252,7 @@ test "SNAPPY round-trip" {
 
 test "unsupported codec" {
     try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .BROTLI, 1));
-    try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .LZ4, 1)); // legacy LZ4 (Hadoop framing) intentionally skipped
+    try testing.expectError(error.UnsupportedCodec, compress(testing.allocator, "x", .LZ4)); // read-only codec
 }
 
 test "GZIP decompresses canned bytes" {
@@ -263,4 +282,57 @@ test "ZSTD decompresses canned bytes" {
 
     const out = try decompress(arena.allocator(), &compressed, .ZSTD, 11);
     try testing.expectEqualStrings("hello world", out);
+}
+
+test "LZ4 (codec 5): Hadoop framing, bare block and frame all decode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = "hello hello hello hello parquet lz4 frame";
+
+    const block = try compress(a, text, .LZ4_RAW);
+    const hadoop = try a.alloc(u8, 8 + block.len);
+    std.mem.writeInt(u32, hadoop[0..4], text.len, .big);
+    std.mem.writeInt(u32, hadoop[4..8], @intCast(block.len), .big);
+    @memcpy(hadoop[8..], block);
+    const frame = lz4.frame_plain; // python-lz4 `lz4.frame.compress(text, store_size=False)`
+    for ([_][]const u8{ hadoop, block, &frame }) |src| {
+        try testing.expectEqualStrings(text, try decompress(a, src, .LZ4, text.len));
+    }
+
+    // A page header whose size disagrees with the payload is an error, whichever container it was.
+    for ([_][]const u8{ hadoop, block }) |src| {
+        try testing.expectError(error.DecompressionFailed, decompress(a, src, .LZ4, text.len + 1));
+    }
+    try testing.expectError(error.SizeMismatch, decompress(a, &frame, .LZ4, text.len + 1));
+    try testing.expectError(error.DecompressionFailed, decompress(a, "\x00\x00\x00\x00garbage!", .LZ4, 4));
+}
+
+test "LZ4 (codec 5): a Hadoop chunk split over several blocks decodes" {
+    // BlockCompressorStream given one write() larger than its 256 KiB buffer writes the total length once, then
+    // a `[clen][block]` piece per buffer-sized slice (MAX_INPUT_SIZE = 262144 - 262144/255 - 16).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try a.alloc(u8, 600_000);
+    var prng = std.Random.DefaultPrng.init(0x1a4);
+    for (raw, 0..) |*b, i| b.* = if (i % 7 == 0) prng.random().int(u8) else @truncate(i / 64);
+
+    var page: std.ArrayList(u8) = .empty;
+    var word: [4]u8 = undefined;
+    std.mem.writeInt(u32, &word, @intCast(raw.len), .big);
+    try page.appendSlice(a, &word);
+    const max_input = 262144 - 262144 / 255 - 16;
+    var off: usize = 0;
+    var pieces: usize = 0;
+    while (off < raw.len) : (pieces += 1) {
+        const n = @min(max_input, raw.len - off);
+        const block = try compress(a, raw[off..][0..n], .LZ4_RAW);
+        std.mem.writeInt(u32, &word, @intCast(block.len), .big);
+        try page.appendSlice(a, &word);
+        try page.appendSlice(a, block);
+        off += n;
+    }
+    try testing.expectEqual(@as(usize, 3), pieces);
+    try testing.expectEqualSlices(u8, raw, try decompress(a, page.items, .LZ4, raw.len));
 }

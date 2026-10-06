@@ -21,6 +21,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const zpq = @import("zpq");
+const nowMonoNs = zpq.clock.monoNs;
 
 const schema = zpq.core.schema;
 const metadata = zpq.core.parquet.metadata;
@@ -194,12 +195,6 @@ fn benchOnce(
 
 fn encodingName(e: schema.Encoding) []const u8 {
     return @tagName(e);
-}
-
-fn nowMonoNs() i64 {
-    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
 }
 
 const MmapFile = struct {

@@ -150,6 +150,21 @@ else
   echo "  SKIP  always-match aggregate (corpus absent)"
 fi
 
+# A bare name binds to the top-level column even when a nested field shares its
+# leaf name (and comes first); the dotted path binds to the nested field.
+SL="$TMP/shared_leaf.parquet"
+if "$DUCKDB" -c "COPY (SELECT {'key': i::BIGINT, 'name': 'n' || i} AS r, (i + 1000)::BIGINT AS key, i::BIGINT AS amount
+                      FROM range(1, 101) t(i)) TO '$SL' (FORMAT PARQUET)" >/dev/null; then
+  compare "bare name binds the top-level column, dotted path the nested one" \
+    "$("$ZPQ" query "$SL" --filter 'key > 1050' --aggregate 'sum(key) AS s, sum(r.key) AS t' 2>/dev/null)" \
+    "$("$DUCKDB" -noheader -csv -c "SELECT sum(key), sum(r.key) FROM '$SL' WHERE key > 1050")"
+  compare "dotted path in a filter (r.key)" \
+    "$("$ZPQ" query "$SL" --filter 'r.key <= 10' --aggregate 'count(*) AS n, sum(key) AS s' 2>/dev/null)" \
+    "$("$DUCKDB" -noheader -csv -c "SELECT count(*), sum(key) FROM '$SL' WHERE r.key <= 10")"
+else
+  echo "duckdb failed to write the shared-leaf fixture" >&2; fail=1
+fi
+
 # --scan-all parity: forcing a full decode (every stats shortcut off) must
 # return IDENTICAL answers to the default stats-fast path. Guards the invariant
 # that the single flag disables shortcuts without changing results — and that

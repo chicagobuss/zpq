@@ -1,0 +1,13 @@
+# BoringSSL static libraries linked by vendor/boring_tls, one line per
+# <target>/<file>: the URL it is fetched from and the sha256 it must have.
+# Read by build.zig (which fetches and verifies a missing pair into the Zig
+# cache) and by tools/r2-fetch-artifacts.sh (which fills prebuilt/ for
+# offline builds). Change a digest only together with the artifact.
+aarch64-linux/libcrypto.a 26a32883266b0e49f50112646262401c5230afb13c8b8dc8e74dc38c39b82394 https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/aarch64-linux/libcrypto.a
+aarch64-linux/libssl.a ccb6c032692b2011e9dcc4ff6c469e0ea50b97dceb8f1494d1b9ddb96aad5260 https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/aarch64-linux/libssl.a
+aarch64-macos/libcrypto.a 7749584c62bd2ad0f686c17ef441e845e3c4d8f3e16d0bc3c5436cf9154e5fce https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/aarch64-macos/libcrypto.a
+aarch64-macos/libssl.a 9aa923eed4814372451c3bd9dc1ed741b9e9f75cbafa720da0195640b189a963 https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/aarch64-macos/libssl.a
+x86_64-linux/libcrypto.a 59eff4094d83d6ee1881e9d8b03226512f885c7dcfc45d2164e91960ec65d235 https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux/libcrypto.a
+x86_64-linux/libssl.a 59b6f95819515c9537d2bf5dc177cc5e7d23007ef69d57e4033de64d0483d3ad https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux/libssl.a
+x86_64-macos/libcrypto.a 84a6e14fcf8ebdab7803984b1765640a74b4d28d355df9d7ea535c80d347f02e https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-macos/libcrypto.a
+x86_64-macos/libssl.a cb3787887ae9a1fc9af23fad1adaa2b5d434eb9bf4df154bb3293c2373802d5c https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-macos/libssl.a

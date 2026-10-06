@@ -124,6 +124,9 @@ pub fn likeMatches(kind: LikeKind, operand: []const u8, value: []const u8) bool 
 pub const Filter = union(enum) {
     int32: Leaf(i32),
     int64: Leaf(i64),
+    /// Any unsigned integer column (UINT_8..UINT_64, INTEGER{isSigned=false}), compared as u64. Decoded lanes hold
+    /// such a column as raw i32 bits, zero-extended i64, or raw u64 bits in an i64; all three bitcast to the value.
+    uint64: Leaf(u64),
     float: Leaf(f32),
     double: Leaf(f64),
     string: Leaf([]const u8),
@@ -139,6 +142,7 @@ pub const Filter = union(enum) {
         switch (self) {
             .int32 => |f| try list.append(allocator, f.col_idx),
             .int64 => |f| try list.append(allocator, f.col_idx),
+            .uint64 => |f| try list.append(allocator, f.col_idx),
             .float => |f| try list.append(allocator, f.col_idx),
             .double => |f| try list.append(allocator, f.col_idx),
             .string => |f| try list.append(allocator, f.col_idx),

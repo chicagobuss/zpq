@@ -34,6 +34,8 @@ pub const Error = error{
     NestedNotSupported,
     DivisionByZero,
     UnsupportedCoalesce,
+    /// An unsigned 64-bit value of 2^63 or more in integer arithmetic, which runs in the signed i64 lane.
+    Unsigned64OutOfRange,
 } || std.mem.Allocator.Error;
 
 const Batch = filter_eval.Batch;
@@ -101,7 +103,7 @@ fn colRefAsGroupKeyColumn(
 
     return switch (c.expr_type) {
         .i64 => .{ .i64 = .{
-            .values = try widenToI64(arena, col),
+            .values = try widenColRefToI64(arena, col, c),
             .def_levels = nulls.def_levels,
             .max_def = nulls.max_def,
             .rep_levels = switch (col) {
@@ -145,14 +147,50 @@ fn evalGroupKeyBinOp(
     column_lookup: []const ?usize,
     b: ast.BinOp,
 ) Error!Batch.Column {
-    const l_col = try evalGroupKeyExpr(arena, batch, column_lookup, b.left.*);
-    const r_col = try evalGroupKeyExpr(arena, batch, column_lookup, b.right.*);
+    const l_raw = try evalGroupKeyExpr(arena, batch, column_lookup, b.left.*);
+    const r_raw = try evalGroupKeyExpr(arena, batch, column_lookup, b.right.*);
+    const l_col = try keyOperandAs(arena, l_raw, b.left.*, b.result_type);
+    const r_col = try keyOperandAs(arena, r_raw, b.right.*, b.result_type);
 
     return switch (b.result_type) {
         .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col),
         .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col),
         .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
     };
+}
+
+/// A binop operand converted to its result lane, for group keys (and for unsigned 64-bit columns, via `evalAs`). The
+/// parser types `i8 + 0.5` as f64 but leaves each side its own type; reading an i64 operand's lane as f64 reinterpreted
+/// its bits (2 became 1e-323). An unsigned 64-bit column converts by value, and in the i64 lane must stay below 2^63.
+fn keyOperandAs(arena: std.mem.Allocator, col: Batch.Column, e: ast.Expr, target: ast.Type) Error!Batch.Column {
+    const unsigned_64 = e == .col_ref and e.col_ref.unsigned_64;
+    switch (target) {
+        .str => return if (col == .string) col else error.TypeMismatch,
+        .i64 => {
+            if (col != .i64) return error.TypeMismatch;
+            if (unsigned_64) for (col.i64.values, 0..) |v, i| {
+                if (v < 0 and !rowIsNull(col, i)) return error.Unsigned64OutOfRange;
+            };
+            return col;
+        },
+        .f64 => switch (col) {
+            .f64 => return col,
+            .i64 => |c| {
+                const out = try arena.alloc(f64, c.values.len);
+                for (c.values, out) |v, *o| o.* = if (unsigned_64)
+                    @floatFromInt(@as(u64, @bitCast(v)))
+                else
+                    @floatFromInt(v);
+                return .{ .f64 = .{
+                    .values = out,
+                    .def_levels = c.def_levels,
+                    .max_def = c.max_def,
+                    .has_nulls = c.has_nulls,
+                } };
+            },
+            else => return error.TypeMismatch,
+        },
+    }
 }
 
 fn evalGroupKeyNumericBinOp(
@@ -259,6 +297,8 @@ fn evalAs(
     target: ast.Type,
 ) Error!Batch.Column {
     const result = try evalExpr(arena, batch, column_lookup, e);
+    // Only binop operands come through here; an unsigned 64-bit column among them needs the same care as in a key.
+    if (e == .col_ref and e.col_ref.unsigned_64) return keyOperandAs(arena, result, e, target);
     if (e.typeOf() == target) return result;
     // Promotion: i64 → f64. The reverse never happens for valid ASTs
     // (the parser sets binop.result_type via Type.promote).
@@ -307,7 +347,7 @@ fn colRefAsColumn(
     try rejectNullableOrNested(col);
 
     return switch (c.expr_type) {
-        .i64 => .{ .i64 = .{ .values = try widenToI64(arena, col) } },
+        .i64 => .{ .i64 = .{ .values = try widenColRefToI64(arena, col, c) } },
         .f64 => .{ .f64 = .{ .values = try widenToF64(arena, col) } },
         .str => .{ .string = .{ .values = try borrowStr(col) } },
     };
@@ -783,6 +823,16 @@ fn rejectNullableOrNested(col: Batch.Column) Error!void {
             }
         },
     }
+}
+
+/// `widenToI64` for a column reference: an unsigned column in the i32 lane zero-extends.
+pub fn widenColRefToI64(arena: std.mem.Allocator, col: Batch.Column, c: ast.ColRef) Error![]i64 {
+    if (c.unsigned_32 and col == .i32) {
+        const out = try arena.alloc(i64, col.i32.values.len);
+        for (col.i32.values, 0..) |v, i| out[i] = @as(u32, @bitCast(v));
+        return out;
+    }
+    return widenToI64(arena, col);
 }
 
 pub fn widenToI64(arena: std.mem.Allocator, col: Batch.Column) Error![]i64 {
@@ -1312,4 +1362,86 @@ test "nullable column rejected" {
 
     const e: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     try testing.expectError(error.NullableNotSupported, evalExpr(a, &batch, &lookup, e));
+}
+
+test "group key: integer operands convert to the binop's float lane" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // i8 + 0.5 and v * 2: the integer side used to be read as raw f64 bits (2 → 1e-323).
+    const ints = [_]i64{ 1, 2, 3, -1 };
+    const dls = [_]u32{ 1, 1, 0, 1 };
+    const dbls = [_]f64{ 1.0, 2.0, 3.0, -2.25 };
+    const big = [_]i64{ @bitCast(@as(u64, 1 << 63)), 5, 0, 1 };
+    const cols = [_]Batch.Column{
+        .{ .i64 = .{ .values = &ints, .def_levels = &dls, .max_def = 1, .has_nulls = true } },
+        col_f64(&dbls),
+        col_i64(&big),
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{ 0, 1, 2 };
+
+    const int_col: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const dbl_col: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const u64_col: ast.Expr = .{
+        .col_ref = .{ .col_idx = 2, .physical_type = .INT64, .expr_type = .i64, .unsigned_64 = true },
+    };
+    const half: ast.Expr = .{ .literal = .{ .f64 = 0.5 } };
+    const two: ast.Expr = .{ .literal = .{ .i64 = 2 } };
+    const one: ast.Expr = .{ .literal = .{ .i64 = 1 } };
+
+    const Case = struct { op: ast.Op, l: ast.Expr, r: ast.Expr, want: []const f64 };
+    const cases = [_]Case{
+        .{ .op = .add, .l = int_col, .r = half, .want = &.{ 1.5, 2.5, 0, -0.5 } },
+        .{ .op = .add, .l = half, .r = int_col, .want = &.{ 1.5, 2.5, 0, -0.5 } },
+        .{ .op = .mul, .l = dbl_col, .r = two, .want = &.{ 2, 4, 6, -4.5 } },
+        .{ .op = .div, .l = dbl_col, .r = two, .want = &.{ 0.5, 1, 1.5, -1.125 } },
+        .{ .op = .mul, .l = int_col, .r = dbl_col, .want = &.{ 1, 4, 0, 2.25 } },
+        // Unsigned 64-bit converts by value, not as a negative i64.
+        .{ .op = .mul, .l = u64_col, .r = half, .want = &.{ 4611686018427387904.0, 2.5, 0, 0.5 } },
+    };
+    for (cases) |c| {
+        const l = try a.create(ast.Expr);
+        const r = try a.create(ast.Expr);
+        l.* = c.l;
+        r.* = c.r;
+        const e: ast.Expr = .{ .binop = .{ .op = c.op, .left = l, .right = r, .result_type = .f64, .depth = 2 } };
+        const out = try evalGroupKeyExpr(a, &batch, &lookup, e);
+        for (c.want, out.f64.values, 0..) |w, g, i| {
+            if (out.f64.def_levels) |d| if (d[i] == 0) continue; // null row
+            try testing.expectEqual(w, g);
+        }
+    }
+
+    // In the signed integer lane an unsigned value of 2^63 or more is rejected, not wrapped negative.
+    const l = try a.create(ast.Expr);
+    const r = try a.create(ast.Expr);
+    l.* = u64_col;
+    r.* = one;
+    const e: ast.Expr = .{ .binop = .{ .op = .add, .left = l, .right = r, .result_type = .i64, .depth = 2 } };
+    try testing.expectError(error.Unsigned64OutOfRange, evalGroupKeyExpr(a, &batch, &lookup, e));
+}
+
+test "select/agg expression: unsigned 64-bit operands convert by value or are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big = [_]i64{ @bitCast(@as(u64, std.math.maxInt(u64))), 4 };
+    const cols = [_]Batch.Column{col_i64(&big)};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 2 };
+    const lookup = [_]?usize{0};
+    const l = try a.create(ast.Expr);
+    const r = try a.create(ast.Expr);
+    l.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64, .unsigned_64 = true } };
+
+    r.* = .{ .literal = .{ .f64 = 0.5 } };
+    const half: ast.Expr = .{ .binop = .{ .op = .mul, .left = l, .right = r, .result_type = .f64, .depth = 2 } };
+    const out = try evalExpr(a, &batch, &lookup, half);
+    try testing.expectEqualSlices(f64, &.{ 9223372036854775807.5, 2 }, out.f64.values);
+
+    r.* = .{ .literal = .{ .i64 = 0 } };
+    const plus: ast.Expr = .{ .binop = .{ .op = .add, .left = l, .right = r, .result_type = .i64, .depth = 2 } };
+    try testing.expectError(error.Unsigned64OutOfRange, evalExpr(a, &batch, &lookup, plus));
 }

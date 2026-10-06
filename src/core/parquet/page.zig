@@ -22,6 +22,8 @@ pub const Error = error{
     UnexpectedEndOfChunk,
     BadPageHeader,
     NegativeSize,
+    /// A page header's value / null / row count is negative, or claims more nulls than values.
+    BadPageCount,
 } || compression.Error;
 
 pub const Page = struct {
@@ -33,12 +35,86 @@ pub const Page = struct {
     bytes: []const u8,
 };
 
+/// Grow-only decode buffers owned by one worker and reused across pages, column chunks, row groups and files, so a
+/// worker faults its decode working set in once instead of once per page from a fresh arena chunk.
+///
+/// Not thread-safe, and at most one ColumnChunkReader may draw on a scratch at a time. Lifetimes: `page` and the
+/// level buffers are overwritten by the next page; `dict` by the next dictionary page. Only readers whose decoded
+/// values are copies may route page bytes here — `[]const u8` values are slices into the page bytes and would dangle.
+///
+/// Safe builds enforce the one-reader rule (see `hold`); ReleaseFast compiles the check out.
+pub const DecodeScratch = struct {
+    gpa: std.mem.Allocator,
+    page: []u8 = &.{},
+    /// Decoded dictionary values for a fixed-width T, viewed as bytes.
+    dict: []align(dict_align) u8 = &.{},
+    def_levels: []u32 = &.{},
+    rep_levels: []u32 = &.{},
+    /// Ticket of the reader whose turn it is, and the last ticket issued. Safe builds only.
+    owner: Ticket = no_ticket,
+    issued: Ticket = no_ticket,
+
+    pub const dict_align = 16;
+
+    /// A reader's claim on a scratch. Zero-sized outside safe builds.
+    pub const Ticket = if (std.debug.runtime_safety) u32 else void;
+    pub const no_ticket: Ticket = if (std.debug.runtime_safety) 0 else {};
+
+    /// Called on every reader entry point. A reader's first call takes the scratch, ending the previous reader's
+    /// turn; each later call fails if another reader has taken it since, because this reader's page, levels or
+    /// dictionary may then have been overwritten under it. Readers carry no deinit, so a turn ends when the next
+    /// reader starts rather than at a release call, and a reader abandoned mid-chunk never blocks the next one.
+    pub fn hold(self: *DecodeScratch, ticket: *Ticket) error{DecodeScratchInterleaved}!void {
+        if (!std.debug.runtime_safety) return;
+        if (ticket.* == no_ticket) {
+            self.issued +%= 1;
+            if (self.issued == no_ticket) self.issued +%= 1;
+            ticket.* = self.issued;
+            self.owner = ticket.*;
+        } else if (self.owner != ticket.*) {
+            return error.DecodeScratchInterleaved;
+        }
+    }
+
+    pub fn init(gpa: std.mem.Allocator) DecodeScratch {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *DecodeScratch) void {
+        self.gpa.free(self.page);
+        self.gpa.free(self.dict);
+        self.gpa.free(self.def_levels);
+        self.gpa.free(self.rep_levels);
+        self.* = undefined;
+    }
+
+    /// First `n` elements of `buf`, regrown (contents discarded) when too short. 1.5x headroom so a run of slightly
+    /// larger pages doesn't trade one buffer of fresh pages for another every time.
+    pub fn ensure(
+        self: *DecodeScratch,
+        comptime T: type,
+        comptime alignment: usize,
+        buf: *[]align(alignment) T,
+        n: usize,
+    ) std.mem.Allocator.Error![]align(alignment) T {
+        if (buf.len < n) {
+            const fresh = try self.gpa.alignedAlloc(T, .fromByteUnits(alignment), @max(n, buf.len + buf.len / 2));
+            self.gpa.free(buf.*);
+            buf.* = fresh;
+        }
+        return buf.*[0..n];
+    }
+};
+
 pub const PageReader = struct {
     /// The full column chunk bytes (compressed pages back-to-back).
     chunk: []const u8,
     pos: usize,
     codec: schema.CompressionCodec,
     arena: std.mem.Allocator,
+    /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
+    /// next `next()`. Null keeps the arena behaviour: page bytes live as long as `arena`.
+    scratch: ?*DecodeScratch = null,
 
     pub fn init(
         chunk: []const u8,
@@ -85,6 +161,7 @@ pub const PageReader = struct {
         if (header.compressed_page_size < 0 or header.uncompressed_page_size < 0) {
             return error.NegativeSize;
         }
+        try checkCounts(header);
         const csize: usize = @intCast(header.compressed_page_size);
         const usize_: usize = @intCast(header.uncompressed_page_size);
 
@@ -111,21 +188,14 @@ pub const PageReader = struct {
             else
                 return error.UnexpectedEndOfChunk;
 
-            const out = try self.arena.alloc(u8, usize_);
+            const out = try self.pageBuffer(usize_);
             @memcpy(out[0..rep_len], payload[0..rep_len]);
             @memcpy(out[rep_len..][0..def_len], payload[rep_len..][0..def_len]);
 
             const value_src = payload[rep_len + def_len ..][0..compressed_value_len];
             const values_dst = out[rep_len + def_len ..][0..value_uncompressed_len];
             if (v2.is_compressed and self.codec != .UNCOMPRESSED) {
-                const decompressed = try compression.decompress(
-                    self.arena,
-                    value_src,
-                    self.codec,
-                    value_uncompressed_len,
-                );
-                if (decompressed.len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
-                @memcpy(values_dst, decompressed);
+                try compression.decompressInto(self.arena, value_src, self.codec, values_dst);
             } else {
                 if (compressed_value_len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
                 @memcpy(values_dst, value_src);
@@ -134,14 +204,43 @@ pub const PageReader = struct {
             return .{ .header = header, .bytes = out };
         }
 
-        const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
-        return .{ .header = header, .bytes = decompressed };
+        if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
+            const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
+            return .{ .header = header, .bytes = decompressed };
+        }
+        const out = try self.pageBuffer(usize_);
+        try compression.decompressInto(self.arena, payload, self.codec, out);
+        return .{ .header = header, .bytes = out };
+    }
+
+    /// Every decoder downstream casts these counts to usize (and V2 subtracts nulls from values), so a header
+    /// that is negative or inconsistent here is rejected before any of them sees it.
+    fn checkCounts(header: schema.PageHeader) Error!void {
+        switch (header.type) {
+            .DATA_PAGE => if (header.data_page_header) |h| {
+                if (h.num_values < 0) return error.BadPageCount;
+            },
+            .DICTIONARY_PAGE => if (header.dictionary_page_header) |h| {
+                if (h.num_values < 0) return error.BadPageCount;
+            },
+            .DATA_PAGE_V2 => if (header.data_page_header_v2) |h| {
+                if (h.num_values < 0 or h.num_rows < 0 or h.num_nulls < 0) return error.BadPageCount;
+                if (h.num_nulls > h.num_values) return error.BadPageCount;
+            },
+            .INDEX_PAGE => {},
+        }
+    }
+
+    fn pageBuffer(self: *PageReader, len: usize) Error![]u8 {
+        if (self.scratch) |s| return s.ensure(u8, 1, &s.page, len);
+        return self.arena.alloc(u8, len);
     }
 
     /// Reposition the reader's cursor to an absolute file offset.
     pub fn seekToPage(self: *PageReader, absolute_offset: i64, chunk_file_offset: i64) !void {
         if (absolute_offset < chunk_file_offset) return error.UnexpectedEndOfChunk;
-        const off: usize = @intCast(absolute_offset - chunk_file_offset);
+        // Both come from the file (page index / column metadata); the difference of two hostile i64s can overflow.
+        const off: usize = @intCast(std.math.sub(i64, absolute_offset, chunk_file_offset) catch return error.UnexpectedEndOfChunk);
         if (off > self.chunk.len) return error.UnexpectedEndOfChunk;
         self.pos = off;
     }
@@ -153,6 +252,7 @@ pub const PageReader = struct {
 
 const testing = std.testing;
 const metadata = @import("metadata.zig");
+const readFileSlice = metadata.readFileSlice;
 
 test "iterate pages of one column from the bench fixture" {
     const fixture_path = "data/benchmark_100mb.parquet";
@@ -204,47 +304,39 @@ test "iterate pages of one column from the bench fixture" {
     );
 }
 
+test "page headers with negative or inconsistent counts are rejected before any decoder casts them" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const Case = struct { header: schema.PageHeader };
+    const v1 = schema.DataPageHeader{ .num_values = -3, .encoding = .PLAIN, .definition_level_encoding = .RLE, .repetition_level_encoding = .RLE };
+    const v2 = schema.DataPageHeaderV2{
+        .num_values = 2,
+        .num_nulls = 5, // more nulls than values: V2 PLAIN BOOLEAN decodes num_values - num_nulls
+        .num_rows = 2,
+        .encoding = .PLAIN,
+        .definition_levels_byte_length = 0,
+        .repetition_levels_byte_length = 0,
+        .is_compressed = false,
+    };
+    const cases = [_]Case{
+        .{ .header = .{ .type = .DATA_PAGE, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = v1, .dictionary_page_header = null, .data_page_header_v2 = null } },
+        .{ .header = .{ .type = .DATA_PAGE_V2, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = null, .dictionary_page_header = null, .data_page_header_v2 = v2 } },
+        .{ .header = .{ .type = .DICTIONARY_PAGE, .uncompressed_page_size = 0, .compressed_page_size = 0, .crc = null, .data_page_header = null, .dictionary_page_header = .{ .num_values = -1, .encoding = .PLAIN, .is_sorted = null }, .data_page_header_v2 = null } },
+    };
+    for (cases) |case| {
+        var w = thrift.Writer.init(arena);
+        try case.header.write(&w);
+        var pr = PageReader.init(w.bytes(), .UNCOMPRESSED, arena);
+        try testing.expectError(error.BadPageCount, pr.next());
+    }
+
+    // Two hostile i64 offsets whose difference overflows.
+    var pr = PageReader.init("", .UNCOMPRESSED, arena);
+    try testing.expectError(error.UnexpectedEndOfChunk, pr.seekToPage(std.math.maxInt(i64), -10));
+}
+
 // ----- File-read helper duplicated from metadata.zig tests -----
 // (Kept local; both test sets read the same fixture but the helper is
 // trivially small.)
-
-fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = signedOrError(r_open) catch return error.FileNotFound;
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    if (errIs(end_pos)) return error.SeekFailed;
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        if (errIs(n)) return error.ReadFailed;
-        const bytes: usize = @intCast(n);
-        if (bytes == 0) break;
-        off += bytes;
-    }
-    return buf;
-}
-
-fn errIs(r: usize) bool {
-    const signed: isize = @bitCast(r);
-    return signed >= -4095 and signed < 0;
-}
-
-fn signedOrError(r: usize) error{SyscallFailed}!std.os.linux.fd_t {
-    if (errIs(r)) return error.SyscallFailed;
-    return @intCast(@as(isize, @bitCast(r)));
-}

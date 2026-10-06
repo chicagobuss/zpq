@@ -143,35 +143,18 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
         .PLAIN;
 
     // 2a. Rep-level prefix when the column has nesting (max_rep > 0).
-    //     Same `<u32 LE byte_len><RLE bytes>` framing as def levels.
     //     V1 layout puts rep before def.
-    const rep_prefix: []const u8 = if (src_max_rep > 0) blk: {
-        const rl = src_rep_levels orelse return error.NullableNotSupported;
-        const bw = bitWidthFor(src_max_rep);
-        const rle = try hybrid_rle.encode(arena, rl, bw);
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
+    const rep_prefix: []const u8 = if (src_max_rep > 0)
+        try levelPrefix(arena, src_rep_levels orelse return error.NullableNotSupported, bitWidthFor(src_max_rep))
+    else
+        &.{};
 
     // 2b. Def-level prefix when OPTIONAL (or when nested with max_def > 0).
     const need_def_prefix = is_optional or src_max_rep > 0;
-    const def_prefix: []const u8 = if (need_def_prefix) blk: {
-        const dl_for_encode = if (src_def_levels) |dl| dl else mk_all_ones: {
-            const buf = try arena.alloc(u32, @intCast(num_values));
-            @memset(buf, 1);
-            break :mk_all_ones buf;
-        };
-        const def_max = if (src_max_def > 0) src_max_def else 1;
-        const bw = bitWidthFor(def_max);
-        const rle = try hybrid_rle.encode(arena, dl_for_encode, bw);
-
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
+    const def_prefix: []const u8 = if (need_def_prefix)
+        try defLevelPrefix(arena, src_def_levels, src_max_def, num_values)
+    else
+        &.{};
 
     const data_total_len = rep_prefix.len + def_prefix.len + values_bytes.len;
 
@@ -179,7 +162,7 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     //    be dupe'd onto a stable arena (the source values may live on
     //    a row-group-scoped arena that's freed before the file footer
     //    is written; borrowing the slice into the footer would dangle).
-    var stats = computeStats(arena, in.values, src_def_levels, src_max_def);
+    var stats = computeStats(arena, in.values, src_def_levels, src_max_def, in.schema_elem);
     _ = &stats;
 
     // 4a. Concatenate the V1 data-page payload: rep_prefix (if
@@ -303,20 +286,7 @@ pub fn encodeDecimalFlba(
         }
     }
 
-    // Def-level prefix for OPTIONAL columns (same RLE framing as encodeColumn).
-    const def_prefix: []const u8 = if (is_optional) blk: {
-        const dl_for_encode = if (def_levels) |dl| dl else mk: {
-            const buf = try arena.alloc(u32, @intCast(num_values));
-            @memset(buf, 1);
-            break :mk buf;
-        };
-        const def_max = if (max_def > 0) max_def else 1;
-        const rle = try hybrid_rle.encode(arena, dl_for_encode, bitWidthFor(def_max));
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
+    const def_prefix: []const u8 = if (is_optional) try defLevelPrefix(arena, def_levels, max_def, num_values) else &.{};
 
     const data_total_len = def_prefix.len + values_bytes.len;
     const payload = try arena.alloc(u8, data_total_len);
@@ -404,27 +374,15 @@ pub fn encodeDecimalFlba(
     return .{ .bytes = total, .meta = meta };
 }
 
-/// Try to dictionary-encode a BYTE_ARRAY column. Returns null when
-/// the cardinality is too high for dict to help (and we should fall
-/// through to PLAIN), or when there are too few values to bother.
-///
-/// Output layout when we DO dict-encode:
-///   [dict_page_thrift][dict_page_compressed][data_page_thrift][data_page_compressed]
-///
-/// The dict page contains the unique values PLAIN-encoded. The data
-/// page contains the def-level prefix (if optional) then a `<u8 bit_width>`
-/// byte followed by hybrid-RLE-encoded indices into the dictionary.
-/// `data_page_offset` is set to the relative byte offset of the data
-/// page inside the returned `bytes` slice; `dictionary_page_offset` is
-/// 0. Callers must ADD their absolute chunk-start offset to both.
+/// Try to dictionary-encode a BYTE_ARRAY column (page layout in
+/// `finishDictionaryColumn`). Returns null when the cardinality is too
+/// high for dict to help (and we should fall through to PLAIN), or when
+/// there are too few values to bother.
 fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64) Error!?EncodedColumn {
-    const elem = in.schema_elem;
-    const phys = elem.type.?;
     const string_col = in.values.string;
     const values = string_col.values;
     const def_levels = string_col.def_levels;
     const max_def = string_col.max_def;
-    const is_optional = elem.repetition_type == .OPTIONAL;
 
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
@@ -466,137 +424,14 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
 
     if (dict_values.items.len == 0) return null;
 
-    // ----- Build dict page -----
-    var dict_raw: std.ArrayList(u8) = .empty;
+    var dict_plain: std.ArrayList(u8) = .empty;
     for (dict_values.items) |v| {
         var len_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_bytes, @intCast(v.len), .little);
-        try dict_raw.appendSlice(arena, &len_bytes);
-        try dict_raw.appendSlice(arena, v);
+        try dict_plain.appendSlice(arena, &len_bytes);
+        try dict_plain.appendSlice(arena, v);
     }
-    const dict_compressed = try compression.compress(arena, dict_raw.items, in.codec);
-
-    var dict_page_hdr: schema.PageHeader = .{
-        .type = .DICTIONARY_PAGE,
-        .uncompressed_page_size = @intCast(dict_raw.items.len),
-        .compressed_page_size = @intCast(dict_compressed.len),
-        .crc = null,
-        .data_page_header = null,
-        .dictionary_page_header = .{
-            .num_values = @intCast(dict_values.items.len),
-            .encoding = .PLAIN,
-            .is_sorted = null,
-        },
-        .data_page_header_v2 = null,
-    };
-    var dw: thrift.Writer = .init(arena);
-    defer dw.deinit();
-    try dict_page_hdr.write(&dw);
-    const dict_thrift_bytes = try arena.dupe(u8, dw.bytes());
-    const dict_total_len = dict_thrift_bytes.len + dict_compressed.len;
-
-    // ----- Build data page (def prefix + bit-width + RLE indices) -----
-    const def_prefix: []const u8 = if (is_optional) blk: {
-        const dl_for_encode = if (def_levels) |dl| dl else mk_all_ones: {
-            const buf = try arena.alloc(u32, @intCast(num_values));
-            @memset(buf, 1);
-            break :mk_all_ones buf;
-        };
-        const def_max = if (max_def > 0) max_def else 1;
-        const bw = bitWidthFor(def_max);
-        const rle = try hybrid_rle.encode(arena, dl_for_encode, bw);
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
-
-    const dict_size: u32 = @intCast(dict_values.items.len);
-    // Index bit-width: min 1 even for a single-entry dictionary. A 0-bit-width
-    // dictionary index page is legal RLE but strict readers (pyarrow) reject it
-    // ("Invalid number of indices: 0") — so a column that filters down to one
-    // distinct value would write output other engines can't read, while ZPQ's
-    // own lenient reader hides it. parquet-mr uses the same min-1. Found by the
-    // differential harness (ZPQ writes → pyarrow reads).
-    const idx_bit_width: u8 = if (dict_size <= 1) 1 else bitWidthFor(dict_size - 1);
-    const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
-
-    const indices_section_len = 1 + idx_rle.len;
-    const data_total_len = def_prefix.len + indices_section_len;
-    const data_payload = try arena.alloc(u8, data_total_len);
-    {
-        var pos: usize = 0;
-        if (def_prefix.len > 0) {
-            @memcpy(data_payload[pos..][0..def_prefix.len], def_prefix);
-            pos += def_prefix.len;
-        }
-        data_payload[pos] = idx_bit_width;
-        pos += 1;
-        @memcpy(data_payload[pos..], idx_rle);
-    }
-    const data_compressed = try compression.compress(arena, data_payload, in.codec);
-
-    var data_page_hdr: schema.PageHeader = .{
-        .type = .DATA_PAGE,
-        .uncompressed_page_size = @intCast(data_total_len),
-        .compressed_page_size = @intCast(data_compressed.len),
-        .crc = null,
-        .data_page_header = .{
-            .num_values = @intCast(num_values),
-            .encoding = .PLAIN_DICTIONARY,
-            .definition_level_encoding = .RLE,
-            .repetition_level_encoding = .RLE,
-        },
-        .dictionary_page_header = null,
-        .data_page_header_v2 = null,
-    };
-    var dpw: thrift.Writer = .init(arena);
-    defer dpw.deinit();
-    try data_page_hdr.write(&dpw);
-    const data_thrift_bytes = try arena.dupe(u8, dpw.bytes());
-    const data_total_with_thrift = data_thrift_bytes.len + data_compressed.len;
-
-    // ----- Concatenate -----
-    const total_len = dict_total_len + data_total_with_thrift;
-    const total = try arena.alloc(u8, total_len);
-    var offset: usize = 0;
-    @memcpy(total[offset..][0..dict_thrift_bytes.len], dict_thrift_bytes);
-    offset += dict_thrift_bytes.len;
-    @memcpy(total[offset..][0..dict_compressed.len], dict_compressed);
-    offset += dict_compressed.len;
-    @memcpy(total[offset..][0..data_thrift_bytes.len], data_thrift_bytes);
-    offset += data_thrift_bytes.len;
-    @memcpy(total[offset..], data_compressed);
-
-    const stats = computeStats(arena, in.values, def_levels, max_def);
-
-    var encodings: schema.EncodingList = .empty;
-    try encodings.append(arena, .RLE);
-    try encodings.append(arena, .PLAIN);
-    try encodings.append(arena, .PLAIN_DICTIONARY);
-
-    var path_list: schema.StringList = .empty;
-    try path_list.appendSlice(arena, in.path_in_schema);
-
-    const total_uncompressed: usize = dict_thrift_bytes.len + dict_raw.items.len +
-        data_thrift_bytes.len + data_total_len;
-
-    const meta: schema.ColumnMetaData = .{
-        .type = phys,
-        .encodings = encodings,
-        .path_in_schema = path_list,
-        .codec = in.codec,
-        .num_values = num_values,
-        .total_uncompressed_size = @intCast(total_uncompressed),
-        .total_compressed_size = @intCast(total_len),
-        // Relative-to-chunk-start. Caller adds absolute chunk start.
-        .data_page_offset = @intCast(dict_total_len),
-        .dictionary_page_offset = 0,
-        .index_page_offset = null,
-        .statistics = stats,
-    };
-
-    return .{ .bytes = total, .meta = meta };
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain.items, dict_values.items.len, indices);
 }
 
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
@@ -611,8 +446,6 @@ fn tryEncodeDictInt(
     num_values: i64,
 ) Error!?EncodedColumn {
     if (T != i32 and T != i64) @compileError("tryEncodeDictInt expects i32/i64");
-    const elem = in.schema_elem;
-    const phys = elem.type.?;
     const col = switch (T) {
         i32 => in.values.i32,
         i64 => in.values.i64,
@@ -621,7 +454,6 @@ fn tryEncodeDictInt(
     const values = col.values;
     const def_levels = col.def_levels;
     const max_def = col.max_def;
-    const is_optional = elem.repetition_type == .OPTIONAL;
 
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
@@ -649,133 +481,12 @@ fn tryEncodeDictInt(
 
     if (dict_values.items.len == 0) return null;
 
-    // ----- Build dict page: PLAIN-encoded T values (little-endian). -----
     const value_size = @sizeOf(T);
-    var dict_raw = try arena.alloc(u8, dict_values.items.len * value_size);
+    const dict_plain = try arena.alloc(u8, dict_values.items.len * value_size);
     for (dict_values.items, 0..) |v, i| {
-        std.mem.writeInt(T, dict_raw[i * value_size ..][0..value_size], v, .little);
+        std.mem.writeInt(T, dict_plain[i * value_size ..][0..value_size], v, .little);
     }
-    const dict_compressed = try compression.compress(arena, dict_raw, in.codec);
-
-    var dict_page_hdr: schema.PageHeader = .{
-        .type = .DICTIONARY_PAGE,
-        .uncompressed_page_size = @intCast(dict_raw.len),
-        .compressed_page_size = @intCast(dict_compressed.len),
-        .crc = null,
-        .data_page_header = null,
-        .dictionary_page_header = .{
-            .num_values = @intCast(dict_values.items.len),
-            .encoding = .PLAIN,
-            .is_sorted = null,
-        },
-        .data_page_header_v2 = null,
-    };
-    var dw: thrift.Writer = .init(arena);
-    defer dw.deinit();
-    try dict_page_hdr.write(&dw);
-    const dict_thrift_bytes = try arena.dupe(u8, dw.bytes());
-    const dict_total_len = dict_thrift_bytes.len + dict_compressed.len;
-
-    // ----- Build data page (def prefix + bit-width + RLE indices) -----
-    const def_prefix: []const u8 = if (is_optional) blk: {
-        const dl_for_encode = if (def_levels) |dl| dl else mk_all_ones: {
-            const buf = try arena.alloc(u32, @intCast(num_values));
-            @memset(buf, 1);
-            break :mk_all_ones buf;
-        };
-        const def_max = if (max_def > 0) max_def else 1;
-        const bw = bitWidthFor(def_max);
-        const rle = try hybrid_rle.encode(arena, dl_for_encode, bw);
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
-
-    const dict_size: u32 = @intCast(dict_values.items.len);
-    // Index bit-width: min 1 even for a single-entry dictionary. A 0-bit-width
-    // dictionary index page is legal RLE but strict readers (pyarrow) reject it
-    // ("Invalid number of indices: 0") — so a column that filters down to one
-    // distinct value would write output other engines can't read, while ZPQ's
-    // own lenient reader hides it. parquet-mr uses the same min-1. Found by the
-    // differential harness (ZPQ writes → pyarrow reads).
-    const idx_bit_width: u8 = if (dict_size <= 1) 1 else bitWidthFor(dict_size - 1);
-    const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
-
-    const indices_section_len = 1 + idx_rle.len;
-    const data_total_len = def_prefix.len + indices_section_len;
-    const data_payload = try arena.alloc(u8, data_total_len);
-    {
-        var pos: usize = 0;
-        if (def_prefix.len > 0) {
-            @memcpy(data_payload[pos..][0..def_prefix.len], def_prefix);
-            pos += def_prefix.len;
-        }
-        data_payload[pos] = idx_bit_width;
-        pos += 1;
-        @memcpy(data_payload[pos..], idx_rle);
-    }
-    const data_compressed = try compression.compress(arena, data_payload, in.codec);
-
-    var data_page_hdr: schema.PageHeader = .{
-        .type = .DATA_PAGE,
-        .uncompressed_page_size = @intCast(data_total_len),
-        .compressed_page_size = @intCast(data_compressed.len),
-        .crc = null,
-        .data_page_header = .{
-            .num_values = @intCast(num_values),
-            .encoding = .PLAIN_DICTIONARY,
-            .definition_level_encoding = .RLE,
-            .repetition_level_encoding = .RLE,
-        },
-        .dictionary_page_header = null,
-        .data_page_header_v2 = null,
-    };
-    var dpw: thrift.Writer = .init(arena);
-    defer dpw.deinit();
-    try data_page_hdr.write(&dpw);
-    const data_thrift_bytes = try arena.dupe(u8, dpw.bytes());
-    const data_total_with_thrift = data_thrift_bytes.len + data_compressed.len;
-
-    const total_len = dict_total_len + data_total_with_thrift;
-    const total = try arena.alloc(u8, total_len);
-    var offset: usize = 0;
-    @memcpy(total[offset..][0..dict_thrift_bytes.len], dict_thrift_bytes);
-    offset += dict_thrift_bytes.len;
-    @memcpy(total[offset..][0..dict_compressed.len], dict_compressed);
-    offset += dict_compressed.len;
-    @memcpy(total[offset..][0..data_thrift_bytes.len], data_thrift_bytes);
-    offset += data_thrift_bytes.len;
-    @memcpy(total[offset..], data_compressed);
-
-    const stats = computeStats(arena, in.values, def_levels, max_def);
-
-    var encodings: schema.EncodingList = .empty;
-    try encodings.append(arena, .RLE);
-    try encodings.append(arena, .PLAIN);
-    try encodings.append(arena, .PLAIN_DICTIONARY);
-
-    var path_list: schema.StringList = .empty;
-    try path_list.appendSlice(arena, in.path_in_schema);
-
-    const total_uncompressed: usize = dict_thrift_bytes.len + dict_raw.len +
-        data_thrift_bytes.len + data_total_len;
-
-    const meta: schema.ColumnMetaData = .{
-        .type = phys,
-        .encodings = encodings,
-        .path_in_schema = path_list,
-        .codec = in.codec,
-        .num_values = num_values,
-        .total_uncompressed_size = @intCast(total_uncompressed),
-        .total_compressed_size = @intCast(total_len),
-        .data_page_offset = @intCast(dict_total_len),
-        .dictionary_page_offset = 0,
-        .index_page_offset = null,
-        .statistics = stats,
-    };
-
-    return .{ .bytes = total, .meta = meta };
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_values.items.len, indices);
 }
 
 /// FLOAT/DOUBLE dictionary encoder. Mirrors `tryEncodeDictInt` —
@@ -798,8 +509,6 @@ fn tryEncodeDictFloat(
     if (T != f32 and T != f64) @compileError("tryEncodeDictFloat expects f32/f64");
     const KeyT = if (T == f32) u32 else u64;
 
-    const elem = in.schema_elem;
-    const phys = elem.type.?;
     const col = switch (T) {
         f32 => in.values.f32,
         f64 => in.values.f64,
@@ -808,7 +517,6 @@ fn tryEncodeDictFloat(
     const values = col.values;
     const def_levels = col.def_levels;
     const max_def = col.max_def;
-    const is_optional = elem.repetition_type == .OPTIONAL;
 
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
@@ -837,78 +545,57 @@ fn tryEncodeDictFloat(
 
     if (dict_values.items.len == 0) return null;
 
-    // ----- Build dict page: PLAIN-encoded floats (little-endian
-    // bit-cast back). -----
+    // The keys are the floats' bit patterns, so writing them little-endian is the PLAIN encoding.
     const value_size = @sizeOf(T);
-    var dict_raw = try arena.alloc(u8, dict_values.items.len * value_size);
+    const dict_plain = try arena.alloc(u8, dict_values.items.len * value_size);
     for (dict_values.items, 0..) |k, i| {
-        std.mem.writeInt(KeyT, dict_raw[i * value_size ..][0..value_size], k, .little);
+        std.mem.writeInt(KeyT, dict_plain[i * value_size ..][0..value_size], k, .little);
     }
-    const dict_compressed = try compression.compress(arena, dict_raw, in.codec);
+    return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_values.items.len, indices);
+}
 
-    var dict_page_hdr: schema.PageHeader = .{
+/// The two pages every dictionary encoder emits once it has interned its values (the encoders differ only in how
+/// they key and PLAIN-encode entries): the compressed `dict_plain` dictionary page holding `dict_count` entries,
+/// then a data page of `indices`, one per present value. `dictionary_page_offset` is 0 and `data_page_offset` the
+/// dictionary page's length, both relative to the returned bytes; callers add the chunk's absolute start to both.
+fn finishDictionaryColumn(
+    arena: std.mem.Allocator,
+    in: ColumnInput,
+    num_values: i64,
+    dict_plain: []const u8,
+    dict_count: usize,
+    indices: []const u32,
+) Error!EncodedColumn {
+    const def_levels = sourceDefLevels(in.values);
+    const max_def = sourceMaxDef(in.values);
+
+    const dict_compressed = try compression.compress(arena, dict_plain, in.codec);
+    const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
-        .uncompressed_page_size = @intCast(dict_raw.len),
+        .uncompressed_page_size = @intCast(dict_plain.len),
         .compressed_page_size = @intCast(dict_compressed.len),
         .crc = null,
         .data_page_header = null,
         .dictionary_page_header = .{
-            .num_values = @intCast(dict_values.items.len),
+            .num_values = @intCast(dict_count),
             .encoding = .PLAIN,
             .is_sorted = null,
         },
         .data_page_header_v2 = null,
-    };
-    var dw: thrift.Writer = .init(arena);
-    defer dw.deinit();
-    try dict_page_hdr.write(&dw);
-    const dict_thrift_bytes = try arena.dupe(u8, dw.bytes());
-    const dict_total_len = dict_thrift_bytes.len + dict_compressed.len;
+    });
 
-    // ----- Build data page (def prefix + bit-width + RLE indices) -----
-    const def_prefix: []const u8 = if (is_optional) blk: {
-        const dl_for_encode = if (def_levels) |dl| dl else mk_all_ones: {
-            const buf = try arena.alloc(u32, @intCast(num_values));
-            @memset(buf, 1);
-            break :mk_all_ones buf;
-        };
-        const def_max = if (max_def > 0) max_def else 1;
-        const bw = bitWidthFor(def_max);
-        const rle = try hybrid_rle.encode(arena, dl_for_encode, bw);
-        const prefix = try arena.alloc(u8, 4 + rle.len);
-        std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
-        @memcpy(prefix[4..], rle);
-        break :blk prefix;
-    } else &.{};
-
-    const dict_size: u32 = @intCast(dict_values.items.len);
-    // Index bit-width: min 1 even for a single-entry dictionary. A 0-bit-width
-    // dictionary index page is legal RLE but strict readers (pyarrow) reject it
-    // ("Invalid number of indices: 0") — so a column that filters down to one
-    // distinct value would write output other engines can't read, while ZPQ's
-    // own lenient reader hides it. parquet-mr uses the same min-1. Found by the
-    // differential harness (ZPQ writes → pyarrow reads).
-    const idx_bit_width: u8 = if (dict_size <= 1) 1 else bitWidthFor(dict_size - 1);
+    // Data page payload: def prefix (OPTIONAL only), the index bit width, then the RLE/bit-packed indices.
+    const def_prefix: []const u8 = if (in.schema_elem.repetition_type == .OPTIONAL)
+        try defLevelPrefix(arena, def_levels, max_def, num_values)
+    else
+        &.{};
+    const idx_bit_width = dictIndexBitWidth(dict_count);
     const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
-
-    const indices_section_len = 1 + idx_rle.len;
-    const data_total_len = def_prefix.len + indices_section_len;
-    const data_payload = try arena.alloc(u8, data_total_len);
-    {
-        var pos: usize = 0;
-        if (def_prefix.len > 0) {
-            @memcpy(data_payload[pos..][0..def_prefix.len], def_prefix);
-            pos += def_prefix.len;
-        }
-        data_payload[pos] = idx_bit_width;
-        pos += 1;
-        @memcpy(data_payload[pos..], idx_rle);
-    }
+    const data_payload = try std.mem.concat(arena, u8, &.{ def_prefix, &.{idx_bit_width}, idx_rle });
     const data_compressed = try compression.compress(arena, data_payload, in.codec);
-
-    var data_page_hdr: schema.PageHeader = .{
+    const data_header = try pageHeaderBytes(arena, .{
         .type = .DATA_PAGE,
-        .uncompressed_page_size = @intCast(data_total_len),
+        .uncompressed_page_size = @intCast(data_payload.len),
         .compressed_page_size = @intCast(data_compressed.len),
         .crc = null,
         .data_page_header = .{
@@ -919,52 +606,63 @@ fn tryEncodeDictFloat(
         },
         .dictionary_page_header = null,
         .data_page_header_v2 = null,
-    };
-    var dpw: thrift.Writer = .init(arena);
-    defer dpw.deinit();
-    try data_page_hdr.write(&dpw);
-    const data_thrift_bytes = try arena.dupe(u8, dpw.bytes());
-    const data_total_with_thrift = data_thrift_bytes.len + data_compressed.len;
+    });
 
-    const total_len = dict_total_len + data_total_with_thrift;
-    const total = try arena.alloc(u8, total_len);
-    var offset: usize = 0;
-    @memcpy(total[offset..][0..dict_thrift_bytes.len], dict_thrift_bytes);
-    offset += dict_thrift_bytes.len;
-    @memcpy(total[offset..][0..dict_compressed.len], dict_compressed);
-    offset += dict_compressed.len;
-    @memcpy(total[offset..][0..data_thrift_bytes.len], data_thrift_bytes);
-    offset += data_thrift_bytes.len;
-    @memcpy(total[offset..], data_compressed);
-
-    const stats = computeStats(arena, in.values, def_levels, max_def);
+    const total = try std.mem.concat(arena, u8, &.{ dict_header, dict_compressed, data_header, data_compressed });
 
     var encodings: schema.EncodingList = .empty;
-    try encodings.append(arena, .RLE);
-    try encodings.append(arena, .PLAIN);
-    try encodings.append(arena, .PLAIN_DICTIONARY);
-
+    try encodings.appendSlice(arena, &.{ .RLE, .PLAIN, .PLAIN_DICTIONARY });
     var path_list: schema.StringList = .empty;
     try path_list.appendSlice(arena, in.path_in_schema);
 
-    const total_uncompressed: usize = dict_thrift_bytes.len + dict_raw.len +
-        data_thrift_bytes.len + data_total_len;
-
-    const meta: schema.ColumnMetaData = .{
-        .type = phys,
+    return .{ .bytes = total, .meta = .{
+        .type = in.schema_elem.type.?,
         .encodings = encodings,
         .path_in_schema = path_list,
         .codec = in.codec,
         .num_values = num_values,
-        .total_uncompressed_size = @intCast(total_uncompressed),
-        .total_compressed_size = @intCast(total_len),
-        .data_page_offset = @intCast(dict_total_len),
+        .total_uncompressed_size = @intCast(dict_header.len + dict_plain.len + data_header.len + data_payload.len),
+        .total_compressed_size = @intCast(total.len),
+        .data_page_offset = @intCast(dict_header.len + dict_compressed.len),
         .dictionary_page_offset = 0,
         .index_page_offset = null,
-        .statistics = stats,
-    };
+        .statistics = computeStats(arena, in.values, def_levels, max_def, in.schema_elem),
+    } };
+}
 
-    return .{ .bytes = total, .meta = meta };
+/// Index width for a `dict_count`-entry dictionary, never below one bit. A 0-bit index page is legal RLE, but
+/// strict readers (pyarrow) reject it ("Invalid number of indices: 0"), so a column filtered down to one distinct
+/// value would be unreadable elsewhere while ZPQ's lenient reader hid it. parquet-mr uses the same minimum. Found by
+/// the differential harness (ZPQ writes, pyarrow reads).
+fn dictIndexBitWidth(dict_count: usize) u8 {
+    return if (dict_count <= 1) 1 else bitWidthFor(@intCast(dict_count - 1));
+}
+
+/// A V1 data page's level stream: `<u32 LE byte length><RLE/bit-packed hybrid levels>`.
+fn levelPrefix(arena: std.mem.Allocator, levels: []const u32, bit_width: u8) Error![]const u8 {
+    const rle = try hybrid_rle.encode(arena, levels, bit_width);
+    const prefix = try arena.alloc(u8, 4 + rle.len);
+    std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
+    @memcpy(prefix[4..], rle);
+    return prefix;
+}
+
+/// Def-level stream for a column that carries one. Without source levels every slot is present, so the stream is
+/// all ones: a few bytes of RLE however many values there are.
+fn defLevelPrefix(arena: std.mem.Allocator, def_levels: ?[]const u32, max_def: u32, num_values: i64) Error![]const u8 {
+    const levels = def_levels orelse blk: {
+        const ones = try arena.alloc(u32, @intCast(num_values));
+        @memset(ones, 1);
+        break :blk ones;
+    };
+    return levelPrefix(arena, levels, bitWidthFor(@max(max_def, 1)));
+}
+
+/// Serialized thrift for one page header; never compressed, so it goes straight in front of its payload.
+fn pageHeaderBytes(arena: std.mem.Allocator, header: schema.PageHeader) Error![]const u8 {
+    var w: thrift.Writer = .init(arena);
+    try header.write(&w);
+    return w.bytes();
 }
 
 /// Materialize the subset of `c` that's active in `sel` into newly-
@@ -1354,7 +1052,7 @@ fn encodePlainTyped(
         switch (@typeInfo(T)) {
             .int => std.mem.writeInt(T, out[pos..][0..item_size], v, .little),
             .float => {
-                const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+                const Bits = @Int(.unsigned, @bitSizeOf(T));
                 const bits: Bits = @bitCast(v);
                 std.mem.writeInt(Bits, out[pos..][0..item_size], bits, .little);
             },
@@ -1430,7 +1128,31 @@ fn valueCount(c: filter_eval.Batch.Column) usize {
 // Statistics — min/max over surviving non-null values
 // ============================================================
 
-fn computeStats(arena: std.mem.Allocator, c: filter_eval.Batch.Column, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
+fn computeStats(
+    arena: std.mem.Allocator,
+    c: filter_eval.Batch.Column,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    elem: *const schema.SchemaElement,
+) ?schema.Statistics {
+    // An unsigned column's bounds are ordered unsigned. The deprecated min/max pair is signed-ordered by definition,
+    // so it is left unset rather than written in the wrong order.
+    if (schema.isUnsignedInt(elem.*)) {
+        const lane_fits = switch (c) {
+            .i32 => elem.type == .INT32,
+            .i64 => elem.type == .INT64,
+            else => false,
+        };
+        if (!lane_fits) return null;
+        var stats = switch (c) {
+            .i32 => |x| statsTyped(arena, u32, @ptrCast(x.values), def_levels, max_def),
+            .i64 => |x| statsTyped(arena, u64, @ptrCast(x.values), def_levels, max_def),
+            else => unreachable,
+        } orelse return null;
+        stats.min = null;
+        stats.max = null;
+        return stats;
+    }
     return switch (c) {
         .i32 => |x| statsTyped(arena, i32, x.values, def_levels, max_def),
         .i64 => |x| statsTyped(arena, i64, x.values, def_levels, max_def),
@@ -1532,7 +1254,7 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
             if (v > hi) hi = v;
         }
     }
-    const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
     const item_size = @sizeOf(T);
     const min_buf = arena.alloc(u8, item_size) catch return null;
     const max_buf = arena.alloc(u8, item_size) catch return null;
@@ -1577,9 +1299,9 @@ fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: 
     // the footer write later sees stable bytes.
     const lo_owned = arena.dupe(u8, lo) catch return null;
     const hi_owned = arena.dupe(u8, hi) catch return null;
+    // Bytewise unsigned is a byte array's type-defined order. The deprecated min/max are defined as signed, so they
+    // are left unset rather than written in an order a legacy reader would misread.
     return .{
-        .min = lo_owned,
-        .max = hi_owned,
         .min_value = lo_owned,
         .max_value = hi_owned,
         .null_count = null_count,
@@ -1631,7 +1353,7 @@ fn expectMirroredStats(stats: schema.Statistics) !void {
     try testing.expectEqualSlices(u8, stats.max.?, stats.max_value.?);
 }
 
-test "statistics populate legacy and modern bounds" {
+test "statistics populate legacy bounds only where their signed order is the type order" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1642,8 +1364,11 @@ test "statistics populate legacy and modern bounds" {
     const floats = [_]f64{ 3.5, -1.25, 9.0 };
     try expectMirroredStats(statsTypedFloat(arena, f64, &floats, null, 0) orelse return error.MissingStats);
 
-    const bytes = [_][]const u8{ "bravo", "alpha", "charlie" };
-    try expectMirroredStats(statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats);
+    const bytes = [_][]const u8{ "bravo", "alpha", "charlie", "\xc3\xa9" };
+    const byte_stats = statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats;
+    try testing.expect(byte_stats.min == null and byte_stats.max == null);
+    try testing.expectEqualStrings("alpha", byte_stats.min_value.?);
+    try testing.expectEqualStrings("\xc3\xa9", byte_stats.max_value.?);
 
     const bools = [_]bool{ true, true, false };
     try expectMirroredStats(statsBool(arena, &bools, null, 0) orelse return error.MissingStats);
@@ -1707,7 +1432,7 @@ test "DELTA_BYTE_ARRAY encode round-trips through the decoder (incl. nulls)" {
     const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &dls, .max_def = 1 } };
 
     const enc = (try tryEncodeValuesDeltaByteArray(a, col, &dls, 1)) orelse return error.ExpectedEncoding;
-    var dec = try dba.DeltaByteArrayDecoder.init(enc, a);
+    var dec = try dba.DeltaByteArrayDecoder.init(enc, a, std.math.maxInt(usize));
     var out: [5][]const u8 = undefined; // 5 present values
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, 5), n);
@@ -1732,28 +1457,11 @@ test "encodeColumn string with mixed nulls writes valid OPTIONAL page" {
     // encodeColumn with the source's def_levels carried through.
     const column = @import("../parquet/column.zig");
     const meta_mod = @import("../parquet/metadata.zig");
-    const linux = std.os.linux;
-
-    const fixture_path = "data/benchmark_100mb.parquet";
-    var path_z: [256]u8 = undefined;
-    @memcpy(path_z[0..fixture_path.len], fixture_path);
-    path_z[fixture_path.len] = 0;
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (@as(isize, @bitCast(r_open)) < 0) return; // missing fixture
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    defer _ = linux.close(fd);
-    const end_pos = linux.lseek(fd, 0, 2);
-    _ = linux.lseek(fd, 0, 0);
-    const size: usize = @intCast(end_pos);
-    const file_bytes = try testing.allocator.alloc(u8, size);
+    const file_bytes = meta_mod.readFileSlice("data/benchmark_100mb.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return; // missing fixture
+        return err;
+    };
     defer testing.allocator.free(file_bytes);
-    var off: usize = 0;
-    while (off < size) {
-        const r = linux.read(fd, file_bytes[off..].ptr, size - off);
-        const n: isize = @bitCast(r);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

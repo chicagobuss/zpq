@@ -62,6 +62,11 @@ pub const SelectionVector = struct {
         return n;
     }
 
+    pub fn any(self: SelectionVector) bool {
+        for (self.mask) |w| if (w != 0) return true;
+        return false;
+    }
+
     /// Replace this bitmask with `mask AND other`.
     pub fn intersect(self: *SelectionVector, other: *const SelectionVector) void {
         std.debug.assert(self.len == other.len);

@@ -13,11 +13,11 @@ name: Verify
 #   6. Conformance against the apache parquet-testing corpus, with a
 #      regression floor: hard failures (crash / wrong shape / wrong
 #      row counts) always fail; the full-pass count must not drop
-#      below the recorded baseline (69 @ 2026-06-14).
+#      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
-# Cross-platform compile (ARM64) is verified at release time, not on
-# every PR; macOS lands with the kqueue backend. This workflow guards
-# the production target.
+# Cross-platform compile (ARM64, macOS) is verified at release time, not
+# on every PR; docs/macos.md covers running the macOS build on a Mac.
+# This workflow guards the production target.
 
 on:
   push:
@@ -57,10 +57,10 @@ jobs:
       # and hung the runner for the full job budget. anyzig downloads
       # the *exact* tarball from ziglang.org with no fallback; setup-zig
       # has redundancy.
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Create Python test environment
         # pyarrow>=21 recognizes the GEOMETRY/GEOGRAPHY logical type. The
@@ -68,7 +68,7 @@ jobs:
         # *open* them ("Thrift LogicalType not recognized") — not a zpq issue,
         # but it dropped the conformance oracle below the floor. zpq reads all
         # 10 correctly (WKB as BYTE_ARRAY); a current pyarrow lets the floor
-        # (69) count them. Bump deliberately alongside the corpus SHA.
+        # (72) count them. Bump deliberately alongside the corpus SHA.
         run: |
           python3 -m venv .venv
           .venv/bin/pip install --quiet --no-input "pyarrow==24.*"
@@ -87,18 +87,6 @@ jobs:
           key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
           restore-keys: ${{ runner.os }}-x86_64-zig-
 
-      - name: Fetch Pre-built BoringSSL
-        run: |
-          # vendor/boring_tls is prebuilt-only by doctrine. Fail loud if
-          # R2 is down — there's no source-build fallback to fall back to.
-          R2="https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux"
-          mkdir -p vendor/boring_tls/prebuilt/x86_64-linux
-          curl -fsSL "$R2/libcrypto.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a
-          curl -fsSL "$R2/libssl.a" -o vendor/boring_tls/prebuilt/x86_64-linux/libssl.a
-          # Sanity: must be > 1 KB (R2 returns a 0-byte body on miss).
-          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libcrypto.a) -gt 1024
-          test $(stat -c%s vendor/boring_tls/prebuilt/x86_64-linux/libssl.a) -gt 1024
-
       - name: Fetch parquet-testing corpus
         run: |
           git clone https://github.com/apache/parquet-testing data/parquet-testing
@@ -107,7 +95,9 @@ jobs:
       - name: Generate nested edges fixture
         run: python3 tools/gen_nested_fixture.py
 
-      # Step 1: builds zpq + zpq-lambda for native linux-x86_64.
+      # Step 1: builds zpq + zpq-lambda for native linux-x86_64. The build
+      # downloads the pinned BoringSSL prebuilts (sha256-checked against
+      # vendor/boring_tls/prebuilt.sha256) and keeps them in .zig-cache.
       # Default build = SQL-enabled CLI (-Dsql defaults true) + Lambda.
       - name: Build (debug)
         run: zig build --summary all
@@ -185,4 +175,4 @@ jobs:
       - name: Conformance (apache/parquet-testing)
         run: |
           zig build -Doptimize=ReleaseFast
-          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 69
+          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 72

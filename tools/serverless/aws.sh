@@ -45,7 +45,10 @@ build() {
     # Without `lambda` as the build step, this would package the CLI
     # binary's `main` (with help-text on missing args) — Lambda runtime
     # then fails with `Runtime.ExitError` because the bootstrap exits
-    # before talking to the runtime API. 
+    # before talking to the runtime API.
+    # ReleaseFast is the Lambda build: ReleaseSmall measured no faster to
+    # start on Lambda and up to 2x slower cold, for a zip far under the
+    # 50 MB direct-upload limit either way.
     zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast lambda
 
     local zpq_bin="zig-out/bin/zpq-lambda"

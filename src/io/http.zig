@@ -6,8 +6,8 @@
 //!
 //! The surface is intentionally narrow:
 //!   - GET / HEAD / PUT / POST methods
-//!   - `Content-Length`-bounded response bodies (no chunked transfer
-//!     yet — S3 GETs always return Content-Length)
+//!   - `Content-Length`-bounded or chunked response bodies; a body
+//!     that ends early is always an error
 //!   - Response headers as a name/value list (case-insensitive lookups)
 //!   - Status code + raw body bytes
 //!
@@ -19,6 +19,10 @@ const tls = @import("tls.zig");
 
 pub const Error = error{
     SendFailed,
+    /// The peer closed or reset the connection before sending any of the response: on a pooled keep-alive connection,
+    /// the mark of one the server dropped while it sat idle. Distinct from `RecvFailed`/`BodyTruncated`, which mean the
+    /// response had started.
+    ClosedBeforeResponse,
     RecvFailed,
     BadStatusLine,
     BadHeader,
@@ -76,7 +80,7 @@ pub fn sendRequest(
 ) Error!Response {
     try sendRequestBytes(arena, conn, req);
 
-    return try drainResponse(arena, conn);
+    return try drainResponse(arena, conn, req.method == .HEAD);
 }
 
 /// Send a request and stream the response body directly into `target`.
@@ -147,7 +151,8 @@ fn buildRequestHead(arena: std.mem.Allocator, req: Request, buf: *std.ArrayList(
 
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 
-fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response {
+/// `head_only`: the response to a HEAD, whose Content-Length describes a body that is never sent.
+fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: bool) Error!Response {
     // Read until \r\n\r\n appears, then keep reading the body.
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(arena);
@@ -159,7 +164,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
 
     while (true) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) break;
         try stream.appendSlice(arena, tmp[0..n]);
         if (headers_end == null) {
@@ -176,7 +181,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
                 // check the no-CL/no-chunked path falls through to
                 // "read until conn closes," which on a keep-alive
                 // connection hangs until the TCP idle timeout fires.
-                if (status) |s| if (statusIsBodyless(s)) {
+                if (status) |s| if (head_only or statusIsBodyless(s)) {
                     return .{
                         .status = s,
                         .headers = try parseHeaders(arena, stream.items[0..i]),
@@ -196,6 +201,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection) Error!Response
     }
 
     const he = headers_end orelse return error.BodyTruncated;
+    if (chunked and !chunkedBodyComplete(stream.items, he + 4)) return error.BodyTruncated;
     const final_status = status orelse try parseStatus(stream.items[0..he]);
     const headers = try parseHeaders(arena, stream.items[0..he]);
 
@@ -235,7 +241,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     var headers_end: ?usize = null;
     while (headers_end == null) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
         if (n == 0) return error.BodyTruncated;
         try stream.appendSlice(arena, tmp[0..n]);
         if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
@@ -260,7 +266,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
 
     while (written < content_length) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try conn.recv(&tmp);
+        const n = try recvResponseBytes(conn, &tmp, he + 4 + written);
         if (n == 0) return error.BodyTruncated;
         const take = @min(n, content_length - written);
         @memcpy(target[written..][0..take], tmp[0..take]);
@@ -268,6 +274,21 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     }
 
     return .{ .status = status, .headers = headers, .body = target[0..written] };
+}
+
+/// `conn.recv` for a response of which `received` bytes have arrived. The peer closing (EOF, which is also how a TLS
+/// close_notify ends) or resetting the connection before the first byte is `error.ClosedBeforeResponse`; a reset later
+/// is `error.RecvFailed`, and a TLS stream ending without close_notify later is `error.BodyTruncated`: callers only
+/// read again while the response is incomplete. Every other error, local ones such as running out of memory
+/// included, passes through.
+fn recvResponseBytes(conn: *tls.Connection, dest: []u8, received: usize) Error!usize {
+    const n = conn.recv(dest) catch |err| switch (err) {
+        error.ConnectionReset => return if (received == 0) error.ClosedBeforeResponse else error.RecvFailed,
+        error.UncleanClose => return if (received == 0) error.ClosedBeforeResponse else error.BodyTruncated,
+        else => return err,
+    };
+    if (n == 0 and received == 0) return error.ClosedBeforeResponse;
+    return n;
 }
 
 fn parseTransferEncodingChunked(headers_bytes: []const u8) bool {
@@ -280,7 +301,7 @@ fn parseTransferEncodingChunked(headers_bytes: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
             // Chunked is the de-facto value S3 sends; tolerate "chunked" mixed
             // with other tokens.
-            return std.ascii.indexOfIgnoreCase(value, "chunked") != null;
+            return std.ascii.findIgnoreCase(value, "chunked") != null;
         }
     }
     return false;
@@ -320,13 +341,15 @@ fn decodeChunked(arena: std.mem.Allocator, raw: []const u8) Error![]const u8 {
         const size_str = std.mem.trim(u8, raw[i..@min(size_str_end, line_end)], " \t");
         const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.BodyTruncated;
         const data_start = line_end + 2;
-        if (chunk_len == 0) break;
+        if (chunk_len == 0) return out.toOwnedSlice(arena);
+        if (chunk_len > raw.len - data_start or raw.len - data_start - chunk_len < 2) return error.BodyTruncated;
         const data_end = data_start + chunk_len;
-        if (data_end > raw.len) return error.BodyTruncated;
+        if (!std.mem.eql(u8, raw[data_end..][0..2], "\r\n")) return error.BodyTruncated;
         try out.appendSlice(arena, raw[data_start..data_end]);
-        i = data_end + 2; // skip trailing CRLF
+        i = data_end + 2;
     }
-    return out.toOwnedSlice(arena);
+    // No last chunk: the body was cut short.
+    return error.BodyTruncated;
 }
 
 fn parseStatus(headers_bytes: []const u8) Error!u16 {
@@ -443,4 +466,150 @@ test "buildRequestHead emits headers without copying body" {
     try testing.expect(std.mem.indexOf(u8, head.items, "Content-Length: 7\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, head.items, "\r\n\r\n"));
     try testing.expect(std.mem.indexOf(u8, head.items, "payload") == null);
+}
+
+test "a connection closed before any response byte is told apart from a truncated response" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var target: [16]u8 = undefined;
+
+    // A response that starts and stops short is truncated...
+    const partial = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n\r\nabc";
+    _ = std.posix.system.write(fds[1], partial.ptr, partial.len);
+    _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+    try testing.expectError(error.BodyTruncated, drainResponseInto(arena.allocator(), &conn, &target));
+    // ...while EOF with nothing received is a connection the peer had already closed.
+    try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+    try testing.expectError(error.ClosedBeforeResponse, drainResponse(arena.allocator(), &conn, false));
+}
+
+test "only a closed or reset connection counts as closed before the response; local read errors propagate" {
+    const posix = std.posix;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var target: [16]u8 = undefined;
+
+    // A peer that resets the connection before answering.
+    {
+        const ls = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        if (posix.errno(ls) != .SUCCESS) return error.SkipZigTest;
+        const lfd: posix.fd_t = @intCast(ls);
+        defer _ = posix.system.close(lfd);
+        var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+        _ = posix.system.listen(lfd, 1);
+        _ = posix.system.getsockname(lfd, @ptrCast(&addr), &len);
+        var conn = try tls.Connection.connectPlain(testing.allocator, .loopback(std.mem.bigToNative(u16, addr.port)));
+        defer conn.deinit();
+        const peer: posix.fd_t = @intCast(posix.system.accept(lfd, null, null));
+        const linger: extern struct { on: c_int, secs: c_int } = .{ .on = 1, .secs = 0 };
+        _ = posix.system.setsockopt(peer, posix.SOL.SOCKET, posix.SO.LINGER, @ptrCast(&linger), @sizeOf(@TypeOf(linger)));
+        _ = posix.system.close(peer);
+        try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+    }
+
+    // A read that fails for a local reason (here: the descriptor is a directory) is not a dropped connection.
+    {
+        const rc = posix.system.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(posix.mode_t, 0));
+        if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        var conn: tls.Connection = .{ .fd = @intCast(rc), .tls = undefined, .allocator = testing.allocator, .plain = true };
+        defer conn.deinit();
+        try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target));
+        try testing.expectError(error.RecvFailed, drainResponse(arena.allocator(), &conn, false));
+    }
+}
+
+test "a HEAD response ends at its headers whatever Content-Length says" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // The peer stays open: reading for the advertised body would block forever.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nETag: \"abc-2\"\r\n\r\n";
+    _ = std.posix.system.write(fds[1], resp.ptr, resp.len);
+    const r = try sendRequest(arena.allocator(), &conn, .{ .method = .HEAD, .host = "h", .path = "/k", .headers = &.{} });
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("\"abc-2\"", r.header("etag").?);
+    try testing.expectEqual(@as(usize, 0), r.body.len);
+}
+
+const test_server = @import("tls_test_server.zig");
+
+test "a TLS response cut short is an error whether or not the server sent close_notify" {
+    var pki = try test_server.Pki.init();
+    defer pki.deinit();
+    var leaf = try pki.issue("leaf", "DNS:good.test");
+    defer leaf.deinit();
+    var context = try tls.ClientContext.init(.{ .ca_cert = pki.ca });
+    defer context.deinit();
+
+    const End = test_server.Behavior.End;
+    const short = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n\r\nabc";
+    const unframed = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc";
+    const Case = struct { response: []const u8, end: End, into: bool = false, want: anyerror![]const u8 };
+    for ([_]Case{
+        .{ .response = short, .end = .close_notify, .want = error.BodyTruncated },
+        .{ .response = short, .end = .tcp_close, .want = error.BodyTruncated },
+        .{ .response = short, .end = .close_notify, .into = true, .want = error.BodyTruncated },
+        .{ .response = short, .end = .tcp_close, .into = true, .want = error.BodyTruncated },
+        // A chunked body that stops at a chunk boundary, before the last chunk.
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+            .end = .close_notify,
+            .want = error.BodyTruncated,
+        },
+        .{
+            .response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+            .end = .tcp_close,
+            .want = error.BodyTruncated,
+        },
+        // A body delimited by the end of the stream is whole only if the stream ended with close_notify.
+        .{ .response = unframed, .end = .close_notify, .want = "abc" },
+        .{ .response = unframed, .end = .tcp_close, .want = error.BodyTruncated },
+        // Bytes that are not TLS are a read error, not the end of the body.
+        .{ .response = short, .end = .garbage, .want = error.RecvFailed },
+        .{ .response = short, .end = .garbage, .into = true, .want = error.RecvFailed },
+        // A complete response is complete however the connection ends afterwards.
+        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", .end = .tcp_close, .want = "abc" },
+        .{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", .end = .garbage, .want = "abc" },
+    }) |case| {
+        var server: test_server.Server = undefined;
+        try server.startWith(&leaf, 1, .{ .respond = .{ .response = case.response, .end = case.end } });
+        defer server.finish() catch {};
+        const peer: tls.Peer = .loopback(server.port);
+        var conn = try tls.Connection.connectWithContext(testing.allocator, &context, peer, "good.test");
+        defer conn.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const req: Request = .{ .method = .GET, .host = "good.test", .path = "/k", .headers = &.{} };
+        var target: [16]u8 = undefined;
+        const a = arena.allocator();
+        const got = if (case.into) sendRequestInto(a, &conn, req, &target) else sendRequest(a, &conn, req);
+        if (case.want) |body| {
+            const resp = got catch |err| {
+                std.debug.print("{s} / {t}: {t}\n", .{ case.response, case.end, err });
+                return err;
+            };
+            try testing.expectEqualStrings(body, resp.body);
+        } else |want_err| {
+            if (got) |resp| {
+                std.debug.print("{s} / {t}: accepted body {s}\n", .{ case.response, case.end, resp.body });
+                return error.TestUnexpectedResult;
+            } else |err| if (err != want_err) {
+                std.debug.print("{s} / {t}: {t}, want {t}\n", .{ case.response, case.end, err, want_err });
+                return error.TestUnexpectedError;
+            }
+        }
+    }
 }

@@ -70,7 +70,8 @@ pub const Kind = struct {
 /// payload (newer writers set both for compat; the LogicalType wins).
 pub fn kindFromSchema(elem: *const schema.SchemaElement) ?Kind {
     const phys = elem.type orelse return null;
-    const tl: u8 = if (elem.type_length) |v| @intCast(v) else 0;
+    // A width no decimal can have (precision 38 needs 16 bytes) is not decoded as one.
+    const tl: u8 = if (elem.type_length) |v| std.math.cast(u8, v) orelse return null else 0;
 
     if (elem.logical_type) |lt| switch (lt) {
         .DECIMAL => |d| return Kind{
@@ -141,6 +142,33 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
     return applyScaleI128(@intCast(raw), scale);
 }
 
+/// A DECIMAL min/max statistic as f64, or null when the bytes cannot be one of `kind`'s values. Statistics hold a
+/// bare value in the physical representation: INT32/INT64 little-endian, FLBA and BYTE_ARRAY big-endian two's
+/// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
+/// all is the caller's decision.
+pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
+    return switch (kind.physical) {
+        .INT32 => {
+            if (bytes.len < 4) return null;
+            return applyScaleInt(i32, std.mem.readInt(i32, bytes[0..4], .little), kind.scale);
+        },
+        .INT64 => {
+            if (bytes.len < 8) return null;
+            return applyScaleInt(i64, std.mem.readInt(i64, bytes[0..8], .little), kind.scale);
+        },
+        .FIXED_LEN_BYTE_ARRAY => {
+            if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH) return null;
+            if (bytes.len < kind.byte_width) return null;
+            return applyScaleI128(flbaToI128(bytes[0..kind.byte_width]), kind.scale);
+        },
+        .BYTE_ARRAY => {
+            if (bytes.len == 0 or bytes.len > MAX_FLBA_BYTE_WIDTH) return null;
+            return applyScaleI128(flbaToI128(bytes), kind.scale);
+        },
+        else => null,
+    };
+}
+
 /// Vectorized `applyScaleInt` over a whole buffer. For the common case
 /// (0 < scale < pow10 table — i.e. every real-world DECIMAL) this is a
 /// SIMD vector divide: `@floatFromInt` widens 8 raw ints to f64 lanes,
@@ -181,7 +209,7 @@ pub fn decodeColumnAsF64(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(f64) {
-    return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{});
+    return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, .{}, null);
 }
 
 pub fn decodeColumnAsF64WithOptions(
@@ -192,10 +220,31 @@ pub fn decodeColumnAsF64WithOptions(
     num_leaves: usize,
     kind: Kind,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
     return switch (kind.physical) {
-        .INT32 => try decodeIntBacked(i32, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
-        .INT64 => try decodeIntBacked(i64, arena, chunk, codec, levels, num_leaves, kind.scale, decode_options),
+        .INT32 => try decodeIntBacked(
+            i32,
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind.scale,
+            decode_options,
+            scratch,
+        ),
+        .INT64 => try decodeIntBacked(
+            i64,
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind.scale,
+            decode_options,
+            scratch,
+        ),
         .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBacked(arena, chunk, codec, levels, num_leaves, kind),
         .BYTE_ARRAY => try decodeByteArrayBacked(
             arena,
@@ -205,6 +254,7 @@ pub fn decodeColumnAsF64WithOptions(
             num_leaves,
             kind.scale,
             decode_options,
+            scratch,
         ),
         else => return error.UnsupportedDecimalPhysicalType,
     };
@@ -255,39 +305,33 @@ fn decodeIntBackedI128(
     num_leaves: usize,
     decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(i128) {
+    // The lossless lane carries no repetition levels.
+    if (levels.max_rep > 0) return error.ShortDecode;
     // Decode the raw ints exactly as the f64 path does, but keep them as
     // integers (widened to i128) — no scale divide.
-    const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-
-    var def_levels_buf: ?[]u32 = null;
-    if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_values[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_values[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, null);
+    const raw = try readAll(T, &reader, num_leaves);
 
     const values = try arena.alloc(i128, num_leaves);
-    for (raw_values, 0..) |v, i| values[i] = @intCast(v);
+    for (raw.values, 0..) |v, i| values[i] = @intCast(v);
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
+        .has_nulls = raw.has_nulls,
+    };
+}
+
+/// The shared column drain, with every decode failure reported as ShortDecode.
+fn readAll(
+    comptime T: type,
+    reader: *column_mod.ColumnChunkReader(T),
+    num_leaves: usize,
+) Error!column_mod.ColumnChunkReader(T).Leaves {
+    return reader.readAll(num_leaves) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ShortDecode,
     };
 }
 
@@ -306,60 +350,22 @@ fn decodeIntBacked(
     num_leaves: usize,
     scale: i32,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    // Decode the raw ints first using the existing column reader
-    // shape. This mirrors decodeColumnT's body in consumer.zig but
-    // without the indirection — we need the raw values to apply scale
-    // in a second pass.
-    const raw_values = try arena.alloc(T, num_leaves);
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-
-    var def_levels_buf: ?[]u32 = null;
-    var rep_levels_buf: ?[]u32 = null;
-
-    if (levels.max_rep > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        const rl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(raw_values[written..], dl[written..], rl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-        rep_levels_buf = rl;
-    } else if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_values[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_values[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
+    const raw = try readAll(T, &reader, num_leaves);
 
     // Apply scale into a new f64 buffer.
     const values = try arena.alloc(f64, num_leaves);
-    applyScaleSimd(T, raw_values, scale, values);
+    applyScaleSimd(T, raw.values, scale, values);
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
-        .rep_levels = rep_levels_buf,
+        .rep_levels = raw.rep_levels,
         .max_rep = @intCast(levels.max_rep),
-        .has_nulls = reader.has_nulls,
+        .has_nulls = raw.has_nulls,
     };
 }
 
@@ -380,56 +386,23 @@ fn decodeByteArrayBacked(
     num_leaves: usize,
     scale: i32,
     decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    const raw_slices = try arena.alloc([]const u8, num_leaves);
     var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
         chunk,
         codec,
         levels,
         arena,
         decode_options,
+        scratch,
     );
-
-    var def_levels_buf: ?[]u32 = null;
-    var rep_levels_buf: ?[]u32 = null;
-
-    if (levels.max_rep > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        const rl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(raw_slices[written..], dl[written..], rl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-        rep_levels_buf = rl;
-    } else if (levels.max_def > 0) {
-        const dl = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(raw_slices[written..], dl[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        def_levels_buf = dl;
-    } else {
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decode(raw_slices[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-    }
+    const raw = try readAll([]const u8, &reader, num_leaves);
 
     const max_def: u32 = @intCast(levels.max_def);
     const values = try arena.alloc(f64, num_leaves);
-    for (raw_slices, 0..) |s, i| {
+    for (raw.values, 0..) |s, i| {
         // Null slot: leave 0.0; aggregators consult def_levels.
-        if (def_levels_buf) |dl| {
+        if (raw.def_levels) |dl| {
             if (dl[i] < max_def) {
                 values[i] = 0.0;
                 continue;
@@ -441,11 +414,11 @@ fn decodeByteArrayBacked(
 
     return .{
         .values = values,
-        .def_levels = def_levels_buf,
+        .def_levels = raw.def_levels,
         .max_def = @intCast(levels.max_def),
-        .rep_levels = rep_levels_buf,
+        .rep_levels = raw.rep_levels,
         .max_rep = @intCast(levels.max_rep),
-        .has_nulls = reader.has_nulls,
+        .has_nulls = raw.has_nulls,
     };
 }
 
@@ -577,6 +550,9 @@ fn decodeFlbaDataPage(
         page_num_values = @intCast(dph.num_values);
         encoding = dph.encoding;
     }
+    // The output buffers are sized from the chunk's num_values; a page claiming more than is left would write past
+    // them.
+    if (page_num_values > values_out.len - written.*) return error.ShortDecode;
 
     // Extract rep/def level slices (if any) and the values payload.
     var values_bytes = pg.bytes;
@@ -611,6 +587,9 @@ fn decodeFlbaDataPage(
         if (levels.max_rep > 0 and rep_len > 0) {
             try decodeLevels(values_bytes[0..rep_len], @as(u32, @intCast(levels.max_rep)), page_num_values, rep_levels_buf, written.*);
         }
+        // Without level bytes the def levels would be left unwritten; an empty page is the only legitimate case.
+        if (levels.max_def > 0 and def_len == 0 and page_num_values > 0) return error.ShortDecode;
+        if (levels.max_rep > 0 and rep_len == 0 and page_num_values > 0) return error.ShortDecode;
         if (levels.max_def > 0 and def_len > 0) {
             try decodeLevels(values_bytes[rep_len .. rep_len + def_len], @as(u32, @intCast(levels.max_def)), page_num_values, def_levels_buf, written.*);
         }
@@ -818,6 +797,58 @@ test "applyScaleInt converts known values" {
     try testing.expectEqual(@as(f64, 0.0), applyScaleInt(i64, 0, 18));
 }
 
+test "statToF64: INT32/INT64 backings apply scale (signed)" {
+    var b32: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b32, 12345, .little);
+    const k32 = Kind{ .scale = 2, .precision = 9, .physical = .INT32, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&b32, k32).?, 1e-9);
+
+    std.mem.writeInt(i32, &b32, -6789, .little); // negative
+    try testing.expectApproxEqAbs(@as(f64, -67.89), statToF64(&b32, k32).?, 1e-9);
+
+    var b64: [8]u8 = undefined;
+    std.mem.writeInt(i64, &b64, 100000, .little);
+    const k64 = Kind{ .scale = 3, .precision = 18, .physical = .INT64, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, 100.0), statToF64(&b64, k64).?, 1e-9);
+}
+
+test "statToF64: FLBA backing sign-extends + scales" {
+    var be: [8]u8 = undefined;
+    const kpos = Kind{ .scale = 2, .precision = 20, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 8 };
+    std.mem.writeInt(i64, &be, 12345, .big);
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&be, kpos).?, 1e-9);
+    std.mem.writeInt(i64, &be, -12345, .big); // high byte 0xFF must sign-extend
+    try testing.expectApproxEqAbs(@as(f64, -123.45), statToF64(&be, kpos).?, 1e-9);
+
+    // narrow 2-byte FLBA, scale 0: -100 = 0xFF9C big-endian
+    var be2: [2]u8 = undefined;
+    std.mem.writeInt(i16, &be2, -100, .big);
+    const k2 = Kind{ .scale = 0, .precision = 4, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 2 };
+    try testing.expectApproxEqAbs(@as(f64, -100.0), statToF64(&be2, k2).?, 1e-9);
+
+    // BYTE_ARRAY: the bound is as wide as its value needs, with no length prefix.
+    const kba = Kind{ .scale = 2, .precision = 9, .physical = .BYTE_ARRAY, .byte_width = 0 };
+    try testing.expectApproxEqAbs(@as(f64, -1.28), statToF64(&.{0x80}, kba).?, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 123.45), statToF64(&.{ 0x30, 0x39 }, kba).?, 1e-9);
+}
+
+test "statToF64: malformed inputs return null (no UB)" {
+    const short = [_]u8{ 0x01, 0x02 }; // < 4 bytes for INT32
+    try testing.expect(statToF64(&short, .{ .scale = 0, .precision = 9, .physical = .INT32, .byte_width = 0 }) == null);
+
+    const some: [8]u8 = @splat(0);
+    // FLBA byte_width 0 → reject; byte_width 17 (> MAX_FLBA_BYTE_WIDTH) → reject
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);
+    // BYTE_ARRAY: empty, or wider than i128.
+    const ba: Kind = .{ .scale = 0, .precision = 9, .physical = .BYTE_ARRAY, .byte_width = 0 };
+    try testing.expect(statToF64(&.{}, ba) == null);
+    const wide: [17]u8 = @splat(0);
+    try testing.expect(statToF64(&wide, ba) == null);
+    // A physical type no DECIMAL has.
+    try testing.expect(statToF64(&some, .{ .scale = 0, .precision = 9, .physical = .DOUBLE, .byte_width = 0 }) == null);
+}
+
 test "kindFromSchema recognises Decimal columns" {
     var elem = schema.SchemaElement{
         .type = .INT64,
@@ -893,36 +924,7 @@ test "kindFromSchema accepts legacy ConvertedType.DECIMAL" {
 // values + sum match.
 
 const metadata = @import("metadata.zig");
-
-fn readFileSlice(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const linux = std.os.linux;
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (@as(isize, @bitCast(r_open)) < 0) return error.FileNotFound;
-    const fd: linux.fd_t = @intCast(@as(isize, @bitCast(r_open)));
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        const bytes: usize = @intCast(@as(isize, @bitCast(n)));
-        if (bytes == 0) break;
-        off += bytes;
-    }
-    return buf;
-}
+const readFileSlice = metadata.readFileSlice;
 
 fn checkDecimalFixture(
     fixture_path: []const u8,

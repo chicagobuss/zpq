@@ -1,8 +1,8 @@
 .{
     .name = .zpq,
-    .version = "0.3.2",
+    .version = "0.4.0",
     .fingerprint = 0xae1a0cc8c4cc362f,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .boring_tls = .{
             .path = "vendor/boring_tls",

@@ -20,6 +20,7 @@
 //! any I/O. The `Sink` is opaque; the source is a borrowed slice.
 
 const std = @import("std");
+const nowMonoNs = @import("../clock.zig").monoNs;
 
 /// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
 /// scan.zig, which imports this module.
@@ -33,16 +34,21 @@ const filter_prune = @import("filter/prune.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_eval = @import("expr/eval.zig");
 const expr_agg = @import("expr/agg.zig");
+const agg_plan = @import("agg_plan.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
 const fastpath = @import("writer/fastpath.zig");
 const thrift = @import("thrift.zig");
 const column_mod = @import("parquet/column.zig");
 const decimal_mod = @import("parquet/decimal.zig");
+const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
+const metadata = @import("parquet/metadata.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
+pub const DecodeScratch = column_mod.DecodeScratch;
+pub const RowGroupArena = @import("row_group_arena.zig").RowGroupArena;
 
 /// Error set the consumer functions can return. Inferred from the
 /// underlying decoders/encoders/sinks; unioned here for documentation.
@@ -171,16 +177,14 @@ pub fn initOutputAggregator(
     for (output_specs, 0..) |spec, i| {
         const phys_type: schema.Type = switch (spec) {
             .passthrough => |kept_ci| blk: {
-                // Find which leaf-column slot has this path. row_groups[*].columns[kept_ci]
-                // gives us the path; meta.getColumnSchema returns the SchemaElement.
-                // We use the first RG's metadata to look up the leaf — every RG of
-                // the same file shares the same schema.
-                if (meta.row_groups.items.len == 0) return error.ColumnMetaMissing;
-                const cm = meta.row_groups.items[0].columns.items[kept_ci].meta_data orelse
-                    return error.ColumnMetaMissing;
-                const src_elem = meta.getColumnSchema(cm.path_in_schema.items) orelse
-                    return error.SchemaLookupFailed;
-                paths[i] = cm.path_in_schema.items;
+                // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
+                // open enforces it), so a file with no row groups still builds its output schema.
+                var leaves: schema.LeafIterator = .init(meta.schema.items);
+                const leaf = while (leaves.next()) |l| {
+                    if (l.index == kept_ci) break l;
+                } else return error.ColumnMetaMissing;
+                const src_elem = leaf.element.*;
+                paths[i] = try arena.dupe([]const u8, leaf.path);
 
                 // DECIMAL source columns. INT32/INT64/FLBA-backed take the
                 // lossless integer lane: decode to unscaled i128, keep the
@@ -234,22 +238,11 @@ pub fn initOutputAggregator(
                 }
 
                 schemas[i] = src_elem;
-                break :blk cm.type;
+                break :blk src_elem.type orelse return error.SchemaLookupFailed;
             },
             .computed => |c| blk: {
                 const expr_type = c.expr.typeOf();
-                schemas[i] = .{
-                    .type = expr_type.toParquet(),
-                    .type_length = null,
-                    .repetition_type = .REQUIRED,
-                    .name = c.alias,
-                    .num_children = 0,
-                    .converted_type = if (expr_type == .str) .UTF8 else null,
-                    .logical_type = if (expr_type == .str) .{ .STRING = .{} } else null,
-                    .scale = null,
-                    .precision = null,
-                    .field_id = null,
-                };
+                schemas[i] = computedSchemaElem(c);
                 const path_buf = try arena.alloc([]const u8, 1);
                 path_buf[0] = c.alias;
                 paths[i] = path_buf;
@@ -386,6 +379,7 @@ pub fn appendProjectedRGWithOptions(
                 n_leaves,
                 k,
                 decode_options,
+                null,
             ),
         } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
             // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
@@ -431,6 +425,7 @@ pub fn appendProjectedRGWithOptions(
                 decode_options,
             ) },
         };
+        try checkRowShape(decoded, num_rows);
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -875,6 +870,31 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
     }
 }
 
+/// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
+pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
+    const expr_type = c.expr.typeOf();
+    // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
+    // are printed and written as the unsigned values they are.
+    const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
+    return .{
+        .type = expr_type.toParquet(),
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = c.alias,
+        .num_children = 0,
+        .converted_type = if (expr_type == .str) .UTF8 else if (unsigned_64) .UINT_64 else null,
+        .logical_type = if (expr_type == .str)
+            .{ .STRING = .{} }
+        else if (unsigned_64)
+            .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } }
+        else
+            null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+}
+
 /// One output column. `passthrough` re-encodes a kept input column;
 /// `computed` evaluates an expression against the (post-filter) decoded
 /// batch and encodes the result as a new flat leaf.
@@ -941,27 +961,20 @@ fn cloneColumnMeta(
     };
 }
 
-/// Byte-copy the kept chunks (or the whole RG span) into `sink` and
-/// emit a cloned `schema.RowGroup` with offsets shifted to the new
-/// stream position.
-///
-/// `kept_set = null`: no projection — push `src.bytes` (which the
-/// caller has arranged to be the whole-RG bounding-box span) and
-/// shift every chunk by the same delta.
-///
-/// Write a 1-row parquet file containing one column-chunk per
-/// `OutputCol` (avg-style aggs already split into two cols upstream).
-/// Used by both CLI and Lambda aggregate paths — the output of an
-/// aggregate workload is a tiny parquet that downstream consumers
-/// (Iceberg/Athena/Polars/another zpq invocation) read like any
-/// other file.
+/// Write an aggregate result — one row, or one per GROUP BY group — as a
+/// single-row-group parquet file with one column-chunk per `OutputCol`
+/// (avg-style aggs already split into two cols upstream), each holding
+/// `num_rows` values. The output of an aggregate workload is a tiny parquet
+/// that downstream consumers (Iceberg/Athena/Polars/another zpq invocation)
+/// read like any other file.
 ///
 /// Returns total bytes written. The sink may be an FdSink (CLI) or
 /// MultipartSink (Lambda) — same protocol either way.
-pub fn writeOneRowAggregate(
+pub fn writeAggregateRows(
     arena: std.mem.Allocator,
     sink: streaming.Sink,
     output_cols: []const expr_agg.OutputCol,
+    num_rows: i64,
     codec: schema.CompressionCodec,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
@@ -977,11 +990,11 @@ pub fn writeOneRowAggregate(
         const leaf_elem: schema.SchemaElement = .{
             .type = out_col.parquet_type,
             .type_length = null,
-            .repetition_type = .REQUIRED,
+            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
             .name = out_col.name,
             .num_children = 0,
-            .converted_type = null,
-            .logical_type = null,
+            .converted_type = out_col.converted_type,
+            .logical_type = out_col.logical_type,
             .scale = null,
             .precision = null,
             .field_id = null,
@@ -996,6 +1009,13 @@ pub fn writeOneRowAggregate(
         var em = enc.meta;
         em.data_page_offset += col_start;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start;
+        // The encoder orders min/max signed; an unsigned column's type-defined order is not, so drop the bounds.
+        if (schema.isUnsignedInt(leaf_elem)) if (em.statistics) |*st| {
+            st.min = null;
+            st.max = null;
+            st.min_value = null;
+            st.max_value = null;
+        };
         try sink.write(enc.bytes);
         off += enc.bytes.len;
         rg_total += @intCast(enc.bytes.len);
@@ -1023,11 +1043,11 @@ pub fn writeOneRowAggregate(
         try new_schema.append(arena, .{
             .type = out_col.parquet_type,
             .type_length = null,
-            .repetition_type = .REQUIRED,
+            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
             .name = out_col.name,
             .num_children = 0,
-            .converted_type = null,
-            .logical_type = null,
+            .converted_type = out_col.converted_type,
+            .logical_type = out_col.logical_type,
             .scale = null,
             .precision = null,
             .field_id = null,
@@ -1038,15 +1058,16 @@ pub fn writeOneRowAggregate(
     try new_row_groups.append(arena, .{
         .columns = rg_columns,
         .total_byte_size = rg_total,
-        .num_rows = 1,
+        .num_rows = num_rows,
     });
 
     const new_meta: schema.FileMetaData = .{
         .version = 1,
         .schema = new_schema,
-        .num_rows = 1,
+        .num_rows = num_rows,
         .created_by = null,
         .row_groups = new_row_groups,
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, rg_columns.items.len, null, &.{}),
     };
 
     var w: thrift.Writer = .init(arena);
@@ -1082,6 +1103,7 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
             const col_idx = switch (f) {
                 .int32 => |l| l.col_idx,
                 .int64 => |l| l.col_idx,
+                .uint64 => |l| l.col_idx,
                 .float => |l| l.col_idx,
                 .double => |l| l.col_idx,
                 .string => |l| l.col_idx,
@@ -1095,81 +1117,76 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
     }
 }
 
-/// Per-RG aggregator update. Decodes the columns referenced by the
-/// outer filter + each aggregate's args/predicates, applies the outer
-/// filter, then folds active rows into each accumulator (with each
-/// agg's own `FILTER (WHERE ...)` predicate composed in).
-///
-/// State (`accumulators`) is owned by the caller and persists across
-/// RGs of the same query. After all RGs are scanned, the caller calls
-/// `expr_agg.finalize(...)` per accumulator and writes the resulting
-/// 1-row parquet via the existing streaming sink + encoder.
-///
-/// No sink writes, no offset advancement, no RGOut. Aggregates produce
-/// nothing per-RG — only at end-of-scan.
-pub fn scanRGForAgg(
-    gpa: std.mem.Allocator,
+/// One row group as `scanRGForAgg` reads it. Everything is borrowed.
+pub const AggRowGroup = struct {
     rg: *const schema.RowGroup,
     meta: *const schema.FileMetaData,
     src: RGSrc,
+    /// The outer filter; null when there is none or statistics prove every row passes it.
     filter: ?filter_ast.Filter,
-    /// When true, never answer aggregates from row-group statistics —
-    /// force every agg down the decode path (the `--scan-all` escape
-    /// hatch: paranoid / untrusted-stats mode).
-    scan_all: bool,
-    /// When false (the default), min/max/sum are answered by decoding rather
-    /// than trusting file statistics, which can be inaccurate. `count(*)` is
-    /// always answered from RowGroup.num_rows regardless. `--trust-stats`
-    /// sets this true to restore the stats fast-path for trusted writers.
-    trust_stats: bool,
-    decode_options: DecodeOptions,
-    fetch_set: []const bool,
-    agg_calls: []const expr_agg.AggCall,
-    accumulators: []expr_agg.Accumulator,
-    group_by_keys: ?[]const expr_ast.Expr,
-    group_table: ?*expr_agg.GroupTable,
-    /// Caller-owned decode scratch, reused across row groups: reset here, never destroyed.
-    rg_arena_state: *std.heap.ArenaAllocator,
-    timings: *Timings,
-) !void {
-    const is_grouped = group_table != null;
-    if (is_grouped) {
-        std.debug.assert(accumulators.len == 0);
-    } else {
-        std.debug.assert(agg_calls.len == accumulators.len);
-    }
-    const num_rows: usize = @intCast(rg.num_rows);
-    const num_leaves = rg.columns.items.len;
-    const has_outer_filter = filter != null;
+    /// Columns to decode (`agg_plan.Columns.forRowGroup`).
+    read: []const bool,
+    /// Columns whose values an aggregate argument, a per-aggregate FILTER or a GROUP BY key consumes
+    /// (`agg_plan.Columns.consumed`); any other column in `read` only the outer filter reads.
+    consumed: []const bool,
+};
 
-    // 1. Stats short-circuit pass. For every agg eligible (count /
-    //    min / max with no outer filter and no per-agg WHERE), try
-    //    to answer from RG metadata only. Mark those as "handled"
-    //    so the decode pass below skips them. Aggs whose stat
-    //    short-circuit fails (stats absent) fall through to decode.
-    const handled_via_stats = try gpa.alloc(bool, agg_calls.len);
+/// What `scanRGForAgg` folds a row group's surviving rows into. The caller owns the state, which persists across
+/// row groups of one query.
+pub const AggTarget = union(enum) {
+    /// One accumulator per call, in call order.
+    scalar: struct { calls: []const expr_agg.AggCall, accumulators: []expr_agg.Accumulator },
+    /// Rows go to the group their key values select; the table holds `calls.len` accumulators per group.
+    grouped: struct { calls: []const expr_agg.AggCall, keys: []const expr_ast.Expr, table: *expr_agg.GroupTable },
+
+    fn calls(self: AggTarget) []const expr_agg.AggCall {
+        return switch (self) {
+            inline else => |t| t.calls,
+        };
+    }
+};
+
+/// A scan worker's state, reused from one row group to the next.
+pub const AggWorkspace = struct {
+    scratch: *DecodeScratch,
+    /// Rewound at each row group that decodes: everything decoded lives here until the next one.
+    rg_arena: *RowGroupArena,
+    timings: *Timings,
+};
+
+/// Per-RG aggregator update. Answers what statistics can, then decodes
+/// the columns the rest read, applies the outer filter, and folds the
+/// surviving rows into `target` (each aggregate's own
+/// `FILTER (WHERE ...)` composed in).
+///
+/// No sink writes, no offset advancement, no RGOut. Aggregates produce
+/// nothing per-RG — only at end-of-scan, when the caller finalizes
+/// `target`'s accumulators.
+///
+/// `gpa` owns what outlives the row group: string min/max winners and
+/// group-table entries.
+pub fn scanRGForAgg(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    stats: agg_plan.StatsUse,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+) !void {
+    const calls = target.calls();
+    const num_rows: usize = @intCast(in.rg.num_rows);
+
+    // 1. Stats short-circuit pass. Aggregates answered from the row
+    //    group's metadata alone are marked handled so the decode pass
+    //    below skips them; the rest fall through to decode.
+    const handled_via_stats = try gpa.alloc(bool, calls.len);
     defer gpa.free(handled_via_stats);
     @memset(handled_via_stats, false);
-
-    var any_decode_required = false;
-    if (is_grouped) {
-        any_decode_required = true;
-    } else {
-        const t_stats_start = nowMonoNs();
-        for (agg_calls, 0..) |call, i| {
-            if (scan_all or !expr_agg.canStatShortCircuit(call, has_outer_filter, trust_stats)) {
-                any_decode_required = true;
-                continue;
-            }
-            const ok = try expr_agg.updateOneFromStats(&accumulators[i], call, rg, meta);
-            if (ok) {
-                handled_via_stats[i] = true;
-            } else {
-                any_decode_required = true;
-            }
-        }
-        timings.eval_ns += @intCast(nowMonoNs() - t_stats_start);
-    }
+    const any_decode_required = switch (target) {
+        // A chunk statistic describes every group at once, so it answers none of them.
+        .grouped => true,
+        .scalar => |s| try foldFromStats(s.calls, s.accumulators, in, stats, handled_via_stats, ws.timings),
+    };
 
     // Fast path: every agg answered from stats, no decode needed at
     // all. This is the headline win — `max(cost)`, `count(*)`, etc.
@@ -1177,87 +1194,223 @@ pub fn scanRGForAgg(
     if (!any_decode_required) return;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
-    // Reset, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
+    // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
     // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
-    _ = rg_arena_state.reset(.retain_capacity);
-    const ra = rg_arena_state.allocator();
+    ws.rg_arena.nextRowGroup();
+    const ra = ws.rg_arena.allocator();
 
+    const page_indexes = try loadPageIndexes(ra, in, stats);
+    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+    const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
+
+    const t_decode_start = nowMonoNs();
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
-    var lookup = try ra.alloc(?usize, meta.schema.items.len);
+    var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
+    for (in.read, 0..) |needed, ci| {
+        if (!needed) continue;
+        if (ci >= in.rg.columns.items.len) continue;
+        const cm = in.rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+        const len: usize = @intCast(cm.total_compressed_size);
+        invariant.assert(start >= @as(usize, @intCast(in.src.byte_origin)));
+        const buf_off = start - @as(usize, @intCast(in.src.byte_origin));
+        if (buf_off + len > in.src.bytes.len) return error.MissingChunkBytes;
+        const chunk = in.src.bytes[buf_off .. buf_off + len];
 
-    const PageIndex = struct {
-        col_index: schema.ColumnIndex,
-        offset_index: schema.OffsetIndex,
-    };
+        const prune_info: ?PruningInfo = if (page_indexes[ci]) |pi|
+            try pagePruning(ra, pi, filter_pages, ci, in.consumed[ci], &sel, num_rows, cm, start)
+        else
+            null;
+        const decoded = try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch);
+        lookup[ci] = batch_cols.items.len;
+        try checkRowShape(decoded, num_rows);
+        try batch_cols.append(ra, decoded);
+    }
+    const t_decode_end = nowMonoNs();
+    ws.timings.decode_ns += @intCast(t_decode_end - t_decode_start);
 
-    const col_indexes = try ra.alloc(?PageIndex, num_leaves);
-    @memset(col_indexes, null);
+    const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+    if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+    const t_eval_end = nowMonoNs();
+    ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
 
-    if (!scan_all) {
-        for (fetch_set, 0..) |needed, ci| {
-            if (!needed) continue;
-            if (ci >= num_leaves) continue;
-            const chunk_meta = rg.columns.items[ci];
+    switch (target) {
+        .grouped => |g| {
+            var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
+            for (g.keys, 0..) |key_expr, idx| {
+                key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch, lookup, key_expr);
+            }
 
-            const co = chunk_meta.column_index_offset orelse continue;
-            const cl = chunk_meta.column_index_length orelse continue;
-            const oo = chunk_meta.offset_index_offset orelse continue;
-            const ol = chunk_meta.offset_index_length orelse continue;
+            var group_id_arr = try ra.alloc(u32, num_rows);
+            @memset(group_id_arr, 0);
 
-            const col_bytes = originSlice(src, co, cl) orelse continue;
-            const off_bytes = originSlice(src, oo, ol) orelse continue;
+            // Never cached across row groups: the resolver's memo holds pointers into `ra`.
+            var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
+            defer key_resolver.deinit(ra);
 
-            var col_reader = thrift.Reader.init(col_bytes);
-            const col_index = schema.ColumnIndex.read(ra, &col_reader) catch continue;
+            var r: usize = 0;
+            while (r < num_rows) : (r += 1) {
+                if (sel.isActive(r)) {
+                    group_id_arr[r] = try key_resolver.resolve(ra, g.table, key_cols, r, g.calls);
+                }
+            }
 
-            var off_reader = thrift.Reader.init(off_bytes);
-            const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
+            for (g.calls, 0..) |call, i| {
+                try expr_agg.updateOneGrouped(
+                    ra,
+                    gpa,
+                    g.table.accumulators.items,
+                    group_id_arr,
+                    i,
+                    g.calls.len,
+                    call,
+                    &batch,
+                    lookup,
+                    &sel,
+                );
+            }
+        },
+        .scalar => |s| {
+            // Update only the aggs that weren't handled via stats. The agg's
+            // own per-WHERE predicate (if any) is composed inside updateOne.
+            for (s.calls, s.accumulators, handled_via_stats) |call, *acc, handled| {
+                if (handled) continue;
+                // `ra` is per-RG scratch; `gpa` is the persist allocator for owned
+                // results (string min/max winner) that outlive both `ra` and the
+                // cross-worker merge.
+                try expr_agg.updateOne(ra, gpa, acc, call, &batch, lookup, &sel);
+            }
+        },
+    }
+    ws.timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
+}
 
-            col_indexes[ci] = PageIndex{
-                .col_index = col_index,
-                .offset_index = offset_index,
-            };
+/// Fold every call statistics can answer for this row group into its accumulator and mark it in `handled`. Returns
+/// whether any call still needs the row group decoded.
+fn foldFromStats(
+    calls: []const expr_agg.AggCall,
+    accumulators: []expr_agg.Accumulator,
+    in: AggRowGroup,
+    stats: agg_plan.StatsUse,
+    handled: []bool,
+    timings: *Timings,
+) !bool {
+    std.debug.assert(calls.len == accumulators.len);
+    const t_stats_start = nowMonoNs();
+    defer timings.eval_ns += @intCast(nowMonoNs() - t_stats_start);
+    var any_decode_required = false;
+    for (calls, accumulators, handled) |call, *acc, *h| {
+        if (stats == .ignore or !expr_agg.canStatShortCircuit(call, in.filter != null, stats == .trust)) {
+            any_decode_required = true;
+            continue;
+        }
+        if (try expr_agg.updateOneFromStats(acc, call, in.rg, in.meta)) {
+            h.* = true;
+        } else {
+            any_decode_required = true;
         }
     }
+    return any_decode_required;
+}
 
-    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+const PageIndex = struct {
+    col_index: schema.ColumnIndex,
+    offset_index: schema.OffsetIndex,
+};
 
-    const col_page_is_skipped = try ra.alloc(?[]bool, num_leaves);
-    @memset(col_page_is_skipped, null);
-    const col_page_is_always_match = try ra.alloc(?[]bool, num_leaves);
-    @memset(col_page_is_always_match, null);
+/// The page indexes of the columns to decode, where present and consistent with the footer; none under
+/// `--scan-all`. An unparseable or inconsistent index is ignored and its column decoded whole.
+fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.StatsUse) ![]?PageIndex {
+    const num_leaves = in.rg.columns.items.len;
+    const num_rows: usize = @intCast(in.rg.num_rows);
+    const indexes = try ra.alloc(?PageIndex, num_leaves);
+    @memset(indexes, null);
+    if (stats == .ignore) return indexes;
+
+    for (in.read, 0..) |needed, ci| {
+        if (!needed) continue;
+        if (ci >= num_leaves) continue;
+        const chunk_meta = in.rg.columns.items[ci];
+
+        const co = chunk_meta.column_index_offset orelse continue;
+        const cl = chunk_meta.column_index_length orelse continue;
+        const oo = chunk_meta.offset_index_offset orelse continue;
+        const ol = chunk_meta.offset_index_length orelse continue;
+
+        const col_bytes = originSlice(in.src, co, cl) orelse continue;
+        const off_bytes = originSlice(in.src, oo, ol) orelse continue;
+
+        var col_reader = thrift.Reader.init(col_bytes);
+        const col_index = schema.ColumnIndex.read(ra, &col_reader) catch continue;
+
+        var off_reader = thrift.Reader.init(off_bytes);
+        const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
+        if (!pageIndexUsable(col_index, offset_index, num_rows)) continue;
+
+        const cm = chunk_meta.meta_data orelse continue;
+        const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
+        if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, in.rg.num_rows)) continue;
+
+        indexes[ci] = .{ .col_index = col_index, .offset_index = offset_index };
+    }
+    return indexes;
+}
+
+/// Per-page verdicts of the outer filter's conjunctive leaves, for the columns they test. Null for a column no
+/// leaf tests (or with no page index).
+const FilterPages = struct {
+    skipped: []?[]bool,
+    always_match: []?[]bool,
+};
+
+/// Prune pages with the outer filter's conjunctive leaves and deselect the rows of every page a leaf skips.
+fn pruneFilterPages(
+    ra: std.mem.Allocator,
+    in: AggRowGroup,
+    page_indexes: []const ?PageIndex,
+    stats: agg_plan.StatsUse,
+    sel: *filter_selection.SelectionVector,
+) !FilterPages {
+    const num_leaves = in.rg.columns.items.len;
+    const num_rows: usize = @intCast(in.rg.num_rows);
+    const pages: FilterPages = .{
+        .skipped = try ra.alloc(?[]bool, num_leaves),
+        .always_match = try ra.alloc(?[]bool, num_leaves),
+    };
+    @memset(pages.skipped, null);
+    @memset(pages.always_match, null);
 
     var conj_leaves: std.ArrayList(ConjunctiveLeaf) = .empty;
-    if (filter) |f| {
+    if (in.filter) |f| {
         try collectConjunctiveLeaves(f, &conj_leaves, ra);
     }
 
     for (conj_leaves.items) |leaf| {
         const ci = leaf.col_idx;
         if (ci >= num_leaves) continue;
-        if (col_indexes[ci]) |pi| {
+        if (page_indexes[ci]) |pi| {
             const locs = pi.offset_index.page_locations.items;
-            const skipped = col_page_is_skipped[ci] orelse blk: {
+            const skipped = pages.skipped[ci] orelse blk: {
                 const s = try ra.alloc(bool, locs.len);
                 @memset(s, false);
                 break :blk s;
             };
-            const always = col_page_is_always_match[ci] orelse blk: {
+            const always = pages.always_match[ci] orelse blk: {
                 const a = try ra.alloc(bool, locs.len);
                 @memset(a, false);
                 break :blk a;
             };
-            const is_first = col_page_is_skipped[ci] == null;
+            const is_first = pages.skipped[ci] == null;
 
             var ci_list = try ra.alloc(?schema.ColumnIndex, num_leaves);
             @memset(ci_list, null);
-            for (col_indexes, 0..) |p_idx, idx| {
+            for (page_indexes, 0..) |p_idx, idx| {
                 if (p_idx) |p| ci_list[idx] = p.col_index;
             }
 
             for (locs, 0..) |loc, page_idx| {
-                const dec = try filter_prune.prunePage(rg, page_idx, leaf.filter, ci_list, ra, meta, trust_stats);
+                const dec = filter_prune.prunePage(in.rg, page_idx, leaf.filter, ci_list, in.meta, stats == .trust);
                 const start: usize = @intCast(loc.first_row_index);
                 const end: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
 
@@ -1277,277 +1430,226 @@ pub fn scanRGForAgg(
                 }
             }
 
-            col_page_is_skipped[ci] = skipped;
-            col_page_is_always_match[ci] = always;
+            pages.skipped[ci] = skipped;
+            pages.always_match[ci] = always;
         }
     }
-
-    // Columns read by an aggregate argument, a per-agg FILTER, or a GROUP BY
-    // key. The always-match shortcut in `decodeWithReaderPruned` fills such a
-    // page with the ColumnIndex minimum instead of decoding it, which is only
-    // sound when the filter is the sole consumer of the values.
-    const values_consumed = try ra.alloc(bool, num_leaves);
-    @memset(values_consumed, false);
-    for (agg_calls) |call| {
-        if (call.arg) |arg_expr| arg_expr.collectColumns(values_consumed);
-        if (call.where) |w_expr| {
-            var cols: std.ArrayList(usize) = .empty;
-            try w_expr.collectColumns(&cols, ra);
-            for (cols.items) |wci| if (wci < num_leaves) {
-                values_consumed[wci] = true;
-            };
-        }
-    }
-    if (group_by_keys) |keys| {
-        for (keys) |key_expr| key_expr.collectColumns(values_consumed);
-    }
-
-    const t_decode_start = nowMonoNs();
-    for (fetch_set, 0..) |needed, ci| {
-        if (!needed) continue;
-        if (ci >= num_leaves) continue;
-        const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-        const len: usize = @intCast(cm.total_compressed_size);
-        invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
-        const buf_off = start - @as(usize, @intCast(src.byte_origin));
-        if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-        const chunk = src.bytes[buf_off .. buf_off + len];
-
-        const levels = meta.getColumnLevels(cm.path_in_schema.items);
-        const n_leaves: usize = @intCast(cm.num_values);
-
-        var prune_info: ?PruningInfo = null;
-        if (col_indexes[ci]) |pi| {
-            const locs = pi.offset_index.page_locations.items;
-            var skipped = col_page_is_skipped[ci];
-            var always = col_page_is_always_match[ci];
-
-            if (skipped == null) {
-                const s = try ra.alloc(bool, locs.len);
-                @memset(s, false);
-                const a = try ra.alloc(bool, locs.len);
-                @memset(a, false);
-
-                for (locs, 0..) |loc, page_idx| {
-                    const start_idx: usize = @intCast(loc.first_row_index);
-                    const end_idx: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
-
-                    var has_active = false;
-                    var r = start_idx;
-                    while (r < end_idx) : (r += 1) {
-                        if (sel.isActive(r)) {
-                            has_active = true;
-                            break;
-                        }
-                    }
-                    if (!has_active) {
-                        s[page_idx] = true;
-                    }
-                }
-                skipped = s;
-                always = a;
-            }
-            if (values_consumed[ci]) {
-                const a = try ra.alloc(bool, locs.len);
-                @memset(a, false);
-                always = a;
-            }
-
-            prune_info = PruningInfo{
-                .locations = locs,
-                .page_is_skipped = skipped.?,
-                .page_is_always_match = always.?,
-                .dictionary_page_offset = cm.dictionary_page_offset,
-                .chunk_file_offset = @intCast(start),
-                .col_index = pi.col_index,
-            };
-        }
-
-        const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-        const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
-
-        const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-            .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                k,
-                decode_options,
-            ),
-        } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
-            .f64 = try decodeFloat16ColumnAsF64Pruned(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                prune_info,
-                decode_options,
-            ),
-        } else switch (cm.type) {
-            .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
-                .{ .i64 = try decodeU32ColumnAsI64Pruned(
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ) }
-            else
-                .{
-                    .i32 = try decodeColumnTPruned(
-                        i32,
-                        ra,
-                        chunk,
-                        cm.codec,
-                        levels,
-                        n_leaves,
-                        prune_info,
-                        decode_options,
-                    ),
-                },
-            .INT64 => .{
-                .i64 = try decodeColumnTPruned(
-                    i64,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ),
-            },
-            .FLOAT => .{
-                .f32 = try decodeColumnTPruned(
-                    f32,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ),
-            },
-            .DOUBLE => .{
-                .f64 = try decodeColumnTPruned(
-                    f64,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ),
-            },
-            .BYTE_ARRAY => .{
-                .string = try decodeColumnTPruned(
-                    []const u8,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ),
-            },
-            .BOOLEAN => .{
-                .boolean = try decodeColumnTPruned(
-                    bool,
-                    ra,
-                    chunk,
-                    cm.codec,
-                    levels,
-                    n_leaves,
-                    prune_info,
-                    decode_options,
-                ),
-            },
-            .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
-            .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                flbaWidth(schema_elem),
-                prune_info,
-                decode_options,
-            ) },
-        };
-        lookup[ci] = batch_cols.items.len;
-        try batch_cols.append(ra, decoded);
-    }
-    const t_decode_end = nowMonoNs();
-    timings.decode_ns += @intCast(t_decode_end - t_decode_start);
-
-    const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
-    if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
-    const t_eval_end = nowMonoNs();
-    timings.eval_ns += @intCast(t_eval_end - t_decode_end);
-
-    if (is_grouped) {
-        const gb_keys = group_by_keys.?;
-        var key_cols = try ra.alloc(filter_eval.Batch.Column, gb_keys.len);
-        for (gb_keys, 0..) |key_expr, idx| {
-            key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch, lookup, key_expr);
-        }
-
-        var group_id_arr = try ra.alloc(u32, num_rows);
-        @memset(group_id_arr, 0);
-
-        // Never cached across row groups: the resolver's memo holds pointers into `ra`.
-        var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
-        defer key_resolver.deinit(ra);
-
-        var r: usize = 0;
-        while (r < num_rows) : (r += 1) {
-            if (sel.isActive(r)) {
-                group_id_arr[r] = try key_resolver.resolve(ra, &group_table.?.*, key_cols, r, agg_calls);
-            }
-        }
-
-        for (agg_calls, 0..) |call, i| {
-            try expr_agg.updateOneGrouped(
-                ra,
-                gpa,
-                group_table.?.accumulators.items,
-                group_id_arr,
-                i,
-                agg_calls.len,
-                call,
-                &batch,
-                lookup,
-                &sel,
-            );
-        }
-    } else {
-        // Update only the aggs that weren't handled via stats. The agg's
-        // own per-WHERE predicate (if any) is composed inside updateOne.
-        for (agg_calls, 0..) |call, i| {
-            if (handled_via_stats[i]) continue;
-            // `ra` is per-RG scratch; `gpa` is the persist allocator for owned
-            // results (string min/max winner) that outlive both `ra` and the
-            // cross-worker merge.
-            try expr_agg.updateOne(ra, gpa, &accumulators[i], call, &batch, lookup, &sel);
-        }
-    }
-    timings.encode_ns += @intCast(nowMonoNs() - t_eval_end);
+    return pages;
 }
 
+/// How to decode column `ci` page by page. A column no filter leaf tests skips just the pages left with no active
+/// row. The always-match shortcut in `decodeWithReaderPruned` fills a page with the ColumnIndex minimum instead of
+/// decoding it, which is only sound when the filter is the sole reader of the values: never for a `consumed` column.
+fn pagePruning(
+    ra: std.mem.Allocator,
+    pi: PageIndex,
+    filter_pages: FilterPages,
+    ci: usize,
+    consumed: bool,
+    sel: *const filter_selection.SelectionVector,
+    num_rows: usize,
+    cm: schema.ColumnMetaData,
+    chunk_start: usize,
+) !PruningInfo {
+    const locs = pi.offset_index.page_locations.items;
+    var skipped = filter_pages.skipped[ci];
+    var always = filter_pages.always_match[ci];
+
+    if (skipped == null) {
+        const s = try ra.alloc(bool, locs.len);
+        @memset(s, false);
+        const a = try ra.alloc(bool, locs.len);
+        @memset(a, false);
+
+        for (locs, 0..) |loc, page_idx| {
+            const start_idx: usize = @intCast(loc.first_row_index);
+            const end_idx: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
+
+            var has_active = false;
+            var r = start_idx;
+            while (r < end_idx) : (r += 1) {
+                if (sel.isActive(r)) {
+                    has_active = true;
+                    break;
+                }
+            }
+            if (!has_active) {
+                s[page_idx] = true;
+            }
+        }
+        skipped = s;
+        always = a;
+    }
+    if (consumed) {
+        const a = try ra.alloc(bool, locs.len);
+        @memset(a, false);
+        always = a;
+    }
+
+    return .{
+        .locations = locs,
+        .page_is_skipped = skipped.?,
+        .page_is_always_match = always.?,
+        .dictionary_page_offset = cm.dictionary_page_offset,
+        .chunk_file_offset = @intCast(chunk_start),
+        .col_index = pi.col_index,
+    };
+}
+
+/// Decode one column chunk into the batch lane its physical and logical type select.
+fn decodeAggColumn(
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    meta: *const schema.FileMetaData,
+    prune_info: ?PruningInfo,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+) !filter_eval.Batch.Column {
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n_leaves: usize = @intCast(cm.num_values);
+    const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+
+    if (dec_kind) |k| return .{
+        .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            k,
+            decode_options,
+            scratch,
+        ),
+    };
+    if (schema_elem != null and schema.isFloat16(schema_elem.?)) return .{
+        .f64 = try decodeFloat16ColumnAsF64Pruned(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ),
+    };
+    return switch (cm.type) {
+        .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
+            .{ .i64 = try decodeU32ColumnAsI64Pruned(
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                prune_info,
+                decode_options,
+                scratch,
+            ) }
+        else
+            .{ .i32 = try decodeColumnTPruned(
+                i32,
+                ra,
+                chunk,
+                cm.codec,
+                levels,
+                n_leaves,
+                prune_info,
+                decode_options,
+                scratch,
+            ) },
+        .INT64 => .{ .i64 = try decodeColumnTPruned(
+            i64,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .FLOAT => .{ .f32 = try decodeColumnTPruned(
+            f32,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .DOUBLE => .{ .f64 = try decodeColumnTPruned(
+            f64,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .BYTE_ARRAY => .{ .string = try decodeColumnTPruned(
+            []const u8,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .BOOLEAN => .{ .boolean = try decodeColumnTPruned(
+            bool,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+        ) },
+        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            flbaWidth(schema_elem),
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+    };
+}
+
+/// Byte-copy one row group into `sink` and return a clone of it whose
+/// chunk offsets (and carried page indexes) point at the new stream
+/// position.
+///
+/// `kept_set = null`: no projection. The group's bounding span, from its
+/// first chunk start to its last chunk end, is copied from `src` in one
+/// write and every chunk shifts by the same delta.
+///
 /// `kept_set != null`: per-column copy. Only chunks where
-/// `kept_set[ci] == true` are written.
+/// `kept_set[ci] == true` are written. A `recompress` that changes any
+/// chunk's codec takes this path too, with every column kept.
 pub fn copyRG(
     out_arena: std.mem.Allocator,
     rg: *const schema.RowGroup,
+    /// Must hold the file from offset 0: page indexes are found by their file offsets.
     src: RGSrc,
     kept_set: ?[]const bool,
     sink: streaming.Sink,
@@ -1557,8 +1659,29 @@ pub fn copyRG(
     // is later placed at a nonzero file offset (the carried OffsetIndex's
     // PageLocation.offset would stay buffer-relative). Direct-to-file: true.
     emit_page_index: bool,
+    /// A requested output codec. Chunks already in it are copied verbatim;
+    /// the rest have their pages recompressed. Null keeps every chunk's codec.
+    recompress: ?Recompress,
 ) !RGOut {
-    if (kept_set) |kept| {
+    invariant.assert(src.byte_origin == 0);
+    // A chunk that must change codec changes size, so the whole-group copy
+    // below cannot place it; take the per-chunk path for every column.
+    var all_kept: ?[]bool = null;
+    if (kept_set == null) if (recompress) |rc| {
+        for (rg.columns.items) |chunk| {
+            const m = chunk.meta_data orelse return error.InvalidColumnOffsets;
+            if (m.codec == rc.codec) continue;
+            all_kept = try out_arena.alloc(bool, rg.columns.items.len);
+            @memset(all_kept.?, true);
+            break;
+        }
+    };
+    const kept_eff: ?[]const bool = kept_set orelse all_kept;
+
+    var out: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset.*) };
+    defer out_offset.* = out.offset;
+
+    if (kept_eff) |kept| {
         var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
         try new_cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
         var rg_total: i64 = 0;
@@ -1566,29 +1689,31 @@ pub fn copyRG(
         for (kept, 0..) |b, ci| {
             if (!b) continue;
             if (ci >= rg.columns.items.len) return error.BadColumnIndex;
-            const src_chunk = rg.columns.items[ci];
+            const src_chunk = &rg.columns.items[ci];
             const m = src_chunk.meta_data orelse return error.InvalidColumnOffsets;
-            const src_start: usize = if (m.dictionary_page_offset) |d| @intCast(d) else @intCast(m.data_page_offset);
-            const src_len: usize = @intCast(m.total_compressed_size);
-            const buf_off = src_start - @as(usize, @intCast(src.byte_origin));
-            if (buf_off + src_len > src.bytes.len) return error.MissingChunkBytes;
-            const slice = src.bytes[buf_off .. buf_off + src_len];
+            const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
+            const slice = try sourceBytes(src, range);
 
-            const new_col_start = out_offset.*;
-            const t_sink_start = nowMonoNs();
-            try sink.write(slice);
-            timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
-            out_offset.* += src_len;
-
-            const delta: i64 = @as(i64, @intCast(new_col_start)) - @as(i64, @intCast(src_start));
-            // Carry the page index forward, written to the sink right
-            // after this chunk's data (offsets rebased by `delta`).
-            const idx = if (emit_page_index)
-                try carryIndexToSink(out_arena, sink, out_offset, src, src_chunk, delta)
-            else
-                fastpath.PageIndexPtrs{};
-            try new_cols.append(out_arena, shiftChunkWithIndex(src_chunk, delta, idx));
-            rg_total += @intCast(src_len);
+            if (recompress) |rc| if (m.codec != rc.codec) {
+                const written = try copyChunkRecompressed(
+                    rc,
+                    src,
+                    src_chunk.*,
+                    slice,
+                    range.start,
+                    &out,
+                    timings,
+                    emit_page_index,
+                );
+                try new_cols.append(out_arena, written);
+                rg_total += written.meta_data.?.total_compressed_size;
+                continue;
+            };
+            const delta = offsetDelta(out.pos(), range.start);
+            try timedWrite(&out, slice, timings);
+            // Carry the page index forward, written right after this chunk's data.
+            try new_cols.append(out_arena, try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index));
+            rg_total += @intCast(range.len);
         }
 
         return .{
@@ -1601,10 +1726,8 @@ pub fn copyRG(
         };
     }
 
-    // No projection: compute this RG's bounding box
-    // [min_col_start, max_col_end) from the column metadata, copy
-    // just that slice, then shift every chunk's offset by a single
-    // delta.
+    // No projection: copy this RG's bounding box [min_col_start,
+    // max_col_end), then shift every chunk's offset by a single delta.
     //
     // We compute the bounding box internally rather than trusting
     // the caller because the contract is easy to get wrong — passing
@@ -1612,78 +1735,483 @@ pub fn copyRG(
     // worth of bytes once per RG (an N-row-group file produces N×
     // output bloat). Production callers pass the whole-file bytes;
     // this branch makes that safe.
-    var rg_min: u64 = std.math.maxInt(u64);
-    var rg_max: u64 = 0;
-    for (rg.columns.items) |chunk| {
-        const m = chunk.meta_data orelse return error.InvalidColumnOffsets;
-        const start: u64 = if (m.dictionary_page_offset) |d| @intCast(d) else @intCast(m.data_page_offset);
-        const end: u64 = start + @as(u64, @intCast(m.total_compressed_size));
-        if (start < rg_min) rg_min = start;
-        if (end > rg_max) rg_max = end;
-    }
-    if (rg_min == std.math.maxInt(u64)) return error.InvalidColumnOffsets;
+    for (rg.columns.items) |chunk| if (chunk.meta_data == null) return error.InvalidColumnOffsets;
+    const range = try fastpath.rowGroupByteRange(rg, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
+    const rg_slice = try sourceBytes(src, range);
 
-    const buf_off: usize = @intCast(rg_min - @as(u64, @intCast(src.byte_origin)));
-    const slice_len: usize = @intCast(rg_max - rg_min);
-    if (buf_off + slice_len > src.bytes.len) return error.MissingChunkBytes;
-    const rg_slice = src.bytes[buf_off .. buf_off + slice_len];
-
-    const new_start = out_offset.*;
-    const t_sink_start = nowMonoNs();
-    try sink.write(rg_slice);
-    timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
-    out_offset.* += slice_len;
-    const delta: i64 = @as(i64, @intCast(new_start)) - @as(i64, @intCast(rg_min));
+    const delta = offsetDelta(out.pos(), range.start);
+    try timedWrite(&out, rg_slice, timings);
 
     var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     try cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
-    for (rg.columns.items) |chunk| {
-        // Whole-RG copy: one delta for the group. Index bytes for each
-        // chunk are appended after the RG data block, in column order.
-        const idx = if (emit_page_index)
-            try carryIndexToSink(out_arena, sink, out_offset, src, chunk, delta)
-        else
-            fastpath.PageIndexPtrs{};
-        try cols.append(out_arena, shiftChunkWithIndex(chunk, delta, idx));
+    // Whole-RG copy: one delta for the group. Index bytes for each
+    // chunk are appended after the RG data block, in column order.
+    for (rg.columns.items) |*chunk| {
+        try cols.append(out_arena, try carryChunk(out_arena, &out, src, chunk, delta, emit_page_index));
     }
 
     return .{
         .surviving_rows = rg.num_rows,
         .rg = .{
             .columns = cols,
-            .total_byte_size = @intCast(slice_len),
+            .total_byte_size = @intCast(range.len),
             .num_rows = rg.num_rows,
         },
     };
 }
 
-/// Clone a ColumnChunk with all in-stream offsets shifted by `delta`,
-/// dropping the offset/column-index pointers (we don't currently
-/// re-emit page indexes — caller's footer omits them).
-fn shiftChunk(src: schema.ColumnChunk, delta: i64) schema.ColumnChunk {
-    var out = src;
-    out.offset_index_offset = null;
-    out.offset_index_length = null;
-    out.column_index_offset = null;
-    out.column_index_length = null;
-    if (out.meta_data) |*m| {
-        m.data_page_offset += delta;
-        if (m.dictionary_page_offset) |d| m.dictionary_page_offset = d + delta;
-        if (m.index_page_offset) |d| m.index_page_offset = d + delta;
-    }
-    if (out.meta_data) |m| out.file_offset = m.data_page_offset;
-    return out;
+/// The bytes of `range`, a span of the source file, in `src`. An S3 input holds only the chunks its plan fetched, so
+/// one outside them is MissingChunkBytes.
+fn sourceBytes(src: RGSrc, range: fastpath.ByteRange) ![]const u8 {
+    const origin: usize = @intCast(src.byte_origin);
+    if (range.start < origin) return error.MissingChunkBytes;
+    const off = range.start - origin;
+    if (off > src.bytes.len or range.len > src.bytes.len - off) return error.MissingChunkBytes;
+    return src.bytes[off..][0..range.len];
 }
 
-/// `shiftChunk` with the page-index pointers set to the carried-forward
-/// locations instead of dropped.
-fn shiftChunkWithIndex(src: schema.ColumnChunk, delta: i64, idx: fastpath.PageIndexPtrs) schema.ColumnChunk {
-    var out = shiftChunk(src, delta);
-    out.offset_index_offset = idx.offset_index_offset;
-    out.offset_index_length = idx.offset_index_length;
-    out.column_index_offset = idx.column_index_offset;
-    out.column_index_length = idx.column_index_length;
-    return out;
+fn offsetDelta(new_start: usize, src_start: usize) i64 {
+    return @as(i64, @intCast(new_start)) - @as(i64, @intCast(src_start));
+}
+
+fn timedWrite(out: *streaming.SinkOut, bytes: []const u8, timings: *Timings) !void {
+    const t_sink_start = nowMonoNs();
+    try out.write(bytes);
+    timings.sink_ns += @intCast(nowMonoNs() - t_sink_start);
+}
+
+/// A copied chunk's metadata, offsets moved by `delta`, with its page index carried into `out` when the output
+/// keeps one.
+fn carryChunk(
+    out_arena: std.mem.Allocator,
+    out: *streaming.SinkOut,
+    src: RGSrc,
+    chunk: *const schema.ColumnChunk,
+    delta: i64,
+    emit_page_index: bool,
+) !schema.ColumnChunk {
+    return if (emit_page_index)
+        fastpath.rebaseChunk(out_arena, out, src.bytes, chunk, delta)
+    else
+        fastpath.shiftChunk(chunk, delta);
+}
+
+/// A codec change requested of a byte copy. `scratch` backs the per-chunk
+/// working memory, released once the chunk is written.
+pub const Recompress = struct {
+    codec: schema.CompressionCodec,
+    scratch: std.mem.Allocator,
+};
+
+/// One page of a recompressed chunk: where it started in the source chunk,
+/// and where it starts and how long it is (header included) in the output.
+const PageMove = struct { src_off: usize, dst_off: usize, dst_len: usize };
+
+const RecompressedChunk = struct {
+    bytes: []const u8,
+    pages: []const PageMove,
+    /// Output size change of the page headers, which `total_uncompressed_size` counts.
+    header_delta: i64,
+};
+
+/// Rewrite every page of a column chunk from codec `from` to codec `to`.
+/// Only compressed payloads change: v1 data and dictionary pages are
+/// recompressed whole, a v2 page's values section (its levels are never
+/// compressed), and a v2 page stored uncompressed is kept as is. Each
+/// header is re-emitted field by field with the new compressed size and
+/// without its CRC, which covered the old bytes; everything else in it,
+/// page statistics included, is carried over unchanged.
+fn recompressChunk(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    from: schema.CompressionCodec,
+    to: schema.CompressionCodec,
+) !RecompressedChunk {
+    var out: std.ArrayList(u8) = .empty;
+    var pages: std.ArrayList(PageMove) = .empty;
+    var header_delta: i64 = 0;
+    var pos: usize = 0;
+    while (pos < chunk.len) {
+        var r = thrift.Reader.init(chunk[pos..]);
+        const h = try schema.PageHeader.read(&r);
+        const hdr_len = r.pos;
+        if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return error.BadPageHeader;
+        const body_len: usize = @intCast(h.compressed_page_size);
+        if (body_len > chunk.len - pos - hdr_len) return error.TruncatedPage;
+        const body = chunk[pos + hdr_len ..][0..body_len];
+        const raw_len: usize = @intCast(h.uncompressed_page_size);
+
+        var new_body: []const u8 = body;
+        switch (h.type) {
+            .DATA_PAGE, .DICTIONARY_PAGE => new_body = try recode(arena, body, from, to, raw_len),
+            .DATA_PAGE_V2 => {
+                const v2 = h.data_page_header_v2 orelse return error.BadPageHeader;
+                if (v2.is_compressed) {
+                    if (v2.definition_levels_byte_length < 0 or v2.repetition_levels_byte_length < 0) return error.BadPageHeader;
+                    const levels: usize = @as(usize, @intCast(v2.definition_levels_byte_length)) +
+                        @as(usize, @intCast(v2.repetition_levels_byte_length));
+                    if (levels > body.len or levels > raw_len) return error.BadPageHeader;
+                    const values = try recode(arena, body[levels..], from, to, raw_len - levels);
+                    const joined = try arena.alloc(u8, levels + values.len);
+                    @memcpy(joined[0..levels], body[0..levels]);
+                    @memcpy(joined[levels..], values);
+                    new_body = joined;
+                }
+            },
+            // Index pages carry no compressed payload.
+            .INDEX_PAGE => {},
+        }
+
+        const new_hdr = try patchPageHeader(arena, chunk[pos..][0..hdr_len], @intCast(new_body.len));
+        try pages.append(arena, .{ .src_off = pos, .dst_off = out.items.len, .dst_len = new_hdr.len + new_body.len });
+        try out.appendSlice(arena, new_hdr);
+        try out.appendSlice(arena, new_body);
+        header_delta += @as(i64, @intCast(new_hdr.len)) - @as(i64, @intCast(hdr_len));
+        pos += hdr_len + body_len;
+    }
+    return .{ .bytes = out.items, .pages = pages.items, .header_delta = header_delta };
+}
+
+fn recode(
+    arena: std.mem.Allocator,
+    body: []const u8,
+    from: schema.CompressionCodec,
+    to: schema.CompressionCodec,
+    raw_len: usize,
+) ![]const u8 {
+    const raw = try compression.decompress(arena, body, from, raw_len);
+    return compression.compress(arena, raw, to);
+}
+
+/// Re-emit a serialized PageHeader with `compressed_page_size` replaced and
+/// `crc` dropped, copying every other top-level field's bytes verbatim.
+fn patchPageHeader(arena: std.mem.Allocator, header: []const u8, compressed_size: i32) ![]const u8 {
+    var r = thrift.Reader.init(header);
+    var w = thrift.Writer.init(arena);
+    r.readStructBegin();
+    w.writeStructBegin();
+    while (true) {
+        const f = try r.readFieldBegin();
+        if (f.type == .Stop) break;
+        const start = r.pos;
+        try r.skip(f.type);
+        switch (f.id) {
+            3 => try w.writeFieldI32(3, compressed_size),
+            4 => {},
+            else => {
+                try w.writeFieldBegin(f.type, f.id);
+                try w.writeBytes(header[start..r.pos]);
+            },
+        }
+    }
+    try w.writeStructEnd();
+    return w.bytes();
+}
+
+/// The output offset of the page that started `src_rel` bytes into the source chunk.
+fn movedPage(pages: []const PageMove, src_rel: i64) ?PageMove {
+    if (src_rel < 0) return null;
+    const want: usize = @intCast(src_rel);
+    // Pages are recorded in chunk order, so `src_off` ascends.
+    var lo: usize = 0;
+    var hi: usize = pages.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (pages[mid].src_off < want) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < pages.len and pages[lo].src_off == want) pages[lo] else null;
+}
+
+/// Where an offset `src_rel` bytes into the source chunk lands in the
+/// recompressed one: the same page when it names a page start, else the next
+/// page start (or the end). Writers do record offsets that name no page, such
+/// as a `data_page_offset` of 0 on a chunk holding only a dictionary page.
+fn relocated(re: RecompressedChunk, src_rel: i64) usize {
+    if (movedPage(re.pages, src_rel)) |p| return p.dst_off;
+    for (re.pages) |p| if (@as(i64, @intCast(p.src_off)) >= src_rel) return p.dst_off;
+    return re.bytes.len;
+}
+
+/// Byte-copy path for a chunk whose codec differs from the requested one:
+/// recompress its pages, write them at `out_offset`, and return the chunk's
+/// metadata pointing at them. The page index follows the pages (ColumnIndex
+/// unchanged, OffsetIndex locations remapped); if a location does not land on
+/// a page start, both are dropped rather than written wrong.
+fn copyChunkRecompressed(
+    rc: Recompress,
+    src: RGSrc,
+    src_chunk: schema.ColumnChunk,
+    slice: []const u8,
+    src_start: usize,
+    out: *streaming.SinkOut,
+    timings: *Timings,
+    emit_page_index: bool,
+) !schema.ColumnChunk {
+    var scratch_state = std.heap.ArenaAllocator.init(rc.scratch);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const m = src_chunk.meta_data.?;
+
+    const t_encode = nowMonoNs();
+    const re = recompressChunk(scratch, slice, m.codec, rc.codec) catch |err| {
+        if (err == error.UnsupportedCodec) {
+            std.debug.print("zpq: cannot recompress column `{s}` to {s}: its pages use {s}, which zpq cannot decompress\n", .{
+                if (m.path_in_schema.items.len > 0) m.path_in_schema.items[m.path_in_schema.items.len - 1] else "?",
+                @tagName(rc.codec),
+                @tagName(m.codec),
+            });
+        }
+        return err;
+    };
+    timings.encode_ns += @intCast(nowMonoNs() - t_encode);
+
+    const new_start: i64 = @intCast(out.pos());
+    try timedWrite(out, re.bytes, timings);
+
+    const src_base: i64 = @intCast(src_start);
+    var chunk = src_chunk;
+    var meta = m;
+    meta.codec = rc.codec;
+    meta.total_compressed_size = @intCast(re.bytes.len);
+    meta.total_uncompressed_size += re.header_delta;
+    meta.data_page_offset = new_start + @as(i64, @intCast(relocated(re, m.data_page_offset - src_base)));
+    if (m.dictionary_page_offset) |d| {
+        meta.dictionary_page_offset = new_start + @as(i64, @intCast(relocated(re, d - src_base)));
+    }
+    meta.index_page_offset = if (m.index_page_offset) |ip|
+        if (movedPage(re.pages, ip - src_base)) |p| new_start + @as(i64, @intCast(p.dst_off)) else null
+    else
+        null;
+    chunk.meta_data = meta;
+    chunk.file_offset = meta.data_page_offset;
+    chunk.offset_index_offset = null;
+    chunk.offset_index_length = null;
+    chunk.column_index_offset = null;
+    chunk.column_index_length = null;
+    if (!emit_page_index) return chunk;
+
+    // The OffsetIndex is carried when every location remaps onto a page
+    // start; the ColumnIndex only beside it, since its pages are found
+    // through those locations.
+    const oo = src_chunk.offset_index_offset orelse return chunk;
+    const ol = src_chunk.offset_index_length orelse return chunk;
+    const oi_bytes = originSlice(src, oo, ol) orelse return chunk;
+    var oi_reader = thrift.Reader.init(oi_bytes);
+    var oi = schema.OffsetIndex.read(scratch, &oi_reader) catch return chunk;
+    for (oi.page_locations.items) |*loc| {
+        const p = movedPage(re.pages, loc.offset - src_base) orelse return chunk;
+        loc.offset = new_start + @as(i64, @intCast(p.dst_off));
+        loc.compressed_page_size = @intCast(p.dst_len);
+    }
+    var oi_w = thrift.Writer.init(scratch);
+    oi.write(&oi_w) catch return chunk;
+
+    if (src_chunk.column_index_offset) |co| if (src_chunk.column_index_length) |cl| {
+        if (originSlice(src, co, cl)) |ci_bytes| if (fastpath.reserializeColumnIndex(scratch, ci_bytes)) |ci_ser| {
+            chunk.column_index_offset = @intCast(out.pos());
+            chunk.column_index_length = @intCast(ci_ser.len);
+            try out.write(ci_ser);
+        };
+    };
+    chunk.offset_index_offset = @intCast(out.pos());
+    chunk.offset_index_length = @intCast(oi_w.bytes().len);
+    try out.write(oi_w.bytes());
+    return chunk;
+}
+
+/// Whether a chunk's ColumnIndex is fit to prune pages with. Page pruning and the always-match fill act on these
+/// claims without decoding, so one the footer or the OffsetIndex can contradict for free is dropped whole and the
+/// chunk reads as if it had no page index: a writer that got one claim wrong cannot be trusted on its neighbours.
+///
+/// The contradictions checked:
+///   - per-page lists whose lengths disagree with the OffsetIndex page count;
+///   - a negative null count, which no page can have;
+///   - a page flagged all-null on a leaf with no optional or repeated ancestor (max definition level 0), which
+///     cannot hold a null at all;
+///   - for a non-repeated leaf, whose entries are its rows, a page flagged all-null whose null count is not its row
+///     count, or null pages covering more rows than the chunk's own statistics say are null.
+///
+/// Writers that collected no page statistics are known to flag every page null and record -1 null counts, while
+/// the pages hold ordinary values; trusting them drops every row.
+pub fn pageIndexIsPlausible(
+    ci: *const schema.ColumnIndex,
+    oi: *const schema.OffsetIndex,
+    cm: schema.ColumnMetaData,
+    levels: schema.Levels,
+    rg_rows: i64,
+) bool {
+    const locs = oi.page_locations.items;
+    const n = locs.len;
+    if (ci.null_pages.items.len != n or ci.min_values.items.len != n or ci.max_values.items.len != n) return false;
+    if (ci.null_counts) |nc| {
+        if (nc.items.len != n) return false;
+        for (nc.items) |c| if (c < 0) return false;
+    }
+
+    var null_page_rows: i64 = 0;
+    for (ci.null_pages.items, 0..) |is_null, i| {
+        if (!is_null) continue;
+        if (levels.max_def == 0) return false;
+        // A repeated leaf's counts are entries, not rows; only the flag itself is checked there.
+        if (levels.max_rep > 0) continue;
+        const end = if (i + 1 < n) locs[i + 1].first_row_index else rg_rows;
+        const rows = end - locs[i].first_row_index;
+        if (ci.null_counts) |nc| if (nc.items[i] != rows) return false;
+        null_page_rows += rows;
+    }
+    if (levels.max_rep == 0) {
+        if (cm.statistics) |s| if (s.null_count) |chunk_nulls| {
+            if (null_page_rows > chunk_nulls) return false;
+        };
+    }
+    return true;
+}
+
+/// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
+/// page's `first_row_index` slices the row selection, so the arrays must agree in length and the row starts must be
+/// in range and non-decreasing. Page offsets and sizes are checked again where the pages are read.
+fn pageIndexUsable(ci: schema.ColumnIndex, oi: schema.OffsetIndex, num_rows: usize) bool {
+    const locs = oi.page_locations.items;
+    if (ci.null_pages.items.len != locs.len) return false;
+    if (ci.min_values.items.len != locs.len or ci.max_values.items.len != locs.len) return false;
+    if (ci.null_counts) |nc| if (nc.items.len != locs.len) return false;
+    var prev: i64 = 0;
+    for (locs) |loc| {
+        if (loc.offset < 0 or loc.compressed_page_size < 0) return false;
+        if (loc.first_row_index < prev) return false;
+        if (loc.first_row_index > num_rows) return false;
+        prev = loc.first_row_index;
+    }
+    return true;
+}
+
+test "pageIndexUsable rejects page indexes whose arrays or row starts disagree" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var ci: schema.ColumnIndex = .{};
+    var oi: schema.OffsetIndex = .{};
+    for ([_]i64{ 0, 10, 20 }) |first| {
+        try ci.null_pages.append(a, false);
+        try ci.min_values.append(a, "");
+        try ci.max_values.append(a, "");
+        try oi.page_locations.append(a, .{ .offset = 4 + first, .compressed_page_size = 8, .first_row_index = first });
+    }
+    try testing.expect(pageIndexUsable(ci, oi, 30));
+    try testing.expect(!pageIndexUsable(ci, oi, 19)); // a page starts past the row group
+
+    oi.page_locations.items[2].first_row_index = 5; // goes backwards
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+    oi.page_locations.items[2].first_row_index = 20;
+
+    oi.page_locations.items[0].first_row_index = -1;
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+    oi.page_locations.items[0].first_row_index = 0;
+
+    _ = ci.min_values.pop(); // ColumnIndex shorter than OffsetIndex
+    try testing.expect(!pageIndexUsable(ci, oi, 30));
+}
+
+/// A decoded column must describe exactly its row group's rows: a flat column one value per row, a repeated one
+/// `num_rows` record starts (repetition level 0), the first entry among them. Filters, the selection vector and the
+/// output aggregator all walk every column against `num_rows`, so a chunk whose counts or levels disagree is corrupt.
+/// O(1) for flat columns; a pass over the levels for repeated ones.
+pub fn checkRowShape(col: filter_eval.Batch.Column, num_rows: usize) error{ColumnRowCountMismatch}!void {
+    switch (col) {
+        inline else => |c| {
+            if (c.rep_levels) |rl| {
+                if (rl.len > 0 and rl[0] != 0) return error.ColumnRowCountMismatch;
+                var starts: usize = 0;
+                for (rl) |r| starts += @intFromBool(r == 0);
+                if (starts != num_rows) return error.ColumnRowCountMismatch;
+            } else if (c.values.len != num_rows) return error.ColumnRowCountMismatch;
+            if (c.def_levels) |dl| if (dl.len != c.values.len) return error.ColumnRowCountMismatch;
+        },
+    }
+}
+
+/// One uncompressed page: header + body.
+fn pageForTest(arena: std.mem.Allocator, header: schema.PageHeader, body: []const u8) ![]u8 {
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, w.bytes());
+    try out.appendSlice(arena, body);
+    return out.items;
+}
+
+test "a page claiming more values than its chunk is rejected before sizing buffers from the claim" {
+    // A few bytes can claim any count: one RLE def-level run of N present values. The level buffer used to be
+    // sized from that claim, so a one-row chunk could make the reader allocate gigabytes.
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const claimed: u32 = 1 << 24;
+    var body: std.ArrayList(u8) = .empty;
+    var run: [8]u8 = undefined; // ULEB128 run header (claimed << 1), then the 1-byte value
+    var n: u32 = claimed << 1;
+    var len: usize = 0;
+    while (true) : (len += 1) {
+        run[len] = @truncate(n & 0x7f);
+        n >>= 7;
+        if (n == 0) break;
+        run[len] |= 0x80;
+    }
+    len += 1;
+    run[len] = 1;
+    len += 1;
+    var prefix: [4]u8 = undefined;
+    std.mem.writeInt(u32, &prefix, @intCast(len), .little);
+    try body.appendSlice(a, &prefix);
+    try body.appendSlice(a, run[0..len]);
+    try body.appendSlice(a, &[_]u8{ 42, 0, 0, 0 });
+    const page = try pageForTest(a, .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = .{ .num_values = claimed, .encoding = .PLAIN, .definition_level_encoding = .RLE, .repetition_level_encoding = .RLE },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    }, body.items);
+    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    try testing.expectError(error.PageValueCountExceedsChunk, decodeColumnT(i32, a, page, .UNCOMPRESSED, optional, 1));
+
+    // A dictionary page claiming far more entries than its bytes can hold.
+    const dict_body = [_]u8{ 1, 0, 0, 0, 'a' };
+    const dict_page = try pageForTest(a, .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = dict_body.len,
+        .compressed_page_size = dict_body.len,
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = .{ .num_values = 1 << 20, .encoding = .PLAIN, .is_sorted = null },
+        .data_page_header_v2 = null,
+    }, &dict_body);
+    const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    try testing.expectError(error.DictionaryLargerThanPage, decodeColumnT([]const u8, a, dict_page, .UNCOMPRESSED, required, 1));
+}
+
+test "checkRowShape ties flat and repeated columns to the row count" {
+    const testing = std.testing;
+    try checkRowShape(.{ .i32 = .{ .values = &.{ 1, 2, 3 } } }, 3);
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(.{ .i32 = .{ .values = &.{ 1, 2 } } }, 3));
+    // Repeated: three records, the second holding two entries.
+    const rep = filter_eval.Batch.Column{ .i32 = .{
+        .values = &.{ 1, 2, 3, 4 },
+        .def_levels = &.{ 1, 1, 1, 1 },
+        .max_def = 1,
+        .rep_levels = &.{ 0, 0, 1, 0 },
+        .max_rep = 1,
+    } };
+    try checkRowShape(rep, 3);
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(rep, 4));
+    const no_start = filter_eval.Batch.Column{ .i32 = .{ .values = &.{1}, .rep_levels = &.{1}, .max_rep = 1 } };
+    try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(no_start, 1));
 }
 
 /// Slice the source page-index bytes for a chunk out of `src.bytes`,
@@ -1699,50 +2227,8 @@ fn originSlice(src: RGSrc, file_off: i64, len: i32) ?[]const u8 {
     return src.bytes[buf_off .. buf_off + l];
 }
 
-/// Re-serialize the source chunk's page index to the sink (ColumnIndex
-/// verbatim, OffsetIndex offsets rebased by `delta`), returning the new
-/// output-relative pointers. Absent/unfetched/unparseable → null
-/// pointers (page index dropped; readers fall back to RG-level pruning).
-fn carryIndexToSink(
-    out_arena: std.mem.Allocator,
-    sink: streaming.Sink,
-    out_offset: *u64,
-    src: RGSrc,
-    src_chunk: schema.ColumnChunk,
-    delta: i64,
-) !fastpath.PageIndexPtrs {
-    var ptrs = fastpath.PageIndexPtrs{};
-
-    if (src_chunk.column_index_offset) |co| if (src_chunk.column_index_length) |cl| {
-        if (originSlice(src, co, cl)) |bytes| {
-            if (fastpath.reserializeColumnIndex(out_arena, bytes)) |ser| {
-                ptrs.column_index_offset = @intCast(out_offset.*);
-                try sink.write(ser);
-                out_offset.* += ser.len;
-                ptrs.column_index_length = @intCast(ser.len);
-            }
-        }
-    };
-
-    if (src_chunk.offset_index_offset) |oo| if (src_chunk.offset_index_length) |ol| {
-        if (originSlice(src, oo, ol)) |bytes| {
-            if (fastpath.reserializeOffsetIndexShifted(out_arena, bytes, delta)) |ser| {
-                ptrs.offset_index_offset = @intCast(out_offset.*);
-                try sink.write(ser);
-                out_offset.* += ser.len;
-                ptrs.offset_index_length = @intCast(ser.len);
-            }
-        }
-    };
-
-    return ptrs;
-}
-
-/// Decode an entire column chunk into a `ColumnT(T)` view: values
-/// plus def_levels (OPTIONAL) and optionally rep_levels (LIST/MAP).
-/// `num_leaves` is the column chunk's `num_values` from metadata
-/// (counts LEAVES, not logical rows — for nested cols this can be
-/// larger than the RG's row count).
+/// A chunk's page index resolved against the filter: which pages to skip,
+/// which the filter matches in full, and where each page lies.
 pub const PruningInfo = struct {
     locations: []const schema.PageLocation,
     page_is_skipped: []const bool,
@@ -1770,6 +2256,7 @@ fn decodeWithReaderPruned(
     num_leaves: usize,
     prune: PruningInfo,
 ) !filter_eval.ColumnT(T) {
+    reader.value_budget = num_leaves;
     const values = try arena.alloc(T, num_leaves);
     @memset(values, defaultVal(T));
 
@@ -1816,16 +2303,27 @@ fn decodeWithReaderPruned(
         _ = try reader.seekAndInstallDictionaryPage(dict_off, prune.chunk_file_offset);
     }
 
+    // Page row starts slice `values`, which is sized from the chunk's value count, not the row group's row count
+    // the index was checked against.
+    for (prune.locations) |loc| if (loc.first_row_index > num_leaves) return error.ShortDecode;
+
     // 2. Loop over pages and decode or skip
     for (prune.locations, 0..) |loc, pi| {
         const start: usize = @intCast(loc.first_row_index);
         const end: usize = if (pi + 1 < prune.locations.len) @intCast(prune.locations[pi + 1].first_row_index) else num_leaves;
 
         const is_skipped = prune.page_is_skipped[pi];
-        const is_always_match = prune.page_is_always_match[pi];
+        // An always-match page stands in for its rows with values that satisfy what the filter proved. On a page
+        // the ColumnIndex flags all-null that is `IS NULL`, so its rows must read as absent (definition level 0),
+        // not as present copies of the page minimum. A leaf without levels cannot express that: decode instead.
+        const null_page = pi < prune.col_index.null_pages.items.len and prune.col_index.null_pages.items[pi];
+        const is_always_match = prune.page_is_always_match[pi] and (!null_page or def_levels != null);
 
         if (is_skipped or is_always_match) {
-            if (is_always_match) {
+            if (is_always_match and null_page) {
+                @memset(values[start..end], defaultVal(T));
+                @memset(def_levels.?[start..end], 0);
+            } else if (is_always_match) {
                 const min_bytes = prune.col_index.min_values.items[pi];
                 const min_v = if (T == []const u8 or T == bool)
                     defaultVal(T)
@@ -1874,6 +2372,11 @@ fn decodeWithReaderPruned(
     };
 }
 
+/// Decode an entire column chunk into a `ColumnT(T)` view: values
+/// plus def_levels (OPTIONAL) and optionally rep_levels (LIST/MAP).
+/// `num_leaves` is the column chunk's `num_values` from metadata
+/// (counts LEAVES, not logical rows — for nested cols this can be
+/// larger than the RG's row count).
 pub fn decodeColumnTPruned(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -1883,12 +2386,13 @@ pub fn decodeColumnTPruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
     if (prune) |p| {
         return decodeWithReaderPruned(T, arena, &reader, levels, num_leaves, p);
     } else {
-        return decodeWithReader(T, arena, &reader, levels, num_leaves);
+        return decodeWithReader(T, &reader, num_leaves);
     }
 }
 
@@ -1900,8 +2404,9 @@ fn decodeFloat16ColumnAsF64Pruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(f64) {
-    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune, decode_options);
+    const cb = try decodeFlbaColumnPruned(arena, chunk, codec, levels, num_leaves, 2, prune, decode_options, scratch);
     const out = try arena.alloc(f64, cb.values.len);
     @memset(out, 0);
     for (cb.values, 0..) |bytes, i| {
@@ -1927,8 +2432,9 @@ fn decodeU32ColumnAsI64Pruned(
     num_leaves: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT(i64) {
-    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune, decode_options);
+    const c32 = try decodeColumnTPruned(i32, arena, chunk, codec, levels, num_leaves, prune, decode_options, scratch);
     const out = try arena.alloc(i64, c32.values.len);
     @memset(out, 0);
     for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
@@ -1950,6 +2456,7 @@ pub fn decodeFlbaColumnPruned(
     type_length: usize,
     prune: ?PruningInfo,
     decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
 ) !filter_eval.ColumnT([]const u8) {
     var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
         chunk,
@@ -1957,12 +2464,13 @@ pub fn decodeFlbaColumnPruned(
         levels,
         arena,
         decode_options,
+        scratch,
     );
     reader.type_length = type_length;
     if (prune) |p| {
         return decodeWithReaderPruned([]const u8, arena, &reader, levels, num_leaves, p);
     } else {
-        return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
+        return decodeWithReader([]const u8, &reader, num_leaves);
     }
 }
 
@@ -1986,8 +2494,8 @@ pub fn decodeColumnTWithOptions(
     num_leaves: usize,
     decode_options: DecodeOptions,
 ) !filter_eval.ColumnT(T) {
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options);
-    return decodeWithReader(T, arena, &reader, levels, num_leaves);
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, decode_options, null);
+    return decodeWithReader(T, &reader, num_leaves);
 }
 
 /// Fixed byte width of a FIXED_LEN_BYTE_ARRAY column from its SchemaElement
@@ -2079,99 +2587,26 @@ pub fn decodeFlbaColumnWithOptions(
         levels,
         arena,
         decode_options,
+        null,
     );
     reader.type_length = type_length;
-    return decodeWithReader([]const u8, arena, &reader, levels, num_leaves);
+    return decodeWithReader([]const u8, &reader, num_leaves);
 }
 
 fn decodeWithReader(
     comptime T: type,
-    arena: std.mem.Allocator,
     reader: *column_mod.ColumnChunkReader(T),
-    levels: schema.Levels,
     num_leaves: usize,
 ) !filter_eval.ColumnT(T) {
-    const values = try arena.alloc(T, num_leaves);
-    if (levels.max_rep > 0) {
-        const def_levels = try arena.alloc(u32, num_leaves);
-        const rep_levels = try arena.alloc(u32, num_leaves);
-        var written: usize = 0;
-        while (written < num_leaves) {
-            const n = reader.decodeWithRepLevels(values[written..], def_levels[written..], rep_levels[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        return .{
-            .values = values,
-            .def_levels = def_levels,
-            .max_def = @intCast(levels.max_def),
-            .rep_levels = rep_levels,
-            .max_rep = @intCast(levels.max_rep),
-            .has_nulls = reader.has_nulls,
-        };
-    }
-    if (levels.max_def > 0) {
-        var written: usize = 0;
-
-        // `--fast-levels`: try to get through the whole chunk without
-        // ever allocating the level array. `ColumnT.def_levels == null`
-        // then carries the same meaning it always has — every leaf is
-        // present — so nothing downstream needs to know this happened.
-        //
-        // Restricted to max_def == 1, the top-level OPTIONAL leaf that
-        // arrow/spark/pandas emit for every nullable flat column. At
-        // max_def >= 2 (an optional leaf under an optional group) a null
-        // def_levels would have to be re-synthesised as "max_def
-        // everywhere" by anything re-encoding the column, and
-        // encoder.zig's fallback writes level 1, not level max_def. Not
-        // worth widening for: the deeper shapes are rare, and they still
-        // get the per-page half of this in `decodePageSlice`.
-        const skip_levels = reader.options.fast_levels and levels.max_rep == 0 and levels.max_def == 1;
-        if (skip_levels) {
-            written = reader.decodeAllPresent(values) catch return error.ShortDecode;
-            if (written == num_leaves) {
-                return .{
-                    .values = values,
-                    .def_levels = null,
-                    .max_def = @intCast(levels.max_def),
-                    .has_nulls = reader.has_nulls,
-                };
-            }
-        }
-
-        // Either fast levels are off, or a page with nulls stopped the
-        // pass above. Everything already written came from all-present
-        // pages, so its levels are max_def by construction.
-        const def_levels = try arena.alloc(u32, num_leaves);
-        @memset(def_levels[0..written], @intCast(levels.max_def));
-        while (written < num_leaves) {
-            const n = reader.decodeWithLevels(values[written..], def_levels[written..]) catch return error.ShortDecode;
-            if (n == 0) break;
-            written += n;
-        }
-        if (written != num_leaves) return error.ShortDecode;
-        return .{
-            .values = values,
-            .def_levels = def_levels,
-            .max_def = @intCast(levels.max_def),
-            .has_nulls = reader.has_nulls,
-        };
-    }
-    var written: usize = 0;
-    while (written < num_leaves) {
-        const n = reader.decode(values[written..]) catch return error.ShortDecode;
-        if (n == 0) break;
-        written += n;
-    }
-    if (written != num_leaves) return error.ShortDecode;
-    return .{ .values = values };
-}
-
-fn nowMonoNs() i64 {
-    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+    const leaves = try reader.readAll(num_leaves);
+    return .{
+        .values = leaves.values,
+        .def_levels = leaves.def_levels,
+        .max_def = @intCast(reader.levels.max_def),
+        .rep_levels = leaves.rep_levels,
+        .max_rep = @intCast(reader.levels.max_rep),
+        .has_nulls = leaves.has_nulls,
+    };
 }
 
 // ============================================================
@@ -2183,7 +2618,6 @@ test "consumer: API is well-typed" {
     _ = encodeAggregator;
     _ = copyRG;
     _ = decodeColumnT;
-    _ = shiftChunk;
 }
 
 test "initOutputAggregator widens FLOAT16 passthrough to DOUBLE" {
@@ -2360,6 +2794,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
         &out_offset,
         &timings,
         true, // direct-to-file: emit page index
+        null,
     );
 
     // Bounding box for RG0 is [100, 160) = 60 bytes. Anything more
@@ -2673,4 +3108,205 @@ test "fast-levels: all-present pages on both sides of a null page" {
     try testing.expectEqualSlices(u32, off.def_levels.?, on.def_levels.?);
     try testing.expectEqualSlices(i32, &present, on.values[per_page * 2 ..]);
     for (on.def_levels.?[per_page * 2 ..]) |d| try testing.expectEqual(@as(u32, 1), d);
+}
+
+test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 reference" {
+    const ref: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+        .unsigned_64 = true,
+    } };
+    const elem = computedSchemaElem(.{ .expr = ref, .alias = "b" });
+    try std.testing.expect(schema.isUnsignedInt64(elem));
+    try std.testing.expectEqualStrings("b", elem.name);
+
+    var signed = ref;
+    signed.col_ref.unsigned_64 = false;
+    try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
+}
+
+test "pageIndexIsPlausible: corpus page indexes are kept except the ones their footers contradict" {
+    const testing = std.testing;
+    // Every parquet-testing file that carries a page index. The datapage_v1 trio flags every page of two REQUIRED
+    // columns null (with -1 null counts) while the pages hold values; the rest, int32_with_null_pages's genuine null
+    // pages included, must keep their index so page pruning still applies to them.
+    const Case = struct { path: []const u8, plausible: bool };
+    const cases = [_]Case{
+        .{ .path = "alltypes_tiny_pages.parquet", .plausible = true },
+        .{ .path = "alltypes_tiny_pages_plain.parquet", .plausible = true },
+        .{ .path = "binary_truncated_min_max.parquet", .plausible = true },
+        .{ .path = "data_index_bloom_encoding_stats.parquet", .plausible = true },
+        .{ .path = "data_index_bloom_encoding_with_length.parquet", .plausible = true },
+        .{ .path = "datapage_v2_empty_datapage.snappy.parquet", .plausible = true },
+        .{ .path = "delta_encoding_required_column.parquet", .plausible = true },
+        .{ .path = "fixed_length_byte_array.parquet", .plausible = true },
+        .{ .path = "floating_orders_nan_count.parquet", .plausible = true },
+        .{ .path = "int32_with_null_pages.parquet", .plausible = true },
+        .{ .path = "old_list_structure.parquet", .plausible = true },
+        .{ .path = "plain-dict-uncompressed-checksum.parquet", .plausible = true },
+        .{ .path = "repeated_primitive_no_list.parquet", .plausible = true },
+        .{ .path = "rle-dict-snappy-checksum.parquet", .plausible = true },
+        .{ .path = "datapage_v1-corrupt-checksum.parquet", .plausible = false },
+        .{ .path = "datapage_v1-snappy-compressed-checksum.parquet", .plausible = false },
+        .{ .path = "datapage_v1-uncompressed-checksum.parquet", .plausible = false },
+    };
+    for (cases) |case| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "data/parquet-testing/data/{s}", .{case.path});
+        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{path});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var indexed: usize = 0;
+        var rejected: usize = 0;
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
+            const cm = chunk.meta_data orelse continue;
+            const co: usize = @intCast(chunk.column_index_offset orelse continue);
+            const oo: usize = @intCast(chunk.offset_index_offset orelse continue);
+            var cr = thrift.Reader.init(bytes[co..][0..@intCast(chunk.column_index_length.?)]);
+            const col_index = try schema.ColumnIndex.read(arena.allocator(), &cr);
+            var orr = thrift.Reader.init(bytes[oo..][0..@intCast(chunk.offset_index_length.?)]);
+            const offset_index = try schema.OffsetIndex.read(arena.allocator(), &orr);
+            indexed += 1;
+            const levels = meta.getColumnLevels(cm.path_in_schema.items);
+            if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, rg.num_rows)) rejected += 1;
+        };
+        testing.expect(indexed > 0) catch |err| {
+            std.debug.print("{s}: no page index found\n", .{case.path});
+            return err;
+        };
+        const want_rejected: usize = if (case.plausible) 0 else indexed;
+        testing.expectEqual(want_rejected, rejected) catch |err| {
+            std.debug.print("{s}: rejected {d} of {d} page indexes\n", .{ case.path, rejected, indexed });
+            return err;
+        };
+    }
+}
+
+test "pageIndexIsPlausible: each contradiction drops the index on its own" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two pages of 10 and 6 rows; page 1 is all null.
+    var oi: schema.OffsetIndex = .{};
+    try oi.page_locations.appendSlice(a, &.{
+        .{ .offset = 4, .compressed_page_size = 10, .first_row_index = 0 },
+        .{ .offset = 14, .compressed_page_size = 10, .first_row_index = 10 },
+    });
+    const Fixture = struct {
+        fn index(alloc: std.mem.Allocator, null_pages: []const bool, null_counts: ?[]const i64) !schema.ColumnIndex {
+            var ci: schema.ColumnIndex = .{};
+            try ci.null_pages.appendSlice(alloc, null_pages);
+            for (null_pages) |np| {
+                const bound: []const u8 = if (np) "" else "\x01\x00\x00\x00";
+                try ci.min_values.append(alloc, bound);
+                try ci.max_values.append(alloc, bound);
+            }
+            if (null_counts) |nc| {
+                var list: std.ArrayListUnmanaged(i64) = .empty;
+                try list.appendSlice(alloc, nc);
+                ci.null_counts = list;
+            }
+            return ci;
+        }
+    };
+    const cm: schema.ColumnMetaData = .{
+        .type = .INT32,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 16,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 4,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    };
+    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    const repeated: schema.Levels = .{ .max_def = 2, .max_rep = 1 };
+
+    const good = try Fixture.index(a, &.{ false, true }, &.{ 2, 6 });
+    try testing.expect(pageIndexIsPlausible(&good, &oi, cm, optional, 16));
+    // Without null counts the flag alone is taken on an optional leaf.
+    const no_counts = try Fixture.index(a, &.{ false, true }, null);
+    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, cm, optional, 16));
+    // A null page on a leaf that cannot be null.
+    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, cm, required, 16));
+    // A required leaf with no null page is fine.
+    const all_values = try Fixture.index(a, &.{ false, false }, &.{ 0, 0 });
+    try testing.expect(pageIndexIsPlausible(&all_values, &oi, cm, required, 16));
+    // Negative null counts.
+    const negative = try Fixture.index(a, &.{ false, false }, &.{ -1, 0 });
+    try testing.expect(!pageIndexIsPlausible(&negative, &oi, cm, optional, 16));
+    // A null page whose null count is not its row count.
+    const short = try Fixture.index(a, &.{ false, true }, &.{ 0, 5 });
+    try testing.expect(!pageIndexIsPlausible(&short, &oi, cm, optional, 16));
+    // ...is only checked where entries are rows.
+    try testing.expect(pageIndexIsPlausible(&short, &oi, cm, repeated, 16));
+    // Null pages covering more rows than the chunk statistics count as null.
+    var with_stats = cm;
+    with_stats.statistics = .{ .null_count = 3 };
+    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
+    with_stats.statistics = .{ .null_count = 6 };
+    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
+    // Per-page lists that disagree with the OffsetIndex page count.
+    const one_page = try Fixture.index(a, &.{false}, null);
+    try testing.expect(!pageIndexIsPlausible(&one_page, &oi, cm, optional, 16));
+}
+
+test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
+    // tiny_pages: uncompressed v1 pages, dictionaries, no CRCs, so UNCOMPRESSED -> ZSTD -> UNCOMPRESSED must reproduce
+    // every header field and payload exactly. datapage_v2: v2 pages, whose levels stay outside the compressed values.
+    const testing = std.testing;
+    const Case = struct { path: []const u8, via: schema.CompressionCodec };
+    const cases = [_]Case{
+        .{ .path = "data/parquet-testing/data/alltypes_tiny_pages.parquet", .via = .ZSTD },
+        .{ .path = "data/parquet-testing/data/datapage_v2.snappy.parquet", .via = .GZIP },
+    };
+    for (cases) |case| {
+        const bytes = metadata.readFileSlice(case.path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{case.path});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pages: usize = 0;
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
+            const cm = chunk.meta_data.?;
+            const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+            const src = bytes[start..][0..@intCast(cm.total_compressed_size)];
+            // Normalise to UNCOMPRESSED first, so the comparison does not depend on one compressor's output.
+            const plain = try recompressChunk(a, src, cm.codec, .UNCOMPRESSED);
+            const there = try recompressChunk(a, plain.bytes, .UNCOMPRESSED, case.via);
+            const back = try recompressChunk(a, there.bytes, case.via, .UNCOMPRESSED);
+            try testing.expectEqualSlices(u8, plain.bytes, back.bytes);
+            if (cm.codec == .UNCOMPRESSED) try testing.expectEqualSlices(u8, src, plain.bytes);
+            try testing.expectEqual(plain.pages.len, there.pages.len);
+            // `there` was cut from `plain`, so each of its pages starts where `plain` put that page.
+            for (there.pages, plain.pages) |t, p| try testing.expectEqual(p.dst_off, t.src_off);
+            pages += there.pages.len;
+        };
+        try testing.expect(pages > 0);
+    }
 }

@@ -16,6 +16,7 @@
 //! Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
 //! optional `AWS_SESSION_TOKEN` are read from the environment.
 //! Lambda always sets these from the execution role.
+//! `S3_NO_SIGN_REQUEST=1` sends requests unsigned instead (public buckets).
 //!
 //! DNS: getaddrinfo via libc. Linking libc adds ~150 KB to the
 //! ReleaseSmall musl binary; rolling our own resolver is a future
@@ -24,7 +25,8 @@
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls.zig");
-const AtomicWorkCursor = @import("work_cursor.zig").AtomicWorkCursor;
+const work_cursor = @import("work_cursor.zig");
+const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
@@ -33,6 +35,7 @@ const retry = @import("retry.zig");
 
 pub const Pool = pool_mod.Pool;
 pub const PoolCriteria = pool_mod.Criteria;
+pub const AnyPool = pool_mod.AnyPool;
 
 /// Maximum concurrent in-flight requests against S3 (multipart parts
 /// or split sub-range fetches). Larger pools increase memory and TLS
@@ -57,6 +60,11 @@ pub const Error = error{
     NoRegion,
     BadS3Url,
     DnsFailed,
+    /// The endpoint host is an IPv4 address in a spelling other than a canonical dotted quad (`127.1`, `0x7f.0.0.1`,
+    /// `010.0.0.1`), which the resolver and the certificate check would read differently.
+    NonCanonicalIpEndpoint,
+    /// The endpoint host is an IPv6 address; connections are IPv4-only.
+    Ipv6EndpointUnsupported,
     BadResponse,
     SignFailed,
 } || tls.Error || http.Error || std.mem.Allocator.Error;
@@ -98,9 +106,25 @@ pub const Credentials = struct {
     /// `/bucket/key` rather than `bucket.host/key`) and SigV4 signs
     /// against the endpoint's hostname. AWS S3 stays virtual-hosted-
     /// style. Read from `S3_ENDPOINT_URL` env var by `fromEnv`.
+    /// The host may be a DNS name or an IPv4 address written as a dotted
+    /// quad; IPv6 endpoints (`https://[::1]:9000`) are not supported.
     endpoint: ?[]const u8 = null,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
+        // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
+        // requests: no keys are read, and the empty access key tells the
+        // signer to leave the Authorization header off. Only buckets that
+        // allow public access answer these.
+        if (env.getPosix("S3_NO_SIGN_REQUEST")) |v| {
+            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+                return .{
+                    .access_key = "",
+                    .secret_key = "",
+                    .region = env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion,
+                    .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+                };
+            }
+        }
         // `S3_*`-prefixed vars override `AWS_*`. This lets a Lambda
         // function target a non-AWS S3-compatible endpoint (R2, MinIO,
         // GCS in compat mode) without colliding with Lambda's
@@ -140,6 +164,10 @@ pub const Credentials = struct {
     /// the input. `http://minio:9000/` -> `minio`.
     pub fn endpointHost(self: Credentials) ?[]const u8 {
         var h = self.endpointAuthority() orelse return null;
+        if (h.len > 0 and h[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, h, ']') orelse return h;
+            return h[1..close];
+        }
         if (std.mem.lastIndexOfScalar(u8, h, ':')) |colon| {
             h = h[0..colon];
         }
@@ -162,7 +190,8 @@ pub const Credentials = struct {
     }
 
     pub fn endpointPort(self: Credentials) u16 {
-        const authority = self.endpointAuthority() orelse return 443;
+        var authority = self.endpointAuthority() orelse return 443;
+        if (std.mem.lastIndexOfScalar(u8, authority, ']')) |close| authority = authority[close + 1 ..];
         if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
             return std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch defaultPort(self.endpointUseTls());
         }
@@ -174,20 +203,33 @@ fn defaultPort(use_tls: bool) u16 {
     return if (use_tls) 443 else 80;
 }
 
+/// Whether requests name `bucket` in the host (virtual-hosted) rather than in the path. Only on AWS, and only for a
+/// bucket without dots: AWS's certificate covers `*.s3.<region>.amazonaws.com`, one label, so `my.bucket.s3...` fails
+/// hostname verification and dotted buckets go path-style, as the AWS SDKs send them.
+pub fn virtualHosted(creds: Credentials, bucket: []const u8) bool {
+    return creds.endpoint == null and std.mem.indexOfScalar(u8, bucket, '.') == null;
+}
+
 /// Construct the request hostname for `bucket` under these creds.
-/// AWS S3: `<bucket>.s3.<region>.amazonaws.com` (virtual-hosted).
+/// AWS S3: `<bucket>.s3.<region>.amazonaws.com` (virtual-hosted), or
+/// `s3.<region>.amazonaws.com` for a dotted bucket (path-style).
 /// Custom endpoint: the endpoint host (path-style; bucket is in the path).
 pub fn hostFor(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
     if (creds.endpointAuthority()) |h| {
         return arena.dupe(u8, h);
     }
-    return std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
+    return awsHost(arena, creds, bucket);
 }
 
 pub fn connectHostFor(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
     if (creds.endpointHost()) |h| {
         return arena.dupe(u8, h);
     }
+    return awsHost(arena, creds, bucket);
+}
+
+fn awsHost(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
+    if (!virtualHosted(creds, bucket)) return std.fmt.allocPrint(arena, "s3.{s}.amazonaws.com", .{creds.region});
     return std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
 }
 
@@ -202,18 +244,24 @@ pub fn useTls(creds: Credentials) bool {
 pub fn poolCriteria(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) !PoolCriteria {
     const host = try hostFor(arena, creds, bucket);
     const connect_host = try connectHostFor(arena, creds, bucket);
-    const addr = try resolveIpv4(arena, connect_host);
-    return .{ .host = host, .addr_v4 = addr, .port = portFor(creds), .use_tls = useTls(creds) };
+    const addrs = try resolveIpv4(arena, connect_host);
+    return .{ .host = host, .addrs = addrs, .port = portFor(creds), .use_tls = useTls(creds) };
 }
 
-pub fn connect(arena: std.mem.Allocator, creds: Credentials, addr_v4: []const u8, host: []const u8) Error!tls.Connection {
-    const port = portFor(creds);
-    if (useTls(creds)) return try tls.Connection.connect(arena, addr_v4, port, host);
-    return try tls.Connection.connectPlain(arena, addr_v4, port);
+/// A one-off connection to `host`, at the first of `addrs` that accepts.
+pub fn connect(
+    arena: std.mem.Allocator,
+    creds: Credentials,
+    addrs: []const tls.Ipv4,
+    host: []const u8,
+) Error!tls.Connection {
+    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds) };
+    if (useTls(creds)) return try tls.Connection.connect(arena, peer, host);
+    return try tls.Connection.connectPlain(arena, peer);
 }
 
-/// Construct the HTTP request path. AWS S3 (virtual-hosted): `/<key>`.
-/// Custom endpoint (path-style): `/<bucket>/<key>`. Both URI-encode the
+/// Construct the HTTP request path. Virtual-hosted: `/<key>`.
+/// Path-style (custom endpoint, dotted bucket): `/<bucket>/<key>`. Both URI-encode the
 /// key per RFC 3986 — both the path component and the SigV4 canonical
 /// URI MUST use this same encoding.
 pub fn pathFor(
@@ -223,7 +271,7 @@ pub fn pathFor(
     key: []const u8,
 ) ![]u8 {
     const encoded_key = try buildEncodedPath(arena, key);
-    if (creds.endpoint == null) return encoded_key;
+    if (virtualHosted(creds, bucket)) return encoded_key;
     // Path-style: prefix with /<bucket>. encoded_key already starts with `/`.
     return std.fmt.allocPrint(arena, "/{s}{s}", .{ bucket, encoded_key });
 }
@@ -263,7 +311,7 @@ pub const Client = struct {
     creds: Credentials,
     bucket: []const u8,
     host: []u8, // owned, in client_arena
-    addr_v4: []const u8, // owned, in client_arena
+    addrs: []const tls.Ipv4, // owned, in client_arena
     conn: ?tls.Connection,
 
     pub fn init(
@@ -273,13 +321,13 @@ pub const Client = struct {
     ) Error!Client {
         const host = try hostFor(client_arena, creds, bucket);
         const connect_host = try connectHostFor(client_arena, creds, bucket);
-        const addr_v4 = try resolveIpv4(client_arena, connect_host);
+        const addrs = try resolveIpv4(client_arena, connect_host);
         return .{
             .client_arena = client_arena,
             .creds = creds,
             .bucket = bucket,
             .host = host,
-            .addr_v4 = addr_v4,
+            .addrs = addrs,
             .conn = null,
         };
     }
@@ -303,7 +351,7 @@ pub const Client = struct {
         return self.sendOnce(req_arena, key, range) catch |err| switch (err) {
             // Stale-connection signals: server closed our idle socket
             // since the last request. Retry once with a fresh conn.
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
+            error.ClosedBeforeResponse, error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
                 if (self.conn) |*conn| {
                     conn.deinit();
                     self.conn = null;
@@ -321,7 +369,7 @@ pub const Client = struct {
         range: ?Range,
     ) Error!http.Response {
         if (self.conn == null) {
-            self.conn = try connect(self.client_arena, self.creds, self.addr_v4, self.host);
+            self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
         return try buildAndSend(
             req_arena,
@@ -347,7 +395,7 @@ pub const Client = struct {
         continuation_token: ?[]const u8,
     ) Error!ListPage {
         if (self.conn == null) {
-            self.conn = try connect(self.client_arena, self.creds, self.addr_v4, self.host);
+            self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
         return try sendListV2(
             req_arena,
@@ -420,17 +468,16 @@ pub fn put(
 ) Error!http.Response {
     const host = try hostFor(arena, creds, url.bucket);
     const connect_host = try connectHostFor(arena, creds, url.bucket);
-    const addr_v4 = try resolveIpv4(arena, connect_host);
-    var conn = try connect(arena, creds, addr_v4, host);
+    const addrs = try resolveIpv4(arena, connect_host);
+    var conn = try connect(arena, creds, addrs, host);
     defer conn.deinit();
     return try sendPut(arena, &conn, creds, host, url.bucket, url.key, body);
 }
 
 /// Same as `get`, but acquires a connection from the supplied pool
 /// instead of opening a fresh one. Caller is responsible for the
-/// pool's host matching `url.bucket`. Retries once on stale-connection
-/// errors (S3 closes idle connections after ~30s; the pool can hand
-/// out a closed slot when warm-container reuse spans that gap).
+/// pool's host matching `url.bucket`. A pooled connection found dead
+/// is retried at once on a new one; server errors back off (`retry`).
 pub fn getViaPool(
     io: Io,
     p: anytype,
@@ -461,53 +508,70 @@ pub fn getViaPoolWithOpts(
     url: Url,
     opts: GetOpts,
 ) !http.Response {
-    var throttled: ?http.Response = null;
-    var attempt: u8 = 0;
-    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
-        if (attempt > 0) try retry.sleepBackoff(io, retry.default_policy, attempt - 1);
-        const resp = getViaPoolOnce(io, p, arena, creds, url, opts) catch |err| switch (err) {
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
-            else => return err,
-        };
-        // Throttle/transient statuses (429/5xx) retry with backoff; any
-        // other status — including 304/403/404 — is a real answer the
-        // caller must interpret.
-        if (retry.retryableStatus(resp.status)) {
-            throttled = resp;
-            continue;
+    const host = try hostFor(arena, creds, url.bucket);
+    const criteria = try poolCriteria(arena, creds, url.bucket);
+    const Get = struct {
+        creds: Credentials,
+        host: []const u8,
+        url: Url,
+        opts: GetOpts,
+        fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return buildAndSend(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.opts);
         }
-        return resp;
-    }
-    // Budget exhausted on throttle: surface the last response so the
-    // caller sees the actual status instead of a connection error.
-    if (throttled) |r| return r;
-    return error.RecvFailed;
+    };
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
-fn getViaPoolOnce(
+pub const RequestOpts = struct {
+    /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the request.
+    idempotent: bool,
+};
+
+/// One request over pooled connections under the retry policy: `send(context, arena, conn)` performs one exchange and
+/// returns the response. Failing to get a connection (connect, TLS handshake) counts as a failed attempt on a fresh
+/// connection and backs off like one; a reused connection found dead retries at once on a new one; a throttle or
+/// server-error status backs off, and is returned as is once the budget runs out. Every other status is the answer.
+pub fn requestViaPool(
     io: Io,
     p: anytype,
     arena: std.mem.Allocator,
-    creds: Credentials,
-    url: Url,
-    opts: GetOpts,
+    criteria: PoolCriteria,
+    opts: RequestOpts,
+    context: anytype,
+    comptime send: fn (@TypeOf(context), std.mem.Allocator, *tls.Connection) anyerror!http.Response,
 ) !http.Response {
-    const host = try hostFor(arena, creds, url.bucket);
-    const criteria = try poolCriteria(arena, creds, url.bucket);
-    const handle = try p.acquire(io, criteria);
-    var released = false;
-    errdefer if (!released) p.discard(io, handle);
-
-    const resp = try buildAndSend(arena, handle.conn, creds, host, url.bucket, url.key, opts);
-
-    p.release(io, handle);
-    released = true;
-    return resp;
+    var throttled: ?http.Response = null;
+    var attempts: retry.Attempts = .{};
+    while (true) {
+        var last_err: anyerror = error.RetryableStatus;
+        const failure: retry.Failure = blk: {
+            const handle = p.acquire(io, criteria, .{ .fresh = attempts.fresh }) catch |err| {
+                last_err = err;
+                break :blk retry.classifyConnect(err);
+            };
+            if (send(context, arena, handle.conn)) |resp| {
+                p.release(io, handle);
+                if (!retry.retryableStatus(resp.status)) return resp;
+                throttled = resp;
+                break :blk .transient;
+            } else |err| {
+                p.discard(io, handle);
+                last_err = err;
+                break :blk retry.classify(err, .{ .idempotent = opts.idempotent, .reused = handle.reused });
+            }
+        };
+        if (failure == .fatal) return last_err;
+        if (!try attempts.retryAfter(io, failure)) {
+            // Out of budget: a throttled answer tells the caller more than the connection error does.
+            if (throttled) |r| return r;
+            return last_err;
+        }
+        p.noteRetry(io, failure);
+    }
 }
 
 /// Same as `put`, but acquires a connection from the supplied pool
-/// instead of opening a fresh one. Retries once on stale-connection
-/// errors (see getViaPool).
+/// instead of opening a fresh one, retrying as `getViaPool` does.
 pub fn putViaPool(
     io: Io,
     p: anytype,
@@ -516,43 +580,18 @@ pub fn putViaPool(
     url: Url,
     body: []const u8,
 ) !http.Response {
-    var throttled: ?http.Response = null;
-    var attempt: u8 = 0;
-    while (attempt < MAX_PARTS + 1) : (attempt += 1) {
-        if (attempt > 0) try retry.sleepBackoff(io, retry.default_policy, attempt - 1);
-        const resp = putViaPoolOnce(io, p, arena, creds, url, body) catch |err| switch (err) {
-            error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => continue,
-            else => return err,
-        };
-        if (retry.retryableStatus(resp.status)) {
-            throttled = resp;
-            continue;
-        }
-        return resp;
-    }
-    if (throttled) |r| return r;
-    return error.SendFailed;
-}
-
-fn putViaPoolOnce(
-    io: Io,
-    p: anytype,
-    arena: std.mem.Allocator,
-    creds: Credentials,
-    url: Url,
-    body: []const u8,
-) !http.Response {
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
-    const handle = try p.acquire(io, criteria);
-    var released = false;
-    errdefer if (!released) p.discard(io, handle);
-
-    const resp = try sendPut(arena, handle.conn, creds, host, url.bucket, url.key, body);
-
-    p.release(io, handle);
-    released = true;
-    return resp;
+    const Put = struct {
+        creds: Credentials,
+        host: []const u8,
+        url: Url,
+        body: []const u8,
+        fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return sendPut(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.body);
+        }
+    };
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .creds = creds, .host = host, .url = url, .body = body }, Put.send);
 }
 
 fn sendPut(
@@ -619,9 +658,8 @@ pub const FetchJob = struct {
 /// interchangeably through the same bounded pool, so multi-file scans
 /// share one global connection budget.
 ///
-/// `workers` is clamped to pool capacity and to the job count, but must not exceed the `Io`'s concurrency limit:
-/// `Io.Group.concurrent` rejects submissions past its limit rather than queueing them, and dispatch runs under `try`
-/// inside a `defer group.cancel`, so an over-large count cancels the batch.
+/// `workers` is clamped to pool capacity and to the job count. Workers start through `startWorkers`, so an `Io`
+/// whose concurrency limit is reached delays the batch instead of failing it.
 pub fn fetchJobs(
     io: Io,
     p: anytype, // *Pool(N) for some comptime N
@@ -663,7 +701,8 @@ pub fn fetchJobs(
 
     // 2. Resolve host+addr once per bucket. `Pool(N)` gates in-flight
     // requests globally, but idle TLS sessions are keyed by this criteria.
-    var hosts: std.StringHashMapUnmanaged(struct { host: []const u8, addr: []const u8, port: u16, use_tls: bool }) = .empty;
+    const HostInfo = struct { host: []const u8, addrs: []const tls.Ipv4, port: u16, use_tls: bool };
+    var hosts: std.StringHashMapUnmanaged(HostInfo) = .empty;
     defer hosts.deinit(arena);
     for (split.items) |j| {
         if (hosts.get(j.bucket) != null) continue;
@@ -672,7 +711,7 @@ pub fn fetchJobs(
         const a = try resolveIpv4(arena, connect_host);
         try hosts.put(arena, j.bucket, .{
             .host = h,
-            .addr = a,
+            .addrs = a,
             .port = portFor(creds),
             .use_tls = useTls(creds),
         });
@@ -683,16 +722,13 @@ pub fn fetchJobs(
     for (split.items, 0..) |j, i| {
         const hi = hosts.get(j.bucket).?;
         ctxs[i] = .{
-            .pool_ptr = @ptrCast(p),
-            .pool_acquire_fn = poolAcquireFn(@TypeOf(p.*)),
-            .pool_release_fn = poolReleaseFn(@TypeOf(p.*)),
-            .pool_discard_fn = poolDiscardFn(@TypeOf(p.*)),
+            .pool = AnyPool.of(p),
             .gpa = gpa,
             .creds = creds,
             .bucket = j.bucket,
             .key = j.key,
             .host = hi.host,
-            .addr_v4 = hi.addr,
+            .addrs = hi.addrs,
             .port = hi.port,
             .use_tls = hi.use_tls,
             .range = j.range,
@@ -705,22 +741,12 @@ pub fn fetchJobs(
     //    busy, and a worker parked on a blocking socket read is busy, so submitting every sub-job at once created far
     //    more threads than permits. Completion order is arbitrary either way — nothing may depend on it.
     var shared: AtomicWorkCursor(FetchCtx) = .{ .items = ctxs };
-    const Worker = struct {
-        fn run(loop_io: Io, sh: *AtomicWorkCursor(FetchCtx)) Io.Cancelable!void {
-            while (sh.next()) |ctx_ptr| try fetchOneTask(loop_io, ctx_ptr);
-        }
-    };
     var group: Io.Group = .init;
     defer group.cancel(io);
     // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
     // rather than as the bad argument it is.
-    const n_workers = if (ctxs.len == 0)
-        0
-    else
-        @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
-    for (0..n_workers) |_| {
-        try group.concurrent(io, Worker.run, .{ io, &shared });
-    }
+    const n_workers = @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
+    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
     try group.await(io);
 
     // 5. Tally + check for failures.
@@ -760,28 +786,14 @@ pub fn fetchManyRanges(
     return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
 }
 
-/// Type-erased view of `Pool(N).Handle` so the dispatch glue between
-/// `fetchManyRanges` / `uploadMultipart` and any `Pool(N)` instance
-/// can speak a common shape regardless of the comptime size.
-pub const PoolHandle = struct {
-    conn: *tls.Connection,
-    node: *anyopaque,
-    permit: usize,
-};
-
 const FetchCtx = struct {
-    /// Type-erased pool handle so this works for any Pool(N).
-    pool_ptr: *anyopaque,
-    pool_acquire_fn: *const fn (*anyopaque, Io, PoolCriteria) anyerror!PoolHandle,
-    pool_release_fn: *const fn (*anyopaque, Io, PoolHandle) void,
-    pool_discard_fn: *const fn (*anyopaque, Io, PoolHandle) void,
-
+    pool: AnyPool,
     gpa: std.mem.Allocator,
     creds: Credentials,
     bucket: []const u8,
     key: []const u8,
     host: []const u8,
-    addr_v4: []const u8,
+    addrs: []const tls.Ipv4,
     port: u16,
     use_tls: bool,
     range: Range,
@@ -790,89 +802,26 @@ const FetchCtx = struct {
     ok: bool,
 };
 
-fn poolAcquireFn(comptime P: type) *const fn (*anyopaque, Io, PoolCriteria) anyerror!PoolHandle {
-    return struct {
-        fn f(p: *anyopaque, io: Io, criteria: PoolCriteria) anyerror!PoolHandle {
-            const typed: *P = @ptrCast(@alignCast(p));
-            const h = try typed.acquire(io, criteria);
-            return .{ .conn = h.conn, .node = @ptrCast(h.node), .permit = h.permit };
-        }
-    }.f;
-}
-
-fn poolReleaseFn(comptime P: type) *const fn (*anyopaque, Io, PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.release(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
-fn poolDiscardFn(comptime P: type) *const fn (*anyopaque, Io, PoolHandle) void {
-    return struct {
-        fn f(p: *anyopaque, io: Io, h: PoolHandle) void {
-            const typed: *P = @ptrCast(@alignCast(p));
-            typed.discard(io, .{
-                .conn = h.conn,
-                .node = @ptrCast(@alignCast(h.node)),
-                .permit = h.permit,
-            });
-        }
-    }.f;
-}
-
+/// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
-    // Retry up to POOL_SIZE+1 times on stale-connection errors. After
-    // idle, S3 may have closed every pooled connection; each failed
-    // acquire discards-and-recycles its slot to the queue tail, so
-    // worst case we burn through all 8 stale slots before getting a
-    // freshly-init'd one.
-    var attempts: u8 = 0;
-    while (attempts < MAX_PARTS + 1) : (attempts += 1) {
-        if (attempts > 0) try retry.sleepBackoff(io, retry.default_policy, attempts - 1);
-        var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const criteria: PoolCriteria = .{
-            .host = ctx.host,
-            .addr_v4 = ctx.addr_v4,
-            .port = ctx.port,
-            .use_tls = ctx.use_tls,
-        };
-        const handle = ctx.pool_acquire_fn(ctx.pool_ptr, io, criteria) catch return;
-        const ok = doFetch(arena, ctx, handle.conn) catch |err| {
-            ctx.pool_discard_fn(ctx.pool_ptr, io, handle);
-            switch (err) {
-                error.RecvFailed,
-                error.SendFailed,
-                error.BodyTruncated,
-                error.BadStatusLine,
-                error.RetryableStatus,
-                => continue,
-                else => return,
-            }
-        };
-        if (!ok) {
-            ctx.pool_discard_fn(ctx.pool_ptr, io, handle);
-            return;
-        }
-        ctx.ok = true;
-        ctx.pool_release_fn(ctx.pool_ptr, io, handle);
-        return;
-    }
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const criteria: PoolCriteria = .{
+        .host = ctx.host,
+        .addrs = ctx.addrs,
+        .port = ctx.port,
+        .use_tls = ctx.use_tls,
+    };
+    const resp = requestViaPool(io, ctx.pool, arena_state.allocator(), criteria, .{ .idempotent = true }, ctx, doFetch) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+    // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
+    ctx.ok = (resp.status == 206 or resp.status == 200) and resp.body.len == ctx.target.len;
 }
 
-/// Issue one ranged GET on the given connection and copy the bytes
-/// into ctx.into. Returns true on success, false on a non-error
-/// failure (e.g. wrong status, length mismatch). Errors propagate so
-/// the caller can decide whether to retry.
-fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !bool {
+/// Issue one ranged GET on `conn`, streaming the body into `ctx.target`.
+fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !http.Response {
     const path = try pathFor(arena, ctx.creds, ctx.bucket, ctx.key);
 
     var range_buf: [64]u8 = undefined;
@@ -894,21 +843,12 @@ fn doFetch(arena: std.mem.Allocator, ctx: *FetchCtx, conn: *tls.Connection) !boo
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = try http.sendRequestInto(arena, conn, .{
+    return http.sendRequestInto(arena, conn, .{
         .method = .GET,
         .host = ctx.host,
         .path = path,
         .headers = headers.items,
     }, ctx.target);
-
-    // Throttle/transient statuses retry with backoff via fetchOneTask's
-    // loop; any other unexpected status (or a short body on a good
-    // status) is a hard failure for this fetch.
-    if (retry.retryableStatus(resp.status)) return error.RetryableStatus;
-    if (resp.status != 206 and resp.status != 200) return false;
-
-    if (resp.body.len != ctx.target.len) return false;
-    return true;
 }
 
 /// Parallel multipart upload of `body` to `url`. Thin wrapper around
@@ -1036,9 +976,9 @@ fn sendListV2(
     max_keys: u32,
     continuation_token: ?[]const u8,
 ) Error!ListPage {
-    // Path: virtual-hosted (AWS) is "/"; path-style (R2 / endpoint
-    // override) is "/<bucket>". Same logic as `pathFor` for an empty key.
-    const list_path: []const u8 = if (creds.endpoint == null)
+    // Path: virtual-hosted is "/"; path-style (R2 / endpoint override /
+    // dotted bucket) is "/<bucket>". Same logic as `pathFor` for an empty key.
+    const list_path: []const u8 = if (virtualHosted(creds, bucket))
         "/"
     else
         try std.fmt.allocPrint(req_arena, "/{s}", .{bucket});
@@ -1147,35 +1087,30 @@ fn extractTag(haystack: []const u8, open_tag: []const u8, close_tag: []const u8)
 // DNS via libc getaddrinfo
 // ============================================================
 
-const c = struct {
-    extern fn getaddrinfo(
-        node: [*:0]const u8,
-        service: ?[*:0]const u8,
-        hints: ?*const addrinfo,
-        res: *?*addrinfo,
-    ) c_int;
-    extern fn freeaddrinfo(res: *addrinfo) void;
+// `std.c.addrinfo` follows each OS's layout: Darwin orders `canonname` before `addr`, the reverse of Linux.
+const c = std.c;
 
-    const addrinfo = extern struct {
-        flags: c_int,
-        family: c_int,
-        socktype: c_int,
-        protocol: c_int,
-        addrlen: u32,
-        addr: ?*sockaddr,
-        canonname: ?[*:0]u8,
-        next: ?*addrinfo,
+/// Refuse a host the resolver would take as an address but the TLS layer would not: an IPv6 literal (connections are
+/// IPv4-only), or IPv4 in a legacy spelling getaddrinfo still accepts (`127.1`, `0x7f.0.0.1`, `2130706433`, `010.0.0.1`
+/// in octal). Such a host would be dialled as one address and verified as a DNS name, so it is an error, not something
+/// to normalise behind the user's back.
+fn checkNumericHost(host_z: [:0]const u8) Error!void {
+    if (std.mem.indexOfScalar(u8, host_z, ':') != null) {
+        std.log.warn("S3 endpoint host '{s}' is an IPv6 address; IPv6 endpoints are not supported", .{host_z});
+        return error.Ipv6EndpointUnsupported;
+    }
+    var hints = std.mem.zeroes(c.addrinfo);
+    hints.family = c.AF.INET;
+    hints.socktype = c.SOCK.STREAM;
+    hints.flags = .{ .NUMERICHOST = true };
+    var result: ?*c.addrinfo = null;
+    if (@backingInt(c.getaddrinfo(host_z, null, &hints, &result)) != 0) return; // not numeric: a DNS name
+    if (result) |r| c.freeaddrinfo(r);
+    _ = std.Io.net.Ip4Address.parse(host_z, 0) catch {
+        std.log.warn("S3 endpoint host '{s}' is a non-canonical IPv4 address; write it as a dotted quad", .{host_z});
+        return error.NonCanonicalIpEndpoint;
     };
-
-    const sockaddr = extern struct {
-        family: u16,
-        port: u16,
-        addr: u32, // for IPv4 only
-        zero: [8]u8,
-    };
-
-    const AF_INET: c_int = 2;
-};
+}
 
 /// URI-encode an S3 key for use in path + SigV4 canonical URI. Both
 /// the HTTP request line and the SigV4 signature canonical-URI must
@@ -1205,24 +1140,31 @@ pub fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const u8 {
-    const host_z = try arena.dupeZ(u8, host);
+/// Every IPv4 address of `host`, in the resolver's order, without duplicates.
+pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const tls.Ipv4 {
+    const host_z = try arena.dupeSentinel(u8, host, 0);
+    try checkNumericHost(host_z);
 
     var hints = std.mem.zeroes(c.addrinfo);
-    hints.family = c.AF_INET;
+    hints.family = c.AF.INET;
+    hints.socktype = c.SOCK.STREAM;
     var result: ?*c.addrinfo = null;
     const rc = c.getaddrinfo(host_z, null, &hints, &result);
-    if (rc != 0 or result == null) return error.DnsFailed;
+    if (@backingInt(rc) != 0 or result == null) return error.DnsFailed;
     defer c.freeaddrinfo(result.?);
 
-    const sa = result.?.addr orelse return error.DnsFailed;
-    const ip = std.mem.bigToNative(u32, sa.addr);
-    return std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{
-        (ip >> 24) & 0xff,
-        (ip >> 16) & 0xff,
-        (ip >> 8) & 0xff,
-        ip & 0xff,
-    });
+    var addrs: std.ArrayList(tls.Ipv4) = .empty;
+    var it = result;
+    while (it) |ai| : (it = ai.next) {
+        const sa = ai.addr orelse continue;
+        const sin: *align(1) const c.sockaddr.in = @ptrCast(sa);
+        const ip: tls.Ipv4 = @bitCast(sin.addr);
+        for (addrs.items) |seen| {
+            if (std.mem.eql(u8, &seen, &ip)) break;
+        } else try addrs.append(arena, ip);
+    }
+    if (addrs.items.len == 0) return error.DnsFailed;
+    return addrs.items;
 }
 
 // ============================================================
@@ -1241,6 +1183,105 @@ test "parse s3 url rejects malformed" {
     try testing.expectError(error.BadS3Url, Url.parse("https://foo/bar"));
     try testing.expectError(error.BadS3Url, Url.parse("s3://bucket"));
     try testing.expectError(error.BadS3Url, Url.parse("s3:///key"));
+}
+
+test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS's wildcard certificate" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const aws: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-west-2" };
+
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs.example"));
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try connectHostFor(a, aws, "logs.example"));
+    try testing.expectEqualStrings("/logs.example/k%3D1.parquet", try pathFor(a, aws, "logs.example", "k=1.parquet"));
+
+    try testing.expectEqualStrings("logs.s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs"));
+    try testing.expectEqualStrings("/k.parquet", try pathFor(a, aws, "logs", "k.parquet"));
+
+    const r2: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "auto",
+        .endpoint = "https://acct.r2.example:8443",
+    };
+    try testing.expectEqualStrings("acct.r2.example:8443", try hostFor(a, r2, "logs"));
+    try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, r2, "logs", "k.parquet"));
+}
+
+fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
+    const slice = comptime blk: {
+        var a: [entries.len:null]?[*:0]const u8 = undefined;
+        for (entries, 0..) |e, i| a[i] = e;
+        const final = a;
+        break :blk &final;
+    };
+    return .{ .block = .{ .slice = slice } };
+}
+
+test "S3_NO_SIGN_REQUEST yields anonymous credentials instead of NoCredentials" {
+    const anon = try Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=1" }));
+    try testing.expectEqualStrings("", anon.access_key);
+    try testing.expectEqualStrings("", anon.secret_key);
+    try testing.expectEqual(@as(?[]const u8, null), anon.session_token);
+    try testing.expectEqualStrings("us-east-1", anon.region);
+
+    const r2 = try Credentials.fromEnv(testEnviron(&.{
+        "S3_REGION=auto", "S3_ENDPOINT_URL=https://acct.r2.example", "S3_NO_SIGN_REQUEST=yes",
+    }));
+    try testing.expectEqualStrings("auto", r2.region);
+    try testing.expectEqualStrings("https://acct.r2.example", r2.endpoint.?);
+
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{"AWS_REGION=us-east-1"})));
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=0" })));
+    try testing.expectError(error.NoCredentials, Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=" })));
+    try testing.expectError(error.NoRegion, Credentials.fromEnv(testEnviron(&.{"S3_NO_SIGN_REQUEST=1"})));
+}
+
+fn endpointCreds(endpoint: []const u8) Credentials {
+    return .{ .access_key = "ak", .secret_key = "sk", .region = "auto", .endpoint = endpoint };
+}
+
+test "an endpoint written as a non-canonical IPv4 address is refused, not quietly reinterpreted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The resolver reads each of these as a number (`010.0.0.1` in octal, as 8.0.0.1), while the certificate check
+    // would take it for a DNS name.
+    for ([_][]const u8{
+        "https://127.1:9000",
+        "https://0x7f.0.0.1:9000",
+        "https://2130706433",
+        "https://010.0.0.1",
+        "https://127.0.0.01:9000",
+    }) |ep| {
+        if (poolCriteria(a, endpointCreds(ep), "bkt")) |_| {
+            std.debug.print("accepted endpoint {s}\n", .{ep});
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.NonCanonicalIpEndpoint, err);
+    }
+    const crit = try poolCriteria(a, endpointCreds("https://127.0.0.1:9"), "bkt");
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &crit.addrs[0]);
+    try testing.expectEqual(@as(u16, 9), crit.port);
+}
+
+test "an IPv6 endpoint is refused as unsupported" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{ "https://[::1]:9000", "https://[::1]", "http://[2001:db8::1]:9000/" }) |ep| {
+        try testing.expectError(error.Ipv6EndpointUnsupported, poolCriteria(a, endpointCreds(ep), "bkt"));
+    }
+    const v6 = endpointCreds("https://[::1]:9");
+    try testing.expectEqualStrings("::1", v6.endpointHost().?);
+    try testing.expectEqual(@as(u16, 9), v6.endpointPort());
+}
+
+test "resolveIpv4 returns every address once" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const one = try resolveIpv4(arena_state.allocator(), "127.0.0.1");
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &one[0]);
 }
 
 test "Range.span formats inclusive byte range" {
@@ -1288,4 +1329,132 @@ test "fetchManyRanges instantiates and short-circuits on an empty range list" {
         &.{},
     );
     try testing.expectEqual(@as(u64, 0), n);
+}
+
+/// A stand-in for `Pool(N)` that scripts what each `acquire` yields, for driving the retry loops without a network.
+/// A live connection is a socketpair whose peer has the response already queued; a dead one's peer has shut down
+/// writing, so the request goes out and EOF comes back before any response byte.
+const ScriptedPool = struct {
+    pub const capacity: usize = 1;
+    pub const Step = union(enum) {
+        fail: anyerror,
+        live: struct { reused: bool, response: []const u8 },
+        dead: struct { reused: bool },
+    };
+    pub const Slot = struct { conn: tls.Connection, peer: std.posix.fd_t };
+    pub const Handle = struct { conn: *tls.Connection, node: *Slot, permit: usize, reused: bool };
+
+    steps: []const Step,
+    next: usize = 0,
+    fresh_requests: usize = 0,
+    stale_retries: usize = 0,
+    backoff_retries: usize = 0,
+    slots: [8]Slot = undefined,
+
+    fn deinit(self: *ScriptedPool) void {
+        for (self.slots[0..self.next], self.steps[0..self.next]) |*slot, step| switch (step) {
+            .fail => {},
+            else => {
+                slot.conn.deinit();
+                _ = std.posix.system.close(slot.peer);
+            },
+        };
+    }
+
+    pub fn acquire(self: *ScriptedPool, io: Io, criteria: PoolCriteria, opts: pool_mod.AcquireOptions) !Handle {
+        _ = io;
+        _ = criteria;
+        if (opts.fresh) self.fresh_requests += 1;
+        const i = self.next;
+        self.next += 1;
+        const slot = &self.slots[i];
+        const reused, const response: ?[]const u8 = switch (self.steps[i]) {
+            .fail => |err| return err,
+            .live => |l| .{ l.reused, l.response },
+            .dead => |d| .{ d.reused, null },
+        };
+        var fds: [2]std.posix.fd_t = undefined;
+        if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+            return error.SkipZigTest;
+        slot.* = .{ .conn = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true }, .peer = fds[1] };
+        if (response) |r| {
+            _ = std.posix.system.write(fds[1], r.ptr, r.len);
+        } else {
+            _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+        }
+        return .{ .conn = &slot.conn, .node = slot, .permit = 0, .reused = reused };
+    }
+    pub fn release(_: *ScriptedPool, _: Io, _: Handle) void {}
+    pub fn discard(_: *ScriptedPool, _: Io, _: Handle) void {}
+    pub fn noteRetry(self: *ScriptedPool, _: Io, failure: retry.Failure) void {
+        switch (failure) {
+            .stale => self.stale_retries += 1,
+            .transient => self.backoff_retries += 1,
+            .fatal => {},
+        }
+    }
+};
+
+const test_creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1", .endpoint = "http://127.0.0.1:9" };
+const ok_206 = "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/2\r\n\r\nok";
+
+test "getViaPool retries a connection that fails its handshake, including the fresh one after a stale failure" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const url: Url = .{ .bucket = "b", .key = "k" };
+
+    // Thawed sandbox: the pooled connection is dead, and the fresh one forced after it fails its TLS handshake.
+    var p: ScriptedPool = .{ .steps = &.{
+        .{ .dead = .{ .reused = true } },
+        .{ .fail = error.HandshakeFailed },
+        .{ .live = .{ .reused = false, .response = ok_206 } },
+    } };
+    defer p.deinit();
+    const resp = try getViaPool(testing.io, &p, arena_state.allocator(), test_creds, url, Range.span(0, 1));
+    try testing.expectEqual(@as(u16, 206), resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+    try testing.expectEqual(@as(usize, 1), p.stale_retries);
+    try testing.expectEqual(@as(usize, 1), p.backoff_retries);
+    try testing.expectEqual(@as(usize, 1), p.fresh_requests);
+
+    // A ClientHello that cannot be written surfaces from acquire as SendFailed; it is still only a connect failure.
+    var q: ScriptedPool = .{ .steps = &.{
+        .{ .fail = error.SendFailed },
+        .{ .fail = error.ConnectFailed },
+        .{ .live = .{ .reused = false, .response = ok_206 } },
+    } };
+    defer q.deinit();
+    const put_resp = try putViaPool(testing.io, &q, arena_state.allocator(), test_creds, url, "ok");
+    try testing.expectEqual(@as(u16, 206), put_resp.status);
+    try testing.expectEqual(@as(usize, 2), q.backoff_retries);
+}
+
+test "requestViaPool retries a dead reused connection at once only for an idempotent request" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const criteria: PoolCriteria = .{ .host = "h", .addrs = &.{.{ 127, 0, 0, 1 }}, .port = 9, .use_tls = false };
+    const Post = struct {
+        fn send(_: void, a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return http.sendRequest(a, conn, .{ .method = .POST, .host = "h", .path = "/k?uploads=", .headers = &.{} });
+        }
+    };
+    const steps: []const ScriptedPool.Step = &.{
+        .{ .dead = .{ .reused = true } },
+        .{ .live = .{ .reused = false, .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" } },
+    };
+
+    // POST-style: the dead connection fails the request; nothing is sent again.
+    var post_pool: ScriptedPool = .{ .steps = steps };
+    defer post_pool.deinit();
+    try testing.expectError(error.ClosedBeforeResponse, requestViaPool(testing.io, &post_pool, arena_state.allocator(), criteria, .{ .idempotent = false }, {}, Post.send));
+    try testing.expectEqual(@as(usize, 1), post_pool.next);
+    try testing.expectEqual(@as(usize, 0), post_pool.stale_retries);
+
+    // The same exchange declared idempotent goes again at once on a fresh connection.
+    var put_pool: ScriptedPool = .{ .steps = steps };
+    defer put_pool.deinit();
+    const resp = try requestViaPool(testing.io, &put_pool, arena_state.allocator(), criteria, .{ .idempotent = true }, {}, Post.send);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqual(@as(usize, 1), put_pool.stale_retries);
+    try testing.expectEqual(@as(usize, 1), put_pool.fresh_requests);
 }

@@ -2,6 +2,13 @@
 
 Three layers, fastest first. None require Docker.
 
+Test the cold path first. zpq-lambda is meant to run as many short, cold invocations (see
+[`lambda_capabilities.md`](lambda_capabilities.md#cold-starts-are-the-design-point)), so the case that matters most is a
+freshly started bootstrap answering its first event: every scenario below starts a new `zpq-lambda` process, which is
+exactly that. Tests that send several events to one process (back-to-back invocations, connections the server dropped
+while the process sat idle) cover what happens when Lambda reuses a sandbox; zpq has to handle reuse correctly, but
+does not rely on it.
+
 ## 1. In-process fake runtime API (default; `zig build test-integration`)
 
 The Lambda integration test harness in `tests/lambda_integration.zig`:
@@ -63,6 +70,9 @@ curl -XPOST http://localhost:8080/2015-03-31/functions/function/invocations \
 
 kill $RIE_PID
 ```
+
+Each `aws-lambda-rie` start is a cold start of the bootstrap; the first `curl` after it is the invocation that
+matters most.
 
 Use when:
 - You want to attach a debugger to the bootstrap binary and step through interactively (gdb, lldb, perf record).

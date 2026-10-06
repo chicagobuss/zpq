@@ -28,6 +28,7 @@ const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
+const statistics = @import("../parquet/statistics.zig");
 
 pub const Error = error{
     BadAggArg,
@@ -60,6 +61,9 @@ pub const AggCall = struct {
     where: ?filter_ast.Filter,
     /// User-supplied alias (or auto-generated if AS was omitted).
     alias: []const u8,
+    /// Set when AS was omitted: the call's source text (`sum(x)`, `count(*)`), the output name to fall back on when
+    /// the bare function name `alias` defaults to would clash with another output column.
+    default_name: ?[]const u8 = null,
     /// Result lane resolved at parse time.
     result: ResultShape,
 };
@@ -86,8 +90,10 @@ pub const Accumulator = union(enum) {
     /// i64-overflowing sums (e.g. wide DELTA columns) without wrapping. The
     /// JSON output emits the full i128; only the 1-row result *parquet* column
     /// is INT64 and errors `AggIntTooWide` past i64 range.
-    sum_i: i128,
-    sum_f: f64,
+    /// `null` until a non-null value is folded in: SQL's sum over no values is
+    /// NULL, not 0.
+    sum_i: ?i128,
+    sum_f: ?f64,
     /// Min/max — `null` means no values seen yet. Distinguishes
     /// "all rows filtered out" from "min was 0". i128 so an unsigned-64
     /// extremum (up to 2^64-1) is representable; signed i64 values widen in.
@@ -111,8 +117,8 @@ pub const Accumulator = union(enum) {
         return switch (call.func) {
             .count => .{ .count = 0 },
             .sum => switch (call.result) {
-                .i64 => .{ .sum_i = 0 },
-                .f64 => .{ .sum_f = 0 },
+                .i64 => .{ .sum_i = null },
+                .f64 => .{ .sum_f = null },
                 .bytes, .avg_f64 => unreachable,
             },
             .min => switch (call.result) {
@@ -138,8 +144,12 @@ pub const Accumulator = union(enum) {
     pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) void {
         switch (dst.*) {
             .count => |*c| c.* += src.count,
-            .sum_i => |*s| s.* += src.sum_i,
-            .sum_f => |*s| s.* += src.sum_f,
+            .sum_i => |*s| if (src.sum_i) |sv| {
+                s.* = (s.* orelse 0) + sv;
+            },
+            .sum_f => |*s| if (src.sum_f) |sv| {
+                s.* = (s.* orelse 0) + sv;
+            },
             .min_i => |*m| if (src.min_i) |sv| {
                 if (m.* == null or sv < m.*.?) m.* = sv;
             },
@@ -258,8 +268,9 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
     return switch (call.func) {
         .count => true,
         // String min/max can't trust row-group stats: `min_value`/`max_value`
-        // may be TRUNCATED (a rounded bound, not a present value), and we
-        // don't parse the `is_*_value_exact` flags — so always decode.
+        // may be TRUNCATED (a rounded bound, not a present value), and this
+        // stats path doesn't consult the `is_*_value_exact` flags — so
+        // always decode.
         .min, .max => call.result != .bytes,
         // `sum` is short-circuitable per-RG only when min == max for
         // that RG (constant-column case): the RG contributes
@@ -301,35 +312,15 @@ pub fn statsCoverageComplete(
         for (m.row_groups.items) |rg| {
             if (ci >= rg.columns.items.len) return false;
             const cm = rg.columns.items[ci].meta_data orelse return false;
-            const levels = columnLevelsForStats(&m, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats_opt = cm.statistics;
             switch (call.func) {
                 .count => {
-                    _ = statPresentCount(&rg, &cm, stats_opt, &m) orelse return false;
+                    const levels = columnLevelsForStats(&m, &cm) orelse return false;
+                    if (levels.max_rep > 0) return false;
+                    _ = statPresentCount(&rg, &cm, cm.statistics, &m) orelse return false;
                 },
-                .min => {
-                    const stats = stats_opt orelse return false;
-                    if (stats.min_value == null and stats.min == null) return false;
-                },
-                .max => {
-                    const stats = stats_opt orelse return false;
-                    if (stats.max_value == null and stats.max == null) return false;
-                },
-                .sum => {
-                    // Strict precondition for fetch-skip: every RG must
-                    // be a constant column (min == max) AND both stat
-                    // fields must be present. If any RG has variable
-                    // values, we'll still need to fetch+decode for that
-                    // RG — so we can't drop the column from the fetch
-                    // set. Per-RG `updateOneFromStats` handles the
-                    // mixed case at scan time.
-                    const stats = stats_opt orelse return false;
-                    const min_bytes = stats.min_value orelse stats.min orelse return false;
-                    const max_bytes = stats.max_value orelse stats.max orelse return false;
-                    if (!std.mem.eql(u8, min_bytes, max_bytes)) return false;
-                    _ = statPresentCount(&rg, &cm, stats_opt, &m) orelse return false;
-                },
+                // The same plan `updateOneFromStats` folds from: any row group it would decode instead keeps the
+                // column in the fetch set. Sum needs every row group constant (min == max) to drop the column.
+                .min, .max, .sum => if (planStatFold(call, &rg, ci, &m) == null) return false,
                 else => unreachable,
             }
         }
@@ -369,129 +360,90 @@ pub fn updateOneFromStats(
             return true;
         },
         .min, .max => {
-            // Need to find the column-chunk. The arg must be a bare
-            // col_ref for stat-eligibility (we don't try to compute
-            // min/max of an expression like `cost * qty` from stats).
-            const arg = call.arg orelse return error.BadAggArg;
-            const col_idx = switch (arg) {
-                .col_ref => |c| c.col_idx,
-                else => return false, // expression args fall back to decode
-            };
-            if (col_idx >= rg.columns.items.len) return false;
-            const cm = rg.columns.items[col_idx].meta_data orelse return false;
-            const levels = columnLevelsForStats(file_meta, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats = cm.statistics orelse return false;
-            // Prefer the newer min_value/max_value (post-2.0 stat
-            // fields) over legacy min/max. For numeric columns the
-            // semantics match in the cases we support.
-            const bytes_opt = if (call.func == .min)
-                (stats.min_value orelse stats.min)
-            else
-                (stats.max_value orelse stats.max);
-            const bytes = bytes_opt orelse return false;
-
-            // DECIMAL columns: the accumulator is .min_f / .max_f
-            // (col_ref's expr_type is .f64) but the on-disk physical
-            // type is INT32 / INT64 / FLBA, and the stats bytes are
-            // in the physical wire format. Decode them through the
-            // same byte → i128 → f64-with-scale pipeline the value
-            // path uses, then fold.
-            const elem_opt = file_meta.getColumnSchema(cm.path_in_schema.items);
-
-            // Unsigned ints: the stat min/max bytes are in unsigned order, but
-            // this signed-int path would read 0xFF..FF as -1. Bail to decode,
-            // which handles unsigned correctly (zero-extend ≤32 / u64-fold 64).
-            if (elem_opt) |se| if (schema.isUnsignedInt(se)) return false;
-
-            const dec_kind: ?decimal_mod.Kind = if (elem_opt) |se|
-                decimal_mod.kindFromSchema(&se)
-            else
-                null;
-            if (dec_kind) |k| {
-                try foldDecimalStatBytes(state, call, k, bytes);
-                return true;
+            // Only a bare col_ref is stat-eligible; an expression like `cost * qty` decodes.
+            const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
+            // A chunk with no non-null values contributes nothing, whatever bounds its writer left behind.
+            const cm = rg.columns.items[statArgColumn(call).?].meta_data.?;
+            if (statPresentCount(rg, &cm, cm.statistics, file_meta) == 0) return true;
+            const bytes = if (call.func == .min) plan.bounds.min else plan.bounds.max;
+            switch (plan.lane) {
+                // DECIMAL stat bytes are in the physical wire format: decode them through the same
+                // byte → i128 → f64-with-scale pipeline the value path uses, then fold into .min_f / .max_f.
+                .decimal => |k| try foldDecimalStatBytes(state, call, k, bytes),
+                .int, .float => try foldStatBytes(state, call, plan.physical, bytes),
             }
-
-            // Non-DECIMAL accumulator/parquet-type mismatch: bail to
-            // the decode path. This was a hidden bug before — e.g.
-            // a future float-accum vs int-physical mismatch would
-            // have errored out of foldStatBytes.
-            const accum_is_float = switch (state.*) {
-                .min_f, .max_f => true,
-                else => false,
-            };
-            const phys_is_float = switch (cm.type) {
-                .FLOAT, .DOUBLE => true,
-                else => false,
-            };
-            if (accum_is_float != phys_is_float) return false;
-
-            try foldStatBytes(state, call, cm.type, bytes);
             return true;
         },
         .sum => {
-            // Constant-column case: when this RG's min == max, every
-            // value in the RG equals that constant, so this RG
-            // contributes num_rows × min to the sum. Return false
-            // (decode-fallback) for any RG that isn't constant; the
-            // mixed case still works — the constant RGs fold from
-            // stats, the rest decode normally.
-            const arg = call.arg orelse return error.BadAggArg;
-            const col_idx = switch (arg) {
-                .col_ref => |c| c.col_idx,
-                else => return false,
-            };
-            if (col_idx >= rg.columns.items.len) return false;
-            const cm = rg.columns.items[col_idx].meta_data orelse return false;
-            const levels = columnLevelsForStats(file_meta, &cm) orelse return false;
-            if (levels.max_rep > 0) return false;
-            const stats = cm.statistics orelse return false;
-            const min_bytes = stats.min_value orelse stats.min orelse return false;
-            const max_bytes = stats.max_value orelse stats.max orelse return false;
-            if (!std.mem.eql(u8, min_bytes, max_bytes)) return false;
-
-            // Non-null row count. REQUIRED columns can use row count;
-            // nullable columns need null_count or we would count null
-            // slots as the constant value.
-            const present = statPresentCount(rg, &cm, stats, file_meta) orelse return false;
-            if (present == 0) return true; // nothing to add
-
-            // DECIMAL columns fold through decimal_mod (same as min/max).
-            const elem_opt = file_meta.getColumnSchema(cm.path_in_schema.items);
-            // Unsigned ints: stat bytes are unsigned-ordered; the signed
-            // constant-sum fold would misread them. Decode instead.
-            if (elem_opt) |se| if (schema.isUnsignedInt(se)) return false;
-            const dec_kind: ?decimal_mod.Kind = if (elem_opt) |se|
-                decimal_mod.kindFromSchema(&se)
-            else
-                null;
-            if (dec_kind) |k| {
-                const v_f = decimalStatBytesToF64(min_bytes, k) orelse return false;
-                switch (state.*) {
-                    .sum_f => |*s| s.* += v_f * @as(f64, @floatFromInt(present)),
-                    else => return false,
-                }
-                return true;
+            // Constant-column case: when this RG's min == max, every value in it equals that constant, so it
+            // contributes present × min. A non-constant RG decodes; the constant ones still fold from stats.
+            const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
+            if (plan.present == 0) return true; // nothing to add; an all-null sum stays NULL
+            switch (plan.lane) {
+                .decimal => |k| state.sum_f = (state.sum_f orelse 0) + decimal_mod.statToF64(plan.bounds.min, k).? *
+                    @as(f64, @floatFromInt(plan.present)),
+                .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
             }
-
-            // Type-mismatch guard mirrors the min/max path.
-            const accum_is_float = switch (state.*) {
-                .sum_f => true,
-                .sum_i => false,
-                else => return false,
-            };
-            const phys_is_float = switch (cm.type) {
-                .FLOAT, .DOUBLE => true,
-                else => false,
-            };
-            if (accum_is_float != phys_is_float) return false;
-
-            try foldConstantSumStatBytes(state, cm.type, min_bytes, present);
             return true;
         },
         .avg => return false, // never short-circuitable
     }
+}
+
+const StatLane = union(enum) { decimal: decimal_mod.Kind, int, float };
+
+/// Everything `updateOneFromStats` needs to answer `call` from one row group's statistics.
+const StatFold = struct {
+    lane: StatLane,
+    physical: schema.Type,
+    bounds: statistics.Bounds,
+    /// Non-null rows; only computed (and required) for sum.
+    present: i64 = 0,
+};
+
+/// Whether, and how, `call`'s column can be folded from this row group's statistics; null means decode it. The one
+/// decision both `updateOneFromStats` and `statsCoverageComplete` act on: if coverage accepted a row group the fold
+/// then declined, the column would already be dropped from the fetch set with nothing left to decode.
+fn planStatFold(
+    call: AggCall,
+    rg: *const schema.RowGroup,
+    col_idx: usize,
+    file_meta: *const schema.FileMetaData,
+) ?StatFold {
+    if (col_idx >= rg.columns.items.len) return null;
+    const cm = rg.columns.items[col_idx].meta_data orelse return null;
+    const levels = columnLevelsForStats(file_meta, &cm) orelse return null;
+    if (levels.max_rep > 0) return null;
+    // Bounds in the column's own order: the deprecated pair only where signed is that order.
+    const bounds = statistics.chunkBounds(rg, col_idx, file_meta) orelse return null;
+    const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
+    var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
+    if (call.func == .sum) {
+        if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
+        // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
+        // constant.
+        plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
+        if (lane == .decimal and decimal_mod.statToF64(bounds.min, lane.decimal) == null) return null;
+    }
+    return plan;
+}
+
+/// The stat-bytes lane for `call`, which must match the accumulator `call.result` gives it.
+fn statFoldLane(call: AggCall, physical: schema.Type, elem_opt: ?schema.SchemaElement) ?StatLane {
+    const accum_is_float = call.result == .f64;
+    if (elem_opt) |se| {
+        // Unsigned bounds are unsigned-ordered; the int fold would read 0xFF..FF as -1. Decode instead, which
+        // zero-extends (<=32) or folds as u64.
+        if (schema.isUnsignedInt(se)) return null;
+        if (decimal_mod.kindFromSchema(&se)) |k| return if (accum_is_float) .{ .decimal = k } else null;
+        // FLOAT16 decodes to the f64 lane, but its bounds are 2-byte halves no fold here reads.
+        if (schema.isFloat16(se)) return null;
+    }
+    return switch (physical) {
+        .INT32, .INT64 => if (accum_is_float) null else .int,
+        .FLOAT, .DOUBLE => if (accum_is_float) .float else null,
+        else => null,
+    };
 }
 
 fn statArgColumn(call: AggCall) ?usize {
@@ -524,37 +476,6 @@ fn statPresentCount(
     return if (levels.max_def == 0) rg.num_rows else null;
 }
 
-/// Decode a DECIMAL stat bytes slice to f64. Mirrors the helper in
-/// `filter/prune.zig`. Inlined here to avoid the cross-module
-/// dependency direction (agg → prune would be wrong).
-fn decimalStatBytesToF64(bytes: []const u8, kind: decimal_mod.Kind) ?f64 {
-    return switch (kind.physical) {
-        .INT32 => blk: {
-            if (bytes.len < 4) break :blk null;
-            const i = std.mem.readInt(i32, bytes[0..4], .little);
-            break :blk decimal_mod.applyScaleInt(i32, i, kind.scale);
-        },
-        .INT64 => blk: {
-            if (bytes.len < 8) break :blk null;
-            const i = std.mem.readInt(i64, bytes[0..8], .little);
-            break :blk decimal_mod.applyScaleInt(i64, i, kind.scale);
-        },
-        .FIXED_LEN_BYTE_ARRAY => blk: {
-            if (kind.byte_width == 0 or kind.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH) break :blk null;
-            if (bytes.len < kind.byte_width) break :blk null;
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes[0..kind.byte_width]),
-                kind.scale,
-            );
-        },
-        .BYTE_ARRAY => blk: {
-            if (bytes.len == 0 or bytes.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) break :blk null;
-            break :blk decimal_mod.applyScaleI128(decimal_mod.flbaToI128(bytes), kind.scale);
-        },
-        else => null,
-    };
-}
-
 /// Decode a non-DECIMAL stat min/max bytes slice as the column's
 /// physical type and add `present × value` into the accumulator.
 fn foldConstantSumStatBytes(
@@ -576,7 +497,7 @@ fn foldConstantSumStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            s.* += @as(i128, v) * @as(i128, present);
+            s.* = (s.* orelse 0) + @as(i128, v) * @as(i128, present);
         },
         .sum_f => |*s| {
             const v: f64 = switch (parquet_type) {
@@ -592,55 +513,23 @@ fn foldConstantSumStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            s.* += v * @as(f64, @floatFromInt(present));
+            s.* = (s.* orelse 0) + v * @as(f64, @floatFromInt(present));
         },
         else => return error.UnsupportedAggType,
     }
 }
 
-/// Fold a DECIMAL column's stat min/max bytes into an .min_f /
-/// .max_f accumulator. The bytes are in the column's physical wire
-/// format (INT32/INT64 little-endian, FLBA big-endian two's-comp).
-/// We decode through decimal_mod's helpers so it matches what the
-/// value-decode path produced — same answer, no per-RG decode.
+/// Fold a DECIMAL column's stat min/max bytes into an .min_f / .max_f accumulator, decoded the way the value path
+/// decodes them so the answer is the same without a per-RG decode.
 fn foldDecimalStatBytes(
     state: *Accumulator,
     call: AggCall,
     kind: decimal_mod.Kind,
     bytes: []const u8,
 ) !void {
-    const v: f64 = switch (kind.physical) {
-        .INT32 => blk: {
-            if (bytes.len < 4) return error.BadAggArg;
-            const i = std.mem.readInt(i32, bytes[0..4], .little);
-            break :blk decimal_mod.applyScaleInt(i32, i, kind.scale);
-        },
-        .INT64 => blk: {
-            if (bytes.len < 8) return error.BadAggArg;
-            const i = std.mem.readInt(i64, bytes[0..8], .little);
-            break :blk decimal_mod.applyScaleInt(i64, i, kind.scale);
-        },
-        .FIXED_LEN_BYTE_ARRAY => blk: {
-            if (kind.byte_width == 0 or kind.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH) {
-                return error.BadAggArg;
-            }
-            if (bytes.len < kind.byte_width) return error.BadAggArg;
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes[0..kind.byte_width]),
-                kind.scale,
-            );
-        },
-        // BYTE_ARRAY stat: raw variable-width bytes (no length prefix).
-        .BYTE_ARRAY => blk: {
-            if (bytes.len == 0 or bytes.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) {
-                return error.BadAggArg;
-            }
-            break :blk decimal_mod.applyScaleI128(
-                decimal_mod.flbaToI128(bytes),
-                kind.scale,
-            );
-        },
-        else => return error.UnsupportedAggType,
+    const v = decimal_mod.statToF64(bytes, kind) orelse return switch (kind.physical) {
+        .INT32, .INT64, .FIXED_LEN_BYTE_ARRAY, .BYTE_ARRAY => error.BadAggArg,
+        else => error.UnsupportedAggType,
     };
     switch (state.*) {
         .min_f => |*slot| {
@@ -704,22 +593,11 @@ fn foldStatBytes(
     }
 }
 
-/// Update one accumulator using one RG's decoded batch. Builds the
-/// per-aggregate SelectionVector by cloning `outer_sel` and ANDing
-/// in the agg's own `where` predicate (if any), then folds the
-/// active rows into the accumulator.
+/// Update one accumulator using one RG's decoded batch: fold the rows
+/// the call selects (`PreparedAggInput`) into it in bulk.
 ///
 /// `outer_sel` is the SelectionVector after the outer query
 /// `--filter` ran. `arena` is a per-RG scratch arena.
-///
-/// Null handling: when `call.arg` is a bare `col_ref` to an OPTIONAL
-/// column, we AND the column's present-mask into the per-call sel
-/// before folding. That lets `sum/min/max/avg/count(col)` produce
-/// the correct answer over real-world parquet (writers like Spark /
-/// DuckDB emit columns OPTIONAL even when actual nulls are present).
-/// Computed args over nullable columns (e.g. `sum(cost * 2)` where
-/// cost is OPTIONAL) still error via `expr_eval.evalExpr`'s reject —
-/// null-aware arithmetic in the binop kernel is a separate slice.
 pub fn updateOne(
     arena: std.mem.Allocator,
     /// Long-lived allocator for owned results that must outlive `arena`
@@ -732,39 +610,12 @@ pub fn updateOne(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    // 1. Build per-agg selection vector. Start from outer_sel; AND in
-    //    the agg's WHERE predicate (if present) and the col_ref's
-    //    null mask (if the arg is a nullable bare col_ref).
-    var sel_owned: ?filter_selection.SelectionVector = null;
-    defer if (sel_owned) |*s| s.deinit();
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    defer input.deinit(arena);
+    const sel = input.selection();
+    const values = input.values;
+    const u64_col = input.unsigned_64;
 
-    if (call.where) |pred| {
-        sel_owned = try outer_sel.cloneAlloc(arena);
-        try filter_eval.evaluate(pred, batch, &sel_owned.?, column_lookup, arena);
-    }
-
-    // 2. Compute the value column (skip for count(*)). For a bare
-    //    col_ref we go through `colRefForAgg`, which tolerates
-    //    OPTIONAL columns (rejecting nested LIST/MAP) and AND-masks
-    //    the per-call sel. For computed args we delegate to the
-    //    general evaluator (which still rejects nullable inputs).
-    var values: ?filter_eval.Batch.Column = null;
-    if (call.arg) |arg| {
-        if (arg == .col_ref) {
-            values = try colRefForAgg(arena, batch, column_lookup, arg.col_ref, outer_sel, &sel_owned);
-        } else {
-            values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
-        }
-    }
-
-    const sel: *const filter_selection.SelectionVector =
-        if (sel_owned) |*s| s else outer_sel;
-
-    // Unsigned INT64 column: the i64 lane holds raw bits; the numeric folds
-    // must reinterpret them as u64 (see ColRef.unsigned_64).
-    const u64_col = if (call.arg) |a| (a == .col_ref and a.col_ref.unsigned_64) else false;
-
-    // 3. Fold into accumulator.
     switch (call.func) {
         .count => state.count += sel.count(),
         .sum => try foldSum(state, values.?, sel, u64_col),
@@ -821,50 +672,108 @@ fn foldMinMaxBytes(
     slot.* = try persist.dupe(u8, cand);
 }
 
-/// Borrow values for a bare col_ref agg arg, handling type widening
-/// (i32→i64, f32→f64) and null-aware sel-mask intersection. Rejects
-/// nested (LIST/MAP) columns — flat-fold semantics over a nested
-/// column aren't well-defined here.
+/// One aggregate's input over one row group's batch: the rows it folds and the values it folds them from. The scalar
+/// bulk fold (`updateOne`) and the grouped per-row fold (`updateOneGrouped`) prepare it the same way.
 ///
-/// If the column is OPTIONAL with any actual nulls, lazily clones
-/// `outer_sel` into `*sel_owned` (if not already cloned for a WHERE
-/// clause) and clears bits where def_levels[i] < max_def. The
-/// returned Batch.Column carries placeholder values at null
-/// positions, which the caller never reads because the sel mask
-/// has cleared the corresponding bits.
-fn colRefForAgg(
-    arena: std.mem.Allocator,
-    batch: *const filter_eval.Batch,
-    column_lookup: []const ?usize,
-    c: expr_ast.ColRef,
+/// Null handling: when `call.arg` is a bare `col_ref` to an OPTIONAL
+/// column, the column's present-mask is ANDed into the call's selection.
+/// That lets `sum/min/max/avg/count(col)` produce the correct answer over
+/// real-world parquet (writers like Spark / DuckDB emit columns OPTIONAL
+/// even when actual nulls are present). Computed args over nullable
+/// columns (e.g. `sum(cost * 2)` where cost is OPTIONAL) still error via
+/// `expr_eval.evalExpr`'s reject — null-aware arithmetic in the binop
+/// kernel is a separate slice.
+const PreparedAggInput = struct {
     outer_sel: *const filter_selection.SelectionVector,
-    sel_owned: *?filter_selection.SelectionVector,
-) Error!filter_eval.Batch.Column {
-    const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
-    const raw = batch.cols[pos];
-    switch (raw) {
-        inline else => |x| if (x.max_rep > 0) return error.UnsupportedAggType,
-    }
+    /// The call's own copy of the selection, narrowed by its FILTER and its argument's nulls; null when neither
+    /// applies. Owned, in the arena.
+    own_sel: ?filter_selection.SelectionVector = null,
+    /// The argument's values; null for count(*). Placeholder values sit at null positions, which the selection has
+    /// already cleared.
+    values: ?filter_eval.Batch.Column = null,
+    /// `values` is a widened copy (i32/bool -> i64, f32 -> f64) owned in the arena, not a borrow of the batch.
+    values_owned: bool = false,
+    /// Unsigned INT64 column: the i64 lane holds raw bits; the numeric folds
+    /// must reinterpret them as u64 (see ColRef.unsigned_64).
+    unsigned_64: bool = false,
 
-    // Intersect the present-mask only if the column actually carries
-    // null entries (a no-op for REQUIRED columns and for OPTIONAL
-    // columns whose every row happens to be present).
-    if (columnHasNulls(raw)) {
-        if (sel_owned.* == null) {
-            sel_owned.* = try outer_sel.cloneAlloc(arena);
+    fn init(
+        arena: std.mem.Allocator,
+        call: AggCall,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        outer_sel: *const filter_selection.SelectionVector,
+    ) Error!PreparedAggInput {
+        var in: PreparedAggInput = .{ .outer_sel = outer_sel };
+        errdefer in.deinit(arena);
+        if (call.where) |pred| {
+            in.own_sel = try outer_sel.cloneAlloc(arena);
+            try filter_eval.evaluate(pred, batch, &in.own_sel.?, column_lookup, arena);
         }
-        intersectPresentMask(&sel_owned.*.?, raw);
+        // A bare col_ref tolerates OPTIONAL columns and narrows the selection by their nulls; a computed argument goes
+        // to the general evaluator, which still rejects nullable inputs.
+        if (call.arg) |arg| switch (arg) {
+            .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
+            else => in.values = try expr_eval.evalExpr(arena, batch, column_lookup, arg),
+        };
+        return in;
     }
 
-    return switch (c.expr_type) {
-        .i64 => .{ .i64 = .{ .values = try expr_eval.widenToI64(arena, raw) } },
-        .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, raw) } },
-        // String columns pass through unwidened; foldMinMaxBytes compares the
-        // borrowed slices and dups the winner into `persist`. (Null rows are
-        // already cleared from `sel` by the present-mask intersection above.)
-        .str => raw,
-    };
-}
+    fn selection(self: *const PreparedAggInput) *const filter_selection.SelectionVector {
+        return if (self.own_sel) |*s| s else self.outer_sel;
+    }
+
+    /// Free the temporaries newest first. The per-RG arena only reclaims its newest allocation, so handing the widened
+    /// copy back lets the next aggregate's widen land on bytes already faulted in instead of fresh pages.
+    fn deinit(self: *PreparedAggInput, arena: std.mem.Allocator) void {
+        if (self.values_owned) switch (self.values.?) {
+            inline .i64, .f64 => |x| arena.free(x.values),
+            else => unreachable,
+        };
+        if (self.own_sel) |*s| s.deinit();
+        self.* = undefined;
+    }
+
+    /// Bind a bare col_ref argument, widening it to its aggregate lane. Rejects nested (LIST/MAP) columns: flat-fold
+    /// semantics over a nested column aren't well-defined here.
+    fn bindColRef(
+        self: *PreparedAggInput,
+        arena: std.mem.Allocator,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        c: expr_ast.ColRef,
+    ) Error!void {
+        const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
+        const raw = batch.cols[pos];
+        switch (raw) {
+            inline else => |x| if (x.max_rep > 0) return error.UnsupportedAggType,
+        }
+
+        // Intersect the present-mask only if the column actually carries
+        // null entries (a no-op for REQUIRED columns and for OPTIONAL
+        // columns whose every row happens to be present).
+        if (columnHasNulls(raw)) {
+            if (self.own_sel == null) self.own_sel = try self.outer_sel.cloneAlloc(arena);
+            intersectPresentMask(&self.own_sel.?, raw);
+        }
+
+        self.unsigned_64 = c.unsigned_64;
+        switch (c.expr_type) {
+            // Already the lane's type: borrowed, not copied.
+            .i64 => {
+                self.values = .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, raw, c) } };
+                self.values_owned = raw != .i64;
+            },
+            .f64 => {
+                self.values = .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, raw) } };
+                self.values_owned = raw != .f64;
+            },
+            // String columns pass through unwidened; foldMinMaxBytes compares the
+            // borrowed slices and dups the winner into `persist`.
+            .str => self.values = raw,
+        }
+    }
+};
 
 inline fn columnHasNulls(col: filter_eval.Batch.Column) bool {
     return switch (col) {
@@ -1137,13 +1046,13 @@ fn foldSum(
     sel: *const filter_selection.SelectionVector,
     unsigned_64: bool,
 ) Error!void {
+    if (!sel.any()) return; // no values: leave a NULL sum NULL
     switch (state.*) {
         .sum_i => |*s| {
-            s.* += if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
+            s.* = (s.* orelse 0) + if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
         },
         .sum_f => |*s| {
-            const partial = simdSumF64(col.f64.values, sel);
-            s.* += partial;
+            s.* = (s.* orelse 0) + simdSumF64(col.f64.values, sel);
         },
         else => return error.UnsupportedAggType,
     }
@@ -1229,6 +1138,12 @@ pub const OutputCol = struct {
     /// Parquet physical type — used by the caller to synthesize a
     /// SchemaElement for the output leaf.
     parquet_type: schema.Type,
+    /// OPTIONAL in the output schema. Set by the aggregate kind, not by whether this result happens to be NULL, so
+    /// per-file outputs of one query share a schema and re-aggregate together.
+    nullable: bool,
+    /// Annotations carried from a source column whose values pass through unchanged (see `engine.retypeOutputCol`).
+    logical_type: ?schema.LogicalType = null,
+    converted_type: ?schema.ConvertedType = null,
 };
 
 pub fn finalize(
@@ -1237,66 +1152,87 @@ pub fn finalize(
     state: Accumulator,
 ) Error![]OutputCol {
     return switch (call.func) {
-        .count => try emitOneI64(arena, call.alias, @intCast(state.count)),
+        .count => try emitOneI64(arena, call.alias, @intCast(state.count), false),
         .sum => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.sum_i),
+            .i64 => try emitOneI64(arena, call.alias, state.sum_i, true),
             .f64 => try emitOneF64(arena, call.alias, state.sum_f),
             .bytes, .avg_f64 => unreachable,
         },
         .min => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.min_i orelse 0),
-            .f64 => try emitOneF64(arena, call.alias, state.min_f orelse 0),
-            // empty selection → "" (same sentinel-not-NULL gap as numerics;
-            // the NULL fix is a separate general agg item).
-            .bytes => try emitOneString(arena, call.alias, state.min_bytes orelse ""),
+            .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.min_i), true),
+            .f64 => try emitOneF64(arena, call.alias, state.min_f),
+            .bytes => try emitOneString(arena, call.alias, state.min_bytes),
             .avg_f64 => unreachable,
         },
         .max => switch (call.result) {
-            .i64 => try emitOneI64(arena, call.alias, state.max_i orelse 0),
-            .f64 => try emitOneF64(arena, call.alias, state.max_f orelse 0),
-            .bytes => try emitOneString(arena, call.alias, state.max_bytes orelse ""),
+            .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.max_i), true),
+            .f64 => try emitOneF64(arena, call.alias, state.max_f),
+            .bytes => try emitOneString(arena, call.alias, state.max_bytes),
             .avg_f64 => unreachable,
         },
         .avg => try emitAvgPair(arena, call.alias, state.avg),
     };
 }
 
-fn emitOneI64(arena: std.mem.Allocator, name: []const u8, v: i128) Error![]OutputCol {
+/// min/max of an unsigned 64-bit column as the raw bits it is stored as, so an extremum of 2^63 or more still fits the
+/// INT64 column; the writer annotates it unsigned.
+fn u64Bits(call: AggCall, v: ?i128) ?i128 {
+    const x = v orelse return null;
+    const unsigned = if (call.arg) |a| a == .col_ref and a.col_ref.unsigned_64 else false;
+    return if (unsigned) @as(i64, @bitCast(@as(u64, @intCast(x)))) else x;
+}
+
+/// A one-row output column. NULL is a placeholder value under def level 0, so it needs `nullable`.
+fn oneRow(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    v: ?T,
+    placeholder: T,
+    nullable: bool,
+) Error!filter_eval.ColumnT(T) {
+    std.debug.assert(nullable or v != null);
+    const slot = try arena.alloc(T, 1);
+    slot[0] = v orelse placeholder;
+    if (!nullable) return .{ .values = slot };
+    if (v != null) return .{ .values = slot, .max_def = 1 };
+    const def = try arena.alloc(u32, 1);
+    def[0] = 0;
+    return .{ .values = slot, .def_levels = def, .max_def = 1, .has_nulls = true };
+}
+
+fn emitOneI64(arena: std.mem.Allocator, name: []const u8, v: ?i128, nullable: bool) Error![]OutputCol {
     // The result parquet column is INT64; a value outside i64 range (an
     // overflowing sum or an unsigned-64 extremum) can't be stored. Error
     // rather than silently wrap — the JSON path carries the full i128.
-    if (v > std.math.maxInt(i64) or v < std.math.minInt(i64)) return error.AggIntTooWide;
-    const slot = try arena.alloc(i64, 1);
-    slot[0] = @intCast(v);
+    const narrowed: ?i64 = if (v) |x| std.math.cast(i64, x) orelse return error.AggIntTooWide else null;
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .i64 = .{ .values = slot } },
+        .col = .{ .i64 = try oneRow(i64, arena, narrowed, 0, nullable) },
         .parquet_type = .INT64,
+        .nullable = nullable,
     };
     return out;
 }
 
-fn emitOneString(arena: std.mem.Allocator, name: []const u8, v: []const u8) Error![]OutputCol {
-    const slot = try arena.alloc([]const u8, 1);
-    slot[0] = v;
+fn emitOneString(arena: std.mem.Allocator, name: []const u8, v: ?[]const u8) Error![]OutputCol {
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .string = .{ .values = slot } },
+        .col = .{ .string = try oneRow([]const u8, arena, v, "", true) },
         .parquet_type = .BYTE_ARRAY,
+        .nullable = true,
     };
     return out;
 }
 
-fn emitOneF64(arena: std.mem.Allocator, name: []const u8, v: f64) Error![]OutputCol {
-    const slot = try arena.alloc(f64, 1);
-    slot[0] = v;
+fn emitOneF64(arena: std.mem.Allocator, name: []const u8, v: ?f64) Error![]OutputCol {
     const out = try arena.alloc(OutputCol, 1);
     out[0] = .{
         .name = name,
-        .col = .{ .f64 = .{ .values = slot } },
+        .col = .{ .f64 = try oneRow(f64, arena, v, 0, true) },
         .parquet_type = .DOUBLE,
+        .nullable = true,
     };
     return out;
 }
@@ -1305,27 +1241,21 @@ fn emitAvgPair(arena: std.mem.Allocator, name: []const u8, st: AvgState) Error![
     // Two columns: <alias>__sum (DOUBLE) and <alias>__count (INT64).
     // Caller running `zpq query --aggregate "avg(...) AS x"` over the
     // tier-1 outputs gets sum(x__sum) / sum(x__count) — algebraically
-    // correct re-aggregation.
+    // correct re-aggregation. With no values the sum is NULL like sum()'s,
+    // and the count 0 like count()'s.
     const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
     const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
-
-    const sum_slot = try arena.alloc(f64, 1);
-    sum_slot[0] = st.sum;
-    const count_slot = try arena.alloc(i64, 1);
-    count_slot[0] = @intCast(st.count);
-
+    const sum = try emitOneF64(arena, sum_name, avgSum(st));
+    const count = try emitOneI64(arena, count_name, st.count, false);
     const out = try arena.alloc(OutputCol, 2);
-    out[0] = .{
-        .name = sum_name,
-        .col = .{ .f64 = .{ .values = sum_slot } },
-        .parquet_type = .DOUBLE,
-    };
-    out[1] = .{
-        .name = count_name,
-        .col = .{ .i64 = .{ .values = count_slot } },
-        .parquet_type = .INT64,
-    };
+    out[0] = sum[0];
+    out[1] = count[0];
     return out;
+}
+
+/// The avg pair's sum, NULL when no value was averaged.
+pub fn avgSum(st: AvgState) ?f64 {
+    return if (st.count == 0) null else st.sum;
 }
 
 // ============================================================
@@ -1459,7 +1389,7 @@ test "unsigned-64 sum/min/max read the i64 lane as u64" {
         var state = Accumulator.init(call);
         try updateOne(a, a, &state, call, &batch, &lookup, &sel);
         const got: i128 = switch (state) {
-            .sum_i => |v| v,
+            .sum_i => |v| v.?,
             .min_i => |v| v.?,
             .max_i => |v| v.?,
             else => unreachable,
@@ -1556,6 +1486,44 @@ test "aggregates over a bool column (widened to 0/1)" {
     try testing.expectEqual(@as(i128, 3), s.sum_i); // sum = #trues
     try testing.expectEqual(@as(i64, 0), mn.min_i.?); // min = 0 (a false present)
     try testing.expectEqual(@as(i64, 1), mx.max_i.?); // max = 1 (a true present)
+}
+
+test "prepared aggregate input owns its widened copy and nothing it borrows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const narrow = [_]i32{ 1, 2, 3 };
+    const wide = [_]i64{ 4, 5, 6 };
+    const defs = [_]u32{ 1, 0, 1 };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .i32 = .{ .values = &narrow } },
+        .{ .i64 = .{ .values = &wide, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1 };
+    var sel = try filter_selection.SelectionVector.init(a, 3);
+
+    const narrow_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const sum_narrow: AggCall = .{ .func = .sum, .arg = narrow_arg, .where = null, .alias = "s", .result = .i64 };
+    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel);
+    try testing.expect(widened.values_owned);
+    try testing.expect(widened.own_sel == null);
+    try testing.expectEqual(&sel, widened.selection());
+    const copy = widened.values.?.i64.values.ptr;
+    widened.deinit(a);
+    // Freed newest first, so the arena hands the same bytes to the next row group's widen.
+    try testing.expectEqual(copy, (try a.alloc(i64, 3)).ptr);
+
+    const wide_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const sum_wide: AggCall = .{ .func = .sum, .arg = wide_arg, .where = null, .alias = "s", .result = .i64 };
+    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel);
+    defer borrowed.deinit(a);
+    try testing.expect(!borrowed.values_owned);
+    try testing.expectEqual(@as([*]const i64, &wide), borrowed.values.?.i64.values.ptr);
+    // The null row leaves the call's own selection, not the shared one.
+    try testing.expect(!borrowed.selection().isActive(1));
+    try testing.expect(sel.isActive(1));
 }
 
 test "avg emits sum + count pair" {
@@ -1707,7 +1675,51 @@ test "updateOneFromStats sum: constant-column RG folds num_rows × value" {
     rg.columns.items[0].meta_data.?.statistics.?.max_value = hi_buf;
     var state2 = Accumulator.init(sum_call);
     try testing.expectEqual(false, try updateOneFromStats(&state2, sum_call, &rg, &test_meta));
-    try testing.expectEqual(@as(i128, 0), state2.sum_i);
+    try testing.expectEqual(@as(?i128, null), state2.sum_i);
+}
+
+test "updateOneFromStats: an all-null row group leaves sum/min/max NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Bounds a writer left on a chunk whose every row is null must not become a value (or a 0 sum).
+    const bound = try a.alloc(u8, 8);
+    std.mem.writeInt(i64, bound[0..8], 7, .little);
+    var path: schema.StringList = .empty;
+    try path.append(a, "x");
+    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try col_chunks.append(a, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT64,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 100,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = .{ .min_value = bound, .max_value = bound, .null_count = 100 },
+        },
+    });
+    const rg: schema.RowGroup = .{ .columns = col_chunks, .total_byte_size = 0, .num_rows = 100 };
+    const meta = try testI64Meta(a, .empty, 100, .OPTIONAL);
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+
+    inline for (.{ AggFunc.sum, AggFunc.min, AggFunc.max }) |func| {
+        const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "x", .result = .i64 };
+        var state = Accumulator.init(call);
+        try testing.expect(try updateOneFromStats(&state, call, &rg, &meta));
+        const v: ?i128 = switch (state) {
+            .sum_i, .min_i, .max_i => |x| x,
+            else => unreachable,
+        };
+        try testing.expectEqual(@as(?i128, null), v);
+    }
 }
 
 test "updateOneFromStats decodes typed min/max bytes" {
@@ -1975,6 +1987,25 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
     try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, true));
     try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, false));
     try testing.expect(statsCoverageComplete(star_call, &.{meta_partial}, 0, false));
+
+    // `updateOneFromStats` never folds an unsigned column, so its stats cannot let the column go unfetched.
+    meta_complete.schema.items[1].converted_type = .UINT_64;
+    try testing.expect(!statsCoverageComplete(max_call, &.{meta_complete}, 0, true));
+    try testing.expect(statsCoverageComplete(star_call, &.{meta_complete}, 0, true));
+
+    // FLOAT16 decodes to the f64 lane, but no fold reads its 2-byte bounds: it too must stay fetched.
+    const leaf = &meta_complete.schema.items[1];
+    leaf.converted_type = null;
+    leaf.type = .FIXED_LEN_BYTE_ARRAY;
+    leaf.type_length = 2;
+    leaf.logical_type = .{ .FLOAT16 = .{} };
+    const half: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .f64,
+    } };
+    const half_max: AggCall = .{ .func = .max, .arg = half, .where = null, .alias = "hi", .result = .f64 };
+    try testing.expect(!statsCoverageComplete(half_max, &.{meta_complete}, 0, true));
 }
 
 test "simdSumI64 widens correctly across positive and negative i64 extremes" {
@@ -2167,50 +2198,114 @@ test "conditional agg via FILTER predicate" {
     try testing.expectEqual(@as(i128, 90), state.sum_i);
 }
 
-// --- DECIMAL aggregate stats-fast-path (self-contained, no fixtures) ---
-// decimalStatBytesToF64 is how min/max/sum on a DECIMAL column are answered
-// from row-group Statistics without decoding values. It's pure (byte slice +
-// Kind → f64), so it's testable directly; the fixture-based decode tests in
-// decimal.zig skip without the corpus, but these always run in CI.
+test "sum/avg/min/max over no values are NULL; count is 0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-test "decimalStatBytesToF64: INT32/INT64 backings apply scale (signed)" {
-    var b32: [4]u8 = undefined;
-    std.mem.writeInt(i32, &b32, 12345, .little);
-    const k32 = decimal_mod.Kind{ .scale = 2, .precision = 9, .physical = .INT32, .byte_width = 0 };
-    try testing.expectApproxEqAbs(@as(f64, 123.45), decimalStatBytesToF64(&b32, k32).?, 1e-9);
+    // Column 0: all null. Column 1: present, but rows are deselected below. Column 2: strings.
+    const nulls = [_]f64{ 7, 7, 7 };
+    const zeros = [_]u32{ 0, 0, 0 };
+    const ints = [_]i64{ 1, 2, 3 };
+    const strs = [_][]const u8{ "a", "b", "c" };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .f64 = .{ .values = &nulls, .def_levels = &zeros, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = &ints } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    var all = try filter_selection.SelectionVector.init(a, 3);
+    var none = try filter_selection.SelectionVector.init(a, 3);
+    for (0..3) |i| none.set(i, false);
 
-    std.mem.writeInt(i32, &b32, -6789, .little); // negative
-    try testing.expectApproxEqAbs(@as(f64, -67.89), decimalStatBytesToF64(&b32, k32).?, 1e-9);
+    const f_null: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const i_col: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const s_col: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const never: filter_ast.Filter = .{ .int64 = .{ .col_idx = 1, .op = .Lt, .value = 0 } };
+    const Case = struct { call: AggCall, sel: *filter_selection.SelectionVector };
+    const cases = [_]Case{
+        // all-null input
+        .{ .call = .{ .func = .sum, .arg = f_null, .where = null, .alias = "a", .result = .f64 }, .sel = &all },
+        .{ .call = .{ .func = .min, .arg = f_null, .where = null, .alias = "b", .result = .f64 }, .sel = &all },
+        .{ .call = .{ .func = .avg, .arg = f_null, .where = null, .alias = "c", .result = .avg_f64 }, .sel = &all },
+        // zero rows selected by the outer filter
+        .{ .call = .{ .func = .sum, .arg = i_col, .where = null, .alias = "d", .result = .i64 }, .sel = &none },
+        .{ .call = .{ .func = .max, .arg = i_col, .where = null, .alias = "e", .result = .i64 }, .sel = &none },
+        .{ .call = .{ .func = .min, .arg = s_col, .where = null, .alias = "f", .result = .bytes }, .sel = &none },
+        // a FILTER clause that selects nothing
+        .{ .call = .{ .func = .sum, .arg = i_col, .where = never, .alias = "g", .result = .i64 }, .sel = &all },
+        .{ .call = .{ .func = .max, .arg = s_col, .where = never, .alias = "h", .result = .bytes }, .sel = &all },
+    };
+    for (cases) |c| {
+        var state = Accumulator.init(c.call);
+        try updateOne(a, a, &state, c.call, &batch, &lookup, c.sel);
+        // A second, equally empty partial merged in must not turn NULL into 0.
+        state.merge(Accumulator.init(c.call), a);
+        const outs = try finalize(a, c.call, state);
+        // avg's count column stays a REQUIRED 0; every other output is a NULL.
+        for (outs) |o| {
+            if (std.mem.endsWith(u8, o.name, "__count")) {
+                try testing.expect(!o.nullable);
+                try testing.expectEqual(@as(i64, 0), o.col.i64.values[0]);
+                continue;
+            }
+            try testing.expect(o.nullable);
+            switch (o.col) {
+                inline else => |col| {
+                    try testing.expect(col.has_nulls);
+                    try testing.expectEqualSlices(u32, &.{0}, col.def_levels.?);
+                },
+            }
+        }
+    }
 
-    var b64: [8]u8 = undefined;
-    std.mem.writeInt(i64, &b64, 100000, .little);
-    const k64 = decimal_mod.Kind{ .scale = 3, .precision = 18, .physical = .INT64, .byte_width = 0 };
-    try testing.expectApproxEqAbs(@as(f64, 100.0), decimalStatBytesToF64(&b64, k64).?, 1e-9);
+    // count(*) and count(col) over the same inputs are 0, not NULL.
+    const count_col: AggCall = .{ .func = .count, .arg = f_null, .where = null, .alias = "n", .result = .i64 };
+    var cs = Accumulator.init(count_col);
+    try updateOne(a, a, &cs, count_col, &batch, &lookup, &all);
+    const cout = try finalize(a, count_col, cs);
+    try testing.expect(!cout[0].nullable);
+    try testing.expectEqual(@as(i64, 0), cout[0].col.i64.values[0]);
+
+    // NULL is the identity for merging partials: NULL + 6 = 6.
+    const sum_call: AggCall = .{ .func = .sum, .arg = i_col, .where = null, .alias = "s", .result = .i64 };
+    var empty = Accumulator.init(sum_call);
+    var full = Accumulator.init(sum_call);
+    try updateOne(a, a, &full, sum_call, &batch, &lookup, &all);
+    empty.merge(full, a);
+    try testing.expectEqual(@as(?i128, 6), empty.sum_i);
 }
 
-test "decimalStatBytesToF64: FLBA backing sign-extends + scales" {
-    var be: [8]u8 = undefined;
-    const kpos = decimal_mod.Kind{ .scale = 2, .precision = 20, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 8 };
-    std.mem.writeInt(i64, &be, 12345, .big);
-    try testing.expectApproxEqAbs(@as(f64, 123.45), decimalStatBytesToF64(&be, kpos).?, 1e-9);
-    std.mem.writeInt(i64, &be, -12345, .big); // high byte 0xFF must sign-extend
-    try testing.expectApproxEqAbs(@as(f64, -123.45), decimalStatBytesToF64(&be, kpos).?, 1e-9);
+test "grouped sum/min over a group with only null values stays NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    // narrow 2-byte FLBA, scale 0: -100 = 0xFF9C big-endian
-    var be2: [2]u8 = undefined;
-    std.mem.writeInt(i16, &be2, -100, .big);
-    const k2 = decimal_mod.Kind{ .scale = 0, .precision = 4, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 2 };
-    try testing.expectApproxEqAbs(@as(f64, -100.0), decimalStatBytesToF64(&be2, k2).?, 1e-9);
-}
-
-test "decimalStatBytesToF64: malformed inputs return null (no UB)" {
-    const short = [_]u8{ 0x01, 0x02 }; // < 4 bytes for INT32
-    try testing.expect(decimalStatBytesToF64(&short, .{ .scale = 0, .precision = 9, .physical = .INT32, .byte_width = 0 }) == null);
-
-    const some = [_]u8{0} ** 8;
-    // FLBA byte_width 0 → reject; byte_width 17 (> MAX_FLBA_BYTE_WIDTH) → reject
-    try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 0 }) == null);
-    try testing.expect(decimalStatBytesToF64(&some, .{ .scale = 0, .precision = 40, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 17 }) == null);
+    // Group 0 holds rows 0 and 2 (both null); group 1 holds row 1 (value 5).
+    const vals = [_]i64{ 9, 5, 9 };
+    const dls = [_]u32{ 0, 1, 0 };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .i64 = .{ .values = &vals, .def_levels = &dls, .max_def = 1, .has_nulls = true } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+    const sel = try filter_selection.SelectionVector.init(a, 3);
+    const gids = [_]u32{ 0, 1, 0 };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .min, .arg = arg, .where = null, .alias = "m", .result = .i64 },
+    };
+    var accs: [4]Accumulator = undefined;
+    for (0..2) |g| for (calls, 0..) |c, i| {
+        accs[g * 2 + i] = Accumulator.init(c);
+    };
+    for (calls, 0..) |c, i| try updateOneGrouped(a, a, &accs, &gids, i, calls.len, c, &batch, &lookup, &sel);
+    try testing.expectEqual(@as(?i128, null), accs[0].sum_i);
+    try testing.expectEqual(@as(?i128, null), accs[1].min_i);
+    try testing.expectEqual(@as(?i128, 5), accs[2].sum_i);
+    try testing.expectEqual(@as(?i128, 5), accs[3].min_i);
 }
 
 pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {
@@ -2495,6 +2590,8 @@ pub const GroupTable = struct {
     }
 };
 
+/// Grouped counterpart of `updateOne`: fold each row the call selects into its group's accumulator,
+/// `accs[group_id_arr[row] * agg_len + agg_idx]`.
 pub fn updateOneGrouped(
     arena: std.mem.Allocator,
     persist: std.mem.Allocator,
@@ -2507,27 +2604,11 @@ pub fn updateOneGrouped(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    var sel_owned: ?filter_selection.SelectionVector = null;
-    defer if (sel_owned) |*s| s.deinit();
-
-    if (call.where) |pred| {
-        sel_owned = try outer_sel.cloneAlloc(arena);
-        try filter_eval.evaluate(pred, batch, &sel_owned.?, column_lookup, arena);
-    }
-
-    var values: ?filter_eval.Batch.Column = null;
-    if (call.arg) |arg| {
-        if (arg == .col_ref) {
-            values = try colRefForAgg(arena, batch, column_lookup, arg.col_ref, outer_sel, &sel_owned);
-        } else {
-            values = try expr_eval.evalExpr(arena, batch, column_lookup, arg);
-        }
-    }
-
-    const sel: *const filter_selection.SelectionVector =
-        if (sel_owned) |*s| s else outer_sel;
-
-    const u64_col = if (call.arg) |a| (a == .col_ref and a.col_ref.unsigned_64) else false;
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
+    defer input.deinit(arena);
+    const sel = input.selection();
+    const values = input.values;
+    const u64_col = input.unsigned_64;
 
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
@@ -2559,7 +2640,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
                 else => return error.UnsupportedAggType,
             };
-            s.* += v;
+            s.* = (s.* orelse 0) + v;
         },
         .sum_f => |*s| {
             const v = switch (col) {
@@ -2567,7 +2648,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .f64 => |c| c.values[r],
                 else => return error.UnsupportedAggType,
             };
-            s.* += v;
+            s.* = (s.* orelse 0) + v;
         },
         else => return error.UnsupportedAggType,
     }

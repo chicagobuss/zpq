@@ -10,7 +10,9 @@ pub const core = struct {
     pub const consumer = @import("core/consumer.zig");
     pub const invariant = @import("core/invariant.zig");
     pub const scan = @import("core/scan.zig");
+    pub const diag = @import("core/diag.zig");
     pub const spawn = @import("core/spawn.zig");
+    pub const huge_pages = @import("core/huge_pages.zig");
     pub const filter = struct {
         pub const ast = @import("core/filter/ast.zig");
         pub const encoded = @import("core/filter/encoded.zig");
@@ -33,6 +35,7 @@ pub const core = struct {
             struct {};
     };
     pub const system = @import("core/system.zig");
+    pub const bytes = @import("core/bytes.zig");
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");
@@ -47,6 +50,7 @@ pub const core = struct {
         pub const page = @import("core/parquet/page.zig");
         pub const column = @import("core/parquet/column.zig");
         pub const decimal = @import("core/parquet/decimal.zig");
+        pub const statistics = @import("core/parquet/statistics.zig");
         pub const int96 = @import("core/parquet/int96.zig");
         pub const fuzz_decode = @import("core/parquet/fuzz_decode.zig");
         pub const encoding = struct {
@@ -60,6 +64,8 @@ pub const core = struct {
 };
 
 pub const engine = @import("engine.zig");
+pub const clock = @import("clock.zig");
+pub const local_fs = @import("local_fs.zig");
 
 pub const io = struct {
     pub const strategy = @import("io/strategy.zig");
@@ -83,6 +89,8 @@ test {
     _ = @import("core/thrift.zig");
     _ = @import("core/consumer.zig");
     _ = @import("core/scan.zig");
+    _ = @import("core/agg_plan.zig");
+    _ = @import("core/huge_pages.zig");
     _ = @import("core/spawn.zig");
     _ = @import("core/invariant.zig");
     _ = @import("core/filter/ast.zig");
@@ -101,6 +109,8 @@ test {
     _ = @import("core/writer/encoder.zig");
     _ = @import("core/writer/streaming.zig");
     _ = @import("core/system.zig");
+    _ = @import("core/bytes.zig");
+    _ = @import("core/row_group_arena.zig");
     _ = @import("core/parquet/metadata.zig");
     _ = @import("core/parquet/schema_tree.zig");
     _ = @import("core/parquet/snappy.zig");
@@ -109,6 +119,7 @@ test {
     _ = @import("core/parquet/page.zig");
     _ = @import("core/parquet/column.zig");
     _ = @import("core/parquet/decimal.zig");
+    _ = @import("core/parquet/statistics.zig");
     _ = @import("core/parquet/int96.zig");
     _ = @import("core/parquet/fuzz_decode.zig");
     _ = @import("core/parquet/encoding/plain.zig");
@@ -117,6 +128,8 @@ test {
     _ = @import("core/parquet/encoding/delta_binary_packed.zig");
     _ = @import("core/parquet/encoding/delta_byte_array.zig");
     _ = @import("engine.zig");
+    _ = @import("clock.zig");
+    _ = @import("local_fs.zig");
     _ = @import("io/strategy.zig");
     _ = @import("io/loop.zig");
     _ = @import("io/epoll.zig");

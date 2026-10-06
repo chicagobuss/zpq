@@ -15,8 +15,12 @@ same shape under the same Lambda configuration.
 - Validate every output with `benchmarks/validate_outputs.py`; it opens each
   output with PyArrow and DuckDB. Do not publish a timing row whose output was
   not validated.
-- Report Lambda-reported `total_ms` for warm execution, separately from caller
-  wall-clock time and cold-start `Init Duration`. They measure different things.
+- Lead with cold invocations: zpq on Lambda is meant to run cold, bursty and
+  fanned out, so `Init Duration` plus `Duration` of forced cold starts is the
+  primary figure (the 2026-10-05 run is in
+  `lambda_cold_start_2026-10-05.md`). Report Lambda-reported `total_ms` for
+  warm execution separately, as a secondary figure, and keep both apart from
+  caller wall-clock time. They measure different things.
   `benchmarks/summarize_lambda_results.py` refuses to produce a table without
   the validation sidecar from the same run.
 

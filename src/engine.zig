@@ -701,6 +701,138 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
     if (w.first_err) |e| return e;
 }
 
+/// A byte copy that changes codec: producers recompress whole row groups in parallel, and the in-order writer places
+/// them through `consumer.copyRG`, which writes straight to the sink at final offsets, so page indexes carry over
+/// exactly as on the serial copy.
+const RecompressCtx = struct {
+    const writer = recompressWriter;
+    const producer = recompressProducer;
+
+    gpa: std.mem.Allocator,
+    io: std.Io = undefined, // set in runWindowed once the runtime exists
+    jobs: []const RGJob,
+    kept: ?[]const bool,
+    codec: schema.CompressionCodec,
+    slots: []RecompressSlot,
+    window: *std.Io.Semaphore,
+    completions: *std.Io.Semaphore,
+    cpu: std.Io.Semaphore = .{},
+
+    // Writer-owned; read back after the fan-out.
+    sink: streaming.Sink,
+    out_offset: u64,
+    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    arena: std.mem.Allocator, // writer-only: footer metadata
+    rows_kept: i64 = 0,
+    rgs_kept: usize = 0,
+    core: consumer.Timings = .{},
+    first_err: ?anyerror = null,
+    profiler: ?*profile.Profiler = null,
+};
+
+const RecompressSlot = struct {
+    /// Private to the producer until `done`, then to the writer, which frees it once the row group is written.
+    arena: std.heap.ArenaAllocator,
+    chunks: []?consumer.RecompressedChunk = &.{},
+    encode_ns: u64 = 0,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn recompressProducer(w: *RecompressCtx, i: usize) void {
+    const prof = profile.threadOf(w.profiler, .encode);
+    const span = profile.Span.begin(prof);
+    defer span.end(.encode_rg, profile.args(.{ w.jobs[i].file_index, w.jobs[i].rg_index, false }));
+    const slot = &w.slots[i];
+    var timings: consumer.Timings = .{ .prof = prof };
+    const job = w.jobs[i];
+    if (consumer.recompressRowGroup(
+        slot.arena.allocator(),
+        w.gpa,
+        job.rg,
+        .{ .bytes = job.bytes, .byte_origin = 0 },
+        w.kept,
+        w.codec,
+        &timings,
+    )) |chunks| {
+        slot.chunks = chunks;
+    } else |e| slot.err = e;
+    slot.encode_ns = timings.encode_ns;
+    slot.done.store(true, .release);
+    w.completions.post(w.io);
+}
+
+fn recompressWriter(w: *RecompressCtx) void {
+    const prof = profile.threadOf(w.profiler, .writer);
+    w.core.prof = prof;
+    defer w.core.prof = null;
+    for (w.slots, w.jobs) |*slot, job| {
+        while (!slot.done.load(.acquire)) w.completions.waitUncancelable(w.io);
+        w.core.encode_ns += slot.encode_ns;
+        if (slot.err) |e| {
+            if (w.first_err == null) w.first_err = e;
+        } else if (w.first_err == null) {
+            const rg_span = profile.Span.begin(prof);
+            defer rg_span.end(.copy_rg, profile.args(.{job.rg.total_byte_size}));
+            if (consumer.copyRG(
+                w.arena,
+                job.rg,
+                .{ .bytes = job.bytes, .byte_origin = 0 },
+                w.kept,
+                w.sink,
+                &w.out_offset,
+                &w.core,
+                true,
+                .{ .codec = w.codec, .scratch = w.gpa, .done = slot.chunks },
+            )) |out| {
+                if (out.rg) |rg| w.new_row_groups.append(w.arena, rg) catch |e| {
+                    w.first_err = e;
+                };
+                w.rows_kept += out.surviving_rows;
+                if (out.surviving_rows > 0) w.rgs_kept += 1;
+            } else |e| w.first_err = e;
+        }
+        slot.arena.deinit();
+        slot.arena = std.heap.ArenaAllocator.init(w.gpa);
+        w.window.post(w.io);
+    }
+}
+
+const WriteWindow = struct { workers: usize, window: usize };
+
+/// The write fan-out's two knobs:
+///   - concurrency: explicit -j, else the Lambda- and quota-aware CPU budget;
+///   - window: row groups in flight, from a byte budget for buffered output in every environment, so a large -j or
+///     large row groups cannot retain many GB. On Lambda we own the container (about half the tier); elsewhere stay
+///     polite (a modest cap, a small fraction of what is available).
+/// A tight byte budget may cut the workers below the CPU budget: idle workers beat exceeding the memory cap.
+fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWindow {
+    const async_budget = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    var sum_bytes: u64 = 0;
+    for (jobs) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
+    const avg_rg = @max(@as(u64, 1), sum_bytes / @max(@as(u64, 1), jobs.len));
+    const inflight_budget: u64 = if (system.onLambda(ctx.env))
+        system.discoverAvailableMemory(ctx.env) / 2
+    else
+        @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
+    const window = system.windowCapacity(inflight_budget, avg_rg, jobs.len);
+    return .{ .workers = @min(async_budget, window), .window = window };
+}
+
+/// True when some kept chunk of some row group is stored in another codec than `codec`.
+fn anyChunkNeedsRecompress(
+    metas: []const schema.FileMetaData,
+    kept: ?[]const bool,
+    codec: schema.CompressionCodec,
+) bool {
+    for (metas) |*m| for (m.row_groups.items) |*rg| for (rg.columns.items, 0..) |*col, ci| {
+        if (kept) |k| if (ci >= k.len or !k[ci]) continue;
+        const md = col.meta_data orelse continue;
+        if (md.codec != codec) return true;
+    };
+    return false;
+}
+
 /// True when every kept (output) column chunk of `rg` is already stored in
 /// `codec` — the precondition for a byte-copy passthrough to honor a requested
 /// --codec without re-encoding.
@@ -1160,7 +1292,59 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var win_slots: []Slot = &.{};
     defer for (win_slots) |*s| s.meta_arena.deinit();
 
-    if (!need_encoder) {
+    const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
+    if (!need_encoder and args.codec != null and anyChunkNeedsRecompress(metas, kept_opt, args.codec.?)) {
+        // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
+        // behind a byte window, as the re-encode path below does.
+        var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+        for (opened.inputs, metas, 0..) |in, *meta_p, ii| {
+            bytes_in += in.bytes.len;
+            for (meta_p.row_groups.items) |*src_rg| {
+                rgs_in += 1;
+                rows_in += src_rg.num_rows;
+                try jobs.append(arena, .{
+                    .bytes = in.bytes,
+                    .meta = meta_p,
+                    .rg = src_rg,
+                    .file_index = ii,
+                    .rg_index = rgs_in - 1,
+                });
+            }
+        }
+        for (metas) |*m| try copied_from.append(arena, m);
+        if (jobs.items.len > 0) {
+            const sizing = writeWindow(ctx, args, jobs.items);
+            const window = sizing.window;
+            const slots = try arena.alloc(RecompressSlot, jobs.items.len);
+            for (slots) |*sl| sl.* = .{ .arena = std.heap.ArenaAllocator.init(ctx.gpa) };
+            defer for (slots) |*sl| sl.arena.deinit();
+            var window_sem: std.Io.Semaphore = .{ .permits = window };
+            var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+            var rw = RecompressCtx{
+                .gpa = ctx.gpa,
+                .jobs = jobs.items,
+                .kept = kept_opt,
+                .codec = args.codec.?,
+                .slots = slots,
+                .window = &window_sem,
+                .completions = &completions_sem,
+                .sink = sink,
+                .out_offset = out_offset,
+                .new_row_groups = &new_row_groups,
+                .arena = arena,
+                .profiler = args.profiler,
+            };
+            const effective = sizing.workers;
+            const re_span = profile.Span.begin(prof);
+            defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective, window }));
+            try runWindowed(RecompressCtx, &rw, jobs.items.len, effective);
+            out_offset = rw.out_offset;
+            rows_kept += rw.rows_kept;
+            rg_kept += rw.rgs_kept;
+            t.core.sink_ns += rw.core.sink_ns;
+            t.core.encode_ns += rw.core.encode_ns;
+        }
+    } else if (!need_encoder) {
         // Byte-copy fastpath: copy kept column chunks verbatim (serial;
         // memcpy-bound and already faster than every other engine). A chunk
         // stored in another codec than the one requested is recompressed.
@@ -1257,30 +1441,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 
         if (jobs.items.len > 0) {
             // 2. Size the two knobs from the environment.
-            //    - concurrency: explicit -j, else Lambda-aware vCPU budget.
-            //    - window: on Lambda, generously from the owned memory tier;
-            //      elsewhere a small polite multiple of the worker count.
-            const async_budget = if (args.parallelism > 0)
-                args.parallelism
-            else
-                system.discoverAvailableParallelism(ctx.env);
-
-            var sum_bytes: u64 = 0;
-            for (jobs.items) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
-            const avg_rg = @max(@as(u64, 1), sum_bytes / jobs.items.len);
-            // In-flight memory budget for buffered encoded output, byte-derived
-            // in BOTH environments so a large -j or large row groups can't
-            // retain many GB. On Lambda we own the container → ~half the tier;
-            // elsewhere stay polite (a modest cap / small fraction of avail).
-            const inflight_budget: u64 = if (system.onLambda(ctx.env))
-                system.discoverAvailableMemory(ctx.env) / 2
-            else
-                @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
-            const window = system.windowCapacity(inflight_budget, avg_rg, jobs.items.len);
-            // A tight byte budget may intentionally reduce effective CPU
-            // parallelism. Idle requested workers are preferable to exceeding
-            // the memory cap and risking an OOM.
-            const effective_async_budget = @min(async_budget, window);
+            const sizing = writeWindow(ctx, args, jobs.items);
+            const window = sizing.window;
+            const effective_async_budget = sizing.workers;
 
             // 3. Slots hold per-RG results; their meta arenas live to the footer.
             const slots = try arena.alloc(Slot, jobs.items.len);
@@ -3519,6 +3682,53 @@ test "windowed re-encode writes the same bytes at every parallelism" {
             } else first = bytes;
         }
     }
+}
+
+test "a recompressing copy writes the same bytes at every parallelism and reads back the same answer" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const agg = "count(*) AS n, sum(x) AS sx, max(s) AS ms, sum(ts) AS st";
+
+    var want = try runQuery(ctx, .{ .inputs = &.{fixture}, .aggregate = agg });
+    defer want.aggregate.deinit(gpa);
+
+    // The fixture is SNAPPY: every chunk changes codec, with and without a projection.
+    const all: ?[]const []const u8 = null;
+    const projections = [_]?[]const []const u8{ all, &.{ "ts", "x", "s" } };
+    for (projections) |columns| for ([_]schema.CompressionCodec{ .ZSTD, .UNCOMPRESSED }) |codec| {
+        var first: ?[]u8 = null;
+        defer if (first) |b| gpa.free(b);
+        for ([_]usize{ 1, 2, 3, 8 }) |j| {
+            var r = try runQuery(ctx, .{
+                .inputs = &.{fixture},
+                .output = out,
+                .columns = columns,
+                .codec = codec,
+                .parallelism = j,
+            });
+            defer r.deinit(gpa);
+            try std.testing.expectEqual(@as(?schema.CompressionCodec, codec), r.write.codec);
+            try std.testing.expectEqual(@as(usize, 8), r.write.row_groups_kept);
+            const bytes = try metadata.readFileSlice(out, gpa);
+            if (first) |b| {
+                defer gpa.free(bytes);
+                try std.testing.expectEqualSlices(u8, b, bytes);
+            } else first = bytes;
+        }
+        var got = try runQuery(ctx, .{ .inputs = &.{out}, .aggregate = agg });
+        defer got.aggregate.deinit(gpa);
+        for (want.aggregate.output.aggs, got.aggregate.output.aggs) |w, g| switch (w.value) {
+            .s => |ws| try std.testing.expectEqualStrings(ws, g.value.s),
+            else => try std.testing.expectEqualDeep(w.value, g.value),
+        };
+    };
 }
 
 test "a select output naming one column twice is rejected and named, like aggregate outputs" {

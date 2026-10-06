@@ -20,6 +20,7 @@ const snappy = @import("../parquet/snappy.zig");
 const compression = @import("../parquet/compression.zig");
 const delta_binary_packed = @import("../parquet/encoding/delta_binary_packed.zig");
 const bloom = @import("../parquet/bloom.zig");
+const agg_coded = @import("../expr/agg_coded.zig");
 
 pub const Error = error{
     NullableNotSupported,
@@ -73,7 +74,7 @@ pub const ColumnInput = struct {
 ///    PLAIN bytes carry only the non-null values (parquet PLAIN
 ///    encoding for OPTIONAL columns excludes null slots).
 pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
-    var enc = try encodeValues(arena, in);
+    var enc = if (in.values.codes() != null) try encodeCodedColumn(arena, in) else try encodeValues(arena, in);
     if (in.bloom_fpp) |fpp| enc.bloom = try bloomFilter(arena, in.values, enc.meta.type, fpp) orelse &.{};
     return enc;
 }
@@ -99,7 +100,11 @@ pub fn bloomFilter(
     if (stored != physical) return null;
     return switch (col) {
         .boolean => unreachable,
-        inline else => |c| try bloomOf(@TypeOf(c.values[0]), arena, c.values, c.def_levels, c.max_def, fpp),
+        // A coded column may hold no values: its dictionary's entries, a superset of those present, fill the filter.
+        inline else => |c| if (c.codes != null)
+            try bloomOf(@TypeOf(c.dict[0]), arena, c.dict, null, 0, fpp)
+        else
+            try bloomOf(@TypeOf(c.values[0]), arena, c.values, c.def_levels, c.max_def, fpp),
     };
 }
 
@@ -449,6 +454,74 @@ pub fn encodeDecimalFlba(
         .encoding_stats = try pageStats(arena, &.{.{ .page_type = .DATA_PAGE, .encoding = .PLAIN }}),
     };
     return .{ .bytes = total, .meta = meta };
+}
+
+/// A column carried as codes into its source dictionary (`ColumnT.codes`). The dictionary is rebuilt from the codes
+/// alone: each code met among present rows becomes the next entry, in first-occurrence order and under the same
+/// cardinality cap as the hashing encoders, so with a source dictionary of distinct entries the chunk is the one
+/// hashing the values would write, without hashing any. Past the cap (or with too few values) the values are
+/// gathered and encoded as any other column.
+fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
+    switch (in.values) {
+        inline else => |c, tag| {
+            const T = @TypeOf(c.dict[0]);
+            const codes = c.codes.?;
+            const n = codes.len;
+            const num_present = countPresent(n, c.def_levels, c.max_def);
+            if (T != bool and c.max_rep == 0 and num_present >= 64) dict: {
+                const max_cardinality = num_present / 10;
+                const none = std.math.maxInt(u32);
+                const remap = try arena.alloc(u32, c.dict.len);
+                @memset(remap, none);
+                const entries = try arena.alloc(T, @min(max_cardinality, c.dict.len));
+                var n_entries: usize = 0;
+                const indices = try arena.alloc(u32, num_present);
+                var pos: usize = 0;
+                for (codes, 0..) |k, i| {
+                    if (!isPresent(c.def_levels, c.max_def, i)) continue;
+                    if (k >= c.dict.len) return error.CorruptInput;
+                    if (remap[k] == none) {
+                        if (n_entries >= entries.len) break :dict;
+                        remap[k] = @intCast(n_entries);
+                        entries[n_entries] = c.dict[k];
+                        n_entries += 1;
+                    }
+                    indices[pos] = remap[k];
+                    pos += 1;
+                }
+                const used = entries[0..n_entries];
+                const dict_plain = if (T == []const u8) blk: {
+                    var len: usize = 0;
+                    for (used) |v| len += 4 + v.len;
+                    const out = try arena.alloc(u8, len);
+                    var o: usize = 0;
+                    for (used) |v| {
+                        std.mem.writeInt(u32, out[o..][0..4], @intCast(v.len), .little);
+                        @memcpy(out[o + 4 ..][0..v.len], v);
+                        o += 4 + v.len;
+                    }
+                    break :blk out;
+                } else blk: {
+                    const Bits = @Int(.unsigned, @bitSizeOf(T));
+                    const out = try arena.alloc(u8, used.len * @sizeOf(T));
+                    for (used, 0..) |v, i| {
+                        std.mem.writeInt(Bits, out[i * @sizeOf(T) ..][0..@sizeOf(T)], @bitCast(v), .little);
+                    }
+                    break :blk out;
+                };
+                const dict_col = @unionInit(filter_eval.Batch.Column, @tagName(tag), .{ .values = used });
+                return finishDictionaryColumn(arena, in, @intCast(n), dict_plain, dict_col, indices);
+            }
+            var vals = c;
+            const gathered = try agg_coded.materialize(arena, in.values);
+            vals.values = @field(gathered, @tagName(tag)).values;
+            vals.codes = null;
+            vals.dict = &.{};
+            var plain = in;
+            plain.values = @unionInit(filter_eval.Batch.Column, @tagName(tag), vals);
+            return encodeColumn(arena, plain);
+        },
+    }
 }
 
 /// Try to dictionary-encode a BYTE_ARRAY column (page layout in
@@ -1790,5 +1863,70 @@ test "a dictionary chunk's statistics, taken over its entries, equal those of a 
         try testing.expectEqual(want.null_count, got.null_count);
         try testing.expectEqualSlices(u8, want.min_value.?, got.min_value.?);
         try testing.expectEqualSlices(u8, want.max_value.?, got.max_value.?);
+    }
+}
+
+test "a coded column encodes to the same bytes as its values, over and past the dictionary cap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    // A source dictionary listed in another order than rows first use it, with an entry no row uses.
+    const dict = [_][]const u8{ "unused", "kiwi", "fig", "lime", "date" };
+    for ([_]usize{ 4, 400 }) |distinct_rows| {
+        const n = 1000;
+        const codes = try a.alloc(u32, n);
+        const defs = try a.alloc(u32, n);
+        const vals = try a.alloc([]const u8, n);
+        for (0..n) |i| {
+            defs[i] = @intFromBool(i % 9 != 5);
+            codes[i] = if (defs[i] == 1) @intCast(1 + (i * 7) % 4) else 0;
+            vals[i] = if (defs[i] == 1) dict[codes[i]] else "";
+        }
+        // Past the cap the column is one whose dictionary holds `distinct_rows` entries.
+        const big_dict = try a.alloc([]const u8, distinct_rows);
+        for (big_dict, 0..) |*d, k| d.* = try std.fmt.allocPrint(a, "v{d}", .{k});
+        const big_codes = try a.alloc(u32, n);
+        for (big_codes, 0..) |*c, i| c.* = @intCast(i % distinct_rows);
+        const big_vals = try a.alloc([]const u8, n);
+        for (big_vals, defs, big_codes) |*x, d, c| x.* = if (d == 1) big_dict[c] else "";
+        const Pair = struct { coded: filter_eval.Batch.Column, plain: filter_eval.Batch.Column };
+        for ([_]Pair{
+            .{
+                .coded = .{ .string = .{
+                    .values = &.{},
+                    .codes = codes,
+                    .dict = &dict,
+                    .def_levels = defs,
+                    .max_def = 1,
+                } },
+                .plain = .{ .string = .{ .values = vals, .def_levels = defs, .max_def = 1 } },
+            },
+            .{
+                .coded = .{ .string = .{
+                    .values = &.{},
+                    .codes = big_codes,
+                    .dict = big_dict,
+                    .def_levels = defs,
+                    .max_def = 1,
+                } },
+                .plain = .{ .string = .{ .values = big_vals, .def_levels = defs, .max_def = 1 } },
+            },
+        }) |pair| {
+            const path: []const []const u8 = &.{"s"};
+            const want = try encodeColumn(a, .{ .values = pair.plain, .schema_elem = &elem, .path_in_schema = path });
+            const got = try encodeColumn(a, .{ .values = pair.coded, .schema_elem = &elem, .path_in_schema = path });
+            try testing.expectEqualSlices(u8, want.bytes, got.bytes);
+        }
     }
 }

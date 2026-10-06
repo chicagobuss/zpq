@@ -536,6 +536,7 @@ fn encodeRGToBuffer(
     defer scratch.deinit();
     var timings: consumer.Timings = .{ .prof = prof };
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
+    agg.keep_codes = true;
     // Decodes on an arena of its own over `work`, deinitialised before it returns.
     _ = try consumer.appendProjectedRGWithOptions(
         &agg,

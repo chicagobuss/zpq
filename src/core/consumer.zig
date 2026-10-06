@@ -143,6 +143,10 @@ pub const OutputAggregator = struct {
     paths: [][]const []const u8,
     num_rows: usize,
     captured: bool,
+    /// Keep a dictionary-encoded source column's codes and dictionary instead of its values, for the encoder to
+    /// re-dictionary without hashing a value. Only for an aggregator holding one row group (the per-row-group
+    /// re-encode): codes index one source dictionary.
+    keep_codes: bool = false,
 
     pub const ColumnBuf = union(enum) {
         i32: TypedBuf(i32),
@@ -163,6 +167,10 @@ pub const OutputAggregator = struct {
             values: std.ArrayList(T) = .empty,
             def_levels: std.ArrayList(u32) = .empty,
             max_def: u32 = 0,
+            /// With `coded`, the rows are `codes` into `dict` (0 at null rows) and `values` is empty.
+            coded: bool = false,
+            codes: std.ArrayList(u32) = .empty,
+            dict: []const T = &.{},
         };
     }
 };
@@ -287,6 +295,9 @@ pub fn resetAggregator(agg: *OutputAggregator) void {
             inline else => |*tb| {
                 tb.values.clearRetainingCapacity();
                 tb.def_levels.clearRetainingCapacity();
+                tb.codes.clearRetainingCapacity();
+                tb.coded = false;
+                tb.dict = &.{};
             },
         }
     }
@@ -362,15 +373,22 @@ pub fn appendProjectedRGWithOptions(
             early[ci] = true;
         };
     }
+    // Columns a computed output reads stay values; any other may decode to dictionary codes (`keep_codes`).
+    const computed_refs = try ra.alloc(bool, num_leaves);
+    @memset(computed_refs, false);
     for (output_specs) |spec| switch (spec) {
-        .computed => |c| c.expr.collectColumns(early),
+        .computed => |c| c.expr.collectColumns(computed_refs),
         .passthrough => {},
     };
+    for (early, computed_refs) |*e, c| e.* = e.* or c;
 
     const t_decode_start = nowMonoNs();
     for (fetch_set, 0..) |needed, ci| {
         if (!needed or !early[ci]) continue;
-        const decoded = try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
+        const decoded = if (agg.keep_codes and !computed_refs[ci])
+            try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
+        else
+            try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
         batch_pos_for_col[ci] = batch_cols.items.len;
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, decoded);
@@ -421,7 +439,10 @@ pub fn appendProjectedRGWithOptions(
             else if (kept_ci < fetch_set.len and fetch_set[kept_ci]) blk: {
                 const t0 = nowMonoNs();
                 const la = late.allocator();
-                const decoded = try decodeWriteColumn(la, rg, meta, src, kept_ci, decode_options, timings.prof);
+                const decoded = if (agg.keep_codes)
+                    try decodeWriteColumnMaybeCoded(la, rg, meta, src, kept_ci, decode_options, timings.prof)
+                else
+                    try decodeWriteColumn(la, rg, meta, src, kept_ci, decode_options, timings.prof);
                 const t1 = nowMonoNs();
                 timings.decode_ns += @intCast(t1 - t0);
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
@@ -430,7 +451,7 @@ pub fn appendProjectedRGWithOptions(
             .computed => |c| try expr_eval.evalExpr(ra, &batch, lookup, c.expr),
         };
         if (col.nullInfo().max_rep == 0) {
-            try appendSelected(&agg.cols[i], col, &sel, surviving, agg.arena);
+            try appendSelected(&agg.cols[i], col, &sel, surviving, agg.arena, agg.keep_codes, late.allocator());
             continue;
         }
         try appendIntoBuf(&agg.cols[i], try encoder.applySelection(late.allocator(), col, &sel), agg.arena);
@@ -631,13 +652,30 @@ fn synthPageIndexToSink(
 /// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
 /// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
 /// with the row group.
+///
+/// A coded column (`codes` + `dict`) keeps its codes when `keep_codes` lets the buffer take them: the buffer is still
+/// empty, so every code indexes this one dictionary, which is copied into `arena`. Otherwise its values are gathered
+/// first, on `scratch`.
 fn appendSelected(
     buf: *OutputAggregator.ColumnBuf,
-    src: filter_eval.Batch.Column,
+    src_in: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
     surviving: usize,
     arena: std.mem.Allocator,
+    keep_codes: bool,
+    scratch: std.mem.Allocator,
 ) !void {
+    var src = src_in;
+    if (src.codes() != null) {
+        const fresh = switch (buf.*) {
+            inline else => |*tb| tb.values.items.len == 0 and !tb.coded,
+        };
+        if (keep_codes and fresh) return appendSelectedCodes(buf, src, sel, surviving, arena);
+        src = try agg_coded.materialize(scratch, src);
+    }
+    switch (buf.*) {
+        inline else => |*tb| if (tb.coded) try materializeBuf(tb, arena),
+    }
     switch (src) {
         inline else => |c, tag| {
             const T = @TypeOf(c.values[0]);
@@ -667,6 +705,94 @@ fn appendSelected(
             } else @memset(dl_out, c.max_def);
         },
     }
+}
+
+fn appendSelectedCodes(
+    buf: *OutputAggregator.ColumnBuf,
+    src: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    surviving: usize,
+    arena: std.mem.Allocator,
+) !void {
+    switch (src) {
+        inline else => |c, tag| {
+            const T = @TypeOf(c.dict[0]);
+            const tb = &@field(buf.*, @tagName(tag));
+            try tb.codes.ensureTotalCapacityPrecise(arena, surviving);
+            encoder.compactByMask(u32, c.codes.?, sel.mask, tb.codes.addManyAsSliceAssumeCapacity(surviving));
+            if (T == []const u8) {
+                // The entries point into the source's decoded dictionary page, which dies with the row group.
+                var total: usize = 0;
+                for (c.dict) |v| total += v.len;
+                const block = try arena.alloc(u8, total);
+                const dict = try arena.alloc([]const u8, c.dict.len);
+                var pos: usize = 0;
+                for (dict, c.dict) |*d, v| {
+                    @memcpy(block[pos..][0..v.len], v);
+                    d.* = block[pos..][0..v.len];
+                    pos += v.len;
+                }
+                tb.dict = dict;
+            } else tb.dict = try arena.dupe(T, c.dict);
+            tb.coded = true;
+            if (c.max_def == 0) return;
+            tb.max_def = c.max_def;
+            try tb.def_levels.ensureTotalCapacityPrecise(arena, surviving);
+            const dl_out = tb.def_levels.addManyAsSliceAssumeCapacity(surviving);
+            if (c.def_levels) |dl| {
+                encoder.compactByMask(u32, dl, sel.mask, dl_out);
+            } else @memset(dl_out, c.max_def);
+        },
+    }
+}
+
+/// Turn a coded buffer back into values, for an append it cannot keep codes for.
+fn materializeBuf(tb: anytype, arena: std.mem.Allocator) !void {
+    const T = @TypeOf(tb.dict[0]);
+    try tb.values.ensureTotalCapacityPrecise(arena, tb.codes.items.len);
+    const vals = tb.values.addManyAsSliceAssumeCapacity(tb.codes.items.len);
+    for (vals, tb.codes.items, 0..) |*v, k, r| {
+        const present = tb.max_def == 0 or tb.def_levels.items[r] == tb.max_def;
+        v.* = if (present) tb.dict[k] else std.mem.zeroes(T);
+    }
+    tb.codes.clearRetainingCapacity();
+    tb.coded = false;
+    tb.dict = &.{};
+}
+
+/// `decodeWriteColumn`, but a dictionary-encoded chunk of a type the write path keeps unconverted decodes to codes
+/// (see `ColumnChunkReader.readAllCodes`); anything else decodes as values.
+fn decodeWriteColumnMaybeCoded(
+    ra: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    ci: usize,
+    decode_options: DecodeOptions,
+    prof: ?*profile.Thread,
+) !filter_eval.Batch.Column {
+    const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const se = meta.getColumnSchema(cm.path_in_schema.items);
+    const converted = if (se) |e| decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e) else false;
+    if (!decode_options.encoded or converted or levels.max_rep > 0)
+        return decodeWriteColumn(ra, rg, meta, src, ci, decode_options, prof);
+    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+    const chunk = try sourceBytes(src, .{ .start = start, .len = @intCast(cm.total_compressed_size) });
+    const n_leaves: usize = @intCast(cm.num_values);
+    const chunk_span = profile.Span.begin(prof);
+    const coded: ?filter_eval.Batch.Column = switch (cm.type) {
+        .INT32 => try codedOrValues(i32, .i32, ra, chunk, cm, levels, n_leaves, decode_options, null),
+        .INT64 => try codedOrValues(i64, .i64, ra, chunk, cm, levels, n_leaves, decode_options, null),
+        .FLOAT => try codedOrValues(f32, .f32, ra, chunk, cm, levels, n_leaves, decode_options, null),
+        .DOUBLE => try codedOrValues(f64, .f64, ra, chunk, cm, levels, n_leaves, decode_options, null),
+        .BYTE_ARRAY => try codedOrValues([]const u8, .string, ra, chunk, cm, levels, n_leaves, decode_options, null),
+        else => null,
+    };
+    const col = coded orelse return decodeWriteColumn(ra, rg, meta, src, ci, decode_options, prof);
+    try checkRowShape(col, @intCast(rg.num_rows));
+    if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
+    return col;
 }
 
 fn appendIntoBuf(
@@ -753,31 +879,43 @@ pub fn encodeAggregator(
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             .i64 => |b| .{ .i64 = .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             .f32 => |b| .{ .f32 = .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             .f64 => |b| .{ .f64 = .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             .string => |b| .{ .string = .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             .boolean => |b| .{ .boolean = .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
+                .codes = if (b.coded) b.codes.items else null,
+                .dict = b.dict,
             } },
             // Lossless DECIMAL: narrow the unscaled i128 back to its
             // source physical width (exact — the values were decoded
@@ -1668,7 +1806,7 @@ fn codedOrValues(
     levels: schema.Levels,
     n_leaves: usize,
     decode_options: DecodeOptions,
-    scratch: *DecodeScratch,
+    scratch: ?*DecodeScratch,
 ) !?filter_eval.Batch.Column {
     const r = (try decodeCodes(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse return null;
     return switch (r) {
@@ -1865,7 +2003,7 @@ fn decodeCodes(
     levels: schema.Levels,
     n_leaves: usize,
     decode_options: DecodeOptions,
-    scratch: *DecodeScratch,
+    scratch: ?*DecodeScratch,
 ) !?column_mod.ColumnChunkReader(T).CodedOrValues {
     var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
     return reader.readAllCodes(n_leaves);

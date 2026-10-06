@@ -110,6 +110,8 @@ pub const Error = error{
     BadInputUrl,
     BadOutputUrl,
     NoCredentials,
+    /// Neither `AWS_REGION` nor `S3_REGION` is set; signed and anonymous S3 requests both need one.
+    NoRegion,
     BadResponse,
     TailTooSmall,
     NotParquet,
@@ -677,6 +679,11 @@ fn outputColumnNames(
     return names;
 }
 
+/// S3 credentials from the environment, telling a missing region apart from missing keys.
+fn credentialsFromEnv(env: std.process.Environ) error{ NoCredentials, NoRegion }!s3.Credentials {
+    return s3.Credentials.fromEnv(env) catch |err| if (err == error.NoRegion) error.NoRegion else error.NoCredentials;
+}
+
 fn sameName(name: []const u8) []const u8 {
     return name;
 }
@@ -876,7 +883,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     errdefer if (remove_on_error) local_fs.removeFile(out_path);
     if (out_is_s3) {
         const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
-        const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+        const creds = try credentialsFromEnv(ctx.env);
         const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
         const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
             try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
@@ -1350,7 +1357,7 @@ pub fn fetchS3Schema(
     path: []const u8,
     arena: std.mem.Allocator,
 ) !schema.FileMetaData {
-    const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+    const creds = try credentialsFromEnv(ctx.env);
     const url = s3.Url.parse(path) catch return error.BadInputUrl;
 
     const pool = try arena.create(s3.Pool(POOL_SIZE));
@@ -1424,7 +1431,7 @@ fn openInputs(
     var owned_pools: std.ArrayList(*s3.Pool(POOL_SIZE)) = .empty;
     var s3_buffers: std.ArrayList([]u8) = .empty;
     if (s3_indices.items.len > 0) {
-        const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+        const creds = try credentialsFromEnv(ctx.env);
 
         var read_exec = readExecutor(ctx.gpa);
         defer read_exec.deinit();
@@ -3018,4 +3025,25 @@ test "a select output naming one column twice is rejected and named, like aggreg
         .diag = &diag,
     }));
     try std.testing.expectEqualStrings("v", diag.column.get());
+}
+
+test "an S3 query with no region says so rather than blaming the credentials" {
+    const gpa = std.testing.allocator;
+    const Case = struct { env: []const ?[*:0]const u8, want: anyerror };
+    const cases = [_]Case{
+        // Anonymous requests read no keys, so only the region can be missing. (Signed requests reach the same
+        // `credentialsFromEnv`; `s3.Credentials.fromEnv`'s own tests cover their missing region.)
+        .{ .env = &.{"S3_NO_SIGN_REQUEST=1"}, .want = error.NoRegion },
+        .{ .env = &.{"AWS_REGION=us-west-2"}, .want = error.NoCredentials },
+    };
+    for (cases) |c| {
+        const block = try gpa.allocSentinel(?[*:0]const u8, c.env.len, null);
+        defer gpa.free(block);
+        @memcpy(block, c.env);
+        const env: std.process.Environ = .{ .block = .{ .slice = block } };
+        try std.testing.expectError(c.want, runQuery(.{ .gpa = gpa, .env = env, .io = std.testing.io }, .{
+            .inputs = &.{"s3://bucket/key.parquet"},
+            .aggregate = "count(*) AS n",
+        }));
+    }
 }

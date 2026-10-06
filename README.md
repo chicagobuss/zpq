@@ -35,8 +35,8 @@ response format in [`docs/lambda_requests.md`](docs/lambda_requests.md).
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible
-stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; a
-region is still required.
+stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; like
+signed requests, these need `AWS_REGION` or `S3_REGION`, and zpq reports a missing region as such.
 
 ## Performance
 

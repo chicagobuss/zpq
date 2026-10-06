@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 error.DuplicateOutputColumn => std.debug.print(
                     "zpq query: output column `{s}` is defined more than once;\n" ++
-                        "  give each aggregate and GROUP BY key a distinct name\n",
+                        "  give each output column (aggregate, GROUP BY key or select item) a distinct name\n",
                     .{diag.column.get()},
                 ),
                 error.AmbiguousOutputColumn => std.debug.print(
@@ -141,6 +141,7 @@ pub fn main(init: std.process.Init) !void {
                 error.BadInputUrl => std.debug.print("zpq query: invalid input S3 URL\n", .{}),
                 error.BadOutputUrl => std.debug.print("zpq query: invalid output S3 URL\n", .{}),
                 error.NoCredentials => std.debug.print("zpq query: missing AWS credentials for S3 query\n", .{}),
+                error.NoRegion => std.debug.print("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
                 error.BadResponse => std.debug.print("zpq query: bad S3 HTTP response\n", .{}),
                 error.TailTooSmall => std.debug.print("zpq query: file footer metadata tail too small\n", .{}),
                 error.NotParquet, error.BadMagic => if (diag.input) |in| std.debug.print(

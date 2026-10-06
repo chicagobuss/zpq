@@ -1,10 +1,10 @@
 FROM public.ecr.aws/lambda/python:3.12
 
 # Build one image per engine so a Polars cold start does not carry the DuckDB
-# wheel (or vice versa). Both are current stable releases as of 2026-08-21.
+# wheel (or vice versa). Both are the versions the 2026-10-05 Lambda measurements used.
 ARG ENGINE
-ARG DUCKDB_VERSION=1.5.5
-ARG POLARS_VERSION=1.43.2
+ARG DUCKDB_VERSION=1.5.6
+ARG POLARS_VERSION=1.44.2
 
 RUN test "$ENGINE" = duckdb || test "$ENGINE" = polars
 RUN if [ "$ENGINE" = duckdb ]; then \

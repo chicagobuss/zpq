@@ -33,9 +33,11 @@ force a cold container.
 For the 0.3.2 candidate, run `benchmarks/deploy_lambda_comparators.sh` first.
 It creates only `zpq-032-*` dedicated x86_64 functions and makes the ZPQ,
 Polars, and DuckDB configurations identical (3008 MB, 120 seconds, us-west-2).
-It also builds one image per Python engine, pins DuckDB 1.5.5 and Polars 1.43.2,
-and bundles DuckDB's S3 extensions in the image so an invocation never measures
-an extension download. The deploy script is a maintainer harness: it needs
+It also builds one image per Python engine from
+`benchmarks/python_baseline/Dockerfile`, which pins DuckDB 1.5.6 and Polars
+1.44.2 (the versions of the 2026-10-05 run; the 0.3.2 candidate used 1.5.5 and
+1.43.2), and bundles DuckDB's S3 extensions in the image so an invocation never
+measures an extension download. The deploy script is a maintainer harness: it needs
 Docker, `jq`, an ECR repository it creates, an IAM role supplied through
 `LAMBDA_BENCH_ROLE_ARN`, and the Overture fixture object in `AWS_S3_BUCKET`.
 

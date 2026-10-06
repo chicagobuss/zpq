@@ -21,7 +21,8 @@ the CLI flags of the same name.
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
 without building them, so they cost no memory. With `aggregate` or `group_by` the response is the aggregate JSON;
-otherwise with `output_url` it is the write summary.
+otherwise with `output_url` it is the write summary. A request with neither gets the older single-file diagnostic
+answer for its first input.
 
 ## Responses
 
@@ -59,8 +60,9 @@ cache hits from earlier invocations appear only when Lambda reuses a sandbox, wh
 | `max_idle_ms` | The longest any idle connection had waited when a request looked at it. |
 | `acquire_wait_ms`, `acquire_lock_ms` | Time spent waiting for a connection permit, and holding the pool lock. |
 
-Response changes: the aggregate response gained `pool`; in the write response `pool` moved
-after `meta_cache` and gained `idle_evictions`, `stale_retries`, `backoff_retries` and `max_idle_ms`.
+Response changes: the aggregate response gained `row_groups_full_match` and `pool`; in the write response `output` is
+now JSON-escaped, and `pool` moved after `meta_cache` and gained `idle_evictions`, `stale_retries`, `backoff_retries`
+and `max_idle_ms`.
 
 ### Multipart writes whose answer is lost
 
@@ -76,7 +78,9 @@ uploads (for example `AbortIncompleteMultipartUpload` with `DaysAfterInitiation:
 
 A request that cannot be read answers `{"error":"bad_json","reason":R}`, plus `"field":F` when R is `BadFieldType`.
 A query the engine rejects answers `{"error":"engine","reason":R}`, plus `"column":C` when the error is about one
-column (`UnknownColumn`, `AmbiguousColumn`, `DuplicateOutputColumn`, `AmbiguousOutputColumn`).
+column (for example `UnknownColumn`, `AmbiguousColumn`, `DuplicateOutputColumn`, `AmbiguousOutputColumn`), and
+`"input":I`, with `"cause":E` when known, when it is about one input file. An empty event answers
+`{"error":"empty_body"}`.
 
 ## Lambda request changes
 

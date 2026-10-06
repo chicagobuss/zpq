@@ -9,16 +9,16 @@ Cloudflare R2.
 ## The headlines
 
 **Local CLI** on one 24-thread workstation, one in-process
-invocation:
+invocation (measured in June 2026 with zpq 0.1.x):
 
 | Query | Wall | Notes |
 |-------|------|-------|
 | `count(*)` across 24 files / 79.5 M rows | **6 ms** | Zero decode; answer comes from row-group footers. Less than the cost of starting `python`. |
-| `count(*), max(tip), sum(fare)` — full f64 decode | **254 ms** | $1.54 B in fares totalled across 2023-2024. 24-way per-file decode through libzstd. |
+| `count(*), max(tip), sum(fare)` — full f64 decode | **254 ms** | $1.54 B in fares totalled across 2023-2024. Row-group-parallel decode through libzstd. |
 | Six aggregates (sum × 4 + count + avg) | **404 ms** | Heavier decode pass, same files. |
 | With `--filter "tip_amount > 50"` | **215 ms** | 16 611 rows kept; filter eval is folded into the same decode pass. |
 
-**AWS Lambda** (5 GB memory, x86_64, `provided.al2023`, data in R2):
+**AWS Lambda** (5 GB memory, x86_64, `provided.al2023`, data in R2; same June 2026 measurements):
 
 | Query | Wall | Cost |
 |-------|------|------|
@@ -28,7 +28,7 @@ invocation:
 Every one of those invocations can be a cold start, and that is the
 intended way to run it: the fan-out above runs 24 sandboxes at once
 rather than leaning on a warm one. The runtime is one static binary —
-no AWS SDK, no system OpenSSL, no event-loop dependency — deployed by
+no AWS SDK, no system OpenSSL, no event-loop dependency — built by
 `just lambda-build` as a ReleaseFast zip of about 10 MB. On 2026-10-05
 (zpq 0.4.0, us-west-2, 3008 MB) its median Lambda `Init Duration` was
 18–22 ms on arm64 and 26–35 ms on x86_64; see
@@ -41,15 +41,18 @@ ZPQ does the absolute minimum work required to satisfy a query:
 * `count(*)` answers from row-group `num_rows` in the footer — never
   decode a value page. **6 ms across 80 M rows** is the floor for any
   serverless engine; everything else is overhead.
-* `min`/`max` answer from `Statistics.min_value`/`max_value` when the
-  writer populated them (DuckDB output, Spark output — always; NYC
-  TLC's writer — never, hence the demo's `max(tip)` decodes).
+* `min`/`max`/`sum` decode the data by default. With `--trust-stats`,
+  `min`/`max` answer from `Statistics.min_value`/`max_value` when the
+  writer populated them (NYC TLC's writer does not, so the demo's
+  `max(tip)` decodes either way).
 * Filters prune row groups by stats before any column bytes are
   fetched. Survivors decode only the projected columns.
 * Per-row-group decode → encode pipelines stream straight into a
   multipart S3 upload. Memory ceiling is one row group, not one file.
-* Talks to any S3-compatible store via path-style URLs. Cloudflare R2,
-  AWS S3, MinIO — same code path, no SDK switch.
+* Talks to any S3-compatible store. Custom endpoints (Cloudflare R2,
+  MinIO) use path-style URLs; AWS S3 uses virtual-hosted URLs, or
+  path-style for bucket names containing dots. Same code path, no SDK
+  switch.
 
 ## Reproduce: local CLI
 
@@ -109,9 +112,9 @@ zpq query '/tmp/nyc-taxi/*.parquet' \
 }
 ```
 
-24 worker threads, one per file. Each thread decodes its file's value
-pages into a per-thread accumulator slice; the main thread merges
-them at the end.
+The 69 row groups across the 24 files are shared out over one worker
+per CPU (`-j` overrides). Each worker decodes value pages into its own
+accumulators; the main thread merges them at the end.
 
 ### Filter + aggregate
 
@@ -122,14 +125,14 @@ zpq query '/tmp/nyc-taxi/*.parquet' \
 ```
 
 Returns 16 611 trips with > $50 tips, $2.1 M in matching fares — in
-~1.5 s. The filter is evaluated in the same decode pass; tip + fare
+~215 ms. The filter is evaluated in the same decode pass; tip + fare
 columns are fetched once and walked together.
 
 ### Glob patterns
 
 `zpq query` accepts a single path, multiple paths, or a `prefix*suffix`
 glob — basename-only, like `data/*.parquet`. Same UX as
-`duckdb 'SELECT * FROM "data/*.parquet"'`. Schemas are validated
+`duckdb -c "SELECT * FROM 'data/*.parquet'"`. Schemas are validated
 across all files (case-insensitively, so the real-world
 `Airport_fee` / `airport_fee` drift in the NYC dataset doesn't trip).
 
@@ -221,7 +224,7 @@ INPUTS=$(jq -nc --arg b "$BUCKET" '[
   "s3://"+$b+"/demo/nyc-taxi/yellow/yellow_tripdata_2024-03.parquet",
   "s3://"+$b+"/demo/nyc-taxi/yellow/yellow_tripdata_2024-04.parquet"
 ]')
-OUT="s3://$BUCKET/demo/output/big-tippers-2024-q1.parquet"
+OUT="s3://$BUCKET/demo/output/big-tippers-2024-01-to-04.parquet"
 
 just lambda-invoke "$FN" "$(jq -nc \
   --argjson inputs "$INPUTS" --arg out "$OUT" \
@@ -274,7 +277,7 @@ What zpq is for:
   keep warm.
 * **No catalog required.** Drop a Parquet file anywhere — local
   disk, R2, MinIO, S3 — and query it. No Glue, no DDL, no partition
-  registration. Same UX as `duckdb 'data/*.parquet'`.
+  registration. Same UX as `duckdb -c "SELECT * FROM 'data/*.parquet'"`.
 * **The data doesn't have to be in S3.** Cloudflare R2, MinIO,
   GCS-compat — same code, same speed envelope, no migration to AWS.
 * **Writes stream S3-to-S3.** ZPQ Lambda filters, projects and
@@ -284,9 +287,9 @@ What zpq is for:
 ## Caveats
 
 * **`count(*)` is metadata-only**, but `min` / `max` / `sum` decode
-  unless the writer populated `Statistics`. NYC TLC's writer doesn't,
-  so the demo's full-aggregate decodes everything. DuckDB and Spark
-  output do populate stats and would short-circuit.
+  unless you pass `--trust-stats` and the writer populated
+  `Statistics`. NYC TLC's writer doesn't, so the demo's full-aggregate
+  decodes everything either way.
 * **Single-thread decode rate is now ~870 MB/s** of decoded f64
   through libzstd → RLE_DICTIONARY → f64 sum. (Pre-2026-05-06 it was
   ~89 MB/s; Zig stdlib's pure-Zig zstd decoder was the bottleneck —

@@ -8,7 +8,7 @@ Workloads it's intended for:
 
 * Iceberg / Delta table maintenance — one Lambda per file, filter and rewrite in place.
 * Billing / cost roll-ups — answer from row-group statistics when possible, decode bytes only when necessary.
-* Log summarization — Parquet queries without the Athena round- trip; one-line CLI output for ad-hoc work.
+* Log summarization — Parquet queries without the Athena round-trip; one-line CLI output for ad-hoc work.
 
 Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
 vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
@@ -35,7 +35,8 @@ response format in [`docs/lambda_requests.md`](docs/lambda_requests.md).
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible
-stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads.
+stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; like
+signed requests, these need `AWS_REGION` or `S3_REGION`, and zpq reports a missing region as such.
 
 ## Performance
 
@@ -117,7 +118,8 @@ zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
 ```
 
 `--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
-is the opposite extreme — decode everything, disable pruning too, for when you don't trust even the row counts.
+is the opposite extreme — no statistics at all, so row-group pruning is off too and every filter is evaluated on decoded
+values (`count(*)` still comes from the row counts).
 
 For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
 levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
@@ -148,14 +150,14 @@ just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 
 `zpq --version` reports the release the binary was built from.
 
-The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases (CLI for Linux and
-macOS, each x86_64 + aarch64) ship to `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/` and
-a matching GitHub Release.
+The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases ship the CLI for Linux
+and macOS, each x86_64 and arm64, as `zpq-<linux|macos>-<x86_64|arm64>.tar.gz` (plus a `.sha256`) on the GitHub Release
+and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or `releases/v<version>/`).
 
 ## Use as a library
 
-The engine is consumable as a Zig module — the same sans-IO core the binaries use, minus the SQL frontend (no C sources
-for consumers):
+The engine is consumable as a Zig module — the same sans-IO core the binaries use, minus the SQL frontend and its C
+parser (libzstd is still built from C, and BoringSSL is linked from the pinned prebuilts):
 
 ```zig
 // build.zig.zon
@@ -182,7 +184,7 @@ just flamegraph query data/benchmark_100mb.parquet \
 Sub-100 ms runs are too short to sample meaningfully — wrap in a 50× shell loop or use a multi-file glob to get hundreds
 of samples. Open the SVG in a browser to drill into hotspots.
 
-`just flamegraph-bpf <secs>` attaches via `profile-bpfcc` for long- running processes (eBPF-based, lower overhead, needs
+`just flamegraph-bpf <secs>` attaches via `profile-bpfcc` for long-running processes (eBPF-based, lower overhead, needs
 sudo).
 
 ## Layout

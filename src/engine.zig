@@ -110,6 +110,8 @@ pub const Error = error{
     BadInputUrl,
     BadOutputUrl,
     NoCredentials,
+    /// Neither `AWS_REGION` nor `S3_REGION` is set; signed and anonymous S3 requests both need one.
+    NoRegion,
     BadResponse,
     TailTooSmall,
     NotParquet,
@@ -677,6 +679,15 @@ fn outputColumnNames(
     return names;
 }
 
+/// S3 credentials from the environment, telling a missing region apart from missing keys.
+fn credentialsFromEnv(env: std.process.Environ) error{ NoCredentials, NoRegion }!s3.Credentials {
+    return s3.Credentials.fromEnv(env) catch |err| if (err == error.NoRegion) error.NoRegion else error.NoCredentials;
+}
+
+fn sameName(name: []const u8) []const u8 {
+    return name;
+}
+
 /// What a write or print outputs and reads, parsed from --columns / --select / --filter against the first file's
 /// footer. Output-format restrictions, nested printing, and sink and codec choice stay with each consumer.
 const ProjectionPlan = struct {
@@ -764,6 +775,12 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         for (filter_cols.items) |ci| {
             if (ci < num_leaves) fetch[ci] = true;
         }
+    }
+    // A --select names its outputs, so two may clash, as aggregate and GROUP BY outputs may; a plain copy keeps the
+    // source's own names and is not checked.
+    if (select_items != null) {
+        const names = try outputColumnNames(arena, &labels, output_specs.items);
+        try scan.checkDistinctOutputNames([]const u8, names, sameName, args.diag);
     }
 
     return .{
@@ -866,7 +883,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     errdefer if (remove_on_error) local_fs.removeFile(out_path);
     if (out_is_s3) {
         const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
-        const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+        const creds = try credentialsFromEnv(ctx.env);
         const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
         const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
             try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
@@ -1340,7 +1357,7 @@ pub fn fetchS3Schema(
     path: []const u8,
     arena: std.mem.Allocator,
 ) !schema.FileMetaData {
-    const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+    const creds = try credentialsFromEnv(ctx.env);
     const url = s3.Url.parse(path) catch return error.BadInputUrl;
 
     const pool = try arena.create(s3.Pool(POOL_SIZE));
@@ -1414,7 +1431,7 @@ fn openInputs(
     var owned_pools: std.ArrayList(*s3.Pool(POOL_SIZE)) = .empty;
     var s3_buffers: std.ArrayList([]u8) = .empty;
     if (s3_indices.items.len > 0) {
-        const creds = s3.Credentials.fromEnv(ctx.env) catch return error.NoCredentials;
+        const creds = try credentialsFromEnv(ctx.env);
 
         var read_exec = readExecutor(ctx.gpa);
         defer read_exec.deinit();
@@ -2952,5 +2969,81 @@ test "windowed re-encode writes the same bytes at every parallelism" {
                 try std.testing.expectEqualSlices(u8, b, bytes);
             } else first = bytes;
         }
+    }
+}
+
+test "a select output naming one column twice is rejected and named, like aggregate outputs" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    const Case = struct { select: []const u8, column: []const u8 };
+    const cases = [_]Case{
+        .{ .select = "x AS v, ts AS v", .column = "v" },
+        // Case-insensitive, as the aggregate rule is; a passthrough column keeps its own name.
+        .{ .select = "x AS v, ts AS V", .column = "V" },
+        .{ .select = "s, x AS S", .column = "S" },
+    };
+    for (cases) |c| {
+        // The write, and both printed formats.
+        var diag: Diag = .{};
+        try std.testing.expectError(error.DuplicateOutputColumn, runQuery(ctx, .{
+            .inputs = &.{fixture},
+            .output = out,
+            .select = c.select,
+            .diag = &diag,
+        }));
+        try std.testing.expectEqualStrings(c.column, diag.column.get());
+        for ([_]PrintFormat{ .csv, .jsonl }) |fmt| {
+            var print_diag: Diag = .{};
+            try std.testing.expectError(error.DuplicateOutputColumn, runPrint(ctx, .{
+                .inputs = &.{fixture},
+                .select = c.select,
+                .diag = &print_diag,
+            }, fmt, 0));
+            try std.testing.expectEqualStrings(c.column, print_diag.column.get());
+        }
+    }
+    // Nothing was written.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, out, .{}));
+
+    // The SQL front end's SELECT list reaches the same check.
+    const sql_parser = if (@import("build_options").enable_sql) @import("core/expr/sql_parser.zig") else return;
+    const q = try sql_parser.parseSqlQuery(gpa, "SELECT x AS v, ts AS v FROM 't.parquet'");
+    defer q.deinit(gpa);
+    var diag: Diag = .{};
+    try std.testing.expectError(error.DuplicateOutputColumn, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .output = out,
+        .select = q.select_str,
+        .diag = &diag,
+    }));
+    try std.testing.expectEqualStrings("v", diag.column.get());
+}
+
+test "an S3 query with no region says so rather than blaming the credentials" {
+    const gpa = std.testing.allocator;
+    const Case = struct { env: []const ?[*:0]const u8, want: anyerror };
+    const cases = [_]Case{
+        // Anonymous requests read no keys, so only the region can be missing. (Signed requests reach the same
+        // `credentialsFromEnv`; `s3.Credentials.fromEnv`'s own tests cover their missing region.)
+        .{ .env = &.{"S3_NO_SIGN_REQUEST=1"}, .want = error.NoRegion },
+        .{ .env = &.{"AWS_REGION=us-west-2"}, .want = error.NoCredentials },
+    };
+    for (cases) |c| {
+        const block = try gpa.allocSentinel(?[*:0]const u8, c.env.len, null);
+        defer gpa.free(block);
+        @memcpy(block, c.env);
+        const env: std.process.Environ = .{ .block = .{ .slice = block } };
+        try std.testing.expectError(c.want, runQuery(.{ .gpa = gpa, .env = env, .io = std.testing.io }, .{
+            .inputs = &.{"s3://bucket/key.parquet"},
+            .aggregate = "count(*) AS n",
+        }));
     }
 }

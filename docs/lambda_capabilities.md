@@ -59,7 +59,8 @@ Lambda was invoked at 1024 MB cold + warm, then memory-swept for CPU/throughput 
 considered but skipped — the host kernel determines syscall availability and Lambda is running 5.10 (an older AL2-class
 kernel), so AL2023 docker on a 6.x host wouldn't be apples-to-apples.
 
-Raw outputs: `output/probe/zpq-probe-caps-{arm64,x86_64}_{cold,warm}.json`.
+The raw JSON outputs of that run were written to `output/probe/`, which is gitignored and not committed; re-run the
+probe (below) to regenerate them.
 
 ## Syscall reachability
 
@@ -122,7 +123,7 @@ Measured 2026-10-03, us-west-2, 3008 MB, x86_64 and arm64.
 - **Read throughput depends on how long the sandbox rested.** A 174.8 MB full scan read in about 1.95 s back-to-back
   (~90 MB/s), 0.93 s after 1 s idle, and 0.34–0.44 s after 2–3 s idle (~450 MB/s), on both architectures, on reused and
   fresh connections alike, with decode time unchanged. Polars in the same configuration slows the same way (2.25 s
-  back-to-back, 0.53–0.61 s after at least 2 s idle), so this is a per-sandbox network allowance, not engine state.
+  back-to-back, 0.53–0.61 s after 2–6 s idle), so this is a per-sandbox network allowance, not engine state.
   Back-to-back full scans measure that allowance, not the engine.
 
 ## Memory
@@ -188,8 +189,9 @@ These findings should drive the current architecture, not be appended to it:
    `std.Io.Net` here; the runtime API is a poor fit for vtable-based abstractions.
 5. **Consider `MSG_ZEROCOPY` for S3 upload payloads.** `SO_ZEROCOPY` allowed means we can zero-copy *outbound* sends,
    which is exactly the S3 multipart upload story. This is independent of io_uring availability.
-6. **Threading is fine at every memory tier.** No need to gate the threadpool on memory size — `sched_getaffinity` will
-   report whatever CPU count is appropriate and the kernel will time-slice us correctly.
+6. **Threading is fine at every memory tier, sized to the tier.** The affinity mask shows 2 CPUs at every tier up to
+   3008 MB, so it does not say how much CPU time a sandbox gets. `src/core/system.zig` caps parallelism at the memory
+   tier's vCPUs, rounded up (2 at 3008 MB), or at a cgroup CPU quota when one is visible.
 7. **`/tmp` is unsuitable for hot-path I/O.** 587 MB/s peak is half what we get on bare metal, and at 1024 MB Lambda
    configs (the common case for small jobs) you get ~285 MB/s. Local spilling is viable for sort/agg, but the dominant
    strategy remains "stream from S3 to S3 without touching /tmp."
@@ -205,8 +207,8 @@ zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
   -target aarch64-linux-musl \
   -femit-bin=zig-out/probe_lambda_caps_arm64
 
-# Local CLI run
-./zig-out/probe_lambda_caps_native | jq
+# Local CLI run (builds the native probe first)
+just probe-local
 
 # Lambda deploy + invoke (functions exist in sandbox account)
 source .env

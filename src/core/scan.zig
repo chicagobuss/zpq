@@ -756,17 +756,11 @@ pub fn runMultiAggregate(
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
     if (n_workers > 1) {
-        var threads = try arena.alloc(std.Thread, n_workers);
-        var spawned: usize = 0;
-        for (workers, 0..) |*w, i| {
-            // Deliberately not `try`: running threads hold pointers into `arena` and their own `group_table`, both
-            // freed by the caller, so an early return here is a use-after-free, not just a leak.
-            threads[i] = spawn_util.spawn(.{ .stack_size = WORKER_STACK_SIZE }, workerRun, .{w}) catch break;
-            spawned += 1;
-        }
-        // Run the work that never got a thread; one runner drains the shared cursor however many spawns failed.
-        if (spawned < n_workers) workerRun(&workers[spawned]);
-        for (threads[0..spawned]) |th| th.join();
+        // Started as a tree, so the last worker is not a millisecond late. Spawn failure never returns early (running
+        // threads hold pointers into `arena` and their own `group_table`); workers that never start are idle, and
+        // with no thread at all one inline runner drains the shared cursor.
+        const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+        if (!spawn_util.runTree(Worker, workers, config, workerRun)) workerRun(&workers[0]);
     } else {
         // Single-threaded fast path. Avoids std.Thread overhead.
         workerRun(&workers[0]);

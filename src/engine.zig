@@ -1723,7 +1723,7 @@ fn openInputs(
         // after it prune the same row groups.
         if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
-            var src: S3Membership = .{ .ctx = read_ctx, .creds = creds, .pool = pool, .specs = specs };
+            var src: S3Membership = .init(read_ctx, creds, pool, specs);
             membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
         };
 
@@ -2010,6 +2010,9 @@ const FetchSpec = struct {
     /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
+    /// How long a tiny GET took on a connection already open (the 8-byte head read, or the revalidation): this
+    /// query's sample of a request's fixed cost.
+    rtt_ns: u64 = 0,
     err: ?anyerror = null,
 
     fn etag(self: *const FetchSpec) []const u8 {
@@ -2033,21 +2036,62 @@ const S3Membership = struct {
     creds: s3.Credentials,
     pool: *s3.Pool(POOL_SIZE),
     specs: []const FetchSpec,
+    /// What this query has measured: a request's fixed cost, and one connection's bandwidth. Null until measured.
+    rtt_ns: ?u64 = null,
+    bytes_per_s: ?f64 = null,
 
-    /// A GET's fixed cost as the bytes one connection moves meanwhile (first byte ~25 ms at ~80 MB/s, measured on
-    /// Lambda against S3 in-region), over the permits a fetch runs on, each request no longer than `fetchJobs` keeps
-    /// whole.
+    /// Until measured: a GET's first byte after ~25 ms at ~80 MB/s a connection, as on Lambda against S3 in-region.
+    const default_rtt_ns: u64 = 25 * std.time.ns_per_ms;
+    const default_bytes_per_s: f64 = 80e6;
+
     const cost: membership.Cost = .{
         .request_bytes = 2 << 20,
         .concurrency = READ_CONCURRENCY,
         .max_request = s3.SPLIT_THRESHOLD,
     };
 
+    fn init(ctx: Context, creds: s3.Credentials, pool: *s3.Pool(POOL_SIZE), specs: []const FetchSpec) S3Membership {
+        var self: S3Membership = .{ .ctx = ctx, .creds = creds, .pool = pool, .specs = specs };
+        // The fastest footer round trip: slower ones waited on a connection being opened.
+        for (specs) |sp| if (sp.rtt_ns > 0) {
+            self.rtt_ns = @min(self.rtt_ns orelse sp.rtt_ns, sp.rtt_ns);
+        };
+        return self;
+    }
+
     fn source(self: *S3Membership) membership.Source {
         return .{ .ctx = self, .vtable = &vtable, .cost = cost };
     }
 
-    const vtable: membership.Source.VTable = .{ .read = read, .cached = cached, .retain = retain };
+    const vtable: membership.Source.VTable = .{ .read = read, .cached = cached, .retain = retain, .measured = measured };
+
+    /// A request's fixed cost as the bytes a connection moves meanwhile, from what this query has timed.
+    fn measured(ctx: *anyopaque) ?membership.Cost {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        if (self.rtt_ns == null and self.bytes_per_s == null) return null;
+        const rtt_s = @as(f64, @floatFromInt(self.rtt_ns orelse default_rtt_ns)) / std.time.ns_per_s;
+        var c = cost;
+        c.request_bytes = @intFromFloat(@max(4096.0, rtt_s * (self.bytes_per_s orelse default_bytes_per_s)));
+        return c;
+    }
+
+    /// Learn from one batch of `n` requests moving `bytes` in `ns`: small requests time the round trip, large ones the
+    /// bandwidth left once the round trips are paid.
+    fn observe(self: *S3Membership, n: usize, bytes: u64, ns: u64) void {
+        if (n == 0) return;
+        const lanes = @min(n, READ_CONCURRENCY);
+        const rounds = std.math.divCeil(usize, n, READ_CONCURRENCY) catch unreachable;
+        const per_lane = bytes / lanes;
+        if (per_lane < 128 << 10) {
+            self.rtt_ns = @min(self.rtt_ns orelse ns, std.math.clamp(ns / rounds, std.time.ns_per_ms, std.time.ns_per_s));
+            return;
+        }
+        const rtt = self.rtt_ns orelse default_rtt_ns;
+        const transfer = ns -| rounds * rtt;
+        if (transfer < ns / 4) return; // round trips dominated; the bandwidth is not visible here
+        const bw = @as(f64, @floatFromInt(per_lane * rounds)) / (@as(f64, @floatFromInt(transfer)) / std.time.ns_per_s);
+        self.bytes_per_s = std.math.clamp(bw, 1e6, 2e9);
+    }
 
     fn read(
         ctx: *anyopaque,
@@ -2082,7 +2126,9 @@ const S3Membership = struct {
             o.* = buf;
         }
         if (jobs.items.len > 0) {
-            _ = try s3.fetchJobs(self.ctx.io, self.pool, self.ctx.gpa, arena, self.creds, jobs.items, READ_CONCURRENCY);
+            const t0 = nowMonoNs();
+            const got = try s3.fetchJobs(self.ctx.io, self.pool, self.ctx.gpa, arena, self.creds, jobs.items, READ_CONCURRENCY);
+            self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
     }
 
@@ -2182,6 +2228,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // installed at the end of the cold path.
     if (t.ctx.meta_cache) |cache| {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
+            const t_cond = nowMonoNs();
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
                 .range = s3.Range.suffix(TAIL_SIZE),
                 .if_none_match = entry.etag,
@@ -2189,6 +2236,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             });
             t.cache = if (cond.status == 304) 1 else 2;
             if (cond.status == 304) {
+                sp.rtt_ns = @intCast(nowMonoNs() - t_cond);
                 sp.noteEtag(entry.etag);
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
@@ -2256,10 +2304,12 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     // S3 reads more lenient than the spec — a corrupt object with
     // a forged-looking header could pass our gate. Pay the RT and
     // validate honestly.
+    const t_head = nowMonoNs();
     const head = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
         .range = s3.Range.span(0, 7),
         .prof = t.prof,
     });
+    sp.rtt_ns = @intCast(nowMonoNs() - t_head);
     if (head.status != 206) return error.BadResponse;
     if (head.body.len < PAR1.len or !std.mem.eql(u8, head.body[0..PAR1.len], &PAR1)) return error.NotParquet;
 
@@ -2757,10 +2807,11 @@ pub fn writeJsonFloat(writer: anytype, f: f64) !void {
 /// statistics (already counted in `row_groups_pruned`).
 pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
-        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"us\":{d}}}",
+        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"request_kb\":{d},\"us\":{d}}}",
         .{
-            s.row_groups_bloom, s.row_groups_dict, s.filters,      s.dictionaries,               s.requests,
-            s.bytes,            s.bloom_stopped,   s.dict_stopped, s.ns / std.time.ns_per_us,
+            s.row_groups_bloom, s.row_groups_dict, s.filters,             s.dictionaries,
+            s.requests,         s.bytes,           s.bloom_stopped,       s.dict_stopped,
+            s.request_bytes / 1024, s.ns / std.time.ns_per_us,
         },
     );
 }
@@ -3849,4 +3900,21 @@ test "BloomSpec.parse: a column, optionally with a probability" {
     for ([_][]const u8{ "", "id:0", "id:1", "id:-0.1", "id:1.5", ":0.1" }) |bad| {
         try std.testing.expectError(error.BadBloomFilter, BloomSpec.parse(bad));
     }
+}
+
+test "S3 Bloom reads learn the round trip from small requests and the bandwidth from large ones" {
+    var m: S3Membership = .{ .ctx = undefined, .creds = undefined, .pool = undefined, .specs = &.{} };
+    try std.testing.expect(S3Membership.measured(&m) == null);
+    // Eight 32-byte blocks in 60 ms: one round of round trips.
+    m.observe(8, 256, 60 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?u64, 60 * std.time.ns_per_ms), m.rtt_ns);
+    // 80 MB over eight connections in 60 ms of round trip plus 1 s: 10 MB/s a connection.
+    m.observe(8, 80_000_000, 1060 * std.time.ns_per_ms);
+    try std.testing.expectApproxEqRel(@as(f64, 10e6), m.bytes_per_s.?, 0.01);
+    // A request then costs what one connection moves in 60 ms: 600 KB, not the Lambda default of 2 MiB.
+    const c = S3Membership.measured(&m).?;
+    try std.testing.expectApproxEqRel(@as(f64, 600e3), @as(f64, @floatFromInt(c.request_bytes)), 0.01);
+    // A batch its round trips account for says nothing about bandwidth.
+    m.observe(16, 4 << 20, 125 * std.time.ns_per_ms);
+    try std.testing.expectApproxEqRel(@as(f64, 10e6), m.bytes_per_s.?, 0.01);
 }

@@ -206,7 +206,16 @@ pub const Source = struct {
         /// Start fetching `spans` in the background, so the reads after it overlap instead of waiting in turn: on a
         /// mapping, one cold page fault per probe would otherwise be one disk read at a time.
         prefetch: ?*const fn (ctx: *anyopaque, spans: []const Span) void = null,
+        /// The cost as this query has measured it so far, once the source has timed enough of its reads; `cost`
+        /// stands until then.
+        measured: ?*const fn (ctx: *anyopaque) ?Cost = null,
     };
+
+    /// What planning should assume now.
+    pub fn currentCost(self: Source) Cost {
+        if (self.vtable.measured) |m| if (m(self.ctx)) |c| return c;
+        return self.cost;
+    }
 
     fn prefetch(self: Source, spans: []const Span) void {
         if (spans.len > 0) if (self.vtable.prefetch) |f| f(self.ctx, spans);
@@ -283,15 +292,28 @@ pub fn planSpans(arena: std.mem.Allocator, ranges: []const Span, cost: Cost) ![]
     return best;
 }
 
+/// The gap bytes one merged span may carry: a mebibyte, or twice the bytes it is read for, whichever is more. A plan
+/// that reads several times what it wants bets on bandwidth the medium may not have, and cold reads vary too much to
+/// take that bet on an estimate.
+pub const max_gap_floor: u64 = 1 << 20;
+
 fn merge(arena: std.mem.Allocator, ranges: []const Span, gap: u64) ![]Span {
     var out: std.ArrayList(Span) = .empty;
     var cur = ranges[0];
+    var wanted = cur.len();
+    var gaps: u64 = 0;
     for (ranges[1..]) |r| {
-        if (r.file == cur.file and r.start <= cur.end +| gap) {
+        const g = if (r.start > cur.end) r.start - cur.end else 0;
+        const adds = if (r.end > cur.end) r.end - @max(r.start, cur.end) else 0;
+        if (r.file == cur.file and g <= gap and gaps + g <= @max(max_gap_floor, 2 * (wanted + adds))) {
             cur.end = @max(cur.end, r.end);
+            wanted += adds;
+            gaps += g;
         } else {
             try out.append(arena, cur);
             cur = r;
+            wanted = r.len();
+            gaps = 0;
         }
     }
     try out.append(arena, cur);
@@ -357,7 +379,7 @@ fn sortedSpans(arena: std.mem.Allocator, reqs: []const Req) ![]Span {
 /// Read every request through `src`, merged and split per its cost; a request split across spans is reassembled.
 fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats) !void {
     if (reqs.len == 0) return;
-    const spans = try planSpans(arena, try sortedSpans(arena, reqs), src.cost);
+    const spans = try planSpans(arena, try sortedSpans(arena, reqs), src.currentCost());
     const got = try arena.alloc([]const u8, spans.len);
     try src.read(arena, spans, got);
     // A mapping reads nothing up front; the pages a probe touches fault in on their own.
@@ -421,9 +443,12 @@ pub const Stats = struct {
     /// A first wave pruned too little to pay for reading the rest of its kind.
     bloom_stopped: bool = false,
     dict_stopped: bool = false,
+    /// A request's fixed cost, in bytes, that the last plan assumed (remote sources only).
+    request_bytes: u64 = 0,
     ns: u64 = 0,
 
     pub fn add(self: *Stats, o: Stats) void {
+        self.request_bytes = @max(self.request_bytes, o.request_bytes);
         self.row_groups_bloom += o.row_groups_bloom;
         self.row_groups_dict += o.row_groups_dict;
         self.filters += o.filters;
@@ -506,6 +531,7 @@ pub fn load(
         .opts = opts,
     };
     try p.run();
+    if (src.cost.remote()) stats.request_bytes = src.currentCost().request_bytes;
     stats.ns = @intCast(nowMonoNs() - t0);
     return stats;
 }
@@ -856,7 +882,7 @@ const Probing = struct {
         var plan = try self.wholePlan(wave, spans, fetch);
         if (self.src.cost.remote()) {
             if (try self.sparsePlan(wave, spans, fetch)) |sparse| {
-                const cost = self.src.cost;
+                const cost = self.src.currentCost();
                 const t_sparse = try estimateReqs(a, sparse.reqs.items, cost);
                 if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) plan = sparse;
             }
@@ -1279,14 +1305,29 @@ test "planSpans: memory merges only what touches; remote merges where requests c
     try testing.expectEqual(Span{ .file = 0, .start = 10, .end = 40 }, mapped[0]);
 
     const s3ish: Cost = .{ .request_bytes = 1 << 20, .concurrency = 8, .max_request = 24 << 20 };
-    // 100 blocks 300 KB apart: one request each would queue ~13 deep per lane; reading the 30 MB between them in eight
-    // pieces is far cheaper.
+    // 100 blocks 300 KB apart: one request each would queue ~13 deep per lane, so neighbours merge, but no merged span
+    // carries more than a mebibyte of bytes nobody asked for.
     var close: [100]Span = undefined;
     for (&close, 0..) |*s, i| s.* = .{ .file = 0, .start = i * 300_000, .end = i * 300_000 + 32 };
     const merged = try planSpans(a, &close, s3ish);
-    try testing.expect(merged.len <= 16);
+    try testing.expect(merged.len < 50);
     try testing.expect(try estimate(a, merged, s3ish) < try estimate(a, &close, s3ish));
-    for (merged) |s| try testing.expect(s.len() <= s3ish.max_request);
+    for (merged) |s| try testing.expect(s.len() <= max_gap_floor + 32 * 5);
+    // Wanted bytes earn their gap: 100 ranges of 200 KB 300 KB apart may merge whole (gaps under twice the wanted).
+    var wide: [100]Span = undefined;
+    for (&wide, 0..) |*s, i| s.* = .{ .file = 0, .start = i * 500_000, .end = i * 500_000 + 200_000 };
+    try testing.expect((try merge(a, &wide, std.math.maxInt(u64))).len == 1);
+    // At 100 KB wanted per 1.4 MB apart they cannot: each merge would add more gap than twice what it wants.
+    for (&wide, 0..) |*s, i| s.* = .{ .file = 0, .start = i * 1_500_000, .end = i * 1_500_000 + 100_000 };
+    const capped = try merge(a, &wide, std.math.maxInt(u64));
+    try testing.expect(capped.len > 1);
+    for (capped) |s| {
+        var want: u64 = 0;
+        for (wide) |b| if (b.start >= s.start and b.end <= s.end) {
+            want += b.len();
+        };
+        try testing.expect(s.len() - want <= @max(max_gap_floor, 2 * want));
+    }
     // The same blocks 300 MB apart: merging would read gigabytes, so each stays its own request.
     var far: [100]Span = undefined;
     for (&far, 0..) |*s, i| s.* = .{ .file = 0, .start = i * 300_000_000, .end = i * 300_000_000 + 32 };

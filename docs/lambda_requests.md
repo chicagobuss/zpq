@@ -59,6 +59,7 @@ also counted in `row_groups_pruned`):
 | `filters`, `dictionaries` | Filters and dictionaries probed. |
 | `requests`, `bytes` | S3 requests made, and bytes read, to fetch them (0 for local files and for filters the warm cache held). |
 | `bloom_stopped`, `dict_stopped` | The first eight row groups probed pruned too few to pay for reading the rest of that kind. |
+| `request_kb` | A request's fixed cost, as the KiB a connection moves meanwhile, that the last read plan assumed (S3 only). |
 | `us` | Time spent, in microseconds. |
 
 **`pool`** (both responses), for the sandbox's S3 connection pool during this invocation. On a cold invocation, the

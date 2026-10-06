@@ -170,6 +170,9 @@ pub const QueryArgs = struct {
     /// wrong answer here would be silent. See `core/parquet/column.zig`
     /// (`fast_levels`) for what the detection actually proves.
     fast_levels: bool = false,
+    /// Encoded execution in aggregate scans (`DecodeOptions.encoded`). `ZPQ_ENCODED=0` in the environment turns it
+    /// off too, so one binary can be compared against itself.
+    encoded: bool = true,
     max_memory: usize = 512 * 1024 * 1024,
     /// Records the query's spans when set (`--profile`, the Lambda's `"profile"`); see `profile.zig`.
     profiler: ?*profile.Profiler = null,
@@ -366,6 +369,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .scan_all = args.scan_all,
         .trust_stats = args.trust_stats,
         .fast_levels = args.fast_levels,
+        .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
@@ -920,6 +924,12 @@ fn outputColumnNames(
 }
 
 /// S3 credentials from the environment, telling a missing region apart from missing keys.
+/// Whether `name` is set to "0" in `env`.
+fn envDisables(env: std.process.Environ, name: []const u8) bool {
+    const v = env.getPosix(name) orelse return false;
+    return std.mem.eql(u8, v, "0");
+}
+
 fn credentialsFromEnv(env: std.process.Environ) error{ NoCredentials, NoRegion }!s3.Credentials {
     return s3.Credentials.fromEnv(env) catch |err| if (err == error.NoRegion) error.NoRegion else error.NoCredentials;
 }

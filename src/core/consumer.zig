@@ -46,6 +46,7 @@ const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
+const agg_coded = @import("expr/agg_coded.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
@@ -1240,6 +1241,7 @@ pub fn scanRGForAgg(
     const t_decode_start = nowMonoNs();
     var pages_total: usize = 0;
     var pages_skipped: usize = 0;
+    const uses = try planCodeUses(ra, in, target);
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
@@ -1259,7 +1261,26 @@ pub fn scanRGForAgg(
             try pagePruning(ra, pi, filter_pages, ci, in.consumed[ci], &sel, num_rows, cm, start)
         else
             null;
-        const decoded = try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch);
+        // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
+        // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
+        // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
+        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
+        const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and target == .scalar;
+        const hist_col: ?filter_eval.Batch.Column = if (encoded and !levels_only and uses.code[ci] and
+            uses.hist_ok[ci] and !uses.value[ci])
+            try decodeAggColumnHist(ra, chunk, cm, in.meta, decode_options, ws.scratch, num_rows)
+        else
+            null;
+        var decoded = if (hist_col) |hc|
+            hc
+        else if (levels_only)
+            try decodeLevelsOnly(ra, chunk, cm, in.meta, decode_options, ws.scratch, num_rows)
+        else if (encoded and (uses.code[ci] or uses.levels[ci]))
+            (try decodeAggColumnCoded(ra, chunk, cm, in.meta, decode_options, ws.scratch)) orelse
+                try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch)
+        else
+            try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch);
+        if (ci < uses.value.len and uses.value[ci]) decoded = try agg_coded.materialize(ra, decoded);
         lookup[ci] = batch_cols.items.len;
         try checkRowShape(decoded, num_rows);
         try batch_cols.append(ra, decoded);
@@ -1288,6 +1309,16 @@ pub fn scanRGForAgg(
 
     switch (target) {
         .grouped => |g| {
+            if (decode_options.encoded and
+                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, &batch, lookup, &sel))
+            {
+                const t_agg_end = nowMonoNs();
+                ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
+                profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+                return;
+            }
+            // The row path reads values: gather any column decoded as codes only.
+            for (batch_cols.items) |*bc| bc.* = try agg_coded.materialize(ra, bc.*);
             var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
             for (g.keys, 0..) |key_expr, idx| {
                 key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch, lookup, key_expr);
@@ -1349,6 +1380,386 @@ fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profi
         cm.total_compressed_size,
         cm.total_uncompressed_size,
     });
+}
+
+/// Which columns a coded decode serves (`code`) and which still need materialized values (`value`).
+const CodeUses = struct { code: []bool, value: []bool, levels: []bool, hist_ok: []bool };
+
+fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !CodeUses {
+    const n = in.read.len;
+    const u: CodeUses = .{
+        .code = try ra.alloc(bool, n),
+        .value = try ra.alloc(bool, n),
+        .levels = try ra.alloc(bool, n),
+        .hist_ok = try ra.alloc(bool, n),
+    };
+    @memset(u.code, false);
+    @memset(u.value, false);
+    @memset(u.levels, false);
+    // A column folds straight into a histogram when every row is selected and only unfiltered scalar aggregates
+    // read it as a bare argument.
+    @memset(u.hist_ok, in.filter == null and target == .scalar);
+    if (target == .scalar) for (target.calls()) |call| {
+        if (call.where) |w| markFilterSet(u.hist_ok, w, false);
+        if (call.arg) |arg| {
+            if (call.where != null) markExprSet(u.hist_ok, arg, false);
+            if (arg != .col_ref) markExprSet(u.hist_ok, arg, false);
+        }
+    };
+    if (in.filter) |f| markFilter(u, f);
+    for (target.calls()) |call| {
+        if (call.where) |w| markFilter(u, w);
+        if (call.arg) |arg| switch (arg) {
+            .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
+            else => markExprValues(u, arg),
+        };
+    }
+    switch (target) {
+        .grouped => |g| for (g.keys) |k| switch (k) {
+            .col_ref => |c| mark(u.code, c.col_idx),
+            else => markExprValues(u, k),
+        },
+        .scalar => {},
+    }
+    return u;
+}
+
+fn markFilterSet(set: []bool, f: filter_ast.Filter, v: bool) void {
+    switch (f) {
+        .and_filter, .or_filter => |c| {
+            markFilterSet(set, c.left.*, v);
+            markFilterSet(set, c.right.*, v);
+        },
+        inline else => |l| if (l.col_idx < set.len) {
+            set[l.col_idx] = v;
+        },
+    }
+}
+
+fn markExprSet(set: []bool, e: expr_ast.Expr, v: bool) void {
+    switch (e) {
+        .literal => {},
+        .col_ref => |c| if (c.col_idx < set.len) {
+            set[c.col_idx] = v;
+        },
+        .binop => |b| {
+            markExprSet(set, b.left.*, v);
+            markExprSet(set, b.right.*, v);
+        },
+        .call => |c| for (c.args) |a| markExprSet(set, a.*, v),
+    }
+}
+
+fn mark(set: []bool, ci: usize) void {
+    if (ci < set.len) set[ci] = true;
+}
+
+fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
+    switch (f) {
+        .and_filter => |c| {
+            markFilter(u, c.left.*);
+            markFilter(u, c.right.*);
+        },
+        .or_filter => |c| {
+            markFilter(u, c.left.*);
+            markFilter(u, c.right.*);
+        },
+        .int32 => |l| mark(u.code, l.col_idx),
+        .int64 => |l| mark(u.code, l.col_idx),
+        .uint64 => |l| mark(u.code, l.col_idx),
+        .float => |l| mark(u.code, l.col_idx),
+        .double => |l| mark(u.code, l.col_idx),
+        .string => |l| mark(u.code, l.col_idx),
+        .boolean => |l| mark(u.value, l.col_idx),
+        .null_check => |l| mark(u.levels, l.col_idx),
+        .like => |l| mark(u.code, l.col_idx),
+    }
+}
+
+fn markExprValues(u: CodeUses, e: expr_ast.Expr) void {
+    switch (e) {
+        .literal => {},
+        .col_ref => |c| mark(u.value, c.col_idx),
+        .binop => |b| {
+            markExprValues(u, b.left.*);
+            markExprValues(u, b.right.*);
+        },
+        .call => |c| for (c.args) |a| markExprValues(u, a.*),
+    }
+}
+
+/// `decodeAggColumn` as dictionary codes, or null when the chunk's type or encoding has no coded form here.
+fn decodeAggColumnCoded(
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    meta: *const schema.FileMetaData,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+) !?filter_eval.Batch.Column {
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    if (levels.max_rep > 0) return null;
+    const n_leaves: usize = @intCast(cm.num_values);
+    const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    if (dec_kind) |k| {
+        return switch (k.physical) {
+            inline .INT32, .INT64 => |p| blk: {
+                const T = if (p == .INT32) i32 else i64;
+                const r = (try decodeCodes(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                    break :blk null;
+                switch (r) {
+                    .codes => |c| {
+                        const d = try ra.alloc(f64, c.dict.len);
+                        decimal_mod.applyScaleSimd(T, c.dict, k.scale, d);
+                        break :blk .{ .f64 = codedCol(f64, c, d, levels) };
+                    },
+                    .values => |v| {
+                        const d = try ra.alloc(f64, v.values.len);
+                        decimal_mod.applyScaleSimd(T, v.values, k.scale, d);
+                        break :blk .{ .f64 = scaledCol(f64, d, v, levels) };
+                    },
+                }
+            },
+            else => null,
+        };
+    }
+    if (schema_elem != null and schema.isFloat16(schema_elem.?)) return null;
+    return switch (cm.type) {
+        .INT32 => blk: {
+            if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?)) {
+                const r = (try decodeCodes(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                    break :blk null;
+                switch (r) {
+                    .codes => |c| {
+                        const d = try ra.alloc(i64, c.dict.len);
+                        for (d, c.dict) |*o, v| o.* = @as(u32, @bitCast(v));
+                        break :blk .{ .i64 = codedCol(i64, c, d, levels) };
+                    },
+                    // Rare (unsigned INT32 whose dictionary overflowed): decode again the ordinary way.
+                    .values => break :blk null,
+                }
+            }
+            break :blk try codedOrValues(i32, .i32, ra, chunk, cm, levels, n_leaves, decode_options, scratch);
+        },
+        .INT64 => try codedOrValues(i64, .i64, ra, chunk, cm, levels, n_leaves, decode_options, scratch),
+        .FLOAT => try codedOrValues(f32, .f32, ra, chunk, cm, levels, n_leaves, decode_options, scratch),
+        .DOUBLE => try codedOrValues(f64, .f64, ra, chunk, cm, levels, n_leaves, decode_options, scratch),
+        .BYTE_ARRAY => try codedOrValues([]const u8, .string, ra, chunk, cm, levels, n_leaves, decode_options, scratch),
+        else => null,
+    };
+}
+
+fn codedOrValues(
+    comptime T: type,
+    comptime tag: std.meta.Tag(filter_eval.Batch.Column),
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    levels: schema.Levels,
+    n_leaves: usize,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+) !?filter_eval.Batch.Column {
+    const r = (try decodeCodes(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse return null;
+    return switch (r) {
+        .codes => |c| @unionInit(filter_eval.Batch.Column, @tagName(tag), codedCol(T, c, c.dict, levels)),
+        .values => |v| @unionInit(filter_eval.Batch.Column, @tagName(tag), valuesCol(T, v, levels)),
+    };
+}
+
+/// `decodeAggColumnCoded` folded straight into a code histogram, or null when the chunk doesn't qualify (the caller
+/// then decodes it afresh). Decimal and unsigned-INT32 dictionaries convert once per entry.
+fn decodeAggColumnHist(
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    meta: *const schema.FileMetaData,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+    num_rows: usize,
+) !?filter_eval.Batch.Column {
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    if (levels.max_rep > 0) return null;
+    const n_leaves: usize = @intCast(cm.num_values);
+    const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    if (dec_kind) |k| {
+        return switch (k.physical) {
+            inline .INT32, .INT64 => |p| blk: {
+                const T = if (p == .INT32) i32 else i64;
+                const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                    break :blk null;
+                switch (r) {
+                    .hist => |h| {
+                        const d = try ra.alloc(f64, h.dict.len);
+                        decimal_mod.applyScaleSimd(T, h.dict, k.scale, d);
+                        break :blk .{ .f64 = histCol(f64, h, d, num_rows) };
+                    },
+                    .values => |v| {
+                        const d = try ra.alloc(f64, v.values.len);
+                        decimal_mod.applyScaleSimd(T, v.values, k.scale, d);
+                        break :blk .{ .f64 = scaledCol(f64, d, v, levels) };
+                    },
+                }
+            },
+            else => null,
+        };
+    }
+    if (schema_elem != null and schema.isFloat16(schema_elem.?)) return null;
+    return switch (cm.type) {
+        .INT32 => blk: {
+            const r = (try histOf(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                break :blk null;
+            const unsigned = schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?);
+            switch (r) {
+                .hist => |h| {
+                    if (unsigned) {
+                        const d = try ra.alloc(i64, h.dict.len);
+                        for (d, h.dict) |*o, v| o.* = @as(u32, @bitCast(v));
+                        break :blk .{ .i64 = histCol(i64, h, d, num_rows) };
+                    }
+                    break :blk .{ .i32 = histCol(i32, h, h.dict, num_rows) };
+                },
+                .values => |v| {
+                    if (unsigned) {
+                        const d = try ra.alloc(i64, v.values.len);
+                        for (d, v.values) |*o, x| o.* = @as(u32, @bitCast(x));
+                        break :blk .{ .i64 = scaledCol(i64, d, v, levels) };
+                    }
+                    break :blk .{ .i32 = valuesCol(i32, v, levels) };
+                },
+            }
+        },
+        inline .INT64, .FLOAT, .DOUBLE, .BYTE_ARRAY => |t| blk: {
+            const T = switch (t) {
+                .INT64 => i64,
+                .FLOAT => f32,
+                .DOUBLE => f64,
+                else => []const u8,
+            };
+            const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                break :blk null;
+            const tag = switch (t) {
+                .INT64 => "i64",
+                .FLOAT => "f32",
+                .DOUBLE => "f64",
+                else => "string",
+            };
+            break :blk switch (r) {
+                .hist => |h| @unionInit(filter_eval.Batch.Column, tag, histCol(T, h, h.dict, num_rows)),
+                .values => |v| @unionInit(filter_eval.Batch.Column, tag, valuesCol(T, v, levels)),
+            };
+        },
+        else => null,
+    };
+}
+
+fn histCol(comptime T: type, h: anytype, dict: []const T, num_rows: usize) filter_eval.ColumnT(T) {
+    return .{
+        .values = &.{},
+        .dict = dict,
+        .hist = h.hist,
+        .levels_only_rows = num_rows,
+        .has_nulls = h.num_present != num_rows,
+    };
+}
+
+fn histOf(
+    comptime T: type,
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    n_leaves: usize,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+) !?column_mod.ColumnChunkReader(T).HistOrValues {
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
+    return reader.readAllHistogram(n_leaves);
+}
+
+/// A column of definition levels only, typed as `decodeAggColumn` would type it so lookups and type checks agree.
+fn decodeLevelsOnly(
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    meta: *const schema.FileMetaData,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+    num_rows: usize,
+) !filter_eval.Batch.Column {
+    _ = num_rows;
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n_leaves: usize = @intCast(cm.num_values);
+    var dl: ?[]u32 = null;
+    if (levels.max_def > 0) {
+        var reader = column_mod.ColumnChunkReader(i32).initWithOptions(
+            chunk,
+            cm.codec,
+            levels,
+            ra,
+            decode_options,
+            scratch,
+        );
+        const r = (try reader.readAllLevels(n_leaves)) orelse
+            return decodeAggColumn(ra, chunk, cm, meta, null, decode_options, scratch);
+        dl = r.def_levels;
+    }
+    var has_nulls = false;
+    if (dl) |d| for (d) |x| {
+        if (x < levels.max_def) {
+            has_nulls = true;
+            break;
+        }
+    };
+    // The lane tag is irrelevant to count(col) and IS [NOT] NULL; i64 keeps every reader of nullInfo happy.
+    return .{ .i64 = .{
+        .values = &.{},
+        .def_levels = dl,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = has_nulls,
+        .levels_only_rows = if (dl) |d| d.len else n_leaves,
+    } };
+}
+
+/// A values column built from converted values `d` (decimal scaling, unsigned widening) with `v`'s levels.
+fn scaledCol(comptime T: type, d: []const T, v: anytype, levels: schema.Levels) filter_eval.ColumnT(T) {
+    return .{ .values = d, .def_levels = v.def_levels, .max_def = @intCast(levels.max_def), .has_nulls = v.has_nulls };
+}
+
+fn codedCol(comptime T: type, c: anytype, dict: []const T, levels: schema.Levels) filter_eval.ColumnT(T) {
+    return .{
+        .values = &.{},
+        .codes = c.codes,
+        .dict = dict,
+        .def_levels = c.def_levels,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = c.has_nulls,
+    };
+}
+
+fn valuesCol(comptime T: type, v: anytype, levels: schema.Levels) filter_eval.ColumnT(T) {
+    return .{
+        .values = v.values,
+        .def_levels = v.def_levels,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = v.has_nulls,
+    };
+}
+
+fn decodeCodes(
+    comptime T: type,
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    n_leaves: usize,
+    decode_options: DecodeOptions,
+    scratch: *DecodeScratch,
+) !?column_mod.ColumnChunkReader(T).CodedOrValues {
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
+    return reader.readAllCodes(n_leaves);
 }
 
 /// Fold every call statistics can answer for this row group into its accumulator and mark it in `handled`. Returns
@@ -2321,8 +2732,8 @@ pub fn checkRowShape(col: filter_eval.Batch.Column, num_rows: usize) error{Colum
                 var starts: usize = 0;
                 for (rl) |r| starts += @intFromBool(r == 0);
                 if (starts != num_rows) return error.ColumnRowCountMismatch;
-            } else if (c.values.len != num_rows) return error.ColumnRowCountMismatch;
-            if (c.def_levels) |dl| if (dl.len != c.values.len) return error.ColumnRowCountMismatch;
+            } else if (c.rowCount() != num_rows) return error.ColumnRowCountMismatch;
+            if (c.def_levels) |dl| if (dl.len != c.rowCount()) return error.ColumnRowCountMismatch;
         },
     }
 }

@@ -28,6 +28,7 @@ const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
+const agg_coded = @import("agg_coded.zig");
 const statistics = @import("../parquet/statistics.zig");
 
 pub const Error = error{
@@ -610,6 +611,7 @@ pub fn updateOne(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
+    if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel)) return;
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
     defer input.deinit(arena);
     const sel = input.selection();
@@ -784,7 +786,7 @@ inline fn columnHasNulls(col: filter_eval.Batch.Column) bool {
 /// Clear bits in `sel` for rows where the column is null. Operates
 /// per-bit; for typical RG sizes (~1M rows) this runs once and is
 /// not a hot path. The fold inner loops do remain SIMD-able.
-fn intersectPresentMask(
+pub fn intersectPresentMask(
     sel: *filter_selection.SelectionVector,
     col: filter_eval.Batch.Column,
 ) void {
@@ -2606,10 +2608,34 @@ pub fn updateOneGrouped(
 ) Error!void {
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel);
     defer input.deinit(arena);
-    const sel = input.selection();
-    const values = input.values;
-    const u64_col = input.unsigned_64;
+    return updateOneGroupedValues(
+        arena,
+        persist,
+        accs,
+        group_id_arr,
+        agg_idx,
+        agg_len,
+        call,
+        input.values,
+        input.selection(),
+        input.unsigned_64,
+    );
+}
 
+/// `updateOneGrouped` over an already-prepared argument and selection.
+pub fn updateOneGroupedValues(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    call: AggCall,
+    values: ?filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    u64_col: bool,
+) Error!void {
+    _ = arena;
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (sel.isActive(r)) {

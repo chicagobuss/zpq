@@ -178,7 +178,7 @@ pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
 /// differs (the scalar loop did one f64 divide per value; this does 8
 /// per instruction on AVX). scale<=0 / out-of-table scales fall back to
 /// the scalar path.
-fn applyScaleSimd(comptime T: type, raw: []const T, scale: i32, out: []f64) void {
+pub fn applyScaleSimd(comptime T: type, raw: []const T, scale: i32, out: []f64) void {
     if (scale <= 0 or scale >= pow10_f64.len) {
         for (raw, 0..) |v, i| out[i] = applyScaleInt(T, v, scale);
         return;

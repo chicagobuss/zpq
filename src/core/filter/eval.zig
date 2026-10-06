@@ -215,6 +215,25 @@ pub fn ColumnT(comptime T: type) type {
         rep_levels: ?[]const u32 = null,
         max_rep: u32 = 0,
         has_nulls: bool = false,
+        /// A dictionary-encoded view of the same rows. When non-null, `codes[i]` indexes
+        /// `dict` for row i (0 at null rows, which `def_levels` marks). `values` may then be empty: such a column
+        /// is only handed to consumers that read codes (see `consumer.scanRGForAgg`), or materialized first.
+        codes: ?[]const u32 = null,
+        dict: []const T = &.{},
+        /// Nonzero when only the levels were decoded (no values, no codes) for this many rows.
+        /// With `hist` set, the column was folded straight into a histogram over `dict` (no levels either).
+        levels_only_rows: usize = 0,
+        hist: ?[]const u64 = null,
+
+        pub fn rowCount(self: @This()) usize {
+            if (self.levels_only_rows != 0) return self.levels_only_rows;
+            return if (self.codes) |c| c.len else self.values.len;
+        }
+
+        /// Values not materialized: only the codes are present.
+        pub fn codesOnly(self: @This()) bool {
+            return self.codes != null and self.values.len != self.codes.?.len;
+        }
     };
 }
 
@@ -236,6 +255,37 @@ pub const Batch = struct {
 
         /// Null mask + nesting, independent of the value type — used by
         /// IS NULL / IS NOT NULL, which never touch values.
+        pub fn levelsOnly(self: Column) bool {
+            return switch (self) {
+                inline else => |c| c.levels_only_rows != 0 and c.hist == null,
+            };
+        }
+
+        pub fn hist(self: Column) ?[]const u64 {
+            return switch (self) {
+                inline else => |c| c.hist,
+            };
+        }
+
+        pub fn codes(self: Column) ?[]const u32 {
+            return switch (self) {
+                inline else => |c| c.codes,
+            };
+        }
+
+        /// The dictionary as a column of its own (one row per entry, no nulls), for evaluating per entry.
+        pub fn dictColumn(self: Column) Column {
+            return switch (self) {
+                inline else => |c, tag| @unionInit(Column, @tagName(tag), .{ .values = c.dict }),
+            };
+        }
+
+        pub fn dictLen(self: Column) usize {
+            return switch (self) {
+                inline else => |c| c.dict.len,
+            };
+        }
+
         pub fn nullInfo(self: Column) struct { def_levels: ?[]const u32, max_def: u32, max_rep: u32 } {
             return switch (self) {
                 inline else => |c| .{ .def_levels = c.def_levels, .max_def = c.max_def, .max_rep = c.max_rep },
@@ -256,6 +306,11 @@ pub fn evaluate(
     column_lookup: []const ?usize,
     arena: std.mem.Allocator,
 ) Error!void {
+    if (leafColumn(filter)) |ci| {
+        const col_pos = column_lookup[ci] orelse return error.BadColumn;
+        const col = batch.cols[col_pos];
+        if (col.codes()) |codes| return evalCodedLeaf(filter, ci, col, codes, sel, column_lookup.len, arena);
+    }
     switch (filter) {
         .int32 => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
@@ -328,6 +383,9 @@ pub fn evaluate(
         },
         .and_filter => |c| {
             if (c.in_set) |s| return evalInSet(s, batch, sel, column_lookup);
+            // Leaves of one AND chain that test the same coded column combine into one
+            // per-entry match table and a single pass over the rows.
+            if (try evalAndCoded(filter, batch, sel, column_lookup, arena)) return;
             // AND composes naturally: left clears bits, right clears
             // more bits. No state to save.
             try evaluate(c.left.*, batch, sel, column_lookup, arena);
@@ -394,6 +452,146 @@ fn UnsignedLane(comptime L: type) type {
             return self.set.contains(@as(U, @bitCast(v)));
         }
     };
+}
+
+/// The column a value leaf tests; null for AND/OR and IS [NOT] NULL (which reads levels only).
+fn leafColumn(f: ast.Filter) ?usize {
+    return switch (f) {
+        .int32 => |l| l.col_idx,
+        .int64 => |l| l.col_idx,
+        .uint64 => |l| l.col_idx,
+        .float => |l| l.col_idx,
+        .double => |l| l.col_idx,
+        .string => |l| l.col_idx,
+        .boolean => |l| l.col_idx,
+        .like => |l| l.col_idx,
+        .null_check, .and_filter, .or_filter => null,
+    };
+}
+
+/// A value leaf over a dictionary-coded column. The predicate runs once per dictionary entry
+/// (through the ordinary kernels, over the dictionary as a column), then rows reduce to one table lookup by code
+/// plus the null test, 64 rows per selection word.
+fn evalCodedLeaf(
+    filter: ast.Filter,
+    col_idx: usize,
+    col: Batch.Column,
+    codes: []const u32,
+    sel: *selection.SelectionVector,
+    lookup_len: usize,
+    arena: std.mem.Allocator,
+) Error!void {
+    const ni = col.nullInfo();
+    if (ni.max_rep > 0) return error.NestedFilterNotSupported;
+    const n_dict = col.dictLen();
+    const dict_cols = [_]Batch.Column{col.dictColumn()};
+    const dict_batch: Batch = .{ .cols = &dict_cols, .num_rows = n_dict };
+    const dict_lookup = try arena.alloc(?usize, lookup_len);
+    defer arena.free(dict_lookup);
+    @memset(dict_lookup, null);
+    dict_lookup[col_idx] = 0;
+    var dict_sel = try selection.SelectionVector.init(arena, n_dict);
+    defer dict_sel.deinit();
+    try evaluate(filter, &dict_batch, &dict_sel, dict_lookup, arena);
+    const match = try arena.alloc(u8, n_dict);
+    defer arena.free(match);
+    for (match, 0..) |*m, k| m.* = @intFromBool(dict_sel.isActive(k));
+    applyCodeMatch(codes, match, ni.def_levels, ni.max_def, sel);
+}
+
+fn flattenAnd(f: ast.Filter, out: *std.ArrayList(ast.Filter), arena: std.mem.Allocator) Error!void {
+    switch (f) {
+        .and_filter => |c| {
+            try flattenAnd(c.left.*, out, arena);
+            try flattenAnd(c.right.*, out, arena);
+        },
+        else => try out.append(arena, f),
+    }
+}
+
+/// Evaluate an AND chain, merging leaves on the same coded column. Returns false (nothing done) when no coded
+/// column carries two or more leaves, leaving the ordinary recursion to it.
+fn evalAndCoded(
+    f: ast.Filter,
+    batch: *const Batch,
+    sel: *selection.SelectionVector,
+    column_lookup: []const ?usize,
+    arena: std.mem.Allocator,
+) Error!bool {
+    var leaves: std.ArrayList(ast.Filter) = .empty;
+    defer leaves.deinit(arena);
+    try flattenAnd(f, &leaves, arena);
+    var any_group = false;
+    for (leaves.items, 0..) |a, i| {
+        const ca = leafColumn(a) orelse continue;
+        const pa = column_lookup[ca] orelse continue;
+        if (batch.cols[pa].codes() == null) continue;
+        for (leaves.items[i + 1 ..]) |b| {
+            if (leafColumn(b) == ca) any_group = true;
+        }
+    }
+    if (!any_group) return false;
+    const done = try arena.alloc(bool, leaves.items.len);
+    defer arena.free(done);
+    @memset(done, false);
+    for (leaves.items, 0..) |a, i| {
+        if (done[i]) continue;
+        const ca = leafColumn(a) orelse continue;
+        const pa = column_lookup[ca] orelse return error.BadColumn;
+        const col = batch.cols[pa];
+        const codes = col.codes() orelse continue;
+        const ni = col.nullInfo();
+        if (ni.max_rep > 0) return error.NestedFilterNotSupported;
+        const n_dict = col.dictLen();
+        const dict_cols = [_]Batch.Column{col.dictColumn()};
+        const dict_batch: Batch = .{ .cols = &dict_cols, .num_rows = n_dict };
+        const dict_lookup = try arena.alloc(?usize, column_lookup.len);
+        @memset(dict_lookup, null);
+        dict_lookup[ca] = 0;
+        var dict_sel = try selection.SelectionVector.init(arena, n_dict);
+        for (leaves.items[i..], i..) |b, j| {
+            if (leafColumn(b) != ca) continue;
+            try evaluate(b, &dict_batch, &dict_sel, dict_lookup, arena);
+            done[j] = true;
+        }
+        const match = try arena.alloc(u8, n_dict);
+        for (match, 0..) |*m, k| m.* = @intFromBool(dict_sel.isActive(k));
+        applyCodeMatch(codes, match, ni.def_levels, ni.max_def, sel);
+    }
+    for (leaves.items, done) |b, d| if (!d) try evaluate(b, batch, sel, column_lookup, arena);
+    return true;
+}
+
+/// `sel[r] &= match[codes[r]] and row r present`, a selection word at a time.
+pub fn applyCodeMatch(
+    codes: []const u32,
+    match: []const u8,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    sel: *selection.SelectionVector,
+) void {
+    std.debug.assert(codes.len == sel.len);
+    const n = codes.len;
+    var w: usize = 0;
+    while (w * 64 < n) : (w += 1) {
+        const word = sel.mask[w];
+        if (word == 0) continue;
+        const base = w * 64;
+        const end = @min(base + 64, n);
+        var bits: u64 = 0;
+        if (def_levels) |dl| {
+            for (base..end) |r| {
+                const keep: u64 = match[codes[r]] & @intFromBool(dl[r] == max_def);
+                bits |= keep << @intCast(r - base);
+            }
+        } else {
+            for (base..end) |r| {
+                const keep: u64 = match[codes[r]];
+                bits |= keep << @intCast(r - base);
+            }
+        }
+        sel.mask[w] = word & bits;
+    }
 }
 
 // ============================================================
@@ -637,5 +835,49 @@ test "evaluate unsigned leaf over raw i32, zero-extended i64, and raw u64 lanes"
         try evaluate(f, &batch, &sv, &lookup, a);
         try testing.expectEqual(@as(usize, 1), sv.count());
         try testing.expect(sv.isActive(1));
+    }
+}
+
+test "a coded column filters exactly as its values do, nulls and same-column AND chains included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Rows: x, NULL, z, y, x, z, NULL, y over the dictionary {x, y, z}; the coded view holds 0 at null rows.
+    const dict = [_][]const u8{ "x", "y", "z" };
+    const codes = [_]u32{ 0, 0, 2, 1, 0, 2, 0, 1 };
+    const defs = [_]u32{ 1, 0, 1, 1, 1, 1, 0, 1 };
+    const vals = [_][]const u8{ "x", "", "z", "y", "x", "z", "", "y" };
+    const ints = [_]i32{ 5, 6, 7, 8, 9, 10, 11, 12 };
+    const coded: Batch.Column = .{ .string = .{
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const plain: Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+    const lookup = [_]?usize{ 0, 1 };
+
+    const ge_y = try a.create(ast.Filter);
+    ge_y.* = .{ .string = .{ .col_idx = 0, .op = .GtEq, .value = "y" } };
+    const ne_z = try a.create(ast.Filter);
+    ne_z.* = .{ .string = .{ .col_idx = 0, .op = .NotEq, .value = "z" } };
+    const int_ge = try a.create(ast.Filter);
+    int_ge.* = .{ .int32 = .{ .col_idx = 1, .op = .GtEq, .value = 7 } };
+    const same_col: ast.Filter = .{ .and_filter = .{ .left = ge_y, .right = ne_z } };
+    const inner = try a.create(ast.Filter);
+    inner.* = same_col;
+    const mixed: ast.Filter = .{ .and_filter = .{ .left = inner, .right = int_ge } };
+
+    for ([_]ast.Filter{ ge_y.*, ne_z.*, same_col, mixed }) |f| {
+        var want = try selection.SelectionVector.init(a, vals.len);
+        const plain_cols = [_]Batch.Column{ plain, .{ .i32 = .{ .values = &ints } } };
+        try evaluate(f, &.{ .cols = &plain_cols, .num_rows = vals.len }, &want, &lookup, a);
+        var got = try selection.SelectionVector.init(a, vals.len);
+        const coded_cols = [_]Batch.Column{ coded, .{ .i32 = .{ .values = &ints } } };
+        try evaluate(f, &.{ .cols = &coded_cols, .num_rows = vals.len }, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
     }
 }

@@ -93,6 +93,8 @@ pub const MultiAggArgs = struct {
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
     fast_levels: bool = false,
+    /// See `consumer.DecodeOptions.encoded`.
+    encoded: bool = true,
     /// Receives what a failure was about; see `diag.zig`.
     diag: ?*Diag = null,
     /// Records the scan's spans when set; see `profile.zig`.
@@ -728,7 +730,7 @@ pub fn runMultiAggregate(
             .cursor = &work_cursor,
             .agg_calls = agg_calls,
             .plan = &plan,
-            .decode_options = .{ .fast_levels = args.fast_levels },
+            .decode_options = .{ .fast_levels = args.fast_levels, .encoded = args.encoded },
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,

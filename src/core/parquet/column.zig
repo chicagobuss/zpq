@@ -99,6 +99,9 @@ pub const DecodeOptions = struct {
     /// proves every value present. Kept on each reader so concurrent queries
     /// can choose independently without process-global mutable state.
     fast_levels: bool = false,
+    /// Let an aggregate scan work on dictionary-encoded columns as codes (filters once per dictionary entry,
+    /// histogram aggregates, level-only counts) instead of materialising values. Off only to compare against.
+    encoded: bool = true,
 };
 
 /// Hardwood's definition-level test, ported: a page has no nulls iff its
@@ -390,6 +393,310 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 written += n;
             }
             if (written != num_leaves) return error.ShortDecode;
+            return .{ .values = values };
+        }
+
+        /// A whole chunk as dictionary codes, as `readAllCodes` returns it.
+        pub const CodeLeaves = struct {
+            /// `codes[i]` indexes `dict` for leaf i; 0 at null leaves (the def levels govern).
+            codes: []u32,
+            /// Chunk-lifetime dictionary, copied out of any per-worker scratch.
+            dict: []const T,
+            def_levels: ?[]u32 = null,
+            has_nulls: bool = false,
+        };
+
+        pub const CodedOrValues = union(enum) { codes: CodeLeaves, values: Leaves };
+
+        /// Drain the chunk as dictionary codes, never resolving a value. A chunk that is not
+        /// dictionary-encoded throughout (a PLAIN fallback page after the dictionary outgrew its page) switches to
+        /// values in place: the codes so far are gathered and the remaining pages decode as `readAll` would, so the
+        /// fallback costs one gather, not a second decode. Null when there is no coded form at all (BOOLEAN, nested,
+        /// a chunk opening with a non-dictionary page); the reader is then untouched past its first page and the
+        /// caller decodes with a fresh one.
+        pub fn readAllCodes(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?CodedOrValues {
+            if (T == bool) {
+                return null;
+            } else {
+                return self.readAllCodesImpl(num_leaves);
+            }
+        }
+
+        fn readAllCodesImpl(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?CodedOrValues {
+            if (self.levels.max_rep > 0) return null;
+            // All-present pages are proven from the level stream's opening run (never a false positive) and their
+            // levels never expanded; the level array is only built once a page actually has nulls.
+            self.options.fast_levels = true;
+            self.value_budget = num_leaves;
+            try self.holdScratch();
+            const max_def: u32 = @intCast(self.levels.max_def);
+            var codes: []u32 = &.{};
+            var def_out: ?[]u32 = null;
+            var dict_ptr: ?[*]const T = null;
+            var written: usize = 0;
+            while (written < num_leaves) {
+                const remaining_in_page = if (self.hasActivePage())
+                    self.current_page_num_values - self.current_def_pos
+                else
+                    0;
+                if (remaining_in_page > 0) {
+                    if (self.active != .rle_dict) {
+                        return .{ .values = try self.finishAsValues(codes, def_out, written, num_leaves) };
+                    }
+                    const d = self.dictionary orelse return null;
+                    if (dict_ptr) |p| {
+                        if (p != d.ptr)
+                            return .{ .values = try self.finishAsValues(codes, def_out, written, num_leaves) };
+                    } else if (d.len == 0 or d.len > num_leaves / 8) {
+                        // Near-unique dictionary: codes buy nothing over values, and per-entry work rivals per-row.
+                        return .{ .values = try self.finishAsValues(codes, def_out, written, num_leaves) };
+                    } else {
+                        dict_ptr = d.ptr;
+                        codes = try self.arena.alloc(u32, num_leaves);
+                    }
+                    const want = @min(num_leaves - written, remaining_in_page);
+                    const out = codes[written..][0..want];
+                    const idx = &self.active.rle_dict.indices;
+                    const page_has_levels = !self.current_def_all_present and self.current_def_levels != null;
+                    if (max_def > 0 and def_out == null and page_has_levels) {
+                        def_out = try self.arena.alloc(u32, num_leaves);
+                        @memset(def_out.?[0..written], max_def);
+                    }
+                    if (def_out == null or self.current_def_all_present or self.current_def_levels == null) {
+                        if (def_out) |dl| @memset(dl[written..][0..want], max_def);
+                        const got = idx.decode(out) catch return error.UnexpectedPage;
+                        if (got != want) return error.UnexpectedPage;
+                        try self.checkCodes(out);
+                    } else {
+                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
+                        @memcpy(def_out.?[written..][0..want], src);
+                        var num_present: usize = 0;
+                        for (src) |dv| num_present += @intFromBool(dv == max_def);
+                        if (num_present > 0) {
+                            const got = idx.decode(out[0..num_present]) catch return error.UnexpectedPage;
+                            if (got != num_present) return error.UnexpectedPage;
+                            try self.checkCodes(out[0..num_present]);
+                        }
+                        if (num_present != want) {
+                            self.has_nulls = true;
+                            var read: usize = num_present;
+                            var i: usize = want;
+                            while (i > 0) {
+                                i -= 1;
+                                if (src[i] == max_def) {
+                                    read -= 1;
+                                    out[i] = out[read];
+                                } else out[i] = 0;
+                            }
+                        }
+                    }
+                    written += want;
+                    self.current_def_pos += want;
+                    continue;
+                }
+                self.resetPageState();
+                if (!try self.advancePage()) break;
+            }
+            if (written != num_leaves) return error.ShortDecode;
+            if (num_leaves == 0) return null;
+            const dict = self.dictionary orelse return null;
+            const owned: []const T = if (T == []const u8) dict else try self.arena.dupe(T, dict);
+            return .{ .codes = .{ .codes = codes, .dict = owned, .def_levels = def_out, .has_nulls = self.has_nulls } };
+        }
+
+        pub const HistLeaves = struct {
+            /// Present leaves per dictionary entry.
+            hist: []u64,
+            dict: []const T,
+            num_present: usize,
+        };
+
+        /// Fold the chunk straight into a histogram of dictionary codes, never writing a code or
+        /// a value per row. An RLE run of the index stream costs O(1) (`hist[v] += run length`); bit-packed indices
+        /// pass through a 256-entry staging buffer. Null rows are counted out from the levels. Null when the chunk is
+        /// not dictionary-encoded throughout, or the dictionary is near-unique; the caller then decodes afresh.
+        pub const HistOrValues = union(enum) { hist: HistLeaves, values: Leaves };
+
+        pub fn readAllHistogram(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?HistOrValues {
+            if (T == bool) {
+                return null;
+            } else {
+                return self.readAllHistogramImpl(num_leaves);
+            }
+        }
+
+        fn readAllHistogramImpl(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?HistOrValues {
+            if (self.levels.max_rep > 0) return null;
+            self.options.fast_levels = true;
+            self.value_budget = num_leaves;
+            try self.holdScratch();
+            const max_def: u32 = @intCast(self.levels.max_def);
+            var hist: []u64 = &.{};
+            var dict_ptr: ?[*]const T = null;
+            var written: usize = 0;
+            var present_total: usize = 0;
+            var buf: [256]u32 = undefined;
+            while (written < num_leaves) {
+                const remaining_in_page = if (self.hasActivePage())
+                    self.current_page_num_values - self.current_def_pos
+                else
+                    0;
+                if (remaining_in_page > 0) {
+                    const first = dict_ptr == null;
+                    const usable = self.active == .rle_dict and self.dictionary != null and
+                        self.dictionary.?.len != 0 and self.dictionary.?.len <= num_leaves / 8;
+                    if (first and !usable) {
+                        // Nothing folded yet: decode this chunk as values in place instead of starting over.
+                        return .{ .values = try self.finishAsValues(&.{}, null, 0, num_leaves) };
+                    }
+                    if (self.active != .rle_dict) return null;
+                    const d = self.dictionary orelse return null;
+                    if (dict_ptr) |p| {
+                        if (p != d.ptr) return null;
+                    } else {
+                        dict_ptr = d.ptr;
+                        hist = try self.arena.alloc(u64, d.len);
+                        @memset(hist, 0);
+                    }
+                    const want = @min(num_leaves - written, remaining_in_page);
+                    var present = want;
+                    if (max_def > 0 and !self.current_def_all_present and self.current_def_levels != null) {
+                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
+                        present = 0;
+                        for (src) |dv| present += @intFromBool(dv == max_def);
+                    }
+                    const idx = &self.active.rle_dict.indices;
+                    const n_dict = d.len;
+                    var left = present;
+                    while (left > 0) {
+                        if (idx.takeRleRun(left) catch return error.UnexpectedPage) |run| {
+                            if (run.value >= n_dict) return error.UnexpectedPage;
+                            hist[run.value] += run.count;
+                            left -= run.count;
+                            continue;
+                        }
+                        const take = @min(left, buf.len);
+                        const got = idx.decode(buf[0..take]) catch return error.UnexpectedPage;
+                        if (got == 0) return error.UnexpectedPage;
+                        var oob: u32 = 0;
+                        for (buf[0..got]) |k| {
+                            oob |= @intFromBool(k >= n_dict);
+                            hist[@min(k, n_dict - 1)] += 1;
+                        }
+                        if (oob != 0) return error.UnexpectedPage;
+                        left -= got;
+                    }
+                    present_total += present;
+                    written += want;
+                    self.current_def_pos += want;
+                    continue;
+                }
+                self.resetPageState();
+                if (!try self.advancePage()) break;
+            }
+            if (written != num_leaves) return error.ShortDecode;
+            if (num_leaves == 0) return null;
+            const dict = self.dictionary orelse return null;
+            const owned: []const T = if (T == []const u8) dict else try self.arena.dupe(T, dict);
+            return .{ .hist = .{ .hist = hist, .dict = owned, .num_present = present_total } };
+        }
+
+        /// Drain only the definition levels (count(col) needs nothing else). Pages are still
+        /// decompressed (V1 levels sit inside the compressed body); no value is decoded. Null for nested columns.
+        pub const LevelsResult = struct { def_levels: ?[]u32 };
+
+        /// `def_levels` null: every leaf present.
+        pub fn readAllLevels(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?LevelsResult {
+            if (self.levels.max_rep > 0 or self.levels.max_def == 0) return null;
+            self.options.fast_levels = true;
+            self.value_budget = num_leaves;
+            try self.holdScratch();
+            const max_def: u32 = @intCast(self.levels.max_def);
+            var out_opt: ?[]u32 = null;
+            var written: usize = 0;
+            while (written < num_leaves) {
+                const remaining_in_page = if (self.hasActivePage())
+                    self.current_page_num_values - self.current_def_pos
+                else
+                    0;
+                if (remaining_in_page > 0) {
+                    const want = @min(num_leaves - written, remaining_in_page);
+                    if (self.current_def_all_present or self.current_def_levels == null) {
+                        if (out_opt) |out| @memset(out[written..][0..want], max_def);
+                    } else {
+                        if (out_opt == null) {
+                            out_opt = try self.arena.alloc(u32, num_leaves);
+                            @memset(out_opt.?[0..written], max_def);
+                        }
+                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
+                        @memcpy(out_opt.?[written..][0..want], src);
+                    }
+                    written += want;
+                    self.current_def_pos += want;
+                    continue;
+                }
+                self.resetPageState();
+                if (!try self.advancePage()) break;
+            }
+            if (written != num_leaves) return error.ShortDecode;
+            return .{ .def_levels = out_opt };
+        }
+
+        /// Indices come from the file: one past the dictionary would be an out-of-bounds read downstream.
+        fn checkCodes(self: *Self, out: []const u32) Error!void {
+            const dict = self.dictionary.?;
+            if (out.len == 0) return;
+            if (dict.len >= (@as(u64, 1) << @intCast(self.active.rle_dict.indices.bit_width))) return;
+            const V = @Vector(8, u32);
+            var acc: V = @splat(0);
+            var i: usize = 0;
+            while (i + 8 <= out.len) : (i += 8) acc = @max(acc, @as(V, out[i..][0..8].*));
+            var mx: u32 = @reduce(.Max, acc);
+            while (i < out.len) : (i += 1) mx = @max(mx, out[i]);
+            if (mx >= dict.len) return error.UnexpectedPage;
+        }
+
+        /// Dictionary fallback mid-chunk: gather the leaves decoded as codes so far, then decode the rest as values.
+        fn finishAsValues(
+            self: *Self,
+            codes: []const u32,
+            def_out: ?[]u32,
+            written: usize,
+            num_leaves: usize,
+        ) (Error || error{ShortDecode})!Leaves {
+            const values = try self.arena.alloc(T, num_leaves);
+            if (written > 0) {
+                const dict = self.dictionary.?;
+                for (values[0..written], codes[0..written]) |*v, k| v.* = dict[k];
+            }
+            const max_def: u32 = @intCast(self.levels.max_def);
+            // Values decode needs expanded levels from here on.
+            self.options.fast_levels = false;
+            var def_buf = def_out;
+            if (max_def > 0 and def_buf == null) {
+                def_buf = try self.arena.alloc(u32, num_leaves);
+                @memset(def_buf.?[0..written], max_def);
+            }
+            if (def_buf) |dl| {
+                for (values[0..written], dl[0..written]) |*v, dv| {
+                    if (dv < max_def) v.* = defaultValue();
+                }
+                var w = written;
+                while (w < num_leaves) {
+                    const n = try self.decodeWithLevels(values[w..], dl[w..]);
+                    if (n == 0) break;
+                    w += n;
+                }
+                if (w != num_leaves) return error.ShortDecode;
+                return .{ .values = values, .def_levels = dl, .has_nulls = self.has_nulls };
+            }
+            var w = written;
+            while (w < num_leaves) {
+                const n = try self.decode(values[w..]);
+                if (n == 0) break;
+                w += n;
+            }
+            if (w != num_leaves) return error.ShortDecode;
             return .{ .values = values };
         }
 

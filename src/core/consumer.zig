@@ -1859,7 +1859,7 @@ fn carryChunk(
     return if (emit_page_index)
         fastpath.rebaseChunk(out_arena, out, src.bytes, chunk, delta)
     else
-        fastpath.shiftChunk(chunk, delta);
+        fastpath.copiedChunk(src.bytes, chunk, delta);
 }
 
 /// A codec change requested of a byte copy. `scratch` backs the per-chunk
@@ -2039,6 +2039,8 @@ fn copyChunkRecompressed(
     const src_base: i64 = @intCast(src_start);
     var chunk = src_chunk;
     chunk.absent = &.{};
+    // Recompressing changes the bytes, not the values: the filter still holds.
+    chunk.bloom_out = fastpath.carriedFilter(src.bytes, &src_chunk);
     var meta = m;
     meta.bloom_filter_offset = null;
     meta.bloom_filter_length = null;

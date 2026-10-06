@@ -24,8 +24,10 @@
 //!     so page-level pruning survives a compaction. It is dropped only
 //!     when the source has none or its index bytes were not fetched (the
 //!     S3 fast path may hold just the column-chunk + footer ranges).
-//!   - Bloom-filter offsets in the input footer are still **dropped**.
-//!     Downstream readers fall back to row-group-level pruning.
+//!   - Bloom filters are **carried forward** too: a copied chunk's rows are
+//!     its source's, so its filter still holds. Each is written after the
+//!     row groups (`placeFilters`), where the spec puts them, with fields
+//!     14 and 15 pointing at it; a dropped column drops its filter.
 //!   - The schema, statistics, encodings, and per-row-group metadata are
 //!     all copied through unchanged. Strings (paths, stats min/max) are
 //!     borrowed from `meta` — caller must keep `meta` alive until the
@@ -34,6 +36,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
+const bloom = @import("../parquet/bloom.zig");
 
 const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
@@ -144,6 +147,8 @@ pub fn assemble(
         try new_row_groups.append(arena, new_rg);
         total_rows += rg.num_rows;
     };
+
+    try placeFilters(out, new_row_groups.items);
 
     // The schema is shared by reference unless projecting, which needs a reduced list.
     const meta0 = files[0].meta;
@@ -257,9 +262,9 @@ fn offsetDelta(new_start: usize, src_start: usize) i64 {
 }
 
 /// `src` with every offset shifted by `delta`, the distance its data
-/// moved, and its page index carried forward into `out`. Inner slices
-/// (encodings, paths, stats) are borrowed from the source; bloom-filter
-/// offsets are dropped.
+/// moved, its page index carried forward into `out`, and its Bloom filter
+/// held for `placeFilters`. Inner slices (encodings, paths, stats, the
+/// filter) are borrowed from the source.
 pub fn rebaseChunk(
     arena: std.mem.Allocator,
     out: anytype,
@@ -267,7 +272,7 @@ pub fn rebaseChunk(
     src: *const schema.ColumnChunk,
     delta: i64,
 ) !schema.ColumnChunk {
-    var chunk = shiftChunk(src, delta);
+    var chunk = copiedChunk(input, src, delta);
     const idx = try carryPageIndex(arena, out, input, src, delta);
     chunk.offset_index_offset = idx.offset_index_offset;
     chunk.offset_index_length = idx.offset_index_length;
@@ -277,6 +282,42 @@ pub fn rebaseChunk(
 }
 
 /// `rebaseChunk` without the page index, for output that carries none.
+pub fn copiedChunk(input: []const u8, src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
+    var chunk = shiftChunk(src, delta);
+    chunk.bloom_out = carriedFilter(input, src);
+    return chunk;
+}
+
+/// The Bloom filter (header and bitset) of `src` inside `input`, which an output copying the chunk's rows unchanged
+/// may keep; empty when there is none, it lies outside `input` (an S3 input holds only the ranges it fetched), the
+/// chunk is encrypted, or it reads as no filter.
+pub fn carriedFilter(input: []const u8, src: *const schema.ColumnChunk) []const u8 {
+    if (src.encrypted) return &.{};
+    const cm = src.meta_data orelse return &.{};
+    const off = std.math.cast(usize, cm.bloom_filter_offset orelse return &.{}) orelse return &.{};
+    if (off < 4 or off >= input.len) return &.{};
+    const h = bloom.parseHeader(input[off..]) orelse return &.{};
+    const total = h.len + h.num_bytes;
+    if (total > input.len - off) return &.{};
+    // A length that disagrees with the header leaves no telling which to trust.
+    if (cm.bloom_filter_length) |l| if (l != total) return &.{};
+    return input[off..][0..total];
+}
+
+/// Write the Bloom filter each chunk of `row_groups` carries (`bloom_out`) to `out`, which must be past the last row
+/// group, and point the chunk's fields 14 and 15 at it. Row group by row group, columns in schema order: the layout
+/// the spec describes and readers expect.
+pub fn placeFilters(out: anytype, row_groups: []schema.RowGroup) !void {
+    for (row_groups) |*rg| for (rg.columns.items) |*c| {
+        if (c.bloom_out.len == 0) continue;
+        const m = if (c.meta_data) |*m| m else continue;
+        m.bloom_filter_offset = @intCast(out.pos());
+        m.bloom_filter_length = @intCast(c.bloom_out.len);
+        try out.write(c.bloom_out);
+    };
+}
+
+/// `src` moved by `delta`, carrying neither its page index nor its Bloom filter.
 pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
     var chunk = src.*;
     if (chunk.meta_data) |*m| {
@@ -293,6 +334,7 @@ pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk
         m.bloom_filter_length = null;
     }
     chunk.absent = &.{};
+    chunk.bloom_out = &.{};
     chunk.offset_index_offset = null;
     chunk.offset_index_length = null;
     chunk.column_index_offset = null;
@@ -845,4 +887,89 @@ test "byte copy refuses chunk ranges outside its input" {
         try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, null));
         try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, &.{0}));
     }
+}
+
+test "byte copies carry each kept chunk's Bloom filter, after the row groups, and readers prune on it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // tools/gen_bloom_fixture.py: `id` and `s` carry filters in every row group; `cat` and `x` none.
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/bloom_keys.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(arena, bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    survivors[2] = false;
+
+    for ([_]?[]const usize{ null, &.{ 1, 3 } }) |kept| {
+        const out = try build(arena, bytes, &meta, survivors, kept);
+        const copied = try metadata.open(arena, out);
+        try testing.expectEqual(@as(usize, 7), copied.row_groups.items.len);
+        var last_chunk_end: i64 = 0;
+        var next_filter: i64 = 0;
+        for (copied.row_groups.items, 0..) |rg, ri| {
+            const src_rg = meta.row_groups.items[if (ri < 2) ri else ri + 1];
+            for (rg.columns.items, 0..) |c, ci| {
+                const m = c.meta_data.?;
+                const chunk_end = (m.dictionary_page_offset orelse m.data_page_offset) + m.total_compressed_size;
+                last_chunk_end = @max(last_chunk_end, chunk_end);
+                const src_ci = if (kept) |k| k[ci] else ci;
+                const src = src_rg.columns.items[src_ci];
+                if (src.meta_data.?.bloom_filter_offset == null) {
+                    try testing.expect(m.bloom_filter_offset == null);
+                    continue;
+                }
+                // Laid out row group by row group, in column order, the bytes unchanged.
+                const off = m.bloom_filter_offset.?;
+                const len = m.bloom_filter_length.?;
+                if (next_filter != 0) try testing.expectEqual(next_filter, off);
+                next_filter = off + len;
+                const src_off: usize = @intCast(src.meta_data.?.bloom_filter_offset.?);
+                const n: usize = @intCast(len);
+                try testing.expectEqualSlices(u8, bytes[src_off..][0..n], out[@intCast(off)..][0..n]);
+            }
+        }
+        // After every row group.
+        try testing.expect(next_filter > last_chunk_end);
+    }
+
+    // The filters hold in the copy: an absent key prunes every group there as in the source.
+    const out = try build(arena, bytes, &meta, survivors, null);
+    const copied = [_]schema.FileMetaData{try metadata.open(arena, out)};
+    const membership = @import("../filter/membership.zig");
+    const parser = @import("../filter/parser.zig");
+    const prune = @import("../filter/prune.zig");
+    const f = try parser.parse(arena, "id = 1001", &copied[0], null);
+    const mapped: membership.MappedSource = .{ .files = &.{out} };
+    const st = try membership.load(arena, testing.allocator, f, &copied, mapped.source(), .{});
+    try testing.expectEqual(@as(usize, 7), st.row_groups_bloom);
+    for (copied[0].row_groups.items) |*rg| try testing.expectEqual(.skip, prune.pruneRowGroup(rg, f, &copied[0]));
+}
+
+test "carriedFilter: only a filter that reads whole and agrees with the footer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/bloom_keys.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(arena, bytes);
+    const good = meta.row_groups.items[0].columns.items[0];
+    const len: usize = @intCast(good.meta_data.?.bloom_filter_length.?);
+    try testing.expectEqual(len, carriedFilter(bytes, &good).len);
+    var c = good;
+    c.encrypted = true;
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes, &c).len);
+    c = good;
+    c.meta_data.?.bloom_filter_length = good.meta_data.?.bloom_filter_length.? + 1;
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes, &c).len);
+    // Not in this buffer (an S3 input that did not fetch it).
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes[0..1000], &good).len);
+    // No length: the header alone locates it.
+    c = good;
+    c.meta_data.?.bloom_filter_length = null;
+    try testing.expectEqual(carriedFilter(bytes, &good).len, carriedFilter(bytes, &c).len);
 }

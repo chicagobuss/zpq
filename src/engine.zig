@@ -45,6 +45,7 @@ const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
 const membership = @import("core/filter/membership.zig");
 const streaming = @import("core/writer/streaming.zig");
+const fastpath = @import("core/writer/fastpath.zig");
 
 const s3 = @import("io/s3.zig");
 const tls = @import("io/tls.zig");
@@ -1213,9 +1214,14 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         }
     }
 
-    // 6. Build footer.
+    // 6. Bloom filters after the row groups, then the footer.
     const t_footer = nowMonoNs();
     const footer_span = profile.Span.begin(prof);
+    {
+        var so: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset) };
+        try fastpath.placeFilters(&so, new_row_groups.items);
+        out_offset = so.offset;
+    }
     var new_schema_items = meta0.schema;
     if (select_items != null) {
         // Build a flat schema for --select. Each output_spec produces
@@ -1661,6 +1667,18 @@ fn openInputs(
                     // becomes a fetch job.
                     try ranges.append(arena, .{ .start = start, .end = start + len });
                 }
+                // A copied row group keeps its Bloom filters, so they are fetched with it.
+                if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |c, ci| {
+                    if (!c or ci >= rg.columns.items.len) continue;
+                    const cm = rg.columns.items[ci].meta_data orelse continue;
+                    const off = cm.bloom_filter_offset orelse continue;
+                    const len = cm.bloom_filter_length orelse continue;
+                    if (off < 4 or len <= 0) continue;
+                    const start: u64 = @intCast(off);
+                    const end = start + @as(u64, @intCast(len));
+                    if (end > sp.total_size) continue;
+                    try ranges.append(arena, .{ .start = start, .end = end });
+                };
             }
 
             if (ranges.items.len == 0) {
@@ -1779,7 +1797,8 @@ const RangePlan = union(enum) {
     /// unfetched is one no worker reads.
     aggregate: agg_plan.Plan,
     /// Write and print evaluate the filter in every row group they keep, so a kept row group needs all of `columns`.
-    projection: struct { filter: ?filter_ast.Filter, columns: []const bool },
+    /// `carry`: the columns whose Bloom filters a write's byte copy keeps; null when no row group is copied.
+    projection: struct { filter: ?filter_ast.Filter, columns: []const bool, carry: ?[]const bool = null },
 
     /// Every column some row group may fetch.
     fn columns(self: *const RangePlan) []const bool {
@@ -1801,6 +1820,22 @@ const RangePlan = union(enum) {
                 return p.columns;
             },
         }
+    }
+
+    /// The columns of `rg` whose Bloom filters the output will carry, or null: a write copies a row group only when
+    /// there is no filter or statistics prove every row passes it (the same rule `runWrite` applies).
+    fn carriedFilters(
+        self: *const RangePlan,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+    ) ?[]const bool {
+        const p = switch (self.*) {
+            .aggregate => return null,
+            .projection => |p| p,
+        };
+        const cols = p.carry orelse return null;
+        if (p.filter) |f| if (filter_prune.pruneRowGroup(rg, f, meta) != .always_match) return null;
+        return cols;
     }
 };
 
@@ -1832,7 +1867,13 @@ fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.F
 
     // The write and print paths decode exactly these leaves.
     const proj = try planProjection(arena, args, meta0);
-    return .{ .projection = .{ .filter = if (args.scan_all) null else proj.filter, .columns = proj.fetch } };
+    const copies = args.output != null and proj.select_items == null and !proj.any_computed and
+        (proj.filter == null or !args.scan_all);
+    return .{ .projection = .{
+        .filter = if (args.scan_all) null else proj.filter,
+        .columns = proj.fetch,
+        .carry = if (copies) proj.kept else null,
+    } };
 }
 
 const CompactRange = struct {
@@ -2196,6 +2237,12 @@ fn rebaseFetchedOffsets(
             chunk.column_index_length = null;
             chunk.offset_index_offset = null;
             chunk.offset_index_length = null;
+            // A Bloom filter fetched for a byte copy moves into the buffer; any other no longer describes it. (Probing
+            // is over: it read the filters through their source offsets before this.)
+            if (chunk.meta_data) |*cm| {
+                cm.bloom_filter_offset = rebaseContained(cm.bloom_filter_offset, cm.bloom_filter_length, ranges);
+                if (cm.bloom_filter_offset == null) cm.bloom_filter_length = null;
+            }
         }
     }
 
@@ -2229,6 +2276,16 @@ fn rebaseFetchedOffsets(
             if (chunk.meta_data) |cm| chunk.file_offset = cm.data_page_offset;
         }
     }
+}
+
+/// Where `[off, off + len)` of the source lands in the compact buffer, when one range holds all of it.
+fn rebaseContained(off_opt: ?i64, len_opt: ?i32, ranges: []const CompactRange) ?i64 {
+    const off = std.math.cast(u64, off_opt orelse return null) orelse return null;
+    const len = std.math.cast(u64, len_opt orelse return null) orelse return null;
+    for (ranges) |r| {
+        if (off >= r.start and off + len <= r.end) return @intCast(@as(u64, @intCast(r.dst_start)) + (off - r.start));
+    }
+    return null;
 }
 
 fn rebaseOneOffset(old: i64, ranges: []const CompactRange) !i64 {

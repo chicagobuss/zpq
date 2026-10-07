@@ -4,12 +4,17 @@ A local Parquet file is mapped read-only, and by default the decode workers faul
 Linux an aggregate query can instead read the column chunks it needs explicitly (`src/io/local_reader.zig`):
 
 - The planner's column-chunk ranges (and the page indexes of those chunks) are read into an anonymous buffer laid out
-  like the file, row group by row group, ahead of the workers. Nothing else in the file is read or allocated.
+  like the file, row group by row group, ahead of the workers. Reads are rounded out to whole pages, and a row group's
+  ranges at most 64 KiB apart are read as one, gap included; otherwise nothing in the file is read or allocated.
+  Neighbouring row groups can therefore read the same pages (Arrow writes every row group's page indexes together
+  after the data), and the bytes the profile reports count each such read.
 - A worker waits on a row group's gate before touching it. Once every work item of a row group is done, the pages
-  no other unfinished row group's reads cover go back to the kernel (`MADV_DONTNEED`), so the reader holds at most a
-  window of bytes read ahead and not yet scanned. A file far bigger than memory scans in bounded memory.
+  no other unfinished row group's reads cover go back to the kernel (`MADV_DONTNEED`). A file far bigger than memory
+  scans in bounded memory.
 - Row groups enter the window one at a time in input order, so a later row group never takes the room an earlier one
-  needs.
+  needs. A row group is admitted once its bytes fit beside those already read ahead and not yet released, so the
+  reader holds at most the window; one row group bigger than the window is admitted alone, once nothing else is
+  outstanding.
 - Row groups that statistics, Bloom filters or dictionaries prune are never read. Footers are parsed, and Bloom
   filters and dictionaries probed, through the mapping.
 
@@ -44,5 +49,7 @@ No registered buffers are used, so the default `memlock` limit is enough.
 | `ZPQ_IO_WINDOW_MIB` | 1024 | bytes read ahead of the workers and not yet released |
 | `ZPQ_IO_THREADS` | 8 | reader threads |
 
-`--profile-summary` names the backend a query used. With a reader it adds a line with the bytes read, how often and
-how long workers waited on reads, and how often the reader waited for the window.
+`--profile-summary` names the backend a query used. With a reader it adds a line with what the reads actually went
+through (reader threads on io_uring and on pread, the latter including any whose ring failed to set up; files read
+`O_DIRECT` and through the page cache), the bytes read, how often and how long workers waited on reads, and how often
+the reader waited for the window.

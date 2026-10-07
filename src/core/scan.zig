@@ -94,6 +94,9 @@ pub const MultiAggArgs = struct {
     /// flat list of all row groups across all inputs, distributed across
     /// `min(this, total_row_groups)` workers — so one big file uses all cores.
     parallelism: usize = 0,
+    /// Leave each worker's decode region mapped when it finishes, for the process exit to release (see the engine's
+    /// `Context.exit_after`): a worker's unmap otherwise delays its join, and with it the answer.
+    leave_regions: bool = false,
     /// `--scan-all`: disable every stats shortcut — no row-group pruning,
     /// no stats-driven column drop, no aggregate stat short-circuit. Forces
     /// a full page/byte decode. The paranoid / untrusted-writer-stats path.
@@ -481,6 +484,7 @@ const Worker = struct {
     block_merge: ?*BlockMerge = null,
     /// Work items per row group (every row group gets the same number), for `Input.gate`.
     items_per_rg: usize = 1,
+    leave_region: bool = false,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -513,7 +517,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     // Both it and the scratch are written front to back and reused, and both live in one huge-page region that a
     // single unmap releases (see `huge_pages.Region`).
     var region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
-    defer region.deinit();
+    defer if (!w.leave_region) region.deinit();
     var rg_decode_arena = consumer.RowGroupArena.init(region.allocator());
     defer rg_decode_arena.deinit();
     var scratch = consumer.DecodeScratch.init(region.allocator());
@@ -903,6 +907,7 @@ pub fn runMultiAggregate(
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
             .items_per_rg = chunks_per_rg,
+            .leave_region = args.leave_regions,
         };
     }
 

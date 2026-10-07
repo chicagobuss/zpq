@@ -587,6 +587,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .gpa = gpa,
             .env = env,
             .io = io,
+            .exit_after = true,
         }, .{
             .inputs = inputs,
             .output = output,
@@ -697,6 +698,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .gpa = gpa,
         .env = env,
         .io = io,
+        .exit_after = true,
     }, .{
         .inputs = inputs,
         .output = out,

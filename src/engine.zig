@@ -221,6 +221,10 @@ pub const Context = struct {
     /// against the same object (validated via If-None-Match
     /// conditional GET on every hit). CLI passes null.
     meta_cache: ?*meta_cache_mod.MetaCache = null,
+    /// The process exits once this query's answer is out (the CLI). Input mappings and scan workers' regions are then
+    /// left to the exit: unmapping a large populated mapping first holds the answer back by milliseconds, and the
+    /// kernel tears it down at exit regardless. Never for a process that runs another query (the Lambda).
+    exit_after: bool = false,
 };
 
 /// Vtable so both lambda's `PersistentPool` and an inline-CLI
@@ -413,6 +417,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .trust_stats = args.trust_stats,
         .fast_levels = args.fast_levels,
         .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
+        .leave_regions = ctx.exit_after,
         .unordered = args.unordered,
         .select_cols = args.select_cols,
         .column_order = args.column_order,
@@ -1791,9 +1796,11 @@ const OpenedInputs = struct {
     s3_buffers: []const []u8,
     /// Bloom filter probing done while planning the S3 fetch.
     membership: membership.Stats = .{},
+    /// `Context.exit_after`: the mappings go with the process.
+    leave_mappings: bool = false,
 
     pub fn deinit(self: *OpenedInputs) void {
-        for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
+        if (!self.leave_mappings) for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
         for (self.s3_buffers) |buf| self.gpa.free(buf);
         for (self.owned_pools) |p| {
             p.deinit();
@@ -2162,6 +2169,7 @@ fn openInputs(
         .owned_pools = try owned_pools.toOwnedSlice(arena),
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
         .membership = membership_stats,
+        .leave_mappings = ctx.exit_after,
     };
 }
 

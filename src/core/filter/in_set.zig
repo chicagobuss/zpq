@@ -7,7 +7,9 @@
 //!   - integers spanning at most `bitmap_max_bits` values: one bit per value of the range, one load per row;
 //!   - other numbers: an open-addressing table built so every literal sits within `window` slots of its home slot,
 //!     so a probe is one vector load and compare of that window;
-//!   - strings: compared directly when few, else the same table over their hashes, comparing bytes only on a match.
+//!   - strings: compared directly when few, else the same table over their hashes, comparing bytes only on a match;
+//!   - literals chosen so the table can't seat them (colliding homes) without growing past `max_growth` per literal:
+//!     a sorted array searched without branches, for strings an array of their sorted hashes.
 //! Equality is the leaves' own: `==` on numbers (so -0 matches +0 and NaN matches nothing), bytes on strings; a null
 //! row matches neither IN nor NOT IN.
 
@@ -21,6 +23,8 @@ const str_direct_max = 2;
 const window = 8;
 /// 128 KiB of bitmap: within L2, and one load per row beats any probe.
 const bitmap_max_bits = 1 << 20;
+/// Slots per literal the window table may grow to before the sorted fallback; 4 is where it starts.
+const max_growth = 64;
 
 pub const InSet = struct {
     col_idx: usize,
@@ -31,6 +35,8 @@ pub const InSet = struct {
     pub const Probe = union(enum) {
         i32: NumSet(i32),
         i64: NumSet(i64),
+        /// An unsigned column, compared on the stored bits: a u32 zero-extended from an INT32 lane, or a u64.
+        u64: NumSet(u64),
         f32: NumSet(f32),
         f64: NumSet(f64),
         string: StrSet,
@@ -51,10 +57,13 @@ inline fn home(x: u64, bits: u6) usize {
 }
 
 /// Slots `[0, 2^bits + window)` with each key at most `window - 1` past `home(key, bits)`; the window never wraps.
-/// Doubles the table until every key fits, which a load factor of 1/4 makes the first try almost always.
-fn windowTable(comptime K: type, arena: std.mem.Allocator, keys: []const K, empty: K) !struct { slots: []K, bits: u6 } {
-    var bits: u6 = @intCast(std.math.log2_int_ceil(usize, @max(keys.len * 4, 16)));
-    outer: while (true) : (bits += 1) {
+/// Doubles the table until every key fits, which a load factor of 1/4 makes the first try almost always; null once it
+/// would pass `max_growth` slots per key, as keys picked to share a home can force.
+fn windowTable(comptime K: type, arena: std.mem.Allocator, keys: []const K, empty: K) !?struct { slots: []K, bits: u6 } {
+    const start = std.math.log2_int_ceil(usize, @max(keys.len * 4, 16));
+    const limit = std.math.log2_int_ceil(usize, @max(keys.len * max_growth, 16));
+    var bits: u6 = @intCast(start);
+    outer: while (bits <= limit) : (bits += 1) {
         const slots = try arena.alloc(K, (@as(usize, 1) << bits) + window);
         @memset(slots, empty);
         for (keys) |k| {
@@ -71,6 +80,20 @@ fn windowTable(comptime K: type, arena: std.mem.Allocator, keys: []const K, empt
         }
         return .{ .slots = slots, .bits = bits };
     }
+    return null;
+}
+
+/// Whether `v` is in `s`, sorted ascending and not empty. The halving steps depend only on the length, so the search
+/// takes no branch on the data.
+inline fn sortedContains(comptime T: type, s: []const T, v: T) bool {
+    var base: usize = 0;
+    var len = s.len;
+    while (len > 1) {
+        const half = len / 2;
+        base = if (s[base + half - 1] < v) base + half else base;
+        len -= half;
+    }
+    return s[base] == v;
 }
 
 pub fn NumSet(comptime T: type) type {
@@ -86,9 +109,11 @@ pub fn NumSet(comptime T: type) type {
             /// Padded with copies of the first literal.
             few: V,
             /// Bit `v - min` set for each literal.
-            bitmap: struct { min: i64, span: u64, bits: []const u64 },
+            bitmap: struct { min: T, max: T, bits: []const u64 },
             /// See `windowTable`; `empty` marks a free slot and is no literal's bits.
             hash: struct { slots: []const Bits, bits: u6, empty: Bits },
+            /// The literals' bits, sorted, when `windowTable` can't seat them.
+            sorted: []const Bits,
         },
 
         /// `values`: the literals, in any order, duplicates allowed. NaN never equals anything, so it is dropped.
@@ -123,17 +148,17 @@ pub fn NumSet(comptime T: type) type {
                 return .{ .how = .{ .few = lanes } };
             }
             if (is_int) {
-                const min: i64 = distinct[0];
-                const wide: i128 = @as(i128, distinct[distinct.len - 1]) - min + 1;
+                const min = distinct[0];
+                const wide: i129 = @as(i129, distinct[distinct.len - 1]) - min + 1;
                 if (wide <= bitmap_max_bits) {
                     const span: u64 = @intCast(wide);
                     const bits = try arena.alloc(u64, (span + 63) / 64);
                     @memset(bits, 0);
                     for (distinct) |v| {
-                        const off: u64 = @intCast(@as(i64, v) - min);
+                        const off: u64 = @as(Bits, @bitCast(v -% min));
                         bits[off / 64] |= @as(u64, 1) << @intCast(off % 64);
                     }
-                    return .{ .how = .{ .bitmap = .{ .min = min, .span = span, .bits = bits } } };
+                    return .{ .how = .{ .bitmap = .{ .min = min, .max = distinct[distinct.len - 1], .bits = bits } } };
                 }
             }
             const keys = try arena.alloc(Bits, distinct.len);
@@ -145,7 +170,7 @@ pub fn NumSet(comptime T: type) type {
                 if (k != empty) break;
                 empty += 1;
             }
-            const t = try windowTable(Bits, arena, keys, empty);
+            const t = try windowTable(Bits, arena, keys, empty) orelse return .{ .how = .{ .sorted = keys } };
             return .{ .how = .{ .hash = .{ .slots = t.slots, .bits = t.bits, .empty = empty } } };
         }
 
@@ -154,11 +179,11 @@ pub fn NumSet(comptime T: type) type {
                 .few => |lanes| return @reduce(.Or, lanes == @as(V, @splat(v))),
                 .bitmap => |b| {
                     if (comptime !is_int) unreachable;
-                    const off: u64 = @bitCast(@as(i64, v) -% b.min);
-                    // Out of range wraps to a huge offset; one compare covers both sides, and the load stays in bounds.
-                    const in_range = off < b.span;
-                    const word = b.bits[if (in_range) off / 64 else 0];
-                    return in_range and (word >> @intCast(off % 64)) & 1 == 1;
+                    // Both bounds, not one unsigned compare of `v - min`: that wraps back into range for a value near the
+                    // other end of T. Out of range reads word 0, so the load needs no branch either.
+                    const in_range = @intFromBool(v >= b.min) & @intFromBool(v <= b.max) == 1;
+                    const off: u64 = if (in_range) @as(Bits, @bitCast(v -% b.min)) else 0;
+                    return in_range and (b.bits[off / 64] >> @intCast(off % 64)) & 1 == 1;
                 },
                 .hash => |h| {
                     const key: Bits = @bitCast(if (is_int) v else v + 0.0);
@@ -167,6 +192,7 @@ pub fn NumSet(comptime T: type) type {
                     // A NaN row has NaN bits, which no literal has; the empty marker matches free slots, so exclude it.
                     return @reduce(.Or, slots == @as(W, @splat(key))) and key != h.empty;
                 },
+                .sorted => |keys| return sortedContains(Bits, keys, @bitCast(if (is_int) v else v + 0.0)),
             }
         }
     };
@@ -176,10 +202,12 @@ pub const StrSet = struct {
     /// Distinct literals.
     values: []const []const u8,
     /// Empty when `values` are few enough to compare directly; else `windowTable` slots of hashes (0 = free) with
-    /// `index + 1` of the literal beside each.
+    /// `index + 1` of the literal beside each, or, when the table can't seat them (`sorted`), the distinct hashes in
+    /// ascending order with `index[i]` the first literal of `hashes[i]`.
     hashes: []const u64 = &.{},
     index: []const u32 = &.{},
     bits: u6 = 0,
+    sorted: bool = false,
 
     pub fn init(arena: std.mem.Allocator, values: []const []const u8) !StrSet {
         var set: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -196,7 +224,6 @@ pub const StrSet = struct {
             keys[n] = k;
             n += 1;
         }
-        const t = try windowTable(u64, arena, keys[0..n], 0);
         // Literals ordered by hash, so the ones sharing a hash sit together from `index`.
         const by_hash = try arena.dupe([]const u8, distinct);
         std.mem.sort([]const u8, by_hash, {}, struct {
@@ -204,6 +231,15 @@ pub const StrSet = struct {
                 return hash(x) < hash(y);
             }
         }.lt);
+        const t = try windowTable(u64, arena, keys[0..n], 0) orelse {
+            const first = try arena.alloc(u32, n);
+            var i: usize = 0;
+            for (keys[0..n], first) |h, *f| {
+                while (hash(by_hash[i]) != h) i += 1;
+                f.* = @intCast(i);
+            }
+            return .{ .values = by_hash, .hashes = keys[0..n], .index = first, .sorted = true };
+        };
         const index = try arena.alloc(u32, t.slots.len);
         @memset(index, 0);
         var i: usize = 0;
@@ -228,11 +264,24 @@ pub const StrSet = struct {
             return false;
         }
         const h = hash(v);
-        const at = home(h, self.bits);
-        const slots: @Vector(window, u64) = self.hashes[at..][0..window].*;
-        const hit: u8 = @bitCast(slots == @as(@Vector(window, u64), @splat(h)));
-        if (hit == 0) return false;
-        var i = self.index[at + @ctz(hit)] - 1;
+        var i: usize = undefined;
+        if (self.sorted) {
+            var base: usize = 0;
+            var len = self.hashes.len;
+            while (len > 1) {
+                const half = len / 2;
+                base = if (self.hashes[base + half - 1] < h) base + half else base;
+                len -= half;
+            }
+            if (self.hashes[base] != h) return false;
+            i = self.index[base];
+        } else {
+            const at = home(h, self.bits);
+            const slots: @Vector(window, u64) = self.hashes[at..][0..window].*;
+            const hit: u8 = @bitCast(slots == @as(@Vector(window, u64), @splat(h)));
+            if (hit == 0) return false;
+            i = self.index[at + @ctz(hit)] - 1;
+        }
         while (i < self.values.len and hash(self.values[i]) == h) : (i += 1) {
             if (std.mem.eql(u8, self.values[i], v)) return true;
         }
@@ -276,7 +325,7 @@ test "each numeric shape answers as == does" {
     const a = arena_state.allocator();
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
-    // few, bitmap (dense), sorted (sparse, few), hash (sparse, many), and the extremes of the type.
+    // few, bitmap (dense), hash (sparse), and the extremes of the type.
     const cases = [_]struct { k: usize, spread: i64, shape: []const u8 }{
         .{ .k = 5, .spread = 1000, .shape = "few" },
         .{ .k = 300, .spread = 600, .shape = "bitmap" },
@@ -360,5 +409,49 @@ test "filterWords: nulls, the incoming selection and NOT IN" {
             const want = i % 3 != 0 and defs[i] == 1 and listed != negated;
             try testing.expectEqual(want, (mask[i / 64] >> @intCast(i % 64)) & 1 == 1);
         }
+    }
+}
+
+/// The multiplicative inverse of `home`'s multiplier: `k * inverse` hashes home to `k * 2^64`, slot 0 at every size.
+fn homeInverse() u64 {
+    const m: u64 = 0x9E3779B97F4A7C15;
+    var x: u64 = m;
+    for (0..6) |_| x *%= 2 -% m *% x;
+    return x;
+}
+
+test "literals chosen to share every home fall back to a sorted search, in bounded memory" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const inv = homeInverse();
+    try testing.expectEqual(@as(u64, 1), inv *% 0x9E3779B97F4A7C15);
+    var keys: [window + 1]u64 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @as(u64, i) *% inv;
+    std.mem.sort(u64, &keys, {}, std.sort.asc(u64));
+    try testing.expect(try windowTable(u64, a, &keys, 1) == null);
+
+    var lits: [window + 1]i64 = undefined;
+    for (&lits, 0..) |*l, i| l.* = @bitCast(@as(u64, i) *% inv);
+    const set = try NumSet(i64).init(a, &lits);
+    try testing.expectEqualStrings("sorted", @tagName(set.how));
+    for (lits) |l| try testing.expect(set.contains(l) and !set.contains(l +% 1));
+}
+
+test "a bitmap at one end of the type rejects values from the other end" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    inline for (.{ i32, i64, u64 }) |T| {
+        var lits: [300]T = undefined;
+        for (&lits, 0..) |*l, i| l.* = std.math.maxInt(T) - @as(T, @intCast(2 * i));
+        const set = try NumSet(T).init(a, &lits);
+        try testing.expectEqualStrings("bitmap", @tagName(set.how));
+        var v: T = std.math.minInt(T);
+        for (0..2000) |_| {
+            try testing.expect(!set.contains(v));
+            v += 1;
+        }
+        for (lits) |l| try testing.expect(set.contains(l) and !set.contains(l - 1));
     }
 }

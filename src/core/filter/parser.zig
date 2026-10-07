@@ -313,25 +313,39 @@ fn parseInList(
     return tree;
 }
 
-/// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't
-/// hold (unsigned, boolean), which then evaluate leaf by leaf.
+/// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't hold
+/// (boolean) or one of them isn't a plain `=` (`!=` for NOT IN) or a constant, which then evaluate leaf by leaf.
 fn bindInSet(
     arena: std.mem.Allocator,
     col_idx: usize,
     negated: bool,
     leaves: []const ast.Filter,
 ) Error!?*const in_set.InSet {
+    const want: ast.Operator = if (negated) .NotEq else .Eq;
     const probe: in_set.InSet.Probe = switch (leaves[0]) {
-        inline .int32, .int64, .float, .double, .string => |_, tag| blk: {
+        inline .int32, .int64, .uint64, .float, .double, .string => |_, tag| blk: {
             const T = @FieldType(@FieldType(ast.Filter, @tagName(tag)), "value");
-            const values = try arena.alloc(T, leaves.len);
-            for (leaves, values) |l, *v| v.* = @field(l, @tagName(tag)).value;
+            var values: std.ArrayList(T) = .empty;
+            for (leaves) |l| {
+                if (std.meta.activeTag(l) != tag) return null;
+                const leaf = @field(l, @tagName(tag));
+                if (leaf.op == want) {
+                    try values.append(arena, leaf.value);
+                    continue;
+                }
+                // A literal no stored value can equal binds to a constant leaf: one that matches nothing adds no
+                // member to IN, one that matches every present row adds none to NOT IN. Anything else stays leaves.
+                const constant = constantLeaf(T, leaf) orelse return null;
+                if (constant != negated) return null;
+            }
+            if (values.items.len == 0) return null;
             break :blk switch (tag) {
-                .int32 => .{ .i32 = try .init(arena, values) },
-                .int64 => .{ .i64 = try .init(arena, values) },
-                .float => .{ .f32 = try .init(arena, values) },
-                .double => .{ .f64 = try .init(arena, values) },
-                .string => .{ .string = try .init(arena, values) },
+                .int32 => .{ .i32 = try .init(arena, values.items) },
+                .int64 => .{ .i64 = try .init(arena, values.items) },
+                .uint64 => .{ .u64 = try .init(arena, values.items) },
+                .float => .{ .f32 = try .init(arena, values.items) },
+                .double => .{ .f64 = try .init(arena, values.items) },
+                .string => .{ .string = try .init(arena, values.items) },
                 else => unreachable,
             };
         },
@@ -340,6 +354,29 @@ fn bindInSet(
     const set = try arena.create(in_set.InSet);
     set.* = .{ .col_idx = col_idx, .negated = negated, .probe = probe };
     return set;
+}
+
+/// What the binder's constant leaves always answer for a present row: true for `exactLeaf`'s `<= maxInt` and
+/// `buildUnsignedLeaf`'s `>= 0`, false for `> maxInt` and `< 0`; null for any other leaf.
+fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
+    switch (@typeInfo(T)) {
+        .int => |info| if (info.signedness == .unsigned) {
+            if (leaf.value != 0) return null;
+            return switch (leaf.op) {
+                .GtEq => true,
+                .Lt => false,
+                else => null,
+            };
+        } else {
+            if (leaf.value != std.math.maxInt(T)) return null;
+            return switch (leaf.op) {
+                .LtEq => true,
+                .Gt => false,
+                else => null,
+            };
+        },
+        else => return null,
+    }
 }
 
 /// `leaves`, in order, joined by OR (AND when `conjunction`) into a tree of depth log2 of their count. Every pass over
@@ -1059,6 +1096,103 @@ test "IN lists bound to a set select exactly what their leaves do: nulls, NaN, -
             std.debug.print("IN set disagrees with its leaves on: {s}\n", .{expr[0..@min(expr.len, 120)]});
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+test "IN lists holding literals no stored value can equal bind only their real members" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // `ts` is TIMESTAMP(MICROS): a nanosecond literal binds to the constant `> maxInt` (`<= maxInt` under NOT IN).
+    // A set that took the constant's value as a member would match the row holding maxInt.
+    const tss = [_]i64{ std.math.maxInt(i64), 2, 3, 5, std.math.minInt(i64), 0 };
+    const cols = [_]eval.Batch.Column{.{ .i64 = .{ .values = &tss } }};
+    var lookup: [11]?usize = @splat(null);
+    lookup[4] = 0;
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = tss.len };
+    const sub_us = "'1970-01-01 00:00:00.000000001'";
+    const cases = [_]struct { expr: []const u8, bound: bool }{
+        .{ .expr = "ts IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "ts NOT IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "NOT ts IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "ts IN (" ++ sub_us ++ ", '1970-01-01 00:00:00.000000002')", .bound = false },
+        .{ .expr = "ts NOT IN (" ++ sub_us ++ ", '1970-01-01 00:00:00.000000002')", .bound = false },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.expr, &meta, null);
+        const bound = switch (f) {
+            .and_filter, .or_filter => |comp| comp.in_set != null,
+            else => false,
+        };
+        try testing.expectEqual(c.bound, bound);
+        var want = try selection.SelectionVector.init(a, tss.len);
+        var got = try selection.SelectionVector.init(a, tss.len);
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
+        // The maxInt row: only NOT IN keeps it.
+        try testing.expectEqual(std.mem.indexOf(u8, c.expr, "NOT") != null, got.isActive(0));
+    }
+}
+
+test "unsigned IN lists compare stored bits on both lanes, out-of-range literals folded" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    const root: schema.SchemaElement = .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = null,
+        .name = "schema",
+        .num_children = 2,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    try items.append(a, root);
+    var u32_elem = root;
+    u32_elem.type = .INT32;
+    u32_elem.name = "u";
+    u32_elem.num_children = null;
+    u32_elem.converted_type = .UINT_32;
+    try items.append(a, u32_elem);
+    var u64_elem = u32_elem;
+    u64_elem.type = .INT64;
+    u64_elem.name = "w";
+    u64_elem.converted_type = null;
+    u64_elem.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+    try items.append(a, u64_elem);
+    const fm: schema.FileMetaData = .{ .version = 1, .schema = items, .num_rows = 0, .created_by = null, .row_groups = .empty };
+
+    const u_vals = [_]i32{ @bitCast(@as(u32, 3_000_000_000)), 1, -1, 7, 0, @bitCast(@as(u32, 4_000_000_000)) };
+    const w_vals = [_]i64{ @bitCast(@as(u64, std.math.maxInt(u64))), 1, -1, 7, 0, 99 };
+    const cols = [_]eval.Batch.Column{ .{ .i32 = .{ .values = &u_vals } }, .{ .i64 = .{ .values = &w_vals } } };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = u_vals.len };
+    for ([_][]const u8{
+        "u IN (3000000000, 1, -1, 2, 3, 4, 5, 6, 8, 9, 4294967296)",
+        "u NOT IN (3000000000, 1, -1, 2, 3, 4, 5, 6, 8, 9, 4294967296)",
+        "w IN (18446744073709551615, 1, -1, 2, 3, 4, 5, 6, 8, 9, 18446744073709551616)",
+        "NOT w IN (18446744073709551615, 1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 13)",
+    }) |expr| {
+        const f = try parse(a, expr, &fm, null);
+        try testing.expect(switch (f) {
+            .and_filter, .or_filter => |c| c.in_set != null,
+            else => false,
+        });
+        var want = try selection.SelectionVector.init(a, u_vals.len);
+        var got = try selection.SelectionVector.init(a, u_vals.len);
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
     }
 }
 

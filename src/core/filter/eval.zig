@@ -363,9 +363,19 @@ fn evalInSet(
     column_lookup: []const ?usize,
 ) Error!void {
     const col_pos = column_lookup[s.col_idx] orelse return error.BadColumn;
+    const col = batch.cols[col_pos];
     switch (s.probe) {
+        // As `evalLeafUnsigned`: an INT32 lane holds the u32's raw bits, an i64 lane the u64's.
+        .u64 => |*set| switch (col) {
+            inline .i32, .i64 => |c| {
+                try rejectIfNested(c);
+                const L = @TypeOf(c.values[0]);
+                const lane: UnsignedLane(L) = .{ .set = set };
+                in_set.filterWords(L, &lane, s.negated, c.values, c.def_levels, c.max_def, sel.mask);
+            },
+            else => return error.TypeMismatch,
+        },
         inline else => |*set, tag| {
-            const col = batch.cols[col_pos];
             if (col != @field(std.meta.Tag(Batch.Column), @tagName(tag))) return error.TypeMismatch;
             const c = @field(col, @tagName(tag));
             try rejectIfNested(c);
@@ -373,6 +383,17 @@ fn evalInSet(
             in_set.filterWords(@TypeOf(c.values[0]), set, s.negated, c.values, c.def_levels, c.max_def, sel.mask);
         },
     }
+}
+
+fn UnsignedLane(comptime L: type) type {
+    return struct {
+        set: *const in_set.NumSet(u64),
+
+        pub inline fn contains(self: *const @This(), v: L) bool {
+            const U = @Int(.unsigned, @bitSizeOf(L));
+            return self.set.contains(@as(U, @bitCast(v)));
+        }
+    };
 }
 
 // ============================================================

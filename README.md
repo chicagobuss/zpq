@@ -91,8 +91,9 @@ the codec every written chunk uses, or is `"MIXED"` when a plain copy without `-
 **Order** is the input's: every output that lists rows (print, `--format`, `-o` writes and byte copies, several files,
 S3 and Lambda) keeps files in the order given, then row groups, then rows, at any `-j`. `GROUP BY` lists groups in the
 order they first appear in the input (before 0.5.0, in the byte order of their serialized keys), and every aggregate,
-floating-point sums and averages included, comes out with the same bits at every `-j` and on every run: each fixed
-block of row groups folds into its own table and the blocks merge in input order. `--unordered` (the Lambda's
+floating-point sums and averages included, comes out with the same bits at every `-j` and on every run: for float
+results each fixed block of row groups folds into its own table and the blocks merge in input order, which can take up
+to about twice the GROUP BY memory of `--unordered` (`--max-memory` counts it). `--unordered` (the Lambda's
 `"ordered": false`) gives both up for speed: groups in no set order, float aggregates free to differ in their last
 bits.
 

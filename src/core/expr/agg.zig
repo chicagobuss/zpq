@@ -868,10 +868,14 @@ pub fn intersectPresentMask(
             const dls = c.def_levels orelse return;
             const max_def = c.max_def;
             const len = @min(dls.len, sel.len);
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                if (dls[i] < max_def) sel.set(i, false);
+            // 64 levels compared as one vector into a word of present bits: no branch per row.
+            const full = len / 64;
+            const md: @Vector(64, u32) = @splat(max_def);
+            for (sel.mask[0..full], 0..) |*word, w| {
+                const d: @Vector(64, u32) = dls[w * 64 ..][0..64].*;
+                word.* &= @as(u64, @bitCast(d >= md));
             }
+            for (full * 64..len) |i| if (dls[i] < max_def) sel.set(i, false);
         },
     }
 }

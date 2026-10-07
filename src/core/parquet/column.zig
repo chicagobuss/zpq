@@ -841,16 +841,17 @@ pub fn ColumnChunkReader(comptime T: type) type {
             // Scatter from the packed front into the correct slots,
             // walking back-to-front so a packed value is never
             // overwritten before its scatter destination has been read.
+            // No branch on the level: the read index steps by the present bit and a select picks the value, since a
+            // column with real nulls mispredicts any branch on them. Reading `values[read]` at a null slot is harmless:
+            // read <= i there, and the read is discarded.
             var read: usize = num_present;
             var i: usize = values.len;
             while (i > 0) {
                 i -= 1;
-                if (src[i] == max_def) {
-                    read -= 1;
-                    values[i] = values[read];
-                } else {
-                    values[i] = defaultValue();
-                }
+                const present = src[i] == max_def;
+                read -= @intFromBool(present);
+                const v = values[@min(read, values.len - 1)];
+                values[i] = if (present) v else defaultValue();
             }
         }
 

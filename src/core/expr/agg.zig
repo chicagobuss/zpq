@@ -154,15 +154,11 @@ pub const Accumulator = union(enum) {
             .min_i => |*m| if (src.min_i) |sv| {
                 if (m.* == null or sv < m.*.?) m.* = sv;
             },
-            .min_f => |*m| if (src.min_f) |sv| {
-                if (m.* == null or sv < m.*.?) m.* = sv;
-            },
+            .min_f => |*m| if (src.min_f) |sv| foldExtremeF(true, m, sv),
             .max_i => |*m| if (src.max_i) |sv| {
                 if (m.* == null or sv > m.*.?) m.* = sv;
             },
-            .max_f => |*m| if (src.max_f) |sv| {
-                if (m.* == null or sv > m.*.?) m.* = sv;
-            },
+            .max_f => |*m| if (src.max_f) |sv| foldExtremeF(false, m, sv),
             // Pointer copy: both src and the merged dst hold slices dup'd
             // into the shared persist allocator. We free the loser to prevent leaks.
             .min_bytes => |*m| if (src.min_bytes) |sv| {
@@ -418,6 +414,12 @@ fn planStatFold(
     // Bounds in the column's own order: the deprecated pair only where signed is that order.
     const bounds = statistics.chunkBounds(rg, col_idx, file_meta) orelse return null;
     const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
+    // Bounds leave NaN out. A min skips NaN anyway (and an all-NaN chunk has no bounds), but a max or a constant sum
+    // can take them only when the chunk is known to hold none.
+    if (lane == .float and call.func != .min) {
+        const nan_free = if (cm.statistics) |st| st.nan_count == 0 else false;
+        if (!nan_free) return null;
+    }
     var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
     if (call.func == .sum) {
         if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
@@ -533,12 +535,8 @@ fn foldDecimalStatBytes(
         else => error.UnsupportedAggType,
     };
     switch (state.*) {
-        .min_f => |*slot| {
-            slot.* = if (slot.*) |current| @min(current, v) else v;
-        },
-        .max_f => |*slot| {
-            slot.* = if (slot.*) |current| @max(current, v) else v;
-        },
+        .min_f => |*slot| foldExtremeF(true, slot, v),
+        .max_f => |*slot| foldExtremeF(false, slot, v),
         else => return error.UnsupportedAggType,
     }
     _ = call;
@@ -585,10 +583,7 @@ fn foldStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            slot.* = if (slot.*) |current|
-                (if (call.func == .min) @min(current, v) else @max(current, v))
-            else
-                v;
+            if (call.func == .min) foldExtremeF(true, slot, v) else foldExtremeF(false, slot, v);
         },
         else => return error.UnsupportedAggType,
     }
@@ -631,6 +626,30 @@ pub fn updateOne(
             foldMax(state, values.?, sel, u64_col),
         .avg => try foldAvg(state, values.?, sel),
     }
+}
+
+/// Float min/max order every path shares, as DuckDB, Postgres and Spark order floats: NaN sorts above every number,
+/// and of two equal zeros -0 is the lesser. It is a total order, so a min or max is the same whatever order values and
+/// partial results meet in: min skips NaN unless every value is NaN, max is NaN if any value is.
+pub inline fn minTotal(a: f64, b: f64) f64 {
+    if (std.math.isNan(a)) return b;
+    if (std.math.isNan(b)) return a;
+    if (a < b) return a;
+    if (b < a) return b;
+    return if (std.math.signbit(a)) a else b;
+}
+
+pub inline fn maxTotal(a: f64, b: f64) f64 {
+    if (std.math.isNan(a)) return a;
+    if (std.math.isNan(b)) return b;
+    if (a > b) return a;
+    if (b > a) return b;
+    return if (std.math.signbit(a)) b else a;
+}
+
+/// Fold `v` into a float min (`is_min`) or max accumulator slot.
+pub inline fn foldExtremeF(comptime is_min: bool, slot: *?f64, v: f64) void {
+    slot.* = if (slot.*) |cur| (if (is_min) minTotal(cur, v) else maxTotal(cur, v)) else v;
 }
 
 /// Bytewise/unsigned min (`is_min`) or max over a decoded string column,
@@ -1038,14 +1057,17 @@ fn simdMinMaxI64(
     return if (any_active) acc_s else null;
 }
 
+/// Float min (`is_min`) or max of the selected values in `minTotal`/`maxTotal` order, null when none is selected.
+/// Lanes fold with the same order, so the answer doesn't depend on which lane a value lands in.
 fn simdMinMaxF64(
     comptime is_min: bool,
     vals: []const f64,
     sel: *const filter_selection.SelectionVector,
 ) ?f64 {
-    const sentinel: f64 = if (is_min) std.math.inf(f64) else -std.math.inf(f64);
-    var acc_v: VF64 = @splat(sentinel);
-    var acc_s: f64 = sentinel;
+    // The identity of each order: NaN is above every number (min skips it), -inf below every number but NaN.
+    const identity: f64 = if (is_min) std.math.nan(f64) else -std.math.inf(f64);
+    var acc_v: VF64 = @splat(identity);
+    var acc_s: f64 = identity;
     var any_active = false;
     var word_i: usize = 0;
     while ((word_i + 1) * 64 <= vals.len) : (word_i += 1) {
@@ -1055,7 +1077,7 @@ fn simdMinMaxF64(
             any_active = true;
             inline for (0..64 / VLANES) |k| {
                 const chunk: VF64 = vals[base + k * VLANES ..][0..VLANES].*;
-                acc_v = if (is_min) @min(acc_v, chunk) else @max(acc_v, chunk);
+                acc_v = if (is_min) vMinTotal(acc_v, chunk) else vMaxTotal(acc_v, chunk);
             }
         } else if (w != 0) {
             any_active = true;
@@ -1063,20 +1085,42 @@ fn simdMinMaxF64(
             while (bits != 0) {
                 const idx: u6 = @intCast(@ctz(bits));
                 const v = vals[base + idx];
-                acc_s = if (is_min) @min(acc_s, v) else @max(acc_s, v);
+                acc_s = if (is_min) minTotal(acc_s, v) else maxTotal(acc_s, v);
                 bits &= bits - 1;
             }
         }
     }
-    const v_reduced = if (is_min) @reduce(.Min, acc_v) else @reduce(.Max, acc_v);
-    acc_s = if (is_min) @min(acc_s, v_reduced) else @max(acc_s, v_reduced);
+    const lanes: [VLANES]f64 = acc_v;
+    for (lanes) |l| acc_s = if (is_min) minTotal(acc_s, l) else maxTotal(acc_s, l);
     const tail_start = word_i * 64;
     for (tail_start..vals.len) |i| if (sel.isActive(i)) {
         any_active = true;
         const v = vals[i];
-        acc_s = if (is_min) @min(acc_s, v) else @max(acc_s, v);
+        acc_s = if (is_min) minTotal(acc_s, v) else maxTotal(acc_s, v);
     };
     return if (any_active) acc_s else null;
+}
+
+/// `minTotal` lane by lane.
+inline fn vMinTotal(a: VF64, b: VF64) VF64 {
+    const a_nan: @Vector(VLANES, u1) = @intFromBool(a != a);
+    const b_nan: @Vector(VLANES, u1) = @intFromBool(b != b);
+    const lt: @Vector(VLANES, u1) = @intFromBool(a < b);
+    const eq: @Vector(VLANES, u1) = @intFromBool(a == b);
+    const a_neg: @Vector(VLANES, u1) = @truncate(@as(@Vector(VLANES, u64), @bitCast(a)) >> @splat(63));
+    const take_a = ~a_nan & (b_nan | lt | (eq & a_neg));
+    return @select(f64, take_a == @as(@Vector(VLANES, u1), @splat(1)), a, b);
+}
+
+/// `maxTotal` lane by lane.
+inline fn vMaxTotal(a: VF64, b: VF64) VF64 {
+    const a_nan: @Vector(VLANES, u1) = @intFromBool(a != a);
+    const b_nan: @Vector(VLANES, u1) = @intFromBool(b != b);
+    const gt: @Vector(VLANES, u1) = @intFromBool(a > b);
+    const eq: @Vector(VLANES, u1) = @intFromBool(a == b);
+    const a_neg: @Vector(VLANES, u1) = @truncate(@as(@Vector(VLANES, u64), @bitCast(a)) >> @splat(63));
+    const take_a = a_nan | (~b_nan & (gt | (eq & ~a_neg)));
+    return @select(f64, take_a == @as(@Vector(VLANES, u1), @splat(1)), a, b);
 }
 
 /// SIMD avg-fold returns (sum, count) so the caller can merge across RGs.
@@ -1150,11 +1194,7 @@ fn foldMin(
             else if (simdMinMaxI64(true, col.i64.values, sel)) |v| @as(i128, v) else null;
             if (v_opt) |v| s.* = if (s.*) |current| @min(current, v) else v;
         },
-        .min_f => |*s| {
-            if (simdMinMaxF64(true, col.f64.values, sel)) |v| {
-                s.* = if (s.*) |current| @min(current, v) else v;
-            }
-        },
+        .min_f => |*s| if (simdMinMaxF64(true, col.f64.values, sel)) |v| foldExtremeF(true, s, v),
         else => unreachable,
     }
 }
@@ -1172,11 +1212,7 @@ fn foldMax(
             else if (simdMinMaxI64(false, col.i64.values, sel)) |v| @as(i128, v) else null;
             if (v_opt) |v| s.* = if (s.*) |current| @max(current, v) else v;
         },
-        .max_f => |*s| {
-            if (simdMinMaxF64(false, col.f64.values, sel)) |v| {
-                s.* = if (s.*) |current| @max(current, v) else v;
-            }
-        },
+        .max_f => |*s| if (simdMinMaxF64(false, col.f64.values, sel)) |v| foldExtremeF(false, s, v),
         else => unreachable,
     }
 }
@@ -2789,7 +2825,7 @@ fn foldMinGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .f64 => |c| c.values[r],
                 else => unreachable,
             };
-            if (m.* == null or v < m.*.?) m.* = v;
+            foldExtremeF(true, m, v);
         },
         else => unreachable,
     }
@@ -2811,7 +2847,7 @@ fn foldMaxGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .f64 => |c| c.values[r],
                 else => unreachable,
             };
-            if (m.* == null or v > m.*.?) m.* = v;
+            foldExtremeF(false, m, v);
         },
         else => unreachable,
     }
@@ -3007,4 +3043,51 @@ test "string min/max by 16-byte prefix agree with a byte-by-byte fold: shared pr
             if (want) |w| try testing.expectEqualSlices(u8, w, got.?) else try testing.expect(got == null);
         }
     }
+}
+
+/// Both NaN, or the same bits (so -0 and +0 differ).
+fn sameF(want: f64, got: f64) bool {
+    if (std.math.isNan(want)) return std.math.isNan(got);
+    return @as(u64, @bitCast(want)) == @as(u64, @bitCast(got));
+}
+
+test "float min/max: NaN above every number, -0 below +0, the same in any order and on every path" {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const cases = [_]struct { vals: []const f64, lo: f64, hi: f64 }{
+        .{ .vals = &.{ nan, 1, 3 }, .lo = 1, .hi = nan },
+        .{ .vals = &.{ 3, nan, 1 }, .lo = 1, .hi = nan },
+        .{ .vals = &.{ nan, nan }, .lo = nan, .hi = nan },
+        .{ .vals = &.{ 0.0, -0.0 }, .lo = -0.0, .hi = 0.0 },
+        .{ .vals = &.{ -0.0, 0.0 }, .lo = -0.0, .hi = 0.0 },
+        .{ .vals = &.{ -inf, inf, nan }, .lo = -inf, .hi = nan },
+        .{ .vals = &.{ -inf, -inf }, .lo = -inf, .hi = -inf },
+    };
+    var prng = std.Random.DefaultPrng.init(0x7a7);
+    const r = prng.random();
+    for (cases) |c| for (0..20) |_| {
+        // Values in a random order (each at least once), past 64 rows so the SIMD lanes run; folded one at a time,
+        // through the kernel, and as two halves merged: all give the same answer.
+        var vals: [130]f64 = undefined;
+        for (&vals) |*v| v.* = c.vals[r.uintLessThan(usize, c.vals.len)];
+        for (c.vals, 0..) |v, k| vals[k * 7] = v;
+        var sel = try filter_selection.SelectionVector.init(std.testing.allocator, vals.len);
+        defer sel.deinit();
+        inline for (.{ true, false }) |is_min| {
+            const want = if (is_min) c.lo else c.hi;
+            var one: ?f64 = null;
+            for (vals) |v| foldExtremeF(is_min, &one, v);
+            var half_a: ?f64 = null;
+            var half_b: ?f64 = null;
+            for (vals[0..65]) |v| foldExtremeF(is_min, &half_a, v);
+            for (vals[65..]) |v| foldExtremeF(is_min, &half_b, v);
+            foldExtremeF(is_min, &half_b, half_a.?);
+            for ([_]f64{ one.?, half_b.?, simdMinMaxF64(is_min, &vals, &sel).? }) |got| {
+                if (!sameF(want, got)) {
+                    std.debug.print("{s} of {any}: want {d}, got {d}\n", .{ if (is_min) "min" else "max", c.vals, want, got });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    };
 }

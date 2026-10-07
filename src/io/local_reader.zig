@@ -169,6 +169,9 @@ pub const File = struct {
         if (rg >= f.rg_items_done.len) return;
         const prev = f.rg_items_done[rg].fetchAdd(1, .acq_rel);
         if (prev + 1 != items) return;
+        // A failed row group may never have been admitted, so it has no charge to give back; its pages, read or
+        // not, go with the buffer at teardown.
+        if (f.rg_ready[rg].load(.acquire) != 1) return;
         const rd = f.reader;
         // Segments never straddle a range's ends, so a range is exactly the run of segments starting inside it.
         for (f.ranges.items[f.rg_first[rg]..f.rg_first[rg + 1]]) |r| {
@@ -445,8 +448,10 @@ pub const Reader = struct {
     /// window still reads, alone.
     fn admit(self: *Reader, u: Unit) bool {
         if (u.charge == 0) return true;
+        if (self.cancel.load(.acquire)) return false;
         if (self.admit_next.load(.acquire) != u.ticket) return false;
-        const out = self.submitted.load(.monotonic) - self.released.load(.acquire);
+        // Only this admitter adds to `submitted`, and only admitted row groups add to `released`.
+        const out = self.submitted.load(.monotonic) -| self.released.load(.acquire);
         if (out + u.charge > self.cfg.window and out != 0) return false;
         _ = self.submitted.fetchAdd(u.charge, .monotonic);
         self.admit_next.store(u.ticket + 1, .release);
@@ -802,4 +807,68 @@ test "threads whose ring fails to set up read with pread, and say so" {
             gate.done(gate.ctx, g, 1);
         }
     }
+}
+
+fn virtualBytesForTest() !u64 {
+    const rc = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [128 << 10]u8 = undefined;
+    const nr = linux.read(fd, &buf, buf.len);
+    if (linux.errno(nr) != .SUCCESS or nr == buf.len) return error.ReadFailed;
+    var total: u64 = 0;
+    var lines = std.mem.splitScalar(u8, buf[0..nr], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.ReadFailed;
+        const lo = try std.fmt.parseInt(u64, line[0..dash], 16);
+        const hi = try std.fmt.parseInt(u64, line[dash + 1 .. space], 16);
+        total += hi - lo;
+    }
+    return total;
+}
+
+test "failed reader open returns its anonymous mapping too" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", "x", &path_buf);
+    const rd = try Reader.create(testing.allocator, .{ .mode = .pread });
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    rd.gpa = failing.allocator();
+    defer rd.destroy();
+    _ = try virtualBytesForTest();
+    const before = try virtualBytesForTest();
+    // File alloc succeeds; files.append fails after a 32 MiB mapping has been made.
+    try testing.expectError(error.OutOfMemory, rd.openFile(path, 32 << 20));
+    const after = try virtualBytesForTest();
+    // Ignore a small allocator/stack VMA change; the failed open's mapping must be gone.
+    try testing.expect(after <= before + (1 << 20));
+}
+
+test "failed row group gates do not release bytes never admitted" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 256 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 3);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{ .mode = .pread, .threads = 3, .window = 4096, .fail_unit = 0 });
+    defer rd.destroy();
+    const f = try rd.openFile(path, data.len);
+    var store: [2][1]Range = .{ .{.{ .start = 0, .end = 128 << 10 }}, .{.{ .start = 128 << 10, .end = 256 << 10 }} };
+    var plans: [2]?[]Range = .{ &store[0], &store[1] };
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    for (0..2) |g| try testing.expectError(error.LocalReadFailed, gate.wait(gate.ctx, g));
+    // End the I/O failure before examining the scan workers' required error callbacks.
+    for (rd.threads.items) |t| t.join();
+    rd.threads.clearRetainingCapacity();
+    for (0..2) |g| gate.done(gate.ctx, g, 1);
+    try testing.expect(rd.released.load(.acquire) <= rd.submitted.load(.acquire));
 }

@@ -175,13 +175,14 @@ assert jsonl("--filter", f"{Q} > 10") == [{"a.b": None, Q: 20}]
 # GROUP BY on each column, and on both: the aggregate JSON keys and the grouped parquet.
 def agg(*args):
     return json.loads(run(src, *args), object_pairs_hook=no_dup_keys)["agg"]
-assert agg("--group-by", "b", "--aggregate", "count(*) AS n") == [{Q: None, "n": 1}, {Q: 10, "n": 1}, {Q: 20, "n": 1}]
+# Groups list where they first appear: rows (a.b, "a"."b") are (1, 10), (null, 20), (3, null).
+assert agg("--group-by", "b", "--aggregate", "count(*) AS n") == [{Q: 10, "n": 1}, {Q: 20, "n": 1}, {Q: None, "n": 1}]
 assert agg("--group-by", Q, "--aggregate", 'max("a.b") AS m') == [
-    {Q: None, "m": 3}, {Q: 10, "m": 1}, {Q: 20, "m": None}]
+    {Q: 10, "m": 1}, {Q: 20, "m": None}, {Q: None, "m": 3}]
 assert agg("--group-by", '"a.b"', "--aggregate", f"max({Q}) AS m") == [
-    {"a.b": None, "m": 20}, {"a.b": 1, "m": 10}, {"a.b": 3, "m": None}]
+    {"a.b": 1, "m": 10}, {"a.b": None, "m": 20}, {"a.b": 3, "m": None}]
 got = agg("--group-by", 'b, "a.b"', "--aggregate", "count(*) AS n")
-assert got == [{Q: None, "a.b": 3, "n": 1}, {Q: 10, "a.b": 1, "n": 1}, {Q: 20, "a.b": None, "n": 1}], got
+assert got == [{Q: 10, "a.b": 1, "n": 1}, {Q: 20, "a.b": None, "n": 1}, {Q: None, "a.b": 3, "n": 1}], got
 run(src, "-o", f"{d}/dotted_twin_gb.parquet", "--group-by", 'b, "a.b"', "--aggregate", "count(*) AS n")
 t = pq.read_table(f"{d}/dotted_twin_gb.parquet")
 assert t.schema.names == [Q, "a.b", "n"], t.schema.names

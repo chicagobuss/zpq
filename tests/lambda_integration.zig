@@ -640,13 +640,13 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
         },
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"s\",\"aggregate\":\"sum(x) AS n\"}",
-            .want = "{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2},{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1}",
+            .want = "{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1},{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2}",
         },
         .{
             // Invalid UTF-8 becomes one U+FFFD per offending byte; U+2028 is escaped.
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"count(*) AS n\"}",
-            .want = "[{\"b\":\"\\u2028\",\"n\":1},{\"b\":\"\u{FFFD}\u{FFFD}\u{FFFD}\",\"n\":1}," ++
-                "{\"b\":\"\u{FFFD}\u{FFFD}A\u{FFFD}\u{FFFD}\",\"n\":1}]",
+            .want = "[{\"b\":\"\u{FFFD}\u{FFFD}A\u{FFFD}\u{FFFD}\",\"n\":1}," ++
+                "{\"b\":\"\u{FFFD}\u{FFFD}\u{FFFD}\",\"n\":1},{\"b\":\"\\u2028\",\"n\":1}]",
         },
     });
 }
@@ -659,12 +659,12 @@ test "lambda labels a nested GROUP BY key by its quoted path when a top-level co
     try expectResponses("lambda dotted twin", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b, a.b\",\"aggregate\":\"count(*) AS n\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
-                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"a.b\":1,\"n\":1},{" ++ q ++ ":20,\"a.b\":null,\"n\":1}," ++
+                "{" ++ q ++ ":null,\"a.b\":3,\"n\":1}]",
         },
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"max(a.b) AS m\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"m\":3},{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null},{" ++ q ++ ":null,\"m\":3}]",
         },
     });
 }
@@ -751,14 +751,14 @@ test "lambda decodes JSON escapes in request strings" {
             // Quoted column names: the nested field b of group a, then the top-level column `a.b`.
             .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\\"a\\\".\\\"b\\\", \\\"a.b\\\"\"," ++
                 "\"aggregate\":\"count(*) AS n\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
-                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"a.b\":1,\"n\":1},{" ++ q ++ ":20,\"a.b\":null,\"n\":1}," ++
+                "{" ++ q ++ ":null,\"a.b\":3,\"n\":1}]",
         },
         .{
             // \u escapes, and a surrogate pair decoded into one UTF-8 sequence (no row holds it).
             .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\u0062\"," ++
                 "\"aggregate\":\"count(*) AS n\",\"filter\":\"\\\"a.b\\\" IS NOT NULL\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"n\":1},{" ++ q ++ ":10,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"n\":1},{" ++ q ++ ":null,\"n\":1}]",
         },
         .{
             // A string literal holding an escaped quote, a backslash, a newline and a control byte.

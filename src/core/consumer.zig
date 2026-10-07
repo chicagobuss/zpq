@@ -347,96 +347,157 @@ pub fn appendProjectedRGWithOptions(
     timings: *Timings,
     decode_options: DecodeOptions,
 ) !usize {
-    const num_rows: usize = @intCast(rg.num_rows);
-    const num_leaves = rg.columns.items.len;
+    var p: ProjectedRG = undefined;
+    try p.init(agg, gpa, rg, meta, src, filter, fetch_set, output_specs, timings, decode_options);
+    defer p.deinit();
+    if (p.surviving == 0) return 0;
+    const project_span = profile.Span.begin(timings.prof);
+    defer project_span.end(.project, profile.args(.{ p.surviving, output_specs.len }));
+    for (0..output_specs.len) |i| try p.projectColumn(agg, i, gpa, timings);
+    agg.num_rows += p.surviving;
+    return p.surviving;
+}
 
-    var rg_arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer rg_arena_state.deinit();
-    const ra = rg_arena_state.allocator();
+/// A row group with its filter evaluated, its output columns still to project one at a time (`projectColumn`). Late
+/// materialisation: only what the filter and computed outputs read is decoded here; every other output column is
+/// decoded only when projected, on an arena released right after. Holds its arena by address: never moved once
+/// `init` has run.
+pub const ProjectedRG = struct {
+    arena_state: std.heap.ArenaAllocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    fetch_set: []const bool,
+    output_specs: []const OutputCol,
+    decode_options: DecodeOptions,
+    batch: filter_eval.Batch,
+    lookup: []?usize,
+    batch_pos_for_col: []?usize,
+    sel: filter_selection.SelectionVector,
+    surviving: usize,
 
-    var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
-    var lookup = try ra.alloc(?usize, meta.schema.items.len);
-    @memset(lookup, null);
+    pub fn init(
+        self: *ProjectedRG,
+        agg: *const OutputAggregator,
+        gpa: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: RGSrc,
+        filter: ?filter_ast.Filter,
+        fetch_set: []const bool,
+        output_specs: []const OutputCol,
+        timings: *Timings,
+        decode_options: DecodeOptions,
+    ) !void {
+        self.arena_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer self.arena_state.deinit();
+        const ra = self.arena_state.allocator();
+        const num_rows: usize = @intCast(rg.num_rows);
+        const num_leaves = rg.columns.items.len;
 
-    var batch_pos_for_col = try ra.alloc(?usize, num_leaves);
-    @memset(batch_pos_for_col, null);
+        var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+        const lookup = try ra.alloc(?usize, meta.schema.items.len);
+        @memset(lookup, null);
+        const batch_pos_for_col = try ra.alloc(?usize, num_leaves);
+        @memset(batch_pos_for_col, null);
 
-    // Late materialisation: decode what the filter and computed outputs read, evaluate the filter, then decode each
-    // remaining output column only to append its surviving rows, on an arena freed before the next, so a row
-    // group never holds more than its filter columns and one other column decoded at once.
-    const early = try ra.alloc(bool, num_leaves);
-    @memset(early, false);
-    if (filter) |f| {
-        var cols: std.ArrayList(usize) = .empty;
-        try f.collectColumns(&cols, ra);
-        for (cols.items) |ci| if (ci < num_leaves) {
-            early[ci] = true;
+        const early = try ra.alloc(bool, num_leaves);
+        @memset(early, false);
+        if (filter) |f| {
+            var cols: std.ArrayList(usize) = .empty;
+            try f.collectColumns(&cols, ra);
+            for (cols.items) |ci| if (ci < num_leaves) {
+                early[ci] = true;
+            };
+        }
+        // Columns a computed output reads stay values; any other may decode to dictionary codes (`keep_codes`).
+        const computed_refs = try ra.alloc(bool, num_leaves);
+        @memset(computed_refs, false);
+        for (output_specs) |spec| switch (spec) {
+            .computed => |c| c.expr.collectColumns(computed_refs),
+            .passthrough => {},
+        };
+        for (early, computed_refs) |*e, c| e.* = e.* or c;
+
+        const t_decode_start = nowMonoNs();
+        for (fetch_set, 0..) |needed, ci| {
+            if (!needed or !early[ci]) continue;
+            const decoded = if (agg.keep_codes and !computed_refs[ci])
+                try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
+            else
+                try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
+            batch_pos_for_col[ci] = batch_cols.items.len;
+            lookup[ci] = batch_cols.items.len;
+            try batch_cols.append(ra, decoded);
+        }
+        const t_decode_end = nowMonoNs();
+        timings.decode_ns += @intCast(t_decode_end - t_decode_start);
+        profile.record(timings.prof, .decode, t_decode_start, t_decode_end, profile.args(.{ 0, 0, batch_cols.items.len }));
+
+        const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+        var sel = try filter_selection.SelectionVector.init(ra, num_rows);
+        if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+        const t_eval_end = nowMonoNs();
+        timings.eval_ns += @intCast(t_eval_end - t_decode_end);
+        const surviving = sel.count();
+        profile.record(timings.prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, surviving }));
+
+        self.* = .{
+            .arena_state = self.arena_state,
+            .rg = rg,
+            .meta = meta,
+            .src = src,
+            .fetch_set = fetch_set,
+            .output_specs = output_specs,
+            .decode_options = decode_options,
+            .batch = batch,
+            .lookup = lookup,
+            .batch_pos_for_col = batch_pos_for_col,
+            .sel = sel,
+            .surviving = surviving,
         };
     }
-    // Columns a computed output reads stay values; any other may decode to dictionary codes (`keep_codes`).
-    const computed_refs = try ra.alloc(bool, num_leaves);
-    @memset(computed_refs, false);
-    for (output_specs) |spec| switch (spec) {
-        .computed => |c| c.expr.collectColumns(computed_refs),
-        .passthrough => {},
-    };
-    for (early, computed_refs) |*e, c| e.* = e.* or c;
 
-    const t_decode_start = nowMonoNs();
-    for (fetch_set, 0..) |needed, ci| {
-        if (!needed or !early[ci]) continue;
-        const decoded = if (agg.keep_codes and !computed_refs[ci])
-            try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
-        else
-            try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
-        batch_pos_for_col[ci] = batch_cols.items.len;
-        lookup[ci] = batch_cols.items.len;
-        try batch_cols.append(ra, decoded);
+    pub fn deinit(self: *ProjectedRG) void {
+        self.arena_state.deinit();
     }
-    const t_decode_end = nowMonoNs();
-    timings.decode_ns += @intCast(t_decode_end - t_decode_start);
-    profile.record(timings.prof, .decode, t_decode_start, t_decode_end, profile.args(.{ 0, 0, batch_cols.items.len }));
 
-    const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
-    var sel = try filter_selection.SelectionVector.init(ra, num_rows);
-    if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
-    const t_eval_end = nowMonoNs();
-    timings.eval_ns += @intCast(t_eval_end - t_decode_end);
-
-    const surviving = sel.count();
-    profile.record(timings.prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, surviving }));
-    if (surviving == 0) return 0;
-    const project_span = profile.Span.begin(timings.prof);
-    defer project_span.end(.project, profile.args(.{ surviving, output_specs.len }));
-
-    // For each output spec: produce a post-selection Batch.Column and
-    // copy values into the aggregator. BYTE_ARRAY content is duped into
-    // agg.arena (slice bytes live on the per-RG arena which is freed
-    // when this function returns).
-    for (output_specs, 0..) |spec, i| {
-        // Lossless DECIMAL lane: the buf is `.decimal` only for an
-        // INT32/INT64-backed passthrough decimal. Decode the source
-        // chunk to unscaled i128 (a second, cheap decode beside the f64
-        // batch copy — see the decode-once follow-up in plan 02), apply
-        // the selection, and append the integers untouched.
+    /// Append output column `i`'s surviving rows to `agg.cols[i]` (on `agg.arena`). A column the filter didn't need
+    /// decodes on an arena over `gpa`, freed before returning. The caller adds `surviving` to `agg.num_rows`.
+    pub fn projectColumn(
+        self: *ProjectedRG,
+        agg: *OutputAggregator,
+        i: usize,
+        gpa: std.mem.Allocator,
+        timings: *Timings,
+    ) !void {
+        const ra = self.arena_state.allocator();
+        const rg = self.rg;
+        const meta = self.meta;
+        const src = self.src;
+        const decode_options = self.decode_options;
+        const spec = self.output_specs[i];
+        // Lossless DECIMAL lane: the buf is `.decimal` only for an INT32/INT64-backed passthrough decimal. Decode the
+        // source chunk to unscaled i128, apply the selection, and append the integers untouched.
         if (agg.cols[i] == .decimal) {
             const kept_ci = switch (spec) {
                 .passthrough => |ci| ci,
                 .computed => return error.MissingDecodedColumn,
             };
-            const dcol = try decodeDecimalI128(ra, rg, meta, src, kept_ci, decode_options);
-            const filtered_dec = try encoder.applySelectionI128(ra, dcol, &sel);
+            var late = std.heap.ArenaAllocator.init(gpa);
+            defer late.deinit();
+            const dcol = try decodeDecimalI128(late.allocator(), rg, meta, src, kept_ci, decode_options);
+            const filtered_dec = try encoder.applySelectionI128(late.allocator(), dcol, &self.sel);
             try appendTyped(i128, &agg.cols[i].decimal, filtered_dec.values, filtered_dec.def_levels, filtered_dec.max_def, agg.arena);
-            continue;
+            return;
         }
 
-        // A column read only here decodes on an arena of its own, released once its rows are appended.
         var late = std.heap.ArenaAllocator.init(gpa);
         defer late.deinit();
         const col: filter_eval.Batch.Column = switch (spec) {
-            .passthrough => |kept_ci| if (batch_pos_for_col[kept_ci]) |pos|
-                batch.cols[pos]
-            else if (kept_ci < fetch_set.len and fetch_set[kept_ci]) blk: {
+            .passthrough => |kept_ci| if (self.batch_pos_for_col[kept_ci]) |pos|
+                self.batch.cols[pos]
+            else if (kept_ci < self.fetch_set.len and self.fetch_set[kept_ci]) blk: {
                 const t0 = nowMonoNs();
                 const la = late.allocator();
                 const decoded = if (agg.keep_codes)
@@ -448,18 +509,15 @@ pub fn appendProjectedRGWithOptions(
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
                 break :blk decoded;
             } else return error.MissingDecodedColumn,
-            .computed => |c| try expr_eval.evalExpr(ra, &batch, lookup, c.expr),
+            .computed => |c| try expr_eval.evalExpr(ra, &self.batch, self.lookup, c.expr),
         };
         if (col.nullInfo().max_rep == 0) {
-            try appendSelected(&agg.cols[i], col, &sel, surviving, agg.arena, agg.keep_codes, late.allocator());
-            continue;
+            try appendSelected(&agg.cols[i], col, &self.sel, self.surviving, agg.arena, agg.keep_codes, late.allocator());
+            return;
         }
-        try appendIntoBuf(&agg.cols[i], try encoder.applySelection(late.allocator(), col, &sel), agg.arena);
+        try appendIntoBuf(&agg.cols[i], try encoder.applySelection(late.allocator(), col, &self.sel), agg.arena);
     }
-
-    agg.num_rows += surviving;
-    return surviving;
-}
+};
 
 /// Decode column `ci` of a row group into the batch lane the write path keeps it in.
 fn decodeWriteColumn(
@@ -870,80 +928,9 @@ pub fn encodeAggregator(
 
     const n_specs = agg.cols.len;
 
-    // Synthesize a Batch.Column per output col from the aggregator's
-    // typed buffers. Lifetimes: these point into agg.arena.
+    // A Batch.Column per output col over the aggregator's typed buffers (pointing into agg.arena).
     const batch_cols = try ra.alloc(filter_eval.Batch.Column, n_specs);
-    for (agg.cols, 0..) |cbuf, i| {
-        batch_cols[i] = switch (cbuf) {
-            .i32 => |b| .{ .i32 = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            .i64 => |b| .{ .i64 = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            .f32 => |b| .{ .f32 = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            .f64 => |b| .{ .f64 = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            .string => |b| .{ .string = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            .boolean => |b| .{ .boolean = .{
-                .values = b.values.items,
-                .def_levels = if (b.max_def > 0) b.def_levels.items else null,
-                .max_def = b.max_def,
-                .codes = if (b.coded) b.codes.items else null,
-                .dict = b.dict,
-            } },
-            // Lossless DECIMAL: narrow the unscaled i128 back to its
-            // source physical width (exact — the values were decoded
-            // from i32/i64 and widened) and feed the existing integer
-            // encoder. The kept DECIMAL schema element makes the footer
-            // (and `meta.type`) carry the logical type through.
-            .decimal => |b| blk: {
-                const phys = agg.schema_elems[i].type orelse return error.UnsupportedColumnType;
-                const dl = if (b.max_def > 0) b.def_levels.items else null;
-                switch (phys) {
-                    .INT32 => {
-                        const vals = try ra.alloc(i32, b.values.items.len);
-                        for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
-                        break :blk .{ .i32 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
-                    },
-                    .INT64 => {
-                        const vals = try ra.alloc(i64, b.values.items.len);
-                        for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
-                        break :blk .{ .i64 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
-                    },
-                    // FLBA decimals can't ride an integer lane — placeholder
-                    // here; the pre-pass below encodes them via encodeDecimalFlba.
-                    .FIXED_LEN_BYTE_ARRAY => break :blk .{ .i64 = .{ .values = &.{} } },
-                    else => return error.UnsupportedColumnType,
-                }
-            },
-        };
-    }
+    for (batch_cols, 0..) |*bc, i| bc.* = try aggBatchColumn(agg, i, ra);
 
     // Parallel encode of all output columns. Same shape as the per-RG
     // path: spawn workers up to min(n_specs, cpus), each pulls a slice
@@ -995,27 +982,7 @@ pub fn encodeAggregator(
         for (0..n_specs) |i| {
             var col_arena = std.heap.ArenaAllocator.init(gpa);
             defer col_arena.deinit();
-            const enc = results[i] orelse blk: { // FLBA decimals were encoded in the pre-pass
-                const t0 = nowMonoNs();
-                const span = profile.Span.begin(timings.prof);
-                const e = try encoder.encodeColumn(col_arena.allocator(), .{
-                    .values = batch_cols[i],
-                    .schema_elem = &agg.schema_elems[i],
-                    .path_in_schema = agg.paths[i],
-                    .codec = output_codec,
-                    .bloom_fpp = bloom_write.at(i),
-                });
-                if (span.t != null) {
-                    const em = e.meta;
-                    span.end(.encode_chunk, profile.args(.{
-                        i, output_codec, em.total_uncompressed_size, em.total_compressed_size, em.num_values,
-                    }));
-                }
-                const t1 = nowMonoNs();
-                timings.encode_ns += @intCast(t1 - t0);
-                profile.record(timings.prof, .encode, t0, t1, profile.args(.{ 1, agg.num_rows }));
-                break :blk e;
-            };
+            const enc = results[i] orelse try encodeAggColumn(agg, i, col_arena.allocator(), output_codec, bloom_write, timings);
             try placer.place(enc);
         }
     } else {
@@ -1070,6 +1037,158 @@ pub fn encodeAggregator(
         },
     };
 }
+
+/// Output column `i` of `agg` as a Batch.Column over its typed buffer. DECIMAL lanes narrow the unscaled i128 back to
+/// their source physical width (exact: decoded from i32/i64 and widened) for the integer encoder, the kept DECIMAL
+/// schema element carrying the logical type; an FLBA decimal gets an empty placeholder (`encodeAggColumn` encodes it).
+fn aggBatchColumn(agg: *const OutputAggregator, i: usize, ra: std.mem.Allocator) !filter_eval.Batch.Column {
+    const cbuf = agg.cols[i];
+    return switch (cbuf) {
+        .i32 => |b| .{ .i32 = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        .i64 => |b| .{ .i64 = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        .f32 => |b| .{ .f32 = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        .f64 => |b| .{ .f64 = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        .string => |b| .{ .string = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        .boolean => |b| .{ .boolean = .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+            .codes = if (b.coded) b.codes.items else null,
+            .dict = b.dict,
+        } },
+        // Lossless DECIMAL: narrow the unscaled i128 back to its
+        // source physical width (exact — the values were decoded
+        // from i32/i64 and widened) and feed the existing integer
+        // encoder. The kept DECIMAL schema element makes the footer
+        // (and `meta.type`) carry the logical type through.
+        .decimal => |b| blk: {
+            const phys = agg.schema_elems[i].type orelse return error.UnsupportedColumnType;
+            const dl = if (b.max_def > 0) b.def_levels.items else null;
+            switch (phys) {
+                .INT32 => {
+                    const vals = try ra.alloc(i32, b.values.items.len);
+                    for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
+                    break :blk .{ .i32 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
+                },
+                .INT64 => {
+                    const vals = try ra.alloc(i64, b.values.items.len);
+                    for (b.values.items, 0..) |v, j| vals[j] = @intCast(v);
+                    break :blk .{ .i64 = .{ .values = vals, .def_levels = dl, .max_def = b.max_def } };
+                },
+                // FLBA decimals can't ride an integer lane — placeholder
+                // here; the pre-pass below encodes them via encodeDecimalFlba.
+                .FIXED_LEN_BYTE_ARRAY => break :blk .{ .i64 = .{ .values = &.{} } },
+                else => return error.UnsupportedColumnType,
+            }
+        },
+    };
+}
+
+/// Encode output column `i` of `agg` on `arena`.
+fn encodeAggColumn(
+    agg: *const OutputAggregator,
+    i: usize,
+    arena: std.mem.Allocator,
+    output_codec: schema.CompressionCodec,
+    bloom_write: BloomWrite,
+    timings: *Timings,
+) !encoder.EncodedColumn {
+    const t0 = nowMonoNs();
+    const span = profile.Span.begin(timings.prof);
+    const e = if (agg.cols[i] == .decimal and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) blk: {
+        const b = agg.cols[i].decimal;
+        break :blk try encoder.encodeDecimalFlba(arena, .{
+            .values = b.values.items,
+            .def_levels = if (b.max_def > 0) b.def_levels.items else null,
+            .max_def = b.max_def,
+        }, &agg.schema_elems[i], agg.paths[i], output_codec);
+    } else try encoder.encodeColumn(arena, .{
+        .values = try aggBatchColumn(agg, i, arena),
+        .schema_elem = &agg.schema_elems[i],
+        .path_in_schema = agg.paths[i],
+        .codec = output_codec,
+        .bloom_fpp = bloom_write.at(i),
+    });
+    if (span.t != null) {
+        const em = e.meta;
+        span.end(.encode_chunk, profile.args(.{
+            i, output_codec, em.total_uncompressed_size, em.total_compressed_size, em.num_values,
+        }));
+    }
+    const t1 = nowMonoNs();
+    timings.encode_ns += @intCast(t1 - t0);
+    profile.record(timings.prof, .encode, t0, t1, profile.args(.{ 1, agg.num_rows }));
+    return e;
+}
+
+/// Encodes and places a row group's output columns one at a time, in output order, so a caller can project, encode
+/// and drop each column before the next (the per-row-group re-encode's working set is then one column, not a row
+/// group). Offsets are relative to `out_offset`; no page index (see `encodeAggregator`'s `emit_page_index`).
+pub const RGEncoder = struct {
+    columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty,
+    total: i64 = 0,
+    out_arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    out_offset: *u64,
+    codec: schema.CompressionCodec,
+    bloom_write: BloomWrite,
+    timings: *Timings,
+
+    /// Encode `agg`'s column `i` (its rows complete) on `arena` and write it; `arena` may be released once this
+    /// returns, the chunk's metadata being cloned into `out_arena`.
+    pub fn column(self: *RGEncoder, agg: *const OutputAggregator, i: usize, arena: std.mem.Allocator) !void {
+        if (self.columns.capacity == 0) try self.columns.ensureTotalCapacity(self.out_arena, agg.cols.len);
+        const enc = try encodeAggColumn(agg, i, arena, self.codec, self.bloom_write, self.timings);
+        const placer: ChunkPlacer = .{
+            .out_arena = self.out_arena,
+            .sink = self.sink,
+            .out_offset = self.out_offset,
+            .timings = self.timings,
+            .emit_page_index = false,
+            .columns = &self.columns,
+            .total = &self.total,
+        };
+        try placer.place(enc);
+    }
+
+    pub fn finish(self: *RGEncoder, num_rows: usize) RGOut {
+        if (num_rows == 0) return .{ .surviving_rows = 0, .rg = null };
+        return .{
+            .surviving_rows = @intCast(num_rows),
+            .rg = .{ .columns = self.columns, .total_byte_size = self.total, .num_rows = @intCast(num_rows) },
+        };
+    }
+};
 
 /// Writes encoded chunks to the sink in output order: metadata deep-cloned into `out_arena` (which outlives the
 /// encoders' arenas) with offsets made absolute, and, direct to a file, a synthesised page index after each chunk.

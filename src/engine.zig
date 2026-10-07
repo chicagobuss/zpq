@@ -576,8 +576,10 @@ fn encodeRGToBuffer(
     prof: ?*profile.Thread,
     bloom: consumer.BloomWrite,
 ) !EncodedRG {
+    // `rows` holds what lives for the whole row group (the aggregator's frame, the filter's columns and selection);
+    // each output column is projected, encoded and written out of `work`, rewound before the next, so the working
+    // set is one column rather than the row group (whose first touch, on every producer, is page faults).
     const work_region = &regions.work;
-    const work = work_region.allocator();
     defer work_region.rewind();
     defer regions.rows.rewind();
     var scratch = std.heap.ArenaAllocator.init(regions.rows.allocator());
@@ -585,10 +587,10 @@ fn encodeRGToBuffer(
     var timings: consumer.Timings = .{ .prof = prof };
     var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
     agg.keep_codes = true;
-    // Decodes on an arena of its own over `work`, deinitialised before it returns.
-    _ = try consumer.appendProjectedRGWithOptions(
+    var projected: consumer.ProjectedRG = undefined;
+    try projected.init(
         &agg,
-        work,
+        scratch.allocator(),
         job.rg,
         job.meta,
         .{ .bytes = job.bytes, .byte_origin = 0 },
@@ -598,13 +600,51 @@ fn encodeRGToBuffer(
         &timings,
         decode_options,
     );
+    defer projected.deinit();
+    // The output waits here for its turn at the sink, so every row group's is fresh memory: in huge pages, a fault per
+    // 2 MiB rather than per 4 KiB. Freed by the writer through `gpa`, to which the advisor forwards frees.
+    var advisor: huge_pages.HugePageAdvisor = .{ .child = gpa };
+    const out_gpa = advisor.allocator();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
+    errdefer buf.deinit(out_gpa);
+    var bufsink = BufSink{ .buf = &buf, .gpa = out_gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
-    work_region.rewind();
     var local_off: u64 = 0;
-    const out = try consumer.encodeAggregator(&agg, meta_alloc, work, sink, &local_off, codec, &timings, 1, false, bloom);
-    const owned = try buf.toOwnedSlice(gpa);
+    var rg_enc: consumer.RGEncoder = .{
+        .out_arena = meta_alloc,
+        .sink = sink,
+        .out_offset = &local_off,
+        .codec = codec,
+        .bloom_write = bloom,
+        .timings = &timings,
+    };
+    if (projected.surviving > 0) {
+        // The output is about as big as the compressed chunks it comes from: reserve that once rather than growing
+        // the buffer by doubling (each step a copy, and fresh pages to fault).
+        var estimate: usize = 0;
+        for (job.rg.columns.items, 0..) |cc, ci| {
+            const m = cc.meta_data orelse continue;
+            if (ci < fetch_arr.len and fetch_arr[ci]) estimate += @intCast(@max(0, m.total_compressed_size));
+        }
+        try buf.ensureTotalCapacity(out_gpa, estimate);
+        agg.num_rows = projected.surviving;
+        for (0..output_specs.len) |i| {
+            work_region.rewind();
+            var col_arena = std.heap.ArenaAllocator.init(work_region.allocator());
+            defer col_arena.deinit();
+            agg.arena = col_arena.allocator();
+            const span = profile.Span.begin(prof);
+            try projected.projectColumn(&agg, i, col_arena.allocator(), &timings);
+            span.end(.project, profile.args(.{ projected.surviving, 1 }));
+            try rg_enc.column(&agg, i, col_arena.allocator());
+            // Its rows lived on `col_arena`: nothing may read them after this.
+            agg.cols[i] = switch (agg.cols[i]) {
+                inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+            };
+        }
+    }
+    const out = rg_enc.finish(projected.surviving);
+    const owned = try buf.toOwnedSlice(out_gpa);
     timings.prof = null;
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
 }

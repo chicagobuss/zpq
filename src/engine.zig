@@ -764,6 +764,8 @@ const RecompressCtx = struct {
     jobs: []const RGJob,
     kept: ?[]const bool,
     codec: schema.CompressionCodec,
+    /// Bloom filter probability per leaf (`--bloom-filter`), for copied chunks that carry none.
+    bloom_leaves: []const ?f64 = &.{},
     slots: []RecompressSlot,
     window: *std.Io.Semaphore,
     completions: *std.Io.Semaphore,
@@ -835,6 +837,7 @@ fn recompressWriter(w: *RecompressCtx) void {
                 &w.core,
                 true,
                 .{ .codec = w.codec, .scratch = w.gpa, .done = slot.chunks },
+                .{ .fpp = w.bloom_leaves, .meta = job.meta, .scratch = w.gpa },
             )) |out| {
                 if (out.rg) |rg| w.new_row_groups.append(w.arena, rg) catch |e| {
                     w.first_err = e;
@@ -1382,6 +1385,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .jobs = jobs.items,
                 .kept = kept_opt,
                 .codec = args.codec.?,
+                .bloom_leaves = blooms.leaves,
                 .slots = slots,
                 .window = &window_sem,
                 .completions = &completions_sem,

@@ -417,6 +417,15 @@ fi
 if "$ZPQ" query "$DIR/in.parquet" --aggregate 'sum(nope) AS n' --profile "$DIR/prof_failed.json" 2> /dev/null; then
   echo "a query over a missing column did not fail" >&2; exit 1
 fi
+mkdir -p "$DIR/prof_dir"
+printf 'earlier\n' > "$DIR/prof_dir_out.parquet"
+if "$ZPQ" query "$DIR/in.parquet" -o "$DIR/prof_dir_out.parquet" --profile "$DIR/prof_dir" \
+  > "$DIR/prof_dir.out" 2> /dev/null; then
+  echo "a directory as --profile path did not fail" >&2; exit 1
+fi
+if "$ZPQ" query "$DIR/in.parquet" -o "$DIR/prof_fifo_out.parquet" --profile /dev/null 2> /dev/null; then
+  echo "a device as --profile path did not fail" >&2; exit 1
+fi
 if "$ZPQ" query "$DIR/in.parquet" --aggregate 'sum(nope) AS n' --profile "$DIR/prof_kept.json" 2> /dev/null; then
   echo "a query over a missing column did not fail" >&2; exit 1
 fi
@@ -435,6 +444,9 @@ assert "cannot write profile" in open(f"{d}/prof_bad.err").read()
 assert not os.path.exists(f"{d}/prof_failed.json"), "a failed query left an empty trace"
 assert open(f"{d}/prof_kept.json").read() == "earlier\n", "a failed query touched the trace already at its path"
 assert not glob.glob(f"{d}/*.zpq-tmp"), "a temporary trace was left behind"
+assert open(f"{d}/prof_dir_out.parquet").read() == "earlier\n", "the query ran before a directory --profile path failed"
+assert open(f"{d}/prof_dir.out").read() == "", "the query answered before a directory --profile path failed"
+assert not os.path.exists(f"{d}/prof_fifo_out.parquet"), "the query ran before a device --profile path failed"
 print("Profiling checks passed")
 PY
 

@@ -500,7 +500,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             return error.BadArgs;
         }
         // Before the query, so an unwritable path costs nothing and a query that succeeds exits 0.
-        try profile_out.open();
+        try profile_out.open(io);
         var meta = zpq.profile.Meta.discover(env);
         meta.query = try commandLine(arena, init.minimal.args);
         const opts = zpq.profile.Options.forBudget(max_mem_limit);
@@ -724,8 +724,23 @@ const ProfileOut = struct {
         return self.trace_path != null or self.summary != null;
     }
 
-    fn open(self: *ProfileOut) !void {
+    fn open(self: *ProfileOut, io: std.Io) !void {
         const path = self.trace_path orelse return;
+        // The trace replaces what is at its path only after the query, so anything a rename can't sensibly replace is
+        // refused now, before the query has side effects. An unwritable directory fails creating the temporary below.
+        if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+            if (st.kind != .file) {
+                const why = if (st.kind == .directory) "IsDir" else "NotAFile";
+                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, why });
+                return error.BadArgs;
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+                return error.BadArgs;
+            },
+        }
         const pid: u32 = @bitCast(std.posix.system.getpid());
         const tmp = std.fmt.bufPrint(&self.tmp_buf, "{s}.{d}.zpq-tmp", .{ path, pid }) catch {
             std.debug.print("zpq query: cannot write profile {s}: NameTooLong\n", .{path});

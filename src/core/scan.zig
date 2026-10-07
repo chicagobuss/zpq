@@ -99,6 +99,9 @@ pub const MultiAggArgs = struct {
     /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
     /// at every `-j`; see `group_blocks_max`.
     unordered: bool = false,
+    /// Workers are sized so each gets at least this many bytes to decode; tests lower it to run several workers on
+    /// small fixtures.
+    min_bytes_per_worker: u64 = 2 * 1024 * 1024,
     /// Receives what a failure was about; see `diag.zig`.
     diag: ?*Diag = null,
     /// Records the scan's spans when set; see `profile.zig`.
@@ -726,8 +729,7 @@ pub fn runMultiAggregate(
     }
 
     // Size the worker set by BYTES to decode, not row-group count: thread creation has a fixed cost and a query may
-    // touch only a small part of a wide schema. 2 MiB per worker is a conservative floor.
-    const MIN_BYTES_PER_WORKER: u64 = 2 * 1024 * 1024;
+    // touch only a small part of a wide schema. 2 MiB per worker (`min_bytes_per_worker`) is a conservative floor.
     var fetch_bytes: u64 = 0;
     for (work_items.items) |item| {
         const rg = &metas[item.file].row_groups.items[item.rg];
@@ -744,7 +746,7 @@ pub fn runMultiAggregate(
             }
         }
     }
-    const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / MIN_BYTES_PER_WORKER)));
+    const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / @max(1, args.min_bytes_per_worker))));
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
@@ -3019,6 +3021,7 @@ test "ordered GROUP BY: groups as they first appear, and the same float bits at 
                 .parallelism = j,
                 .encoded = encoded,
                 .scan_all = true,
+                .min_bytes_per_worker = 1,
             });
             const rows = res.output.group_rows.?;
             try testing.expectEqual(want_order.len, rows.len);

@@ -485,3 +485,6 @@ fi
 
 # Bloom filters: writer oracle (pyarrow- and zpq-written), lookup parity, and a fuzz pass (tools/bloom/check.py).
 "$PY" tools/bloom/check.py "$ZPQ"
+
+# Row and group order across thread counts (tools/order_check.py says what is checked).
+"$PY" tools/order_check.py "$ZPQ" "$DIR/order"

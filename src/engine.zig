@@ -44,6 +44,7 @@ const filter_ast = @import("core/filter/ast.zig");
 const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
 const membership = @import("core/filter/membership.zig");
+const sbbf = @import("core/parquet/bloom.zig");
 const streaming = @import("core/writer/streaming.zig");
 const fastpath = @import("core/writer/fastpath.zig");
 
@@ -1780,7 +1781,7 @@ fn openInputs(
                     const cm = rg.columns.items[ci].meta_data orelse continue;
                     const off = cm.bloom_filter_offset orelse continue;
                     const len = cm.bloom_filter_length orelse continue;
-                    if (off < 4 or len <= 0) continue;
+                    if (off < 4 or len <= 0 or len > sbbf.max_filter_bytes) continue;
                     const start: u64 = @intCast(off);
                     const end = start + @as(u64, @intCast(len));
                     if (end > sp.total_size) continue;
@@ -3852,7 +3853,7 @@ test "a write builds the Bloom filters asked for, in re-encoded and copied row g
     const arena = arena_state.allocator();
     const bytes = first.?;
     const meta = try metadata.open(arena, bytes);
-    const bloom = @import("core/parquet/bloom.zig");
+    const bloom = sbbf;
     var key_buf: [32]u8 = undefined;
     for (meta.row_groups.items, 0..) |rg, g| {
         const has = [_]bool{ g > 0, g > 0, true, true }; // id, s carried where copied; cat, x built everywhere

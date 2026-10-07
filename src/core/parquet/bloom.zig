@@ -25,6 +25,10 @@ pub const max_bitset_bytes: u32 = 128 * 1024 * 1024;
 /// Bytes enough for any header `writeHeader` emits (and any canonical one): 1 + 5 + 13.
 pub const max_header_bytes = 19;
 
+/// The longest header plus bitset a footer's `bloom_filter_length` can sensibly claim; anything longer is corrupt.
+/// Headers of other writers may carry fields beyond the canonical ones, hence the slack.
+pub const max_filter_bytes: i64 = max_bitset_bytes + 4096;
+
 pub const Header = struct {
     num_bytes: u32,
     /// Serialized header length; the bitset starts here.

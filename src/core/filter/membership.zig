@@ -483,9 +483,9 @@ const Target = struct {
     }
 };
 
-fn isAbsent(t: *const Target, k: *const Key) bool {
-    for (t.absent.items) |a| if (std.mem.eql(u8, a, k.form(0))) return true;
-    return false;
+/// Whether `k` is among `proven`, the keys earlier waves proved absent (sorted as each wave ended).
+fn isAbsent(proven: []const []const u8, k: *const Key) bool {
+    return std.sort.binarySearch([]const u8, proven, k.form(0), orderBytes) != null;
 }
 
 fn orderBytes(want: []const u8, have: []const u8) std.math.Order {
@@ -494,13 +494,15 @@ fn orderBytes(want: []const u8, have: []const u8) std.math.Order {
 
 /// Probes hoisted per literal form: the hash and its 8-lane mask, computed once however many chunks they test.
 const ProbeCache = struct {
-    forms: std.ArrayList(struct { bytes: []const u8, probe: bloom.Probe }) = .empty,
+    forms: std.StringHashMapUnmanaged(bloom.Probe) = .empty,
 
     fn get(self: *ProbeCache, arena: std.mem.Allocator, bytes: []const u8) !bloom.Probe {
-        for (self.forms.items) |f| if (std.mem.eql(u8, f.bytes, bytes)) return f.probe;
-        const p = bloom.Probe.init(bloom.hashBytes(bytes));
-        try self.forms.append(arena, .{ .bytes = try arena.dupe(u8, bytes), .probe = p });
-        return p;
+        const gop = try self.forms.getOrPut(arena, bytes);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try arena.dupe(u8, bytes);
+            gop.value_ptr.* = bloom.Probe.init(bloom.hashBytes(bytes));
+        }
+        return gop.value_ptr.*;
     }
 };
 
@@ -595,7 +597,8 @@ fn filterSpan(t: *const Target, metas: []const schema.FileMetaData) ?Span {
     if (off < 4) return null;
     const start: u64 = @intCast(off);
     if (cm.bloom_filter_length) |l| {
-        if (l <= 0) return null;
+        // No reader accepts a bitset past the cap, so a longer length is corrupt, not a filter.
+        if (l <= 0 or l > bloom.max_filter_bytes) return null;
         return .{ .file = t.file, .start = start, .end = start + @as(u64, @intCast(l)) };
     }
     return .{ .file = t.file, .start = start, .end = start };
@@ -719,7 +722,8 @@ fn scanDictionary(values: []const u8, count: usize, slot: Slot, want: []const []
         pos += len;
         if (std.sort.binarySearch([]const u8, want, entry, orderBytes)) |i| found[i] = true;
     }
-    return true;
+    // Bytes left over mean the page holds more than it says: it is corrupt, and proves nothing.
+    return pos == values.len;
 }
 
 /// Whether a file's writer emits the canonical header, which is what lets a block be located without its header.
@@ -735,15 +739,14 @@ const Fetch = union(enum) {
     bytes: []const u8,
     /// Header and bitset, read by request `req`.
     whole: usize,
-    /// Only the blocks the keys select: requests `first..end`, block `blocks[i - first]` each.
-    blocks: struct { first: usize, end: usize, num_blocks: u64, blocks: []const u64 },
+    /// Only the blocks the keys select: requests `first..end`, block `blocks[i - first]` each (ascending), and this
+    /// filter's own header in request `header`, which must match the canonical one the blocks were located by.
+    blocks: struct { first: usize, end: usize, num_blocks: u64, blocks: []const u64, header: usize, total_len: u64 },
 };
 
 const ReadPlan = struct {
     reqs: std.ArrayList(Req) = .empty,
     fetch: []Fetch,
-    /// A real header read alongside a file's blocks, to verify the location they were found by.
-    headers: std.ArrayList(struct { file: u32, req: usize, total_len: u64 }) = .empty,
 };
 
 const WaveResult = struct { row_groups: usize = 0, pruned: usize = 0 };
@@ -888,12 +891,6 @@ const Probing = struct {
             }
         }
         try readAll(a, self.src, plan.reqs.items, self.stats);
-        for (plan.headers.items) |hv| {
-            var buf: [bloom.max_header_bytes]u8 = undefined;
-            const want = bloom.canonicalHeader(hv.total_len, &buf);
-            const ok = want != null and std.mem.eql(u8, want.?, plan.reqs.items[hv.req].out);
-            self.verdicts[hv.file] = if (ok) .canonical else .other;
-        }
 
         if (!self.src.cost.remote()) try self.prefetchBlocks(wave, plan, spans);
 
@@ -909,8 +906,14 @@ const Probing = struct {
                     try self.probeWhole(t, r.out);
                 },
                 .blocks => |b| {
-                    // Blocks count only once a real header of their file matched the canonical one that located them.
-                    if (self.verdicts[t.file] != .canonical) continue;
+                    // Blocks count only if this filter's own header is the canonical one that located them; one
+                    // writer can emit headers of several shapes in one file.
+                    var buf: [bloom.max_header_bytes]u8 = undefined;
+                    const want = bloom.canonicalHeader(b.total_len, &buf);
+                    if (want == null or !std.mem.eql(u8, want.?, plan.reqs.items[b.header].out)) {
+                        self.verdicts[t.file] = .other;
+                        continue;
+                    }
                     self.stats.filters += 1;
                     const set: BlockSet = .{
                         .reqs = plan.reqs.items[b.first..b.end],
@@ -944,6 +947,11 @@ const Probing = struct {
     }
 
     fn probeWhole(self: *Probing, t: *Target, bytes: []const u8) !void {
+        const h = bloom.parseHeader(bytes) orelse return;
+        // A header whose size disagrees with the footer's length leaves no telling which is right: no filter.
+        if (t.chunk(self.metas).meta_data.?.bloom_filter_length) |l| {
+            if (h.len + h.num_bytes != l) return;
+        }
         const bits = bloom.bitset(bytes) orelse return;
         self.noteHeader(t.file, bytes);
         self.stats.filters += 1;
@@ -1018,10 +1026,12 @@ const Probing = struct {
             const cm = t.chunk(self.metas).meta_data.?;
             const values = dictionaryValues(a, page, cm.codec) orelse continue;
             self.stats.dictionaries += 1;
-            // Every form of every key still open, sorted so each entry costs one binary search.
+            // Every form of every key still open, sorted so each entry costs one binary search. Only what earlier
+            // waves proved is sorted; this one appends below.
+            const proven = t.absent.items;
             want.clearRetainingCapacity();
             for (t.keys.items) |*k| {
-                if (isAbsent(t, k)) continue;
+                if (isAbsent(proven, k)) continue;
                 for (0..k.n) |fi| try want.append(a, k.form(fi));
             }
             std.mem.sort([]const u8, want.items, {}, bytesLess);
@@ -1038,7 +1048,7 @@ const Probing = struct {
             const slot = chunkSlot(t.rowGroup(self.metas), t.col, &self.metas[t.file]) orelse continue;
             if (!scanDictionary(values.bytes, values.count, slot, want.items, found)) continue;
             for (t.keys.items) |*k| {
-                if (isAbsent(t, k)) continue;
+                if (isAbsent(proven, k)) continue;
                 const held = for (0..k.n) |fi| {
                     const at = std.sort.binarySearch([]const u8, want.items, k.form(fi), orderBytes).?;
                     if (found[at]) break true;
@@ -1048,14 +1058,11 @@ const Probing = struct {
         }
     }
 
-    /// The blocks the keys select in each filter of known length, located through the canonical header, plus one real
-    /// header per file not yet verified to check that location by. Filters it cannot locate stay whole; null when it
-    /// locates none.
+    /// The blocks the keys select in each filter of known length, located through the canonical header, plus that
+    /// filter's real header to check the location by. Filters it cannot locate stay whole; null when it locates none.
     fn sparsePlan(self: *Probing, wave: []const *Target, spans: []const ?Span, fetch: []const Fetch) !?ReadPlan {
         const a = self.scratch;
         var plan: ReadPlan = .{ .fetch = try a.dupe(Fetch, fetch) };
-        const header_asked = try a.alloc(bool, self.metas.len);
-        @memset(header_asked, false);
         var any = false;
         for (wave, spans, plan.fetch) |t, s, *f| {
             if (f.* != .none) continue;
@@ -1069,10 +1076,17 @@ const Probing = struct {
             };
             const num_blocks = (sp.len() - h.len) / bloom.block_bytes;
             var blocks: std.ArrayList(u64) = .empty;
-            for (t.keys.items) |*k| for (0..k.n) |i| {
-                const b = (try self.probes.get(a, k.form(i))).block(num_blocks);
-                if (std.mem.indexOfScalar(u64, blocks.items, b) == null) try blocks.append(a, b);
-            };
+            for (t.keys.items) |*k| for (0..k.n) |i| try blocks.append(a, (try self.probes.get(a, k.form(i))).block(num_blocks));
+            std.mem.sort(u64, blocks.items, {}, std.sort.asc(u64));
+            var distinct: usize = 0;
+            for (blocks.items) |b| {
+                if (distinct > 0 and blocks.items[distinct - 1] == b) continue;
+                blocks.items[distinct] = b;
+                distinct += 1;
+            }
+            blocks.shrinkRetainingCapacity(distinct);
+            const header = plan.reqs.items.len;
+            try plan.reqs.append(a, .{ .span = .{ .file = sp.file, .start = sp.start, .end = sp.start + h.len } });
             const first = plan.reqs.items.len;
             for (blocks.items) |b| {
                 const at = sp.start + h.len + b * bloom.block_bytes;
@@ -1083,12 +1097,9 @@ const Probing = struct {
                 .end = plan.reqs.items.len,
                 .num_blocks = num_blocks,
                 .blocks = blocks.items,
+                .header = header,
+                .total_len = sp.len(),
             } };
-            if (self.verdicts[t.file] == .unknown and !header_asked[t.file]) {
-                header_asked[t.file] = true;
-                try plan.headers.append(a, .{ .file = t.file, .req = plan.reqs.items.len, .total_len = sp.len() });
-                try plan.reqs.append(a, .{ .span = .{ .file = sp.file, .start = sp.start, .end = sp.start + h.len } });
-            }
             any = true;
         }
         return if (any) plan else null;
@@ -1111,7 +1122,11 @@ const BlockSet = struct {
 
     fn has(self: BlockSet, p: bloom.Probe) bool {
         const want = p.block(self.num_blocks);
-        const i = std.mem.indexOfScalar(u64, self.blocks, want) orelse return true;
+        const i = std.sort.binarySearch(u64, self.blocks, want, struct {
+            fn cmp(w: u64, b: u64) std.math.Order {
+                return std.math.order(w, b);
+            }
+        }.cmp) orelse return true;
         // A block that did not come back whole answers "maybe".
         const out = self.reqs[i].out;
         if (out.len != bloom.block_bytes) return true;
@@ -1424,12 +1439,13 @@ const SynthFile = struct {
     meta: schema.FileMetaData,
 
     fn init(a: std.mem.Allocator, n_rgs: usize, per_rg: usize) !SynthFile {
-        return initOpts(a, n_rgs, per_rg, false);
+        return initOpts(a, n_rgs, per_rg, null);
     }
 
-    /// `forge`: headers carry an extra 32-byte field after the three unions. Still valid (readers skip unknown
-    /// fields), but the bitset no longer sits where a header of the canonical shape would put it.
-    fn initOpts(a: std.mem.Allocator, n_rgs: usize, per_rg: usize, forge: bool) !SynthFile {
+    /// `forge_from`: the headers of filters from that row group on carry an extra 32-byte field after the three
+    /// unions. Still valid (readers skip unknown fields), but the bitset no longer sits where a header of the canonical
+    /// shape would put it.
+    fn initOpts(a: std.mem.Allocator, n_rgs: usize, per_rg: usize, forge_from: ?usize) !SynthFile {
         var meta: schema.FileMetaData = .{
             .version = 1,
             .schema = .empty,
@@ -1446,7 +1462,7 @@ const SynthFile = struct {
             for (0..per_rg) |j| b.insert(bloom.hashBytes(try std.fmt.allocPrint(a, "k{d}-{d}", .{ i, j })));
             b.foldToFpp(0.01);
             var filt = try b.serialize(a);
-            if (forge) {
+            if (forge_from != null and i >= forge_from.?) {
                 const h = bloom.parseHeader(filt).?;
                 var forged: std.ArrayList(u8) = .empty;
                 try forged.appendSlice(a, filt[0 .. h.len - 1]);
@@ -1516,9 +1532,10 @@ test "remote: big filters are read by block, each file's layout verified, and ev
     const f = try parser.parse(a, "c = 'k7-123'", &metas[0], null);
     const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
     try testing.expect(!st.bloom_stopped);
-    try testing.expect(remote.bytes < 64 << 10);
-    // One block per filter, the first file header verified alongside (merged into a neighbouring block's request).
-    try testing.expect(remote.block_reads >= 39 and remote.requests <= 41);
+    // One read per filter: its header and the block the key selects (2 KiB in, so merged with the header), ~2 KiB each
+    // where whole filters would be 10 MiB.
+    try testing.expectEqual(@as(usize, 40), st.filters);
+    try testing.expect(remote.bytes < 128 << 10 and remote.requests <= 41);
     var kept: usize = 0;
     for (metas[0].row_groups.items, 0..) |*rg, i| {
         const d = prune.pruneRowGroup(rg, f, &metas[0]);
@@ -1552,7 +1569,7 @@ test "remote: a forged header layout voids the blocks it located" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const sf = try SynthFile.initOpts(a, 20, 200_000, true);
+    const sf = try SynthFile.initOpts(a, 20, 200_000, 0);
     const off0: usize = @intCast(sf.meta.row_groups.items[0].columns.items[0].meta_data.?.bloom_filter_offset.?);
     try testing.expect(bloom.bitset(sf.bytes[off0..]) != null);
     const metas = [_]schema.FileMetaData{sf.meta};
@@ -1814,5 +1831,100 @@ test "fuzz: random values of every filterable type, written with filters, read b
         var fp: usize = 0;
         for (0..4000) |_| fp += @intFromBool(bloom.Probe.init(r.int(u64)).mightContain(bits));
         try testing.expect(@as(f64, @floatFromInt(fp)) / 4000.0 < @max(3.0 * fpp, 0.02));
+    }
+}
+
+test "regression: one file mixing header shapes; blocks count only under their own filter's header" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The first filter's header is canonical and the rest carry an extra field: verifying one header per file would
+    // locate every later filter's blocks wrong and miss present keys.
+    const sf = try SynthFile.initOpts(a, 16, 200_000, 1);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = .{ .request_bytes = 4 << 10, .concurrency = 8 } };
+    var buf: [32]u8 = undefined;
+    for (0..16) |g| {
+        for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*c| {
+            c.absent = &.{};
+        };
+        const f = try parser.parse(a, try std.fmt.bufPrint(&buf, "c = 'k{d}-77'", .{g}), &metas[0], null);
+        _ = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+        try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[g], f, &metas[0]) != .skip);
+    }
+}
+
+test "regression: a header whose size disagrees with the footer's length is no filter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fx = try openFixture(a, "ci/fixtures/parquet/bloom_keys.parquet");
+    // Halve every `id` filter's numBytes (1024 -> 512 keeps its varint two bytes): the bits read would be the wrong
+    // half's, and present ids would test absent.
+    for (fx.meta.row_groups.items) |rg| {
+        const off: usize = @intCast(rg.columns.items[0].meta_data.?.bloom_filter_offset.?);
+        try testing.expectEqualSlices(u8, &.{ 0x15, 0x80, 0x10 }, fx.bytes[off..][0..3]);
+        fx.bytes[off + 2] = 0x08;
+    }
+    const metas = [_]schema.FileMetaData{fx.meta};
+    const mapped: MappedSource = .{ .files = &.{fx.bytes} };
+    for (0..8) |g| for ([_]usize{ 0, 61, 333, 499 }) |j| {
+        for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*c| {
+            c.absent = &.{};
+        };
+        const f = try parser.parse(a, try std.fmt.allocPrint(a, "id = {d}", .{2 * (8 * j + g)}), &metas[0], null);
+        const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
+        try testing.expectEqual(@as(usize, 0), st.filters);
+        try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[g], f, &metas[0]) != .skip);
+    };
+}
+
+test "regression: a footer length past any real filter is no filter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fx = try openFixture(a, "ci/fixtures/parquet/bloom_keys.parquet");
+    for (fx.meta.row_groups.items) |rg| rg.columns.items[0].meta_data.?.bloom_filter_length = std.math.maxInt(i32);
+    const metas = [_]schema.FileMetaData{fx.meta};
+    var remote: FakeRemote = .{ .files = &.{fx.bytes} };
+    const f = try parser.parse(a, "id = 1001", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 0), st.filters);
+    try testing.expectEqual(@as(usize, 0), remote.requests);
+}
+
+test "regression: a dictionary page holding more than it says proves nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const fx = try openFixture(a, "ci/fixtures/parquet/bloom_keys.parquet");
+    const cm = fx.meta.row_groups.items[0].columns.items[2].meta_data.?;
+    const page = fx.bytes[@intCast(cm.dictionary_page_offset.?)..@intCast(cm.data_page_offset)];
+    const values = dictionaryValues(a, page, cm.codec) orelse return error.TestUnexpectedResult;
+    const slot: Slot = .{ .physical = .BYTE_ARRAY, .type_length = null };
+    var found: [1]bool = .{false};
+    try testing.expect(scanDictionary(values.bytes, values.count, slot, &.{"m-0"}, &found));
+    try testing.expect(!scanDictionary(values.bytes, values.count - 1, slot, &.{"m-0"}, &found));
+}
+
+test "regression: an 8000-value IN list probes in time linear in its length" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf = try SynthFile.init(a, 16, 2000);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var expr: std.ArrayList(u8) = .empty;
+    try expr.appendSlice(a, "c IN (");
+    for (0..8000) |i| try expr.print(a, "{s}'z{d}'", .{ if (i == 0) "" else ", ", i });
+    try expr.appendSlice(a, ", 'k3-5')");
+    const f = try parser.parse(a, expr.items, &metas[0], null);
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = .{ .request_bytes = 4 << 10, .concurrency = 8 } };
+    const t0 = nowMonoNs();
+    _ = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    const ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
+    // Quadratic structures took tens of seconds here; a debug build does this in well under one.
+    try testing.expect(ms < 5000);
+    for (metas[0].row_groups.items, 0..) |*rg, g| {
+        if (g == 3) try testing.expect(prune.pruneRowGroup(rg, f, &metas[0]) != .skip);
     }
 }

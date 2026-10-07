@@ -226,7 +226,7 @@ def written(*args):
     t = pq.read_table(out)
     return t.schema.names, t.to_pylist()
 
-nested, top = [None, 10, 20], [None, 1, 3]
+nested, top = [10, 20, None], [1, None, 3]  # as the groups first appear
 for name, keys in (("b", nested), ('"a"."b"', nested), ("a.b", top), ('"a.b"', top)):
     # The key is named by its label however the reference is spelled, in SQL and with the flag.
     sql = json.loads(run("--query", f"SELECT {name}, count(*) AS n FROM '{src}' GROUP BY {name}"))["agg"]

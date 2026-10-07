@@ -78,7 +78,6 @@ pub const IoStat = struct {
     io_mode: u64 = 0,
     io_resident_permille: u64 = 0,
     io_coverage_permille: u64 = 0,
-    io_willneed: u64 = 0,
 
     pub fn requests(self: IoStat) u64 {
         return self.gets + self.puts;
@@ -347,7 +346,6 @@ fn tally(
             s.io.io_mode = a[1];
             s.io.io_resident_permille = a[2];
             s.io.io_coverage_permille = a[3];
-            s.io.io_willneed = a[4];
         },
         .local_backend => {
             s.io.local_uring_threads = a[0];
@@ -482,10 +480,9 @@ fn ms(ns: u64) f64 {
 fn writeIoChoice(w: *std.Io.Writer, io: IoStat) !void {
     const profiles = [_][]const u8{ "auto", "mmap", "pread", "uring" };
     const modes = [_][]const u8{ "mmap", "pread", "io_uring" };
-    try w.print("       read mode: {s} -> {s}{s}", .{
+    try w.print("       read mode: {s} -> {s}", .{
         profiles[@min(io.io_profile, profiles.len - 1)],
         modes[@min(io.io_mode, modes.len - 1)],
-        if (io.io_willneed != 0) " + WILLNEED readahead" else "",
     });
     if (io.io_profile == 0) {
         try w.print(" ({d}% cached", .{io.io_resident_permille / 10});

@@ -382,25 +382,16 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
     const io_mode: local_reader.Mode = if (all_local) io_policy.choose(resident, coverage) else .mmap;
-    const will_need = all_local and io_policy.willNeed(io_mode, resident, coverage);
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         io_policy.profile,
         io_mode,
         @as(u64, @intFromFloat(resident * 1000)),
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
-        will_need,
     }));
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (reader) |rd| rd.destroy();
-    var prefetches: []*local_reader.Prefetch = &.{};
-    defer for (prefetches) |pf| pf.destroy();
-    const scan_inputs = if (will_need) blk: {
-        const maps = try arena.alloc([]const u8, opened.mmaps.len);
-        for (maps, opened.mmaps) |*m, mm| m.* = mm.?.bytes;
-        const files = local_plan.?.files;
-        break :blk try startPrefetches(ctx.gpa, arena, opened.inputs, files, maps, io_policy.window, &prefetches);
-    } else if (io_mode == .mmap) opened.inputs else try startLocalReader(
+    const scan_inputs = if (io_mode == .mmap) opened.inputs else try startLocalReader(
         ctx,
         arena,
         opened,
@@ -2255,7 +2246,7 @@ fn localResidency(gpa: std.mem.Allocator, opened: OpenedInputs) f64 {
 }
 
 /// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page
-/// indexes. What the reader reads, the prefetcher advises, and `auto` weighs against the files' size.
+/// indexes. What the reader reads, and what `auto` weighs against the files' size.
 const LocalPlan = struct {
     files: []const []const ?[]local_reader.Range,
     planned: u64,
@@ -2306,58 +2297,6 @@ fn planLocalReads(
         file.* = per_rg;
     }
     return .{ .files = files, .planned = planned, .total = total };
-}
-
-/// Gate each of `inputs` (all local, mapped as `maps`) on a prefetcher advising its planned ranges ahead of the
-/// workers. `made` is extended to each prefetcher as it is created and is the only owner: on failure the caller's
-/// cleanup of `made` releases exactly those, once.
-fn startPrefetches(
-    gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    inputs: []const scan.Input,
-    files: []const []const ?[]local_reader.Range,
-    maps: []const []const u8,
-    window: u64,
-    made: *[]*local_reader.Prefetch,
-) ![]const scan.Input {
-    const gated = try arena.dupe(scan.Input, inputs);
-    const slots = try arena.alloc(*local_reader.Prefetch, gated.len);
-    made.* = slots[0..0];
-    for (gated, files, maps, 0..) |*in, per_rg, map, i| {
-        slots[i] = try local_reader.Prefetch.create(gpa, map, per_rg, window);
-        made.* = slots[0 .. i + 1];
-        in.gate = slots[i].gate();
-    }
-    return gated;
-}
-
-test "prefetch setup failing at any allocation, over two inputs, releases exactly what it made" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-    const page = std.heap.pageSize();
-    const m0 = try std.posix.mmap(null, 16 * page, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    defer std.posix.munmap(m0);
-    const m1 = try std.posix.mmap(null, 16 * page, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    defer std.posix.munmap(m1);
-    var r0 = [_]local_reader.Range{.{ .start = 0, .end = 4 * page }};
-    var r1 = [_]local_reader.Range{.{ .start = 4 * page + 9, .end = 9 * page }};
-    var r2 = [_]local_reader.Range{.{ .start = 9 * page, .end = 16 * page }};
-    const f0 = [_]?[]local_reader.Range{ &r0, null, &r1 };
-    const f1 = [_]?[]local_reader.Range{ &r2, &r0 };
-    const Files = []const []const ?[]local_reader.Range;
-    const files: Files = &.{ &f0, &f1 };
-    const maps: []const []const u8 = &.{ m0, m1 };
-    const inputs: []const scan.Input = &.{ .{ .name = "a", .bytes = m0 }, .{ .name = "b", .bytes = m1 } };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(a: std.mem.Allocator, ins: []const scan.Input, fs: Files, ms: []const []const u8) !void {
-            var arena = std.heap.ArenaAllocator.init(a);
-            defer arena.deinit();
-            var made: []*local_reader.Prefetch = &.{};
-            defer for (made) |pf| pf.destroy();
-            const gated = try startPrefetches(a, arena.allocator(), ins, fs, ms, 8 * std.heap.pageSize(), &made);
-            try std.testing.expectEqual(@as(usize, 2), made.len);
-            for (gated) |in| try std.testing.expect(in.gate != null);
-        }
-    }.run, .{ inputs, files, maps });
 }
 
 /// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:

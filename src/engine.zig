@@ -24,6 +24,7 @@ const std = @import("std");
 const nowMonoNs = @import("clock.zig").monoNs;
 const profile = @import("profile.zig");
 const local_fs = @import("local_fs.zig");
+const local_reader = @import("io/local_reader.zig");
 
 const schema = @import("core/schema.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
@@ -353,8 +354,16 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    cheap, microseconds. Easier than threading the parsed AST
     //    through the open step + the scan step.) Footers parsed here are probed here; the scan probes the ones it
     //    parses.
+    //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
+    //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
+    const io_policy = local_reader.Policy.fromEnv(ctx.env);
+    // Comptime .mmap off Linux, so the reader (io_uring, futexes) is never compiled in there.
+    const io_mode: local_reader.Mode = if (@import("builtin").os.tag == .linux)
+        localReadMode(ctx.gpa, io_policy, opened)
+    else
+        .mmap;
     var probed = opened.membership;
-    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta) blk: {
+    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta or io_mode != .mmap) blk: {
         const m = try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
@@ -363,8 +372,29 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
         break :blk m;
     } else null;
+    // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
+    var reader: ?*local_reader.Reader = null;
+    defer if (reader) |rd| rd.destroy();
+    const scan_inputs = if (io_mode == .mmap) opened.inputs else try startLocalReader(
+        ctx,
+        arena,
+        args,
+        opened,
+        metas.?,
+        .{ .mode = io_mode, .threads = io_policy.threads, .window = io_policy.window },
+        &reader,
+    );
+    const t_reader = nowMonoNs();
+    defer if (reader) |rd| profile.record(prof, .local_read, t_reader, nowMonoNs(), profile.args(.{
+        @as(u64, if (io_mode == .uring) 2 else 1),
+        rd.stats.bytes.load(.monotonic),
+        rd.threads.items.len,
+        rd.stats.stalls.load(.monotonic),
+        rd.stats.stall_ns.load(.monotonic),
+        rd.stats.window_waits.load(.monotonic),
+    }));
     var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
-        .inputs = opened.inputs,
+        .inputs = scan_inputs,
         .metas = metas,
         .filter = args.filter,
         .aggregate = agg_str,
@@ -2124,6 +2154,71 @@ fn openInputs(
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
         .membership = membership_stats,
     };
+}
+
+/// How the scan reads this query's local files: `policy`'s choice, given how much of them the page cache holds.
+/// The mapping when there are none, or when any input is remote (the S3 path plans its own reads).
+fn localReadMode(gpa: std.mem.Allocator, policy: local_reader.Policy, opened: OpenedInputs) local_reader.Mode {
+    var total: f64 = 0;
+    var resident: f64 = 0;
+    for (opened.mmaps) |m_opt| {
+        const m = m_opt orelse return .mmap;
+        const n: f64 = @floatFromInt(m.bytes.len);
+        total += n;
+        // Only the auto policy looks at residency; `mincore` over a big file isn't free.
+        if (policy.profile == .auto) resident += n * local_reader.residentShare(gpa, m.bytes);
+    }
+    if (total == 0) return .mmap;
+    return policy.choose(resident / total);
+}
+
+/// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:
+/// each local one over the reader's buffer, gated per row group. `metas` carry what pruning has proved.
+fn startLocalReader(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    opened: OpenedInputs,
+    metas: []const schema.FileMetaData,
+    cfg: local_reader.Config,
+    out: *?*local_reader.Reader,
+) ![]const scan.Input {
+    const rd = try local_reader.Reader.create(ctx.gpa, cfg);
+    out.* = rd;
+    const plan = try planRanges(arena, args, metas);
+    const inputs = try arena.dupe(scan.Input, opened.inputs);
+    for (inputs, metas, opened.mmaps) |*in, *meta, m_opt| {
+        const m = m_opt orelse continue;
+        const f = try rd.openFile(in.name, m.bytes.len);
+        const per_rg = try arena.alloc(?[]local_reader.Range, meta.row_groups.items.len);
+        for (meta.row_groups.items, per_rg) |*rg, *rgs| {
+            const cols = plan.rowGroupColumns(rg, meta) orelse {
+                rgs.* = null;
+                continue;
+            };
+            var rs: std.ArrayList(local_reader.Range) = .empty;
+            for (cols, 0..) |needed, ci| {
+                if (!needed or ci >= rg.columns.items.len) continue;
+                const chunk = rg.columns.items[ci];
+                const cm = chunk.meta_data orelse continue;
+                const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
+                try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
+                // The scan reads a needed chunk's page index too.
+                if (chunk.column_index_offset) |o| if (chunk.column_index_length) |l| {
+                    try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
+                };
+                if (chunk.offset_index_offset) |o| if (chunk.offset_index_length) |l| {
+                    try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
+                };
+            }
+            rgs.* = rs.items;
+        }
+        try rd.planFile(f, per_rg, COALESCE_GAP);
+        in.bytes = f.bytes();
+        in.gate = f.gate();
+    }
+    try rd.start();
+    return inputs;
 }
 
 /// What the S3 planner fetches from each row group.

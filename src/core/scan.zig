@@ -63,6 +63,16 @@ pub const Input = struct {
     /// Logical source size. S3 inputs may compact fetched ranges into
     /// `bytes`; keep reporting the object size in query results.
     logical_size: u64 = 0,
+    /// Set while `bytes` are still being read in (`io/local_reader.zig`): a worker waits on it before touching a row
+    /// group, and reports each finished work item so a done row group's pages can go back.
+    gate: ?RowGroupGate = null,
+};
+
+pub const RowGroupGate = struct {
+    ctx: *anyopaque,
+    wait: *const fn (ctx: *anyopaque, rg: usize) anyerror!void,
+    /// One of the row group's `items` work items is finished, read or skipped.
+    done: *const fn (ctx: *anyopaque, rg: usize, items: usize) void,
 };
 
 pub const MultiAggArgs = struct {
@@ -469,6 +479,8 @@ const Worker = struct {
     block_cursor: ?*std.atomic.Value(usize) = null,
     /// With `blocks`: where finished blocks merge, in block order.
     block_merge: ?*BlockMerge = null,
+    /// Work items per row group (every row group gets the same number), for `Input.gate`.
+    items_per_rg: usize = 1,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -537,6 +549,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         };
         items.* += 1;
         const item = w.work[idx];
+        const gate = w.inputs[item.file].gate;
+        defer if (gate) |g| g.done(g.ctx, item.rg, w.items_per_rg);
         const meta = &w.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
         // File bytes are shared read-only across workers (one mmap / one
@@ -569,6 +583,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         if (item.agg_start == 0) {
             w.rows_kept += rg.num_rows;
         }
+        if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
         const target: consumer.AggTarget = if (table) |gt|
             .{ .grouped = .{
@@ -883,6 +898,7 @@ pub fn runMultiAggregate(
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
+            .items_per_rg = chunks_per_rg,
         };
     }
 

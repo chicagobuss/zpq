@@ -51,6 +51,9 @@ pub const Kind = enum(u8) {
     query,
     open_inputs,
     open_file,
+    /// The explicit local reader over a query's scan: mode (1 pread, 2 io_uring), bytes read, reader threads, worker
+    /// stalls waiting on reads and their total ns, waits for the window.
+    local_read,
     footer_batch,
     footer_fetch,
     footer_parse,
@@ -102,7 +105,7 @@ pub const Kind = enum(u8) {
             .encode, .encode_chunk => .encode,
             .copy_rg, .sink_write, .footer_write => .write,
             .merge, .finalize => .merge,
-            .footer_batch, .fetch, .scan, .reencode, .upload_wait => .wait,
+            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read => .wait,
         };
     }
 
@@ -117,6 +120,7 @@ pub const Kind = enum(u8) {
             .query, .parse_query, .merge, .finalize => &.{},
             .open_inputs, .footer_batch => &.{"files"},
             .open_file, .footer_parse => &.{ "file", "bytes" },
+            .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },
             .footer_fetch => &.{ "file", "cache" },
             .plan => &.{ "work_items", "workers", "row_groups" },
             .plan_ranges => &.{ "ranges", "merged", "fetch_jobs", "bytes", "row_groups", "row_groups_pruned" },

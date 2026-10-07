@@ -60,6 +60,13 @@ pub const IoStat = struct {
     fetch_jobs: u64 = 0,
     mapped_files: u64 = 0,
     mapped_bytes: u64 = 0,
+    /// The explicit local reader (`local_read`): 0 when the mapping was read instead.
+    local_mode: u64 = 0,
+    local_bytes: u64 = 0,
+    local_threads: u64 = 0,
+    local_stalls: u64 = 0,
+    local_stall_ns: u64 = 0,
+    local_window_waits: u64 = 0,
 
     pub fn requests(self: IoStat) u64 {
         return self.gets + self.puts;
@@ -314,6 +321,14 @@ fn tally(
             s.io.mapped_files += 1;
             s.io.mapped_bytes += a[1];
         },
+        .local_read => {
+            s.io.local_mode = a[0];
+            s.io.local_bytes += a[1];
+            s.io.local_threads = a[2];
+            s.io.local_stalls += a[3];
+            s.io.local_stall_ns += a[4];
+            s.io.local_window_waits += a[5];
+        },
         .parse_query => s.reconcile.parse_ns += dur,
         .scan => s.reconcile.decode_wall_ns += dur,
         .decode => s.reconcile.decode_ns += dur,
@@ -522,6 +537,17 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     const io = s.io;
     if (io.mapped_files > 0) {
         try w.print("io     local mmap: {d} file(s), {d:.1} MB mapped\n", .{ io.mapped_files, mb(io.mapped_bytes) });
+        if (io.local_mode != 0) try w.print(
+            "       read by {s} ({d} threads): {d:.1} MB; {d} waits on reads ({d:.1} ms), {d} on the window\n",
+            .{
+                if (io.local_mode == 2) "io_uring O_DIRECT" else "pread",
+                io.local_threads,
+                mb(io.local_bytes),
+                io.local_stalls,
+                @as(f64, @floatFromInt(io.local_stall_ns)) / 1e6,
+                io.local_window_waits,
+            },
+        );
     }
     if (io.requests() > 0) {
         const n: f64 = @floatFromInt(io.requests());

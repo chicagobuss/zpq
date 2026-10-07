@@ -97,6 +97,10 @@ to about twice the GROUP BY memory of `--unordered` (`--max-memory` counts it). 
 `"ordered": false`) gives both up for speed: groups in no set order, float aggregates free to differ in their last
 bits.
 
+**Read local files** through the page cache or explicitly: on Linux, an aggregate over files mostly not in the page cache
+reads just the column chunks it needs, row group by row group, with io_uring (`O_DIRECT`) or `pread`, in a bounded window;
+see [Local reads](docs/local_io.md).
+
 **Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
 produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
 

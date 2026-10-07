@@ -84,6 +84,7 @@ pub const io = struct {
     pub const work_cursor = @import("io/work_cursor.zig");
     pub const multipart_sink = @import("io/multipart_sink.zig");
     pub const meta_cache = @import("io/meta_cache.zig");
+    pub const local_reader = @import("io/local_reader.zig");
     pub const retry = @import("io/retry.zig");
 };
 
@@ -152,5 +153,6 @@ test {
     _ = @import("io/work_cursor.zig");
     _ = @import("io/multipart_sink.zig");
     _ = @import("io/meta_cache.zig");
+    _ = @import("io/local_reader.zig");
     _ = @import("io/retry.zig");
 }

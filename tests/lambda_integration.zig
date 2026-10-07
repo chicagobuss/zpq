@@ -961,6 +961,43 @@ test "lambda answers back-to-back S3 queries without running out of read workers
     }
 }
 
+test "an S3 query over an object with a corrupt footer fails and frees all it made" {
+    // The error left openInputs after its connection pool was made, and only a successful return freed it.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    const footer_len = std.mem.readInt(u32, object[object.len - 8 ..][0..4], .little);
+    @memset(object[object.len - 8 - footer_len ..][0..16], 0xff);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+    const res = try runCliOnS3(a, &s3, &.{ "query", "s3://bkt/f.parquet", "--aggregate", "count(*) AS c" });
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    if (res.term == .exited and res.term.exited == 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
+        std.debug.print("[s3 corrupt footer] {any}\nstderr: {s}\n", .{ res.term, res.stderr });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Run the CLI with its `s3://` inputs resolved to `s3`.
+fn runCliOnS3(a: std.mem.Allocator, s3: *const FakeS3, args: []const []const u8) !std.process.RunResult {
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", url);
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(a);
+    try argv.append(a, CLI_BIN);
+    try argv.appendSlice(a, args);
+    return std.process.run(a, std.testing.io, .{ .argv = argv.items, .environ_map = &env_map });
+}
+
 test "an S3 query whose every row group prunes frees all it fetched" {
     // Nothing is left to fetch past the footer, and the fetched tail used to leak on that path. The CLI's Debug
     // allocator reports leaks on stderr as it exits.
@@ -971,20 +1008,8 @@ test "an S3 query whose every row group prunes frees all it fetched" {
     try s3.start(object, 0);
     defer s3.deinit();
 
-    var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
-    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
-    defer env_map.deinit();
-    try env_map.put("S3_ENDPOINT_URL", url);
-    try env_map.put("S3_ACCESS_KEY_ID", "fake");
-    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
-    try env_map.put("S3_REGION", "us-east-1");
-    try env_map.put("PATH", "/usr/bin:/bin");
     for ([_][]const u8{ "ts < 0", "ts < 0 OR ts > 1000000" }) |filter| {
-        const res = try std.process.run(a, std.testing.io, .{
-            .argv = &.{ CLI_BIN, "query", "s3://bkt/f.parquet", "--filter", filter, "--aggregate", "count(*) AS c" },
-            .environ_map = &env_map,
-        });
+        const res = try runCliOnS3(a, &s3, &.{ "query", "s3://bkt/f.parquet", "--filter", filter, "--aggregate", "count(*) AS c" });
         defer a.free(res.stdout);
         defer a.free(res.stderr);
         if (res.term != .exited or res.term.exited != 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {

@@ -1659,6 +1659,8 @@ fn openInputs(
     // S3: gather per-bucket batches, one pool per bucket, fetch each
     // batch in parallel via Io.Group.
     var owned_pools: std.ArrayList(*s3.Pool(POOL_SIZE)) = .empty;
+    // On success the returned `OpenedInputs` owns them; until then, every way out frees them.
+    errdefer for (owned_pools.items) |p| p.deinit();
     var s3_buffers: std.ArrayList([]u8) = .empty;
     var membership_stats: membership.Stats = .{};
     if (s3_indices.items.len > 0) {
@@ -1689,6 +1691,7 @@ fn openInputs(
         else blk: {
             const p = try arena.create(s3.Pool(POOL_SIZE));
             try p.init(ctx.gpa);
+            errdefer p.deinit();
             try owned_pools.append(arena, p);
             break :blk p;
         };

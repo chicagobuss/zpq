@@ -5,9 +5,11 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 
 - The planner's column-chunk ranges (and the page indexes of those chunks) are read into an anonymous buffer laid out
   like the file, row group by row group, ahead of the workers. Nothing else in the file is read or allocated.
-- A worker waits on a row group's gate before touching it. Once every work item of a row group is done, its pages go
-  back to the kernel (`MADV_DONTNEED`), so the reader holds at most a window of bytes read ahead and not yet scanned.
-  A file far bigger than memory scans in bounded memory.
+- A worker waits on a row group's gate before touching it. Once every work item of a row group is done, the pages
+  no other unfinished row group's reads cover go back to the kernel (`MADV_DONTNEED`), so the reader holds at most a
+  window of bytes read ahead and not yet scanned. A file far bigger than memory scans in bounded memory.
+- Row groups enter the window one at a time in input order, so a later row group never takes the room an earlier one
+  needs.
 - Row groups that statistics, Bloom filters or dictionaries prune are never read. Footers are parsed, and Bloom
   filters and dictionaries probed, through the mapping.
 

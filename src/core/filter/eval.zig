@@ -15,6 +15,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const selection = @import("selection.zig");
+const in_set = @import("in_set.zig");
 
 pub const Error = error{
     TypeMismatch,
@@ -326,12 +327,14 @@ pub fn evaluate(
             evalLike(col.string.values, col.string.def_levels, col.string.max_def, m, sel);
         },
         .and_filter => |c| {
+            if (c.in_set) |s| return evalInSet(s, batch, sel, column_lookup);
             // AND composes naturally: left clears bits, right clears
             // more bits. No state to save.
             try evaluate(c.left.*, batch, sel, column_lookup, arena);
             try evaluate(c.right.*, batch, sel, column_lookup, arena);
         },
         .or_filter => |c| {
+            if (c.in_set) |s| return evalInSet(s, batch, sel, column_lookup);
             // OR: snapshot the entry state so each branch evaluates
             // against the same input set; then merge.
             var entry = try sel.cloneAlloc(arena);
@@ -348,6 +351,26 @@ pub fn evaluate(
             try evaluate(c.right.*, batch, sel, column_lookup, arena);
             // sel now holds right's result; OR-merge with left.
             sel.unionWith(&left_result);
+        },
+    }
+}
+
+/// An IN / NOT IN list in one pass over the rows (see `in_set.zig`).
+fn evalInSet(
+    s: *const in_set.InSet,
+    batch: *const Batch,
+    sel: *selection.SelectionVector,
+    column_lookup: []const ?usize,
+) Error!void {
+    const col_pos = column_lookup[s.col_idx] orelse return error.BadColumn;
+    switch (s.probe) {
+        inline else => |*set, tag| {
+            const col = batch.cols[col_pos];
+            if (col != @field(std.meta.Tag(Batch.Column), @tagName(tag))) return error.TypeMismatch;
+            const c = @field(col, @tagName(tag));
+            try rejectIfNested(c);
+            std.debug.assert(c.values.len == sel.len);
+            in_set.filterWords(@TypeOf(c.values[0]), set, s.negated, c.values, c.def_levels, c.max_def, sel.mask);
         },
     }
 }

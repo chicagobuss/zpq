@@ -21,6 +21,7 @@ pub const core = struct {
         pub const membership = @import("core/filter/membership.zig");
         pub const selection = @import("core/filter/selection.zig");
         pub const eval = @import("core/filter/eval.zig");
+        pub const in_set = @import("core/filter/in_set.zig");
         pub const partition = @import("core/filter/partition.zig");
     };
     pub const expr = struct {
@@ -104,6 +105,7 @@ test {
     _ = @import("core/filter/membership.zig");
     _ = @import("core/filter/selection.zig");
     _ = @import("core/filter/eval.zig");
+    _ = @import("core/filter/in_set.zig");
     _ = @import("core/filter/partition.zig");
     _ = @import("core/expr/ast.zig");
     _ = @import("core/expr/parser.zig");

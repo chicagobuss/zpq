@@ -53,7 +53,15 @@ pub fn applyOpStr(a: []const u8, op: Operator, b: []const u8) bool {
     };
 }
 
-pub const Composite = struct { left: *Filter, right: *Filter };
+pub const Composite = struct {
+    left: *Filter,
+    right: *Filter,
+    /// Set on the root of an IN / NOT IN list the parser built: the list's literals bound for evaluation in one pass
+    /// (see `in_set.zig`). The leaves below stay for every other reader (pruning, membership).
+    in_set: ?*const in_set_mod.InSet = null,
+};
+
+const in_set_mod = @import("in_set.zig");
 
 pub fn Leaf(comptime T: type) type {
     return struct {

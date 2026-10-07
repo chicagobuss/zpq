@@ -191,6 +191,21 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // in-bench: IN-list evaluation over one in-memory batch, with user-space instruction and cycle counters.
+    const in_bench = b.addExecutable(.{
+        .name = "in_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/in_bench/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "zpq", .module = cli_zpq.zpq },
+            },
+        }),
+    });
+    b.step("in-bench", "Build the IN-list evaluation microbenchmark").dependOn(&b.addInstallArtifact(in_bench, .{}).step);
+
     const microbench_step = b.step("microbench", "Build the decode-path microbenchmark");
     microbench_step.dependOn(&b.addInstallArtifact(microbench, .{}).step);
 

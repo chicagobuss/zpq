@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const in_set = @import("in_set.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
@@ -304,7 +305,41 @@ fn parseInList(
         if (v.len == 0) return error.BadValue;
         try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
     }
-    return balancedTree(arena, leaves.items, inc.negated);
+    var tree = try balancedTree(arena, leaves.items, inc.negated);
+    switch (tree) {
+        .and_filter, .or_filter => |*c| c.in_set = try bindInSet(arena, col_idx, inc.negated, leaves.items),
+        else => {},
+    }
+    return tree;
+}
+
+/// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't
+/// hold (unsigned, boolean), which then evaluate leaf by leaf.
+fn bindInSet(
+    arena: std.mem.Allocator,
+    col_idx: usize,
+    negated: bool,
+    leaves: []const ast.Filter,
+) Error!?*const in_set.InSet {
+    const probe: in_set.InSet.Probe = switch (leaves[0]) {
+        inline .int32, .int64, .float, .double, .string => |_, tag| blk: {
+            const T = @FieldType(@FieldType(ast.Filter, @tagName(tag)), "value");
+            const values = try arena.alloc(T, leaves.len);
+            for (leaves, values) |l, *v| v.* = @field(l, @tagName(tag)).value;
+            break :blk switch (tag) {
+                .int32 => .{ .i32 = try .init(arena, values) },
+                .int64 => .{ .i64 = try .init(arena, values) },
+                .float => .{ .f32 = try .init(arena, values) },
+                .double => .{ .f64 = try .init(arena, values) },
+                .string => .{ .string = try .init(arena, values) },
+                else => unreachable,
+            };
+        },
+        else => return null,
+    };
+    const set = try arena.create(in_set.InSet);
+    set.* = .{ .col_idx = col_idx, .negated = negated, .probe = probe };
+    return set;
 }
 
 /// `leaves`, in order, joined by OR (AND when `conjunction`) into a tree of depth log2 of their count. Every pass over
@@ -339,14 +374,16 @@ fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
             const r = try arena.create(ast.Filter);
             l.* = try negateFilter(arena, c.left.*);
             r.* = try negateFilter(arena, c.right.*);
-            break :blk .{ .or_filter = .{ .left = l, .right = r } };
+            const s = if (c.in_set) |s| try s.negate(arena) else null;
+            break :blk .{ .or_filter = .{ .left = l, .right = r, .in_set = s } };
         },
         .or_filter => |c| blk: {
             const l = try arena.create(ast.Filter);
             const r = try arena.create(ast.Filter);
             l.* = try negateFilter(arena, c.left.*);
             r.* = try negateFilter(arena, c.right.*);
-            break :blk .{ .and_filter = .{ .left = l, .right = r } };
+            const s = if (c.in_set) |s| try s.negate(arena) else null;
+            break :blk .{ .and_filter = .{ .left = l, .right = r, .in_set = s } };
         },
     };
 }
@@ -919,6 +956,112 @@ test "regression: IN and NOT IN lists of thousands nest log-deep, values in orde
     }
 }
 
+/// `f` with every bound IN set dropped, so it evaluates leaf by leaf.
+fn withoutInSets(a: std.mem.Allocator, f: ast.Filter) !ast.Filter {
+    return switch (f) {
+        inline .and_filter, .or_filter => |c, tag| blk: {
+            const l = try a.create(ast.Filter);
+            const r = try a.create(ast.Filter);
+            l.* = try withoutInSets(a, c.left.*);
+            r.* = try withoutInSets(a, c.right.*);
+            break :blk @unionInit(ast.Filter, @tagName(tag), .{ .left = l, .right = r });
+        },
+        else => f,
+    };
+}
+
+test "IN lists bound to a set select exactly what their leaves do: nulls, NaN, -0, NOT IN and NOT (IN)" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const n = 777;
+    var prng = std.Random.DefaultPrng.init(0x15e7);
+    const r = prng.random();
+    const ids = try a.alloc(i32, n);
+    const strs = try a.alloc([]const u8, n);
+    const scores = try a.alloc(f64, n);
+    const tss = try a.alloc(i64, n);
+    const defs = try a.alloc(u32, n);
+    const specials = [_]f64{ 0.0, -0.0, std.math.nan(f64), std.math.inf(f64), 2.5 };
+    for (0..n) |i| {
+        ids[i] = r.intRangeAtMost(i32, -300, 300);
+        strs[i] = try std.fmt.allocPrint(a, "s{d}", .{r.uintLessThan(u32, 400)});
+        scores[i] = if (r.boolean())
+            specials[r.uintLessThan(usize, specials.len)]
+        else
+            @floatFromInt(r.intRangeAtMost(i32, -50, 50));
+        tss[i] = r.intRangeAtMost(i64, -1 << 40, 1 << 40);
+        defs[i] = @intFromBool(r.uintLessThan(u8, 6) != 0);
+    }
+    for ([_]usize{ 0, 4 }) |k| tss[k] = 123456789;
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = ids, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = strs, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .f64 = .{ .values = scores, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = tss } },
+    };
+    var lookup: [11]?usize = @splat(null);
+    lookup[0] = 0;
+    lookup[1] = 1;
+    lookup[2] = 2;
+    lookup[4] = 3;
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = n };
+
+    var exprs: std.ArrayList([]const u8) = .empty;
+    for ([_]usize{ 2, 5, 8, 9, 40, 300, 2000 }) |k| {
+        const heads = [_][]const u8{
+            "id IN (",         "id NOT IN (", "status IN (",
+            "NOT status IN (", "ts IN (",     "ts NOT IN (",
+        };
+        for (heads) |head| {
+            var e: std.ArrayList(u8) = .empty;
+            try e.appendSlice(a, head);
+            for (0..k) |i| {
+                if (i > 0) try e.appendSlice(a, ", ");
+                if (head[0] == 's' or head[4] == 's') {
+                    try e.print(a, "'s{d}'", .{r.uintLessThan(u32, 500)});
+                } else if (head[0] == 't') {
+                    try e.print(a, "{d}", .{if (i == 0) 123456789 else r.intRangeAtMost(i64, -1 << 40, 1 << 40)});
+                } else {
+                    try e.print(a, "{d}", .{r.intRangeAtMost(i32, -400, 400)});
+                }
+            }
+            try e.append(a, ')');
+            try exprs.append(a, e.items);
+        }
+    }
+    try exprs.appendSlice(a, &.{
+        "score IN (0, 2.5, 7)",
+        "score IN (-0.0, nan, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+        "score NOT IN (nan, 0, inf, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
+        "NOT score IN (-0.0, -inf, 2.5)",
+    });
+    for (exprs.items) |expr| {
+        const f = try parse(a, expr, &meta, null);
+        try testing.expect(switch (f) {
+            .and_filter, .or_filter => |c| c.in_set != null,
+            else => false,
+        });
+        var want = try selection.SelectionVector.init(a, n);
+        var got = try selection.SelectionVector.init(a, n);
+        for (0..n) |i| if (i % 5 == 0) {
+            want.set(i, false);
+            got.set(i, false);
+        };
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        if (!std.mem.eql(u64, want.mask, got.mask)) {
+            std.debug.print("IN set disagrees with its leaves on: {s}\n", .{expr[0..@min(expr.len, 120)]});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "regression: a UUID literal binds to the 16 bytes the column stores" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -926,7 +1069,10 @@ test "regression: a UUID literal binds to the 16 bytes the column stores" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    const want = [16]u8{ 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00 };
+    const want = [16]u8{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    };
     for ([_][]const u8{
         "uid = '550e8400-e29b-41d4-a716-446655440000'",
         "uid = '550E8400E29B41D4A716446655440000'",

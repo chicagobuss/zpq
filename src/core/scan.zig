@@ -762,7 +762,11 @@ pub fn runMultiAggregate(
     const requested = if (args.parallelism == 0) cpu_count else args.parallelism;
 
     // No row groups (a valid empty file) is `total_rgs == 0`: no work items, and nothing to divide by.
-    var chunks_per_rg = if (total_rgs == 0 or total_rgs >= requested) @as(usize, 1) else (requested + total_rgs - 1) / total_rgs;
+    // About four items per worker: with one per row group, a row group per worker leaves the scan as slow as its
+    // slowest row group and a few more leave a tail. Each item over a row group re-decodes and re-evaluates the
+    // filter, so a filtered scan splits a row group only when there are fewer row groups than workers.
+    const items_wanted = if (args.filter == null) 4 * requested else requested;
+    var chunks_per_rg = if (total_rgs == 0 or total_rgs >= items_wanted) @as(usize, 1) else (items_wanted + total_rgs - 1) / total_rgs;
     if (group_by_keys != null) {
         chunks_per_rg = 1;
     } else {

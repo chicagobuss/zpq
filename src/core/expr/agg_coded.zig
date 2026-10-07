@@ -435,7 +435,11 @@ fn foldGroupedCall(
         return;
     }
 
-    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST) {
+    // Float min/max fold rows in order (below), as the row path does; a histogram loses the order a NaN met first needs.
+    const float_extreme = call.result == .f64 and (call.func == .min or call.func == .max);
+    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
+        !float_extreme)
+    {
         // (composite, code) histogram, then fold each entry once per group.
         const col = arg_col.?;
         const c = call.arg.?.col_ref;
@@ -480,8 +484,8 @@ fn foldGroupedCall(
     // Strings, float min/max and anything unusual: the row fold, with group ids expanded from composites. A float
     // min/max keeps the first value it meets and then only a strictly lesser (greater) one, so a NaN met first stays;
     // per-composite partials merged afterwards would answer differently whenever NaN is among the values.
-    const float_extreme = vals_col == .f64 and (call.func == .min or call.func == .max);
-    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64) and call.result != .bytes and !float_extreme;
+    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64) and call.result != .bytes and
+        !(vals_col == .f64 and float_extreme);
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -815,6 +819,37 @@ test "regression: grouped coded keys do not invent infinities for all-NaN values
     defer table.deinit();
     var sel = try Sel.init(a, vals.len);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vals.len };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
+    try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
+    try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
+}
+
+test "regression: grouped float min/max over coded keys and coded values keep a NaN met first" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const keys = [_][]const u8{"key"};
+    const key_codes: [256]u32 = @splat(0);
+    // The values are themselves coded: row 0 holds NaN, every later row 1.0. The row path keeps the NaN.
+    const vdict = [_]f64{ std.math.nan(f64), 1.0 };
+    var vcodes: [256]u32 = @splat(1);
+    vcodes[0] = 0;
+    const cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = &key_codes, .dict = &keys } },
+        .{ .f64 = .{ .values = &.{}, .codes = &vcodes, .dict = &vdict } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .min, .arg = arg, .result = .f64, .where = null, .alias = "lo" },
+        .{ .func = .max, .arg = arg, .result = .f64, .where = null, .alias = "hi" },
+    };
+    var table = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer table.deinit();
+    var sel = try Sel.init(a, vcodes.len);
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vcodes.len };
     try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
     try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));

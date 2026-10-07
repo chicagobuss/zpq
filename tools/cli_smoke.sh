@@ -404,8 +404,10 @@ for src, out in (("in", "to_zstd"), ("pages", "pages_zstd")):
 print("All --codec copy checks passed")
 PY
 
-# Profiling: the answer comes before the summary, the trace path is checked before the query runs, and a failed
-# query leaves no trace behind.
+# Profiling: the answer comes before the summary, the trace path is checked before the query runs, a trace replaces
+# what was at its path only once complete, and a failed query leaves no trace behind and an earlier one untouched.
+printf 'earlier\n' > "$DIR/trace.json"
+printf 'earlier\n' > "$DIR/prof_kept.json"
 "$ZPQ" query "$DIR/in.parquet" --aggregate 'count(*) AS n' --profile "$DIR/trace.json" --profile-summary \
   > "$DIR/prof_both.txt" 2>&1
 if "$ZPQ" query "$DIR/in.parquet" -o "$DIR/prof_never.parquet" --profile "$DIR/no/such/dir/t.json" \
@@ -415,8 +417,11 @@ fi
 if "$ZPQ" query "$DIR/in.parquet" --aggregate 'sum(nope) AS n' --profile "$DIR/prof_failed.json" 2> /dev/null; then
   echo "a query over a missing column did not fail" >&2; exit 1
 fi
+if "$ZPQ" query "$DIR/in.parquet" --aggregate 'sum(nope) AS n' --profile "$DIR/prof_kept.json" 2> /dev/null; then
+  echo "a query over a missing column did not fail" >&2; exit 1
+fi
 "$PY" - "$DIR" <<'PY'
-import json, os, sys
+import glob, json, os, sys
 d = sys.argv[1]
 both = open(f"{d}/prof_both.txt").read()
 answer, summary = both.find('{"ok":true'), both.find("zpq profile:")
@@ -428,6 +433,8 @@ assert not os.path.exists(f"{d}/prof_never.parquet"), "the query ran before the 
 assert open(f"{d}/prof_bad.out").read() == "", "the query answered before the --profile path was checked"
 assert "cannot write profile" in open(f"{d}/prof_bad.err").read()
 assert not os.path.exists(f"{d}/prof_failed.json"), "a failed query left an empty trace"
+assert open(f"{d}/prof_kept.json").read() == "earlier\n", "a failed query touched the trace already at its path"
+assert not glob.glob(f"{d}/*.zpq-tmp"), "a temporary trace was left behind"
 print("Profiling checks passed")
 PY
 

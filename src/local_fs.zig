@@ -24,6 +24,20 @@ pub fn createFile(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
 }
 
+/// Create `path` for writing, mode 0644, failing with `error.PathAlreadyExists` if anything is there.
+pub fn createNewFile(path: []const u8) !fd_t {
+    return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644);
+}
+
+/// Rename `from` to `to`, replacing what `to` names.
+pub fn rename(from: []const u8, to: []const u8) error{ NameTooLong, RenameFailed }!void {
+    const from_z = posix.toPosixPath(from) catch return error.NameTooLong;
+    const to_z = posix.toPosixPath(to) catch return error.NameTooLong;
+    if (posix.errno(posix.system.renameat(posix.AT.FDCWD, &from_z, posix.AT.FDCWD, &to_z)) != .SUCCESS) {
+        return error.RenameFailed;
+    }
+}
+
 /// Best-effort unlink.
 pub fn removeFile(path: []const u8) void {
     const path_z = posix.toPosixPath(path) catch return;
@@ -161,6 +175,28 @@ test "createFile / writeAll / readFile / mapFile / listFiles round-trip" {
 
     removeFile(file_path);
     try testing.expectError(error.FileNotFound, readFile(testing.allocator, file_path));
+}
+
+test "createNewFile refuses an existing path; rename replaces its target" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a_buf: [256]u8 = undefined;
+    var b_buf: [256]u8 = undefined;
+    const a = try std.fmt.bufPrint(&a_buf, ".zig-cache/tmp/{s}/a", .{tmp.sub_path});
+    const b = try std.fmt.bufPrint(&b_buf, ".zig-cache/tmp/{s}/b", .{tmp.sub_path});
+    var fd = try createNewFile(a);
+    try writeAll(fd, "new");
+    close(fd);
+    try testing.expectError(error.PathAlreadyExists, createNewFile(a));
+    fd = try createFile(b);
+    try writeAll(fd, "old");
+    close(fd);
+    try rename(a, b);
+    const bytes = try readFile(testing.allocator, b);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("new", bytes);
+    try testing.expectError(error.FileNotFound, readFile(testing.allocator, a));
+    try testing.expectError(error.RenameFailed, rename(a, b));
 }
 
 test "mapFile rejects an empty file" {

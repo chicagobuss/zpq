@@ -492,6 +492,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     defer if (profiler) |p| p.destroy();
     // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
     var engine_max_mem = max_mem_limit;
+    // A failed query leaves no partial trace behind, and an earlier trace at the path untouched.
+    defer profile_out.close();
     if (profile_out.wanted()) {
         if (comptime !zpq.profile.enabled) {
             std.debug.print("zpq query: this build has no profiler (built with -Dprofile=false)\n", .{});
@@ -505,9 +507,6 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         profiler = try zpq.profile.Profiler.create(gpa, opts, meta);
         engine_max_mem = max_mem_limit -| opts.reservedBytes();
     }
-    defer profile_out.close();
-    // A failed query leaves no empty trace behind.
-    errdefer profile_out.discard();
 
     if (format) |fmt| {
         const cols = if (columns_csv) |csv|
@@ -713,8 +712,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
 const ProfileOut = struct {
     trace_path: ?[]const u8 = null,
     summary: ?Format = null,
-    /// The trace file, created by `open` before the query runs.
+    /// A new file beside `trace_path`, created by `open` before the query runs. It replaces `trace_path` only once the
+    /// trace is written whole, so a failed query leaves an earlier trace there as it was.
     trace_fd: ?local_fs.fd_t = null,
+    tmp_buf: [std.fs.max_path_bytes]u8 = undefined,
+    tmp_len: usize = 0,
 
     const Format = enum { text, json };
 
@@ -724,25 +726,33 @@ const ProfileOut = struct {
 
     fn open(self: *ProfileOut) !void {
         const path = self.trace_path orelse return;
-        self.trace_fd = local_fs.createFile(path) catch |err| {
+        const pid: u32 = @bitCast(std.posix.system.getpid());
+        const tmp = std.fmt.bufPrint(&self.tmp_buf, "{s}.{d}.zpq-tmp", .{ path, pid }) catch {
+            std.debug.print("zpq query: cannot write profile {s}: NameTooLong\n", .{path});
+            return error.BadArgs;
+        };
+        self.trace_fd = local_fs.createNewFile(tmp) catch |err| {
             std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
             return error.BadArgs;
         };
+        self.tmp_len = tmp.len;
     }
 
+    fn tmpPath(self: *const ProfileOut) []const u8 {
+        return self.tmp_buf[0..self.tmp_len];
+    }
+
+    /// Drop a trace not yet written whole: its temporary file goes, and `trace_path` is left as it was.
     fn close(self: *ProfileOut) void {
-        if (self.trace_fd) |fd| local_fs.close(fd);
+        const fd = self.trace_fd orelse return;
+        local_fs.close(fd);
         self.trace_fd = null;
+        local_fs.removeFile(self.tmpPath());
     }
 
-    fn discard(self: *ProfileOut) void {
-        if (self.trace_fd == null) return;
-        self.close();
-        local_fs.removeFile(self.trace_path.?);
-    }
-
-    /// The trace streams to its file, never held whole in memory; the summary, a few KB, goes to stderr.
-    fn emit(self: ProfileOut, gpa: std.mem.Allocator, io: std.Io, p: *zpq.profile.Profiler) !void {
+    /// The trace streams to its file, never held whole in memory, and replaces `trace_path` once complete; the
+    /// summary, a few KB, goes to stderr.
+    fn emit(self: *ProfileOut, gpa: std.mem.Allocator, io: std.Io, p: *zpq.profile.Profiler) !void {
         p.finish();
         if (self.trace_fd) |fd| {
             const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
@@ -752,6 +762,13 @@ const ProfileOut = struct {
             wrote catch |err| {
                 const why = if (fw.err) |e| @errorName(e) else @errorName(err);
                 std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, why });
+                return error.BadArgs;
+            };
+            local_fs.close(fd);
+            self.trace_fd = null;
+            local_fs.rename(self.tmpPath(), self.trace_path.?) catch |err| {
+                local_fs.removeFile(self.tmpPath());
+                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, @errorName(err) });
                 return error.BadArgs;
             };
         }

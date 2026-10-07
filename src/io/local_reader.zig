@@ -193,7 +193,7 @@ pub const File = struct {
 };
 
 /// One read: `len` bytes at `off`. `charge` is the window bytes it accounts for (its row group's on the first unit),
-/// and `ticket` that first unit's turn to be admitted.
+/// and `ticket` its row group's turn to be admitted.
 const Unit = struct { file: u32, rg: u32, off: u64, len: u32, charge: u64 = 0, ticket: u32 = 0 };
 
 pub const Stats = struct {
@@ -327,7 +327,7 @@ pub const Reader = struct {
             }
             if (units > 0) {
                 self.units.items[first_unit].charge = f.rg_bytes[rg];
-                self.units.items[first_unit].ticket = self.tickets;
+                for (self.units.items[first_unit..]) |*u| u.ticket = self.tickets;
                 self.tickets += 1;
             }
             f.rg_units_left[rg] = .init(units);
@@ -439,17 +439,18 @@ pub const Reader = struct {
         };
     }
 
-    /// Whether unit `u` may be read now, taking its window charge if so. A row group's charge rides on its first
-    /// unit, so the rest (charge 0) belong to a row group already admitted and always go: holding them back would wait
-    /// on a release only that row group can give. First units go strictly in ticket order, so a later row group can
-    /// never take the room an earlier one needs (an ordered scan waits on the earlier one first); with one admitter
-    /// at a time and releases only shrinking what is outstanding, the check and the charge are one reservation. A
-    /// first unit goes when the window has room, or when nothing is outstanding, so a row group bigger than the
-    /// window still reads, alone.
+    /// Whether unit `u` may be read now, taking its row group's window charge if it is the first. First units go
+    /// strictly in ticket order, so a later row group can never take the room an earlier one needs (an ordered scan
+    /// waits on the earlier one first); with one admitter at a time and releases only shrinking what is outstanding,
+    /// the check and the charge are one reservation. A first unit goes when the window has room, or when nothing is
+    /// outstanding, so a row group bigger than the window still reads, alone. The rest of a row group's units go once
+    /// it is admitted, whatever room is left: holding them back would wait on a release only that row group can give,
+    /// and letting them go before would read a row group the window has no room for.
     fn admit(self: *Reader, u: Unit) bool {
-        if (u.charge == 0) return true;
         if (self.cancel.load(.acquire)) return false;
-        if (self.admit_next.load(.acquire) != u.ticket) return false;
+        const next = self.admit_next.load(.acquire);
+        if (u.charge == 0) return next > u.ticket;
+        if (next != u.ticket) return false;
         // Only this admitter adds to `submitted`, and only admitted row groups add to `released`.
         const out = self.submitted.load(.monotonic) -| self.released.load(.acquire);
         if (out + u.charge > self.cfg.window and out != 0) return false;
@@ -871,4 +872,45 @@ test "failed row group gates do not release bytes never admitted" {
     rd.threads.clearRetainingCapacity();
     for (0..2) |g| gate.done(gate.ctx, g, 1);
     try testing.expect(rd.released.load(.acquire) <= rd.submitted.load(.acquire));
+}
+
+test "continuation reads wait until their row group is admitted" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 8 << 20);
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| {
+        if (mode == .uring and !uringAvailable()) continue;
+        try continuationsWaitFor(mode, path, data.len);
+    }
+}
+
+fn continuationsWaitFor(mode: Mode, path: []const u8, size: usize) !void {
+    const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 3, .block = 64 << 10, .window = 4096 });
+    defer rd.destroy();
+    const f = try rd.openFile(path, size);
+    var store: [2][1]Range = .{ .{.{ .start = 0, .end = 4 << 20 }}, .{.{ .start = 4 << 20, .end = 8 << 20 }} };
+    var plans: [2]?[]Range = .{ &store[0], &store[1] };
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    // Keep the first row group's window charge: the second cannot yet be admitted.
+    // Its continuation units must not read behind its waiting first unit.
+    const deadline = nowNs() + 200 * std.time.ns_per_ms;
+    while (nowNs() < deadline and rd.stats.bytes.load(.acquire) <= rd.submitted.load(.acquire)) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+    const read = rd.stats.bytes.load(.acquire);
+    const charged = rd.submitted.load(.acquire);
+    try testing.expectEqual(@as(u64, 4 << 20), charged);
+    try testing.expectEqual(charged, read);
+    gate.done(gate.ctx, 0, 1);
+    try gate.wait(gate.ctx, 1);
+    gate.done(gate.ctx, 1, 1);
 }

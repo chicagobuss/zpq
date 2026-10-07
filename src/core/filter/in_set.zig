@@ -23,7 +23,8 @@ const str_direct_max = 2;
 const window = 8;
 /// 128 KiB of bitmap: within L2, and one load per row beats any probe.
 const bitmap_max_bits = 1 << 20;
-/// Slots per literal the window table may grow to before the sorted fallback; 4 is where it starts.
+/// The window table grows to at most the power of two at or above this many slots per literal (so under twice it), plus
+/// the window, before the sorted fallback; 4 is where it starts.
 const max_growth = 64;
 
 pub const InSet = struct {
@@ -58,7 +59,7 @@ inline fn home(x: u64, bits: u6) usize {
 
 /// Slots `[0, 2^bits + window)` with each key at most `window - 1` past `home(key, bits)`; the window never wraps.
 /// Doubles the table until every key fits, which a load factor of 1/4 makes the first try almost always; null once it
-/// would pass `max_growth` slots per key, as keys picked to share a home can force.
+/// would pass the power of two at or above `max_growth` slots per key, as keys picked to share a home can force.
 fn windowTable(comptime K: type, arena: std.mem.Allocator, keys: []const K, empty: K) !?struct { slots: []K, bits: u6 } {
     const start = std.math.log2_int_ceil(usize, @max(keys.len * 4, 16));
     const limit = std.math.log2_int_ceil(usize, @max(keys.len * max_growth, 16));
@@ -468,4 +469,37 @@ test "regression: nine adversarial integer literals bind within one MiB" {
     const set = try NumSet(i64).init(fixed.allocator(), &literals);
     for (literals) |literal| try testing.expect(set.contains(literal));
     try testing.expect(!set.contains(1));
+}
+
+test "regression: adversarial string homes use the sorted fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values: [9][]const u8 = undefined;
+    var n: usize = 0;
+    for (0..100_000) |i| {
+        const v = try std.fmt.allocPrint(a, "collision-{d}", .{i});
+        if (home(StrSet.hash(v), 10) != 0) continue;
+        values[n] = v;
+        n += 1;
+        if (n == values.len) break;
+    }
+    try testing.expectEqual(values.len, n);
+    const set = try StrSet.init(a, &values);
+    try testing.expect(set.sorted);
+    for (values) |v| try testing.expect(set.contains(v));
+    try testing.expect(!set.contains("") and !set.contains("missing"));
+}
+
+test "regression: float bit collisions keep IEEE equality in the sorted fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var values: [9]f64 = undefined;
+    for (&values, 0..) |*v, i| v.* = @bitCast(@as(u64, i) *% homeInverse());
+    const set = try NumSet(f64).init(a, &values);
+    try testing.expectEqualStrings("sorted", @tagName(set.how));
+    for (values) |v| try testing.expect(set.contains(v));
+    try testing.expect(set.contains(-0.0));
+    try testing.expect(!set.contains(std.math.nan(f64)) and !set.contains(1.0));
 }

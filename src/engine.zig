@@ -1728,6 +1728,7 @@ fn openInputs(
         if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
             var src: S3Membership = .init(read_ctx, creds, pool, specs);
+            src.profiler = args.profiler;
             membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
         };
 
@@ -2041,6 +2042,8 @@ const S3Membership = struct {
     creds: s3.Credentials,
     pool: *s3.Pool(POOL_SIZE),
     specs: []const FetchSpec,
+    /// Records each filter fetch as a span when set.
+    profiler: ?*profile.Profiler = null,
     /// What this query has measured: a request's fixed cost, and one connection's bandwidth. Null until measured.
     rtt_ns: ?u64 = null,
     bytes_per_s: ?f64 = null,
@@ -2132,7 +2135,16 @@ const S3Membership = struct {
         }
         if (jobs.items.len > 0) {
             const t0 = nowMonoNs();
-            const got = try s3.fetchJobs(self.ctx.io, self.pool, self.ctx.gpa, arena, self.creds, jobs.items, READ_CONCURRENCY);
+            const got = try s3.fetchJobs(
+                self.ctx.io,
+                self.pool,
+                self.ctx.gpa,
+                arena,
+                self.creds,
+                jobs.items,
+                READ_CONCURRENCY,
+                self.profiler,
+            );
             self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
     }

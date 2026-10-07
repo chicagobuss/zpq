@@ -1103,3 +1103,23 @@ test "lambda profiles an S3 query: requests, coalescing and footer fetches land 
         try std.testing.expect(resp.len < 64 * 1024);
     }
 }
+
+test "lambda profile honors the request memory budget without changing the answer" {
+    const a = std.testing.allocator;
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambda(a, endpoint);
+    defer killChild(&child);
+    const resp = try invoke(&server, a, "{\"inputs\":[\"ci/fixtures/parquet/json_escape.parquet\"]," ++
+        "\"aggregate\":\"count(*) AS n\",\"profile\":true,\"max_memory\":1048576}");
+    defer a.free(resp);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("agg").?.object.get("n").?.integer);
+    const prof = parsed.value.object.get("profile").?.object;
+    const cap = prof.get("event_cap").?.integer;
+    try std.testing.expect(cap > 0 and cap < 1024);
+    try std.testing.expect(prof.get("events").?.integer <= cap + 4096);
+}

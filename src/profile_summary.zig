@@ -821,3 +821,24 @@ test "the text summary says busy, not CPU, and leaves out pruning a write does n
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| try testing.expect(line.len <= 80);
 }
+
+test "summary JSON preserves whole multibyte column tails and replaces invalid bytes" {
+    if (!profile.enabled) return error.SkipZigTest;
+    const p = try fakeProfiler();
+    defer p.destroy();
+    const name = "prefix" ++ "\u{e9}" ++ @as([127]u8, @splat('a'));
+    p.setColumns(&.{ name, "invalid\xffname" });
+    var s: Summary = .{};
+    s.n_top = 2;
+    s.top[0] = .{ .col = 0 };
+    s.top[1] = .{ .col = 1 };
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJson(s, p, &aw.writer);
+    try testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const top = parsed.value.object.get("top_chunks").?.array.items;
+    try testing.expectEqualStrings(@as([127]u8, @splat('a'))[0..], top[0].object.get("column").?.string);
+    try testing.expectEqualStrings("invalid\u{fffd}name", top[1].object.get("column").?.string);
+}

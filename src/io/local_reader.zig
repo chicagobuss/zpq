@@ -421,7 +421,8 @@ pub const Reader = struct {
 
     fn unitDone(self: *Reader, u: Unit) void {
         const f = self.files.items[u.file];
-        _ = self.stats.bytes.fetchAdd(u.len, .monotonic);
+        // The file's bytes, not the page padding past its end; the window charge stays page-rounded.
+        _ = self.stats.bytes.fetchAdd(@min(u.len, f.size -| u.off), .monotonic);
         if (f.rg_units_left[u.rg].fetchSub(1, .acq_rel) == 1) {
             f.rg_ready[u.rg].store(1, .release);
             _ = linux.futex_3arg(&f.rg_ready[u.rg].raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
@@ -913,4 +914,28 @@ fn continuationsWaitFor(mode: Mode, path: []const u8, size: usize) !void {
     gate.done(gate.ctx, 0, 1);
     try gate.wait(gate.ctx, 1);
     gate.done(gate.ctx, 1, 1);
+}
+
+test "local read bytes exclude EOF padding without shrinking the window charge" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", "x", &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| {
+        if (mode == .uring and !uringAvailable()) continue;
+        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 1 });
+        defer rd.destroy();
+        const f = try rd.openFile(path, 1);
+        var ranges = [_]Range{.{ .start = 0, .end = 1 }};
+        const plans = [_]?[]Range{&ranges};
+        try rd.planFile(f, &plans, 0);
+        try rd.start();
+        const gate = f.gate();
+        try gate.wait(gate.ctx, 0);
+        try testing.expectEqual(@as(u64, 1), rd.stats.bytes.load(.acquire));
+        try testing.expectEqual(pageLen(), rd.submitted.load(.acquire));
+        gate.done(gate.ctx, 0, 1);
+        try testing.expectEqual(pageLen(), rd.released.load(.acquire));
+    }
 }

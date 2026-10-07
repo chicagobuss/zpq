@@ -3102,3 +3102,55 @@ test "float min/max: NaN above every number, -0 below +0, the same in any order 
         }
     };
 }
+
+test "zero float bounds never prove sign even with known zero NaNs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ schema.Type.FLOAT, schema.Type.DOUBLE }) |physical| {
+        const T = if (physical == .FLOAT) f32 else f64;
+        const U = if (physical == .FLOAT) u32 else u64;
+        var meta = try testI64Meta(a, .empty, 100, .REQUIRED);
+        meta.schema.items[1].type = physical;
+        const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = physical, .expr_type = .f64 } };
+        const Case = struct { lo: T, hi: T, min_folds: bool, max_folds: bool };
+        for ([_]Case{
+            .{ .lo = -0.0, .hi = 0.0, .min_folds = false, .max_folds = false },
+            .{ .lo = 0.0, .hi = 1.0, .min_folds = false, .max_folds = true },
+            .{ .lo = -1.0, .hi = -0.0, .min_folds = true, .max_folds = false },
+            .{ .lo = 1.5, .hi = 2.5, .min_folds = true, .max_folds = true },
+        }) |c| {
+            var lo: [@sizeOf(T)]u8 = undefined;
+            var hi: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(U, &lo, @bitCast(c.lo), .little);
+            std.mem.writeInt(U, &hi, @bitCast(c.hi), .little);
+            var path: schema.StringList = .empty;
+            try path.append(a, "x");
+            var chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+            try chunks.append(a, .{
+                .file_path = null,
+                .file_offset = 0,
+                .meta_data = .{
+                    .type = physical,
+                    .encodings = .empty,
+                    .path_in_schema = path,
+                    .codec = .UNCOMPRESSED,
+                    .num_values = 100,
+                    .total_uncompressed_size = 0,
+                    .total_compressed_size = 0,
+                    .data_page_offset = 0,
+                    .index_page_offset = null,
+                    .dictionary_page_offset = null,
+                    .statistics = .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 },
+                },
+            });
+            const rg: schema.RowGroup = .{ .columns = chunks, .total_byte_size = 0, .num_rows = 100 };
+            inline for (.{ AggFunc.min, AggFunc.max }) |func| {
+                const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "x", .result = .f64 };
+                var state = Accumulator.init(call);
+                try testing.expectEqual(if (func == .min) c.min_folds else c.max_folds,
+                    try updateOneFromStats(&state, call, &rg, &meta));
+            }
+        }
+    }
+}

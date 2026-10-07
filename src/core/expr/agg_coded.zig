@@ -477,8 +477,11 @@ fn foldGroupedCall(
         },
         else => |e| vals_col = try expr_eval.evalExpr(ra, batch, lookup, e),
     }
-    // Strings and anything unusual: the row fold, with group ids expanded from composites.
-    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64) and call.result != .bytes;
+    // Strings, float min/max and anything unusual: the row fold, with group ids expanded from composites. A float
+    // min/max keeps the first value it meets and then only a strictly lesser (greater) one, so a NaN met first stays;
+    // per-composite partials merged afterwards would answer differently whenever NaN is among the values.
+    const float_extreme = vals_col == .f64 and (call.func == .min or call.func == .max);
+    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64) and call.result != .bytes and !float_extreme;
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -787,4 +790,32 @@ test "gatherSelected keeps the selected rows of a coded or plain column, in orde
         try testing.expectEqualSlices(f64, want.items, got.f64.values);
         try testing.expectEqualSlices(u32, want_defs.items, got.f64.def_levels.?);
     }
+}
+
+test "regression: grouped coded keys do not invent infinities for all-NaN values" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dict = [_][]const u8{"key"};
+    const codes: [256]u32 = @splat(0);
+    const vals: [256]f64 = @splat(std.math.nan(f64));
+    const cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } },
+        .{ .f64 = .{ .values = &vals } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .min, .arg = arg, .result = .f64, .where = null, .alias = "lo" },
+        .{ .func = .max, .arg = arg, .result = .f64, .where = null, .alias = "hi" },
+    };
+    var table = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer table.deinit();
+    var sel = try Sel.init(a, vals.len);
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vals.len };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
+    try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
+    try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
 }

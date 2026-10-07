@@ -954,3 +954,21 @@ test "local read bytes exclude EOF padding without shrinking the window charge" 
         try testing.expectEqual(pageLen(), rd.released.load(.acquire));
     }
 }
+
+
+test "residentShare bounds sampled allocation and partial-page windows" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const mapping = try posix.mmap(null, 4096 * page + 1, .{ .READ = true, .WRITE = true }, .{
+        .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true,
+    }, -1, 0);
+    defer posix.munmap(mapping);
+    @memset(mapping, 1);
+    var storage: [2048]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&storage);
+    try testing.expectEqual(@as(f64, 1), residentShare(bounded.allocator(), mapping));
+    bounded.reset();
+    try testing.expectEqual(@as(f64, 1), residentShare(bounded.allocator(), mapping[0 .. 32 * page - 1]));
+    bounded.reset();
+    try testing.expectEqual(@as(f64, 0), residentShare(bounded.allocator(), mapping[0..0]));
+}

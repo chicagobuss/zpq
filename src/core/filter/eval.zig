@@ -55,16 +55,8 @@ pub fn evalLeaf(
     sel: *selection.SelectionVector,
 ) void {
     std.debug.assert(values.len == sel.len);
-    var i: usize = 0;
-    while (i < values.len) : (i += 1) {
-        if (!sel.isActive(i)) continue;
-        if (rowIsNull(def_levels, max_def, i)) {
-            sel.set(i, false);
-            continue;
-        }
-        if (!ast.applyOp(T, values[i], op, needle)) {
-            sel.set(i, false);
-        }
+    switch (op) {
+        inline else => |o| filterWords(T, T, o, values, def_levels, max_def, needle, sel.mask),
     }
 }
 
@@ -80,16 +72,72 @@ pub fn evalLeafUnsigned(
     sel: *selection.SelectionVector,
 ) void {
     std.debug.assert(values.len == sel.len);
-    var i: usize = 0;
-    while (i < values.len) : (i += 1) {
-        if (!sel.isActive(i)) continue;
-        if (rowIsNull(def_levels, max_def, i)) {
-            sel.set(i, false);
-            continue;
-        }
-        const v: u64 = @as(U, @bitCast(values[i]));
-        if (!ast.applyOp(u64, v, op, needle)) sel.set(i, false);
+    // A needle past the lane's range compares as `u64` would: every stored value is below it.
+    const n = std.math.cast(U, needle) orelse {
+        const holds = switch (op) {
+            .Eq, .Gt, .GtEq => false,
+            .NotEq, .Lt, .LtEq => true,
+        };
+        if (holds) evalNotNull(def_levels, max_def, sel) else @memset(sel.mask, 0);
+        return;
+    };
+    switch (op) {
+        inline else => |o| filterWords(@TypeOf(values[0]), U, o, values, def_levels, max_def, n, sel.mask),
     }
+}
+
+/// `mask[w] &= rows w*64.. present and passing `v op needle``: 64 rows compared as one vector into a word of results,
+/// then ANDed with validity. No branch looks at a row; a word the selection already cleared is skipped whole. `C` is
+/// the type compared in (an unsigned twin bit-casts the lane).
+fn filterWords(
+    comptime L: type,
+    comptime C: type,
+    comptime op: ast.Operator,
+    values: []const L,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    needle: C,
+    mask: []u64,
+) void {
+    const V = @Vector(64, C);
+    const nv: V = @splat(needle);
+    const full = values.len / 64;
+    for (mask[0..full], 0..) |*word, w| {
+        if (word.* == 0) continue;
+        const v: V = @bitCast(@as(@Vector(64, L), values[w * 64 ..][0..64].*));
+        var bits: u64 = @bitCast(compare(op, V, v, nv));
+        if (def_levels) |dl| {
+            const d: @Vector(64, u32) = dl[w * 64 ..][0..64].*;
+            bits &= @bitCast(d == @as(@Vector(64, u32), @splat(max_def)));
+        }
+        word.* &= bits;
+    }
+    if (full * 64 < values.len) {
+        const word = &mask[full];
+        var bits: u64 = 0;
+        for (values[full * 64 ..], full * 64..) |x, i| {
+            const pass = ast.applyOp(C, @bitCast(x), op, needle) and !rowIsNull(def_levels, max_def, i);
+            bits |= @as(u64, @intFromBool(pass)) << @intCast(i - full * 64);
+        }
+        word.* &= bits;
+    }
+}
+
+inline fn compare(comptime op: ast.Operator, comptime V: type, a: V, b: V) @Vector(@typeInfo(V).vector.len, bool) {
+    return switch (op) {
+        .Eq => a == b,
+        .NotEq => a != b,
+        .Lt => a < b,
+        .LtEq => a <= b,
+        .Gt => a > b,
+        .GtEq => a >= b,
+    };
+}
+
+/// `sel &= present`, for a predicate every present value passes.
+fn evalNotNull(def_levels: ?[]const u32, max_def: u32, sel: *selection.SelectionVector) void {
+    const dl = def_levels orelse return;
+    for (dl, 0..) |d, i| if (d < max_def) sel.set(i, false);
 }
 
 /// `IS NULL` / `IS NOT NULL` against a column's definition levels.
@@ -879,5 +927,61 @@ test "a coded column filters exactly as its values do, nulls and same-column AND
         const coded_cols = [_]Batch.Column{ coded, .{ .i32 = .{ .values = &ints } } };
         try evaluate(f, &.{ .cols = &coded_cols, .num_rows = vals.len }, &got, &lookup, a);
         try testing.expectEqualSlices(u64, want.mask, got.mask);
+    }
+}
+
+test "leaf kernels select exactly what a row-by-row compare does: every op, nulls, NaN, ±0, unsigned, ragged tails" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x5e1);
+    const r = prng.random();
+    const ops = [_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq };
+    for ([_]usize{ 0, 1, 63, 64, 65, 200, 1000 }) |n| {
+        const defs = try a.alloc(u32, n);
+        for (defs) |*d| d.* = @intFromBool(r.uintLessThan(u8, 5) != 0);
+        const start = try a.alloc(bool, n);
+        for (start) |*s| s.* = r.uintLessThan(u8, 4) != 0;
+        inline for (.{ i32, i64, f32, f64 }) |T| {
+            const vals = try a.alloc(T, n);
+            const specials = [_]f64{ 0.0, -0.0, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 3, -3 };
+            for (vals) |*v| v.* = if (@typeInfo(T) == .float)
+                @floatCast(specials[r.uintLessThan(usize, specials.len)])
+            else
+                r.intRangeAtMost(T, -4, 4);
+            const needles: []const T = if (@typeInfo(T) == .float)
+                &.{ 0.0, -0.0, std.math.nan(T), 3, std.math.inf(T) }
+            else
+                &.{ 0, 3, -4, std.math.minInt(T), std.math.maxInt(T) };
+            for (ops) |op| for (needles) |needle| for ([_]bool{ false, true }) |nullable| {
+                var sel = try selection.SelectionVector.init(a, n);
+                for (start, 0..) |s, i| sel.set(i, s);
+                const dl: ?[]const u32 = if (nullable) defs else null;
+                evalLeaf(T, vals, dl, 1, op, needle, &sel);
+                for (0..n) |i| {
+                    const want = start[i] and !(nullable and defs[i] == 0) and ast.applyOp(T, vals[i], op, needle);
+                    try testing.expectEqual(want, sel.isActive(i));
+                }
+            };
+        }
+        inline for (.{ u32, u64 }) |U| {
+            const S = @Int(.signed, @bitSizeOf(U));
+            const vals = try a.alloc(S, n);
+            for (vals) |*v| {
+                const u: U = if (r.boolean()) r.uintLessThan(U, 5) else std.math.maxInt(U) - r.uintLessThan(U, 3);
+                v.* = @bitCast(u);
+            }
+            const needles = [_]u64{ 0, 3, std.math.maxInt(U), std.math.maxInt(U) - 1, 1 << 40, std.math.maxInt(u64) };
+            for (ops) |op| for (needles) |needle| {
+                var sel = try selection.SelectionVector.init(a, n);
+                for (start, 0..) |s, i| sel.set(i, s);
+                evalLeafUnsigned(U, vals, defs, 1, op, needle, &sel);
+                for (0..n) |i| {
+                    const v: u64 = @as(U, @bitCast(vals[i]));
+                    const want = start[i] and defs[i] == 1 and ast.applyOp(u64, v, op, needle);
+                    try testing.expectEqual(want, sel.isActive(i));
+                }
+            };
+        }
     }
 }

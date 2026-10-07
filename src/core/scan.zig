@@ -378,6 +378,67 @@ fn parseFooters(
     return .{ .ok = parsed };
 }
 
+/// Ordered GROUP BY whose results depend on the order partials meet in (`orderSensitive`): each finished block merges
+/// into one table, strictly in block order, as soon as every block before it has, and its own table is freed. A worker
+/// starts block `b` only once `b` is fewer than `ahead` blocks past the first unmerged one, so at most `ahead` block
+/// tables are alive beside the merged one, about what one table per worker holds.
+const BlockMerge = struct {
+    tables: []expr_agg.GroupTable,
+    merged: *expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    gpa: std.mem.Allocator,
+    done: []std.atomic.Value(bool),
+    /// The first block not yet merged.
+    next: std.atomic.Value(usize) = .init(0),
+    ahead: usize,
+    lock: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    /// Wait until block `b` may start; false once another worker has failed.
+    fn awaitTurn(self: *BlockMerge, b: usize) bool {
+        while (b >= self.next.load(.acquire) + self.ahead) {
+            if (self.failed.load(.acquire)) return false;
+            std.Thread.yield() catch {};
+        }
+        return !self.failed.load(.acquire);
+    }
+
+    /// Block `b` is complete: merge it, and any finished after it, once every earlier block has merged. Whoever holds
+    /// the lock merges every block ready by then, so none is left behind.
+    fn finish(self: *BlockMerge, b: usize) !void {
+        self.done[b].store(true, .release);
+        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.Thread.yield() catch {};
+        defer self.lock.store(false, .release);
+        var n = self.next.load(.monotonic);
+        while (n < self.tables.len and self.done[n].load(.acquire)) : (n += 1) {
+            const src = &self.tables[n];
+            const len = self.calls.len;
+            for (src.keys.items, 0..) |key, g| {
+                const id = try self.merged.getOrInsert(key, self.calls, src.first.items[g]);
+                const dst = self.merged.accumulators.items[@as(usize, id) * len ..][0..len];
+                for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| mergeOwnedAccumulator(d, sa, self.gpa);
+            }
+            src.deinit();
+            src.* = expr_agg.GroupTable.init(self.gpa, 0);
+            self.next.store(n + 1, .release);
+        }
+    }
+
+    fn fail(self: *BlockMerge) void {
+        self.failed.store(true, .release);
+    }
+};
+
+/// Whether merging partial results in another order can change their bits: float sums and averages round
+/// differently, and a float min or max may come out -0 or +0. Integer and string results never do.
+fn orderSensitive(calls: []const expr_agg.AggCall) bool {
+    for (calls) |c| {
+        if (c.func == .count) continue;
+        if (c.result == .f64 or c.result == .avg_f64) return true;
+    }
+    return false;
+}
+
 /// One worker thread's slice of work.
 const Worker = struct {
     gpa: std.mem.Allocator,
@@ -406,6 +467,8 @@ const Worker = struct {
     /// whole through `block_cursor` and folded in order into `group_tables[b]`.
     blocks: ?[]const usize = null,
     block_cursor: ?*std.atomic.Value(usize) = null,
+    /// With `blocks`: where finished blocks merge, in block order.
+    block_merge: ?*BlockMerge = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -423,6 +486,7 @@ fn workerRun(w: *Worker) void {
     w.timings.prof = prof;
     workerRunErr(w, prof, &items) catch |e| {
         w.err = e;
+        if (w.block_merge) |m| m.fail();
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
     // doing the real work. (Ordered blocks release theirs as each finishes.)
@@ -446,15 +510,19 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
 
     var next: usize = 0;
     var block_end: usize = 0;
+    var block: ?usize = null;
     var table: ?*expr_agg.GroupTable = if (w.blocks == null and w.group_tables.len > 0) &w.group_tables[w.index] else null;
     while (true) {
         const claimed: ?usize = if (w.blocks) |bounds| claim: {
             while (next == block_end) {
-                if (table) |t| t.releaseSlack();
+                if (block) |done| try w.block_merge.?.finish(done);
+                block = null;
                 const b = w.block_cursor.?.fetchAdd(1, .monotonic);
                 if (b + 1 >= bounds.len) break :claim null;
+                if (!w.block_merge.?.awaitTurn(b)) break :claim null;
                 next = bounds[b];
                 block_end = bounds[b + 1];
+                block = b;
                 table = &w.group_tables[b];
             }
             next += 1;
@@ -760,10 +828,12 @@ pub fn runMultiAggregate(
         .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
     };
 
-    // GROUP BY tables. Unordered: one per worker. Ordered: one per fixed block of the work list, so which rows fold
-    // into which table, and in what order, doesn't depend on the number of workers or their timing.
+    // GROUP BY tables. One per worker, unless results depend on the order partials merge in and order is asked for:
+    // then one per fixed block of the work list, so which rows fold into which table, and the order the tables merge
+    // in, doesn't depend on the number of workers or their timing (see `BlockMerge`).
     var block_bounds: ?[]usize = null;
-    const n_tables: usize = if (group_by_keys == null) 0 else if (args.unordered) n_workers else blk: {
+    const use_blocks = group_by_keys != null and !args.unordered and orderSensitive(agg_calls);
+    const n_tables: usize = if (group_by_keys == null) 0 else if (!use_blocks) n_workers else blk: {
         const n_blocks = @max(1, @min(work_items.items.len, group_blocks_max));
         const bounds = try arena.alloc(usize, n_blocks + 1);
         for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_blocks;
@@ -779,6 +849,21 @@ pub fn runMultiAggregate(
     }
     defer for (group_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
+    var merged_table = expr_agg.GroupTable.init(gpa, 0);
+    merged_table.shared = &group_budget;
+    defer merged_table.deinit();
+    var block_merge: ?BlockMerge = if (use_blocks) .{
+        .tables = group_tables,
+        .merged = &merged_table,
+        .calls = agg_calls,
+        .gpa = gpa,
+        .done = blk: {
+            const d = try arena.alloc(std.atomic.Value(bool), n_tables);
+            @memset(d, .init(false));
+            break :blk d;
+        },
+        .ahead = n_workers,
+    } else null;
 
     var work_cursor = std.atomic.Value(usize).init(0);
     for (workers, 0..) |*w, wi| {
@@ -797,6 +882,7 @@ pub fn runMultiAggregate(
             .group_tables = group_tables,
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
+            .block_merge = if (block_merge) |*m| m else null,
         };
     }
 
@@ -858,19 +944,20 @@ pub fn runMultiAggregate(
         // Sorting lightweight references lets equal keys from different
         // tables meet next to each other. Their accumulator ownership is
         // folded directly into one temporary row state, then materialized;
-        // the tables remain the only GROUP BY tables in memory. Equal keys
-        // merge in table order, which for ordered blocks is input order: the
-        // same partial sums meet in the same order at every `-j`.
+        // the tables remain the only GROUP BY tables in memory. Blocks have
+        // already merged, in input order, into one table; per-worker tables
+        // hold only results whose bits no merge order changes.
+        const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else group_tables;
         const GroupRef = struct {
             table: u32,
             group: u32,
         };
         var total_group_refs: usize = 0;
-        for (group_tables) |gt| total_group_refs += gt.keys.items.len;
+        for (out_tables) |gt| total_group_refs += gt.keys.items.len;
         const group_refs = try gpa.alloc(GroupRef, total_group_refs);
         defer gpa.free(group_refs);
         var ref_i: usize = 0;
-        for (group_tables, 0..) |gt, ti| {
+        for (out_tables, 0..) |gt, ti| {
             for (0..gt.keys.items.len) |gi| {
                 group_refs[ref_i] = .{
                     .table = @intCast(ti),
@@ -895,7 +982,7 @@ pub fn runMultiAggregate(
                 };
             }
         };
-        const ref_sorter = GroupRefSorter{ .tables = group_tables };
+        const ref_sorter = GroupRefSorter{ .tables = out_tables };
         std.mem.sort(GroupRef, group_refs, ref_sorter, GroupRefSorter.lessThan);
 
         var distinct_groups: usize = 0;
@@ -967,7 +1054,7 @@ pub fn runMultiAggregate(
 
             var first: u64 = std.math.maxInt(u64);
             for (group_refs[group_start..group_end]) |ref| {
-                const gt = &group_tables[ref.table];
+                const gt = &out_tables[ref.table];
                 first = @min(first, gt.first.items[ref.group]);
                 const acc_start = @as(usize, ref.group) * agg_calls.len;
                 for (merged, gt.accumulators.items[acc_start..][0..agg_calls.len]) |*dst, *src| {
@@ -1014,7 +1101,7 @@ pub fn runMultiAggregate(
         // Result rows own any strings they need; table keys and accumulator
         // winners can now be released before returning (the deferred deinit
         // then finds them empty).
-        for (group_tables) |*gt| {
+        for (out_tables) |*gt| {
             gt.deinit();
             gt.* = expr_agg.GroupTable.init(gpa, 0);
         }
@@ -1731,6 +1818,8 @@ test "runMultiAggregate: skewed work does not let idle workers strand the budget
             .group_by = "group_key",
             .parallelism = parallelism,
             .max_memory = 710000,
+            // Per-worker tables: ordered float results need room for a block's partials too (the next test).
+            .unordered = true,
         }) catch |err| {
             std.debug.print(
                 "-j{d}: skewed work rejected a query with 10% headroom: {s}\n",
@@ -1776,6 +1865,7 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
             .group_by = "group_key",
             .parallelism = parallelism,
             .max_memory = 800,
+            .unordered = true,
         }) catch |err| {
             std.debug.print(
                 "-j{d}: a GROUP BY that fits 800 bytes at -j1 was rejected: {s}\n",
@@ -1785,6 +1875,32 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
         };
         defer freeResult(res);
         try testing.expectEqual(@as(usize, 1), (res.output.group_rows orelse return error.TestUnexpectedResult).len);
+    }
+    // Ordered float sums keep a block's partials beside the merged sums: twice one group's room is enough at every
+    // -j. Integer results merge in any order, so they need no more than unordered (the min/max query below).
+    for ([_]usize{ 1, 2, 4 }) |parallelism| {
+        for ([_]struct { agg: []const u8, budget: usize }{
+            .{ .agg = SPAWN_FIXTURE_AGG, .budget = 1600 },
+            .{ .agg = "count(*) AS n, min(group_key) AS lo, max(group_key) AS hi", .budget = 800 },
+        }) |c| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const res = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .filter = "group_key = 0",
+                .aggregate = c.agg,
+                .group_by = "group_key",
+                .parallelism = parallelism,
+                .max_memory = c.budget,
+            }) catch |err| {
+                std.debug.print("-j{d}: ordered {s} rejected at {d} bytes: {s}\n", .{
+                    parallelism, c.agg[0..@min(c.agg.len, 24)], c.budget, @errorName(err),
+                });
+                return err;
+            };
+            defer freeResult(res);
+            try testing.expectEqual(@as(usize, 1), (res.output.group_rows orelse return error.TestUnexpectedResult).len);
+        }
     }
 }
 
@@ -3036,4 +3152,23 @@ test "ordered GROUP BY: groups as they first appear, and the same float bits at 
             } else first = res;
         }
     };
+}
+
+test "regression: ordered grouping retains the small-query memory budget at one worker" {
+    const path = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = try metadata.readFileSlice(path, testing.allocator);
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{ .{ .name = path, .bytes = bytes }, .{ .name = path, .bytes = bytes } };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const res = try runMultiAggregate(testing.allocator, arena.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n",
+        .group_by = "k",
+        .parallelism = 1,
+        .max_memory = 4096,
+        .scan_all = true,
+    });
+    defer freeResult(res);
+    try testing.expectEqual(@as(usize, 6), res.output.group_rows.?.len);
 }

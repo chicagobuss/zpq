@@ -40,7 +40,7 @@ const usage_text =
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
-    \\            [--scan-all] [--trust-stats] [--fast-levels]
+    \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
     \\            [--bloom-filter COL[:FPP] ...]
     \\            [--format csv|jsonl] [--limit N]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
@@ -73,6 +73,11 @@ const usage_text =
     \\                 whose level stream proves every value is present.
     \\                 Helps supported flat OPTIONAL primitive columns that
     \\                 hold no nulls; off by default while it is new.
+    \\  --unordered    GROUP BY rows in no set order, and float sums and
+    \\                 averages free to differ in their last bits from run
+    \\                 to run. By default groups come in the order they
+    \\                 first appear in the input and the same bits come out
+    \\                 at every -j.
     \\  --max-memory   ceiling on accounted GROUP BY entries across all worker
     \\                 tables. Allocator capacity overhead, finalization
     \\                 scratch, and materialized output rows are outside this
@@ -282,6 +287,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var scan_all: bool = false;
     var trust_stats: bool = false;
     var fast_levels: bool = false;
+    var unordered: bool = false;
     var format: ?engine.PrintFormat = null;
     var limit: ?usize = null;
     var max_memory: ?usize = null;
@@ -371,6 +377,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
         } else if (std.mem.eql(u8, tok, "--fast-levels")) {
             fast_levels = true; // valueless: skip def levels on provably no-null pages
+        } else if (std.mem.eql(u8, tok, "--unordered")) {
+            unordered = true; // valueless: GROUP BY order and float bits may vary
         } else if (std.mem.eql(u8, tok, "--format")) {
             const v = iter.next() orelse {
                 std.debug.print("zpq query: --format requires a value\n", .{});
@@ -559,6 +567,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .scan_all = scan_all,
             .trust_stats = trust_stats,
             .fast_levels = fast_levels,
+            .unordered = unordered,
             .max_memory = engine_max_mem,
             .group_by = group_by,
             .select_cols = select_cols,
@@ -588,6 +597,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .scan_all = scan_all,
             .trust_stats = trust_stats,
             .fast_levels = fast_levels,
+            .unordered = unordered,
             .max_memory = engine_max_mem,
             .group_by = group_by,
             .select_cols = select_cols,
@@ -698,6 +708,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .scan_all = scan_all,
         .trust_stats = trust_stats,
         .fast_levels = fast_levels,
+        .unordered = unordered,
         .max_memory = engine_max_mem,
         .bloom_filters = bloom_filters.items,
         .diag = diag,

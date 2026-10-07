@@ -88,6 +88,14 @@ codec; with it, a plain copy recompresses any chunk stored in another codec. The
 the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one
 (for example, inputs written with different codecs).
 
+**Order** is the input's: every output that lists rows (print, `--format`, `-o` writes and byte copies, several files,
+S3 and Lambda) keeps files in the order given, then row groups, then rows, at any `-j`. `GROUP BY` lists groups in the
+order they first appear in the input (before 0.5.0, in the byte order of their serialized keys), and every aggregate,
+floating-point sums and averages included, comes out with the same bits at every `-j` and on every run: each fixed
+block of row groups folds into its own table and the blocks merge in input order. `--unordered` (the Lambda's
+`"ordered": false`) gives both up for speed: groups in no set order, float aggregates free to differ in their last
+bits.
+
 **Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
 produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
 

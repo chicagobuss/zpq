@@ -174,6 +174,9 @@ pub const QueryArgs = struct {
     /// Encoded execution in aggregate scans (`DecodeOptions.encoded`). `ZPQ_ENCODED=0` in the environment turns it
     /// off too, so one binary can be compared against itself.
     encoded: bool = true,
+    /// `--unordered` (the Lambda's `"ordered": false`): GROUP BY rows in no particular order, floating-point
+    /// aggregates summed in whatever order workers finish (`MultiAggArgs.unordered`).
+    unordered: bool = false,
     max_memory: usize = 512 * 1024 * 1024,
     /// Records the query's spans when set (`--profile`, the Lambda's `"profile"`); see `profile.zig`.
     profiler: ?*profile.Profiler = null,
@@ -371,6 +374,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .trust_stats = args.trust_stats,
         .fast_levels = args.fast_levels,
         .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
+        .unordered = args.unordered,
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,

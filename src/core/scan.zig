@@ -95,6 +95,10 @@ pub const MultiAggArgs = struct {
     fast_levels: bool = false,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
+    /// `--unordered`: GROUP BY output in no particular order, with floating-point aggregates summed in whatever order
+    /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
+    /// at every `-j`; see `group_blocks_max`.
+    unordered: bool = false,
     /// Receives what a failure was about; see `diag.zig`.
     diag: ?*Diag = null,
     /// Records the scan's spans when set; see `profile.zig`.
@@ -245,6 +249,12 @@ const WorkItem = struct {
     accumulators: []expr_agg.Accumulator,
 };
 
+/// Ordered GROUP BY folds the work list in at most this many fixed blocks, each into a table of its own (see
+/// `MultiAggArgs.unordered`). Fixed, not the worker count: the blocks, and so the order partial sums meet in, must not
+/// depend on `-j`. Enough that 32 workers share them evenly; few enough that their tables cost little more than one
+/// per worker.
+const group_blocks_max = 64;
+
 /// Zig's 16 MiB default makes worker creation expensive for short scans. Safe to shrink: these workers decode, and
 /// every nesting path here is bounded.
 pub const WORKER_STACK_SIZE: usize = 1 << 20;
@@ -386,7 +396,13 @@ const Worker = struct {
     rgs_pruned: usize = 0,
     rgs_full_match: usize = 0,
     group_by_keys: ?[]const expr_ast.Expr = null,
-    group_table: ?expr_agg.GroupTable = null,
+    /// GROUP BY tables, shared by every worker: one per worker when unordered (this worker's is `index`), else one per
+    /// block of `blocks`.
+    group_tables: []expr_agg.GroupTable = &.{},
+    /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
+    /// whole through `block_cursor` and folded in order into `group_tables[b]`.
+    blocks: ?[]const usize = null,
+    block_cursor: ?*std.atomic.Value(usize) = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -406,8 +422,8 @@ fn workerRun(w: *Worker) void {
         w.err = e;
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
-    // doing the real work.
-    if (w.group_table) |*gt| gt.releaseSlack();
+    // doing the real work. (Ordered blocks release theirs as each finishes.)
+    if (w.blocks == null and w.group_tables.len > 0) w.group_tables[w.index].releaseSlack();
 }
 
 fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
@@ -425,12 +441,29 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     defer scratch.deinit();
     scratch.prof = prof;
 
+    var next: usize = 0;
+    var block_end: usize = 0;
+    var table: ?*expr_agg.GroupTable = if (w.blocks == null and w.group_tables.len > 0) &w.group_tables[w.index] else null;
     while (true) {
-        const idx = w.cursor.fetchAdd(1, .monotonic);
-        if (idx >= w.work.len) {
+        const claimed: ?usize = if (w.blocks) |bounds| claim: {
+            while (next == block_end) {
+                if (table) |t| t.releaseSlack();
+                const b = w.block_cursor.?.fetchAdd(1, .monotonic);
+                if (b + 1 >= bounds.len) break :claim null;
+                next = bounds[b];
+                block_end = bounds[b + 1];
+                table = &w.group_tables[b];
+            }
+            next += 1;
+            break :claim next - 1;
+        } else claim: {
+            const i = w.cursor.fetchAdd(1, .monotonic);
+            break :claim if (i < w.work.len) i else null;
+        };
+        const idx = claimed orelse {
             release_span = .begin(prof);
             break;
-        }
+        };
         items.* += 1;
         const item = w.work[idx];
         const meta = &w.metas[item.file];
@@ -466,8 +499,13 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             w.rows_kept += rg.num_rows;
         }
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
-        const target: consumer.AggTarget = if (w.group_table) |*gt|
-            .{ .grouped = .{ .calls = sub_agg_calls, .keys = w.group_by_keys.?, .table = gt } }
+        const target: consumer.AggTarget = if (table) |gt|
+            .{ .grouped = .{
+                .calls = sub_agg_calls,
+                .keys = w.group_by_keys.?,
+                .table = gt,
+                .pos_base = expr_agg.firstPosition(idx, 0),
+            } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         try consumer.scanRGForAgg(w.gpa, .{
@@ -720,6 +758,26 @@ pub fn runMultiAggregate(
         .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
     };
 
+    // GROUP BY tables. Unordered: one per worker. Ordered: one per fixed block of the work list, so which rows fold
+    // into which table, and in what order, doesn't depend on the number of workers or their timing.
+    var block_bounds: ?[]usize = null;
+    const n_tables: usize = if (group_by_keys == null) 0 else if (args.unordered) n_workers else blk: {
+        const n_blocks = @max(1, @min(work_items.items.len, group_blocks_max));
+        const bounds = try arena.alloc(usize, n_blocks + 1);
+        for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_blocks;
+        block_bounds = bounds;
+        break :blk n_blocks;
+    };
+    const group_tables = try arena.alloc(expr_agg.GroupTable, n_tables);
+    for (group_tables) |*gt| {
+        // Zero local ceiling: everything is drawn from the shared pool, so an idle table reserves nothing others
+        // could use.
+        gt.* = expr_agg.GroupTable.init(gpa, 0);
+        gt.shared = &group_budget;
+    }
+    defer for (group_tables) |*gt| gt.deinit();
+    var block_cursor = std.atomic.Value(usize).init(0);
+
     var work_cursor = std.atomic.Value(usize).init(0);
     for (workers, 0..) |*w, wi| {
         w.* = .{
@@ -734,20 +792,11 @@ pub fn runMultiAggregate(
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,
-            .group_table = if (group_by_keys != null) blk_gt: {
-                // Zero local ceiling: everything is drawn from the shared pool, so an idle worker reserves nothing
-                // others could use.
-                var gt = expr_agg.GroupTable.init(gpa, 0);
-                gt.shared = &group_budget;
-                break :blk_gt gt;
-            } else null,
+            .group_tables = group_tables,
+            .blocks = block_bounds,
+            .block_cursor = &block_cursor,
         };
     }
-    defer if (group_by_keys != null) {
-        for (workers) |*w| {
-            if (w.group_table) |*gt| gt.deinit();
-        }
-    };
 
     // Workers fold string min/max winners into the items' accumulators; merging below moves them out, so this frees
     // only what a failure leaves behind.
@@ -759,8 +808,8 @@ pub fn runMultiAggregate(
     const t_decode = nowMonoNs();
     if (n_workers > 1) {
         // Started as a tree, so the last worker is not a millisecond late. Spawn failure never returns early (running
-        // threads hold pointers into `arena` and their own `group_table`); workers that never start are idle, and
-        // with no thread at all one inline runner drains the shared cursor.
+        // threads hold pointers into `arena` and `group_tables`); workers that never start are idle, and with no
+        // thread at all one inline runner drains the shared cursor.
         const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
         if (!spawn_util.runTree(Worker, workers, config, workerRun)) workerRun(&workers[0]);
     } else {
@@ -799,50 +848,52 @@ pub fn runMultiAggregate(
             t.core.encode_ns += w.timings.encode_ns;
         }
 
-        // Merge worker groups without building a second GroupTable. The old
+        // Merge the tables' groups without building a second GroupTable. The old
         // coordinator copied every key while the source table was still live,
         // so a one-worker query admitted at the max-memory ceiling briefly
         // held almost twice that much table state during finalization.
         //
         // Sorting lightweight references lets equal keys from different
-        // workers meet next to each other. Their accumulator ownership is
+        // tables meet next to each other. Their accumulator ownership is
         // folded directly into one temporary row state, then materialized;
-        // the worker tables remain the only GROUP BY tables in memory.
+        // the tables remain the only GROUP BY tables in memory. Equal keys
+        // merge in table order, which for ordered blocks is input order: the
+        // same partial sums meet in the same order at every `-j`.
         const GroupRef = struct {
-            worker: u32,
+            table: u32,
             group: u32,
         };
         var total_group_refs: usize = 0;
-        for (workers) |w| {
-            if (w.group_table) |gt| total_group_refs += gt.keys.items.len;
-        }
+        for (group_tables) |gt| total_group_refs += gt.keys.items.len;
         const group_refs = try gpa.alloc(GroupRef, total_group_refs);
         defer gpa.free(group_refs);
         var ref_i: usize = 0;
-        for (workers, 0..) |w, wi| {
-            if (w.group_table) |gt| {
-                for (0..gt.keys.items.len) |gi| {
-                    group_refs[ref_i] = .{
-                        .worker = @intCast(wi),
-                        .group = @intCast(gi),
-                    };
-                    ref_i += 1;
-                }
+        for (group_tables, 0..) |gt, ti| {
+            for (0..gt.keys.items.len) |gi| {
+                group_refs[ref_i] = .{
+                    .table = @intCast(ti),
+                    .group = @intCast(gi),
+                };
+                ref_i += 1;
             }
         }
 
         const GroupRefSorter = struct {
-            workers: []const Worker,
+            tables: []const expr_agg.GroupTable,
 
             fn key(ctx: @This(), ref: GroupRef) []const u8 {
-                return ctx.workers[ref.worker].group_table.?.keys.items[ref.group];
+                return ctx.tables[ref.table].keys.items[ref.group];
             }
 
             pub fn lessThan(ctx: @This(), lhs: GroupRef, rhs: GroupRef) bool {
-                return std.mem.lessThan(u8, ctx.key(lhs), ctx.key(rhs));
+                return switch (std.mem.order(u8, ctx.key(lhs), ctx.key(rhs))) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => lhs.table < rhs.table,
+                };
             }
         };
-        const ref_sorter = GroupRefSorter{ .workers = workers };
+        const ref_sorter = GroupRefSorter{ .tables = group_tables };
         std.mem.sort(GroupRef, group_refs, ref_sorter, GroupRefSorter.lessThan);
 
         var distinct_groups: usize = 0;
@@ -890,6 +941,7 @@ pub fn runMultiAggregate(
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
         // answer: unbuilt rows are empty, unbuilt values NULL.
         const rows = try gpa.alloc([]const AggValue, distinct_groups);
+        const row_first = try arena.alloc(u64, distinct_groups);
         @memset(rows, &.{});
         output.group_rows = rows;
         var rows_built: usize = 0;
@@ -911,8 +963,10 @@ pub fn runMultiAggregate(
                 gpa.free(merged);
             }
 
+            var first: u64 = std.math.maxInt(u64);
             for (group_refs[group_start..group_end]) |ref| {
-                const gt = &workers[ref.worker].group_table.?;
+                const gt = &group_tables[ref.table];
+                first = @min(first, gt.first.items[ref.group]);
                 const acc_start = @as(usize, ref.group) * agg_calls.len;
                 for (merged, gt.accumulators.items[acc_start..][0..agg_calls.len]) |*dst, *src| {
                     mergeOwnedAccumulator(dst, src, gpa);
@@ -922,6 +976,7 @@ pub fn runMultiAggregate(
             const row_vals = try gpa.alloc(AggValue, outputs.len);
             @memset(row_vals, .null_val);
             rows[rows_built] = row_vals;
+            row_first[rows_built] = first;
             for (outputs, row_vals) |out, *val| {
                 switch (out.source) {
                     .key => |k_idx| {
@@ -941,13 +996,25 @@ pub fn runMultiAggregate(
         output.group_cols = cols;
         for (outputs, cols) |out, *col| col.* = try gpa.dupe(u8, out.name);
 
-        // Result rows own any strings they need; worker table keys and
-        // accumulator winners can now be released before returning.
-        for (workers) |*w| {
-            if (w.group_table) |*gt| {
-                gt.deinit();
-                w.group_table = null;
-            }
+        // Ordered: groups as they first appear in the input. The key order above only brought equal keys together.
+        if (!args.unordered) {
+            const perm = try arena.alloc(u32, rows.len);
+            for (perm, 0..) |*p, i| p.* = @intCast(i);
+            std.mem.sort(u32, perm, row_first, struct {
+                fn lt(firsts: []const u64, a: u32, b: u32) bool {
+                    return firsts[a] < firsts[b];
+                }
+            }.lt);
+            const by_key = try arena.dupe([]const AggValue, rows);
+            for (rows, perm) |*r, p| r.* = by_key[p];
+        }
+
+        // Result rows own any strings they need; table keys and accumulator
+        // winners can now be released before returning (the deferred deinit
+        // then finds them empty).
+        for (group_tables) |*gt| {
+            gt.deinit();
+            gt.* = expr_agg.GroupTable.init(gpa, 0);
         }
     } else {
         // Merge each work item exactly ONCE: `work` is shared and claimed dynamically, so folding it per worker would
@@ -2925,4 +2992,45 @@ test "runMultiAggregate: the result destructors free a partly built answer" {
     try testing.checkAllAllocationFailures(fixed.allocator(), runAndFree, args);
     const grouped = .{ &inputs, &meta, "min(s) AS m, count(*) AS n", @as(?[]const u8, "s") };
     try testing.checkAllAllocationFailures(fixed.allocator(), runAndFree, grouped);
+}
+
+test "ordered GROUP BY: groups as they first appear, and the same float bits at every -j" {
+    const path = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{ .{ .name = path, .bytes = bytes }, .{ .name = path, .bytes = bytes } };
+    // Keys first appear zeta, mu, alpha, omega, beta, kappa (24 row groups, mixed in as they go); `x` mixes
+    // magnitudes from 1e-3 to 1e16, so where partial sums meet changes the bits of every float sum.
+    const want_order = [_][]const u8{ "zeta", "mu", "alpha", "omega", "beta", "kappa" };
+    for ([_]bool{ false, true }) |encoded| for ([_][]const u8{ "k", "i" }) |key| {
+        // Results keep state in the arena, so it outlives every one of them.
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var first: ?MultiAggResult = null;
+        defer if (first) |f| freeResult(f);
+        for ([_]usize{ 1, 2, 3, 8, 32, 32, 7 }) |j| {
+            const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .aggregate = "sum(x) AS s, avg(x) AS a, count(*) AS n, min(k) AS m",
+                .group_by = key,
+                .parallelism = j,
+                .encoded = encoded,
+                .scan_all = true,
+            });
+            const rows = res.output.group_rows.?;
+            try testing.expectEqual(want_order.len, rows.len);
+            for (rows, want_order) |r, k| try testing.expectEqualStrings(k, r[4].s);
+            if (first) |f| {
+                for (rows, f.output.group_rows.?) |r, fr| {
+                    try testing.expectEqual(@as(u64, @bitCast(fr[1].f)), @as(u64, @bitCast(r[1].f)));
+                    try testing.expectEqual(@as(u64, @bitCast(fr[2].avg.sum.?)), @as(u64, @bitCast(r[2].avg.sum.?)));
+                    try testing.expectEqual(fr[3].i, r[3].i);
+                }
+                freeResult(res);
+            } else first = res;
+        }
+    };
 }

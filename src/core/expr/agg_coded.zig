@@ -268,6 +268,8 @@ pub fn groupedCoded(
     calls: []const AggCall,
     keys: []const expr_ast.Expr,
     table: *agg.GroupTable,
+    /// `agg.firstPosition` of row 0.
+    pos_base: u64,
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     sel: *const Sel,
@@ -313,10 +315,22 @@ pub fn groupedCoded(
     }
     var scratch: std.ArrayList(u8) = .empty;
     const rows = try ra.alloc(usize, keys.len);
-    // One pass counts selected rows per composite; only composites that occur get resolved.
-    const occur = try compositeCounts(ra, comp, space, sel);
-    for (occur, 0..) |cnt, cp| {
-        if (cnt == 0) continue;
+    // One pass finds each composite's first selected row; only composites that occur get resolved, in the order they
+    // first occur, so a new group's position is where it first appears.
+    const first_row = try compositeFirstRows(ra, comp, space, sel);
+    const order = try ra.alloc(u32, space);
+    var n_occur: usize = 0;
+    for (first_row, 0..) |fr, cp| {
+        if (fr == no_row) continue;
+        order[n_occur] = @intCast(cp);
+        n_occur += 1;
+    }
+    std.mem.sort(u32, order[0..n_occur], first_row, struct {
+        fn lt(fr: []const u32, a: u32, b: u32) bool {
+            return fr[a] < fr[b];
+        }
+    }.lt);
+    for (order[0..n_occur]) |cp| {
         var rem: usize = cp;
         var i: usize = keys.len;
         while (i > 0) {
@@ -325,7 +339,7 @@ pub fn groupedCoded(
             rem %= strides[i];
         }
         try serializeKeyAt(&scratch, ra, kd_cols, rows);
-        gid_of[cp] = try table.getOrInsert(scratch.items, calls);
+        gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base | first_row[cp]);
     }
 
     const agg_len = calls.len;
@@ -560,6 +574,21 @@ fn foldGroupedCall(
         },
         else => unreachable,
     }
+}
+
+const no_row = std.math.maxInt(u32);
+
+/// Each composite's first row `sel` keeps, or `no_row`.
+fn compositeFirstRows(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u32 {
+    const first = try ra.alloc(u32, space);
+    @memset(first, no_row);
+    forEachActive(sel, comp.len, struct {
+        fn f(ctx: anytype, r: usize) void {
+            const slot = &ctx.first[ctx.comp[r]];
+            if (slot.* == no_row) slot.* = @intCast(r);
+        }
+    }.f, .{ .first = first, .comp = comp });
+    return first;
 }
 
 fn compositeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {

@@ -251,6 +251,7 @@ fn handle(
             .codec = output_codec,
             .scan_all = req.scan_all,
             .trust_stats = req.trust_stats,
+            .unordered = req.unordered,
             .max_memory = if (profiler != null) budget -| prof_opts.reservedBytes() else budget,
             .group_by = req.group_by,
             .column_order = req.column_order,

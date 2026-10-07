@@ -1417,7 +1417,13 @@ pub const AggTarget = union(enum) {
     /// One accumulator per call, in call order.
     scalar: struct { calls: []const expr_agg.AggCall, accumulators: []expr_agg.Accumulator },
     /// Rows go to the group their key values select; the table holds `calls.len` accumulators per group.
-    grouped: struct { calls: []const expr_agg.AggCall, keys: []const expr_ast.Expr, table: *expr_agg.GroupTable },
+    grouped: struct {
+        calls: []const expr_agg.AggCall,
+        keys: []const expr_ast.Expr,
+        table: *expr_agg.GroupTable,
+        /// `expr_agg.firstPosition` of the row group's row 0.
+        pos_base: u64,
+    },
 
     fn calls(self: AggTarget) []const expr_agg.AggCall {
         return switch (self) {
@@ -1557,7 +1563,7 @@ pub fn scanRGForAgg(
     switch (target) {
         .grouped => |g| {
             if (decode_options.encoded and
-                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, &batch, lookup, &sel))
+                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel))
             {
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -1581,7 +1587,7 @@ pub fn scanRGForAgg(
             var r: usize = 0;
             while (r < num_rows) : (r += 1) {
                 if (sel.isActive(r)) {
-                    group_id_arr[r] = try key_resolver.resolve(ra, g.table, key_cols, r, g.calls);
+                    group_id_arr[r] = try key_resolver.resolve(ra, g.table, key_cols, r, g.calls, g.pos_base);
                 }
             }
 

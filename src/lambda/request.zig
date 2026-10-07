@@ -27,6 +27,7 @@ const Wire = struct {
     column_order: ?std.json.Value = null,
     scan_all: ?std.json.Value = null,
     trust_stats: ?std.json.Value = null,
+    ordered: ?std.json.Value = null,
     max_memory: ?std.json.Value = null,
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
@@ -48,6 +49,8 @@ pub const Request = struct {
     column_order: ?[]const u8 = null,
     scan_all: bool = false,
     trust_stats: bool = false,
+    /// `"ordered": false`; ordered when absent or null.
+    unordered: bool = false,
     /// `max_memory`: a byte count, or a size string the caller parses (`"512MB"`).
     max_memory: ?MaxMemory = null,
     /// `profile`: return a profile summary in the response.
@@ -87,6 +90,11 @@ pub const Request = struct {
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");
+        req.unordered = if (parsed.value.ordered) |v| switch (v) {
+            .bool => |b| !b,
+            .null => false,
+            else => return f.bad("ordered"),
+        } else false;
         req.profile_url = try f.string("profile_url");
         req.profile = try f.boolean("profile") or req.profile_url != null;
         if (try f.strings(arena, "bloom_filters", true)) |b| req.bloom_filters = b;
@@ -198,6 +206,13 @@ test "request: s3_url shorthand, numeric max_memory, nulls as absent" {
     , &bad);
     defer nulls.deinit();
     try testing.expect(nulls.max_memory == null and !nulls.scan_all and nulls.columns == null and nulls.select == null);
+    try testing.expect(!nulls.unordered);
+
+    var unordered = try Request.parse(testing.allocator,
+        \\{"s3_url":"s3://b/k","ordered":false}
+    , &bad);
+    defer unordered.deinit();
+    try testing.expect(unordered.unordered);
 
     var prof = try Request.parse(testing.allocator,
         \\{"s3_url":"s3://b/k","profile_url":"s3://b/trace.json"}
@@ -219,6 +234,7 @@ test "malformed requests are errors, wrong-typed fields named" {
         .{ .body = "{\"inputs\":[\"a\"]} x", .err = error.SyntaxError },
         .{ .body = "{\"inputs\":[\"a\"],\"filter\":\"a\",\"filter\":\"b\"}", .err = error.DuplicateField },
         .{ .body = "[\"a\"]", .err = error.UnexpectedToken },
+        .{ .body = "{\"inputs\":[\"a\"],\"ordered\":0}", .err = error.BadFieldType, .field = "ordered" },
         .{ .body = "{\"filter\":\"a\"}", .err = error.MissingField },
         .{ .body = "{\"inputs\":\"a\"}", .err = error.BadFieldType, .field = "inputs" },
         .{ .body = "{\"inputs\":[\"a\",1]}", .err = error.BadFieldType, .field = "inputs" },

@@ -2406,6 +2406,7 @@ pub const GroupKeyResolver = struct {
         key_cols: []const filter_eval.Batch.Column,
         row: usize,
         agg_calls: []const AggCall,
+        pos_base: u64,
     ) !u32 {
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
             const s = key_cols[0].string.values[row];
@@ -2415,13 +2416,13 @@ pub const GroupKeyResolver = struct {
             // On error the entry just reserved would hold an undefined value.
             errdefer _ = self.memo.remove(id);
             try serializeRowKey(&self.scratch, allocator, key_cols, row);
-            const gid = try table.getOrInsert(self.scratch.items, agg_calls);
+            const gid = try table.getOrInsert(self.scratch.items, agg_calls, pos_base | row);
             gop.value_ptr.* = gid;
             return gid;
         }
 
         try serializeRowKey(&self.scratch, allocator, key_cols, row);
-        return table.getOrInsert(self.scratch.items, agg_calls);
+        return table.getOrInsert(self.scratch.items, agg_calls, pos_base | row);
     }
 };
 
@@ -2544,6 +2545,9 @@ pub const SharedBudget = struct {
 pub const GroupTable = struct {
     allocator: std.mem.Allocator,
     keys: std.ArrayList([]const u8),
+    /// Where each group first appeared, `first_position` of the row that created it (see `getOrInsert`): the ordered
+    /// output lists groups in this order.
+    first: std.ArrayList(u64) = .empty,
     accumulators: std.ArrayList(Accumulator),
     map: std.StringHashMap(u32),
     allocated_bytes: usize,
@@ -2570,6 +2574,7 @@ pub const GroupTable = struct {
             self.allocator.free(key);
         }
         self.keys.deinit(self.allocator);
+        self.first.deinit(self.allocator);
 
         for (self.accumulators.items) |acc| {
             switch (acc) {
@@ -2592,12 +2597,15 @@ pub const GroupTable = struct {
         budget.release(slack);
     }
 
-    pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall) !u32 {
+    /// The group of `key`, made if new. `pos` is where the row asking for it sits in the input (`firstPosition`); a
+    /// group remembers the least it was asked from.
+    pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
         if (self.map.get(key)) |id| {
+            self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
 
-        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + MapNodeOverhead;
+        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead;
         if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
             const budget = self.shared orelse return error.ExceededMemoryBudget;
             // Checked on the draw path rather than per new group, to keep the shared atomic off the insertion path.
@@ -2627,13 +2635,21 @@ pub const GroupTable = struct {
         try self.map.put(key_copy, group_id);
         errdefer _ = self.map.remove(key_copy);
 
+        try self.first.ensureUnusedCapacity(self.allocator, 1);
         try self.keys.append(self.allocator, key_copy);
+        self.first.appendAssumeCapacity(pos);
 
         self.allocated_bytes += entry_size;
 
         return group_id;
     }
 };
+
+/// A row's place in the input, for first-appearance group order: its row group's ordinal across all inputs (files
+/// in order, then their row groups) above the row's index within the row group.
+pub fn firstPosition(rg_ordinal: usize, row: usize) u64 {
+    return (@as(u64, @intCast(rg_ordinal)) << 32) | @as(u64, @intCast(row));
+}
 
 /// Grouped counterpart of `updateOne`: fold each row the call selects into its group's accumulator,
 /// `accs[group_id_arr[row] * agg_len + agg_idx]`.
@@ -2816,9 +2832,9 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
         },
     };
 
-    const gid1 = try gt.getOrInsert("group_a", agg_calls);
-    const gid2 = try gt.getOrInsert("group_b", agg_calls);
-    const gid1_dup = try gt.getOrInsert("group_a", agg_calls);
+    const gid1 = try gt.getOrInsert("group_a", agg_calls, 0);
+    const gid2 = try gt.getOrInsert("group_b", agg_calls, 1);
+    const gid1_dup = try gt.getOrInsert("group_a", agg_calls, 0);
 
     try std.testing.expect(gid1 == 0);
     try std.testing.expect(gid2 == 1);
@@ -2876,7 +2892,7 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
 
     var small_gt = GroupTable.init(allocator, 10);
     defer small_gt.deinit();
-    try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls));
+    try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls, 0));
 }
 
 test "SharedBudget: tables share one budget instead of owning fixed slices" {
@@ -2896,7 +2912,7 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
     var placed: usize = 0;
     while (placed < 500) : (placed += 1) {
         const key = std.fmt.bufPrint(&key_buf, "k{d}", .{placed}) catch unreachable;
-        _ = b.getOrInsert(key, &agg_calls) catch break;
+        _ = b.getOrInsert(key, &agg_calls, 0) catch break;
     }
     try std.testing.expect(b.keys.items.len > 0);
     try std.testing.expect(budget.used.load(.monotonic) > 4096 / 2);
@@ -2906,14 +2922,14 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
     var c = GroupTable.init(allocator, 0);
     c.shared = &full;
     defer c.deinit();
-    try std.testing.expectError(error.ExceededMemoryBudget, c.getOrInsert("too-big", &agg_calls));
+    try std.testing.expectError(error.ExceededMemoryBudget, c.getOrInsert("too-big", &agg_calls, 0));
 
     // Freed tables return their quota: workers merge, then free.
     var recycle = SharedBudget{ .limit = 4096 };
     {
         var tmp = GroupTable.init(allocator, 0);
         tmp.shared = &recycle;
-        _ = try tmp.getOrInsert("k", &agg_calls);
+        _ = try tmp.getOrInsert("k", &agg_calls, 0);
         try std.testing.expect(recycle.used.load(.monotonic) > 0);
         tmp.deinit();
     }

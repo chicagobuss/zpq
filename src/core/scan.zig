@@ -509,6 +509,20 @@ fn workerRun(w: *Worker) void {
     if (w.blocks == null and w.group_tables.len > 0) w.group_tables[w.index].releaseSlack();
 }
 
+/// Whether a scan's filter columns hold at most a quarter of the compressed bytes it reads, over every row group of
+/// every input: then splitting a row group's aggregates across items costs little in repeated filter decoding.
+fn filterIsCheap(metas: []const schema.FileMetaData, plan: *const agg_plan.Plan) bool {
+    var filter_bytes: u64 = 0;
+    var other_bytes: u64 = 0;
+    for (metas) |m| for (m.row_groups.items) |rg| for (rg.columns.items, 0..) |cc, ci| {
+        if (ci >= plan.filter_cols.len or !plan.columns.read[ci]) continue;
+        const md = cc.meta_data orelse continue;
+        const n: u64 = @intCast(@max(0, md.total_compressed_size));
+        if (plan.filter_cols[ci]) filter_bytes += n else other_bytes += n;
+    };
+    return filter_bytes * 4 <= other_bytes;
+}
+
 fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     // Declared first so it runs last: the release span covers freeing the arena and scratch below.
     var release_span: profile.Span = .{ .t = null, .start = 0 };
@@ -768,8 +782,9 @@ pub fn runMultiAggregate(
     // No row groups (a valid empty file) is `total_rgs == 0`: no work items, and nothing to divide by.
     // About four items per worker: with one per row group, a row group per worker leaves the scan as slow as its
     // slowest row group and a few more leave a tail. Each item over a row group re-decodes and re-evaluates the
-    // filter, so a filtered scan splits a row group only when there are fewer row groups than workers.
-    const items_wanted = if (args.filter == null) 4 * requested else requested;
+    // filter, so a filtered scan splits that finely only when its filter columns are cheap beside the rest (at most
+    // a quarter of the compressed bytes read), and otherwise only when there are fewer row groups than workers.
+    const items_wanted = if (filter_opt == null or filterIsCheap(metas, &plan)) 4 * requested else requested;
     var chunks_per_rg = if (total_rgs == 0 or total_rgs >= items_wanted) @as(usize, 1) else (items_wanted + total_rgs - 1) / total_rgs;
     if (group_by_keys != null) {
         chunks_per_rg = 1;

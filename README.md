@@ -50,6 +50,8 @@ Numbers and trade-offs are dated and contextualised as they're captured. Harness
   [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
 * `benchmarks/regression/runner.py` — golden-output regression net.
 
+<!-- 0.5.0 release figures go here once the release benchmark run is reviewed. -->
+
 ## What it can do
 
 **Read** standard Parquet — V1 + V2 data pages; PLAIN / RLE / RLE_DICTIONARY / DELTA_BINARY_PACKED /
@@ -57,9 +59,10 @@ DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY
 codecs, plus the deprecated LZ4 codec in each container writers used for it (parquet-mr's Hadoop framing, a bare LZ4
 block, an LZ4 frame); all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
 
-**Filter** with `= != < <= > >=`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and Hive-partition
-pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals (`'2024-01-01'`,
-`'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is not rounded to it.
+**Filter** with `= != < <= > >=`, `IN` / `NOT IN`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and
+Hive-partition pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals
+(`'2024-01-01'`, `'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is
+not rounded to it.
 
 **Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
 
@@ -97,9 +100,9 @@ to about twice the GROUP BY memory of `--unordered` (`--max-memory` counts it). 
 `"ordered": false`) gives both up for speed: groups in no set order, float aggregates free to differ in their last
 bits.
 
-**Read local files** through the page cache or explicitly: on Linux, an aggregate over files mostly not in the page cache
-reads just the column chunks it needs, row group by row group, with io_uring (`O_DIRECT`) or `pread`, in a bounded window;
-see [Local reads](docs/local_io.md).
+**Read local files** through the page cache or explicitly: on Linux, an aggregate over files mostly not in the page
+cache reads just the column chunks it needs, row group by row group, with io_uring (`O_DIRECT`) or `pread`, in a
+bounded window; see [Local reads](docs/local_io.md).
 
 **Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
 produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
@@ -266,6 +269,7 @@ src/
     http.zig             HTTP/1.1
     pool.zig             Connection pool
     coalescer.zig        Range coalescer for byte-range fetches
+    local_reader.zig     Gated local reads: pread / io_uring into a windowed buffer
     sigv4.zig            SigV4 signer
 
 probes/probe_lambda_caps/   Empirical Lambda capability prober

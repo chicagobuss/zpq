@@ -637,8 +637,10 @@ pub fn updateOne(
 /// honoring the selection vector and the null mask. The per-batch winner is
 /// a slice borrowed from the per-RG decode arena, so when it beats the
 /// accumulator's running winner we dup it into `persist` (freeing the prior
-/// owned copy). `std.mem.order` is the right tool here — string min/max isn't
-/// the hot numeric path, so no hand-rolled SIMD (cf. simdMinMaxI64).
+/// owned copy). Rows compare first on their leading 16 bytes as one big-endian
+/// integer: a strictly lesser (greater) prefix decides it, and only an equal
+/// prefix pays the byte-by-byte compare, which mispredicted on every row.
+/// (8 bytes left too many ties: keys like `category_0010` share 9.)
 fn foldMinMaxBytes(
     persist: std.mem.Allocator,
     comptime is_min: bool,
@@ -651,13 +653,24 @@ fn foldMinMaxBytes(
     const max_def = col.string.max_def;
 
     var batch_winner: ?[]const u8 = null;
-    for (vals, 0..) |v, i| {
-        if (!sel.isActive(i)) continue;
-        if (def_levels) |dl| if (dl[i] != max_def) continue; // skip nulls
-        if (batch_winner) |w| {
-            const ord = std.mem.order(u8, v, w);
-            if ((is_min and ord == .lt) or (!is_min and ord == .gt)) batch_winner = v;
-        } else batch_winner = v;
+    var wp: u128 = 0;
+    for (sel.mask, 0..) |word, w| {
+        var bits = word;
+        while (bits != 0) : (bits &= bits - 1) {
+            const i = w * 64 + @ctz(bits);
+            if (def_levels) |dl| if (dl[i] != max_def) continue; // skip nulls
+            const v = vals[i];
+            const vp = prefix16(v);
+            if (batch_winner) |win| {
+                if (if (is_min) vp > wp else vp < wp) continue;
+                if (vp == wp) {
+                    const ord = std.mem.order(u8, v, win);
+                    if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) continue;
+                }
+            }
+            batch_winner = v;
+            wp = vp;
+        }
     }
     const cand = batch_winner orelse return; // nothing selected/present
 
@@ -672,6 +685,23 @@ fn foldMinMaxBytes(
         persist.free(cur);
     }
     slot.* = try persist.dupe(u8, cand);
+}
+
+/// The first 16 bytes of `s` as a big-endian integer, zero-padded: a strictly lesser prefix means a strictly lesser
+/// string in byte order, an equal one decides nothing.
+inline fn prefix16(s: []const u8) u128 {
+    if (s.len >= 16) return std.mem.readInt(u128, s[0..16], .big);
+    if (s.len >= 8) {
+        // Bytes 8.. come from the last 8 bytes, shifted past the ones the first load already has; no copy, and no
+        // read beyond the slice.
+        const head = std.mem.readInt(u64, s[0..8], .big);
+        const tail = std.mem.readInt(u64, s[s.len - 8 ..][0..8], .big);
+        const rest: u64 = if (s.len == 8) 0 else tail << @intCast((16 - s.len) * 8);
+        return (@as(u128, head) << 64) | rest;
+    }
+    var buf: [8]u8 = @splat(0);
+    @memcpy(buf[0..s.len], s);
+    return @as(u128, std.mem.readInt(u64, &buf, .big)) << 64;
 }
 
 /// One aggregate's input over one row group's batch: the rows it folds and the values it folds them from. The scalar
@@ -2934,4 +2964,43 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
         tmp.deinit();
     }
     try std.testing.expectEqual(@as(usize, 0), recycle.used.load(.monotonic));
+}
+
+test "string min/max by 16-byte prefix agree with a byte-by-byte fold: shared prefixes, zero bytes, nulls" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0xb17e);
+    const r = prng.random();
+    const alphabet = [_]u8{ 0, 1, 'a', 'b', 0xff };
+    for (0..200) |_| {
+        const n = r.uintLessThan(usize, 300) + 1;
+        const vals = try a.alloc([]const u8, n);
+        const defs = try a.alloc(u32, n);
+        for (vals, defs) |*v, *d| {
+            const len = r.uintLessThan(usize, 22);
+            const buf = try a.alloc(u8, len);
+            // A long shared prefix in most rows, so the full compare runs too.
+            for (buf, 0..) |*c, k| {
+                c.* = if (k < 17 and r.uintLessThan(u8, 6) != 0) 'a' else alphabet[r.uintLessThan(usize, alphabet.len)];
+            }
+            v.* = buf;
+            d.* = @intFromBool(r.uintLessThan(u8, 5) != 0);
+        }
+        var sel = try filter_selection.SelectionVector.init(a, n);
+        for (0..n) |i| if (r.uintLessThan(u8, 3) == 0) sel.set(i, false);
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
+        inline for (.{ true, false }) |is_min| {
+            var want: ?[]const u8 = null;
+            for (vals, defs, 0..) |v, d, i| {
+                if (!sel.isActive(i) or d != 1) continue;
+                const ord = if (want) |w| std.mem.order(u8, v, w) else .lt;
+                if (want == null or (is_min and ord == .lt) or (!is_min and ord == .gt)) want = v;
+            }
+            var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
+            try foldMinMaxBytes(a, is_min, &state, col, &sel);
+            const got = if (is_min) state.min_bytes else state.max_bytes;
+            if (want) |w| try testing.expectEqualSlices(u8, w, got.?) else try testing.expect(got == null);
+        }
+    }
 }

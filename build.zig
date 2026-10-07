@@ -143,6 +143,8 @@ pub fn build(b: *std.Build) void {
     const integration_opts = b.addOptions();
     const lambda_install = b.addInstallArtifact(lambda, .{});
     integration_opts.addOptionPath("lambda_bin", lambda.getEmittedBin());
+    // The CLI too, for the S3 paths a Lambda child can't show: in Debug its allocator reports leaks as it exits.
+    integration_opts.addOptionPath("cli_bin", cli.getEmittedBin());
 
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{

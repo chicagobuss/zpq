@@ -20,6 +20,7 @@ const linux = std.os.linux;
 const integration_opts = @import("integration_opts");
 
 const LAMBDA_BIN = integration_opts.lambda_bin;
+const CLI_BIN = integration_opts.cli_bin;
 
 // ============================================================
 // Fake runtime API server
@@ -957,6 +958,40 @@ test "lambda answers back-to-back S3 queries without running out of read workers
             std.debug.print("[s3 back-to-back] invocation {d}: {s}\n  want {s}\n", .{ i, resp, want });
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+test "an S3 query whose every row group prunes frees all it fetched" {
+    // Nothing is left to fetch past the footer, and the fetched tail used to leak on that path. The CLI's Debug
+    // allocator reports leaks on stderr as it exits.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", url);
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+    for ([_][]const u8{ "ts < 0", "ts < 0 OR ts > 1000000" }) |filter| {
+        const res = try std.process.run(a, std.testing.io, .{
+            .argv = &.{ CLI_BIN, "query", "s3://bkt/f.parquet", "--filter", filter, "--aggregate", "count(*) AS c" },
+            .environ_map = &env_map,
+        });
+        defer a.free(res.stdout);
+        defer a.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
+            std.debug.print("[s3 all pruned] {s}: {any}\nstdout: {s}\nstderr: {s}\n", .{ filter, res.term, res.stdout, res.stderr });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, res.stdout, "0") != null);
     }
 }
 

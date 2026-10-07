@@ -1605,9 +1605,7 @@ pub fn fetchS3Schema(
     // Re-parse from an arena-owned copy so the gpa buffers can be freed
     // here instead of leaking out of this one-shot helper.
     const sp = &specs[0];
-    if (sp.tail.len > 0 and sp.tail.ptr != sp.footer_region.ptr) {
-        ctx.gpa.free(sp.tail);
-    }
+    sp.releaseTail(ctx.gpa);
     const footer_len = sp.footer_region.len - 8;
     const footer_copy = try arena.dupe(u8, sp.footer_region[0..footer_len]);
     ctx.gpa.free(sp.footer_region);
@@ -1702,7 +1700,8 @@ fn openInputs(
         for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u, .file_index = s3_indices.items[k] };
         const batch_span = profile.Span.begin(prof);
         fetchMetaBatch(read_ctx, arena, creds, pool, specs, args.profiler) catch |err| {
-            for (specs) |sp| {
+            for (specs) |*sp| {
+                sp.releaseTail(ctx.gpa);
                 if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
             }
@@ -1711,7 +1710,8 @@ fn openInputs(
         batch_span.end(.footer_batch, profile.args(.{specs.len}));
         var specs_returned = false;
         errdefer if (!specs_returned) {
-            for (specs) |sp| {
+            for (specs) |*sp| {
+                sp.releaseTail(ctx.gpa);
                 if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
             }
@@ -1750,6 +1750,9 @@ fn openInputs(
         // and the parsed metadata offsets are rebased to that layout.
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
         for (specs) |*sp| {
+            // The tail serves the footer parse and the copies below; every way out of this iteration frees it, a file
+            // whose row groups all prune included.
+            defer sp.releaseTail(ctx.gpa);
             const meta = &sp.meta;
             sp.rg_columns = try arena.alloc(?[]const bool, meta.row_groups.items.len);
 
@@ -1834,14 +1837,6 @@ fn openInputs(
                     @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
                 }
             }
-
-            // The tail buffer has served its purpose (footer parse + the
-            // copies above). Free it now — unless it aliases footer_region
-            // (the warm meta-cache path), which s3_buffers tracks separately.
-            if (sp.tail.len > 0 and sp.tail.ptr != sp.footer_region.ptr) {
-                ctx.gpa.free(sp.tail);
-            }
-            sp.tail = &.{};
         }
 
         if (plan_span.t != null) {
@@ -2015,6 +2010,12 @@ const FetchSpec = struct {
     /// query's sample of a request's fixed cost.
     rtt_ns: u64 = 0,
     err: ?anyerror = null,
+
+    /// Free the fetched tail, unless it is `footer_region` itself (the warm meta-cache path), which is owned apart.
+    fn releaseTail(self: *FetchSpec, gpa: std.mem.Allocator) void {
+        if (self.tail.len > 0 and self.tail.ptr != self.footer_region.ptr) gpa.free(self.tail);
+        self.tail = &.{};
+    }
 
     fn etag(self: *const FetchSpec) []const u8 {
         return self.etag_buf[0..self.etag_len];

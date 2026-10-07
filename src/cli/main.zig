@@ -599,7 +599,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         defer result.deinit(gpa);
         const ar = result.aggregate;
         const answer = ar.output;
-        const total_ms_a = @divTrunc(nowMonoNs() - t_start_a, std.time.ns_per_ms);
+        const total_ns_a = nowMonoNs() - t_start_a;
 
         var ws: StdoutWriter = .{ .fd = 1 };
         defer ws.flush();
@@ -654,9 +654,10 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         }
         try engine.writeMembershipJson(&ws, ar.membership);
         try ws.print(
-            ",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
+            ",\"total_ms\":{d},\"total_us\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
             .{
-                total_ms_a,
+                @divTrunc(total_ns_a, std.time.ns_per_ms),
+                @divTrunc(total_ns_a, std.time.ns_per_us),
                 ar.timings.read_ns / std.time.ns_per_ms,
                 ar.timings.parse_ns / std.time.ns_per_ms,
                 ar.timings.core.decode_ns / std.time.ns_per_ms,
@@ -703,7 +704,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .profiler = profiler,
     })).write;
     const in = inputs[0]; // first input — used in the JSON envelope below
-    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
+    const total_ns = nowMonoNs() - t_start;
 
     // JSON envelope to stderr — same shape as the Lambda response.
     var w: StdoutWriter = .{ .fd = 2 };
@@ -729,10 +730,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     });
     try engine.writeMembershipJson(&w, result.membership);
     try w.print(
-        \\,"total_ms":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
+        \\,"total_ms":{d},"total_us":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
         \\
     , .{
-        total_ms,
+        @divTrunc(total_ns, std.time.ns_per_ms),
+        @divTrunc(total_ns, std.time.ns_per_us),
         result.timings.read_ns / std.time.ns_per_ms,
         result.timings.parse_ns / std.time.ns_per_ms,
         result.timings.core.decode_ns / std.time.ns_per_ms,

@@ -430,7 +430,7 @@ pub fn evaluate(
             evalLike(col.string.values, col.string.def_levels, col.string.max_def, m, sel);
         },
         .and_filter => |c| {
-            if (c.in_set) |s| return evalInSet(s, batch, sel, column_lookup);
+            if (c.in_set) |s| return evalInList(filter, s, batch, sel, column_lookup, arena);
             // Leaves of one AND chain that test the same coded column combine into one
             // per-entry match table and a single pass over the rows.
             if (try evalAndCoded(filter, batch, sel, column_lookup, arena)) return;
@@ -440,7 +440,7 @@ pub fn evaluate(
             try evaluate(c.right.*, batch, sel, column_lookup, arena);
         },
         .or_filter => |c| {
-            if (c.in_set) |s| return evalInSet(s, batch, sel, column_lookup);
+            if (c.in_set) |s| return evalInList(filter, s, batch, sel, column_lookup, arena);
             // OR: snapshot the entry state so each branch evaluates
             // against the same input set; then merge.
             var entry = try sel.cloneAlloc(arena);
@@ -459,6 +459,22 @@ pub fn evaluate(
             sel.unionWith(&left_result);
         },
     }
+}
+
+/// An IN / NOT IN list (`filter`, bound to `s`). Over a dictionary-coded column the set answers once per dictionary
+/// entry and rows look their code up; otherwise it tests every row.
+fn evalInList(
+    filter: ast.Filter,
+    s: *const in_set.InSet,
+    batch: *const Batch,
+    sel: *selection.SelectionVector,
+    column_lookup: []const ?usize,
+    arena: std.mem.Allocator,
+) Error!void {
+    const col_pos = column_lookup[s.col_idx] orelse return error.BadColumn;
+    const col = batch.cols[col_pos];
+    if (col.codes()) |codes| return evalCodedLeaf(filter, s.col_idx, col, codes, sel, column_lookup.len, arena);
+    return evalInSet(s, batch, sel, column_lookup);
 }
 
 /// An IN / NOT IN list in one pass over the rows (see `in_set.zig`).
@@ -549,7 +565,8 @@ fn evalCodedLeaf(
 
 fn flattenAnd(f: ast.Filter, out: *std.ArrayList(ast.Filter), arena: std.mem.Allocator) Error!void {
     switch (f) {
-        .and_filter => |c| {
+        // A NOT IN list stays whole: its set tests it in one pass, its `!=` leaves one pass each.
+        .and_filter => |c| if (c.in_set != null) try out.append(arena, f) else {
             try flattenAnd(c.left.*, out, arena);
             try flattenAnd(c.right.*, out, arena);
         },
@@ -982,6 +999,79 @@ test "leaf kernels select exactly what a row-by-row compare does: every op, null
                     try testing.expectEqual(want, sel.isActive(i));
                 }
             };
+        }
+    }
+}
+
+test "IN and NOT IN sets over a coded column select as they do over its values, inside AND chains too" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const r = prng.random();
+    const dict = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j" };
+    const n = 333;
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var vals: [n][]const u8 = undefined;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(r.uintLessThan(u8, 6) != 0);
+        codes[i] = if (defs[i] == 1) r.uintLessThan(u32, dict.len) else 0;
+        vals[i] = if (defs[i] == 1) dict[codes[i]] else "";
+    }
+    const coded: Batch.Column = .{ .string = .{
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const plain: Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+    const lookup = [_]?usize{0};
+    const list = [_][]const u8{ "b", "d", "e", "zz", "h" };
+
+    for ([_]bool{ false, true }) |negated| {
+        // The parser's shape: leaves joined by OR (AND for NOT IN), the set bound on the root.
+        var tree: ?ast.Filter = null;
+        for (list) |v| {
+            const leaf: ast.Filter = .{ .string = .{ .col_idx = 0, .op = if (negated) .NotEq else .Eq, .value = v } };
+            if (tree) |prev| {
+                const l = try a.create(ast.Filter);
+                const rr = try a.create(ast.Filter);
+                l.* = prev;
+                rr.* = leaf;
+                const c: ast.Composite = .{ .left = l, .right = rr };
+                tree = if (negated) .{ .and_filter = c } else .{ .or_filter = c };
+            } else tree = leaf;
+        }
+        const set = try a.create(in_set.InSet);
+        set.* = .{ .col_idx = 0, .negated = negated, .probe = .{ .string = try .init(a, &list) } };
+        switch (tree.?) {
+            .and_filter, .or_filter => |*c| c.in_set = set,
+            else => unreachable,
+        }
+        // Also inside an AND chain with another leaf on the same coded column.
+        const in_list = try a.create(ast.Filter);
+        in_list.* = tree.?;
+        const other = try a.create(ast.Filter);
+        other.* = .{ .string = .{ .col_idx = 0, .op = .LtEq, .value = "f" } };
+        const chained: ast.Filter = .{ .and_filter = .{ .left = other, .right = in_list } };
+
+        for ([_]ast.Filter{ tree.?, chained }) |f| {
+            var want = try selection.SelectionVector.init(a, n);
+            try evaluate(f, &.{ .cols = &.{plain}, .num_rows = n }, &want, &lookup, a);
+            var got = try selection.SelectionVector.init(a, n);
+            try evaluate(f, &.{ .cols = &.{coded}, .num_rows = n }, &got, &lookup, a);
+            try testing.expectEqualSlices(u64, want.mask, got.mask);
+        }
+        // And the plain answer is the list's: present rows, listed (or not, for NOT IN).
+        var plain_sel = try selection.SelectionVector.init(a, n);
+        try evaluate(tree.?, &.{ .cols = &.{plain}, .num_rows = n }, &plain_sel, &lookup, a);
+        for (0..n) |i| {
+            var listed = false;
+            for (list) |v| listed = listed or std.mem.eql(u8, v, vals[i]);
+            try testing.expectEqual(defs[i] == 1 and listed != negated, plain_sel.isActive(i));
         }
     }
 }

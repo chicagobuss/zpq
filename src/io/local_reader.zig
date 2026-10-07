@@ -93,17 +93,32 @@ pub fn uringAvailable() bool {
     return true;
 }
 
-/// The share (0..1) of `bytes`' pages the page cache holds, by `mincore`; 0 when it can't tell.
+/// The share (0..1) of `bytes`' pages the page cache holds, by `mincore`; 0 when it can't tell. Past a few thousand
+/// pages it samples evenly spaced windows: mincore costs a page-cache lookup per page, milliseconds over a file of
+/// tens of thousands, which every local aggregate would pay before its first decode.
 pub fn residentShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_min) const u8) f64 {
     if (builtin.os.tag != .linux or bytes.len == 0) return 0;
     const page = pageLen();
     const pages = (bytes.len + page - 1) / page;
-    const vec = gpa.alloc(u8, pages) catch return 0;
+    const windows: usize = 64;
+    const window_pages: usize = 32;
+    const sampled = if (pages <= windows * window_pages) pages else windows * window_pages;
+    const vec = gpa.alloc(u8, sampled) catch return 0;
     defer gpa.free(vec);
-    if (linux.errno(linux.mincore(@constCast(bytes.ptr), bytes.len, vec.ptr)) != .SUCCESS) return 0;
+    if (sampled == pages) {
+        if (linux.errno(linux.mincore(@constCast(bytes.ptr), bytes.len, vec.ptr)) != .SUCCESS) return 0;
+    } else {
+        const stride = pages / windows;
+        for (0..windows) |w| {
+            const first = w * stride;
+            const out = vec[w * window_pages ..][0..window_pages];
+            const p: [*]u8 = @constCast(bytes.ptr + first * page);
+            if (linux.errno(linux.mincore(p, window_pages * page, out.ptr)) != .SUCCESS) return 0;
+        }
+    }
     var n: usize = 0;
     for (vec) |v| n += v & 1;
-    return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(pages));
+    return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(sampled));
 }
 
 pub const Range = struct { start: u64, end: u64 };

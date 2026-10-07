@@ -1928,3 +1928,24 @@ test "regression: an 8000-value IN list probes in time linear in its length" {
         if (g == 3) try testing.expect(prune.pruneRowGroup(rg, f, &metas[0]) != .skip);
     }
 }
+
+test "regression: cached probes own transient key bytes through growth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cache: ProbeCache = .{};
+    var bytes: [8]u8 = undefined;
+    for (0..1024) |i| {
+        std.mem.writeInt(u64, &bytes, i, .little);
+        _ = try cache.get(a, &bytes);
+    }
+    try testing.expectEqual(@as(usize, 1024), cache.forms.count());
+    for (0..1024) |i| {
+        std.mem.writeInt(u64, &bytes, i, .little);
+        const got = try cache.get(a, &bytes);
+        const want = bloom.Probe.init(bloom.hashBytes(&bytes));
+        try testing.expectEqual(want.hi, got.hi);
+        try testing.expect(@reduce(.And, want.m == got.m));
+    }
+    try testing.expectEqual(@as(usize, 1024), cache.forms.count());
+}

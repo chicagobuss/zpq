@@ -3923,3 +3923,24 @@ test "S3 Bloom reads keep the Lambda calibration in-region and measure a distant
     m.observe(115, 115 * 32, 900 * std.time.ns_per_ms);
     try std.testing.expectApproxEqRel(@as(f64, 262_144.0 / 0.225), m.bytes_per_s.?, 0.01);
 }
+
+test "regression: releaseTail keeps aliased warm footer ownership and clears cold tails" {
+    const a = std.testing.allocator;
+    const footer = try a.alloc(u8, 128);
+    defer a.free(footer);
+    @memset(footer, 42);
+    var warm: FetchSpec = .{ .url = try s3.Url.parse("s3://b/k"), .footer_region = footer, .tail = footer };
+    warm.releaseTail(a);
+    try std.testing.expectEqual(@as(usize, 0), warm.tail.len);
+    try std.testing.expectEqual(@as(u8, 42), footer[0]);
+    warm.releaseTail(a);
+    var cold: FetchSpec = .{
+        .url = try s3.Url.parse("s3://b/k"),
+        .footer_region = footer,
+        .tail = try a.alloc(u8, 65536),
+    };
+    cold.releaseTail(a);
+    try std.testing.expectEqual(@as(usize, 0), cold.tail.len);
+    try std.testing.expectEqual(@as(u8, 42), footer[0]);
+    cold.releaseTail(a);
+}

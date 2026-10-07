@@ -420,6 +420,17 @@ fn planStatFold(
         const nan_free = if (cm.statistics) |st| st.nan_count == 0 else false;
         if (!nan_free) return null;
     }
+    // Nor do bounds prove which zero occurs: writers record -0 and +0 as a chunk's bounds whenever it holds any zero.
+    // A zero answer decodes, so no zero of the other sign is invented.
+    if (lane == .float) {
+        const b = if (call.func == .max) bounds.max else bounds.min;
+        const v: ?f64 = switch (cm.type) {
+            .FLOAT => if (b.len >= 4) @as(f64, @as(f32, @bitCast(std.mem.readInt(u32, b[0..4], .little)))) else null,
+            .DOUBLE => if (b.len >= 8) @as(f64, @bitCast(std.mem.readInt(u64, b[0..8], .little))) else null,
+            else => null,
+        };
+        if (v == null or v.? == 0) return null;
+    }
     var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
     if (call.func == .sum) {
         if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;

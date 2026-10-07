@@ -3172,3 +3172,31 @@ test "regression: ordered grouping retains the small-query memory budget at one 
     defer freeResult(res);
     try testing.expectEqual(@as(usize, 6), res.output.group_rows.?.len);
 }
+
+test "statistics never invent a zero of the other sign: --trust-stats answers zero extrema as decoding does" {
+    // Arrow records -0 / +0 bounds for any chunk holding a zero, all +0 or all -0 alike.
+    const path = "ci/fixtures/parquet/signed_zero.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for ([_]?[]const u8{ null, "k = 0", "k = 1", "k = 2", "k >= 2" }) |filter| {
+        var answers: [2][2]u64 = undefined;
+        for ([_]bool{ false, true }, 0..) |trust, t| {
+            const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .filter = filter,
+                .aggregate = "min(v) AS lo, max(v) AS hi",
+                .trust_stats = trust,
+                .scan_all = !trust,
+            });
+            defer freeResult(res);
+            answers[t] = .{ @bitCast(res.output.aggs[0].value.f), @bitCast(res.output.aggs[1].value.f) };
+        }
+        try testing.expectEqual(answers[0], answers[1]);
+    }
+}

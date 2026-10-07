@@ -1748,3 +1748,33 @@ test "parse binds a quoted path to the nested leaf a top-level column's dotted n
     try testing.expectEqual(@as(usize, 0), in_list.or_filter.left.int64.col_idx);
     try testing.expectEqual(@as(usize, 1), (try parse(a, "\"r\".\"name\" LIKE 'a%'", &meta, null)).like.col_idx);
 }
+
+
+test "regression: IN sets preserve temporal comparison rewrites" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    meta.schema.items[5].logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .NANOS = .{} } } };
+    const values = [_]i64{ 0, 1, std.math.maxInt(i64), 0 };
+    const defs = [_]u32{ 1, 1, 1, 0 };
+    const columns = [_]eval.Batch.Column{.{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const batch: eval.Batch = .{ .cols = &columns, .num_rows = values.len };
+    var lookup: [11]?usize = @splat(null);
+    lookup[4] = 0;
+    for ([_][]const u8{
+        "ts IN ('1970-01-01 00:00:00.0000000001', '1970-01-01 00:00:00.0000000002')",
+        "ts NOT IN ('1970-01-01 00:00:00.0000000001', '1970-01-01 00:00:00.0000000002')",
+        "ts IN ('1970-01-01', '1970-01-01 00:00:00.0000000001')",
+    }) |expr| {
+        const filter = try parse(a, expr, &meta, null);
+        var expected = try selection.SelectionVector.init(a, values.len);
+        var actual = try selection.SelectionVector.init(a, values.len);
+        try eval.evaluate(try withoutInSets(a, filter), &batch, &expected, &lookup, a);
+        try eval.evaluate(filter, &batch, &actual, &lookup, a);
+        try testing.expectEqualSlices(u64, expected.mask, actual.mask);
+    }
+}

@@ -455,3 +455,17 @@ test "a bitmap at one end of the type rejects values from the other end" {
         for (lits) |l| try testing.expect(set.contains(l) and !set.contains(l - 1));
     }
 }
+
+test "regression: nine adversarial integer literals bind within one MiB" {
+    const backing = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(backing);
+    var fixed = std.heap.FixedBufferAllocator.init(backing);
+    const multiplier: u64 = 0x9E3779B97F4A7C15;
+    const inverse: u64 = 0xf1de83e19937733d;
+    try testing.expectEqual(@as(u64, 1), inverse *% multiplier);
+    var literals: [9]i64 = undefined;
+    for (&literals, 0..) |*literal, i| literal.* = @bitCast(@as(u64, @intCast(i)) *% inverse);
+    const set = try NumSet(i64).init(fixed.allocator(), &literals);
+    for (literals) |literal| try testing.expect(set.contains(literal));
+    try testing.expect(!set.contains(1));
+}

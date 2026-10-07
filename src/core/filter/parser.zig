@@ -297,24 +297,26 @@ fn parseInList(
 
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
-    var acc: ?ast.Filter = null;
+    var leaves: std.ArrayList(ast.Filter) = .empty;
     var it = std.mem.splitScalar(u8, vals, ',');
     while (it.next()) |raw| {
         const v = std.mem.trim(u8, raw, " ");
         if (v.len == 0) return error.BadValue;
-        const leaf = try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag);
-        if (acc) |prev| {
-            const l = try arena.create(ast.Filter);
-            const r = try arena.create(ast.Filter);
-            l.* = prev;
-            r.* = leaf;
-            acc = if (inc.negated)
-                .{ .and_filter = .{ .left = l, .right = r } }
-            else
-                .{ .or_filter = .{ .left = l, .right = r } };
-        } else acc = leaf;
+        try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
     }
-    return acc orelse error.BadValue;
+    return balancedTree(arena, leaves.items, inc.negated);
+}
+
+/// `leaves`, in order, joined by OR (AND when `conjunction`) into a tree of depth log2 of their count. Every pass over
+/// a filter recurses, and a chain one level per value overflowed the stack on lists of a few thousand.
+fn balancedTree(arena: std.mem.Allocator, leaves: []const ast.Filter, conjunction: bool) Error!ast.Filter {
+    if (leaves.len == 1) return leaves[0];
+    const l = try arena.create(ast.Filter);
+    const r = try arena.create(ast.Filter);
+    l.* = try balancedTree(arena, leaves[0 .. leaves.len / 2], conjunction);
+    r.* = try balancedTree(arena, leaves[leaves.len / 2 ..], conjunction);
+    const c: ast.Composite = .{ .left = l, .right = r };
+    return if (conjunction) .{ .and_filter = c } else .{ .or_filter = c };
 }
 
 /// Negate a filter subtree: flip leaf operators, De Morgan on composites.
@@ -877,6 +879,46 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
     return meta;
 }
 
+fn filterDepth(f: ast.Filter) usize {
+    return switch (f) {
+        .and_filter, .or_filter => |c| 1 + @max(filterDepth(c.left.*), filterDepth(c.right.*)),
+        else => 1,
+    };
+}
+
+test "regression: IN and NOT IN lists of thousands nest log-deep, values in order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    for ([_][]const u8{ " IN (", " NOT IN (" }) |kw| {
+        var expr: std.ArrayList(u8) = .empty;
+        try expr.print(a, "id{s}", .{kw});
+        for (0..8000) |i| try expr.print(a, "{s}{d}", .{ if (i == 0) "" else ", ", i });
+        try expr.append(a, ')');
+        const f = try parse(a, expr.items, &meta, null);
+        try testing.expect(filterDepth(f) <= 15);
+        // Leaves left to right are the list's values.
+        var stack: std.ArrayList(ast.Filter) = .empty;
+        try stack.append(a, f);
+        var next: i32 = 0;
+        while (stack.pop()) |n| switch (n) {
+            .and_filter, .or_filter => |c| {
+                try testing.expect((n == .and_filter) == (kw.len > 5));
+                try stack.append(a, c.right.*);
+                try stack.append(a, c.left.*);
+            },
+            else => {
+                try testing.expectEqual(next, n.int32.value);
+                next += 1;
+            },
+        };
+        try testing.expectEqual(@as(i32, 8000), next);
+    }
+}
+
 test "regression: a UUID literal binds to the 16 bytes the column stores" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1066,12 +1108,13 @@ test "parse IN / NOT IN / NOT" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // id IN (1, 2, 3) → ((id=1 OR id=2) OR id=3)
+    // id IN (1, 2, 3) → (id=1 OR (id=2 OR id=3)), balanced
     const f = try parse(a, "id IN (1, 2, 3)", &meta, null);
     try testing.expect(f == .or_filter);
-    try testing.expectEqual(@as(i32, 1), f.or_filter.left.*.or_filter.left.*.int32.value);
-    try testing.expectEqual(ast.Operator.Eq, f.or_filter.left.*.or_filter.left.*.int32.op);
-    try testing.expectEqual(@as(i32, 3), f.or_filter.right.*.int32.value);
+    try testing.expectEqual(@as(i32, 1), f.or_filter.left.*.int32.value);
+    try testing.expectEqual(ast.Operator.Eq, f.or_filter.left.*.int32.op);
+    try testing.expectEqual(@as(i32, 2), f.or_filter.right.*.or_filter.left.*.int32.value);
+    try testing.expectEqual(@as(i32, 3), f.or_filter.right.*.or_filter.right.*.int32.value);
 
     // id NOT IN (1, 2) → (id!=1 AND id!=2)
     const fni = try parse(a, "id NOT IN (1, 2)", &meta, null);

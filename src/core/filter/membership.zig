@@ -623,9 +623,9 @@ fn waveEnd(ts: []const *Target, n: usize) usize {
 /// PLAIN_DICTIONARY with nothing but level encodings beside it; a v2 RLE_DICTIONARY chunk could have fallen back to
 /// PLAIN without saying so.
 pub fn dictionaryCoversChunk(cm: *const schema.ColumnMetaData) bool {
-    const DICTIONARY_PAGE = @intFromEnum(schema.PageType.DICTIONARY_PAGE);
-    const plain_dictionary = @intFromEnum(schema.Encoding.PLAIN_DICTIONARY);
-    const rle_dictionary = @intFromEnum(schema.Encoding.RLE_DICTIONARY);
+    const DICTIONARY_PAGE = @backingInt(schema.PageType.DICTIONARY_PAGE);
+    const plain_dictionary = @backingInt(schema.Encoding.PLAIN_DICTIONARY);
+    const rle_dictionary = @backingInt(schema.Encoding.RLE_DICTIONARY);
     if (cm.encoding_stats) |es| {
         var dict_page = false;
         var data_page = false;
@@ -633,8 +633,8 @@ pub fn dictionaryCoversChunk(cm: *const schema.ColumnMetaData) bool {
             if (e.count <= 0) continue;
             switch (e.page_type) {
                 DICTIONARY_PAGE => dict_page = true,
-                @intFromEnum(schema.PageType.INDEX_PAGE) => {},
-                @intFromEnum(schema.PageType.DATA_PAGE), @intFromEnum(schema.PageType.DATA_PAGE_V2) => {
+                @backingInt(schema.PageType.INDEX_PAGE) => {},
+                @backingInt(schema.PageType.DATA_PAGE), @backingInt(schema.PageType.DATA_PAGE_V2) => {
                     if (e.encoding != plain_dictionary and e.encoding != rle_dictionary) return false;
                     data_page = true;
                 },
@@ -1611,7 +1611,7 @@ test "remote: a first wave that prunes nothing leaves the other filters unread" 
 }
 
 fn pageStat(page: schema.PageType, enc: schema.Encoding, count: i32) schema.PageEncodingStats {
-    return .{ .page_type = @intFromEnum(page), .encoding = @intFromEnum(enc), .count = count };
+    return .{ .page_type = @backingInt(page), .encoding = @backingInt(enc), .count = count };
 }
 
 test "dictionaryCoversChunk: encoding_stats decide; without them only the v1 signature does" {

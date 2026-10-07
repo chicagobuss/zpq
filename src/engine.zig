@@ -2814,8 +2814,8 @@ pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
         "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"request_kb\":{d},\"us\":{d}}}",
         .{
-            s.row_groups_bloom, s.row_groups_dict, s.filters,             s.dictionaries,
-            s.requests,         s.bytes,           s.bloom_stopped,       s.dict_stopped,
+            s.row_groups_bloom,     s.row_groups_dict,         s.filters,       s.dictionaries,
+            s.requests,             s.bytes,                   s.bloom_stopped, s.dict_stopped,
             s.request_bytes / 1024, s.ns / std.time.ns_per_us,
         },
     );

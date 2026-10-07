@@ -302,7 +302,7 @@ fn parseInList(
     while (it.next()) |raw| {
         const v = std.mem.trim(u8, raw, " ");
         if (v.len == 0) return error.BadValue;
-        const leaf = try buildTypedComparison(col_idx, &elem, leaf_op, v, diag);
+        const leaf = try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag);
         if (acc) |prev| {
             const l = try arena.create(ast.Filter);
             const r = try arena.create(ast.Filter);
@@ -373,8 +373,8 @@ fn parseBetween(
     // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
     const left = try arena.create(ast.Filter);
     const right = try arena.create(ast.Filter);
-    left.* = try buildTypedComparison(col_idx, &elem, .GtEq, x_str, diag);
-    right.* = try buildTypedComparison(col_idx, &elem, .LtEq, y_str, diag);
+    left.* = try buildTypedComparison(arena, col_idx, &elem, .GtEq, x_str, diag);
+    right.* = try buildTypedComparison(arena, col_idx, &elem, .LtEq, y_str, diag);
     return .{ .and_filter = .{ .left = left, .right = right } };
 }
 
@@ -384,7 +384,6 @@ fn parseComparisonLeaf(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    _ = arena;
     // Stray parens reach here only as grouping attempts — IN-list parens
     // were consumed upstream. Without this, `(a OR b)` splits into the
     // fragment `(a` and fails with a misleading UnknownColumn.
@@ -433,7 +432,7 @@ fn parseComparisonLeaf(
 
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-    return try buildTypedComparison(col_idx, &elem, op, val_str, diag);
+    return try buildTypedComparison(arena, col_idx, &elem, op, val_str, diag);
 }
 
 /// Build a single typed comparison leaf, honoring DECIMAL columns (decoded
@@ -441,6 +440,7 @@ fn parseComparisonLeaf(
 /// → stored epoch ints). Shared by the comparison path and the IN-list
 /// expansion so both get identical type handling.
 fn buildTypedComparison(
+    arena: std.mem.Allocator,
     col_idx: usize,
     elem: *const schema.SchemaElement,
     op: ast.Operator,
@@ -469,8 +469,36 @@ fn buildTypedComparison(
         Diag.set(diag, elem.name, .float16_filter);
         return error.UnsupportedType;
     }
+    // A UUID is stored as its 16 bytes; the literal is its text. Compared as text, it never matched.
+    if (elem.logical_type != null and elem.logical_type.? == .UUID and elem.type == .FIXED_LEN_BYTE_ARRAY) {
+        const bytes = try arena.create([16]u8);
+        bytes.* = parseUuid(stripStringQuotes(val_str)) orelse return error.BadValue;
+        return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = bytes } });
+    }
     const ptype = elem.type orelse return error.UnsupportedType;
     return markStored(try buildLeafFilter(col_idx, op, val_str, ptype));
+}
+
+/// The 16 bytes of a UUID written as 32 hex digits, either bare or hyphenated 8-4-4-4-12.
+fn parseUuid(text: []const u8) ?[16]u8 {
+    var hex: [32]u8 = undefined;
+    switch (text.len) {
+        32 => @memcpy(&hex, text),
+        36 => {
+            var n: usize = 0;
+            for (text, 0..) |c, i| {
+                const dash = i == 8 or i == 13 or i == 18 or i == 23;
+                if (dash != (c == '-')) return null;
+                if (dash) continue;
+                hex[n] = c;
+                n += 1;
+            }
+        },
+        else => return null,
+    }
+    var out: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, &hex) catch return null;
+    return out;
 }
 
 fn markStored(f: ast.Filter) ast.Filter {
@@ -747,7 +775,7 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .type_length = null,
         .repetition_type = .REQUIRED,
         .name = "root",
-        .num_children = 10,
+        .num_children = 11,
         .scale = null,
         .precision = null,
         .field_id = null,
@@ -835,7 +863,43 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .field_id = null,
         .logical_type = t.lt,
     });
+    try meta.schema.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 16,
+        .repetition_type = .OPTIONAL,
+        .name = "uid",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = .{ .UUID = .{} },
+    });
     return meta;
+}
+
+test "regression: a UUID literal binds to the 16 bytes the column stores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const want = [16]u8{ 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00 };
+    for ([_][]const u8{
+        "uid = '550e8400-e29b-41d4-a716-446655440000'",
+        "uid = '550E8400E29B41D4A716446655440000'",
+        "uid IN ('550e8400-e29b-41d4-a716-446655440000')",
+    }) |expr| {
+        const f = try parse(a, expr, &meta, null);
+        try testing.expectEqualSlices(u8, &want, f.string.value);
+        try testing.expect(f.string.stored);
+    }
+    for ([_][]const u8{
+        "uid = '550e8400-e29b-41d4-a716-44665544000'",
+        "uid = '550e8400e-29b-41d4-a716-446655440000'",
+        "uid = '550e8400-e29b-41d4-a716-44665544000g'",
+        "uid = 'abc'",
+    }) |expr| try testing.expectError(error.BadValue, parse(a, expr, &meta, null));
 }
 
 test "parse simple int equality" {

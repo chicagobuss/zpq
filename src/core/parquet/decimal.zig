@@ -260,6 +260,31 @@ pub fn decodeColumnAsF64WithOptions(
     };
 }
 
+/// `col`, a DECIMAL column's unscaled integers as `decodeColumnAsI128` decodes an INT32/INT64-backed chunk, as the
+/// f64 column `decodeColumnAsF64` decodes from that chunk: the same conversion per value (an exact integer rounded
+/// to f64, then divided by 10^scale), so the same bits, without decoding the chunk a second time.
+pub fn scaledF64FromI128(
+    arena: std.mem.Allocator,
+    col: filter_eval.ColumnT(i128),
+    scale: i32,
+) Error!filter_eval.ColumnT(f64) {
+    // The values came from i32/i64, so they convert through i64: an i128 conversion is a library call per value.
+    const values = try arena.alloc(f64, col.values.len);
+    var i: usize = 0;
+    if (scale > 0 and scale < pow10_f64.len) {
+        const LANES = 8;
+        const divisor: @Vector(LANES, f64) = @splat(pow10_f64[@intCast(scale)]);
+        while (i + LANES <= values.len) : (i += LANES) {
+            var iv: @Vector(LANES, i64) = undefined;
+            inline for (0..LANES) |l| iv[l] = @intCast(col.values[i + l]);
+            const fv: @Vector(LANES, f64) = @floatFromInt(iv);
+            values[i..][0..LANES].* = fv / divisor;
+        }
+    }
+    for (i..values.len) |j| values[j] = applyScaleInt(i64, @intCast(col.values[j]), scale);
+    return .{ .values = values, .def_levels = col.def_levels, .max_def = col.max_def, .has_nulls = col.has_nulls };
+}
+
 const column_mod = @import("column.zig");
 
 /// Decode a DECIMAL column to its **unscaled integers** widened to i128
@@ -1092,4 +1117,22 @@ test "applyScaleI128: out-of-table scale uses the pow fallback without trapping"
     // (Out of spec — precision/scale <= 38 — but must not index out of bounds.)
     const v = applyScaleI128(12345, 40);
     try testing.expect(v > 0 and v < 1e-30);
+}
+
+test "scaledF64FromI128 matches decodeColumnAsF64 bit for bit" {
+    var prng = std.Random.DefaultPrng.init(0xdec);
+    const r = prng.random();
+    inline for (.{ i32, i64 }) |T| {
+        for ([_]i32{ 0, 2, 7, 15 }) |scale| {
+            var raw: [1000]T = undefined;
+            for (&raw) |*v| v.* = r.int(T);
+            var want: [1000]f64 = undefined;
+            applyScaleSimd(T, &raw, scale, &want);
+            var wide: [1000]i128 = undefined;
+            for (raw, &wide) |v, *w| w.* = v;
+            const got = try scaledF64FromI128(testing.allocator, .{ .values = &wide }, scale);
+            defer testing.allocator.free(got.values);
+            for (want, got.values) |a, b| try testing.expectEqual(@as(u64, @bitCast(a)), @as(u64, @bitCast(b)));
+        }
+    }
 }

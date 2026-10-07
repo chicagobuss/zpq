@@ -373,6 +373,9 @@ pub const ProjectedRG = struct {
     batch: filter_eval.Batch,
     lookup: []?usize,
     batch_pos_for_col: []?usize,
+    /// Per leaf: a DECIMAL column both filtered on and written as DECIMAL, decoded once as unscaled integers; the
+    /// filter reads the f64 column made from them, the output these.
+    unscaled: []?filter_eval.ColumnT(i128),
     sel: filter_selection.SelectionVector,
     surviving: usize,
 
@@ -418,11 +421,28 @@ pub const ProjectedRG = struct {
             .passthrough => {},
         };
         for (early, computed_refs) |*e, c| e.* = e.* or c;
+        // Leaves an output writes through the lossless DECIMAL lane (INT32/INT64-backed passthrough decimals).
+        const unscaled = try ra.alloc(?filter_eval.ColumnT(i128), num_leaves);
+        @memset(unscaled, null);
+        const lossless = try ra.alloc(bool, num_leaves);
+        @memset(lossless, false);
+        for (output_specs, agg.cols) |spec, cbuf| switch (spec) {
+            .passthrough => |ci| if (cbuf == .decimal and ci < num_leaves) {
+                lossless[ci] = true;
+            },
+            .computed => {},
+        };
 
         const t_decode_start = nowMonoNs();
         for (fetch_set, 0..) |needed, ci| {
             if (!needed or !early[ci]) continue;
-            const decoded = if (agg.keep_codes and !computed_refs[ci])
+            const kind = if (lossless[ci]) decimalKind(rg, meta, ci) else null;
+            const int_backed = if (kind) |k| k.physical == .INT32 or k.physical == .INT64 else false;
+            const decoded: filter_eval.Batch.Column = if (int_backed) blk: {
+                const dcol = try decodeDecimalI128(ra, rg, meta, src, ci, decode_options);
+                unscaled[ci] = dcol;
+                break :blk .{ .f64 = try decimal_mod.scaledF64FromI128(ra, dcol, kind.?.scale) };
+            } else if (agg.keep_codes and !computed_refs[ci])
                 try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
             else
                 try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
@@ -453,6 +473,7 @@ pub const ProjectedRG = struct {
             .batch = batch,
             .lookup = lookup,
             .batch_pos_for_col = batch_pos_for_col,
+            .unscaled = unscaled,
             .sel = sel,
             .surviving = surviving,
         };
@@ -486,7 +507,8 @@ pub const ProjectedRG = struct {
             };
             var late = std.heap.ArenaAllocator.init(gpa);
             defer late.deinit();
-            const dcol = try decodeDecimalI128(late.allocator(), rg, meta, src, kept_ci, decode_options);
+            const dcol = self.unscaled[kept_ci] orelse
+                try decodeDecimalI128(late.allocator(), rg, meta, src, kept_ci, decode_options);
             const filtered_dec = try encoder.applySelectionI128(late.allocator(), dcol, &self.sel);
             try appendTyped(i128, &agg.cols[i].decimal, filtered_dec.values, filtered_dec.def_levels, filtered_dec.max_def, agg.arena);
             return;
@@ -617,6 +639,13 @@ fn decodeWriteColumn(
 /// lossless output lane). Re-derives the chunk window the same way the
 /// batch-decode loop does. Caller guarantees the column is an
 /// INT32/INT64-backed decimal.
+/// Leaf `ci`'s DECIMAL kind, or null when it is no decimal.
+fn decimalKind(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) ?decimal_mod.Kind {
+    const cm = rg.columns.items[ci].meta_data orelse return null;
+    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
+    return decimal_mod.kindFromSchema(&se);
+}
+
 fn decodeDecimalI128(
     ra: std.mem.Allocator,
     rg: *const schema.RowGroup,

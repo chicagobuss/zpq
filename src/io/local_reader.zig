@@ -60,17 +60,33 @@ pub const Policy = struct {
         return p;
     }
 
-    /// The mode for files of which `resident` (0..1) is in the page cache. Mostly resident files read fastest as they
-    /// are; otherwise io_uring where the kernel allows it, else pread.
-    pub fn choose(self: Policy, resident: f64) Mode {
+    /// The share of the files' bytes a query must read before `auto` treats it as a full scan.
+    pub const wide_scan: f64 = 0.5;
+
+    /// The mode for files of which `resident` (0..1) is in the page cache and `coverage` (0..1) the share a query
+    /// plans to read. Mostly resident files read fastest as they are. Otherwise io_uring where the kernel allows it;
+    /// failing that, pread for a narrow read, but the mapping (see `willNeed`) for a wide one, where the kernel's
+    /// readahead beats blocking reads.
+    pub fn choose(self: Policy, resident: f64, coverage: f64) Mode {
         return switch (self.profile) {
             .mmap => .mmap,
             .pread => .pread,
             .uring => if (uringAvailable()) .uring else .pread,
             .auto => if (builtin.os.tag != .linux or resident >= 0.8)
                 .mmap
-            else if (uringAvailable()) .uring else .pread,
+            else if (uringAvailable())
+                .uring
+            else if (coverage >= wide_scan)
+                .mmap
+            else
+                .pread,
         };
+    }
+
+    /// Whether `auto`, having chosen the mapping for a wide read of uncached files, should ask the kernel to read it
+    /// ahead (MADV_WILLNEED) rather than leave it to page faults.
+    pub fn willNeed(self: Policy, mode: Mode, resident: f64, coverage: f64) bool {
+        return self.profile == .auto and mode == .mmap and resident < 0.8 and coverage >= wide_scan;
     }
 };
 
@@ -205,6 +221,82 @@ pub const File = struct {
         _ = rd.rel_gen.fetchAdd(1, .release);
         _ = linux.futex_3arg(&rd.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
     }
+};
+
+/// `auto`'s fallback for a wide read of uncached files without io_uring: the mapping stays what the workers read, and
+/// as they reach each row group the planned ranges of those ahead of it, up to `window` bytes, are advised
+/// MADV_WILLNEED, so the kernel reads them while earlier row groups decode. Advising the whole file at once would
+/// read a file bigger than memory into the page cache only to evict it again.
+pub const Prefetch = struct {
+    gpa: std.mem.Allocator,
+    map: []const u8,
+    /// Per row group, its planned ranges, page-aligned.
+    ranges: []const []const Range,
+    /// `prefix[rg]`: planned bytes of the row groups before `rg`.
+    prefix: []u64,
+    /// The first row group not yet advised.
+    next: std.atomic.Value(usize) = .init(0),
+    window: u64,
+
+    /// `per_rg[rg]` (null when pruned) as `Reader.planFile` takes it; the ranges are copied.
+    pub fn create(gpa: std.mem.Allocator, map: []const u8, per_rg: []const ?[]Range, window: u64) !*Prefetch {
+        const p = try gpa.create(Prefetch);
+        errdefer gpa.destroy(p);
+        const ranges = try gpa.alloc([]const Range, per_rg.len);
+        @memset(ranges, &.{});
+        errdefer {
+            for (ranges) |r| gpa.free(r);
+            gpa.free(ranges);
+        }
+        const prefix = try gpa.alloc(u64, per_rg.len + 1);
+        errdefer gpa.free(prefix);
+        prefix[0] = 0;
+        for (per_rg, 0..) |opt, rg| {
+            var bytes: u64 = 0;
+            if (opt) |rs| {
+                const out = try gpa.alloc(Range, rs.len);
+                for (rs, out) |r, *o| {
+                    const end = @min(r.end, map.len);
+                    o.* = .{ .start = std.mem.alignBackward(u64, @min(r.start, end), pageLen()), .end = end };
+                    bytes += o.end - o.start;
+                }
+                ranges[rg] = out;
+            }
+            prefix[rg + 1] = prefix[rg] + bytes;
+        }
+        p.* = .{ .gpa = gpa, .map = map, .ranges = ranges, .prefix = prefix, .window = window };
+        return p;
+    }
+
+    pub fn destroy(self: *Prefetch) void {
+        for (self.ranges) |r| self.gpa.free(r);
+        self.gpa.free(self.ranges);
+        self.gpa.free(self.prefix);
+        self.gpa.destroy(self);
+    }
+
+    pub fn gate(self: *Prefetch) Gate {
+        return .{ .ctx = self, .wait = prefetchWait, .done = prefetchDone };
+    }
+
+    fn prefetchWait(ctx: *anyopaque, rg: usize) anyerror!void {
+        const self: *Prefetch = @ptrCast(@alignCast(ctx));
+        if (rg >= self.ranges.len) return;
+        var k = self.next.load(.monotonic);
+        // Each row group is claimed by one caller, so it is advised once; a lost race just moves on.
+        while (k < self.ranges.len and (k <= rg or self.prefix[k] - self.prefix[rg] < self.window)) {
+            if (self.next.cmpxchgWeak(k, k + 1, .monotonic, .monotonic)) |seen| {
+                k = seen;
+                continue;
+            }
+            for (self.ranges[k]) |r| if (r.end > r.start) {
+                _ = linux.madvise(@constCast(self.map.ptr) + r.start, @intCast(r.end - r.start), linux.MADV.WILLNEED);
+            };
+            k += 1;
+        }
+    }
+
+    fn prefetchDone(_: *anyopaque, _: usize, _: usize) void {}
 };
 
 /// One read: `len` bytes at `off`. `charge` is the window bytes it accounts for (its row group's on the first unit),
@@ -955,12 +1047,13 @@ test "local read bytes exclude EOF padding without shrinking the window charge" 
     }
 }
 
-
 test "residentShare bounds sampled allocation and partial-page windows" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     const mapping = try posix.mmap(null, 4096 * page + 1, .{ .READ = true, .WRITE = true }, .{
-        .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true,
+        .TYPE = .PRIVATE,
+        .ANONYMOUS = true,
+        .NORESERVE = true,
     }, -1, 0);
     defer posix.munmap(mapping);
     @memset(mapping, 1);
@@ -971,4 +1064,56 @@ test "residentShare bounds sampled allocation and partial-page windows" {
     try testing.expectEqual(@as(f64, 1), residentShare(bounded.allocator(), mapping[0 .. 32 * page - 1]));
     bounded.reset();
     try testing.expectEqual(@as(f64, 0), residentShare(bounded.allocator(), mapping[0..0]));
+}
+
+test "auto never reads a wide scan with pread, and advises the mapping ahead instead" {
+    const auto: Policy = .{};
+    // Cached: the mapping, whatever the share read.
+    try testing.expectEqual(Mode.mmap, auto.choose(0.9, 1.0));
+    try testing.expect(!auto.willNeed(.mmap, 0.9, 1.0));
+    const pinned: Policy = .{ .profile = .pread };
+    try testing.expectEqual(Mode.pread, pinned.choose(0.0, 1.0));
+    try testing.expect(!pinned.willNeed(.pread, 0.0, 1.0));
+    if (builtin.os.tag != .linux) return;
+    const wide = auto.choose(0.0, 0.99);
+    const narrow = auto.choose(0.0, 0.2);
+    if (uringAvailable()) {
+        try testing.expectEqual(Mode.uring, wide);
+        try testing.expectEqual(Mode.uring, narrow);
+    } else {
+        try testing.expectEqual(Mode.mmap, wide);
+        try testing.expect(auto.willNeed(wide, 0.0, 0.99));
+        try testing.expectEqual(Mode.pread, narrow);
+    }
+    try testing.expect(auto.willNeed(.mmap, 0.0, Policy.wide_scan));
+    try testing.expect(!auto.willNeed(.mmap, 0.0, Policy.wide_scan - 0.01));
+}
+
+test "prefetch advises each row group once, never past the window ahead of the caller" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const size = 64 * pageLen();
+    const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer posix.munmap(map);
+    var store: [8][1]Range = undefined;
+    var plans: [8]?[]Range = undefined;
+    for (&store, &plans, 0..) |*st, *p, g| {
+        st[0] = .{ .start = g * 8 * pageLen() + 100, .end = (g + 1) * 8 * pageLen() };
+        p.* = if (g == 3) null else st;
+    }
+    const pf = try Prefetch.create(testing.allocator, map, &plans, 16 * pageLen());
+    defer pf.destroy();
+    const gate = pf.gate();
+    try gate.wait(gate.ctx, 0);
+    // Row group 0, and 1 ahead of it: their 16 pages fill the window.
+    try testing.expectEqual(@as(usize, 2), pf.next.load(.monotonic));
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqual(@as(usize, 2), pf.next.load(.monotonic));
+    // Row group 2 then reaches past the pruned 3 (no bytes) to 4.
+    try gate.wait(gate.ctx, 2);
+    try testing.expectEqual(@as(usize, 5), pf.next.load(.monotonic));
+    try gate.wait(gate.ctx, 6);
+    try testing.expect(pf.next.load(.monotonic) >= 7);
+    try gate.wait(gate.ctx, 7);
+    try testing.expectEqual(@as(usize, 8), pf.next.load(.monotonic));
+    gate.done(gate.ctx, 7, 1);
 }

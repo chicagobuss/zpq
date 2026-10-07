@@ -72,6 +72,13 @@ pub const IoStat = struct {
     local_pread_threads: u64 = 0,
     local_direct_files: u64 = 0,
     local_buffered_files: u64 = 0,
+    /// `io_choice`, when local inputs were weighed: see that event for the encodings.
+    io_choice_seen: u64 = 0,
+    io_profile: u64 = 0,
+    io_mode: u64 = 0,
+    io_resident_permille: u64 = 0,
+    io_coverage_permille: u64 = 0,
+    io_willneed: u64 = 0,
 
     pub fn requests(self: IoStat) u64 {
         return self.gets + self.puts;
@@ -334,6 +341,14 @@ fn tally(
             s.io.local_stall_ns += a[4];
             s.io.local_window_waits += a[5];
         },
+        .io_choice => {
+            s.io.io_choice_seen = 1;
+            s.io.io_profile = a[0];
+            s.io.io_mode = a[1];
+            s.io.io_resident_permille = a[2];
+            s.io.io_coverage_permille = a[3];
+            s.io.io_willneed = a[4];
+        },
         .local_backend => {
             s.io.local_uring_threads = a[0];
             s.io.local_pread_threads = a[1];
@@ -462,6 +477,26 @@ fn ms(ns: u64) f64 {
 
 /// The local reader's actual backends, mixed ones included: io_uring asked for can end up pread on some or all
 /// threads (a ring that would not set up), and O_DIRECT on some or no files (a file system that refused it).
+/// How the local inputs were to be read and why: the profile asked for, the mode chosen, and for `auto` what it
+/// weighed.
+fn writeIoChoice(w: *std.Io.Writer, io: IoStat) !void {
+    const profiles = [_][]const u8{ "auto", "mmap", "pread", "uring" };
+    const modes = [_][]const u8{ "mmap", "pread", "io_uring" };
+    try w.print("       read mode: {s} -> {s}{s}", .{
+        profiles[@min(io.io_profile, profiles.len - 1)],
+        modes[@min(io.io_mode, modes.len - 1)],
+        if (io.io_willneed != 0) " + WILLNEED readahead" else "",
+    });
+    if (io.io_profile == 0) {
+        try w.print(" ({d}% cached", .{io.io_resident_permille / 10});
+        if (io.io_coverage_permille <= 1000) {
+            try w.print(", plans to read {d}% of the bytes", .{io.io_coverage_permille / 10});
+        }
+        try w.writeAll(")");
+    }
+    try w.writeAll("\n");
+}
+
 fn writeLocalBackend(w: *std.Io.Writer, io: IoStat) !void {
     const u = io.local_uring_threads;
     const p = io.local_pread_threads;
@@ -567,6 +602,7 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     const io = s.io;
     if (io.mapped_files > 0) {
         try w.print("io     local mmap: {d} file(s), {d:.1} MB mapped\n", .{ io.mapped_files, mb(io.mapped_bytes) });
+        if (io.io_choice_seen != 0) try writeIoChoice(w, io);
         if (io.local_mode != 0) {
             try w.writeAll("       read by ");
             try writeLocalBackend(w, io);

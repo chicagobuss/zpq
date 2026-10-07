@@ -57,6 +57,10 @@ pub const Kind = enum(u8) {
     /// What that reader actually read with: threads on io_uring, threads on pread (a pread mode, or a ring that failed
     /// to set up), files opened O_DIRECT, files read through the page cache.
     local_backend,
+    /// How a query's local inputs are read: the ZPQ_IO_PROFILE asked for (0 auto, 1 mmap, 2 pread, 3 uring), the mode
+    /// chosen (0 mmap, 1 pread, 2 uring), the share of the inputs cached and of them the query plans to read (per
+    /// mille; coverage 2^32-1 when not weighed), and whether the mapping is advised ahead (MADV_WILLNEED).
+    io_choice,
     footer_batch,
     footer_fetch,
     footer_parse,
@@ -108,7 +112,7 @@ pub const Kind = enum(u8) {
             .encode, .encode_chunk => .encode,
             .copy_rg, .sink_write, .footer_write => .write,
             .merge, .finalize => .merge,
-            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read, .local_backend => .wait,
+            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read, .local_backend, .io_choice => .wait,
         };
     }
 
@@ -125,6 +129,7 @@ pub const Kind = enum(u8) {
             .open_file, .footer_parse => &.{ "file", "bytes" },
             .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },
             .local_backend => &.{ "uring_threads", "pread_threads", "direct_files", "buffered_files" },
+            .io_choice => &.{ "profile", "mode", "resident_permille", "coverage_permille", "willneed" },
             .footer_fetch => &.{ "file", "cache" },
             .plan => &.{ "work_items", "workers", "row_groups" },
             .plan_ranges => &.{ "ranges", "merged", "fetch_jobs", "bytes", "row_groups", "row_groups_pruned" },

@@ -29,9 +29,16 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 `ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default). With `auto`:
 
 - on Lambda (`AWS_LAMBDA_FUNCTION_NAME` set), or on any OS but Linux: `mmap`;
-- when at least 80% of the inputs' pages are already in the page cache (`mincore`): `mmap`, since a warm mapping reads
-  fastest as it is;
-- otherwise `uring` where the kernel allows an io_uring, else `pread`.
+- when an estimated 80% or more of the inputs' bytes are already in the page cache: `mmap`, since a warm mapping reads
+  fastest as it is. The estimate comes from `mincore` over 64 evenly spaced windows of 32 pages per file (every page
+  of a file under 2048 pages), so it costs microseconds however big the file;
+- otherwise `uring` where the kernel allows an io_uring;
+- without one, a query that plans to read at least half of the inputs' bytes (a full or wide scan) uses `mmap`, with
+  the planned ranges of the row groups ahead of the workers advised `MADV_WILLNEED` up to the window: blocking `pread`
+  loses to the kernel's readahead there. A narrower read uses `pread`.
+
+The footers are parsed and the query planned before the choice, so pruned row groups and unread columns don't count
+toward the share read.
 
 Each mode falls back rather than fails:
 
@@ -49,7 +56,8 @@ No registered buffers are used, so the default `memlock` limit is enough.
 | `ZPQ_IO_WINDOW_MIB` | 1024 | bytes read ahead of the workers and not yet released |
 | `ZPQ_IO_THREADS` | 8 | reader threads |
 
-`--profile-summary` names the backend a query used. With a reader it adds a line with what the reads actually went
-through (reader threads on io_uring and on pread, the latter including any whose ring failed to set up; files read
-`O_DIRECT` and through the page cache), the bytes read, how often and how long workers waited on reads, and how often
-the reader waited for the window.
+`--profile-summary` names the backend a query used, and on a `read mode:` line what `ZPQ_IO_PROFILE` asked for, what was
+chosen and, for `auto`, the cached share and the share the query plans to read. With a reader it adds a line with what
+the reads actually went through (reader threads on io_uring and on pread, the latter including any whose ring failed to
+set up; files read `O_DIRECT` and through the page cache), the bytes read, how often and how long workers waited on
+reads, and how often the reader waited for the window.

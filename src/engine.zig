@@ -361,13 +361,16 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
     //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
     const io_policy = local_reader.Policy.fromEnv(ctx.env);
-    // Comptime .mmap off Linux, so the reader (io_uring, futexes) is never compiled in there.
-    const io_mode: local_reader.Mode = if (@import("builtin").os.tag == .linux)
-        localReadMode(ctx.gpa, io_policy, opened)
-    else
-        .mmap;
+    // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
+    const on_linux = @import("builtin").os.tag == .linux;
+    const all_local = on_linux and allLocal(opened);
+    const resident: f64 = if (all_local and io_policy.profile == .auto) localResidency(ctx.gpa, opened) else 0;
+    // Anything but the plain mapping needs the footers and the plan here: the explicit modes to read by them, and
+    // `auto` over uncached files to weigh how much of them the query reads.
+    const plan_io = all_local and (io_policy.profile == .pread or io_policy.profile == .uring or
+        (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
-    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta or io_mode != .mmap) blk: {
+    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta or plan_io) blk: {
         const m = try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
@@ -376,15 +379,40 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
         break :blk m;
     } else null;
+    const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
+    const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
+    const io_mode: local_reader.Mode = if (all_local) io_policy.choose(resident, coverage) else .mmap;
+    const will_need = all_local and io_policy.willNeed(io_mode, resident, coverage);
+    profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
+        io_policy.profile,
+        io_mode,
+        @as(u64, @intFromFloat(resident * 1000)),
+        @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
+        will_need,
+    }));
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (reader) |rd| rd.destroy();
-    const scan_inputs = if (io_mode == .mmap) opened.inputs else try startLocalReader(
+    var prefetches: []*local_reader.Prefetch = &.{};
+    defer for (prefetches) |pf| pf.destroy();
+    const scan_inputs = if (will_need) blk: {
+        const inputs = try arena.dupe(scan.Input, opened.inputs);
+        prefetches = try arena.alloc(*local_reader.Prefetch, inputs.len);
+        var made: usize = 0;
+        errdefer for (prefetches[0..made]) |pf| pf.destroy();
+        for (inputs, local_plan.?.files, opened.mmaps) |*in, per_rg, m| {
+            const pf = try local_reader.Prefetch.create(ctx.gpa, m.?.bytes, per_rg, io_policy.window);
+            prefetches[made] = pf;
+            made += 1;
+            in.gate = pf.gate();
+        }
+        prefetches = prefetches[0..made];
+        break :blk inputs;
+    } else if (io_mode == .mmap) opened.inputs else try startLocalReader(
         ctx,
         arena,
-        args,
         opened,
-        metas.?,
+        local_plan.?,
         .{ .mode = io_mode, .threads = io_policy.threads, .window = io_policy.window },
         &reader,
     );
@@ -2215,38 +2243,50 @@ fn openInputs(
 
 /// How the scan reads this query's local files: `policy`'s choice, given how much of them the page cache holds.
 /// The mapping when there are none, or when any input is remote (the S3 path plans its own reads).
-fn localReadMode(gpa: std.mem.Allocator, policy: local_reader.Policy, opened: OpenedInputs) local_reader.Mode {
+fn allLocal(opened: OpenedInputs) bool {
+    if (opened.mmaps.len == 0) return false;
+    for (opened.mmaps) |m| if (m == null) return false;
+    return true;
+}
+
+/// The share (0..1) of the local inputs' bytes the page cache holds.
+fn localResidency(gpa: std.mem.Allocator, opened: OpenedInputs) f64 {
     var total: f64 = 0;
     var resident: f64 = 0;
     for (opened.mmaps) |m_opt| {
-        const m = m_opt orelse return .mmap;
+        const m = m_opt orelse continue;
         const n: f64 = @floatFromInt(m.bytes.len);
         total += n;
-        // Only the auto policy looks at residency; `mincore` over a big file isn't free.
-        if (policy.profile == .auto) resident += n * local_reader.residentShare(gpa, m.bytes);
+        resident += n * local_reader.residentShare(gpa, m.bytes);
     }
-    if (total == 0) return .mmap;
-    return policy.choose(resident / total);
+    return if (total == 0) 0 else resident / total;
 }
 
-/// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:
-/// each local one over the reader's buffer, gated per row group. `metas` carry what pruning has proved.
-fn startLocalReader(
-    ctx: Context,
+/// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page
+/// indexes. What the reader reads, the prefetcher advises, and `auto` weighs against the files' size.
+const LocalPlan = struct {
+    files: []const []const ?[]local_reader.Range,
+    planned: u64,
+    total: u64,
+
+    fn coverage(self: LocalPlan) f64 {
+        if (self.total == 0) return 0;
+        return @min(1.0, @as(f64, @floatFromInt(self.planned)) / @as(f64, @floatFromInt(self.total)));
+    }
+};
+
+fn planLocalReads(
     arena: std.mem.Allocator,
     args: QueryArgs,
     opened: OpenedInputs,
     metas: []const schema.FileMetaData,
-    cfg: local_reader.Config,
-    out: *?*local_reader.Reader,
-) ![]const scan.Input {
-    const rd = try local_reader.Reader.create(ctx.gpa, cfg);
-    out.* = rd;
+) !LocalPlan {
     const plan = try planRanges(arena, args, metas);
-    const inputs = try arena.dupe(scan.Input, opened.inputs);
-    for (inputs, metas, opened.mmaps) |*in, *meta, m_opt| {
-        const m = m_opt orelse continue;
-        const f = try rd.openFile(in.name, m.bytes.len);
+    const files = try arena.alloc([]const ?[]local_reader.Range, metas.len);
+    var planned: u64 = 0;
+    var total: u64 = 0;
+    for (files, metas, opened.mmaps) |*file, *meta, m_opt| {
+        total += if (m_opt) |m| m.bytes.len else 0;
         const per_rg = try arena.alloc(?[]local_reader.Range, meta.row_groups.items.len);
         for (meta.row_groups.items, per_rg) |*rg, *rgs| {
             const cols = plan.rowGroupColumns(rg, meta) orelse {
@@ -2260,6 +2300,7 @@ fn startLocalReader(
                 const cm = chunk.meta_data orelse continue;
                 const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
                 try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
+                planned += @intCast(cm.total_compressed_size);
                 // The scan reads a needed chunk's page index too.
                 if (chunk.column_index_offset) |o| if (chunk.column_index_length) |l| {
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
@@ -2270,6 +2311,27 @@ fn startLocalReader(
             }
             rgs.* = rs.items;
         }
+        file.* = per_rg;
+    }
+    return .{ .files = files, .planned = planned, .total = total };
+}
+
+/// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:
+/// each local one over the reader's buffer, gated per row group.
+fn startLocalReader(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    opened: OpenedInputs,
+    local_plan: LocalPlan,
+    cfg: local_reader.Config,
+    out: *?*local_reader.Reader,
+) ![]const scan.Input {
+    const rd = try local_reader.Reader.create(ctx.gpa, cfg);
+    out.* = rd;
+    const inputs = try arena.dupe(scan.Input, opened.inputs);
+    for (inputs, local_plan.files, opened.mmaps) |*in, per_rg, m_opt| {
+        const m = m_opt orelse continue;
+        const f = try rd.openFile(in.name, m.bytes.len);
         try rd.planFile(f, per_rg, COALESCE_GAP);
         in.bytes = f.bytes();
         in.gate = f.gate();

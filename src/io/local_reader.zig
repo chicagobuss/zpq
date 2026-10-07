@@ -1,6 +1,6 @@
 //! Explicit local reads that feed the scan workers row group by row group (Linux).
 //!
-//! A local input is otherwise one read-only `mmap` the decode workers page-fault in: one fault per 4 KiB page, taken
+//! A local input is otherwise one read-only `mmap` the decode workers page-fault in: one fault per page, taken
 //! by the very threads that should be decoding. Here the planned column-chunk ranges of each row group are read
 //! explicitly into an anonymous buffer laid out like the file (no offset changes, and pages never planned are never
 //! allocated), in row-group order, ahead of the workers. A worker waits on a row group's gate before touching it, and
@@ -94,6 +94,7 @@ pub fn uringAvailable() bool {
 /// The share (0..1) of `bytes`' pages the page cache holds, by `mincore`; 0 when it can't tell.
 pub fn residentShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_min) const u8) f64 {
     if (builtin.os.tag != .linux or bytes.len == 0) return 0;
+    const page = pageLen();
     const pages = (bytes.len + page - 1) / page;
     const vec = gpa.alloc(u8, pages) catch return 0;
     defer gpa.free(vec);
@@ -105,7 +106,10 @@ pub fn residentShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_m
 
 pub const Range = struct { start: u64, end: u64 };
 
-const page: u64 = 4096;
+/// The runtime base page (64 KiB on some aarch64 Linux): mincore reports, and madvise rounds lengths up to, these.
+fn pageLen() u64 {
+    return std.heap.pageSize();
+}
 
 /// What a scan worker calls around each work item (see `scan.Input.gate`).
 pub const Gate = @import("../core/scan.zig").RowGroupGate;
@@ -237,12 +241,13 @@ pub const Reader = struct {
 
         const f = try self.gpa.create(File);
         errdefer self.gpa.destroy(f);
-        const map_len: usize = @intCast(@max(page, std.mem.alignForward(u64, size, page)));
+        const map_len: usize = @intCast(@max(pageLen(), std.mem.alignForward(u64, size, pageLen())));
         const buf = try posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{
             .TYPE = .PRIVATE,
             .ANONYMOUS = true,
             .NORESERVE = true,
         }, -1, 0);
+        errdefer posix.munmap(buf);
         // THP on this buffer backed the gaps between projected chunks too: RSS 3-7x for nothing.
         _ = linux.madvise(buf.ptr, buf.len, linux.MADV.NOHUGEPAGE);
         f.* = .{ .reader = self, .fd = fd, .size = size, .buf = buf };
@@ -280,8 +285,8 @@ pub const Reader = struct {
                     if (end <= r.start) continue;
                     // Whole pages: O_DIRECT needs them, and they make overlaps with other row groups exact.
                     const clipped: Range = .{
-                        .start = std.mem.alignBackward(u64, r.start, page),
-                        .end = std.mem.alignForward(u64, end, page),
+                        .start = std.mem.alignBackward(u64, r.start, pageLen()),
+                        .end = std.mem.alignForward(u64, end, pageLen()),
                     };
                     if (cur) |*c| {
                         if (clipped.start <= c.end + gap) {
@@ -352,12 +357,14 @@ pub const Reader = struct {
 
     pub fn start(self: *Reader) !void {
         const n = @max(1, self.cfg.threads);
+        // Reserved first: a spawned thread missing from the list would never be joined.
+        try self.threads.ensureUnusedCapacity(self.gpa, n);
         for (0..n) |_| {
             const t = std.Thread.spawn(.{ .stack_size = 1 << 20 }, threadMain, .{self}) catch |err| {
                 if (self.threads.items.len > 0) return; // fewer readers, same work
                 return err;
             };
-            try self.threads.append(self.gpa, t);
+            self.threads.appendAssumeCapacity(t);
         }
     }
 
@@ -520,7 +527,7 @@ pub const Reader = struct {
 fn preadAll(f: *File, lo: u64, hi: u64) !void {
     var off = lo;
     while (off < hi) {
-        const len = std.mem.alignForward(u64, hi - off, page);
+        const len = std.mem.alignForward(u64, hi - off, pageLen());
         const rc = linux.pread(f.fd, f.buf.ptr + off, @intCast(@min(len, f.buf.len - off)), @intCast(off));
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -673,4 +680,31 @@ test "a row group's release keeps pages other row groups' ranges still cover" {
         for (f.seg_refs) |*r| try testing.expectEqual(@as(u32, 0), r.load(.monotonic));
         try testing.expectEqual(@as(u64, 0), rd.submitted.load(.monotonic) - rd.released.load(.monotonic));
     };
+}
+
+test "an allocation failing anywhere in open, plan or start leaks nothing and leaves no thread behind" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 256 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 3);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, p: []const u8, size: usize) !void {
+            const rd = try Reader.create(gpa, .{ .mode = .pread, .threads = 3, .block = 16 << 10 });
+            defer rd.destroy();
+            const f = try rd.openFile(p, size);
+            var store: [2][1]Range = .{ .{.{ .start = 0, .end = 100_000 }}, .{.{ .start = 90_000, .end = size }} };
+            var plans: [2]?[]Range = .{ &store[0], &store[1] };
+            try rd.planFile(f, &plans, 4096);
+            try rd.start();
+            const gate = f.gate();
+            for (0..2) |g| {
+                try gate.wait(gate.ctx, g);
+                gate.done(gate.ctx, g, 1);
+            }
+        }
+    }.run, .{ path, data.len });
 }

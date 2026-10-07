@@ -67,6 +67,11 @@ pub const IoStat = struct {
     local_stalls: u64 = 0,
     local_stall_ns: u64 = 0,
     local_window_waits: u64 = 0,
+    /// `local_backend`: what the reads actually went through, which a failed ring setup or a refused O_DIRECT changes.
+    local_uring_threads: u64 = 0,
+    local_pread_threads: u64 = 0,
+    local_direct_files: u64 = 0,
+    local_buffered_files: u64 = 0,
 
     pub fn requests(self: IoStat) u64 {
         return self.gets + self.puts;
@@ -329,6 +334,12 @@ fn tally(
             s.io.local_stall_ns += a[4];
             s.io.local_window_waits += a[5];
         },
+        .local_backend => {
+            s.io.local_uring_threads = a[0];
+            s.io.local_pread_threads = a[1];
+            s.io.local_direct_files = a[2];
+            s.io.local_buffered_files = a[3];
+        },
         .parse_query => s.reconcile.parse_ns += dur,
         .scan => s.reconcile.decode_wall_ns += dur,
         .decode => s.reconcile.decode_ns += dur,
@@ -449,6 +460,25 @@ fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
+/// The local reader's actual backends, mixed ones included: io_uring asked for can end up pread on some or all
+/// threads (a ring that would not set up), and O_DIRECT on some or no files (a file system that refused it).
+fn writeLocalBackend(w: *std.Io.Writer, io: IoStat) !void {
+    const u = io.local_uring_threads;
+    const p = io.local_pread_threads;
+    if (u > 0) try w.print("io_uring ({d} threads)", .{u});
+    if (u > 0 and p > 0) try w.writeAll(" + ");
+    if (p > 0) try w.print("pread ({d} threads{s})", .{ p, if (io.local_mode == 2) ", io_uring setup failed" else "" });
+    const d = io.local_direct_files;
+    const b = io.local_buffered_files;
+    if (b == 0) {
+        try w.writeAll(", O_DIRECT");
+    } else if (d == 0) {
+        try w.writeAll(", through the page cache");
+    } else {
+        try w.print(", O_DIRECT for {d} file(s), through the page cache for {d}", .{ d, b });
+    }
+}
+
 fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
@@ -537,17 +567,16 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     const io = s.io;
     if (io.mapped_files > 0) {
         try w.print("io     local mmap: {d} file(s), {d:.1} MB mapped\n", .{ io.mapped_files, mb(io.mapped_bytes) });
-        if (io.local_mode != 0) try w.print(
-            "       read by {s} ({d} threads): {d:.1} MB; {d} waits on reads ({d:.1} ms), {d} on the window\n",
-            .{
-                if (io.local_mode == 2) "io_uring O_DIRECT" else "pread",
-                io.local_threads,
+        if (io.local_mode != 0) {
+            try w.writeAll("       read by ");
+            try writeLocalBackend(w, io);
+            try w.print(": {d:.1} MB; {d} waits on reads ({d:.1} ms), {d} on the window\n", .{
                 mb(io.local_bytes),
                 io.local_stalls,
                 @as(f64, @floatFromInt(io.local_stall_ns)) / 1e6,
                 io.local_window_waits,
-            },
-        );
+            });
+        }
     }
     if (io.requests() > 0) {
         const n: f64 = @floatFromInt(io.requests());
@@ -867,4 +896,38 @@ test "summary JSON preserves whole multibyte column tails and replaces invalid b
     const top = parsed.value.object.get("top_chunks").?.array.items;
     try testing.expectEqualStrings(@as([127]u8, @splat('a'))[0..], top[0].object.get("column").?.string);
     try testing.expectEqualStrings("invalid\u{fffd}name", top[1].object.get("column").?.string);
+}
+
+test "the local reader line names the backends actually used, mixed ones included" {
+    const cases = [_]struct { io: IoStat, want: []const u8 }{
+        .{
+            .io = .{ .local_mode = 2, .local_uring_threads = 8, .local_direct_files = 2 },
+            .want = "io_uring (8 threads), O_DIRECT",
+        },
+        .{
+            .io = .{ .local_mode = 2, .local_pread_threads = 8, .local_direct_files = 1 },
+            .want = "pread (8 threads, io_uring setup failed), O_DIRECT",
+        },
+        .{
+            .io = .{
+                .local_mode = 2,
+                .local_uring_threads = 3,
+                .local_pread_threads = 5,
+                .local_direct_files = 1,
+                .local_buffered_files = 2,
+            },
+            .want = "io_uring (3 threads) + pread (5 threads, io_uring setup failed), " ++
+                "O_DIRECT for 1 file(s), through the page cache for 2",
+        },
+        .{
+            .io = .{ .local_mode = 1, .local_pread_threads = 4, .local_buffered_files = 3 },
+            .want = "pread (4 threads), through the page cache",
+        },
+    };
+    for (cases) |c| {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeLocalBackend(&w, c.io);
+        try std.testing.expectEqualStrings(c.want, w.buffered());
+    }
 }

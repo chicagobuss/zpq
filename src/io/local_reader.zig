@@ -35,6 +35,8 @@ pub const Config = struct {
     window: u64 = 1 << 30,
     /// Test hook: the read of this unit fails as an I/O error would.
     fail_unit: ?usize = null,
+    /// Test hook: the ring of reader thread `i` fails to set up when bit `i` is set, as seccomp or memlock can make it.
+    fail_rings: u64 = 0,
 };
 
 /// How a query reads local files: the mode `ZPQ_IO_PROFILE` names (`mmap`, `pread`, `uring`), or with `auto` (the
@@ -118,6 +120,8 @@ pub const File = struct {
     reader: *Reader,
     fd: i32,
     size: u64,
+    /// Opened O_DIRECT; false when the mode is pread or the file system refused it.
+    direct: bool,
     /// Anonymous, laid out like the file; only planned pages are ever written.
     buf: []align(std.heap.page_size_min) u8,
     /// 0 until the row group's reads are in, 1 once they are, 2 when a read failed.
@@ -212,8 +216,11 @@ pub const Reader = struct {
     admit_next: std.atomic.Value(u32) = .init(0),
     tickets: u32 = 0,
     stats: Stats = .{},
-    /// O_DIRECT opens refused (tmpfs, some FUSE): those files read through pread instead.
+    /// O_DIRECT opens refused (tmpfs, some FUSE): those files read through the page cache instead.
     direct_refused: bool = false,
+    /// Reader threads by the backend they actually got: a uring thread whose ring setup failed reads with pread.
+    uring_threads: u32 = 0,
+    pread_threads: u32 = 0,
 
     pub fn create(gpa: std.mem.Allocator, cfg: Config) !*Reader {
         std.debug.assert(cfg.mode != .mmap);
@@ -250,7 +257,7 @@ pub const Reader = struct {
         errdefer posix.munmap(buf);
         // THP on this buffer backed the gaps between projected chunks too: RSS 3-7x for nothing.
         _ = linux.madvise(buf.ptr, buf.len, linux.MADV.NOHUGEPAGE);
-        f.* = .{ .reader = self, .fd = fd, .size = size, .buf = buf };
+        f.* = .{ .reader = self, .fd = fd, .size = size, .direct = direct, .buf = buf };
         try self.files.append(self.gpa, f);
         return f;
     }
@@ -303,7 +310,12 @@ pub const Reader = struct {
                     const end = r.end;
                     while (off < end) {
                         const len = @min(self.cfg.block, end - off);
-                        try self.units.append(self.gpa, .{ .file = file_idx, .rg = @intCast(rg), .off = off, .len = @intCast(len) });
+                        try self.units.append(self.gpa, .{
+                            .file = file_idx,
+                            .rg = @intCast(rg),
+                            .off = off,
+                            .len = @intCast(len),
+                        });
                         f.rg_bytes[rg] += len;
                         units += 1;
                         off += len;
@@ -359,12 +371,23 @@ pub const Reader = struct {
         const n = @max(1, self.cfg.threads);
         // Reserved first: a spawned thread missing from the list would never be joined.
         try self.threads.ensureUnusedCapacity(self.gpa, n);
-        for (0..n) |_| {
-            const t = std.Thread.spawn(.{ .stack_size = 1 << 20 }, threadMain, .{self}) catch |err| {
+        var entries: u16 = 1;
+        while (entries < self.cfg.qd) entries *= 2;
+        for (0..n) |i| {
+            // Rings are set up here rather than in each thread, so what every thread reads with is known (and
+            // reported) once start returns: setup can fail per ring (seccomp, memlock) after a probe succeeded.
+            const fail = i < 64 and (self.cfg.fail_rings >> @intCast(i)) & 1 == 1;
+            var ring: ?linux.IoUring = if (self.cfg.mode == .uring and !fail)
+                linux.IoUring.init(entries, 0) catch null
+            else
+                null;
+            const t = std.Thread.spawn(.{ .stack_size = 1 << 20 }, threadMain, .{ self, ring }) catch |err| {
+                if (ring) |*r| r.deinit();
                 if (self.threads.items.len > 0) return; // fewer readers, same work
                 return err;
             };
             self.threads.appendAssumeCapacity(t);
+            if (ring != null) self.uring_threads += 1 else self.pread_threads += 1;
         }
     }
 
@@ -439,9 +462,23 @@ pub const Reader = struct {
         _ = linux.futex_4arg(&self.rel_gen.raw, .{ .cmd = .WAIT, .private = true }, g, &ts);
     }
 
-    fn threadMain(self: *Reader) void {
-        const ran = if (self.cfg.mode == .uring) self.uringRun() else self.preadRun();
+    fn threadMain(self: *Reader, ring: ?linux.IoUring) void {
+        const ran = if (ring) |r| self.uringRun(r) else self.preadRun();
         ran catch self.failAll();
+    }
+
+    pub const Backends = struct { uring_threads: u32, pread_threads: u32, direct_files: u32, buffered_files: u32 };
+
+    /// What the reads actually went through, valid once `start` returns.
+    pub fn backends(self: *const Reader) Backends {
+        var direct: u32 = 0;
+        for (self.files.items) |f| direct += @intFromBool(f.direct);
+        return .{
+            .uring_threads = self.uring_threads,
+            .pread_threads = self.pread_threads,
+            .direct_files = direct,
+            .buffered_files = @as(u32, @intCast(self.files.items.len)) - direct,
+        };
     }
 
     /// Read unit `i` with a blocking pread, retrying short reads; the tail of the file reads short by design.
@@ -466,10 +503,8 @@ pub const Reader = struct {
         }
     }
 
-    fn uringRun(self: *Reader) !void {
-        var entries: u16 = 1;
-        while (entries < self.cfg.qd) entries *= 2;
-        var ring = linux.IoUring.init(entries, 0) catch return self.preadRun();
+    fn uringRun(self: *Reader, ring_in: linux.IoUring) !void {
+        var ring = ring_in;
         defer ring.deinit();
         const units = self.units.items;
         var inflight: usize = 0;
@@ -569,7 +604,12 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
 
     for ([_]Mode{ .pread, .uring }) |mode| for ([_]u64{ 1 << 30, 4096 }) |window| {
         if (mode == .uring and !uringAvailable()) continue;
-        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 3, .block = 64 << 10, .window = window });
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = mode,
+            .threads = 3,
+            .block = 64 << 10,
+            .window = window,
+        });
         defer rd.destroy();
         const f = try rd.openFile(path, size);
         // Eight row groups over consecutive eighths of the file, each wanting a few ranges of it; one pruned.
@@ -594,7 +634,9 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
         for (plans, 0..) |p, g| {
             try gate.wait(gate.ctx, g);
             if (p) |rs| for (rs) |rg| {
-                try testing.expectEqualSlices(u8, data[@intCast(rg.start)..@intCast(rg.end)], f.bytes()[@intCast(rg.start)..@intCast(rg.end)]);
+                const lo: usize = @intCast(rg.start);
+                const hi: usize = @intCast(rg.end);
+                try testing.expectEqualSlices(u8, data[lo..hi], f.bytes()[lo..hi]);
             };
             gate.done(gate.ctx, g, 1);
         }
@@ -613,7 +655,12 @@ test "a failed read fails the row groups waiting on it, and teardown neither han
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
-        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 2, .block = 16 << 10, .fail_unit = 5 });
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = mode,
+            .threads = 2,
+            .block = 16 << 10,
+            .fail_unit = 5,
+        });
         defer rd.destroy();
         const f = try rd.openFile(path, data.len);
         var store: [4][1]Range = undefined;
@@ -658,7 +705,12 @@ test "a row group's release keeps pages other row groups' ranges still cover" {
     for ([_]Mode{ .pread, .uring }) |mode| for ([_]bool{ false, true }) |reverse| {
         if (mode == .uring and !uringAvailable()) continue;
         const window: u64 = if (reverse) 1 << 30 else 4096;
-        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 3, .block = 16 << 10, .window = window });
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = mode,
+            .threads = 3,
+            .block = 16 << 10,
+            .window = window,
+        });
         defer rd.destroy();
         const f = try rd.openFile(path, size);
         try rd.planFile(f, &plans, 1 << 20);
@@ -707,4 +759,47 @@ test "an allocation failing anywhere in open, plan or start leaks nothing and le
             }
         }
     }.run, .{ path, data.len });
+}
+
+test "threads whose ring fails to set up read with pread, and say so" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prng = std.Random.DefaultPrng.init(0xf1);
+    const data = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(data);
+    prng.random().bytes(data);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    for ([_]struct { fail: u64, uring: u32 }{ .{ .fail = 0b101, .uring = 1 }, .{ .fail = 0b111, .uring = 0 } }) |c| {
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = .uring,
+            .threads = 3,
+            .block = 16 << 10,
+            .fail_rings = c.fail,
+        });
+        defer rd.destroy();
+        const f = try rd.openFile(path, data.len);
+        var store: [4][1]Range = undefined;
+        var plans: [4]?[]Range = undefined;
+        for (&plans, &store, 0..) |*p, *st, g| {
+            st[0] = .{ .start = g * (256 << 10) + 7, .end = (g + 1) * (256 << 10) - 7 };
+            p.* = st;
+        }
+        try rd.planFile(f, &plans, 0);
+        try rd.start();
+        const b = rd.backends();
+        try testing.expectEqual(c.uring, b.uring_threads);
+        try testing.expectEqual(3 - c.uring, b.pread_threads);
+        try testing.expectEqual(@as(u32, 1), b.direct_files + b.buffered_files);
+        try testing.expectEqual(f.direct, b.direct_files == 1);
+        const gate = f.gate();
+        for (store, 0..) |st, g| {
+            try gate.wait(gate.ctx, g);
+            const lo: usize = @intCast(st[0].start);
+            const hi: usize = @intCast(st[0].end);
+            try testing.expectEqualSlices(u8, data[lo..hi], f.bytes()[lo..hi]);
+            gate.done(gate.ctx, g, 1);
+        }
+    }
 }

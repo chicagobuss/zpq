@@ -393,6 +393,15 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         rd.stats.stall_ns.load(.monotonic),
         rd.stats.window_waits.load(.monotonic),
     }));
+    if (reader) |rd| {
+        const b = rd.backends();
+        profile.record(prof, .local_backend, t_reader, t_reader, profile.args(.{
+            b.uring_threads,
+            b.pread_threads,
+            b.direct_files,
+            b.buffered_files,
+        }));
+    }
     var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
         .inputs = scan_inputs,
         .metas = metas,

@@ -51,9 +51,12 @@ pub const Kind = enum(u8) {
     query,
     open_inputs,
     open_file,
-    /// The explicit local reader over a query's scan: mode (1 pread, 2 io_uring), bytes read, reader threads, worker
-    /// stalls waiting on reads and their total ns, waits for the window.
+    /// The explicit local reader over a query's scan: the mode asked for (1 pread, 2 io_uring), bytes read, reader
+    /// threads, worker stalls waiting on reads and their total ns, waits for the window.
     local_read,
+    /// What that reader actually read with: threads on io_uring, threads on pread (a pread mode, or a ring that failed
+    /// to set up), files opened O_DIRECT, files read through the page cache.
+    local_backend,
     footer_batch,
     footer_fetch,
     footer_parse,
@@ -105,7 +108,7 @@ pub const Kind = enum(u8) {
             .encode, .encode_chunk => .encode,
             .copy_rg, .sink_write, .footer_write => .write,
             .merge, .finalize => .merge,
-            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read => .wait,
+            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read, .local_backend => .wait,
         };
     }
 
@@ -121,6 +124,7 @@ pub const Kind = enum(u8) {
             .open_inputs, .footer_batch => &.{"files"},
             .open_file, .footer_parse => &.{ "file", "bytes" },
             .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },
+            .local_backend => &.{ "uring_threads", "pread_threads", "direct_files", "buffered_files" },
             .footer_fetch => &.{ "file", "cache" },
             .plan => &.{ "work_items", "workers", "row_groups" },
             .plan_ranges => &.{ "ranges", "merged", "fetch_jobs", "bytes", "row_groups", "row_groups_pruned" },

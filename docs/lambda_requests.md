@@ -16,7 +16,7 @@ the CLI flags of the same name.
 | `output_url` | string | Write the result here, as `-o`. |
 | `output_codec` | string | `snappy`, `zstd`, `gzip`, `lz4`/`lz4_raw` or `uncompressed`; anything else is snappy. |
 | `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats`. |
-| `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. |
+| `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. Defaults to the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |

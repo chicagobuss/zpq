@@ -57,7 +57,9 @@ the medium moves in that time, the requests in flight at once, and the longest r
   so a cold page cache costs two rounds of parallel reads rather than one disk read per filter.
 - On a remote source, the filters of the first eight row groups are read first. If they prune fewer than a quarter of
   them, the rest are left unread, which bounds what filters cost a query they cannot help.
-- Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer.
+- Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer. The
+  cache may hold a sixteenth of the function's memory, at most 256 MiB, and a query's default `max_memory` is what it
+  leaves.
 
 Dictionaries are read only for chunks without a filter, in row groups still kept, through the same source and the
 same first-wave rule (on a mapping the wave bounds decode time instead). Where a filter says "maybe", the literal is
@@ -81,8 +83,11 @@ Filters are written after the last row group, one column's after another, with `
 `bloom_filter_length` both set. Other writers go row group by row group, so an equality on one column finds its
 filters scattered among the others'; in a zpq-written file they are contiguous and a reader fetches them in one ranged
 read (split for parallelism). Readers locate each filter through its own offset, so the order is invisible to them.
-Filters are held in memory until then: about 1.2 bytes per distinct value per chunk at 0.01, so a write with filters on
-a unique key holds about 1.2 bytes per row of that column until it closes.
+Memory, per requested column at 0.01: while a chunk is encoded its filter is first sized as if every present value
+were distinct, about 1.2 bytes per present value rounded up to a power of two (so up to 2.4, and at most 128 MiB), and
+folded once the chunk is filled. The folded filter is held until the file closes: 1.2 to 2.4 bytes per distinct value
+per chunk, so a write with a filter on a unique key holds up to 2.4 bytes per row of that column until it closes. This
+is outside `--max-memory`. A copied chunk's filter is a slice of the input, which the write holds anyway.
 
 A byte copy keeps each copied chunk's filter, whatever probability it was written at; a requested column whose source
 chunk has none is decoded to build one. A re-encoded row group gets filters only for requested columns. Dropped columns

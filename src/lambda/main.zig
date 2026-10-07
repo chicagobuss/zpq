@@ -82,6 +82,16 @@ const PersistentPool = struct {
     output: engine.OutputLane = undefined,
     output_initialized: bool = false,
 
+    /// A sixteenth of the function's memory for warm Bloom filters (188 MB at 3008 MB), at most 256 MiB.
+    pub fn sized(available: usize) PersistentPool {
+        return .{ .blob_budget = @min(256 << 20, available / 16) };
+    }
+
+    /// A query's default `max_memory`: what the warm filters, which outlive it, may leave of `available`.
+    pub fn queryMemory(self: *const PersistentPool, available: usize) usize {
+        return available -| self.blob_budget;
+    }
+
     pub fn ensureForBucket(
         self: *PersistentPool,
         gpa: std.mem.Allocator,
@@ -138,8 +148,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
-    // A sixteenth of the function's memory for warm Bloom filters: 188 MB at 3008 MB.
-    var pool: PersistentPool = .{ .blob_budget = @min(256 << 20, zpq.core.system.discoverAvailableMemory(env) / 16) };
+    var pool: PersistentPool = .sized(zpq.core.system.discoverAvailableMemory(env));
 
     while (true) {
         var inv = client.nextInvocation() catch |err| {
@@ -221,7 +230,7 @@ fn handle(
         // A new option is one field on QueryArgs + one parse line on each
         // surface — the handlers below pass `qa` straight through to the
         // engine, so options like `scan_all` flow without touching them.
-        const budget = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
+        const budget = max_memory orelse pool.queryMemory(zpq.core.system.discoverAvailableMemory(env));
         // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
         const prof_opts = zpq.profile.Options.forBudget(budget);
         var profiler: ?*zpq.profile.Profiler = null;
@@ -923,6 +932,14 @@ fn expectStringField(body: []const u8, key: []const u8, want: []const u8) !void 
     defer parsed.deinit();
     const got = parsed.value.object.get(key) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(want, got.string);
+}
+
+test "regression: a query's default memory budget leaves room for the warm Bloom filters" {
+    for ([_]usize{ 128 << 20, 1024 << 20, 3008 << 20, 10240 << 20 }) |available| {
+        const pool: PersistentPool = .sized(available);
+        try std.testing.expect(pool.blob_budget > 0 and pool.blob_budget <= 256 << 20);
+        try std.testing.expectEqual(available, pool.queryMemory(available) + pool.blob_budget);
+    }
 }
 
 test "the write response escapes the output name" {

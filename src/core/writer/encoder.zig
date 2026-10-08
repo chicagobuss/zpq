@@ -2312,3 +2312,97 @@ test "a coded string column past the dictionary's byte limit encodes to the same
     try testing.expectEqualSlices(u8, want.bytes, got.bytes);
     try testing.expect(want.meta.dictionary_page_offset == null);
 }
+test "the string prefix choice is inclusive at a quarter, and skips nulls" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const defs = [_]u32{ 1, 0, 1 };
+    for ([_]struct { last: []const u8, want: schema.Encoding }{
+        .{ .last = "aXYZ", .want = .DELTA_LENGTH_BYTE_ARRAY },
+        .{ .last = "abXY", .want = .DELTA_BYTE_ARRAY },
+        .{ .last = "abcX", .want = .DELTA_BYTE_ARRAY },
+    }) |case| {
+        const vals = [_][]const u8{ "abcd", "a-null-is-not-the-previous-value", case.last };
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1 } };
+        const got = (try encodeValuesStrings(a, col, &defs, 1)).?;
+        try testing.expectEqual(case.want, got.encoding);
+        const dba = @import("../parquet/encoding/delta_byte_array.zig");
+        var out: [2][]const u8 = undefined;
+        const n = if (got.encoding == .DELTA_BYTE_ARRAY) blk: {
+            var decoder = try dba.DeltaByteArrayDecoder.init(got.bytes, a, 2);
+            break :blk try decoder.decode(&out);
+        } else blk: {
+            var decoder = try dba.DeltaLengthByteArrayDecoder.init(got.bytes, a, 2);
+            break :blk try decoder.decode(&out);
+        };
+        try testing.expectEqual(@as(usize, 2), n);
+        try testing.expectEqualStrings("abcd", out[0]);
+        try testing.expectEqualStrings(case.last, out[1]);
+    }
+}
+
+test "the string dictionary limits admit exactly a quarter distinct and exactly 1 MiB" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const path: []const []const u8 = &.{"s"};
+    // Sixteen entries * (65532 bytes + four PLAIN length bytes) = exactly 1 MiB.
+    for ([_]usize{ 65531, 65532, 65533 }) |last_len| {
+        var dict: [16][]const u8 = undefined;
+        for (&dict, 0..) |*d, i| {
+            const bytes = try a.alloc(u8, if (i == 15) last_len else 65532);
+            @memset(bytes, @intCast(i));
+            d.* = bytes;
+        }
+        var vals: [64][]const u8 = undefined;
+        var codes: [64]u32 = undefined;
+        for (&vals, &codes, 0..) |*v, *c, i| {
+            c.* = @intCast(i % 16);
+            v.* = dict[c.*];
+        }
+        const hashed = try encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &vals } },
+            .schema_elem = &elem,
+            .path_in_schema = path,
+        });
+        const coded = try encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } },
+            .schema_elem = &elem,
+            .path_in_schema = path,
+        });
+        try testing.expectEqual(last_len <= 65532, hashed.meta.dictionary_page_offset != null);
+        try testing.expectEqualSlices(u8, hashed.bytes, coded.bytes);
+    }
+    var dict: [17][]const u8 = undefined;
+    for (&dict, 0..) |*d, i| d.* = try a.dupe(u8, &.{@intCast(i)});
+    for ([_]usize{ 16, 17 }) |k| {
+        var vals: [64][]const u8 = undefined;
+        var codes: [64]u32 = undefined;
+        for (&vals, &codes, 0..) |*v, *c, i| {
+            c.* = @intCast(i % k);
+            v.* = dict[c.*];
+        }
+        const hashed = try encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &vals } },
+            .schema_elem = &elem,
+            .path_in_schema = path,
+        });
+        const coded = try encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } },
+            .schema_elem = &elem,
+            .path_in_schema = path,
+        });
+        try testing.expectEqual(k == 16, hashed.meta.dictionary_page_offset != null);
+        try testing.expectEqualSlices(u8, hashed.bytes, coded.bytes);
+    }
+}

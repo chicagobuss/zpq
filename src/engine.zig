@@ -871,6 +871,9 @@ const RecompressCtx = struct {
     kept: ?[]const bool,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan = .{},
+    /// Threads each producer recompresses its row group's pages with: the CPU budget shared among the row groups that
+    /// run at once, so a file of one row group still uses all of it.
+    page_workers: usize = 1,
     /// Bloom filter probability per leaf (`--bloom-filter`), for copied chunks that carry none.
     bloom_leaves: []const ?f64 = &.{},
     slots: []RecompressSlot,
@@ -915,6 +918,7 @@ fn recompressProducer(w: *RecompressCtx, i: usize) void {
         w.codec,
         w.zstd,
         &timings,
+        w.page_workers,
     )) |chunks| {
         slot.chunks = chunks;
     } else |e| slot.err = e;
@@ -960,7 +964,12 @@ fn recompressWriter(w: *RecompressCtx) void {
     }
 }
 
-const WriteWindow = struct { workers: usize, window: usize };
+const WriteWindow = struct {
+    workers: usize,
+    window: usize,
+    /// The CPU budget `workers` was taken from (they are fewer when the window holds fewer row groups).
+    budget: usize,
+};
 
 /// The write fan-out's two knobs:
 ///   - concurrency: explicit -j, else the Lambda- and quota-aware CPU budget;
@@ -978,7 +987,7 @@ fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWindow {
     else
         @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
     const window = system.windowCapacity(inflight_budget, avg_rg, jobs.len);
-    return .{ .workers = @min(async_budget, window), .window = window };
+    return .{ .workers = @min(async_budget, window), .window = window, .budget = async_budget };
 }
 
 /// True when some kept chunk of some row group is stored in another codec than `codec`.
@@ -1510,6 +1519,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .profiler = args.profiler,
             };
             const effective = sizing.workers;
+            rw.page_workers = @max(1, sizing.budget / @max(1, effective));
             const re_span = profile.Span.begin(prof);
             defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective, window }));
             try runWindowed(RecompressCtx, &rw, jobs.items.len, effective);

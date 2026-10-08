@@ -50,6 +50,8 @@
   fewer of the values are distinct and it fits 1 MiB (was: a tenth), DELTA_BYTE_ARRAY only where values share long
   prefixes with the previous one, and DELTA_LENGTH_BYTE_ARRAY otherwise, which every reader we measured decodes
   fastest.
+- A copy that changes codec recompresses a row group's pages across the CPU budget: a file of one or a few row groups
+  is no longer recompressed on one core, a column at a time. The output is the same bytes.
 - Column encoding writes the same bytes in fewer instructions: bit packing and run detection work a word at a time,
   string statistics compare a 16-byte prefix first, and dense columns copy and pack without per-value branches.
 - Writes filter first and then decode and project one column at a time. They re-encode dictionary columns from their

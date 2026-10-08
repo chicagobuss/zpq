@@ -2808,29 +2808,7 @@ fn recompressChunk(
         const body_len: usize = @intCast(h.compressed_page_size);
         if (body_len > chunk.len - pos - hdr_len) return error.TruncatedPage;
         const body = chunk[pos + hdr_len ..][0..body_len];
-        const raw_len: usize = @intCast(h.uncompressed_page_size);
-
-        var new_body: []const u8 = body;
-        switch (h.type) {
-            .DATA_PAGE, .DICTIONARY_PAGE => new_body = try recode(arena, scratch, &raw, body, from, to, zstd, raw_len),
-            .DATA_PAGE_V2 => {
-                const v2 = h.data_page_header_v2 orelse return error.BadPageHeader;
-                if (v2.is_compressed) {
-                    if (v2.definition_levels_byte_length < 0 or v2.repetition_levels_byte_length < 0) return error.BadPageHeader;
-                    const levels: usize = @as(usize, @intCast(v2.definition_levels_byte_length)) +
-                        @as(usize, @intCast(v2.repetition_levels_byte_length));
-                    if (levels > body.len or levels > raw_len) return error.BadPageHeader;
-                    const values = try recode(arena, scratch, &raw, body[levels..], from, to, zstd, raw_len - levels);
-                    const joined = try arena.alloc(u8, levels + values.len);
-                    @memcpy(joined[0..levels], body[0..levels]);
-                    @memcpy(joined[levels..], values);
-                    new_body = joined;
-                }
-            },
-            // Index pages carry no compressed payload.
-            .INDEX_PAGE => {},
-        }
-
+        const new_body = try recodePage(arena, scratch, &raw, &h, body, from, to, zstd);
         const new_hdr = try patchPageHeader(arena, chunk[pos..][0..hdr_len], @intCast(new_body.len));
         try pages.append(arena, .{ .src_off = pos, .dst_off = out.items.len, .dst_len = new_hdr.len + new_body.len });
         try out.appendSlice(arena, new_hdr);
@@ -2839,6 +2817,39 @@ fn recompressChunk(
         pos += hdr_len + body_len;
     }
     return .{ .bytes = out.items, .pages = pages.items, .header_delta = header_delta };
+}
+
+/// A page's body in codec `to`: a v1 data or dictionary page recompressed whole, a compressed v2 page's values section
+/// (its levels are never compressed), anything else as it is.
+fn recodePage(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    raw: *std.ArrayList(u8),
+    h: *const schema.PageHeader,
+    body: []const u8,
+    from: schema.CompressionCodec,
+    to: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+) ![]const u8 {
+    const raw_len: usize = @intCast(h.uncompressed_page_size);
+    switch (h.type) {
+        .DATA_PAGE, .DICTIONARY_PAGE => return recode(arena, scratch, raw, body, from, to, zstd, raw_len),
+        .DATA_PAGE_V2 => {
+            const v2 = h.data_page_header_v2 orelse return error.BadPageHeader;
+            if (!v2.is_compressed) return body;
+            if (v2.definition_levels_byte_length < 0 or v2.repetition_levels_byte_length < 0) return error.BadPageHeader;
+            const levels: usize = @as(usize, @intCast(v2.definition_levels_byte_length)) +
+                @as(usize, @intCast(v2.repetition_levels_byte_length));
+            if (levels > body.len or levels > raw_len) return error.BadPageHeader;
+            const values = try recode(arena, scratch, raw, body[levels..], from, to, zstd, raw_len - levels);
+            const joined = try arena.alloc(u8, levels + values.len);
+            @memcpy(joined[0..levels], body[0..levels]);
+            @memcpy(joined[levels..], values);
+            return joined;
+        },
+        // Index pages carry no compressed payload.
+        .INDEX_PAGE => return body,
+    }
 }
 
 fn recode(
@@ -2861,7 +2872,9 @@ fn recode(
 
 /// Recompress every chunk of `rg` that `kept` selects (null: all) and is not already in `codec`, one entry per
 /// column, for `copyRG` to place through `Recompress.done`. Results live on `arena`; `scratch` is per-chunk working
-/// memory. Safe to run for several row groups at once: it only reads `src`.
+/// memory, and must be safe to use from several threads when `workers` > 1. Safe to run for several row groups at
+/// once: it only reads `src`. With `workers` > 1 the row group's pages are recompressed by that many threads and
+/// placed in order: the same bytes as one thread writes.
 pub fn recompressRowGroup(
     arena: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -2871,7 +2884,9 @@ pub fn recompressRowGroup(
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
     timings: *Timings,
+    workers: usize,
 ) ![]?RecompressedChunk {
+    if (workers > 1) return recompressRowGroupPages(arena, scratch, rg, src, kept, codec, zstd, timings, workers);
     const done = try arena.alloc(?RecompressedChunk, rg.columns.items.len);
     @memset(done, null);
     for (rg.columns.items, done, 0..) |*chunk, *slot, ci| {
@@ -2885,6 +2900,165 @@ pub fn recompressRowGroup(
         const t1 = nowMonoNs();
         timings.encode_ns += @intCast(t1 - t0);
         profile.record(timings.prof, .encode, t0, t1, profile.args(.{ 1, m.num_values }));
+    }
+    return done;
+}
+
+/// One page of a row group being recompressed: its header, where it sits in its chunk, and its new body once a
+/// worker has recoded it.
+const PageTask = struct {
+    column: usize,
+    header: schema.PageHeader,
+    src_off: usize,
+    hdr: []const u8,
+    body: []const u8,
+    from: schema.CompressionCodec,
+    out: []const u8 = &.{},
+};
+
+const RecodeShared = struct {
+    tasks: []PageTask,
+    next: std.atomic.Value(usize) = .init(0),
+    to: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    scratch: std.mem.Allocator,
+    /// The lowest index of a task that failed, and its error: the failure one thread working in order meets first.
+    failed: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    errs: []?anyerror,
+};
+
+/// A worker of `recompressRowGroupPages`: recodes tasks until none are left, its bodies on its own arena.
+const RecodeWorker = struct {
+    shared: *RecodeShared,
+    arena: std.heap.ArenaAllocator,
+    busy_ns: u64 = 0,
+
+    fn run(self: *RecodeWorker) void {
+        const t0 = nowMonoNs();
+        defer self.busy_ns = @intCast(nowMonoNs() - t0);
+        const sh = self.shared;
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(sh.scratch);
+        while (true) {
+            const i = sh.next.fetchAdd(1, .monotonic);
+            if (i >= sh.tasks.len) return;
+            // Tasks past a failure are not needed: the failure is reported, nothing written.
+            if (i > sh.failed.load(.monotonic)) continue;
+            const t = &sh.tasks[i];
+            t.out = recodePage(self.arena.allocator(), sh.scratch, &raw, &t.header, t.body, t.from, sh.to, sh.zstd) catch |err| {
+                sh.errs[i] = err;
+                _ = sh.failed.fetchMin(i, .monotonic);
+                continue;
+            };
+        }
+    }
+};
+
+/// `recompressRowGroup` over `workers` threads: every page of the row group's chunks is a task, recoded by whichever
+/// worker takes it, then each chunk is assembled in page order as `recompressChunk` assembles it.
+fn recompressRowGroupPages(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    src: RGSrc,
+    kept: ?[]const bool,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    timings: *Timings,
+    workers: usize,
+) ![]?RecompressedChunk {
+    const t0 = nowMonoNs();
+    const done = try arena.alloc(?RecompressedChunk, rg.columns.items.len);
+    @memset(done, null);
+    var tasks: std.ArrayList(PageTask) = .empty;
+    defer tasks.deinit(scratch);
+    // A page header that does not parse is reported after any failure in the pages before it, as one thread meets
+    // them.
+    var parse_err: ?struct { column: usize, err: anyerror } = null;
+    var values: i64 = 0;
+    collect: for (rg.columns.items, 0..) |*chunk, ci| {
+        if (kept) |k| if (ci >= k.len or !k[ci]) continue;
+        const m = chunk.meta_data orelse return error.InvalidColumnOffsets;
+        if (m.codec == codec) continue;
+        const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
+        const bytes = try sourceBytes(src, range);
+        values += m.num_values;
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            var r = thrift.Reader.init(bytes[pos..]);
+            const h = schema.PageHeader.read(&r) catch |err| {
+                parse_err = .{ .column = ci, .err = err };
+                break :collect;
+            };
+            const hdr_len = r.pos;
+            if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) {
+                parse_err = .{ .column = ci, .err = error.BadPageHeader };
+                break :collect;
+            }
+            const body_len: usize = @intCast(h.compressed_page_size);
+            if (body_len > bytes.len - pos - hdr_len) {
+                parse_err = .{ .column = ci, .err = error.TruncatedPage };
+                break :collect;
+            }
+            try tasks.append(scratch, .{
+                .column = ci,
+                .header = h,
+                .src_off = pos,
+                .hdr = bytes[pos..][0..hdr_len],
+                .body = bytes[pos + hdr_len ..][0..body_len],
+                .from = m.codec,
+            });
+            pos += hdr_len + body_len;
+        }
+        // An empty chunk still gets its (empty) entry, as `recompressChunk` gives it.
+        done[ci] = .{ .bytes = &.{}, .pages = &.{}, .header_delta = 0 };
+    }
+
+    const errs = try scratch.alloc(?anyerror, tasks.items.len);
+    defer scratch.free(errs);
+    @memset(errs, null);
+    var shared: RecodeShared = .{ .tasks = tasks.items, .to = codec, .zstd = zstd, .scratch = scratch, .errs = errs };
+    const n_workers = @max(1, @min(workers, tasks.items.len));
+    const pool = try scratch.alloc(RecodeWorker, n_workers);
+    defer scratch.free(pool);
+    for (pool) |*w| w.* = .{ .shared = &shared, .arena = .init(scratch) };
+    defer for (pool) |*w| w.arena.deinit();
+    const threads = try scratch.alloc(?std.Thread, n_workers);
+    defer scratch.free(threads);
+    @memset(threads, null);
+    // The calling thread is worker 0; a worker that cannot start leaves its share to the others.
+    for (pool[1..], threads[1..]) |*w, *t| t.* = std.Thread.spawn(.{}, RecodeWorker.run, .{w}) catch null;
+    pool[0].run();
+    for (threads[1..]) |t| if (t) |th| th.join();
+
+    var busy: u64 = 0;
+    for (pool) |w| busy += w.busy_ns;
+    timings.encode_ns += busy;
+    profile.record(timings.prof, .encode, t0, nowMonoNs(), profile.args(.{ done.len, values }));
+
+    const failed = shared.failed.load(.monotonic);
+    if (failed < tasks.items.len) {
+        const m = rg.columns.items[tasks.items[failed].column].meta_data.?;
+        return reportRecompressError(errs[failed].?, m, codec);
+    }
+    if (parse_err) |pe| return reportRecompressError(pe.err, rg.columns.items[pe.column].meta_data.?, codec);
+
+    // Assemble each chunk in page order, as `recompressChunk` does.
+    var i: usize = 0;
+    while (i < tasks.items.len) {
+        const ci = tasks.items[i].column;
+        var out: std.ArrayList(u8) = .empty;
+        var pages: std.ArrayList(PageMove) = .empty;
+        var header_delta: i64 = 0;
+        while (i < tasks.items.len and tasks.items[i].column == ci) : (i += 1) {
+            const t = tasks.items[i];
+            const new_hdr = try patchPageHeader(arena, t.hdr, @intCast(t.out.len));
+            try pages.append(arena, .{ .src_off = t.src_off, .dst_off = out.items.len, .dst_len = new_hdr.len + t.out.len });
+            try out.appendSlice(arena, new_hdr);
+            try out.appendSlice(arena, t.out);
+            header_delta += @as(i64, @intCast(new_hdr.len)) - @as(i64, @intCast(t.hdr.len));
+        }
+        done[ci] = .{ .bytes = out.items, .pages = pages.items, .header_delta = header_delta };
     }
     return done;
 }
@@ -4331,5 +4505,69 @@ test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
             pages += there.pages.len;
         };
         try testing.expect(pages > 0);
+    }
+}
+
+test "recompressRowGroup over several threads writes the bytes one thread writes, and fails where it fails" {
+    const testing = std.testing;
+    const paths = [_][]const u8{
+        "data/parquet-testing/data/alltypes_tiny_pages.parquet",
+        "data/parquet-testing/data/datapage_v2.snappy.parquet",
+    };
+    for (paths) |path| {
+        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("skipping: {s} not present\n", .{path});
+                return error.SkipZigTest;
+            }
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var timings: Timings = .{};
+        for (meta.row_groups.items) |*rg| for ([_]schema.CompressionCodec{ .ZSTD, .GZIP, .UNCOMPRESSED }) |codec| {
+            // Every column, and every other one.
+            const alternate = try a.alloc(bool, rg.columns.items.len);
+            for (alternate, 0..) |*k, i| k.* = i % 2 == 0;
+            for ([_]?[]const bool{ null, alternate }) |kept| {
+                const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+                const one = try recompressRowGroup(a, testing.allocator, rg, src, kept, codec, .{}, &timings, 1);
+                for ([_]usize{ 2, 5 }) |workers| {
+                    const many = try recompressRowGroup(a, testing.allocator, rg, src, kept, codec, .{}, &timings, workers);
+                    try testing.expectEqual(one.len, many.len);
+                    for (one, many) |x, y| {
+                        try testing.expectEqual(x == null, y == null);
+                        const p = x orelse continue;
+                        const q = y.?;
+                        try testing.expectEqualSlices(u8, p.bytes, q.bytes);
+                        try testing.expectEqualSlices(PageMove, p.pages, q.pages);
+                        try testing.expectEqual(p.header_delta, q.header_delta);
+                    }
+                }
+            }
+        };
+
+        // A page body that does not decompress, in the first chunk, and a page header that does not parse, in the
+        // last: one thread fails at the body first, and so must several.
+        const rg = &meta.row_groups.items[0];
+        if (rg.columns.items.len < 2 or rg.columns.items[0].meta_data.?.codec == .UNCOMPRESSED) continue;
+        const broken = try a.dupe(u8, bytes);
+        const first = rg.columns.items[0].meta_data.?;
+        const first_start: usize = @intCast(first.dictionary_page_offset orelse first.data_page_offset);
+        var r = thrift.Reader.init(broken[first_start..]);
+        const h = try schema.PageHeader.read(&r);
+        @memset(broken[first_start + r.pos ..][0..@intCast(@min(h.compressed_page_size, 16))], 0xFF);
+        const last = rg.columns.items[rg.columns.items.len - 1].meta_data.?;
+        const last_start: usize = @intCast(last.dictionary_page_offset orelse last.data_page_offset);
+        @memset(broken[last_start..][0..4], 0xFF);
+        const src: RGSrc = .{ .bytes = broken, .byte_origin = 0 };
+        const want = if (recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 1)) |_|
+            return error.TestExpectedError
+        else |err| err;
+        try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
     }
 }

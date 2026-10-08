@@ -1,7 +1,8 @@
 //! Codec dispatch for Parquet pages.
 //!
-//! UNCOMPRESSED, SNAPPY and the LZ4s are handled in-tree; ZSTD uses libzstd
-//! and GZIP the Zig stdlib. The deprecated LZ4 codec (5) is read, never written:
+//! UNCOMPRESSED, SNAPPY and the LZ4s are handled in-tree; ZSTD uses libzstd;
+//! GZIP is read with libdeflate (`ZPQ_GZIP_STD` selects the Zig stdlib instead)
+//! and written with the Zig stdlib. The deprecated LZ4 codec (5) is read, never written:
 //! the spec replaced it with LZ4_RAW, which is what `--codec lz4` writes.
 
 const std = @import("std");
@@ -10,6 +11,7 @@ const snappy = @import("snappy.zig");
 const lz4 = @import("lz4.zig");
 
 const c_zstd = @import("zstd_c");
+const c_deflate = @import("libdeflate_c");
 
 pub const Error = error{
     UnsupportedCodec,
@@ -384,7 +386,7 @@ pub fn decompressInto(
             const n = snappy.uncompress(src, out) catch return error.DecompressionFailed;
             if (n != out.len) return error.SizeMismatch;
         },
-        .GZIP => try decompressFlate(arena, src, out, .gzip),
+        .GZIP => try decompressGzip(arena, src, out),
         .ZSTD => try decompressZstd(src, out),
         .LZ4_RAW => {
             const n = lz4.uncompress(src, out) catch return error.DecompressionFailed;
@@ -411,6 +413,54 @@ fn decompressLz4Legacy(src: []const u8, out: []u8) Error!void {
         return;
     }
     return error.DecompressionFailed;
+}
+
+/// Which inflater reads GZIP pages: 0 not decided yet, 1 libdeflate, 2 `std.compress.flate`. `ZPQ_GZIP_STD` set to
+/// anything but "0" selects the stdlib, to compare the two or to fall back; decided once per process.
+var gzip_impl: std.atomic.Value(u8) = .init(0);
+
+fn gzipUsesStd() bool {
+    var v = gzip_impl.load(.monotonic);
+    if (v == 0) {
+        const e = std.c.getenv("ZPQ_GZIP_STD");
+        const std_flate = if (e) |p| p[0] != 0 and !(p[0] == '0' and p[1] == 0) else false;
+        v = if (std_flate) 2 else 1;
+        gzip_impl.store(v, .monotonic);
+    }
+    return v == 2;
+}
+
+/// For tests: read GZIP pages with the stdlib (true) or libdeflate (false), whatever the environment says.
+pub fn setGzipStd(std_flate: bool) void {
+    gzip_impl.store(if (std_flate) 2 else 1, .monotonic);
+}
+
+/// A GZIP page body into `out`, which is exactly its size: one gzip member or several back to back
+/// (concatenated_gzip_members.parquet), each checked against its CRC-32 and length. libdeflate decodes the whole
+/// buffer at once and never writes past `out`; malformed input is an error.
+fn decompressGzip(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void {
+    if (gzipUsesStd()) return decompressFlate(arena, src, out, .gzip);
+    const d = c_deflate.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;
+    defer c_deflate.libdeflate_free_decompressor(d);
+    var written: usize = 0;
+    var pos: usize = 0;
+    while (written < out.len and pos < src.len) {
+        var used: usize = 0;
+        var got: usize = 0;
+        const r = c_deflate.libdeflate_gzip_decompress_ex(
+            d,
+            src.ptr + pos,
+            src.len - pos,
+            out.ptr + written,
+            out.len - written,
+            &used,
+            &got,
+        );
+        if (r != c_deflate.LIBDEFLATE_SUCCESS) return error.DecompressionFailed;
+        pos += used;
+        written += got;
+    }
+    if (written != out.len) return error.DecompressionFailed;
 }
 
 fn decompressFlate(
@@ -744,4 +794,186 @@ test "zstd frames are the same bytes with the AVX-512 Huffman encoder and withou
             try testing.expectEqualSlices(u8, scalar[0..a], vector[0..b]);
         }
     };
+}
+
+const GzipForm = union(enum) { level: std.compress.flate.Compress.Options, stored, huffman };
+
+/// `data` as one gzip member written by the stdlib in `form`.
+fn gzipStream(a: std.mem.Allocator, data: []const u8, form: GzipForm) ![]u8 {
+    var out = try std.Io.Writer.Allocating.initCapacity(a, @max(64, data.len + data.len / 8 + 64));
+    const window = try a.alloc(u8, std.compress.flate.max_window_len);
+    const flate = std.compress.flate.Compress;
+    switch (form) {
+        .level => |opts| {
+            var c = try flate.init(&out.writer, window, .gzip, opts);
+            try c.writer.writeAll(data);
+            try c.finish();
+        },
+        .stored => {
+            var c = try flate.Raw.init(&out.writer, window, .gzip);
+            try c.writer.writeAll(data);
+            try c.finish();
+        },
+        .huffman => {
+            var c = try flate.Huffman.init(&out.writer, window, .gzip);
+            try c.writer.writeAll(data);
+            try c.finish();
+        },
+    }
+    return out.writer.buffered();
+}
+
+/// Decompresses `src` into a buffer of `want_len` with libdeflate and with the stdlib; neither writes outside its
+/// buffer. libdeflate either fails or gives back exactly `want` (it checks each member's CRC-32 and length); so must
+/// the stdlib when `strict_std`, but it stops once the buffer is full and never reads a trailer, so on corrupt input
+/// it may also return other bytes.
+fn expectGzipBoth(a: std.mem.Allocator, src: []const u8, want: []const u8, want_len: usize, strict_std: bool) !struct { ok: [2]bool } {
+    defer setGzipStd(false);
+    var ok: [2]bool = undefined;
+    for ([_]bool{ false, true }, 0..) |use_std, k| {
+        setGzipStd(use_std);
+        // Guard bytes either side of the output.
+        const buf = try a.alloc(u8, want_len + 64);
+        @memset(buf, 0xA5);
+        const out = buf[32..][0..want_len];
+        if (decompressGzip(a, src, out)) |_| {
+            if (!use_std or strict_std) try testing.expectEqualSlices(u8, want, out);
+            ok[k] = std.mem.eql(u8, want, out);
+        } else |_| ok[k] = false;
+        for (buf[0..32]) |g| try testing.expectEqual(@as(u8, 0xA5), g);
+        for (buf[32 + want_len ..]) |g| try testing.expectEqual(@as(u8, 0xA5), g);
+    }
+    return .{ .ok = ok };
+}
+
+test "GZIP pages: libdeflate and the stdlib inflate every block kind, level and size to the same bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x9a19);
+    const r = prng.random();
+    const flate = std.compress.flate.Compress.Options;
+    const forms = [_]GzipForm{
+        .stored,                    .huffman,
+        .{ .level = flate.level_1 }, .{ .level = flate.level_2 },
+        .{ .level = flate.level_3 }, .{ .level = flate.level_4 },
+        .{ .level = flate.level_5 }, .{ .level = flate.level_6 },
+        .{ .level = flate.level_7 }, .{ .level = flate.level_8 },
+        .{ .level = flate.level_9 },
+    };
+    for ([_]usize{ 0, 1, 100, 65535, 65536, 65537, 300_000 }) |n| for (0..4) |kind| {
+        const data = try a.alloc(u8, n);
+        for (data, 0..) |*b, i| b.* = switch (kind) {
+            0 => r.int(u8), // incompressible: stored blocks
+            1 => 0, // one long run
+            2 => "parquet page bytes, "[i % 20] ^ @as(u8, @intCast((i / 4096) % 3)), // matches
+            else => @intCast(@min(255, @as(u32, @clz(r.int(u32) | 1)) * 7)), // skewed literals
+        };
+        for (forms) |form| {
+            const z = try gzipStream(a, data, form);
+            const got = try expectGzipBoth(a, z, data, n, true);
+            try testing.expect(got.ok[0] and got.ok[1]);
+        }
+        // Two members back to back, as some writers emit.
+        const half = n / 2;
+        const two = try std.mem.concat(a, u8, &.{
+            try gzipStream(a, data[0..half], .{ .level = flate.level_1 }),
+            try gzipStream(a, data[half..], .stored),
+        });
+        try testing.expect((try expectGzipBoth(a, two, data, n, true)).ok[0]);
+    };
+}
+
+test "GZIP pages: truncated, bit-flipped and oversized input fails cleanly in libdeflate and the stdlib" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0xbadf);
+    const r = prng.random();
+    const data = try a.alloc(u8, 3000);
+    for (data, 0..) |*b, i| b.* = if (i % 5 == 0) r.int(u8) else "abcdefgh"[i % 8];
+    for ([_]GzipForm{ .{ .level = .default }, .stored, .huffman }) |form| {
+        const z = try gzipStream(a, data, form);
+        // Every truncation: a gzip member is checked to its last byte, so each one fails.
+        for (0..z.len) |cut| {
+            const got = try expectGzipBoth(a, z[0..cut], data, data.len, false);
+            try testing.expect(!got.ok[0]);
+        }
+        // Every single-bit flip: an error, or the original exactly (a flip in a header field nothing checks).
+        const flipped = try a.dupe(u8, z);
+        for (0..z.len * 8) |bit| {
+            flipped[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+            _ = try expectGzipBoth(a, flipped, data, data.len, false);
+            flipped[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+        }
+        // A page header claiming more bytes than the member holds.
+        const bigger = try a.alloc(u8, data.len + 1);
+        @memcpy(bigger[0..data.len], data);
+        try testing.expect(!(try expectGzipBoth(a, z, bigger, bigger.len, false)).ok[0]);
+    }
+}
+
+/// A gzip member around one fixed-Huffman block: the literal 'a', then a match of length 3 at `distance`, then the
+/// end of block, with the trailer of "aaaa".
+fn fixedHuffmanMember(a: std.mem.Allocator, distance: u5) ![]u8 {
+    var bits: std.ArrayList(u8) = .empty;
+    var acc: u32 = 0;
+    var n: u5 = 0;
+    const Put = struct {
+        fn bitsLsb(list: *std.ArrayList(u8), al: std.mem.Allocator, accp: *u32, np: *u5, v: u32, len: u5) !void {
+            for (0..len) |i| {
+                accp.* |= ((v >> @intCast(i)) & 1) << np.*;
+                np.* += 1;
+                if (np.* == 8) {
+                    try list.append(al, @truncate(accp.*));
+                    accp.* = 0;
+                    np.* = 0;
+                }
+            }
+        }
+        // Huffman codes go most significant bit first.
+        fn code(list: *std.ArrayList(u8), al: std.mem.Allocator, accp: *u32, np: *u5, v: u32, len: u5) !void {
+            var i: u5 = len;
+            while (i > 0) {
+                i -= 1;
+                try bitsLsb(list, al, accp, np, (v >> i) & 1, 1);
+            }
+        }
+    };
+    try Put.bitsLsb(&bits, a, &acc, &n, 1, 1); // BFINAL
+    try Put.bitsLsb(&bits, a, &acc, &n, 1, 2); // BTYPE 01: fixed Huffman
+    try Put.code(&bits, a, &acc, &n, 0x30 + 'a', 8); // literal 'a'
+    try Put.code(&bits, a, &acc, &n, 257 - 256, 7); // length 3
+    try Put.code(&bits, a, &acc, &n, distance - 1, 5); // distance code d-1 is distance d, for d <= 4
+    try Put.code(&bits, a, &acc, &n, 0, 7); // end of block
+    if (n > 0) try bits.append(a, @truncate(acc));
+    const header = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 };
+    var trailer: [8]u8 = undefined;
+    std.mem.writeInt(u32, trailer[0..4], std.hash.Crc32.hash("aaaa"), .little);
+    std.mem.writeInt(u32, trailer[4..8], 4, .little);
+    return std.mem.concat(a, u8, &.{ &header, bits.items, &trailer });
+}
+
+test "GZIP pages: a match reaching before the start of the output is rejected by both inflaters" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Distance 1 copies the 'a' just written: valid.
+    const good = try expectGzipBoth(a, try fixedHuffmanMember(a, 1), "aaaa", 4, true);
+    try testing.expect(good.ok[0] and good.ok[1]);
+    // Distance 2 reaches a byte before the first one written.
+    const bad = try expectGzipBoth(a, try fixedHuffmanMember(a, 2), "aaaa", 4, true);
+    try testing.expect(!bad.ok[0] and !bad.ok[1]);
+}
+
+test "GZIP pages: libdeflate rejects a member whose CRC-32 does not match its bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const data = "a page whose trailer is wrong, a page whose trailer is wrong, a page whose trailer is wrong";
+    const z = try a.dupe(u8, try gzipStream(a, data, .{ .level = .default }));
+    z[z.len - 8] ^= 1; // CRC-32, first byte
+    const out = try a.alloc(u8, data.len);
+    setGzipStd(false);
+    try testing.expectError(error.DecompressionFailed, decompressGzip(a, z, out));
 }

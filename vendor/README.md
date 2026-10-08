@@ -52,3 +52,17 @@ as patch files in `vendor/zstd/patches/`, each applied to the tree and listed he
 
 To check the tree against the release: unpack zstd 1.5.7, apply the patches with `patch -p1`, and compare
 `vendor/zstd/lib` with its `lib` (only the files listed above are vendored).
+
+## libdeflate (`vendor/libdeflate`, ebiggers/libdeflate 1.26)
+
+`COPYING`, `libdeflate.h`, `common_defs.h` and the whole of `lib/`, copied unmodified from the v1.26 tag. zpq builds
+only the decompression sources (`libdeflateLibrary` in `build.zig`: `deflate_decompress.c`, `gzip_decompress.c`,
+`crc32.c`, `utils.c` and the x86 and arm `cpu_features.c`, each of which compiles to nothing on other architectures),
+to read GZIP pages; the compressor stays vendored for a later GZIP writer. libdeflate picks its CPU-specific paths at
+run time (BMI2, AVX2/AVX-512, PCLMUL/VPCLMUL on x86; PMULL/CRC32 on arm) and falls back to portable code. No local
+changes. `ZPQ_GZIP_STD` set to anything but `0` reads GZIP pages with Zig's `std.compress.flate` instead, to compare
+the two or to fall back. `tools/gzip-inflate` compares libdeflate with zlib over any corpus, its portable paths
+included.
+
+To check the tree against the release: clone `ebiggers/libdeflate` at `v1.26` and compare its `lib`, `libdeflate.h`,
+`common_defs.h` and `COPYING` with `vendor/libdeflate`.

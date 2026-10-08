@@ -137,6 +137,7 @@ This product includes cryptographic software written by Eric Young
 ## 5. Facebook ZSTD
 
 - **Home page**: https://github.com/facebook/zstd
+- **Version**: 1.5.7, vendored in `vendor/zstd` (local changes listed in `vendor/README.md`)
 - **License**: BSD-3-Clause OR GPL-2.0
 - **Copyright**: Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
 

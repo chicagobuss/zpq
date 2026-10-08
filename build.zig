@@ -237,7 +237,7 @@ const CoreDeps = struct {
     /// Replaces the hand-rolled zig snappy compressor (still used for
     /// decode-side fallback; the C version is 3-5× faster on compress).
     snappy: *std.Build.Module,
-    /// facebook/zstd 1.5.7 — vendor via allyourcodebase/zstd. Used for
+    /// facebook/zstd 1.5.7 — vendored (`vendor/zstd`, see vendor/README.md). Used for
     /// both encode (E2b) and decode. Zig stdlib's pure-Zig zstd
     /// decoder works correctly but is ~10× slower than libzstd on
     /// dict-encoded numeric column-chunks (perf profile 2026-05-06:
@@ -259,11 +259,7 @@ const CoreDeps = struct {
         optimize: std.builtin.Optimize,
         fetch_prebuilt: bool,
     ) CoreDeps {
-        const zstd = b.dependency("zstd", .{
-            .target = target,
-            .optimize = optimize,
-            .dictbuilder = false,
-        }).artifact("zstd");
+        const zstd = zstdLibrary(b, target, optimize);
 
         const liteparser_mod = b.createModule(.{
             .target = target,
@@ -440,6 +436,59 @@ fn cHeaderModule(
         .target = target,
         .optimize = optimize,
     });
+}
+
+/// libzstd from `vendor/zstd/lib`: the sources, macros and headers the allyourcodebase/zstd package built before it
+/// was vendored (compression and decompression, legacy frames from v0.5, no dictionary builder, the x86-64 Huffman
+/// decoder in assembly).
+fn zstdLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zstd",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    const root = b.path("vendor/zstd/lib");
+    lib.root_module.addCSourceFiles(.{ .root = root, .files = &.{
+        "common/zstd_common.c",
+        "common/threading.c",
+        "common/entropy_common.c",
+        "common/fse_decompress.c",
+        "common/xxhash.c",
+        "common/error_private.c",
+        "common/pool.c",
+        "compress/fse_compress.c",
+        "compress/huf_compress.c",
+        "compress/zstd_double_fast.c",
+        "compress/zstd_compress_literals.c",
+        "compress/zstdmt_compress.c",
+        "compress/zstd_compress_superblock.c",
+        "compress/zstd_opt.c",
+        "compress/zstd_compress.c",
+        "compress/zstd_compress_sequences.c",
+        "compress/hist.c",
+        "compress/zstd_ldm.c",
+        "compress/zstd_lazy.c",
+        "compress/zstd_preSplit.c",
+        "compress/zstd_fast.c",
+        "decompress/zstd_decompress.c",
+        "decompress/huf_decompress.c",
+        "decompress/zstd_ddict.c",
+        "decompress/zstd_decompress_block.c",
+        "legacy/zstd_v05.c",
+        "legacy/zstd_v06.c",
+        "legacy/zstd_v07.c",
+    } });
+    if (target.result.cpu.arch == .x86_64) {
+        lib.root_module.addAssemblyFile(b.path("vendor/zstd/lib/decompress/huf_decompress_amd64.S"));
+    } else {
+        lib.root_module.addCMacro("ZSTD_DISABLE_ASM", "");
+    }
+    lib.root_module.addCMacro("ZSTD_LEGACY_SUPPORT", "5");
+    if (target.result.os.tag != .wasi) lib.root_module.addCMacro("ZSTD_MULTITHREAD", "1");
+    lib.installHeader(b.path("vendor/zstd/lib/zstd.h"), "zstd.h");
+    lib.installHeader(b.path("vendor/zstd/lib/zdict.h"), "zdict.h");
+    lib.installHeader(b.path("vendor/zstd/lib/zstd_errors.h"), "zstd_errors.h");
+    return lib;
 }
 
 fn zstdCModule(

@@ -31,3 +31,12 @@ sources.
 - `build.zig`, `src/tls.zig`: OpenSSL headers come through a translate-c step instead of `@cImport`, which Zig 0.17
   removed, and the local-prebuilt probe declares its file dependencies to the configure cache, since 0.17 runs the
   configure phase in its own process.
+
+## zstd (`vendor/zstd`, facebook/zstd 1.5.7)
+
+`vendor/zstd/lib` holds upstream's `lib/common`, `lib/compress`, `lib/decompress`, the v0.5–v0.7 legacy decoders and the
+public headers, copied unmodified from the 1.5.7 release (`LICENSE` and `COPYING` beside them); the dictionary builder,
+deprecated API and older legacy formats are left out, as the package build that preceded vendoring left them out. The
+library is built by `zstdLibrary` in the top-level `build.zig` with the same sources and macros
+(`ZSTD_LEGACY_SUPPORT=5`, `ZSTD_MULTITHREAD=1` except on WASI, `ZSTD_DISABLE_ASM` off x86-64). Local changes are kept
+as patch files in `vendor/zstd/patches/`, each applied to the tree and listed here.

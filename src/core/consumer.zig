@@ -2972,16 +2972,26 @@ fn recompressRowGroupPages(
     @memset(done, null);
     var tasks: std.ArrayList(PageTask) = .empty;
     defer tasks.deinit(scratch);
-    // A page header that does not parse is reported after any failure in the pages before it, as one thread meets
-    // them.
-    var parse_err: ?struct { column: usize, err: anyerror } = null;
+    // A chunk that cannot be located or read, or a page header that does not parse, is reported after any failure in
+    // the pages before it, as one thread meets them. Errors locating a chunk are returned as they are, as the serial
+    // loop returns them; a page header's go through `reportRecompressError`, as `recompressChunk`'s do.
+    var parse_err: ?struct { column: usize, err: anyerror, report: bool = true } = null;
     var values: i64 = 0;
     collect: for (rg.columns.items, 0..) |*chunk, ci| {
         if (kept) |k| if (ci >= k.len or !k[ci]) continue;
-        const m = chunk.meta_data orelse return error.InvalidColumnOffsets;
+        const m = chunk.meta_data orelse {
+            parse_err = .{ .column = ci, .err = error.InvalidColumnOffsets, .report = false };
+            break :collect;
+        };
         if (m.codec == codec) continue;
-        const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
-        const bytes = try sourceBytes(src, range);
+        const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse {
+            parse_err = .{ .column = ci, .err = error.InvalidColumnOffsets, .report = false };
+            break :collect;
+        };
+        const bytes = sourceBytes(src, range) catch |err| {
+            parse_err = .{ .column = ci, .err = err, .report = false };
+            break :collect;
+        };
         values += m.num_values;
         var pos: usize = 0;
         while (pos < bytes.len) {
@@ -3041,7 +3051,10 @@ fn recompressRowGroupPages(
         const m = rg.columns.items[tasks.items[failed].column].meta_data.?;
         return reportRecompressError(errs[failed].?, m, codec);
     }
-    if (parse_err) |pe| return reportRecompressError(pe.err, rg.columns.items[pe.column].meta_data.?, codec);
+    if (parse_err) |pe| {
+        if (!pe.report) return pe.err;
+        return reportRecompressError(pe.err, rg.columns.items[pe.column].meta_data.?, codec);
+    }
 
     // Assemble each chunk in page order, as `recompressChunk` does.
     var i: usize = 0;
@@ -4537,7 +4550,8 @@ test "recompressRowGroup over several threads writes the bytes one thread writes
                 const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
                 const one = try recompressRowGroup(a, testing.allocator, rg, src, kept, codec, .{}, &timings, 1);
                 for ([_]usize{ 2, 5 }) |workers| {
-                    const many = try recompressRowGroup(a, testing.allocator, rg, src, kept, codec, .{}, &timings, workers);
+                    const many =
+                        try recompressRowGroup(a, testing.allocator, rg, src, kept, codec, .{}, &timings, workers);
                     try testing.expectEqual(one.len, many.len);
                     for (one, many) |x, y| {
                         try testing.expectEqual(x == null, y == null);
@@ -4570,4 +4584,41 @@ test "recompressRowGroup over several threads writes the bytes one thread writes
         else |err| err;
         try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
     }
+}
+
+
+test "recompressRowGroup over several threads reports a bad page body ahead of a later chunk with no metadata" {
+    const testing = std.testing;
+    const path = "data/parquet-testing/data/datapage_v2.snappy.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{path});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var meta = try metadata.open(testing.allocator, bytes);
+    defer meta.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const rg = &meta.row_groups.items[0];
+    // The first chunk's first page body does not decompress; the last chunk has no metadata.
+    const broken = try a.dupe(u8, bytes);
+    const m = rg.columns.items[0].meta_data.?;
+    const start: usize = @intCast(m.dictionary_page_offset orelse m.data_page_offset);
+    var r = thrift.Reader.init(broken[start..]);
+    const h = try schema.PageHeader.read(&r);
+    @memset(broken[start + r.pos ..][0..@intCast(@min(h.compressed_page_size, 16))], 0xFF);
+    const last = &rg.columns.items[rg.columns.items.len - 1];
+    const saved = last.meta_data;
+    defer last.meta_data = saved;
+    last.meta_data = null;
+    var timings: Timings = .{};
+    const src: RGSrc = .{ .bytes = broken, .byte_origin = 0 };
+    const want = if (recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 1)) |_|
+        return error.TestExpectedError
+    else |err| err;
+    try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
 }

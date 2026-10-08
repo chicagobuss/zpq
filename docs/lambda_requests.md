@@ -15,7 +15,7 @@ the CLI flags of the same name.
 | `column_order` | string | As `--column-order`. |
 | `output_url` | string | Write the result here, as `-o`. |
 | `output_codec` | string | `snappy`, `zstd`, `gzip`, `lz4`/`lz4_raw` or `uncompressed`; anything else is snappy. |
-| `compress_priority` | string | As `--compress-priority`: `size`, `balanced` or `speed`; anything else is `bad_json`/`BadCompressPriority`. Absent: `size`, as the output crosses the network. |
+| `compress_priority` | string | As `--compress-priority`: `size` or `speed`; anything else is `bad_json`/`BadCompressPriority`. Absent: `size`. |
 | `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats`. |
 | `ordered` | boolean | `false` is `--unordered`. Absent or `null`: ordered. |
 | `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. Defaults to the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |

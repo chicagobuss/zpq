@@ -155,9 +155,8 @@ pub const QueryArgs = struct {
     /// Requested output codec. Null when none was asked for: re-encoded
     /// output is then SNAPPY and byte copies keep each chunk's own codec.
     codec: ?schema.CompressionCodec = null,
-    /// How hard zstd works on the output (`--compress-priority`, the Lambda's "compress_priority"). Null: size first
-    /// for an S3 destination, balanced for a local one (`resolvePriority`).
-    compress_priority: ?CompressPriority = null,
+    /// How hard zstd works on the output (`--compress-priority`, the Lambda's "compress_priority").
+    compress_priority: CompressPriority = .size,
     parallelism: usize = 0,
     /// `--scan-all`: disable every stats shortcut (row-group pruning,
     /// stats-driven column drop, aggregate stat short-circuit) and decode
@@ -191,12 +190,6 @@ pub const QueryArgs = struct {
 };
 
 pub const CompressPriority = compression.CompressPriority;
-
-/// The priority a write to `out_path` compresses with: the one asked for, else size first for S3, where output bytes
-/// are what a query waits on and pays for, and balanced for local disk.
-pub fn resolvePriority(args: QueryArgs, out_path: []const u8) CompressPriority {
-    return args.compress_priority orelse if (std.mem.startsWith(u8, out_path, "s3://")) .size else .balanced;
-}
 
 /// One `--bloom-filter col[:fpp]`: a written column and its filter's false-positive probability.
 pub const BloomSpec = struct {
@@ -466,7 +459,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         const t_footer = nowMonoNs();
         const st = r.state;
         const codec = args.codec orelse .SNAPPY;
-        const zstd: compression.ZstdPlan = .{ .lambda = resolvePriority(args, out_path).lambda() };
+        const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
         bytes_out = if (r.output.group_rows) |rows|
             try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd)
         else
@@ -1349,7 +1342,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
     // zstd pages are compressed per the destination's priority; the modes they take are counted for the profile.
-    const priority = resolvePriority(args, out_path);
+    const priority = args.compress_priority;
     var zstd_counts: compression.ZstdModeCounts = .{};
     const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
 
@@ -3627,15 +3620,6 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
-}
-
-test "compress priority: size first for S3 output and balanced locally, unless asked for" {
-    const local: QueryArgs = .{ .inputs = &.{} };
-    try std.testing.expectEqual(CompressPriority.size, resolvePriority(local, "s3://b/out.parquet"));
-    try std.testing.expectEqual(CompressPriority.balanced, resolvePriority(local, "/tmp/out.parquet"));
-    const asked: QueryArgs = .{ .inputs = &.{}, .compress_priority = .speed };
-    try std.testing.expectEqual(CompressPriority.speed, resolvePriority(asked, "s3://b/out.parquet"));
-    try std.testing.expectEqual(CompressPriority.speed, resolvePriority(asked, "/tmp/out.parquet"));
 }
 
 test "re-encoded FLOAT16 footer widens to DOUBLE" {

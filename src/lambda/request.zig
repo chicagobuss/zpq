@@ -44,7 +44,7 @@ pub const Request = struct {
     filter: ?[]const u8 = null,
     output_url: ?[]const u8 = null,
     output_codec: ?[]const u8 = null,
-    /// `compress_priority`: "size", "balanced" or "speed", as the CLI's `--compress-priority` takes them.
+    /// `compress_priority`: "size" or "speed", as the CLI's `--compress-priority` takes them.
     compress_priority: ?[]const u8 = null,
     select: ?[]const u8 = null,
     aggregate: ?[]const u8 = null,

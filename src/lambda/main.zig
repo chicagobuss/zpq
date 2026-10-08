@@ -210,8 +210,7 @@ fn handle(
             break :blk .SNAPPY;
         } else null;
 
-        // How hard zstd works on the output. Absent: size first, as a Lambda's output crosses the network and every
-        // byte saved is time the query does not wait.
+        // How hard zstd works on the output, as the CLI's --compress-priority. Absent: size (level 3).
         const compress_priority: engine.CompressPriority = if (req.compress_priority) |s|
             std.meta.stringToEnum(engine.CompressPriority, s) orelse
                 return rejectResponse(allocator, "bad_json", "BadCompressPriority", "compress_priority", s)

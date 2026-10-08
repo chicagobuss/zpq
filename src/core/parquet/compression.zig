@@ -26,28 +26,21 @@ pub const Error = error{
 pub const ZSTD_DEFAULT_LEVEL: c_int = 3;
 
 /// How hard zstd works on a write, as a user asks for it (`--compress-priority`, the Lambda's "compress_priority").
-///
-/// Worst cases, per page:
-/// - `size`: level 3, as before priorities existed; the same bytes.
-/// - `balanced`, `speed`: a page leaves level 3 only when its sample says the cheaper form costs less (CPU plus
-///   `lambda` per output byte) and the whole page then passes `passesPageChecks`; otherwise it is compressed at
-///   level 3 and the smaller frame kept. A frame that passes is at most 10% plus 1 KiB over the size the sample
-///   predicted for it. A raw or literals-only frame also passed a full-page match search that saves less than that
-///   margin, and a raw frame a full-page order-0 entropy bound within it, so no part of the page the sample missed
-///   compresses well. What is left is the gap between those checks and level 3's deeper match search.
 pub const CompressPriority = enum {
-    /// Smallest output: level 3 for every page (S3 and Lambda destinations, bandwidth-bound).
+    /// Level 3 for every page: the default, and the same bytes as before priorities existed.
     size,
-    /// An output byte is worth 1000 ticks (local destinations).
-    balanced,
-    /// An output byte is worth 100 ticks: CPU first, a few percent larger.
+    /// Opt-in: each page in the form that costs least when an output byte is worth 100 CPU ticks, chosen from a
+    /// sample (`chooseZstdMode`) and kept only if the page passes `passesPageChecks`, else level 3. The checks see
+    /// less than level 3's own match search does, so there is no bound relative to level 3: a page whose matches
+    /// they miss is written as raw blocks, its size plus about 0.01%. For example, an 8 MiB page repeating 600,000
+    /// random bytes (repeats beyond the checks' 512 KiB window) is written in 8,388,809 bytes where level 3 needs
+    /// 610,006, 13.75 times as many.
     speed,
 
     /// What an output byte is worth, in CPU ticks, to the page-mode choice; null for `size`, which keeps level 3.
     pub fn lambda(p: CompressPriority) ?f64 {
         return switch (p) {
             .size => null,
-            .balanced => 1000,
             .speed => 100,
         };
     }
@@ -64,7 +57,7 @@ pub const ZstdModeCounts = struct {
 /// How a write's pages are compressed with zstd: the price of an output byte (see `CompressPriority`; null keeps
 /// level 3 for every page) and, when the caller wants them, counters of the modes chosen.
 pub const ZstdPlan = struct {
-    lambda: ?f64 = CompressPriority.balanced.lambda(),
+    lambda: ?f64 = null,
     counts: ?*ZstdModeCounts = null,
 };
 
@@ -81,7 +74,7 @@ pub const ZstdMode = enum(u2) {
 /// Compress a buffer using `codec`. Returns a newly-allocated slice
 /// owned by `arena`. UNCOMPRESSED is a no-op identity copy onto the
 /// arena (so the caller can free with the same allocator regardless
-/// of codec). zstd pages get the balanced plan; see `compressPage`.
+/// of codec). zstd pages are compressed at level 3; see `compressPage`.
 /// `compress`, with zstd pages compressed per `plan`.
 pub fn compressPage(
     arena: std.mem.Allocator,
@@ -217,14 +210,16 @@ fn withinMargin(bound: f64) f64 {
     return bound * 1.1 + 1024;
 }
 
-/// Whether a page compressed in `choice.mode` (a frame of `got` bytes) keeps it, judged on the whole page so a
-/// sample that missed its compressible parts cannot cost unbounded bytes:
+/// Whether a page compressed in `choice.mode` (a frame of `got` bytes) keeps it, judged on the whole page to catch
+/// a sample unlike the rest of it:
 /// 1. the frame is within the margin of the size the sample predicted;
 /// 2. raw and literals-only frames search no matches, so a fast full-page match search (level -1, which stores
 ///    literals as they are) must save less than the margin;
 /// 3. raw frames code no literals, so the page's order-0 entropy, a lower bound on entropy-coded literals, must be
 ///    within the margin of its size.
-/// Deterministic: it depends on the page's bytes alone.
+/// Deterministic: it depends on the page's bytes alone. Level -1 searches a 512 KiB window for matches of at least
+/// 6 bytes, where level 3 searches 1-2 MiB for 5, so a page compressible only through matches it cannot see passes;
+/// see `CompressPriority.speed`.
 fn passesPageChecks(arena: std.mem.Allocator, cctx: *c_zstd.ZSTD_CCtx, src: []const u8, choice: Choice, got: usize) Error!bool {
     const n: f64 = @floatFromInt(src.len);
     if (@as(f64, @floatFromInt(got)) > withinMargin(choice.estimate)) return false;
@@ -669,7 +664,7 @@ fn adversarialPage(a: std.mem.Allocator, kind: usize, r: std.Random) ![]u8 {
     return src;
 }
 
-test "a page the sample misjudges stays within the margin of level 3, and size is level 3" {
+test "pages built to mislead the sample: size writes level 3's bytes, speed decodes and stays a raw frame at most" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -692,7 +687,9 @@ test "a page the sample misjudges stays within the margin of level 3, and size i
             if (p == .size) {
                 try testing.expectEqualSlices(u8, l3, got);
             } else {
-                try testing.expect(@as(f64, @floatFromInt(got.len)) <= withinMargin(@floatFromInt(l3.len)));
+                try testing.expect(got.len <= rawFrameLen(src.len));
+                // The checks catch these: random bytes only where the sample looks, and low-entropy bytes behind it.
+                if (kind == 0 or kind == 5) try testing.expectEqualSlices(u8, l3, got);
             }
         }
     }

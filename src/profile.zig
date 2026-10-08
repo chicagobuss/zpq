@@ -61,7 +61,7 @@ pub const Kind = enum(u8) {
     /// chosen (0 mmap, 1 pread, 2 uring), and the share of the inputs cached and of them the query plans to read (per
     /// mille; coverage 2^32-1 when not weighed).
     io_choice,
-    /// How a zstd write compressed its pages: the `CompressPriority` (0 size, 1 balanced, 2 speed), the pages each
+    /// How a zstd write compressed its pages: the `CompressPriority` (0 size, 1 speed), the pages each
     /// `ZstdMode` took (raw blocks, literals only, level 1, level 3), and the pages whose cheaper form failed its
     /// full-page checks and were compressed at level 3 too.
     zstd_plan,

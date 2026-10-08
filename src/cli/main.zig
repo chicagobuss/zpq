@@ -40,14 +40,14 @@ const usage_text =
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
-    \\            [--compress-priority size|balanced|speed]
+    \\            [--compress-priority size|speed]
     \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
     \\            [--bloom-filter COL[:FPP] ...]
     \\            [--format csv|jsonl] [--limit N]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
-    \\            [--compress-priority size|balanced|speed]
+    \\            [--compress-priority size|speed]
     \\            [--scan-all] [--trust-stats]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq schema <file.parquet>
@@ -61,12 +61,12 @@ const usage_text =
     \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
     \\                 deprecated LZ4 codec but never compresses to it.
     \\  --compress-priority
-    \\                 how hard zstd works. `size`: level 3 for every page.
-    \\                 `balanced`, `speed`: each page stored raw, as
+    \\                 how hard zstd works. `size` (default): level 3 for
+    \\                 every page. `speed`: each page stored raw, as
     \\                 entropy-coded literals, or at level 1 or 3, whichever
-    \\                 costs least when an output byte is worth 1000 or 100
-    \\                 cycles, checked against the whole page (see README).
-    \\                 Default: size for s3:// output, balanced locally.
+    \\                 a sample says costs least; less CPU, but a page can
+    \\                 come out uncompressed where level 3 would shrink it
+    \\                 (see README).
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
     \\                 (row-group pruning, stats-as-answer). Slower but
     \\                 thorough — use when you don't trust a file's stats.
@@ -292,7 +292,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var aggregate: ?[]const u8 = null;
     var query: ?[]const u8 = null;
     var codec: ?schema.CompressionCodec = null;
-    var compress_priority: ?engine.CompressPriority = null;
+    var compress_priority: engine.CompressPriority = .size;
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
@@ -369,7 +369,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 return error.BadArgs;
             };
             compress_priority = std.meta.stringToEnum(engine.CompressPriority, v) orelse {
-                std.debug.print("zpq query: invalid compress priority: {s} (size, balanced or speed)\n", .{v});
+                std.debug.print("zpq query: invalid compress priority: {s} (size or speed)\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {

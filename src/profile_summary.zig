@@ -517,13 +517,13 @@ fn writeIoChoice(w: *std.Io.Writer, io: IoStat) !void {
 
 /// `compression.CompressPriority`'s names, by value.
 fn priorityName(z: ZstdStat) []const u8 {
-    const names = [_][]const u8{ "size", "balanced", "speed" };
+    const names = [_][]const u8{ "size", "speed" };
     return if (z.priority < names.len) names[z.priority] else "?";
 }
 
 /// `compression.CompressPriority.lambda`, by value; 0 for `size`, which keeps level 3.
 fn priorityLambda(z: ZstdStat) u64 {
-    const lambdas = [_]u64{ 0, 1000, 100 };
+    const lambdas = [_]u64{ 0, 100 };
     return if (z.priority < lambdas.len) lambdas[z.priority] else 0;
 }
 

@@ -66,3 +66,14 @@ included.
 
 To check the tree against the release: clone `ebiggers/libdeflate` at `v1.26` and compare its `lib`, `libdeflate.h`,
 `common_defs.h` and `COPYING` with `vendor/libdeflate`.
+
+## lz4 (`vendor/lz4`, lz4/lz4 1.10.0)
+
+`lib/lz4.c`, `lib/lz4.h` and `lib/LICENSE` from the v1.10.0 tag, unmodified. zpq builds `lz4.c` (`lz4Library` in
+`build.zig`) and calls `LZ4_compress_default` to write LZ4_RAW pages: the format's reference block encoder,
+deterministic for a given input. Reading stays with zpq's own decoder (`src/core/parquet/lz4.zig`), which also parses
+the Hadoop and frame containers the deprecated LZ4 codec appears in. No local changes.
+
+To check the tree against the release: clone `lz4/lz4` at `v1.10.0` and compare its `lib/lz4.c`, `lib/lz4.h` and
+`lib/LICENSE` with `vendor/lz4`.
+

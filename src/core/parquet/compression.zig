@@ -1,6 +1,7 @@
 //! Codec dispatch for Parquet pages.
 //!
-//! UNCOMPRESSED, SNAPPY and the LZ4s are handled in-tree; ZSTD uses libzstd;
+//! UNCOMPRESSED and SNAPPY are handled in-tree; LZ4_RAW is written with liblz4
+//! and the LZ4s read in-tree; ZSTD uses libzstd;
 //! GZIP is read with libdeflate (`ZPQ_GZIP_STD` selects the Zig stdlib instead)
 //! and written with the Zig stdlib. The deprecated LZ4 codec (5) is read, never written:
 //! the spec replaced it with LZ4_RAW, which is what `--codec lz4` writes.
@@ -12,6 +13,7 @@ const lz4 = @import("lz4.zig");
 
 const c_zstd = @import("zstd_c");
 const c_deflate = @import("libdeflate_c");
+const c_lz4 = @import("lz4_c");
 
 pub const Error = error{
     UnsupportedCodec,
@@ -102,13 +104,15 @@ pub fn compress(
     };
 }
 
+/// `src` as one LZ4 block (LZ4_RAW), by liblz4's default compressor: deterministic, the format's reference encoder.
 fn compressLz4Raw(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
-    const table = try arena.alloc(u32, lz4.HASH_SIZE);
-    defer arena.free(table);
-    const dest = try arena.alloc(u8, lz4.compressBound(src.len));
+    if (src.len > c_lz4.LZ4_MAX_INPUT_SIZE) return error.CompressionFailed;
+    const bound: usize = @intCast(c_lz4.LZ4_compressBound(@intCast(src.len)));
+    const dest = try arena.alloc(u8, bound);
     errdefer arena.free(dest);
-    const n = lz4.compress(src, dest, table) catch return error.CompressionFailed;
-    return dest[0..n];
+    const n = c_lz4.LZ4_compress_default(src.ptr, dest.ptr, @intCast(src.len), @intCast(dest.len));
+    if (n <= 0) return error.CompressionFailed;
+    return dest[0..@intCast(n)];
 }
 
 /// Compress `src` to a single gzip member via stdlib deflate. Mirrors the
@@ -1039,4 +1043,39 @@ test "GZIP pages: every member is checked, empty ones and ones past the page's s
             }
         }
     }
+}
+
+test "LZ4_RAW pages from liblz4 decode with zpq's reader at the format's edges, and the same bytes every time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x1a24);
+    const r = prng.random();
+    // Around the end-of-block rules (12 bytes no match may start in, 5 literal bytes last), the 64 KiB match offset
+    // limit, and sizes a page reaches.
+    const sizes = [_]usize{ 0, 1, 4, 5, 11, 12, 13, 14, 17, 64, 65535, 65536, 65537, 131072, 1 << 20 };
+    for (sizes) |n| for (0..5) |kind| {
+        const data = try a.alloc(u8, n);
+        switch (kind) {
+            0 => r.bytes(data), // incompressible
+            1 => @memset(data, 'Z'), // one run
+            2 => for (data, 0..) |*b, i| {
+                b.* = "the quick brown fox jumps over the lazy dog "[i % 44];
+            },
+            // A random block repeated at a period of exactly 65535, then 65536: matches at the offset limit and one
+            // past it.
+            else => {
+                const period: usize = if (kind == 3) 65535 else 65536;
+                r.bytes(data[0..@min(period, n)]);
+                var i: usize = period;
+                while (i < n) : (i += 1) data[i] = data[i - period];
+            },
+        }
+        const page = try compressPage(a, data, .LZ4_RAW, .{});
+        const again = try compressPage(a, data, .LZ4_RAW, .{});
+        try testing.expectEqualSlices(u8, page, again);
+        const back = try decompress(a, page, .LZ4_RAW, n);
+        try testing.expectEqualSlices(u8, data, back);
+        if (kind == 1 and n >= 4096) try testing.expect(page.len < n / 100);
+    };
 }

@@ -250,6 +250,10 @@ const CoreDeps = struct {
     /// pages, about three times as fast as `std.compress.flate`.
     libdeflate: *std.Build.Step.Compile,
     libdeflate_c: *std.Build.Module,
+    /// lz4/lz4 1.10.0 — vendored (`vendor/lz4`, see vendor/README.md), the block compressor only: LZ4_RAW pages are
+    /// written with it and read with zpq's own decoder (src/core/parquet/lz4.zig).
+    lz4: *std.Build.Step.Compile,
+    lz4_c: *std.Build.Module,
     /// The SQL frontend's C parser. Only linked into modules built with
     /// `sql = true`; an unreferenced library step is never compiled.
     liteparser: *std.Build.Step.Compile,
@@ -265,6 +269,7 @@ const CoreDeps = struct {
     ) CoreDeps {
         const zstd = zstdLibrary(b, target, optimize);
         const libdeflate = libdeflateLibrary(b, target, optimize);
+        const lz4 = lz4Library(b, target, optimize);
 
         const liteparser_mod = b.createModule(.{
             .target = target,
@@ -305,6 +310,8 @@ const CoreDeps = struct {
             .zstd_c = zstdCModule(b, target, optimize, zstd),
             .libdeflate = libdeflate,
             .libdeflate_c = libdeflateCModule(b, target, optimize, libdeflate),
+            .lz4 = lz4,
+            .lz4_c = lz4CModule(b, target, optimize, lz4),
             .liteparser = b.addLibrary(.{
                 .name = "liteparser",
                 .root_module = liteparser_mod,
@@ -363,6 +370,7 @@ fn addCoreModule(
             .{ .name = "snappy", .module = deps.snappy },
             .{ .name = "zstd_c", .module = deps.zstd_c },
             .{ .name = "libdeflate_c", .module = deps.libdeflate_c },
+            .{ .name = "lz4_c", .module = deps.lz4_c },
         },
     };
     const zpq_mod = if (options.export_as) |name|
@@ -371,6 +379,7 @@ fn addCoreModule(
         b.createModule(module_options);
     zpq_mod.linkLibrary(deps.zstd);
     zpq_mod.linkLibrary(deps.libdeflate);
+    zpq_mod.linkLibrary(deps.lz4);
     if (options.sql) {
         zpq_mod.linkLibrary(deps.liteparser);
         zpq_mod.addIncludePath(b.path("vendor/liteparser"));
@@ -551,6 +560,29 @@ fn libdeflateCModule(
     lib: *std.Build.Step.Compile,
 ) *std.Build.Module {
     const tc = cHeaderModule(b, target, optimize, "libdeflate_c.h", "#include <libdeflate.h>\n");
+    tc.addIncludePath(lib.getEmittedIncludeTree());
+    return tc.createModule();
+}
+
+/// liblz4 from `vendor/lz4`: `lz4.c`, the block format (no frames, no HC), as upstream builds it.
+fn lz4Library(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "lz4",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/lz4"), .files = &.{"lz4.c"} });
+    lib.installHeader(b.path("vendor/lz4/lz4.h"), "lz4.h");
+    return lib;
+}
+
+fn lz4CModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    lib: *std.Build.Step.Compile,
+) *std.Build.Module {
+    const tc = cHeaderModule(b, target, optimize, "lz4_c.h", "#include <lz4.h>\n");
     tc.addIncludePath(lib.getEmittedIncludeTree());
     return tc.createModule();
 }

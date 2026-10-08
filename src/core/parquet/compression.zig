@@ -484,12 +484,25 @@ fn decompressFlate(
     // decoder advances `input.seek` precisely (it peeks then tosses exactly
     // the bytes it consumes), leaving `seek` at the next member's first byte.
     // Single-member streams take one iteration and exit.
+    //
+    // Each member is read to its end, so its trailer is parsed, and checked
+    // here: std's Decompress records a gzip member's CRC-32 and length but
+    // does not compare them, and a member that does not end within the page
+    // is an error, not a truncated read.
     var written: usize = 0;
     while (written < uncompressed_size and input.seek < input.end) {
         var d = std.compress.flate.Decompress.init(&input, container, window);
-        const n = d.reader.readSliceShort(out[written..]) catch return error.DecompressionFailed;
-        if (n == 0) break;
-        written += n;
+        const start = written;
+        written += d.reader.readSliceShort(out[written..]) catch return error.DecompressionFailed;
+        var past: [1]u8 = undefined;
+        if ((d.reader.readSliceShort(&past) catch return error.DecompressionFailed) != 0)
+            return error.DecompressionFailed;
+        if (container == .gzip) {
+            const trailer = d.container_metadata.gzip;
+            const member = out[start..written];
+            if (trailer.crc != std.hash.Crc32.hash(member) or trailer.count != @as(u32, @truncate(member.len)))
+                return error.DecompressionFailed;
+        }
     }
     if (written != uncompressed_size) return error.DecompressionFailed;
 }
@@ -823,11 +836,10 @@ fn gzipStream(a: std.mem.Allocator, data: []const u8, form: GzipForm) ![]u8 {
     return out.writer.buffered();
 }
 
-/// Decompresses `src` into a buffer of `want_len` with libdeflate and with the stdlib; neither writes outside its
-/// buffer. libdeflate either fails or gives back exactly `want` (it checks each member's CRC-32 and length); so must
-/// the stdlib when `strict_std`, but it stops once the buffer is full and never reads a trailer, so on corrupt input
-/// it may also return other bytes.
-fn expectGzipBoth(a: std.mem.Allocator, src: []const u8, want: []const u8, want_len: usize, strict_std: bool) !struct { ok: [2]bool } {
+/// Decompresses `src` into a buffer of `want_len` with libdeflate and with the stdlib (`ZPQ_GZIP_STD`): each either
+/// fails or gives back exactly `want`, both checking every member's CRC-32 and length, and neither writes outside its
+/// buffer.
+fn expectGzipBoth(a: std.mem.Allocator, src: []const u8, want: []const u8, want_len: usize) !struct { ok: [2]bool } {
     defer setGzipStd(false);
     var ok: [2]bool = undefined;
     for ([_]bool{ false, true }, 0..) |use_std, k| {
@@ -837,8 +849,8 @@ fn expectGzipBoth(a: std.mem.Allocator, src: []const u8, want: []const u8, want_
         @memset(buf, 0xA5);
         const out = buf[32..][0..want_len];
         if (decompressGzip(a, src, out)) |_| {
-            if (!use_std or strict_std) try testing.expectEqualSlices(u8, want, out);
-            ok[k] = std.mem.eql(u8, want, out);
+            try testing.expectEqualSlices(u8, want, out);
+            ok[k] = true;
         } else |_| ok[k] = false;
         for (buf[0..32]) |g| try testing.expectEqual(@as(u8, 0xA5), g);
         for (buf[32 + want_len ..]) |g| try testing.expectEqual(@as(u8, 0xA5), g);
@@ -871,7 +883,7 @@ test "GZIP pages: libdeflate and the stdlib inflate every block kind, level and 
         };
         for (forms) |form| {
             const z = try gzipStream(a, data, form);
-            const got = try expectGzipBoth(a, z, data, n, true);
+            const got = try expectGzipBoth(a, z, data, n);
             try testing.expect(got.ok[0] and got.ok[1]);
         }
         // Two members back to back, as some writers emit.
@@ -880,7 +892,8 @@ test "GZIP pages: libdeflate and the stdlib inflate every block kind, level and 
             try gzipStream(a, data[0..half], .{ .level = flate.level_1 }),
             try gzipStream(a, data[half..], .stored),
         });
-        try testing.expect((try expectGzipBoth(a, two, data, n, true)).ok[0]);
+        const both = try expectGzipBoth(a, two, data, n);
+        try testing.expect(both.ok[0] and both.ok[1]);
     };
 }
 
@@ -894,22 +907,24 @@ test "GZIP pages: truncated, bit-flipped and oversized input fails cleanly in li
     for (data, 0..) |*b, i| b.* = if (i % 5 == 0) r.int(u8) else "abcdefgh"[i % 8];
     for ([_]GzipForm{ .{ .level = .default }, .stored, .huffman }) |form| {
         const z = try gzipStream(a, data, form);
-        // Every truncation: a gzip member is checked to its last byte, so each one fails.
+        // Every truncation: a gzip member is checked to its last byte, so each one fails, on both paths.
         for (0..z.len) |cut| {
-            const got = try expectGzipBoth(a, z[0..cut], data, data.len, false);
-            try testing.expect(!got.ok[0]);
+            const got = try expectGzipBoth(a, z[0..cut], data, data.len);
+            try testing.expect(!got.ok[0] and !got.ok[1]);
         }
-        // Every single-bit flip: an error, or the original exactly (a flip in a header field nothing checks).
+        // Every single-bit flip, on both paths: an error, or the original exactly (a flip in a header field nothing
+        // checks).
         const flipped = try a.dupe(u8, z);
         for (0..z.len * 8) |bit| {
             flipped[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
-            _ = try expectGzipBoth(a, flipped, data, data.len, false);
+            _ = try expectGzipBoth(a, flipped, data, data.len);
             flipped[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
         }
         // A page header claiming more bytes than the member holds.
         const bigger = try a.alloc(u8, data.len + 1);
         @memcpy(bigger[0..data.len], data);
-        try testing.expect(!(try expectGzipBoth(a, z, bigger, bigger.len, false)).ok[0]);
+        const over = try expectGzipBoth(a, z, bigger, bigger.len);
+        try testing.expect(!over.ok[0] and !over.ok[1]);
     }
 }
 
@@ -959,21 +974,26 @@ test "GZIP pages: a match reaching before the start of the output is rejected by
     defer arena_state.deinit();
     const a = arena_state.allocator();
     // Distance 1 copies the 'a' just written: valid.
-    const good = try expectGzipBoth(a, try fixedHuffmanMember(a, 1), "aaaa", 4, true);
+    const good = try expectGzipBoth(a, try fixedHuffmanMember(a, 1), "aaaa", 4);
     try testing.expect(good.ok[0] and good.ok[1]);
     // Distance 2 reaches a byte before the first one written.
-    const bad = try expectGzipBoth(a, try fixedHuffmanMember(a, 2), "aaaa", 4, true);
+    const bad = try expectGzipBoth(a, try fixedHuffmanMember(a, 2), "aaaa", 4);
     try testing.expect(!bad.ok[0] and !bad.ok[1]);
 }
 
-test "GZIP pages: libdeflate rejects a member whose CRC-32 does not match its bytes" {
+test "GZIP pages: both inflaters reject a member whose CRC-32 or length does not match its bytes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const data = "a page whose trailer is wrong, a page whose trailer is wrong, a page whose trailer is wrong";
-    const z = try a.dupe(u8, try gzipStream(a, data, .{ .level = .default }));
-    z[z.len - 8] ^= 1; // CRC-32, first byte
-    const out = try a.alloc(u8, data.len);
-    setGzipStd(false);
-    try testing.expectError(error.DecompressionFailed, decompressGzip(a, z, out));
+    defer setGzipStd(false);
+    for ([_]usize{ 8, 4 }) |from_end| { // CRC-32's first byte, ISIZE's first byte
+        const z = try a.dupe(u8, try gzipStream(a, data, .{ .level = .default }));
+        z[z.len - from_end] ^= 1;
+        const out = try a.alloc(u8, data.len);
+        for ([_]bool{ false, true }) |use_std| {
+            setGzipStd(use_std);
+            try testing.expectError(error.DecompressionFailed, decompressGzip(a, z, out));
+        }
+    }
 }

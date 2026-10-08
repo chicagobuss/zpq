@@ -61,10 +61,11 @@ const usage_text =
     \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
     \\                 deprecated LZ4 codec but never compresses to it.
     \\  --compress-priority
-    \\                 how hard zstd works: each page is stored raw, as
+    \\                 how hard zstd works. `size`: level 3 for every page.
+    \\                 `balanced`, `speed`: each page stored raw, as
     \\                 entropy-coded literals, or at level 1 or 3, whichever
-    \\                 costs least when an output byte is worth `size` (any
-    \\                 CPU), `balanced` (1000 cycles) or `speed` (100).
+    \\                 costs least when an output byte is worth 1000 or 100
+    \\                 cycles, checked against the whole page (see README).
     \\                 Default: size for s3:// output, balanced locally.
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
     \\                 (row-group pruning, stats-as-answer). Slower but

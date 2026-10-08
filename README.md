@@ -91,20 +91,24 @@ codec; with it, a plain copy recompresses any chunk stored in another codec. The
 the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one
 (for example, inputs written with different codecs).
 
-zstd pages each take the form that costs least: raw blocks (for pages nothing compresses, such as bit-packed
-dictionary indices), entropy-coded literals with no match search, level 1, or level 3. Each is a standard zstd frame
-every reader decodes. The choice weighs each form's CPU against the bytes it writes, the sizes estimated by compressing
-a fixed sample of the page, so the output is the same at every `-j` and on every run. `--compress-priority` (the
-Lambda's `"compress_priority"`) sets what an output byte is worth:
+`--compress-priority` (the Lambda's `"compress_priority"`) sets how hard zstd works:
 
-| priority | an output byte is worth | for |
+| priority | pages | for |
 | --- | --- | --- |
-| `size` | any CPU (lambda 10^9 cycles) | S3 output and the Lambda: the default there |
-| `balanced` | 1000 cycles | local output: the default there |
-| `speed` | 100 cycles | the least CPU, for output a few percent larger |
+| `size` | level 3, every page | S3 output and the Lambda: the default there |
+| `balanced` | the form that costs least when an output byte is worth 1000 cycles | local output: the default there |
+| `speed` | the same, an output byte worth 100 cycles | the least CPU, for output a few percent larger |
 
-Pages under 16 KiB are compressed at level 3 at every priority. `--profile-summary` reports the priority and how many
-pages took each form.
+Under `balanced` and `speed` a page may be stored as raw blocks (for pages nothing compresses, such as bit-packed
+dictionary indices), as entropy-coded literals with no match search, or at level 1, each a standard zstd frame every
+reader decodes. The choice weighs each form's CPU against the bytes it writes, the sizes estimated by compressing four
+slices spread over the page. The whole page is then checked: the frame must be within 10% plus 1 KiB of the size the
+sample predicted, a raw or literals-only page must have no more than that to gain from a fast full-page match search,
+and a raw page no more than that from entropy coding (its byte entropy). A page that fails is compressed at level 3
+too and the smaller frame kept, so a sample that misses where a page compresses costs at most that margin. Every
+step depends on the page's bytes alone: the output is the same at every `-j` and on every run. Pages under 16 KiB are
+compressed at level 3. `--profile-summary` reports the priority, how many pages took each form and how many failed
+their checks.
 
 **Order** is the input's: every output that lists rows (print, `--format`, `-o` writes and byte copies, several files,
 S3 and Lambda) keeps files in the order given, then row groups, then rows, at any `-j`. `GROUP BY` lists groups in the

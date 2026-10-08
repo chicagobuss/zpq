@@ -119,11 +119,11 @@ pub const Reconcile = struct {
 pub const ZstdStat = struct {
     seen: u64 = 0,
     priority: u64 = 0,
-    lambda: u64 = 0,
     raw_pages: u64 = 0,
     literals_pages: u64 = 0,
     level1_pages: u64 = 0,
     level3_pages: u64 = 0,
+    rechecked: u64 = 0,
 };
 
 pub const top_n = 10;
@@ -362,11 +362,11 @@ fn tally(
         .zstd_plan => s.zstd = .{
             .seen = 1,
             .priority = a[0],
-            .lambda = a[1],
-            .raw_pages = a[2],
-            .literals_pages = a[3],
-            .level1_pages = a[4],
-            .level3_pages = a[5],
+            .raw_pages = a[1],
+            .literals_pages = a[2],
+            .level1_pages = a[3],
+            .level3_pages = a[4],
+            .rechecked = a[5],
         },
         .local_backend => {
             s.io.local_uring_threads = a[0];
@@ -521,10 +521,21 @@ fn priorityName(z: ZstdStat) []const u8 {
     return if (z.priority < names.len) names[z.priority] else "?";
 }
 
+/// `compression.CompressPriority.lambda`, by value; 0 for `size`, which keeps level 3.
+fn priorityLambda(z: ZstdStat) u64 {
+    const lambdas = [_]u64{ 0, 1000, 100 };
+    return if (z.priority < lambdas.len) lambdas[z.priority] else 0;
+}
+
 fn writeZstd(w: *std.Io.Writer, z: ZstdStat) !void {
-    try w.print("zstd   priority {s} (lambda {d}): {d} pages raw, {d} literals only, {d} level 1, {d} level 3\n", .{
-        priorityName(z), z.lambda, z.raw_pages, z.literals_pages, z.level1_pages, z.level3_pages,
+    if (priorityLambda(z) == 0) {
+        try w.print("zstd   priority {s}: level 3 for all {d} pages\n", .{ priorityName(z), z.level3_pages });
+        return;
+    }
+    try w.print("zstd   priority {s} (lambda {d}): {d} pages raw, {d} literals only, {d} level 1, {d} level 3", .{
+        priorityName(z), priorityLambda(z), z.raw_pages, z.literals_pages, z.level1_pages, z.level3_pages,
     });
+    try w.print("; {d} failed their page checks\n", .{z.rechecked});
 }
 
 fn writeLocalBackend(w: *std.Io.Writer, io: IoStat) !void {
@@ -815,11 +826,12 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     if (s.zstd.seen != 0) {
         var zstd = try o.object("zstd");
         try zstd.str("priority", priorityName(s.zstd));
-        try zstd.int("lambda", s.zstd.lambda);
+        try zstd.int("lambda", priorityLambda(s.zstd));
         try zstd.int("raw_pages", s.zstd.raw_pages);
         try zstd.int("literals_pages", s.zstd.literals_pages);
         try zstd.int("level1_pages", s.zstd.level1_pages);
         try zstd.int("level3_pages", s.zstd.level3_pages);
+        try zstd.int("rechecked", s.zstd.rechecked);
         try zstd.end();
     }
     {

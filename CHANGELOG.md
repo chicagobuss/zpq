@@ -38,10 +38,11 @@
 - Aggregate scans work on dictionary codes where they can, and evaluate computed aggregate arguments only over the
   selected rows. String `min` / `max` compare a 16-byte prefix before the full bytes.
 - Scan workers start as a spawn tree, and each one backs its decode memory with a single huge-page region.
-- zstd output compresses each page in the form that costs least, from raw blocks through literals only and level 1 to
-  level 3, sampling the page to estimate sizes; the output is the same at every `-j`. `--compress-priority
-  size|balanced|speed` (the Lambda's `"compress_priority"`) sets how much CPU a saved byte is worth. The default is
-  `size` for S3 output and the Lambda and `balanced` for local output.
+- `--compress-priority size|balanced|speed` (the Lambda's `"compress_priority"`). `size`, the default for S3 output
+  and the Lambda, compresses zstd pages at level 3 as before. `balanced`, the default for local output, and `speed`
+  store each page in the form that costs least (raw blocks, literals only, level 1 or level 3), estimated from a
+  sample and checked against the whole page, falling back to level 3 when the check fails. The output is the same at
+  every `-j`.
 - zstd's Huffman coding of literals runs on AVX-512 (F, BW, VL, VBMI and VBMI2) where the CPU has it, writing the same
   bytes as zstd's own encoder, which runs everywhere else. `ZPQ_ZSTD_SCALAR=1` turns it off. The change to the vendored
   zstd is one patch, described in [vendor/README.md](vendor/README.md).

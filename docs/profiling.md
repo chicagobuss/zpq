@@ -56,7 +56,7 @@ JSON file. Open it at <https://ui.perfetto.dev> (Open trace file) or load it wit
 | `upload_create`, `upload_complete` | io | Starting and completing a multipart upload (a single PUT when the output fits one part). | `parts` |
 | `upload_wait` | wait | Waiting for the last parts to finish uploading. | `parts` |
 | `footer_write` | write | Writing the output footer. | `bytes` |
-| `zstd_plan` | wait | A zstd write's compression priority and the pages each form took (an instant). | `priority` (0 size, 1 balanced, 2 speed), `lambda`, `raw_pages`, `literals_pages`, `level1_pages`, `level3_pages` |
+| `zstd_plan` | wait | A zstd write's compression priority and the pages each form took (an instant). | `priority` (0 size, 1 balanced, 2 speed), `raw_pages`, `literals_pages`, `level1_pages`, `level3_pages`, `rechecked` (pages whose cheaper form failed its full-page checks) |
 
 Counter tracks: `requests in_flight` and `bytes in_flight` (S3 requests and the bytes they move, stepped exactly where
 they change), `buffered bytes` (encoded row groups waiting for the writer), and `rss bytes` (resident memory, sampled
@@ -140,7 +140,7 @@ A zstd write adds the priority its pages were compressed with and the mode each 
 the README):
 
 ```
-zstd   priority balanced (lambda 1000): 0 pages raw, 35 literals only, 21 level 1, 61 level 3
+zstd   priority balanced (lambda 1000): 0 pages raw, 35 literals only, 21 level 1, 61 level 3; 0 failed their page checks
 ```
 
 The `prune` lines cover scans: the write path records no row-group decisions, so a write's summary leaves them out (its

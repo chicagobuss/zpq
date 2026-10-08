@@ -1680,7 +1680,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         for (&pages, &zstd_counts.pages) |*n, *c| n.* = c.load(.monotonic);
         const now = nowMonoNs();
         profile.record(prof, .zstd_plan, now, now, profile.args(.{
-            @intFromEnum(priority), @as(u64, @intFromFloat(priority.lambda())), pages[0], pages[1], pages[2], pages[3],
+            @intFromEnum(priority), pages[0], pages[1], pages[2], pages[3], zstd_counts.rechecked.load(.monotonic),
         }));
     }
 

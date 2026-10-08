@@ -32,6 +32,9 @@
 #include "../common/huf.h"
 #include "../common/error_private.h"
 #include "../common/bits.h"       /* ZSTD_highbit32 */
+#if defined(ZPQ_HUF4X_AVX512)
+#  include "../../zpq/huf4x_avx512.h"   /* zpq: ZPQ_HUF_compress4X_avx512 */
+#endif
 
 
 /* **************************************************************
@@ -1175,6 +1178,13 @@ HUF_compress4X_usingCTable_internal(void* dst, size_t dstSize,
     BYTE* const ostart = (BYTE*) dst;
     BYTE* const oend = ostart + dstSize;
     BYTE* op = ostart;
+
+#if defined(ZPQ_HUF4X_AVX512)
+    /* zpq: the same bytes from AVX-512 when the CPU has it; (size_t)-1 when it does not apply */
+    {   size_t const r = ZPQ_HUF_compress4X_avx512(dst, dstSize, src, srcSize, CTable);
+        if (r != (size_t)-1) return r;
+    }
+#endif
 
     if (dstSize < 6 + 1 + 1 + 1 + 8) return 0;   /* minimum space to compress successfully */
     if (srcSize < 12) return 0;   /* no saving possible : too small input */

@@ -540,3 +540,46 @@ test "every zstd page mode makes a frame libzstd decodes, and each priority pick
         try testing.expectEqual(@as(u64, 1), pages);
     }
 }
+
+// zpq's AVX-512 Huffman encoder in the vendored zstd (vendor/zstd/zpq): selection, and its comparison with zstd's own.
+extern fn ZPQ_huf4x_select(mode: c_int) c_int;
+extern fn ZPQ_huf4x_check(iters: c_ulong, seed: c_ulonglong, checked: *c_ulong) c_long;
+
+test "the AVX-512 Huffman encoder writes zstd's bytes for every literal distribution" {
+    var checked: c_ulong = 0;
+    const mismatches = ZPQ_huf4x_check(3000, 0x5eed, &checked);
+    if (mismatches < 0) return error.SkipZigTest; // no AVX-512 VBMI2 here, or ZPQ_ZSTD_SCALAR set
+    try testing.expect(checked > 3000);
+    try testing.expectEqual(@as(c_long, 0), mismatches);
+}
+
+test "zstd frames are the same bytes with the AVX-512 Huffman encoder and without" {
+    defer _ = ZPQ_huf4x_select(0);
+    if (ZPQ_huf4x_select(0) == 0) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0x4f4e);
+    const r = prng.random();
+    const cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+    defer _ = c_zstd.ZSTD_freeCCtx(cctx);
+    const src = try testing.allocator.alloc(u8, 300_000);
+    defer testing.allocator.free(src);
+    const cap = @max(c_zstd.ZSTD_compressBound(src.len), rawFrameLen(src.len));
+    const scalar = try testing.allocator.alloc(u8, cap);
+    defer testing.allocator.free(scalar);
+    const vector = try testing.allocator.alloc(u8, cap);
+    defer testing.allocator.free(vector);
+    // Text-like, skewed numeric and near-random bytes, at sizes around the 128 KiB block.
+    for ([_]usize{ 100, 5_000, 70_000, 131_072, 300_000 }) |n| for (0..3) |shape| {
+        for (src[0..n], 0..) |*b, i| b.* = switch (shape) {
+            0 => "the quick brown fox jumps over a lazy dog "[(i * 7 + r.uintLessThan(usize, 3)) % 42],
+            1 => @intCast(@min(255, @as(u32, @clz(r.int(u32) | 1)) * 9 + r.uintLessThan(u32, 4))),
+            else => r.int(u8) & 0xBF,
+        };
+        for ([_]ZstdMode{ .literals, .level1, .level3 }) |m| {
+            _ = ZPQ_huf4x_select(1);
+            const a = try zstdWith(cctx, m, scalar, src[0..n]);
+            _ = ZPQ_huf4x_select(0);
+            const b = try zstdWith(cctx, m, vector, src[0..n]);
+            try testing.expectEqualSlices(u8, scalar[0..a], vector[0..b]);
+        }
+    };
+}

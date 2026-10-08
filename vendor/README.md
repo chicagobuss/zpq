@@ -40,3 +40,15 @@ deprecated API and older legacy formats are left out, as the package build that 
 library is built by `zstdLibrary` in the top-level `build.zig` with the same sources and macros
 (`ZSTD_LEGACY_SUPPORT=5`, `ZSTD_MULTITHREAD=1` except on WASI, `ZSTD_DISABLE_ASM` off x86-64). Local changes are kept
 as patch files in `vendor/zstd/patches/`, each applied to the tree and listed here.
+
+- `0001-huf-compress4x-avx512.patch` (`lib/compress/huf_compress.c`): `HUF_compress4X_usingCTable_internal` first
+  offers the block to `ZPQ_HUF_compress4X_avx512` (`vendor/zstd/zpq/huf4x_avx512.c`, zpq's own code, MIT), an AVX-512
+  encoder of the four Huffman streams that writes the same bytes zstd does, and returns its result unless it declines
+  with `(size_t)-1`. It declines when the CPU or OS lacks AVX-512 F, BW, VL, VBMI or VBMI2 (checked once, with CPUID
+  and XGETBV), when `ZPQ_ZSTD_SCALAR` is set to anything but `0`, and for tables over 11 bits; off x86-64 the file is
+  a stub that always declines. Guarded by `ZPQ_HUF4X_AVX512`, which `zstdLibrary` defines: without it the file is
+  upstream's. `vendor/zstd/zpq/huf4x_check.c` compares the two encoders for the unit tests, and
+  `tools/zstd-avx512` over any corpus.
+
+To check the tree against the release: unpack zstd 1.5.7, apply the patches with `patch -p1`, and compare
+`vendor/zstd/lib` with its `lib` (only the files listed above are vendored).

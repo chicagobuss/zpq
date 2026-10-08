@@ -42,6 +42,9 @@
   level 3, sampling the page to estimate sizes; the output is the same at every `-j`. `--compress-priority
   size|balanced|speed` (the Lambda's `"compress_priority"`) sets how much CPU a saved byte is worth. The default is
   `size` for S3 output and the Lambda and `balanced` for local output.
+- zstd's Huffman coding of literals runs on AVX-512 (F, BW, VL, VBMI and VBMI2) where the CPU has it, writing the same
+  bytes as zstd's own encoder, which runs everywhere else. `ZPQ_ZSTD_SCALAR=1` turns it off. The change to the vendored
+  zstd is one patch, described in [vendor/README.md](vendor/README.md).
 - Column encoding writes the same bytes in fewer instructions: bit packing and run detection work a word at a time,
   string statistics compare a 16-byte prefix first, and dense columns copy and pack without per-value branches.
 - Writes filter first and then decode and project one column at a time. They re-encode dictionary columns from their

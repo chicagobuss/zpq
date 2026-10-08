@@ -478,6 +478,14 @@ fn zstdLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "legacy/zstd_v06.c",
         "legacy/zstd_v07.c",
     } });
+    // zpq's AVX-512 Huffman encoder, wired in by patches/0001 (vendor/README.md). Every target builds it; off x86-64
+    // it is a stub and zstd's own encoder runs. huf4x_check.c is for the unit tests: nothing else references it, so
+    // nothing else links it.
+    lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/zstd/zpq"), .files = &.{
+        "huf4x_avx512.c",
+        "huf4x_check.c",
+    } });
+    lib.root_module.addCMacro("ZPQ_HUF4X_AVX512", "1");
     if (target.result.cpu.arch == .x86_64) {
         lib.root_module.addAssemblyFile(b.path("vendor/zstd/lib/decompress/huf_decompress_amd64.S"));
     } else {

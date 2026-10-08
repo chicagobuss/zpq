@@ -436,15 +436,17 @@ pub fn setGzipStd(std_flate: bool) void {
 }
 
 /// A GZIP page body into `out`, which is exactly its size: one gzip member or several back to back
-/// (concatenated_gzip_members.parquet), each checked against its CRC-32 and length. libdeflate decodes the whole
-/// buffer at once and never writes past `out`; malformed input is an error.
+/// (concatenated_gzip_members.parquet). Every member, empty ones included, is decoded and checked against its CRC-32
+/// and length; the members must use all of `src` and fill `out` exactly, so trailing bytes that are no member, or a
+/// member past the page's size, are errors. libdeflate decodes a member into the space left and never writes past
+/// `out`. An empty body is accepted only for an empty page: there is nothing in it to check.
 fn decompressGzip(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void {
     if (gzipUsesStd()) return decompressFlate(arena, src, out, .gzip);
     const d = c_deflate.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;
     defer c_deflate.libdeflate_free_decompressor(d);
     var written: usize = 0;
     var pos: usize = 0;
-    while (written < out.len and pos < src.len) {
+    while (pos < src.len) {
         var used: usize = 0;
         var got: usize = 0;
         const r = c_deflate.libdeflate_gzip_decompress_ex(
@@ -485,12 +487,13 @@ fn decompressFlate(
     // the bytes it consumes), leaving `seek` at the next member's first byte.
     // Single-member streams take one iteration and exit.
     //
-    // Each member is read to its end, so its trailer is parsed, and checked
-    // here: std's Decompress records a gzip member's CRC-32 and length but
-    // does not compare them, and a member that does not end within the page
-    // is an error, not a truncated read.
+    // Every member, empty ones included, is read to its end, so its trailer is
+    // parsed, and checked here: std's Decompress records a gzip member's
+    // CRC-32 and length but does not compare them. The members must use all
+    // of `src` and fill `out` exactly: trailing bytes that are no member, or a
+    // member that does not end within the page, are errors.
     var written: usize = 0;
-    while (written < uncompressed_size and input.seek < input.end) {
+    while (input.seek < input.end) {
         var d = std.compress.flate.Decompress.init(&input, container, window);
         const start = written;
         written += d.reader.readSliceShort(out[written..]) catch return error.DecompressionFailed;
@@ -994,6 +997,46 @@ test "GZIP pages: both inflaters reject a member whose CRC-32 or length does not
         for ([_]bool{ false, true }) |use_std| {
             setGzipStd(use_std);
             try testing.expectError(error.DecompressionFailed, decompressGzip(a, z, out));
+        }
+    }
+}
+
+test "GZIP pages: every member is checked, empty ones and ones past the page's size included" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const empty = try gzipStream(a, "", .stored);
+    const corrupt_empty = try a.dupe(u8, empty);
+    corrupt_empty[corrupt_empty.len - 8] ^= 1; // its CRC-32
+    const first = try gzipStream(a, "abc", .stored);
+    const Case = struct { src: []const u8, out_len: usize, ok: bool };
+    const cases = [_]Case{
+        // A corrupt empty member, for an empty page.
+        .{ .src = corrupt_empty, .out_len = 0, .ok = false },
+        // "abc", then a corrupt empty member.
+        .{ .src = try std.mem.concat(a, u8, &.{ first, corrupt_empty }), .out_len = 3, .ok = false },
+        // "abc", then a member with more bytes than the page holds.
+        .{ .src = try std.mem.concat(a, u8, &.{ first, try gzipStream(a, "d", .stored) }), .out_len = 3, .ok = false },
+        // "abc", then bytes that are no gzip member.
+        .{ .src = try std.mem.concat(a, u8, &.{ first, "junk" }), .out_len = 3, .ok = false },
+        // A sound empty member, for an empty page; "abc" then a sound empty member; empty members on either side.
+        .{ .src = empty, .out_len = 0, .ok = true },
+        .{ .src = try std.mem.concat(a, u8, &.{ first, empty }), .out_len = 3, .ok = true },
+        .{ .src = try std.mem.concat(a, u8, &.{ empty, first, empty }), .out_len = 3, .ok = true },
+        // No body at all for an empty page: nothing to check.
+        .{ .src = "", .out_len = 0, .ok = true },
+    };
+    defer setGzipStd(false);
+    for ([_]bool{ false, true }) |use_std| {
+        setGzipStd(use_std);
+        for (cases) |case| {
+            const out = try a.alloc(u8, case.out_len);
+            if (case.ok) {
+                try decompressGzip(a, case.src, out);
+                try testing.expectEqualStrings("abc"[0..case.out_len], out);
+            } else {
+                try testing.expectError(error.DecompressionFailed, decompressGzip(a, case.src, out));
+            }
         }
     }
 }

@@ -50,10 +50,10 @@ static long zlibInflate(const unsigned char* s, size_t n, unsigned char* d, size
 
 static struct libdeflate_decompressor* D;
 
-/* As zpq calls it: members back to back into a buffer of the known size. */
+/* As zpq calls it: every member of the input, back to back, filling a buffer of the known size exactly. */
 static long ldInflate(const unsigned char* s, size_t n, unsigned char* d, size_t want) {
     size_t pos = 0, out = 0;
-    while (out < want && pos < n) {
+    while (pos < n) {
         size_t used = 0, got = 0;
         if (libdeflate_gzip_decompress_ex(D, s + pos, n - pos, d + out, want - out, &used, &got) != LIBDEFLATE_SUCCESS)
             return -1;

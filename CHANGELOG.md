@@ -46,6 +46,10 @@
 - zstd's Huffman coding of literals runs on AVX-512 (F, BW, VL, VBMI and VBMI2) where the CPU has it, writing the same
   bytes as zstd's own encoder, which runs everywhere else. `ZPQ_ZSTD_SCALAR=1` turns it off. The change to the vendored
   zstd is one patch, described in [vendor/README.md](vendor/README.md).
+- Re-encoded string columns read faster everywhere and come out a little smaller: a dictionary while a quarter or
+  fewer of the values are distinct and it fits 1 MiB (was: a tenth), DELTA_BYTE_ARRAY only where values share long
+  prefixes with the previous one, and DELTA_LENGTH_BYTE_ARRAY otherwise, which every reader we measured decodes
+  fastest.
 - Column encoding writes the same bytes in fewer instructions: bit packing and run detection work a word at a time,
   string statistics compare a 16-byte prefix first, and dense columns copy and pack without per-value branches.
 - Writes filter first and then decode and project one column at a time. They re-encode dictionary columns from their

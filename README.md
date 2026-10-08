@@ -81,8 +81,8 @@ entry budget, so leave headroom.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
-arrays; DELTA_BINARY_PACKED for INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL columns re-encode
-losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never a lossy detour through
+arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and
+DELTA_LENGTH_BYTE_ARRAY otherwise. DECIMAL columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never a lossy detour through
 DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes currently omit them and
 readers fall back to row-group pruning.
 

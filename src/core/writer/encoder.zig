@@ -148,21 +148,18 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     const src_rep_levels = sourceRepLevels(in.values);
     const src_max_rep = sourceMaxRep(in.values);
 
-    // Try dictionary encoding for BYTE_ARRAY first. If unique-count
-    // stays below the cardinality cap inside `tryEncodeDictBytes`
-    // (currently num_present / 10) AND there are at least 64 present
-    // values, we emit a two-page chunk (DICTIONARY_PAGE then
-    // DATA_PAGE with RLE_DICTIONARY-encoded indices). Otherwise we
-    // fall through to the plain path. Numeric columns stay PLAIN
-    // (snappy already compresses fixed-width well; dict adds
-    // overhead with marginal gain on most numeric distributions).
+    // Try dictionary encoding for BYTE_ARRAY first. Within the limits of
+    // `tryEncodeDictBytes` (a quarter of the values distinct, 1 MiB of
+    // dictionary) AND with at least 64 present values, we emit a two-page
+    // chunk (DICTIONARY_PAGE then DATA_PAGE with RLE_DICTIONARY-encoded
+    // indices). Otherwise we fall through to the paths below.
     if (in.values == .string and src_max_rep == 0) {
         if (try tryEncodeDictBytes(arena, in, num_values)) |enc| return enc;
     }
     // Dict-encode low-cardinality INT32/INT64 columns. The big win is
     // hourly-rounded timestamp columns (24 unique values per daily
     // shard) where dict crushes DELTA: 1.3 bytes/row vs 4.4.
-    // Cardinality cap mirrors the BYTE_ARRAY path (num_present / 10).
+    // Cardinality cap: num_present / 10.
     //
     // FLOAT/DOUBLE columns get the same treatment for the same reason:
     // rounded cost / percentage data is heavily repeated (1M cents in
@@ -190,24 +187,22 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
         try tryEncodeValuesDelta(arena, in.values, src_def_levels, src_max_def)
     else
         null;
-    // High-cardinality strings (dict already declined above): DELTA_BYTE_ARRAY
-    // (prefix + suffix-length deltas) beats PLAIN on sorted/shared-prefix data
-    // and ties it otherwise — the parquet v2 default for binary, and a format we
-    // already read. Only for flat columns.
-    const dba_bytes_opt = if (delta_bytes_opt == null and src_max_rep == 0)
-        try tryEncodeValuesDeltaByteArray(arena, in.values, src_def_levels, src_max_def)
+    // Strings the dictionary declined: DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (see `encodeValuesStrings`).
+    // Only for flat columns.
+    const strings_opt = if (delta_bytes_opt == null and src_max_rep == 0)
+        try encodeValuesStrings(arena, in.values, src_def_levels, src_max_def)
     else
         null;
     const values_bytes = if (delta_bytes_opt) |b|
         b
-    else if (dba_bytes_opt) |b|
-        b
+    else if (strings_opt) |sv|
+        sv.bytes
     else
         try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def);
     const values_encoding: schema.Encoding = if (delta_bytes_opt != null)
         .DELTA_BINARY_PACKED
-    else if (dba_bytes_opt != null)
-        .DELTA_BYTE_ARRAY
+    else if (strings_opt) |sv|
+        sv.encoding
     else
         .PLAIN;
 
@@ -462,7 +457,8 @@ pub fn encodeDecimalFlba(
 
 /// A column carried as codes into its source dictionary (`ColumnT.codes`). The dictionary is rebuilt from the codes
 /// alone: each code met among present rows becomes the next entry, in first-occurrence order and under the same
-/// cardinality cap as the hashing encoders, so with a source dictionary of distinct entries the chunk is the one
+/// limits as the hashing encoders (`stringDictMaxEntries` and `string_dict_max_bytes` for strings), so with a source
+/// dictionary of distinct entries the chunk is the one
 /// hashing the values would write, without hashing any. Past the cap (or with too few values) the values are
 /// gathered and encoded as any other column.
 fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
@@ -473,7 +469,9 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
             const n = codes.len;
             const num_present = countPresent(n, c.def_levels, c.max_def);
             if (T != bool and c.max_rep == 0 and num_present >= 64) dict: {
-                const max_cardinality = num_present / 10;
+                const is_string = T == []const u8;
+                const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 10;
+                var dict_bytes: usize = 0;
                 const none = std.math.maxInt(u32);
                 const remap = try arena.alloc(u32, c.dict.len);
                 @memset(remap, none);
@@ -486,6 +484,10 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
                     if (k >= c.dict.len) return error.CorruptInput;
                     if (remap[k] == none) {
                         if (n_entries >= entries.len) break :dict;
+                        if (is_string) {
+                            dict_bytes += 4 + c.dict[k].len;
+                            if (dict_bytes > string_dict_max_bytes) break :dict;
+                        }
                         remap[k] = @intCast(n_entries);
                         entries[n_entries] = c.dict[k];
                         n_entries += 1;
@@ -528,10 +530,21 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
     }
 }
 
+/// A string column is dictionary-encoded when its values repeat four times on average or more (at most a quarter of
+/// them distinct) and the dictionary's PLAIN bytes stay within 1 MiB, the dictionary page limit Arrow writers default
+/// to. Both limits only grow as values are interned, so either one passing ends the attempt with the same answer the
+/// whole column would give. A dictionary beats every other string encoding where it applies: smaller, the fastest to
+/// read in every reader we measured, and it lets readers prune row groups by `=` and `IN`.
+const string_dict_max_bytes = 1 << 20;
+
+fn stringDictMaxEntries(num_present: usize) usize {
+    return num_present / 4;
+}
+
 /// Try to dictionary-encode a BYTE_ARRAY column (page layout in
-/// `finishDictionaryColumn`). Returns null when the cardinality is too
-/// high for dict to help (and we should fall through to PLAIN), or when
-/// there are too few values to bother.
+/// `finishDictionaryColumn`) within the limits above. Returns null when
+/// the column passes them (the caller then writes DELTA_BYTE_ARRAY or
+/// PLAIN), or when there are too few values to bother.
 fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64) Error!?EncodedColumn {
     const string_col = in.values.string;
     const values = string_col.values;
@@ -545,31 +558,18 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     defer lookup.deinit();
     var dict_values: std.ArrayList([]const u8) = .empty;
     var indices = try arena.alloc(u32, num_present);
+    const max_entries = stringDictMaxEntries(num_present);
     // Sized for the most entries the cap admits, so the table never rehashes on the way.
-    try lookup.ensureTotalCapacity(@intCast(@min(num_present / 10 + 1, num_present)));
+    try lookup.ensureTotalCapacity(@intCast(@min(max_entries + 1, num_present)));
 
-    // Bail when the dictionary would grow past 10% of values. The
-    // 25% threshold this replaced mostly wasted CPU on
-    // high-cardinality columns: for a 131k-row column of unique
-    // strings we'd hash + insert ~32k entries before giving up. At
-    // 10%, the abort fires after only ~13k entries and we go
-    // straight to PLAIN. This is tuned for the current default
-    // PLAIN+snappy path; zstd or uncompressed output may want a
-    // different cutoff once the benchmark matrix covers them.
-    //
-    // The downside is we lose some dict savings on columns with
-    // 10-25% cardinality. That regime is the marginal one where
-    // dict was paying for itself only barely; PLAIN+snappy lands
-    // within a few % on output size for our distributions, with
-    // less encode CPU.
-    const max_cardinality = num_present / 10;
-
+    var dict_bytes: usize = 0;
     var idx_pos: usize = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
         const gop = try lookup.getOrPut(v);
         if (!gop.found_existing) {
-            if (dict_values.items.len >= max_cardinality) return null;
+            dict_bytes += 4 + v.len;
+            if (dict_values.items.len >= max_entries or dict_bytes > string_dict_max_bytes) return null;
             const new_idx: u32 = @intCast(dict_values.items.len);
             try dict_values.append(arena, v);
             gop.value_ptr.* = new_idx;
@@ -707,8 +707,8 @@ fn internColumn(
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
 /// tryEncodeDictBytes: PLAIN-encoded dictionary page, then a data
 /// page of RLE/bit-packed indices. Returns null when the dictionary
-/// would exceed `num_present / 10` (the bytes path's cardinality cap)
-/// or when there are fewer than 64 present values.
+/// would exceed `num_present / 10` or when there are fewer than 64
+/// present values.
 fn tryEncodeDictInt(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -757,9 +757,9 @@ fn tryEncodeDictInt(
 /// model where NaN != NaN but each specific NaN bit pattern is its
 /// own entry).
 ///
-/// Cardinality cap = num_present / 10 (same as the INT and BYTE_ARRAY
-/// paths). Returns null when the dictionary would exceed the cap or
-/// when there are fewer than 64 present values.
+/// Cardinality cap = num_present / 10 (as the INT path). Returns null
+/// when the dictionary would exceed the cap or when there are fewer
+/// than 64 present values.
 fn tryEncodeDictFloat(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -1237,18 +1237,24 @@ fn buildAndDeltaEncode(
     return try delta_binary_packed.encodeDefault(T, arena, dense);
 }
 
-/// DELTA_BYTE_ARRAY encode for a BYTE_ARRAY column (present values only).
-/// Layout (mirrors the decoder): `DBP(prefix_lengths) ++ DBP(suffix_lengths) ++
-/// concat(suffixes)`, where prefix_length[i] is the shared-prefix length with
-/// the previous present value and suffix[i] is the remainder. Returns null for
-/// non-string columns (so the caller falls back to PLAIN). The empty case is
-/// left to PLAIN — a degenerate column isn't worth the two delta headers.
-fn tryEncodeValuesDeltaByteArray(
+const StringValues = struct { bytes: []u8, encoding: schema.Encoding };
+
+/// The values of a BYTE_ARRAY column the dictionary declined (present values only), in one of two layouts the
+/// decoder reads:
+/// - DELTA_BYTE_ARRAY, `DBP(prefix_lengths) ++ DBP(suffix_lengths) ++ concat(suffixes)` (prefix_length[i] the length
+///   shared with the previous present value, suffix[i] the rest), where those prefixes cover at least a quarter of
+///   the column's bytes: sorted keys, paths;
+/// - otherwise DELTA_LENGTH_BYTE_ARRAY, `DBP(lengths) ++ concat(values)`.
+/// Both keep the bytes contiguous, apart from their lengths: zstd compresses that faster and smaller than PLAIN's
+/// interleaved lengths, and readers decode it faster (DELTA_LENGTH_BYTE_ARRAY fastest of all in Polars, pyarrow and
+/// DuckDB; DELTA_BYTE_ARRAY several times slower in Polars, hence the prefix condition). Returns null for non-string
+/// columns and empty ones (the caller writes PLAIN).
+fn encodeValuesStrings(
     arena: std.mem.Allocator,
     vals: filter_eval.Batch.Column,
     def_levels: ?[]const u32,
     max_def: u32,
-) Error!?[]u8 {
+) Error!?StringValues {
     const col = switch (vals) {
         .string => |c| c,
         else => return null,
@@ -1260,15 +1266,32 @@ fn tryEncodeValuesDeltaByteArray(
     const suffix_lengths = try arena.alloc(i32, num_present);
     var prev: []const u8 = &.{};
     var k: usize = 0;
+    var prefix_total: usize = 0;
     var suffix_total: usize = 0;
     for (col.values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
         const lcp = commonPrefix(prev, v);
         prefix_lengths[k] = @intCast(lcp);
         suffix_lengths[k] = @intCast(v.len - lcp);
+        prefix_total += lcp;
         suffix_total += v.len - lcp;
         prev = v;
         k += 1;
+    }
+    const prefixes_pay = prefix_total * 4 >= prefix_total + suffix_total;
+    if (!prefixes_pay) {
+        // The lengths, then the values whole.
+        for (prefix_lengths, suffix_lengths) |p, *l| l.* += p;
+        const len_enc = try delta_binary_packed.encodeDefault(i32, arena, suffix_lengths);
+        const out = try arena.alloc(u8, len_enc.len + prefix_total + suffix_total);
+        @memcpy(out[0..len_enc.len], len_enc);
+        var o = len_enc.len;
+        for (col.values, 0..) |v, i| {
+            if (!isPresent(def_levels, max_def, i)) continue;
+            @memcpy(out[o..][0..v.len], v);
+            o += v.len;
+        }
+        return .{ .bytes = out, .encoding = .DELTA_LENGTH_BYTE_ARRAY };
     }
     const prefix_enc = try delta_binary_packed.encodeDefault(i32, arena, prefix_lengths);
     const suffix_len_enc = try delta_binary_packed.encodeDefault(i32, arena, suffix_lengths);
@@ -1284,7 +1307,7 @@ fn tryEncodeValuesDeltaByteArray(
         o += v.len - lcp;
         k += 1;
     }
-    return out;
+    return .{ .bytes = out, .encoding = .DELTA_BYTE_ARRAY };
 }
 
 /// Length of the common prefix of `a` and `b`: 16 bytes compared per step, then 8, then one overlapping 8-byte
@@ -1752,24 +1775,40 @@ test "encodePlainBytes round-trip" {
     }
 }
 
-test "DELTA_BYTE_ARRAY encode round-trips through the decoder (incl. nulls)" {
+test "both string layouts round-trip through their decoders (incl. nulls), chosen by shared prefixes" {
     const dba = @import("../parquet/encoding/delta_byte_array.zig");
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const a = arena_inst.allocator();
-
-    // Shared-prefix strings (DBA's case) + a null in the middle.
-    const vals = [_][]const u8{ "apple", "apple_pie", "", "apricot", "banana", "bandana" };
     const dls = [_]u32{ 1, 1, 0, 1, 1, 1 }; // index 2 is null (def < max_def)
-    const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &dls, .max_def = 1 } };
 
-    const enc = (try tryEncodeValuesDeltaByteArray(a, col, &dls, 1)) orelse return error.ExpectedEncoding;
-    var dec = try dba.DeltaByteArrayDecoder.init(enc, a, std.math.maxInt(usize));
-    var out: [5][]const u8 = undefined; // 5 present values
-    const n = try dec.decode(&out);
-    try testing.expectEqual(@as(usize, 5), n);
-    const expect = [_][]const u8{ "apple", "apple_pie", "apricot", "banana", "bandana" };
-    for (expect, 0..) |e, i| try testing.expectEqualStrings(e, out[i]);
+    // Shared-prefix strings: DELTA_BYTE_ARRAY.
+    const shared = [_][]const u8{ "apple", "apple_pie", "", "apricot", "banana", "bandana" };
+    // Unrelated strings: DELTA_LENGTH_BYTE_ARRAY.
+    const unrelated = [_][]const u8{ "kiwi", "fig", "", "lime", "", "date" };
+    for ([_]struct { vals: []const []const u8, want: schema.Encoding }{
+        .{ .vals = &shared, .want = .DELTA_BYTE_ARRAY },
+        .{ .vals = &unrelated, .want = .DELTA_LENGTH_BYTE_ARRAY },
+    }) |case| {
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = case.vals, .def_levels = &dls, .max_def = 1 } };
+        const enc = (try encodeValuesStrings(a, col, &dls, 1)) orelse return error.ExpectedEncoding;
+        try testing.expectEqual(case.want, enc.encoding);
+        var out: [5][]const u8 = undefined; // 5 present values
+        const n = if (enc.encoding == .DELTA_BYTE_ARRAY) blk: {
+            var dec = try dba.DeltaByteArrayDecoder.init(enc.bytes, a, std.math.maxInt(usize));
+            break :blk try dec.decode(&out);
+        } else blk: {
+            var dec = try dba.DeltaLengthByteArrayDecoder.init(enc.bytes, a, std.math.maxInt(usize));
+            break :blk try dec.decode(&out);
+        };
+        try testing.expectEqual(@as(usize, 5), n);
+        var k: usize = 0;
+        for (case.vals, dls) |v, d| {
+            if (d == 0) continue;
+            try testing.expectEqualStrings(v, out[k]);
+            k += 1;
+        }
+    }
 }
 
 test "encodePlainBool packs 8 per byte LSB-first" {
@@ -2177,4 +2216,99 @@ test "dictionary keys chosen to collide in the interner's hash: bounded probes, 
     for (indices, 0..) |x, i| try testing.expectEqual(@as(u32, @intCast(i % 1000)), x);
     // Too many distinct keys still declines, on either path.
     try testing.expect(!try internColumn(i64, a, values, null, 0, 999, &dict, indices));
+}
+
+test "string columns: dictionary within its limits, DELTA_BYTE_ARRAY where prefixes pay, else DELTA_LENGTH_BYTE_ARRAY" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const path: []const []const u8 = &.{"s"};
+    const n = 4000;
+    var prng = std.Random.DefaultPrng.init(0x5715);
+    const r = prng.random();
+    const Form = enum { dictionary, delta_byte_array, delta_length_byte_array, plain };
+    const Case = struct { name: []const u8, want: Form };
+    for ([_]Case{
+        // 15% distinct: past the old one-in-ten cap, within a quarter.
+        .{ .name = "repeating", .want = .dictionary },
+        // Every value distinct and unrelated: DELTA_LENGTH_BYTE_ARRAY.
+        .{ .name = "random", .want = .delta_length_byte_array },
+        // Every value distinct, sorted with long shared prefixes: DELTA_BYTE_ARRAY.
+        .{ .name = "sorted", .want = .delta_byte_array },
+        // 100 distinct values of 16 KiB: repeat often, but the dictionary would pass 1 MiB.
+        .{ .name = "large", .want = .delta_length_byte_array },
+    }) |case| {
+        const vals = try a.alloc([]const u8, n);
+        const big = try a.alloc(u8, 100 * (16 << 10));
+        r.bytes(big);
+        for (vals, 0..) |*v, i| v.* = if (std.mem.eql(u8, case.name, "repeating"))
+            try std.fmt.allocPrint(a, "k{d}", .{(i * 7919) % 600})
+        else if (std.mem.eql(u8, case.name, "random")) blk: {
+            const b = try a.alloc(u8, 16);
+            r.bytes(b);
+            break :blk b;
+        } else if (std.mem.eql(u8, case.name, "sorted"))
+            try std.fmt.allocPrint(a, "s3://bucket/some/long/prefix/part-{d:0>8}", .{i})
+        else
+            big[(i % 100) * (16 << 10) ..][0 .. 16 << 10];
+        const enc = try encodeColumn(a, .{ .values = .{ .string = .{ .values = vals } }, .schema_elem = &elem, .path_in_schema = path });
+        const got: Form = if (enc.meta.dictionary_page_offset != null)
+            .dictionary
+        else if (std.mem.indexOfScalar(schema.Encoding, enc.meta.encodings.items, .DELTA_BYTE_ARRAY) != null)
+            .delta_byte_array
+        else if (std.mem.indexOfScalar(schema.Encoding, enc.meta.encodings.items, .DELTA_LENGTH_BYTE_ARRAY) != null)
+            .delta_length_byte_array
+        else
+            .plain;
+        try testing.expectEqual(case.want, got);
+    }
+}
+
+test "a coded string column past the dictionary's byte limit encodes to the same bytes as its values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const path: []const []const u8 = &.{"s"};
+    // 100 entries of 12 KiB: 1.2 MiB of dictionary, crossing the limit part-way through the first pass.
+    const dict = try a.alloc([]const u8, 100);
+    for (dict, 0..) |*d, k| {
+        const b = try a.alloc(u8, 12 << 10);
+        @memset(b, @intCast(k));
+        d.* = b;
+    }
+    const n = 2000;
+    const codes = try a.alloc(u32, n);
+    const vals = try a.alloc([]const u8, n);
+    for (codes, vals, 0..) |*c, *v, i| {
+        c.* = @intCast((i * 37) % 100);
+        v.* = dict[c.*];
+    }
+    const want = try encodeColumn(a, .{ .values = .{ .string = .{ .values = vals } }, .schema_elem = &elem, .path_in_schema = path });
+    const got = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &.{}, .codes = codes, .dict = dict } },
+        .schema_elem = &elem,
+        .path_in_schema = path,
+    });
+    try testing.expectEqualSlices(u8, want.bytes, got.bytes);
+    try testing.expect(want.meta.dictionary_page_offset == null);
 }

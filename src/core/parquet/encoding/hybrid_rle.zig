@@ -413,6 +413,135 @@ inline fn unpackFastFixed(
 /// regardless of N. Worth keeping simple.
 pub fn encode(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
     std.debug.assert(bit_width <= 32);
+    if (bit_width == 0 or values.len == 0) return &.{};
+    // The same runs as `encodeReference`, in one walk over maximal runs, written straight into a buffer sized for the
+    // worst case (a 1-value RLE run per value: header + value bytes) instead of a byte append per output byte.
+    const value_bytes: usize = (bit_width + 7) / 8;
+    const cap = values.len * (2 + value_bytes) + values.len * bit_width / 8 + 64;
+    const out = try arena.alloc(u8, cap);
+    var o: usize = 0;
+    var i: usize = 0;
+    const n = values.len;
+    while (i < n) {
+        const end = runEnd(values, i);
+        if (end - i >= 8) {
+            o = putRleRun(out, o, values[i], end - i, value_bytes);
+            i = end;
+            continue;
+        }
+        // Bit-pack up to where the next run of 8 or more equal values starts, in whole groups of 8.
+        const j = nextLongRun(values, end);
+        const pack_count = (j - i) / 8 * 8;
+        if (pack_count > 0) {
+            o = putBitPackedRun(out, o, values[i .. i + pack_count], bit_width);
+            i += pack_count;
+        } else {
+            o = putRleRun(out, o, values[i], 1, value_bytes);
+            i += 1;
+        }
+    }
+    // Shrunk to what was written, so callers may free it with its own length (in place on an arena).
+    return arena.realloc(out, o);
+}
+
+/// The first `s >= from` where `values[s..s+8]` are all equal, or `values.len`. Each step compares 64 positions with
+/// their successors into a bit mask (with 16 more for lookahead); a run of 8 starts where 7 consecutive bits are set.
+fn nextLongRun(values: []const u32, from: usize) usize {
+    const n = values.len;
+    var p = from;
+    while (p + 8 <= n) {
+        if (p + 81 > n) {
+            // Too close to the end for a full window: scalar.
+            while (p + 8 <= n) : (p += 1) {
+                if (runEnd(values, p) - p >= 8) return p;
+            }
+            return n;
+        }
+        var m: u128 = 0;
+        inline for (0..5) |c| {
+            const a: @Vector(16, u32) = values[p + c * 16 ..][0..16].*;
+            const b: @Vector(16, u32) = values[p + c * 16 + 1 ..][0..16].*;
+            const eq: u16 = @bitCast(a == b);
+            m |= @as(u128, eq) << (c * 16);
+        }
+        // Bit k: values[p+k] == values[p+k+1]; a run of 8 at p+k needs bits k..k+6.
+        const q = m & (m >> 1) & (m >> 2) & (m >> 3) & (m >> 4) & (m >> 5) & (m >> 6);
+        const lo: u64 = @truncate(q);
+        if (lo != 0) return p + @ctz(lo);
+        p += 64;
+    }
+    return n;
+}
+
+/// End of the maximal run of `values[start]`'s value that starts at `start`: 16 values compared per step.
+fn runEnd(values: []const u32, start: usize) usize {
+    const L = 16;
+    const x = values[start];
+    if (start + 1 >= values.len or values[start + 1] != x) return start + 1;
+    var k = start + 1;
+    const splat: @Vector(L, u32) = @splat(x);
+    while (k + L <= values.len) : (k += L) {
+        const v: @Vector(L, u32) = values[k..][0..L].*;
+        const ne: u16 = @bitCast(v != splat);
+        if (ne != 0) return k + @ctz(ne);
+    }
+    while (k < values.len and values[k] == x) : (k += 1) {}
+    return k;
+}
+
+fn putUleb128(out: []u8, o: usize, value: u64) usize {
+    var v = value;
+    var p = o;
+    while (true) {
+        var b: u8 = @truncate(v & 0x7f);
+        v >>= 7;
+        if (v != 0) b |= 0x80;
+        out[p] = b;
+        p += 1;
+        if (v == 0) return p;
+    }
+}
+
+fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) usize {
+    var p = putUleb128(out, o, @as(u64, count) << 1);
+    for (0..value_bytes) |b| {
+        out[p] = @truncate(value >> @intCast(b * 8));
+        p += 1;
+    }
+    return p;
+}
+
+/// `values` (a whole number of groups of 8) bit-packed LSB-first, through a 128-bit accumulator drained 8 bytes at a
+/// time. The buffer's slack covers the 8-byte stores past the last whole byte.
+fn putBitPackedRun(out: []u8, o: usize, values: []const u32, bit_width: u8) usize {
+    const p0 = putUleb128(out, o, (@as(u64, values.len / 8) << 1) | 1);
+    const mask: u64 = if (bit_width == 32) 0xffff_ffff else (@as(u64, 1) << @intCast(bit_width)) - 1;
+    var acc: u128 = 0;
+    var bits: u32 = 0;
+    var p = p0;
+    for (values) |v| {
+        acc |= @as(u128, v & mask) << @intCast(bits);
+        bits += bit_width;
+        if (bits >= 64) {
+            std.mem.writeInt(u64, out[p..][0..8], @truncate(acc), .little);
+            p += 8;
+            acc >>= 64;
+            bits -= 64;
+        }
+    }
+    // Groups of 8 values make whole bytes, so what is left is whole bytes too.
+    const tail = bits / 8;
+    var t: u32 = 0;
+    while (t < tail) : (t += 1) {
+        out[p] = @truncate(acc >> @intCast(t * 8));
+        p += 1;
+    }
+    return p;
+}
+
+/// The encoder `encode` replaced, kept to prove they write the same bytes.
+fn encodeReference(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
+    std.debug.assert(bit_width <= 32);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
@@ -540,7 +669,6 @@ fn writeBitPackedRun(
 // ============================================================
 
 const testing = std.testing;
-
 
 test "a long bit-packed run ending the stream decodes in one call" {
     // Level decoding asks for a whole page at once. A run this close to the end of the bytes takes the padded
@@ -928,4 +1056,30 @@ test "encode bit_width=0 produces empty output" {
     const encoded = try encode(arena, &values, 0);
     defer arena.free(encoded);
     try testing.expectEqual(@as(usize, 0), encoded.len);
+}
+
+test "encode writes the same bytes as the reference encoder on random runs and widths" {
+    var prng = std.Random.DefaultPrng.init(0x81e);
+    const r = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..3000) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const bw: u8 = @intCast(1 + r.uintLessThan(u8, 32));
+        const n = r.uintLessThan(usize, if (iter % 10 == 0) 5000 else 200);
+        const vals = try a.alloc(u32, n);
+        const maxv: u64 = (@as(u64, 1) << @intCast(bw)) - 1;
+        var k: usize = 0;
+        while (k < n) {
+            const run = 1 + r.uintLessThan(usize, if (r.boolean()) 3 else 20);
+            const v: u32 = @intCast(r.uintAtMost(u64, @min(maxv, if (r.boolean()) 3 else maxv)));
+            var m: usize = 0;
+            while (m < run and k < n) : (m += 1) {
+                vals[k] = v;
+                k += 1;
+            }
+        }
+        try testing.expectEqualSlices(u8, try encodeReference(a, vals, bw), try encode(a, vals, bw));
+    }
 }

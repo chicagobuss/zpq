@@ -21,6 +21,7 @@ const compression = @import("../parquet/compression.zig");
 const delta_binary_packed = @import("../parquet/encoding/delta_binary_packed.zig");
 const bloom = @import("../parquet/bloom.zig");
 const agg_coded = @import("../expr/agg_coded.zig");
+const prefix16 = @import("../expr/agg.zig").prefix16;
 
 pub const Error = error{
     NullableNotSupported,
@@ -589,6 +590,117 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
 
+/// An open-addressing set of fixed-width keys for the dictionary attempts: at most `limit` entries (the cardinality
+/// cap), so a power-of-two table at least twice that never fills and never grows. A slot holds its entry's index + 1
+/// (0 is empty); a multiply-shift hash replaces the general map's per-key hash call. The hash is fixed, so keys can be
+/// chosen to collide: a lookup gives up after `max_probe` slots, and the caller then interns with `MapInterner`.
+fn Interner(comptime K: type) type {
+    return struct {
+        keys: []K,
+        slots: []u32,
+        shift: u6,
+
+        const Self = @This();
+
+        fn init(arena: std.mem.Allocator, limit: usize) Error!Self {
+            const bits: u6 = @intCast(std.math.log2_int_ceil(usize, @max(16, 2 * (limit + 1))));
+            const n = @as(usize, 1) << bits;
+            const slots = try arena.alloc(u32, n);
+            @memset(slots, 0);
+            return .{ .keys = try arena.alloc(K, n), .slots = slots, .shift = @intCast(64 - @as(u7, bits)) };
+        }
+
+        /// Slots a lookup compares before giving up; at half load a well-spread key set needs one or two.
+        const max_probe = 16;
+
+        /// The slot for `key`: its entry's index + 1, or 0 for the caller to fill (the key is then recorded); null
+        /// when `max_probe` slots hold other keys.
+        inline fn find(self: *Self, key: K) ?*u32 {
+            const mask = self.slots.len - 1;
+            var h: usize = @intCast((@as(u64, key) *% 0x9E3779B97F4A7C15) >> self.shift);
+            for (0..max_probe) |_| {
+                if (self.slots[h] == 0) {
+                    self.keys[h] = key;
+                    return &self.slots[h];
+                }
+                if (self.keys[h] == key) return &self.slots[h];
+                h = (h + 1) & mask;
+            }
+            return null;
+        }
+    };
+}
+
+/// The general map, with the same interface as `Interner`, for keys that collide in its hash.
+fn MapInterner(comptime K: type) type {
+    return struct {
+        map: std.AutoHashMapUnmanaged(K, u32) = .empty,
+
+        const Self = @This();
+
+        fn init(arena: std.mem.Allocator, limit: usize) Error!Self {
+            var self: Self = .{};
+            // One key past the cap is recorded before the caller sees it is one too many.
+            try self.map.ensureTotalCapacity(arena, @intCast(limit + 1));
+            return self;
+        }
+
+        inline fn find(self: *Self, key: K) ?*u32 {
+            const gop = self.map.getOrPutAssumeCapacity(key);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            return gop.value_ptr;
+        }
+    };
+}
+
+/// Interns the present entries of `values`, keyed by their bits, into `dict` (first occurrence first, at most `limit`)
+/// and `indices` (one per present value). True when done, false when the column has more than `limit` distinct
+/// values, null when `Lookup` gave up on a key.
+fn internValues(
+    comptime T: type,
+    comptime Lookup: type,
+    arena: std.mem.Allocator,
+    values: []const T,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    limit: usize,
+    dict: *std.ArrayList(@Int(.unsigned, @bitSizeOf(T))),
+    indices: []u32,
+) Error!?bool {
+    var lookup = try Lookup.init(arena, limit);
+    dict.clearRetainingCapacity();
+    var idx_pos: usize = 0;
+    for (values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) continue;
+        const key: @Int(.unsigned, @bitSizeOf(T)) = @bitCast(v);
+        const slot = lookup.find(key) orelse return null;
+        if (slot.* == 0) {
+            if (dict.items.len >= limit) return false;
+            dict.appendAssumeCapacity(key);
+            slot.* = @intCast(dict.items.len);
+        }
+        indices[idx_pos] = slot.* - 1;
+        idx_pos += 1;
+    }
+    return true;
+}
+
+/// `internValues`, with `Interner` and, should its fixed hash be defeated, the general map.
+fn internColumn(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    values: []const T,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    limit: usize,
+    dict: *std.ArrayList(@Int(.unsigned, @bitSizeOf(T))),
+    indices: []u32,
+) Error!bool {
+    const K = @Int(.unsigned, @bitSizeOf(T));
+    return (try internValues(T, Interner(K), arena, values, def_levels, max_def, limit, dict, indices)) orelse
+        (try internValues(T, MapInterner(K), arena, values, def_levels, max_def, limit, dict, indices)).?;
+}
+
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
 /// tryEncodeDictBytes: PLAIN-encoded dictionary page, then a data
 /// page of RLE/bit-packed indices. Returns null when the dictionary
@@ -613,39 +725,23 @@ fn tryEncodeDictInt(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    var lookup = std.AutoHashMap(T, u32).init(arena);
-    defer lookup.deinit();
-    var dict_values: std.ArrayList(T) = .empty;
-    var indices = try arena.alloc(u32, num_present);
-
     const max_cardinality = num_present / 10;
-    try lookup.ensureTotalCapacity(@intCast(@min(max_cardinality + 1, num_present)));
-
-    var idx_pos: usize = 0;
-    for (values, 0..) |v, i| {
-        if (!isPresent(def_levels, max_def, i)) continue;
-        const gop = try lookup.getOrPut(v);
-        if (!gop.found_existing) {
-            if (dict_values.items.len >= max_cardinality) return null;
-            const new_idx: u32 = @intCast(dict_values.items.len);
-            try dict_values.append(arena, v);
-            gop.value_ptr.* = new_idx;
-        }
-        indices[idx_pos] = gop.value_ptr.*;
-        idx_pos += 1;
-    }
-
-    if (dict_values.items.len == 0) return null;
+    var dict_keys: std.ArrayList(@Int(.unsigned, @bitSizeOf(T))) = .empty;
+    try dict_keys.ensureTotalCapacity(arena, max_cardinality);
+    const indices = try arena.alloc(u32, num_present);
+    if (!try internColumn(T, arena, values, def_levels, max_def, max_cardinality, &dict_keys, indices)) return null;
+    if (dict_keys.items.len == 0) return null;
+    const dict_values: []const T = @ptrCast(dict_keys.items);
 
     const value_size = @sizeOf(T);
-    const dict_plain = try arena.alloc(u8, dict_values.items.len * value_size);
-    for (dict_values.items, 0..) |v, i| {
+    const dict_plain = try arena.alloc(u8, dict_values.len * value_size);
+    for (dict_values, 0..) |v, i| {
         std.mem.writeInt(T, dict_plain[i * value_size ..][0..value_size], v, .little);
     }
     const dict_col: filter_eval.Batch.Column = @unionInit(
         filter_eval.Batch.Column,
         if (T == i32) "i32" else "i64",
-        .{ .values = dict_values.items },
+        .{ .values = dict_values },
     );
     return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
@@ -682,29 +778,11 @@ fn tryEncodeDictFloat(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    var lookup = std.AutoHashMap(KeyT, u32).init(arena);
-    defer lookup.deinit();
-    var dict_values: std.ArrayList(KeyT) = .empty;
-    var indices = try arena.alloc(u32, num_present);
-
     const max_cardinality = num_present / 10;
-    try lookup.ensureTotalCapacity(@intCast(@min(max_cardinality + 1, num_present)));
-
-    var idx_pos: usize = 0;
-    for (values, 0..) |v, i| {
-        if (!isPresent(def_levels, max_def, i)) continue;
-        const key: KeyT = @bitCast(v);
-        const gop = try lookup.getOrPut(key);
-        if (!gop.found_existing) {
-            if (dict_values.items.len >= max_cardinality) return null;
-            const new_idx: u32 = @intCast(dict_values.items.len);
-            try dict_values.append(arena, key);
-            gop.value_ptr.* = new_idx;
-        }
-        indices[idx_pos] = gop.value_ptr.*;
-        idx_pos += 1;
-    }
-
+    var dict_values: std.ArrayList(KeyT) = .empty;
+    try dict_values.ensureTotalCapacity(arena, max_cardinality);
+    const indices = try arena.alloc(u32, num_present);
+    if (!try internColumn(T, arena, values, def_levels, max_def, max_cardinality, &dict_values, indices)) return null;
     if (dict_values.items.len == 0) return null;
 
     // The keys are the floats' bit patterns, so writing them little-endian is the PLAIN encoding.
@@ -742,7 +820,6 @@ fn finishDictionaryColumn(
     // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
     var stats = computeStats(arena, dict, null, 0, in.schema_elem);
     if (stats) |*st| st.null_count = num_values - @as(i64, @intCast(indices.len));
-
     const dict_compressed = try compression.compress(arena, dict_plain, in.codec);
     const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
@@ -789,24 +866,27 @@ fn finishDictionaryColumn(
     var path_list: schema.StringList = .empty;
     try path_list.appendSlice(arena, in.path_in_schema);
 
-    return .{ .bytes = total, .meta = .{
-        .type = in.schema_elem.type.?,
-        .encodings = encodings,
-        .path_in_schema = path_list,
-        .codec = in.codec,
-        .num_values = num_values,
-        .total_uncompressed_size = @intCast(dict_header.len + dict_plain.len + data_header.len + data_payload.len),
-        .total_compressed_size = @intCast(total.len),
-        .data_page_offset = @intCast(dict_header.len + dict_compressed.len),
-        .dictionary_page_offset = 0,
-        .index_page_offset = null,
-        .statistics = stats,
-        // Every value is in the dictionary: readers may prune row groups on it.
-        .encoding_stats = try pageStats(arena, &.{
-            .{ .page_type = .DICTIONARY_PAGE, .encoding = .PLAIN },
-            .{ .page_type = .DATA_PAGE, .encoding = .PLAIN_DICTIONARY },
-        }),
-    } };
+    return .{
+        .bytes = total,
+        .meta = .{
+            .type = in.schema_elem.type.?,
+            .encodings = encodings,
+            .path_in_schema = path_list,
+            .codec = in.codec,
+            .num_values = num_values,
+            .total_uncompressed_size = @intCast(dict_header.len + dict_plain.len + data_header.len + data_payload.len),
+            .total_compressed_size = @intCast(total.len),
+            .data_page_offset = @intCast(dict_header.len + dict_compressed.len),
+            .dictionary_page_offset = 0,
+            .index_page_offset = null,
+            .statistics = stats,
+            // Every value is in the dictionary: readers may prune row groups on it.
+            .encoding_stats = try pageStats(arena, &.{
+                .{ .page_type = .DICTIONARY_PAGE, .encoding = .PLAIN },
+                .{ .page_type = .DATA_PAGE, .encoding = .PLAIN_DICTIONARY },
+            }),
+        },
+    };
 }
 
 /// Index width for a `dict_count`-entry dictionary, never below one bit. A 0-bit index page is legal RLE, but
@@ -1175,41 +1255,74 @@ fn tryEncodeValuesDeltaByteArray(
 
     const prefix_lengths = try arena.alloc(i32, num_present);
     const suffix_lengths = try arena.alloc(i32, num_present);
-    var suffix_bytes: std.ArrayList(u8) = .empty;
     var prev: []const u8 = &.{};
     var k: usize = 0;
+    var suffix_total: usize = 0;
     for (col.values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
-        var lcp: usize = 0;
-        const cap = @min(prev.len, v.len);
-        while (lcp < cap and prev[lcp] == v[lcp]) lcp += 1;
+        const lcp = commonPrefix(prev, v);
         prefix_lengths[k] = @intCast(lcp);
         suffix_lengths[k] = @intCast(v.len - lcp);
-        try suffix_bytes.appendSlice(arena, v[lcp..]);
+        suffix_total += v.len - lcp;
         prev = v;
         k += 1;
     }
-
     const prefix_enc = try delta_binary_packed.encodeDefault(i32, arena, prefix_lengths);
     const suffix_len_enc = try delta_binary_packed.encodeDefault(i32, arena, suffix_lengths);
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, prefix_enc);
-    try out.appendSlice(arena, suffix_len_enc);
-    try out.appendSlice(arena, suffix_bytes.items);
-    return try out.toOwnedSlice(arena);
+    const out = try arena.alloc(u8, prefix_enc.len + suffix_len_enc.len + suffix_total);
+    @memcpy(out[0..prefix_enc.len], prefix_enc);
+    @memcpy(out[prefix_enc.len..][0..suffix_len_enc.len], suffix_len_enc);
+    var o = prefix_enc.len + suffix_len_enc.len;
+    k = 0;
+    for (col.values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) continue;
+        const lcp: usize = @intCast(prefix_lengths[k]);
+        @memcpy(out[o..][0 .. v.len - lcp], v[lcp..]);
+        o += v.len - lcp;
+        k += 1;
+    }
+    return out;
+}
+
+/// Length of the common prefix of `a` and `b`: 16 bytes compared per step, then 8, then one overlapping 8-byte
+/// window over the tail (its bytes before `n` are already known equal), so no byte loop unless both are under 8.
+fn commonPrefix(a: []const u8, b: []const u8) usize {
+    const cap = @min(a.len, b.len);
+    var n: usize = 0;
+    while (n + 16 <= cap) : (n += 16) {
+        const x: @Vector(16, u8) = a[n..][0..16].*;
+        const y: @Vector(16, u8) = b[n..][0..16].*;
+        const ne: u16 = @bitCast(x != y);
+        if (ne != 0) return n + @ctz(ne);
+    }
+    if (cap >= 8) {
+        while (n + 8 <= cap) : (n += 8) {
+            const x = std.mem.readInt(u64, a[n..][0..8], .little) ^ std.mem.readInt(u64, b[n..][0..8], .little);
+            if (x != 0) return n + @ctz(x) / 8;
+        }
+        if (n == cap) return n;
+        const t = cap - 8;
+        const x = std.mem.readInt(u64, a[t..][0..8], .little) ^ std.mem.readInt(u64, b[t..][0..8], .little);
+        return if (x != 0) t + @ctz(x) / 8 else cap;
+    }
+    while (n < cap and a[n] == b[n]) : (n += 1) {}
+    return n;
 }
 
 /// Number of slots where def_levels[i] == max_def. When def_levels is
 /// null, every slot counts.
 fn countPresent(values_len: usize, def_levels: ?[]const u32, max_def: u32) usize {
-    if (def_levels) |dl| {
-        var n: usize = 0;
-        for (dl) |d| {
-            if (d == max_def) n += 1;
-        }
-        return n;
+    const dl = def_levels orelse return values_len;
+    const L = 16;
+    const want: @Vector(L, u32) = @splat(max_def);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + L <= dl.len) : (i += L) {
+        const v: @Vector(L, u32) = dl[i..][0..L].*;
+        n += @popCount(@as(u16, @bitCast(v == want)));
     }
-    return values_len;
+    for (dl[i..]) |d| n += @intFromBool(d == max_def);
+    return n;
 }
 
 /// PLAIN encoding for fixed-width primitive types (i32/i64/f32/f64).
@@ -1225,6 +1338,11 @@ fn encodePlainTyped(
     const item_size = @sizeOf(T);
     const num_present = countPresent(values.len, def_levels, max_def);
     const out = try arena.alloc(u8, num_present * item_size);
+    // Dense: the values are already PLAIN's little-endian bytes.
+    if (def_levels == null and comptime @import("builtin").cpu.arch.endian() == .little) {
+        @memcpy(out, std.mem.sliceAsBytes(values));
+        return out;
+    }
     var pos: usize = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
@@ -1279,6 +1397,16 @@ fn encodePlainBool(
     const num_bytes = (num_present + 7) / 8;
     const out = try arena.alloc(u8, num_bytes);
     @memset(out, 0);
+    if (def_levels == null) {
+        // Dense: 8 values per output byte, LSB first.
+        var b: usize = 0;
+        while (b * 8 + 8 <= values.len) : (b += 1) {
+            const v: @Vector(8, bool) = values[b * 8 ..][0..8].*;
+            out[b] = @bitCast(v);
+        }
+        for (values[b * 8 ..], 0..) |v, k| out[b] |= @as(u8, @intFromBool(v)) << @intCast(k);
+        return out;
+    }
     var bit_idx: usize = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
@@ -1475,13 +1603,25 @@ fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: 
     const fi = first_idx orelse return .{ .null_count = null_count };
     var lo: []const u8 = values[fi];
     var hi: []const u8 = values[fi];
+    // Compared by 16-byte big-endian prefix first (a lesser prefix is a lesser string); bytes only on a tie.
+    var lo_key = prefix16(lo);
+    var hi_key = lo_key;
     for (values[fi + 1 ..], fi + 1..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) {
             null_count += 1;
             continue;
         }
-        if (std.mem.lessThan(u8, v, lo)) lo = v;
-        if (std.mem.lessThan(u8, hi, v)) hi = v;
+        // A first byte strictly between the bounds' first bytes makes v neither (most values, once bounds settle).
+        if (v.len > 0 and lo.len > 0 and hi.len > 0 and v[0] > lo[0] and v[0] < hi[0]) continue;
+        const k = prefix16(v);
+        if (k < lo_key or (k == lo_key and std.mem.lessThan(u8, v, lo))) {
+            lo = v;
+            lo_key = k;
+        }
+        if (k > hi_key or (k == hi_key and std.mem.lessThan(u8, hi, v))) {
+            hi = v;
+            hi_key = k;
+        }
     }
     // Caller's arena is the file-footer-lifetime arena; the values
     // slices typically borrow from a row-group-scoped arena. Dupe so
@@ -1929,4 +2069,109 @@ test "a coded column encodes to the same bytes as its values, over and past the 
             try testing.expectEqualSlices(u8, want.bytes, got.bytes);
         }
     }
+}
+
+test "string statistics equal a byte-order fold: shared prefixes, empty strings, zero bytes, nulls" {
+    var prng = std.Random.DefaultPrng.init(0x57a7);
+    const r = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..3000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        const n = 1 + r.uintLessThan(usize, 60);
+        const vals = try a.alloc([]const u8, n);
+        const defs = try a.alloc(u32, n);
+        const nullable = r.boolean();
+        for (vals, defs) |*v, *d| {
+            const len = r.uintLessThan(usize, 24);
+            const buf = try a.alloc(u8, len);
+            const prefix = r.uintLessThan(usize, 20);
+            for (buf, 0..) |*c, i| c.* = if (i < prefix) 'p' else switch (r.uintLessThan(u8, 4)) {
+                0 => 0,
+                1 => 0xff,
+                else => r.int(u8),
+            };
+            v.* = buf;
+            d.* = if (nullable and r.uintLessThan(u8, 4) == 0) 0 else 1;
+        }
+        const st = statsBytes(a, vals, if (nullable) defs else null, 1) orelse return error.TestUnexpectedResult;
+        var lo: ?[]const u8 = null;
+        var hi: ?[]const u8 = null;
+        for (vals, defs) |v, d| {
+            if (nullable and d == 0) continue;
+            if (lo == null or std.mem.lessThan(u8, v, lo.?)) lo = v;
+            if (hi == null or std.mem.lessThan(u8, hi.?, v)) hi = v;
+        }
+        if (lo) |l| {
+            try testing.expectEqualSlices(u8, l, st.min_value.?);
+            try testing.expectEqualSlices(u8, hi.?, st.max_value.?);
+        } else try testing.expect(st.min_value == null);
+    }
+}
+
+test "commonPrefix agrees with a byte loop at every length and mismatch position" {
+    var prng = std.Random.DefaultPrng.init(0xc0);
+    const r = prng.random();
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    for (0..20000) |_| {
+        const la = r.uintAtMost(usize, 40);
+        const lb = r.uintAtMost(usize, 40);
+        r.bytes(a[0..la]);
+        const common = r.uintAtMost(usize, @min(la, lb));
+        @memcpy(b[0..common], a[0..common]);
+        r.bytes(b[common..lb]);
+        var want: usize = 0;
+        while (want < @min(la, lb) and a[want] == b[want]) want += 1;
+        try testing.expectEqual(want, commonPrefix(a[0..la], b[0..lb]));
+    }
+}
+
+test "dense boolean PLAIN packs as the bit loop does" {
+    var prng = std.Random.DefaultPrng.init(0xb0);
+    const r = prng.random();
+    for (0..500) |_| {
+        const n = r.uintAtMost(usize, 100);
+        const vals = try testing.allocator.alloc(bool, n);
+        defer testing.allocator.free(vals);
+        for (vals) |*v| v.* = r.boolean();
+        const got = try encodePlainBool(testing.allocator, vals, null, 0);
+        defer testing.allocator.free(got);
+        for (vals, 0..) |v, i| try testing.expectEqual(v, (got[i / 8] >> @intCast(i % 8)) & 1 == 1);
+        if (n % 8 != 0) try testing.expectEqual(@as(u8, 0), got[n / 8] >> @intCast(n % 8));
+    }
+}
+
+test "dictionary keys chosen to collide in the interner's hash: bounded probes, the same column" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // i * inverse(multiplier) hashes every key to slot 0: one chain, quadratic without a bound.
+    const inverse: u64 = 0xF1DE83E19937733D;
+    var lookup = try Interner(u64).init(a, 1000);
+    var gave_up = false;
+    for (0..1000) |i| {
+        const key = @as(u64, i) *% inverse;
+        try testing.expectEqual(@as(u64, 0), (key *% 0x9E3779B97F4A7C15) >> lookup.shift);
+        const slot = lookup.find(key) orelse {
+            gave_up = true;
+            break;
+        };
+        slot.* = @intCast(i + 1);
+    }
+    try testing.expect(gave_up);
+
+    // A column of those keys repeated: interned by the general map, entries in first-occurrence order.
+    const values = try a.alloc(i64, 20_000);
+    for (values, 0..) |*v, i| v.* = @bitCast(@as(u64, i % 1000) *% inverse);
+    var dict: std.ArrayList(u64) = .empty;
+    try dict.ensureTotalCapacity(a, values.len / 10);
+    const indices = try a.alloc(u32, values.len);
+    try testing.expect(try internColumn(i64, a, values, null, 0, values.len / 10, &dict, indices));
+    try testing.expectEqual(@as(usize, 1000), dict.items.len);
+    for (dict.items, 0..) |k, i| try testing.expectEqual(@as(u64, i) *% inverse, k);
+    for (indices, 0..) |x, i| try testing.expectEqual(@as(u32, @intCast(i % 1000)), x);
+    // Too many distinct keys still declines, on either path.
+    try testing.expect(!try internColumn(i64, a, values, null, 0, 999, &dict, indices));
 }

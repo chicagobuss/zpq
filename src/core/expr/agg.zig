@@ -719,7 +719,7 @@ fn foldMinMaxBytes(
 
 /// The first 16 bytes of `s` as a big-endian integer, zero-padded: a strictly lesser prefix means a strictly lesser
 /// string in byte order, an equal one decides nothing.
-inline fn prefix16(s: []const u8) u128 {
+pub inline fn prefix16(s: []const u8) u128 {
     if (s.len >= 16) return std.mem.readInt(u128, s[0..16], .big);
     if (s.len >= 8) {
         // Bytes 8.. come from the last 8 bytes, shifted past the ones the first load already has; no copy, and no

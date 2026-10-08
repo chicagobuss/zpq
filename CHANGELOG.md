@@ -38,6 +38,8 @@
 - Aggregate scans work on dictionary codes where they can, and evaluate computed aggregate arguments only over the
   selected rows. String `min` / `max` compare a 16-byte prefix before the full bytes.
 - Scan workers start as a spawn tree, and each one backs its decode memory with a single huge-page region.
+- Column encoding writes the same bytes in fewer instructions: bit packing and run detection work a word at a time,
+  string statistics compare a 16-byte prefix first, and dense columns copy and pack without per-value branches.
 - Writes filter first and then decode and project one column at a time. They re-encode dictionary columns from their
   codes, keep working memory across row groups, and recompress byte-copied row groups in parallel.
 

@@ -40,12 +40,14 @@ const usage_text =
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
+    \\            [--compress-priority size|balanced|speed]
     \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
     \\            [--bloom-filter COL[:FPP] ...]
     \\            [--format csv|jsonl] [--limit N]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
+    \\            [--compress-priority size|balanced|speed]
     \\            [--scan-all] [--trust-stats]
     \\            [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq schema <file.parquet>
@@ -58,6 +60,12 @@ const usage_text =
     \\                 uses, or "MIXED" when a copy keeps several.
     \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
     \\                 deprecated LZ4 codec but never compresses to it.
+    \\  --compress-priority
+    \\                 how hard zstd works: each page is stored raw, as
+    \\                 entropy-coded literals, or at level 1 or 3, whichever
+    \\                 costs least when an output byte is worth `size` (any
+    \\                 CPU), `balanced` (1000 cycles) or `speed` (100).
+    \\                 Default: size for s3:// output, balanced locally.
     \\  --scan-all     decode every page/byte: disables all stats shortcuts
     \\                 (row-group pruning, stats-as-answer). Slower but
     \\                 thorough — use when you don't trust a file's stats.
@@ -283,6 +291,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var aggregate: ?[]const u8 = null;
     var query: ?[]const u8 = null;
     var codec: ?schema.CompressionCodec = null;
+    var compress_priority: ?engine.CompressPriority = null;
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
@@ -353,6 +362,15 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 std.debug.print("zpq query: invalid codec: {s}\n", .{v});
                 return error.BadArgs;
             }
+        } else if (std.mem.eql(u8, tok, "--compress-priority")) {
+            const v = iter.next() orelse {
+                std.debug.print("zpq query: --compress-priority requires a value\n", .{});
+                return error.BadArgs;
+            };
+            compress_priority = std.meta.stringToEnum(engine.CompressPriority, v) orelse {
+                std.debug.print("zpq query: invalid compress priority: {s} (size, balanced or speed)\n", .{v});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {
             const v = iter.next() orelse {
                 std.debug.print("zpq query: --threads requires a value\n", .{});
@@ -563,6 +581,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .columns = cols,
             .select = select,
             .codec = codec,
+            .compress_priority = compress_priority,
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
@@ -594,6 +613,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .filter = filter,
             .aggregate = agg_str,
             .codec = codec,
+            .compress_priority = compress_priority,
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
@@ -706,6 +726,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .columns = cols,
         .select = select,
         .codec = codec,
+        .compress_priority = compress_priority,
         .parallelism = parallelism,
         .scan_all = scan_all,
         .trust_stats = trust_stats,

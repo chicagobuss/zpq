@@ -115,6 +115,17 @@ pub const Reconcile = struct {
     encode_ns: u64 = 0,
 };
 
+/// The `zstd_plan` event of a zstd write.
+pub const ZstdStat = struct {
+    seen: u64 = 0,
+    priority: u64 = 0,
+    lambda: u64 = 0,
+    raw_pages: u64 = 0,
+    literals_pages: u64 = 0,
+    level1_pages: u64 = 0,
+    level3_pages: u64 = 0,
+};
+
 pub const top_n = 10;
 
 pub const Summary = struct {
@@ -133,6 +144,7 @@ pub const Summary = struct {
     io: IoStat = .{},
     prune: PruneStat = .{},
     reconcile: Reconcile = .{},
+    zstd: ZstdStat = .{},
     usage: profile.Usage = .{},
     workers: u64 = 0,
     worker_user_ns: u64 = 0,
@@ -347,6 +359,15 @@ fn tally(
             s.io.io_resident_permille = a[2];
             s.io.io_coverage_permille = a[3];
         },
+        .zstd_plan => s.zstd = .{
+            .seen = 1,
+            .priority = a[0],
+            .lambda = a[1],
+            .raw_pages = a[2],
+            .literals_pages = a[3],
+            .level1_pages = a[4],
+            .level3_pages = a[5],
+        },
         .local_backend => {
             s.io.local_uring_threads = a[0];
             s.io.local_pread_threads = a[1];
@@ -492,6 +513,18 @@ fn writeIoChoice(w: *std.Io.Writer, io: IoStat) !void {
         try w.writeAll(")");
     }
     try w.writeAll("\n");
+}
+
+/// `compression.CompressPriority`'s names, by value.
+fn priorityName(z: ZstdStat) []const u8 {
+    const names = [_][]const u8{ "size", "balanced", "speed" };
+    return if (z.priority < names.len) names[z.priority] else "?";
+}
+
+fn writeZstd(w: *std.Io.Writer, z: ZstdStat) !void {
+    try w.print("zstd   priority {s} (lambda {d}): {d} pages raw, {d} literals only, {d} level 1, {d} level 3\n", .{
+        priorityName(z), z.lambda, z.raw_pages, z.literals_pages, z.level1_pages, z.level3_pages,
+    });
 }
 
 fn writeLocalBackend(w: *std.Io.Writer, io: IoStat) !void {
@@ -647,6 +680,7 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
             s.workers, ms(s.worker_user_ns), ms(s.worker_sys_ns), s.worker_minor_faults,
         });
     }
+    if (s.zstd.seen != 0) try writeZstd(w, s.zstd);
     const r = s.reconcile;
     try w.print("engine read {d:.2} parse {d:.2} decode {d:.2} (wall {d:.2}) eval {d:.2} ms\n", .{
         ms(r.read_ns), ms(r.parse_ns), ms(r.decode_ns), ms(r.decode_wall_ns), ms(r.eval_ns),
@@ -777,6 +811,16 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
         try workers.int("sys_ns", s.worker_sys_ns);
         try workers.int("minor_faults", s.worker_minor_faults);
         try workers.end();
+    }
+    if (s.zstd.seen != 0) {
+        var zstd = try o.object("zstd");
+        try zstd.str("priority", priorityName(s.zstd));
+        try zstd.int("lambda", s.zstd.lambda);
+        try zstd.int("raw_pages", s.zstd.raw_pages);
+        try zstd.int("literals_pages", s.zstd.literals_pages);
+        try zstd.int("level1_pages", s.zstd.level1_pages);
+        try zstd.int("level3_pages", s.zstd.level3_pages);
+        try zstd.end();
     }
     {
         var engine = try o.object("engine");

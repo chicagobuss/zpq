@@ -27,6 +27,7 @@ const local_fs = @import("local_fs.zig");
 const local_reader = @import("io/local_reader.zig");
 
 const schema = @import("core/schema.zig");
+const compression = @import("core/parquet/compression.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
 const huge_pages = @import("core/huge_pages.zig");
 const consumer = @import("core/consumer.zig");
@@ -154,6 +155,9 @@ pub const QueryArgs = struct {
     /// Requested output codec. Null when none was asked for: re-encoded
     /// output is then SNAPPY and byte copies keep each chunk's own codec.
     codec: ?schema.CompressionCodec = null,
+    /// How hard zstd works on the output (`--compress-priority`, the Lambda's "compress_priority"). Null: size first
+    /// for an S3 destination, balanced for a local one (`resolvePriority`).
+    compress_priority: ?CompressPriority = null,
     parallelism: usize = 0,
     /// `--scan-all`: disable every stats shortcut (row-group pruning,
     /// stats-driven column drop, aggregate stat short-circuit) and decode
@@ -185,6 +189,14 @@ pub const QueryArgs = struct {
     /// has; one without is decoded to build one.
     bloom_filters: []const BloomSpec = &.{},
 };
+
+pub const CompressPriority = compression.CompressPriority;
+
+/// The priority a write to `out_path` compresses with: the one asked for, else size first for S3, where output bytes
+/// are what a query waits on and pays for, and balanced for local disk.
+pub fn resolvePriority(args: QueryArgs, out_path: []const u8) CompressPriority {
+    return args.compress_priority orelse if (std.mem.startsWith(u8, out_path, "s3://")) .size else .balanced;
+}
 
 /// One `--bloom-filter col[:fpp]`: a written column and its filter's false-positive probability.
 pub const BloomSpec = struct {
@@ -453,10 +465,12 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         }
         const t_footer = nowMonoNs();
         const st = r.state;
+        const codec = args.codec orelse .SNAPPY;
+        const zstd: compression.ZstdPlan = .{ .lambda = resolvePriority(args, out_path).lambda() };
         bytes_out = if (r.output.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, args.codec orelse .SNAPPY)
+            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd)
         else
-            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, args.codec orelse .SNAPPY);
+            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, codec, zstd);
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
@@ -583,6 +597,7 @@ fn encodeRGToBuffer(
     fetch_arr: []const bool,
     output_specs: []const consumer.OutputCol,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     decode_options: consumer.DecodeOptions,
     prof: ?*profile.Thread,
     bloom: consumer.BloomWrite,
@@ -626,6 +641,7 @@ fn encodeRGToBuffer(
         .sink = sink,
         .out_offset = &local_off,
         .codec = codec,
+        .zstd = zstd,
         .bloom_write = bloom,
         .timings = &timings,
     };
@@ -699,6 +715,7 @@ const WinCtx = struct {
     output_specs: []const consumer.OutputCol,
     kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan = .{},
     decode_options: consumer.DecodeOptions,
     /// The Bloom filters asked for: per output column for re-encoded row groups, per source leaf for copied ones.
     bloom_outputs: []const ?f64 = &.{},
@@ -753,6 +770,7 @@ fn winProducer(w: *WinCtx, i: usize) void {
             w.fetch_arr,
             w.output_specs,
             w.codec,
+            w.zstd,
             w.decode_options,
             prof,
             .{ .fpp = w.bloom_outputs },
@@ -859,6 +877,7 @@ const RecompressCtx = struct {
     jobs: []const RGJob,
     kept: ?[]const bool,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan = .{},
     /// Bloom filter probability per leaf (`--bloom-filter`), for copied chunks that carry none.
     bloom_leaves: []const ?f64 = &.{},
     slots: []RecompressSlot,
@@ -901,6 +920,7 @@ fn recompressProducer(w: *RecompressCtx, i: usize) void {
         .{ .bytes = job.bytes, .byte_origin = 0 },
         w.kept,
         w.codec,
+        w.zstd,
         &timings,
     )) |chunks| {
         slot.chunks = chunks;
@@ -931,7 +951,7 @@ fn recompressWriter(w: *RecompressCtx) void {
                 &w.out_offset,
                 &w.core,
                 true,
-                .{ .codec = w.codec, .scratch = w.gpa, .done = slot.chunks },
+                .{ .codec = w.codec, .zstd = w.zstd, .scratch = w.gpa, .done = slot.chunks },
                 .{ .fpp = w.bloom_leaves, .meta = job.meta, .scratch = w.gpa },
             )) |out| {
                 if (out.rg) |rg| w.new_row_groups.append(w.arena, rg) catch |e| {
@@ -1328,6 +1348,11 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
+    // zstd pages are compressed per the destination's priority; the modes they take are counted for the profile.
+    const priority = resolvePriority(args, out_path);
+    var zstd_counts: compression.ZstdModeCounts = .{};
+    const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
+
     // 4. Open output sink: local fd or s3 multipart.
     const out_is_s3 = std.mem.startsWith(u8, out_path, "s3://");
     var fd_sink: FdSink = .{ .fd = 0 };
@@ -1480,6 +1505,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .jobs = jobs.items,
                 .kept = kept_opt,
                 .codec = args.codec.?,
+                .zstd = zstd,
                 .bloom_leaves = blooms.leaves,
                 .slots = slots,
                 .window = &window_sem,
@@ -1504,7 +1530,10 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         // Byte-copy fastpath: copy kept column chunks verbatim (serial;
         // memcpy-bound and already faster than every other engine). A chunk
         // stored in another codec than the one requested is recompressed.
-        const recompress: ?consumer.Recompress = if (args.codec) |c| .{ .codec = c, .scratch = ctx.gpa } else null;
+        const recompress: ?consumer.Recompress = if (args.codec) |c|
+            .{ .codec = c, .zstd = zstd, .scratch = ctx.gpa }
+        else
+            null;
         for (opened.inputs, metas) |in, meta_i| {
             bytes_in += in.bytes.len;
             const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
@@ -1619,6 +1648,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .output_specs = output_specs,
                 .kept_set = kept_set,
                 .codec = args.codec orelse .SNAPPY,
+                .zstd = zstd,
                 .decode_options = .{ .fast_levels = args.fast_levels },
                 .bloom_outputs = blooms.outputs,
                 .bloom_leaves = blooms.leaves,
@@ -1643,6 +1673,15 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             t.core.eval_ns += w.core.eval_ns;
             t.core.encode_ns += w.core.encode_ns;
         }
+    }
+
+    if (args.codec == .ZSTD) {
+        var pages: [4]u64 = undefined;
+        for (&pages, &zstd_counts.pages) |*n, *c| n.* = c.load(.monotonic);
+        const now = nowMonoNs();
+        profile.record(prof, .zstd_plan, now, now, profile.args(.{
+            @intFromEnum(priority), @as(u64, @intFromFloat(priority.lambda())), pages[0], pages[1], pages[2], pages[3],
+        }));
     }
 
     // 6. Bloom filters after the row groups, then the footer.
@@ -2919,6 +2958,7 @@ fn writeOneRowParquet(
     accumulators: []const expr_agg.Accumulator,
     sources: []const ?schema.SchemaElement,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
 ) !u64 {
     const fd = try createFile(out_path);
     defer local_fs.close(fd);
@@ -2931,7 +2971,7 @@ fn writeOneRowParquet(
         const cols = try expr_agg.finalize(arena, call, accumulators[i]);
         for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
     }
-    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, 1, codec);
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, 1, codec, zstd);
     return written;
 }
 
@@ -2944,6 +2984,7 @@ fn writeGroupedParquet(
     types: []const scan.GroupColType,
     rows: []const []const scan.AggValue,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
 ) !u64 {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (cols, types, 0..) |name, ty, ci| switch (ty.lane) {
@@ -2970,7 +3011,7 @@ fn writeGroupedParquet(
     defer local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
-    return consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec);
+    return consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd);
 }
 
 /// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a
@@ -3586,6 +3627,15 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
+}
+
+test "compress priority: size first for S3 output and balanced locally, unless asked for" {
+    const local: QueryArgs = .{ .inputs = &.{} };
+    try std.testing.expectEqual(CompressPriority.size, resolvePriority(local, "s3://b/out.parquet"));
+    try std.testing.expectEqual(CompressPriority.balanced, resolvePriority(local, "/tmp/out.parquet"));
+    const asked: QueryArgs = .{ .inputs = &.{}, .compress_priority = .speed };
+    try std.testing.expectEqual(CompressPriority.speed, resolvePriority(asked, "s3://b/out.parquet"));
+    try std.testing.expectEqual(CompressPriority.speed, resolvePriority(asked, "/tmp/out.parquet"));
 }
 
 test "re-encoded FLOAT16 footer widens to DOUBLE" {

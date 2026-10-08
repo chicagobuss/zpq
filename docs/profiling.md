@@ -56,6 +56,7 @@ JSON file. Open it at <https://ui.perfetto.dev> (Open trace file) or load it wit
 | `upload_create`, `upload_complete` | io | Starting and completing a multipart upload (a single PUT when the output fits one part). | `parts` |
 | `upload_wait` | wait | Waiting for the last parts to finish uploading. | `parts` |
 | `footer_write` | write | Writing the output footer. | `bytes` |
+| `zstd_plan` | wait | A zstd write's compression priority and the pages each form took (an instant). | `priority` (0 size, 1 balanced, 2 speed), `lambda`, `raw_pages`, `literals_pages`, `level1_pages`, `level3_pages` |
 
 Counter tracks: `requests in_flight` and `bytes in_flight` (S3 requests and the bytes they move, stepped exactly where
 they change), `buffered bytes` (encoded row groups waiting for the writer), and `rss bytes` (resident memory, sampled
@@ -135,6 +136,13 @@ engine read 0.03 parse 0.12 decode 70.46 (wall 13.53) eval 0.01 ms
        agg 5.88 encode 0.00 ms (the sources of the JSON phase fields)
 ```
 
+A zstd write adds the priority its pages were compressed with and the mode each took (see `--compress-priority` in
+the README):
+
+```
+zstd   priority balanced (lambda 1000): 0 pages raw, 35 literals only, 21 level 1, 61 level 3
+```
+
 The `prune` lines cover scans: the write path records no row-group decisions, so a write's summary leaves them out (its
 JSON `prune` counts are zero).
 
@@ -143,7 +151,7 @@ are taken from the very timestamps the engine uses, so they match exactly; `deco
 `wall` the scan's elapsed time.
 
 `--profile-summary=json` prints the same as one JSON object (`total_ns`, `idle_ns`, `cpu`, `meta`, `phases`,
-`top_chunks`, `io`, `prune`, `workers`, `engine`, all times in nanoseconds), for scripts that compare runs.
+`top_chunks`, `io`, `prune`, `workers`, `zstd` (zstd writes only), `engine`, all times in nanoseconds), for scripts that compare runs.
 
 ## On Lambda
 

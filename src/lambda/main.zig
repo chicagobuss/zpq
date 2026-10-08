@@ -210,6 +210,14 @@ fn handle(
             break :blk .SNAPPY;
         } else null;
 
+        // How hard zstd works on the output. Absent: size first, as a Lambda's output crosses the network and every
+        // byte saved is time the query does not wait.
+        const compress_priority: engine.CompressPriority = if (req.compress_priority) |s|
+            std.meta.stringToEnum(engine.CompressPriority, s) orelse
+                return rejectResponse(allocator, "bad_json", "BadCompressPriority", "compress_priority", s)
+        else
+            .size;
+
         const max_memory: ?usize = if (req.max_memory) |m| switch (m) {
             .bytes => |n| n,
             .text => |t| zpq.core.system.parseSizeString(t) catch return std.fmt.allocPrint(
@@ -249,6 +257,7 @@ fn handle(
             .select = req.select,
             .aggregate = req.aggregate,
             .codec = output_codec,
+            .compress_priority = compress_priority,
             .scan_all = req.scan_all,
             .trust_stats = req.trust_stats,
             .unordered = req.unordered,

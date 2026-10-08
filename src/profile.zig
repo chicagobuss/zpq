@@ -61,6 +61,9 @@ pub const Kind = enum(u8) {
     /// chosen (0 mmap, 1 pread, 2 uring), and the share of the inputs cached and of them the query plans to read (per
     /// mille; coverage 2^32-1 when not weighed).
     io_choice,
+    /// How a zstd write compressed its pages: the `CompressPriority` (0 size, 1 balanced, 2 speed), its lambda, and
+    /// the pages each `ZstdMode` took (raw blocks, literals only, level 1, level 3).
+    zstd_plan,
     footer_batch,
     footer_fetch,
     footer_parse,
@@ -112,7 +115,8 @@ pub const Kind = enum(u8) {
             .encode, .encode_chunk => .encode,
             .copy_rg, .sink_write, .footer_write => .write,
             .merge, .finalize => .merge,
-            .footer_batch, .fetch, .scan, .reencode, .upload_wait, .local_read, .local_backend, .io_choice => .wait,
+            .footer_batch, .fetch, .scan, .reencode, .upload_wait => .wait,
+            .local_read, .local_backend, .io_choice, .zstd_plan => .wait,
         };
     }
 
@@ -130,6 +134,7 @@ pub const Kind = enum(u8) {
             .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },
             .local_backend => &.{ "uring_threads", "pread_threads", "direct_files", "buffered_files" },
             .io_choice => &.{ "profile", "mode", "resident_permille", "coverage_permille" },
+            .zstd_plan => &.{ "priority", "lambda", "raw_pages", "literals_pages", "level1_pages", "level3_pages" },
             .footer_fetch => &.{ "file", "cache" },
             .plan => &.{ "work_items", "workers", "row_groups" },
             .plan_ranges => &.{ "ranges", "merged", "fetch_jobs", "bytes", "row_groups", "row_groups_pruned" },

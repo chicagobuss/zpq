@@ -56,6 +56,8 @@ pub const ColumnInput = struct {
     /// (~30% smaller output, ~400 MB/s encode at level 3).
     /// UNCOMPRESSED is supported but discouraged outside diagnostics.
     codec: schema.CompressionCodec = .SNAPPY,
+    /// How zstd pages are compressed, when `codec` is ZSTD.
+    zstd: compression.ZstdPlan = .{},
     /// Build a split-block Bloom filter of the chunk at this false-positive probability.
     bloom_fpp: ?f64 = null,
 };
@@ -250,13 +252,13 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
         @memcpy(payload[pos..], values_bytes);
     }
 
-    // 4b. Snappy-compress the payload. Page header thrift is NEVER
+    // 4b. Compress the payload. Page header thrift is NEVER
     //     compressed in Parquet — only the data portion. If the
     //     compressed output is somehow >= original (incompressible
     //     data) we still ship the compressed version; the format
-    //     allows it and a 1-2% bloat is preferable to a per-page
-    //     branching codec.
-    const compressed = try compression.compress(arena, payload, in.codec);
+    //     allows it. (zstd pages pick their own mode, raw blocks
+    //     among them; see `compression.ZstdPlan`.)
+    const compressed = try compression.compressPage(arena, payload, in.codec, in.zstd);
 
     // 5. Build PageHeader. uncompressed_page_size measures the
     //    payload-as-if-uncompressed; compressed_page_size measures
@@ -344,6 +346,7 @@ pub fn encodeDecimalFlba(
     schema_elem: *const schema.SchemaElement,
     path_in_schema: []const []const u8,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
 ) Error!EncodedColumn {
     if (schema_elem.type != .FIXED_LEN_BYTE_ARRAY) return error.UnsupportedType;
     const bw: usize = if (schema_elem.type_length) |tl| @intCast(tl) else return error.UnsupportedType;
@@ -374,7 +377,7 @@ pub fn encodeDecimalFlba(
     const payload = try arena.alloc(u8, data_total_len);
     @memcpy(payload[0..def_prefix.len], def_prefix);
     @memcpy(payload[def_prefix.len..], values_bytes);
-    const compressed = try compression.compress(arena, payload, codec);
+    const compressed = try compression.compressPage(arena, payload, codec, zstd);
 
     // Stats: min/max over present values as big-endian `bw` bytes.
     var stats = schema.Statistics{};
@@ -820,7 +823,7 @@ fn finishDictionaryColumn(
     // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
     var stats = computeStats(arena, dict, null, 0, in.schema_elem);
     if (stats) |*st| st.null_count = num_values - @as(i64, @intCast(indices.len));
-    const dict_compressed = try compression.compress(arena, dict_plain, in.codec);
+    const dict_compressed = try compression.compressPage(arena, dict_plain, in.codec, in.zstd);
     const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
         .uncompressed_page_size = @intCast(dict_plain.len),
@@ -843,7 +846,7 @@ fn finishDictionaryColumn(
     const idx_bit_width = dictIndexBitWidth(dict_count);
     const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
     const data_payload = try std.mem.concat(arena, u8, &.{ def_prefix, &.{idx_bit_width}, idx_rle });
-    const data_compressed = try compression.compress(arena, data_payload, in.codec);
+    const data_compressed = try compression.compressPage(arena, data_payload, in.codec, in.zstd);
     const data_header = try pageHeaderBytes(arena, .{
         .type = .DATA_PAGE,
         .uncompressed_page_size = @intCast(data_payload.len),
@@ -1950,7 +1953,7 @@ test "encodeDecimalFlba round-trips i128 through decodeColumnAsI128 (DECIMAL(38,
         std.math.maxInt(i128) >> 4,
     };
     const col = filter_eval.ColumnT(i128){ .values = &vals };
-    const enc = try encodeDecimalFlba(arena, col, &elem, &[_][]const u8{"cost"}, .UNCOMPRESSED);
+    const enc = try encodeDecimalFlba(arena, col, &elem, &[_][]const u8{"cost"}, .UNCOMPRESSED, .{});
     try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, enc.meta.type);
 
     const kind = decimal_mod_test.kindFromSchema(&elem).?;

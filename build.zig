@@ -497,7 +497,8 @@ fn zstdCModule(
     optimize: std.builtin.Optimize,
     zstd_lib: *std.Build.Step.Compile,
 ) *std.Build.Module {
-    const tc = cHeaderModule(b, target, optimize, "zstd_c.h", "#include <zstd.h>\n");
+    // The static-linking API (ZSTD_compressSequences) is safe: libzstd is vendored and linked statically.
+    const tc = cHeaderModule(b, target, optimize, "zstd_c.h", "#define ZSTD_STATIC_LINKING_ONLY\n#include <zstd.h>\n");
     // The header tree is a WriteFile step the library step does not depend on; addIncludePath orders
     // translate-c after it. An `.other_step` include dir skipped that edge and raced the maker into a panic.
     tc.addIncludePath(zstd_lib.getEmittedIncludeTree());

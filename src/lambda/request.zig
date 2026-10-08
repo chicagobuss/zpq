@@ -21,6 +21,7 @@ const Wire = struct {
     filter: ?std.json.Value = null,
     output_url: ?std.json.Value = null,
     output_codec: ?std.json.Value = null,
+    compress_priority: ?std.json.Value = null,
     select: ?std.json.Value = null,
     aggregate: ?std.json.Value = null,
     group_by: ?std.json.Value = null,
@@ -43,6 +44,8 @@ pub const Request = struct {
     filter: ?[]const u8 = null,
     output_url: ?[]const u8 = null,
     output_codec: ?[]const u8 = null,
+    /// `compress_priority`: "size", "balanced" or "speed", as the CLI's `--compress-priority` takes them.
+    compress_priority: ?[]const u8 = null,
     select: ?[]const u8 = null,
     aggregate: ?[]const u8 = null,
     group_by: ?[]const u8 = null,
@@ -84,6 +87,7 @@ pub const Request = struct {
         req.filter = try f.string("filter");
         req.output_url = try f.string("output_url");
         req.output_codec = try f.string("output_codec");
+        req.compress_priority = try f.string("compress_priority");
         req.select = try f.string("select");
         req.aggregate = try f.string("aggregate");
         req.group_by = try f.string("group_by");
@@ -220,6 +224,13 @@ test "request: s3_url shorthand, numeric max_memory, nulls as absent" {
     defer prof.deinit();
     try testing.expect(prof.profile);
     try testing.expectEqualStrings("s3://b/trace.json", prof.profile_url.?);
+
+    var priority = try Request.parse(testing.allocator,
+        \\{"s3_url":"s3://b/k","output_codec":"zstd","compress_priority":"speed"}
+    , &bad);
+    defer priority.deinit();
+    try testing.expectEqualStrings("speed", priority.compress_priority.?);
+    try testing.expect(nulls.compress_priority == null);
 }
 
 test "malformed requests are errors, wrong-typed fields named" {

@@ -25,10 +25,62 @@ pub const Error = error{
 /// the bottleneck so we prefer the fast knob.
 pub const ZSTD_DEFAULT_LEVEL: c_int = 3;
 
+/// How hard zstd works on a write, as a user asks for it (`--compress-priority`, the Lambda's "compress_priority"):
+/// each priority is a price for an output byte, in CPU ticks, that `ZstdPlan` weighs against each page mode's cost.
+pub const CompressPriority = enum {
+    /// Smallest output: every saved byte is worth any CPU (S3 and Lambda destinations, bandwidth-bound).
+    size,
+    /// A byte is worth 1000 ticks (local destinations).
+    balanced,
+    /// A byte is worth 100 ticks: CPU first, a few percent larger.
+    speed,
+
+    pub fn lambda(p: CompressPriority) f64 {
+        return switch (p) {
+            .size => 1e9,
+            .balanced => 1000,
+            .speed => 100,
+        };
+    }
+};
+
+/// What zstd page modes a write used, counted across its threads.
+pub const ZstdModeCounts = struct {
+    /// Pages per `ZstdMode`.
+    pages: [4]std.atomic.Value(u64) = @splat(.init(0)),
+};
+
+/// How a write's pages are compressed with zstd: the price of an output byte (see `CompressPriority`) and, when the
+/// caller wants them, counters of the modes chosen.
+pub const ZstdPlan = struct {
+    lambda: f64 = CompressPriority.balanced.lambda(),
+    counts: ?*ZstdModeCounts = null,
+};
+
+/// A zstd page's form. Every one is a standard zstd frame any decoder reads.
+pub const ZstdMode = enum(u2) {
+    /// Raw blocks: a copy, for pages nothing compresses (high-entropy bit-packed data).
+    raw,
+    /// Entropy-coded literals with no match search.
+    literals,
+    level1,
+    level3,
+};
+
 /// Compress a buffer using `codec`. Returns a newly-allocated slice
 /// owned by `arena`. UNCOMPRESSED is a no-op identity copy onto the
 /// arena (so the caller can free with the same allocator regardless
-/// of codec).
+/// of codec). zstd pages get the balanced plan; see `compressPage`.
+/// `compress`, with zstd pages compressed per `plan`.
+pub fn compressPage(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    codec: schema.CompressionCodec,
+    plan: ZstdPlan,
+) Error![]u8 {
+    return if (codec == .ZSTD) compressZstd(arena, src, plan) else compress(arena, src, codec);
+}
+
 pub fn compress(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -37,7 +89,7 @@ pub fn compress(
     return switch (codec) {
         .UNCOMPRESSED => try arena.dupe(u8, src),
         .SNAPPY => snappy.compressAlloc(arena, src) catch return error.CompressionFailed,
-        .ZSTD => compressZstd(arena, src),
+        .ZSTD => compressZstd(arena, src, .{}),
         .GZIP => compressFlate(arena, src, .gzip),
         .LZ4_RAW => compressLz4Raw(arena, src),
         else => error.UnsupportedCodec,
@@ -77,20 +129,120 @@ fn compressFlate(
     return out.writer.buffered();
 }
 
-fn compressZstd(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
+fn compressZstd(arena: std.mem.Allocator, src: []const u8, plan: ZstdPlan) Error![]u8 {
     const max_len = c_zstd.ZSTD_compressBound(src.len);
     if (c_zstd.ZSTD_isError(max_len) != 0) return error.CompressionFailed;
-    const buf = try arena.alloc(u8, max_len);
+    const buf = try arena.alloc(u8, @max(max_len, rawFrameLen(src.len)));
     errdefer arena.free(buf);
-    const n = c_zstd.ZSTD_compress(
-        buf.ptr,
-        buf.len,
-        src.ptr,
-        src.len,
-        ZSTD_DEFAULT_LEVEL,
-    );
-    if (c_zstd.ZSTD_isError(n) != 0) return error.CompressionFailed;
+    const cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+    defer _ = c_zstd.ZSTD_freeCCtx(cctx);
+    const mode = try chooseZstdMode(arena, cctx, src, plan.lambda);
+    if (plan.counts) |c| _ = c.pages[@intFromEnum(mode)].fetchAdd(1, .monotonic);
+    const n = try zstdWith(cctx, mode, buf, src);
     return buf[0..n];
+}
+
+/// Pages under this are compressed at level 3: a trial would cost about what it steers.
+const trial_min_page = 16 << 10;
+const trial_sample = 16 << 10;
+
+/// CPU ticks per input byte each mode costs (Zen 5; level 3 ranges 3-22 over Parquet page kinds, 12 its byte-weighted
+/// mean). Constants, never timings, so a page's mode depends on its bytes alone.
+const mode_price = [_]f64{ 0.1, 2.6, 3.5, 12.0 };
+
+/// The mode with the lowest estimated cost for `src`: its CPU (`mode_price` per input byte) plus `lambda` per output
+/// byte, each mode's output size estimated by compressing a deterministic sample of the page (four slices at fixed
+/// fractions of it). Bit-packed integer and dictionary-index pages are often incompressible, where level 3 searches
+/// for matches it never finds; structured strings often come out smaller at level 1; text keeps level 3. The choice
+/// depends on the page's bytes and `lambda` only, so output is byte-identical across threads and runs.
+fn chooseZstdMode(arena: std.mem.Allocator, cctx: *c_zstd.ZSTD_CCtx, src: []const u8, lambda: f64) Error!ZstdMode {
+    if (src.len < trial_min_page) return .level3;
+    const slice = trial_sample / 4;
+    var sample: [trial_sample]u8 = undefined;
+    for (0..4) |k| {
+        const off = (src.len - slice) * k / 3;
+        @memcpy(sample[k * slice ..][0..slice], src[off..][0..slice]);
+    }
+    const scratch = try arena.alloc(u8, c_zstd.ZSTD_compressBound(sample.len));
+    defer arena.free(scratch);
+    const n: f64 = @floatFromInt(src.len);
+    var best: ZstdMode = .level3;
+    var best_cost = std.math.inf(f64);
+    for (std.meta.tags(ZstdMode)) |m| {
+        const out: f64 = @floatFromInt(try zstdWith(cctx, m, scratch, &sample));
+        const cost = mode_price[@intFromEnum(m)] * n + lambda * n * out / @as(f64, @floatFromInt(sample.len));
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = m;
+        }
+    }
+    return best;
+}
+
+/// Compress `src` into `dst` as one standard zstd frame in `mode`; returns the frame's length.
+fn zstdWith(cctx: *c_zstd.ZSTD_CCtx, mode: ZstdMode, dst: []u8, src: []const u8) Error!usize {
+    if (mode == .raw) return writeRawFrame(dst, src);
+    _ = c_zstd.ZSTD_CCtx_reset(cctx, c_zstd.ZSTD_reset_session_and_parameters);
+    const level: c_int = if (mode == .level1) 1 else ZSTD_DEFAULT_LEVEL;
+    if (c_zstd.ZSTD_isError(c_zstd.ZSTD_CCtx_setParameter(cctx, c_zstd.ZSTD_c_compressionLevel, level)) != 0)
+        return error.CompressionFailed;
+    const n = if (mode == .literals) blk: {
+        // No sequences: every byte is a literal, entropy-coded (or stored, when that is smaller), no match search.
+        const no_delims = c_zstd.ZSTD_sf_noBlockDelimiters;
+        const delims = c_zstd.ZSTD_CCtx_setParameter(cctx, c_zstd.ZSTD_c_blockDelimiters, no_delims);
+        if (c_zstd.ZSTD_isError(delims) != 0) return error.CompressionFailed;
+        break :blk c_zstd.ZSTD_compressSequences(cctx, dst.ptr, dst.len, null, 0, src.ptr, src.len);
+    } else c_zstd.ZSTD_compress2(cctx, dst.ptr, dst.len, src.ptr, src.len);
+    if (c_zstd.ZSTD_isError(n) != 0) return error.CompressionFailed;
+    return n;
+}
+
+const raw_block_max = 128 << 10;
+
+fn rawFrameLen(n: usize) usize {
+    return 4 + 9 + 3 * @max(1, (n + raw_block_max - 1) / raw_block_max) + n;
+}
+
+/// A standard zstd frame of raw blocks: magic, a single-segment frame header carrying the content size, then the
+/// bytes in blocks of at most 128 KiB, each behind a 3-byte header. What zstd emits for incompressible input, without
+/// first searching it.
+fn writeRawFrame(dst: []u8, src: []const u8) usize {
+    std.mem.writeInt(u32, dst[0..4], 0xFD2FB528, .little);
+    var p: usize = 4;
+    const n = src.len;
+    // Frame header descriptor: single segment (bit 5), content size field width in bits 6-7.
+    if (n < 256) {
+        dst[p] = 0x20;
+        dst[p + 1] = @intCast(n);
+        p += 2;
+    } else if (n < 65536 + 256) {
+        dst[p] = 0x60;
+        std.mem.writeInt(u16, dst[p + 1 ..][0..2], @intCast(n - 256), .little);
+        p += 3;
+    } else if (n <= std.math.maxInt(u32)) {
+        dst[p] = 0xA0;
+        std.mem.writeInt(u32, dst[p + 1 ..][0..4], @intCast(n), .little);
+        p += 5;
+    } else {
+        dst[p] = 0xE0;
+        std.mem.writeInt(u64, dst[p + 1 ..][0..8], n, .little);
+        p += 9;
+    }
+    var off: usize = 0;
+    while (true) {
+        const b = @min(raw_block_max, n - off);
+        const last: u32 = @intFromBool(off + b == n);
+        // Block header: last-block bit, type 0 (raw) in bits 1-2, size in bits 3-23.
+        const h: u32 = last | (@as(u32, @intCast(b)) << 3);
+        dst[p] = @truncate(h);
+        dst[p + 1] = @truncate(h >> 8);
+        dst[p + 2] = @truncate(h >> 16);
+        p += 3;
+        @memcpy(dst[p..][0..b], src[off..][0..b]);
+        p += b;
+        off += b;
+        if (off == n) return p;
+    }
 }
 
 /// Decompress a single Parquet page's payload.
@@ -274,8 +426,8 @@ test "ZSTD decompresses canned bytes" {
     // zstd of "hello world" — generated by `printf 'hello world' | zstd`.
     const compressed = [_]u8{
         0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x59, 0x00, 0x00,
-        0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64,
-        0x68, 0x69, 0x1e, 0xb2,
+        0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72,
+        0x6c, 0x64, 0x68, 0x69, 0x1e, 0xb2,
     };
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -335,4 +487,56 @@ test "LZ4 (codec 5): a Hadoop chunk split over several blocks decodes" {
     }
     try testing.expectEqual(@as(usize, 3), pieces);
     try testing.expectEqualSlices(u8, raw, try decompress(a, page.items, .LZ4, raw.len));
+}
+
+test "raw-block frames decode to their input at every size boundary" {
+    for ([_]usize{ 0, 1, 255, 256, 65791, 65792, 131072, 131073, 300000 }) |n| {
+        const src = try testing.allocator.alloc(u8, n);
+        defer testing.allocator.free(src);
+        for (src, 0..) |*b, i| b.* = @truncate(i *% 2654435761);
+        const frame = try testing.allocator.alloc(u8, rawFrameLen(n));
+        defer testing.allocator.free(frame);
+        const len = writeRawFrame(frame, src);
+        try testing.expect(len <= frame.len);
+        const back = try testing.allocator.alloc(u8, n);
+        defer testing.allocator.free(back);
+        const got = c_zstd.ZSTD_decompress(back.ptr, back.len, frame.ptr, len);
+        try testing.expect(c_zstd.ZSTD_isError(got) == 0);
+        try testing.expectEqual(n, got);
+        try testing.expectEqualSlices(u8, src, back);
+    }
+}
+
+test "every zstd page mode makes a frame libzstd decodes, and each priority picks deterministically" {
+    var prng = std.Random.DefaultPrng.init(0x2577d);
+    const r = prng.random();
+    const n = 100_000;
+    const src = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(src);
+    for (src, 0..) |*b, i| b.* = if (i % 3 == 0) r.int(u8) else @truncate(i / 7);
+    const cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+    defer _ = c_zstd.ZSTD_freeCCtx(cctx);
+    const dst = try testing.allocator.alloc(u8, @max(c_zstd.ZSTD_compressBound(n), rawFrameLen(n)));
+    defer testing.allocator.free(dst);
+    const back = try testing.allocator.alloc(u8, n);
+    defer testing.allocator.free(back);
+    for (std.meta.tags(ZstdMode)) |m| {
+        const len = try zstdWith(cctx, m, dst, src);
+        const got = c_zstd.ZSTD_decompress(back.ptr, back.len, dst.ptr, len);
+        try testing.expect(c_zstd.ZSTD_isError(got) == 0);
+        try testing.expectEqualSlices(u8, src, back[0..got]);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (std.meta.tags(CompressPriority)) |p| {
+        var counts: ZstdModeCounts = .{};
+        const a = try compressPage(arena_state.allocator(), src, .ZSTD, .{ .lambda = p.lambda(), .counts = &counts });
+        const b = try compressPage(arena_state.allocator(), src, .ZSTD, .{ .lambda = p.lambda() });
+        try testing.expectEqualSlices(u8, a, b);
+        const got = c_zstd.ZSTD_decompress(back.ptr, back.len, a.ptr, a.len);
+        try testing.expectEqualSlices(u8, src, back[0..got]);
+        var pages: u64 = 0;
+        for (&counts.pages) |*c| pages += c.load(.monotonic);
+        try testing.expectEqual(@as(u64, 1), pages);
+    }
 }

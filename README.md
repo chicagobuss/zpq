@@ -91,6 +91,21 @@ codec; with it, a plain copy recompresses any chunk stored in another codec. The
 the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one
 (for example, inputs written with different codecs).
 
+zstd pages each take the form that costs least: raw blocks (for pages nothing compresses, such as bit-packed
+dictionary indices), entropy-coded literals with no match search, level 1, or level 3. Each is a standard zstd frame
+every reader decodes. The choice weighs each form's CPU against the bytes it writes, the sizes estimated by compressing
+a fixed sample of the page, so the output is the same at every `-j` and on every run. `--compress-priority` (the
+Lambda's `"compress_priority"`) sets what an output byte is worth:
+
+| priority | an output byte is worth | for |
+| --- | --- | --- |
+| `size` | any CPU (lambda 10^9 cycles) | S3 output and the Lambda: the default there |
+| `balanced` | 1000 cycles | local output: the default there |
+| `speed` | 100 cycles | the least CPU, for output a few percent larger |
+
+Pages under 16 KiB are compressed at level 3 at every priority. `--profile-summary` reports the priority and how many
+pages took each form.
+
 **Order** is the input's: every output that lists rows (print, `--format`, `-o` writes and byte copies, several files,
 S3 and Lambda) keeps files in the order given, then row groups, then rows, at any `-j`. `GROUP BY` lists groups in the
 order they first appear in the input (before 0.5.0, in the byte order of their serialized keys), and every aggregate,

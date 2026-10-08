@@ -936,6 +936,7 @@ pub fn encodeAggregator(
     sink: streaming.Sink,
     out_offset: *u64,
     output_codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     timings: *Timings,
     // Column-encode parallelism: 0 = auto (min(n_cols, cpus)). Pass 1 to
     // force serial column encode when the CALLER is already parallel across
@@ -987,7 +988,7 @@ pub fn encodeAggregator(
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
                 .max_def = b.max_def,
-            }, &agg.schema_elems[i], agg.paths[i], output_codec);
+            }, &agg.schema_elems[i], agg.paths[i], output_codec, zstd);
         }
     }
 
@@ -1011,7 +1012,8 @@ pub fn encodeAggregator(
         for (0..n_specs) |i| {
             var col_arena = std.heap.ArenaAllocator.init(gpa);
             defer col_arena.deinit();
-            const enc = results[i] orelse try encodeAggColumn(agg, i, col_arena.allocator(), output_codec, bloom_write, timings);
+            const enc = results[i] orelse
+                try encodeAggColumn(agg, i, col_arena.allocator(), output_codec, zstd, bloom_write, timings);
             try placer.place(enc);
         }
     } else {
@@ -1032,6 +1034,7 @@ pub fn encodeAggregator(
                 .schema_elems = agg.schema_elems,
                 .paths = agg.paths,
                 .codec = output_codec,
+                .zstd = zstd,
                 .bloom_write = bloom_write,
                 .results = results,
                 .err = null,
@@ -1149,6 +1152,7 @@ fn encodeAggColumn(
     i: usize,
     arena: std.mem.Allocator,
     output_codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     bloom_write: BloomWrite,
     timings: *Timings,
 ) !encoder.EncodedColumn {
@@ -1160,12 +1164,13 @@ fn encodeAggColumn(
             .values = b.values.items,
             .def_levels = if (b.max_def > 0) b.def_levels.items else null,
             .max_def = b.max_def,
-        }, &agg.schema_elems[i], agg.paths[i], output_codec);
+        }, &agg.schema_elems[i], agg.paths[i], output_codec, zstd);
     } else try encoder.encodeColumn(arena, .{
         .values = try aggBatchColumn(agg, i, arena),
         .schema_elem = &agg.schema_elems[i],
         .path_in_schema = agg.paths[i],
         .codec = output_codec,
+        .zstd = zstd,
         .bloom_fpp = bloom_write.at(i),
     });
     if (span.t != null) {
@@ -1190,6 +1195,7 @@ pub const RGEncoder = struct {
     sink: streaming.Sink,
     out_offset: *u64,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan = .{},
     bloom_write: BloomWrite,
     timings: *Timings,
 
@@ -1197,7 +1203,7 @@ pub const RGEncoder = struct {
     /// returns, the chunk's metadata being cloned into `out_arena`.
     pub fn column(self: *RGEncoder, agg: *const OutputAggregator, i: usize, arena: std.mem.Allocator) !void {
         if (self.columns.capacity == 0) try self.columns.ensureTotalCapacity(self.out_arena, agg.cols.len);
-        const enc = try encodeAggColumn(agg, i, arena, self.codec, self.bloom_write, self.timings);
+        const enc = try encodeAggColumn(agg, i, arena, self.codec, self.zstd, self.bloom_write, self.timings);
         const placer: ChunkPlacer = .{
             .out_arena = self.out_arena,
             .sink = self.sink,
@@ -1272,6 +1278,7 @@ const AggEncodeCtx = struct {
     schema_elems: []const schema.SchemaElement,
     paths: []const []const []const u8,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     bloom_write: BloomWrite,
     results: []?encoder.EncodedColumn,
     err: ?anyerror,
@@ -1286,6 +1293,7 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
             .schema_elem = &ctx.schema_elems[i],
             .path_in_schema = ctx.paths[i],
             .codec = ctx.codec,
+            .zstd = ctx.zstd,
             .bloom_fpp = ctx.bloom_write.at(i),
         }) catch |err| {
             ctx.err = err;
@@ -1401,6 +1409,7 @@ pub fn writeAggregateRows(
     output_cols: []const expr_agg.OutputCol,
     num_rows: i64,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
 ) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
     var off: u64 = 0;
@@ -1429,6 +1438,7 @@ pub fn writeAggregateRows(
             .schema_elem = &leaf_elem,
             .path_in_schema = path_buf,
             .codec = codec,
+            .zstd = zstd,
         });
         const col_start: i64 = @intCast(off);
         var em = enc.meta;
@@ -2748,6 +2758,7 @@ pub const BloomWrite = struct {
 /// working memory, released once the chunk is written.
 pub const Recompress = struct {
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan = .{},
     scratch: std.mem.Allocator,
     /// The row group's chunks already recompressed by `recompressRowGroup`, indexed by column (null where the chunk
     /// keeps its codec), so row groups can be recompressed in parallel and still be placed in order by `copyRG`.
@@ -2781,6 +2792,7 @@ fn recompressChunk(
     chunk: []const u8,
     from: schema.CompressionCodec,
     to: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
 ) !RecompressedChunk {
     var out: std.ArrayList(u8) = .empty;
     var pages: std.ArrayList(PageMove) = .empty;
@@ -2800,7 +2812,7 @@ fn recompressChunk(
 
         var new_body: []const u8 = body;
         switch (h.type) {
-            .DATA_PAGE, .DICTIONARY_PAGE => new_body = try recode(arena, scratch, &raw, body, from, to, raw_len),
+            .DATA_PAGE, .DICTIONARY_PAGE => new_body = try recode(arena, scratch, &raw, body, from, to, zstd, raw_len),
             .DATA_PAGE_V2 => {
                 const v2 = h.data_page_header_v2 orelse return error.BadPageHeader;
                 if (v2.is_compressed) {
@@ -2808,7 +2820,7 @@ fn recompressChunk(
                     const levels: usize = @as(usize, @intCast(v2.definition_levels_byte_length)) +
                         @as(usize, @intCast(v2.repetition_levels_byte_length));
                     if (levels > body.len or levels > raw_len) return error.BadPageHeader;
-                    const values = try recode(arena, scratch, &raw, body[levels..], from, to, raw_len - levels);
+                    const values = try recode(arena, scratch, &raw, body[levels..], from, to, zstd, raw_len - levels);
                     const joined = try arena.alloc(u8, levels + values.len);
                     @memcpy(joined[0..levels], body[0..levels]);
                     @memcpy(joined[levels..], values);
@@ -2836,14 +2848,15 @@ fn recode(
     body: []const u8,
     from: schema.CompressionCodec,
     to: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     raw_len: usize,
 ) ![]const u8 {
     // UNCOMPRESSED decompresses to `body` itself: no copy into the buffer.
     if (from == .UNCOMPRESSED or raw_len == 0)
-        return compression.compress(arena, try compression.decompress(arena, body, from, raw_len), to);
+        return compression.compressPage(arena, try compression.decompress(arena, body, from, raw_len), to, zstd);
     try raw.resize(scratch, raw_len);
     try compression.decompressInto(arena, body, from, raw.items);
-    return compression.compress(arena, raw.items, to);
+    return compression.compressPage(arena, raw.items, to, zstd);
 }
 
 /// Recompress every chunk of `rg` that `kept` selects (null: all) and is not already in `codec`, one entry per
@@ -2856,6 +2869,7 @@ pub fn recompressRowGroup(
     src: RGSrc,
     kept: ?[]const bool,
     codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
     timings: *Timings,
 ) ![]?RecompressedChunk {
     const done = try arena.alloc(?RecompressedChunk, rg.columns.items.len);
@@ -2866,7 +2880,7 @@ pub fn recompressRowGroup(
         if (m.codec == codec) continue;
         const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
         const t0 = nowMonoNs();
-        slot.* = recompressChunk(arena, scratch, try sourceBytes(src, range), m.codec, codec) catch |err|
+        slot.* = recompressChunk(arena, scratch, try sourceBytes(src, range), m.codec, codec, zstd) catch |err|
             return reportRecompressError(err, m, codec);
         const t1 = nowMonoNs();
         timings.encode_ns += @intCast(t1 - t0);
@@ -2960,7 +2974,7 @@ fn copyChunkRecompressed(
 
     const re = if (precomputed) |p| p else blk: {
         const t_encode = nowMonoNs();
-        const r = recompressChunk(scratch, rc.scratch, slice, m.codec, rc.codec) catch |err|
+        const r = recompressChunk(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd) catch |err|
             return reportRecompressError(err, m, rc.codec);
         const t_encode_end = nowMonoNs();
         timings.encode_ns += @intCast(t_encode_end - t_encode);
@@ -4306,9 +4320,9 @@ test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
             const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
             const src = bytes[start..][0..@intCast(cm.total_compressed_size)];
             // Normalise to UNCOMPRESSED first, so the comparison does not depend on one compressor's output.
-            const plain = try recompressChunk(a, testing.allocator, src, cm.codec, .UNCOMPRESSED);
-            const there = try recompressChunk(a, testing.allocator, plain.bytes, .UNCOMPRESSED, case.via);
-            const back = try recompressChunk(a, testing.allocator, there.bytes, case.via, .UNCOMPRESSED);
+            const plain = try recompressChunk(a, testing.allocator, src, cm.codec, .UNCOMPRESSED, .{});
+            const there = try recompressChunk(a, testing.allocator, plain.bytes, .UNCOMPRESSED, case.via, .{});
+            const back = try recompressChunk(a, testing.allocator, there.bytes, case.via, .UNCOMPRESSED, .{});
             try testing.expectEqualSlices(u8, plain.bytes, back.bytes);
             if (cm.codec == .UNCOMPRESSED) try testing.expectEqualSlices(u8, src, plain.bytes);
             try testing.expectEqual(plain.pages.len, there.pages.len);

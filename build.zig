@@ -246,6 +246,10 @@ const CoreDeps = struct {
     /// for a large perf win.
     zstd: *std.Build.Step.Compile,
     zstd_c: *std.Build.Module,
+    /// ebiggers/libdeflate 1.26 — vendored (`vendor/libdeflate`, see vendor/README.md), decompression only: GZIP
+    /// pages, about three times as fast as `std.compress.flate`.
+    libdeflate: *std.Build.Step.Compile,
+    libdeflate_c: *std.Build.Module,
     /// The SQL frontend's C parser. Only linked into modules built with
     /// `sql = true`; an unreferenced library step is never compiled.
     liteparser: *std.Build.Step.Compile,
@@ -260,6 +264,7 @@ const CoreDeps = struct {
         fetch_prebuilt: bool,
     ) CoreDeps {
         const zstd = zstdLibrary(b, target, optimize);
+        const libdeflate = libdeflateLibrary(b, target, optimize);
 
         const liteparser_mod = b.createModule(.{
             .target = target,
@@ -298,6 +303,8 @@ const CoreDeps = struct {
             }).module("snappy"),
             .zstd = zstd,
             .zstd_c = zstdCModule(b, target, optimize, zstd),
+            .libdeflate = libdeflate,
+            .libdeflate_c = libdeflateCModule(b, target, optimize, libdeflate),
             .liteparser = b.addLibrary(.{
                 .name = "liteparser",
                 .root_module = liteparser_mod,
@@ -355,6 +362,7 @@ fn addCoreModule(
             .{ .name = "boring_tls", .module = deps.boring_tls },
             .{ .name = "snappy", .module = deps.snappy },
             .{ .name = "zstd_c", .module = deps.zstd_c },
+            .{ .name = "libdeflate_c", .module = deps.libdeflate_c },
         },
     };
     const zpq_mod = if (options.export_as) |name|
@@ -362,6 +370,7 @@ fn addCoreModule(
     else
         b.createModule(module_options);
     zpq_mod.linkLibrary(deps.zstd);
+    zpq_mod.linkLibrary(deps.libdeflate);
     if (options.sql) {
         zpq_mod.linkLibrary(deps.liteparser);
         zpq_mod.addIncludePath(b.path("vendor/liteparser"));
@@ -510,6 +519,39 @@ fn zstdCModule(
     // The header tree is a WriteFile step the library step does not depend on; addIncludePath orders
     // translate-c after it. An `.other_step` include dir skipped that edge and raced the maker into a panic.
     tc.addIncludePath(zstd_lib.getEmittedIncludeTree());
+    return tc.createModule();
+}
+
+/// libdeflate from `vendor/libdeflate`: the decompression sources only (DEFLATE and its gzip framing, CRC-32, the
+/// allocator), with the x86 and arm CPU-feature probes, each of which compiles to nothing on other architectures.
+/// libdeflate chooses its CPU-specific paths at run time and keeps a portable one for everything else.
+fn libdeflateLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "deflate",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/libdeflate/lib"), .files = &.{
+        "deflate_decompress.c",
+        "gzip_decompress.c",
+        "crc32.c",
+        "utils.c",
+        "x86/cpu_features.c",
+        "arm/cpu_features.c",
+    } });
+    lib.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    lib.installHeader(b.path("vendor/libdeflate/libdeflate.h"), "libdeflate.h");
+    return lib;
+}
+
+fn libdeflateCModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    lib: *std.Build.Step.Compile,
+) *std.Build.Module {
+    const tc = cHeaderModule(b, target, optimize, "libdeflate_c.h", "#include <libdeflate.h>\n");
+    tc.addIncludePath(lib.getEmittedIncludeTree());
     return tc.createModule();
 }
 

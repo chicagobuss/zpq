@@ -142,6 +142,18 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
     return applyScaleI128(@intCast(raw), scale);
 }
 
+/// A DECIMAL min/max statistic's exact unscaled value; the same bytes and the same refusals as `statToF64`.
+pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
+    return switch (kind.physical) {
+        .INT32 => if (bytes.len < 4) null else std.mem.readInt(i32, bytes[0..4], .little),
+        .INT64 => if (bytes.len < 8) null else std.mem.readInt(i64, bytes[0..8], .little),
+        .FIXED_LEN_BYTE_ARRAY => if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH or
+            bytes.len < kind.byte_width) null else flbaToI128(bytes[0..kind.byte_width]),
+        .BYTE_ARRAY => if (bytes.len == 0 or bytes.len > MAX_FLBA_BYTE_WIDTH) null else flbaToI128(bytes),
+        else => null,
+    };
+}
+
 /// A DECIMAL min/max statistic as f64, or null when the bytes cannot be one of `kind`'s values. Statistics hold a
 /// bare value in the physical representation: INT32/INT64 little-endian, FLBA and BYTE_ARRAY big-endian two's
 /// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
@@ -258,6 +270,86 @@ pub fn decodeColumnAsF64WithOptions(
         ),
         else => return error.UnsupportedDecimalPhysicalType,
     };
+}
+
+/// A DECIMAL column as `decodeColumnAsF64WithOptions` decodes it, plus its exact unscaled integers in `unscaled`
+/// (see `filter_eval.ColumnT.unscaled`). The f64 view converts those same integers the same way, so it is bit for bit
+/// what the f64 decode gives and filters see no change. A nested column gets no exact view: nothing exact reads one.
+pub fn decodeColumnExact(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.ColumnT(f64) {
+    if (levels.max_rep > 0) {
+        return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, decode_options, scratch);
+    }
+    switch (kind.physical) {
+        inline .INT32, .INT64 => |phys| {
+            const T = if (phys == .INT32) i32 else i64;
+            const Reader = column_mod.ColumnChunkReader(T);
+            var reader = Reader.initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
+            const raw = try readAll(T, &reader, num_leaves);
+            const values = try arena.alloc(f64, num_leaves);
+            applyScaleSimd(T, raw.values, kind.scale, values);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = @intCast(levels.max_def),
+                .has_nulls = raw.has_nulls,
+                .unscaled = @unionInit(filter_eval.Exact, @typeName(T), raw.values),
+            };
+        },
+        .FIXED_LEN_BYTE_ARRAY => {
+            const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind);
+            const values = try arena.alloc(f64, raw.values.len);
+            for (raw.values, values) |v, *o| o.* = applyScaleI128(v, kind.scale);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = raw.max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = raw.values },
+            };
+        },
+        .BYTE_ARRAY => {
+            var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+                chunk,
+                codec,
+                levels,
+                arena,
+                decode_options,
+                scratch,
+            );
+            const raw = try readAll([]const u8, &reader, num_leaves);
+            const max_def: u32 = @intCast(levels.max_def);
+            const values = try arena.alloc(f64, num_leaves);
+            const unscaled = try arena.alloc(i128, num_leaves);
+            for (raw.values, values, unscaled, 0..) |b, *v, *u, i| {
+                const present = if (raw.def_levels) |dl| dl[i] >= max_def else true;
+                if (!present) {
+                    v.* = 0.0;
+                    u.* = 0;
+                    continue;
+                }
+                if (b.len > MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
+                u.* = flbaToI128(b);
+                v.* = applyScaleI128(u.*, kind.scale);
+            }
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = unscaled },
+            };
+        },
+        else => return error.UnsupportedDecimalPhysicalType,
+    }
 }
 
 /// `col`, a DECIMAL column's unscaled integers as `decodeColumnAsI128` decodes an INT32/INT64-backed chunk, as the

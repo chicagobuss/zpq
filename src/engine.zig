@@ -3008,6 +3008,13 @@ fn writeGroupedParquet(
             try outs.append(arena, try groupedColumn(f64, arena, sum_name, true, rows, ci, .DOUBLE, false));
             try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
         },
+        .dec => try outs.append(arena, try groupedDecColumn(arena, name, rows, ci, ty.dec.?)),
+        .avg_dec => {
+            const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
+            const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
+            try outs.append(arena, try groupedDecColumn(arena, sum_name, rows, ci, ty.dec.?.sum()));
+            try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
+        },
     };
 
     const fd = try createFile(out_path);
@@ -3097,6 +3104,8 @@ fn groupedColumn(
                 i64 => p.count,
                 else => return error.TypeMismatch,
             },
+            .avg_dec => |p| if (T == i64) p.count else return error.TypeMismatch,
+            .dec => return error.TypeMismatch,
         };
         v.* = cell orelse std.mem.zeroes(T);
         d.* = @intFromBool(cell != null);
@@ -3119,6 +3128,42 @@ fn groupedColumn(
         },
         .parquet_type = parquet_type,
         .nullable = nullable,
+    };
+}
+
+/// Column `ci` of every grouped row as an exact DECIMAL(`spec`) column: a `dec` value, or an avg's exact sum.
+fn groupedDecColumn(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    rows: []const []const scan.AggValue,
+    ci: usize,
+    spec: expr_ast.Dec,
+) !expr_agg.OutputCol {
+    const values = try arena.alloc(i128, rows.len);
+    const defs = try arena.alloc(u32, rows.len);
+    var has_nulls = false;
+    for (rows, values, defs) |row, *v, *d| {
+        const cell: ?i128 = switch (row[ci]) {
+            .null_val => null,
+            .dec => |x| x.v,
+            .avg_dec => |p| p.sum,
+            else => return error.TypeMismatch,
+        };
+        v.* = cell orelse 0;
+        d.* = @intFromBool(cell != null);
+        if (cell == null) has_nulls = true;
+    }
+    return .{
+        .name = name,
+        .col = .{ .i128 = .{
+            .values = values,
+            .def_levels = if (has_nulls) defs else null,
+            .max_def = 1,
+            .has_nulls = has_nulls,
+        } },
+        .parquet_type = spec.physical(),
+        .nullable = true,
+        .dec = spec,
     };
 }
 
@@ -3312,6 +3357,16 @@ pub fn writeAggValueJson(writer: anytype, v: scan.AggValue) !void {
             if (pair.sum) |sum| try writeJsonFloat(writer, sum) else try writer.writeAll("null");
             try writer.print(",\"count\":{d}}}", .{pair.count});
         },
+        // Exact text: a JSON number with every digit of the scale, so a reader parsing numbers as decimals gets the
+        // value bit for bit (one parsing them as doubles gets the nearest double, as with any JSON number).
+        .dec => |d| try writeDecimal(writer, d.v, d.spec.scale),
+        .avg_dec => |p| {
+            try writer.writeAll("{\"sum\":");
+            if (p.sum) |sum| try writeDecimal(writer, sum, p.spec.scale) else try writer.writeAll("null");
+            try writer.print(",\"count\":{d},\"avg\":", .{p.count});
+            if (p.mean) |m| try writeDecimal(writer, m, p.spec.scale) else try writer.writeAll("null");
+            try writer.writeByte('}');
+        },
         .null_val => try writer.writeAll("null"),
     }
 }
@@ -3428,7 +3483,7 @@ fn printCell(
                 try writer.writeAll(if (tb.values.items[row_idx]) "true" else "false");
             }
         },
-        .decimal => |tb| {
+        .i128 => |tb| {
             if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {

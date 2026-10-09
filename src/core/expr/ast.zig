@@ -43,6 +43,8 @@ pub const Type = enum {
     i64,
     f64,
     str,
+    /// Exact DECIMAL: unscaled i128 values; precision and scale ride on the node (`Expr.decSpec`).
+    dec,
 
     /// Result type of `lhs op rhs`. Strings can only combine with
     /// strings (concat); any cross-lane mix returns null and the
@@ -52,7 +54,9 @@ pub const Type = enum {
             if (a == .str and b == .str) return .str;
             return null;
         }
+        // As in SQL engines, a DOUBLE operand makes the result DOUBLE; otherwise an exact operand keeps it exact.
         if (a == .f64 or b == .f64) return .f64;
+        if (a == .dec or b == .dec) return .dec;
         return .i64;
     }
 
@@ -62,22 +66,113 @@ pub const Type = enum {
             .i64 => .INT64,
             .f64 => .DOUBLE,
             .str => .BYTE_ARRAY,
+            // The width follows the precision; `Dec.physical` picks it.
+            .dec => .FIXED_LEN_BYTE_ARRAY,
         };
     }
+};
+
+/// A DECIMAL(precision, scale) type. Result types follow the rules DuckDB and Trino (Athena) share, which also give
+/// Spark's scales: `+`/`-` take the larger scale and one more integer digit, `*` adds scales and precisions, both
+/// capped at 38 digits; `/` leaves exact arithmetic (DOUBLE, as DuckDB does). Values are checked against the result
+/// precision, so an overflow is an error, never a wrapped or rounded answer.
+pub const Dec = struct {
+    precision: u8,
+    scale: u8,
+
+    pub const max_precision: u8 = 38;
+
+    pub const Error = error{
+        /// A product's scale would pass 38 digits, which no DECIMAL can hold.
+        DecimalScaleTooLarge,
+    };
+
+    pub fn valid(precision: i64, scale: i64) bool {
+        return precision >= 1 and precision <= max_precision and scale >= 0 and scale <= precision;
+    }
+
+    /// An integer as the DECIMAL it widens to: INTEGER-sized values to DECIMAL(10,0), BIGINT to DECIMAL(19,0).
+    pub fn ofInt(digits: u8) Dec {
+        return .{ .precision = digits, .scale = 0 };
+    }
+
+    fn intDigits(self: Dec) u8 {
+        return self.precision - self.scale;
+    }
+
+    pub fn addSub(a: Dec, b: Dec) Dec {
+        const scale = @max(a.scale, b.scale);
+        const int_digits = @max(a.intDigits(), b.intDigits());
+        return .{ .precision = @min(max_precision, int_digits + scale + 1), .scale = scale };
+    }
+
+    pub fn mul(a: Dec, b: Dec) Error!Dec {
+        const scale = @as(u16, a.scale) + b.scale;
+        if (scale > max_precision) return error.DecimalScaleTooLarge;
+        const precision: u16 = @min(max_precision, @as(u16, a.precision) + b.precision);
+        return .{ .precision = @intCast(@max(precision, scale)), .scale = @intCast(scale) };
+    }
+
+    /// The type values of both fit, for coalesce: every integer digit either has, at the larger scale.
+    pub fn common(a: Dec, b: Dec) Dec {
+        const scale = @max(a.scale, b.scale);
+        return .{ .precision = @min(max_precision, @max(a.intDigits(), b.intDigits()) + scale), .scale = scale };
+    }
+
+    /// sum() of this type: DECIMAL(38, s), as DuckDB and Trino give it.
+    pub fn sum(self: Dec) Dec {
+        return .{ .precision = max_precision, .scale = self.scale };
+    }
+
+    /// 10^precision, the first magnitude a value of this type cannot hold.
+    pub fn bound(self: Dec) i128 {
+        return pow10(self.precision);
+    }
+
+    /// The narrowest physical type the parquet spec allows for this precision: INT32 to 9 digits, INT64 to 18, and
+    /// past that a 16-byte FIXED_LEN_BYTE_ARRAY (38 digits need 16 bytes).
+    pub fn physical(self: Dec) schema.Type {
+        if (self.precision <= 9) return .INT32;
+        if (self.precision <= 18) return .INT64;
+        return .FIXED_LEN_BYTE_ARRAY;
+    }
+};
+
+/// 10^n for n in 0..38, exactly.
+pub fn pow10(n: u8) i128 {
+    std.debug.assert(n <= Dec.max_precision);
+    return pow10_table[n];
+}
+
+const pow10_table: [Dec.max_precision + 1]i128 = blk: {
+    var t: [Dec.max_precision + 1]i128 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
 };
 
 pub const Literal = union(enum) {
     i64: i64,
     f64: f64,
     str: []const u8,
+    /// A numeric literal with a decimal point (`0.05`): exact, as SQL types it. `f` is its correctly rounded double,
+    /// for when it meets a DOUBLE operand.
+    dec: DecLit,
 
     pub fn typeOf(self: Literal) Type {
         return switch (self) {
             .i64 => .i64,
             .f64 => .f64,
             .str => .str,
+            .dec => .dec,
         };
     }
+};
+
+pub const DecLit = struct {
+    unscaled: i128,
+    spec: Dec,
+    f: f64,
 };
 
 /// Column reference — resolved at parse time. `col_idx` indexes into
@@ -98,6 +193,8 @@ pub const ColRef = struct {
     /// INT32-physical column annotated UNSIGNED at <=32 bits. Decoders that keep such a column in the i32 lane
     /// store its raw bits, so widening must zero-extend rather than sign-extend.
     unsigned_32: bool = false,
+    /// The column's DECIMAL type when `expr_type == .dec`.
+    dec: ?Dec = null,
 };
 
 pub const BinOp = struct {
@@ -109,6 +206,8 @@ pub const BinOp = struct {
     result_type: Type,
     /// Cached because the parser checks it on every node it builds; a recursive walk would be O(nodes) per check.
     depth: u32,
+    /// The result's DECIMAL type when `result_type == .dec`.
+    dec: ?Dec = null,
 };
 
 /// Built-in scalar functions. The first slice ships only `coalesce`
@@ -125,6 +224,8 @@ pub const Call = struct {
     /// Result type, resolved at parse time from the args' types.
     result_type: Type,
     depth: u32,
+    /// The result's DECIMAL type when `result_type == .dec`.
+    dec: ?Dec = null,
 };
 
 pub const Expr = union(enum) {
@@ -139,6 +240,30 @@ pub const Expr = union(enum) {
             .col_ref => |c| c.expr_type,
             .binop => |b| b.result_type,
             .call => |c| c.result_type,
+        };
+    }
+
+    /// The DECIMAL type this expression's values have in exact arithmetic: its own for a DECIMAL expression, the
+    /// integer widening for an integer one (INTEGER-sized columns and literals to 10 digits, BOOLEAN to 1, the rest to
+    /// BIGINT's 19); null for DOUBLE and strings, which never become exact.
+    pub fn decSpec(self: Expr) ?Dec {
+        return switch (self.typeOf()) {
+            .dec => switch (self) {
+                .literal => |l| l.dec.spec,
+                .col_ref => |c| c.dec.?,
+                .binop => |b| b.dec.?,
+                .call => |c| c.dec.?,
+            },
+            .i64 => switch (self) {
+                .literal => |l| Dec.ofInt(if (std.math.cast(i32, l.i64) != null) 10 else 19),
+                .col_ref => |c| switch (c.physical_type) {
+                    .INT32 => Dec.ofInt(10),
+                    .BOOLEAN => Dec.ofInt(1),
+                    else => Dec.ofInt(if (c.unsigned_64) 20 else 19),
+                },
+                else => Dec.ofInt(19),
+            },
+            .f64, .str => null,
         };
     }
 

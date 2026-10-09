@@ -11,14 +11,14 @@ rows ZPQ writes out against DuckDB's answer for the same query.
 For each (filter, projection): ZPQ writes filtered+projected parquet; we read it
 back and diff it, order-independent, against DuckDB. DuckDB is the oracle (same
 role Hardwood gives it). Values compare under tools/oracle_compare.py: exact for
-NULL, integers and DECIMAL, tolerant for floats and zpq's f64 lane.
+NULL, integers and DECIMAL (zpq's JSON digits read as Decimal), tolerant for floats.
 
 Usage: .venv/bin/python tools/differential.py
 """
 import duckdb, subprocess, os, sys, tempfile, json
 import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
-from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, canon, same, self_check
+from oracle_compare import DUCKDB_STATS_DIVERGENCES, canon, same, self_check
 
 ZPQ = "zig-out/bin/zpq"
 # Physical column order of the fixture (gen_fixture below). `--columns` projects
@@ -126,9 +126,24 @@ def rows_sorted(con, sql, lanes=None):
     return canon_rows(con.execute(sql).fetchall(), lanes)
 
 
+# A DECIMAL result column: zpq prints it exactly, so its JSON digits are read as Decimal and compared exactly.
+EXACT = "exact"
+
+
 def json_lanes(rel):
-    """Per result column of a DuckDB query: zpq's JSON answers a DECIMAL result from its f64 lane."""
-    return [F64 if str(d[1]).startswith("DECIMAL") else None for d in rel.description]
+    """Per result column of a DuckDB query: EXACT for DECIMAL, else None."""
+    return [EXACT if str(d[1]).startswith("DECIMAL") else None for d in rel.description]
+
+
+def zjson(text):
+    """zpq's JSON with every number's digits kept: a DECIMAL answer is exact text."""
+    return json.loads(text, parse_float=Decimal)
+
+
+def from_zpq(vals, lanes):
+    """zpq values for comparison: Decimal in an EXACT column, the double it prints anywhere else."""
+    return [float(v) if isinstance(v, Decimal) and (lanes is None or lanes[i] != EXACT) else v
+            for i, v in enumerate(vals)]
 
 
 # --- statistics order: columns whose stats order differs from the signed order of their bytes ---
@@ -230,7 +245,8 @@ def stats_order_checks(con, tmp):
         if r.returncode != 0:
             report(False, f"{label} × jsonl", f"ZPQ error: {r.stderr.strip()[:70]}")
         else:
-            got = canon_rows([[json.loads(l)[c] for c in cols] for l in r.stdout.splitlines() if l.strip()], row_lanes)
+            got = canon_rows([from_zpq([zjson(l)[c] for c in cols], row_lanes)
+                              for l in r.stdout.splitlines() if l.strip()], row_lanes)
             want_json = canon_rows(want_rows, row_lanes)
             report(got == want_json, f"{label} × jsonl", f"zpq={len(got)} {src}={len(want_json)} rows")
 
@@ -255,7 +271,7 @@ def stats_order_checks(con, tmp):
             if r.returncode != 0:
                 report(False, tag, f"ZPQ error: {r.stderr.strip()[:70]}")
                 continue
-            zvals = list(json.loads(r.stdout)["agg"].values())
+            zvals = from_zpq(list(zjson(r.stdout)["agg"].values()), agg_lanes)
             ok = len(zvals) == len(want_agg) and all(same(z, w, lane) for z, w, lane in zip(zvals, want_agg, agg_lanes))
             report(ok, tag, f"zpq={zvals} {src}={want_agg}")
 
@@ -457,7 +473,7 @@ def main():
                 continue
 
             try:
-                zout = json.loads(r.stdout)
+                zout = zjson(r.stdout)
                 zvals = [fold_avg(v) for v in zout["agg"].values()]
                 proven = zout.get("row_groups_full_match", 0)
             except Exception as e:
@@ -467,6 +483,7 @@ def main():
             where = f" WHERE {dw}" if dw is not None else ""
             duck = con.execute(f"SELECT {ds} FROM '{fixture}'{where}")
             lanes = json_lanes(duck)
+            zvals = from_zpq(zvals, lanes)
             dvals = list(duck.fetchone())
             ok = len(zvals) == len(dvals) and all(same(a, b, lane) for a, b, lane in zip(zvals, dvals, lanes))
             if ok:
@@ -519,7 +536,7 @@ def main():
                 continue
 
             try:
-                zrows_raw = json.loads(r.stdout)["agg"]
+                zrows_raw = zjson(r.stdout)["agg"]
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
                 fails += 1
@@ -536,7 +553,8 @@ def main():
                 col_names = [desc[0] for desc in duck_rel.description]
                 lanes = json_lanes(duck_rel)
                 drows = canon_rows(duck_rel.fetchall(), lanes)
-                zrows = canon_rows([[fold_avg(row_dict.get(c)) for c in col_names] for row_dict in zrows_raw], lanes)
+                zrows = canon_rows([from_zpq([fold_avg(row_dict.get(c)) for c in col_names], lanes)
+                                    for row_dict in zrows_raw], lanes)
             except Exception as e:
                 print(f"  FAIL  {label}  compare setup error: {e}")
                 fails += 1
@@ -561,15 +579,20 @@ def main():
             want_cols, want_rows = [], []
             for c, v in (zrows_raw[0].items() if zrows_raw else []):
                 want_cols += [f"{c}__sum", f"{c}__count"] if isinstance(v, dict) else [c]
+            json_rows = []
             for row_dict in zrows_raw:
                 vals = []
                 for v in row_dict.values():
                     vals += [v["sum"], v["count"]] if isinstance(v, dict) else [v]
-                want_rows.append(tuple(canon(v) for v in vals))
+                json_rows.append(vals)
             try:
                 if r.returncode != 0:
                     raise RuntimeError((r.stderr or r.stdout).strip()[:70])
                 tbl = pq.read_table(out)
+                # A DECIMAL column's JSON digits are its exact value; any other number is the double it prints.
+                exact = [str(f.type).startswith("decimal") for f in tbl.schema]
+                want_rows = [tuple(canon(float(v) if isinstance(v, Decimal) and not (i < len(exact) and exact[i])
+                                         else v) for i, v in enumerate(vals)) for vals in json_rows]
                 got_rows = [tuple(canon(v.decode() if isinstance(v, bytes) else v) for v in row.values())
                             for row in tbl.to_pylist()]
                 problem = None
@@ -617,7 +640,7 @@ def main():
                             f"min({col}) AS lo, max({col}) AS hi, count(*) AS n, sum(i8) AS si"],
                            capture_output=True, text=True)
         label = f"typed-o:{col}"
-        want = pa.float64() if col == "dec" else src_types.field(col).type
+        want = src_types.field(col).type
         try:
             if r.returncode != 0:
                 raise RuntimeError((r.stderr or r.stdout).strip()[:70])
@@ -627,7 +650,7 @@ def main():
                 raise RuntimeError(f"types {[str(t) for t in types]} want {want} x3, int64 x2")
             # DuckDB hands back tz-aware timestamps only through pytz; it reads them as naive UTC instead, which is
             # what canon() turns zpq's tz-aware values into.
-            lanes = [F64] * 3 + [None] * 2 if col == "dec" else None  # zpq writes DECIMAL extremes as DOUBLE
+            lanes = None
             zrows = canon_rows([list(row.values()) for row in got.to_pylist()], lanes)
             c = f"timezone('UTC', {col})" if getattr(want, "tz", None) else col
             drows = rows_sorted(con, f"SELECT {c}, min({c}), max({c}), count(*), sum(i8) FROM '{typed}' GROUP BY 1",
@@ -635,6 +658,41 @@ def main():
             if zrows != drows:
                 raise RuntimeError(f"rows zpq={zrows[:2]} duck={drows[:2]}")
             print(f"  OK    {label}  ({want})")
+        except Exception as e:
+            fails += 1
+            print(f"  FAIL  {label}  {e}")
+
+    # Exact DECIMAL aggregates written with -o: DECIMAL columns of the type SQL gives the result (sum DECIMAL(38, s),
+    # min/max the argument's, avg's exact sum beside its count), read back by pyarrow and DuckDB value for value.
+    dfix = "ci/fixtures/parquet/decimal_exact.parquet"
+    DEC_O = [
+        ("scalar", [], "sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, avg(dn) AS a",
+         "SELECT sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, sum(dn) AS a__sum, count(dn) AS a__count FROM '{f}'",
+         ["decimal128(38, 2)", "decimal128(38, 10)", "decimal128(38, 6)", "decimal128(38, 2)", "int64"]),
+        ("grouped", ["--group-by", "k"], "sum(d18 * q) AS p, max(dn) AS mx",
+         "SELECT k, sum(d18 * q) AS p, max(dn) AS mx FROM '{f}' GROUP BY k",
+         ["string", "decimal128(38, 6)", "decimal128(15, 2)"]),
+    ]
+    for dlabel, extra, za, dsql, want_types in DEC_O:
+        total += 1
+        out = os.path.join(tmp, "zdec.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", dfix, "-o", out, "--aggregate", za] + extra, capture_output=True, text=True)
+        label = f"decimal-o:{dlabel}"
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+            got = pq.read_table(out)
+            types = [str(f.type) for f in got.schema]
+            if types != want_types:
+                raise RuntimeError(f"types {types} want {want_types}")
+            want = rows_sorted(con, dsql.format(f=dfix))
+            if canon_rows([list(row.values()) for row in got.to_pylist()]) != want:
+                raise RuntimeError(f"pyarrow rows {got.to_pylist()[:2]} want {want[:2]}")
+            if rows_sorted(con, f"SELECT * FROM '{out}'") != want:
+                raise RuntimeError("DuckDB reads other values back")
+            print(f"  OK    {label}  {types}")
         except Exception as e:
             fails += 1
             print(f"  FAIL  {label}  {e}")

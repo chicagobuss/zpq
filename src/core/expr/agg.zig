@@ -73,13 +73,67 @@ pub const AggCall = struct {
 ///   - single i64: count, sum/min/max of integer columns
 ///   - single f64: sum/min/max of float columns
 ///   - two-column avg: `<alias>__sum: f64` + `<alias>__count: i64`
+///   - exact DECIMAL sum/min/max, and avg's DECIMAL sum beside its count
 pub const ResultShape = enum {
     i64,
     f64,
     avg_f64,
     /// String (BYTE_ARRAY/UTF8) min/max — bytewise/unsigned order.
     bytes,
+    /// DECIMAL sum (DECIMAL(38, s)), min or max (the argument's type): exact. See `resultDec`.
+    dec,
+    /// avg over a DECIMAL: the exact sum and count, and the mean rounded to the argument's type.
+    avg_dec,
 };
+
+/// The DECIMAL type a `.dec`/`.avg_dec` call's result has: sum widens to 38 digits at the argument's scale, as
+/// DuckDB and Trino type it; min, max and avg keep the argument's type (avg rounds to it, as Trino does).
+pub fn resultDec(call: AggCall) expr_ast.Dec {
+    const arg = call.arg.?.decSpec().?;
+    return if (call.func == .sum) arg.sum() else arg;
+}
+
+/// An exact DECIMAL sum. Wide enough that no run of i128 values can overflow it before 2^64 of them, so only the
+/// final sum has to fit 38 digits — as in Trino, a sum may pass through larger values and come back.
+pub const DecSum = struct {
+    /// A 192-bit two's-complement sum split in two, so the state is 32 bytes like the other accumulators': no run of
+    /// fewer than 2^64 values under 2^127 reaches 2^191.
+    lo: u128 = 0,
+    hi: i64 = 0,
+    n: u64 = 0,
+
+    pub fn get(self: DecSum) i192 {
+        return (@as(i192, self.hi) << 128) | self.lo;
+    }
+
+    pub fn add(self: *DecSum, v: i192, n: u64) void {
+        const sum = self.get() + v;
+        self.lo = @truncate(@as(u192, @bitCast(sum)));
+        self.hi = @intCast(sum >> 128);
+        self.n += n;
+    }
+
+    /// The sum as a 38-digit DECIMAL: null over no values, an error past 38 digits rather than a wrapped value.
+    pub fn result(self: DecSum) expr_eval.Error!?i128 {
+        if (self.n == 0) return null;
+        return try fit38(self.get());
+    }
+
+    /// The mean rounded half away from zero to the argument's scale (Trino's rule for avg over a DECIMAL).
+    pub fn mean(self: DecSum) expr_eval.Error!?i128 {
+        if (self.n == 0) return null;
+        const v = self.get();
+        const n: u192 = self.n;
+        const q: i192 = @intCast((2 * @abs(v) + n) / (2 * n));
+        return try fit38(if (v < 0) -q else q);
+    }
+};
+
+fn fit38(v: i192) expr_eval.Error!i128 {
+    const bound: i192 = expr_ast.pow10(expr_ast.Dec.max_precision);
+    if (v >= bound or v <= -bound) return error.DecimalOverflow;
+    return @intCast(v);
+}
 
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
@@ -111,8 +165,14 @@ pub const Accumulator = union(enum) {
     max_bytes: ?[]const u8,
     /// Avg always lands as f64. Internal sum is f64 even for int
     /// input — for huge int sums this loses precision past 2^53;
-    /// document the caveat. Decimal-precision avg is a future slice.
+    /// document the caveat. DECIMAL avg is exact: `avg_d`.
     avg: AvgState,
+    /// Exact DECIMAL folds over unscaled values (the scale is the call's): sum and avg keep a wide sum and a count,
+    /// min/max the extreme seen, null until one is.
+    sum_d: DecSum,
+    avg_d: DecSum,
+    min_d: ?i128,
+    max_d: ?i128,
 
     pub fn init(call: AggCall) Accumulator {
         return switch (call.func) {
@@ -120,21 +180,24 @@ pub const Accumulator = union(enum) {
             .sum => switch (call.result) {
                 .i64 => .{ .sum_i = null },
                 .f64 => .{ .sum_f = null },
-                .bytes, .avg_f64 => unreachable,
+                .dec => .{ .sum_d = .{} },
+                .bytes, .avg_f64, .avg_dec => unreachable,
             },
             .min => switch (call.result) {
                 .i64 => .{ .min_i = null },
                 .f64 => .{ .min_f = null },
                 .bytes => .{ .min_bytes = null },
-                .avg_f64 => unreachable,
+                .dec => .{ .min_d = null },
+                .avg_f64, .avg_dec => unreachable,
             },
             .max => switch (call.result) {
                 .i64 => .{ .max_i = null },
                 .f64 => .{ .max_f = null },
                 .bytes => .{ .max_bytes = null },
-                .avg_f64 => unreachable,
+                .dec => .{ .max_d = null },
+                .avg_f64, .avg_dec => unreachable,
             },
-            .avg => .{ .avg = .{ .sum = 0, .count = 0 } },
+            .avg => if (call.result == .avg_dec) .{ .avg_d = .{} } else .{ .avg = .{ .sum = 0, .count = 0 } },
         };
     }
 
@@ -191,6 +254,14 @@ pub const Accumulator = union(enum) {
                 a.sum += src.avg.sum;
                 a.count += src.avg.count;
             },
+            .sum_d => |*d| d.add(src.sum_d.get(), src.sum_d.n),
+            .avg_d => |*d| d.add(src.avg_d.get(), src.avg_d.n),
+            .min_d => |*m| if (src.min_d) |sv| {
+                if (m.* == null or sv < m.*.?) m.* = sv;
+            },
+            .max_d => |*m| if (src.max_d) |sv| {
+                if (m.* == null or sv > m.*.?) m.* = sv;
+            },
         }
     }
 };
@@ -208,12 +279,13 @@ pub const ResolveError = error{ BadAggArg, UnsupportedAggType };
 pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShape {
     return switch (func) {
         .count => .i64,
-        .avg => .avg_f64,
+        .avg => if (arg != null and arg.?.typeOf() == .dec) .avg_dec else .avg_f64,
         .sum => blk: {
             const e = arg orelse return error.BadAggArg;
             break :blk switch (e.typeOf()) {
                 .i64 => .i64,
                 .f64 => .f64,
+                .dec => .dec,
                 .str => error.UnsupportedAggType, // sum of strings is meaningless
             };
         },
@@ -222,6 +294,7 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             break :blk switch (e.typeOf()) {
                 .i64 => .i64,
                 .f64 => .f64,
+                .dec => .dec,
                 .str => .bytes, // bytewise/unsigned min/max over BYTE_ARRAY
             };
         },
@@ -377,8 +450,10 @@ pub fn updateOneFromStats(
             const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
             if (plan.present == 0) return true; // nothing to add; an all-null sum stays NULL
             switch (plan.lane) {
-                .decimal => |k| state.sum_f = (state.sum_f orelse 0) + decimal_mod.statToF64(plan.bounds.min, k).? *
-                    @as(f64, @floatFromInt(plan.present)),
+                .decimal => |k| state.sum_d.add(
+                    @as(i192, decimal_mod.statToI128(plan.bounds.min, k).?) * plan.present,
+                    @intCast(plan.present),
+                ),
                 .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
             }
             return true;
@@ -437,7 +512,7 @@ fn planStatFold(
         // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
         // constant.
         plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
-        if (lane == .decimal and decimal_mod.statToF64(bounds.min, lane.decimal) == null) return null;
+        if (lane == .decimal and decimal_mod.statToI128(bounds.min, lane.decimal) == null) return null;
     }
     return plan;
 }
@@ -449,7 +524,7 @@ fn statFoldLane(call: AggCall, physical: schema.Type, elem_opt: ?schema.SchemaEl
         // Unsigned bounds are unsigned-ordered; the int fold would read 0xFF..FF as -1. Decode instead, which
         // zero-extends (<=32) or folds as u64.
         if (schema.isUnsignedInt(se)) return null;
-        if (decimal_mod.kindFromSchema(&se)) |k| return if (accum_is_float) .{ .decimal = k } else null;
+        if (decimal_mod.kindFromSchema(&se)) |k| return if (call.result == .dec) .{ .decimal = k } else null;
         // FLOAT16 decodes to the f64 lane, but its bounds are 2-byte halves no fold here reads.
         if (schema.isFloat16(se)) return null;
     }
@@ -533,21 +608,20 @@ fn foldConstantSumStatBytes(
     }
 }
 
-/// Fold a DECIMAL column's stat min/max bytes into an .min_f / .max_f accumulator, decoded the way the value path
-/// decodes them so the answer is the same without a per-RG decode.
+/// Fold a DECIMAL column's stat min/max bytes, exactly, into a .min_d / .max_d accumulator.
 fn foldDecimalStatBytes(
     state: *Accumulator,
     call: AggCall,
     kind: decimal_mod.Kind,
     bytes: []const u8,
 ) !void {
-    const v = decimal_mod.statToF64(bytes, kind) orelse return switch (kind.physical) {
+    const v = decimal_mod.statToI128(bytes, kind) orelse return switch (kind.physical) {
         .INT32, .INT64, .FIXED_LEN_BYTE_ARRAY, .BYTE_ARRAY => error.BadAggArg,
         else => error.UnsupportedAggType,
     };
     switch (state.*) {
-        .min_f => |*slot| foldExtremeF(true, slot, v),
-        .max_f => |*slot| foldExtremeF(false, slot, v),
+        .min_d => |*m| m.* = if (m.*) |cur| @min(cur, v) else v,
+        .max_d => |*m| m.* = if (m.*) |cur| @max(cur, v) else v,
         else => return error.UnsupportedAggType,
     }
     _ = call;
@@ -876,6 +950,7 @@ const PreparedAggInput = struct {
             // String columns pass through unwidened; foldMinMaxBytes compares the
             // borrowed slices and dups the winner into `persist`.
             .str => self.values = raw,
+            .dec => self.values = try expr_eval.exactColumn(raw),
         }
     }
 };
@@ -1188,8 +1263,100 @@ fn foldSum(
         .sum_f => |*s| {
             s.* = (s.* orelse 0) + simdSumF64(col.f64.values, sel);
         },
+        .sum_d => |*d| d.add(sumExact(col, sel), sel.count()),
         else => return error.UnsupportedAggType,
     }
+}
+
+/// Exact sum of the selected values of an exact column (`.i32`, `.i64` or `.i128` lane, unscaled).
+fn sumExact(col: filter_eval.Batch.Column, sel: *const filter_selection.SelectionVector) i192 {
+    return switch (col) {
+        .i64 => |c| simdSumI64(c.values, sel),
+        .i32 => |c| blk: {
+            var acc: i64 = 0; // 2^31 per row: no i64 overflow before 2^32 rows, and a row group has fewer
+            const Ctx = struct {
+                vals: []const i32,
+                acc: *i64,
+                fn f(ctx: @This(), r: usize) void {
+                    ctx.acc.* += ctx.vals[r];
+                }
+            };
+            agg_coded.forEachActive(sel, c.values.len, Ctx.f, Ctx{ .vals = c.values, .acc = &acc });
+            break :blk acc;
+        },
+        .i128 => |c| sumI128(c.values, sel),
+        else => unreachable,
+    };
+}
+
+fn extremeExact(
+    comptime is_min: bool,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+) ?i128 {
+    return switch (col) {
+        .i64 => |c| if (simdMinMaxI64(is_min, c.values, sel)) |v| v else null,
+        .i32 => |c| blk: {
+            const Ctx = struct {
+                vals: []const i32,
+                best: ?i32 = null,
+                fn f(ctx: *@This(), r: usize) void {
+                    const v = ctx.vals[r];
+                    ctx.best = if (ctx.best) |b| (if (is_min) @min(b, v) else @max(b, v)) else v;
+                }
+            };
+            var ctx: Ctx = .{ .vals = c.values };
+            agg_coded.forEachActive(sel, c.values.len, Ctx.f, &ctx);
+            break :blk if (ctx.best) |v| v else null;
+        },
+        .i128 => |c| extremeI128(is_min, c.values, sel),
+        else => unreachable,
+    };
+}
+
+/// Row `r` of an exact column (any of its lanes) as an unscaled i128.
+inline fn exactAt(col: filter_eval.Batch.Column, r: usize) i128 {
+    return switch (col) {
+        .i32 => |c| c.values[r],
+        .i64 => |c| c.values[r],
+        .i128 => |c| c.values[r],
+        else => unreachable,
+    };
+}
+
+/// Exact sum of the selected unscaled values. Adds in i128 and carries into the wide sum only when an add would
+/// overflow, so the common case is one 128-bit add per row.
+fn sumI128(vals: []const i128, sel: *const filter_selection.SelectionVector) i192 {
+    const Ctx = struct {
+        vals: []const i128,
+        wide: i192 = 0,
+        part: i128 = 0,
+        fn f(ctx: *@This(), r: usize) void {
+            const v = ctx.vals[r];
+            const sum, const over = @addWithOverflow(ctx.part, v);
+            if (over != 0) {
+                ctx.wide += ctx.part;
+                ctx.part = v;
+            } else ctx.part = sum;
+        }
+    };
+    var ctx: Ctx = .{ .vals = vals };
+    agg_coded.forEachActive(sel, vals.len, Ctx.f, &ctx);
+    return ctx.wide + ctx.part;
+}
+
+fn extremeI128(comptime is_min: bool, vals: []const i128, sel: *const filter_selection.SelectionVector) ?i128 {
+    const Ctx = struct {
+        vals: []const i128,
+        best: ?i128 = null,
+        fn f(ctx: *@This(), r: usize) void {
+            const v = ctx.vals[r];
+            ctx.best = if (ctx.best) |b| (if (is_min) @min(b, v) else @max(b, v)) else v;
+        }
+    };
+    var ctx: Ctx = .{ .vals = vals };
+    agg_coded.forEachActive(sel, vals.len, Ctx.f, &ctx);
+    return ctx.best;
 }
 
 fn foldMin(
@@ -1206,6 +1373,9 @@ fn foldMin(
             if (v_opt) |v| s.* = if (s.*) |current| @min(current, v) else v;
         },
         .min_f => |*s| if (simdMinMaxF64(true, col.f64.values, sel)) |v| foldExtremeF(true, s, v),
+        .min_d => |*s| if (extremeExact(true, col, sel)) |v| {
+            s.* = if (s.*) |cur| @min(cur, v) else v;
+        },
         else => unreachable,
     }
 }
@@ -1224,6 +1394,9 @@ fn foldMax(
             if (v_opt) |v| s.* = if (s.*) |current| @max(current, v) else v;
         },
         .max_f => |*s| if (simdMinMaxF64(false, col.f64.values, sel)) |v| foldExtremeF(false, s, v),
+        .max_d => |*s| if (extremeExact(false, col, sel)) |v| {
+            s.* = if (s.*) |cur| @max(cur, v) else v;
+        },
         else => unreachable,
     }
 }
@@ -1233,6 +1406,7 @@ fn foldAvg(
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
 ) Error!void {
+    if (state.* == .avg_d) return state.avg_d.add(sumExact(col, sel), sel.count());
     const a = &state.avg;
     switch (col) {
         .i64 => |c| {
@@ -1270,6 +1444,8 @@ pub const OutputCol = struct {
     /// Annotations carried from a source column whose values pass through unchanged (see `engine.retypeOutputCol`).
     logical_type: ?schema.LogicalType = null,
     converted_type: ?schema.ConvertedType = null,
+    /// An exact DECIMAL output: `col` is `.i128` (unscaled) and the leaf is DECIMAL(precision, scale).
+    dec: ?expr_ast.Dec = null,
 };
 
 pub fn finalize(
@@ -1282,22 +1458,53 @@ pub fn finalize(
         .sum => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, state.sum_i, true),
             .f64 => try emitOneF64(arena, call.alias, state.sum_f),
-            .bytes, .avg_f64 => unreachable,
+            .dec => try emitOneDec(arena, call.alias, try state.sum_d.result(), resultDec(call)),
+            .bytes, .avg_f64, .avg_dec => unreachable,
         },
         .min => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.min_i), true),
             .f64 => try emitOneF64(arena, call.alias, state.min_f),
             .bytes => try emitOneString(arena, call.alias, state.min_bytes),
-            .avg_f64 => unreachable,
+            .dec => try emitOneDec(arena, call.alias, state.min_d, resultDec(call)),
+            .avg_f64, .avg_dec => unreachable,
         },
         .max => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.max_i), true),
             .f64 => try emitOneF64(arena, call.alias, state.max_f),
             .bytes => try emitOneString(arena, call.alias, state.max_bytes),
-            .avg_f64 => unreachable,
+            .dec => try emitOneDec(arena, call.alias, state.max_d, resultDec(call)),
+            .avg_f64, .avg_dec => unreachable,
         },
-        .avg => try emitAvgPair(arena, call.alias, state.avg),
+        .avg => if (call.result == .avg_dec)
+            try emitAvgDecPair(arena, call.alias, state.avg_d, resultDec(call))
+        else
+            try emitAvgPair(arena, call.alias, state.avg),
     };
+}
+
+/// A one-row exact DECIMAL column, typed DECIMAL(`spec`) at the physical width its precision takes.
+fn emitOneDec(arena: std.mem.Allocator, name: []const u8, v: ?i128, spec: expr_ast.Dec) Error![]OutputCol {
+    const out = try arena.alloc(OutputCol, 1);
+    out[0] = .{
+        .name = name,
+        .col = .{ .i128 = try oneRow(i128, arena, v, 0, true) },
+        .parquet_type = spec.physical(),
+        .nullable = true,
+        .dec = spec,
+    };
+    return out;
+}
+
+/// avg over a DECIMAL as `<alias>__sum` (DECIMAL(38, s), exact) and `<alias>__count`, which re-aggregate exactly.
+fn emitAvgDecPair(arena: std.mem.Allocator, name: []const u8, st: DecSum, spec: expr_ast.Dec) Error![]OutputCol {
+    const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
+    const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
+    const sum = try emitOneDec(arena, sum_name, try st.result(), spec.sum());
+    const count = try emitOneI64(arena, count_name, st.n, false);
+    const out = try arena.alloc(OutputCol, 2);
+    out[0] = sum[0];
+    out[1] = count[0];
+    return out;
 }
 
 /// min/max of an unsigned 64-bit column as the raw bits it is stored as, so an extremum of 2^63 or more still fits the
@@ -2568,6 +2775,12 @@ pub fn serializeRowKey(
                     std.mem.writeInt(i64, &buf, if (c.values[row]) 1 else 0, .little);
                     try list.appendSlice(allocator, &buf);
                 },
+                // An exact DECIMAL key: its unscaled value. A key column has one scale, so equal values frame equally.
+                .i128 => |c| {
+                    var buf: [16]u8 = undefined;
+                    std.mem.writeInt(i128, &buf, c.values[row], .little);
+                    try list.appendSlice(allocator, &buf);
+                },
             }
         }
     }
@@ -2816,6 +3029,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
             };
             s.* = (s.* orelse 0) + v;
         },
+        .sum_d => |*d| d.add(exactAt(col, r), 1),
         else => return error.UnsupportedAggType,
     }
 }
@@ -2838,6 +3052,10 @@ fn foldMinGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
             };
             foldExtremeF(true, m, v);
         },
+        .min_d => |*m| {
+            const v = exactAt(col, r);
+            if (m.* == null or v < m.*.?) m.* = v;
+        },
         else => unreachable,
     }
 }
@@ -2859,6 +3077,10 @@ fn foldMaxGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 else => unreachable,
             };
             foldExtremeF(false, m, v);
+        },
+        .max_d => |*m| {
+            const v = exactAt(col, r);
+            if (m.* == null or v > m.*.?) m.* = v;
         },
         else => unreachable,
     }
@@ -2886,6 +3108,7 @@ fn foldMinMaxBytesGroupedOne(
 }
 
 fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize) !void {
+    if (state.* == .avg_d) return state.avg_d.add(exactAt(col, r), 1);
     const v = switch (col) {
         .i32 => |c| @as(f64, @floatFromInt(c.values[r])),
         .i64 => |c| @as(f64, @floatFromInt(c.values[r])),

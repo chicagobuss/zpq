@@ -78,6 +78,12 @@ fn widenDict(arena: std.mem.Allocator, col: Column, c: expr_ast.ColRef) Error!Co
         .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, d, c) } },
         .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, d) } },
         .str => d,
+        .dec => switch (col) {
+            .f64 => |f| switch (f.dict_unscaled orelse return error.DecimalUnavailable) {
+                inline else => |vals, tag| @unionInit(Column, @tagName(tag), .{ .values = vals }),
+            },
+            else => error.TypeMismatch,
+        },
     };
 }
 
@@ -245,6 +251,28 @@ fn foldHist(
                 }
                 a.sum += sum;
                 a.count += total;
+            }
+        },
+        // Exact DECIMAL over a dictionary (`widenDict` gives its unscaled entries): count × entry, summed wide.
+        .sum_d, .avg_d => |*d| {
+            var acc: i192 = 0;
+            switch (dict) {
+                inline .i32, .i64, .i128 => |dc| for (hist, dc.values) |h, v| {
+                    if (h == 0) continue;
+                    acc += @as(i192, v) * h;
+                },
+                else => return error.UnsupportedAggType,
+            }
+            d.add(acc, total);
+        },
+        .min_d, .max_d => |*m| {
+            const is_min = state.* == .min_d;
+            switch (dict) {
+                inline .i32, .i64, .i128 => |dc| for (hist, dc.values) |h, v| {
+                    if (h == 0) continue;
+                    m.* = if (m.*) |cur| (if (is_min) @min(cur, v) else @max(cur, v)) else v;
+                },
+                else => return error.UnsupportedAggType,
             }
         },
         .count => unreachable,
@@ -471,12 +499,17 @@ fn foldGroupedCall(
                 .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(ra, raw, c) } },
                 .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(ra, raw) } },
                 .str => raw,
+                // Exact, at the decoder's width; INT32-backed widens to the i64 fold below.
+                .dec => switch (try expr_eval.exactColumn(raw)) {
+                    .i32 => |x| .{ .i64 = .{ .values = try expr_eval.widenToI64(ra, .{ .i32 = x }) } },
+                    else => |x| x,
+                },
             };
         },
         else => |e| vals_col = try expr_eval.evalExpr(ra, batch, lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
-    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64) and call.result != .bytes;
+    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes;
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -550,7 +583,11 @@ fn foldGroupedCall(
                 const x: i128 = if (unsigned_64) @as(u64, @bitCast(v[r])) else v[r];
                 switch (call.func) {
                     .sum => part[cp] += x,
-                    .avg => fpart[cp] += @floatFromInt(v[r]),
+                    // The exact sum serves a DECIMAL avg, the double sum any other.
+                    .avg => {
+                        part[cp] += x;
+                        fpart[cp] += @floatFromInt(v[r]);
+                    },
                     .min => part[cp] = @min(part[cp], x),
                     .max => part[cp] = @max(part[cp], x),
                     .count => unreachable,
@@ -567,6 +604,46 @@ fn foldGroupedCall(
                     },
                     .min_i => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
                     .max_i => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    // An INT32/INT64-backed DECIMAL, folded as the integers it is stored as.
+                    .sum_d, .avg_d => |*d| d.add(part[cp], seen[cp]),
+                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
+                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    else => return error.UnsupportedAggType,
+                }
+            }
+        },
+        // Exact DECIMAL: per-composite wide sums (as `agg.DecSum`), or extremes.
+        .i128 => |vc| {
+            const v = vc.values;
+            const sums = try ra.alloc(i192, space);
+            @memset(sums, 0);
+            const ext = try ra.alloc(i128, space);
+            switch (call.func) {
+                .sum, .avg => {},
+                .min => @memset(ext, std.math.maxInt(i128)),
+                .max => @memset(ext, std.math.minInt(i128)),
+                .count => unreachable,
+            }
+            var r: usize = 0;
+            while (r < comp.len) : (r += 1) {
+                if (!sel.isActive(r)) continue;
+                const cp = comp[r];
+                seen[cp] += 1;
+                switch (call.func) {
+                    .sum, .avg => sums[cp] += v[r],
+                    .min => ext[cp] = @min(ext[cp], v[r]),
+                    .max => ext[cp] = @max(ext[cp], v[r]),
+                    .count => unreachable,
+                }
+            }
+            for (0..space) |cp| {
+                if (seen[cp] == 0) continue;
+                const st = &accs[gid_of[cp] * agg_len + ai];
+                switch (st.*) {
+                    .sum_d => |*d| d.add(sums[cp], seen[cp]),
+                    .avg_d => |*d| d.add(sums[cp], seen[cp]),
+                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, ext[cp]) else ext[cp],
+                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, ext[cp]) else ext[cp],
                     else => return error.UnsupportedAggType,
                 }
             }
@@ -601,7 +678,7 @@ fn compositeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: 
     return cnt;
 }
 
-inline fn forEachActive(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
+pub inline fn forEachActive(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
     var w: usize = 0;
     while (w * 64 < n) : (w += 1) {
         const word = sel.mask[w];
@@ -643,11 +720,30 @@ pub fn gatherSelected(ra: std.mem.Allocator, col: Column, sel: *const Sel, activ
                 }
             }.f, &ctx);
             std.debug.assert(ctx.j == active);
+            // A decimal's exact values move with its rows (see `ColumnT.unscaled`), looked up like `values` when coded.
+            const exact = if (c.codes != null) c.dict_unscaled else c.unscaled;
+            const unscaled: ?filter_eval.Exact = if (exact) |u| switch (u) {
+                // At the lane's own width, like `values` above.
+                inline else => |uv, utag| blk2: {
+                    const U = @TypeOf(uv[0]);
+                    const out = try ra.alloc(U, active);
+                    var j: usize = 0;
+                    forEachActive(sel, sel.len, struct {
+                        fn f(x: anytype, r: usize) void {
+                            const present = if (x.c.def_levels) |d| d[r] == x.c.max_def else true;
+                            x.out[x.j.*] = if (x.c.codes) |k| (if (present) x.u[k[r]] else 0) else x.u[r];
+                            x.j.* += 1;
+                        }
+                    }.f, .{ .out = out, .u = uv, .j = &j, .c = c });
+                    break :blk2 @unionInit(filter_eval.Exact, @tagName(utag), out);
+                },
+            } else null;
             break :blk @unionInit(Column, @tagName(tag), .{
                 .values = vals,
                 .def_levels = dl,
                 .max_def = c.max_def,
                 .has_nulls = c.has_nulls,
+                .unscaled = unscaled,
             });
         },
     };
@@ -672,6 +768,18 @@ pub fn materialize(ra: std.mem.Allocator, col: Column) !Column {
             };
             var out = c;
             out.values = vals;
+            if (c.dict_unscaled) |du| {
+                const u = try ra.alloc(i128, codes.len);
+                if (d.len == 0) {
+                    @memset(u, 0);
+                } else for (u, codes) |*o, k| {
+                    o.* = du.at(k);
+                }
+                if (c.def_levels) |dl| for (u, dl) |*o, dv| {
+                    if (dv < c.max_def) o.* = 0;
+                };
+                out.unscaled = .{ .i128 = u };
+            }
             break :blk @unionInit(Column, @tagName(tag), out);
         },
     };

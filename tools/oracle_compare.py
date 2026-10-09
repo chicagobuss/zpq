@@ -6,9 +6,10 @@ One policy for tools/differential.py and tools/triangulate.py:
 - NULL equals only NULL. sum/min/max/avg over no values is NULL on every engine, zpq included; count is never NULL.
 - Integers compare exactly. That includes integral results an oracle widens to DECIMAL or HUGEINT (DuckDB's SUM of
   an integer column reaches Python as Decimal('6') through Arrow), so two large sums one apart never pass.
-- DECIMAL compares exactly against DECIMAL. zpq evaluates DECIMAL aggregates and expressions in f64, so a result from
-  that lane compares as a float: pass lane=F64 where the result type says so, since an integral f64 prints as an
-  integer in zpq's JSON and cannot be told apart by its value.
+- DECIMAL compares exactly against DECIMAL. zpq evaluates DECIMAL aggregates and expressions exactly and prints them
+  as exact text, so read its JSON with parse_float=Decimal for those columns. A result zpq does compute in f64 (a
+  DECIMAL divided, or mixed with a DOUBLE) compares as a float: pass lane=F64 there, since an integral f64 prints as
+  an integer in zpq's JSON and cannot be told apart by its value.
 - Floats compare with a relative tolerance (REL_TOL, absolute below 1.0): engines sum in different orders. NaN equals
   NaN and each infinity itself. Float min/max skip NaN in zpq, as in Arrow compute and Polars, while DuckDB orders NaN
   above every number, so DuckDB is asked for the NaN-free extreme (duckdb_agg).

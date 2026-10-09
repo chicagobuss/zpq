@@ -77,6 +77,7 @@ pub const ColumnInput = struct {
 ///    PLAIN bytes carry only the non-null values (parquet PLAIN
 ///    encoding for OPTIONAL columns excludes null slots).
 pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
+    if (in.values == .i128) return encodeDecimalColumn(arena, in);
     var enc = if (in.values.codes() != null) try encodeCodedColumn(arena, in) else try encodeValues(arena, in);
     if (in.bloom_fpp) |fpp| enc.bloom = try bloomFilter(arena, in.values, enc.meta.type, fpp) orelse &.{};
     return enc;
@@ -98,11 +99,11 @@ pub fn bloomFilter(
         .f32 => .FLOAT,
         .f64 => .DOUBLE,
         .string => if (physical == .FIXED_LEN_BYTE_ARRAY) .FIXED_LEN_BYTE_ARRAY else .BYTE_ARRAY,
-        .boolean => return null,
+        .boolean, .i128 => return null,
     };
     if (stored != physical) return null;
     return switch (col) {
-        .boolean => unreachable,
+        .boolean, .i128 => unreachable,
         // A coded column may hold no values: its dictionary's entries, a superset of those present, fill the filter.
         inline else => |c| if (c.codes != null)
             try bloomOf(@TypeOf(c.dict[0]), arena, c.dict, null, 0, fpp)
@@ -335,6 +336,32 @@ fn pageStats(
 /// complement bytes (parquet's decimal-FLBA wire format), matching what
 /// `decimal.decodeColumnAsI128` reads back. The DECIMAL annotation lives
 /// in the footer `schema_elem`, unchanged. Single data page, PLAIN.
+/// An exact DECIMAL column (unscaled i128) at the physical type its schema element declares: INT32/INT64 values are
+/// narrowed (an out-of-range value is an error, never a wrap) and take the integer encoders; FLBA writes big-endian.
+fn encodeDecimalColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
+    const c = in.values.i128;
+    switch (in.schema_elem.type orelse return error.UnsupportedType) {
+        .FIXED_LEN_BYTE_ARRAY => {
+            return encodeDecimalFlba(arena, c, in.schema_elem, in.path_in_schema, in.codec, in.zstd);
+        },
+        inline .INT32, .INT64 => |phys| {
+            const T = if (phys == .INT32) i32 else i64;
+            const vals = try arena.alloc(T, c.values.len);
+            for (c.values, vals) |v, *o| o.* = std.math.cast(T, v) orelse return error.UnsupportedType;
+            var narrowed = in;
+            const col: filter_eval.ColumnT(T) = .{
+                .values = vals,
+                .def_levels = c.def_levels,
+                .max_def = c.max_def,
+                .has_nulls = c.has_nulls,
+            };
+            narrowed.values = if (T == i32) .{ .i32 = col } else .{ .i64 = col };
+            return encodeColumn(arena, narrowed);
+        },
+        else => return error.UnsupportedType,
+    }
+}
+
 pub fn encodeDecimalFlba(
     arena: std.mem.Allocator,
     col: filter_eval.ColumnT(i128),
@@ -956,6 +983,7 @@ pub fn applySelection(
         .f64 => |col| .{ .f64 = try filterColumn(f64, arena, col, sel, surviving) },
         .string => |col| .{ .string = try filterColumn([]const u8, arena, col, sel, surviving) },
         .boolean => |col| .{ .boolean = try filterColumn(bool, arena, col, sel, surviving) },
+        .i128 => |col| .{ .i128 = try filterColumn(i128, arena, col, sel, surviving) },
     };
 }
 
@@ -1122,6 +1150,7 @@ fn sourceDefLevels(c: filter_eval.Batch.Column) ?[]const u32 {
         .f64 => |x| x.def_levels,
         .string => |x| x.def_levels,
         .boolean => |x| x.def_levels,
+        .i128 => |x| x.def_levels,
     };
 }
 
@@ -1133,6 +1162,7 @@ fn sourceMaxDef(c: filter_eval.Batch.Column) u32 {
         .f64 => |x| x.max_def,
         .string => |x| x.max_def,
         .boolean => |x| x.max_def,
+        .i128 => |x| x.max_def,
     };
 }
 
@@ -1144,6 +1174,7 @@ fn sourceRepLevels(c: filter_eval.Batch.Column) ?[]const u32 {
         .f64 => |x| x.rep_levels,
         .string => |x| x.rep_levels,
         .boolean => |x| x.rep_levels,
+        .i128 => |x| x.rep_levels,
     };
 }
 
@@ -1155,6 +1186,7 @@ fn sourceMaxRep(c: filter_eval.Batch.Column) u32 {
         .f64 => |x| x.max_rep,
         .string => |x| x.max_rep,
         .boolean => |x| x.max_rep,
+        .i128 => |x| x.max_rep,
     };
 }
 
@@ -1186,6 +1218,8 @@ fn encodeValuesPlain(
         .f64 => |c| try encodePlainTyped(f64, arena, c.values, def_levels, max_def),
         .string => |c| try encodePlainBytes(arena, c.values, def_levels, max_def),
         .boolean => |c| try encodePlainBool(arena, c.values, def_levels, max_def),
+        // encodeColumn sends DECIMAL to encodeDecimalColumn before any PLAIN encoding.
+        .i128 => unreachable,
     };
 }
 
@@ -1454,6 +1488,7 @@ fn valueCount(c: filter_eval.Batch.Column) usize {
         .f64 => |x| x.values.len,
         .string => |x| x.values.len,
         .boolean => |x| x.values.len,
+        .i128 => |x| x.values.len,
     };
 }
 
@@ -1493,6 +1528,7 @@ fn computeStats(
         .f64 => |x| statsTypedFloat(arena, f64, x.values, def_levels, max_def),
         .string => |x| statsBytes(arena, x.values, def_levels, max_def),
         .boolean => |x| statsBool(arena, x.values, def_levels, max_def),
+        .i128 => unreachable,
     };
 }
 

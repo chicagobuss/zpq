@@ -159,7 +159,7 @@ pub const OutputAggregator = struct {
         /// i128). Only INT32/INT64-backed decimals use it (D1); the buf
         /// is converted back to an i32/i64 column at encode time, with
         /// the source DECIMAL schema element preserved.
-        decimal: TypedBuf(i128),
+        i128: TypedBuf(i128),
     };
 
     pub fn TypedBuf(comptime T: type) type {
@@ -210,7 +210,7 @@ pub fn initOutputAggregator(
                         k.physical == .FIXED_LEN_BYTE_ARRAY)
                     {
                         schemas[i] = src_elem; // keep DECIMAL annotation
-                        cols[i] = .{ .decimal = .{} };
+                        cols[i] = .{ .i128 = .{} };
                         continue;
                     }
                     schemas[i] = .{
@@ -259,6 +259,11 @@ pub fn initOutputAggregator(
                 const path_buf = try arena.alloc([]const u8, 1);
                 path_buf[0] = c.alias;
                 paths[i] = path_buf;
+                // An exact DECIMAL result buffers its unscaled values, encoded at the width its schema leaf names.
+                if (expr_type == .dec) {
+                    cols[i] = .{ .i128 = .{} };
+                    continue;
+                }
                 break :blk expr_type.toParquet();
             },
         };
@@ -427,7 +432,7 @@ pub const ProjectedRG = struct {
         const lossless = try ra.alloc(bool, num_leaves);
         @memset(lossless, false);
         for (output_specs, agg.cols) |spec, cbuf| switch (spec) {
-            .passthrough => |ci| if (cbuf == .decimal and ci < num_leaves) {
+            .passthrough => |ci| if (cbuf == .i128 and ci < num_leaves) {
                 lossless[ci] = true;
             },
             .computed => {},
@@ -441,7 +446,9 @@ pub const ProjectedRG = struct {
             const decoded: filter_eval.Batch.Column = if (int_backed) blk: {
                 const dcol = try decodeDecimalI128(ra, rg, meta, src, ci, decode_options);
                 unscaled[ci] = dcol;
-                break :blk .{ .f64 = try decimal_mod.scaledF64FromI128(ra, dcol, kind.?.scale) };
+                var view = try decimal_mod.scaledF64FromI128(ra, dcol, kind.?.scale);
+                view.unscaled = .{ .i128 = dcol.values };
+                break :blk .{ .f64 = view };
             } else if (agg.keep_codes and !computed_refs[ci])
                 try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
             else
@@ -498,19 +505,17 @@ pub const ProjectedRG = struct {
         const src = self.src;
         const decode_options = self.decode_options;
         const spec = self.output_specs[i];
-        // Lossless DECIMAL lane: the buf is `.decimal` only for an INT32/INT64-backed passthrough decimal. Decode the
-        // source chunk to unscaled i128, apply the selection, and append the integers untouched.
-        if (agg.cols[i] == .decimal) {
-            const kept_ci = switch (spec) {
-                .passthrough => |ci| ci,
-                .computed => return error.MissingDecodedColumn,
-            };
+        // Lossless DECIMAL lane: a passthrough decimal's buf is `.i128`. Decode the source chunk to unscaled i128,
+        // apply the selection, and append the integers untouched. A computed DECIMAL evaluates to `.i128` below.
+        if (agg.cols[i] == .i128 and spec == .passthrough) {
+            const kept_ci = spec.passthrough;
             var late = std.heap.ArenaAllocator.init(gpa);
             defer late.deinit();
             const dcol = self.unscaled[kept_ci] orelse
                 try decodeDecimalI128(late.allocator(), rg, meta, src, kept_ci, decode_options);
             const filtered_dec = try encoder.applySelectionI128(late.allocator(), dcol, &self.sel);
-            try appendTyped(i128, &agg.cols[i].decimal, filtered_dec.values, filtered_dec.def_levels, filtered_dec.max_def, agg.arena);
+            const f = filtered_dec;
+            try appendTyped(i128, &agg.cols[i].i128, f.values, f.def_levels, f.max_def, agg.arena);
             return;
         }
 
@@ -569,23 +574,13 @@ fn decodeWriteColumn(
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const n_leaves: usize = @intCast(cm.num_values);
 
-    // DECIMAL columns: regardless of physical backing (INT32, INT64,
-    // FLBA), decode to f64 with scale applied. Reuses the existing
-    // f64 column lane through filter / agg / expression.
+    // DECIMAL columns, whatever their backing: the f64 view filters compare, with the exact unscaled values beside it
+    // for expressions and aggregates (`decodeColumnExact`).
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
     const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-        .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            k,
-            decode_options,
-            null,
-        ),
+        .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, null),
     } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
         // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
         .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
@@ -893,6 +888,7 @@ fn appendIntoBuf(
         .f32 => |c| try appendTyped(f32, &buf.f32, c.values, c.def_levels, c.max_def, dupe_arena),
         .f64 => |c| try appendTyped(f64, &buf.f64, c.values, c.def_levels, c.max_def, dupe_arena),
         .boolean => |c| try appendTyped(bool, &buf.boolean, c.values, c.def_levels, c.max_def, dupe_arena),
+        .i128 => |c| try appendTyped(i128, &buf.i128, c.values, c.def_levels, c.max_def, dupe_arena),
         .string => |c| {
             // Dupe slice bytes into agg arena so they outlive the source RG.
             const duped = try dupe_arena.alloc([]const u8, c.values.len);
@@ -982,8 +978,8 @@ pub fn encodeAggregator(
     // encode them directly (a small subset; serial is fine). The encode
     // loops below skip any index already filled here.
     for (agg.cols, 0..) |cbuf, i| {
-        if (cbuf == .decimal and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) {
-            const b = cbuf.decimal;
+        if (cbuf == .i128 and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) {
+            const b = cbuf.i128;
             results[i] = try encoder.encodeDecimalFlba(ra, .{
                 .values = b.values.items,
                 .def_levels = if (b.max_def > 0) b.def_levels.items else null,
@@ -1123,7 +1119,7 @@ fn aggBatchColumn(agg: *const OutputAggregator, i: usize, ra: std.mem.Allocator)
         // from i32/i64 and widened) and feed the existing integer
         // encoder. The kept DECIMAL schema element makes the footer
         // (and `meta.type`) carry the logical type through.
-        .decimal => |b| blk: {
+        .i128 => |b| blk: {
             const phys = agg.schema_elems[i].type orelse return error.UnsupportedColumnType;
             const dl = if (b.max_def > 0) b.def_levels.items else null;
             switch (phys) {
@@ -1158,8 +1154,8 @@ fn encodeAggColumn(
 ) !encoder.EncodedColumn {
     const t0 = nowMonoNs();
     const span = profile.Span.begin(timings.prof);
-    const e = if (agg.cols[i] == .decimal and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) blk: {
-        const b = agg.cols[i].decimal;
+    const e = if (agg.cols[i] == .i128 and agg.schema_elems[i].type == .FIXED_LEN_BYTE_ARRAY) blk: {
+        const b = agg.cols[i].i128;
         break :blk try encoder.encodeDecimalFlba(arena, .{
             .values = b.values.items,
             .def_levels = if (b.max_def > 0) b.def_levels.items else null,
@@ -1305,6 +1301,22 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
 /// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
 pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
     const expr_type = c.expr.typeOf();
+    if (expr_type == .dec) {
+        var elem: schema.SchemaElement = .{
+            .type = null,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .name = c.alias,
+            .num_children = 0,
+            .converted_type = null,
+            .logical_type = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        decimalElem(&elem, c.expr.decSpec().?);
+        return elem;
+    }
     // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
     // are printed and written as the unsigned values they are.
     const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
@@ -1394,6 +1406,35 @@ fn cloneColumnMeta(
     };
 }
 
+/// The schema leaf an aggregate output column is written under. An exact DECIMAL is annotated DECIMAL(p, s), both
+/// ways (logical and converted type), at the physical width `Dec.physical` gives its precision.
+fn aggLeafElem(out_col: expr_agg.OutputCol) schema.SchemaElement {
+    var elem: schema.SchemaElement = .{
+        .type = out_col.parquet_type,
+        .type_length = null,
+        .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
+        .name = out_col.name,
+        .num_children = 0,
+        .converted_type = out_col.converted_type,
+        .logical_type = out_col.logical_type,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    if (out_col.dec) |d| decimalElem(&elem, d);
+    return elem;
+}
+
+/// Type `elem` as DECIMAL(`d`) at the physical width its precision takes.
+pub fn decimalElem(elem: *schema.SchemaElement, d: expr_ast.Dec) void {
+    elem.type = d.physical();
+    elem.type_length = if (d.physical() == .FIXED_LEN_BYTE_ARRAY) 16 else null;
+    elem.converted_type = .DECIMAL;
+    elem.logical_type = .{ .DECIMAL = .{ .scale = d.scale, .precision = d.precision } };
+    elem.scale = d.scale;
+    elem.precision = d.precision;
+}
+
 /// Write an aggregate result — one row, or one per GROUP BY group — as a
 /// single-row-group parquet file with one column-chunk per `OutputCol`
 /// (avg-style aggs already split into two cols upstream), each holding
@@ -1421,18 +1462,7 @@ pub fn writeAggregateRows(
     for (output_cols) |out_col| {
         const path_buf = try arena.alloc([]const u8, 1);
         path_buf[0] = out_col.name;
-        const leaf_elem: schema.SchemaElement = .{
-            .type = out_col.parquet_type,
-            .type_length = null,
-            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
-            .name = out_col.name,
-            .num_children = 0,
-            .converted_type = out_col.converted_type,
-            .logical_type = out_col.logical_type,
-            .scale = null,
-            .precision = null,
-            .field_id = null,
-        };
+        const leaf_elem = aggLeafElem(out_col);
         const enc = try encoder.encodeColumn(arena, .{
             .values = out_col.col,
             .schema_elem = &leaf_elem,
@@ -1474,20 +1504,7 @@ pub fn writeAggregateRows(
         .precision = null,
         .field_id = null,
     });
-    for (output_cols) |out_col| {
-        try new_schema.append(arena, .{
-            .type = out_col.parquet_type,
-            .type_length = null,
-            .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
-            .name = out_col.name,
-            .num_children = 0,
-            .converted_type = out_col.converted_type,
-            .logical_type = out_col.logical_type,
-            .scale = null,
-            .precision = null,
-            .field_id = null,
-        });
-    }
+    for (output_cols) |out_col| try new_schema.append(arena, aggLeafElem(out_col));
 
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     try new_row_groups.append(arena, .{
@@ -1924,12 +1941,16 @@ fn decodeAggColumnCoded(
                     .codes => |c| {
                         const d = try ra.alloc(f64, c.dict.len);
                         decimal_mod.applyScaleSimd(T, c.dict, k.scale, d);
-                        break :blk .{ .f64 = codedCol(f64, c, d, levels) };
+                        var col = codedCol(f64, c, d, levels);
+                        col.dict_unscaled = @unionInit(filter_eval.Exact, @typeName(T), c.dict);
+                        break :blk .{ .f64 = col };
                     },
                     .values => |v| {
                         const d = try ra.alloc(f64, v.values.len);
                         decimal_mod.applyScaleSimd(T, v.values, k.scale, d);
-                        break :blk .{ .f64 = scaledCol(f64, d, v, levels) };
+                        var col = scaledCol(f64, d, v, levels);
+                        col.unscaled = @unionInit(filter_eval.Exact, @typeName(T), v.values);
+                        break :blk .{ .f64 = col };
                     },
                 }
             },
@@ -2006,12 +2027,16 @@ fn decodeAggColumnHist(
                     .hist => |h| {
                         const d = try ra.alloc(f64, h.dict.len);
                         decimal_mod.applyScaleSimd(T, h.dict, k.scale, d);
-                        break :blk .{ .f64 = histCol(f64, h, d, num_rows) };
+                        var col = histCol(f64, h, d, num_rows);
+                        col.dict_unscaled = @unionInit(filter_eval.Exact, @typeName(T), h.dict);
+                        break :blk .{ .f64 = col };
                     },
                     .values => |v| {
                         const d = try ra.alloc(f64, v.values.len);
                         decimal_mod.applyScaleSimd(T, v.values, k.scale, d);
-                        break :blk .{ .f64 = scaledCol(f64, d, v, levels) };
+                        var col = scaledCol(f64, d, v, levels);
+                        col.unscaled = @unionInit(filter_eval.Exact, @typeName(T), v.values);
+                        break :blk .{ .f64 = col };
                     },
                 }
             },
@@ -2406,16 +2431,7 @@ fn decodeAggColumn(
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
     if (dec_kind) |k| return .{
-        .f64 = try decimal_mod.decodeColumnAsF64WithOptions(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            k,
-            decode_options,
-            scratch,
-        ),
+        .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, scratch),
     };
     if (schema_elem != null and schema.isFloat16(schema_elem.?)) return .{
         .f64 = try decodeFloat16ColumnAsF64Pruned(

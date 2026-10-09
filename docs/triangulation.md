@@ -116,8 +116,9 @@ renders the rest as text; when one side of a pair is text, it is coerced toward 
   JSON export spells null `null`; its CSV export writes an empty field for null (`--null-string` overrides), which CSV
   cannot tell apart from an empty string, so the harness reads JSON.
 - **Integers:** exact, including integral results DuckDB widens to `DECIMAL`/`HUGEINT` (its integer `SUM`s).
-- **Decimals:** exact against each other. ZPQ answers `sum`/`min`/`max` of a DECIMAL column in `f64`, so those results
-  compare as floats; Hardwood prints plain decimal strings and DuckDB returns `Decimal`.
+- **Decimals:** exact against each other. ZPQ prints DECIMAL results exactly, but this harness still reads its JSON
+  numbers as floats, so those results compare as floats here (`tools/differential.py` compares them exactly);
+  Hardwood prints plain decimal strings and DuckDB returns `Decimal`.
 - **Floats:** Compared using a relative tolerance ($1e-4$) to ignore precision jitter. `NaN` and `±Infinity` (strings
   in Hardwood's JSON) compare by token.
 - **Temporals:** ISO-8601 text with a `T` separator, trailing fractional zeros trimmed, UTC offset dropped. Hardwood

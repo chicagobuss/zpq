@@ -4,6 +4,12 @@
 
 ### Behaviour changes
 
+- DECIMAL is exact. `sum` / `min` / `max` / `avg` over DECIMAL columns and DECIMAL arithmetic (`+`, `-`, `*`, e.g.
+  `price * (1 - discount) * (1 + tax)`) compute in scaled 128-bit integers with the result types DuckDB and Trino use,
+  where they answered in f64 before (a TPC-H Q1 sum was a cent off at SF30). Numeric literals with a decimal point are
+  DECIMAL, as in SQL. The JSON prints exact text, `-o` writes DECIMAL columns (a DECIMAL `GROUP BY` key and min/max
+  were DOUBLE), and a result past its type's 38 digits is an error instead of a rounded value. `avg` keeps the
+  argument's type, rounded half away from zero (Trino's rule), and its JSON gains `"avg"`. DECIMAL `/` is DOUBLE.
 - `GROUP BY` lists groups in the order they first appear in the input (files in the order given, then row groups, then
   rows), at every `-j`; before, groups came in the byte order of their serialized keys. Floating-point sums and
   averages come out with the same bits at every `-j` and on every run. `--unordered` (the Lambda's `"ordered": false`)

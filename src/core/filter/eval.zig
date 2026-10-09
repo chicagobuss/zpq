@@ -248,6 +248,20 @@ pub fn evalLeafBool(
 /// is a leaf (which may have multiple leaves per logical row). A
 /// logical row starts at every position where `rep_levels[i] == 0`.
 /// Higher rep values mean "continuation of this row at depth N."
+/// A DECIMAL column's exact unscaled integers at the width they were decoded at, so an INT32/INT64-backed decimal
+/// borrows the decoder's own buffer rather than a widened copy.
+pub const Exact = union(enum) {
+    i32: []const i32,
+    i64: []const i64,
+    i128: []const i128,
+
+    pub fn at(self: Exact, i: usize) i128 {
+        return switch (self) {
+            inline else => |v| v[i],
+        };
+    }
+};
+
 pub fn ColumnT(comptime T: type) type {
     return struct {
         values: []const T,
@@ -272,6 +286,12 @@ pub fn ColumnT(comptime T: type) type {
         /// With `hist` set, the column was folded straight into a histogram over `dict` (no levels either).
         levels_only_rows: usize = 0,
         hist: ?[]const u64 = null,
+        /// A DECIMAL column's exact unscaled integers, row for row with `values` (the f64 view filters compare). Only
+        /// set on a decoded decimal; anything that moves rows (gather, selection) must move these too or drop them,
+        /// and exact decimal evaluation refuses a column without them rather than fall back to the f64 view.
+        unscaled: ?Exact = null,
+        /// The same for a coded column's dictionary: entry for entry with `dict`.
+        dict_unscaled: ?Exact = null,
 
         pub fn rowCount(self: @This()) usize {
             if (self.levels_only_rows != 0) return self.levels_only_rows;
@@ -300,6 +320,9 @@ pub const Batch = struct {
         f64: ColumnT(f64),
         string: ColumnT([]const u8),
         boolean: ColumnT(bool),
+        /// Exact DECIMAL values, unscaled; the scale travels with the expression type (`expr_ast.Dec`), not here.
+        /// Produced by expression evaluation and aggregate output, never by decode.
+        i128: ColumnT(i128),
 
         /// Null mask + nesting, independent of the value type — used by
         /// IS NULL / IS NOT NULL, which never touch values.

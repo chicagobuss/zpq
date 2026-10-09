@@ -66,8 +66,8 @@ not rounded to it.
 
 **Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
 
-**Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + 1.0 → f64`), string concat (`||`),
-`coalesce(col, default)`, parens, unary minus.
+**Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
+`coalesce(col, default)`, parens, unary minus. DECIMAL arithmetic is exact (see below).
 
 **Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`.
 As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet; avg's
@@ -78,6 +78,16 @@ JSON (avg as `<name>__sum` / `<name>__count`).
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
 entry budget, so leave headroom.
+
+**DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
+compute in scaled 128-bit integers, never through a double. Result types follow the rules DuckDB and Trino (Athena)
+share: `a + b` / `a - b` take the larger scale and one more integer digit, `a * b` adds scales and precisions (both
+capped at 38 digits), an integer operand counts as DECIMAL(10,0) or DECIMAL(19,0), and `/` or a DOUBLE operand gives
+DOUBLE. `sum` is DECIMAL(38, s); `min` / `max` keep the column's type; `avg` keeps it too, rounded half away from zero
+as Trino does (DuckDB answers avg in DOUBLE). The JSON prints every digit of the scale (`3344516955134.66`), `-o`
+writes DECIMAL columns, and a DECIMAL avg's JSON adds `"avg"` beside `{"sum", "count"}`. A value that needs more than
+its type's digits stops the query with an error rather than wrapping or rounding. Filters still compare DECIMAL
+columns as doubles: exact while the values and the literal have at most 15 significant digits.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte

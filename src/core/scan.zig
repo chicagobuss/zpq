@@ -140,8 +140,15 @@ pub const AggValue = union(enum) {
     avg: struct { sum: ?f64, count: i64 },
     /// String (bytewise/unsigned) min/max result or string group key. Owned by the `AggOutput` holding it.
     s: []const u8,
+    /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL.
+    dec: DecValue,
+    /// avg over a DECIMAL: the exact sum (DECIMAL(38, s)) and count, which re-aggregate, and the mean rounded to the
+    /// argument's type. `sum` and `mean` are NULL when count is 0.
+    avg_dec: struct { sum: ?i128, count: i64, mean: ?i128, spec: expr_ast.Dec },
     null_val: void,
 };
+
+pub const DecValue = struct { v: i128, spec: expr_ast.Dec };
 
 pub const AggOutputItem = struct {
     alias: []const u8,
@@ -247,7 +254,9 @@ pub const MultiAggResult = struct {
 
 /// What one GROUP BY result column holds. `nullable` is false only for counts, matching the 1-row output.
 pub const GroupColType = struct {
-    lane: enum { i64, f64, string, avg },
+    lane: enum { i64, f64, string, avg, dec, avg_dec },
+    /// The DECIMAL type of a `dec` column, or of an `avg_dec` mean.
+    dec: ?expr_ast.Dec = null,
     nullable: bool,
     /// The column whose values pass through unchanged (a bare key, min/max of a column), to type the output by.
     source: ?schema.SchemaElement = null,
@@ -1032,7 +1041,9 @@ pub fn runMultiAggregate(
                     .i64, .u64 => .i64,
                     .f64 => .f64,
                     .string => .string,
+                    .dec => .dec,
                 },
+                .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
                 .source = if (keys[k_idx] == .col_ref) leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx) else null,
             },
             .agg => |a_idx| .{
@@ -1042,6 +1053,12 @@ pub fn runMultiAggregate(
                     .f64 => .f64,
                     .bytes => .string,
                     .avg_f64 => .avg,
+                    .dec => .dec,
+                    .avg_dec => .avg_dec,
+                },
+                .dec = switch (agg_calls[a_idx].result) {
+                    .dec, .avg_dec => expr_agg.resultDec(agg_calls[a_idx]),
+                    else => null,
                 },
                 .source = agg_sources[a_idx],
             },
@@ -1233,7 +1250,8 @@ fn freeOwnedAccumulatorStrings(
 /// `boolean` (1 byte) — silently truncating every later column in a
 /// composite key.
 /// `u64` frames exactly like `i64`; only the reported value differs, read as the unsigned column it came from.
-const KeyType = enum { i64, u64, f64, string };
+/// `dec` frames 16 bytes, an exact DECIMAL key's unscaled value, reported at its type.
+const KeyType = union(enum) { i64, u64, f64, string, dec: expr_ast.Dec };
 
 /// The names a query's GROUP BY keys go by, each worked out once on first use: a column key's label walks the
 /// schema, and binding output columns asks for every key's names once per output column.
@@ -1487,6 +1505,7 @@ fn keyTypeFromExpr(expr: expr_ast.Expr) KeyType {
         .i64 => .i64,
         .f64 => .f64,
         .str => .string,
+        .dec => .{ .dec = expr.decSpec().? },
     };
 }
 
@@ -1563,9 +1582,15 @@ pub fn deserializeKeyColumn(
                         .i64 => .{ .i = @as(i64, @bitCast(raw)) },
                         .u64 => .{ .i = raw },
                         .f64 => .{ .f = @bitCast(raw) },
-                        .string => unreachable,
+                        .string, .dec => unreachable,
                     };
                 }
+            },
+            .dec => |spec| {
+                if (cursor + 16 > key_bytes.len) return error.BadGroupKey;
+                const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
+                cursor += 16;
+                if (current_idx == target_idx) return .{ .dec = .{ .v = v, .spec = spec } };
             },
             .string => {
                 if (cursor + 4 > key_bytes.len) return error.BadGroupKey;
@@ -1584,6 +1609,10 @@ pub fn deserializeKeyColumn(
     return error.BadGroupKey;
 }
 
+fn decValue(v: ?i128, spec: expr_ast.Dec) AggValue {
+    return if (v) |x| .{ .dec = .{ .v = x, .spec = spec } } else .null_val;
+}
+
 /// Convert one agg's final accumulator state into a wire-friendly value.
 pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     return switch (call.func) {
@@ -1594,21 +1623,29 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         .sum => switch (call.result) {
             .i64 => if (state.sum_i) |v| .{ .i = v } else .null_val,
             .f64 => if (state.sum_f) |v| .{ .f = v } else .null_val,
-            .bytes, .avg_f64 => unreachable,
+            .dec => decValue(try state.sum_d.result(), expr_agg.resultDec(call)),
+            .bytes, .avg_f64, .avg_dec => unreachable,
         },
         .min => switch (call.result) {
             .i64 => if (state.min_i) |v| .{ .i = v } else .null_val,
             .f64 => if (state.min_f) |v| .{ .f = v } else .null_val,
             .bytes => if (state.min_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
-            .avg_f64 => unreachable,
+            .dec => decValue(state.min_d, expr_agg.resultDec(call)),
+            .avg_f64, .avg_dec => unreachable,
         },
         .max => switch (call.result) {
             .i64 => if (state.max_i) |v| .{ .i = v } else .null_val,
             .f64 => if (state.max_f) |v| .{ .f = v } else .null_val,
             .bytes => if (state.max_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
-            .avg_f64 => unreachable,
+            .dec => decValue(state.max_d, expr_agg.resultDec(call)),
+            .avg_f64, .avg_dec => unreachable,
         },
-        .avg => .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } },
+        .avg => if (call.result == .avg_dec) .{ .avg_dec = .{
+            .sum = try state.avg_d.result(),
+            .count = @intCast(state.avg_d.n),
+            .mean = try state.avg_d.mean(),
+            .spec = expr_agg.resultDec(call),
+        } } else .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } },
     };
 }
 
@@ -2213,6 +2250,8 @@ fn expectSameAggValue(want: AggValue, got: AggValue) !void {
             try testing.expectEqual(v.count, got.avg.count);
         },
         .s => |v| try testing.expectEqualStrings(v, got.s),
+        .dec => |v| try testing.expectEqual(v, got.dec),
+        .avg_dec => |v| try testing.expectEqual(v, got.avg_dec),
         .null_val => {},
     }
 }
@@ -2658,8 +2697,10 @@ test "deprecated min/max never answer a DECIMAL aggregate under --trust-stats" {
         .trust_stats = true,
     });
     defer freeResult(res);
-    try testing.expectEqual(@as(f64, 1.0), res.output.aggs[0].value.f);
-    try testing.expectEqual(@as(f64, 7.0), res.output.aggs[1].value.f);
+    // DECIMAL(9,2): exact unscaled values.
+    const d92: expr_ast.Dec = .{ .precision = 9, .scale = 2 };
+    try testing.expectEqual(DecValue{ .v = 100, .spec = d92 }, res.output.aggs[0].value.dec);
+    try testing.expectEqual(DecValue{ .v = 700, .spec = d92 }, res.output.aggs[1].value.dec);
     try testing.expectEqual(@as(i128, 103), res.output.aggs[2].value.i);
 }
 
@@ -3220,4 +3261,179 @@ test "statistics never invent a zero of the other sign: --trust-stats answers ze
         }
         try testing.expectEqual(answers[0], answers[1]);
     }
+}
+
+// ============================================================ Exact DECIMAL.
+//
+// The fixture (tools/gen_decimal_exact_fixture.py) stores decimals as INT32, INT64 and FLBA(16), dictionary-encoded,
+// in three row groups. Every expected value is DuckDB's answer for the same query, as unscaled integer and type.
+
+const decimal_exact_fixture = "ci/fixtures/parquet/decimal_exact.parquet";
+
+const DecWant = struct { alias: []const u8, v: i128, p: u8, s: u8 };
+
+fn expectDecimalAnswers(args: MultiAggArgs, want: []const DecWant) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), args);
+    defer freeResult(res);
+    for (want) |w| {
+        const item = for (res.output.aggs) |it| {
+            if (std.mem.eql(u8, it.alias, w.alias)) break it;
+        } else return error.TestUnexpectedResult;
+        const got: DecValue = switch (item.value) {
+            .dec => |d| d,
+            .avg_dec => |a| .{ .v = a.mean.?, .spec = a.spec },
+            else => {
+                std.debug.print("{s}: not a DECIMAL answer ({s})\n", .{ w.alias, @tagName(item.value) });
+                return error.TestUnexpectedResult;
+            },
+        };
+        testing.expectEqual(DecValue{ .v = w.v, .spec = .{ .precision = w.p, .scale = w.s } }, got) catch |err| {
+            std.debug.print("{s}: got {d} DECIMAL({d},{d})\n", .{ w.alias, got.v, got.spec.precision, got.spec.scale });
+            return err;
+        };
+    }
+}
+
+test "DECIMAL aggregates and arithmetic are exact, on every decode path and worker count" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    const want = [_]DecWant{
+        .{ .alias = "s9", .v = -15150, .p = 38, .s = 2 },
+        .{ .alias = "mn9", .v = -15150, .p = 9, .s = 2 },
+        .{ .alias = "mx9", .v = 15049, .p = 9, .s = 2 },
+        .{ .alias = "s18", .v = 344850, .p = 38, .s = 4 },
+        .{ .alias = "s38", .v = 448500000000000, .p = 38, .s = 10 },
+        .{ .alias = "mn38", .v = -123456789012345678901234561234567891, .p = 38, .s = 10 },
+        .{ .alias = "mx38", .v = 123456789012345678901237551234567891, .p = 38, .s = 10 },
+        .{ .alias = "sdn", .v = 3670000, .p = 38, .s = 2 },
+        .{ .alias = "sq", .v = 45000, .p = 38, .s = 2 },
+        // DECIMAL(9,2) * DECIMAL(18,4) is DECIMAL(27,6); a sum is DECIMAL(38, s).
+        .{ .alias = "p", .v = 209832550, .p = 38, .s = 6 },
+        // Mixed with an INT32 column (DECIMAL(10,0)) and with literals, as SQL types them.
+        .{ .alias = "di", .v = -30150, .p = 38, .s = 2 },
+        .{ .alias = "dti", .v = 227255050, .p = 38, .s = 2 },
+        .{ .alias = "dd", .v = 450015000000000, .p = 38, .s = 10 },
+        .{ .alias = "dlit", .v = -227250, .p = 38, .s = 3 },
+        .{ .alias = "ilit", .v = -2250, .p = 38, .s = 1 },
+        .{ .alias = "neg", .v = 15150, .p = 38, .s = 2 },
+        .{ .alias = "co", .v = 3670000, .p = 38, .s = 2 },
+        .{ .alias = "cc", .v = 3649800, .p = 38, .s = 2 },
+        // avg keeps the argument's type, rounded half away from zero: 36700.00 / 133 = 275.939...
+        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+        .{ .alias = "a38", .v = 1495000000000, .p = 38, .s = 10 },
+    };
+    const aggregate =
+        "sum(d9) AS s9, min(d9) AS mn9, max(d9) AS mx9, sum(d18) AS s18, sum(d38) AS s38, min(d38) AS mn38, " ++
+        "max(d38) AS mx38, sum(dn) AS sdn, sum(q) AS sq, sum(d9 * d18) AS p, sum(d9 + i) AS di, " ++
+        "sum(d9 * i) AS dti, sum(d38 - d9) AS dd, sum(d9 * 1.5) AS dlit, sum(i * 1.5) AS ilit, sum(-d9) AS neg, " ++
+        "sum(coalesce(dn, 0)) AS co, sum(coalesce(dn, d9)) AS cc, avg(dn) AS adn, avg(d38) AS a38";
+    for ([_]bool{ true, false }) |encoded| for ([_]usize{ 1, 3 }) |j| {
+        try expectDecimalAnswers(.{
+            .inputs = &inputs,
+            .aggregate = aggregate,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .encoded = encoded,
+        }, &want);
+    };
+    // A filter: Q6's shape over the decimals (a sparse selection gathers the exact values with the rows).
+    try expectDecimalAnswers(.{
+        .inputs = &inputs,
+        .aggregate = "sum(d9 * d18) AS p, sum(q) AS sq",
+        .filter = "q >= 1.00 AND q <= 2.00 AND i < 100",
+        .parallelism = 1,
+    }, &.{
+        .{ .alias = "p", .v = -296209063, .p = 38, .s = 6 },
+        .{ .alias = "sq", .v = 18700, .p = 38, .s = 2 },
+    });
+}
+
+test "a DECIMAL result past its precision is an error, never a wrapped or rounded value" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    // Two values of 10^38 - 1 sum past 38 digits; each row of `big * 10` and `big + big` is past them already.
+    for ([_][]const u8{ "sum(big) AS s", "sum(big * 10) AS s", "sum(big + big) AS s", "avg(big) AS a" }) |agg| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try testing.expectError(error.DecimalOverflow, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = agg,
+            .parallelism = 1,
+        }));
+    }
+    // The same column without its two wide rows fits.
+    try expectDecimalAnswers(.{
+        .inputs = &inputs,
+        .aggregate = "sum(big) AS s",
+        .filter = "i >= -148",
+        .parallelism = 1,
+    }, &.{.{ .alias = "s", .v = 298, .p = 38, .s = 0 }});
+}
+
+test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is exact" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Row group 1 holds only NULL `dn`.
+    const empty = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "sum(dn) AS s, min(dn) AS m, avg(dn) AS a",
+        .filter = "i >= -50 AND i < 50",
+        .parallelism = 1,
+    });
+    defer freeResult(empty);
+    try testing.expect(empty.output.aggs[0].value == .null_val);
+    try testing.expect(empty.output.aggs[1].value == .null_val);
+    const a = empty.output.aggs[2].value.avg_dec;
+    try testing.expect(a.sum == null and a.mean == null and a.count == 0);
+
+    const grouped = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n, sum(d18 * q) AS p",
+        .group_by = "dn",
+        .filter = "i >= -60 AND i <= 60",
+        .parallelism = 1,
+    });
+    defer freeResult(grouped);
+    const rows = grouped.output.group_rows.?;
+    // 121 rows: 108 have a NULL `dn`, the other 13 a distinct value each.
+    try testing.expectEqual(@as(usize, 14), rows.len);
+    var nulls: usize = 0;
+    for (rows) |row| switch (row[0]) {
+        .null_val => {
+            nulls += 1;
+            try testing.expectEqual(@as(i128, 108), row[1].i);
+        },
+        .dec => |k| {
+            try testing.expectEqual(expr_ast.Dec{ .precision = 15, .scale = 2 }, k.spec);
+            try testing.expectEqual(@as(i128, 1), row[1].i);
+            try testing.expectEqual(@as(u8, 6), row[2].dec.spec.scale);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 1), nulls);
+}
+
+test "--trust-stats answers DECIMAL min/max from statistics exactly, as decoding does" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    const want = [_]DecWant{
+        .{ .alias = "mn9", .v = -15150, .p = 9, .s = 2 },
+        .{ .alias = "mx18", .v = 1299, .p = 18, .s = 4 },
+        .{ .alias = "mn38", .v = -123456789012345678901234561234567891, .p = 38, .s = 10 },
+        .{ .alias = "mx38", .v = 123456789012345678901237551234567891, .p = 38, .s = 10 },
+    };
+    for ([_]bool{ false, true }) |trust| try expectDecimalAnswers(.{
+        .inputs = &inputs,
+        .aggregate = "min(d9) AS mn9, max(d18) AS mx18, min(d38) AS mn38, max(d38) AS mx38",
+        .parallelism = 1,
+        .trust_stats = trust,
+    }, &want);
 }

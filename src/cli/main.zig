@@ -234,6 +234,21 @@ pub fn main(init: std.process.Init) !void {
                 error.BadGroupKey => std.debug.print("zpq query: corrupted GROUP BY key framing\n", .{}),
                 error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
                 error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
+                error.DecimalOverflow => std.debug.print(
+                    "zpq query: a DECIMAL result needs more digits than its type holds (at\n" ++
+                        "most 38); zpq stops rather than return a rounded or wrapped value\n",
+                    .{},
+                ),
+                error.DecimalScaleTooLarge => std.debug.print(
+                    "zpq query: a DECIMAL product would have more than 38 digits after the\n" ++
+                        "point; cast an operand to DOUBLE (divide by 1.0) to compute it inexactly\n",
+                    .{},
+                ),
+                error.InvalidDecimalType => std.debug.print(
+                    "zpq query: a DECIMAL column declares a precision/scale no DECIMAL can\n" ++
+                        "have (precision 1..38, scale 0..precision)\n",
+                    .{},
+                ),
                 error.NestedNotSupported => std.debug.print("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
                 error.DivisionByZero => std.debug.print("zpq query: division by zero in GROUP BY expression\n", .{}),
                 error.GroupingNotSupported => std.debug.print(

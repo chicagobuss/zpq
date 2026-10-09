@@ -51,6 +51,10 @@ pub const Error = error{
     /// A UINT64 column used as an operand. Expressions compute in i64, where values >= 2^63 have no representation,
     /// so arithmetic and functions over such a column are refused rather than answered wrongly.
     Unsigned64Operand,
+    /// A product's scale would pass 38 digits, which no DECIMAL holds.
+    DecimalScaleTooLarge,
+    /// A DECIMAL column whose declared precision/scale no DECIMAL can have (precision 1..38, scale 0..precision).
+    InvalidDecimalType,
 } || std.mem.Allocator.Error || filter_parser.Error;
 
 /// A bare UINT64 reference is fine on its own (selected, grouped by, aggregated); as an operand it is not.
@@ -360,6 +364,9 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                 .literal => |lit| switch (lit) {
                     .i64 => |v| return .{ .literal = .{ .i64 = -v } },
                     .f64 => |v| return .{ .literal = .{ .f64 = -v } },
+                    .dec => |d| return .{ .literal = .{
+                        .dec = .{ .unscaled = -d.unscaled, .spec = d.spec, .f = -d.f },
+                    } },
                     .str => return error.TypeMismatch,
                 },
                 else => {
@@ -372,12 +379,14 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     if (result_type == .str) return error.TypeMismatch;
                     const depth = 1 + inner.depth();
                     if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+                    // Negation can't grow a value, so a DECIMAL keeps its operand's type (as SQL engines type `-x`).
                     return .{ .binop = .{
                         .op = .sub,
                         .left = lp,
                         .right = rp,
                         .result_type = result_type,
                         .depth = depth,
+                        .dec = if (result_type == .dec) inner.decSpec() else null,
                     } };
                 },
             }
@@ -388,6 +397,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
         },
         .number_float => {
             const v = std.fmt.parseFloat(f64, tk.text) catch return error.BadNumber;
+            if (decimalLiteral(tk.text, v)) |d| return .{ .literal = .{ .dec = d } };
             return .{ .literal = .{ .f64 = v } };
         },
         .string => {
@@ -411,12 +421,14 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             };
             const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
             const phys = elem.type orelse return error.UnsupportedColumnType;
-            // DECIMAL columns are decoded to f64 by the consumer
-            // (see core/parquet/decimal.zig) regardless of their
-            // physical backing — so expressions reference them as
-            // f64, not as the underlying INT32/INT64/FLBA.
-            const is_decimal = decimal_mod.kindFromSchema(&elem) != null;
-            const expr_type: ast.Type = if (is_decimal or schema.isFloat16(elem)) .f64 else switch (phys) {
+            // DECIMAL columns are exact: expressions and aggregates read the unscaled integers the consumer decodes
+            // beside the f64 view filters use (see core/parquet/decimal.zig `decodeColumnExact`).
+            var dec: ?ast.Dec = null;
+            if (decimal_mod.kindFromSchema(&elem)) |k| {
+                if (!ast.Dec.valid(k.precision, k.scale)) return error.InvalidDecimalType;
+                dec = .{ .precision = @intCast(k.precision), .scale = @intCast(k.scale) };
+            }
+            const expr_type: ast.Type = if (dec != null) .dec else if (schema.isFloat16(elem)) .f64 else switch (phys) {
                 .INT32, .INT64 => .i64,
                 .FLOAT, .DOUBLE => .f64,
                 .BYTE_ARRAY => .str,
@@ -439,6 +451,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     // zero-extends at decode).
                     .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
                     .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
+                    .dec = dec,
                 },
             };
         },
@@ -491,6 +504,11 @@ fn parseCall(
     }
 
     const result_type = try resolveCallType(func, args.items);
+    var dec: ?ast.Dec = null;
+    if (result_type == .dec) {
+        dec = args.items[0].decSpec().?;
+        for (args.items[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
+    }
     var deepest: u32 = 0;
     for (args.items) |a| deepest = @max(deepest, a.depth());
     const depth = 1 + deepest;
@@ -500,6 +518,7 @@ fn parseCall(
         .args = args.items,
         .result_type = result_type,
         .depth = depth,
+        .dec = dec,
     } };
 }
 
@@ -528,7 +547,14 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
 fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
     try rejectUnsigned64Operand(l);
     try rejectUnsigned64Operand(r);
-    const result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
+    var result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
+    // Exact division has no closed result scale; DECIMAL `/` is DOUBLE, as DuckDB types it.
+    if (op == .div and result_type == .dec) result_type = .f64;
+    const dec: ?ast.Dec = if (result_type != .dec) null else switch (op) {
+        .add, .sub => ast.Dec.addSub(l.decSpec().?, r.decSpec().?),
+        .mul => try ast.Dec.mul(l.decSpec().?, r.decSpec().?),
+        .div, .concat => unreachable,
+    };
     // Op/type compatibility: `concat` is string-only, arithmetic ops
     // are numeric-only.
     if (op == .concat and result_type != .str) return error.TypeMismatch;
@@ -549,7 +575,28 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
         .right = rp,
         .result_type = result_type,
         .depth = depth,
+        .dec = dec,
     } };
+}
+
+/// `text` (digits with one `.`) as the exact DECIMAL SQL gives it: every digit counts toward the precision and those
+/// after the point are the scale, so `0.05` is DECIMAL(3,2). Past 38 digits it stays DOUBLE, as DuckDB has it.
+fn decimalLiteral(text: []const u8, f: f64) ?ast.DecLit {
+    var unscaled: i128 = 0;
+    var digits: u8 = 0;
+    var scale: u8 = 0;
+    var after_point = false;
+    for (text) |c| {
+        if (c == '.') {
+            after_point = true;
+            continue;
+        }
+        if (digits == ast.Dec.max_precision) return null;
+        unscaled = unscaled * 10 + (c - '0');
+        digits += 1;
+        if (after_point) scale += 1;
+    }
+    return .{ .unscaled = unscaled, .spec = .{ .precision = @max(digits, 1), .scale = scale }, .f = f };
 }
 
 fn asciiEqIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -784,9 +831,12 @@ test "parse: literal float" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{}, &.{});
+    // A literal with a decimal point is an exact DECIMAL, as SQL types it, with its double alongside.
     const e = try parseExprOnly(a, "3.14", &file, null);
-    try testing.expectEqual(ast.Type.f64, e.typeOf());
-    try testing.expect(@abs(e.literal.f64 - 3.14) < 1e-9);
+    try testing.expectEqual(ast.Type.dec, e.typeOf());
+    try testing.expectEqual(@as(i128, 314), e.literal.dec.unscaled);
+    try testing.expectEqual(ast.Dec{ .precision = 3, .scale = 2 }, e.literal.dec.spec);
+    try testing.expectEqual(@as(f64, 3.14), e.literal.dec.f);
 }
 
 test "parse: column ref resolves" {
@@ -1142,4 +1192,64 @@ test "parse: a quoted path binds the nested leaf a top-level column's dotted nam
     try testing.expectEqual(@as(usize, 2), keys[1].expr.col_ref.col_idx);
     try testing.expectError(error.UnknownColumn, parseExprOnly(a, "\"r\".\"nope\"", &file, null));
     try testing.expectError(error.UnterminatedString, parseExprOnly(a, "\"r\".\"key", &file, null));
+}
+
+test "parse: DECIMAL columns are exact, typed as DuckDB and Trino type their arithmetic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try fakeFile(a, &.{ "p", "d", "i", "b", "f" }, &.{ .INT64, .INT64, .INT32, .INT64, .DOUBLE });
+    file.schema.items[1].logical_type = .{ .DECIMAL = .{ .precision = 15, .scale = 2 } };
+    file.schema.items[2].logical_type = .{ .DECIMAL = .{ .precision = 15, .scale = 2 } };
+    const Case = struct { src: []const u8, t: ast.Type, dec: ?ast.Dec = null };
+    const cases = [_]Case{
+        .{ .src = "p", .t = .dec, .dec = .{ .precision = 15, .scale = 2 } },
+        .{ .src = "p * d", .t = .dec, .dec = .{ .precision = 30, .scale = 4 } },
+        .{ .src = "1 - d", .t = .dec, .dec = .{ .precision = 16, .scale = 2 } },
+        .{ .src = "p * (1 - d) * (1 + d)", .t = .dec, .dec = .{ .precision = 38, .scale = 6 } },
+        .{ .src = "p + i", .t = .dec, .dec = .{ .precision = 16, .scale = 2 } },
+        .{ .src = "p + b", .t = .dec, .dec = .{ .precision = 22, .scale = 2 } },
+        .{ .src = "p * b", .t = .dec, .dec = .{ .precision = 34, .scale = 2 } },
+        .{ .src = "p * 0.5", .t = .dec, .dec = .{ .precision = 17, .scale = 3 } },
+        .{ .src = "-p", .t = .dec, .dec = .{ .precision = 15, .scale = 2 } },
+        .{ .src = "coalesce(p, i)", .t = .dec, .dec = .{ .precision = 15, .scale = 2 } },
+        .{ .src = "i * 1.5", .t = .dec, .dec = .{ .precision = 12, .scale = 1 } },
+        // Division and DOUBLE operands leave exact arithmetic; integers alone stay integers.
+        .{ .src = "p / d", .t = .f64 },
+        .{ .src = "i / 1.0", .t = .f64 },
+        .{ .src = "p + f", .t = .f64 },
+        .{ .src = "i + b", .t = .i64 },
+    };
+    for (cases) |c| {
+        const e = try parseExprOnly(a, c.src, &file, null);
+        testing.expectEqual(c.t, e.typeOf()) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ c.src, @tagName(e.typeOf()) });
+            return err;
+        };
+        if (c.dec) |want| try testing.expectEqual(want, e.decSpec().?);
+    }
+}
+
+test "parse: DECIMAL limits — declared types, literal width, product scale" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try fakeFile(a, &.{ "neg", "wide", "s30" }, &.{ .INT64, .FIXED_LEN_BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY });
+    // Parquet allows no negative scale and no precision past 38: such a column is refused, not approximated.
+    file.schema.items[1].logical_type = .{ .DECIMAL = .{ .precision = 10, .scale = -2 } };
+    file.schema.items[2].logical_type = .{ .DECIMAL = .{ .precision = 39, .scale = 0 } };
+    file.schema.items[3].logical_type = .{ .DECIMAL = .{ .precision = 38, .scale = 30 } };
+    try testing.expectError(error.InvalidDecimalType, parseExprOnly(a, "neg", &file, null));
+    try testing.expectError(error.InvalidDecimalType, parseExprOnly(a, "wide + 1", &file, null));
+    // Scales add under `*`: 30 + 30 has no DECIMAL.
+    try testing.expectError(error.DecimalScaleTooLarge, parseExprOnly(a, "s30 * s30", &file, null));
+    _ = try parseExprOnly(a, "s30 * 1.25", &file, null);
+    // 38 digits is still exact; a 39th makes the literal DOUBLE, as in DuckDB.
+    const d38 = try parseExprOnly(a, "1234567890123456789012345678.9012345678", &file, null);
+    try testing.expectEqual(ast.Dec{ .precision = 38, .scale = 10 }, d38.literal.dec.spec);
+    const d39 = try parseExprOnly(a, "1234567890123456789012345678.90123456789", &file, null);
+    try testing.expectEqual(ast.Type.f64, d39.typeOf());
+    const lit = try parseExprOnly(a, "-0.05", &file, null);
+    try testing.expectEqual(@as(i128, -5), lit.literal.dec.unscaled);
+    try testing.expectEqual(ast.Dec{ .precision = 3, .scale = 2 }, lit.literal.dec.spec);
 }

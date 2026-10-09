@@ -77,6 +77,8 @@ pub const FakeS3 = struct {
     failed: u32 = 0,
     /// CreateMultipartUpload requests received, whatever became of them.
     creates: u32 = 0,
+    /// Answer a CreateMultipartUpload 200, having applied it, with a body that carries no UploadId.
+    create_unreadable: bool = false,
     /// Set by `deinit`: stalled connection threads stop waiting.
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -351,7 +353,11 @@ pub const FakeS3 = struct {
         var advertised_len: ?usize = null;
         if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {
             const id = try self.createUpload(key, realtimeS());
-            resp_body = try std.fmt.allocPrint(a, "<InitiateMultipartUploadResult><UploadId>{s}</UploadId></InitiateMultipartUploadResult>", .{id});
+            resp_body = if (self.create_unreadable)
+                "<InitiateMultipartUploadResult/>"
+            else
+                try std.fmt.allocPrint(a, "<InitiateMultipartUploadResult><UploadId>{s}</UploadId>" ++
+                    "</InitiateMultipartUploadResult>", .{id});
         } else if (std.mem.eql(u8, method, "PUT") and param(query, "uploadId") != null) {
             const u = self.findUpload(param(query, "uploadId").?) orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchUpload</Code></Error>", null);
             var md5: [Md5.digest_length]u8 = undefined;

@@ -601,7 +601,10 @@ fn controlConnect(
         tried += 1;
         const err = connected: {
             const addrs = s3.resolveIpv4(arena, connect_host) catch |err| break :connected err;
-            return control.connect(arena, creds, addrs, host) catch |err| break :connected err;
+            const conn = control.connect(arena, creds, addrs, host) catch |err| break :connected err;
+            // Connected: what fails from here is this attempt's, not the earlier connect error.
+            failure.* = .{ .op = failure.op, .phase = .connect, .attempts = tried };
+            return conn;
         };
         failure.* = .{ .op = failure.op, .phase = .connect, .err = err, .attempts = tried };
         const again = if (io) |i| try attempts.retryAfter(i, retry.classifyConnect(err)) else false;
@@ -1311,4 +1314,115 @@ test "a CompleteMultipartUpload answered with an error is not sent again, aborts
     try testing.expect(fake.object("out.parquet") == null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
     try expectFailure(&diag, "CompleteMultipartUpload was answered 500 InternalError");
+}
+
+test "a CreateMultipartUpload that connects on its third try and then fails reports three attempts and its own error" {
+    // Refused: answered 503 SlowDown.
+    {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        fake.fail = "POST /bkt/out.parquet?uploads";
+        var diag: Diag = .{};
+        const control = FlakyConnect.arm(2, error.ConnectTimeout);
+        const options: Options = .{ .target_part_size = 1024, .control = control, .diag = &diag };
+
+        const got = writeToPort(fake.port, "out.parquet", &test_payload, .{}, options);
+        try testing.expectError(error.CreateMultipartFailed, got);
+        try testing.expectEqual(@as(u32, 1), fake.creates);
+        try expectFailure(&diag, "CreateMultipartUpload was answered 503 SlowDown (3 attempts)");
+    }
+    // Unanswered: the response never starts.
+    {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        fake.stall = "POST /bkt/out.parquet?uploads";
+        fake.stall_at = .before_headers;
+        var diag: Diag = .{};
+        const control = FlakyConnect.arm(2, error.ConnectTimeout);
+        const options: Options = .{ .target_part_size = 1024, .control = control, .diag = &diag };
+
+        const got = writeToPort(fake.port, "out.parquet", &test_payload, stall_timeouts, options);
+        try testing.expectError(error.CreateMultipartFailed, got);
+        try testing.expectEqual(@as(u32, 1), fake.creates);
+        try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+        const want = "CreateMultipartUpload failed after the request was sent (3 attempts): FirstByteTimeout";
+        try expectFailure(&diag, want);
+    }
+}
+
+/// A `Control.connect` that times out twice, then connects and makes `alloc`'s next allocation fail: a local failure
+/// after a retried connect.
+const OomAfterConnect = struct {
+    var failures: u32 = 0;
+    var alloc: *std.testing.FailingAllocator = undefined;
+
+    fn connect(
+        arena: std.mem.Allocator,
+        creds: s3.Credentials,
+        addrs: []const tls.Ipv4,
+        host: []const u8,
+    ) s3.Error!tls.Connection {
+        if (failures > 0) {
+            failures -= 1;
+            return error.ConnectTimeout;
+        }
+        const conn = try s3.connect(arena, creds, addrs, host);
+        alloc.fail_index = alloc.alloc_index;
+        return conn;
+    }
+};
+
+test "a CreateMultipartUpload that fails locally after a retried connect reports that failure, not the connect's" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var alloc = std.testing.FailingAllocator.init(arena_state.allocator(), .{});
+    OomAfterConnect.alloc = &alloc;
+    OomAfterConnect.failures = 2;
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: s3.Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+    };
+    const url: s3.Url = .{ .bucket = "bkt", .key = "out.parquet" };
+    var pool: s3.Pool(4) = undefined;
+    try pool.init(testing.allocator);
+    defer pool.deinit();
+    const criteria = try s3.poolCriteria(arena_state.allocator(), creds, url.bucket);
+    var diag: Diag = .{};
+    var sink = MultipartSink.init(threaded.io(), testing.allocator, alloc.allocator(), creds, url, &pool, criteria, .{
+        .diag = &diag,
+        .control = .{ .connect = OomAfterConnect.connect, .policy = fast_policy },
+    });
+    defer {
+        if (!sink.isClosed()) sink.abort();
+        sink.deinit();
+    }
+
+    try testing.expectError(error.CreateMultipartFailed, sink.ensureUploadId());
+    try testing.expect(alloc.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), fake.creates);
+    try expectFailure(&diag, "CreateMultipartUpload failed while connecting (3 attempts): OutOfMemory");
+}
+
+test "a CreateMultipartUpload answered 200 without an UploadId is sent once, and the upload it started is aborted" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.create_unreadable = true;
+    var diag: Diag = .{};
+
+    const got = writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{ .target_part_size = 1024, .diag = &diag });
+    try testing.expectError(error.CreateMultipartFailed, got);
+    try testing.expectEqual(@as(u32, 1), fake.creates);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+    try expectFailure(&diag, "CreateMultipartUpload was answered 200 (no S3 error code): XmlTagMissing");
 }

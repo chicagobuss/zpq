@@ -52,6 +52,12 @@ export fn zpq_open(options_json: ?[*:0]const u8) ?*Ctx {
     };
     ctx.pool.per_call_stats = false;
     ctx.pool.query_memory = query_memory;
+    // Ready before any call: every query, the first ones included, gets the footer cache.
+    ctx.pool.warm(gpa) catch {
+        ctx.threaded.deinit();
+        gpa.destroy(ctx);
+        return null;
+    };
     return ctx;
 }
 
@@ -62,10 +68,11 @@ export fn zpq_run(
     out_json: ?*?[*:0]u8,
     out_len: ?*usize,
 ) c_int {
+    // Every output the caller gave is cleared first, so no return leaves a stale one behind.
+    if (out_json) |o| o.* = null;
+    if (out_len) |l| l.* = 0;
     const c = ctx orelse return ZPQ_EINVAL;
     const out = out_json orelse return ZPQ_EINVAL;
-    out.* = null;
-    if (out_len) |l| l.* = 0;
     const body: []const u8 = if (len == 0) "" else (request_json orelse return ZPQ_EINVAL)[0..len];
 
     const response = service.handle(c.threaded.io(), gpa, processEnviron(), body, &c.pool, null) catch

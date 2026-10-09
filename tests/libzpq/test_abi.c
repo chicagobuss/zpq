@@ -165,11 +165,15 @@ static void test_errors(zpq_ctx *c) {
 }
 
 static void test_invalid_arguments(zpq_ctx *c) {
+    /* Every output given is cleared, whichever argument is refused. */
     char *out = (char *)1;
     size_t len = 7;
-    CHECK(zpq_run(NULL, "{}", 2, &out, &len) == ZPQ_EINVAL, "NULL ctx");
-    CHECK(zpq_run(c, "{}", 2, NULL, &len) == ZPQ_EINVAL, "NULL out_json");
+    CHECK(zpq_run(NULL, "{}", 2, &out, &len) == ZPQ_EINVAL && out == NULL && len == 0, "NULL ctx: %p %zu",
+          (void *)out, len);
+    len = 7;
+    CHECK(zpq_run(c, "{}", 2, NULL, &len) == ZPQ_EINVAL && len == 0, "NULL out_json: %zu", len);
     out = (char *)1;
+    len = 7;
     CHECK(zpq_run(c, NULL, 5, &out, &len) == ZPQ_EINVAL && out == NULL && len == 0, "NULL request");
     /* NULL request of length 0 is the empty request; out_len may be NULL. */
     CHECK(zpq_run(c, NULL, 0, &out, NULL) == ZPQ_ERROR_RESPONSE && out, "empty request");
@@ -207,17 +211,30 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-static void test_concurrent(zpq_ctx *c) {
+static void run_threads(zpq_ctx *c) {
     shared = c;
+    pthread_t t[THREADS];
+    for (long i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, worker, (void *)i);
+    for (int i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
+}
+
+static void test_concurrent(zpq_ctx *c) {
     for (int k = 0; k < 3; k++) {
         char *out = NULL;
         CHECK(run(c, mix_req[k], &out) == ZPQ_OK, "%s", out);
         mix_want[k] = agg_of(out);
         zpq_free(out);
     }
-    pthread_t t[THREADS];
-    for (long i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, worker, (void *)i);
-    for (int i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
+    /* Warm: the context has answered before. */
+    run_threads(c);
+    /* Cold: every thread's first call is the fresh context's first. */
+    for (int round = 0; round < 8; round++) {
+        zpq_ctx *cold = zpq_open(NULL);
+        CHECK(cold != NULL, "zpq_open");
+        if (!cold) break;
+        run_threads(cold);
+        zpq_close(cold);
+    }
     for (int k = 0; k < 3; k++) free(mix_want[k]);
 }
 

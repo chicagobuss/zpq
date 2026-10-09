@@ -6,7 +6,8 @@
 
 `run` takes the zpq Lambda's request (a dict, or JSON text) and returns its response as a dict; an {"error": ...}
 response raises `ZpqError`, unless `check=False`. One `Zpq` serves any number of threads at once: ctypes releases
-the GIL for the call, and each query runs on threads of its own.
+the GIL for the call, and each query runs on threads of its own. `close` waits for the calls in flight and refuses
+new ones (`ZpqClosed`), so a context is never freed under a running query.
 
 The library is found at $ZPQ_LIB, else as libzpq.so next to this file, in ../zig-out/lib, or on the loader path.
 """
@@ -16,7 +17,7 @@ import json
 import os
 import threading
 
-__all__ = ["Zpq", "ZpqError", "load_library"]
+__all__ = ["Zpq", "ZpqError", "ZpqClosed", "load_library"]
 
 OK = 0
 ERROR_RESPONSE = 1
@@ -31,6 +32,10 @@ class ZpqError(Exception):
     def __init__(self, response):
         self.response = response
         super().__init__(json.dumps(response))
+
+
+class ZpqClosed(ValueError):
+    """A call on a `Zpq` that is closing or closed."""
 
 
 def _candidates():
@@ -87,15 +92,30 @@ class Zpq:
     def __init__(self, max_memory=None, library=None):
         self._lib = load_library(library)
         opts = {} if max_memory is None else {"max_memory": max_memory}
+        # Calls in flight, and whether close has begun: close waits for the first to drain before freeing the context.
+        self._cond = threading.Condition()
+        self._inflight = 0
+        self._closing = False
         self._ctx = self._lib.zpq_open(json.dumps(opts).encode())
         if not self._ctx:
             raise ValueError(f"zpq_open refused options {opts!r}")
 
     def run_raw(self, request):
         """Run `request` (str or bytes of JSON); returns (return code, response text)."""
-        if self._ctx is None:
-            raise ValueError("Zpq is closed")
         body = request.encode() if isinstance(request, str) else bytes(request)
+        with self._cond:
+            if self._closing:
+                raise ZpqClosed("Zpq is closed")
+            self._inflight += 1
+        try:
+            return self._run(body)
+        finally:
+            with self._cond:
+                self._inflight -= 1
+                if self._inflight == 0:
+                    self._cond.notify_all()
+
+    def _run(self, body):
         out = ctypes.c_void_p()
         out_len = ctypes.c_size_t()
         rc = self._lib.zpq_run(self._ctx, body, len(body), ctypes.byref(out), ctypes.byref(out_len))
@@ -116,10 +136,17 @@ class Zpq:
         return response
 
     def close(self):
-        """Free the context. No `run` may be in flight."""
-        if self._ctx is not None:
-            self._lib.zpq_close(self._ctx)
-            self._ctx = None
+        """Refuse new calls, wait for those in flight, then free the context. Idempotent."""
+        cond = getattr(self, "_cond", None)
+        if cond is None:  # __init__ failed before the context existed
+            return
+        with cond:
+            self._closing = True
+            while self._inflight:
+                cond.wait()
+            ctx, self._ctx = self._ctx, None
+        if ctx:
+            self._lib.zpq_close(ctx)
 
     def __enter__(self):
         return self

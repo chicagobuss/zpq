@@ -39,7 +39,8 @@ zpq_ctx *zpq_open(const char *options_json);
 /*
  * Run one request (request_json, len bytes, need not be NUL-terminated). On ZPQ_OK and ZPQ_ERROR_RESPONSE,
  * *out_json is a NUL-terminated response the caller frees with zpq_free, and *out_len (when out_len is not NULL)
- * its length without the NUL. Otherwise *out_json is NULL.
+ * its length without the NUL. Otherwise *out_json is NULL and *out_len 0: every output given is cleared first,
+ * whatever the return.
  */
 int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json, size_t *out_len);
 

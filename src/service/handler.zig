@@ -32,12 +32,13 @@ pub const PersistentPool = struct {
     cache: zpq.io.meta_cache.MetaCache = undefined,
     /// What the cache may hold of Bloom filters across warm invocations.
     blob_budget: usize = zpq.io.meta_cache.MetaCache.default_blob_budget,
-    initialized: bool = false,
+    /// Set, with a release store, once `inner` and `cache` are; read with acquire loads, so a query that finds it set
+    /// on another thread's first call also sees what it publishes. Written only under `lock`.
+    initialized: std.atomic.Value(bool) = .init(false),
     output: engine.OutputLane = undefined,
     output_initialized: bool = false,
     /// Set when init tried to pre-connect. Null when it did not (no S3 config, or the count is 0).
     preconnect_ns: ?u64 = null,
-    preconnect_opened: u64 = 0,
     /// Guards the lazy set-up below, for callers that run queries on one pool from several threads (libzpq).
     lock: std.c.pthread_mutex_t = .{},
     /// Zero the connection counters at each query, so its `"pool"` member reports that query alone. Off where
@@ -69,12 +70,19 @@ pub const PersistentPool = struct {
         return self.ensureLocked(gpa);
     }
 
+    /// Set the pool up now rather than at the first S3 request, so queries that start together all see it ready.
+    pub fn warm(self: *PersistentPool, gpa: std.mem.Allocator) !void {
+        _ = std.c.pthread_mutex_lock(&self.lock);
+        defer _ = std.c.pthread_mutex_unlock(&self.lock);
+        _ = try self.ensureLocked(gpa);
+    }
+
     fn ensureLocked(self: *PersistentPool, gpa: std.mem.Allocator) !*Inner {
-        if (self.initialized) return &self.inner;
+        if (self.initialized.load(.acquire)) return &self.inner;
         try self.inner.init(gpa);
         self.cache.init(gpa, META_CACHE_CAPACITY);
         self.cache.blob_budget = self.blob_budget;
-        self.initialized = true;
+        self.initialized.store(true, .release);
         return &self.inner;
     }
 
@@ -99,23 +107,23 @@ pub const PersistentPool = struct {
     /// Free what the pool set up. Only for an owner that outlives every query on it (libzpq's `zpq_close`); the Lambda
     /// keeps its pool for the life of the process.
     pub fn deinit(self: *PersistentPool) void {
-        if (!self.initialized) return;
+        if (!self.initialized.load(.acquire)) return;
         self.cache.deinit();
         self.inner.deinit();
-        self.initialized = false;
+        self.initialized.store(false, .release);
     }
 
     pub fn metaCache(self: *PersistentPool) ?*zpq.io.meta_cache.MetaCache {
-        return if (self.initialized) &self.cache else null;
+        return if (self.initialized.load(.acquire)) &self.cache else null;
     }
 
     /// Zero the connection-pool counters, so `stats` after a query reports that invocation alone.
     pub fn resetStats(self: *PersistentPool) void {
-        if (self.initialized) self.inner.resetStats();
+        if (self.initialized.load(.acquire)) self.inner.resetStats();
     }
 
     pub fn stats(self: *PersistentPool) Inner.Stats {
-        return if (self.initialized) self.inner.snapshotStats() else .{};
+        return if (self.initialized.load(.acquire)) self.inner.snapshotStats() else .{};
     }
 };
 
@@ -235,8 +243,9 @@ pub fn handle(
             var meta = zpq.profile.Meta.discover(env);
             meta.query = zpq.profile.utf8Prefix(trimmed, MAX_PROFILE_QUERY);
             meta.s3_preconnect_ns = pool.preconnect_ns;
-            if (pool.initialized) pool.preconnect_opened = pool.inner.preconnect_parked.load(.monotonic);
-            meta.s3_preconnect_opened = pool.preconnect_opened;
+            // Read, not stored: requests on one pool may run at once (libzpq).
+            if (pool.initialized.load(.acquire))
+                meta.s3_preconnect_opened = pool.inner.preconnect_parked.load(.monotonic);
             profiler = try zpq.profile.Profiler.create(allocator, prof_opts, meta);
         }
 

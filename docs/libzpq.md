@@ -13,7 +13,9 @@ zig build libzpq -Doptimize=ReleaseFast
 # zig-out/lib/libzpq.so, zig-out/lib/libzpq.a, zig-out/include/zpq.h
 ```
 
-- `libzpq.so` carries everything it links: BoringSSL, the codecs and libc++. It needs only libc at run time.
+- `libzpq.so` carries everything it links: BoringSSL, the codecs and libc++. At run time it needs the system C
+  library alone: libc and the dynamic loader on x86_64; on aarch64 (glibc) it also declares libpthread and libdl,
+  which are part of glibc. It needs no TLS, codec or C++ library from the system.
 - It exports the five `zpq_*` functions and nothing else (`src/libzpq/libzpq.map`). Its BoringSSL cannot collide
   with a host's own OpenSSL, such as the one a Python process loads.
 - The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
@@ -46,8 +48,10 @@ int zpq_abi_version(void);                      /* 1 */
     failed.
   - `ZPQ_EINVAL` (-1): bad arguments.
   - `ZPQ_ENOMEM` (-2): out of memory.
-  On 0 and 1 the response is NUL-terminated and the caller frees it with `zpq_free`.
-- **Threads.** Any number of `zpq_run` calls may run at once on one context. Each query runs on threads of its own,
+  On 0 and 1 the response is NUL-terminated and the caller frees it with `zpq_free`. Every output pointer given is
+  cleared before anything else, so a refused call leaves `*out_json` NULL and `*out_len` 0.
+- **Threads.** Any number of `zpq_run` calls may run at once on one context, from its first call on: `zpq_open`
+  sets the pool up before returning. Each query runs on threads of its own,
   as in the CLI, and shares the context's S3 connection pool and footer cache. The `"pool"` member of a response then
   reports the pool's running totals, not the one query's.
 - **Environment.** Each call reads the process environment as it is called: S3 credentials, endpoint and region, as
@@ -80,7 +84,8 @@ with zpq.Zpq(max_memory="4GB") as z:
 ```
 
 `run` returns the response as a dict and raises `zpq.ZpqError` on an `{"error": ...}` response, unless
-`check=False`. ctypes releases the GIL during the call, so threads run queries in parallel.
+`check=False`. ctypes releases the GIL during the call, so threads run queries in parallel. `close` waits for the
+calls in flight and refuses new ones (`zpq.ZpqClosed`), so the C context is never freed under a running query.
 
 `python/zpq_service.py` is a stdlib HTTP service: one process and one context, with a thread per request.
 
@@ -91,6 +96,15 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
 
 `POST /query` answers 200 with a response, or 400 with an `{"error": ...}` one; `GET /health` answers
 `{"ok": true}`.
+- A missing `Content-Length` answers 411; one that is not a non-negative integer, 400; one over 16 MiB, 413. Each of
+  these is answered without reading the body, and closes the connection.
+- On shutdown (Ctrl-C, or `server.shutdown()` then `zpq_service.stop(server, z)` when embedded), the service:
+  - stops accepting;
+  - ends idle keep-alive connections;
+  - joins every request thread, so queries in flight finish and answer;
+  - only then frees the context.
+
+  A call reaching the context after that answers 503 `{"error":"shutting_down"}`.
 
 ## Tests
 
@@ -98,11 +112,14 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
 
 - `tests/libzpq/test_abi.c`, the C ABI end to end:
   - options, round trip, a write read back, error responses and invalid arguments;
-  - 16 threads × 40 mixed calls on one context, each answer checked;
+  - 16 threads × 40 mixed calls on one context, each answer checked, on a warm context and on 8 fresh ones whose
+    first calls all start together;
   - resident memory over 10,000 calls (the second half must not grow it);
 - the same program under AddressSanitizer and LeakSanitizer, with a tenth of the calls (the system compiler builds
   it; `zig cc` has no sanitizer runtime);
-- `tests/libzpq/test_python.py`: the binding, 480 calls from 16 threads, and the HTTP service.
+- `tests/libzpq/test_python.py`: the binding, 480 calls from 16 threads, and the HTTP service. It also checks
+  `close` and service shutdown with a query in flight and a keep-alive connection idle (no request thread may
+  still run when the context closes), and malformed `Content-Length` values.
 
 `tests/libzpq/overhead.sh` compares a query through a warm context with the CLI, which starts a process per query,
 in perf counters.

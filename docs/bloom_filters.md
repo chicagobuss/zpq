@@ -87,7 +87,9 @@ Memory, per requested column at 0.01: while a chunk is encoded its filter is fir
 were distinct, about 1.2 bytes per present value rounded up to a power of two (so up to 2.4, and at most 128 MiB), and
 folded once the chunk is filled. The folded filter is held until the file closes: 1.2 to 2.4 bytes per distinct value
 per chunk, so a write with a filter on a unique key holds up to 2.4 bytes per row of that column until it closes. This
-is outside `--max-memory`. A copied chunk's filter is a slice of the input, which the write holds anyway.
+is outside `--max-memory`. A copied chunk's filter is copied out of the input when its row group is written (a
+windowed S3 input releases the row group before the footer) and held until the file closes, also outside
+`--max-memory`: its stored size, whatever probability it was written at.
 
 A byte copy keeps each copied chunk's filter, whatever probability it was written at; a requested column whose source
 chunk has none is decoded to build one. A re-encoded row group gets filters only for requested columns. Dropped columns

@@ -173,8 +173,8 @@ pub const Connection = struct {
     timeouts: Timeouts = .{},
     /// A request has gone out and no byte of its response has come back: a read waits `first_byte_ms`, not `idle_ms`.
     awaiting_response: bool = false,
-    /// The socket's current receive timeout, ms (0: not yet set), so it is only set again when it changes.
-    rcv_ms: u32 = 0,
+    /// The socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, so each is only set again when it changes.
+    sock: SockTimeouts = .{},
 
     /// Open a TCP connection, perform a TLS handshake, return the
     /// connected client. Caller eventually calls deinit().
@@ -239,16 +239,21 @@ pub const Connection = struct {
         var tls = boring.tls_client.TlsClient.init(allocator, context, serverName(host)) catch |err|
             return handshakeError(err);
         errdefer tls.deinit();
-        handshake(fd, &tls, peer.timeouts.handshake_ms) catch |err| {
+        var opts: SockTimeouts = .{};
+        handshake(fd, &tls, peer.timeouts.handshake_ms, &opts) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
                 const reason = boring.tls.c.X509_verify_cert_error_string(boring.tls.c.SSL_get_verify_result(tls.ssl));
                 std.log.warn("TLS: certificate of {s} rejected: {s}", .{ serverName(host), std.mem.span(reason) });
             }
             return err;
         };
-        // From here on a send may sit idle for `idle_ms`; reads set their own timeout (`armRecv`).
-        try setSockTimeout(fd, posix.SO.SNDTIMEO, peer.timeouts.idle_ms);
-        return .{ .fd = fd, .tls = tls, .allocator = allocator, .timeouts = peer.timeouts };
+        return .{
+            .fd = fd,
+            .tls = tls,
+            .allocator = allocator,
+            .timeouts = peer.timeouts,
+            .sock = opts,
+        };
     }
 
     /// Drive the handshake to completion, within `budget_ms` in all. Each iteration:
@@ -256,18 +261,16 @@ pub const Connection = struct {
     ///   2. write them to the socket
     ///   3. read from the socket, feed back into TLS
     /// Stop when the client reports handshake complete.
-    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient, budget_ms: u32) Error!void {
+    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient, budget_ms: u32, opts: *SockTimeouts) Error!void {
+        // One deadline for the whole stage: every read and write gets only what is left of it.
         const deadline = monoMs() + budget_ms;
-        try setSockTimeout(fd, posix.SO.SNDTIMEO, budget_ms);
         const initial = tls.startHandshake() catch |err| return handshakeError(err);
-        if (initial.encrypted) |bytes| writeAll(fd, bytes) catch |err| return handshakeIo(err);
+        if (initial.encrypted) |bytes|
+            writeAllBy(fd, bytes, budget_ms, deadline, opts) catch |err| return handshakeIo(err);
 
         var rx_buf: [16 * 1024]u8 = undefined;
         while (!tls.isHandshakeComplete()) {
-            const now = monoMs();
-            if (now >= deadline) return error.HandshakeTimeout;
-            try setSockTimeout(fd, posix.SO.RCVTIMEO, @intCast(deadline - now));
-            const n = readSome(fd, &rx_buf) catch |err| return if (err == error.WouldBlock)
+            const n = readBy(fd, &rx_buf, deadline, opts) catch |err| return if (err == error.WouldBlock)
                 error.HandshakeTimeout
             else
                 error.HandshakeFailed;
@@ -275,7 +278,8 @@ pub const Connection = struct {
             _ = tls.processIncoming(rx_buf[0..n], null) catch |err| return handshakeError(err);
             // After feeding bytes in, drain any outgoing handshake data.
             const out = tls.processOutgoing(null) catch |err| return handshakeError(err);
-            if (out.encrypted) |bytes| writeAll(fd, bytes) catch |err| return handshakeIo(err);
+            if (out.encrypted) |bytes|
+                writeAllBy(fd, bytes, budget_ms, deadline, opts) catch |err| return handshakeIo(err);
         }
     }
 
@@ -285,25 +289,26 @@ pub const Connection = struct {
 
     pub fn connectPlain(allocator: std.mem.Allocator, peer: Peer) Error!Connection {
         const fd = try openTcpAny(peer);
-        errdefer closeFd(fd);
-        try setSockTimeout(fd, posix.SO.SNDTIMEO, peer.timeouts.idle_ms);
         return .{ .fd = fd, .tls = undefined, .allocator = allocator, .plain = true, .timeouts = peer.timeouts };
     }
 
-    /// Use `t` from the next request on: a pooled connection takes the timeouts of the query that reuses it.
-    pub fn setTimeouts(self: *Connection, t: Timeouts) Error!void {
-        if (std.meta.eql(self.timeouts, t)) return;
-        try setSockTimeout(self.fd, posix.SO.SNDTIMEO, t.idle_ms);
+    /// Use `t` from the next request on: a pooled connection takes the timeouts of the query that reuses it. The
+    /// socket options follow at the next read or write.
+    pub fn setTimeouts(self: *Connection, t: Timeouts) void {
         self.timeouts = t;
     }
 
-    /// Set the receive timeout a read must use now: `first_byte_ms` while a request awaits its response, else
-    /// `idle_ms`. Only calls into the kernel when the value changes (twice per request at most).
-    fn armRecv(self: *Connection) Error!void {
-        const want = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
-        if (want == self.rcv_ms) return;
-        try setSockTimeout(self.fd, posix.SO.RCVTIMEO, want);
-        self.rcv_ms = want;
+    /// Read from the socket, waiting at most `first_byte_ms` for a response's first byte, else `idle_ms`.
+    fn readSocket(self: *Connection, buf: []u8) Error!usize {
+        const wait = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
+        const n = readBy(self.fd, buf, monoMs() + wait, &self.sock) catch |err| return self.recvError(err);
+        if (n > 0) self.awaiting_response = false;
+        return n;
+    }
+
+    /// Write all of `buf`, failing with `error.SendTimeout` once `idle_ms` pass with no byte taken.
+    fn writeSocket(self: *Connection, buf: []const u8) Error!void {
+        writeAllBy(self.fd, buf, self.timeouts.idle_ms, null, &self.sock) catch |err| return sendError(err);
     }
 
     /// A socket read that timed out, named for what it was waiting for.
@@ -330,13 +335,13 @@ pub const Connection = struct {
     /// Sending is what a request does, so afterwards the next read waits for the first byte of its response.
     pub fn send(self: *Connection, plaintext: []const u8) Error!void {
         self.awaiting_response = true;
-        if (self.plain) return writeAll(self.fd, plaintext) catch |err| return sendError(err);
+        if (self.plain) return self.writeSocket(plaintext);
 
         var off: usize = 0;
         while (off < plaintext.len) {
             const out = self.tls.processOutgoing(plaintext[off..]) catch return error.SendFailed;
             const drained = if (out.encrypted) |bytes| bytes.len else 0;
-            if (drained > 0) writeAll(self.fd, out.encrypted.?) catch |err| return sendError(err);
+            if (drained > 0) try self.writeSocket(out.encrypted.?);
             if (out.consumed == 0 and drained == 0) return error.SendFailed;
             off += out.consumed;
         }
@@ -346,12 +351,7 @@ pub const Connection = struct {
     /// close_notify; the TCP stream ending without one is `error.UncleanClose`, and data that does not decrypt is
     /// `error.RecvFailed`.
     pub fn recv(self: *Connection, dest: []u8) Error!usize {
-        if (self.plain) {
-            try self.armRecv();
-            const n = readSome(self.fd, dest) catch |err| return self.recvError(err);
-            if (n > 0) self.awaiting_response = false;
-            return n;
-        }
+        if (self.plain) return self.readSocket(dest);
 
         // Drain anything we previously buffered.
         if (self.pending.items.len > 0) {
@@ -376,10 +376,8 @@ pub const Connection = struct {
                 }
             }
             // No plaintext yet (mid-record); read more. Any byte is progress: the idle timeout applies from here.
-            try self.armRecv();
-            const n = readSome(self.fd, &rx_buf) catch |err| return self.recvError(err);
+            const n = try self.readSocket(&rx_buf);
             if (n == 0) return error.UncleanClose;
-            self.awaiting_response = false;
             input = rx_buf[0..n];
         }
     }
@@ -484,12 +482,25 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32) Error!posix.fd_t {
     return fd;
 }
 
-/// Set SO_RCVTIMEO or SO_SNDTIMEO: a blocking read or write on `fd` waiting `ms` without moving a byte fails with
-/// EAGAIN (`error.WouldBlock` from `readSome` / `writeAll`).
-fn setSockTimeout(fd: posix.fd_t, opt: u32, ms: u32) Error!void {
+/// A socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, ms (0: never).
+pub const SockTimeouts = struct { rcv_ms: u32 = 0, snd_ms: u32 = 0 };
+
+/// Set SO_RCVTIMEO or SO_SNDTIMEO to `ms` unless it already holds it. A blocking read or write that waits that long
+/// without moving a byte then fails with EAGAIN.
+fn armSockTimeout(fd: posix.fd_t, opt: u32, ms: u32, current: *u32) bool {
+    if (current.* == ms) return true;
     const tv: posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast(@as(u32, ms % 1000) * 1000) };
     const r = posix.system.setsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&tv), @sizeOf(posix.timeval));
-    if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
+    if (posix.errno(r) != .SUCCESS) return false;
+    current.* = ms;
+    return true;
+}
+
+/// Milliseconds left until `deadline`, at least 1; null once it has passed.
+fn msLeft(deadline: u64) ?u32 {
+    const now = monoMs();
+    if (now >= deadline) return null;
+    return @intCast(@min(deadline - now, std.math.maxInt(u32)));
 }
 
 fn monoMs() u64 {
@@ -503,10 +514,16 @@ fn closeFd(fd: posix.fd_t) void {
 const WriteError = error{ SendFailed, WouldBlock };
 const ReadError = error{ ReadFailed, ConnectionReset, WouldBlock };
 
-/// Write all of `buf`. `error.WouldBlock`: SO_SNDTIMEO passed without the peer taking a byte.
-fn writeAll(fd: posix.fd_t, buf: []const u8) WriteError!void {
+/// Write all of `buf`. `error.WouldBlock`: `idle_ms` passed with no byte taken, or `stage` (an absolute deadline,
+/// for the handshake) passed. Every byte taken restarts the idle wait; a signal interrupting a wait does not, since
+/// the socket timeout is set to the time left before each write.
+fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
+    var deadline = monoMs() + idle_ms;
+    if (stage) |d| deadline = @min(deadline, d);
     var off: usize = 0;
     while (off < buf.len) {
+        const left = msLeft(deadline) orelse return error.WouldBlock;
+        if (!armSockTimeout(fd, posix.SO.SNDTIMEO, left, &opts.snd_ms)) return error.SendFailed;
         const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
         switch (posix.errno(r)) {
             .SUCCESS => {},
@@ -517,6 +534,8 @@ fn writeAll(fd: posix.fd_t, buf: []const u8) WriteError!void {
         const n: usize = @intCast(r);
         if (n == 0) return error.SendFailed;
         off += n;
+        deadline = monoMs() + idle_ms;
+        if (stage) |d| deadline = @min(deadline, d);
     }
 }
 
@@ -527,9 +546,12 @@ fn sendError(err: WriteError) Error {
     };
 }
 
-/// One read. `error.WouldBlock`: SO_RCVTIMEO passed without a byte arriving.
-fn readSome(fd: posix.fd_t, buf: []u8) ReadError!usize {
+/// One read, by `deadline` (absolute, `monoMs`). `error.WouldBlock`: the deadline passed without a byte arriving.
+/// A signal interrupting the wait does not extend it: the socket timeout is set to the time left before each try.
+fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
     while (true) {
+        const left = msLeft(deadline) orelse return error.WouldBlock;
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, left, &opts.rcv_ms)) return error.ReadFailed;
         const r = posix.system.read(fd, buf.ptr, buf.len);
         return switch (posix.errno(r)) {
             .SUCCESS => @intCast(r),
@@ -917,4 +939,106 @@ test "a connect the listener never completes fails within its timeout" {
         };
     }
     return error.SkipZigTest; // this kernel queued every connection: nothing to time out here
+}
+
+/// Interrupts one thread with SIGUSR1 every 20 ms, through a handler installed without SA_RESTART, so each of its
+/// blocking reads and writes keeps returning EINTR, as a profiler's or runtime's signals do.
+const Interrupter = struct {
+    target: std.c.pthread_t,
+    stop: std.atomic.Value(bool) = .init(false),
+    sent: std.atomic.Value(u32) = .init(0),
+    old: posix.Sigaction = undefined,
+    thread: std.Thread = undefined,
+
+    fn ignore(_: posix.SIG) callconv(.c) void {}
+
+    fn start(self: *Interrupter) !void {
+        const act: posix.Sigaction = .{ .handler = .{ .handler = ignore }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(.USR1, &act, &self.old);
+        errdefer posix.sigaction(.USR1, &self.old, null);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Interrupter) void {
+        while (!self.stop.load(.acquire)) {
+            _ = std.c.pthread_kill(self.target, .USR1);
+            _ = self.sent.fetchAdd(1, .monotonic);
+            const ts: posix.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = posix.system.nanosleep(&ts, null);
+        }
+    }
+
+    fn finish(self: *Interrupter) void {
+        self.stop.store(true, .release);
+        self.thread.join();
+        posix.sigaction(.USR1, &self.old, null);
+    }
+};
+
+test "signals interrupting a wait do not extend the handshake, first-byte, idle read or send deadlines" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var irq: Interrupter = .{ .target = std.c.pthread_self() };
+    try irq.start();
+    defer irq.finish();
+
+    {
+        var pki = try test_server.Pki.init();
+        defer pki.deinit();
+        var leaf = try pki.issue("mute.test", "DNS:mute.test");
+        defer leaf.deinit();
+        var server: test_server.Server = undefined;
+        try server.startWith(&leaf, 1, .mute);
+        defer server.finish() catch {};
+        var context = try ClientContext.init(.{ .verify_certificate = false });
+        defer context.deinit();
+        var peer: Peer = .loopback(server.port);
+        peer.timeouts = short;
+        const t0 = monoMs();
+        const got = Connection.connectWithContext(testing.allocator, &context, peer, "mute.test");
+        try testing.expectError(error.HandshakeTimeout, got);
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    {
+        var pki = try test_server.Pki.init();
+        defer pki.deinit();
+        var leaf = try pki.issue("hold.test", "DNS:hold.test");
+        defer leaf.deinit();
+        var server: test_server.Server = undefined;
+        try server.startWith(&leaf, 1, .hold);
+        defer server.finish() catch {};
+        var context = try ClientContext.init(.{ .verify_certificate = false });
+        defer context.deinit();
+        var peer: Peer = .loopback(server.port);
+        peer.timeouts = short;
+        var conn = try Connection.connectWithContext(testing.allocator, &context, peer, "hold.test");
+        defer conn.deinit();
+        try conn.send("GET /k HTTP/1.1\r\nHost: hold.test\r\n\r\n");
+        var buf: [64]u8 = undefined;
+        const t0 = monoMs();
+        try testing.expectError(error.FirstByteTimeout, conn.recv(&buf));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    {
+        // A plain connection over a socket pair whose far end neither writes nor reads.
+        var fds: [2]i32 = undefined;
+        if (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+            return error.SkipZigTest;
+        defer closeFd(fds[1]);
+        var conn: Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+        defer conn.deinit();
+        conn.setTimeouts(short);
+        var buf: [64]u8 = undefined;
+        var t0 = monoMs();
+        try testing.expectError(error.ReadTimeout, conn.recv(&buf));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+
+        const big = try testing.allocator.alloc(u8, 8 << 20);
+        defer testing.allocator.free(big);
+        @memset(big, 'x');
+        t0 = monoMs();
+        try testing.expectError(error.SendTimeout, conn.send(big));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    // At 20 ms apart, each 200 ms wait above was interrupted several times.
+    try testing.expect(irq.sent.load(.monotonic) >= 20);
 }

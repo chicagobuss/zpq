@@ -60,6 +60,11 @@ pub const FakeS3 = struct {
     stall: ?[]const u8 = null,
     stall_at: StallAt = .mid_body,
     stalls_left: u32 = 1,
+    /// Matching requests let through before the stalls start (the footer read, say, to stall a ranged fetch after it).
+    stall_skip: u32 = 0,
+    /// When set, only a request for an explicit byte range at least this long matches: a column-chunk fetch, not the
+    /// footer read (a suffix range) or a short header read.
+    stall_min_len: usize = 0,
     stalled: u32 = 0,
     trickle_ms: u32 = 60,
     /// Set by `deinit`: stalled connection threads stop waiting.
@@ -259,6 +264,10 @@ pub const FakeS3 = struct {
         defer self.unlock();
         const pat = self.stall orelse return false;
         if (std.mem.indexOf(u8, head[0..sp2], pat) == null) return false;
+        if (self.stall_skip > 0) {
+            self.stall_skip -= 1;
+            return false;
+        }
         self.stalled += 1;
         self.stalls_left -|= 1;
         if (self.stalls_left == 0) self.stall = null;
@@ -287,12 +296,19 @@ pub const FakeS3 = struct {
         defer if (locked) self.unlock();
         var lose = false;
         stall_reply = null;
-        if (self.stall_at != .request_body) if (self.stall) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
-            self.stalled += 1;
-            self.stalls_left -|= 1;
-            if (self.stalls_left == 0) self.stall = null;
-            stall_reply = self.stall_at;
-        };
+        const stalls_here = self.stall_at != .request_body and self.stall != null and
+            std.mem.indexOf(u8, desc, self.stall.?) != null and
+            (self.stall_min_len == 0 or (rangeLen(head) orelse 0) >= self.stall_min_len);
+        if (stalls_here) {
+            if (self.stall_skip > 0) {
+                self.stall_skip -= 1;
+            } else {
+                self.stalled += 1;
+                self.stalls_left -|= 1;
+                if (self.stalls_left == 0) self.stall = null;
+                stall_reply = self.stall_at;
+            }
+        }
         if (self.drop) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
             self.drop = null;
             self.dropped += 1;
@@ -482,6 +498,18 @@ pub const FakeS3 = struct {
         try self.objects.append(self.allocator, .{ .key = try self.allocator.dupe(u8, key), .etag = etag, .len = len });
     }
 };
+
+/// The length a request's `Range: bytes=a-b` asks for; null without one, or for a suffix range (`bytes=-n`).
+fn rangeLen(head: []const u8) ?usize {
+    const r = header(head, "Range") orelse return null;
+    if (!std.mem.startsWith(u8, r, "bytes=")) return null;
+    const spec = r["bytes=".len..];
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    if (dash == 0) return null;
+    const lo = std.fmt.parseInt(usize, spec[0..dash], 10) catch return null;
+    const hi = std.fmt.parseInt(usize, spec[dash + 1 ..], 10) catch return null;
+    return if (hi >= lo) hi - lo + 1 else null;
+}
 
 fn sleepMs(ms: u32) void {
     var ts: posix.timespec = .{

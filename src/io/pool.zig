@@ -206,15 +206,8 @@ pub fn Pool(comptime N: usize) type {
             while (expired.popFirst()) |n| self.destroyNode(@alignCast(@fieldParentPtr("pool_node", n)));
 
             if (reused) |slot| {
-                if (slot.conn.setTimeouts(criteria.timeouts)) |_| {
-                    return .{ .conn = &slot.conn, .node = slot, .permit = permit, .reused = true };
-                } else |_| {
-                    // A socket that refuses its options is no use: drop it and open a new one.
-                    self.mutex.lockUncancelable(io);
-                    self.used.remove(&slot.pool_node);
-                    self.mutex.unlock(io);
-                    self.destroyNode(slot);
-                }
+                slot.conn.setTimeouts(criteria.timeouts);
+                return .{ .conn = &slot.conn, .node = slot, .permit = permit, .reused = true };
             }
 
             const slot = try self.allocator.create(Node);

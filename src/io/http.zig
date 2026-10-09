@@ -534,7 +534,7 @@ test "only a closed or reset connection counts as closed before the response; lo
             .tls = undefined,
             .allocator = testing.allocator,
             .plain = true,
-            .rcv_ms = (tls.Timeouts{}).idle_ms,
+            .sock = .{ .rcv_ms = (tls.Timeouts{}).idle_ms },
         };
         defer conn.deinit();
         try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target));

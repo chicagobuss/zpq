@@ -5399,15 +5399,64 @@ test "an S3 read that stalls is retried on a new connection and the query answer
             if (want == null) want = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, window, &stall_env);
             fake.stall = "GET /bkt/t/b.parquet";
             fake.stall_at = at;
+            const t0 = nowMonoNs();
             const got = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, window, &stall_env);
             defer gpa.free(got);
+            const ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
             std.testing.expectEqualStrings(want.?, got) catch |err| {
                 std.debug.print("window {?d}, stall {t}\n", .{ window, at });
                 return err;
             };
             try std.testing.expectEqual(@as(u32, 1), fake.stalled);
+            // Recovered within the query's 200 ms timeouts, not a 10 s default.
+            std.testing.expect(ms < 3_000) catch |err| {
+                std.debug.print("window {?d}, stall {t}: {d} ms\n", .{ window, at, ms });
+                return err;
+            };
         }
     }
+}
+
+test "the parallel range fetches take the query's first-byte and idle timeouts, windowed or not" {
+    // A stalled column-chunk range fetch (the fake stalls only an explicit range of 1 KiB or more: never the footer's
+    // suffix read or the 8-byte header read) recovers within the query's short timeout of the stalled kind, the other
+    // set long: were either ignored, recovery would wait out a default.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    const keys = [_][]const u8{"t/m.parquet"};
+    const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(a) AS s, max(b) AS m", .parallelism = 2 };
+    const Case = struct { at: fake_s3.FakeS3.StallAt, env: []const [*:0]const u8 };
+    const cases = [_]Case{
+        .{ .at = .before_headers, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=200", "ZPQ_S3_IDLE_TIMEOUT_MS=60000" } },
+        .{ .at = .mid_body, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=60000", "ZPQ_S3_IDLE_TIMEOUT_MS=200" } },
+    };
+    var want: ?[]u8 = null;
+    defer if (want) |w| gpa.free(w);
+    for ([_]?u32{ null, 1 }) |window| for (cases) |c| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(gpa);
+        defer fake.deinit();
+        try fake.serveBytes("t/m.parquet", bytes);
+        if (want == null) want = try fakeS3AggregateJson(gpa, &fake, &keys, q, window);
+        fake.stall = "GET /bkt/t/m.parquet";
+        fake.stall_at = c.at;
+        fake.stall_min_len = 1024;
+        const t0 = nowMonoNs();
+        const got = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, window, c.env);
+        defer gpa.free(got);
+        const ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
+        std.testing.expectEqualStrings(want.?, got) catch |err| {
+            std.debug.print("window {?d}, stall {t}\n", .{ window, c.at });
+            return err;
+        };
+        try std.testing.expectEqual(@as(u32, 1), fake.stalled);
+        std.testing.expect(ms >= 150 and ms < 3_000) catch |err| {
+            std.debug.print("window {?d}, stall {t}: {d} ms\n", .{ window, c.at, ms });
+            return err;
+        };
+    };
 }
 
 test "a recompressing S3 copy whose ranged read stalls writes the same bytes as one that does not" {
@@ -5435,6 +5484,7 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
             fake.stall = "GET /bkt/t/m.parquet";
             fake.stall_at = x;
             fake.stalls_left = 2;
+            fake.stall_min_len = 1024; // column-chunk range fetches through the window
         }
         var lines: std.ArrayList(?[*:0]const u8) = .empty;
         try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
@@ -5443,6 +5493,7 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
         for (stall_env) |e| try lines.append(a, e);
         const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
         @memcpy(block, lines.items);
+        const t0 = nowMonoNs();
         var r = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io }, .{
             .inputs = &.{"s3://bkt/t/m.parquet"},
             .output = out,
@@ -5451,6 +5502,8 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
             .parallelism = 2,
         });
         r.deinit(gpa);
+        // Two stalls, each recovered within the query's 200 ms timeouts, not a 10 s default.
+        try std.testing.expect(@divTrunc(nowMonoNs() - t0, std.time.ns_per_ms) < 5_000);
         const written = try metadata.readFileSlice(out, gpa);
         if (first) |f| {
             defer gpa.free(written);

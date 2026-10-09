@@ -911,6 +911,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         .addrs = ctx.addrs,
         .port = ctx.port,
         .use_tls = ctx.use_tls,
+        .timeouts = ctx.creds.timeouts,
     };
     const opts: RequestOpts = .{
         .idempotent = true,

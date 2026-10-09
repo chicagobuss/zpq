@@ -1589,6 +1589,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             out_criteria,
             .{
                 .profiler = args.profiler,
+                .diag = args.diag,
                 // Parts uploading at once come out of the query's budget too: an eighth of it, at least two parts.
                 .max_bytes_in_flight = @max(
                     2 * multipart_sink.TARGET_PART_SIZE,

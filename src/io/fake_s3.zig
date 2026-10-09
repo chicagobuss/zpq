@@ -5,7 +5,8 @@
 //! the request (or, with `apply_dropped = false`, does not) and then resets the connection without sending a byte.
 //! `stall` makes it go silent on matching requests while keeping the connection open, the way a stuck server or
 //! network path looks: before the response, part-way through its headers or its body, or (for a request with a body)
-//! without reading that body, so the client's send blocks.
+//! without reading that body, so the client's send blocks. `fail` makes it refuse matching requests with an error
+//! status and S3 error code, without applying them.
 //!
 //! Test-only: imported from tests, never from the engine.
 
@@ -67,6 +68,15 @@ pub const FakeS3 = struct {
     stall_min_len: usize = 0,
     stalled: u32 = 0,
     trickle_ms: u32 = 60,
+    /// Substring of "METHOD target" whose next `fails_left` matches are refused with `fail_status` and `fail_code`,
+    /// unapplied.
+    fail: ?[]const u8 = null,
+    fail_status: u16 = 503,
+    fail_code: []const u8 = "SlowDown",
+    fails_left: u32 = 1,
+    failed: u32 = 0,
+    /// CreateMultipartUpload requests received, whatever became of them.
+    creates: u32 = 0,
     /// Set by `deinit`: stalled connection threads stop waiting.
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -296,6 +306,15 @@ pub const FakeS3 = struct {
         defer if (locked) self.unlock();
         var lose = false;
         stall_reply = null;
+        if (std.mem.eql(u8, method, "POST") and std.mem.indexOf(u8, target, "?uploads") != null) self.creates += 1;
+        if (self.fail) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
+            self.failed += 1;
+            self.fails_left -|= 1;
+            if (self.fails_left == 0) self.fail = null;
+            var err_buf: [256]u8 = undefined;
+            const err_body = try std.fmt.bufPrint(&err_buf, "<Error><Code>{s}</Code></Error>", .{self.fail_code});
+            return self.reply(fd, false, self.fail_status, "", err_body, null);
+        };
         const stalls_here = self.stall_at != .request_body and self.stall != null and
             std.mem.indexOf(u8, desc, self.stall.?) != null and
             (self.stall_min_len == 0 or (rangeLen(head) orelse 0) >= self.stall_min_len);

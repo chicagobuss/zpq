@@ -67,4 +67,46 @@ pub const Detail = union(enum) {
     like_non_string: struct { type_name: []const u8 },
     /// A filter compares the FLOAT16 column `Diag.column`.
     float16_filter,
+    /// The S3 request behind the error failed: which one, at what point, and how.
+    s3_request: S3Failure,
+};
+
+/// A failed S3 request, as reported to the user: the operation, the phase it failed in, and the error or the status
+/// and S3 error code it was answered with.
+pub const S3Failure = struct {
+    op: Op,
+    phase: Phase,
+    /// The error, for the `connect` and `request` phases.
+    err: ?anyerror = null,
+    /// The HTTP status and S3 error code (`<Code>`), for the `response` phase.
+    status: u16 = 0,
+    code: Text = .{},
+    /// Connections tried; only a connect failure is tried again.
+    attempts: u8 = 1,
+
+    pub const Op = enum { CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload };
+
+    pub const Phase = enum {
+        /// Resolving the host, connecting, or the TLS handshake: nothing was sent.
+        connect,
+        /// Sending the request or awaiting its answer: the server may have applied it.
+        request,
+        /// S3 answered with an error status.
+        response,
+    };
+
+    /// One line: `CreateMultipartUpload failed while connecting (3 attempts): ConnectTimeout`.
+    pub fn format(self: S3Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s} ", .{@tagName(self.op)});
+        switch (self.phase) {
+            .connect => try w.writeAll("failed while connecting"),
+            .request => try w.writeAll("failed after the request was sent"),
+            .response => {
+                const code = if (self.code.len > 0) self.code.get() else "(no S3 error code)";
+                try w.print("was answered {d} {s}", .{ self.status, code });
+            },
+        }
+        if (self.attempts > 1) try w.print(" ({d} attempts)", .{self.attempts});
+        if (self.err) |e| try w.print(": {s}", .{@errorName(e)});
+    }
 };

@@ -50,7 +50,14 @@ Every S3 connection has deadlines, in milliseconds, each overridable from the en
 The last is an idle timeout: a transfer that keeps moving is never cut off, however long it takes. A request that
 times out is sent again on a new connection when that is safe (GETs, HEADs, object and part PUTs). The retries are
 charged to its usual retry budget, so a server that keeps stalling fails the query with the timeout instead of
-hanging it. Creating and completing a multipart upload are never sent twice.
+hanging it. Creating and completing a multipart upload are never sent twice; a Create that could not connect (DNS,
+TCP or the TLS handshake failed, so nothing was sent) is tried again on a new connection within the same budget. When
+one of them fails, the error names the request, whether it failed while connecting or after it was sent, and the HTTP
+status and S3 error code it was answered with: on stderr from the CLI, and in the Lambda's error JSON as `"s3"`.
+
+An upload that fails part-way is aborted, but an abort can fail too, and a Create whose answer was lost may have
+started an upload zpq never hears of. Give the output bucket a lifecycle rule with `AbortIncompleteMultipartUpload`
+(a day or so after initiation) so such uploads, and the storage their parts hold, are cleaned up whatever happened.
 
 ## Performance
 

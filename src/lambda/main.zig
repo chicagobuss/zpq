@@ -395,8 +395,22 @@ fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) !
         try engine.writeJsonQuoted(w, input);
         if (diag.cause) |cause| try w.print(",\"cause\":\"{s}\"", .{@errorName(cause)});
     }
+    if (diag.detail == .s3_request) try writeS3Failure(w, diag.detail.s3_request);
     try w.writeByte('}');
     return aw.toOwnedSlice();
+}
+
+/// `,"s3":{...}`: the failed S3 request behind an engine error, its phase, and its error or its status and S3 code.
+fn writeS3Failure(w: *std.Io.Writer, f: zpq.core.diag.S3Failure) !void {
+    try w.print(",\"s3\":{{\"op\":\"{s}\",\"phase\":\"{s}\",\"attempts\":{d}", .{
+        @tagName(f.op), @tagName(f.phase), f.attempts,
+    });
+    if (f.err) |e| try w.print(",\"error\":\"{s}\"", .{@errorName(e)});
+    if (f.phase == .response) {
+        try w.print(",\"status\":{d},\"code\":", .{f.status});
+        try engine.writeJsonQuoted(w, f.code.get());
+    }
+    try w.writeByte('}');
 }
 
 /// Adapter that lets engine.runQuery use the lambda's PersistentPool
@@ -1006,4 +1020,29 @@ test {
     _ = @import("request.zig");
     _ = @import("runtime.zig");
     _ = @import("scan.zig");
+}
+
+test "an engine error names the failed S3 request, its phase, and its error or status and S3 code" {
+    const gpa = std.testing.allocator;
+    var diag: Diag = .{};
+    diag.detail = .{ .s3_request = .{
+        .op = .CreateMultipartUpload,
+        .phase = .connect,
+        .err = error.ConnectTimeout,
+        .attempts = 3,
+    } };
+    const timed_out = try engineError(gpa, error.CreateMultipartFailed, &diag);
+    defer gpa.free(timed_out);
+    try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"CreateMultipartFailed\"," ++
+        "\"s3\":{\"op\":\"CreateMultipartUpload\",\"phase\":\"connect\",\"attempts\":3," ++
+        "\"error\":\"ConnectTimeout\"}}", timed_out);
+
+    var refused: zpq.core.diag.S3Failure = .{ .op = .CreateMultipartUpload, .phase = .response, .status = 503 };
+    refused.code.set("SlowDown");
+    diag.detail = .{ .s3_request = refused };
+    const slow = try engineError(gpa, error.CreateMultipartFailed, &diag);
+    defer gpa.free(slow);
+    try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"CreateMultipartFailed\"," ++
+        "\"s3\":{\"op\":\"CreateMultipartUpload\",\"phase\":\"response\",\"attempts\":1,\"status\":503," ++
+        "\"code\":\"SlowDown\"}}", slow);
 }

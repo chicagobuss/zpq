@@ -1250,6 +1250,8 @@ fn printDetail(diag: *const Diag) void {
             "filter: FLOAT16 column `{s}` is not yet supported for filtering\n",
             .{name},
         ),
+        // The upload logged it to stderr when it happened.
+        .s3_request => {},
     }
 }
 

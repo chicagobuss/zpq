@@ -16,12 +16,16 @@ const std = @import("std");
 const clock = @import("../clock.zig");
 const nowMonoNs = clock.monoNs;
 const Io = std.Io;
+const posix = std.posix;
 const s3 = @import("s3.zig");
 const tls = @import("tls.zig");
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const retry = @import("retry.zig");
 const profile = @import("../profile.zig");
+const diag_mod = @import("../core/diag.zig");
+const Diag = diag_mod.Diag;
+const S3Failure = diag_mod.S3Failure;
 
 /// Percent-encode an S3 query-parameter value (RFC 3986: keep the unreserved
 /// set A-Za-z0-9-._~, escape everything else as %XX). `sigv4.zig` signs the
@@ -76,6 +80,18 @@ pub const Options = struct {
     max_bytes_in_flight: usize = DEFAULT_MAX_BYTES_IN_FLIGHT,
     /// Records the upload's requests when set.
     profiler: ?*profile.Profiler = null,
+    /// Receives the cause of a failed CreateMultipartUpload or CompleteMultipartUpload; see `core/diag.zig`.
+    diag: ?*Diag = null,
+    control: Control = .{},
+};
+
+/// How the control-plane requests (Create, Complete, Abort) get their connections. Tests replace `connect` to fail the
+/// way a network does, and `policy` to back off briefly.
+pub const Control = struct {
+    pub const ConnectFn = fn (std.mem.Allocator, s3.Credentials, []const tls.Ipv4, []const u8) s3.Error!tls.Connection;
+
+    connect: *const ConnectFn = s3.connect,
+    policy: retry.Policy = retry.default_policy,
 };
 
 const EtagSlot = struct {
@@ -244,11 +260,27 @@ pub const MultipartSink = struct {
         const started_s = clock.realtimeS();
         const span = profile.Span.begin(profile.threadOf(self.options.profiler, .writer));
         defer span.end(.upload_create, profile.args(.{0}));
-        self.upload_id = createMultipartUpload(self.arena, self.creds, self.url) catch |err| {
-            // The upload may exist even though its id never reached us; nothing else could ever abort it.
-            if (outcomeUnknown(err, error.CreateMultipartFailed)) abortUploadsStartedSince(self.arena, self.creds, self.url, started_s);
+        var failure: S3Failure = .{ .op = .CreateMultipartUpload, .phase = .connect };
+        const control = self.options.control;
+        const arena = self.arena;
+        self.upload_id = createMultipartUpload(arena, self.creds, self.url, control, self.io, &failure) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            if (failure.err == null and failure.phase != .response) failure.err = err;
+            self.controlFailed(failure);
+            // Once sent, the upload may exist even though its id never reached us (no answer, or a 200 we could not
+            // read); nothing else could ever abort it.
+            const maybe_started = failure.phase == .request or (failure.phase == .response and failure.status == 200);
+            if (maybe_started) abortUploadsStartedSince(arena, self.creds, self.url, control, started_s);
             return error.CreateMultipartFailed;
         };
+    }
+
+    /// Report a failed control-plane request: always logged, and kept in the query's `Diag` unless it already holds a
+    /// detail.
+    fn controlFailed(self: *MultipartSink, failure: S3Failure) void {
+        std.log.warn("multipart sink: {f}", .{failure});
+        const d = self.options.diag orelse return;
+        if (d.detail == .none) d.detail = .{ .s3_request = failure };
     }
 
     /// Common machinery: register the etag slot, reserve the byte
@@ -318,7 +350,7 @@ pub const MultipartSink = struct {
 
     fn abortOpenUpload(self: *MultipartSink) void {
         if (self.upload_id) |id| {
-            abortMultipartUpload(self.arena, self.creds, self.url, id) catch {};
+            _ = abortLogged(self.arena, self.creds, self.url, self.options.control, id);
             self.upload_id = null;
         }
     }
@@ -362,16 +394,21 @@ pub const MultipartSink = struct {
 
         const t_complete_start = nowMonoNs();
         if (self.upload_id) |id| {
-            completeMultipartUpload(self.arena, self.creds, self.url, id, self.etags.items) catch |err| {
+            var failure: S3Failure = .{ .op = .CompleteMultipartUpload, .phase = .connect };
+            const control = self.options.control;
+            const etags = self.etags.items;
+            completeMultipartUpload(self.arena, self.creds, self.url, control, id, etags, &failure) catch |err| {
+                if (failure.err == null and failure.phase != .response) failure.err = err;
                 // A Complete whose answer was lost may have committed the object: accept it only if the key now holds
                 // exactly this upload.
-                if (!outcomeUnknown(err, error.CompleteMultipartFailed) or
-                    !completedObjectMatches(self.arena, self.creds, self.url, self.etags.items))
-                {
+                const applied = failure.phase == .request and
+                    completedObjectMatches(self.arena, self.creds, self.url, self.etags.items);
+                if (!applied) {
+                    self.controlFailed(failure);
                     self.abortOpenUpload();
                     return err;
                 }
-                std.log.warn("multipart sink: CompleteMultipartUpload answer lost ({s}); the object carries this upload's ETag", .{@errorName(err)});
+                std.log.warn("multipart sink: {f}; the object carries this upload's ETag", .{failure});
             };
             self.upload_id = null;
         } else {
@@ -497,15 +534,22 @@ fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connecti
 // Control-plane operations (one-off connections, not pool-backed)
 // ============================================================
 
-fn createMultipartUpload(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) ![]const u8 {
+/// Start a multipart upload. A failure to connect is tried again (`controlConnect`); once the request is being sent
+/// it is never repeated, since the server may have applied it. A failure is described in `failure`.
+fn createMultipartUpload(
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    url: s3.Url,
+    control: Control,
+    io: Io,
+    failure: *S3Failure,
+) ![]const u8 {
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const query = "uploads=";
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
-    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addrs = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addrs, host);
+    var conn = try controlConnect(arena, creds, url, control, io, failure);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -519,24 +563,77 @@ fn createMultipartUpload(arena: std.mem.Allocator, creds: s3.Credentials, url: s
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = try http.sendRequest(arena, &conn, .{
+    const resp = try controlSend(arena, &conn, .{
         .method = .POST,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = "",
-    });
-    if (resp.status != 200) return error.CreateMultipartFailed;
+    }, failure);
+    if (resp.status != 200) {
+        noteRefusal(resp, failure);
+        return error.CreateMultipartFailed;
+    }
+    return s3.extractXml(arena, resp.body, "UploadId") catch |err| {
+        noteRefusal(resp, failure);
+        failure.err = err;
+        return err;
+    };
+}
 
-    return try s3.extractXml(arena, resp.body, "UploadId");
+/// A connection for one control-plane request, recording a failure in `failure` (phase `connect`). Nothing has been
+/// sent then, so with `io` a failure `retry.classifyConnect` calls transient (resolving, connecting, the TLS
+/// handshake) is tried again on a new connection, charged and backed off, until the budget runs out; a rejected
+/// certificate and local errors are not.
+fn controlConnect(
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    url: s3.Url,
+    control: Control,
+    io: ?Io,
+    failure: *S3Failure,
+) !tls.Connection {
+    const host = try s3.hostFor(arena, creds, url.bucket);
+    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
+    var attempts: retry.Attempts = .{ .policy = control.policy };
+    var tried: u8 = 0;
+    while (true) {
+        tried += 1;
+        const err = connected: {
+            const addrs = s3.resolveIpv4(arena, connect_host) catch |err| break :connected err;
+            return control.connect(arena, creds, addrs, host) catch |err| break :connected err;
+        };
+        failure.* = .{ .op = failure.op, .phase = .connect, .err = err, .attempts = tried };
+        const again = if (io) |i| try attempts.retryAfter(i, retry.classifyConnect(err)) else false;
+        if (!again) return err;
+    }
+}
+
+/// Send a control-plane request and read its answer, recording a failure in `failure` (phase `request`).
+fn controlSend(arena: std.mem.Allocator, conn: *tls.Connection, req: http.Request, failure: *S3Failure) !http.Response {
+    return http.sendRequest(arena, conn, req) catch |err| {
+        failure.phase = .request;
+        failure.err = err;
+        return err;
+    };
+}
+
+/// Record S3's refusal `resp`, its status and `<Code>`, in `failure` (phase `response`).
+fn noteRefusal(resp: http.Response, failure: *S3Failure) void {
+    failure.phase = .response;
+    failure.status = resp.status;
+    failure.err = null;
+    if (xmlText(resp.body, "Code")) |code| failure.code.set(code);
 }
 
 fn completeMultipartUpload(
     arena: std.mem.Allocator,
     creds: s3.Credentials,
     url: s3.Url,
+    control: Control,
     upload_id: []const u8,
     etag_slots: []const *EtagSlot,
+    failure: *S3Failure,
 ) !void {
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
@@ -555,9 +652,7 @@ fn completeMultipartUpload(
     }
     try body.appendSlice(arena, "</CompleteMultipartUpload>");
 
-    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addrs = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addrs, host);
+    var conn = try controlConnect(arena, creds, url, control, null, failure);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -571,32 +666,18 @@ fn completeMultipartUpload(
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    const resp = try http.sendRequest(arena, &conn, .{
+    const resp = try controlSend(arena, &conn, .{
         .method = .POST,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = body.items,
-    });
-    if (resp.status != 200) return error.CompleteMultipartFailed;
-    if (std.mem.indexOf(u8, resp.body, "<Error>") != null) return error.CompleteMultipartFailed;
-}
-
-/// Whether a control-plane request that failed with `err` may still have taken effect on the server. `definite` is
-/// the error for an answer that said no; failing to connect means nothing was sent.
-fn outcomeUnknown(err: anyerror, definite: anyerror) bool {
-    if (err == definite) return false;
-    return switch (err) {
-        error.DnsFailed,
-        error.SocketFailed,
-        error.ConnectFailed,
-        error.HandshakeFailed,
-        error.CertificateRejected,
-        error.ConnectTimeout,
-        error.HandshakeTimeout,
-        => false,
-        else => true,
-    };
+    }, failure);
+    // S3 can answer 200 and then report an error in the body.
+    if (resp.status != 200 or std.mem.indexOf(u8, resp.body, "<Error>") != null) {
+        noteRefusal(resp, failure);
+        return error.CompleteMultipartFailed;
+    }
 }
 
 /// Best effort, after a CreateMultipartUpload whose answer was lost: abort the in-progress uploads of exactly this key
@@ -604,7 +685,13 @@ fn outcomeUnknown(err: anyerror, definite: anyerror) bool {
 /// could have started. Older uploads, and uploads of keys this one is only a prefix of, are never touched. An upload
 /// another writer starts on the same key in the same window cannot be told apart from ours; a bucket lifecycle rule
 /// that aborts incomplete multipart uploads is the backstop for anything this misses.
-fn abortUploadsStartedSince(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url, since_s: i64) void {
+fn abortUploadsStartedSince(
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    url: s3.Url,
+    control: Control,
+    since_s: i64,
+) void {
     const uploads = listMultipartUploads(arena, creds, url) catch |err| {
         std.log.warn("multipart sink: could not list uploads to clean up after a lost Create: {s}", .{@errorName(err)});
         return;
@@ -613,11 +700,8 @@ fn abortUploadsStartedSince(arena: std.mem.Allocator, creds: s3.Credentials, url
         if (!std.mem.eql(u8, u.key, url.key)) continue;
         const initiated = parseIso8601Seconds(u.initiated) orelse continue;
         if (initiated < since_s) continue;
-        abortMultipartUpload(arena, creds, url, u.upload_id) catch |err| {
-            std.log.warn("multipart sink: abort of orphaned upload failed: {s}", .{@errorName(err)});
-            continue;
-        };
-        std.log.warn("multipart sink: aborted an upload orphaned by a lost CreateMultipartUpload", .{});
+        if (abortLogged(arena, creds, url, control, u.upload_id))
+            std.log.warn("multipart sink: aborted an upload orphaned by a lost CreateMultipartUpload", .{});
     }
 }
 
@@ -773,20 +857,37 @@ fn headObject(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) !htt
     return http.sendRequest(arena, &conn, .{ .method = .HEAD, .host = host, .path = path, .headers = headers.items });
 }
 
+/// Abort upload `upload_id`, best effort: a failure is logged with its cause. True when S3 confirmed it.
+fn abortLogged(
+    arena: std.mem.Allocator,
+    creds: s3.Credentials,
+    url: s3.Url,
+    control: Control,
+    upload_id: []const u8,
+) bool {
+    var failure: S3Failure = .{ .op = .AbortMultipartUpload, .phase = .connect };
+    abortMultipartUpload(arena, creds, url, control, upload_id, &failure) catch |err| {
+        if (failure.err == null and failure.phase != .response) failure.err = err;
+        std.log.warn("multipart sink: {f}; the upload stays open until a lifecycle rule aborts it", .{failure});
+        return false;
+    };
+    return true;
+}
+
 fn abortMultipartUpload(
     arena: std.mem.Allocator,
     creds: s3.Credentials,
     url: s3.Url,
+    control: Control,
     upload_id: []const u8,
+    failure: *S3Failure,
 ) !void {
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const query = try std.fmt.allocPrint(arena, "uploadId={s}", .{try uriEncodeQueryValue(arena, upload_id)});
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
-    const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
-    const addrs = try s3.resolveIpv4(arena, connect_host);
-    var conn = try s3.connect(arena, creds, addrs, host);
+    var conn = try controlConnect(arena, creds, url, control, null, failure);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -800,13 +901,17 @@ fn abortMultipartUpload(
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    _ = try http.sendRequest(arena, &conn, .{
+    const resp = try controlSend(arena, &conn, .{
         .method = .DELETE,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = "",
-    });
+    }, failure);
+    if (resp.status != 204 and resp.status != 200) {
+        noteRefusal(resp, failure);
+        return error.AbortMultipartFailed;
+    }
 }
 
 fn singlePut(
@@ -851,6 +956,11 @@ fn writeThroughSinkWith(
     timeouts: tls.Timeouts,
     part_size: usize,
 ) !void {
+    return writeToPort(fake.port, key, payload, timeouts, .{ .target_part_size = part_size });
+}
+
+/// Push `payload` through a sink with `options` to bucket `bkt` of the S3 endpoint on local `port`, then close it.
+fn writeToPort(port: u16, key: []const u8, payload: []const u8, timeouts: tls.Timeouts, options: Options) !void {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -863,7 +973,7 @@ fn writeThroughSinkWith(
         .access_key = "ak",
         .secret_key = "sk",
         .region = "us-east-1",
-        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{port}),
         .timeouts = timeouts,
     };
     const url: s3.Url = .{ .bucket = "bkt", .key = key };
@@ -872,9 +982,7 @@ fn writeThroughSinkWith(
     defer pool.deinit();
     const criteria = try s3.poolCriteria(arena, creds, url.bucket);
 
-    var sink = MultipartSink.init(io, testing.allocator, arena, creds, url, &pool, criteria, .{
-        .target_part_size = part_size,
-    });
+    var sink = MultipartSink.init(io, testing.allocator, arena, creds, url, &pool, criteria, options);
     defer {
         if (!sink.isClosed()) sink.abort();
         sink.deinit();
@@ -1038,12 +1146,18 @@ test "a CreateMultipartUpload whose answer never comes is not sent again, and le
     fake.stall = "POST /bkt/out.parquet?uploads";
     fake.stall_at = .before_headers;
 
+    var diag: Diag = .{};
     try testing.expectError(
         error.CreateMultipartFailed,
-        writeThroughSinkWith(&fake, "out.parquet", &test_payload, stall_timeouts, 1024),
+        writeToPort(fake.port, "out.parquet", &test_payload, stall_timeouts, .{
+            .target_part_size = 1024,
+            .diag = &diag,
+        }),
     );
     try testing.expectEqual(@as(u32, 1), fake.stalled);
+    try testing.expectEqual(@as(u32, 1), fake.creates);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+    try expectFailure(&diag, "CreateMultipartUpload failed after the request was sent: FirstByteTimeout");
 }
 
 test "a CompleteMultipartUpload whose answer never comes is not sent again, and is accepted once the object shows it" {
@@ -1057,4 +1171,144 @@ test "a CompleteMultipartUpload whose answer never comes is not sent again, and 
     try testing.expectEqual(@as(u32, 1), fake.stalled);
     try testing.expect(fake.object("out.parquet") != null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+/// `diag` holds an S3 failure that reads `want`.
+fn expectFailure(diag: *const Diag, want: []const u8) !void {
+    if (diag.detail != .s3_request) return error.TestUnexpectedResult;
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(want, try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request}));
+}
+
+/// A `Control.connect` that fails its next `failures` calls with `fail_with`, then connects. One test at a time uses
+/// it; `arm` resets it.
+const FlakyConnect = struct {
+    var failures: u32 = 0;
+    var fail_with: s3.Error = error.ConnectFailed;
+    var failed: u32 = 0;
+
+    fn arm(n: u32, err: s3.Error) Control {
+        failures = n;
+        fail_with = err;
+        failed = 0;
+        return .{ .connect = connect, .policy = fast_policy };
+    }
+
+    fn connect(
+        arena: std.mem.Allocator,
+        creds: s3.Credentials,
+        addrs: []const tls.Ipv4,
+        host: []const u8,
+    ) s3.Error!tls.Connection {
+        if (failures > 0) {
+            failures -= 1;
+            failed += 1;
+            return fail_with;
+        }
+        return s3.connect(arena, creds, addrs, host);
+    }
+};
+
+const fast_policy: retry.Policy = .{ .base_ms = 1, .cap_ms = 2 };
+
+test "a CreateMultipartUpload that could not connect or finish its TLS handshake is tried again, and sent once" {
+    // Each fails before the request is written: a TLS handshake's own SendFailed included.
+    for ([_]s3.Error{
+        error.ConnectFailed,    error.ConnectTimeout, error.DnsFailed,  error.HandshakeFailed,
+        error.HandshakeTimeout, error.SendFailed,     error.RecvFailed,
+    }) |err| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        var diag: Diag = .{};
+        const control = FlakyConnect.arm(2, err);
+
+        const options: Options = .{ .target_part_size = 1024, .control = control, .diag = &diag };
+        try writeToPort(fake.port, "out.parquet", &test_payload, .{}, options);
+        try testing.expectEqual(@as(u32, 2), FlakyConnect.failed);
+        try testing.expectEqual(@as(u32, 1), fake.creates);
+        try testing.expect(fake.object("out.parquet") != null);
+        try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+        try testing.expect(diag.detail == .none);
+    }
+}
+
+test "a CreateMultipartUpload whose connections are all refused gives up after the retry budget, never sent" {
+    // A bound socket that is not listening: every connect to its port is refused.
+    const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: posix.fd_t = @intCast(rc);
+    defer _ = posix.system.close(fd);
+    var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+
+    var diag: Diag = .{};
+    try testing.expectError(error.CreateMultipartFailed, writeToPort(
+        std.mem.bigToNative(u16, addr.port),
+        "out.parquet",
+        &test_payload,
+        .{},
+        .{ .target_part_size = 1024, .control = .{ .policy = fast_policy }, .diag = &diag },
+    ));
+    try expectFailure(&diag, "CreateMultipartUpload failed while connecting (9 attempts): ConnectFailed");
+    try testing.expectEqual(retry.max_attempts, diag.detail.s3_request.attempts);
+}
+
+test "a CreateMultipartUpload whose certificate is rejected is not tried again" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    var diag: Diag = .{};
+    const control = FlakyConnect.arm(100, error.CertificateRejected);
+
+    const options: Options = .{ .target_part_size = 1024, .control = control, .diag = &diag };
+    const got = writeToPort(fake.port, "out.parquet", &test_payload, .{}, options);
+    try testing.expectError(error.CreateMultipartFailed, got);
+    try testing.expectEqual(@as(u32, 1), FlakyConnect.failed);
+    try testing.expectEqual(@as(u32, 0), fake.creates);
+    try expectFailure(&diag, "CreateMultipartUpload failed while connecting: CertificateRejected");
+}
+
+test "a CreateMultipartUpload answered with a 5xx is not sent again, and the status and S3 code are reported" {
+    // S3 may have applied a request it answered 500 InternalError; 503 SlowDown is treated the same.
+    for ([_]struct { u16, []const u8 }{ .{ 503, "SlowDown" }, .{ 500, "InternalError" } }) |answer| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        fake.fail = "POST /bkt/out.parquet?uploads";
+        fake.fail_status = answer[0];
+        fake.fail_code = answer[1];
+        var diag: Diag = .{};
+
+        try testing.expectError(
+            error.CreateMultipartFailed,
+            writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{ .target_part_size = 1024, .diag = &diag }),
+        );
+        try testing.expectEqual(@as(u32, 1), fake.creates);
+        try testing.expectEqual(@as(u32, 1), fake.failed);
+        try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+        var want: [64]u8 = undefined;
+        try expectFailure(&diag, try std.fmt.bufPrint(&want, "CreateMultipartUpload was answered {d} {s}", answer));
+    }
+}
+
+test "a CompleteMultipartUpload answered with an error is not sent again, aborts the upload, and is reported" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.fail = "POST /bkt/out.parquet?uploadId";
+    fake.fail_status = 500;
+    fake.fail_code = "InternalError";
+    var diag: Diag = .{};
+
+    try testing.expectError(
+        error.CompleteMultipartFailed,
+        writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{ .target_part_size = 1024, .diag = &diag }),
+    );
+    try testing.expectEqual(@as(u32, 1), fake.failed);
+    try testing.expect(fake.object("out.parquet") == null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+    try expectFailure(&diag, "CompleteMultipartUpload was answered 500 InternalError");
 }

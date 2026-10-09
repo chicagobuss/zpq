@@ -84,6 +84,8 @@ pub const MultiAggArgs = struct {
     aggregate: []const u8,
     group_by: ?[]const u8 = null,
     max_memory: usize = 512 * 1024 * 1024,
+    /// What the workers' decoded row groups may take together (`consumer.DecodeBudget`); null leaves decode unbounded.
+    decode_limit: ?usize = null,
     /// The GROUP BY output columns as a select list writes them (SQL).
     select_cols: ?[]const expr_ast.SelectColumn = null,
     /// Comma-separated output column names. Only used with GROUP BY when
@@ -142,9 +144,10 @@ pub const AggValue = union(enum) {
     s: []const u8,
     /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL.
     dec: DecValue,
-    /// avg over a DECIMAL: the exact sum (DECIMAL(38, s)) and count, which re-aggregate, and the mean rounded to the
-    /// argument's type. `sum` and `mean` are NULL when count is 0.
-    avg_dec: struct { sum: ?i128, count: i64, mean: ?i128, spec: expr_ast.Dec },
+    /// avg over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's type.
+    /// The sum may pass 38 digits while the mean fits (two values near 10^38); JSON prints it whole, and only `-o`,
+    /// whose `__sum` column is DECIMAL(38, s), refuses it. `sum` and `mean` are NULL when count is 0.
+    avg_dec: struct { sum: ?i192, count: i64, mean: ?i128, spec: expr_ast.Dec },
     null_val: void,
 };
 
@@ -494,6 +497,7 @@ const Worker = struct {
     /// Work items per row group (every row group gets the same number), for `Input.gate`.
     items_per_rg: usize = 1,
     leave_region: bool = false,
+    decode_budget: ?*consumer.DecodeBudget = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -620,6 +624,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .scratch = &scratch,
             .rg_arena = &rg_decode_arena,
             .timings = &w.timings,
+            .budget = w.decode_budget,
         });
     }
 }
@@ -847,6 +852,10 @@ pub fn runMultiAggregate(
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
     var workers = try arena.alloc(Worker, n_workers);
+    var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
+        .{ .limit = l, .workers = n_workers }
+    else
+        null;
     // One budget shared by every worker table, not per-worker quotas: work is claimed off a shared cursor, so which
     // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
     // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished
@@ -913,6 +922,7 @@ pub fn runMultiAggregate(
             .block_merge = if (block_merge) |*m| m else null,
             .items_per_rg = chunks_per_rg,
             .leave_region = args.leave_regions,
+            .decode_budget = if (decode_budget) |*b| b else null,
         };
     }
 
@@ -1641,7 +1651,7 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
             .avg_f64, .avg_dec => unreachable,
         },
         .avg => if (call.result == .avg_dec) .{ .avg_dec = .{
-            .sum = try state.avg_d.result(),
+            .sum = state.avg_d.wide(),
             .count = @intCast(state.avg_d.n),
             .mean = try state.avg_d.mean(),
             .spec = expr_agg.resultDec(call),
@@ -3355,8 +3365,10 @@ test "a DECIMAL result past its precision is an error, never a wrapped or rounde
     const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
     const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
-    // Two values of 10^38 - 1 sum past 38 digits; each row of `big * 10` and `big + big` is past them already.
-    for ([_][]const u8{ "sum(big) AS s", "sum(big * 10) AS s", "sum(big + big) AS s", "avg(big) AS a" }) |agg| {
+    // Two values of 10^38 - 1 sum past 38 digits; each row of `big * 10` and `big + big` is past them already; and
+    // `big + 0.1` first brings `big` to the common DECIMAL(38,1), where 10^38 - 1 has no room (as the SQL engines
+    // refuse that cast).
+    for ([_][]const u8{ "sum(big) AS s", "sum(big * 10) AS s", "sum(big + big) AS s", "sum(big + 0.1) AS s" }) |agg| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         try testing.expectError(error.DecimalOverflow, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
@@ -3372,6 +3384,19 @@ test "a DECIMAL result past its precision is an error, never a wrapped or rounde
         .filter = "i >= -148",
         .parallelism = 1,
     }, &.{.{ .alias = "s", .v = 298, .p = 38, .s = 0 }});
+    try expectDecimalAnswers(.{
+        .inputs = &inputs,
+        .aggregate = "sum(big + 0.1) AS s",
+        .filter = "i >= -148",
+        .parallelism = 1,
+    }, &.{.{ .alias = "s", .v = 3278, .p = 38, .s = 1 }});
+    // A mean fits wherever its values do, though their sum does not: avg divides the wide sum. (2 × (10^38 - 1) +
+    // 298) / 300, rounded half away from zero.
+    try expectDecimalAnswers(.{
+        .inputs = &inputs,
+        .aggregate = "avg(big) AS a",
+        .parallelism = 1,
+    }, &.{.{ .alias = "a", .v = 666666666666666666666666666666666668, .p = 38, .s = 0 }});
 }
 
 test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is exact" {
@@ -3436,4 +3461,52 @@ test "--trust-stats answers DECIMAL min/max from statistics exactly, as decoding
         .parallelism = 1,
         .trust_stats = trust,
     }, &want);
+}
+
+test "a decode budget stages wide row groups one aggregate at a time, same answer, and refuses what cannot fit" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    const want = [_]DecWant{
+        .{ .alias = "s9", .v = -15150, .p = 38, .s = 2 },
+        .{ .alias = "s38", .v = 448500000000000, .p = 38, .s = 10 },
+        .{ .alias = "p", .v = 209832550, .p = 38, .s = 6 },
+        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+    };
+    const aggregate = "sum(d9) AS s9, sum(d38) AS s38, sum(d9 * d18) AS p, avg(dn) AS adn";
+    // Unbounded; then a budget too small for a whole row group per worker but enough staged (100 rows of ~16 bytes a
+    // column); then one too small even staged.
+    for ([_]?usize{ null, 10_000 }) |limit| for ([_]usize{ 1, 3 }) |j| {
+        try expectDecimalAnswers(.{
+            .inputs = &inputs,
+            .aggregate = aggregate,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .decode_limit = limit,
+        }, &want);
+    };
+    // GROUP BY stages too: keys first, then each aggregate's columns.
+    for ([_]?usize{ null, 16_000 }) |limit| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "sum(d18 * q) AS p, max(dn) AS mx",
+            .group_by = "k",
+            .parallelism = 1,
+            .decode_limit = limit,
+        });
+        defer freeResult(res);
+        const rows = res.output.group_rows.?;
+        try testing.expectEqual(@as(usize, 3), rows.len);
+        try testing.expectEqual(@as(i128, 17235000), rows[0][1].dec.v);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.RowGroupTooLarge, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = aggregate,
+        .parallelism = 1,
+        .decode_limit = 1000,
+    }));
 }

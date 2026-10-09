@@ -536,7 +536,7 @@ pub const ProjectedRG = struct {
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
                 break :blk decoded;
             } else return error.MissingDecodedColumn,
-            .computed => |c| try expr_eval.evalExpr(ra, &self.batch, self.lookup, c.expr),
+            .computed => |c| try expr_eval.evalExpr(ra, &self.batch.restrictedTo(&self.sel), self.lookup, c.expr),
         };
         if (col.nullInfo().max_rep == 0) {
             try appendSelected(&agg.cols[i], col, &self.sel, self.surviving, agg.arena, agg.keep_codes, late.allocator());
@@ -629,6 +629,218 @@ fn decodeWriteColumn(
     if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
     return decoded;
 }
+
+/// Append a slice's surviving rows to `agg` (on `agg.arena`): `batch` holds every fetched column of the slice
+/// (`lookup` by leaf), `sel` its filtered rows. The sliced counterpart of `ProjectedRG.projectColumn` over every
+/// output.
+pub fn appendSliceRows(
+    agg: *OutputAggregator,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const filter_selection.SelectionVector,
+    output_specs: []const OutputCol,
+    scratch: std.mem.Allocator,
+) !usize {
+    const surviving = sel.count();
+    if (surviving == 0) return 0;
+    for (output_specs, 0..) |spec, i| {
+        var col: filter_eval.Batch.Column = switch (spec) {
+            .passthrough => |ci| batch.cols[lookup[ci] orelse return error.MissingDecodedColumn],
+            .computed => |c| try expr_eval.evalExpr(scratch, &batch.restrictedTo(sel), lookup, c.expr),
+        };
+        // A DECIMAL written losslessly buffers its exact integers.
+        if (agg.cols[i] == .i128 and col == .f64) {
+            // Into a temporary first: assigned straight into `col`, the union's new tag lands before `col` is read.
+            const exact = try expr_eval.unscaledView(scratch, col);
+            col = .{ .i128 = exact };
+        }
+        try appendSelected(&agg.cols[i], col, sel, surviving, agg.arena, false, scratch);
+    }
+    agg.num_rows += surviving;
+    return surviving;
+}
+
+/// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
+/// for a row group too big to hold decoded at once. Each reader keeps its own page buffers (`scratch`), so the memory
+/// held is a slice of values plus a page per column — except byte arrays, whose values point into their pages, which
+/// stay for the row group (its uncompressed bytes, not its decoded size).
+pub const SliceReader = struct {
+    /// In place for the reader's life: a reader holds pointers into itself once it has decoded.
+    raw: *Raw,
+    scratch: *DecodeScratch,
+    levels: schema.Levels,
+    dec: ?decimal_mod.Kind,
+    float16: bool,
+    left: usize,
+
+    const Raw = union(enum) {
+        i32: column_mod.ColumnChunkReader(i32),
+        i64: column_mod.ColumnChunkReader(i64),
+        f32: column_mod.ColumnChunkReader(f32),
+        f64: column_mod.ColumnChunkReader(f64),
+        boolean: column_mod.ColumnChunkReader(bool),
+        bytes: column_mod.ColumnChunkReader([]const u8),
+    };
+
+    /// A reader of leaf `ci`, or null when the column has no sliced form (nested, INT96, or a FIXED_LEN_BYTE_ARRAY
+    /// DECIMAL, whose decoders walk pages of their own); the caller then decodes the row group whole. `a` holds the
+    /// reader's pages and must live until the last slice is used.
+    pub fn init(
+        a: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: RGSrc,
+        ci: usize,
+        decode_options: DecodeOptions,
+    ) !?SliceReader {
+        const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+        const levels = meta.getColumnLevels(cm.path_in_schema.items);
+        if (levels.max_rep > 0) return null;
+        const se = meta.getColumnSchema(cm.path_in_schema.items);
+        const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
+        if (cm.type == .INT96) return null;
+        if (dec != null and cm.type == .FIXED_LEN_BYTE_ARRAY) return null;
+        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+        const len: usize = @intCast(cm.total_compressed_size);
+        invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
+        const buf_off = start - @as(usize, @intCast(src.byte_origin));
+        if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
+        const chunk = src.bytes[buf_off .. buf_off + len];
+        const scratch = try a.create(DecodeScratch);
+        scratch.* = .init(gpa);
+        const raw = try a.create(Raw);
+        raw.* = switch (cm.type) {
+            inline .INT32, .INT64, .FLOAT, .DOUBLE, .BOOLEAN => |t| blk: {
+                const T, const tag = switch (t) {
+                    .INT32 => .{ i32, "i32" },
+                    .INT64 => .{ i64, "i64" },
+                    .FLOAT => .{ f32, "f32" },
+                    .DOUBLE => .{ f64, "f64" },
+                    .BOOLEAN => .{ bool, "boolean" },
+                    else => comptime unreachable,
+                };
+                const Reader = column_mod.ColumnChunkReader(T);
+                const r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, scratch);
+                break :blk @unionInit(Raw, tag, r);
+            },
+            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => blk: {
+                const Reader = column_mod.ColumnChunkReader([]const u8);
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, null);
+                if (cm.type == .FIXED_LEN_BYTE_ARRAY) r.type_length = flbaWidth(se);
+                break :blk .{ .bytes = r };
+            },
+            .INT96 => unreachable,
+        };
+        return .{
+            .raw = raw,
+            .scratch = scratch,
+            .levels = levels,
+            .dec = dec,
+            .float16 = if (se) |e| schema.isFloat16(e) else false,
+            .left = @intCast(cm.num_values),
+        };
+    }
+
+    pub fn deinit(self: *SliceReader) void {
+        self.scratch.deinit();
+    }
+
+    /// The next `n` rows (fewer only at the chunk's end), on `a`.
+    pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
+        const n = @min(n_want, self.left);
+        self.left -= n;
+        switch (self.raw.*) {
+            inline else => |*r, tag| {
+                const T = @TypeOf(r.*).Value;
+                const values = try a.alloc(T, n);
+                const def: ?[]u32 = if (self.levels.max_def > 0) try a.alloc(u32, n) else null;
+                var got: usize = 0;
+                while (got < n) {
+                    const k = if (def) |d|
+                        try r.decodeWithLevels(values[got..], d[got..])
+                    else
+                        try r.decode(values[got..]);
+                    if (k == 0) break;
+                    got += k;
+                }
+                if (got != n) return error.ShortDecode;
+                const max_def: u32 = @intCast(self.levels.max_def);
+                var has_nulls = false;
+                if (def) |d| for (d) |v| {
+                    if (v < max_def) {
+                        has_nulls = true;
+                        break;
+                    }
+                };
+                const col: filter_eval.ColumnT(T) = .{
+                    .values = values,
+                    .def_levels = def,
+                    .max_def = max_def,
+                    .has_nulls = has_nulls,
+                };
+                if (self.dec) |k| return .{ .f64 = try exactSlice(T, a, col, k) };
+                if (self.float16 and T == []const u8) {
+                    const out = try a.alloc(f64, n);
+                    for (values, out) |b, *o| o.* = if (b.len >= 2)
+                        @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, b[0..2], .little))))
+                    else
+                        0;
+                    const half: filter_eval.ColumnT(f64) = .{
+                        .values = out,
+                        .def_levels = def,
+                        .max_def = max_def,
+                        .has_nulls = has_nulls,
+                    };
+                    return .{ .f64 = half };
+                }
+                return switch (tag) {
+                    .bytes => .{ .string = col },
+                    else => @unionInit(filter_eval.Batch.Column, @tagName(tag), col),
+                };
+            },
+        }
+    }
+
+    /// A DECIMAL slice as `decimal_mod.decodeColumnExact` gives a chunk: the f64 view with the exact integers beside.
+    fn exactSlice(
+        comptime T: type,
+        a: std.mem.Allocator,
+        col: filter_eval.ColumnT(T),
+        k: decimal_mod.Kind,
+    ) !filter_eval.ColumnT(f64) {
+        const out = try a.alloc(f64, col.values.len);
+        var view: filter_eval.ColumnT(f64) = .{
+            .values = out,
+            .def_levels = col.def_levels,
+            .max_def = col.max_def,
+            .has_nulls = col.has_nulls,
+        };
+        switch (T) {
+            i32, i64 => {
+                decimal_mod.applyScaleSimd(T, col.values, k.scale, out);
+                view.unscaled = @unionInit(filter_eval.Exact, @typeName(T), col.values);
+            },
+            []const u8 => {
+                const u = try a.alloc(i128, col.values.len);
+                for (col.values, out, u, 0..) |b, *o, *x, i| {
+                    const present = if (col.def_levels) |d| d[i] >= col.max_def else true;
+                    if (!present) {
+                        o.* = 0;
+                        x.* = 0;
+                        continue;
+                    }
+                    if (b.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
+                    x.* = decimal_mod.flbaToI128(b);
+                    o.* = decimal_mod.applyScaleI128(x.*, k.scale);
+                }
+                view.unscaled = .{ .i128 = u };
+            },
+            else => return error.UnsupportedDecimalPhysicalType,
+        }
+        return view;
+    }
+};
 
 /// Decode one DECIMAL column's chunk to unscaled i128 integers (the
 /// lossless output lane). Re-derives the chunk window the same way the
@@ -1613,7 +1825,82 @@ pub const AggWorkspace = struct {
     /// Rewound at each row group that decodes: everything decoded lives here until the next one.
     rg_arena: *RowGroupArena,
     timings: *Timings,
+    /// Shared by the query's scan workers; null decodes without a bound (tests, callers that budget elsewhere).
+    budget: ?*DecodeBudget = null,
 };
+
+/// The memory a query's scan workers' decoded row groups may take together (`scan.runMultiAggregate` gives it half of
+/// `max_memory`). A worker reserves a row group's estimate (`decodeEstimate`) before decoding it and gives it back
+/// after, so a row group that does not fit beside the others waits for them. One bigger than a worker's share decodes
+/// staged — the filter and keys, then one aggregate's columns at a time on memory handed back after each — and one
+/// that does not fit the whole budget even so is refused before anything is allocated, rather than killed by the OS.
+pub const DecodeBudget = struct {
+    limit: usize,
+    workers: usize = 1,
+    used: std.atomic.Value(usize) = .init(0),
+
+    /// What one worker may hold without staging: its even share.
+    pub fn share(self: *const DecodeBudget) usize {
+        return self.limit / @max(1, self.workers);
+    }
+
+    pub fn acquire(self: *DecodeBudget, bytes: usize) error{RowGroupTooLarge}!void {
+        if (bytes > self.limit) return error.RowGroupTooLarge;
+        var waits: u32 = 0;
+        while (true) {
+            const cur = self.used.load(.monotonic);
+            if (cur + bytes <= self.limit) {
+                if (self.used.cmpxchgWeak(cur, cur + bytes, .acquire, .monotonic) == null) return;
+                continue;
+            }
+            // Others hold the budget for a whole row group's decode: milliseconds at least. Yield a few times, then
+            // sleep rather than spin on a core a decoding worker needs (Lambda has two).
+            waits += 1;
+            if (waits < 8) std.Thread.yield() catch {} else {
+                const ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000 };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+    }
+
+    pub fn release(self: *DecodeBudget, bytes: usize) void {
+        _ = self.used.fetchSub(bytes, .release);
+    }
+};
+
+/// Bytes decoding `cols` of `in` takes, from its metadata: each leaf's values in its batch lane (a string as a slice
+/// plus its page bytes, which the values point into), its levels, and a computed argument's intermediate columns.
+/// An estimate, kept on the high side; it decides waiting and staging, not correctness.
+pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_agg.AggCall, grouped: bool) usize {
+    const rows: usize = @intCast(@max(0, in.rg.num_rows));
+    var total: usize = rows / 8 + 64; // selection
+    for (cols, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        const cm = in.rg.columns.items[ci].meta_data orelse continue;
+        const n: usize = @intCast(@max(0, cm.num_values));
+        const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
+        const se = in.meta.getColumnSchema(cm.path_in_schema.items);
+        const decimal = if (se) |e| decimal_mod.kindFromSchema(&e) != null else false;
+        const lane: usize = switch (cm.type) {
+            .BOOLEAN => 1,
+            .INT32 => if (decimal) 12 else 8, // a decimal's f64 view beside its integers; unsigned widens to 8
+            .FLOAT, .DOUBLE, .INT96 => 8,
+            .INT64 => if (decimal) 16 else 8,
+            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => 24, // slice, or a decimal's f64 view and i128
+        };
+        total += n * lane;
+        if (cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY) {
+            total += @intCast(@max(0, cm.total_uncompressed_size));
+        }
+        if (levels.max_def > 0) total += n * 4;
+        if (levels.max_rep > 0) total += n * 4;
+    }
+    // A computed argument materializes a 16-byte column per operator; a grouped scan a group id per row.
+    for (calls) |c| if (c.arg) |a| if (a != .col_ref) {
+        total += rows * 16 * a.depth();
+    };
+    return total + if (grouped) rows * 4 else 0;
+}
 
 /// Per-RG aggregator update. Answers what statistics can, then decodes
 /// the columns the rest read, applies the outer filter, and folds the
@@ -1656,74 +1943,72 @@ pub fn scanRGForAgg(
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
     // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
-    // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan.
+    // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan, which the
+    // decode budget bounds: a row group past a worker's share decodes staged, on memory handed back when it is done.
     ws.rg_arena.nextRowGroup();
-    const ra = ws.rg_arena.allocator();
-
     const prof = ws.timings.prof;
+
+    var staged = false;
+    var reserved: usize = 0;
+    var plan_arena = std.heap.ArenaAllocator.init(gpa);
+    defer plan_arena.deinit();
+    const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
+        const full = decodeEstimate(in, in.read, calls, target == .grouped);
+        reserved = full;
+        // Too big for this worker's share: a slice of rows at a time when every column has a sliced form, else one
+        // aggregate's columns at a time.
+        if (full > b.share() and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {
+            return;
+        }
+        if (full > b.share()) {
+            const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
+            if (sp.estimate < full) {
+                staged = true;
+                reserved = sp.estimate;
+                break :plan sp;
+            }
+        }
+        break :plan null;
+    } else null;
+    if (ws.budget) |b| try b.acquire(reserved);
+    defer if (ws.budget) |b| b.release(reserved);
+    // Staged, everything decoded lives on memory of its own, given back with the row group; otherwise on the
+    // worker's arena.
+    var staged_arena = std.heap.ArenaAllocator.init(gpa);
+    defer staged_arena.deinit();
+    const ra = if (staged) staged_arena.allocator() else ws.rg_arena.allocator();
+
     const prune_span = profile.Span.begin(prof);
     const page_indexes = try loadPageIndexes(ra, in, stats);
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
 
     const t_decode_start = nowMonoNs();
-    var pages_total: usize = 0;
-    var pages_skipped: usize = 0;
-    const uses = try planCodeUses(ra, in, target);
+    var dec: ChunkDecoder = .{
+        .in = in,
+        .uses = try planCodeUses(ra, in, target),
+        .page_indexes = page_indexes,
+        .filter_pages = filter_pages,
+        .num_rows = num_rows,
+        .decode_options = decode_options,
+        .ws = ws,
+        .target = target,
+    };
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
+    // Pages are pruned by the rows the filter's page statistics leave, as when every column decodes up front.
+    const sel_pre = if (staged) try sel.cloneAlloc(ra) else sel;
     for (in.read, 0..) |needed, ci| {
-        if (!needed) continue;
-        if (ci >= in.rg.columns.items.len) continue;
-        const cm = in.rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-        const len: usize = @intCast(cm.total_compressed_size);
-        invariant.assert(start >= @as(usize, @intCast(in.src.byte_origin)));
-        const buf_off = start - @as(usize, @intCast(in.src.byte_origin));
-        if (buf_off + len > in.src.bytes.len) return error.MissingChunkBytes;
-        const chunk = in.src.bytes[buf_off .. buf_off + len];
-
-        const chunk_span = profile.Span.begin(prof);
-        const prune_info: ?PruningInfo = if (page_indexes[ci]) |pi|
-            try pagePruning(ra, pi, filter_pages, ci, in.consumed[ci], &sel, num_rows, cm, start)
-        else
-            null;
-        // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
-        // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
-        // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
-        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
-        const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and target == .scalar;
-        const hist_col: ?filter_eval.Batch.Column = if (encoded and !levels_only and uses.code[ci] and
-            uses.hist_ok[ci] and !uses.value[ci])
-            try decodeAggColumnHist(ra, chunk, cm, in.meta, decode_options, ws.scratch, num_rows)
-        else
-            null;
-        var decoded = if (hist_col) |hc|
-            hc
-        else if (levels_only)
-            try decodeLevelsOnly(ra, chunk, cm, in.meta, decode_options, ws.scratch, num_rows)
-        else if (encoded and (uses.code[ci] or uses.levels[ci]))
-            (try decodeAggColumnCoded(ra, chunk, cm, in.meta, decode_options, ws.scratch)) orelse
-                try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch)
-        else
-            try decodeAggColumn(ra, chunk, cm, in.meta, prune_info, decode_options, ws.scratch);
-        if (ci < uses.value.len and uses.value[ci]) decoded = try agg_coded.materialize(ra, decoded);
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        if (stage_plan) |sp| if (!sp.base[ci]) continue;
         lookup[ci] = batch_cols.items.len;
-        try checkRowShape(decoded, num_rows);
-        try batch_cols.append(ra, decoded);
-        if (chunk_span.t != null) {
-            chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
-            if (prune_info) |pi| {
-                pages_total += pi.page_is_skipped.len;
-                pages_skipped += std.mem.count(bool, pi.page_is_skipped, &.{true});
-            }
-        }
+        try batch_cols.append(ra, try dec.column(ra, ci, &sel_pre));
     }
     const t_decode_end = nowMonoNs();
     ws.timings.decode_ns += @intCast(t_decode_end - t_decode_start);
     if (prof) |t| {
-        t.record(.prune_pages, prune_span.start, t_decode_start, profile.args(.{ pages_total, pages_skipped }));
+        t.record(.prune_pages, prune_span.start, t_decode_start, profile.args(.{ dec.pages_total, dec.pages_skipped }));
         const decode_args = profile.args(.{ in.file_index, in.rg_index, batch_cols.items.len });
         t.record(.decode, t_decode_start, t_decode_end, decode_args);
     }
@@ -1737,7 +2022,7 @@ pub fn scanRGForAgg(
 
     switch (target) {
         .grouped => |g| {
-            if (decode_options.encoded and
+            if (!staged and decode_options.encoded and
                 try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel))
             {
                 const t_agg_end = nowMonoNs();
@@ -1749,7 +2034,7 @@ pub fn scanRGForAgg(
             for (batch_cols.items) |*bc| bc.* = try agg_coded.materialize(ra, bc.*);
             var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
             for (g.keys, 0..) |key_expr, idx| {
-                key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch, lookup, key_expr);
+                key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(&sel), lookup, key_expr);
             }
 
             var group_id_arr = try ra.alloc(u32, num_rows);
@@ -1767,16 +2052,23 @@ pub fn scanRGForAgg(
             }
 
             for (g.calls, 0..) |call, i| {
+                var call_arena = std.heap.ArenaAllocator.init(gpa);
+                defer call_arena.deinit();
+                const ca = if (staged) call_arena.allocator() else ra;
+                const cb = if (stage_plan) |sp|
+                    try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, true)
+                else
+                    CallBatch{ .batch = batch, .lookup = lookup };
                 try expr_agg.updateOneGrouped(
-                    ra,
+                    ca,
                     gpa,
                     g.table.accumulators.items,
                     group_id_arr,
                     i,
                     g.calls.len,
                     call,
-                    &batch,
-                    lookup,
+                    &cb.batch,
+                    cb.lookup,
                     &sel,
                 );
             }
@@ -1784,12 +2076,18 @@ pub fn scanRGForAgg(
         .scalar => |s| {
             // Update only the aggs that weren't handled via stats. The agg's
             // own per-WHERE predicate (if any) is composed inside updateOne.
-            for (s.calls, s.accumulators, handled_via_stats) |call, *acc, handled| {
+            for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
                 if (handled) continue;
-                // `ra` is per-RG scratch; `gpa` is the persist allocator for owned
-                // results (string min/max winner) that outlive both `ra` and the
-                // cross-worker merge.
-                try expr_agg.updateOne(ra, gpa, acc, call, &batch, lookup, &sel);
+                var call_arena = std.heap.ArenaAllocator.init(gpa);
+                defer call_arena.deinit();
+                const ca = if (staged) call_arena.allocator() else ra;
+                const cb = if (stage_plan) |sp|
+                    try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, false)
+                else
+                    CallBatch{ .batch = batch, .lookup = lookup };
+                // `ca` is per-RG (or per-call) scratch; `gpa` is the persist allocator for owned results (string
+                // min/max winner) that outlive both and the cross-worker merge.
+                try expr_agg.updateOne(ca, gpa, acc, call, &cb.batch, cb.lookup, &sel);
             }
         },
     }
@@ -1797,6 +2095,228 @@ pub fn scanRGForAgg(
     ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
     profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
 }
+
+/// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
+/// for a row group too big for a worker's share of `budget`. False, having done nothing, when some column has no
+/// sliced form.
+fn scanRGSliced(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+    budget: *DecodeBudget,
+    handled: []const bool,
+    full: usize,
+) !bool {
+    const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
+    if (num_rows == 0) return false;
+    var pages = std.heap.ArenaAllocator.init(gpa);
+    defer pages.deinit();
+    var readers: std.ArrayList(SliceReader) = .empty;
+    defer for (readers.items) |*r| r.deinit();
+    const lookup = try pages.allocator().alloc(?usize, in.meta.schema.items.len);
+    @memset(lookup, null);
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        const r = try SliceReader.init(pages.allocator(), gpa, in.rg, in.meta, in.src, ci, decode_options) orelse
+            return false;
+        lookup[ci] = readers.items.len;
+        try readers.append(pages.allocator(), r);
+    }
+    const per_row = @max(1, full / num_rows);
+    const slice_rows = std.math.clamp(budget.share() / per_row, @min(1024, num_rows), num_rows);
+    const reserved = @min(budget.limit, slice_rows * per_row);
+    try budget.acquire(reserved);
+    defer budget.release(reserved);
+
+    const prof = ws.timings.prof;
+    const t0 = nowMonoNs();
+    var done: usize = 0;
+    while (done < num_rows) {
+        const n = @min(slice_rows, num_rows - done);
+        defer done += n;
+        var slice = std.heap.ArenaAllocator.init(gpa);
+        defer slice.deinit();
+        const sa = slice.allocator();
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
+        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        var sel = try filter_selection.SelectionVector.init(sa, n);
+        if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        switch (target) {
+            .scalar => |s| for (s.calls, s.accumulators, handled) |call, *acc, h| {
+                if (h) continue;
+                try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
+            },
+            .grouped => |g| {
+                const key_cols = try sa.alloc(filter_eval.Batch.Column, g.keys.len);
+                const keyed = batch.restrictedTo(&sel);
+                for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(sa, &keyed, lookup, k);
+                const ids = try sa.alloc(u32, n);
+                @memset(ids, 0);
+                var resolver = expr_agg.GroupKeyResolver.init(key_cols);
+                defer resolver.deinit(sa);
+                // First appearance counts rows from the row group's start, as when it decodes whole.
+                for (0..n) |r| if (sel.isActive(r)) {
+                    ids[r] = try resolver.resolve(sa, g.table, key_cols, r, g.calls, g.pos_base + done);
+                };
+                for (g.calls, 0..) |call, i| {
+                    const accs = g.table.accumulators.items;
+                    try expr_agg.updateOneGrouped(sa, gpa, accs, ids, i, g.calls.len, call, &batch, lookup, &sel);
+                }
+            },
+        }
+    }
+    const t1 = nowMonoNs();
+    ws.timings.decode_ns += @intCast(t1 - t0);
+    profile.record(prof, .decode, t0, t1, profile.args(.{ in.file_index, in.rg_index, readers.items.len }));
+    return true;
+}
+
+/// A staged row group's decode: the columns the outer filter and GROUP BY keys read (`base`), decoded first; then
+/// each aggregate's own (`calls[i]`, less `base`), decoded for it alone and dropped after.
+const StagePlan = struct {
+    base: []bool,
+    calls: [][]bool,
+    /// The most the plan holds at once: `base` and the largest call's columns.
+    estimate: usize,
+
+    fn init(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget, handled: []const bool) !StagePlan {
+        const n = in.read.len;
+        const base = try a.alloc(bool, n);
+        @memset(base, false);
+        if (in.filter) |f| {
+            var cols: std.ArrayList(usize) = .empty;
+            try f.collectColumns(&cols, a);
+            for (cols.items) |ci| if (ci < n) {
+                base[ci] = true;
+            };
+        }
+        switch (target) {
+            .grouped => |g| for (g.keys) |k| k.collectColumns(base),
+            .scalar => {},
+        }
+        for (base, in.read) |*b, r| b.* = b.* and r;
+        const calls = target.calls();
+        const per_call = try a.alloc([]bool, calls.len);
+        var widest: usize = 0;
+        for (calls, per_call, 0..) |call, *cols, i| {
+            cols.* = try a.alloc(bool, n);
+            @memset(cols.*, false);
+            if (i < handled.len and handled[i]) continue;
+            if (call.arg) |arg| arg.collectColumns(cols.*);
+            if (call.where) |w| {
+                var wc: std.ArrayList(usize) = .empty;
+                try w.collectColumns(&wc, a);
+                for (wc.items) |ci| if (ci < n) {
+                    cols.*[ci] = true;
+                };
+            }
+            for (cols.*, in.read, base) |*c, r, b| c.* = c.* and r and !b;
+            widest = @max(widest, decodeEstimate(in, cols.*, calls[i .. i + 1], false));
+        }
+        const base_bytes = decodeEstimate(in, base, &.{}, target == .grouped);
+        return .{ .base = base, .calls = per_call, .estimate = base_bytes + widest };
+    }
+};
+
+const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
+
+/// Decodes one row group's column chunks into batch lanes, the way every column of `in.read` is decoded.
+const ChunkDecoder = struct {
+    in: AggRowGroup,
+    uses: CodeUses,
+    page_indexes: []const ?PageIndex,
+    filter_pages: FilterPages,
+    num_rows: usize,
+    decode_options: DecodeOptions,
+    ws: AggWorkspace,
+    target: AggTarget,
+    pages_total: usize = 0,
+    pages_skipped: usize = 0,
+
+    fn column(
+        self: *ChunkDecoder,
+        a: std.mem.Allocator,
+        ci: usize,
+        sel: *const filter_selection.SelectionVector,
+    ) !filter_eval.Batch.Column {
+        const in = self.in;
+        const prof = self.ws.timings.prof;
+        const cm = in.rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+        const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+        const len: usize = @intCast(cm.total_compressed_size);
+        invariant.assert(start >= @as(usize, @intCast(in.src.byte_origin)));
+        const buf_off = start - @as(usize, @intCast(in.src.byte_origin));
+        if (buf_off + len > in.src.bytes.len) return error.MissingChunkBytes;
+        const chunk = in.src.bytes[buf_off .. buf_off + len];
+
+        const chunk_span = profile.Span.begin(prof);
+        const prune_info: ?PruningInfo = if (self.page_indexes[ci]) |pi|
+            try pagePruning(a, pi, self.filter_pages, ci, in.consumed[ci], sel, self.num_rows, cm, start)
+        else
+            null;
+        // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
+        // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
+        // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
+        const uses = self.uses;
+        const decode_options = self.decode_options;
+        const scratch = self.ws.scratch;
+        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
+        const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
+            self.target == .scalar;
+        const hist_col: ?filter_eval.Batch.Column = if (encoded and !levels_only and uses.code[ci] and
+            uses.hist_ok[ci] and !uses.value[ci])
+            try decodeAggColumnHist(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows)
+        else
+            null;
+        var decoded = if (hist_col) |hc|
+            hc
+        else if (levels_only)
+            try decodeLevelsOnly(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows)
+        else if (encoded and (uses.code[ci] or uses.levels[ci]))
+            (try decodeAggColumnCoded(a, chunk, cm, in.meta, decode_options, scratch)) orelse
+                try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch)
+        else
+            try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
+        if (ci < uses.value.len and uses.value[ci]) decoded = try agg_coded.materialize(a, decoded);
+        try checkRowShape(decoded, self.num_rows);
+        if (chunk_span.t != null) {
+            chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
+            if (prune_info) |pi| {
+                self.pages_total += pi.page_is_skipped.len;
+                self.pages_skipped += std.mem.count(bool, pi.page_is_skipped, &.{true});
+            }
+        }
+        return decoded;
+    }
+
+    /// `batch` with call `i`'s own columns (`plan.calls[i]`) decoded beside it, on `a`.
+    fn withCallColumns(
+        self: *ChunkDecoder,
+        a: std.mem.Allocator,
+        plan: StagePlan,
+        i: usize,
+        batch: *const filter_eval.Batch,
+        lookup: []const ?usize,
+        sel: *const filter_selection.SelectionVector,
+        values: bool,
+    ) !CallBatch {
+        var cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+        try cols.appendSlice(a, batch.cols);
+        const lk = try a.dupe(?usize, lookup);
+        for (plan.calls[i], 0..) |needed, ci| {
+            if (!needed) continue;
+            var col = try self.column(a, ci, sel);
+            // The grouped row fold reads values, not codes.
+            if (values) col = try agg_coded.materialize(a, col);
+            lk[ci] = cols.items.len;
+            try cols.append(a, col);
+        }
+        return .{ .batch = .{ .cols = cols.items, .num_rows = batch.num_rows }, .lookup = lk };
+    }
+};
 
 /// `column_chunk` span arguments for chunk `ci` of a row group.
 fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profile.Args {

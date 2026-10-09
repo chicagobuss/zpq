@@ -144,6 +144,7 @@ fn unsplitByteStreamSplit(arena: std.mem.Allocator, encoded: []const u8, width: 
 pub fn ColumnChunkReader(comptime T: type) type {
     return struct {
         const Self = @This();
+        pub const Value = T;
 
         pages: page_mod.PageReader,
         arena: std.mem.Allocator,

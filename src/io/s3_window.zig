@@ -7,12 +7,17 @@
 //! `local_reader.zig`; elsewhere the caller fetches everything up front.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const s3 = @import("s3.zig");
 const profile = @import("../profile.zig");
 const scan = @import("../core/scan.zig");
 
 pub const Gate = scan.RowGroupGate;
+
+/// Whether the window runs here. Elsewhere the caller never builds one, and the system calls below are not compiled
+/// for the target (their std wrappers are Linux-only).
+pub const supported = builtin.os.tag == .linux;
 
 pub const page = std.heap.page_size_min;
 
@@ -46,7 +51,7 @@ pub const RowGroup = struct {
             if (p == State.dropped) rg.window.release(rg);
             return;
         }
-        _ = linux.futex_3arg(&rg.state.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        wakeAll(&rg.state);
     }
 };
 
@@ -66,7 +71,7 @@ pub const File = struct {
         const w = rg.window;
         const t0 = nowNs();
         while (v == State.waiting) {
-            _ = linux.futex_4arg(&rg.state.raw, .{ .cmd = .WAIT, .private = true }, v, null);
+            wait(&rg.state, v, null);
             v = rg.state.load(.acquire);
         }
         _ = w.stalls.fetchAdd(1, .monotonic);
@@ -136,6 +141,9 @@ pub fn Fetcher(comptime Pool: type) type {
             var exec = self.executor(w.gpa);
             defer exec.deinit();
             var next: usize = 0;
+            // Slow start: the first batch is one row group, so the first rows are ready soon and a reader that stops
+            // early (a print's `--limit`) has fetched little; each batch may then take twice the last, up to `batch`.
+            var cap: u64 = 0;
             while (next < w.order.len) {
                 if (w.cancel.load(.acquire)) return;
                 const first = next;
@@ -149,7 +157,7 @@ pub fn Fetcher(comptime Pool: type) type {
                     // A row group bigger than the window still goes, alone, when nothing else is held.
                     const out = w.submitted -| w.released.load(.acquire);
                     if (out != 0 and out + rg.bytes > w.limit) break;
-                    if (bytes != 0 and bytes + rg.bytes > w.batch) break;
+                    if (bytes != 0 and bytes + rg.bytes > cap) break;
                     w.submitted += rg.bytes;
                     bytes += rg.bytes;
                     next += 1;
@@ -158,6 +166,7 @@ pub fn Fetcher(comptime Pool: type) type {
                     if (next == first) w.waitRelease();
                     continue;
                 }
+                cap = @min(w.batch, @max(cap, bytes) * 2);
                 var arena_state = std.heap.ArenaAllocator.init(w.gpa);
                 defer arena_state.deinit();
                 const arena = arena_state.allocator();
@@ -203,22 +212,21 @@ pub const Window = struct {
     stall_ns: std.atomic.Value(u64) = .init(0),
 
     fn release(w: *Window, rg: *RowGroup) void {
-        if (rg.seg.len > 0) _ = linux.madvise(rg.seg.ptr, rg.seg.len, linux.MADV.DONTNEED);
+        if (rg.seg.len > 0) dontNeed(rg.seg);
         _ = w.released.fetchAdd(rg.bytes, .release);
         w.wakeFetcher();
     }
 
     fn wakeFetcher(w: *Window) void {
         _ = w.rel_gen.fetchAdd(1, .release);
-        _ = linux.futex_3arg(&w.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        wakeAll(&w.rel_gen);
     }
 
     fn waitRelease(w: *Window) void {
         w.stats.window_waits += 1;
         const g = w.rel_gen.load(.acquire);
         // Bounded, so a missed wake costs a millisecond rather than a hang.
-        const ts: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = linux.futex_4arg(&w.rel_gen.raw, .{ .cmd = .WAIT, .private = true }, g, &ts);
+        wait(&w.rel_gen, g, 1_000_000);
     }
 
     /// A fetch failed: every row group not yet in fails the workers waiting on it.
@@ -227,7 +235,7 @@ pub const Window = struct {
         w.cancel.store(true, .release);
         for (w.order) |rg| {
             const prev = rg.state.cmpxchgStrong(State.waiting, State.failed, .acq_rel, .acquire);
-            if (prev == null) _ = linux.futex_3arg(&rg.state.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+            if (prev == null) wakeAll(&rg.state);
         }
     }
 };
@@ -241,6 +249,7 @@ pub fn windowFor(max_memory: usize) u64 {
 /// A page-aligned anonymous buffer: committed only where written, and given back page by page with MADV_DONTNEED.
 pub fn mapBuffer(len: usize) ![]align(page) u8 {
     if (len == 0) return &.{};
+    if (comptime !supported) return error.Unsupported;
     const n = std.mem.alignForward(usize, len, page);
     const rc = linux.mmap(null, n, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     if (linux.errno(rc) != .SUCCESS) return error.OutOfMemory;
@@ -249,11 +258,29 @@ pub fn mapBuffer(len: usize) ![]align(page) u8 {
 }
 
 fn nowNs() u64 {
+    if (comptime !supported) return 0;
     var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 pub fn unmapBuffer(buf: []align(page) u8) void {
+    if (comptime !supported) return;
     if (buf.len > 0) _ = linux.munmap(buf.ptr, buf.len);
+}
+
+fn wait(word: *std.atomic.Value(u32), expect: u32, timeout_ns: ?u32) void {
+    if (comptime !supported) unreachable;
+    const ts: linux.timespec = .{ .sec = 0, .nsec = timeout_ns orelse 0 };
+    _ = linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expect, if (timeout_ns != null) &ts else null);
+}
+
+fn wakeAll(word: *std.atomic.Value(u32)) void {
+    if (comptime !supported) unreachable;
+    _ = linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+}
+
+fn dontNeed(seg: []align(page) u8) void {
+    if (comptime !supported) unreachable;
+    _ = linux.madvise(seg.ptr, seg.len, linux.MADV.DONTNEED);
 }

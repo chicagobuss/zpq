@@ -27,6 +27,7 @@ const ast = @import("ast.zig");
 const filter_eval = @import("../filter/eval.zig");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
+const selection = @import("../filter/selection.zig");
 
 pub const Error = error{
     BadColumn,
@@ -452,7 +453,14 @@ pub fn unscaledView(arena: std.mem.Allocator, col: Batch.Column) Error!ColumnT(i
 /// `e`'s exact values (`col`, as evaluated) as unscaled integers at `scale`, which is at least `e`'s own: an integer
 /// widens, a DECIMAL at a smaller scale multiplies up. Null layout kept; a null slot holds whatever the decoder left,
 /// so it is never multiplied (it must not fail the row group). Errors rather than wraps past i128.
-fn decColumnAt(arena: std.mem.Allocator, col: Batch.Column, e: ast.Expr, scale: u8) Error!ColumnT(i128) {
+fn decColumnAt(
+    arena: std.mem.Allocator,
+    col: Batch.Column,
+    e: ast.Expr,
+    scale: u8,
+    /// Rows outside it are not checked (see `Batch.sel`).
+    sel: ?*const selection.SelectionVector,
+) Error!ColumnT(i128) {
     const own = e.decSpec() orelse return error.TypeMismatch;
     std.debug.assert(scale >= own.scale);
     const factor = ast.pow10(scale - own.scale);
@@ -464,7 +472,7 @@ fn decColumnAt(arena: std.mem.Allocator, col: Batch.Column, e: ast.Expr, scale: 
             const limit = @divTrunc(std.math.maxInt(i128), factor);
             for (c.values, out, 0..) |v, *o, i| {
                 if (v > limit or v < -limit) {
-                    if (c.def_levels != null and rowIsNull(col, i)) {
+                    if ((c.def_levels != null and rowIsNull(col, i)) or (sel != null and !sel.?.isActive(i))) {
                         o.* = 0;
                         continue;
                     }
@@ -480,7 +488,7 @@ fn decColumnAt(arena: std.mem.Allocator, col: Batch.Column, e: ast.Expr, scale: 
             if (factor > ast.pow10(19)) {
                 // Only a target scale past 19 gets here, where a 64-bit value times the factor can leave i128.
                 for (c.values, out, 0..) |v, *o, i| {
-                    if (c.def_levels != null and rowIsNull(col, i)) {
+                    if ((c.def_levels != null and rowIsNull(col, i)) or (sel != null and !sel.?.isActive(i))) {
                         o.* = 0;
                         continue;
                     }
@@ -526,7 +534,7 @@ fn decOperand(
     key: bool,
 ) Error!struct { op: DecOperand, nulls: ?Batch.Column } {
     if (e == .literal) {
-        const one = try decColumnAt(arena, try literalAsColumn(arena, e.literal, 1), e, scale);
+        const one = try decColumnAt(arena, try literalAsColumn(arena, e.literal, 1), e, scale, null);
         return .{ .op = .{ .scalar = one.values[0] }, .nulls = null };
     }
     // A DECIMAL column is read from the decoder's integers, a DECIMAL binop at its narrowest lane; anything else is
@@ -550,7 +558,7 @@ fn decOperand(
             return .{ .op = .{ .i64s = .{ .v = raw.i64.values, .factor = factor } }, .nulls = nulls };
         }
     }
-    return .{ .op = .{ .i128 = (try decColumnAt(arena, raw, e, scale)).values }, .nulls = nulls };
+    return .{ .op = .{ .i128 = (try decColumnAt(arena, raw, e, scale, batch.sel)).values }, .nulls = nulls };
 }
 
 /// Whether some row of `col` is null. An OPTIONAL column with no nulls has levels but none below max, and not every
@@ -604,6 +612,22 @@ fn decBinOpLane(
     const r = try decOperand(arena, batch, column_lookup, b.right.*, rhs_scale, key);
     const n = batch.num_rows;
     const bound: u128 = @intCast(spec.bound());
+    // `+` and `-` first bring both sides to their common type, as the SQL engines cast them: a value that does not
+    // fit it (an integer 1 against DECIMAL(38,38), 10^37 against a scale-1 operand) is an error there, so here too.
+    // A product takes its operands as they are.
+    // Below the 38-digit cap the common type holds every value either side's type can, so only a capped one checks.
+    const operand_bound: u128 = switch (b.op) {
+        .add, .sub => blk: {
+            const ls = b.left.decSpec().?;
+            const rs = b.right.decSpec().?;
+            const digits = @as(u16, @max(ls.precision - ls.scale, rs.precision - rs.scale)) + @max(ls.scale, rs.scale);
+            break :blk if (digits <= ast.Dec.max_precision)
+                std.math.maxInt(u128)
+            else
+                @intCast(ast.Dec.common(ls, rs).bound());
+        },
+        else => std.math.maxInt(u128),
+    };
     const def: ?[]u32 = if (l.nulls != null or r.nulls != null) try arena.alloc(u32, n) else null;
     if (def) |d| for (d, 0..) |*dv, i| {
         const is_null = (l.nulls != null and rowIsNull(l.nulls.?, i)) or (r.nulls != null and rowIsNull(r.nulls.?, i));
@@ -617,9 +641,9 @@ fn decBinOpLane(
                 inline else => |rv, rt| inline for (.{ i64, i128 }) |Out| if ((Out == i64) == narrow) {
                     const out = try arena.alloc(Out, n);
                     if (def) |d|
-                        try decKernel(op, lt, rt, true, lv, rv, out, d, bound)
+                        try decKernel(op, lt, rt, true, lv, rv, out, d, bound, operand_bound, batch.sel)
                     else
-                        try decKernel(op, lt, rt, false, lv, rv, out, &.{}, bound);
+                        try decKernel(op, lt, rt, false, lv, rv, out, &.{}, bound, operand_bound, batch.sel);
                     const col: ColumnT(Out) = if (def) |d|
                         .{ .values = out, .def_levels = d, .max_def = 1, .has_nulls = true }
                     else
@@ -653,24 +677,37 @@ fn decKernel(
     out: anytype,
     def: []const u32,
     bound: u128,
+    operand_bound: u128,
+    sel: ?*const selection.SelectionVector,
 ) Error!void {
     for (out, 0..) |*o, i| {
         if (nullable and def[i] == 0) {
             o.* = 0;
             continue;
         }
-        const v: i128 = switch (op) {
-            .add => std.math.add(i128, decAt(lt, l, i), decAt(rt, r, i)) catch return error.DecimalOverflow,
-            .sub => std.math.sub(i128, decAt(lt, l, i), decAt(rt, r, i)) catch return error.DecimalOverflow,
+        const v: ?i128 = switch (op) {
+            inline .add, .sub => |aop| blk: {
+                const x = decAt(lt, l, i);
+                const y = decAt(rt, r, i);
+                if (@abs(x) >= operand_bound or @abs(y) >= operand_bound) break :blk null;
+                break :blk (if (aop == .add) std.math.add(i128, x, y) else std.math.sub(i128, x, y)) catch null;
+            },
             // Two unscaled 64-bit values multiply wide, which cannot overflow.
             .mul => if (lt == .i64 and rt == .i64)
                 std.math.mulWide(i64, l[i], r[i])
             else
-                mulExact(decAt(lt, l, i), decAt(rt, r, i)) catch return error.DecimalOverflow,
+                mulExact(decAt(lt, l, i), decAt(rt, r, i)) catch null,
             else => comptime unreachable,
         };
-        if (@abs(v) >= bound) return error.DecimalOverflow;
-        o.* = @intCast(v);
+        if (v == null or @abs(v.?) >= bound) {
+            // Only a row the filter keeps is an error; the selection is read on this path alone.
+            if (sel != null and !sel.?.isActive(i)) {
+                o.* = 0;
+                continue;
+            }
+            return error.DecimalOverflow;
+        }
+        o.* = @intCast(v.?);
     }
 }
 
@@ -785,11 +822,12 @@ fn evalCoalesceColLit(
         .dec => blk: {
             const spec = c_dec.?;
             const ref: ast.Expr = .{ .col_ref = col_ref };
-            const a = try decColumnAt(arena, try exactView(col, ref), ref, spec.scale);
-            const fallback = try decColumnAt(arena, try literalAsColumn(arena, lit, 1), .{ .literal = lit }, spec.scale);
+            const a = try decColumnAt(arena, try exactView(col, ref), ref, spec.scale, batch.sel);
+            const one = try literalAsColumn(arena, lit, 1);
+            const fallback = try decColumnAt(arena, one, .{ .literal = lit }, spec.scale, null);
             const out = try arena.alloc(i128, a.values.len);
             for (a.values, out, 0..) |v, *o, i| o.* = if (rowIsNull(.{ .i128 = a }, i)) fallback.values[0] else v;
-            break :blk .{ .i128 = .{ .values = try checkBound(out, spec) } };
+            break :blk .{ .i128 = .{ .values = try checkBound(out, spec, batch.sel) } };
         },
     };
 }
@@ -799,9 +837,12 @@ fn exactView(col: Batch.Column, e: ast.Expr) Error!Batch.Column {
     return if (e.typeOf() == .dec) exactColumn(col) else col;
 }
 
-fn checkBound(values: []i128, spec: ast.Dec) Error![]i128 {
+fn checkBound(values: []i128, spec: ast.Dec, sel: ?*const selection.SelectionVector) Error![]i128 {
     const bound = spec.bound();
-    for (values) |v| if (v >= bound or v <= -bound) return error.DecimalOverflow;
+    for (values, 0..) |v, i| if (v >= bound or v <= -bound) {
+        if (sel != null and !sel.?.isActive(i)) continue;
+        return error.DecimalOverflow;
+    };
     return values;
 }
 
@@ -849,14 +890,14 @@ fn evalCoalesceColCol(
             const spec = c_dec.?;
             const ea: ast.Expr = .{ .col_ref = lhs_ref };
             const eb: ast.Expr = .{ .col_ref = rhs_ref };
-            const a = try decColumnAt(arena, try exactView(col_a, ea), ea, spec.scale);
-            const b = try decColumnAt(arena, try exactView(col_b, eb), eb, spec.scale);
+            const a = try decColumnAt(arena, try exactView(col_a, ea), ea, spec.scale, batch.sel);
+            const b = try decColumnAt(arena, try exactView(col_b, eb), eb, spec.scale, batch.sel);
             const out = try arena.alloc(i128, a.values.len);
             // Both null takes the lane's zero, as the other lanes do (see above).
             for (a.values, b.values, out, 0..) |va, vb, *o, i| o.* = if (!rowIsNull(.{ .i128 = a }, i))
                 va
             else if (!rowIsNull(.{ .i128 = b }, i)) vb else 0;
-            break :blk .{ .i128 = .{ .values = try checkBound(out, spec) } };
+            break :blk .{ .i128 = .{ .values = try checkBound(out, spec, batch.sel) } };
         },
     };
 }

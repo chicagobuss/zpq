@@ -235,8 +235,15 @@ pub fn main(init: std.process.Init) !void {
                 error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
                 error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
                 error.DecimalOverflow => std.debug.print(
-                    "zpq query: a DECIMAL result needs more digits than its type holds (at\n" ++
-                        "most 38); zpq stops rather than return a rounded or wrapped value\n",
+                    "zpq query: a DECIMAL value needs more digits than its type holds (at\n" ++
+                        "most 38): a result, or an operand of + or - brought to their common\n" ++
+                        "type; zpq stops rather than return a rounded or wrapped value\n",
+                    .{},
+                ),
+                error.RowGroupTooLarge => std.debug.print(
+                    "zpq query: a row group needs more memory to decode than --max-memory\n" ++
+                        "allows, even one aggregate at a time; raise --max-memory or rewrite\n" ++
+                        "the file with smaller row groups\n",
                     .{},
                 ),
                 error.DecimalScaleTooLarge => std.debug.print(

@@ -44,6 +44,7 @@ const expr_parser = @import("core/expr/parser.zig");
 const expr_agg = @import("core/expr/agg.zig");
 const filter_eval = @import("core/filter/eval.zig");
 const filter_ast = @import("core/filter/ast.zig");
+const filter_selection = @import("core/filter/selection.zig");
 const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
 const membership = @import("core/filter/membership.zig");
@@ -74,7 +75,12 @@ const COALESCE_GAP: u64 = 64 * 1024;
 
 const S3Fetcher = s3_window.Fetcher(s3.Pool(POOL_SIZE));
 
-/// An aggregate's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set (tuning, tests), else from its memory budget.
+const FetchWindow = struct {
+    limit: u64,
+    always: bool = false,
+};
+
+/// A query's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set (tuning, tests), else from its memory budget.
 fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
     if (env) |e| if (e.getPosix("ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
         return @max(1, k) << 10;
@@ -364,7 +370,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    needs.
     const prof = profile.threadOf(args.profiler, .main);
     const t_open = nowMonoNs();
-    var opened = try openInputs(ctx, arena, args, s3FetchWindow(ctx.env, args.max_memory));
+    var opened = try openInputs(ctx, arena, args, .{ .limit = s3FetchWindow(ctx.env, args.max_memory) });
     defer opened.deinit();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
@@ -449,6 +455,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .select_cols = args.select_cols,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
+        // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
+        .decode_limit = args.max_memory / 2,
         .diag = args.diag,
         .profiler = args.profiler,
     });
@@ -569,11 +577,32 @@ const RGJob = struct {
     /// Input file and row group (counted across files), for profile spans.
     file_index: usize = 0,
     rg_index: usize = 0,
+    /// The input's fetch gate (`scan.Input.gate`), and this row group's index in its file.
+    gate: ?scan.RowGroupGate = null,
+    file_rg: usize = 0,
+
+    /// Wait until the row group's bytes are in, when they are still being fetched.
+    fn arrive(self: RGJob) !void {
+        if (self.gate) |g| try g.wait(g.ctx, self.file_rg);
+    }
+
+    /// The row group's bytes are no longer needed: the fetch window may have them back.
+    fn leave(self: RGJob) void {
+        if (self.gate) |g| g.done(g.ctx, self.file_rg, 1);
+    }
 };
+
+/// Row group `rg` of `in` is skipped: give its fetch window share back as if it had been read.
+fn skipRowGroup(in: scan.Input, rg: usize) void {
+    if (in.gate) |g| g.done(g.ctx, rg, 1);
+}
 
 const EncodedRG = struct {
     bytes: []u8 = &.{}, // encoded RG bytes (gpa-owned; writer frees after sink.write)
     rg: ?schema.RowGroup = null, // footer meta, offsets relative to 0 (meta_arena-owned)
+    /// Output row groups after `rg` in `bytes`, offsets also relative to 0: a source row group too big to decode at
+    /// once is written a slice of rows at a time (`encodeRGSliced`).
+    more: []const schema.RowGroup = &.{},
     surviving: i64 = 0,
     err: ?anyerror = null,
     /// The producer's decode/eval/encode time for this row group, summed by the writer.
@@ -746,6 +775,8 @@ const WinCtx = struct {
     inflight: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
     profiler: ?*profile.Profiler = null,
+    /// What one producer's decoded rows may take; a row group past it is written in slices (`encodeRGSliced`).
+    decode_share: usize = std.math.maxInt(usize),
 };
 
 fn winProducer(w: *WinCtx, i: usize) void {
@@ -762,23 +793,8 @@ fn winProducer(w: *WinCtx, i: usize) void {
         break :blk &spare.?;
     };
     defer regions.busy.store(false, .release);
-    const enc = (if (w.jobs[i].passthrough)
-        copyRGToBuffer(w.gpa, ma, w.jobs[i], w.kept_set, prof, w.bloom_leaves)
-    else
-        encodeRGToBuffer(
-            w.gpa,
-            ma,
-            regions,
-            w.jobs[i],
-            w.filter,
-            w.fetch_arr,
-            w.output_specs,
-            w.codec,
-            w.zstd,
-            w.decode_options,
-            prof,
-            .{ .fpp = w.bloom_outputs },
-        )) catch |e| {
+    defer w.jobs[i].leave();
+    const enc = produceRG(w, i, ma, regions, prof) catch |e| {
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
@@ -791,6 +807,135 @@ fn winProducer(w: *WinCtx, i: usize) void {
     w.slots[i].enc = enc;
     w.slots[i].done.store(true, .release);
     w.completions.post(w.io);
+}
+
+/// Job `i`'s output: a byte copy, the row group sliced when it is too big to decode at once, or re-encoded whole.
+fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions, prof: ?*profile.Thread) !EncodedRG {
+    const job = w.jobs[i];
+    try job.arrive();
+    if (job.passthrough) return copyRGToBuffer(w.gpa, ma, job, w.kept_set, prof, w.bloom_leaves);
+    const bloom: consumer.BloomWrite = .{ .fpp = w.bloom_outputs };
+    const sliced = try encodeRGSliced(
+        w.gpa,
+        ma,
+        job,
+        w.filter,
+        w.fetch_arr,
+        w.output_specs,
+        w.codec,
+        w.zstd,
+        w.decode_options,
+        prof,
+        bloom,
+        w.decode_share,
+    );
+    if (sliced) |e| return e;
+    return encodeRGToBuffer(
+        w.gpa,
+        ma,
+        regions,
+        job,
+        w.filter,
+        w.fetch_arr,
+        w.output_specs,
+        w.codec,
+        w.zstd,
+        w.decode_options,
+        prof,
+        bloom,
+    );
+}
+
+/// Re-encode `job`'s row group a slice of rows at a time, one output row group per slice, when its decoded columns
+/// would take more than `share`: each slice decodes (`consumer.SliceReader`), filters and encodes on memory of its own,
+/// so the producer holds a slice rather than the row group. Null when it fits, or has a column with no sliced form.
+fn encodeRGSliced(
+    gpa: std.mem.Allocator,
+    meta_alloc: std.mem.Allocator,
+    job: RGJob,
+    filter: ?filter_ast.Filter,
+    fetch_arr: []const bool,
+    output_specs: []const consumer.OutputCol,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    decode_options: consumer.DecodeOptions,
+    prof: ?*profile.Thread,
+    bloom: consumer.BloomWrite,
+    share: usize,
+) !?EncodedRG {
+    const rg = job.rg;
+    const num_rows: usize = @intCast(@max(0, rg.num_rows));
+    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
+    // Decoded, then buffered for the encoder, then encoded.
+    const est = consumer.decodeEstimate(.{
+        .rg = rg,
+        .meta = job.meta,
+        .src = src,
+        .filter = null,
+        .read = fetch_arr,
+        .consumed = fetch_arr,
+    }, fetch_arr, &.{}, false) * 3;
+    if (est <= share or num_rows == 0) return null;
+
+    var pages = std.heap.ArenaAllocator.init(gpa);
+    defer pages.deinit();
+    var readers: std.ArrayList(consumer.SliceReader) = .empty;
+    defer for (readers.items) |*r| r.deinit();
+    const lookup = try pages.allocator().alloc(?usize, fetch_arr.len);
+    @memset(lookup, null);
+    for (fetch_arr, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, job.meta, src, ci, decode_options) orelse
+            return null;
+        lookup[ci] = readers.items.len;
+        try readers.append(pages.allocator(), r);
+    }
+    const per_row = @max(1, est / num_rows);
+    const slice_rows = std.math.clamp(share / per_row, @min(4096, num_rows), num_rows);
+
+    var advisor: huge_pages.HugePageAdvisor = .{ .child = gpa };
+    const out_gpa = advisor.allocator();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(out_gpa);
+    var bufsink = BufSink{ .buf = &buf, .gpa = out_gpa };
+    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
+    var local_off: u64 = 0;
+    var timings: consumer.Timings = .{ .prof = prof };
+    var rgs: std.ArrayList(schema.RowGroup) = .empty;
+    var surviving: i64 = 0;
+    var done: usize = 0;
+    while (done < num_rows) {
+        const n = @min(slice_rows, num_rows - done);
+        done += n;
+        var slice = std.heap.ArenaAllocator.init(gpa);
+        defer slice.deinit();
+        const sa = slice.allocator();
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
+        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        var sel = try filter_selection.SelectionVector.init(sa, n);
+        if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        var agg = try consumer.initOutputAggregator(sa, job.meta, output_specs);
+        _ = try consumer.appendSliceRows(&agg, &batch, lookup, &sel, output_specs, sa);
+        if (agg.num_rows == 0) continue;
+        var rg_enc: consumer.RGEncoder = .{
+            .out_arena = meta_alloc,
+            .sink = sink,
+            .out_offset = &local_off,
+            .codec = codec,
+            .zstd = zstd,
+            .bloom_write = bloom,
+            .timings = &timings,
+        };
+        for (0..output_specs.len) |i| try rg_enc.column(&agg, i, sa);
+        const out = rg_enc.finish(agg.num_rows);
+        try rgs.append(meta_alloc, out.rg.?);
+        surviving += out.surviving_rows;
+    }
+    timings.prof = null;
+    const owned = try buf.toOwnedSlice(out_gpa);
+    if (rgs.items.len == 0) return .{ .bytes = owned, .rg = null, .surviving = 0, .timings = timings };
+    return .{ .bytes = owned, .rg = rgs.items[0], .more = rgs.items[1..], .surviving = surviving, .timings = timings };
 }
 
 /// In-order writer: drains slots 0..N, rebasing offsets, writing to the sink,
@@ -810,6 +955,13 @@ fn winWriter(w: *WinCtx) void {
             if (enc.surviving > 0) {
                 var rgm = rg;
                 consumer.rebaseRowGroupOffsets(&rgm, @intCast(w.out_offset));
+                for (enc.more) |extra| {
+                    var m = extra;
+                    consumer.rebaseRowGroupOffsets(&m, @intCast(w.out_offset));
+                    w.new_row_groups.append(w.arena, m) catch |e| {
+                        if (w.first_err == null) w.first_err = e;
+                    };
+                }
                 const t0 = nowMonoNs();
                 w.sink.write(enc.bytes) catch |e| {
                     if (w.first_err == null) w.first_err = e;
@@ -819,8 +971,9 @@ fn winWriter(w: *WinCtx) void {
                 profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.bytes.len}));
                 w.out_offset += enc.bytes.len;
                 w.rows_kept += enc.surviving;
-                w.rgs_kept += 1;
-                w.new_row_groups.append(w.arena, rgm) catch |e| {
+                w.rgs_kept += 1 + enc.more.len;
+                // The first row group goes before the extra ones appended above.
+                w.new_row_groups.insert(w.arena, w.new_row_groups.items.len - enc.more.len, rgm) catch |e| {
                     if (w.first_err == null) w.first_err = e;
                 };
             }
@@ -920,7 +1073,8 @@ fn recompressProducer(w: *RecompressCtx, i: usize) void {
     const slot = &w.slots[i];
     var timings: consumer.Timings = .{ .prof = prof };
     const job = w.jobs[i];
-    if (consumer.recompressRowGroup(
+    defer job.leave();
+    if (job.arrive()) |_| if (consumer.recompressRowGroup(
         slot.arena.allocator(),
         w.gpa,
         job.rg,
@@ -932,6 +1086,8 @@ fn recompressProducer(w: *RecompressCtx, i: usize) void {
         w.page_workers,
     )) |chunks| {
         slot.chunks = chunks;
+    } else |e| {
+        slot.err = e;
     } else |e| slot.err = e;
     slot.encode_ns = timings.encode_ns;
     slot.done.store(true, .release);
@@ -993,10 +1149,12 @@ fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWindow {
     var sum_bytes: u64 = 0;
     for (jobs) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
     const avg_rg = @max(@as(u64, 1), sum_bytes / @max(@as(u64, 1), jobs.len));
-    const inflight_budget: u64 = if (system.onLambda(ctx.env))
+    // Never more than a quarter of the query's budget: the S3 fetch window takes another (`s3FetchWindow`), and the
+    // rest is for the producers' decode and encode working sets.
+    const inflight_budget: u64 = @min(@as(u64, args.max_memory) / 4, if (system.onLambda(ctx.env))
         system.discoverAvailableMemory(ctx.env) / 2
     else
-        @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8);
+        @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8));
     const window = system.windowCapacity(inflight_budget, avg_rg, jobs.len);
     return .{ .workers = @min(async_budget, window), .window = window, .budget = async_budget };
 }
@@ -1309,7 +1467,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const prof = profile.threadOf(args.profiler, .main);
     t.core.prof = prof;
     const t_open = nowMonoNs();
-    var opened = try openInputs(ctx, arena, args, null);
+    var opened = try openInputs(ctx, arena, args, .{ .limit = s3FetchWindow(ctx.env, args.max_memory) });
     defer opened.deinit();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
@@ -1492,7 +1650,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
         for (opened.inputs, metas, 0..) |in, *meta_p, ii| {
             bytes_in += in.bytes.len;
-            for (meta_p.row_groups.items) |*src_rg| {
+            for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
                 rgs_in += 1;
                 rows_in += src_rg.num_rows;
                 try jobs.append(arena, .{
@@ -1501,6 +1659,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     .rg = src_rg,
                     .file_index = ii,
                     .rg_index = rgs_in - 1,
+                    .gate = in.gate,
+                    .file_rg = ri,
                 });
             }
         }
@@ -1552,11 +1712,13 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             bytes_in += in.bytes.len;
             const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
             const meta_const = meta_i;
-            for (meta_const.row_groups.items) |*src_rg| {
+            for (meta_const.row_groups.items, 0..) |*src_rg, ri| {
                 rgs_in += 1;
                 rows_in += src_rg.num_rows;
                 const rg_span = profile.Span.begin(prof);
                 defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
+                if (in.gate) |g| try g.wait(g.ctx, ri);
+                defer skipRowGroup(in, ri);
                 const bloom_write: consumer.BloomWrite = .{ .fpp = blooms.leaves, .meta = &meta_i, .scratch = ctx.gpa };
                 const out = try consumer.copyRG(
                     arena,
@@ -1609,13 +1771,16 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         for (opened.inputs, 0..) |in, ii| {
             bytes_in += in.bytes.len;
             const meta_p = &metas[ii];
-            for (meta_p.row_groups.items) |*src_rg| {
+            for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
                 rgs_in += 1;
                 rows_in += src_rg.num_rows;
                 var passthrough = false;
                 if (filter_opt) |f| if (!args.scan_all) {
                     const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
-                    if (d == .skip) continue;
+                    if (d == .skip) {
+                        skipRowGroup(in, ri);
+                        continue;
+                    }
                     // Byte-copy preserves the source codec, so it may only stand
                     // in for a re-encode when the requested --codec already
                     // matches every kept column (else re-encode to honor it).
@@ -1634,6 +1799,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     .passthrough = passthrough,
                     .file_index = ii,
                     .rg_index = rgs_in - 1,
+                    .gate = in.gate,
+                    .file_rg = ri,
                 });
             }
         }
@@ -1675,6 +1842,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .new_row_groups = &new_row_groups,
                 .arena = arena,
                 .profiler = args.profiler,
+                // Half the budget for the producers' decoded rows (the fetch window and the encoded output in flight
+                // take a quarter each), shared among those that run at once.
+                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
             };
             const re_span = profile.Span.begin(prof);
             defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
@@ -2000,8 +2170,9 @@ fn openInputs(
     ctx: Context,
     arena: std.mem.Allocator,
     args: QueryArgs,
-    /// For an aggregate, the S3 bytes it may hold fetched at once (`s3_window.windowFor`); null fetches all up front.
-    fetch_window: ?u64,
+    /// The S3 bytes the query may hold fetched at once (`s3FetchWindow`). Past it — or always, with `always` — S3
+    /// inputs are fetched behind the consumer's row group gates instead of all up front.
+    fetch_window: FetchWindow,
 ) !OpenedInputs {
     const paths = args.inputs;
     const prof = profile.threadOf(args.profiler, .main);
@@ -2053,7 +2224,6 @@ fn openInputs(
     errdefer for (s3_mapped.items) |b| s3_window.unmapBuffer(b);
     var s3_fetcher: ?*S3Fetcher = null;
     var windowed = false;
-    const on_linux = @import("builtin").os.tag == .linux;
     var membership_stats: membership.Stats = .{};
     if (s3_indices.items.len > 0) {
         const creds = try credentialsFromEnv(ctx.env);
@@ -2148,7 +2318,8 @@ fn openInputs(
         // Over a window's worth of bytes, an aggregate fetches as its workers go (`io/s3_window.zig`): each row group's
         // chunks get their own page-aligned stretch of the buffer, filled ahead of the workers and given back behind
         // them. Under it (and off Linux), everything is fetched before the scan starts.
-        if (on_linux) if (fetch_window) |limit| {
+        if (s3_window.supported) {
+            const limit = fetch_window.limit;
             var need: u64 = 0;
             for (specs) |*sp| for (sp.meta.row_groups.items) |*rg| {
                 const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
@@ -2158,8 +2329,8 @@ fn openInputs(
                     need += @intCast(cm.total_compressed_size);
                 }
             };
-            windowed = need > limit;
-        };
+            windowed = need > limit or (fetch_window.always and need > 0);
+        }
         var win_order: std.ArrayList(*s3_window.RowGroup) = .empty;
         const win_files = try arena.alloc(s3_window.File, specs.len);
 
@@ -2304,8 +2475,8 @@ fn openInputs(
                 .window = .{
                     .gpa = ctx.gpa,
                     .order = win_order.items,
-                    .limit = fetch_window.?,
-                    .batch = @max(1, fetch_window.? / 4),
+                    .limit = fetch_window.limit,
+                    .batch = @max(1, fetch_window.limit / 4),
                 },
                 .pool = pool,
                 .creds = creds,
@@ -3257,7 +3428,12 @@ fn groupedDecColumn(
         const cell: ?i128 = switch (row[ci]) {
             .null_val => null,
             .dec => |x| x.v,
-            .avg_dec => |p| p.sum,
+            // The `__sum` column is DECIMAL(38, s): a wider exact sum cannot be stored, and is not rounded to fit.
+            .avg_dec => |p| blk: {
+                const x = p.sum orelse break :blk null;
+                if (@abs(x) >= @as(u192, @intCast(spec.bound()))) return error.DecimalOverflow;
+                break :blk @as(i128, @intCast(x));
+            },
             else => return error.TypeMismatch,
         };
         v.* = cell orelse 0;
@@ -3381,36 +3557,24 @@ fn writeFloat(writer: anytype, f: anytype, is_jsonl: bool) !void {
     }
 }
 
-fn writeDecimal(writer: anytype, unscaled: i128, scale: i32) !void {
+/// `unscaled` (any signed integer width, an avg's 192-bit sum included) as decimal text with `scale` digits after the
+/// point, every one printed: `-0.05`, `300.00`.
+fn writeDecimal(writer: anytype, unscaled: anytype, scale: i32) !void {
     if (scale <= 0) {
         try writer.print("{d}", .{unscaled});
         return;
     }
-    const abs_val = @abs(unscaled);
-    const sign = if (unscaled < 0) "-" else "";
-    const divisor = std.math.pow(u128, 10, @intCast(scale));
-    const integer_part = abs_val / divisor;
-    const fractional_part = abs_val % divisor;
-
-    try writer.print("{s}{d}.", .{ sign, integer_part });
-
-    var temp = fractional_part;
-    var digits: usize = 0;
-    if (temp == 0) {
-        digits = 1;
+    var buf: [64]u8 = undefined;
+    const digits = try std.fmt.bufPrint(&buf, "{d}", .{@abs(unscaled)});
+    const s: usize = @intCast(scale);
+    if (unscaled < 0) try writer.writeByte('-');
+    if (digits.len > s) {
+        try writer.print("{s}.{s}", .{ digits[0 .. digits.len - s], digits[digits.len - s ..] });
     } else {
-        while (temp > 0) {
-            digits += 1;
-            temp /= 10;
-        }
+        try writer.writeAll("0.");
+        for (0..s - digits.len) |_| try writer.writeByte('0');
+        try writer.writeAll(digits);
     }
-
-    const num_zeros = if (@as(usize, @intCast(scale)) > digits) @as(usize, @intCast(scale)) - digits else 0;
-    var z: usize = 0;
-    while (z < num_zeros) : (z += 1) {
-        try writer.writeByte('0');
-    }
-    try writer.print("{d}", .{fractional_part});
 }
 
 fn writeCsvString(writer: anytype, s: []const u8) !void {
@@ -3604,6 +3768,94 @@ fn printCell(
     }
 }
 
+const SlicedPrint = struct {
+    names: []const []const u8,
+    writer: *StdoutWriter,
+    is_jsonl: bool,
+    limit: ?usize,
+    total_printed: *usize,
+    /// What the row group's decoded columns may take; past it, it prints in slices.
+    budget: usize,
+    decode_options: consumer.DecodeOptions,
+};
+
+/// Print `rg` a slice of rows at a time when its decoded columns would take more than `o.budget`, or a limit is set:
+/// each slice's fetched columns decode (`consumer.SliceReader`), filter and print on memory of their own, and printing
+/// stops at the limit without decoding further. False, having printed nothing, when the row group fits, or has a
+/// column with no sliced form; the caller then prints it whole.
+fn printRowGroupSliced(
+    gpa: std.mem.Allocator,
+    agg: *consumer.OutputAggregator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: consumer.RGSrc,
+    filter: ?filter_ast.Filter,
+    fetch_arr: []const bool,
+    output_specs: []const consumer.OutputCol,
+    o: SlicedPrint,
+) !bool {
+    const num_rows: usize = @intCast(@max(0, rg.num_rows));
+    const est = consumer.decodeEstimate(.{
+        .rg = rg,
+        .meta = meta,
+        .src = src,
+        .filter = null,
+        .read = fetch_arr,
+        .consumed = fetch_arr,
+    }, fetch_arr, &.{}, false) * 2; // decoded, then buffered for printing
+    if (num_rows == 0) return false;
+    // A limit also slices, so a print that wants a few rows decodes about that many.
+    const wanted: ?usize = if (o.limit) |lim| lim -| o.total_printed.* else null;
+    if (est <= o.budget and wanted == null) return false;
+
+    var pages = std.heap.ArenaAllocator.init(gpa);
+    defer pages.deinit();
+    var readers: std.ArrayList(consumer.SliceReader) = .empty;
+    defer for (readers.items) |*r| r.deinit();
+    const lookup = try pages.allocator().alloc(?usize, fetch_arr.len);
+    @memset(lookup, null);
+    for (fetch_arr, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, meta, src, ci, o.decode_options) orelse
+            return false;
+        lookup[ci] = readers.items.len;
+        try readers.append(pages.allocator(), r);
+    }
+    // A slice takes a quarter of the budget.
+    const per_row = @max(1, est / num_rows);
+    const floor = @min(4096, num_rows);
+    var slice_rows = std.math.clamp(o.budget / 4 / per_row, floor, num_rows);
+    if (wanted) |w| slice_rows = std.math.clamp(w * 2, floor, slice_rows);
+
+    var done: usize = 0;
+    while (done < num_rows) {
+        if (o.limit) |lim| if (o.total_printed.* >= lim) break;
+        const n = @min(slice_rows, num_rows - done);
+        var slice = std.heap.ArenaAllocator.init(gpa);
+        defer slice.deinit();
+        const sa = slice.allocator();
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
+        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        var sel = try filter_selection.SelectionVector.init(sa, n);
+        if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        // The aggregator's buffers live on the slice's memory and go with it.
+        agg.arena = sa;
+        for (agg.cols) |*c| c.* = switch (c.*) {
+            inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+        };
+        agg.num_rows = 0;
+        _ = try consumer.appendSliceRows(agg, &batch, lookup, &sel, output_specs, sa);
+        try flushAggregator(agg, o.names, o.writer, o.is_jsonl, o.limit, o.total_printed);
+        for (agg.cols) |*c| c.* = switch (c.*) {
+            inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+        };
+        agg.num_rows = 0;
+        done += n;
+    }
+    return true;
+}
+
 fn flushAggregator(
     agg: *consumer.OutputAggregator,
     names: []const []const u8,
@@ -3661,7 +3913,11 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     if (args.select != null and args.columns != null) return error.AggregateMutexWithSelect;
 
     const open_span = profile.Span.begin(prof);
-    var opened = try openInputs(ctx, arena, args, null);
+    // With a limit, fetch as the rows are printed, so a query that stops early stops fetching too.
+    var opened = try openInputs(ctx, arena, args, .{
+        .limit = s3FetchWindow(ctx.env, args.max_memory),
+        .always = limit != null,
+    });
     defer opened.deinit();
     open_span.end(.open_inputs, profile.args(.{args.inputs.len}));
 
@@ -3759,9 +4015,35 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
             if (filter_opt) |f| if (!args.scan_all) {
                 if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
                     skipped = true;
+                    skipRowGroup(in, rg_i);
                     continue;
                 }
             };
+            if (in.gate) |g| try g.wait(g.ctx, rg_i);
+            defer skipRowGroup(in, rg_i);
+
+            // A row group too big to hold decoded prints a slice of rows at a time.
+            const sliced: SlicedPrint = .{
+                .names = names,
+                .writer = &stdout_writer,
+                .is_jsonl = is_jsonl,
+                .limit = limit,
+                .total_printed = &total_printed,
+                .budget = args.max_memory / 2,
+                .decode_options = .{ .fast_levels = args.fast_levels },
+            };
+            const printed = try printRowGroupSliced(
+                ctx.gpa,
+                &agg,
+                src_rg,
+                &meta_const,
+                rg_src,
+                filter_opt,
+                fetch_arr,
+                output_specs,
+                sliced,
+            );
+            if (printed) continue;
 
             _ = try consumer.appendProjectedRGWithOptions(
                 &agg,
@@ -4747,4 +5029,65 @@ test "a windowed S3 fetch that fails mid-scan fails the query rather than hangin
     const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
     const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .parallelism = 2 };
     try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJson(gpa, &fake, &keys, q, 1));
+}
+
+test "every S3 write path writes the same bytes through a window as with everything fetched up front" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/a.parquet", bytes);
+    try fake.serveBytes("t/b.parquet", bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+    const creds = [_]?[*:0]const u8{
+        endpoint,
+        "AWS_REGION=us-east-1",
+        "AWS_ACCESS_KEY_ID=ak",
+        "AWS_SECRET_ACCESS_KEY=sk",
+    };
+    const inputs = [_][]const u8{ "s3://bkt/t/a.parquet", "s3://bkt/t/b.parquet" };
+    const Case = struct { label: []const u8, args: QueryArgs };
+    const cases = [_]Case{
+        .{ .label = "byte copy", .args = .{ .inputs = &inputs, .columns = &.{ "k", "i" } } },
+        .{ .label = "recompressing copy", .args = .{ .inputs = &inputs, .codec = .ZSTD } },
+        .{ .label = "re-encode", .args = .{ .inputs = &inputs, .filter = "i >= 300", .parallelism = 3 } },
+        .{ .label = "select", .args = .{ .inputs = &inputs, .select = "i * 2 AS d, k", .parallelism = 2 } },
+    };
+    for (cases) |c| {
+        var first: ?[]u8 = null;
+        defer if (first) |b| gpa.free(b);
+        // Up front (no override: the files fit the default window), then a window smaller than any row group.
+        for ([_]?[*:0]const u8{ null, "ZPQ_S3_WINDOW_KIB=1" }) |win| {
+            var lines: std.ArrayList(?[*:0]const u8) = .empty;
+            try lines.appendSlice(a, &creds);
+            if (win) |w| try lines.append(a, w);
+            const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+            @memcpy(block, lines.items);
+            var q = c.args;
+            q.output = out;
+            var r = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io }, q);
+            r.deinit(gpa);
+            const written = try metadata.readFileSlice(out, gpa);
+            if (first) |b| {
+                defer gpa.free(written);
+                std.testing.expectEqualSlices(u8, b, written) catch |err| {
+                    std.debug.print("{s}: windowed output differs\n", .{c.label});
+                    return err;
+                };
+            } else first = written;
+        }
+    }
 }

@@ -312,6 +312,16 @@ pub const Batch = struct {
     /// need to be present (caller decides what to provide).
     cols: []const Column,
     num_rows: usize,
+    /// The rows a computed result is wanted for, when not all. Exact DECIMAL evaluation checks only these: a value
+    /// too wide in a row the filter dropped is no error, as the SQL engines filter before they compute.
+    sel: ?*const selection.SelectionVector = null,
+
+    /// This batch, with computed results wanted only for `s`'s rows (see `sel`).
+    pub fn restrictedTo(self: *const Batch, s: *const selection.SelectionVector) Batch {
+        var b = self.*;
+        b.sel = s;
+        return b;
+    }
 
     pub const Column = union(enum) {
         i32: ColumnT(i32),

@@ -113,6 +113,11 @@ pub const DecSum = struct {
         self.n += n;
     }
 
+    /// The exact sum at any width (up to 192 bits), null over no values: what an avg reports beside its mean.
+    pub fn wide(self: DecSum) ?i192 {
+        return if (self.n == 0) null else self.get();
+    }
+
     /// The sum as a 38-digit DECIMAL: null over no values, an error past 38 digits rather than a wrapped value.
     pub fn result(self: DecSum) expr_eval.Error!?i128 {
         if (self.n == 0) return null;
@@ -855,7 +860,7 @@ const PreparedAggInput = struct {
             else => in.values = if (rowless)
                 try in.evalArg(arena, batch, column_lookup, arg)
             else
-                try expr_eval.evalExpr(arena, batch, column_lookup, arg),
+                try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg),
         };
         return in;
     }
@@ -881,7 +886,7 @@ const PreparedAggInput = struct {
         const sel = self.selection();
         const active = sel.count();
         const sparse = active * 4 <= batch.num_rows;
-        if (!sparse and !any_coded) return expr_eval.evalExpr(arena, batch, column_lookup, arg);
+        if (!sparse and !any_coded) return expr_eval.evalExpr(arena, &batch.restrictedTo(sel), column_lookup, arg);
 
         const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
         for (refs, column_lookup) |r, pos| if (r) if (pos) |p| {

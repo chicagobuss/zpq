@@ -697,6 +697,64 @@ def main():
             fails += 1
             print(f"  FAIL  {label}  {e}")
 
+    # A row group bigger than --max-memory lets one producer hold: written, printed and aggregated a slice of rows at a
+    # time, with the same answers as DuckDB, down to a budget of a few slices.
+    big = os.path.join(tmp, "one_big_rg.parquet")
+    con.execute(f"""COPY (SELECT i::BIGINT AS id, (i % 97)::INTEGER AS g, CAST(i * 0.01 AS DECIMAL(18,2)) AS price,
+        'n' || (i % 1000) AS name, (CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END)::DOUBLE AS amt
+        FROM range(0, 50000) t(i)) TO '{big}' (FORMAT PARQUET, ROW_GROUP_SIZE 100000)""")
+    tiny = ["--max-memory", "2M", "-j", "2"]
+    out = os.path.join(tmp, "zbig.parquet")
+    for blabel, args, dsql in [
+        ("write", ["-o", out, "--filter", "id >= 100", "--select", "id, price * 2 AS p, name, amt"],
+         "SELECT id, price * 2 AS p, name, amt FROM '{f}' WHERE id >= 100"),
+        ("print", ["--format", "jsonl", "--filter", "g = 3"], "SELECT * FROM '{f}' WHERE g = 3"),
+        ("print-limit", ["--format", "jsonl", "--limit", "7"], "SELECT * FROM '{f}' LIMIT 7"),
+        ("aggregate", ["--aggregate", "sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t"],
+         "SELECT sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t FROM '{f}'"),
+        ("grouped", ["--aggregate", "sum(price) AS s, min(amt) AS a", "--group-by", "g"],
+         "SELECT g, sum(price) AS s, min(amt) AS a FROM '{f}' GROUP BY g"),
+    ]:
+        total += 1
+        label = f"sliced:{blabel}"
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", big] + args + tiny, capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+            rel = con.execute(dsql.format(f=big))
+            lanes = json_lanes(rel)
+            want = canon_rows(rel.fetchall(), lanes)
+            cols = [d[0] for d in rel.description]
+            if blabel == "write":
+                if pq.ParquetFile(out).metadata.num_row_groups < 2:
+                    raise RuntimeError("one row group out: the write was not sliced")
+                got = canon_rows([[row[c] for c in cols] for row in pq.read_table(out).to_pylist()], lanes)
+            elif blabel.startswith("print"):
+                got = canon_rows([from_zpq([zjson(l)[c] for c in cols], lanes)
+                                  for l in r.stdout.splitlines() if l.strip()], lanes)
+                if blabel == "print-limit":
+                    # LIMIT without ORDER BY: compare to the file's first rows in order.
+                    want = canon_rows(con.execute(f"SELECT * FROM '{big}'").fetchmany(7), lanes)
+            else:
+                agg = zjson(r.stdout)["agg"]
+                rows = agg if isinstance(agg, list) else [agg]
+                got = canon_rows([from_zpq([fold_avg(row.get(c)) for c in cols], lanes) for row in rows], lanes)
+            if got != want:
+                raise RuntimeError(f"zpq={got[:2]} duck={want[:2]} ({len(got)} vs {len(want)})")
+            print(f"  OK    {label}  ({len(got)} rows)")
+        except Exception as e:
+            fails += 1
+            print(f"  FAIL  {label}  {e}")
+    total += 1
+    r = subprocess.run([ZPQ, "query", big, "--aggregate", "sum(price) AS s", "--max-memory", "100K"],
+                       capture_output=True, text=True)
+    want_s = con.execute(f"SELECT sum(price) FROM '{big}'").fetchone()[0]
+    streamed = r.returncode == 0 and zjson(r.stdout)["agg"]["s"] == want_s
+    print(f"  {'OK  ' if streamed else 'FAIL'}  sliced:tiny-budget  {(r.stderr or r.stdout).strip()[:70]}")
+    fails += 0 if streamed else 1
+
     # Clashing output names fail loudly, naming the column, instead of one column showing another's values.
     CLASHES = [
         ("key_vs_alias", ["--group-by", "name AS k", "--aggregate", "sum(amt) AS name"], "name"),

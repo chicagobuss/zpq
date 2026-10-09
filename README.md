@@ -77,20 +77,37 @@ JSON (avg as `<name>__sum` / `<name>__count`).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
-entry budget, so leave headroom. It also bounds what an aggregate over S3 holds fetched: past a quarter of it (between
-64 MiB and 1 GiB; `ZPQ_S3_WINDOW_KIB` sets it), row groups are fetched just ahead of the workers and released behind
-them, so a scan larger than memory completes. Its default is 80% of available memory, three quarters of a cgroup's
-memory limit or a Lambda's memory size where those are lower.
+entry budget, so leave headroom. It also bounds a query's working memory on every path (aggregate, print, write, byte
+copy), over S3 and locally alike, so a scan larger than memory completes:
+- **Fetched bytes:** S3 inputs past a quarter of it (between 64 MiB and 1 GiB; `ZPQ_S3_WINDOW_KIB` sets it) are
+  fetched just ahead of the readers and released behind them (Linux; elsewhere still up front). A print with
+  `--limit` fetches row group by row group and stops once it has its rows.
+- **Decoded rows:** half of it is for decoded row groups, shared by the workers. A row group too big for a worker's
+  share is decoded, filtered and aggregated, printed or written a slice of rows at a time (a write then emits one
+  output row group per slice); one whose columns have no sliced form (nested, INT96, FIXED_LEN_BYTE_ARRAY DECIMAL)
+  aggregates one aggregate's columns at a time, and is refused (`RowGroupTooLarge`) rather than run out of memory when
+  even that cannot fit.
+
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default is 80%
+of available memory, three quarters of a cgroup's memory limit or a Lambda's memory size where those are lower.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
-compute in scaled 128-bit integers, never through a double. Result types follow the rules DuckDB and Trino (Athena)
-share: `a + b` / `a - b` take the larger scale and one more integer digit, `a * b` adds scales and precisions (both
-capped at 38 digits), an integer operand counts as DECIMAL(10,0) or DECIMAL(19,0), and `/` or a DOUBLE operand gives
-DOUBLE. `sum` is DECIMAL(38, s); `min` / `max` keep the column's type; `avg` keeps it too, rounded half away from zero
-as Trino does (DuckDB answers avg in DOUBLE). The JSON prints every digit of the scale (`3344516955134.66`), `-o`
-writes DECIMAL columns, and a DECIMAL avg's JSON adds `"avg"` beside `{"sum", "count"}`. A value that needs more than
-its type's digits stops the query with an error rather than wrapping or rounding. Filters still compare DECIMAL
-columns as doubles: exact while the values and the literal have at most 15 significant digits.
+compute in scaled 128-bit integers, never through a double. Result types follow Trino's (Athena's) rules: `a + b` /
+`a - b` take the larger scale and one more integer digit, both sides first brought to their common type (the larger
+scale, every integer digit either side has, at most 38 digits; a value that does not fit it is an error, as the cast
+is there), `a * b` adds scales and precisions (capped at 38 digits), an integer operand counts as DECIMAL(10,0) or
+DECIMAL(19,0), and a DOUBLE operand gives DOUBLE. Two places follow DuckDB instead: `/` gives DOUBLE, and an `avg`'s
+sum may pass 38 digits. DuckDB agrees on every scale but keeps some results at 18 digits where Trino and zpq widen
+(the product of two DECIMAL(15,2) is DECIMAL(18,4) in DuckDB, DECIMAL(30,4) here); values are the same.
+`sum` is DECIMAL(38, s); `min` / `max` keep the column's type; `avg` keeps it too, the exact mean rounded half away
+from zero as Trino does (DuckDB answers avg in DOUBLE). The JSON prints every digit of the scale
+(`3344516955134.66`), `-o` writes DECIMAL columns, and a DECIMAL avg's JSON adds `"avg"` beside `{"sum", "count"}`; its
+sum is exact at any width, but `-o`'s `__sum` column is DECIMAL(38, s), so an avg whose sum passes 38 digits answers in
+JSON and errors with `-o`. A value that needs more than its type's digits stops the query with an error rather than
+wrapping or rounding, but only in rows the filter keeps. Two limits remain: filters compare DECIMAL columns as
+doubles (exact while the values and the literal have at most 15 significant digits), and arithmetic over a column
+that holds NULLs is refused (`nullable values are not supported`), as for every type; bare aggregates and GROUP BY
+keys over nullable DECIMAL columns are exact.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte

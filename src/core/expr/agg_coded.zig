@@ -506,7 +506,7 @@ fn foldGroupedCall(
                 },
             };
         },
-        else => |e| vals_col = try expr_eval.evalExpr(ra, batch, lookup, e),
+        else => |e| vals_col = try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
     const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes;

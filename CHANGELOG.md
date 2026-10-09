@@ -9,7 +9,8 @@
   where they answered in f64 before (a TPC-H Q1 sum was a cent off at SF30). Numeric literals with a decimal point are
   DECIMAL, as in SQL. The JSON prints exact text, `-o` writes DECIMAL columns (a DECIMAL `GROUP BY` key and min/max
   were DOUBLE), and a result past its type's 38 digits is an error instead of a rounded value. `avg` keeps the
-  argument's type, rounded half away from zero (Trino's rule), and its JSON gains `"avg"`. DECIMAL `/` is DOUBLE.
+  argument's type, its exact mean rounded half away from zero (Trino's rule), and its JSON gains `"avg"`. DECIMAL `/`
+  is DOUBLE. See the README for the result-type rules and where DuckDB's differ.
 - `GROUP BY` lists groups in the order they first appear in the input (files in the order given, then row groups, then
   rows), at every `-j`; before, groups came in the byte order of their serialized keys. Floating-point sums and
   averages come out with the same bits at every `-j` and on every run. `--unordered` (the Lambda's `"ordered": false`)
@@ -70,11 +71,14 @@
 
 ### Fixes
 
-- An aggregate over S3 no longer holds every byte it reads at once, which ran a 6.7 GB full scan out of memory on a
-  3008 MB Lambda. Past a window of a quarter of `--max-memory` (64 MiB to 1 GiB; `ZPQ_S3_WINDOW_KIB` overrides it),
-  row groups are fetched ahead of the scan workers and their memory handed back as each is done (Linux; elsewhere the
-  fetch is still up front). The default `--max-memory` also honours a cgroup v2 memory limit, as it already did a
-  Lambda's memory size.
+- `--max-memory` bounds a query's working memory on every path, over S3 and locally, where an S3 query held every
+  byte it read at once (a 6.7 GB full scan ran out of memory on a 3008 MB Lambda) and a large row group was decoded
+  whole. S3 inputs past a quarter of it (64 MiB to 1 GiB; `ZPQ_S3_WINDOW_KIB` overrides it) are fetched ahead of the
+  readers and released behind them (Linux; elsewhere still up front), and a print with `--limit` stops fetching once
+  it has its rows. Half of it is for decoded row groups, shared by the workers: a row group too big for one is
+  aggregated, printed or written a slice of rows at a time (a write emitting a row group per slice), and one with no
+  sliced form is aggregated one aggregate's columns at a time or refused with `RowGroupTooLarge`, never killed. The
+  default also honours a cgroup v2 memory limit, as it already did a Lambda's memory size.
 - Corrupted GZIP pages are rejected instead of returning wrong values. Each gzip member's CRC-32 and length are now
   checked; before, decoding stopped once a page's bytes were out and never read the member's trailer.
 - A `--trust-stats` float `min` / `max` of zero decodes the chunk rather than taking its sign from bounds, since writers

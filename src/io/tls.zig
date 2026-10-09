@@ -11,11 +11,17 @@
 //!
 //! Keeping TLS as a memory-BIO state machine lets the I/O scheduler
 //! change without changing the TLS logic.
+//!
+//! Every network wait has a deadline (`Timeouts`): connecting and the TLS handshake each as a whole, the first byte
+//! of a response after the request went out, and silence while reading or sending. The last two are idle timeouts,
+//! reset by every byte that moves, so a slow transfer that keeps moving is never cut off. A stalled peer that keeps
+//! its connection open would otherwise block a read forever (and with it the whole query).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const boring = @import("boring_tls");
+const clock = @import("../clock.zig");
 
 pub const Error = error{
     DnsFailed,
@@ -33,7 +39,52 @@ pub const Error = error{
     /// was is for the protocol above to judge.
     UncleanClose,
     Closed,
+    /// No TCP connection within `Timeouts.connect_ms`.
+    ConnectTimeout,
+    /// The TLS handshake did not complete within `Timeouts.handshake_ms`.
+    HandshakeTimeout,
+    /// No byte of a response within `Timeouts.first_byte_ms` of sending the request.
+    FirstByteTimeout,
+    /// No further byte of a response for `Timeouts.idle_ms`.
+    ReadTimeout,
+    /// The peer took no byte of what was being sent for `Timeouts.idle_ms`.
+    SendTimeout,
 } || std.mem.Allocator.Error;
+
+/// How long a connection waits on the network. The defaults, and the environment variables that override them (in
+/// milliseconds, read by `fromEnv`):
+///
+///   connect_ms     5 000   ZPQ_S3_CONNECT_TIMEOUT_MS      TCP connect, per address tried
+///   handshake_ms   5 000   ZPQ_S3_HANDSHAKE_TIMEOUT_MS    the whole TLS handshake
+///   first_byte_ms 10 000   ZPQ_S3_FIRST_BYTE_TIMEOUT_MS   from the request sent to the first byte of its response
+///   idle_ms       10 000   ZPQ_S3_IDLE_TIMEOUT_MS         silence while reading a response or sending a request
+///
+/// S3 answers its first byte in tens of milliseconds and moves 8 MiB in about 0.1 s even under Lambda's network
+/// policer, so ten seconds without a byte is a stalled connection, not a slow one; each extra second waited is billed
+/// on Lambda. A timeout fails the attempt; the request layer retries it on a new connection (`retry.classify`).
+pub const Timeouts = struct {
+    connect_ms: u32 = 5_000,
+    handshake_ms: u32 = 5_000,
+    first_byte_ms: u32 = 10_000,
+    idle_ms: u32 = 10_000,
+
+    /// The defaults, each overridden by its environment variable when that holds a positive integer.
+    pub fn fromEnv(env: std.process.Environ) Timeouts {
+        var t: Timeouts = .{};
+        inline for (.{
+            .{ "connect_ms", "ZPQ_S3_CONNECT_TIMEOUT_MS" },
+            .{ "handshake_ms", "ZPQ_S3_HANDSHAKE_TIMEOUT_MS" },
+            .{ "first_byte_ms", "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS" },
+            .{ "idle_ms", "ZPQ_S3_IDLE_TIMEOUT_MS" },
+        }) |f| {
+            if (env.getPosix(f[1])) |v| {
+                const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 0;
+                if (n > 0) @field(t, f[0]) = n;
+            }
+        }
+        return t;
+    }
+};
 
 pub const ClientContext = boring.tls_client.ClientContext;
 
@@ -41,12 +92,14 @@ pub const ClientContext = boring.tls_client.ClientContext;
 pub const Ipv4 = [4]u8;
 
 /// Where to connect: a host's IPv4 addresses, tried from `first` on (wrapping) until one accepts the TCP connection.
-/// A refused or unreachable address only costs a failed connect, which is the whole of the fallback: there is no
-/// racing and no timeout of our own.
+/// A refused, unreachable or silent address (`Timeouts.connect_ms`) only costs a failed connect, which is the whole
+/// of the fallback: there is no racing.
 pub const Peer = struct {
     addrs: []const Ipv4,
     first: usize = 0,
     port: u16,
+    /// The connection's deadlines, from connecting on.
+    timeouts: Timeouts = .{},
 
     pub fn loopback(port: u16) Peer {
         return .{ .addrs = &.{.{ 127, 0, 0, 1 }}, .port = port };
@@ -117,6 +170,11 @@ pub const Connection = struct {
     /// the next recv() call. processIncoming() clears its internal
     /// buffer on each invocation, so we must own this carry-over.
     pending: std.ArrayList(u8) = .empty,
+    timeouts: Timeouts = .{},
+    /// A request has gone out and no byte of its response has come back: a read waits `first_byte_ms`, not `idle_ms`.
+    awaiting_response: bool = false,
+    /// The socket's current receive timeout, ms (0: not yet set), so it is only set again when it changes.
+    rcv_ms: u32 = 0,
 
     /// Open a TCP connection, perform a TLS handshake, return the
     /// connected client. Caller eventually calls deinit().
@@ -181,39 +239,76 @@ pub const Connection = struct {
         var tls = boring.tls_client.TlsClient.init(allocator, context, serverName(host)) catch |err|
             return handshakeError(err);
         errdefer tls.deinit();
-        handshake(fd, &tls) catch |err| {
+        handshake(fd, &tls, peer.timeouts.handshake_ms) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
                 const reason = boring.tls.c.X509_verify_cert_error_string(boring.tls.c.SSL_get_verify_result(tls.ssl));
                 std.log.warn("TLS: certificate of {s} rejected: {s}", .{ serverName(host), std.mem.span(reason) });
             }
             return err;
         };
-        return .{ .fd = fd, .tls = tls, .allocator = allocator };
+        // From here on a send may sit idle for `idle_ms`; reads set their own timeout (`armRecv`).
+        try setSockTimeout(fd, posix.SO.SNDTIMEO, peer.timeouts.idle_ms);
+        return .{ .fd = fd, .tls = tls, .allocator = allocator, .timeouts = peer.timeouts };
     }
 
-    /// Drive the handshake to completion. Each iteration:
+    /// Drive the handshake to completion, within `budget_ms` in all. Each iteration:
     ///   1. ask the TLS client for outgoing bytes (ClientHello / Finished / ...)
     ///   2. write them to the socket
     ///   3. read from the socket, feed back into TLS
     /// Stop when the client reports handshake complete.
-    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient) Error!void {
+    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient, budget_ms: u32) Error!void {
+        const deadline = monoMs() + budget_ms;
+        try setSockTimeout(fd, posix.SO.SNDTIMEO, budget_ms);
         const initial = tls.startHandshake() catch |err| return handshakeError(err);
-        if (initial.encrypted) |bytes| try writeAll(fd, bytes);
+        if (initial.encrypted) |bytes| writeAll(fd, bytes) catch |err| return handshakeIo(err);
 
         var rx_buf: [16 * 1024]u8 = undefined;
         while (!tls.isHandshakeComplete()) {
-            const n = readSome(fd, &rx_buf) catch return error.HandshakeFailed;
+            const now = monoMs();
+            if (now >= deadline) return error.HandshakeTimeout;
+            try setSockTimeout(fd, posix.SO.RCVTIMEO, @intCast(deadline - now));
+            const n = readSome(fd, &rx_buf) catch |err| return if (err == error.WouldBlock)
+                error.HandshakeTimeout
+            else
+                error.HandshakeFailed;
             if (n == 0) return error.HandshakeFailed;
             _ = tls.processIncoming(rx_buf[0..n], null) catch |err| return handshakeError(err);
             // After feeding bytes in, drain any outgoing handshake data.
             const out = tls.processOutgoing(null) catch |err| return handshakeError(err);
-            if (out.encrypted) |bytes| try writeAll(fd, bytes);
+            if (out.encrypted) |bytes| writeAll(fd, bytes) catch |err| return handshakeIo(err);
         }
+    }
+
+    fn handshakeIo(err: WriteError) Error {
+        return if (err == error.WouldBlock) error.HandshakeTimeout else error.SendFailed;
     }
 
     pub fn connectPlain(allocator: std.mem.Allocator, peer: Peer) Error!Connection {
         const fd = try openTcpAny(peer);
-        return .{ .fd = fd, .tls = undefined, .allocator = allocator, .plain = true };
+        errdefer closeFd(fd);
+        try setSockTimeout(fd, posix.SO.SNDTIMEO, peer.timeouts.idle_ms);
+        return .{ .fd = fd, .tls = undefined, .allocator = allocator, .plain = true, .timeouts = peer.timeouts };
+    }
+
+    /// Use `t` from the next request on: a pooled connection takes the timeouts of the query that reuses it.
+    pub fn setTimeouts(self: *Connection, t: Timeouts) Error!void {
+        if (std.meta.eql(self.timeouts, t)) return;
+        try setSockTimeout(self.fd, posix.SO.SNDTIMEO, t.idle_ms);
+        self.timeouts = t;
+    }
+
+    /// Set the receive timeout a read must use now: `first_byte_ms` while a request awaits its response, else
+    /// `idle_ms`. Only calls into the kernel when the value changes (twice per request at most).
+    fn armRecv(self: *Connection) Error!void {
+        const want = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
+        if (want == self.rcv_ms) return;
+        try setSockTimeout(self.fd, posix.SO.RCVTIMEO, want);
+        self.rcv_ms = want;
+    }
+
+    /// A socket read that timed out, named for what it was waiting for.
+    fn readTimeout(self: *const Connection) Error {
+        return if (self.awaiting_response) error.FirstByteTimeout else error.ReadTimeout;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -231,14 +326,17 @@ pub const Connection = struct {
     /// case `consumed == 0` doesn't mean failure — it means "drain the
     /// encrypted bytes to the socket, then I can encrypt more." Only fail
     /// when neither side makes progress.
+    ///
+    /// Sending is what a request does, so afterwards the next read waits for the first byte of its response.
     pub fn send(self: *Connection, plaintext: []const u8) Error!void {
-        if (self.plain) return writeAll(self.fd, plaintext);
+        self.awaiting_response = true;
+        if (self.plain) return writeAll(self.fd, plaintext) catch |err| return sendError(err);
 
         var off: usize = 0;
         while (off < plaintext.len) {
             const out = self.tls.processOutgoing(plaintext[off..]) catch return error.SendFailed;
             const drained = if (out.encrypted) |bytes| bytes.len else 0;
-            if (drained > 0) try writeAll(self.fd, out.encrypted.?);
+            if (drained > 0) writeAll(self.fd, out.encrypted.?) catch |err| return sendError(err);
             if (out.consumed == 0 and drained == 0) return error.SendFailed;
             off += out.consumed;
         }
@@ -248,7 +346,12 @@ pub const Connection = struct {
     /// close_notify; the TCP stream ending without one is `error.UncleanClose`, and data that does not decrypt is
     /// `error.RecvFailed`.
     pub fn recv(self: *Connection, dest: []u8) Error!usize {
-        if (self.plain) return readSome(self.fd, dest) catch |err| return recvError(err);
+        if (self.plain) {
+            try self.armRecv();
+            const n = readSome(self.fd, dest) catch |err| return self.recvError(err);
+            if (n > 0) self.awaiting_response = false;
+            return n;
+        }
 
         // Drain anything we previously buffered.
         if (self.pending.items.len > 0) {
@@ -272,11 +375,21 @@ pub const Connection = struct {
                     return self.consumePending(dest);
                 }
             }
-            // No plaintext yet (mid-record); read more.
-            const n = readSome(self.fd, &rx_buf) catch |err| return recvError(err);
+            // No plaintext yet (mid-record); read more. Any byte is progress: the idle timeout applies from here.
+            try self.armRecv();
+            const n = readSome(self.fd, &rx_buf) catch |err| return self.recvError(err);
             if (n == 0) return error.UncleanClose;
+            self.awaiting_response = false;
             input = rx_buf[0..n];
         }
+    }
+
+    fn recvError(self: *const Connection, err: ReadError) Error {
+        return switch (err) {
+            error.ConnectionReset => error.ConnectionReset,
+            error.ReadFailed => error.RecvFailed,
+            error.WouldBlock => self.readTimeout(),
+        };
     }
 
     fn consumePending(self: *Connection, dest: []u8) usize {
@@ -309,8 +422,8 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     var last: Error = error.ConnectFailed;
     for (0..peer.addrs.len) |k| {
         const addr = peer.addrs[(peer.first +% k) % peer.addrs.len];
-        return openTcp(addr, peer.port) catch |err| switch (err) {
-            error.ConnectFailed => {
+        return openTcp(addr, peer.port, peer.timeouts.connect_ms) catch |err| switch (err) {
+            error.ConnectFailed, error.ConnectTimeout => {
                 last = err;
                 continue;
             },
@@ -320,7 +433,10 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     return last;
 }
 
-fn openTcp(ip: Ipv4, port: u16) Error!posix.fd_t {
+/// A connected TCP socket to `ip:port`, in blocking mode, or `error.ConnectTimeout` when the connection is not
+/// established within `timeout_ms`. The connect itself runs non-blocking under `poll`, which bounds it the same way
+/// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO).
+fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32) Error!posix.fd_t {
     // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
     const cloexec_flag = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
     const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
@@ -335,40 +451,94 @@ fn openTcp(ip: Ipv4, port: u16) Error!posix.fd_t {
         .addr = @bitCast(ip),
     };
 
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    if (posix.errno(flags) != .SUCCESS) return error.SocketFailed;
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    const blocking: c_int = @intCast(flags);
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, blocking | nonblock)) != .SUCCESS) return error.SocketFailed;
+
     const cr = posix.system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-    if (posix.errno(cr) != .SUCCESS) return error.ConnectFailed;
+    switch (posix.errno(cr)) {
+        .SUCCESS => {},
+        .INPROGRESS, .INTR => {
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const deadline = monoMs() + timeout_ms;
+            while (true) {
+                const now = monoMs();
+                if (now >= deadline) return error.ConnectTimeout;
+                const pr = posix.system.poll(&pfd, 1, @intCast(@min(deadline - now, std.math.maxInt(i32))));
+                switch (posix.errno(pr)) {
+                    .SUCCESS => if (pr > 0) break else return error.ConnectTimeout,
+                    .INTR => continue,
+                    else => return error.ConnectFailed,
+                }
+            }
+            var so_err: c_int = 0;
+            var len: posix.socklen_t = @sizeOf(c_int);
+            const gr = posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &len);
+            if (posix.errno(gr) != .SUCCESS or so_err != 0) return error.ConnectFailed;
+        },
+        else => return error.ConnectFailed,
+    }
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, blocking)) != .SUCCESS) return error.SocketFailed;
     return fd;
+}
+
+/// Set SO_RCVTIMEO or SO_SNDTIMEO: a blocking read or write on `fd` waiting `ms` without moving a byte fails with
+/// EAGAIN (`error.WouldBlock` from `readSome` / `writeAll`).
+fn setSockTimeout(fd: posix.fd_t, opt: u32, ms: u32) Error!void {
+    const tv: posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast(@as(u32, ms % 1000) * 1000) };
+    const r = posix.system.setsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&tv), @sizeOf(posix.timeval));
+    if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
+}
+
+fn monoMs() u64 {
+    return @intCast(@divTrunc(clock.monoNs(), std.time.ns_per_ms));
 }
 
 fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
-fn writeAll(fd: posix.fd_t, buf: []const u8) Error!void {
+const WriteError = error{ SendFailed, WouldBlock };
+const ReadError = error{ ReadFailed, ConnectionReset, WouldBlock };
+
+/// Write all of `buf`. `error.WouldBlock`: SO_SNDTIMEO passed without the peer taking a byte.
+fn writeAll(fd: posix.fd_t, buf: []const u8) WriteError!void {
     var off: usize = 0;
     while (off < buf.len) {
         const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
-        if (posix.errno(r) != .SUCCESS) return error.SendFailed;
+        switch (posix.errno(r)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
         const n: usize = @intCast(r);
         if (n == 0) return error.SendFailed;
         off += n;
     }
 }
 
-fn readSome(fd: posix.fd_t, buf: []u8) error{ ReadFailed, ConnectionReset }!usize {
-    const r = posix.system.read(fd, buf.ptr, buf.len);
-    return switch (posix.errno(r)) {
-        .SUCCESS => @intCast(r),
-        .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
-        else => error.ReadFailed,
+fn sendError(err: WriteError) Error {
+    return switch (err) {
+        error.WouldBlock => error.SendTimeout,
+        error.SendFailed => error.SendFailed,
     };
 }
 
-fn recvError(err: error{ ReadFailed, ConnectionReset }) Error {
-    return switch (err) {
-        error.ConnectionReset => error.ConnectionReset,
-        error.ReadFailed => error.RecvFailed,
-    };
+/// One read. `error.WouldBlock`: SO_RCVTIMEO passed without a byte arriving.
+fn readSome(fd: posix.fd_t, buf: []u8) ReadError!usize {
+    while (true) {
+        const r = posix.system.read(fd, buf.ptr, buf.len);
+        return switch (posix.errno(r)) {
+            .SUCCESS => @intCast(r),
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
+            else => error.ReadFailed,
+        };
+    }
 }
 
 /// The TLS server name in `host`, a host name or IP literal optionally written as an HTTP authority: `:port`, IPv6
@@ -650,4 +820,101 @@ test "a handshake that fails before any certificate is a retryable failure, not 
     // Nothing was learnt about the Amazon roots.
     try testing.expect(!pref.abandoned.load(.monotonic));
     try testing.expect(!fallback.ready.load(.monotonic));
+}
+
+test "Timeouts.fromEnv takes positive overrides and keeps the defaults otherwise" {
+    const block = [_:null]?[*:0]const u8{
+        "ZPQ_S3_CONNECT_TIMEOUT_MS=250",
+        "ZPQ_S3_HANDSHAKE_TIMEOUT_MS=0",
+        "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=abc",
+        "ZPQ_S3_IDLE_TIMEOUT_MS= 30000",
+    };
+    const t = Timeouts.fromEnv(.{ .block = .{ .slice = &block } });
+    try testing.expectEqual(@as(u32, 250), t.connect_ms);
+    try testing.expectEqual(@as(u32, 5_000), t.handshake_ms);
+    try testing.expectEqual(@as(u32, 10_000), t.first_byte_ms);
+    try testing.expectEqual(@as(u32, 30_000), t.idle_ms);
+    try testing.expectEqual(Timeouts{}, Timeouts.fromEnv(.empty));
+}
+
+/// Milliseconds since `t0` (from `monoMs`).
+fn sinceMs(t0: u64) u64 {
+    return monoMs() - t0;
+}
+
+const short: Timeouts = .{ .connect_ms = 200, .handshake_ms = 200, .first_byte_ms = 200, .idle_ms = 200 };
+
+test "a TLS handshake the server never answers fails within its timeout, as a retryable connect failure" {
+    var pki = try test_server.Pki.init();
+    defer pki.deinit();
+    var leaf = try pki.issue("mute.test", "DNS:mute.test");
+    defer leaf.deinit();
+    var server: test_server.Server = undefined;
+    try server.startWith(&leaf, 1, .mute);
+    defer server.finish() catch {};
+    var context = try ClientContext.init(.{ .verify_certificate = false });
+    defer context.deinit();
+
+    var peer: Peer = .loopback(server.port);
+    peer.timeouts = short;
+    const t0 = monoMs();
+    const got = Connection.connectWithContext(testing.allocator, &context, peer, "mute.test");
+    try testing.expectError(error.HandshakeTimeout, got);
+    try testing.expect(sinceMs(t0) < 2_000);
+    try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(error.HandshakeTimeout));
+}
+
+test "a TLS response that never starts fails with FirstByteTimeout, and a request on it may not be retried at once" {
+    var pki = try test_server.Pki.init();
+    defer pki.deinit();
+    var leaf = try pki.issue("hold.test", "DNS:hold.test");
+    defer leaf.deinit();
+    var server: test_server.Server = undefined;
+    try server.startWith(&leaf, 1, .hold);
+    defer server.finish() catch {};
+    var context = try ClientContext.init(.{ .verify_certificate = false });
+    defer context.deinit();
+
+    var peer: Peer = .loopback(server.port);
+    peer.timeouts = short;
+    var conn = try Connection.connectWithContext(testing.allocator, &context, peer, "hold.test");
+    defer conn.deinit();
+    try conn.send("GET /k HTTP/1.1\r\nHost: hold.test\r\n\r\n");
+    var buf: [64]u8 = undefined;
+    const t0 = monoMs();
+    try testing.expectError(error.FirstByteTimeout, conn.recv(&buf));
+    try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 2_000);
+    // Charged and backed off on a new connection, whether or not this one came from the pool.
+    const fbt = error.FirstByteTimeout;
+    try testing.expectEqual(retry.Failure.stalled, retry.classify(fbt, .{ .idempotent = true, .reused = true }));
+    try testing.expectEqual(retry.Failure.fatal, retry.classify(fbt, .{ .idempotent = false, .reused = false }));
+}
+
+test "a connect the listener never completes fails within its timeout" {
+    // A listener that never accepts, with the shortest backlog: once its queue is full the kernel drops further SYNs,
+    // so a connect waits on retransmissions with no answer, as an unreachable front end looks.
+    const lfd_r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (posix.errno(lfd_r) != .SUCCESS) return error.SkipZigTest;
+    const lfd: posix.fd_t = @intCast(lfd_r);
+    defer closeFd(lfd);
+    var addr: posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+
+    var peer: Peer = .loopback(std.mem.bigToNative(u16, addr.port));
+    peer.timeouts = short;
+    var opened: [8]?Connection = @splat(null);
+    defer for (&opened) |*o| if (o.*) |*conn| conn.deinit();
+    for (&opened) |*o| {
+        const t0 = monoMs();
+        o.* = Connection.connectPlain(testing.allocator, peer) catch |err| {
+            try testing.expectEqual(error.ConnectTimeout, err);
+            try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 2_000);
+            try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(err));
+            return;
+        };
+    }
+    return error.SkipZigTest; // this kernel queued every connection: nothing to time out here
 }

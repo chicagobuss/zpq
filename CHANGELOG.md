@@ -71,6 +71,12 @@
 
 ### Fixes
 
+- An S3 response that stalls no longer hangs the query. A read had no deadline, so a connection the server or the
+  network left open but silent blocked its request forever, and with it the whole query: about one in ten Lambda
+  rewrites of an 868 MB object stalled until the function timed out. Connecting, the TLS handshake, the first byte of
+  a response and every gap mid-transfer now have deadlines (5 s, 5 s, 10 s and 10 s by default; the
+  `ZPQ_S3_*_TIMEOUT_MS` variables override them). A timed-out GET or part upload is retried on a new connection
+  within the usual retry budget. 0.4.0 had the same gap.
 - `--max-memory` bounds a query's working memory on every path, over S3 and locally, where an S3 query held every
   byte it read at once (a 6.7 GB full scan ran out of memory on a 3008 MB Lambda) and a large row group was decoded
   whole. S3 inputs past a quarter of it (64 MiB to 1 GiB; `ZPQ_S3_WINDOW_KIB` overrides it) are fetched ahead of the

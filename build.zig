@@ -86,9 +86,17 @@ pub fn build(b: *std.Build) void {
     const test_zpq_mod = test_core.zpq;
     const test_opts_mod = test_core.build_options;
 
+    // `-Dtest-filter=TEXT` (repeatable) builds only the tests whose names contain TEXT, to loop a few of them.
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Build only the unit tests whose names contain this text",
+    ) orelse &.{};
+
     // Sans-IO + io tests (live in src/zpq.zig and what it imports).
     const lib_tests = b.addTest(.{
         .root_module = test_zpq_mod,
+        .filters = test_filters,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
@@ -104,6 +112,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = test_opts_mod },
             },
         }),
+        .filters = test_filters,
     });
     const run_lambda_tests = b.addRunArtifact(lambda_tests);
 

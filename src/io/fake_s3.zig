@@ -3,6 +3,9 @@
 //! ranged GETs of objects a test registers with `serveBytes`, one thread per connection. `drop` makes it lose the
 //! response to one matching request, the way a response lost on the network looks to the client: the server applies
 //! the request (or, with `apply_dropped = false`, does not) and then resets the connection without sending a byte.
+//! `stall` makes it go silent on matching requests while keeping the connection open, the way a stuck server or
+//! network path looks: before the response, part-way through its headers or its body, or (for a request with a body)
+//! without reading that body, so the client's send blocks.
 //!
 //! Test-only: imported from tests, never from the engine.
 
@@ -52,6 +55,30 @@ pub const FakeS3 = struct {
     /// When set, object GETs past this many are refused (403), as a revoked credential or a deleted object would be.
     gets_allowed: ?u32 = null,
     gets: u32 = 0,
+    /// Substring of "METHOD target" on whose next `stalls_left` matches the server goes silent (`stall_at`), holding
+    /// the connection open until the client closes it or the server stops.
+    stall: ?[]const u8 = null,
+    stall_at: StallAt = .mid_body,
+    stalls_left: u32 = 1,
+    stalled: u32 = 0,
+    trickle_ms: u32 = 60,
+    /// Set by `deinit`: stalled connection threads stop waiting.
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    pub const StallAt = enum {
+        /// No byte of the response.
+        before_headers,
+        /// Part of the status line.
+        mid_headers,
+        /// The headers and half the body.
+        mid_body,
+        /// The request's head is read but not its body: a large body (an UploadPart) fills the socket buffers and
+        /// the client's send blocks.
+        request_body,
+        /// Not a stall: the whole response, its body in eight pieces `trickle_ms` apart, slower in all than a
+        /// client's idle timeout but never silent for that long.
+        trickle,
+    };
 
     pub fn start(self: *FakeS3, allocator: std.mem.Allocator) !void {
         var stop: [2]posix.fd_t = undefined;
@@ -80,6 +107,7 @@ pub const FakeS3 = struct {
     /// sockets down, which does work everywhere. A thread that still has not stopped after `stop_timeout_ms` is a
     /// panic naming the server, not a test run that never ends; it cannot be abandoned, since it points into `self`.
     pub fn deinit(self: *FakeS3) void {
+        self.stopping.store(true, .release);
         _ = posix.system.write(self.stop[0], "s", 1);
         if (!waitReadable(self.stop[0], stop_timeout_ms))
             std.debug.panic("fake_s3 on port {d}: the accept thread has not stopped {d} ms after deinit()", .{ self.port, stop_timeout_ms });
@@ -176,6 +204,11 @@ pub const FakeS3 = struct {
                 else => return,
             }
             const fd: posix.fd_t = @intCast(rc);
+            if (self.stall != null and self.stall_at == .request_body) {
+                // A small receive buffer, so a body this server does not read soon blocks the client's send.
+                const small: c_int = 16 * 1024;
+                _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&small), @sizeOf(c_int));
+            }
             // A response goes out in several writes; without this, Nagle holds each later one for the client's delayed
             // ACK, about 40 ms a request, which a test fetching row group by row group pays hundreds of times.
             const one: c_int = 1;
@@ -196,6 +229,10 @@ pub const FakeS3 = struct {
                 if (!readMore(self.allocator, fd, &buf)) return;
             };
             const body_len = contentLength(buf.items[0..head_end]);
+            if (self.takeStall(buf.items[0..head_end], .request_body)) {
+                self.holdSilent(fd);
+                return;
+            }
             while (buf.items.len < head_end + 4 + body_len) if (!readMore(self.allocator, fd, &buf)) return;
             // Sliced only now: reading the body may have moved `buf`.
             const request = buf.items[0 .. head_end + 4 + body_len];
@@ -213,6 +250,28 @@ pub const FakeS3 = struct {
         }
     }
 
+    /// Whether the request with this head is the next to stall at `at` (and count it).
+    fn takeStall(self: *FakeS3, head: []const u8, at: StallAt) bool {
+        if (self.stall_at != at) return false;
+        const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const sp2 = std.mem.lastIndexOfScalar(u8, head[0..line_end], ' ') orelse return false;
+        self.lock();
+        defer self.unlock();
+        const pat = self.stall orelse return false;
+        if (std.mem.indexOf(u8, head[0..sp2], pat) == null) return false;
+        self.stalled += 1;
+        self.stalls_left -|= 1;
+        if (self.stalls_left == 0) self.stall = null;
+        return true;
+    }
+
+    /// Say nothing more on `fd`, without reading from it, until the server stops; the client gives up and closes its
+    /// end in the meantime.
+    fn holdSilent(self: *FakeS3, fd: posix.fd_t) void {
+        _ = fd;
+        while (!self.stopping.load(.acquire)) sleepMs(5);
+    }
+
     /// Apply one request and answer it; false when the connection is to be dropped instead.
     fn handle(self: *FakeS3, fd: posix.fd_t, head: []const u8, body: []const u8) !bool {
         const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
@@ -227,6 +286,13 @@ pub const FakeS3 = struct {
         var locked = true;
         defer if (locked) self.unlock();
         var lose = false;
+        stall_reply = null;
+        if (self.stall_at != .request_body) if (self.stall) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
+            self.stalled += 1;
+            self.stalls_left -|= 1;
+            if (self.stalls_left == 0) self.stall = null;
+            stall_reply = self.stall_at;
+        };
         if (self.drop) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
             self.drop = null;
             self.dropped += 1;
@@ -256,6 +322,11 @@ pub const FakeS3 = struct {
             var md5: [Md5.digest_length]u8 = undefined;
             Md5.hash(body, &md5, .{});
             const number = try std.fmt.parseInt(u32, param(query, "partNumber") orelse "0", 10);
+            // As S3: a part sent again replaces the one with its number.
+            for (u.parts.items, 0..) |p, i| if (p.number == number) {
+                _ = u.parts.orderedRemove(i);
+                break;
+            };
             try u.parts.append(self.allocator, .{ .number = number, .md5 = md5 });
             extra = try std.fmt.allocPrint(a, "ETag: \"{x}\"\r\n", .{md5});
         } else if (std.mem.eql(u8, method, "POST") and param(query, "uploadId") != null) {
@@ -348,10 +419,40 @@ pub const FakeS3 = struct {
         return self.reply(fd, lose, status, extra, resp_body, advertised_len);
     }
 
-    fn reply(_: *FakeS3, fd: posix.fd_t, lose: bool, status: u16, extra: []const u8, body: []const u8, advertised_len: ?usize) !bool {
+    fn reply(
+        self: *FakeS3,
+        fd: posix.fd_t,
+        lose: bool,
+        status: u16,
+        extra: []const u8,
+        body: []const u8,
+        advertised_len: ?usize,
+    ) !bool {
         if (lose) return false;
         var head_buf: [512]u8 = undefined;
         const head = try std.fmt.bufPrint(&head_buf, "HTTP/1.1 {d} X\r\nContent-Length: {d}\r\n{s}\r\n", .{ status, advertised_len orelse body.len, extra });
+        if (stall_reply) |at| {
+            if (at == .trickle) {
+                try writeAll(fd, head);
+                const step = (body.len + 7) / 8;
+                var off: usize = 0;
+                while (off < body.len) : (off += step) {
+                    sleepMs(self.trickle_ms);
+                    try writeAll(fd, body[off..@min(body.len, off + step)]);
+                }
+                return true;
+            }
+            switch (at) {
+                .before_headers, .request_body, .trickle => {},
+                .mid_headers => try writeAll(fd, head[0 .. head.len / 2]),
+                .mid_body => {
+                    try writeAll(fd, head);
+                    try writeAll(fd, body[0 .. body.len / 2]);
+                },
+            }
+            self.holdSilent(fd);
+            return false;
+        }
         try writeAll(fd, head);
         if (status != 204 and advertised_len == null) try writeAll(fd, body);
         return true;
@@ -381,6 +482,17 @@ pub const FakeS3 = struct {
         try self.objects.append(self.allocator, .{ .key = try self.allocator.dupe(u8, key), .etag = etag, .len = len });
     }
 };
+
+fn sleepMs(ms: u32) void {
+    var ts: posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = posix.system.nanosleep(&ts, &ts);
+}
+
+/// The stall `handle` picked for the request this connection thread is answering, acted on by `reply`.
+threadlocal var stall_reply: ?FakeS3.StallAt = null;
 
 /// How long `deinit` waits for the accept thread. A test that works never gets near it.
 const stop_timeout_ms = 20_000;

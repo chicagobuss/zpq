@@ -528,7 +528,14 @@ test "only a closed or reset connection counts as closed before the response; lo
     {
         const rc = posix.system.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(posix.mode_t, 0));
         if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
-        var conn: tls.Connection = .{ .fd = @intCast(rc), .tls = undefined, .allocator = testing.allocator, .plain = true };
+        // Its receive timeout counts as set (a directory takes no socket options), so the read itself fails.
+        var conn: tls.Connection = .{
+            .fd = @intCast(rc),
+            .tls = undefined,
+            .allocator = testing.allocator,
+            .plain = true,
+            .rcv_ms = (tls.Timeouts{}).idle_ms,
+        };
         defer conn.deinit();
         try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target));
         try testing.expectError(error.RecvFailed, drainResponse(arena.allocator(), &conn, false));

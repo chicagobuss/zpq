@@ -46,6 +46,8 @@ pub const Criteria = struct {
     addrs: []const tls.Ipv4,
     port: u16,
     use_tls: bool = true,
+    /// Deadlines for a new connection; a reused one takes them on too (`tls.Connection.setTimeouts`).
+    timeouts: tls.Timeouts = .{},
 };
 
 pub fn Pool(comptime N: usize) type {
@@ -86,6 +88,8 @@ pub fn Pool(comptime N: usize) type {
             stale_retries: u64 = 0,
             /// Requests retried after a backoff (server errors, throttling, failures on fresh connections).
             backoff_retries: u64 = 0,
+            /// Of those, retries after a connection went silent past a deadline (`tls.Timeouts`).
+            timeout_retries: u64 = 0,
             /// Oldest idle connection `acquire` looked at, reused or evicted.
             max_idle_ns: u64 = 0,
             acquire_wait_ns: u64 = 0,
@@ -202,7 +206,15 @@ pub fn Pool(comptime N: usize) type {
             while (expired.popFirst()) |n| self.destroyNode(@alignCast(@fieldParentPtr("pool_node", n)));
 
             if (reused) |slot| {
-                return .{ .conn = &slot.conn, .node = slot, .permit = permit, .reused = true };
+                if (slot.conn.setTimeouts(criteria.timeouts)) |_| {
+                    return .{ .conn = &slot.conn, .node = slot, .permit = permit, .reused = true };
+                } else |_| {
+                    // A socket that refuses its options is no use: drop it and open a new one.
+                    self.mutex.lockUncancelable(io);
+                    self.used.remove(&slot.pool_node);
+                    self.mutex.unlock(io);
+                    self.destroyNode(slot);
+                }
             }
 
             const slot = try self.allocator.create(Node);
@@ -211,7 +223,12 @@ pub fn Pool(comptime N: usize) type {
             const host_owned = try self.allocator.dupe(u8, criteria.host);
             errdefer self.allocator.free(host_owned);
 
-            const peer: tls.Peer = .{ .addrs = criteria.addrs, .first = first_addr, .port = criteria.port };
+            const peer: tls.Peer = .{
+                .addrs = criteria.addrs,
+                .first = first_addr,
+                .port = criteria.port,
+                .timeouts = criteria.timeouts,
+            };
             const conn = if (criteria.use_tls)
                 try tls.Connection.connect(self.allocator, peer, criteria.host)
             else
@@ -279,6 +296,10 @@ pub fn Pool(comptime N: usize) type {
             switch (failure) {
                 .stale => self.stats.stale_retries += 1,
                 .transient => self.stats.backoff_retries += 1,
+                .stalled => {
+                    self.stats.backoff_retries += 1;
+                    self.stats.timeout_retries += 1;
+                },
                 .fatal => {},
             }
         }

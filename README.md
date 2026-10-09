@@ -38,6 +38,20 @@ role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, tak
 stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; like
 signed requests, these need `AWS_REGION` or `S3_REGION`, and zpq reports a missing region as such.
 
+Every S3 connection has deadlines, in milliseconds, each overridable from the environment:
+
+| wait | default | variable |
+|---|---:|---|
+| TCP connect (per address) | 5 000 | `ZPQ_S3_CONNECT_TIMEOUT_MS` |
+| TLS handshake | 5 000 | `ZPQ_S3_HANDSHAKE_TIMEOUT_MS` |
+| first byte of a response, after the request is sent | 10 000 | `ZPQ_S3_FIRST_BYTE_TIMEOUT_MS` |
+| no byte received or sent mid-transfer | 10 000 | `ZPQ_S3_IDLE_TIMEOUT_MS` |
+
+The last is an idle timeout: a transfer that keeps moving is never cut off, however long it takes. A request that
+times out is sent again on a new connection when that is safe (GETs, HEADs, object and part PUTs). The retries are
+charged to its usual retry budget, so a server that keeps stalling fails the query with the timeout instead of
+hanging it. Creating and completing a multipart upload are never sent twice.
+
 ## Performance
 
 Numbers and trade-offs are dated and contextualised as they're captured. Harnesses:

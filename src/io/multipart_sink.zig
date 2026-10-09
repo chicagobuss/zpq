@@ -592,6 +592,8 @@ fn outcomeUnknown(err: anyerror, definite: anyerror) bool {
         error.ConnectFailed,
         error.HandshakeFailed,
         error.CertificateRejected,
+        error.ConnectTimeout,
+        error.HandshakeTimeout,
         => false,
         else => true,
     };
@@ -838,6 +840,17 @@ const fake_s3 = @import("fake_s3.zig");
 
 /// Push `payload` through a sink with 1 KiB parts to `fake`'s bucket `bkt`, then close it.
 fn writeThroughSink(fake: *fake_s3.FakeS3, key: []const u8, payload: []const u8) !void {
+    return writeThroughSinkWith(fake, key, payload, .{}, 1024);
+}
+
+/// `writeThroughSink` with the connections' deadlines and the part size given.
+fn writeThroughSinkWith(
+    fake: *fake_s3.FakeS3,
+    key: []const u8,
+    payload: []const u8,
+    timeouts: tls.Timeouts,
+    part_size: usize,
+) !void {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -851,6 +864,7 @@ fn writeThroughSink(fake: *fake_s3.FakeS3, key: []const u8, payload: []const u8)
         .secret_key = "sk",
         .region = "us-east-1",
         .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = timeouts,
     };
     const url: s3.Url = .{ .bucket = "bkt", .key = key };
     var pool: s3.Pool(4) = undefined;
@@ -858,7 +872,9 @@ fn writeThroughSink(fake: *fake_s3.FakeS3, key: []const u8, payload: []const u8)
     defer pool.deinit();
     const criteria = try s3.poolCriteria(arena, creds, url.bucket);
 
-    var sink = MultipartSink.init(io, testing.allocator, arena, creds, url, &pool, criteria, .{ .target_part_size = 1024 });
+    var sink = MultipartSink.init(io, testing.allocator, arena, creds, url, &pool, criteria, .{
+        .target_part_size = part_size,
+    });
     defer {
         if (!sink.isClosed()) sink.abort();
         sink.deinit();
@@ -958,4 +974,87 @@ test "multipartEtag is the MD5 of the part MD5s and the part count, and refuses 
     var kms: EtagSlot = .{};
     kms.len = (try std.fmt.bufPrint(&kms.buf, "not-an-md5", .{})).len;
     try testing.expectEqual(@as(?[]const u8, null), try multipartEtag(arena.allocator(), &.{ &a, &kms }));
+}
+
+// ------------------------------------------------------------------ stalled connections (tls.Timeouts)
+
+const stall_timeouts: tls.Timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 250, .idle_ms = 250 };
+
+/// A part bigger than the client's socket send buffer can grow to (Linux: tcp_wmem's maximum) plus the server's
+/// small receive buffer, so a part whose body the server stops reading blocks the send itself: at least 6 MiB.
+fn stallPartSize() usize {
+    var buf: [64]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(testing.io, "/proc/sys/net/ipv4/tcp_wmem", &buf) catch return 12 << 20;
+    var it = std.mem.tokenizeAny(u8, text, " \t\n");
+    _ = it.next();
+    _ = it.next();
+    const max = std.fmt.parseInt(usize, it.next() orelse return 12 << 20, 10) catch return 12 << 20;
+    return @max(6 << 20, max + (2 << 20));
+}
+
+/// Two parts of `part` bytes.
+fn bigPayload(part: usize) ![]u8 {
+    const b = try testing.allocator.alloc(u8, 2 * part);
+    for (b, 0..) |*x, i| x.* = @truncate(i *% 2654435761 >> 7);
+    return b;
+}
+
+test "an UploadPart whose body the server stops reading is sent again on a new connection" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.stall = "PUT /bkt/out.parquet?partNumber=1&";
+    fake.stall_at = .request_body;
+    const part = stallPartSize();
+    const payload = try bigPayload(part);
+    defer testing.allocator.free(payload);
+
+    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_timeouts, part);
+    try testing.expectEqual(@as(u32, 1), fake.stalled);
+    try testing.expect(fake.object("out.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+test "an UploadPart whose answer never comes is sent again, and the upload holds that part once" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.stall = "PUT /bkt/out.parquet?partNumber=2&";
+    fake.stall_at = .before_headers;
+    const payload = try bigPayload(6 << 20);
+    defer testing.allocator.free(payload);
+
+    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_timeouts, 6 << 20);
+    try testing.expectEqual(@as(u32, 1), fake.stalled);
+    const obj = fake.object("out.parquet") orelse return error.TestUnexpectedResult;
+    // The ETag of a two-part upload: the part sent twice counted once.
+    try testing.expect(std.mem.endsWith(u8, obj.etag, "-2"));
+}
+
+test "a CreateMultipartUpload whose answer never comes is not sent again, and leaves no upload behind" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.stall = "POST /bkt/out.parquet?uploads";
+    fake.stall_at = .before_headers;
+
+    try testing.expectError(
+        error.CreateMultipartFailed,
+        writeThroughSinkWith(&fake, "out.parquet", &test_payload, stall_timeouts, 1024),
+    );
+    try testing.expectEqual(@as(u32, 1), fake.stalled);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+test "a CompleteMultipartUpload whose answer never comes is not sent again, and is accepted once the object shows it" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.stall = "POST /bkt/out.parquet?uploadId";
+    fake.stall_at = .before_headers;
+
+    try writeThroughSinkWith(&fake, "out.parquet", &test_payload, stall_timeouts, 1024);
+    try testing.expectEqual(@as(u32, 1), fake.stalled);
+    try testing.expect(fake.object("out.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
 }

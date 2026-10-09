@@ -52,6 +52,11 @@ pub const Failure = enum {
     /// A throttle or server error (408, 429, 5xx), a failure on a fresh connection, or one after the response had
     /// started: back off and charge the budget.
     transient,
+    /// The connection went silent past a deadline mid-request (`tls.Timeouts`: no first response byte, or no byte
+    /// read or sent for the idle timeout). Only for an idempotent request: charged and backed off like `transient`,
+    /// and the next attempt opens a new connection, since the pool's other connections may lead to the same stalled
+    /// front end.
+    stalled,
     /// Anything else; not worth repeating.
     fatal,
 };
@@ -71,6 +76,8 @@ pub fn classify(err: anyerror, req: Request) Failure {
         error.RetryableStatus => .transient,
         error.SendFailed, error.ClosedBeforeResponse => if (!req.idempotent) .fatal else if (req.reused) .stale else .transient,
         error.RecvFailed, error.BodyTruncated, error.BadStatusLine => if (req.idempotent) .transient else .fatal,
+        // The request may have reached the server: only an idempotent one is sent again.
+        error.FirstByteTimeout, error.ReadTimeout, error.SendTimeout => if (req.idempotent) .stalled else .fatal,
         else => .fatal,
     };
 }
@@ -80,7 +87,15 @@ pub fn classify(err: anyerror, req: Request) Failure {
 /// connection; only local trouble (cancelation, memory, a closed pool) is fatal.
 pub fn classifyConnect(err: anyerror) Failure {
     return switch (err) {
-        error.DnsFailed, error.SocketFailed, error.ConnectFailed, error.HandshakeFailed, error.SendFailed, error.RecvFailed => .transient,
+        error.DnsFailed,
+        error.SocketFailed,
+        error.ConnectFailed,
+        error.HandshakeFailed,
+        error.SendFailed,
+        error.RecvFailed,
+        error.ConnectTimeout,
+        error.HandshakeTimeout,
+        => .transient,
         else => .fatal,
     };
 }
@@ -103,8 +118,8 @@ pub const Attempts = struct {
                 self.fresh = true;
                 return true;
             },
-            .transient => {
-                self.fresh = false;
+            .transient, .stalled => {
+                self.fresh = failure == .stalled;
                 self.charged += 1;
                 if (self.charged >= max_attempts) return false;
                 try sleepBackoff(io, self.policy, self.charged - 1);
@@ -225,4 +240,27 @@ test "Attempts charges only transient failures and forces a fresh connection aft
     try t.expectEqual(max_attempts - 1, retried);
     var fresh_start: Attempts = .{};
     try t.expect(!try fresh_start.retryAfter(io, .fatal));
+}
+
+test "a timeout mid-request is charged, forces a new connection, and is never repeated for a non-idempotent request" {
+    const t = std.testing;
+    for ([_]anyerror{ error.FirstByteTimeout, error.ReadTimeout, error.SendTimeout }) |e| {
+        for ([_]bool{ false, true }) |reused| {
+            try t.expectEqual(Failure.stalled, classify(e, .{ .idempotent = true, .reused = reused }));
+            try t.expectEqual(Failure.fatal, classify(e, .{ .idempotent = false, .reused = reused }));
+        }
+    }
+    for ([_]anyerror{ error.ConnectTimeout, error.HandshakeTimeout }) |e| {
+        try t.expectEqual(Failure.transient, classifyConnect(e));
+    }
+
+    var a: Attempts = .{ .policy = .{ .base_ms = 0, .cap_ms = 0 } };
+    var n: usize = 0;
+    while (try a.retryAfter(t.io, .stalled)) {
+        try t.expect(a.fresh);
+        n += 1;
+    }
+    // Stalls spend the budget like any charged failure: they cannot go on forever.
+    try t.expectEqual(@as(usize, max_attempts - 1), n);
+    try t.expectEqual(max_attempts, a.charged);
 }

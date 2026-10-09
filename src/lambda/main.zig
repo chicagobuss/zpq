@@ -602,7 +602,8 @@ fn writeResponse(
 fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
     try w.print(
         "\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"idle_evictions\":{d}," ++
-            "\"stale_retries\":{d},\"backoff_retries\":{d},\"max_idle_ms\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}}",
+            "\"stale_retries\":{d},\"backoff_retries\":{d},\"timeout_retries\":{d},\"max_idle_ms\":{d}," ++
+            "\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}}",
         .{
             stats.acquires,
             stats.opens,
@@ -611,6 +612,7 @@ fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
             stats.idle_evictions,
             stats.stale_retries,
             stats.backoff_retries,
+            stats.timeout_retries,
             stats.max_idle_ns / std.time.ns_per_ms,
             stats.acquire_wait_ns / std.time.ns_per_ms,
             stats.acquire_lock_ns / std.time.ns_per_ms,

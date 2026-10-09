@@ -4994,12 +4994,25 @@ fn fakeS3AggregateJson(
     args: QueryArgs,
     window_kib: ?u32,
 ) ![]u8 {
+    return fakeS3AggregateJsonEnv(gpa, fake, keys, args, window_kib, &.{});
+}
+
+/// `fakeS3AggregateJson` with `extra` lines added to the query's environment.
+fn fakeS3AggregateJsonEnv(
+    gpa: std.mem.Allocator,
+    fake: *fake_s3.FakeS3,
+    keys: []const []const u8,
+    args: QueryArgs,
+    window_kib: ?u32,
+    extra: []const [*:0]const u8,
+) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var lines: std.ArrayList(?[*:0]const u8) = .empty;
     try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
     try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
+    for (extra) |e| try lines.append(a, e);
     if (window_kib) |k| try lines.append(a, try std.fmt.allocPrintSentinel(a, "ZPQ_S3_WINDOW_KIB={d}", .{k}, 0));
     const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
     @memcpy(block, lines.items);
@@ -5356,6 +5369,95 @@ test "windowed S3 rebasing uses the owning row group's overlapping source range"
     const cm = meta.row_groups.items[1].columns.items[0].meta_data.?;
     try std.testing.expectEqual(@as(i64, 65_536), cm.data_page_offset);
     try std.testing.expectEqual(@as(?i64, 65_536 + 60_000 - 1_100), cm.bloom_filter_offset);
+}
+
+/// Deadlines short enough for tests, through the query's environment (not process state).
+const stall_env = [_][*:0]const u8{
+    "ZPQ_S3_CONNECT_TIMEOUT_MS=300",
+    "ZPQ_S3_HANDSHAKE_TIMEOUT_MS=300",
+    "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=200",
+    "ZPQ_S3_IDLE_TIMEOUT_MS=200",
+};
+
+test "an S3 read that stalls is retried on a new connection and the query answers exactly, windowed or not" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
+    const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s, max(k) AS m", .parallelism = 2 };
+    var want: ?[]u8 = null;
+    defer if (want) |w| gpa.free(w);
+    for ([_]?u32{ null, 1 }) |window| {
+        for ([_]fake_s3.FakeS3.StallAt{ .before_headers, .mid_headers, .mid_body }) |at| {
+            var fake: fake_s3.FakeS3 = undefined;
+            try fake.start(gpa);
+            defer fake.deinit();
+            try fake.serveBytes("t/a.parquet", bytes);
+            try fake.serveBytes("t/b.parquet", bytes);
+            if (want == null) want = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, window, &stall_env);
+            fake.stall = "GET /bkt/t/b.parquet";
+            fake.stall_at = at;
+            const got = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, window, &stall_env);
+            defer gpa.free(got);
+            std.testing.expectEqualStrings(want.?, got) catch |err| {
+                std.debug.print("window {?d}, stall {t}\n", .{ window, at });
+                return err;
+            };
+            try std.testing.expectEqual(@as(u32, 1), fake.stalled);
+        }
+    }
+}
+
+test "a recompressing S3 copy whose ranged read stalls writes the same bytes as one that does not" {
+    // The Overture rewrite that hung on Lambda: a byte copy to another codec, input through the fetch window.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var first: ?[]u8 = null;
+    defer if (first) |f| gpa.free(f);
+    for ([_]?fake_s3.FakeS3.StallAt{ null, .mid_body, .before_headers }) |at| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(gpa);
+        defer fake.deinit();
+        try fake.serveBytes("t/m.parquet", bytes);
+        if (at) |x| {
+            fake.stall = "GET /bkt/t/m.parquet";
+            fake.stall_at = x;
+            fake.stalls_left = 2;
+        }
+        var lines: std.ArrayList(?[*:0]const u8) = .empty;
+        try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
+        try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
+        try lines.append(a, "ZPQ_S3_WINDOW_KIB=1");
+        for (stall_env) |e| try lines.append(a, e);
+        const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+        @memcpy(block, lines.items);
+        var r = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io }, .{
+            .inputs = &.{"s3://bkt/t/m.parquet"},
+            .output = out,
+            .codec = .ZSTD,
+            .compress_priority = .speed,
+            .parallelism = 2,
+        });
+        r.deinit(gpa);
+        const written = try metadata.readFileSlice(out, gpa);
+        if (first) |f| {
+            defer gpa.free(written);
+            try std.testing.expectEqualSlices(u8, f, written);
+            try std.testing.expectEqual(@as(u32, 2), fake.stalled);
+        } else first = written;
+    }
 }
 
 test "a windowed S3 fetch that fails mid-scan fails the query rather than hanging it" {

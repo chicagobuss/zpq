@@ -111,6 +111,8 @@ pub const Credentials = struct {
     /// The host may be a DNS name or an IPv4 address written as a dotted
     /// quad; IPv6 endpoints (`https://[::1]:9000`) are not supported.
     endpoint: ?[]const u8 = null,
+    /// Connection deadlines (`tls.Timeouts`): the defaults, or `ZPQ_S3_*_TIMEOUT_MS` from the environment.
+    timeouts: tls.Timeouts = .{},
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
         // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
@@ -124,6 +126,7 @@ pub const Credentials = struct {
                     .secret_key = "",
                     .region = env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion,
                     .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+                    .timeouts = .fromEnv(env),
                 };
             }
         }
@@ -158,6 +161,7 @@ pub const Credentials = struct {
             .session_token = session_token,
             .region = region,
             .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+            .timeouts = .fromEnv(env),
         };
     }
 
@@ -247,7 +251,13 @@ pub fn poolCriteria(arena: std.mem.Allocator, creds: Credentials, bucket: []cons
     const host = try hostFor(arena, creds, bucket);
     const connect_host = try connectHostFor(arena, creds, bucket);
     const addrs = try resolveIpv4(arena, connect_host);
-    return .{ .host = host, .addrs = addrs, .port = portFor(creds), .use_tls = useTls(creds) };
+    return .{
+        .host = host,
+        .addrs = addrs,
+        .port = portFor(creds),
+        .use_tls = useTls(creds),
+        .timeouts = creds.timeouts,
+    };
 }
 
 /// A one-off connection to `host`, at the first of `addrs` that accepts.
@@ -257,7 +267,7 @@ pub fn connect(
     addrs: []const tls.Ipv4,
     host: []const u8,
 ) Error!tls.Connection {
-    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds) };
+    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds), .timeouts = creds.timeouts };
     if (useTls(creds)) return try tls.Connection.connect(arena, peer, host);
     return try tls.Connection.connectPlain(arena, peer);
 }
@@ -1487,7 +1497,7 @@ const ScriptedPool = struct {
     pub fn noteRetry(self: *ScriptedPool, _: Io, failure: retry.Failure) void {
         switch (failure) {
             .stale => self.stale_retries += 1,
-            .transient => self.backoff_retries += 1,
+            .transient, .stalled => self.backoff_retries += 1,
             .fatal => {},
         }
     }
@@ -1555,4 +1565,94 @@ test "requestViaPool retries a dead reused connection at once only for an idempo
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expectEqual(@as(usize, 1), put_pool.stale_retries);
     try testing.expectEqual(@as(usize, 1), put_pool.fresh_requests);
+}
+
+// ------------------------------------------------------------------ stalled connections (tls.Timeouts)
+
+const fake_s3 = @import("fake_s3.zig");
+
+/// Per-connection deadlines short enough for tests; production uses `tls.Timeouts` defaults or the environment.
+const test_timeouts: tls.Timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 200, .idle_ms = 200 };
+
+const stall_payload: [96 * 1024]u8 = blk: {
+    @setEvalBranchQuota(400_000);
+    var b: [96 * 1024]u8 = undefined;
+    for (&b, 0..) |*x, i| x.* = @truncate(i *% 131 +% 17);
+    break :blk b;
+};
+
+/// A ranged GET of `stall_payload` from `fake` through a pool of its own; returns the body (on `arena`).
+fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stats) ![]const u8 {
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = test_timeouts,
+    };
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    defer stats.* = p.snapshotStats();
+    const url: Url = .{ .bucket = "bkt", .key = "obj" };
+    const resp = try getViaPool(testing.io, &p, arena, creds, url, Range.span(1000, 1000 + 64 * 1024 - 1));
+    if (resp.status != 206) return error.TestUnexpectedResult;
+    return try arena.dupe(u8, resp.body);
+}
+
+test "a ranged GET that stalls before, inside or after its response headers is sent again and gets the exact bytes" {
+    for ([_]fake_s3.FakeS3.StallAt{ .before_headers, .mid_headers, .mid_body }) |at| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        try fake.serveBytes("obj", &stall_payload);
+        fake.stall = "GET /bkt/obj";
+        fake.stall_at = at;
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var stats: Pool(4).Stats = .{};
+        const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+        try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
+        try testing.expectEqual(@as(u32, 1), fake.stalled);
+        // One retry, charged, on a connection opened for it.
+        try testing.expectEqual(@as(u64, 1), stats.timeout_retries);
+        try testing.expectEqual(@as(u64, 0), stats.stale_retries);
+        try testing.expectEqual(@as(u64, 2), stats.opens);
+    }
+}
+
+test "a response that keeps arriving is not cut off, however long it takes in all" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .trickle;
+    fake.trickle_ms = 120; // eight pieces: about 1 s in all, against a 200 ms idle timeout
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var stats: Pool(4).Stats = .{};
+    const t0 = clock.monoNs();
+    const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+    try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
+    try testing.expect(clock.monoNs() - t0 >= 800 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
+    try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+}
+
+test "a server that always stalls fails the request with the timeout once the retry budget is spent" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .mid_body;
+    fake.stalls_left = 1000;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var stats: Pool(4).Stats = .{};
+    try testing.expectError(error.ReadTimeout, fakeGet(&fake, arena_state.allocator(), &stats));
+    try testing.expectEqual(@as(u32, retry.max_attempts), fake.stalled);
+    try testing.expectEqual(@as(u64, retry.max_attempts - 1), stats.timeout_retries);
 }

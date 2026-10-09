@@ -661,16 +661,23 @@ pub fn appendSliceRows(
 }
 
 /// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
-/// for a row group too big to hold decoded at once. Each reader keeps its own page buffers (`scratch`), so the memory
-/// held is a slice of values plus a page per column — except byte arrays, whose values point into their pages, which
-/// stay for the row group (its uncompressed bytes, not its decoded size).
+/// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
+/// slice of values plus a page per column (and a byte-array column's dictionary): fixed-width readers recycle theirs
+/// (`scratch`); byte-array readers decode a page at a time onto `pages`, copy the slice's bytes out and free the page
+/// once it is drained.
 pub const SliceReader = struct {
     /// In place for the reader's life: a reader holds pointers into itself once it has decoded.
     raw: *Raw,
     scratch: *DecodeScratch,
+    /// A byte-array reader's page allocations, reset whenever a page is drained.
+    pages: *std.heap.ArenaAllocator,
+    /// Holds a byte-array dictionary for the chunk, copied off `pages` once installed.
+    held: std.mem.Allocator,
+    dict_held: bool = false,
     levels: schema.Levels,
     dec: ?decimal_mod.Kind,
     float16: bool,
+    int96: bool,
     left: usize,
 
     const Raw = union(enum) {
@@ -682,9 +689,8 @@ pub const SliceReader = struct {
         bytes: column_mod.ColumnChunkReader([]const u8),
     };
 
-    /// A reader of leaf `ci`, or null when the column has no sliced form (nested, INT96, or a FIXED_LEN_BYTE_ARRAY
-    /// DECIMAL, whose decoders walk pages of their own); the caller then decodes the row group whole. `a` holds the
-    /// reader's pages and must live until the last slice is used.
+    /// A reader of leaf `ci`, or null when the column has no sliced form (nested); the caller then decodes the row
+    /// group whole. `a` holds the slices' bookkeeping and must live until the last slice is used.
     pub fn init(
         a: std.mem.Allocator,
         gpa: std.mem.Allocator,
@@ -694,13 +700,14 @@ pub const SliceReader = struct {
         ci: usize,
         decode_options: DecodeOptions,
     ) !?SliceReader {
+        if (!supports(rg, meta, ci)) return null;
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
-        if (levels.max_rep > 0) return null;
         const se = meta.getColumnSchema(cm.path_in_schema.items);
         const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
-        if (cm.type == .INT96) return null;
-        if (dec != null and cm.type == .FIXED_LEN_BYTE_ARRAY) return null;
+        if (dec) |k| if (cm.type == .FIXED_LEN_BYTE_ARRAY and
+            (k.byte_width == 0 or k.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH))
+            return error.DecimalByteWidthTooLarge;
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
         const len: usize = @intCast(cm.total_compressed_size);
         invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
@@ -709,6 +716,9 @@ pub const SliceReader = struct {
         const chunk = src.bytes[buf_off .. buf_off + len];
         const scratch = try a.create(DecodeScratch);
         scratch.* = .init(gpa);
+        errdefer scratch.deinit();
+        const pages = try a.create(std.heap.ArenaAllocator);
+        pages.* = .init(gpa);
         const raw = try a.create(Raw);
         raw.* = switch (cm.type) {
             inline .INT32, .INT64, .FLOAT, .DOUBLE, .BOOLEAN => |t| blk: {
@@ -724,36 +734,39 @@ pub const SliceReader = struct {
                 const r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, scratch);
                 break :blk @unionInit(Raw, tag, r);
             },
-            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => blk: {
+            .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
-                var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, null);
-                if (cm.type == .FIXED_LEN_BYTE_ARRAY) r.type_length = flbaWidth(se);
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, pages.allocator(), decode_options, null);
+                r.type_length = switch (cm.type) {
+                    .FIXED_LEN_BYTE_ARRAY => flbaWidth(se),
+                    .INT96 => int96_mod.INT96_WIDTH,
+                    else => 0,
+                };
                 break :blk .{ .bytes = r };
             },
-            .INT96 => unreachable,
         };
         return .{
             .raw = raw,
             .scratch = scratch,
+            .pages = pages,
+            .held = a,
             .levels = levels,
             .dec = dec,
             .float16 = if (se) |e| schema.isFloat16(e) else false,
+            .int96 = cm.type == .INT96,
             .left = @intCast(cm.num_values),
         };
     }
 
     pub fn deinit(self: *SliceReader) void {
         self.scratch.deinit();
+        self.pages.deinit();
     }
 
     /// Whether leaf `ci` has a sliced form (what `init` returns non-null for).
     pub fn supports(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) bool {
         const cm = rg.columns.items[ci].meta_data orelse return false;
-        if (meta.getColumnLevels(cm.path_in_schema.items).max_rep > 0) return false;
-        if (cm.type == .INT96) return false;
-        const se = meta.getColumnSchema(cm.path_in_schema.items);
-        const dec = if (se) |e| decimal_mod.kindFromSchema(&e) != null else false;
-        return !(dec and cm.type == .FIXED_LEN_BYTE_ARRAY);
+        return meta.getColumnLevels(cm.path_in_schema.items).max_rep == 0;
     }
 
     /// The next `n` rows (fewer only at the chunk's end), on `a`.
@@ -765,15 +778,10 @@ pub const SliceReader = struct {
                 const T = @TypeOf(r.*).Value;
                 const values = try a.alloc(T, n);
                 const def: ?[]u32 = if (self.levels.max_def > 0) try a.alloc(u32, n) else null;
-                var got: usize = 0;
-                while (got < n) {
-                    const k = if (def) |d|
-                        try r.decodeWithLevels(values[got..], d[got..])
-                    else
-                        try r.decode(values[got..]);
-                    if (k == 0) break;
-                    got += k;
-                }
+                const got = if (T == []const u8)
+                    try self.decodeBytes(r, a, values, def)
+                else
+                    try decodeSome(T, r, values, def);
                 if (got != n) return error.ShortDecode;
                 const max_def: u32 = @intCast(self.levels.max_def);
                 var has_nulls = false;
@@ -790,6 +798,20 @@ pub const SliceReader = struct {
                     .has_nulls = has_nulls,
                 };
                 if (self.dec) |k| return .{ .f64 = try exactSlice(T, a, col, k) };
+                if (T == []const u8 and self.int96) {
+                    const out = try a.alloc(i64, n);
+                    for (values, out) |b, *o| o.* = if (b.len == int96_mod.INT96_WIDTH)
+                        int96_mod.int96ToEpochNanos(b)
+                    else
+                        0;
+                    const nanos: filter_eval.ColumnT(i64) = .{
+                        .values = out,
+                        .def_levels = def,
+                        .max_def = max_def,
+                        .has_nulls = has_nulls,
+                    };
+                    return .{ .i64 = nanos };
+                }
                 if (self.float16 and T == []const u8) {
                     const out = try a.alloc(f64, n);
                     for (values, out) |b, *o| o.* = if (b.len >= 2)
@@ -810,6 +832,64 @@ pub const SliceReader = struct {
                 };
             },
         }
+    }
+
+    fn decodeSome(comptime T: type, r: *column_mod.ColumnChunkReader(T), values: []T, def: ?[]u32) !usize {
+        var got: usize = 0;
+        while (got < values.len) {
+            const k = if (def) |d|
+                try r.decodeWithLevels(values[got..], d[got..])
+            else
+                try r.decode(values[got..]);
+            if (k == 0) break;
+            got += k;
+        }
+        return got;
+    }
+
+    /// Byte arrays a page at a time: each page's values are copied onto `a` before the next page is read, and a
+    /// drained page's bytes are freed, so the reader holds one page however many the slice spans.
+    fn decodeBytes(
+        self: *SliceReader,
+        r: *column_mod.ColumnChunkReader([]const u8),
+        a: std.mem.Allocator,
+        values: [][]const u8,
+        def: ?[]u32,
+    ) !usize {
+        var got: usize = 0;
+        while (got < values.len) {
+            if (r.pageValuesLeft() == 0) {
+                _ = self.pages.reset(.retain_capacity);
+                if (!try r.nextPage()) break;
+                if (!self.dict_held) {
+                    // The dictionary page comes first, so it is in by now; it serves every page that follows.
+                    if (r.dictionary) |d| r.dictionary = try copyBytes(self.held, try self.held.dupe([]const u8, d));
+                    self.dict_held = true;
+                }
+                continue;
+            }
+            const want = @min(values.len - got, r.pageValuesLeft());
+            const dst = values[got..][0..want];
+            const k = if (def) |d| try r.decodeWithLevels(dst, d[got..][0..want]) else try r.decode(dst);
+            if (k != want) return error.ShortDecode;
+            _ = try copyBytes(a, dst);
+            got += k;
+        }
+        return got;
+    }
+
+    /// Re-point `vals` at one block of `a` holding their bytes.
+    fn copyBytes(a: std.mem.Allocator, vals: [][]const u8) ![][]const u8 {
+        var total: usize = 0;
+        for (vals) |v| total += v.len;
+        const buf = try a.alloc(u8, total);
+        var off: usize = 0;
+        for (vals) |*v| {
+            @memcpy(buf[off..][0..v.len], v.*);
+            v.* = buf[off..][0..v.len];
+            off += v.len;
+        }
+        return vals;
     }
 
     /// A DECIMAL slice as `decimal_mod.decodeColumnExact` gives a chunk: the f64 view with the exact integers beside.
@@ -2135,7 +2215,7 @@ fn scanRGSliced(
         try readers.append(pages.allocator(), r);
     }
     const per_row = @max(1, full / num_rows);
-    const slice_rows = std.math.clamp(budget.share() / per_row, @min(1024, num_rows), num_rows);
+    const slice_rows = std.math.clamp(budget.share() / per_row, 1, num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
     defer budget.release(reserved);
@@ -3208,7 +3288,8 @@ pub fn copyRG(
 }
 
 /// Give a copied chunk the Bloom filter the write asks of column `ci`, when it carries none from its source: decode
-/// the source chunk and build one from its values.
+/// the source chunk and build one from its values. A filter it carries is copied onto `out_arena` too: the filters
+/// are written after the last row group, and a windowed input has released this one's bytes by then.
 fn requestedFilter(
     out_arena: std.mem.Allocator,
     copied: *schema.ColumnChunk,
@@ -3217,7 +3298,10 @@ fn requestedFilter(
     src: RGSrc,
     bloom_write: BloomWrite,
 ) !void {
-    if (copied.bloom_out.len > 0) return;
+    if (copied.bloom_out.len > 0) {
+        copied.bloom_out = try out_arena.dupe(u8, copied.bloom_out);
+        return;
+    }
     const fpp = bloom_write.at(ci) orelse return;
     const meta = bloom_write.meta orelse return;
     var scratch = std.heap.ArenaAllocator.init(bloom_write.scratch orelse return);

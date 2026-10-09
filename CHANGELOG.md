@@ -76,8 +76,10 @@
   whole. S3 inputs past a quarter of it (64 MiB to 1 GiB; `ZPQ_S3_WINDOW_KIB` overrides it) are fetched ahead of the
   readers and released behind them (Linux; elsewhere still up front), and a print with `--limit` stops fetching once
   it has its rows. Half of it is for decoded row groups, shared by the workers: a row group too big for one is
-  aggregated, printed or written a slice of rows at a time (a write emitting a row group per slice), and one with no
-  sliced form is aggregated one aggregate's columns at a time or refused with `RowGroupTooLarge`, never killed. A
+  aggregated, printed or written a slice of rows at a time, a page per column held beside the slice, and one with no
+  sliced form (a nested column) is refused with `RowGroupTooLarge` before it decodes, never killed. A write emits a
+  row group per slice: contents are identical, but row-group boundaries of filtered or computed writes may depend on
+  `--max-memory` and `-j` (and are the same for the same values). A
   write holds at most a quarter of it encoded: a row group whose rewrite could take more (an expanding codec, a sliced
   row group) streams to the output a page or a slice at a time, and S3 uploads keep at most an eighth in flight. The
   default also honours a cgroup v2 memory limit, as it already did a Lambda's memory size.

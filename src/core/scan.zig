@@ -3463,7 +3463,7 @@ test "--trust-stats answers DECIMAL min/max from statistics exactly, as decoding
     }, &want);
 }
 
-test "a decode budget stages wide row groups one aggregate at a time, same answer, and refuses what cannot fit" {
+test "a decode budget slices wide row groups, FIXED_LEN_BYTE_ARRAY DECIMAL included, with the same answer" {
     const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
     const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
@@ -3474,9 +3474,8 @@ test "a decode budget stages wide row groups one aggregate at a time, same answe
         .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
     };
     const aggregate = "sum(d9) AS s9, sum(d38) AS s38, sum(d9 * d18) AS p, avg(dn) AS adn";
-    // Unbounded; then a budget too small for a whole row group per worker but enough staged (100 rows of ~16 bytes a
-    // column); then one too small even staged.
-    for ([_]?usize{ null, 10_000 }) |limit| for ([_]usize{ 1, 3 }) |j| {
+    // Unbounded; then budgets too small for a whole row group per worker, down to a few rows a slice.
+    for ([_]?usize{ null, 10_000, 1000 }) |limit| for ([_]usize{ 1, 3 }) |j| {
         try expectDecimalAnswers(.{
             .inputs = &inputs,
             .aggregate = aggregate,
@@ -3485,8 +3484,8 @@ test "a decode budget stages wide row groups one aggregate at a time, same answe
             .decode_limit = limit,
         }, &want);
     };
-    // GROUP BY stages too: keys first, then each aggregate's columns.
-    for ([_]?usize{ null, 16_000 }) |limit| {
+    // GROUP BY slices too.
+    for ([_]?usize{ null, 16_000, 1000 }) |limit| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
@@ -3501,12 +3500,4 @@ test "a decode budget stages wide row groups one aggregate at a time, same answe
         try testing.expectEqual(@as(usize, 3), rows.len);
         try testing.expectEqual(@as(i128, 17235000), rows[0][1].dec.v);
     }
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    try testing.expectError(error.RowGroupTooLarge, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
-        .inputs = &inputs,
-        .aggregate = aggregate,
-        .parallelism = 1,
-        .decode_limit = 1000,
-    }));
 }

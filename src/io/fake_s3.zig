@@ -176,6 +176,10 @@ pub const FakeS3 = struct {
                 else => return,
             }
             const fd: posix.fd_t = @intCast(rc);
+            // A response goes out in several writes; without this, Nagle holds each later one for the client's delayed
+            // ACK, about 40 ms a request, which a test fetching row group by row group pays hundreds of times.
+            const one: c_int = 1;
+            _ = posix.system.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
             self.conn_fds[self.conns] = fd;
             self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
             self.conns += 1;

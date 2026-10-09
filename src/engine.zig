@@ -817,7 +817,7 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
     try job.arrive();
     if (job.passthrough) return copyRGToBuffer(w.gpa, ma, job, w.kept_set, prof, w.bloom_leaves);
     const bloom: consumer.BloomWrite = .{ .fpp = w.bloom_outputs };
-    if (sliceRG(job, w.fetch_arr, w.decode_share)) return .{ .deferred = true };
+    if (try sliceRG(job, w.fetch_arr, w.decode_share)) return .{ .deferred = true };
     return encodeRGToBuffer(
         w.gpa,
         ma,
@@ -835,8 +835,8 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
 }
 
 /// Whether `job`'s row group is re-encoded a slice of rows at a time (`encodeRGSliced`): its decoded columns would take
-/// more than `share`, and each of them has a sliced form.
-fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) bool {
+/// more than `share`. One that would, with a column that has no sliced form, is refused before anything decodes.
+fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooLarge}!bool {
     const rg = job.rg;
     if (rg.num_rows <= 0) return false;
     // Decoded, then buffered for the encoder, then encoded.
@@ -851,7 +851,7 @@ fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) bool {
     if (est <= share) return false;
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
-        if (!consumer.SliceReader.supports(rg, job.meta, ci)) return false;
+        if (!consumer.SliceReader.supports(rg, job.meta, ci)) return error.RowGroupTooLarge;
     }
     return true;
 }
@@ -887,7 +887,7 @@ fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
         try readers.append(pages.allocator(), r);
     }
     const per_row = @max(1, est / num_rows);
-    const slice_rows = std.math.clamp(w.decode_share / per_row, @min(4096, num_rows), num_rows);
+    const slice_rows = std.math.clamp(w.decode_share / per_row, 1, num_rows);
 
     var timings: consumer.Timings = .{ .prof = prof };
     defer {
@@ -1876,8 +1876,10 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .arena = arena,
                 .profiler = args.profiler,
                 // Half the budget for the producers' decoded rows (the fetch window and the encoded output in flight
-                // take a quarter each), shared among those that run at once.
-                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
+                // take a quarter each), shared among as many as -j allows. Not among those that run at once, which
+                // the host's memory sizes: the share sets a sliced row group's output layout, so it depends only on
+                // --max-memory and -j.
+                .decode_share = args.max_memory / 2 / @max(1, sizing.budget),
             };
             const re_span = profile.Span.begin(prof);
             defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
@@ -2451,7 +2453,13 @@ fn openInputs(
                 try s3_mapped.append(arena, buf);
                 sp.file_buf = buf[0..compact_len];
             } else sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
-            try rebaseFetchedOffsets(&sp.meta, plan.columns(), sp.compact_ranges, sp.rg_columns);
+            try rebaseFetchedOffsets(
+                &sp.meta,
+                plan.columns(),
+                sp.compact_ranges,
+                sp.rg_columns,
+                if (windowed) rg_compact else null,
+            );
 
             for (0..meta.row_groups.items.len) |ri| {
                 if (!windowed and ri > 0) break;
@@ -3176,18 +3184,25 @@ const UNFETCHED_CHUNK_OFFSET: i64 = std.math.maxInt(i64) / 4;
 
 /// Point `meta`'s chunk offsets into the compact buffer `ranges` describe. `fetched` is every column some row group
 /// fetched (`RangePlan.columns`) and `rg_columns` what each row group fetched (null where statistics pruned it).
+/// `rg_compact`, when the buffer is windowed, gives each row group its own ranges,
+/// `ranges[rg_compact[rg]..rg_compact[rg + 1]]`: its offsets rebase only onto those. Another row group's range may
+/// cover the same source bytes (a range coalesced across a gap to a carried Bloom filter), but its segment is released
+/// when that row group is done, not when this one is.
 fn rebaseFetchedOffsets(
     meta: *schema.FileMetaData,
     fetched: []const bool,
-    ranges: []const CompactRange,
+    all_ranges: []const CompactRange,
     rg_columns: []const ?[]const bool,
+    rg_compact: ?[]const usize,
 ) !void {
     std.debug.assert(rg_columns.len == meta.row_groups.items.len);
+    if (rg_compact) |rc| std.debug.assert(rc.len == meta.row_groups.items.len + 1);
     // Page-index blocks are never fetched, so their offsets have nothing to rebase onto — yet consumers bounds-check
     // them against the compact buffer, not the file. In a noncanonical file a stale offset can land inside that buffer,
     // where unrelated bytes may decode as a ColumnIndex whose foreign min/max prune pages on read and get copied into
     // output on write. Pruned row groups are cleared too: the metadata no longer describes the source layout.
-    for (meta.row_groups.items) |*rg| {
+    for (meta.row_groups.items, 0..) |*rg, ri| {
+        const ranges = if (rg_compact) |rc| all_ranges[rc[ri]..rc[ri + 1]] else all_ranges;
         for (rg.columns.items) |*chunk| {
             chunk.column_index_offset = null;
             chunk.column_index_length = null;
@@ -3202,7 +3217,8 @@ fn rebaseFetchedOffsets(
         }
     }
 
-    for (meta.row_groups.items, rg_columns) |*rg, rg_cols_opt| {
+    for (meta.row_groups.items, rg_columns, 0..) |*rg, rg_cols_opt, ri| {
+        const ranges = if (rg_compact) |rc| all_ranges[rc[ri]..rc[ri + 1]] else all_ranges;
         // Pruned row groups contributed no fetch ranges, so their chunk
         // offsets can't be rebased — and never need to be: the scan
         // workers re-prune with the same stats predicate before touching
@@ -3814,8 +3830,9 @@ const SlicedPrint = struct {
 
 /// Print `rg` a slice of rows at a time when its decoded columns would take more than `o.budget`, or a limit is set:
 /// each slice's fetched columns decode (`consumer.SliceReader`), filter and print on memory of their own, and printing
-/// stops at the limit without decoding further. False, having printed nothing, when the row group fits, or has a
-/// column with no sliced form; the caller then prints it whole.
+/// stops at the limit without decoding further. False, having printed nothing, when the row group fits (or has a
+/// column with no sliced form but fits); the caller then prints it whole. One that fits neither way is refused before
+/// anything decodes.
 fn printRowGroupSliced(
     gpa: std.mem.Allocator,
     agg: *consumer.OutputAggregator,
@@ -3840,6 +3857,12 @@ fn printRowGroupSliced(
     // A limit also slices, so a print that wants a few rows decodes about that many.
     const wanted: ?usize = if (o.limit) |lim| lim -| o.total_printed.* else null;
     if (est <= o.budget and wanted == null) return false;
+    for (fetch_arr, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        if (consumer.SliceReader.supports(rg, meta, ci)) continue;
+        if (est > o.budget) return error.RowGroupTooLarge;
+        return false;
+    }
 
     var pages = std.heap.ArenaAllocator.init(gpa);
     defer pages.deinit();
@@ -3850,15 +3873,15 @@ fn printRowGroupSliced(
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
         const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, meta, src, ci, o.decode_options) orelse
-            return false;
+            unreachable; // every column was checked above
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }
-    // A slice takes a quarter of the budget.
+    // A slice takes a quarter of the budget. Under a limit the first slice is about twice the rows still wanted, and
+    // each one after (a filter dropped rows) twice the last.
     const per_row = @max(1, est / num_rows);
-    const floor = @min(4096, num_rows);
-    var slice_rows = std.math.clamp(o.budget / 4 / per_row, floor, num_rows);
-    if (wanted) |w| slice_rows = std.math.clamp(w * 2, floor, slice_rows);
+    const max_rows = std.math.clamp(o.budget / 4 / per_row, 1, num_rows);
+    var slice_rows = if (wanted) |w| std.math.clamp(w *| 2, @min(64, max_rows), max_rows) else max_rows;
 
     var done: usize = 0;
     while (done < num_rows) {
@@ -3885,6 +3908,7 @@ fn printRowGroupSliced(
         };
         agg.num_rows = 0;
         done += n;
+        slice_rows = @min(max_rows, slice_rows *| 2);
     }
     return true;
 }
@@ -4209,7 +4233,7 @@ test "rebaseFetchedOffsets clears page-index pointers that would resolve inside 
     const fetch_arr = [_]bool{true};
     const rg_columns = [_]?[]const bool{ &fetch_arr, &fetch_arr };
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns, null);
 
     for (meta.row_groups.items, 0..) |rg, i| {
         const chunk = rg.columns.items[0];
@@ -4255,7 +4279,7 @@ test "rebaseFetchedOffsets clears page-index pointers in pruned row groups too" 
     const fetch_arr = [_]bool{true};
     const rg_columns = [_]?[]const bool{null};
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns, null);
 
     const out = meta.row_groups.items[0].columns.items[0];
     try std.testing.expectEqual(@as(?i64, null), out.column_index_offset);
@@ -4293,7 +4317,7 @@ test "rebaseFetchedOffsets poisons filter-only chunks it left unfetched in prove
     const consumed = [_]bool{ false, true };
     const rg_columns = [_]?[]const bool{ &fetch_arr, &consumed };
 
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns, null);
 
     const rg0 = meta.row_groups.items[0].columns.items;
     try std.testing.expectEqual(@as(i64, 0), rg0[0].meta_data.?.data_page_offset);
@@ -4824,7 +4848,7 @@ test "rebaseFetchedOffsets moves a fetched Bloom filter into the compact buffer 
     };
     const fetch_arr = [_]bool{true};
     const rg_columns = [_]?[]const bool{ &fetch_arr, &fetch_arr, null };
-    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns);
+    try rebaseFetchedOffsets(&meta, &fetch_arr, &ranges, &rg_columns, null);
     const got = [_]?i64{ 144, null, null };
     for (meta.row_groups.items, got) |rg, want| {
         const cm = rg.columns.items[0].meta_data.?;
@@ -5044,6 +5068,294 @@ test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatev
             };
         }
     }
+}
+
+const TestDigest = struct { rows: i64, cols: [8]u64 };
+
+/// Every value of every column of the parquet file `bytes`, decoded page by page and hashed per column in row order:
+/// equal for two files holding the same rows however they are cut into row groups. Checks on the way that every page
+/// decodes, every chunk holds the values its metadata counts, and every Bloom filter admits each value of its chunk.
+fn testContentDigest(gpa: std.mem.Allocator, bytes: []const u8) !TestDigest {
+    const column_mod = @import("core/parquet/column.zig");
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const meta = try metadata.open(a, bytes);
+    var hashers: [8]std.hash.Wyhash = @splat(.init(0));
+    var rows: i64 = 0;
+    for (meta.row_groups.items) |rg| {
+        rows += rg.num_rows;
+        if (rg.columns.items.len > hashers.len) return error.TooManyColumns;
+        for (rg.columns.items, hashers[0..rg.columns.items.len]) |chunk, *h| {
+            const cm = chunk.meta_data orelse return error.ColumnMetaMissing;
+            const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+            const len: usize = @intCast(cm.total_compressed_size);
+            if (start + len > bytes.len) return error.MissingChunkBytes;
+            const n: usize = @intCast(cm.num_values);
+            if (n != rg.num_rows) return error.ShortDecode;
+            const levels = meta.getColumnLevels(cm.path_in_schema.items);
+            const bits: ?[]const u8 = if (cm.bloom_filter_offset) |off| blk: {
+                const end = @as(usize, @intCast(off)) + @as(usize, @intCast(cm.bloom_filter_length orelse 0));
+                if (off < 0 or end > bytes.len) return error.BadBloomFilter;
+                break :blk sbbf.bitset(bytes[@intCast(off)..end]) orelse return error.BadBloomFilter;
+            } else null;
+            switch (cm.type) {
+                inline else => |t| {
+                    const T = switch (t) {
+                        .BOOLEAN => bool,
+                        .INT32 => i32,
+                        .INT64 => i64,
+                        .FLOAT => f32,
+                        .DOUBLE => f64,
+                        .INT96, .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => []const u8,
+                    };
+                    var r = column_mod.ColumnChunkReader(T).init(bytes[start..][0..len], cm.codec, levels, a);
+                    if (t == .INT96) r.type_length = 12;
+                    if (t == .FIXED_LEN_BYTE_ARRAY)
+                        r.type_length = consumer.flbaWidth(meta.getColumnSchema(cm.path_in_schema.items));
+                    const values = try a.alloc(T, n);
+                    const def = try a.alloc(u32, n);
+                    @memset(def, @intCast(levels.max_def));
+                    var got: usize = 0;
+                    while (got < n) {
+                        const k = if (levels.max_def > 0)
+                            try r.decodeWithLevels(values[got..], def[got..])
+                        else
+                            try r.decode(values[got..]);
+                        if (k == 0) break;
+                        got += k;
+                    }
+                    if (got != n) return error.ShortDecode;
+                    for (values, def) |v, d| {
+                        if (d < levels.max_def) {
+                            h.update("\x00");
+                            continue;
+                        }
+                        const plain: []const u8 = if (T == []const u8) v else &std.mem.toBytes(std.mem.nativeToLittle(
+                            @Int(.unsigned, @bitSizeOf(T)),
+                            @bitCast(v),
+                        ));
+                        h.update("\x01");
+                        h.update(&std.mem.toBytes(@as(u64, plain.len)));
+                        h.update(plain);
+                        if (bits) |b| if (T != bool and !sbbf.Probe.init(sbbf.hashBytes(plain)).mightContain(b))
+                            return error.BloomFilterMissesValue;
+                    }
+                },
+            }
+        }
+    }
+    var out: [8]u64 = undefined;
+    for (&hashers, &out) |*h, *o| o.* = h.final();
+    return .{ .rows = rows, .cols = out };
+}
+
+test "every write reads back whole, holding what an unbounded run writes, through any window and budget" {
+    // Each output is decoded page by page, its Bloom filters probed with every value, and its rows compared with a
+    // local run's on the default budget: local and S3 inputs, every write path (byte copy, recompress, projection,
+    // filter, computed select, Bloom-building), row groups far smaller and far larger than the window and the decode
+    // budget, with and without Bloom filters to carry. A run that differs only in its S3 window writes the same bytes.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const tiny = metadata.readFileSlice("ci/fixtures/parquet/many_tiny.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(tiny);
+    const mixed = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(mixed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const out = try std.fmt.allocPrint(a, "{s}/out.parquet", .{dir});
+
+    // The tiny row groups again, with Bloom filters on two columns written after the last row group.
+    const tiny_path = try std.fmt.allocPrint(a, "{s}/tiny.parquet", .{dir});
+    const bloom_path = try std.fmt.allocPrint(a, "{s}/tiny_bloom.parquet", .{dir});
+    const mixed_path = try std.fmt.allocPrint(a, "{s}/mixed.parquet", .{dir});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tiny_path, .data = tiny });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = mixed_path, .data = mixed });
+    {
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{tiny_path},
+            .output = bloom_path,
+            .bloom_filters = &.{ .{ .column = "id" }, .{ .column = "s" } },
+        });
+        r.deinit(gpa);
+    }
+    const tiny_bloom = try metadata.readFileSlice(bloom_path, gpa);
+    defer gpa.free(tiny_bloom);
+    try std.testing.expect((try metadata.open(a, tiny_bloom)).row_groups.items[0].columns.items[0].meta_data.?
+        .bloom_filter_offset != null);
+
+    const Fixture = struct {
+        path: []const u8,
+        key: []const u8,
+        bytes: []const u8,
+        filter: []const u8,
+        columns: []const []const u8,
+        select: []const u8,
+        bloom: []const u8,
+    };
+    const fixtures = [_]Fixture{
+        .{
+            .path = tiny_path,
+            .key = "tiny",
+            .bytes = tiny,
+            .filter = "id >= 100",
+            .columns = &.{ "id", "d" },
+            .select = "id * 2 AS x, d, s",
+            .bloom = "g",
+        },
+        .{
+            .path = bloom_path,
+            .key = "tiny_bloom",
+            .bytes = tiny_bloom,
+            .filter = "id >= 100",
+            .columns = &.{ "id", "s" },
+            .select = "id * 2 AS x, d, s",
+            .bloom = "g",
+        },
+        .{
+            .path = mixed_path,
+            .key = "mixed",
+            .bytes = mixed,
+            .filter = "a >= 5",
+            .columns = &.{ "a", "b" },
+            .select = "a * 2 AS x, b, c",
+            .bloom = "b",
+        },
+    };
+    const S3 = enum { local, up_front, window };
+    const Variant = struct { label: []const u8, s3: S3, j: usize, max_memory: ?usize = null };
+    const variants = [_]Variant{
+        .{ .label = "local -j1", .s3 = .local, .j = 1 },
+        .{ .label = "local -j3 64K", .s3 = .local, .j = 3, .max_memory = 64 << 10 },
+        .{ .label = "s3 up front -j1", .s3 = .up_front, .j = 1 },
+        .{ .label = "s3 window -j1", .s3 = .window, .j = 1 },
+        .{ .label = "s3 up front -j3", .s3 = .up_front, .j = 3 },
+        .{ .label = "s3 window -j3", .s3 = .window, .j = 3 },
+        .{ .label = "s3 window -j1 64K", .s3 = .window, .j = 1, .max_memory = 64 << 10 },
+        .{ .label = "s3 window -j2 64K", .s3 = .window, .j = 2, .max_memory = 64 << 10 },
+    };
+    for (fixtures) |f| {
+        const local_in = [_][]const u8{ f.path, f.path };
+        const s3_in = [_][]const u8{
+            try std.fmt.allocPrint(a, "s3://bkt/t/{s}_1.parquet", .{f.key}),
+            try std.fmt.allocPrint(a, "s3://bkt/t/{s}_2.parquet", .{f.key}),
+        };
+        const Mode = struct { label: []const u8, args: QueryArgs };
+        const modes = [_]Mode{
+            .{ .label = "copy", .args = .{ .inputs = &.{} } },
+            .{ .label = "recompress", .args = .{ .inputs = &.{}, .codec = .GZIP } },
+            .{ .label = "expanding recompress", .args = .{ .inputs = &.{}, .codec = .UNCOMPRESSED } },
+            .{ .label = "projection", .args = .{ .inputs = &.{}, .columns = f.columns } },
+            .{ .label = "filter", .args = .{ .inputs = &.{}, .filter = f.filter } },
+            .{ .label = "filter projection", .args = .{ .inputs = &.{}, .filter = f.filter, .columns = f.columns } },
+            .{ .label = "select", .args = .{ .inputs = &.{}, .select = f.select } },
+            .{
+                .label = "filter + Bloom",
+                .args = .{ .inputs = &.{}, .filter = f.filter, .bloom_filters = &.{.{ .column = f.bloom }} },
+            },
+        };
+        for (modes) |m| {
+            var want: ?TestDigest = null;
+            // The bytes each window-less S3 run wrote, by -j, which the windowed run at that -j must match.
+            var up_front: [4]?[]u8 = .{ null, null, null, null };
+            defer for (up_front) |b| if (b) |x| gpa.free(x);
+            for (variants) |v| {
+                var q = m.args;
+                q.inputs = if (v.s3 == .local) &local_in else &s3_in;
+                q.output = out;
+                q.parallelism = v.j;
+                if (v.max_memory) |mm| q.max_memory = mm;
+                // A server per run: one serves a bounded number of connections.
+                var fake: fake_s3.FakeS3 = undefined;
+                try fake.start(gpa);
+                defer fake.deinit();
+                for (s3_in, [_][]const u8{ "1", "2" }) |_, copy| {
+                    try fake.serveBytes(try std.fmt.allocPrint(a, "t/{s}_{s}.parquet", .{ f.key, copy }), f.bytes);
+                }
+                var lines: std.ArrayList(?[*:0]const u8) = .empty;
+                try lines.appendSlice(a, &.{
+                    try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0),
+                    "AWS_REGION=us-east-1",
+                    "AWS_ACCESS_KEY_ID=ak",
+                    "AWS_SECRET_ACCESS_KEY=sk",
+                });
+                if (v.s3 == .window) try lines.append(a, "ZPQ_S3_WINDOW_KIB=1");
+                const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+                @memcpy(block, lines.items);
+                const env: std.process.Environ = if (v.s3 == .local) .empty else .{ .block = .{ .slice = block } };
+                var r = runQuery(.{ .gpa = gpa, .env = env, .io = std.testing.io }, q) catch |err| {
+                    std.debug.print("{s} / {s} / {s}: {s}\n", .{ f.key, m.label, v.label, @errorName(err) });
+                    return err;
+                };
+                r.deinit(gpa);
+                const written = try metadata.readFileSlice(out, gpa);
+                var keep = false;
+                defer if (!keep) gpa.free(written);
+                const got = testContentDigest(gpa, written) catch |err| {
+                    std.debug.print("{s} / {s} / {s}: output does not read back: {s}\n", .{
+                        f.key, m.label, v.label, @errorName(err),
+                    });
+                    return err;
+                };
+                if (want) |w| std.testing.expectEqualDeep(w, got) catch |err| {
+                    std.debug.print("{s} / {s} / {s}: rows differ from the unbounded run's\n", .{
+                        f.key, m.label, v.label,
+                    });
+                    return err;
+                } else want = got;
+                if (v.s3 == .local or v.max_memory != null) continue;
+                if (v.s3 == .up_front) {
+                    up_front[v.j] = written;
+                    keep = true;
+                } else std.testing.expectEqualSlices(u8, up_front[v.j].?, written) catch |err| {
+                    std.debug.print("{s} / {s} / {s}: bytes differ from the up-front fetch's\n", .{
+                        f.key, m.label, v.label,
+                    });
+                    return err;
+                };
+            }
+        }
+    }
+}
+
+test "windowed S3 rebasing uses the owning row group's overlapping source range" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 2,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    for ([_]i64{ 1_000, 1_100 }, [_]i64{ 50_000, 60_000 }) |dpo, bfo| {
+        var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 64, .num_rows = 1 };
+        var chunk = pageIndexTestChunk(dpo);
+        chunk.meta_data.?.bloom_filter_offset = bfo;
+        chunk.meta_data.?.bloom_filter_length = 16;
+        try rg.columns.append(arena, chunk);
+        try meta.row_groups.append(arena, rg);
+    }
+    // Coalescing to carried Bloom filters copies the same source bytes into two row groups' segments, each released
+    // when its own row group is done.
+    const ranges = [_]CompactRange{
+        .{ .start = 1_000, .end = 50_016, .dst_start = 0 },
+        .{ .start = 1_100, .end = 60_016, .dst_start = 65_536 },
+    };
+    const fetched = [_]bool{true};
+    const rg_columns = [_]?[]const bool{ &fetched, &fetched };
+    const rg_compact = [_]usize{ 0, 1, 2 };
+    try rebaseFetchedOffsets(&meta, &fetched, &ranges, &rg_columns, &rg_compact);
+    // Row group 1's page and filter point into its own segment, not row group 0's copy of the same source bytes.
+    const cm = meta.row_groups.items[1].columns.items[0].meta_data.?;
+    try std.testing.expectEqual(@as(i64, 65_536), cm.data_page_offset);
+    try std.testing.expectEqual(@as(?i64, 65_536 + 60_000 - 1_100), cm.bloom_filter_offset);
 }
 
 test "a windowed S3 fetch that fails mid-scan fails the query rather than hanging it" {

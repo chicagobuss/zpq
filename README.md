@@ -83,10 +83,11 @@ copy), over S3 and locally alike, so a scan larger than memory completes:
   fetched just ahead of the readers and released behind them (Linux; elsewhere still up front). A print with
   `--limit` fetches row group by row group and stops once it has its rows.
 - **Decoded rows:** half of it is for decoded row groups, shared by the workers. A row group too big for a worker's
-  share is decoded, filtered and aggregated, printed or written a slice of rows at a time (a write then emits one
-  output row group per slice); one whose columns have no sliced form (nested, INT96, FIXED_LEN_BYTE_ARRAY DECIMAL)
-  aggregates one aggregate's columns at a time, and is refused (`RowGroupTooLarge`) rather than run out of memory when
-  even that cannot fit.
+  share is decoded, filtered and aggregated, printed or written a slice of rows at a time, holding one page per
+  column beside the slice. A write then emits one output row group per slice: the file's contents are identical, but
+  for filtered or computed writes its row-group boundaries may depend on `--max-memory` (and `-j`, which divides it),
+  the same for the same values of both. A row group that cannot be sliced (a nested column) and does not fit is refused
+  (`RowGroupTooLarge`) before anything is decoded, rather than run out of memory.
 - **Output:** a write holds at most a quarter of it encoded and waiting. A row group whose rewrite could take more (a
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.

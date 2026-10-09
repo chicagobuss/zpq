@@ -749,6 +749,20 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return self.active != .idle;
         }
 
+        /// Values the active page has left; 0 when no page is active or it is drained.
+        pub fn pageValuesLeft(self: *const Self) usize {
+            if (!self.hasActivePage()) return 0;
+            return self.current_page_num_values - self.current_def_pos;
+        }
+
+        /// Leave the current page and install the next data page: false at the chunk's end. With `pageValuesLeft`,
+        /// lets a caller decode a page at a time and free what the drained page allocated before reading the next.
+        pub fn nextPage(self: *Self) Error!bool {
+            try self.holdScratch();
+            self.resetPageState();
+            return self.advancePage();
+        }
+
         fn resetPageState(self: *Self) void {
             self.active = .idle;
             self.current_def_levels = null;

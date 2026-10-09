@@ -29,7 +29,7 @@ pub const Error = error{
     UnexpectedEndOfChunk,
 } || page_mod.Error || std.mem.Allocator.Error;
 
-const INT96_WIDTH: usize = 12;
+pub const INT96_WIDTH: usize = 12;
 const JULIAN_TO_UNIX_EPOCH_DAYS: i64 = 2440588;
 const NANOSECONDS_PER_DAY: i64 = 86_400_000_000_000;
 

@@ -701,17 +701,21 @@ def main():
     # time, with the same answers as DuckDB, down to a budget of a few slices.
     big = os.path.join(tmp, "one_big_rg.parquet")
     con.execute(f"""COPY (SELECT i::BIGINT AS id, (i % 97)::INTEGER AS g, CAST(i * 0.01 AS DECIMAL(18,2)) AS price,
-        'n' || (i % 1000) AS name, (CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END)::DOUBLE AS amt
+        'n' || (i % 1000) AS name, (CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END)::DOUBLE AS amt,
+        CAST(i * 1000000007.01 AS DECIMAL(38,2)) AS wide,
+        CASE WHEN i % 5 = 0 THEN NULL ELSE repeat('x', i % 300) END AS pad
         FROM range(0, 50000) t(i)) TO '{big}' (FORMAT PARQUET, ROW_GROUP_SIZE 100000)""")
     tiny = ["--max-memory", "2M", "-j", "2"]
     out = os.path.join(tmp, "zbig.parquet")
     for blabel, args, dsql in [
-        ("write", ["-o", out, "--filter", "id >= 100", "--select", "id, price * 2 AS p, name, amt"],
-         "SELECT id, price * 2 AS p, name, amt FROM '{f}' WHERE id >= 100"),
+        ("write", ["-o", out, "--filter", "id >= 100", "--select", "id, price * 2 AS p, name, amt, wide, pad"],
+         "SELECT id, price * 2 AS p, name, amt, wide, pad FROM '{f}' WHERE id >= 100"),
         ("print", ["--format", "jsonl", "--filter", "g = 3"], "SELECT * FROM '{f}' WHERE g = 3"),
         ("print-limit", ["--format", "jsonl", "--limit", "7"], "SELECT * FROM '{f}' LIMIT 7"),
-        ("aggregate", ["--aggregate", "sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t"],
-         "SELECT sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t FROM '{f}'"),
+        ("aggregate", ["--aggregate", "sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t, "
+                       "sum(wide) AS w, max(pad) AS x, count(pad) AS n"],
+         "SELECT sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t, "
+         "sum(wide) AS w, max(pad) AS x, count(pad) AS n FROM '{f}'"),
         ("grouped", ["--aggregate", "sum(price) AS s, min(amt) AS a", "--group-by", "g"],
          "SELECT g, sum(price) AS s, min(amt) AS a FROM '{f}' GROUP BY g"),
     ]:
@@ -754,6 +758,22 @@ def main():
     streamed = r.returncode == 0 and zjson(r.stdout)["agg"]["s"] == want_s
     print(f"  {'OK  ' if streamed else 'FAIL'}  sliced:tiny-budget  {(r.stderr or r.stdout).strip()[:70]}")
     fails += 0 if streamed else 1
+    # INT96 (no DuckDB writer) and FLOAT16 lanes: printed in slices exactly as printed whole.
+    total += 1
+    import numpy as np
+    legacy = os.path.join(tmp, "one_big_rg_int96.parquet")
+    n = 20000
+    pq.write_table(pa.table({
+        "ts": pa.array([i * 1_000_003_000 for i in range(n)], pa.timestamp("ns")),
+        "h": pa.array(np.arange(n, dtype=np.float16) / 8),
+    }), legacy, row_group_size=n, data_page_size=4096, use_deprecated_int96_timestamps=True)
+    whole = subprocess.run([ZPQ, "query", legacy, "--format", "jsonl"], capture_output=True, text=True)
+    sliced = subprocess.run([ZPQ, "query", legacy, "--format", "jsonl", "--max-memory", "200K"],
+                            capture_output=True, text=True)
+    matched = whole.returncode == 0 and sliced.returncode == 0 and whole.stdout == sliced.stdout and \
+        len(whole.stdout.splitlines()) == n
+    print(f"  {'OK  ' if matched else 'FAIL'}  sliced:int96-float16  {(sliced.stderr or '').strip()[:70]}")
+    fails += 0 if matched else 1
 
     # Clashing output names fail loudly, naming the column, instead of one column showing another's values.
     CLASHES = [

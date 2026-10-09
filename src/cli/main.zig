@@ -95,6 +95,11 @@ const usage_text =
     \\                 shrink what a query may use. Partly-used blocks can
     \\                 collectively strand at most ~5% of the budget, so give
     \\                 it headroom rather than tuning to the exact byte.
+    \\                 It also bounds working memory on every path: a row
+    \\                 group too big for it is read a slice of rows at a
+    \\                 time. Output contents are identical; row-group
+    \\                 boundaries may depend on --max-memory (and -j) for
+    \\                 filtered or computed writes.
     \\  --profile      write a Chrome Trace Event JSON trace of the query
     \\                 (open it at https://ui.perfetto.dev): per-thread spans
     \\                 for every phase, in-flight counters, RSS.
@@ -242,8 +247,8 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 error.RowGroupTooLarge => std.debug.print(
                     "zpq query: a row group needs more memory to decode than --max-memory\n" ++
-                        "allows, even one aggregate at a time; raise --max-memory or rewrite\n" ++
-                        "the file with smaller row groups\n",
+                        "allows, even one aggregate or slice of rows at a time; raise\n" ++
+                        "--max-memory or rewrite the file with smaller row groups\n",
                     .{},
                 ),
                 error.DecimalScaleTooLarge => std.debug.print(

@@ -723,6 +723,14 @@ pub const FetchJob = struct {
     key: []const u8,
     range: Range, // exclusive end (coalescer semantics)
     target: []u8,
+    /// Told, on the fetching thread, each time one of this job's requests has landed its bytes in `target` (a job
+    /// split into several requests reports each), so a reader can start on them before the whole batch is in.
+    landed: ?Landed = null,
+};
+
+pub const Landed = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, bytes: usize) void,
 };
 
 /// Parallel multi-file range fetch using a shared `Pool`. Splits any
@@ -768,6 +776,7 @@ pub fn fetchJobs(
                         .end = j.range.start + @as(u64, sub_off_end),
                     },
                     .target = j.target[sub_off_start..sub_off_end],
+                    .landed = j.landed,
                 });
             }
         } else {
@@ -812,6 +821,7 @@ pub fn fetchJobs(
             .target = j.target,
             .ok = false,
             .profiler = profiler,
+            .landed = j.landed,
         };
     }
 
@@ -879,6 +889,7 @@ const FetchCtx = struct {
     target: []u8,
     ok: bool,
     profiler: ?*profile.Profiler = null,
+    landed: ?Landed = null,
 };
 
 /// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
@@ -904,6 +915,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     };
     // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
     ctx.ok = (resp.status == 206 or resp.status == 200) and resp.body.len == ctx.target.len;
+    if (ctx.ok) if (ctx.landed) |l| l.f(l.ctx, ctx.target.len);
 }
 
 /// Issue one ranged GET on `conn`, streaming the body into `ctx.target`.

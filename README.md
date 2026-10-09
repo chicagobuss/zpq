@@ -77,7 +77,10 @@ JSON (avg as `<name>__sum` / `<name>__count`).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
-entry budget, so leave headroom.
+entry budget, so leave headroom. It also bounds what an aggregate over S3 holds fetched: past a quarter of it (between
+64 MiB and 1 GiB; `ZPQ_S3_WINDOW_KIB` sets it), row groups are fetched just ahead of the workers and released behind
+them, so a scan larger than memory completes. Its default is 80% of available memory, three quarters of a cgroup's
+memory limit or a Lambda's memory size where those are lower.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
 compute in scaled 128-bit integers, never through a double. Result types follow the rules DuckDB and Trino (Athena)

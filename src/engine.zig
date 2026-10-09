@@ -52,6 +52,7 @@ const streaming = @import("core/writer/streaming.zig");
 const fastpath = @import("core/writer/fastpath.zig");
 
 const s3 = @import("io/s3.zig");
+const s3_window = @import("io/s3_window.zig");
 const tls = @import("io/tls.zig");
 const http = @import("io/http.zig");
 const sigv4 = @import("io/sigv4.zig");
@@ -70,6 +71,16 @@ const meta_cache_mod = @import("io/meta_cache.zig");
 /// passthrough write case. The previous lambda code path used the
 /// same value (verified 2026-05-07 against the pre-rewrite numbers).
 const COALESCE_GAP: u64 = 64 * 1024;
+
+const S3Fetcher = s3_window.Fetcher(s3.Pool(POOL_SIZE));
+
+/// An aggregate's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set (tuning, tests), else from its memory budget.
+fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
+    if (env) |e| if (e.getPosix("ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
+        return @max(1, k) << 10;
+    } else |_| {};
+    return s3_window.windowFor(max_memory);
+}
 
 pub const POOL_SIZE: usize = 8;
 pub const TAIL_SIZE: u64 = 64 * 1024;
@@ -353,7 +364,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    needs.
     const prof = profile.threadOf(args.profiler, .main);
     const t_open = nowMonoNs();
-    var opened = try openInputs(ctx, arena, args);
+    var opened = try openInputs(ctx, arena, args, s3FetchWindow(ctx.env, args.max_memory));
     defer opened.deinit();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
@@ -1298,7 +1309,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const prof = profile.threadOf(args.profiler, .main);
     t.core.prof = prof;
     const t_open = nowMonoNs();
-    var opened = try openInputs(ctx, arena, args);
+    var opened = try openInputs(ctx, arena, args, null);
     defer opened.deinit();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
@@ -1891,9 +1902,15 @@ const OpenedInputs = struct {
     membership: membership.Stats = .{},
     /// `Context.exit_after`: the mappings go with the process.
     leave_mappings: bool = false,
+    /// Fetching S3 bytes into `s3_mapped` behind the scan's gates, when the query reads more than its window.
+    s3_fetcher: ?*S3Fetcher = null,
+    s3_mapped: []const []align(s3_window.page) u8 = &.{},
 
     pub fn deinit(self: *OpenedInputs) void {
         if (!self.leave_mappings) for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
+        // Joined before its buffers go: a batch may still be landing in them.
+        if (self.s3_fetcher) |f| f.stop();
+        for (self.s3_mapped) |buf| s3_window.unmapBuffer(buf);
         for (self.s3_buffers) |buf| self.gpa.free(buf);
         for (self.owned_pools) |p| {
             p.deinit();
@@ -1983,6 +2000,8 @@ fn openInputs(
     ctx: Context,
     arena: std.mem.Allocator,
     args: QueryArgs,
+    /// For an aggregate, the S3 bytes it may hold fetched at once (`s3_window.windowFor`); null fetches all up front.
+    fetch_window: ?u64,
 ) !OpenedInputs {
     const paths = args.inputs;
     const prof = profile.threadOf(args.profiler, .main);
@@ -2029,6 +2048,12 @@ fn openInputs(
     // On success the returned `OpenedInputs` owns them; until then, every way out frees them.
     errdefer for (owned_pools.items) |p| p.deinit();
     var s3_buffers: std.ArrayList([]u8) = .empty;
+    // Windowed fetches: the mapped file buffers, and the fetcher filling them (`io/s3_window.zig`).
+    var s3_mapped: std.ArrayList([]align(s3_window.page) u8) = .empty;
+    errdefer for (s3_mapped.items) |b| s3_window.unmapBuffer(b);
+    var s3_fetcher: ?*S3Fetcher = null;
+    var windowed = false;
+    const on_linux = @import("builtin").os.tag == .linux;
     var membership_stats: membership.Stats = .{};
     if (s3_indices.items.len > 0) {
         const creds = try credentialsFromEnv(ctx.env);
@@ -2082,7 +2107,8 @@ fn openInputs(
         errdefer if (!specs_returned) {
             for (specs) |*sp| {
                 sp.releaseTail(ctx.gpa);
-                if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
+                // A windowed buffer is mapped, and unmapped with `s3_mapped`.
+                if (sp.file_buf.len > 0 and !windowed) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
             }
         };
@@ -2119,16 +2145,39 @@ fn openInputs(
         // S3 inputs do NOT materialize a total_size-sized dense buffer.
         // Instead, merged source ranges are packed into a compact buffer
         // and the parsed metadata offsets are rebased to that layout.
+        // Over a window's worth of bytes, an aggregate fetches as its workers go (`io/s3_window.zig`): each row group's
+        // chunks get their own page-aligned stretch of the buffer, filled ahead of the workers and given back behind
+        // them. Under it (and off Linux), everything is fetched before the scan starts.
+        if (on_linux) if (fetch_window) |limit| {
+            var need: u64 = 0;
+            for (specs) |*sp| for (sp.meta.row_groups.items) |*rg| {
+                const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
+                for (cols, 0..) |needed, ci| {
+                    if (!needed or ci >= rg.columns.items.len) continue;
+                    const cm = rg.columns.items[ci].meta_data orelse continue;
+                    need += @intCast(cm.total_compressed_size);
+                }
+            };
+            windowed = need > limit;
+        };
+        var win_order: std.ArrayList(*s3_window.RowGroup) = .empty;
+        const win_files = try arena.alloc(s3_window.File, specs.len);
+
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
-        for (specs) |*sp| {
+        for (specs, win_files) |*sp, *wf| {
             // The tail serves the footer parse and the copies below; every way out of this iteration frees it, a file
             // whose row groups all prune included.
             defer sp.releaseTail(ctx.gpa);
             const meta = &sp.meta;
             sp.rg_columns = try arena.alloc(?[]const bool, meta.row_groups.items.len);
+            wf.* = .{ .rgs = try arena.alloc(?*s3_window.RowGroup, meta.row_groups.items.len) };
+            @memset(wf.rgs, null);
 
+            // Each row group's ranges, `ranges[rg_first[rg]..rg_first[rg + 1]]`.
             var ranges: std.ArrayList(coalescer.Range) = .empty;
-            for (meta.row_groups.items, sp.rg_columns) |*rg, *rg_cols| {
+            const rg_first = try arena.alloc(usize, meta.row_groups.items.len + 1);
+            for (meta.row_groups.items, sp.rg_columns, 0..) |*rg, *rg_cols, ri| {
+                rg_first[ri] = ranges.items.len;
                 rg_cols.* = plan.rowGroupColumns(rg, meta);
                 n_rgs += 1;
                 const cols = rg_cols.* orelse {
@@ -2162,57 +2211,115 @@ fn openInputs(
                     try ranges.append(arena, .{ .start = start, .end = end });
                 };
             }
+            rg_first[meta.row_groups.items.len] = ranges.items.len;
 
             if (ranges.items.len == 0) {
                 sp.file_buf = &.{};
                 continue;
             }
-            const merged = try coalescer.Coalescer.coalesce(arena, ranges.items, COALESCE_GAP);
-            n_ranges += ranges.items.len;
-            n_merged += merged.len;
+            // Windowed, coalescing stops at row group boundaries and each row group starts on a page of its own;
+            // otherwise ranges coalesce across the whole file.
+            var compact: std.ArrayList(CompactRange) = .empty;
             var compact_len: usize = 0;
-            sp.compact_ranges = try arena.alloc(CompactRange, merged.len);
-            for (merged, 0..) |r, ri| {
-                if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
-                const len: usize = @intCast(r.end - r.start);
-                sp.compact_ranges[ri] = .{
-                    .start = r.start,
-                    .end = r.end,
-                    .dst_start = compact_len,
-                };
-                compact_len += len;
+            const page = std.heap.pageSize();
+            // Per row group, `compact.items[rg_compact[rg]..rg_compact[rg + 1]]` (windowed only).
+            const rg_compact = try arena.alloc(usize, meta.row_groups.items.len + 1);
+            for (0..meta.row_groups.items.len + 1) |ri| {
+                if (windowed) rg_compact[ri] = compact.items.len;
+                if (ri == meta.row_groups.items.len) break;
+                if (!windowed and ri > 0) continue;
+                const span = if (windowed) ranges.items[rg_first[ri]..rg_first[ri + 1]] else ranges.items;
+                if (span.len == 0) continue;
+                const merged = try coalescer.Coalescer.coalesce(arena, span, COALESCE_GAP);
+                n_ranges += span.len;
+                n_merged += merged.len;
+                if (windowed) compact_len = std.mem.alignForward(usize, compact_len, page);
+                for (merged) |r| {
+                    if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
+                    try compact.append(arena, .{ .start = r.start, .end = r.end, .dst_start = compact_len });
+                    compact_len += @intCast(r.end - r.start);
+                }
             }
-            sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
+            sp.compact_ranges = compact.items;
+            if (windowed) {
+                const buf = try s3_window.mapBuffer(compact_len);
+                errdefer s3_window.unmapBuffer(buf);
+                try s3_mapped.append(arena, buf);
+                sp.file_buf = buf[0..compact_len];
+            } else sp.file_buf = try ctx.gpa.alloc(u8, compact_len);
             try rebaseFetchedOffsets(&sp.meta, plan.columns(), sp.compact_ranges, sp.rg_columns);
 
-            for (sp.compact_ranges) |r| {
-                const source_len: usize = @intCast(r.end - r.start);
-                const dst = sp.file_buf[r.dst_start .. r.dst_start + source_len];
+            for (0..meta.row_groups.items.len) |ri| {
+                if (!windowed and ri > 0) break;
+                const span = if (windowed) sp.compact_ranges[rg_compact[ri]..rg_compact[ri + 1]] else sp.compact_ranges;
+                if (span.len == 0) continue;
+                var rg_jobs: std.ArrayList(s3.FetchJob) = .empty;
+                var rg_bytes: u64 = 0;
+                for (span) |r| {
+                    const source_len: usize = @intCast(r.end - r.start);
+                    const dst = sp.file_buf[r.dst_start .. r.dst_start + source_len];
 
-                const fetch_end = @min(r.end, sp.tail_start);
-                if (r.start < fetch_end) {
-                    try fetch_jobs.append(arena, .{
-                        .bucket = sp.url.bucket,
-                        .key = sp.url.key,
-                        .range = .{ .start = r.start, .end = fetch_end },
-                        .target = dst[0..@intCast(fetch_end - r.start)],
-                    });
-                }
+                    const fetch_end = @min(r.end, sp.tail_start);
+                    if (r.start < fetch_end) {
+                        const job: s3.FetchJob = .{
+                            .bucket = sp.url.bucket,
+                            .key = sp.url.key,
+                            .range = .{ .start = r.start, .end = fetch_end },
+                            .target = dst[0..@intCast(fetch_end - r.start)],
+                        };
+                        rg_bytes += job.target.len;
+                        try (if (windowed) &rg_jobs else &fetch_jobs).append(arena, job);
+                    }
 
-                if (r.end > sp.tail_start) {
-                    const tail_copy_start = @max(r.start, sp.tail_start);
-                    const dst_off: usize = @intCast(tail_copy_start - r.start);
-                    const tail_off: usize = @intCast(tail_copy_start - sp.tail_start);
-                    const copy_len: usize = @intCast(r.end - tail_copy_start);
-                    if (tail_off + copy_len > sp.tail.len) return error.BadResponse;
-                    @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
+                    if (r.end > sp.tail_start) {
+                        const tail_copy_start = @max(r.start, sp.tail_start);
+                        const dst_off: usize = @intCast(tail_copy_start - r.start);
+                        const tail_off: usize = @intCast(tail_copy_start - sp.tail_start);
+                        const copy_len: usize = @intCast(r.end - tail_copy_start);
+                        if (tail_off + copy_len > sp.tail.len) return error.BadResponse;
+                        @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
+                    }
                 }
+                if (!windowed or rg_bytes == 0) continue;
+                // The row group's pages: from its page-aligned start to the next row group's.
+                const seg_start = span[0].dst_start;
+                const last = span[span.len - 1];
+                const seg_end = @min(
+                    std.mem.alignForward(usize, last.dst_start + @as(usize, @intCast(last.end - last.start)), page),
+                    s3_mapped.items[s3_mapped.items.len - 1].len,
+                );
+                const wrg = try arena.create(s3_window.RowGroup);
+                wrg.* = .{
+                    .jobs = rg_jobs.items,
+                    .bytes = rg_bytes,
+                    .seg = @alignCast(s3_mapped.items[s3_mapped.items.len - 1][seg_start..seg_end]),
+                };
+                wf.rgs[ri] = wrg;
+                try win_order.append(arena, wrg);
             }
+        }
+        if (windowed) {
+            const f = try arena.create(S3Fetcher);
+            f.* = .{
+                .window = .{
+                    .gpa = ctx.gpa,
+                    .order = win_order.items,
+                    .limit = fetch_window.?,
+                    .batch = @max(1, fetch_window.? / 4),
+                },
+                .pool = pool,
+                .creds = creds,
+                .workers = READ_CONCURRENCY,
+                .profiler = args.profiler,
+                .executor = readExecutor,
+            };
+            s3_fetcher = f;
         }
 
         if (plan_span.t != null) {
             var fetch_bytes: u64 = 0;
             for (fetch_jobs.items) |j| fetch_bytes += j.target.len;
+            for (win_order.items) |rg| fetch_bytes += rg.bytes;
             plan_span.end(.plan_ranges, profile.args(.{
                 n_ranges, n_merged, fetch_jobs.items.len, fetch_bytes, n_rgs, n_rgs_pruned,
             }));
@@ -2243,13 +2350,15 @@ fn openInputs(
                 .name = paths[orig_idx],
                 .bytes = specs[k].file_buf,
                 .logical_size = specs[k].total_size,
+                .gate = if (s3_fetcher != null) win_files[k].gate() else null,
             };
-            if (specs[k].file_buf.len > 0) try s3_buffers.append(arena, specs[k].file_buf);
+            if (specs[k].file_buf.len > 0 and s3_fetcher == null) try s3_buffers.append(arena, specs[k].file_buf);
             if (specs[k].footer_region.len > 0) try s3_buffers.append(arena, specs[k].footer_region);
             metas[orig_idx] = specs[k].meta;
             meta_ready[orig_idx] = true;
         }
         specs_returned = true;
+        if (s3_fetcher) |f| try f.start();
     }
 
     return .{
@@ -2263,6 +2372,8 @@ fn openInputs(
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
         .membership = membership_stats,
         .leave_mappings = ctx.exit_after,
+        .s3_fetcher = s3_fetcher,
+        .s3_mapped = try s3_mapped.toOwnedSlice(arena),
     };
 }
 
@@ -3550,7 +3661,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     if (args.select != null and args.columns != null) return error.AggregateMutexWithSelect;
 
     const open_span = profile.Span.begin(prof);
-    var opened = try openInputs(ctx, arena, args);
+    var opened = try openInputs(ctx, arena, args, null);
     defer opened.deinit();
     open_span.end(.open_inputs, profile.args(.{args.inputs.len}));
 
@@ -4529,4 +4640,111 @@ test "regression: releaseTail keeps aliased warm footer ownership and clears col
     try std.testing.expectEqual(@as(usize, 0), cold.tail.len);
     try std.testing.expectEqual(@as(u8, 42), footer[0]);
     cold.releaseTail(a);
+}
+
+// ── Windowed S3 fetch ──
+
+const fake_s3 = @import("io/fake_s3.zig");
+
+/// An aggregate over `keys` served by `fake`, fetched within `window_kib` (null: the window from the memory budget,
+/// here larger than the files, so fetched up front). Returns the answer as JSON text, for comparing across runs.
+fn fakeS3AggregateJson(
+    gpa: std.mem.Allocator,
+    fake: *fake_s3.FakeS3,
+    keys: []const []const u8,
+    args: QueryArgs,
+    window_kib: ?u32,
+) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var lines: std.ArrayList(?[*:0]const u8) = .empty;
+    try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
+    try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
+    if (window_kib) |k| try lines.append(a, try std.fmt.allocPrintSentinel(a, "ZPQ_S3_WINDOW_KIB={d}", .{k}, 0));
+    const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+    @memcpy(block, lines.items);
+    const urls = try a.alloc([]const u8, keys.len);
+    for (keys, urls) |k, *u| u.* = try std.fmt.allocPrint(a, "s3://bkt/{s}", .{k});
+    var q = args;
+    q.inputs = urls;
+    var res = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io }, q);
+    defer res.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const out = res.aggregate.output;
+    for (out.aggs) |item| {
+        try aw.writer.print("{s}=", .{item.alias});
+        try writeAggValueJson(&aw.writer, item.value);
+        try aw.writer.writeByte(';');
+    }
+    for (out.group_rows orelse &.{}) |row| {
+        for (row) |v| {
+            try writeAggValueJson(&aw.writer, v);
+            try aw.writer.writeByte(',');
+        }
+        try aw.writer.writeByte(';');
+    }
+    return aw.toOwnedSlice();
+}
+
+test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatever the window" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // 24 row groups of about 5 KiB: the first dozen lie before the 64 KiB footer tail, so they are really fetched.
+    const fixture = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/a.parquet", bytes);
+    try fake.serveBytes("t/b.parquet", bytes);
+    const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
+    const queries = [_]QueryArgs{
+        .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s, min(k) AS m, avg(x) AS a, max(x) AS x" },
+        .{
+            .inputs = &.{},
+            .aggregate = "sum(i * 2) AS p, count(*) AS n",
+            .filter = "i >= 300 AND i < 400",
+            .parallelism = 3,
+        },
+        .{ .inputs = &.{}, .aggregate = "sum(x) AS s, count(i) AS c", .group_by = "k", .parallelism = 3 },
+        // A filter that prunes row groups: a pruned row group is never fetched, and its gate never waits.
+        .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .filter = "i > 450" },
+    };
+    for (queries) |q| {
+        const whole = try fakeS3AggregateJson(gpa, &fake, &keys, q, null);
+        defer gpa.free(whole);
+        // 1 KiB is smaller than any row group, so each goes alone; 12 KiB takes a few at a time.
+        for ([_]u32{ 1, 12 }) |kib| {
+            const gets_before = fake.gets;
+            const windowed = try fakeS3AggregateJson(gpa, &fake, &keys, q, kib);
+            defer gpa.free(windowed);
+            // Past the two footer tails: row groups were fetched through the window, not served from the tails.
+            if (q.filter == null) try std.testing.expect(fake.gets - gets_before > keys.len);
+            std.testing.expectEqualStrings(whole, windowed) catch |err| {
+                std.debug.print("window {d} KiB, aggregate {s}\n", .{ kib, q.aggregate.? });
+                return err;
+            };
+        }
+    }
+}
+
+test "a windowed S3 fetch that fails mid-scan fails the query rather than hanging it" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/a.parquet", bytes);
+    try fake.serveBytes("t/b.parquet", bytes);
+    // The footer tails (a GET per file) and a few row groups go through; the rest are refused.
+    fake.gets_allowed = 5;
+    const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
+    const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .parallelism = 2 };
+    try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJson(gpa, &fake, &keys, q, 1));
 }

@@ -70,6 +70,11 @@
 
 ### Fixes
 
+- An aggregate over S3 no longer holds every byte it reads at once, which ran a 6.7 GB full scan out of memory on a
+  3008 MB Lambda. Past a window of a quarter of `--max-memory` (64 MiB to 1 GiB; `ZPQ_S3_WINDOW_KIB` overrides it),
+  row groups are fetched ahead of the scan workers and their memory handed back as each is done (Linux; elsewhere the
+  fetch is still up front). The default `--max-memory` also honours a cgroup v2 memory limit, as it already did a
+  Lambda's memory size.
 - Corrupted GZIP pages are rejected instead of returning wrong values. Each gzip member's CRC-32 and length are now
   checked; before, decoding stopped once a page's bytes were out and never read the member's trailer.
 - A `--trust-stats` float `min` / `max` of zero decodes the chunk rather than taking its sign from bounds, since writers

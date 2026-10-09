@@ -1,8 +1,8 @@
-//! In-process, plain-HTTP, path-style S3 stand-in for unit tests of the write path. Serves CreateMultipartUpload,
-//! UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, HEAD and single-object PUT from
-//! memory, one thread per connection. `drop` makes it lose the response to one matching request, the way a response
-//! lost on the network looks to the client: the server applies the request (or, with `apply_dropped = false`, does
-//! not) and then resets the connection without sending a byte.
+//! In-process, plain-HTTP, path-style S3 stand-in for unit tests. Serves CreateMultipartUpload, UploadPart,
+//! CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, HEAD and single-object PUT from memory, and
+//! ranged GETs of objects a test registers with `serveBytes`, one thread per connection. `drop` makes it lose the
+//! response to one matching request, the way a response lost on the network looks to the client: the server applies
+//! the request (or, with `apply_dropped = false`, does not) and then resets the connection without sending a byte.
 //!
 //! Test-only: imported from tests, never from the engine.
 
@@ -19,7 +19,13 @@ pub const Upload = struct {
 
 pub const Part = struct { number: u32, md5: [Md5.digest_length]u8 };
 
-pub const Object = struct { key: []u8, etag: []u8, len: usize };
+pub const Object = struct {
+    key: []u8,
+    etag: []u8,
+    len: usize,
+    /// The bytes a GET reads, borrowed from the test (`serveBytes`); null for objects only written.
+    data: ?[]const u8 = null,
+};
 
 pub const FakeS3 = struct {
     const MAX_CONNS = 64;
@@ -43,6 +49,9 @@ pub const FakeS3 = struct {
     drop: ?[]const u8 = null,
     apply_dropped: bool = true,
     dropped: u32 = 0,
+    /// When set, object GETs past this many are refused (403), as a revoked credential or a deleted object would be.
+    gets_allowed: ?u32 = null,
+    gets: u32 = 0,
 
     pub fn start(self: *FakeS3, allocator: std.mem.Allocator) !void {
         var stop: [2]posix.fd_t = undefined;
@@ -114,6 +123,16 @@ pub const FakeS3 = struct {
             if (std.mem.eql(u8, u.key, key)) n += 1;
         }
         return n;
+    }
+
+    /// Serve `data` (borrowed; it must outlive the server) as object `key` to GETs.
+    pub fn serveBytes(self: *FakeS3, key: []const u8, data: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+        try self.putObject(key, try std.fmt.allocPrint(self.allocator, "etag-{d}", .{data.len}), data.len);
+        for (self.objects.items) |*o| if (std.mem.eql(u8, o.key, key)) {
+            o.data = data;
+        };
     }
 
     pub fn object(self: *FakeS3, key: []const u8) ?Object {
@@ -270,6 +289,40 @@ pub const FakeS3 = struct {
             }
             try out.appendSlice(a, "</ListMultipartUploadsResult>");
             resp_body = out.items;
+        } else if (std.mem.eql(u8, method, "GET")) {
+            var found: ?Object = null;
+            for (self.objects.items) |o| if (std.mem.eql(u8, o.key, key)) {
+                found = o;
+            };
+            const o = found orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchKey</Code></Error>", null);
+            self.gets += 1;
+            if (self.gets_allowed) |n| if (self.gets > n) {
+                return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
+            };
+            const no_key = "<Error><Code>NoSuchKey</Code></Error>";
+            const data = o.data orelse return self.reply(fd, lose, 404, "", no_key, null);
+            var lo: usize = 0;
+            var hi: usize = data.len; // exclusive
+            if (header(head, "Range")) |r| if (std.mem.startsWith(u8, r, "bytes=")) {
+                const spec = r["bytes=".len..];
+                const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return false;
+                if (dash == 0) {
+                    const n = try std.fmt.parseInt(usize, spec[1..], 10);
+                    lo = data.len -| n;
+                } else {
+                    lo = try std.fmt.parseInt(usize, spec[0..dash], 10);
+                    if (dash + 1 < spec.len) {
+                        hi = @min(data.len, try std.fmt.parseInt(usize, spec[dash + 1 ..], 10) + 1);
+                    }
+                }
+                status = 206;
+                extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\nContent-Range: bytes {d}-{d}/{d}\r\n", .{
+                    o.etag, lo, hi -| 1, data.len,
+                });
+            };
+            if (lo > hi) return self.reply(fd, lose, 416, "", "", null);
+            if (status == 200) extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag});
+            resp_body = data[lo..hi];
         } else if (std.mem.eql(u8, method, "HEAD")) {
             var found: ?Object = null;
             for (self.objects.items) |o| if (std.mem.eql(u8, o.key, key)) {
@@ -360,6 +413,17 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
         if (posix.errno(r) != .SUCCESS or r == 0) return error.WriteFailed;
         off += @intCast(r);
     }
+}
+
+/// The value of header `name` (case-insensitive), trimmed.
+fn header(head: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |l| {
+        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(l[0..colon], name)) return std.mem.trim(u8, l[colon + 1 ..], " ");
+    }
+    return null;
 }
 
 fn contentLength(head: []const u8) usize {

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 /// Discover available system memory in bytes, returning:
 /// - 75% of AWS Lambda memory if running in a Lambda container.
-/// - 80% of MemAvailable (from /proc/meminfo) or freeram on Linux.
+/// - 80% of MemAvailable (from /proc/meminfo) or freeram on Linux, and no more than 75% of a cgroup v2 memory limit.
 /// - 50% of total physical memory (via sysctl) on macOS.
 /// - 512 MB fallback on other platforms or on failure.
 pub fn discoverAvailableMemory(env: ?std.process.Environ) usize {
@@ -194,13 +194,41 @@ test "window capacity keeps byte budget authoritative over worker count" {
 }
 
 fn linuxDiscover() usize {
-    if (readLinuxMeminfo()) |mem| {
-        return mem * 8 / 10; // 80% of MemAvailable
+    const host: usize = if (readLinuxMeminfo()) |mem|
+        mem * 8 / 10 // 80% of MemAvailable
+    else if (queryLinuxSysinfo()) |mem|
+        mem * 8 / 10 // 80% of free ram
+    else
+        512 * 1024 * 1024;
+    // A container or `systemd-run -p MemoryMax=` caps the process below what the host has free: budget for the cap,
+    // with the same headroom a Lambda tier gets.
+    const cap = cgroupMemoryLimit() orelse return host;
+    return @min(host, cap * 3 / 4);
+}
+
+/// The tightest cgroup v2 `memory.max` over this process's cgroup and its ancestors, or null when none is set.
+fn cgroupMemoryLimit() ?usize {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [4096]u8 = undefined;
+    const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse return null;
+    var lines = std.mem.tokenizeScalar(u8, self_cgroup, '\n');
+    const rel = while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) break line[3..];
+    } else return null;
+    var best: ?usize = null;
+    var dir = std.mem.trimEnd(u8, rel, "/");
+    while (true) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup{s}/memory.max", .{dir}, 0) catch break;
+        var file_buf: [64]u8 = undefined;
+        if (readSmallFile(path, &file_buf)) |text| {
+            const n = std.fmt.parseInt(usize, std.mem.trim(u8, text, " \n"), 10) catch null;
+            if (n) |v| best = @min(best orelse v, v);
+        }
+        if (dir.len == 0) break;
+        dir = dir[0 .. std.mem.lastIndexOfScalar(u8, dir, '/') orelse 0];
     }
-    if (queryLinuxSysinfo()) |mem| {
-        return mem * 8 / 10; // 80% of free ram
-    }
-    return 512 * 1024 * 1024;
+    return best;
 }
 
 fn readLinuxMeminfo() ?usize {

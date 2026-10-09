@@ -92,12 +92,27 @@ test "runTree runs every context once, and only a started subtree when spawns fa
     try std.testing.expect(runTree(Ctx, &ctxs, .{}, Ctx.bump));
     for (ctxs) |c| try std.testing.expectEqual(@as(usize, 1), c.runs);
 
-    // Three spawns succeed: the root and its two children; their children fail, so nodes 3.. never run.
-    injectFailureAfter(3);
+    // One spawn succeeds: the root, whose children both fail, so it runs alone.
+    injectFailureAfter(1);
     defer resetFailure();
+    var root_only: [13]Ctx = @splat(.{});
+    try std.testing.expect(runTree(Ctx, &root_only, .{}, Ctx.bump));
+    for (root_only, 0..) |c, i| try std.testing.expectEqual(@as(usize, @intFromBool(i == 0)), c.runs);
+    try std.testing.expect(failuresInjected() > 0);
+
+    // Three spawns succeed: the root, then two of the nodes racing to start below it. Which two depends on timing
+    // (node 1 may start node 3 before the root starts node 2), so check what holds either way: three nodes ran, once
+    // each, and each one's parent ran too.
+    injectFailureAfter(3);
     var some: [13]Ctx = @splat(.{});
     try std.testing.expect(runTree(Ctx, &some, .{}, Ctx.bump));
-    for (some, 0..) |c, i| try std.testing.expectEqual(@as(usize, @intFromBool(i < 3)), c.runs);
+    var ran: usize = 0;
+    for (some, 0..) |c, i| {
+        try std.testing.expect(c.runs <= 1);
+        ran += c.runs;
+        if (c.runs == 1 and i > 0) try std.testing.expectEqual(@as(usize, 1), some[(i - 1) / 2].runs);
+    }
+    try std.testing.expectEqual(@as(usize, 3), ran);
     try std.testing.expect(failuresInjected() > 0);
 
     injectFailureAfter(0);

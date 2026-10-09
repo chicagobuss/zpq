@@ -746,6 +746,16 @@ pub const SliceReader = struct {
         self.scratch.deinit();
     }
 
+    /// Whether leaf `ci` has a sliced form (what `init` returns non-null for).
+    pub fn supports(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) bool {
+        const cm = rg.columns.items[ci].meta_data orelse return false;
+        if (meta.getColumnLevels(cm.path_in_schema.items).max_rep > 0) return false;
+        if (cm.type == .INT96) return false;
+        const se = meta.getColumnSchema(cm.path_in_schema.items);
+        const dec = if (se) |e| decimal_mod.kindFromSchema(&e) != null else false;
+        return !(dec and cm.type == .FIXED_LEN_BYTE_ARRAY);
+    }
+
     /// The next `n` rows (fewer only at the chunk's end), on `a`.
     pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
         const n = @min(n_want, self.left);
@@ -3355,6 +3365,48 @@ fn recompressChunk(
     return .{ .bytes = out.items, .pages = pages.items, .header_delta = header_delta };
 }
 
+/// `recompressChunk`, each page written to `out` as soon as it is recoded rather than gathered: the result's `bytes`
+/// is empty, its `pages` place what was written. `arena` holds the page moves; each page's own memory is released
+/// before the next.
+fn recompressChunkTo(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    chunk: []const u8,
+    from: schema.CompressionCodec,
+    to: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    out: *streaming.SinkOut,
+    timings: *Timings,
+) !RecompressedChunk {
+    var pages: std.ArrayList(PageMove) = .empty;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(scratch);
+    var header_delta: i64 = 0;
+    var pos: usize = 0;
+    var dst: usize = 0;
+    while (pos < chunk.len) {
+        var page_arena = std.heap.ArenaAllocator.init(scratch);
+        defer page_arena.deinit();
+        const pa = page_arena.allocator();
+        var r = thrift.Reader.init(chunk[pos..]);
+        const h = try schema.PageHeader.read(&r);
+        const hdr_len = r.pos;
+        if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return error.BadPageHeader;
+        const body_len: usize = @intCast(h.compressed_page_size);
+        if (body_len > chunk.len - pos - hdr_len) return error.TruncatedPage;
+        const body = chunk[pos + hdr_len ..][0..body_len];
+        const new_body = try recodePage(pa, scratch, &raw, &h, body, from, to, zstd);
+        const new_hdr = try patchPageHeader(pa, chunk[pos..][0..hdr_len], @intCast(new_body.len));
+        try pages.append(arena, .{ .src_off = pos, .dst_off = dst, .dst_len = new_hdr.len + new_body.len });
+        try timedWrite(out, new_hdr, timings);
+        try timedWrite(out, new_body, timings);
+        dst += new_hdr.len + new_body.len;
+        header_delta += @as(i64, @intCast(new_hdr.len)) - @as(i64, @intCast(hdr_len));
+        pos += hdr_len + body_len;
+    }
+    return .{ .bytes = &.{}, .pages = pages.items, .header_delta = header_delta };
+}
+
 /// A page's body in codec `to`: a v1 data or dictionary page recompressed whole, a compressed v2 page's values section
 /// (its levels are never compressed), anything else as it is.
 fn recodePage(
@@ -3670,7 +3722,10 @@ fn movedPage(pages: []const PageMove, src_rel: i64) ?PageMove {
 fn relocated(re: RecompressedChunk, src_rel: i64) usize {
     if (movedPage(re.pages, src_rel)) |p| return p.dst_off;
     for (re.pages) |p| if (@as(i64, @intCast(p.src_off)) >= src_rel) return p.dst_off;
-    return re.bytes.len;
+    // The end: past the last page (`bytes` is empty when the pages went straight to the sink).
+    if (re.pages.len == 0) return re.bytes.len;
+    const last = re.pages[re.pages.len - 1];
+    return last.dst_off + last.dst_len;
 }
 
 /// Byte-copy path for a chunk whose codec differs from the requested one:
@@ -3695,18 +3750,21 @@ fn copyChunkRecompressed(
     const scratch = scratch_state.allocator();
     const m = src_chunk.meta_data.?;
 
-    const re = if (precomputed) |p| p else blk: {
+    const new_start: i64 = @intCast(out.pos());
+    const re = if (precomputed) |p| blk: {
+        try timedWrite(out, p.bytes, timings);
+        break :blk p;
+    } else blk: {
+        // Page by page into the sink: a codec that expands (to UNCOMPRESSED, say) never holds more than a page.
         const t_encode = nowMonoNs();
-        const r = recompressChunk(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd) catch |err|
+        const r = recompressChunkTo(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd, out, timings) catch |err|
             return reportRecompressError(err, m, rc.codec);
         const t_encode_end = nowMonoNs();
         timings.encode_ns += @intCast(t_encode_end - t_encode);
         profile.record(timings.prof, .encode, t_encode, t_encode_end, profile.args(.{ 1, m.num_values }));
         break :blk r;
     };
-
-    const new_start: i64 = @intCast(out.pos());
-    try timedWrite(out, re.bytes, timings);
+    const written: usize = @intCast(@as(i64, @intCast(out.pos())) - new_start);
 
     const src_base: i64 = @intCast(src_start);
     var chunk = src_chunk;
@@ -3717,7 +3775,7 @@ fn copyChunkRecompressed(
     meta.bloom_filter_offset = null;
     meta.bloom_filter_length = null;
     meta.codec = rc.codec;
-    meta.total_compressed_size = @intCast(re.bytes.len);
+    meta.total_compressed_size = @intCast(written);
     meta.total_uncompressed_size += re.header_delta;
     meta.data_page_offset = new_start + @as(i64, @intCast(relocated(re, m.data_page_offset - src_base)));
     if (m.dictionary_page_offset) |d| {

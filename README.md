@@ -87,6 +87,9 @@ copy), over S3 and locally alike, so a scan larger than memory completes:
   output row group per slice); one whose columns have no sliced form (nested, INT96, FIXED_LEN_BYTE_ARRAY DECIMAL)
   aggregates one aggregate's columns at a time, and is refused (`RowGroupTooLarge`) rather than run out of memory when
   even that cannot fit.
+- **Output:** a write holds at most a quarter of it encoded and waiting. A row group whose rewrite could take more (a
+  codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
+  turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
 It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default is 80%
 of available memory, three quarters of a cgroup's memory limit or a Lambda's memory size where those are lower.

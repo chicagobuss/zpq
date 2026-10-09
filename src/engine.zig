@@ -600,9 +600,9 @@ fn skipRowGroup(in: scan.Input, rg: usize) void {
 const EncodedRG = struct {
     bytes: []u8 = &.{}, // encoded RG bytes (gpa-owned; writer frees after sink.write)
     rg: ?schema.RowGroup = null, // footer meta, offsets relative to 0 (meta_arena-owned)
-    /// Output row groups after `rg` in `bytes`, offsets also relative to 0: a source row group too big to decode at
-    /// once is written a slice of rows at a time (`encodeRGSliced`).
-    more: []const schema.RowGroup = &.{},
+    /// Too big for a producer to decode at once: the writer re-encodes it a slice at a time straight into the sink in
+    /// its turn (`encodeRGSliced`), and releases its input after.
+    deferred: bool = false,
     surviving: i64 = 0,
     err: ?anyerror = null,
     /// The producer's decode/eval/encode time for this row group, summed by the writer.
@@ -793,13 +793,15 @@ fn winProducer(w: *WinCtx, i: usize) void {
         break :blk &spare.?;
     };
     defer regions.busy.store(false, .release);
-    defer w.jobs[i].leave();
     const enc = produceRG(w, i, ma, regions, prof) catch |e| {
+        w.jobs[i].leave();
         w.slots[i].enc = .{ .err = e };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
         return;
     };
+    // A deferred row group's input is the writer's to release.
+    if (!enc.deferred) w.jobs[i].leave();
     profile.gauge(prof, .buffered_bytes, @intCast(enc.bytes.len));
     const now = w.inflight.fetchAdd(enc.bytes.len, .acq_rel) + enc.bytes.len;
     var p = w.peak_bytes.load(.monotonic);
@@ -815,21 +817,7 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
     try job.arrive();
     if (job.passthrough) return copyRGToBuffer(w.gpa, ma, job, w.kept_set, prof, w.bloom_leaves);
     const bloom: consumer.BloomWrite = .{ .fpp = w.bloom_outputs };
-    const sliced = try encodeRGSliced(
-        w.gpa,
-        ma,
-        job,
-        w.filter,
-        w.fetch_arr,
-        w.output_specs,
-        w.codec,
-        w.zstd,
-        w.decode_options,
-        prof,
-        bloom,
-        w.decode_share,
-    );
-    if (sliced) |e| return e;
+    if (sliceRG(job, w.fetch_arr, w.decode_share)) return .{ .deferred = true };
     return encodeRGToBuffer(
         w.gpa,
         ma,
@@ -846,62 +834,67 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
     );
 }
 
-/// Re-encode `job`'s row group a slice of rows at a time, one output row group per slice, when its decoded columns
-/// would take more than `share`: each slice decodes (`consumer.SliceReader`), filters and encodes on memory of its own,
-/// so the producer holds a slice rather than the row group. Null when it fits, or has a column with no sliced form.
-fn encodeRGSliced(
-    gpa: std.mem.Allocator,
-    meta_alloc: std.mem.Allocator,
-    job: RGJob,
-    filter: ?filter_ast.Filter,
-    fetch_arr: []const bool,
-    output_specs: []const consumer.OutputCol,
-    codec: schema.CompressionCodec,
-    zstd: compression.ZstdPlan,
-    decode_options: consumer.DecodeOptions,
-    prof: ?*profile.Thread,
-    bloom: consumer.BloomWrite,
-    share: usize,
-) !?EncodedRG {
+/// Whether `job`'s row group is re-encoded a slice of rows at a time (`encodeRGSliced`): its decoded columns would take
+/// more than `share`, and each of them has a sliced form.
+fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) bool {
+    const rg = job.rg;
+    if (rg.num_rows <= 0) return false;
+    // Decoded, then buffered for the encoder, then encoded.
+    const est = consumer.decodeEstimate(.{
+        .rg = rg,
+        .meta = job.meta,
+        .src = .{ .bytes = job.bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = fetch_arr,
+        .consumed = fetch_arr,
+    }, fetch_arr, &.{}, false) * 3;
+    if (est <= share) return false;
+    for (fetch_arr, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        if (!consumer.SliceReader.supports(rg, job.meta, ci)) return false;
+    }
+    return true;
+}
+
+/// Re-encode `job`'s row group a slice of rows at a time, one output row group per slice, straight into the writer's
+/// sink: each slice decodes (`consumer.SliceReader`), filters and encodes on memory of its own, so neither the decoded
+/// rows nor the output are ever held whole. Runs on the writer, in the row group's turn; returns the rows written.
+fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
+    const gpa = w.gpa;
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
     const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
-    // Decoded, then buffered for the encoder, then encoded.
     const est = consumer.decodeEstimate(.{
         .rg = rg,
         .meta = job.meta,
         .src = src,
         .filter = null,
-        .read = fetch_arr,
-        .consumed = fetch_arr,
-    }, fetch_arr, &.{}, false) * 3;
-    if (est <= share or num_rows == 0) return null;
+        .read = w.fetch_arr,
+        .consumed = w.fetch_arr,
+    }, w.fetch_arr, &.{}, false) * 3;
 
     var pages = std.heap.ArenaAllocator.init(gpa);
     defer pages.deinit();
     var readers: std.ArrayList(consumer.SliceReader) = .empty;
     defer for (readers.items) |*r| r.deinit();
-    const lookup = try pages.allocator().alloc(?usize, fetch_arr.len);
+    const lookup = try pages.allocator().alloc(?usize, w.fetch_arr.len);
     @memset(lookup, null);
-    for (fetch_arr, 0..) |needed, ci| {
+    for (w.fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
-        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, job.meta, src, ci, decode_options) orelse
-            return null;
+        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, job.meta, src, ci, w.decode_options) orelse
+            return error.UnsupportedColumnType; // `sliceRG` checked every column
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }
     const per_row = @max(1, est / num_rows);
-    const slice_rows = std.math.clamp(share / per_row, @min(4096, num_rows), num_rows);
+    const slice_rows = std.math.clamp(w.decode_share / per_row, @min(4096, num_rows), num_rows);
 
-    var advisor: huge_pages.HugePageAdvisor = .{ .child = gpa };
-    const out_gpa = advisor.allocator();
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(out_gpa);
-    var bufsink = BufSink{ .buf = &buf, .gpa = out_gpa };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
-    var local_off: u64 = 0;
     var timings: consumer.Timings = .{ .prof = prof };
-    var rgs: std.ArrayList(schema.RowGroup) = .empty;
+    defer {
+        w.core.decode_ns += timings.decode_ns;
+        w.core.eval_ns += timings.eval_ns;
+        w.core.encode_ns += timings.encode_ns;
+    }
     var surviving: i64 = 0;
     var done: usize = 0;
     while (done < num_rows) {
@@ -914,28 +907,25 @@ fn encodeRGSliced(
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
         var sel = try filter_selection.SelectionVector.init(sa, n);
-        if (filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
-        var agg = try consumer.initOutputAggregator(sa, job.meta, output_specs);
-        _ = try consumer.appendSliceRows(&agg, &batch, lookup, &sel, output_specs, sa);
+        if (w.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        var agg = try consumer.initOutputAggregator(sa, job.meta, w.output_specs);
+        _ = try consumer.appendSliceRows(&agg, &batch, lookup, &sel, w.output_specs, sa);
         if (agg.num_rows == 0) continue;
         var rg_enc: consumer.RGEncoder = .{
-            .out_arena = meta_alloc,
-            .sink = sink,
-            .out_offset = &local_off,
-            .codec = codec,
-            .zstd = zstd,
-            .bloom_write = bloom,
+            .out_arena = w.arena,
+            .sink = w.sink,
+            .out_offset = &w.out_offset,
+            .codec = w.codec,
+            .zstd = w.zstd,
+            .bloom_write = .{ .fpp = w.bloom_outputs },
             .timings = &timings,
         };
-        for (0..output_specs.len) |i| try rg_enc.column(&agg, i, sa);
+        for (0..w.output_specs.len) |i| try rg_enc.column(&agg, i, sa);
         const out = rg_enc.finish(agg.num_rows);
-        try rgs.append(meta_alloc, out.rg.?);
+        try w.new_row_groups.append(w.arena, out.rg.?);
         surviving += out.surviving_rows;
     }
-    timings.prof = null;
-    const owned = try buf.toOwnedSlice(out_gpa);
-    if (rgs.items.len == 0) return .{ .bytes = owned, .rg = null, .surviving = 0, .timings = timings };
-    return .{ .bytes = owned, .rg = rgs.items[0], .more = rgs.items[1..], .surviving = surviving, .timings = timings };
+    return surviving;
 }
 
 /// In-order writer: drains slots 0..N, rebasing offsets, writing to the sink,
@@ -951,17 +941,21 @@ fn winWriter(w: *WinCtx) void {
         w.core.encode_ns += enc.timings.encode_ns;
         if (enc.err) |e| {
             if (w.first_err == null) w.first_err = e;
+        } else if (enc.deferred) {
+            defer w.jobs[next].leave();
+            if (w.first_err == null) {
+                const before = w.new_row_groups.items.len;
+                const kept = encodeRGSliced(w, w.jobs[next], prof) catch |e| blk: {
+                    w.first_err = e;
+                    break :blk 0;
+                };
+                w.rows_kept += kept;
+                w.rgs_kept += w.new_row_groups.items.len - before;
+            }
         } else if (enc.rg) |rg| {
             if (enc.surviving > 0) {
                 var rgm = rg;
                 consumer.rebaseRowGroupOffsets(&rgm, @intCast(w.out_offset));
-                for (enc.more) |extra| {
-                    var m = extra;
-                    consumer.rebaseRowGroupOffsets(&m, @intCast(w.out_offset));
-                    w.new_row_groups.append(w.arena, m) catch |e| {
-                        if (w.first_err == null) w.first_err = e;
-                    };
-                }
                 const t0 = nowMonoNs();
                 w.sink.write(enc.bytes) catch |e| {
                     if (w.first_err == null) w.first_err = e;
@@ -971,9 +965,8 @@ fn winWriter(w: *WinCtx) void {
                 profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.bytes.len}));
                 w.out_offset += enc.bytes.len;
                 w.rows_kept += enc.surviving;
-                w.rgs_kept += 1 + enc.more.len;
-                // The first row group goes before the extra ones appended above.
-                w.new_row_groups.insert(w.arena, w.new_row_groups.items.len - enc.more.len, rgm) catch |e| {
+                w.rgs_kept += 1;
+                w.new_row_groups.append(w.arena, rgm) catch |e| {
                     if (w.first_err == null) w.first_err = e;
                 };
             }
@@ -1055,12 +1048,16 @@ const RecompressCtx = struct {
     core: consumer.Timings = .{},
     first_err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
+    /// The recompressed output one producer may gather; a row group that could write more is deferred to the writer.
+    share: u64 = std.math.maxInt(u64),
 };
 
 const RecompressSlot = struct {
     /// Private to the producer until `done`, then to the writer, which frees it once the row group is written.
     arena: std.heap.ArenaAllocator,
     chunks: []?consumer.RecompressedChunk = &.{},
+    /// Too big to gather (`recompressedSize`): the writer recompresses it straight into the sink.
+    deferred: bool = false,
     encode_ns: u64 = 0,
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
@@ -1073,25 +1070,46 @@ fn recompressProducer(w: *RecompressCtx, i: usize) void {
     const slot = &w.slots[i];
     var timings: consumer.Timings = .{ .prof = prof };
     const job = w.jobs[i];
-    defer job.leave();
-    if (job.arrive()) |_| if (consumer.recompressRowGroup(
-        slot.arena.allocator(),
-        w.gpa,
-        job.rg,
-        .{ .bytes = job.bytes, .byte_origin = 0 },
-        w.kept,
-        w.codec,
-        w.zstd,
-        &timings,
-        w.page_workers,
-    )) |chunks| {
-        slot.chunks = chunks;
-    } else |e| {
-        slot.err = e;
+    // The input is released by the writer once it has placed the row group: it still copies the chunks that keep
+    // their codec, and carried Bloom filters, from it.
+    if (job.arrive()) |_| {
+        // Output that could pass this producer's share (a codec that expands, as to UNCOMPRESSED) is not gathered
+        // here: the writer recompresses it page by page straight into the sink in its turn.
+        if (recompressedSize(job.rg, w.kept, w.codec) > w.share) {
+            slot.deferred = true;
+        } else if (consumer.recompressRowGroup(
+            slot.arena.allocator(),
+            w.gpa,
+            job.rg,
+            .{ .bytes = job.bytes, .byte_origin = 0 },
+            w.kept,
+            w.codec,
+            w.zstd,
+            &timings,
+            w.page_workers,
+        )) |chunks| {
+            slot.chunks = chunks;
+        } else |e| slot.err = e;
     } else |e| slot.err = e;
     slot.encode_ns = timings.encode_ns;
     slot.done.store(true, .release);
     w.completions.post(w.io);
+}
+
+/// The most a recompressing copy of `rg` can write: a chunk that changes codec at its uncompressed size (the bound of
+/// an UNCOMPRESSED rewrite, and above what a compressing codec writes), any other as it is.
+fn recompressedSize(rg: *const schema.RowGroup, kept: ?[]const bool, codec: schema.CompressionCodec) u64 {
+    var total: u64 = 0;
+    for (rg.columns.items, 0..) |chunk, ci| {
+        if (kept) |k| if (ci >= k.len or !k[ci]) continue;
+        const m = chunk.meta_data orelse continue;
+        const size = if (m.codec == codec)
+            m.total_compressed_size
+        else
+            @max(m.total_compressed_size, m.total_uncompressed_size);
+        total += @intCast(@max(0, size));
+    }
+    return total;
 }
 
 fn recompressWriter(w: *RecompressCtx) void {
@@ -1115,7 +1133,12 @@ fn recompressWriter(w: *RecompressCtx) void {
                 &w.out_offset,
                 &w.core,
                 true,
-                .{ .codec = w.codec, .zstd = w.zstd, .scratch = w.gpa, .done = slot.chunks },
+                .{
+                    .codec = w.codec,
+                    .zstd = w.zstd,
+                    .scratch = w.gpa,
+                    .done = if (slot.deferred) null else slot.chunks,
+                },
                 .{ .fpp = w.bloom_leaves, .meta = job.meta, .scratch = w.gpa },
             )) |out| {
                 if (out.rg) |rg| w.new_row_groups.append(w.arena, rg) catch |e| {
@@ -1125,6 +1148,7 @@ fn recompressWriter(w: *RecompressCtx) void {
                 if (out.surviving_rows > 0) w.rgs_kept += 1;
             } else |e| w.first_err = e;
         }
+        job.leave();
         slot.arena.deinit();
         slot.arena = std.heap.ArenaAllocator.init(w.gpa);
         w.window.post(w.io);
@@ -1563,7 +1587,14 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             out_url,
             out_pool,
             out_criteria,
-            .{ .profiler = args.profiler },
+            .{
+                .profiler = args.profiler,
+                // Parts uploading at once come out of the query's budget too: an eighth of it, at least two parts.
+                .max_bytes_in_flight = @max(
+                    2 * multipart_sink.TARGET_PART_SIZE,
+                    @min(multipart_sink.DEFAULT_MAX_BYTES_IN_FLIGHT, args.max_memory / 8),
+                ),
+            },
         );
         sink = .{
             .ctx = @ptrCast(&mp_sink.?),
@@ -1690,6 +1721,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .profiler = args.profiler,
             };
             const effective = sizing.workers;
+            // The output in flight is a quarter of the budget, shared by the row groups recompressing at once.
+            rw.share = args.max_memory / 4 / @max(1, effective);
             rw.page_workers = @max(1, sizing.budget / @max(1, effective));
             const re_span = profile.Span.begin(prof);
             defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective, window }));
@@ -5066,9 +5099,30 @@ test "every S3 write path writes the same bytes through a window as with everyth
         .{ .label = "re-encode", .args = .{ .inputs = &inputs, .filter = "i >= 300", .parallelism = 3 } },
         .{ .label = "select", .args = .{ .inputs = &inputs, .select = "i * 2 AS d, k", .parallelism = 2 } },
     };
-    for (cases) |c| {
+    // A recompressing copy of chunks in several codecs: some are rewritten, the rest copied from the fetched input,
+    // which must still be held when the writer places them.
+    const mixed = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(mixed);
+    try fake.serveBytes("t/mixed.parquet", mixed);
+    const mixed_in = [_][]const u8{"s3://bkt/t/mixed.parquet"};
+    const all_cases = cases ++ [_]Case{
+        .{ .label = "mixed-codec recompress", .args = .{ .inputs = &mixed_in, .codec = .ZSTD, .parallelism = 3 } },
+        .{ .label = "mixed-codec to uncompressed", .args = .{ .inputs = &mixed_in, .codec = .UNCOMPRESSED } },
+        // A budget too small to gather any row group's output: the writer recompresses each page by page in its turn.
+        .{
+            .label = "mixed-codec streamed",
+            .args = .{ .inputs = &mixed_in, .codec = .UNCOMPRESSED, .parallelism = 2, .max_memory = 64 << 10 },
+        },
+    };
+    // The gathered UNCOMPRESSED rewrite, which the streamed one must match byte for byte.
+    var gathered: ?[]u8 = null;
+    defer if (gathered) |g| gpa.free(g);
+    for (all_cases) |c| {
         var first: ?[]u8 = null;
-        defer if (first) |b| gpa.free(b);
+        defer if (first) |b| {
+            if (std.mem.eql(u8, c.label, "mixed-codec to uncompressed")) gathered = b else gpa.free(b);
+        };
+
         // Up front (no override: the files fit the default window), then a window smaller than any row group.
         for ([_]?[*:0]const u8{ null, "ZPQ_S3_WINDOW_KIB=1" }) |win| {
             var lines: std.ArrayList(?[*:0]const u8) = .empty;
@@ -5088,6 +5142,12 @@ test "every S3 write path writes the same bytes through a window as with everyth
                     return err;
                 };
             } else first = written;
+        }
+        if (std.mem.eql(u8, c.label, "mixed-codec streamed")) {
+            std.testing.expectEqualSlices(u8, gathered.?, first.?) catch |err| {
+                std.debug.print("streamed rewrite differs from the gathered one\n", .{});
+                return err;
+            };
         }
     }
 }

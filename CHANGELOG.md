@@ -77,7 +77,9 @@
   readers and released behind them (Linux; elsewhere still up front), and a print with `--limit` stops fetching once
   it has its rows. Half of it is for decoded row groups, shared by the workers: a row group too big for one is
   aggregated, printed or written a slice of rows at a time (a write emitting a row group per slice), and one with no
-  sliced form is aggregated one aggregate's columns at a time or refused with `RowGroupTooLarge`, never killed. The
+  sliced form is aggregated one aggregate's columns at a time or refused with `RowGroupTooLarge`, never killed. A
+  write holds at most a quarter of it encoded: a row group whose rewrite could take more (an expanding codec, a sliced
+  row group) streams to the output a page or a slice at a time, and S3 uploads keep at most an eighth in flight. The
   default also honours a cgroup v2 memory limit, as it already did a Lambda's memory size.
 - Corrupted GZIP pages are rejected instead of returning wrong values. Each gzip member's CRC-32 and length are now
   checked; before, decoding stopped once a page's bytes were out and never read the member's trailer.

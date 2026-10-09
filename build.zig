@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
     // `-Dprofile=false` compiles the span sites out entirely.
     const profile = b.option(bool, "profile", "Compile in query profiling (--profile; default true)") orelse true;
 
-    var deps = CoreDeps.init(b, target, optimize, fetch_prebuilt);
+    var deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, false);
     deps.profile = profile;
 
     // ----- CLI binary -----
@@ -61,6 +61,37 @@ pub fn build(b: *std.Build) void {
 
     const lambda_step = b.step("lambda", "Build the Lambda binary (zpq-lambda)");
     lambda_step.dependOn(&b.addInstallArtifact(lambda, .{}).step);
+
+    // ----- libzpq: the JSON handler behind a C ABI (include/zpq.h) -----
+    // A shared library carrying everything it links, and a static archive of zpq's own objects (a static link adds
+    // the codec and BoringSSL archives; see docs/libzpq.md). Opt-in: `zig build libzpq`.
+    var libzpq_deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, true);
+    libzpq_deps.profile = profile;
+    const libzpq_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = false });
+    const libzpq_mod = b.createModule(.{
+        .root_source_file = b.path("src/libzpq/libzpq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        .link_libc = true,
+        .pic = true,
+        .imports = &.{
+            .{ .name = "zpq", .module = libzpq_core.zpq },
+            .{ .name = "service", .module = serviceModule(b, target, optimize, libzpq_core.zpq) },
+        },
+    });
+    const libzpq_step = b.step("libzpq", "Build libzpq (shared and static) and install include/zpq.h");
+    for ([_]std.builtin.LinkMode{ .dynamic, .static }) |linkage| {
+        const lib = b.addLibrary(.{ .name = "zpq", .linkage = linkage, .root_module = libzpq_mod });
+        if (linkage == .dynamic) {
+            lib.setVersionScript(b.path("src/libzpq/libzpq.map"));
+            // Zig's own ELF linker ignores version scripts; LLD needs the LLVM backend, which Debug otherwise skips.
+            lib.use_llvm = true;
+            lib.use_lld = true;
+        }
+        libzpq_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    }
+    libzpq_step.dependOn(&b.addInstallFile(b.path("include/zpq.h"), "include/zpq.h").step);
 
     // ----- Public library module -----
     // Lets downstream projects consume the engine as a dependency:
@@ -102,23 +133,41 @@ pub fn build(b: *std.Build) void {
 
     // Lambda binary tests (runtime.zig and anything else lambda-only).
     // Reuses the same zpq module so import paths match the production build.
+    const test_service_mod = serviceModule(b, target, optimize, test_zpq_mod);
     const lambda_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lambda/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "zpq", .module = test_zpq_mod },
                 .{ .name = "build_options", .module = test_opts_mod },
+                .{ .name = "service", .module = test_service_mod },
             },
         }),
         .filters = test_filters,
     });
     const run_lambda_tests = b.addRunArtifact(lambda_tests);
+    // The shared JSON handler's own tests (src/service).
+    const service_tests = b.addTest(.{ .root_module = test_service_mod, .filters = test_filters });
+    const run_service_tests = b.addRunArtifact(service_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
+    test_step.dependOn(&run_service_tests.step);
+    const libzpq_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/libzpq/libzpq.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zpq", .module = test_zpq_mod },
+            .{ .name = "service", .module = test_service_mod },
+        },
+    }), .filters = test_filters });
+    test_step.dependOn(&b.addRunArtifact(libzpq_tests).step);
 
     // Build the unit-test executables without running them, so a cross-compiled pair can be copied to and run on
     // the target (tools/macos_bundle.sh). Run them from the repo root (or a bundle mirroring it): fixtures are
@@ -276,6 +325,8 @@ const CoreDeps = struct {
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.Optimize,
         fetch_prebuilt: bool,
+        /// BoringSSL compiled from source, position-independent, for a shared library; else the pinned prebuilts.
+        boringssl_from_source: bool,
     ) CoreDeps {
         const zstd = zstdLibrary(b, target, optimize);
         const libdeflate = libdeflateLibrary(b, target, optimize);
@@ -311,6 +362,7 @@ const CoreDeps = struct {
                 .target = target,
                 .optimize = optimize,
                 .@"fetch-prebuilt" = fetch_prebuilt,
+                .@"source-build" = boringssl_from_source,
             }).module("boring_tls"),
             .snappy = b.dependency("snappy", .{
                 .target = target,
@@ -445,8 +497,26 @@ fn addBinaryModules(
         root_mod.linkLibrary(deps.liteparser);
         root_mod.addIncludePath(b.path("vendor/liteparser"));
     }
+    if (is_lambda) root_mod.addImport("service", serviceModule(b, target, optimize, core.zpq));
 
     return .{ .root = root_mod, .zpq = core.zpq };
+}
+
+/// The JSON request handler the Lambda and libzpq share (src/service/handler.zig).
+fn serviceModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    zpq_mod: *std.Build.Module,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/service/handler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .omit_frame_pointer = false,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zpq", .module = zpq_mod }},
+    });
 }
 
 /// Translates a one-off C header into a module. Replaces `@cImport`, which

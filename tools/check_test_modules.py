@@ -10,7 +10,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
-TEST_ROOTS = (SRC / "zpq.zig", SRC / "lambda" / "main.zig")
+# One per test artifact in build.zig.
+TEST_ROOTS = (
+    SRC / "zpq.zig",
+    SRC / "lambda" / "main.zig",
+    SRC / "service" / "handler.zig",
+    SRC / "libzpq" / "libzpq.zig",
+)
 TEST_DECL = re.compile(r"^test(?:\s|\{)", re.MULTILINE)
 ROOTED_IMPORT = re.compile(r'^\s*_\s*=\s*@import\("([^\"]+\.zig)"\);\s*$', re.MULTILINE)
 
@@ -39,7 +45,7 @@ def main() -> int:
             print(f"  {relative(path)} ({discovered[path]} tests)", file=sys.stderr)
         print(
             "add each module as a direct `_ = @import(\"...\");` in "
-            "src/zpq.zig or src/lambda/main.zig",
+            "one of: " + ", ".join(relative(r) for r in TEST_ROOTS),
             file=sys.stderr,
         )
         return 1

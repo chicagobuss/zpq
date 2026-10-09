@@ -775,6 +775,44 @@ def main():
     print(f"  {'OK  ' if matched else 'FAIL'}  sliced:int96-float16  {(sliced.stderr or '').strip()[:70]}")
     fails += 0 if matched else 1
 
+    # count/min/max over nullable columns whose pages a reader of another type would refuse: narrow FIXED_LEN_BYTE_ARRAY
+    # dictionaries (FLOAT16's 2-byte entries) and DELTA-encoded strings. Encoded execution (count reads levels only)
+    # must answer as ZPQ_ENCODED=0 does, and the counts as DuckDB's.
+    import numpy as np
+    n = 3000
+    nar = pa.table({
+        "h": pa.array(np.array([(i % 8) - 4 for i in range(n)], dtype=np.float16) / 2, pa.float16(),
+                      mask=np.array([i % 5 == 0 for i in range(n)])),
+        "s": pa.array([None if i % 7 == 0 else f"v{i % 13}" for i in range(n)]),
+        "f": pa.array([None if i % 3 == 0 else bytes([i % 250, 1, 2]) for i in range(n)], pa.binary(3)),
+    })
+    for elabel, kw in [("dictionary", {"use_dictionary": True}),
+                       ("delta", {"use_dictionary": ["h", "f"], "column_encoding": {"s": "DELTA_BYTE_ARRAY"}}),
+                       ("delta-length", {"use_dictionary": ["h", "f"],
+                                         "column_encoding": {"s": "DELTA_LENGTH_BYTE_ARRAY"}})]:
+        path = os.path.join(tmp, f"levels_{elabel}.parquet")
+        pq.write_table(nar, path, **kw)
+        for col in ["h", "s", "f"]:
+            total += 1
+            agg = f"count({col}) AS n, min({col}) AS lo, max({col}) AS hi"
+            outs = [subprocess.run([ZPQ, "query", path, "--aggregate", agg, "--scan-all"], capture_output=True,
+                                   text=True, env=dict(os.environ, ZPQ_ENCODED=e)) for e in ["1", "0"]]
+            label = f"levels-only:{elabel}:{col}"
+            try:
+                for r in outs:
+                    if r.returncode != 0:
+                        raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+                enc, plain = (zjson(r.stdout)["agg"] for r in outs)
+                if enc != plain:
+                    raise RuntimeError(f"encoded {enc} vs ZPQ_ENCODED=0 {plain}")
+                want = con.execute(f"SELECT count({col}) FROM '{path}'").fetchone()[0]
+                if enc["n"] != want:
+                    raise RuntimeError(f"count {enc['n']} want {want}")
+                print(f"  OK    {label}  ({want})")
+            except Exception as e:
+                fails += 1
+                print(f"  FAIL  {label}  {e}")
+
     # Clashing output names fail loudly, naming the column, instead of one column showing another's values.
     CLASHES = [
         ("key_vs_alias", ["--group-by", "name AS k", "--aggregate", "sum(amt) AS name"], "name"),

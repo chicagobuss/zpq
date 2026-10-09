@@ -2741,16 +2741,35 @@ fn decodeLevelsOnly(
     const n_leaves: usize = @intCast(cm.num_values);
     var dl: ?[]u32 = null;
     if (levels.max_def > 0) {
-        var reader = column_mod.ColumnChunkReader(i32).initWithOptions(
-            chunk,
-            cm.codec,
-            levels,
-            ra,
-            decode_options,
-            scratch,
-        );
-        const r = (try reader.readAllLevels(n_leaves)) orelse
-            return decodeAggColumn(ra, chunk, cm, meta, null, decode_options, scratch);
+        // The reader of the column's own physical type, though only levels are read: pages still install their value
+        // decoders, and a dictionary its entries, which another type's reader would mis-size or refuse (a FLOAT16
+        // dictionary's 2-byte entries, a DELTA_BYTE_ARRAY page).
+        const r = switch (cm.type) {
+            inline else => |t| blk: {
+                const T = switch (t) {
+                    .BOOLEAN => bool,
+                    .INT32 => i32,
+                    .INT64 => i64,
+                    .FLOAT => f32,
+                    .DOUBLE => f64,
+                    .INT96, .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => []const u8,
+                };
+                var reader = column_mod.ColumnChunkReader(T).initWithOptions(
+                    chunk,
+                    cm.codec,
+                    levels,
+                    ra,
+                    decode_options,
+                    scratch,
+                );
+                reader.type_length = switch (t) {
+                    .FIXED_LEN_BYTE_ARRAY => flbaWidth(meta.getColumnSchema(cm.path_in_schema.items)),
+                    .INT96 => int96_mod.INT96_WIDTH,
+                    else => 0,
+                };
+                break :blk try reader.readAllLevels(n_leaves);
+            },
+        } orelse return decodeAggColumn(ra, chunk, cm, meta, null, decode_options, scratch);
         dl = r.def_levels;
     }
     var has_nulls = false;

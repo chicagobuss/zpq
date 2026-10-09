@@ -611,6 +611,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (self.levels.max_rep > 0 or self.levels.max_def == 0) return null;
             self.options.fast_levels = true;
             self.value_budget = num_leaves;
+            // No value is handed out, so a byte-array reader's pages can recycle the scratch too: what points into a
+            // page (its dictionary entries, its values) is never read past it.
+            if (T == []const u8) self.pages.scratch = self.scratch;
             try self.holdScratch();
             const max_def: u32 = @intCast(self.levels.max_def);
             var out_opt: ?[]u32 = null;

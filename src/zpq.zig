@@ -156,4 +156,5 @@ test {
     _ = @import("io/meta_cache.zig");
     _ = @import("io/local_reader.zig");
     _ = @import("io/retry.zig");
+    _ = @import("io/s3_window.zig");
 }

@@ -8,7 +8,8 @@
 //!
 //! Lifecycle (production / S3 path):
 //!   1. Receive `{"s3_url": "...", "filter": "...optional..."}`.
-//!   2. One suffix GET (`engine.footerProbeBytes`) for the file size and footer.
+//!   2. One suffix GET (`engine.footerProbeFor`) for the file size and footer. An explicit
+//!      `ZPQ_S3_FOOTER_PROBE` cannot exceed the memory budget.
 //!   3. If the footer is bigger than that suffix, fetch the missing prefix. The leading
 //!      PAR1 is checked only when a fetched range already covers offset 0.
 //!   4. Parse FileMetaData. If filter is present, parse it against
@@ -669,7 +670,9 @@ fn handleS3(
     defer client.deinit();
 
     // 1. One suffix GET for the size and the footer. A footer that does not fit costs one more GET below.
-    const tail_resp = client.get(a, url.key, s3.Range.suffix(engine.footerProbeBytes(env))) catch |err| {
+    // One file. The explicit probe cannot exceed the budget-derived maximum.
+    const probe = engine.footerProbeFor(env, @as(u64, zpq.core.system.discoverAvailableMemory(env)), 1);
+    const tail_resp = client.get(a, url.key, s3.Range.suffix(probe)) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_fetch\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     if (tail_resp.status != 206 and tail_resp.status != 200) {

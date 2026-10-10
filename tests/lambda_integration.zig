@@ -1249,3 +1249,72 @@ test "lambda profile honors the request memory budget without changing the answe
     try std.testing.expect(cap > 0 and cap < 1024);
     try std.testing.expect(prof.get("events").?.integer <= cap + 4096);
 }
+
+test "many files keep a count under the loose rss bound in a fresh process" {
+    const a = std.testing.allocator;
+    // Same shape as the unit test: 48 copies, a 1 MiB pad so the suffix is real, 16 MiB budget, two workers.
+    // The child's ru_maxrss is that process's own high-water. The unit binary's VmHWM is not, because it is the
+    // lifetime peak of every test that ran before this one.
+    const object = try paddedParquet(a, "ci/fixtures/parquet/group_order.parquet", 1 << 20);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    const n_files: usize = 48;
+    const budget: u64 = 16 << 20;
+    var url_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", endpoint);
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, CLI_BIN);
+    try argv.append(arena, "query");
+    for (0..n_files) |i| {
+        try argv.append(arena, try std.fmt.allocPrint(arena, "s3://bkt/p{d}.parquet", .{i}));
+    }
+    try argv.appendSlice(arena, &.{ "--aggregate", "count(*) AS n", "--max-memory", "16MB", "-j", "2" });
+
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .request_resource_usage_statistics = true,
+    });
+    defer child.kill(std.testing.io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(a, std.testing.io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    while (multi_reader.fill(4096, .none)) |_| {
+        // Drain both pipes until the child closes them.
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+    try multi_reader.checkAnyError();
+    const term = try child.wait(std.testing.io);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    defer a.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    defer a.free(stderr);
+    const exited_ok = if (term == .exited) term.exited == 0 else false;
+    if (!exited_ok or std.mem.indexOf(u8, stdout, "\"n\":576000") == null) {
+        std.debug.print("[rss bound] {any}\nstdout: {s}\nstderr: {s}\n", .{ term, stdout, stderr });
+        return error.TestUnexpectedResult;
+    }
+    const rss = child.resource_usage_statistics.getMaxRss() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rss <= budget + (56 << 20));
+}

@@ -44,6 +44,9 @@ pub const RowGroup = struct {
     copied: []const Copied = &.{},
     /// Bytes the jobs fetch plus `copied`: the row group's window charge.
     bytes: u64,
+    /// Set when this row group's `bytes` have been added to the window. A group the scan dropped before admission
+    /// stays false, so finishing the batch does not release a charge it never took.
+    admitted: bool = false,
     /// The page-aligned span of the file buffer only this row group's bytes occupy.
     seg: []align(page) u8,
     window: *Window = undefined,
@@ -171,6 +174,10 @@ pub fn Fetcher(comptime Pool: type) type {
                     if (out != 0 and out + rg.bytes > w.limit) break;
                     if (bytes != 0 and bytes + rg.bytes > cap) break;
                     w.submitted += rg.bytes;
+                    rg.admitted = true;
+                    if (builtin.is_test) if (test_drop_after_admit) |drop| if (drop == rg) {
+                        rg.state.store(State.dropped, .release);
+                    };
                     bytes += rg.bytes;
                     next += 1;
                 }
@@ -185,7 +192,9 @@ pub fn Fetcher(comptime Pool: type) type {
                 var jobs: std.ArrayList(s3.FetchJob) = .empty;
                 for (w.order[first..next]) |rg| {
                     if (rg.state.load(.acquire) == State.dropped) {
-                        if (rg.jobs.len == 0) w.release(rg);
+                        // Only a group this batch charged. One the admission loop skipped was never added to
+                        // `submitted`, and releasing it lets the next group in on a charge that is still held.
+                        if (rg.admitted and rg.jobs.len == 0) w.release(rg);
                         continue;
                     }
                     for (rg.copied) |c| @memcpy(c.dst, c.src);
@@ -308,7 +317,96 @@ fn wakeAll(word: *std.atomic.Value(u32)) void {
     _ = linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
 }
 
+/// The ownership test sets this to a row group that should be dropped the moment it is admitted.
+var test_drop_after_admit: ?*RowGroup = null;
+
 fn dontNeed(seg: []align(page) u8) void {
     if (comptime !supported) unreachable;
     _ = linux.madvise(seg.ptr, seg.len, linux.MADV.DONTNEED);
+}
+
+const copied_byte = [_]u8{0xab};
+
+fn copiedGroup(buf: []align(page) u8, copy: []const Copied) RowGroup {
+    return .{
+        .jobs = &.{},
+        .copied = copy,
+        .bytes = page,
+        .seg = buf,
+    };
+}
+
+fn testExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
+    return std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(1) });
+}
+
+fn startCopied(gpa: std.mem.Allocator, order: []*RowGroup) !Fetcher(s3.Pool(1)) {
+    const pool = try gpa.create(s3.Pool(1));
+    errdefer gpa.destroy(pool);
+    try pool.init(gpa);
+    return .{
+        .window = .{ .gpa = gpa, .order = order, .limit = page, .batch = page },
+        .pool = pool,
+        .creds = .{ .access_key = "a", .secret_key = "b", .region = "us-east-1" },
+        .workers = 1,
+        .profiler = null,
+        .executor = testExecutor,
+    };
+}
+
+fn stopCopied(gpa: std.mem.Allocator, fetcher: *Fetcher(s3.Pool(1))) void {
+    fetcher.stop();
+    fetcher.pool.deinit();
+    gpa.destroy(fetcher.pool);
+}
+
+test "a skipped copied-only group does not release a charge it never took" {
+    if (comptime !supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var bufs: [3][]align(page) u8 = undefined;
+    for (&bufs) |*b| b.* = try mapBuffer(page);
+    defer for (bufs) |b| unmapBuffer(b);
+
+    var copies = [3]Copied{
+        .{ .dst = bufs[0][0..copied_byte.len], .src = &copied_byte },
+        .{ .dst = bufs[1][0..copied_byte.len], .src = &copied_byte },
+        .{ .dst = bufs[2][0..copied_byte.len], .src = &copied_byte },
+    };
+    var one = copiedGroup(bufs[0], copies[0..1]);
+    var two = copiedGroup(bufs[1], copies[1..2]);
+    var three = copiedGroup(bufs[2], copies[2..3]);
+    two.state.store(State.dropped, .release);
+    var order = [_]*RowGroup{ &one, &two, &three };
+    var fetcher = try startCopied(gpa, &order);
+    try fetcher.start();
+    const until = nowNs() + 1_000_000_000;
+    while (nowNs() < until and one.state.load(.acquire) != State.ready) std.atomic.spinLoopHint();
+    stopCopied(gpa, &fetcher);
+
+    try std.testing.expectEqual(State.ready, one.state.load(.acquire));
+    try std.testing.expectEqual(State.dropped, two.state.load(.acquire));
+    try std.testing.expectEqual(State.waiting, three.state.load(.acquire));
+    try std.testing.expectEqual(@as(u64, page), fetcher.window.submitted);
+    try std.testing.expectEqual(@as(u64, 0), fetcher.window.released.load(.acquire));
+}
+
+test "a copied-only group dropped after it is admitted releases its charge" {
+    if (comptime !supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const buf = try mapBuffer(page);
+    defer unmapBuffer(buf);
+    var copy = [_]Copied{.{ .dst = buf[0..copied_byte.len], .src = &copied_byte }};
+    var one = copiedGroup(buf, &copy);
+    var order = [_]*RowGroup{&one};
+    test_drop_after_admit = &one;
+    defer test_drop_after_admit = null;
+    var fetcher = try startCopied(gpa, &order);
+    // On this thread: admission drops the group before the copy, then releases the charge it just took.
+    fetcher.runErr() catch |err| return err;
+    stopCopied(gpa, &fetcher);
+
+    try std.testing.expectEqual(State.dropped, one.state.load(.acquire));
+    try std.testing.expect(one.admitted);
+    try std.testing.expectEqual(@as(u64, page), fetcher.window.submitted);
+    try std.testing.expectEqual(@as(u64, page), fetcher.window.released.load(.acquire));
 }

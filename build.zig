@@ -164,6 +164,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "integration_opts", .module = integration_opts.createModule() },
             },
         }),
+        .filters = test_filters,
     });
     integration_tests.step.dependOn(&lambda_install.step);
     const run_integration_tests = b.addRunArtifact(integration_tests);

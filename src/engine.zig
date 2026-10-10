@@ -91,10 +91,11 @@ fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
 pub const POOL_SIZE: usize = 8;
 
 /// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
-/// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes. The trailing
-/// PAR1 is always checked. The leading PAR1 is not a request of its own: it is checked when a fetched range covers
-/// offset 0, including a footer-prefix GET that starts there. A footer that does not fit is one more GET for the
-/// missing prefix, and never a third.
+/// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes, but never
+/// above the budget-derived maximum from `footerProbeFor`: `--max-memory` wins, and a larger override is clamped
+/// with a one-line warning. The trailing PAR1 is always checked. The leading PAR1 is not a request of its own: it is
+/// checked when a fetched range covers offset 0, including a footer-prefix GET that starts there. A footer that does
+/// not fit is one more GET for the missing prefix, and never a third.
 pub const FOOTER_PROBE_DEFAULT: u64 = 1 << 20;
 const FOOTER_PROBE_MIN: u64 = 64 << 10;
 const FOOTER_PROBE_MAX: u64 = 16 << 20;
@@ -106,13 +107,19 @@ pub fn footerProbeBytes(env: std.process.Environ) u64 {
     return @min(n, FOOTER_PROBE_MAX);
 }
 
-/// Probe used when no `ZPQ_S3_FOOTER_PROBE` is set. Many inputs and a small budget must not each pull a 1 MiB
-/// suffix: `clamp(budget / (2 × concurrent footer fetches), 64 KiB, 1 MiB)`. The 2 counts the response buffer and
-/// the copy that may be retained.
+/// Probe for this budget: `clamp(budget / (2 × concurrent footer fetches), 64 KiB, 1 MiB)`. The 2 counts the response
+/// buffer and the copy that may be retained. An explicit `ZPQ_S3_FOOTER_PROBE` replaces the default only when it is
+/// within that maximum. A larger override is clamped to it, and a warning names both sizes.
 pub fn footerProbeFor(env: std.process.Environ, budget: u64, concurrent: usize) u64 {
-    if (env.getPosix("ZPQ_S3_FOOTER_PROBE") != null) return footerProbeBytes(env);
     const n: u64 = @max(concurrent, 1);
-    return std.math.clamp(budget / (2 * n), FOOTER_PROBE_MIN, FOOTER_PROBE_DEFAULT);
+    const derived = std.math.clamp(budget / (2 * n), FOOTER_PROBE_MIN, FOOTER_PROBE_DEFAULT);
+    if (env.getPosix("ZPQ_S3_FOOTER_PROBE") == null) return derived;
+    const requested = footerProbeBytes(env);
+    if (requested > derived) {
+        std.log.warn("ZPQ_S3_FOOTER_PROBE={d} exceeds the memory budget; using {d} bytes", .{ requested, derived });
+        return derived;
+    }
+    return requested;
 }
 
 /// In-flight footer responses and retained suffixes, against one resident budget. A charge that does not fit is
@@ -2666,8 +2673,20 @@ fn openInputs(
                 .logical_size = specs[k].total_size,
                 .gate = if (s3_fetcher != null) win_files[k].gate() else null,
             };
-            if (specs[k].file_buf.len > 0 and s3_fetcher == null) try s3_buffers.append(arena, specs[k].file_buf);
-            if (specs[k].footer_region.len > 0) try s3_buffers.append(arena, specs[k].footer_region);
+            // Ownership of these gpa buffers moves into `s3_buffers`. Clear the spec so the error path, which frees
+            // both lists, cannot free one twice.
+            if (@import("builtin").is_test) if (test_arm_s3_buffer_fail) |fa| {
+                if (s3_buffers.items.len > 0 and s3_buffers.items.len == s3_buffers.capacity)
+                    fa.fail_index = fa.alloc_index;
+            };
+            if (specs[k].file_buf.len > 0 and s3_fetcher == null) {
+                try s3_buffers.append(arena, specs[k].file_buf);
+                specs[k].file_buf = &.{};
+            }
+            if (specs[k].footer_region.len > 0) {
+                try s3_buffers.append(arena, specs[k].footer_region);
+                specs[k].footer_region = &.{};
+            }
             metas[orig_idx] = specs[k].meta;
             meta_ready[orig_idx] = true;
         }
@@ -5164,11 +5183,56 @@ test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
     try std.testing.expectEqual(@as(u64, 8), footerProbeBytes(.{ .block = .{ .slice = &tiny } }));
     const huge = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=999999999999"};
     try std.testing.expectEqual(FOOTER_PROBE_MAX, footerProbeBytes(.{ .block = .{ .slice = &huge } }));
-    // No override: clamp(budget / (2 × concurrent), 64 KiB, 1 MiB). An explicit probe ignores the budget.
+    // No override: clamp(budget / (2 × concurrent), 64 KiB, 1 MiB).
     try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeFor(.empty, 16 << 20, 8));
     try std.testing.expectEqual(@as(u64, 512 << 10), footerProbeFor(.empty, 8 << 20, 8));
     try std.testing.expectEqual(FOOTER_PROBE_MIN, footerProbeFor(.empty, 1 << 20, 8));
+    // Under the budget-derived maximum, the override is kept. A smaller pin (8 bytes) is kept too.
     try std.testing.expectEqual(@as(u64, 65536), footerProbeFor(.{ .block = .{ .slice = &set } }, 16 << 20, 8));
+    try std.testing.expectEqual(@as(u64, 8), footerProbeFor(.{ .block = .{ .slice = &tiny } }, 16 << 20, 8));
+    // 16 MiB explicit, 8 MiB budget, 8 fetches: derived is 512 KiB. The override cannot exceed it.
+    const over = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=16777216"};
+    try std.testing.expectEqual(@as(u64, 512 << 10), footerProbeFor(.{ .block = .{ .slice = &over } }, 8 << 20, 8));
+}
+
+/// Armed by the footer-ownership test so the next `s3_buffers` growth returns `error.OutOfMemory`.
+var test_arm_s3_buffer_fail: ?*std.testing.FailingAllocator = null;
+
+test "moving a footer buffer into the scan has one owner when the next append fails" {
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/group_order.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    const nfiles = 16;
+    var keys: [nfiles][]const u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.* = try std.fmt.allocPrint(gpa, "t/f{d}.parquet", .{i});
+        errdefer gpa.free(k.*);
+        try fake.serveBytes(k.*, bytes);
+    }
+    defer for (keys) |k| gpa.free(k);
+
+    var backing = std.heap.ArenaAllocator.init(gpa);
+    defer backing.deinit();
+    // Remap would grow the buffer list without an alloc. Refuse it so the growth is an alloc the test can fail.
+    var fa = std.testing.FailingAllocator.init(backing.allocator(), .{ .resize_fail_index = 0 });
+    test_arm_s3_buffer_fail = &fa;
+    defer test_arm_s3_buffer_fail = null;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+    const env = [_:null]?[*:0]const u8{ endpoint, "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" };
+    const urls = try a.alloc([]const u8, nfiles);
+    for (keys, urls) |k, *u| u.* = try std.fmt.allocPrint(a, "s3://bkt/{s}", .{k});
+    const q: QueryArgs = .{ .inputs = urls, .aggregate = "count(*) AS n", .max_memory = 16 << 20 };
+    const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &env } }, .io = std.testing.io };
+    try std.testing.expectError(error.OutOfMemory, openInputs(ctx, fa.allocator(), q, .{ .limit = 64 << 20 }));
+    try std.testing.expect(fa.has_induced_failure);
 }
 
 test "an S3 footer is one suffix GET, and a bad leading magic fails only when those bytes were fetched" {
@@ -5275,23 +5339,8 @@ test "many files keep a count under the memory budget" {
     // arena nodes and the debug allocator's cache move it around, which is what failed a budget+20MiB check.
     const wave = @as(u64, READ_CONCURRENCY) * FOOTER_PROBE_DEFAULT;
     try std.testing.expect(accounted <= @as(u64, budget) + wave);
-    // Process RSS includes the read-executor stacks. One probe per file is well above this.
-    try std.testing.expect(vmHwmBytes() <= @as(u64, budget) + (56 << 20));
-}
-
-fn vmHwmBytes() u64 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return 0;
-    defer _ = std.posix.system.close(fd);
-    var buf: [4096]u8 = undefined;
-    const n = std.posix.read(fd, &buf) catch return 0;
-    const text = buf[0..n];
-    const key = "VmHWM:";
-    const at = std.mem.indexOf(u8, text, key) orelse return 0;
-    var rest = text[at + key.len ..];
-    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
-    const end = std.mem.indexOfAny(u8, rest, " \t\n") orelse rest.len;
-    const kb = std.fmt.parseInt(u64, rest[0..end], 10) catch return 0;
-    return kb << 10;
+    // RSS is not asserted here. VmHWM is the whole test process's lifetime high-water, so earlier tests fail it
+    // even when this query stays inside the allowance. The loose bound runs in its own process; see the integration test.
 }
 
 // ── Windowed S3 fetch ──

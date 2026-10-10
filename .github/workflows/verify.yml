@@ -47,7 +47,8 @@ jobs:
     # the cache was cold + ziglang.org was returning 500s. Compile
     # itself is ~5 min on the runner; the rest is setup + downstream
     # checks. Real headroom matters more than aspirational tightness.
-    timeout-minutes: 15
+    # 25 since libzpq joined: its BoringSSL is compiled from source (position-independent), a few minutes cold.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -71,7 +72,7 @@ jobs:
         # (72) count them. Bump deliberately alongside the corpus SHA.
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install --quiet --no-input "pyarrow==24.*"
+          .venv/bin/pip install --quiet --no-input "pyarrow==24.*" duckdb
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Cache Zig global build cache
@@ -176,3 +177,8 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseFast
           python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 72
+
+      # libzpq: the C ABI test, plain and under ASan/LeakSanitizer (gcc), the Python binding and service, and the
+      # differential corpus answered byte for byte as the CLI and the Lambda do. ReleaseFast reuses the build above.
+      - name: libzpq (C ABI, sanitizers, Python, differential)
+        run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh

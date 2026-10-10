@@ -92,7 +92,7 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential
+check: test-modules test test-integration smoke duckdb-smoke differential libzpq
 
 # Static guard for Zig's lazy test discovery. Every src file containing a
 # top-level test must be directly rooted by one of the two test artifacts.
@@ -143,6 +143,12 @@ duckdb-smoke:
 differential:
     zig build -Doptimize=ReleaseFast
     {{python}} tools/differential.py
+
+# libzpq, the C ABI (Tier 2): its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close
+# cycles), the Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte
+# for byte. Needs gcc (the sanitizer runtime) and duckdb+pyarrow in the .venv.
+libzpq:
+    PYTHON={{python}} OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
 # Conformance against apache/parquet-testing (Tier 3). Clones the corpus on
 # first run. Floor of 72 full-passes (was 64; +5: RLE-BOOLEAN, multi-member GZIP, empty datapage,

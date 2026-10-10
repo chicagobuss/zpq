@@ -104,6 +104,16 @@ def wait_inflight(z, timeout=10):
         time.sleep(0.001)
 
 
+def wait_running(z, timeout=10):
+    """Wait until a query holds the whole ceiling: a probe that may not wait for its budget is then refused. Counting
+    the binding's own calls is not enough, as close ends a call that has not yet been admitted."""
+    probe = {"inputs": [FIX], "aggregate": "count(*) AS n", "budget_wait_ms": 0}
+    end = time.monotonic() + timeout
+    while z.run(probe, check=False).get("reason") != "WaitTimeout":
+        if time.monotonic() > end:
+            raise TimeoutError("no query running")
+
+
 def test_close_drains():
     """close() waits for a call in flight, then refuses new ones; the context is never freed under a query."""
     z = zpq.Zpq()
@@ -115,7 +125,7 @@ def test_close_drains():
 
     t = threading.Thread(target=slow)
     t.start()
-    wait_inflight(z)
+    wait_running(z)
     z.close()
     closed_at = time.monotonic()
     t.join()
@@ -127,6 +137,33 @@ def test_close_drains():
     except zpq.ZpqClosed:
         pass
     z.close()  # idempotent
+
+
+def test_close_ends_waiters():
+    """close() ends a query still waiting for its memory budget with ZpqClosed rather than waiting for it to run; the
+    running one answers."""
+    z = zpq.Zpq(max_memory="64MB")
+    got = {}
+
+    def call(name):
+        try:
+            got[name] = z.run(SLOW)["agg"]
+        except zpq.ZpqClosed as e:
+            got[name] = e
+
+    running = threading.Thread(target=call, args=("running",))
+    running.start()
+    wait_running(z)
+    waiting = threading.Thread(target=call, args=("waiting",))
+    waiting.start()
+    end = time.monotonic() + 10
+    while z._inflight < 2 and time.monotonic() < end:
+        time.sleep(0.001)
+    z.close()
+    running.join()
+    waiting.join()
+    check(got.get("running") == {"s": SLOW_SUM}, f"running call answered {got.get('running')}")
+    check(isinstance(got.get("waiting"), zpq.ZpqClosed), f"waiting call: {got.get('waiting')!r}")
 
 
 def serve(z):
@@ -266,6 +303,7 @@ def main():
         test_service(z)
         test_bad_lengths(z)
     test_close_drains()
+    test_close_ends_waiters()
     test_service_shutdown()
     if failures:
         print(f"{len(failures)} failure(s)", file=sys.stderr)

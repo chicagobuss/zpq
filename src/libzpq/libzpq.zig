@@ -36,7 +36,7 @@ pub const Ctx = struct {
     cond: c.pthread_cond_t = .{},
     /// `zpq_run` calls between their admission and their return.
     inflight: usize = 0,
-    /// Set by `zpq_close`: new calls are refused with ZPQ_ECLOSED.
+    /// Set by `zpq_shutdown` (and so by `zpq_close`): new calls are refused with ZPQ_ECLOSED.
     closing: bool = false,
     /// Reserved for the ETag-validated object cache (F5). It will charge its bytes to `budget` as evictable,
     /// register itself as `budget.reclaimer` so a waiting query can evict before it blocks, and be freed in
@@ -64,6 +64,15 @@ pub const Ctx = struct {
         if (self.closing) return false;
         self.inflight += 1;
         return true;
+    }
+
+    /// Refuse new calls and wake the queries waiting for their budget, which return ZPQ_ECLOSED. Running queries go
+    /// on. The context stays valid, so a host can drain its own calls before `zpq_close`. Idempotent.
+    fn shutdown(self: *Ctx) void {
+        _ = c.pthread_mutex_lock(&self.lock);
+        self.closing = true;
+        _ = c.pthread_mutex_unlock(&self.lock);
+        self.budget.close();
     }
 
     fn leave(self: *Ctx) void {
@@ -199,13 +208,14 @@ export fn zpq_free(json: ?[*:0]u8) void {
     c.free(json);
 }
 
+export fn zpq_shutdown(ctx: ?*Ctx) void {
+    (ctx orelse return).shutdown();
+}
+
 export fn zpq_close(ctx: ?*Ctx) void {
     const self = ctx orelse return;
-    _ = c.pthread_mutex_lock(&self.lock);
-    self.closing = true;
-    _ = c.pthread_mutex_unlock(&self.lock);
     // Queries waiting for their budget leave first, with ZPQ_ECLOSED; then the running ones finish.
-    self.budget.close();
+    self.shutdown();
     _ = c.pthread_mutex_lock(&self.lock);
     while (self.inflight > 0) _ = c.pthread_cond_wait(&self.cond, &self.lock);
     _ = c.pthread_mutex_unlock(&self.lock);

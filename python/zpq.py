@@ -7,8 +7,8 @@
 `run` takes the zpq Lambda's request (a dict, or JSON text) and returns its response as a dict; an {"error": ...}
 response raises `ZpqError`, unless `check=False`. One `Zpq` serves any number of threads at once: ctypes releases
 the GIL for the call, and each query runs on threads of its own, within the context's memory ceiling. `close` refuses
-new calls (`ZpqClosed`) and waits for those in flight, including any still waiting for their memory budget, so a
-context is never freed under a running query.
+new calls and ends those still waiting for their memory budget (both `ZpqClosed`), then waits for the running ones,
+so a context is never freed under a running query.
 
 The library is found at $ZPQ_LIB, else as libzpq.so (libzpq.dylib on macOS) next to this file, in ../zig-out/lib, or
 on the loader path.
@@ -83,6 +83,8 @@ def load_library(path=None):
         lib.zpq_run.restype = ctypes.c_int
         lib.zpq_free.argtypes = [ctypes.c_void_p]
         lib.zpq_free.restype = None
+        lib.zpq_shutdown.argtypes = [ctypes.c_void_p]
+        lib.zpq_shutdown.restype = None
         lib.zpq_close.argtypes = [ctypes.c_void_p]
         lib.zpq_close.restype = None
         lib.zpq_abi_version.argtypes = []
@@ -173,12 +175,16 @@ class Zpq:
         return response
 
     def close(self):
-        """Refuse new calls, wait for those in flight, then free the context. Idempotent."""
+        """Refuse new calls, end those waiting for their memory budget (`ZpqClosed`), wait for the running ones, then
+        free the context. Idempotent."""
         cond = getattr(self, "_cond", None)
         if cond is None:  # __init__ failed before the context existed
             return
         with cond:
             self._closing = True
+            if self._ctx:
+                # Without it, queries queued for their budget would be waited for here and run.
+                self._lib.zpq_shutdown(self._ctx)
             while self._inflight:
                 cond.wait()
             ctx, self._ctx = self._ctx, None

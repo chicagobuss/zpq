@@ -1,7 +1,7 @@
 /*
  * libzpq's C ABI, end to end: options, the round trip, writes, error responses, invalid arguments, concurrent calls
- * on one context, the context's memory ceiling, close while queries wait for it, open/run/close cycles, and resident
- * memory over many calls. Run from the repo root (fixture paths are relative):
+ * on one context, the context's memory ceiling, close and shutdown while queries wait for it, open/run/close cycles,
+ * and resident memory over many calls. Run from the repo root (fixture paths are relative):
  *
  *   tests/libzpq/run.sh            builds the library and this test, plain and under AddressSanitizer
  *   test_abi [loop_calls [cycles]] loop_calls (default 10000) sizes the RSS check, cycles (default 1000) the
@@ -373,15 +373,8 @@ static int silent_endpoint(void) {
     return fd;
 }
 
-static void test_close_while_waiting(void) {
-    int lfd = silent_endpoint();
-    CHECK(lfd >= 0, "listener");
-    if (lfd < 0) return;
-    zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
-    if (!c) return;
-    /* The first holds the whole ceiling, stuck on the silent endpoint; the next two wait behind it. */
-    struct budget_call calls[3];
-    pthread_t t[3];
+/* The first call holds the whole ceiling, stuck on the silent endpoint; the next two wait behind it. */
+static void start_stuck_and_waiters(zpq_ctx *c, struct budget_call calls[3], pthread_t t[3]) {
     calls[0] = (struct budget_call){c, "{\"inputs\":[\"s3://bkt/k.parquet\"],\"aggregate\":\"count(*) AS n\"}", -99,
                                     NULL};
     for (int i = 1; i < 3; i++)
@@ -392,6 +385,17 @@ static void test_close_while_waiting(void) {
         pthread_create(&t[i], NULL, budget_worker, &calls[i]);
         usleep(100 * 1000);
     }
+}
+
+static void test_close_while_waiting(void) {
+    int lfd = silent_endpoint();
+    CHECK(lfd >= 0, "listener");
+    if (lfd < 0) return;
+    zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
+    if (!c) return;
+    struct budget_call calls[3];
+    pthread_t t[3];
+    start_stuck_and_waiters(c, calls, t);
     double t0 = now_s();
     zpq_close(c);
     double took = now_s() - t0;
@@ -406,6 +410,40 @@ static void test_close_while_waiting(void) {
           calls[0].rc, calls[0].out);
     zpq_free(calls[0].out);
     CHECK(took < 20.0, "zpq_close took %.1f s", took);
+    close(lfd);
+    unsetenv("S3_ENDPOINT_URL");
+    unsetenv("ZPQ_S3_FIRST_BYTE_TIMEOUT_MS");
+}
+
+/* zpq_shutdown ends the waiters at once while the running query goes on, and leaves the context valid: a host drains
+   its own calls, then closes. */
+static void test_shutdown(void) {
+    int lfd = silent_endpoint();
+    CHECK(lfd >= 0, "listener");
+    if (lfd < 0) return;
+    zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
+    if (!c) return;
+    struct budget_call calls[3];
+    pthread_t t[3];
+    start_stuck_and_waiters(c, calls, t);
+    zpq_shutdown(c);
+    zpq_shutdown(c);
+    for (int i = 1; i < 3; i++) {
+        pthread_join(t[i], NULL);
+        CHECK(calls[i].rc == ZPQ_ECLOSED && calls[i].out && strstr(calls[i].out, "\"error\":\"closed\""),
+              "waiter %d: rc %d %s", i, calls[i].rc, calls[i].out);
+        zpq_free(calls[i].out);
+    }
+    char *out = NULL;
+    int rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}", &out);
+    CHECK(rc == ZPQ_ECLOSED && out && strstr(out, "\"error\":\"closed\""), "after shutdown: rc %d %s", rc, out);
+    zpq_free(out);
+    pthread_join(t[0], NULL);
+    CHECK(calls[0].rc == ZPQ_OK && calls[0].out && strncmp(calls[0].out, "{\"error\"", 8) == 0, "runner: rc %d %s",
+          calls[0].rc, calls[0].out);
+    zpq_free(calls[0].out);
+    zpq_close(c);
+    zpq_shutdown(NULL);
     close(lfd);
     unsetenv("S3_ENDPOINT_URL");
     unsetenv("ZPQ_S3_FIRST_BYTE_TIMEOUT_MS");
@@ -436,6 +474,7 @@ int main(int argc, char **argv) {
     test_options();
     test_budget();
     test_close_while_waiting();
+    test_shutdown();
     test_cycles(cycles);
     zpq_ctx *c = open_ctx("{\"max_memory\": \"512MB\"}");
     if (!c) {

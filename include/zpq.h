@@ -10,8 +10,10 @@
  * pointer to anything the caller passes in after the call returns.
  *
  * Threads: zpq_run may be called from any number of threads at once on one context. zpq_open, zpq_free,
- * zpq_abi_version and zpq_strerror are thread-safe. zpq_close must be called once per context, and no call on the
- * context may start after zpq_close has returned.
+ * zpq_abi_version and zpq_strerror are thread-safe, and so is zpq_shutdown, which may be called any number of times.
+ * zpq_close must be called once per context, and no call on the context may start once zpq_close has begun: it frees
+ * the context. To close a context other threads may still be calling, call zpq_shutdown (new calls, and queries
+ * waiting for their budget, get ZPQ_ECLOSED), wait until the host's own calls have returned, then call zpq_close.
  *
  * Environment: each zpq_run reads the process environment when it is called (S3 credentials, endpoint, region, as
  * the CLI reads them). Do not change it with setenv while a call is running.
@@ -35,7 +37,7 @@ typedef enum zpq_status {
     ZPQ_OK = 0,         /* Done. zpq_run: *out_json holds the response, which may be an {"error": ...} document. */
     ZPQ_EINVAL = -1,    /* The call itself was malformed: a NULL pointer, a bad length, or bad zpq_open options. */
     ZPQ_ENOMEM = -2,    /* Out of memory before a result could be built. No message. */
-    ZPQ_ECLOSED = -3,   /* zpq_close has begun on this context. */
+    ZPQ_ECLOSED = -3,   /* zpq_shutdown or zpq_close has been called on this context. */
     ZPQ_EINTERNAL = -4, /* A failure that is not the caller's: a thread that would not start, a pool or TLS set-up. */
 } zpq_status;
 
@@ -62,7 +64,7 @@ int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error);
  * 403, a refused memory budget): the response is then an {"error": ...} document, exactly as the Lambda returns it.
  * *out_json is the response, to free with zpq_free; *out_len (when out_len is not NULL) its length without the NUL.
  * The other codes are for the call itself: ZPQ_EINVAL (ctx or out_json NULL, NULL request with len > 0, len too
- * large), ZPQ_ECLOSED (zpq_close has begun; a query waiting for its budget is woken with it), ZPQ_ENOMEM,
+ * large), ZPQ_ECLOSED (the context is shutting down; a query waiting for its budget is woken with it), ZPQ_ENOMEM,
  * ZPQ_EINTERNAL. With those, *out_json is an {"error", "reason"} message to free with zpq_free when one could be
  * built (never for ZPQ_ENOMEM), else NULL.
  * Memory: the query reserves its budget (its "max_memory", else the ceiling) from the context's ceiling before it
@@ -75,9 +77,18 @@ int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json,
 void zpq_free(char *json);
 
 /*
- * Close a context: new calls get ZPQ_ECLOSED, queries waiting for their budget are woken with ZPQ_ECLOSED, then
- * zpq_close waits for the running ones to finish, joins any pre-connect handshakes still in flight (up to about one
- * second), and frees the context. Call it once; the context is gone when it returns. NULL is a no-op.
+ * Shut a context down without freeing it: new calls get ZPQ_ECLOSED, and queries waiting for their memory budget
+ * are woken and return ZPQ_ECLOSED. Running queries are not cancelled: each runs to its end, and one stalled on S3
+ * ends only by the S3 timeouts (ZPQ_S3_CONNECT_TIMEOUT_MS, ZPQ_S3_HANDSHAKE_TIMEOUT_MS, ZPQ_S3_FIRST_BYTE_TIMEOUT_MS,
+ * ZPQ_S3_IDLE_TIMEOUT_MS; 5, 5, 10 and 10 s by default) over its retries, which can take a minute or more. The
+ * context stays valid until zpq_close. Returns at once; any thread, any number of times. NULL is a no-op.
+ */
+void zpq_shutdown(zpq_ctx *ctx);
+
+/*
+ * Close a context: zpq_shutdown, then wait for the running queries to finish, join any pre-connect handshakes still
+ * in flight (up to about one second), and free the context. Call it once, when no other call on the context can
+ * still start (see Threads); the context is gone when it returns. NULL is a no-op.
  */
 void zpq_close(zpq_ctx *ctx);
 

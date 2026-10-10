@@ -5,6 +5,7 @@ LIBZPQ_1 {
     zpq_open;
     zpq_run;
     zpq_free;
+    zpq_shutdown;
     zpq_close;
     zpq_abi_version;
     zpq_strerror;

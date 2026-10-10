@@ -71,11 +71,11 @@ Windows is not built.
 
 - The library carries everything it links: BoringSSL, the codecs and libc++. At run time it needs the system C
   library alone, as in the table. It needs no TLS, codec or C++ library from the system.
-- On Linux it exports the six `zpq_*` functions and nothing else, under the symbol version `LIBZPQ_1`
+- On Linux it exports the seven `zpq_*` functions and nothing else, under the symbol version `LIBZPQ_1`
   (`src/libzpq/libzpq.map`; `nm -D --defined-only libzpq.so` lists them). Its BoringSSL cannot collide with a host's
   own OpenSSL, such as the one a Python process loads.
 - On macOS, which has no version script, every archive the dylib links is compiled with hidden symbols, so it exports
-  the six functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
+  the seven functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
   libc++'s weak `operator new` and `operator delete`, which allocate with `malloc` as the system's do.
 - The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
   CLI and Lambda link are not. That makes the first build slower.
@@ -89,7 +89,8 @@ Windows is not built.
 | `int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error)` | a status | `*out_ctx` until `zpq_close`; `*out_error` (free with `zpq_free`) | any thread, any number at once |
 | `int zpq_run(zpq_ctx *, const char *request_json, size_t len, char **out_json, size_t *out_len)` | a status | `*out_json` (free with `zpq_free`) | any number at once on one context |
 | `void zpq_free(char *)` | | | any thread |
-| `void zpq_close(zpq_ctx *)` | | the context is gone when it returns | once per context |
+| `void zpq_shutdown(zpq_ctx *)` | | | any thread, any number of times |
+| `void zpq_close(zpq_ctx *)` | | the context is gone when it returns | once per context, when no other call can start |
 | `int zpq_abi_version(void)` | `1` | | any thread |
 | `const char *zpq_strerror(int)` | a static string | nothing: never free it | any thread |
 
@@ -103,7 +104,7 @@ nor be NUL-terminated (only `len` bytes are read).
 | `ZPQ_OK` | 0 | `zpq_open`: the context is in `*out_ctx`. `zpq_run`: a response was produced, **including** a query that failed (bad SQL, a missing column, an S3 403, a refused memory budget): an `{"error": ...}` document exactly as the Lambda returns it | the response |
 | `ZPQ_EINVAL` | -1 | the call itself was malformed: a NULL context or output, a NULL request with `len > 0`, a length too large, bad `zpq_open` options | `{"error":"invalid_argument","reason":...}` |
 | `ZPQ_ENOMEM` | -2 | out of memory before a result could be built | none |
-| `ZPQ_ECLOSED` | -3 | `zpq_close` has begun on this context | `{"error":"closed","reason":"Closed"}` |
+| `ZPQ_ECLOSED` | -3 | `zpq_shutdown` or `zpq_close` has been called on this context | `{"error":"closed","reason":"Closed"}` |
 | `ZPQ_EINTERNAL` | -4 | a failure that is not the caller's: a thread that would not start, a pool or TLS set-up | `{"error":"internal","reason":...}` |
 
 Every output pointer given is cleared before anything else. On a non-OK status `*out_ctx` is NULL, and the message
@@ -133,10 +134,18 @@ must aggregate (`aggregate` / `group_by`) or write (`output_url`); anything else
 - Any number of `zpq_run` calls may run at once on one context, from its first call on: `zpq_open` sets the pool up
   before returning. Each query runs on threads of its own, as in the CLI, and shares the context's S3 connection
   pool and footer cache. The `"pool"` member of a response then reports the pool's running totals.
-- `zpq_close` refuses new calls (`ZPQ_ECLOSED`), wakes the queries still waiting for their memory budget (they
-  return `ZPQ_ECLOSED`), waits for the running ones, then frees the context. A call that starts after `zpq_close` has
-  returned uses freed memory: the caller must stop calling first, as with `free`. The Python binding does this for
-  its callers.
+- Closing is two steps, because `zpq_close` frees the context and no call may start once it has begun:
+  1. `zpq_shutdown` refuses new calls and wakes the queries still waiting for their memory budget; both return
+     `ZPQ_ECLOSED`. The context stays valid, so threads that are about to call get that status instead of touching
+     freed memory. It returns at once, and may be called again.
+  2. Once the host's own calls have all returned, `zpq_close` waits for any query still running and frees the
+     context.
+
+  The Python binding's `close` does both for its callers.
+- Neither step cancels a running query: it runs to its end. One stalled on S3 ends only by the S3 timeouts
+  (`ZPQ_S3_CONNECT_TIMEOUT_MS`, `ZPQ_S3_HANDSHAKE_TIMEOUT_MS`, `ZPQ_S3_FIRST_BYTE_TIMEOUT_MS`,
+  `ZPQ_S3_IDLE_TIMEOUT_MS`: 5, 5, 10 and 10 s by default) over its retries, which can hold `zpq_close` for a minute
+  or more. A host that needs a faster shutdown can lower those timeouts. Cancelling running queries is not in 0.5.0.
 - One context per process is the intended use. Several work, but each sets and restores the SIGPIPE/SIGIO handlers
   (below), so close them in the reverse order they were opened.
 
@@ -178,7 +187,7 @@ and warm Bloom filters stay with the context until `zpq_close` and are not count
 
 ## Stable and experimental in 0.5.0
 
-Stable: the six functions, their signatures and ownership, the status codes and their meanings, the option names, and
+Stable: the seven functions, their signatures and ownership, the status codes and their meanings, the option names, and
 the request and response schema the Lambda documents. ABI version 1 only grows: new options, request fields and
 status codes may be added.
 
@@ -191,8 +200,9 @@ API, and the HTTP service. The memory ceiling does not yet count the context's c
 the loader path. `zpq.Zpq(max_memory=None, library=None, *, preconnect=False, budget_wait_ms=None)` opens a context.
 `run` returns the response as a dict and raises `zpq.ZpqError` on an `{"error": ...}` response, unless `check=False`;
 a refused call raises `ValueError`, `MemoryError`, `zpq.ZpqClosed` or `RuntimeError` with its reason. ctypes releases
-the GIL during the call, so threads run queries in parallel. `close` refuses new calls (`zpq.ZpqClosed`) and waits for
-those in flight, so the C context is never freed under a running query.
+the GIL during the call, so threads run queries in parallel. `close` refuses new calls and ends those still waiting
+for their memory budget (both `zpq.ZpqClosed`), then waits for the running ones, so the C context is never freed
+under a running query.
 
 `python/zpq_service.py` is a stdlib HTTP service: one process and one context, with a thread per request.
 
@@ -222,7 +232,8 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
     status, message and cleared outputs;
   - 16 threads × 40 mixed calls on one context, each answer checked, on a warm context and on 8 fresh ones whose
     first calls all start together;
-  - queries whose budgets add up past the ceiling, all answered; close while queries wait for their budget;
+  - queries whose budgets add up past the ceiling, all answered; close and shutdown while queries wait for their
+    budget;
   - 1,000 open/run/close cycles, and resident memory over 10,000 calls (the second half must not grow it);
 - the same program under AddressSanitizer and LeakSanitizer, with a tenth of the calls (the system compiler builds
   it; `zig cc` has no sanitizer runtime);

@@ -113,11 +113,15 @@ export fn zpq_abi_version() c_int {
     return 1;
 }
 
-/// The process environment as it is now (libc's `environ`).
+/// The process environment as it is now (libc's `environ`). After `clearenv()` glibc leaves `environ` NULL, which
+/// std declares as never null: read it through an optional instead, and treat NULL as an empty environment.
 fn processEnviron() std.process.Environ {
-    const live: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const environ_ptr = @extern(*const ?[*:null]const ?[*:0]const u8, .{ .name = "environ" });
+    const live = environ_ptr.* orelse return .{ .block = .{ .slice = &no_environ } };
     return .{ .block = .{ .slice = std.mem.span(live) } };
 }
+
+const no_environ = [_:null]?[*:0]const u8{};
 
 test "options: a byte count, a size string, nothing, or an error" {
     try std.testing.expectEqual(Parsed{}, try parseOptions(""));
@@ -177,4 +181,18 @@ test "a context opens connections to the S3 endpoint only when asked to pre-conn
         _ = posix.system.nanosleep(&ts, null);
     }
     try std.testing.expectEqual(@as(u64, 2), warm.pool.inner.preconnect_parked.load(.monotonic));
+}
+
+test "a context opens and answers after the host clears its environment" {
+    const environ_ptr = @extern(*?[*:null]const ?[*:0]const u8, .{ .name = "environ" });
+    const saved = environ_ptr.*;
+    defer environ_ptr.* = saved;
+    environ_ptr.* = null; // what clearenv() leaves
+    try std.testing.expectEqual(@as(usize, 0), processEnviron().block.slice.len);
+    const ctx = zpq_open(null) orelse return error.TestUnexpectedResult;
+    defer zpq_close(ctx);
+    const req = "{\"inputs\":[\"no/such.parquet\"],\"aggregate\":\"count(*) AS n\"}";
+    var out: ?[*:0]u8 = null;
+    try std.testing.expectEqual(ZPQ_ERROR_RESPONSE, zpq_run(ctx, req, req.len, &out, null));
+    zpq_free(out);
 }

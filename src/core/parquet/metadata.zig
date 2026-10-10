@@ -34,6 +34,9 @@ pub const Error = error{
     ColumnChunkCountMismatch,
     /// The file or a row group claims a negative row count.
     NegativeRowCount,
+    /// A file's row groups claim more rows in all than `max_row_count`, or more than fit an i64; or a column chunk
+    /// claims more values than `max_row_count`.
+    RowCountTooLarge,
     /// A schema element claims a negative child count or type length.
     BadSchemaElement,
     /// A column chunk's value count, offsets or sizes are negative, or its byte range overflows.
@@ -103,6 +106,10 @@ pub fn openFooter(
 /// these i32 / i64 fields to usize or adds them together, which on a hostile value is a panic in safe builds and
 /// undefined behaviour in ReleaseFast. Bounds against the actual file length stay with the code that slices, since
 /// a footer fetched on its own (S3) doesn't know the file's length.
+/// The most rows a file's row groups may claim in all, and values one column chunk may: 2^53, beyond any real file and
+/// far enough below 2^64 that the counts, byte estimates and row offsets derived from them cannot overflow.
+pub const max_row_count: i64 = 1 << 53;
+
 pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
     if (meta.num_rows < 0) return error.NegativeRowCount;
     // Every schema has a root element; code throughout walks `schema.items[1..]`.
@@ -139,8 +146,11 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
         remaining[depth] = children;
     }
     for (remaining[0 .. depth + 1]) |left| if (left > 0) return error.BadSchemaElement; // children past the end
+    var total_rows: i64 = 0;
     for (meta.row_groups.items) |*rg| {
         if (rg.num_rows < 0) return error.NegativeRowCount;
+        total_rows = std.math.add(i64, total_rows, rg.num_rows) catch return error.RowCountTooLarge;
+        if (total_rows > max_row_count) return error.RowCountTooLarge;
         for (rg.columns.items) |*cc| {
             // The page index is optional, and an unusable one is ignored wherever it's read; a negative location
             // drops the chunk's page index (both halves, which pruning uses together) rather than the file.
@@ -156,6 +166,7 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
             const cm = cc.meta_data orelse continue;
             if (cm.num_values < 0 or cm.total_compressed_size < 0 or cm.total_uncompressed_size < 0)
                 return error.BadColumnChunkRange;
+            if (cm.num_values > max_row_count) return error.RowCountTooLarge;
             if (cm.data_page_offset < 0) return error.BadColumnChunkRange;
             if (cm.dictionary_page_offset) |d| if (d < 0) return error.BadColumnChunkRange;
             const start = cm.dictionary_page_offset orelse cm.data_page_offset;
@@ -888,6 +899,23 @@ test "footer open rejects counts, offsets and sizes no valid file can have" {
         .{ .err = error.NegativeRowCount, .apply = struct {
             fn f(m: *schema.FileMetaData) void {
                 m.row_groups.items[0].num_rows = -5;
+            }
+        }.f },
+        // Row and value counts no file can have, which every count, estimate and offset derived from them would
+        // overflow on.
+        .{ .err = error.RowCountTooLarge, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].num_rows = std.math.maxInt(i64);
+            }
+        }.f },
+        .{ .err = error.RowCountTooLarge, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].num_rows = max_row_count + 1;
+            }
+        }.f },
+        .{ .err = error.RowCountTooLarge, .apply = struct {
+            fn f(m: *schema.FileMetaData) void {
+                m.row_groups.items[0].columns.items[1].meta_data.?.num_values = max_row_count + 1;
             }
         }.f },
         .{ .err = error.BadColumnChunkRange, .apply = struct {

@@ -212,7 +212,8 @@ pub const Accumulator = union(enum) {
     /// means "no values seen"; merging skips it.
     pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) void {
         switch (dst.*) {
-            .count => |*c| c.* += src.count,
+            // Each file's rows are bounded at its footer (`metadata.max_row_count`); saturating only across files.
+            .count => |*c| c.* +|= src.count,
             .sum_i => |*s| if (src.sum_i) |sv| {
                 s.* = (s.* orelse 0) + sv;
             },
@@ -420,7 +421,7 @@ pub fn updateOneFromStats(
         .count => {
             // count(*): every row counts, regardless of null content.
             if (call.arg == null) {
-                state.count += @intCast(rg.num_rows);
+                state.count +|= @intCast(rg.num_rows);
                 return true;
             }
             // count(col): strict SQL semantics — exclude nulls. Use
@@ -431,7 +432,7 @@ pub fn updateOneFromStats(
             if (col_idx >= rg.columns.items.len) return false;
             const cm = rg.columns.items[col_idx].meta_data orelse return false;
             const present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return false;
-            state.count += @intCast(present);
+            state.count +|= @intCast(present);
             return true;
         },
         .min, .max => {
@@ -3376,8 +3377,7 @@ test "zero float bounds never prove sign even with known zero NaNs" {
             inline for (.{ AggFunc.min, AggFunc.max }) |func| {
                 const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "x", .result = .f64 };
                 var state = Accumulator.init(call);
-                try testing.expectEqual(if (func == .min) c.min_folds else c.max_folds,
-                    try updateOneFromStats(&state, call, &rg, &meta));
+                try testing.expectEqual(if (func == .min) c.min_folds else c.max_folds, try updateOneFromStats(&state, call, &rg, &meta));
             }
         }
     }

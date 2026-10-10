@@ -1957,7 +1957,8 @@ pub const DecodeBudget = struct {
 
 /// Bytes decoding `cols` of `in` takes, from its metadata: each leaf's values in its batch lane (a string as a slice
 /// plus its page bytes, which the values point into), its levels, and a computed argument's intermediate columns.
-/// An estimate, kept on the high side; it decides waiting and staging, not correctness.
+/// An estimate, kept on the high side; it decides waiting and staging, not correctness. Saturating: each footer count
+/// is bounded (`metadata.max_row_count`), but a wide schema sums many of them.
 pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_agg.AggCall, grouped: bool) usize {
     const rows: usize = @intCast(@max(0, in.rg.num_rows));
     var total: usize = rows / 8 + 64; // selection
@@ -1975,18 +1976,18 @@ pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_a
             .INT64 => if (decimal) 16 else 8,
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => 24, // slice, or a decimal's f64 view and i128
         };
-        total += n * lane;
+        total +|= n *| lane;
         if (cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY) {
-            total += @intCast(@max(0, cm.total_uncompressed_size));
+            total +|= @intCast(@max(0, cm.total_uncompressed_size));
         }
-        if (levels.max_def > 0) total += n * 4;
-        if (levels.max_rep > 0) total += n * 4;
+        if (levels.max_def > 0) total +|= n *| 4;
+        if (levels.max_rep > 0) total +|= n *| 4;
     }
     // A computed argument materializes a 16-byte column per operator; a grouped scan a group id per row.
     for (calls) |c| if (c.arg) |a| if (a != .col_ref) {
-        total += rows * 16 * a.depth();
+        total +|= rows *| 16 *| a.depth();
     };
-    return total + if (grouped) rows * 4 else 0;
+    return total +| if (grouped) rows *| 4 else 0;
 }
 
 /// Per-RG aggregator update. Answers what statistics can, then decodes

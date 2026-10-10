@@ -575,7 +575,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         const rg_src: consumer.RGSrc = .{ .bytes = w.inputs[item.file].bytes, .byte_origin = 0 };
         if (item.agg_start == 0) {
             w.rgs_in += 1;
-            w.rows_in += rg.num_rows;
+            w.rows_in +|= rg.num_rows;
         }
         const rg_span = profile.Span.begin(prof);
         const decision = w.plan.decide(rg, meta);
@@ -598,7 +598,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .filter => {},
         }
         if (item.agg_start == 0) {
-            w.rows_kept += rg.num_rows;
+            w.rows_kept +|= rg.num_rows;
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
@@ -844,8 +844,8 @@ pub fn runMultiAggregate(
                 // materialized.
                 if (col.meta_data) |cm| {
                     const uncompressed: u64 = @intCast(cm.total_uncompressed_size);
-                    const by_rows: u64 = @as(u64, @intCast(rg.num_rows)) * 4;
-                    fetch_bytes += @max(uncompressed, by_rows);
+                    const by_rows: u64 = @as(u64, @intCast(rg.num_rows)) *| 4;
+                    fetch_bytes +|= @max(uncompressed, by_rows);
                 }
             }
         }

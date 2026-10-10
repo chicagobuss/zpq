@@ -67,6 +67,9 @@ pub const Timeouts = struct {
     handshake_ms: u32 = 5_000,
     first_byte_ms: u32 = 10_000,
     idle_ms: u32 = 10_000,
+    /// Test-only. When set, read and write deadlines use this millisecond clock instead of wall time, and waits
+    /// poll so a test can expire a stalled attempt by advancing the clock. Production leaves it null.
+    clock_ms: ?*const fn () u64 = null,
 
     /// The defaults, each overridden by its environment variable when that holds a positive integer.
     pub fn fromEnv(env: std.process.Environ) Timeouts {
@@ -306,14 +309,16 @@ pub const Connection = struct {
 
     /// Read from the socket, waiting at most `first_byte_ms` for a response's first byte, else `idle_ms`.
     fn readSocket(self: *Connection, buf: []u8) Error!usize {
+        self.sock.clock_ms = self.timeouts.clock_ms;
         const wait = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
-        const n = readBy(self.fd, buf, monoMs() + wait, &self.sock) catch |err| return self.recvError(err);
+        const n = readBy(self.fd, buf, nowMs(self.sock.clock_ms) + wait, &self.sock) catch |err| return self.recvError(err);
         if (n > 0) self.awaiting_response = false;
         return n;
     }
 
     /// Write all of `buf`, failing with `error.SendTimeout` once `idle_ms` pass with no byte taken.
     fn writeSocket(self: *Connection, buf: []const u8) Error!void {
+        self.sock.clock_ms = self.timeouts.clock_ms;
         writeAllBy(self.fd, buf, self.timeouts.idle_ms, null, &self.sock) catch |err| return sendError(err);
     }
 
@@ -491,7 +496,48 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32) Error!posix.fd_t {
 }
 
 /// A socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, ms (0: never).
-pub const SockTimeouts = struct { rcv_ms: u32 = 0, snd_ms: u32 = 0 };
+pub const SockTimeouts = struct {
+    rcv_ms: u32 = 0,
+    snd_ms: u32 = 0,
+    /// Copied from `Timeouts.clock_ms` for the wait in progress. Null uses wall time and the socket timeout.
+    clock_ms: ?*const fn () u64 = null,
+};
+
+const test_clock = struct {
+    var on: std.atomic.Value(bool) = .init(false);
+    var ms: std.atomic.Value(u64) = .init(0);
+    /// One test arms the clock at a time. A second waits, so two UploadPart tests cannot move each other's deadlines.
+    var held: std.atomic.Value(bool) = .init(false);
+};
+
+fn waitTestClock() void {
+    while (test_clock.held.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
+        var ts: posix.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = posix.system.nanosleep(&ts, &ts);
+    }
+}
+
+/// Freeze deadline time at the current wall clock. `testClockMs` then stands still until `advanceTestClock`.
+pub fn armTestClock() void {
+    waitTestClock();
+    test_clock.ms.store(monoMs(), .release);
+    test_clock.on.store(true, .release);
+}
+
+pub fn disarmTestClock() void {
+    test_clock.on.store(false, .release);
+    test_clock.held.store(false, .release);
+}
+
+/// Move the frozen clock forward. A no-op unless `armTestClock` is in effect, so a stall in some other test cannot
+/// expire a deadline that is still on the wall clock.
+pub fn advanceTestClock(by_ms: u64) void {
+    if (test_clock.on.load(.acquire)) _ = test_clock.ms.fetchAdd(by_ms, .release);
+}
+
+pub fn testClockMs() u64 {
+    return test_clock.ms.load(.acquire);
+}
 
 /// Set SO_RCVTIMEO or SO_SNDTIMEO to `ms` unless it already holds it. A blocking read or write that waits that long
 /// without moving a byte then fails with EAGAIN.
@@ -505,8 +551,8 @@ fn armSockTimeout(fd: posix.fd_t, opt: u32, ms: u32, current: *u32) bool {
 }
 
 /// Milliseconds left until `deadline`, at least 1; null once it has passed.
-fn msLeft(deadline: u64) ?u32 {
-    const now = monoMs();
+fn msLeft(deadline: u64, clock_ms: ?*const fn () u64) ?u32 {
+    const now = nowMs(clock_ms);
     if (now >= deadline) return null;
     return @intCast(@min(deadline - now, std.math.maxInt(u32)));
 }
@@ -528,6 +574,11 @@ fn stageBudget(cap: u32, deadline_ms: ?u64) u32 {
     return @intCast(@min(@as(u64, cap), deadline - now));
 }
 
+fn nowMs(clock_ms: ?*const fn () u64) u64 {
+    if (clock_ms) |f| return f();
+    return monoMs();
+}
+
 fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
@@ -539,11 +590,45 @@ const ReadError = error{ ReadFailed, ConnectionReset, WouldBlock };
 /// for the handshake) passed. Every byte taken restarts the idle wait; a signal interrupting a wait does not, since
 /// the socket timeout is set to the time left before each write.
 fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
-    var deadline = monoMs() + idle_ms;
+    const clock_ms = opts.clock_ms;
+    var deadline = nowMs(clock_ms) + idle_ms;
     if (stage) |d| deadline = @min(deadline, d);
+    // A test clock must not arm a short socket timeout: that still fires on wall time while the machine is loaded.
+    // Poll and recheck the virtual deadline instead. The socket timeout is only a backstop.
+    if (clock_ms != null) {
+        if (!armSockTimeout(fd, posix.SO.SNDTIMEO, 30_000, &opts.snd_ms)) return error.SendFailed;
+        const real_start = monoMs();
+        var off: usize = 0;
+        while (off < buf.len) {
+            if (nowMs(clock_ms) >= deadline) return error.WouldBlock;
+            // Wall-clock backstop only, so a stuck socket cannot hang the test. The stall itself expires on the
+            // virtual clock, which a loaded machine does not move.
+            if (monoMs() - real_start > 120_000) return error.WouldBlock;
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const pr = posix.system.poll(&pfd, 1, 20);
+            switch (posix.errno(pr)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.SendFailed,
+            }
+            if (pr == 0) continue;
+            const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
+            switch (posix.errno(r)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return error.SendFailed,
+            }
+            const n: usize = @intCast(r);
+            if (n == 0) return error.SendFailed;
+            off += n;
+            deadline = nowMs(clock_ms) + idle_ms;
+            if (stage) |d| deadline = @min(deadline, d);
+        }
+        return;
+    }
     var off: usize = 0;
     while (off < buf.len) {
-        const left = msLeft(deadline) orelse return error.WouldBlock;
+        const left = msLeft(deadline, null) orelse return error.WouldBlock;
         if (!armSockTimeout(fd, posix.SO.SNDTIMEO, left, &opts.snd_ms)) return error.SendFailed;
         const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
         switch (posix.errno(r)) {
@@ -570,8 +655,33 @@ fn sendError(err: WriteError) Error {
 /// One read, by `deadline` (absolute, `monoMs`). `error.WouldBlock`: the deadline passed without a byte arriving.
 /// A signal interrupting the wait does not extend it: the socket timeout is set to the time left before each try.
 fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
+    if (opts.clock_ms) |clock_ms| {
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, 30_000, &opts.rcv_ms)) return error.ReadFailed;
+        const real_start = monoMs();
+        while (true) {
+            if (clock_ms() >= deadline) return error.WouldBlock;
+            // Wall-clock backstop only, so a stuck socket cannot hang the test. The stall itself expires on the
+            // virtual clock, which a loaded machine does not move.
+            if (monoMs() - real_start > 120_000) return error.WouldBlock;
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+            const pr = posix.system.poll(&pfd, 1, 20);
+            switch (posix.errno(pr)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.ReadFailed,
+            }
+            if (pr == 0) continue;
+            const r = posix.system.read(fd, buf.ptr, buf.len);
+            switch (posix.errno(r)) {
+                .SUCCESS => return @intCast(r),
+                .INTR, .AGAIN => continue,
+                .CONNRESET, .CONNABORTED, .TIMEDOUT => return error.ConnectionReset,
+                else => return error.ReadFailed,
+            }
+        }
+    }
     while (true) {
-        const left = msLeft(deadline) orelse return error.WouldBlock;
+        const left = msLeft(deadline, null) orelse return error.WouldBlock;
         if (!armSockTimeout(fd, posix.SO.RCVTIMEO, left, &opts.rcv_ms)) return error.ReadFailed;
         const r = posix.system.read(fd, buf.ptr, buf.len);
         return switch (posix.errno(r)) {

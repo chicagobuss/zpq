@@ -45,11 +45,11 @@ the medium moves in that time, the requests in flight at once, and the longest r
   filters are rarely adjacent; merging across the others' can still beat a request per filter. A merged span carries
   at most a mebibyte of unwanted bytes, or twice the bytes it is read for if that is more: over-reading bets on
   bandwidth a cold read may not get.
-- The S3 source assumes Lambda's in-region costs (about 25 ms a request, 80 MB/s a connection). A 304 revalidation
-  times a small response on an open connection; a slower round trip means a distant link, and then the plan uses that
-  round trip and the bandwidth the first filter reads achieved. Until one has been timed, and in-region, the
-  calibration stands: the first reads also open connections, which a few hundred kilobytes cannot tell apart from
-  slow bandwidth.
+- The S3 source assumes Lambda's in-region costs (about 25 ms a request, 80 MB/s a connection). A successful footer
+  request's time to first byte — a cold suffix, a stale 200/206, or a 304 — is that sample. A slower one means a
+  distant link, and then the plan uses that round trip and the bandwidth the first filter reads achieved. Until one
+  has been timed, and in-region, the calibration stands: the first reads also open connections, which a few hundred
+  kilobytes cannot tell apart from slow bandwidth.
 - When the length is known (`bloom_filter_length`), just the 32-byte blocks the literals select can be read instead
   of whole filters. Blocks are located through the header every known writer emits; they count only once a real
   header from the same file matched that shape. Blocks must save a quarter of the estimated time to be chosen, since

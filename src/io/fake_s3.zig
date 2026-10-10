@@ -32,7 +32,10 @@ pub const Object = struct {
 };
 
 pub const FakeS3 = struct {
-    const MAX_CONNS = 64;
+    /// Lifetime accepts. A finished connection keeps its slot until `deinit`. One query opens at most its pool and
+    /// reuses those connections across row-group windows; a test runs many queries on one server. 64 is enough when
+    /// every query opens a couple, and not when an up-front fetch fills the pool.
+    const MAX_CONNS = 256;
 
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t,
@@ -81,6 +84,17 @@ pub const FakeS3 = struct {
     create_unreadable: bool = false,
     /// Set by `deinit`: stalled connection threads stop waiting.
     stopping: std.atomic.Value(bool) = .init(false),
+    /// When set, a data GET is counted in `gets_arrived` and not answered until `release_gets`. `release_one_get`
+    /// lets exactly one of those answers go out, so a test can open the data-wave gate and watch the rest start.
+    /// When set, `holdSilent` advances `tls`'s test clock once so a stalled attempt times out without a wall-clock wait.
+    expire_virtual_deadline: bool = false,
+    hold_gets: bool = false,
+    gets_arrived: std.atomic.Value(u32) = .init(0),
+    /// Data GETs currently blocked in `hold_gets`, and the most that were blocked at once.
+    gets_waiting: std.atomic.Value(u32) = .init(0),
+    max_waiting: std.atomic.Value(u32) = .init(0),
+    release_gets: std.atomic.Value(bool) = .init(false),
+    release_one_get: std.atomic.Value(bool) = .init(false),
 
     pub const StallAt = enum {
         /// No byte of the response.
@@ -290,6 +304,13 @@ pub const FakeS3 = struct {
     /// end in the meantime.
     fn holdSilent(self: *FakeS3, fd: posix.fd_t) void {
         _ = fd;
+        // One jump of a test clock, then a pause long enough for a 20 ms poll to notice, then no further jumps:
+        // the stalled attempt's virtual deadline expires and the retry's, taken afterwards, does not.
+        if (self.expire_virtual_deadline) {
+            const tls = @import("tls.zig");
+            tls.advanceTestClock(60_000);
+            sleepMs(40);
+        }
         while (!self.stopping.load(.acquire)) sleepMs(5);
     }
 
@@ -455,8 +476,26 @@ pub const FakeS3 = struct {
         } else {
             status = 400;
         }
+        const hold_this = self.hold_gets and std.mem.eql(u8, method, "GET") and param(query, "uploads") == null;
         self.unlock();
         locked = false;
+        if (hold_this) {
+            _ = self.gets_arrived.fetchAdd(1, .release);
+            const waiting = self.gets_waiting.fetchAdd(1, .acq_rel) + 1;
+            var prev = self.max_waiting.load(.acquire);
+            while (waiting > prev) {
+                if (self.max_waiting.cmpxchgWeak(prev, waiting, .acq_rel, .acquire)) |seen| {
+                    prev = seen;
+                    continue;
+                }
+                break;
+            }
+            defer _ = self.gets_waiting.fetchSub(1, .release);
+            while (!self.release_gets.load(.acquire) and !self.stopping.load(.acquire)) {
+                if (self.release_one_get.swap(false, .acq_rel)) break;
+                sleepMs(5);
+            }
+        }
         return self.reply(fd, lose, status, extra, resp_body, advertised_len);
     }
 

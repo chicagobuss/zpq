@@ -138,6 +138,8 @@ engine read 0.03 parse 0.12 decode 70.46 (wall 13.53) eval 0.01 ms
        agg 5.88 encode 0.00 ms (the sources of the JSON phase fields)
 ```
 
+The first data wave of a query keeps at most 8 data-range requests in flight until the first data-range response header arrives, then at most 16. That avoids opening 16 fresh connections and TLS handshakes at once on a cold sandbox. Footer, metadata and Bloom requests are not part of that wave and do not open the gate. `peak` above is whatever was in flight, including after the gate has opened.
+
 A zstd write adds the priority its pages were compressed with and, under `speed`, the form each took and how many
 failed their page checks (see `--compress-priority` in the README):
 

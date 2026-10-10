@@ -169,9 +169,9 @@ pub const OutputLane = pool_mod.Lane(s3.Pool(POOL_SIZE), OUTPUT_POOL_SIZE);
 /// a real fetch descends into BoringSSL and libc `getaddrinfo`/NSS, whose stack use nothing here bounds.
 const READ_WORKER_STACK_SIZE: usize = 4 << 20;
 
-/// Footer and metadata worker loops, and the width of the first data wave. One worker holds one permit. A worker
-/// sleeping in retry backoff still holds its slot, so live concurrency can dip below this while a host throttles.
-/// Data fetches pass `s3.S3_IN_FLIGHT` and let `fetchJobs` open the rest after this first wave is in flight.
+/// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
+/// its slot, so live concurrency can dip below this while a host throttles. Data fetches pass `s3.S3_IN_FLIGHT`;
+/// `s3.DataWave` holds the first of those at `S3_FIRST_WAVE` until a data-range response header arrives.
 pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
 
 /// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
@@ -2448,13 +2448,15 @@ fn openInputs(
         if (s3_window.supported) {
             const limit = fetch_window.limit;
             var need: u64 = 0;
+            // The bytes the compact buffers will hold, gaps included. A gap that would push one row group past the
+            // window, or past twice its selected bytes, is not read.
             for (specs) |*sp| for (sp.meta.row_groups.items) |*rg| {
                 const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
-                for (cols, 0..) |needed, ci| {
-                    if (!needed or ci >= rg.columns.items.len) continue;
-                    const cm = rg.columns.items[ci].meta_data orelse continue;
-                    need += @intCast(cm.total_compressed_size);
-                }
+                var rg_ranges: std.ArrayList(coalescer.Range) = .empty;
+                try appendRgFetchRanges(arena, &rg_ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
+                if (rg_ranges.items.len == 0) continue;
+                const merged = try coalesceS3Spans(arena, rg_ranges.items, sp.rtt_ns, limit);
+                for (merged) |r| need += r.end - r.start;
             };
             windowed = need > limit or (fetch_window.always and need > 0);
         }
@@ -2484,34 +2486,19 @@ fn openInputs(
                     n_rgs_pruned += 1;
                     continue;
                 };
+                // EVERY needed chunk goes into the range list — including ones inside the prefetched tail — so the
+                // compact buffer covers it and offset rebasing can find it. Bytes at or past tail_start are
+                // satisfied by copying from the tail below (no re-fetch); only the sub-tail_start portion becomes
+                // a fetch job.
+                try appendRgFetchRanges(arena, &ranges, rg, cols, plan.carriedFilters(rg, meta), sp.total_size);
                 for (cols, 0..) |needed, ci| {
-                    if (!needed) continue;
-                    if (ci >= rg.columns.items.len) continue;
+                    if (!needed or ci >= rg.columns.items.len) continue;
+                    if (!plan.isFilterCol(ci)) continue;
                     const cm = rg.columns.items[ci].meta_data orelse continue;
                     const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
                     const len: u64 = @intCast(cm.total_compressed_size);
-                    // EVERY needed chunk goes into the range list — including
-                    // ones inside the prefetched tail — so the compact buffer
-                    // covers it and offset rebasing can find it. Bytes at or
-                    // past tail_start are satisfied by copying from the tail
-                    // below (no re-fetch); only the sub-tail_start portion
-                    // becomes a fetch job.
-                    const span_r: coalescer.Range = .{ .start = start, .end = start + len };
-                    try ranges.append(arena, span_r);
-                    if (plan.isFilterCol(ci)) try filter_ranges.append(arena, span_r);
+                    try filter_ranges.append(arena, .{ .start = start, .end = start + len });
                 }
-                // A copied row group keeps its Bloom filters, so they are fetched with it.
-                if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |c, ci| {
-                    if (!c or ci >= rg.columns.items.len) continue;
-                    const cm = rg.columns.items[ci].meta_data orelse continue;
-                    const off = cm.bloom_filter_offset orelse continue;
-                    const len = cm.bloom_filter_length orelse continue;
-                    if (off < 4 or len <= 0 or len > sbbf.max_filter_bytes) continue;
-                    const start: u64 = @intCast(off);
-                    const end = start + @as(u64, @intCast(len));
-                    if (end > sp.total_size) continue;
-                    try ranges.append(arena, .{ .start = start, .end = end });
-                };
             }
             rg_first[meta.row_groups.items.len] = ranges.items.len;
 
@@ -2519,8 +2506,8 @@ fn openInputs(
                 sp.file_buf = &.{};
                 continue;
             }
-            // Windowed, coalescing stops at row group boundaries and each row group starts on a page of its own;
-            // otherwise ranges coalesce across the whole file.
+            // Each row group coalesces on its own, so a gap cannot join two groups into one span bigger than the
+            // window accounted for. A windowed group also starts on a page of its own.
             var compact: std.ArrayList(CompactRange) = .empty;
             var compact_len: usize = 0;
             const page = std.heap.pageSize();
@@ -2529,11 +2516,9 @@ fn openInputs(
             for (0..meta.row_groups.items.len + 1) |ri| {
                 if (windowed) rg_compact[ri] = compact.items.len;
                 if (ri == meta.row_groups.items.len) break;
-                if (!windowed and ri > 0) continue;
-                const span = if (windowed) ranges.items[rg_first[ri]..rg_first[ri + 1]] else ranges.items;
+                const span = ranges.items[rg_first[ri]..rg_first[ri + 1]];
                 if (span.len == 0) continue;
-                const gap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S);
-                const merged = try coalescer.Coalescer.coalesce(arena, span, gap);
+                const merged = try coalesceS3Spans(arena, span, sp.rtt_ns, fetch_window.limit);
                 n_ranges += span.len;
                 n_merged += merged.len;
                 if (windowed) compact_len = std.mem.alignForward(usize, compact_len, page);
@@ -2655,6 +2640,8 @@ fn openInputs(
         // acquire/release.
         if (fetch_jobs.items.len > 0) {
             const fetch_span = profile.Span.begin(prof);
+            // This call is the query's data wave. Footer and Bloom fetches do not share it.
+            var data_wave: s3.DataWave = .{};
             const fetched = try s3.fetchJobs(
                 read_ctx.io,
                 pool,
@@ -2664,6 +2651,7 @@ fn openInputs(
                 fetch_jobs.items,
                 s3.S3_IN_FLIGHT,
                 args.profiler,
+                &data_wave,
             );
             fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
             for (fetch_jobs.items) |j| try ensureHeadMagic(j.range.start, j.target);
@@ -3002,9 +2990,9 @@ const FetchSpec = struct {
     /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
-    /// How long a small conditional GET took on a connection already open (a 304 revalidation). Zero until one has.
-    /// The footer suffix is too large, and too often the first request on a new connection, to be that sample; zero
-    /// leaves the in-region calibration in place.
+    /// Time to the first byte of a successful footer request: a cold suffix, a stale 200/206, or a 304. Zero until
+    /// one has. That is the latency the coalesce gap uses. A 304 used to record the whole exchange; the body after
+    /// the first byte is not latency.
     rtt_ns: u64 = 0,
     err: ?anyerror = null,
 
@@ -3137,6 +3125,7 @@ const S3Membership = struct {
                 jobs.items,
                 READ_CONCURRENCY,
                 self.profiler,
+                null,
             );
             self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
@@ -3207,6 +3196,54 @@ fn trimRetainedSuffix(gpa: std.mem.Allocator, sp: *FetchSpec, plan: RangePlan, a
     gpa.free(@constCast(sp.tail));
     sp.tail = neu;
     sp.tail_start = lo;
+}
+
+/// Column chunks and carried Bloom filters this row group will fetch.
+fn appendRgFetchRanges(
+    arena: std.mem.Allocator,
+    ranges: *std.ArrayList(coalescer.Range),
+    rg: *schema.RowGroup,
+    cols: []const bool,
+    carry: ?[]const bool,
+    total_size: u64,
+) !void {
+    for (cols, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[ci].meta_data orelse continue;
+        const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+        const len: u64 = @intCast(cm.total_compressed_size);
+        try ranges.append(arena, .{ .start = start, .end = start + len });
+    }
+    if (carry) |c| for (c, 0..) |on, ci| {
+        if (!on or ci >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[ci].meta_data orelse continue;
+        const off = cm.bloom_filter_offset orelse continue;
+        const len = cm.bloom_filter_length orelse continue;
+        if (off < 4 or len <= 0 or len > sbbf.max_filter_bytes) continue;
+        const start: u64 = @intCast(off);
+        const end = start + @as(u64, @intCast(len));
+        if (end > total_size) continue;
+        try ranges.append(arena, .{ .start = start, .end = end });
+    };
+}
+
+/// Coalesce one row group's ranges into the spans that will actually be read. Positive gaps merge only while the
+/// row group still takes more than one wave, each gap stays within the latency model, and the merged bytes stay
+/// within twice the selected bytes and within `budget` (what an admitted row group may hold). Selected bytes
+/// themselves are never dropped to satisfy the budget.
+fn coalesceS3Spans(
+    arena: std.mem.Allocator,
+    ranges: []const coalescer.Range,
+    rtt_ns: u64,
+    budget: u64,
+) ![]const coalescer.Range {
+    var selected: u64 = 0;
+    for (ranges) |r| selected += r.end -| r.start;
+    const amp = selected *| 2;
+    const room = if (selected > budget) selected else budget;
+    const byte_cap = @min(amp, room);
+    const gap = coalescer.s3CoalesceGap(rtt_ns, s3.S3_BYTES_PER_S);
+    return coalescer.coalesceMinWaves(arena, ranges, gap, s3.S3_IN_FLIGHT, byte_cap);
 }
 
 fn noteSuffixOverlap(lo: *u64, hi: *u64, tail_lo: u64, tail_hi: u64, start: u64, end: u64) void {
@@ -3300,7 +3337,6 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // installed at the end of the cold path.
     if (t.ctx.meta_cache) |cache| {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
-            const t_cond = nowMonoNs();
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
                 .range = s3.Range.suffix(t.probe),
                 .if_none_match = entry.etag,
@@ -3309,8 +3345,8 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             t.account.add(cond.body.len);
             defer t.account.sub(cond.body.len);
             t.cache = if (cond.status == 304) 1 else 2;
+            noteFooterRtt(sp, cond);
             if (cond.status == 304) {
-                sp.rtt_ns = @intCast(nowMonoNs() - t_cond);
                 sp.noteEtag(entry.etag);
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
@@ -3344,6 +3380,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     t.account.add(tail_resp.body.len);
     defer t.account.sub(tail_resp.body.len);
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
+    noteFooterRtt(sp, tail_resp);
     sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
     try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
@@ -3357,6 +3394,11 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 /// them, and satisfy later ranges with no extra GET. The leading PAR1 is
 /// checked whenever a fetched range covers offset 0, including this suffix
 /// and a footer-prefix GET that itself starts at 0.
+/// The footer's time to first byte, when the exchange recorded one. Cold, stale and 304 responses all count.
+fn noteFooterRtt(sp: *FetchSpec, resp: http.Response) void {
+    if (resp.ttfb_ns > 0) sp.rtt_ns = @intCast(resp.ttfb_ns);
+}
+
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));

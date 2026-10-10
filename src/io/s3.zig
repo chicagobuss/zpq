@@ -55,7 +55,8 @@ pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
 
 /// Most data ranges in flight on S3. More than this made the request policer slower.
 pub const S3_IN_FLIGHT: usize = 16;
-/// The first wave opens only this many. The rest start once these jobs are in flight.
+/// Data-range requests in flight until this query's first data-range response header. Footer, metadata and Bloom
+/// requests are not part of that wave and do not raise the cap. After the header, the cap is `S3_IN_FLIGHT`.
 pub const S3_FIRST_WAVE: usize = 8;
 /// A data GET longer than this is split.
 pub const S3_RANGE_SPLIT: u64 = 8 << 20;
@@ -638,27 +639,32 @@ pub fn requestViaPool(
     while (true) {
         var last_err: anyerror = error.RetryableStatus;
         const failure: retry.Failure = blk: {
-            const t_acquire = if (opts.prof != null) clock.monoNs() else 0;
+            const t_acquire = clock.monoNs();
             trace.attempts +|= 1;
             const handle = p.acquire(io, criteria, .{ .fresh = attempts.fresh }) catch |err| {
                 last_err = err;
                 break :blk retry.classifyConnect(err);
             };
-            const t_send = if (opts.prof != null) clock.monoNs() else 0;
+            const t_send = clock.monoNs();
             trace.reused = handle.reused;
             if (send(context, arena, handle.conn)) |resp| {
                 p.release(io, handle);
+                var out = resp;
+                if (out.first_byte_ns != 0) {
+                    const d = out.first_byte_ns - t_send;
+                    if (d > 0) out.ttfb_ns = d;
+                }
                 if (opts.prof != null) {
                     const t_done = clock.monoNs();
-                    const first = if (resp.first_byte_ns != 0) resp.first_byte_ns else t_done;
-                    trace.status = resp.status;
-                    trace.body_len = resp.body.len;
+                    const first = if (out.first_byte_ns != 0) out.first_byte_ns else t_done;
+                    trace.status = out.status;
+                    trace.body_len = out.body.len;
                     trace.acquire_ns = t_send - t_acquire;
                     trace.ttfb_ns = first - t_send;
                     trace.body_ns = t_done - first;
                 }
-                if (!retry.retryableStatus(resp.status)) return resp;
-                throttled = resp;
+                if (!retry.retryableStatus(out.status)) return out;
+                throttled = out;
                 break :blk .transient;
             } else |err| {
                 p.discard(io, handle);
@@ -764,6 +770,40 @@ pub const Landed = struct {
     f: *const fn (ctx: *anyopaque, bytes: usize) void,
 };
 
+/// The query's first data wave. At most `S3_FIRST_WAVE` data-range requests are in flight until the first
+/// data-range response header of this query arrives, then at most `S3_IN_FLIGHT`. Footer, metadata and Bloom
+/// requests do not use a `DataWave`, so they neither take a slot nor open the gate. One query shares one value
+/// across its data fetches; a later batch in that query already sees the raised cap.
+pub const DataWave = struct {
+    cap: std.atomic.Value(usize) = .init(S3_FIRST_WAVE),
+    in_flight: std.atomic.Value(usize) = .init(0),
+
+    /// Wait until fewer than `cap` data-range requests are in flight, then count this one.
+    pub fn acquire(self: *DataWave, io: Io) Io.Cancelable!void {
+        while (true) {
+            const cap = self.cap.load(.acquire);
+            var cur = self.in_flight.load(.acquire);
+            while (cur < cap) {
+                if (self.in_flight.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire)) |observed| {
+                    cur = observed;
+                    continue;
+                }
+                return;
+            }
+            try io.sleep(.fromNanoseconds(50 * std.time.ns_per_us), .awake);
+        }
+    }
+
+    pub fn release(self: *DataWave) void {
+        _ = self.in_flight.fetchSub(1, .release);
+    }
+
+    /// The first data-range response header has arrived. Later acquires may use the full cap. Idempotent.
+    pub fn noteHeader(self: *DataWave) void {
+        self.cap.store(S3_IN_FLIGHT, .release);
+    }
+};
+
 /// Parallel multi-file range fetch using a shared `Pool`. Splits any
 /// input range larger than SPLIT_THRESHOLD into sub-ranges, then runs them through `workers` worker loops. Returns
 /// total bytes fetched.
@@ -784,6 +824,8 @@ pub fn fetchJobs(
     workers: usize,
     /// Records each request as a span on the fetching thread when set.
     profiler: ?*profile.Profiler,
+    /// The query's data wave, or null for a fetch that is not a data range (Bloom, tests, `fetchManyRanges`).
+    wave: ?*DataWave,
 ) !u64 {
     // 1. Pre-process: split big ranges into sub-jobs.
     var split: std.ArrayList(FetchJob) = .empty;
@@ -853,6 +895,7 @@ pub fn fetchJobs(
             .ok = false,
             .profiler = profiler,
             .landed = j.landed,
+            .wave = wave,
         };
     }
 
@@ -865,16 +908,9 @@ pub fn fetchJobs(
     // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
     // rather than as the bad argument it is.
     const n_workers = @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
-    // The first wave stays at S3_FIRST_WAVE. Further workers start once that many jobs have been
-    // handed out, so a cold batch does not open the whole ceiling at once. They then run together.
-    const first = @min(n_workers, S3_FIRST_WAVE);
-    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, first, io, fetchOneTask);
-    if (n_workers > first) {
-        while (shared.cursor.load(.monotonic) < first and !shared.drained()) {
-            try io.sleep(.fromNanoseconds(50 * std.time.ns_per_us), .awake);
-        }
-        try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers - first, io, fetchOneTask);
-    }
+    // Every worker starts now. A data wave holds each one at `DataWave` until a slot is free, so the first
+    // response header, not a claim count, is what lets the rest go out.
+    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
     try group.await(io);
 
     // 5. Tally + check for failures.
@@ -911,7 +947,7 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null);
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null, null);
 }
 
 const FetchCtx = struct {
@@ -930,10 +966,14 @@ const FetchCtx = struct {
     ok: bool,
     profiler: ?*profile.Profiler = null,
     landed: ?Landed = null,
+    /// Set for a query's data-range fetches. Null for Bloom and other callers.
+    wave: ?*DataWave = null,
 };
 
 /// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
+    if (ctx.wave) |w| try w.acquire(io);
+    defer if (ctx.wave) |w| w.release();
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const criteria: PoolCriteria = .{
@@ -987,7 +1027,12 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
         .host = ctx.host,
         .path = path,
         .headers = headers.items,
-    }, ctx.target);
+    }, ctx.target, if (ctx.wave != null) .{ .ctx = ctx, .f = noteDataHeader } else null);
+}
+
+fn noteDataHeader(ctx: *anyopaque) void {
+    const f: *FetchCtx = @ptrCast(@alignCast(ctx));
+    if (f.wave) |w| w.noteHeader();
 }
 
 /// Parallel multipart upload of `body` to `url`. Thin wrapper around
@@ -1682,6 +1727,107 @@ test "a response that keeps arriving is not cut off, however long it takes in al
     try testing.expect(clock.monoNs() - t0 >= 800 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
     try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+}
+
+fn sleepMs(ms: u64) void {
+    var ts: std.os.linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+test "the first data wave keeps at most 8 data-range requests in flight until the first data-range response header" {
+    // Footer, metadata and Bloom fetches pass a null DataWave. They do not take a slot and do not open this gate.
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    const blob = "0123456789abcdefghij";
+    try fake.serveBytes("obj", blob);
+    fake.hold_gets = true;
+
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = .{ .connect_ms = 2_000, .handshake_ms = 2_000, .first_byte_ms = 5_000, .idle_ms = 5_000 },
+    };
+    var pool: Pool(16) = undefined;
+    try pool.init(testing.allocator);
+    defer pool.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var targets: [20][1]u8 = undefined;
+    var jobs: [20]FetchJob = undefined;
+    for (&jobs, 0..) |*j, i| {
+        const n: u64 = @intCast(i);
+        j.* = .{
+            .bucket = "bkt",
+            .key = "obj",
+            .range = .{ .start = n, .end = n + 1 },
+            .target = &targets[i],
+        };
+    }
+    var wave: DataWave = .{};
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+
+    const Box = struct {
+        io: Io,
+        pool: *Pool(16),
+        arena: std.mem.Allocator,
+        creds: Credentials,
+        jobs: []FetchJob,
+        wave: *DataWave,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = fetchJobs(self.io, self.pool, testing.allocator, self.arena, self.creds, self.jobs, 16, null, self.wave) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+    var box: Box = .{
+        .io = threaded.io(),
+        .pool = &pool,
+        .arena = arena_state.allocator(),
+        .creds = creds,
+        .jobs = &jobs,
+        .wave = &wave,
+    };
+    const worker = try std.Thread.spawn(.{}, Box.run, .{&box});
+
+    var spins: usize = 0;
+    while (fake.gets_waiting.load(.acquire) < 8) {
+        sleepMs(5);
+        spins += 1;
+        if (spins > 400) return error.TestUnexpectedResult;
+    }
+    sleepMs(50);
+    const before = fake.gets_waiting.load(.acquire);
+    const before_max = fake.max_waiting.load(.acquire);
+    try testing.expectEqual(@as(u32, 8), before);
+    try testing.expectEqual(@as(u32, 8), before_max);
+
+    // Forget the pre-header peak so the post-header peak is only what the open gate allowed.
+    fake.max_waiting.store(0, .release);
+    fake.release_one_get.store(true, .release);
+    spins = 0;
+    while (fake.max_waiting.load(.acquire) <= 8) {
+        sleepMs(5);
+        spins += 1;
+        if (spins > 400) return error.TestUnexpectedResult;
+    }
+    sleepMs(50);
+    const after = fake.gets_waiting.load(.acquire);
+    const after_max = fake.max_waiting.load(.acquire);
+    try testing.expect(after > 8);
+    try testing.expect(after <= 16);
+    try testing.expect(after_max <= 16);
+    try testing.expect(after_max > 8);
+
+    fake.release_gets.store(true, .release);
+    worker.join();
+    if (box.err) |e| return e;
 }
 
 test "a server that always stalls fails the request with the timeout once the retry budget is spent" {

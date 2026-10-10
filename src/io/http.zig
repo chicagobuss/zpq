@@ -65,6 +65,9 @@ pub const Response = struct {
     /// `clock.monoNs` when the first response byte arrived (0 when not read off a connection): splits a request's
     /// time to first byte from its body transfer.
     first_byte_ns: i64 = 0,
+    /// Nanoseconds from the request being sent to `first_byte_ns`, filled in by the pooled request path. Zero when
+    /// that split was not measured.
+    ttfb_ns: i64 = 0,
 
     pub fn header(self: *const Response, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -93,14 +96,21 @@ pub fn sendRequest(
 ///
 /// On `error.BodyTooLarge`, unread response bytes remain on `conn`; the
 /// caller must discard the connection rather than returning it to a pool.
+/// Called once the response status line and headers have arrived, before the rest of the body is read.
+pub const OnHeaders = struct {
+    ctx: *anyopaque,
+    f: *const fn (*anyopaque) void,
+};
+
 pub fn sendRequestInto(
     arena: std.mem.Allocator,
     conn: *tls.Connection,
     req: Request,
     target: []u8,
+    on_headers: ?OnHeaders,
 ) Error!Response {
     try sendRequestBytes(arena, conn, req);
-    return try drainResponseInto(arena, conn, target);
+    return try drainResponseInto(arena, conn, target, on_headers);
 }
 
 fn sendRequestBytes(
@@ -241,12 +251,13 @@ fn statusIsBodyless(status: u16) bool {
     };
 }
 
-fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []u8) Error!Response {
+fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []u8, on_headers: ?OnHeaders) Error!Response {
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(arena);
 
     var headers_end: ?usize = null;
     var first_byte_ns: i64 = 0;
+    var noted = false;
     while (headers_end == null) {
         var tmp: [16 * 1024]u8 = undefined;
         const n = try recvResponseBytes(conn, &tmp, stream.items.len);
@@ -256,6 +267,10 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
         if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
             if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
             headers_end = i;
+            if (!noted) {
+                noted = true;
+                if (on_headers) |h| h.f(h.ctx);
+            }
         } else if (stream.items.len > MAX_HEADERS_BYTES) {
             return error.HeadersTooLarge;
         }
@@ -492,9 +507,9 @@ test "a connection closed before any response byte is told apart from a truncate
     const partial = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n\r\nabc";
     _ = std.posix.system.write(fds[1], partial.ptr, partial.len);
     _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
-    try testing.expectError(error.BodyTruncated, drainResponseInto(arena.allocator(), &conn, &target));
+    try testing.expectError(error.BodyTruncated, drainResponseInto(arena.allocator(), &conn, &target, null));
     // ...while EOF with nothing received is a connection the peer had already closed.
-    try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+    try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target, null));
     try testing.expectError(error.ClosedBeforeResponse, drainResponse(arena.allocator(), &conn, false));
 }
 
@@ -521,7 +536,7 @@ test "only a closed or reset connection counts as closed before the response; lo
         const linger: extern struct { on: c_int, secs: c_int } = .{ .on = 1, .secs = 0 };
         _ = posix.system.setsockopt(peer, posix.SOL.SOCKET, posix.SO.LINGER, @ptrCast(&linger), @sizeOf(@TypeOf(linger)));
         _ = posix.system.close(peer);
-        try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target));
+        try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target, null));
     }
 
     // A read that fails for a local reason (here: the descriptor is a directory) is not a dropped connection.
@@ -537,7 +552,7 @@ test "only a closed or reset connection counts as closed before the response; lo
             .sock = .{ .rcv_ms = (tls.Timeouts{}).idle_ms },
         };
         defer conn.deinit();
-        try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target));
+        try testing.expectError(error.RecvFailed, drainResponseInto(arena.allocator(), &conn, &target, null));
         try testing.expectError(error.RecvFailed, drainResponse(arena.allocator(), &conn, false));
     }
 }
@@ -611,7 +626,7 @@ test "a TLS response cut short is an error whether or not the server sent close_
         const req: Request = .{ .method = .GET, .host = "good.test", .path = "/k", .headers = &.{} };
         var target: [16]u8 = undefined;
         const a = arena.allocator();
-        const got = if (case.into) sendRequestInto(a, &conn, req, &target) else sendRequest(a, &conn, req);
+        const got = if (case.into) sendRequestInto(a, &conn, req, &target, null) else sendRequest(a, &conn, req);
         if (case.want) |body| {
             const resp = got catch |err| {
                 std.debug.print("{s} / {t}: {t}\n", .{ case.response, case.end, err });

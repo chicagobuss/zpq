@@ -77,6 +77,64 @@ pub fn s3CoalesceGap(rtt_ns: u64, bytes_per_s: u64) u64 {
     return @min(s3_gap_max, gap);
 }
 
+/// Merge to cut waves, not requests. Overlaps and ranges that touch always merge. When `ranges` already fit in
+/// `wave`, positive gaps stay put: one wave gains nothing by reading bytes it did not ask for. Otherwise the
+/// smallest gaps merge first, while each gap is at most `gap_cap` and the merged bytes stay within `byte_cap`
+/// (twice the selected bytes, and what one admitted row group may hold).
+pub fn coalesceMinWaves(
+    allocator: Allocator,
+    ranges: []const Range,
+    gap_cap: u64,
+    wave: usize,
+    byte_cap: u64,
+) ![]const Range {
+    if (ranges.len == 0) return &.{};
+
+    var sorted = try allocator.alloc(Range, ranges.len);
+    defer allocator.free(sorted);
+    @memcpy(sorted, ranges);
+    std.mem.sort(Range, sorted, {}, struct {
+        fn lessThan(_: void, a: Range, b: Range) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+
+    var merged: std.ArrayList(Range) = .empty;
+    try merged.ensureTotalCapacity(allocator, ranges.len);
+    var current = sorted[0];
+    var total: u64 = 0;
+    for (sorted[1..]) |next| {
+        if (next.start <= current.end) {
+            if (next.end > current.end) current.end = next.end;
+        } else {
+            total += current.end - current.start;
+            merged.appendAssumeCapacity(current);
+            current = next;
+        }
+    }
+    total += current.end - current.start;
+    merged.appendAssumeCapacity(current);
+
+    while (merged.items.len > wave) {
+        var best_i: usize = 0;
+        var best_gap: u64 = std.math.maxInt(u64);
+        for (merged.items[0 .. merged.items.len - 1], 0..) |r, i| {
+            const nxt = merged.items[i + 1];
+            const gap = nxt.start - r.end;
+            if (gap < best_gap) {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        if (best_gap > gap_cap) break;
+        if (total + best_gap > byte_cap) break;
+        merged.items[best_i].end = merged.items[best_i + 1].end;
+        _ = merged.orderedRemove(best_i + 1);
+        total += best_gap;
+    }
+    return merged.toOwnedSlice(allocator);
+}
+
 pub fn overlapsAny(r: Range, others: []const Range) bool {
     for (others) |o| {
         if (r.start < o.end and o.start < r.end) return true;
@@ -150,4 +208,33 @@ test "s3 coalesce gap is 1 MiB until latency is measured, then bandwidth times t
     try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(std.time.ns_per_s, 80_000_000));
     // A short measured latency stays small: 80 MB/s × 1 ms.
     try std.testing.expectEqual(@as(u64, 80_000), s3CoalesceGap(std.time.ns_per_ms, 80_000_000));
+}
+
+test "s3 coalesce leaves a wave that already fits, and will not read gaps past twice the selected bytes" {
+    const allocator = std.testing.allocator;
+    // Three chunks, two 100-byte gaps. Three ranges fit in a wave of 4, so the gaps stay.
+    const fits = [_]Range{
+        .{ .start = 0, .end = 100 },
+        .{ .start = 200, .end = 300 },
+        .{ .start = 400, .end = 500 },
+    };
+    const kept = try coalesceMinWaves(allocator, &fits, 1 << 20, 4, 10 << 20);
+    defer allocator.free(kept);
+    try std.testing.expectEqual(@as(usize, 3), kept.len);
+
+    // Five ranges do not fit in a wave of 2. The smallest gap (50) merges; the 900-byte gap would pass the
+    // latency cap but not a budget of twice the 500 selected bytes.
+    const wide = [_]Range{
+        .{ .start = 0, .end = 100 },
+        .{ .start = 150, .end = 250 },
+        .{ .start = 1_150, .end = 1_250 },
+        .{ .start = 2_150, .end = 2_250 },
+        .{ .start = 3_150, .end = 3_250 },
+    };
+    const selected: u64 = 500;
+    const merged = try coalesceMinWaves(allocator, &wide, 1 << 20, 2, selected * 2);
+    defer allocator.free(merged);
+    try std.testing.expectEqual(@as(usize, 4), merged.len);
+    try std.testing.expectEqual(@as(u64, 0), merged[0].start);
+    try std.testing.expectEqual(@as(u64, 250), merged[0].end);
 }

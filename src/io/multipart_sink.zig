@@ -1091,6 +1091,16 @@ test "multipartEtag is the MD5 of the part MD5s and the part count, and refuses 
 
 const stall_timeouts: tls.Timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 250, .idle_ms = 250 };
 
+/// Same deadlines, read off the test clock. A stall advances that clock, so the attempt times out without waiting
+/// out 250 ms of wall time, and a loaded machine cannot expire the retry that follows.
+const stall_clock_timeouts: tls.Timeouts = .{
+    .connect_ms = 300,
+    .handshake_ms = 300,
+    .first_byte_ms = 250,
+    .idle_ms = 250,
+    .clock_ms = &tls.testClockMs,
+};
+
 /// A part bigger than the client's socket send buffer can grow to (Linux: tcp_wmem's maximum) plus the server's
 /// small receive buffer, so a part whose body the server stops reading blocks the send itself: at least 6 MiB.
 fn stallPartSize() usize {
@@ -1116,11 +1126,14 @@ test "an UploadPart whose body the server stops reading is sent again on a new c
     defer fake.deinit();
     fake.stall = "PUT /bkt/out.parquet?partNumber=1&";
     fake.stall_at = .request_body;
+    fake.expire_virtual_deadline = true;
+    tls.armTestClock();
+    defer tls.disarmTestClock();
     const part = stallPartSize();
     const payload = try bigPayload(part);
     defer testing.allocator.free(payload);
 
-    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_timeouts, part);
+    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, part);
     try testing.expectEqual(@as(u32, 1), fake.stalled);
     try testing.expect(fake.object("out.parquet") != null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
@@ -1132,10 +1145,13 @@ test "an UploadPart whose answer never comes is sent again, and the upload holds
     defer fake.deinit();
     fake.stall = "PUT /bkt/out.parquet?partNumber=2&";
     fake.stall_at = .before_headers;
+    fake.expire_virtual_deadline = true;
+    tls.armTestClock();
+    defer tls.disarmTestClock();
     const payload = try bigPayload(6 << 20);
     defer testing.allocator.free(payload);
 
-    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_timeouts, 6 << 20);
+    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, 6 << 20);
     try testing.expectEqual(@as(u32, 1), fake.stalled);
     const obj = fake.object("out.parquet") orelse return error.TestUnexpectedResult;
     // The ETag of a two-part upload: the part sent twice counted once.

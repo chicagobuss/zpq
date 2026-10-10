@@ -123,6 +123,8 @@ pub fn Fetcher(comptime Pool: type) type {
         profiler: ?*profile.Profiler,
         /// The fetch thread's executor, as the up-front fetch builds its own.
         executor: *const fn (std.mem.Allocator) std.Io.Threaded,
+        /// This query's data wave, shared by every batch. Footer and Bloom fetches do not use it.
+        wave: s3.DataWave = .{},
         thread: ?std.Thread = null,
 
         /// Start fetching `order` (every fetched row group, in the order workers claim them) on a thread of its own.
@@ -216,6 +218,7 @@ pub fn Fetcher(comptime Pool: type) type {
                     jobs.items,
                     self.workers,
                     self.profiler,
+                    &self.wave,
                 );
                 for (jobs.items) |j| {
                     if (j.range.start == 0 and j.target.len >= 4 and !metadata.hasLeadingMagic(j.target)) {

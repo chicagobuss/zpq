@@ -3603,7 +3603,7 @@ fn noteFooterRtt(sp: *FetchSpec, resp: http.Response) void {
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
-    sp.tail_start = sp.total_size - tail_resp.body.len;
+    sp.tail_start = try suffixStart(sp.total_size, tail_resp.body.len);
 
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
@@ -3795,6 +3795,13 @@ fn rebaseOneOffset(old: i64, ranges: []const CompactRange) !i64 {
         return @intCast(dst);
     }
     return error.BadResponse;
+}
+
+/// Where a footer suffix of `body_len` bytes starts in an object of `total` bytes. The total is the server's word
+/// (Content-Range); one smaller than the suffix it came with is a bad response.
+fn suffixStart(total: u64, body_len: usize) error{BadResponse}!u64 {
+    if (body_len > total) return error.BadResponse;
+    return total - body_len;
 }
 
 fn parseTotalFromContentRange(hdr: ?[]const u8) !u64 {
@@ -5065,6 +5072,12 @@ test "a recompressing copy writes the same bytes at every parallelism and reads 
             else => try std.testing.expectEqualDeep(w.value, g.value),
         };
     };
+}
+
+test "a footer suffix whose Content-Range total is smaller than its body is a bad response, not an underflow" {
+    try std.testing.expectError(error.BadResponse, suffixStart(50, 100));
+    try std.testing.expectEqual(@as(u64, 0), try suffixStart(100, 100));
+    try std.testing.expectEqual(@as(u64, 900), try suffixStart(1000, 100));
 }
 
 test "a recompressing copy drops page-index offsets that are not its chunk's, instead of overflowing on them" {

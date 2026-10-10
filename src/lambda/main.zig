@@ -148,6 +148,12 @@ fn handleS3(
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
 
+    // The total is the server's word: one smaller than the suffix it sent cannot be.
+    if (tail_resp.body.len > total_size) {
+        const refusal = "{{\"error\":\"bad_content_range\",\"reason\":\"BodyLongerThanTotal\"}}";
+        return std.fmt.allocPrint(allocator, refusal, .{});
+    }
+
     // 2. Allocate sparse file buffer; stamp the tail.
     const file_buf = try allocator.alloc(u8, total_size);
     defer allocator.free(file_buf);

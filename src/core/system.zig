@@ -174,10 +174,27 @@ fn getLambdaMemory(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
     if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
         if (std.fmt.parseInt(usize, val_str, 10) catch null) |val| {
-            return val * 1024 * 1024 * 3 / 4; // 75% of memory tier
+            // 75% of the memory tier. A size no machine has is ignored, like one that does not parse.
+            const bytes = std.math.mul(usize, val, 1024 * 1024) catch return null;
+            return bytes / 4 * 3;
         }
     }
     return null;
+}
+
+test "a size of 2^64 bytes or more is invalid, not a conversion overflow" {
+    try std.testing.expectError(error.InvalidSize, parseSizeString("16777216TB"));
+    try std.testing.expectError(error.InvalidSize, parseSizeString("18446744073709551616"));
+    try std.testing.expectError(error.InvalidSize, parseSizeString("99999999999999999999999TB"));
+    try std.testing.expectEqual(@as(usize, 16777215) << 40, try parseSizeString("16777215TB"));
+    try std.testing.expectEqual(@as(usize, 3) << 29, try parseSizeString("1.5GB"));
+}
+
+test "a Lambda memory size no machine has is ignored, not an overflow" {
+    var big_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=17592186044416"};
+    try std.testing.expectEqual(@as(?usize, null), getLambdaMemory(.{ .block = .{ .slice = &big_env } }));
+    var ok_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=1024"};
+    try std.testing.expectEqual(@as(?usize, 768 << 20), getLambdaMemory(.{ .block = .{ .slice = &ok_env } }));
 }
 
 test "window capacity keeps byte budget authoritative over worker count" {
@@ -329,8 +346,9 @@ pub fn parseSizeString(s: []const u8) !usize {
     }
 
     const result = val_float * multiplier;
-    if (result < 0 or result > @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
-        return error.InvalidSize;
-    }
+    // maxInt(usize) rounds up to 2^bits as an f64, so the bound is exclusive at 2^bits: "16777216TB" (2^64) is past
+    // it, not equal to a representable maximum.
+    const limit = std.math.ldexp(@as(f64, 1), @bitSizeOf(usize));
+    if (!(result >= 0 and result < limit)) return error.InvalidSize;
     return @intFromFloat(result);
 }

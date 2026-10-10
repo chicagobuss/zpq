@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const s3 = @import("s3.zig");
+const coalescer = @import("coalescer.zig");
 const profile = @import("../profile.zig");
 const scan = @import("../core/scan.zig");
 const metadata = @import("../core/parquet/metadata.zig");
@@ -44,6 +45,9 @@ pub const RowGroup = struct {
     copied: []const Copied = &.{},
     /// Bytes the jobs fetch plus `copied`: the row group's window charge.
     bytes: u64,
+    /// Coalesce gap for this row group's file, from the footer's first-byte latency. A window merges ranges admitted
+    /// together, and this is the largest gap that merge will cross.
+    gap: u64 = coalescer.s3_gap_default,
     /// Set when this row group's `bytes` have been added to the window. A group the scan dropped before admission
     /// stays false, so finishing the batch does not release a charge it never took.
     admitted: bool = false,
@@ -192,6 +196,7 @@ pub fn Fetcher(comptime Pool: type) type {
                 defer arena_state.deinit();
                 const arena = arena_state.allocator();
                 var jobs: std.ArrayList(s3.FetchJob) = .empty;
+                var gaps: std.ArrayList(u64) = .empty;
                 for (w.order[first..next]) |rg| {
                     if (rg.state.load(.acquire) == State.dropped) {
                         // Only a group this batch charged. One the admission loop skipped was never added to
@@ -208,19 +213,25 @@ pub fn Fetcher(comptime Pool: type) type {
                         continue;
                     }
                     try jobs.appendSlice(arena, rg.jobs);
+                    for (rg.jobs) |_| try gaps.append(arena, rg.gap);
                 }
+                const planned = try planDispatch(arena, jobs.items, gaps.items, self.workers);
                 w.stats.bytes += try s3.fetchJobs(
                     exec.io(),
                     self.pool,
                     w.gpa,
                     arena,
                     self.creds,
-                    jobs.items,
+                    planned.fetches,
                     self.workers,
                     self.profiler,
                     &self.wave,
                 );
-                for (jobs.items) |j| {
+                for (planned.held) |h| {
+                    @memcpy(h.dst, h.src);
+                    if (h.landed) |l| l.f(l.ctx, h.dst.len);
+                }
+                for (planned.fetches) |j| {
                     if (j.range.start == 0 and j.target.len >= 4 and !metadata.hasLeadingMagic(j.target)) {
                         return error.NotParquet;
                     }
@@ -229,6 +240,118 @@ pub fn Fetcher(comptime Pool: type) type {
             }
         }
     };
+}
+
+const Held = struct {
+    dst: []u8,
+    src: []const u8,
+    landed: ?s3.Landed,
+};
+
+/// The requests for one admitted window. Ranges of one object merge under the wave rule; a merged span that covers
+/// several row-group buffers is fetched into a scratch and copied back, so the gap is not kept in the window.
+fn planDispatch(
+    arena: std.mem.Allocator,
+    jobs: []const s3.FetchJob,
+    gaps: []const u64,
+    in_flight: usize,
+) !struct { fetches: []s3.FetchJob, held: []Held } {
+    if (jobs.len == 0) return .{ .fetches = &.{}, .held = &.{} };
+    std.debug.assert(gaps.len == jobs.len);
+    var used = try arena.alloc(bool, jobs.len);
+    @memset(used, false);
+    var fetches: std.ArrayList(s3.FetchJob) = .empty;
+    var held: std.ArrayList(Held) = .empty;
+    for (jobs, 0..) |job0, start_i| {
+        if (used[start_i]) continue;
+        var idx: std.ArrayList(usize) = .empty;
+        var gap = gaps[start_i];
+        for (jobs[start_i..], start_i..) |j, i| {
+            if (used[i]) continue;
+            if (!std.mem.eql(u8, j.bucket, job0.bucket) or !std.mem.eql(u8, j.key, job0.key)) continue;
+            used[i] = true;
+            try idx.append(arena, i);
+            gap = @min(gap, gaps[i]);
+        }
+        var s: usize = 1;
+        while (s < idx.items.len) : (s += 1) {
+            var t = s;
+            while (t > 0 and jobs[idx.items[t]].range.start < jobs[idx.items[t - 1]].range.start) : (t -= 1) {
+                std.mem.swap(usize, &idx.items[t], &idx.items[t - 1]);
+            }
+        }
+        const ranges = try arena.alloc(coalescer.Range, idx.items.len);
+        var selected: u64 = 0;
+        for (idx.items, ranges) |i, *r| {
+            const j = jobs[i];
+            r.* = .{ .start = j.range.start, .end = j.range.end };
+            selected += j.target.len;
+        }
+        const merged = try coalescer.coalesceMinWaves(arena, ranges, gap, in_flight, selected *| 2);
+        var at: usize = 0;
+        for (merged) |m| {
+            var cover: std.ArrayList(usize) = .empty;
+            while (at < idx.items.len and jobs[idx.items[at]].range.end <= m.start) at += 1;
+            var k = at;
+            while (k < idx.items.len and jobs[idx.items[k]].range.start < m.end) : (k += 1) {
+                try cover.append(arena, idx.items[k]);
+            }
+            at = k;
+            if (cover.items.len == 1) {
+                const j = jobs[cover.items[0]];
+                if (j.range.start == m.start and j.range.end == m.end) {
+                    try fetches.append(arena, j);
+                    continue;
+                }
+            }
+            const n: usize = @intCast(m.end - m.start);
+            const buf = try arena.alloc(u8, n);
+            var urgent = false;
+            for (cover.items) |i| {
+                const j = jobs[i];
+                urgent = urgent or j.urgent;
+                const off: usize = @intCast(j.range.start - m.start);
+                try held.append(arena, .{
+                    .dst = j.target,
+                    .src = buf[off..][0..j.target.len],
+                    .landed = j.landed,
+                });
+            }
+            const sample = jobs[cover.items[0]];
+            var off: u64 = 0;
+            const len = m.end - m.start;
+            while (off < len) {
+                const piece = @min(s3.S3_RANGE_SPLIT, len - off);
+                const o: usize = @intCast(off);
+                const nsz: usize = @intCast(piece);
+                try fetches.append(arena, .{
+                    .bucket = sample.bucket,
+                    .key = sample.key,
+                    .range = .{ .start = m.start + off, .end = m.start + off + piece },
+                    .target = buf[o .. o + nsz],
+                    .urgent = urgent,
+                });
+                off += piece;
+            }
+        }
+    }
+    if (fetches.items.len > 1) {
+        var front: std.ArrayList(s3.FetchJob) = .empty;
+        var back: std.ArrayList(s3.FetchJob) = .empty;
+        for (fetches.items) |j| {
+            if (j.urgent) try front.append(arena, j) else try back.append(arena, j);
+        }
+        var n: usize = 0;
+        for (front.items) |j| {
+            fetches.items[n] = j;
+            n += 1;
+        }
+        for (back.items) |j| {
+            fetches.items[n] = j;
+            n += 1;
+        }
+    }
+    return .{ .fetches = fetches.items, .held = held.items };
 }
 
 /// The window's accounting, shared by the fetcher and the scan workers' gates.
@@ -412,4 +535,42 @@ test "a copied-only group dropped after it is admitted releases its charge" {
     try std.testing.expect(one.admitted);
     try std.testing.expectEqual(@as(u64, page), fetcher.window.submitted);
     try std.testing.expectEqual(@as(u64, page), fetcher.window.released.load(.acquire));
+}
+
+test "an admitted window merges the gap inside each row group and not the hole between them" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const groups = 20;
+    const col: u64 = 1000;
+    var storage: [groups * 2][1000]u8 = undefined;
+    var jobs: [groups * 2]s3.FetchJob = undefined;
+    var gaps: [groups * 2]u64 = undefined;
+    var at: u64 = 0;
+    for (0..groups) |g| {
+        jobs[g * 2] = .{
+            .bucket = "b",
+            .key = "k",
+            .range = .{ .start = at, .end = at + col },
+            .target = &storage[g * 2],
+        };
+        at += col + 64;
+        jobs[g * 2 + 1] = .{
+            .bucket = "b",
+            .key = "k",
+            .range = .{ .start = at, .end = at + col },
+            .target = &storage[g * 2 + 1],
+        };
+        at += col + (8 << 20);
+        gaps[g * 2] = 2 << 20;
+        gaps[g * 2 + 1] = 2 << 20;
+    }
+    const planned = try planDispatch(arena, &jobs, &gaps, 16);
+    try std.testing.expectEqual(groups, planned.fetches.len);
+    try std.testing.expectEqual(groups * 2, planned.held.len);
+    // One row group is already a single wave, so the same gap stays put.
+    const one = try planDispatch(arena, jobs[0..2], gaps[0..2], 16);
+    try std.testing.expectEqual(@as(usize, 2), one.fetches.len);
+    try std.testing.expectEqual(@as(usize, 0), one.held.len);
 }

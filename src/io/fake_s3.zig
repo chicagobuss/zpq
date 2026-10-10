@@ -86,7 +86,9 @@ pub const FakeS3 = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     /// When set, a data GET is counted in `gets_arrived` and not answered until `release_gets`. `release_one_get`
     /// lets exactly one of those answers go out, so a test can open the data-wave gate and watch the rest start.
-    /// When set, `holdSilent` advances `tls`'s test clock once so a stalled attempt times out without a wall-clock wait.
+    /// When set, `holdSilent` keeps advancing `tls`'s test clock until the stalled client hangs up, so a partial
+    /// send that restarts its idle deadline still times out without a wall-clock wait. The jumps stop at the hangup,
+    /// and the retry is not expired.
     expire_virtual_deadline: bool = false,
     hold_gets: bool = false,
     gets_arrived: std.atomic.Value(u32) = .init(0),
@@ -303,13 +305,18 @@ pub const FakeS3 = struct {
     /// Say nothing more on `fd`, without reading from it, until the server stops; the client gives up and closes its
     /// end in the meantime.
     fn holdSilent(self: *FakeS3, fd: posix.fd_t) void {
-        _ = fd;
-        // One jump of a test clock, then a pause long enough for a 20 ms poll to notice, then no further jumps:
-        // the stalled attempt's virtual deadline expires and the retry's, taken afterwards, does not.
         if (self.expire_virtual_deadline) {
             const tls = @import("tls.zig");
-            tls.advanceTestClock(60_000);
-            sleepMs(40);
+            // A partial write restarts the idle deadline at the frozen clock, so one jump is not enough. Jump by
+            // more than an idle period, a few times, until this connection hangs up. Stop before a retry on a new
+            // connection has armed its own deadline.
+            var jumps: u8 = 0;
+            while (!self.stopping.load(.acquire) and jumps < 6) {
+                if (hungUp(fd)) break;
+                tls.advanceTestClock(60_000);
+                jumps += 1;
+                sleepMs(15);
+            }
         }
         while (!self.stopping.load(.acquire)) sleepMs(5);
     }
@@ -588,6 +595,22 @@ threadlocal var stall_reply: ?FakeS3.StallAt = null;
 
 /// How long `deinit` waits for the accept thread. A test that works never gets near it.
 const stop_timeout_ms = 20_000;
+
+/// Whether the peer has closed `fd`. Data still sitting unread does not count: a stall deliberately leaves the
+/// request body in the buffer.
+fn hungUp(fd: posix.fd_t) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        const n = posix.system.poll(&pfd, 1, 0);
+        switch (posix.errno(n)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    const dead = posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+    return pfd[0].revents & dead != 0;
+}
 
 /// Whether `fd` becomes readable within `timeout_ms`.
 fn waitReadable(fd: posix.fd_t, timeout_ms: i32) bool {

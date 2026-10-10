@@ -1127,13 +1127,22 @@ test "an UploadPart whose body the server stops reading is sent again on a new c
     fake.stall = "PUT /bkt/out.parquet?partNumber=1&";
     fake.stall_at = .request_body;
     fake.expire_virtual_deadline = true;
+    tls.resetDeadlineHit();
     tls.armTestClock();
     defer tls.disarmTestClock();
     const part = stallPartSize();
     const payload = try bigPayload(part);
     defer testing.allocator.free(payload);
 
-    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, part);
+    const started = nowMonoNs();
+    const uploaded = writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, part);
+    const elapsed_ms = @divTrunc(nowMonoNs() -| started, std.time.ns_per_ms);
+    // The stall must expire on the virtual idle deadline, in a few hundred milliseconds. The wall-clock backstop is
+    // a different error (`WallClockBackstop`) and a different cause; a pass through that backstop is a failure.
+    try testing.expectEqual(tls.DeadlineCause.virtual, tls.deadlineHit() orelse return error.TestExpectedEqual);
+    try testing.expect(tls.deadlineHitRealMs() <= 400);
+    try testing.expect(elapsed_ms <= 500);
+    try uploaded;
     try testing.expectEqual(@as(u32, 1), fake.stalled);
     try testing.expect(fake.object("out.parquet") != null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));

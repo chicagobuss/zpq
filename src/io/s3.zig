@@ -55,9 +55,24 @@ pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
 
 /// Most data ranges in flight on S3. More than this made the request policer slower.
 pub const S3_IN_FLIGHT: usize = 16;
-/// Data-range requests in flight until this query's first data-range response header. Footer, metadata and Bloom
-/// requests are not part of that wave and do not raise the cap. After the header, the cap is `S3_IN_FLIGHT`.
+/// Data-range requests in flight until this query's first data-range response header, unless `ZPQ_S3_FIRST_WAVE`
+/// says otherwise. Footer, metadata and Bloom requests are not part of that wave and do not raise the cap. After
+/// the header, the cap is `S3_IN_FLIGHT`. Setting the first cap to `S3_IN_FLIGHT` is no slow start.
 pub const S3_FIRST_WAVE: usize = 8;
+
+/// The first-wave cap for this process: `ZPQ_S3_FIRST_WAVE` when it is a positive integer, otherwise
+/// `S3_FIRST_WAVE`. A value above `S3_IN_FLIGHT` is clamped to it, so 16 starts every data request at the full cap.
+pub fn firstWaveCap(env: ?std.process.Environ) usize {
+    const text = if (env) |e| e.getPosix("ZPQ_S3_FIRST_WAVE") else null;
+    return parseFirstWave(text);
+}
+
+fn parseFirstWave(text: ?[]const u8) usize {
+    const raw = text orelse return S3_FIRST_WAVE;
+    const n = std.fmt.parseInt(usize, raw, 10) catch return S3_FIRST_WAVE;
+    if (n == 0) return S3_FIRST_WAVE;
+    return @min(n, S3_IN_FLIGHT);
+}
 /// A data GET longer than this is split.
 pub const S3_RANGE_SPLIT: u64 = 8 << 20;
 /// Assumed bytes per second of one connection, for a coalesce gap once latency has been measured.
@@ -763,6 +778,8 @@ pub const FetchJob = struct {
     /// Told, on the fetching thread, each time one of this job's requests has landed its bytes in `target` (a job
     /// split into several requests reports each), so a reader can start on them before the whole batch is in.
     landed: ?Landed = null,
+    /// This request overlaps a filter column, so a dispatch sends it before the others.
+    urgent: bool = false,
 };
 
 pub const Landed = struct {
@@ -770,10 +787,11 @@ pub const Landed = struct {
     f: *const fn (ctx: *anyopaque, bytes: usize) void,
 };
 
-/// The query's first data wave. At most `S3_FIRST_WAVE` data-range requests are in flight until the first
-/// data-range response header of this query arrives, then at most `S3_IN_FLIGHT`. Footer, metadata and Bloom
-/// requests do not use a `DataWave`, so they neither take a slot nor open the gate. One query shares one value
-/// across its data fetches; a later batch in that query already sees the raised cap.
+/// The query's first data wave. At most `firstWaveCap` data-range requests are in flight until the first
+/// data-range response header of this query arrives, then at most `S3_IN_FLIGHT`. The default cap is
+/// `S3_FIRST_WAVE`; `ZPQ_S3_FIRST_WAVE=16` starts at the full cap. Footer, metadata and Bloom requests do not use
+/// a `DataWave`, so they neither take a slot nor open the gate. One query shares one value across its data fetches;
+/// a later batch in that query already sees the raised cap.
 pub const DataWave = struct {
     cap: std.atomic.Value(usize) = .init(S3_FIRST_WAVE),
     in_flight: std.atomic.Value(usize) = .init(0),
@@ -850,6 +868,7 @@ pub fn fetchJobs(
                     },
                     .target = j.target[sub_off_start..sub_off_end],
                     .landed = j.landed,
+                    .urgent = j.urgent,
                 });
             }
         } else {
@@ -1732,6 +1751,26 @@ test "a response that keeps arriving is not cut off, however long it takes in al
 fn sleepMs(ms: u64) void {
     var ts: std.os.linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = std.os.linux.nanosleep(&ts, null);
+}
+
+test "ZPQ_S3_FIRST_WAVE selects the cap before the first data header, and 16 is no slow start" {
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave(null));
+    try testing.expectEqual(@as(usize, 8), parseFirstWave("8"));
+    try testing.expectEqual(@as(usize, 4), parseFirstWave("4"));
+    try testing.expectEqual(S3_IN_FLIGHT, parseFirstWave("16"));
+    try testing.expectEqual(S3_IN_FLIGHT, parseFirstWave("32"));
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave("0"));
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave("nope"));
+
+    var open: DataWave = .{ .cap = .init(parseFirstWave("16")) };
+    try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
+    open.noteHeader();
+    try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
+
+    var slow: DataWave = .{ .cap = .init(parseFirstWave(null)) };
+    try testing.expectEqual(S3_FIRST_WAVE, slow.cap.load(.acquire));
+    slow.noteHeader();
+    try testing.expectEqual(S3_IN_FLIGHT, slow.cap.load(.acquire));
 }
 
 test "the first data wave keeps at most 8 data-range requests in flight until the first data-range response header" {

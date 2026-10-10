@@ -77,10 +77,12 @@ pub fn s3CoalesceGap(rtt_ns: u64, bytes_per_s: u64) u64 {
     return @min(s3_gap_max, gap);
 }
 
-/// Merge to cut waves, not requests. Overlaps and ranges that touch always merge. When `ranges` already fit in
-/// `wave`, positive gaps stay put: one wave gains nothing by reading bytes it did not ask for. Otherwise the
-/// smallest gaps merge first, while each gap is at most `gap_cap` and the merged bytes stay within `byte_cap`
-/// (twice the selected bytes, and what one admitted row group may hold).
+/// Merge to cut waves, not requests. Overlaps and ranges that touch always merge. The wave target is
+/// `ceil(ranges / wave)`: how many waves this dispatch takes with `wave` ranges in flight. While that target is
+/// greater than one, the smallest gaps merge first, each at most `gap_cap`, and the bytes read stay within
+/// `byte_cap`. A set that is already one wave keeps its positive gaps. Callers pass every range that will be
+/// fetched together — the whole up-front fetch, or one admitted window — not one row group: a group of two
+/// ranges is already one wave, and nothing would merge.
 pub fn coalesceMinWaves(
     allocator: Allocator,
     ranges: []const Range,
@@ -115,7 +117,9 @@ pub fn coalesceMinWaves(
     total += current.end - current.start;
     merged.appendAssumeCapacity(current);
 
-    while (merged.items.len > wave) {
+    while (true) {
+        const wave_target = std.math.divCeil(usize, merged.items.len, @max(wave, 1)) catch unreachable;
+        if (wave_target <= 1) break;
         var best_i: usize = 0;
         var best_gap: u64 = std.math.maxInt(u64);
         for (merged.items[0 .. merged.items.len - 1], 0..) |r, i| {
@@ -237,4 +241,52 @@ test "s3 coalesce leaves a wave that already fits, and will not read gaps past t
     try std.testing.expectEqual(@as(usize, 4), merged.len);
     try std.testing.expectEqual(@as(u64, 0), merged[0].start);
     try std.testing.expectEqual(@as(u64, 250), merged[0].end);
+}
+
+test "a dispatch of many row groups merges the gap inside each group and not the hole between groups" {
+    const allocator = std.testing.allocator;
+    // 49 row groups, two ranges each. The gap inside a group is small; the hole before the next group is not.
+    // Together that is 98 ranges, ceil(98 / 16) = 7 waves, so the small gaps merge. One group on its own is
+    // already one wave and must not.
+    const groups = 49;
+    const col: u64 = 10_000;
+    var ranges: [groups * 2]Range = undefined;
+    var at: u64 = 0;
+    for (0..groups) |g| {
+        ranges[g * 2] = .{ .start = at, .end = at + col };
+        at += col + 4096;
+        ranges[g * 2 + 1] = .{ .start = at, .end = at + col };
+        at += col + (8 << 20);
+    }
+    const selected: u64 = groups * 2 * col;
+    const merged = try coalesceMinWaves(allocator, &ranges, 2 << 20, 16, selected * 2);
+    defer allocator.free(merged);
+    try std.testing.expectEqual(groups, merged.len);
+    try std.testing.expectEqual(@as(u64, 0), merged[0].start);
+    try std.testing.expectEqual(col + 4096 + col, merged[0].end);
+
+    const alone = try coalesceMinWaves(allocator, ranges[0..2], 2 << 20, 16, 4000);
+    defer allocator.free(alone);
+    try std.testing.expectEqual(@as(usize, 2), alone.len);
+}
+
+test "sparse ranges stay inside twice the selected bytes" {
+    const allocator = std.testing.allocator;
+    // Fifty tiny columns, each pair split by a pad the 2× cap cannot pay for.
+    const n = 50;
+    const col: u64 = 64;
+    const pad: u64 = 950 * 1024;
+    var ranges: [n]Range = undefined;
+    var at: u64 = 0;
+    for (0..n) |i| {
+        ranges[i] = .{ .start = at, .end = at + col };
+        at += col + pad;
+    }
+    const selected: u64 = n * col;
+    const merged = try coalesceMinWaves(allocator, &ranges, 2 << 20, 16, selected * 2);
+    defer allocator.free(merged);
+    try std.testing.expectEqual(n, merged.len);
+    var got: u64 = 0;
+    for (merged) |r| got += r.len();
+    try std.testing.expectEqual(selected, got);
 }

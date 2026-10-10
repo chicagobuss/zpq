@@ -171,7 +171,8 @@ const READ_WORKER_STACK_SIZE: usize = 4 << 20;
 
 /// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
 /// its slot, so live concurrency can dip below this while a host throttles. Data fetches pass `s3.S3_IN_FLIGHT`;
-/// `s3.DataWave` holds the first of those at `S3_FIRST_WAVE` until a data-range response header arrives.
+/// `s3.DataWave` holds the first of those at `s3.firstWaveCap` (`ZPQ_S3_FIRST_WAVE`, default `S3_FIRST_WAVE`) until
+/// a data-range response header arrives.
 pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
 
 /// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
@@ -2448,16 +2449,19 @@ fn openInputs(
         if (s3_window.supported) {
             const limit = fetch_window.limit;
             var need: u64 = 0;
-            // The bytes the compact buffers will hold, gaps included. A gap that would push one row group past the
-            // window, or past twice its selected bytes, is not read.
-            for (specs) |*sp| for (sp.meta.row_groups.items) |*rg| {
-                const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
-                var rg_ranges: std.ArrayList(coalescer.Range) = .empty;
-                try appendRgFetchRanges(arena, &rg_ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
-                if (rg_ranges.items.len == 0) continue;
-                const merged = try coalesceS3Spans(arena, rg_ranges.items, sp.rtt_ns, limit);
+            // What an up-front fetch of each file would hold. The wave rule runs over every range of that fetch, so
+            // the gaps it keeps are in this total. A total past the window is fetched by admitted windows instead,
+            // and each of those windows is coalesced on its own when it is dispatched.
+            for (specs) |*sp| {
+                var file_ranges: std.ArrayList(coalescer.Range) = .empty;
+                for (sp.meta.row_groups.items) |*rg| {
+                    const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
+                    try appendRgFetchRanges(arena, &file_ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
+                }
+                if (file_ranges.items.len == 0) continue;
+                const merged = try coalesceS3Spans(arena, file_ranges.items, sp.rtt_ns, limit);
                 for (merged) |r| need += r.end - r.start;
-            };
+            }
             windowed = need > limit or (fetch_window.always and need > 0);
         }
         var win_order: std.ArrayList(*s3_window.RowGroup) = .empty;
@@ -2506,22 +2510,36 @@ fn openInputs(
                 sp.file_buf = &.{};
                 continue;
             }
-            // Each row group coalesces on its own, so a gap cannot join two groups into one span bigger than the
-            // window accounted for. A windowed group also starts on a page of its own.
+            // Up front, every range of the file is one dispatch: the wave target is ceil(those ranges / in flight),
+            // so the small gap inside a row group merges even though that group alone already fits in a wave. The
+            // hole between groups merges only when it is small enough and the 2× cap still holds. A windowed fetch
+            // keeps each row group's own coalesced span (that is the admission charge) on its own page; ranges
+            // admitted into one window are merged again when that window is dispatched.
             var compact: std.ArrayList(CompactRange) = .empty;
             var compact_len: usize = 0;
             const page = std.heap.pageSize();
             // Per row group, `compact.items[rg_compact[rg]..rg_compact[rg + 1]]` (windowed only).
             const rg_compact = try arena.alloc(usize, meta.row_groups.items.len + 1);
+            if (!windowed) {
+                const merged = try coalesceS3Spans(arena, ranges.items, sp.rtt_ns, fetch_window.limit);
+                n_ranges += ranges.items.len;
+                n_merged += merged.len;
+                for (merged) |r| {
+                    if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
+                    try compact.append(arena, .{ .start = r.start, .end = r.end, .dst_start = compact_len });
+                    compact_len += @intCast(r.end - r.start);
+                }
+            }
             for (0..meta.row_groups.items.len + 1) |ri| {
-                if (windowed) rg_compact[ri] = compact.items.len;
+                if (!windowed) break;
+                rg_compact[ri] = compact.items.len;
                 if (ri == meta.row_groups.items.len) break;
                 const span = ranges.items[rg_first[ri]..rg_first[ri + 1]];
                 if (span.len == 0) continue;
                 const merged = try coalesceS3Spans(arena, span, sp.rtt_ns, fetch_window.limit);
                 n_ranges += span.len;
                 n_merged += merged.len;
-                if (windowed) compact_len = std.mem.alignForward(usize, compact_len, page);
+                compact_len = std.mem.alignForward(usize, compact_len, page);
                 for (merged) |r| {
                     if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
                     try compact.append(arena, .{ .start = r.start, .end = r.end, .dst_start = compact_len });
@@ -2593,6 +2611,7 @@ fn openInputs(
                     .jobs = rg_jobs.items,
                     .copied = copies.items,
                     .bytes = rg_bytes,
+                    .gap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S),
                     .seg = @alignCast(s3_mapped.items[s3_mapped.items.len - 1][seg_start..seg_end]),
                 };
                 wf.rgs[ri] = wrg;
@@ -2622,6 +2641,7 @@ fn openInputs(
                 .workers = s3.S3_IN_FLIGHT,
                 .profiler = args.profiler,
                 .executor = readExecutor,
+                .wave = .{ .cap = .init(s3.firstWaveCap(ctx.env)) },
             };
             s3_fetcher = f;
         }
@@ -2641,7 +2661,7 @@ fn openInputs(
         if (fetch_jobs.items.len > 0) {
             const fetch_span = profile.Span.begin(prof);
             // This call is the query's data wave. Footer and Bloom fetches do not share it.
-            var data_wave: s3.DataWave = .{};
+            var data_wave: s3.DataWave = .{ .cap = .init(s3.firstWaveCap(ctx.env)) };
             const fetched = try s3.fetchJobs(
                 read_ctx.io,
                 pool,
@@ -2950,7 +2970,11 @@ fn orderFilterFirst(arena: std.mem.Allocator, jobs: []s3.FetchJob, filters: []co
     var back: std.ArrayList(s3.FetchJob) = .empty;
     for (jobs) |j| {
         const r: coalescer.Range = .{ .start = j.range.start, .end = j.range.end };
-        if (coalescer.overlapsAny(r, filters)) try front.append(arena, j) else try back.append(arena, j);
+        if (coalescer.overlapsAny(r, filters)) {
+            var u = j;
+            u.urgent = true;
+            try front.append(arena, u);
+        } else try back.append(arena, j);
     }
     var n: usize = 0;
     for (front.items) |j| {
@@ -3227,10 +3251,10 @@ fn appendRgFetchRanges(
     };
 }
 
-/// Coalesce one row group's ranges into the spans that will actually be read. Positive gaps merge only while the
-/// row group still takes more than one wave, each gap stays within the latency model, and the merged bytes stay
-/// within twice the selected bytes and within `budget` (what an admitted row group may hold). Selected bytes
-/// themselves are never dropped to satisfy the budget.
+/// Coalesce one dispatch: every range fetched together. Positive gaps merge only while that set still takes more
+/// than one wave, each gap stays within the latency model, and the merged bytes stay within twice the selected
+/// bytes and within `budget`. Selected bytes themselves are never dropped to satisfy the budget. A single row
+/// group is the dispatch only when it is admitted on its own; an up-front fetch passes every row group of the file.
 fn coalesceS3Spans(
     arena: std.mem.Allocator,
     ranges: []const coalescer.Range,

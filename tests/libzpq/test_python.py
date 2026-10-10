@@ -48,10 +48,11 @@ def test_binding(z):
 
 
 def test_threads(z):
+    # Each names a small budget of its own.
     reqs = [
-        {"inputs": [FIX], "aggregate": "count(*) AS n, sum(a) AS s"},
-        {"inputs": [FIX, FIX], "aggregate": "count(*) AS n", "group_by": "b", "filter": "a < 3"},
-        {"inputs": [FIX], "aggregate": "max(b) AS m", "filter": "a < 1000"},
+        {"inputs": [FIX], "aggregate": "count(*) AS n, sum(a) AS s", "max_memory": "16MB"},
+        {"inputs": [FIX, FIX], "aggregate": "count(*) AS n", "group_by": "b", "filter": "a < 3", "max_memory": "16MB"},
+        {"inputs": [FIX], "aggregate": "max(b) AS m", "filter": "a < 1000", "max_memory": "16MB"},
     ]
     want = [z.run(r)["agg"] for r in reqs]
     with ThreadPoolExecutor(16) as ex:
@@ -237,12 +238,17 @@ def test_bad_lengths(z):
         server.server_close()
 
 
+def test_options():
+    for bad in ({"max_memory": "lots"}, {"max_memory": -1}):
+        try:
+            zpq.Zpq(**bad)
+            check(False, f"bad options accepted: {bad}")
+        except ValueError as e:
+            check("invalid_argument" in str(e), f"refusal names its reason: {e}")
+
+
 def main():
-    try:
-        zpq.Zpq(max_memory="lots")
-        check(False, "bad options accepted")
-    except ValueError:
-        pass
+    test_options()
     with zpq.Zpq(max_memory="512MB") as z:
         test_binding(z)
         test_threads(z)

@@ -7,6 +7,7 @@ LIBZPQ_1 {
     zpq_free;
     zpq_close;
     zpq_abi_version;
+    zpq_strerror;
   local:
     *;
 };

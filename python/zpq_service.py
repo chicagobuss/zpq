@@ -112,14 +112,14 @@ def make_handler(z):
                 return
             body = self.rfile.read(length)
             try:
-                rc, text = z.run_raw(body)
+                text = z.run_raw(body)
             except zpq.ZpqClosed:
                 self._refuse(503, "shutting_down")
                 return
-            except (MemoryError, ValueError) as e:
+            except (MemoryError, ValueError, RuntimeError) as e:
                 self._send(500, json.dumps({"error": "service", "reason": str(e)}))
                 return
-            self._send(400 if rc == zpq.ERROR_RESPONSE else 200, text)
+            self._send(400 if text.startswith('{"error"') else 200, text)
 
     return Handler
 

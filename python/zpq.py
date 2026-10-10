@@ -6,8 +6,8 @@
 
 `run` takes the zpq Lambda's request (a dict, or JSON text) and returns its response as a dict; an {"error": ...}
 response raises `ZpqError`, unless `check=False`. One `Zpq` serves any number of threads at once: ctypes releases
-the GIL for the call, and each query runs on threads of its own. `close` waits for the calls in flight and refuses
-new ones (`ZpqClosed`), so a context is never freed under a running query.
+the GIL for the call, and each query runs on threads of its own. `close` refuses new calls (`ZpqClosed`) and waits for
+those in flight, so a context is never freed under a running query.
 
 The library is found at $ZPQ_LIB, else as libzpq.so next to this file, in ../zig-out/lib, or on the loader path.
 """
@@ -19,10 +19,12 @@ import threading
 
 __all__ = ["Zpq", "ZpqError", "ZpqClosed", "load_library"]
 
+# zpq_status (include/zpq.h).
 OK = 0
-ERROR_RESPONSE = 1
 EINVAL = -1
 ENOMEM = -2
+ECLOSED = -3
+EINTERNAL = -4
 ABI_VERSION = 1
 
 
@@ -68,8 +70,8 @@ def load_library(path=None):
                 errors.append(f"{cand}: {e}")
         else:
             raise OSError("libzpq.so not found; set ZPQ_LIB. " + "; ".join(errors))
-        lib.zpq_open.argtypes = [ctypes.c_char_p]
-        lib.zpq_open.restype = ctypes.c_void_p
+        lib.zpq_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+        lib.zpq_open.restype = ctypes.c_int
         lib.zpq_run.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
                                 ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
         lib.zpq_run.restype = ctypes.c_int
@@ -79,6 +81,8 @@ def load_library(path=None):
         lib.zpq_close.restype = None
         lib.zpq_abi_version.argtypes = []
         lib.zpq_abi_version.restype = ctypes.c_int
+        lib.zpq_strerror.argtypes = [ctypes.c_int]
+        lib.zpq_strerror.restype = ctypes.c_char_p
         got = lib.zpq_abi_version()
         if got != ABI_VERSION:
             raise OSError(f"libzpq ABI {got}, this binding speaks {ABI_VERSION}")
@@ -90,6 +94,8 @@ class Zpq:
     """A libzpq context: warm S3 connections and footers shared by every `run` on it."""
 
     def __init__(self, max_memory=None, library=None, *, preconnect=False):
+        """`max_memory`: a query's budget when its request names none (default: derived from the memory available).
+        `preconnect`: open connections to the S3 endpoint now, as the Lambda does during init."""
         self._lib = load_library(library)
         opts = {} if max_memory is None else {"max_memory": max_memory}
         if preconnect:
@@ -98,12 +104,34 @@ class Zpq:
         self._cond = threading.Condition()
         self._inflight = 0
         self._closing = False
-        self._ctx = self._lib.zpq_open(json.dumps(opts).encode())
-        if not self._ctx:
-            raise ValueError(f"zpq_open refused options {opts!r}")
+        ctx = ctypes.c_void_p()
+        err = ctypes.c_void_p()
+        rc = self._lib.zpq_open(json.dumps(opts).encode(), ctypes.byref(ctx), ctypes.byref(err))
+        self._ctx = ctx.value
+        if rc != OK:
+            raise self._failure("zpq_open", rc, err, opts)
+
+    def _failure(self, call, rc, msg, detail=None):
+        """The exception for status `rc`; frees the message `msg` points to, if any."""
+        text = None
+        if msg.value:
+            try:
+                text = ctypes.string_at(msg.value).decode()
+            finally:
+                self._lib.zpq_free(msg)
+        what = f"{call}: {self._lib.zpq_strerror(rc).decode()}" + (f": {text}" if text else "")
+        if detail is not None:
+            what += f" ({detail!r})"
+        if rc == ENOMEM:
+            return MemoryError(what)
+        if rc == ECLOSED:
+            return ZpqClosed(what)
+        if rc == EINVAL:
+            return ValueError(what)
+        return RuntimeError(what)
 
     def run_raw(self, request):
-        """Run `request` (str or bytes of JSON); returns (return code, response text)."""
+        """Run `request` (str or bytes of JSON); returns the response text, an {"error": ...} document included."""
         body = request.encode() if isinstance(request, str) else bytes(request)
         with self._cond:
             if self._closing:
@@ -121,19 +149,17 @@ class Zpq:
         out = ctypes.c_void_p()
         out_len = ctypes.c_size_t()
         rc = self._lib.zpq_run(self._ctx, body, len(body), ctypes.byref(out), ctypes.byref(out_len))
-        if rc < 0:
-            raise MemoryError("zpq_run: out of memory") if rc == ENOMEM else ValueError(f"zpq_run returned {rc}")
+        if rc != OK:
+            raise self._failure("zpq_run", rc, out)
         try:
-            text = ctypes.string_at(out.value, out_len.value).decode()
+            return ctypes.string_at(out.value, out_len.value).decode()
         finally:
             self._lib.zpq_free(out)
-        return rc, text
 
     def run(self, request, check=True):
         """Run `request` (a dict, or JSON text) and return the response as a dict."""
-        rc, text = self.run_raw(request if isinstance(request, (str, bytes)) else json.dumps(request))
-        response = json.loads(text)
-        if check and rc == ERROR_RESPONSE:
+        response = json.loads(self.run_raw(request if isinstance(request, (str, bytes)) else json.dumps(request)))
+        if check and isinstance(response, dict) and "error" in response:
             raise ZpqError(response)
         return response
 

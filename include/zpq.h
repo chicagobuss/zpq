@@ -1,15 +1,23 @@
 /*
- * libzpq: zpq's query engine behind a C ABI.
+ * libzpq: zpq's query engine behind a C ABI. ABI version 1 (symbol version LIBZPQ_1).
  *
  * A request is the JSON the zpq Lambda takes (see docs/libzpq.md): "inputs" (local paths or s3:// URLs), and an
  * "aggregate" / "group_by", or an "output_url" to write to, with "filter", "select", "columns", "max_memory" and the
- * rest as the Lambda reads them. The response is the JSON the Lambda returns.
+ * rest as the Lambda reads them. The response is the JSON the Lambda returns, an {"error": ...} document included.
  *
- * Threads: zpq_run may be called from any number of threads at once on one context. Each call runs its query on
- * threads of its own; the context's S3 connections and footer cache are shared.
+ * Ownership: every char * libzpq hands out (a response, an error message) is malloc'd, NUL-terminated, owned by the
+ * caller from then on, and freed with zpq_free. zpq_strerror's strings are static: never free them. libzpq keeps no
+ * pointer to anything the caller passes in after the call returns.
+ *
+ * Threads: zpq_run may be called from any number of threads at once on one context. zpq_open, zpq_free,
+ * zpq_abi_version and zpq_strerror are thread-safe. zpq_close must be called once per context, and no call on the
+ * context may start after zpq_close has returned.
  *
  * Environment: each zpq_run reads the process environment when it is called (S3 credentials, endpoint, region, as
  * the CLI reads them). Do not change it with setenv while a call is running.
+ *
+ * Failure: libzpq never aborts the process for a bad request, a bad file or a failing network: those are error
+ * responses. A broken internal invariant still aborts, as it would the CLI.
  */
 #ifndef ZPQ_H
 #define ZPQ_H
@@ -22,38 +30,55 @@ extern "C" {
 
 typedef struct zpq_ctx zpq_ctx;
 
-/* zpq_run's return codes. */
-#define ZPQ_OK 0             /* *out_json holds the response. */
-#define ZPQ_ERROR_RESPONSE 1 /* *out_json holds an {"error": ...} response: a bad request, or a query that failed. */
-#define ZPQ_EINVAL (-1)      /* A NULL context or out_json, or a NULL request with a nonzero length. No response. */
-#define ZPQ_ENOMEM (-2)      /* Out of memory before a response could be built. No response. */
+/* Status codes. Stable: a value never changes meaning, and new ones are only added. */
+typedef enum zpq_status {
+    ZPQ_OK = 0,         /* Done. zpq_run: *out_json holds the response, which may be an {"error": ...} document. */
+    ZPQ_EINVAL = -1,    /* The call itself was malformed: a NULL pointer, a bad length, or bad zpq_open options. */
+    ZPQ_ENOMEM = -2,    /* Out of memory before a result could be built. No message. */
+    ZPQ_ECLOSED = -3,   /* zpq_close has begun on this context. */
+    ZPQ_EINTERNAL = -4, /* A failure that is not the caller's: a thread that would not start, a pool or TLS set-up. */
+} zpq_status;
 
 /*
- * A context for any number of zpq_run calls. options_json may be NULL or "" for the defaults, else a JSON object:
- *   "max_memory": a query's memory budget when its request names none: bytes, or a size string ("2GB").
- *                 Default: derived from the memory available, as the Lambda's is.
- *   "preconnect": true to open connections to the S3 endpoint now (ZPQ_S3_PRECONNECT of them, default 4), as the
- *                 Lambda does during init, so the first queries find them ready. Default: false.
- * Returns NULL on invalid options or when out of memory.
+ * Open a context. options_json may be NULL or "" for the defaults, else a JSON object:
+ *   "max_memory":     a query's memory budget when its request names none: bytes, or a size string ("2GB").
+ *                     Default: derived from the memory available, as the Lambda's is.
+ *   "preconnect":     true to open connections to the S3 endpoint now (ZPQ_S3_PRECONNECT of them, default 4, at most
+ *                     8), as the Lambda does during init. It resolves the endpoint on the calling thread and starts
+ *                     one thread per connection; without S3 credentials in the environment it does nothing. Failures
+ *                     are ignored. Default: false.
+ * On ZPQ_OK, *out_ctx is the context. On any failure *out_ctx is NULL, and *out_error (when out_error is not NULL)
+ * is an {"error", "reason"} JSON message to free with zpq_free, or NULL for ZPQ_ENOMEM.
+ * Returns ZPQ_OK, ZPQ_EINVAL (out_ctx NULL, or bad options), ZPQ_ENOMEM or ZPQ_EINTERNAL.
  */
-zpq_ctx *zpq_open(const char *options_json);
+int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error);
 
 /*
- * Run one request (request_json, len bytes, need not be NUL-terminated). On ZPQ_OK and ZPQ_ERROR_RESPONSE,
- * *out_json is a NUL-terminated response the caller frees with zpq_free, and *out_len (when out_len is not NULL)
- * its length without the NUL. Otherwise *out_json is NULL and *out_len 0: every output given is cleared first,
- * whatever the return.
+ * Run one request (request_json, len bytes, need not be NUL-terminated; NULL only with len 0).
+ * Returns ZPQ_OK whenever a response was produced, including a query that failed (bad SQL, a missing column, an S3
+ * 403): the response is then an {"error": ...} document, exactly as the Lambda returns it.
+ * *out_json is the response, to free with zpq_free; *out_len (when out_len is not NULL) its length without the NUL.
+ * The other codes are for the call itself: ZPQ_EINVAL (ctx or out_json NULL, NULL request with len > 0, len too
+ * large), ZPQ_ECLOSED (zpq_close has begun), ZPQ_ENOMEM, ZPQ_EINTERNAL. With those, *out_json is an
+ * {"error", "reason"} message to free with zpq_free when one could be built (never for ZPQ_ENOMEM), else NULL.
  */
 int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json, size_t *out_len);
 
-/* Free a response from zpq_run. NULL is a no-op. */
+/* Free a response or message from zpq_open or zpq_run. NULL is a no-op. Any thread. */
 void zpq_free(char *json);
 
-/* Free a context. No zpq_run may be running on it. NULL is a no-op. */
+/*
+ * Close a context: new calls get ZPQ_ECLOSED, then zpq_close waits for the running ones to finish, joins any
+ * pre-connect handshakes still in flight (up to about one second), and frees the context. Call it once; the context
+ * is gone when it returns. NULL is a no-op.
+ */
 void zpq_close(zpq_ctx *ctx);
 
 /* The ABI version this library implements: 1. */
 int zpq_abi_version(void);
+
+/* A static description of a status code ("unknown status" for any other value). Never free it. */
+const char *zpq_strerror(int status);
 
 #ifdef __cplusplus
 }

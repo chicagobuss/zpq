@@ -1,9 +1,11 @@
 /*
  * libzpq's C ABI, end to end: options, the round trip, writes, error responses, invalid arguments, concurrent calls
- * on one context, and resident memory over many calls. Run from the repo root (fixture paths are relative):
+ * on one context, open/run/close cycles, and resident memory over many calls. Run from the repo root (fixture paths
+ * are relative):
  *
  *   tests/libzpq/run.sh            builds the library and this test, plain and under AddressSanitizer
- *   test_abi [loop_calls]          loop_calls (default 10000) sizes the RSS check
+ *   test_abi [loop_calls [cycles]] loop_calls (default 10000) sizes the RSS check, cycles (default 1000) the
+ *                                  open/run/close loop
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -30,7 +32,8 @@ static const char *FIXTURE = "ci/fixtures/parquet/mixed_codec.parquet";
 static int run(zpq_ctx *c, const char *req, char **out) {
     size_t len = 0;
     int rc = zpq_run(c, req, strlen(req), out, &len);
-    if (*out) {
+    /* out_len describes a response; a refusal's message leaves it 0. */
+    if (rc == ZPQ_OK && *out) {
         if (strlen(*out) != len) {
             failures++;
             fprintf(stderr, "FAIL: out_len %zu, strlen %zu\n", len, strlen(*out));
@@ -71,21 +74,46 @@ static long rss_kb(void) {
     return resident * (sysconf(_SC_PAGESIZE) / 1024);
 }
 
+/* zpq_open with `options`, NULL on failure (any message freed). */
+static zpq_ctx *open_ctx(const char *options) {
+    zpq_ctx *c = (zpq_ctx *)1;
+    int rc = zpq_open(options, &c, NULL);
+    CHECK((rc == ZPQ_OK) == (c != NULL), "rc %d with ctx %p", rc, (void *)c);
+    return c;
+}
+
 static void test_options(void) {
-    zpq_ctx *c;
     CHECK(zpq_abi_version() == 1, "abi %d", zpq_abi_version());
-    const char *good[] = {NULL, "", "{}", "{\"max_memory\": 1073741824}", "{\"max_memory\": \"256MB\"}"};
+    const char *good[] = {NULL, "", "{}", "{\"max_memory\": 1073741824}", "{\"max_memory\": \"256MB\"}",
+                          "{\"preconnect\": false}"};
     for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
-        c = zpq_open(good[i]);
+        zpq_ctx *c = open_ctx(good[i]);
         CHECK(c != NULL, "options %s refused", good[i] ? good[i] : "NULL");
         zpq_close(c);
     }
-    const char *bad[] = {"{", "[]", "{\"max_mem\": 1}", "{\"max_memory\": -5}", "{\"max_memory\": \"lots\"}"};
+    const char *bad[] = {"{",
+                         "[]",
+                         "{\"max_mem\": 1}",
+                         "{\"max_memory\": -5}",
+                         "{\"max_memory\": \"lots\"}",
+                         "{\"preconnect\": 4}"};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
-        c = zpq_open(bad[i]);
-        CHECK(c == NULL, "options %s accepted", bad[i]);
-        zpq_close(c);
+        zpq_ctx *c = (zpq_ctx *)1;
+        char *err = (char *)1;
+        int rc = zpq_open(bad[i], &c, &err);
+        CHECK(rc == ZPQ_EINVAL && c == NULL, "options %s: rc %d", bad[i], rc);
+        CHECK(err && strstr(err, "\"error\":\"invalid_argument\""), "options %s: message %s", bad[i], err);
+        zpq_free(err);
     }
+    /* No out_ctx: refused, with its reason; no out_error wanted: the status alone. */
+    char *err = NULL;
+    CHECK(zpq_open(NULL, NULL, &err) == ZPQ_EINVAL && err && strstr(err, "NullOutContext"), "%s", err);
+    zpq_free(err);
+    CHECK(zpq_open("{", NULL, NULL) == ZPQ_EINVAL, "NULL everything");
+    /* Static, never freed; every code has one. */
+    CHECK(strcmp(zpq_strerror(ZPQ_ECLOSED), "context is closed") == 0, "%s", zpq_strerror(ZPQ_ECLOSED));
+    CHECK(strcmp(zpq_strerror(ZPQ_EINTERNAL), "internal failure") == 0, "%s", zpq_strerror(ZPQ_EINTERNAL));
+    CHECK(strcmp(zpq_strerror(12345), "unknown status") == 0, "%s", zpq_strerror(12345));
     zpq_close(NULL);
     zpq_free(NULL);
 }
@@ -150,7 +178,7 @@ static void test_errors(zpq_ctx *c) {
     for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
         char *out = NULL;
         int rc = run(c, cases[i].req, &out);
-        CHECK(rc == ZPQ_ERROR_RESPONSE, "request %zu rc %d: %s", i, rc, out);
+        CHECK(rc == ZPQ_OK, "request %zu rc %d: %s", i, rc, out);
         CHECK(out && strncmp(out, "{\"error\"", 8) == 0 && strstr(out, cases[i].want), "request %zu: %s", i, out);
         zpq_free(out);
     }
@@ -165,18 +193,23 @@ static void test_errors(zpq_ctx *c) {
 }
 
 static void test_invalid_arguments(zpq_ctx *c) {
-    /* Every output given is cleared, whichever argument is refused. */
+    /* A refused call clears every output given, then describes the refusal in *out_json; out_len stays 0. */
     char *out = (char *)1;
     size_t len = 7;
-    CHECK(zpq_run(NULL, "{}", 2, &out, &len) == ZPQ_EINVAL && out == NULL && len == 0, "NULL ctx: %p %zu",
-          (void *)out, len);
+    CHECK(zpq_run(NULL, "{}", 2, &out, &len) == ZPQ_EINVAL && out && strstr(out, "NullContext") && len == 0,
+          "NULL ctx: %s %zu", out, len);
+    zpq_free(out);
     len = 7;
     CHECK(zpq_run(c, "{}", 2, NULL, &len) == ZPQ_EINVAL && len == 0, "NULL out_json: %zu", len);
     out = (char *)1;
     len = 7;
-    CHECK(zpq_run(c, NULL, 5, &out, &len) == ZPQ_EINVAL && out == NULL && len == 0, "NULL request");
-    /* NULL request of length 0 is the empty request; out_len may be NULL. */
-    CHECK(zpq_run(c, NULL, 0, &out, NULL) == ZPQ_ERROR_RESPONSE && out, "empty request");
+    CHECK(zpq_run(c, NULL, 5, &out, &len) == ZPQ_EINVAL && out && strstr(out, "NullRequest") && len == 0,
+          "NULL request: %s", out);
+    zpq_free(out);
+    CHECK(zpq_run(c, "{}", (size_t)-1, &out, NULL) == ZPQ_EINVAL && out && strstr(out, "BadLength"), "%s", out);
+    zpq_free(out);
+    /* NULL request of length 0 is the empty request, answered; out_len may be NULL. */
+    CHECK(zpq_run(c, NULL, 0, &out, NULL) == ZPQ_OK && out && strstr(out, "empty_body"), "empty request: %s", out);
     zpq_free(out);
 }
 
@@ -184,12 +217,15 @@ static void test_invalid_arguments(zpq_ctx *c) {
 #define THREADS 16
 #define CALLS_PER_THREAD 40
 static zpq_ctx *shared;
+/* Each names a small budget of its own. */
 static const char *mix_req[] = {
-    "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n, sum(a) AS s\"}",
-    "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"max(b) AS m\",\"filter\":\"a < 1000\"}",
+    "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n, sum(a) AS s\","
+    "\"max_memory\":\"16MB\"}",
+    "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"max(b) AS m\",\"filter\":\"a < 1000\","
+    "\"max_memory\":\"16MB\"}",
     "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\",\"ci/fixtures/parquet/mixed_codec.parquet\"],"
-    "\"aggregate\":\"count(*) AS n\",\"group_by\":\"b\",\"filter\":\"a < 2\"}",
-    "{\"inputs\":[\"no/such.parquet\"],\"aggregate\":\"count(*) AS n\"}",
+    "\"aggregate\":\"count(*) AS n\",\"group_by\":\"b\",\"filter\":\"a < 2\",\"max_memory\":\"16MB\"}",
+    "{\"inputs\":[\"no/such.parquet\"],\"aggregate\":\"count(*) AS n\",\"max_memory\":\"16MB\"}",
 };
 static char *mix_want[4];
 
@@ -200,7 +236,7 @@ static void *worker(void *arg) {
         char *out = NULL;
         int rc = run(shared, mix_req[k], &out);
         if (k == 3) {
-            CHECK(rc == ZPQ_ERROR_RESPONSE, "thread %ld call %d rc %d", id, i, rc);
+            CHECK(rc == ZPQ_OK && out && strncmp(out, "{\"error\"", 8) == 0, "thread %ld call %d rc %d", id, i, rc);
         } else {
             char *a = out ? agg_of(out) : NULL;
             CHECK(rc == ZPQ_OK && a && strcmp(a, mix_want[k]) == 0, "thread %ld query %d: %s", id, k, out);
@@ -229,7 +265,7 @@ static void test_concurrent(zpq_ctx *c) {
     run_threads(c);
     /* Cold: every thread's first call is the fresh context's first. */
     for (int round = 0; round < 8; round++) {
-        zpq_ctx *cold = zpq_open(NULL);
+        zpq_ctx *cold = open_ctx(NULL);
         CHECK(cold != NULL, "zpq_open");
         if (!cold) break;
         run_threads(cold);
@@ -265,10 +301,37 @@ static void test_rss_flat(zpq_ctx *c, int calls) {
 #endif
 }
 
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Every context's memory comes back: open, run and close, many times (LeakSanitizer reports anything left). */
+static void test_cycles(int n) {
+    for (int i = 0; i < n; i++) {
+        zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
+        if (!c) return;
+        char *out = NULL;
+        int rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}",
+                     &out);
+        if (rc != ZPQ_OK || !out || !strstr(out, "\"n\":48000")) {
+            CHECK(0, "cycle %d rc %d: %s", i, rc, out);
+            zpq_free(out);
+            zpq_close(c);
+            return;
+        }
+        zpq_free(out);
+        zpq_close(c);
+    }
+}
+
 int main(int argc, char **argv) {
     int calls = argc > 1 ? atoi(argv[1]) : 10000;
+    int cycles = argc > 2 ? atoi(argv[2]) : 1000;
     test_options();
-    zpq_ctx *c = zpq_open("{\"max_memory\": \"512MB\"}");
+    test_cycles(cycles);
+    zpq_ctx *c = open_ctx("{\"max_memory\": \"512MB\"}");
     if (!c) {
         fprintf(stderr, "zpq_open failed\n");
         return 1;

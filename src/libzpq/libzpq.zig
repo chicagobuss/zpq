@@ -27,37 +27,48 @@ const Options = struct {
     /// Each query's memory budget when its request names none: bytes, or a size string ("2GB"). Absent, it derives
     /// from the memory available, as the Lambda's does.
     max_memory: ?std.json.Value = null,
+    /// Open connections to the S3 endpoint as the context opens (`ZPQ_S3_PRECONNECT` of them, default 4), as the
+    /// Lambda does during init, so the first queries find them ready. Off by default.
+    preconnect: bool = false,
 };
 
-fn parseOptions(text: []const u8) !?usize {
+/// `Options` as a context uses them.
+const Parsed = struct {
+    query_memory: ?usize = null,
+    preconnect: bool = false,
+};
+
+fn parseOptions(text: []const u8) !Parsed {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return null;
+    if (trimmed.len == 0) return .{};
     const parsed = try std.json.parseFromSlice(Options, gpa, trimmed, .{});
     defer parsed.deinit();
-    const v = parsed.value.max_memory orelse return null;
-    return switch (v) {
+    const query_memory: ?usize = if (parsed.value.max_memory) |v| switch (v) {
         .null => null,
-        .integer => |n| if (n > 0) @intCast(n) else error.BadMaxMemory,
+        .integer => |n| if (n > 0) @intCast(n) else return error.BadMaxMemory,
         .string => |str| try zpq.core.system.parseSizeString(str),
-        else => error.BadMaxMemory,
-    };
+        else => return error.BadMaxMemory,
+    } else null;
+    return .{ .query_memory = query_memory, .preconnect = parsed.value.preconnect };
 }
 
 export fn zpq_open(options_json: ?[*:0]const u8) ?*Ctx {
-    const query_memory = parseOptions(if (options_json) |o| std.mem.span(o) else "") catch return null;
+    const opts = parseOptions(if (options_json) |o| std.mem.span(o) else "") catch return null;
     const ctx = gpa.create(Ctx) catch return null;
     ctx.* = .{
         .threaded = std.Io.Threaded.init(gpa, .{}),
         .pool = .sized(zpq.core.system.discoverAvailableMemory(processEnviron())),
     };
     ctx.pool.per_call_stats = false;
-    ctx.pool.query_memory = query_memory;
+    ctx.pool.query_memory = opts.query_memory;
     // Ready before any call: every query, the first ones included, gets the footer cache.
     ctx.pool.warm(gpa) catch {
         ctx.threaded.deinit();
         gpa.destroy(ctx);
         return null;
     };
+    // Only when asked: a host that never touches S3 should not open connections to it. zpq_close joins them.
+    if (opts.preconnect) service.preconnectS3(ctx.threaded.io(), gpa, processEnviron(), &ctx.pool);
     return ctx;
 }
 
@@ -109,10 +120,61 @@ fn processEnviron() std.process.Environ {
 }
 
 test "options: a byte count, a size string, nothing, or an error" {
-    try std.testing.expectEqual(@as(?usize, null), try parseOptions(""));
-    try std.testing.expectEqual(@as(?usize, null), try parseOptions("{}"));
-    try std.testing.expectEqual(@as(?usize, 1 << 20), try parseOptions("{\"max_memory\": 1048576}"));
-    try std.testing.expect((try parseOptions("{\"max_memory\": \"2GB\"}")).? > 1 << 30);
+    try std.testing.expectEqual(Parsed{}, try parseOptions(""));
+    try std.testing.expectEqual(Parsed{}, try parseOptions("{}"));
+    try std.testing.expectEqual(@as(?usize, 1 << 20), (try parseOptions("{\"max_memory\": 1048576}")).query_memory);
+    try std.testing.expect((try parseOptions("{\"max_memory\": \"2GB\"}")).query_memory.? > 1 << 30);
     try std.testing.expectError(error.UnknownField, parseOptions("{\"max_mem\": 1}"));
     try std.testing.expectError(error.BadMaxMemory, parseOptions("{\"max_memory\": -1}"));
+}
+
+test "options: pre-connect is off unless asked, and only a boolean" {
+    try std.testing.expect(!(try parseOptions("{\"max_memory\": 1048576}")).preconnect);
+    try std.testing.expect((try parseOptions("{\"preconnect\": true}")).preconnect);
+    try std.testing.expect(!(try parseOptions("{\"preconnect\": false}")).preconnect);
+    try std.testing.expectError(error.UnexpectedToken, parseOptions("{\"preconnect\": 4}"));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "a context opens connections to the S3 endpoint only when asked to pre-connect" {
+    const posix = std.posix;
+    // A listener for the S3 endpoint: the kernel completes connections to it without an accept.
+    const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const lfd: posix.fd_t = @intCast(rc);
+    defer _ = posix.system.close(lfd);
+    var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.listen(lfd, 16)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+
+    var endpoint: [64]u8 = undefined;
+    const port = std.mem.bigToNative(u16, addr.port);
+    const url = try std.fmt.bufPrintSentinel(&endpoint, "http://127.0.0.1:{d}", .{port}, 0);
+    const vars = [_][2][*:0]const u8{
+        .{ "S3_ENDPOINT_URL", url.ptr }, .{ "AWS_ACCESS_KEY_ID", "ak" }, .{ "AWS_SECRET_ACCESS_KEY", "sk" },
+        .{ "AWS_REGION", "us-east-1" },  .{ "ZPQ_S3_PRECONNECT", "2" },
+    };
+    for (vars) |v| _ = setenv(v[0], v[1], 1);
+    defer for (vars) |v| {
+        _ = unsetenv(v[0]);
+    };
+
+    const plain = zpq_open(null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u64, null), plain.pool.preconnect_ns);
+    zpq_close(plain);
+
+    const warm = zpq_open("{\"preconnect\": true}") orelse return error.TestUnexpectedResult;
+    defer zpq_close(warm);
+    try std.testing.expect(warm.pool.preconnect_ns != null);
+    // Both connections are parked within the pre-connect's own deadline.
+    var waited_ms: u32 = 0;
+    while (warm.pool.inner.preconnect_parked.load(.monotonic) < 2 and waited_ms < 2_000) : (waited_ms += 10) {
+        const ts: posix.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = posix.system.nanosleep(&ts, null);
+    }
+    try std.testing.expectEqual(@as(u64, 2), warm.pool.inner.preconnect_parked.load(.monotonic));
 }

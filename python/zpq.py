@@ -89,9 +89,11 @@ def load_library(path=None):
 class Zpq:
     """A libzpq context: warm S3 connections and footers shared by every `run` on it."""
 
-    def __init__(self, max_memory=None, library=None):
+    def __init__(self, max_memory=None, library=None, *, preconnect=False):
         self._lib = load_library(library)
         opts = {} if max_memory is None else {"max_memory": max_memory}
+        if preconnect:
+            opts["preconnect"] = True
         # Calls in flight, and whether close has begun: close waits for the first to drain before freeing the context.
         self._cond = threading.Condition()
         self._inflight = 0

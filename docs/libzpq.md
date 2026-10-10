@@ -34,9 +34,12 @@ void zpq_close(zpq_ctx *);
 int zpq_abi_version(void);                      /* 1 */
 ```
 
-- **Options.** One option, `{"max_memory": 1073741824}` or `{"max_memory": "4GB"}`. It sets each query's budget
-  when its request names none. By default the budget derives from available memory, as the Lambda's does. An
-  unknown option is an error.
+- **Options.** An unknown option is an error.
+  - `"max_memory"`: `1073741824` or `"4GB"`. Each query's budget when its request names none. By default the
+    budget derives from available memory, as the Lambda's does.
+  - `"preconnect"`: `true` opens connections to the S3 endpoint as the context opens (`ZPQ_S3_PRECONNECT` of them,
+    default 4), as the Lambda does during init, so the first queries find them ready. Off by default: a host that
+    never reads S3 opens no connections. Failures are ignored; the queries then connect on their own.
 - **Request.** The Lambda's request (see [lambda_requests.md](lambda_requests.md)): `inputs`, `filter`,
   `aggregate`, `group_by`, `select`, `columns`, `output_url`, `output_codec`, `max_memory`, `bloom_filters`,
   `profile` and the rest. Inputs and `output_url` may be local paths as well as `s3://` URLs. A request must

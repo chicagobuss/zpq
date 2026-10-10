@@ -32,6 +32,8 @@ typedef struct zpq_ctx zpq_ctx;
  * A context for any number of zpq_run calls. options_json may be NULL or "" for the defaults, else a JSON object:
  *   "max_memory": a query's memory budget when its request names none: bytes, or a size string ("2GB").
  *                 Default: derived from the memory available, as the Lambda's is.
+ *   "preconnect": true to open connections to the S3 endpoint now (ZPQ_S3_PRECONNECT of them, default 4), as the
+ *                 Lambda does during init, so the first queries find them ready. Default: false.
  * Returns NULL on invalid options or when out of memory.
  */
 zpq_ctx *zpq_open(const char *options_json);

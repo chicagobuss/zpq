@@ -40,11 +40,10 @@ Reads go through `membership.Source`: a mapping for local files (slices, nothing
 the medium moves in that time, the requests in flight at once, and the longest request it serves whole.
 
 - Only row groups statistics keep, and only columns with an open `=` literal, are read.
-- Ranges merge across the gap a makespan estimate over the source's connections finds cheapest, and large spans split
-  so every connection stays busy. Most writers lay a file's filters out row group by row group, so one column's
-  filters are rarely adjacent; merging across the others' can still beat a request per filter. A merged span carries
-  at most a mebibyte of unwanted bytes, or twice the bytes it is read for if that is more: over-reading bets on
-  bandwidth a cold read may not get.
+- Bytes the retained suffix already holds are copied from it and are not planned. What remains goes through the same
+  dispatch planner as column data: the in-flight cap, the 8 MiB split, the latency cap, twice the selected bytes, and
+  the fetch window charged to each file. A column whose filters touch is one span. A row-group-major run keeps a
+  filter's own requests when the gap between them fails those caps.
 - The S3 source assumes Lambda's in-region costs (about 25 ms a request, 80 MB/s a connection). A successful footer
   request's time to first byte — a cold suffix, a stale 200/206, or a 304 — is that sample. A slower one means a
   distant link, and then the plan uses that round trip and the bandwidth the first filter reads achieved. Until one
@@ -56,8 +55,9 @@ the medium moves in that time, the requests in flight at once, and the longest r
   whole filters can be kept warm and blocks cannot.
 - On a mapping, every header page and then every block page a probe needs is requested at once (`MADV_WILLNEED`),
   so a cold page cache costs two rounds of parallel reads rather than one disk read per filter.
-- On a remote source, the filters of the first eight row groups are read first. If they prune fewer than a quarter of
-  them, the rest are left unread, which bounds what filters cost a query they cannot help.
+- On a remote source, a column whose needed filters form one contiguous run is read in that one pass. When they do
+  not (a row-group-major layout), the first eight row groups are read first, and if they prune fewer than a quarter
+  of them the rest are left unread. That is what bounds a common key. Dictionaries keep that first wave either way.
 - Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer. The
   cache may hold a sixteenth of the function's memory, at most 256 MiB, and a query's default `max_memory` is what it
   leaves.

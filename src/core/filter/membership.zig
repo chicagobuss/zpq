@@ -12,7 +12,8 @@
 //! caller of `pruneRowGroup` (the S3 planner, the scan workers, the write path) reaches the same answer.
 //!
 //! I/O stays behind `Source`: a mapping for local files, the S3 range fetcher, later an io_uring reader. Which bytes
-//! to read, how to merge them and when to give up is decided here, from the source's `Cost`.
+//! to read, how to merge them and when to give up is decided here, from the source's `Cost`. Bloom ranges that
+//! remain after the retained suffix is dropped go through the same dispatch planner as column data.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +23,7 @@ const schema = @import("../schema.zig");
 const bloom = @import("../parquet/bloom.zig");
 const compression = @import("../parquet/compression.zig");
 const thrift = @import("../thrift.zig");
+const coalescer = @import("../../io/coalescer.zig");
 const nowMonoNs = @import("../../clock.zig").monoNs;
 
 // ============================================================
@@ -166,6 +168,14 @@ pub const Cost = struct {
     concurrency: usize = 1,
     /// The longest request the medium serves whole; longer spans are planned as several.
     max_request: u64 = std.math.maxInt(u64),
+    /// Latency cap for `coalesceDispatch`. 0 keeps the cost-model planner.
+    gap_cap: u64 = 0,
+    /// In-flight cap for that planner. 0 uses `concurrency`.
+    in_flight: usize = 0,
+    /// Split a dispatch span longer than this. 0 leaves the planner's spans whole.
+    split: u64 = 0,
+    /// Window charged to one file's bloom spans. Null does not cap a gap.
+    window: ?u64 = null,
 
     pub const mapped: Cost = .{ .request_bytes = 0 };
 
@@ -209,6 +219,8 @@ pub const Source = struct {
         /// The cost as this query has measured it so far, once the source has timed enough of its reads; `cost`
         /// stands until then.
         measured: ?*const fn (ctx: *anyopaque) ?Cost = null,
+        /// The retained tail of `file`, when this source already holds one. Bytes inside it are not fetched.
+        suffix: ?*const fn (ctx: *anyopaque, file: u32) ?Span = null,
     };
 
     /// What planning should assume now.
@@ -223,6 +235,11 @@ pub const Source = struct {
 
     fn read(self: Source, arena: std.mem.Allocator, spans: []const Span, out: [][]const u8) !void {
         return self.vtable.read(self.ctx, arena, spans, out);
+    }
+
+    fn suffix(self: Source, file: u32) ?Span {
+        const f = self.vtable.suffix orelse return null;
+        return f(self.ctx, file);
     }
 };
 
@@ -376,18 +393,113 @@ fn sortedSpans(arena: std.mem.Allocator, reqs: []const Req) ![]Span {
     return ranges;
 }
 
-/// Read every request through `src`, merged and split per its cost; a request split across spans is reassembled.
-fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats) !void {
+/// How `readAll` turns requests into spans. Header probes stay on the cost model. Bloom bodies use the dispatch
+/// planner when the source has a latency cap.
+const ReadKind = enum { cost, dispatch };
+
+/// The part of `span` the suffix does not already hold, and the part it does.
+fn clipSuffix(span: Span, suf: ?Span) struct { http: ?Span, tail: ?Span } {
+    if (span.end <= span.start) return .{ .http = null, .tail = null };
+    const s = suf orelse return .{ .http = span, .tail = null };
+    if (s.file != span.file or s.end <= span.start or s.start >= span.end) return .{ .http = span, .tail = null };
+    const http: ?Span = if (span.start < s.start) .{
+        .file = span.file,
+        .start = span.start,
+        .end = @min(span.end, s.start),
+    } else null;
+    const tail_start = @max(span.start, s.start);
+    const tail_end = @min(span.end, s.end);
+    const tail: ?Span = if (tail_end > tail_start) .{
+        .file = span.file,
+        .start = tail_start,
+        .end = tail_end,
+    } else null;
+    return .{ .http = http, .tail = tail };
+}
+
+/// Bloom ranges through `coalesceDispatch`. Every piece of one file shares that file's group, so a contiguous
+/// column joins; the window still charges the gaps and refuses one that would push the span past the limit.
+/// A row-group group would refuse that join. Planned spans then split at `cost.split`.
+fn planDispatch(arena: std.mem.Allocator, ranges: []const Span, cost: Cost) ![]Span {
+    if (ranges.len == 0) return &.{};
+    var selected: u64 = 0;
+    const pieces = try arena.alloc(coalescer.Piece, ranges.len);
+    for (ranges, pieces) |r, *p| {
+        selected += r.len();
+        p.* = .{
+            .object = r.file,
+            .group = r.file,
+            .start = r.start,
+            .end = r.end,
+            .gap_cap = cost.gap_cap,
+        };
+    }
+    const flight = if (cost.in_flight > 0) cost.in_flight else @max(cost.concurrency, 1);
+    const planned = try coalescer.coalesceDispatch(arena, pieces, flight, selected *| 2, cost.window);
+    var out: std.ArrayList(Span) = .empty;
+    for (planned) |sp| {
+        var at = sp.start;
+        while (at < sp.end) {
+            const room = sp.end - at;
+            const n = if (cost.split == 0) room else @min(cost.split, room);
+            try out.append(arena, .{ .file = sp.object, .start = at, .end = at + n });
+            at += n;
+        }
+    }
+    std.mem.sort(Span, out.items, {}, spanLess);
+    return out.items;
+}
+
+fn joinBytes(arena: std.mem.Allocator, head: []const u8, tail: []const u8) ![]const u8 {
+    if (tail.len == 0) return head;
+    if (head.len == 0) return tail;
+    const out = try arena.alloc(u8, head.len + tail.len);
+    @memcpy(out[0..head.len], head);
+    @memcpy(out[head.len..], tail);
+    return out;
+}
+
+/// Read every request through `src`. Suffix-covered bytes are copied and are not planned. What remains is merged
+/// by `kind`, then a request split across spans is reassembled. `stats.bytes` counts only what was fetched.
+fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind) !void {
     if (reqs.len == 0) return;
-    const spans = try planSpans(arena, try sortedSpans(arena, reqs), src.currentCost());
-    const got = try arena.alloc([]const u8, spans.len);
-    try src.read(arena, spans, got);
+    const cost = src.currentCost();
+    const Part = struct { http: ?Span, tail: ?usize };
+    const parts = try arena.alloc(Part, reqs.len);
+    var http: std.ArrayList(Span) = .empty;
+    var tails: std.ArrayList(Span) = .empty;
+    for (reqs, parts) |r, *p| {
+        const clip = clipSuffix(r.span, src.suffix(r.span.file));
+        p.http = clip.http;
+        if (clip.http) |h| try http.append(arena, h);
+        if (clip.tail) |t| {
+            p.tail = tails.items.len;
+            try tails.append(arena, t);
+        } else p.tail = null;
+    }
+    const planned: []Span = if (http.items.len == 0)
+        &.{}
+    else if (kind == .dispatch and cost.gap_cap > 0) blk: {
+        break :blk try planDispatch(arena, http.items, cost);
+    } else blk: {
+        std.mem.sort(Span, http.items, {}, spanLess);
+        break :blk try planSpans(arena, http.items, cost);
+    };
+    const got = try arena.alloc([]const u8, planned.len);
+    if (planned.len > 0) try src.read(arena, planned, got);
+    const tail_got = try arena.alloc([]const u8, tails.items.len);
+    if (tails.items.len > 0) try src.read(arena, tails.items, tail_got);
     // A mapping reads nothing up front; the pages a probe touches fault in on their own.
     if (src.cost.remote()) {
-        stats.requests += spans.len;
+        stats.requests += planned.len;
         for (got) |g| stats.bytes += g.len;
+        for (tail_got) |g| stats.suffix_bytes += g.len;
     }
-    for (reqs) |*r| r.out = try assemble(arena, spans, got, r.span);
+    for (reqs, parts) |*r, p| {
+        const head = if (p.http) |h| try assemble(arena, planned, got, h) else &.{};
+        const tail = if (p.tail) |i| tail_got[i] else &.{};
+        r.out = try joinBytes(arena, head, tail);
+    }
 }
 
 fn estimateReqs(arena: std.mem.Allocator, reqs: []const Req, cost: Cost) !u64 {
@@ -437,9 +549,10 @@ pub const Stats = struct {
     /// Filters and dictionaries probed.
     filters: usize = 0,
     dictionaries: usize = 0,
-    /// Requests made, and bytes read by them (remote sources only).
+    /// HTTP requests made, and bytes fetched by them. Copies from a retained suffix are `suffix_bytes`.
     requests: usize = 0,
     bytes: u64 = 0,
+    suffix_bytes: u64 = 0,
     /// A first wave pruned too little to pay for reading the rest of its kind.
     bloom_stopped: bool = false,
     dict_stopped: bool = false,
@@ -455,6 +568,7 @@ pub const Stats = struct {
         self.dictionaries += o.dictionaries;
         self.requests += o.requests;
         self.bytes += o.bytes;
+        self.suffix_bytes += o.suffix_bytes;
         self.bloom_stopped = self.bloom_stopped or o.bloom_stopped;
         self.dict_stopped = self.dict_stopped or o.dict_stopped;
         self.ns += o.ns;
@@ -732,6 +846,11 @@ const Verdict = enum { unknown, canonical, other };
 /// Bytes read to learn a filter's size when the footer leaves its length out. The header is at most 19.
 const header_probe_bytes = 64;
 
+fn bloomFilterTotal(bytes: []const u8) ?u64 {
+    const h = bloom.parseHeader(bytes) orelse return null;
+    return h.len + h.num_bytes;
+}
+
 /// How one target's filter comes back from a read.
 const Fetch = union(enum) {
     none,
@@ -793,6 +912,12 @@ const Probing = struct {
         }
         const all = queue.items;
         if (all.len == 0) return;
+        // A column whose needed filters already touch is one run. The adaptive wave would cut it into two serial
+        // rounds. Scattered filters (a row-group-major run) keep the wave: eight small requests beat reading the rest.
+        if (which == .bloom and self.src.cost.remote()) {
+            try self.stageBloomRemote(all);
+            return;
+        }
         const first_end = if (self.src.cost.remote() or which == .dictionary) waveEnd(all, self.opts.wave) else all.len;
         const first = try self.probeWave(which, all[0..first_end]);
         if (first_end == all.len) return;
@@ -805,6 +930,62 @@ const Probing = struct {
             return;
         }
         _ = try self.probeWave(which, all[first_end..]);
+    }
+
+    /// Remote bloom. Contiguous columns are probed in full. The rest take the adaptive wave, in row-group order.
+    fn stageBloomRemote(self: *Probing, all: []const *Target) !void {
+        var used = try self.scratch.alloc(bool, all.len);
+        @memset(used, false);
+        var scattered: std.ArrayList(*Target) = .empty;
+        var i: usize = 0;
+        while (i < all.len) : (i += 1) {
+            if (used[i]) continue;
+            var col: std.ArrayList(*Target) = .empty;
+            var j: usize = i;
+            while (j < all.len) : (j += 1) {
+                if (used[j]) continue;
+                if (all[j].file != all[i].file or all[j].col != all[i].col) continue;
+                used[j] = true;
+                try col.append(self.scratch, all[j]);
+            }
+            if (try self.columnContiguous(col.items)) {
+                _ = try self.probeWave(.bloom, col.items);
+            } else try scattered.appendSlice(self.scratch, col.items);
+        }
+        if (scattered.items.len == 0) return;
+        std.mem.sort(*Target, scattered.items, {}, struct {
+            fn lessThan(_: void, a: *Target, b: *Target) bool {
+                if (a.file != b.file) return a.file < b.file;
+                if (a.rg != b.rg) return a.rg < b.rg;
+                return a.col < b.col;
+            }
+        }.lessThan);
+        const first_end = waveEnd(scattered.items, self.opts.wave);
+        const first = try self.probeWave(.bloom, scattered.items[0..first_end]);
+        if (first_end == scattered.items.len) return;
+        const want = self.opts.min_wave_prune * @as(f64, @floatFromInt(first.row_groups));
+        if (@as(f64, @floatFromInt(first.pruned)) < want) {
+            self.stats.bloom_stopped = true;
+            return;
+        }
+        _ = try self.probeWave(.bloom, scattered.items[first_end..]);
+    }
+
+    /// Known lengths, and each next filter starts where the previous one ends. An omitted length is not a run.
+    fn columnContiguous(self: *Probing, col: []const *Target) !bool {
+        if (col.len == 0) return true;
+        var spans = try self.scratch.alloc(Span, col.len);
+        for (col, spans) |t, *s| {
+            const fs = filterSpan(t, self.metas).?;
+            if (fs.end == fs.start) return false;
+            s.* = fs;
+        }
+        if (spans.len == 1) return true;
+        std.mem.sort(Span, spans, {}, spanLess);
+        for (spans[0 .. spans.len - 1], spans[1..]) |a, b| {
+            if (b.file != a.file or b.start > a.end) return false;
+        }
+        return true;
     }
 
     fn probeWave(self: *Probing, comptime which: Stage, targets: []const *Target) !WaveResult {
@@ -852,28 +1033,14 @@ const Probing = struct {
         }
 
         // A filter whose length the footer leaves out (older parquet-java) costs a header read first.
-        var heads: std.ArrayList(Req) = .empty;
-        var head_of: std.ArrayList(usize) = .empty;
-        for (wave, 0..) |t, i| {
-            const s = filterSpan(t, self.metas).?;
-            if (s.end != s.start) continue;
-            const head: Span = .{ .file = s.file, .start = s.start, .end = s.start + header_probe_bytes };
-            try heads.append(a, .{ .span = head });
-            try head_of.append(a, i);
-        }
-        try readAll(a, self.src, heads.items, self.stats);
         const spans = try a.alloc(?Span, wave.len);
-        for (wave, spans) |t, *s| {
-            const fs = filterSpan(t, self.metas).?;
-            s.* = if (fs.end != fs.start) fs else null;
-        }
-        for (heads.items, head_of.items) |r, i| {
-            const h = bloom.parseHeader(r.out) orelse continue;
-            const total = h.len + h.num_bytes;
-            if (total <= r.out.len) {
-                fetch[i] = .{ .bytes = r.out[0..total] };
-            } else {
-                spans[i] = .{ .file = r.span.file, .start = r.span.start, .end = r.span.start + total };
+        for (wave, spans) |t, *s| s.* = filterSpan(t, self.metas).?;
+        const omitted = try self.fillOmittedLengths(spans, header_probe_bytes, bloomFilterTotal);
+        for (omitted.reqs, omitted.index) |r, i| {
+            const sp = spans[i] orelse continue;
+            if (sp.len() <= r.out.len) {
+                fetch[i] = .{ .bytes = r.out[0..sp.len()] };
+                spans[i] = null;
             }
         }
         for (wave, spans, fetch) |_, s, *f| if (s) |sp| if (self.src.vtable.cached) |cached| {
@@ -890,7 +1057,7 @@ const Probing = struct {
                 if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) plan = sparse;
             }
         }
-        try readAll(a, self.src, plan.reqs.items, self.stats);
+        try readAll(a, self.src, plan.reqs.items, self.stats, .dispatch);
 
         if (!self.src.cost.remote()) try self.prefetchBlocks(wave, plan, spans);
 
@@ -986,27 +1153,40 @@ const Probing = struct {
         return plan;
     }
 
+    /// A footer that omits a length is an empty span. Read `probe_len` bytes at each such span and, when `parse`
+    /// names a total, replace it with `[start, start + total)`. The header bytes stay on the returned requests.
+    fn fillOmittedLengths(
+        self: *Probing,
+        spans: []?Span,
+        probe_len: u64,
+        parse: *const fn ([]const u8) ?u64,
+    ) !struct { reqs: []Req, index: []usize } {
+        const a = self.scratch;
+        var heads: std.ArrayList(Req) = .empty;
+        var head_of: std.ArrayList(usize) = .empty;
+        for (spans, 0..) |s, i| {
+            const sp = s orelse continue;
+            if (sp.end != sp.start) continue;
+            try heads.append(a, .{ .span = .{ .file = sp.file, .start = sp.start, .end = sp.start + probe_len } });
+            try head_of.append(a, i);
+        }
+        try readAll(a, self.src, heads.items, self.stats, .cost);
+        for (heads.items, head_of.items) |r, i| {
+            const total = parse(r.out) orelse {
+                spans[i] = null;
+                continue;
+            };
+            spans[i] = .{ .file = r.span.file, .start = r.span.start, .end = r.span.start + total };
+        }
+        return .{ .reqs = heads.items, .index = head_of.items };
+    }
+
     /// Read the dictionary pages of `wave` and record every key none of them holds.
     fn probeDictionaries(self: *Probing, wave: []const *Target) !void {
         const a = self.scratch;
-        // A dictionary page whose length the footer does not give costs a header read first.
         const spans = try a.alloc(?Span, wave.len);
-        var heads: std.ArrayList(Req) = .empty;
-        var head_of: std.ArrayList(usize) = .empty;
-        for (wave, spans, 0..) |t, *s, i| {
-            const ds = dictSpan(t, self.metas).?;
-            s.* = if (ds.end != ds.start) ds else null;
-            if (ds.end == ds.start) {
-                const head: Span = .{ .file = ds.file, .start = ds.start, .end = ds.start + page_header_probe };
-                try heads.append(a, .{ .span = head });
-                try head_of.append(a, i);
-            }
-        }
-        try readAll(a, self.src, heads.items, self.stats);
-        for (heads.items, head_of.items) |r, i| {
-            const len = dictionaryPageLen(r.out) orelse continue;
-            spans[i] = .{ .file = r.span.file, .start = r.span.start, .end = r.span.start + len };
-        }
+        for (wave, spans) |t, *s| s.* = dictSpan(t, self.metas).?;
+        _ = try self.fillOmittedLengths(spans, page_header_probe, dictionaryPageLen);
         var reqs: std.ArrayList(Req) = .empty;
         const req_of = try a.alloc(?usize, wave.len);
         for (spans, req_of) |s, *ri| {
@@ -1018,7 +1198,7 @@ const Probing = struct {
         const pages = try a.alloc(Span, reqs.items.len);
         for (reqs.items, pages) |r, *p| p.* = r.span;
         self.src.prefetch(pages);
-        try readAll(a, self.src, reqs.items, self.stats);
+        try readAll(a, self.src, reqs.items, self.stats, .cost);
 
         var want: std.ArrayList([]const u8) = .empty;
         for (wave, req_of) |t, ri| {
@@ -1439,13 +1619,18 @@ const SynthFile = struct {
     meta: schema.FileMetaData,
 
     fn init(a: std.mem.Allocator, n_rgs: usize, per_rg: usize) !SynthFile {
-        return initOpts(a, n_rgs, per_rg, null);
+        return initOpts(a, n_rgs, per_rg, null, 0);
+    }
+
+    /// `gap` bytes between filters. Zero is the column-major run zpq writes.
+    fn initGap(a: std.mem.Allocator, n_rgs: usize, per_rg: usize, gap: usize) !SynthFile {
+        return initOpts(a, n_rgs, per_rg, null, gap);
     }
 
     /// `forge_from`: the headers of filters from that row group on carry an extra 32-byte field after the three
     /// unions. Still valid (readers skip unknown fields), but the bitset no longer sits where a header of the canonical
     /// shape would put it.
-    fn initOpts(a: std.mem.Allocator, n_rgs: usize, per_rg: usize, forge_from: ?usize) !SynthFile {
+    fn initOpts(a: std.mem.Allocator, n_rgs: usize, per_rg: usize, forge_from: ?usize, gap: usize) !SynthFile {
         var meta: schema.FileMetaData = .{
             .version = 1,
             .schema = .empty,
@@ -1490,6 +1675,7 @@ const SynthFile = struct {
                 .bloom_filter_length = @intCast(filt.len),
             } });
             try bytes.appendSlice(a, filt);
+            if (gap > 0 and i + 1 < n_rgs) try bytes.appendNTimes(a, 'g', gap);
             try meta.row_groups.append(a, rg);
         }
         return .{ .bytes = bytes.items, .meta = meta };
@@ -1503,22 +1689,68 @@ const FakeRemote = struct {
     requests: usize = 0,
     bytes: u64 = 0,
     block_reads: usize = 0,
+    /// One increment per `read` that fetched something over HTTP. A suffix copy is not a round.
+    http_rounds: usize = 0,
+    http_end_max: u64 = 0,
+    http_span_max: u64 = 0,
+    /// `[suffix_start, file end)` is already in hand, the way a retained S3 tail is.
+    suffix_start: ?u64 = null,
 
     fn source(self: *FakeRemote) Source {
-        return .{ .ctx = self, .vtable = &.{ .read = readFn }, .cost = self.cost };
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .suffix = suffixFn }, .cost = self.cost };
+    }
+
+    fn suffixFn(ctx: *anyopaque, file: u32) ?Span {
+        const self: *FakeRemote = @ptrCast(@alignCast(ctx));
+        const start = self.suffix_start orelse return null;
+        const f = self.files[file];
+        if (start >= f.len) return null;
+        return .{ .file = file, .start = start, .end = f.len };
     }
 
     fn readFn(ctx: *anyopaque, _: std.mem.Allocator, spans: []const Span, out: [][]const u8) anyerror!void {
         const self: *FakeRemote = @ptrCast(@alignCast(ctx));
+        var http = false;
         for (spans, out) |s, *o| {
             const f = self.files[s.file];
             o.* = f[@intCast(@min(s.start, f.len))..@intCast(@min(s.end, f.len))];
-            self.requests += 1;
-            self.bytes += o.len;
+            const covered = if (self.suffix_start) |suf| s.start >= suf else false;
+            if (!covered) {
+                http = true;
+                self.requests += 1;
+                self.bytes += o.len;
+                self.http_end_max = @max(self.http_end_max, s.end);
+                self.http_span_max = @max(self.http_span_max, s.len());
+            }
             if (s.len() == bloom.block_bytes) self.block_reads += 1;
         }
+        if (http) self.http_rounds += 1;
     }
 };
+
+const dispatch_cost: Cost = .{
+    .request_bytes = 1 << 20,
+    .concurrency = 8,
+    .max_request = 24 << 20,
+    .gap_cap = 1 << 20,
+    .in_flight = 16,
+    .split = 8 << 20,
+    .window = 128 << 20,
+};
+
+fn filterOff(sf: SynthFile, rg: usize) u64 {
+    return @intCast(sf.meta.row_groups.items[rg].columns.items[0].meta_data.?.bloom_filter_offset.?);
+}
+
+fn filterLen(sf: SynthFile, rg: usize) u64 {
+    return @intCast(sf.meta.row_groups.items[rg].columns.items[0].meta_data.?.bloom_filter_length.?);
+}
+
+fn clearAbsent(metas: []const schema.FileMetaData) void {
+    for (metas) |m| for (m.row_groups.items) |rg| for (rg.columns.items) |*c| {
+        c.absent = &.{};
+    };
+}
 
 test "remote: big filters are read by block, each file's layout verified, and every present key keeps its group" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1545,8 +1777,8 @@ test "remote: big filters are read by block, each file's layout verified, and ev
     try testing.expect(kept <= 3);
     try testing.expect(st.row_groups_bloom >= 37);
 
-    // S3-like costs on the same file: its filters sit back to back, so past the first wave, reading them whole in a
-    // few large requests beats a block request per filter. Same answers.
+    // S3-like costs on the same file: its filters sit back to back, so reading them whole in a few large requests
+    // beats a block request per filter. Same answers.
     for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*c| {
         c.absent = &.{};
     };
@@ -1569,13 +1801,15 @@ test "remote: a forged header layout voids the blocks it located" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const sf = try SynthFile.initOpts(a, 20, 200_000, 0);
+    const sf = try SynthFile.initOpts(a, 20, 200_000, 0, 0);
     const off0: usize = @intCast(sf.meta.row_groups.items[0].columns.items[0].meta_data.?.bloom_filter_offset.?);
     try testing.expect(bloom.bitset(sf.bytes[off0..]) != null);
     const metas = [_]schema.FileMetaData{sf.meta};
-    var remote: FakeRemote = .{ .files = &.{sf.bytes} };
+    // Cheap requests, so the blocks are what gets read. A whole filter would still parse: the extra field is skipped.
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = .{ .request_bytes = 4 << 10, .concurrency = 8 } };
     const f = try parser.parse(a, "c = 'zz-not-there'", &metas[0], null);
     _ = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expect(remote.block_reads > 0);
     for (metas[0].row_groups.items) |*rg| try testing.expect(prune.pruneRowGroup(rg, f, &metas[0]) != .skip);
 }
 
@@ -1583,7 +1817,8 @@ test "remote: a first wave that prunes nothing leaves the other filters unread" 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const sf = try SynthFile.init(a, 64, 2000);
+    // One byte between filters: a row-group-major run, so the wave still stops. Gap 0 would be one contiguous column.
+    const sf = try SynthFile.initGap(a, 64, 2000, 1);
     // Every row group's filter says "maybe" to a key inserted in all of them.
     for (sf.meta.row_groups.items) |rg| {
         const cm = rg.columns.items[0].meta_data.?;
@@ -1608,6 +1843,146 @@ test "remote: a first wave that prunes nothing leaves the other filters unread" 
     const st2 = try load(arena2.allocator(), testing.allocator, f, &metas, mapped.source(), .{});
     try testing.expect(!st2.bloom_stopped);
     try testing.expectEqual(@as(usize, 64), st2.filters);
+}
+
+fn paintMaybe(sf: SynthFile) void {
+    for (sf.meta.row_groups.items) |rg| {
+        const cm = rg.columns.items[0].meta_data.?;
+        const off: usize = @intCast(cm.bloom_filter_offset.?);
+        const bits = sf.bytes[off..][0..@intCast(cm.bloom_filter_length.?)];
+        const h = bloom.parseHeader(bits).?;
+        @memset(bits[h.len..], 0xff);
+    }
+}
+
+test "remote: census a contiguous rare key is one bloom round" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // B6 zpq int64_random: one column, gap 0, the key only in the last row group, the tail already in the suffix.
+    const sf = try SynthFile.init(a, 16, 200_000);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    const cut = filterOff(sf, 13);
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost, .suffix_start = cut };
+    const f = try parser.parse(a, "c = 'k15-0'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expect(!st.bloom_stopped);
+    try testing.expectEqual(@as(usize, 16), st.filters);
+    try testing.expectEqual(@as(usize, 1), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 1), st.requests);
+    try testing.expectEqual(cut - filterOff(sf, 0), st.bytes);
+    try testing.expectEqual(cut, remote.http_end_max);
+    try testing.expect(st.suffix_bytes > 0);
+    try testing.expect(st.bytes + st.suffix_bytes == filterOff(sf, 15) + filterLen(sf, 15) - filterOff(sf, 0));
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[15], f, &metas[0]) != .skip);
+
+    // The same run, split at 1 MiB, is still one round. The pieces stay at most that long.
+    clearAbsent(&metas);
+    var split_cost = dispatch_cost;
+    split_cost.split = 1 << 20;
+    var remote2: FakeRemote = .{ .files = &.{sf.bytes}, .cost = split_cost, .suffix_start = cut };
+    const st2 = try load(a, testing.allocator, f, &metas, remote2.source(), .{});
+    try testing.expectEqual(@as(usize, 1), remote2.http_rounds);
+    try testing.expect(st2.requests > 1);
+    try testing.expect(remote2.http_span_max <= 1 << 20);
+    try testing.expectEqual(st.bytes, st2.bytes);
+}
+
+test "remote: census filters inside the suffix make no bloom GET" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Wide k/mix and zpq l_returnflag: the column's run is already in the tail.
+    const sf = try SynthFile.init(a, 16, 64);
+    paintMaybe(sf);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost, .suffix_start = filterOff(sf, 0) };
+    const f = try parser.parse(a, "c = 'k1-1'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 0), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 0), st.requests);
+    try testing.expectEqual(@as(u64, 0), st.bytes);
+    try testing.expectEqual(@as(usize, 16), st.filters);
+    var want: u64 = 0;
+    for (0..16) |i| want += filterLen(sf, i);
+    try testing.expectEqual(want, st.suffix_bytes);
+}
+
+test "remote: census a straddling run plans only its prefix" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // parquet-mr l_partkey: one contiguous column, most of it already in the suffix.
+    const sf = try SynthFile.init(a, 16, 2000);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    const cut = filterOff(sf, 8);
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost, .suffix_start = cut };
+    const f = try parser.parse(a, "c = 'k15-0'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 1), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 1), st.requests);
+    try testing.expectEqual(cut, remote.http_end_max);
+    try testing.expectEqual(cut - filterOff(sf, 0), st.bytes);
+    try testing.expectEqual(@as(usize, 16), st.filters);
+    try testing.expect(st.suffix_bytes == filterOff(sf, 15) + filterLen(sf, 15) - cut);
+}
+
+test "remote: census a scattered common key stops after eight" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // pyarrow and DuckDB: row-group-major, same-column gap over the latency cap, the key in every row group.
+    const sf = try SynthFile.initGap(a, 64, 64, (1 << 20) + 64);
+    paintMaybe(sf);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost };
+    const f = try parser.parse(a, "c = 'k1-1'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expect(st.bloom_stopped);
+    try testing.expectEqual(@as(usize, 8), st.filters);
+    try testing.expectEqual(@as(usize, 1), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 8), st.requests);
+}
+
+test "remote: census a window refuses a bloom gap past its limit" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf = try SynthFile.initGap(a, 2, 64, 64);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    const len = filterLen(sf, 0) + filterLen(sf, 1);
+    var cost = dispatch_cost;
+    cost.in_flight = 1;
+    cost.window = len + 32;
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost };
+    const f = try parser.parse(a, "c = 'k1-0'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 2), st.requests);
+    try testing.expectEqual(@as(usize, 1), remote.http_rounds);
+
+    clearAbsent(&metas);
+    cost.window = 128 << 20;
+    var wide: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost };
+    const st2 = try load(a, testing.allocator, f, &metas, wide.source(), .{});
+    try testing.expectEqual(@as(usize, 1), st2.requests);
+}
+
+test "remote: an omitted filter length is sized by the shared header probe" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf = try SynthFile.init(a, 4, 8);
+    for (sf.meta.row_groups.items) |*rg| {
+        if (rg.columns.items[0].meta_data) |*cm| cm.bloom_filter_length = null;
+    }
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost };
+    const f = try parser.parse(a, "c = 'k3-0'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 4), st.filters);
+    try testing.expect(remote.http_rounds >= 1);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[3], f, &metas[0]) != .skip);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[0], f, &metas[0]) == .skip);
 }
 
 fn pageStat(page: schema.PageType, enc: schema.Encoding, count: i32) schema.PageEncodingStats {

@@ -59,7 +59,8 @@ also counted in `row_groups_pruned`):
 |-------|---------|
 | `bloom_pruned`, `dict_pruned` | Row groups a Bloom filter, or failing that a fully dictionary-encoded chunk's dictionary, proved free of every literal. |
 | `filters`, `dictionaries` | Filters and dictionaries probed. |
-| `requests`, `bytes` | S3 requests made, and bytes read, to fetch them (0 for local files and for filters the warm cache held). |
+| `requests`, `bytes` | S3 requests made, and bytes fetched over HTTP, to read them (0 for local files, for filters the warm cache held, and for bytes copied from the retained suffix). |
+| `suffix_bytes` | Bytes of those filters and dictionaries copied from the retained suffix rather than fetched. |
 | `bloom_stopped`, `dict_stopped` | The first eight row groups probed pruned too few to pay for reading the rest of that kind. |
 | `request_kb` | A request's fixed cost, as the KiB a connection moves meanwhile, that the last read plan assumed (S3 only). |
 | `us` | Time spent, in microseconds. |

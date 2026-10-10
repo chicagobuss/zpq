@@ -2416,7 +2416,7 @@ fn openInputs(
         // after it prune the same row groups.
         if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
-            var src: S3Membership = .init(read_ctx, creds, pool, specs);
+            var src: S3Membership = .init(read_ctx, creds, pool, specs, fetch_window.limit);
             src.profiler = args.profiler;
             membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
         };
@@ -3125,19 +3125,21 @@ const S3Membership = struct {
     /// What this query has measured: a request's fixed cost, and one connection's bandwidth. Null until measured.
     rtt_ns: ?u64 = null,
     bytes_per_s: ?f64 = null,
+    /// The query's fetch window. Bloom gaps are charged against it.
+    window: u64 = 0,
 
     /// Until measured: a GET's first byte after ~25 ms at ~80 MB/s a connection, as on Lambda against S3 in-region.
     const default_rtt_ns: u64 = 25 * std.time.ns_per_ms;
     const default_bytes_per_s: f64 = 80e6;
 
-    const cost: membership.Cost = .{
-        .request_bytes = 2 << 20,
-        .concurrency = READ_CONCURRENCY,
-        .max_request = s3.SPLIT_THRESHOLD,
-    };
-
-    fn init(ctx: Context, creds: s3.Credentials, pool: *s3.Pool(POOL_SIZE), specs: []const FetchSpec) S3Membership {
-        var self: S3Membership = .{ .ctx = ctx, .creds = creds, .pool = pool, .specs = specs };
+    fn init(
+        ctx: Context,
+        creds: s3.Credentials,
+        pool: *s3.Pool(POOL_SIZE),
+        specs: []const FetchSpec,
+        window: u64,
+    ) S3Membership {
+        var self: S3Membership = .{ .ctx = ctx, .creds = creds, .pool = pool, .specs = specs, .window = window };
         // The fastest footer round trip: slower ones waited on a connection being opened.
         for (specs) |sp| if (sp.rtt_ns > 0) {
             self.rtt_ns = @min(self.rtt_ns orelse sp.rtt_ns, sp.rtt_ns);
@@ -3145,11 +3147,33 @@ const S3Membership = struct {
         return self;
     }
 
-    fn source(self: *S3Membership) membership.Source {
-        return .{ .ctx = self, .vtable = &vtable, .cost = cost };
+    /// Bloom uses the same latency cap, in-flight cap and 8 MiB split as a data dispatch. `request_bytes` stays the
+    /// calibration until a distant link has been measured; it only chooses blocks against whole filters.
+    fn bloomCost(self: *const S3Membership, request_bytes: u64) membership.Cost {
+        const rtt = self.rtt_ns orelse 0;
+        const bps: u64 = if (self.bytes_per_s) |b| @intFromFloat(b) else s3.S3_BYTES_PER_S;
+        return .{
+            .request_bytes = request_bytes,
+            .concurrency = READ_CONCURRENCY,
+            .max_request = s3.SPLIT_THRESHOLD,
+            .gap_cap = coalescer.s3CoalesceGap(rtt, if (rtt == 0) 0 else bps),
+            .in_flight = s3.S3_IN_FLIGHT,
+            .split = s3.S3_RANGE_SPLIT,
+            .window = if (self.window == 0) null else self.window,
+        };
     }
 
-    const vtable: membership.Source.VTable = .{ .read = read, .cached = cached, .retain = retain, .measured = measured };
+    fn source(self: *S3Membership) membership.Source {
+        return .{ .ctx = self, .vtable = &vtable, .cost = self.bloomCost(2 << 20) };
+    }
+
+    const vtable: membership.Source.VTable = .{
+        .read = read,
+        .cached = cached,
+        .retain = retain,
+        .measured = measured,
+        .suffix = suffix,
+    };
 
     /// A request's fixed cost as the bytes a connection moves meanwhile, from what this query has timed. A round trip
     /// no slower than the calibration's means an in-region client, and the calibration stands: there the first reads
@@ -3160,17 +3184,24 @@ const S3Membership = struct {
         const rtt = self.rtt_ns orelse return null;
         if (rtt <= default_rtt_ns) return null;
         const rtt_s = @as(f64, @floatFromInt(rtt)) / std.time.ns_per_s;
-        var c = cost;
-        c.request_bytes = @intFromFloat(@max(4096.0, rtt_s * (self.bytes_per_s orelse default_bytes_per_s)));
-        return c;
+        const request_bytes: u64 = @intFromFloat(@max(4096.0, rtt_s * (self.bytes_per_s orelse default_bytes_per_s)));
+        return self.bloomCost(request_bytes);
+    }
+
+    fn suffix(ctx: *anyopaque, file: u32) ?membership.Span {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        if (file >= self.specs.len) return null;
+        const sp = &self.specs[file];
+        if (sp.tail.len == 0) return null;
+        return .{ .file = file, .start = sp.tail_start, .end = sp.tail_start + sp.tail.len };
     }
 
     /// Learn one connection's bandwidth from a batch of `n` requests moving `bytes` in `ns`, once the round trips are
     /// paid; a batch of small requests shows none.
     fn observe(self: *S3Membership, n: usize, bytes: u64, ns: u64) void {
         if (n == 0) return;
-        const lanes = @min(n, READ_CONCURRENCY);
-        const rounds = std.math.divCeil(usize, n, READ_CONCURRENCY) catch unreachable;
+        const lanes = @min(n, s3.S3_IN_FLIGHT);
+        const rounds = std.math.divCeil(usize, n, s3.S3_IN_FLIGHT) catch unreachable;
         const per_lane = bytes / lanes;
         if (per_lane < 128 << 10) return;
         const transfer = ns -| rounds * @max(self.rtt_ns orelse default_rtt_ns, default_rtt_ns);
@@ -3220,7 +3251,7 @@ const S3Membership = struct {
                 arena,
                 self.creds,
                 jobs.items,
-                READ_CONCURRENCY,
+                s3.S3_IN_FLIGHT,
                 self.profiler,
                 null,
             );
@@ -4072,11 +4103,11 @@ pub fn writeJsonFloat(writer: anytype, f: f64) !void {
 /// statistics (already counted in `row_groups_pruned`).
 pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
-        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"request_kb\":{d},\"us\":{d}}}",
+        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"suffix_bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"request_kb\":{d},\"us\":{d}}}",
         .{
-            s.row_groups_bloom,     s.row_groups_dict,         s.filters,       s.dictionaries,
-            s.requests,             s.bytes,                   s.bloom_stopped, s.dict_stopped,
-            s.request_bytes / 1024, s.ns / std.time.ns_per_us,
+            s.row_groups_bloom, s.row_groups_dict, s.filters,       s.dictionaries,
+            s.requests,         s.bytes,           s.suffix_bytes,  s.bloom_stopped,
+            s.dict_stopped,     s.request_bytes / 1024, s.ns / std.time.ns_per_us,
         },
     );
 }

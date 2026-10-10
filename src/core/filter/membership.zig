@@ -953,10 +953,7 @@ pub fn load(
 /// Every `=` leaf on a stored literal, anywhere in `f`: AND, OR and IN compose through `pruneRowGroup`.
 fn collectLeaves(arena: std.mem.Allocator, f: ast.Filter, out: *std.ArrayList(ast.Filter)) !void {
     switch (f) {
-        .and_filter, .or_filter => |c| {
-            try collectLeaves(arena, c.left.*, out);
-            try collectLeaves(arena, c.right.*, out);
-        },
+        .and_filter, .or_filter => |c| for (c.children) |child| try collectLeaves(arena, child, out),
         else => if (eqColumn(f) != null) try out.append(arena, f),
     }
 }

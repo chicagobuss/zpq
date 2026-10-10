@@ -467,29 +467,23 @@ pub fn evaluate(
             // Leaves of one AND chain that test the same coded column combine into one
             // per-entry match table and a single pass over the rows.
             if (try evalAndCoded(filter, batch, sel, column_lookup, arena)) return;
-            // AND composes naturally: left clears bits, right clears
-            // more bits. No state to save.
-            try evaluate(c.left.*, batch, sel, column_lookup, arena);
-            try evaluate(c.right.*, batch, sel, column_lookup, arena);
+            // AND composes naturally: each operand clears more bits. No state to save.
+            for (c.children) |child| try evaluate(child, batch, sel, column_lookup, arena);
         },
         .or_filter => |c| {
             if (c.in_set) |s| return evalInList(filter, s, batch, sel, column_lookup, arena);
-            // OR: snapshot the entry state so each branch evaluates
-            // against the same input set; then merge.
+            // OR: every operand evaluates against the same entry set; their results are merged.
             var entry = try sel.cloneAlloc(arena);
             defer entry.deinit();
-
-            try evaluate(c.left.*, batch, sel, column_lookup, arena);
-            const left_result = try sel.cloneAlloc(arena);
-            defer {
-                var lr = left_result;
-                lr.deinit();
+            var merged = try sel.cloneAlloc(arena);
+            defer merged.deinit();
+            @memset(merged.mask, 0);
+            for (c.children) |child| {
+                sel.copyFrom(&entry);
+                try evaluate(child, batch, sel, column_lookup, arena);
+                merged.unionWith(sel);
             }
-
-            sel.copyFrom(&entry);
-            try evaluate(c.right.*, batch, sel, column_lookup, arena);
-            // sel now holds right's result; OR-merge with left.
-            sel.unionWith(&left_result);
+            sel.copyFrom(&merged);
         },
     }
 }
@@ -600,8 +594,7 @@ fn flattenAnd(f: ast.Filter, out: *std.ArrayList(ast.Filter), arena: std.mem.All
     switch (f) {
         // A NOT IN list stays whole: its set tests it in one pass, its `!=` leaves one pass each.
         .and_filter => |c| if (c.in_set != null) try out.append(arena, f) else {
-            try flattenAnd(c.left.*, out, arena);
-            try flattenAnd(c.right.*, out, arena);
+            for (c.children) |child| try flattenAnd(child, out, arena);
         },
         else => try out.append(arena, f),
     }
@@ -869,11 +862,10 @@ test "evaluate AND composite — both narrow the selection" {
     const lookup = [_]?usize{ 0, 1 };
 
     // AST: int_col >= 20 AND str_col = "x"
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .GtEq, .value = 20 } };
-    const right = try a.create(ast.Filter);
-    right.* = .{ .string = .{ .col_idx = 1, .op = .Eq, .value = "x" } };
-    const f: ast.Filter = .{ .and_filter = .{ .left = left, .right = right } };
+    const f = try ast.join(a, true, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .GtEq, .value = 20 } },
+        .{ .string = .{ .col_idx = 1, .op = .Eq, .value = "x" } },
+    });
 
     try evaluate(f, &batch, &sv, &lookup, a);
 
@@ -897,11 +889,10 @@ test "evaluate OR composite — union of branches" {
     const lookup = [_]?usize{0};
 
     // AST: int_col = 10 OR int_col >= 40
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 10 } };
-    const right = try a.create(ast.Filter);
-    right.* = .{ .int32 = .{ .col_idx = 0, .op = .GtEq, .value = 40 } };
-    const f: ast.Filter = .{ .or_filter = .{ .left = left, .right = right } };
+    const f = try ast.join(a, false, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 10 } },
+        .{ .int32 = .{ .col_idx = 0, .op = .GtEq, .value = 40 } },
+    });
 
     try evaluate(f, &batch, &sv, &lookup, a);
 
@@ -964,10 +955,8 @@ test "a coded column filters exactly as its values do, nulls and same-column AND
     ne_z.* = .{ .string = .{ .col_idx = 0, .op = .NotEq, .value = "z" } };
     const int_ge = try a.create(ast.Filter);
     int_ge.* = .{ .int32 = .{ .col_idx = 1, .op = .GtEq, .value = 7 } };
-    const same_col: ast.Filter = .{ .and_filter = .{ .left = ge_y, .right = ne_z } };
-    const inner = try a.create(ast.Filter);
-    inner.* = same_col;
-    const mixed: ast.Filter = .{ .and_filter = .{ .left = inner, .right = int_ge } };
+    const same_col = try ast.join(a, true, &.{ ge_y.*, ne_z.* });
+    const mixed = try ast.join(a, true, &.{ same_col, int_ge.* });
 
     for ([_]ast.Filter{ ge_y.*, ne_z.*, same_col, mixed }) |f| {
         var want = try selection.SelectionVector.init(a, vals.len);
@@ -1065,31 +1054,17 @@ test "IN and NOT IN sets over a coded column select as they do over its values, 
     const list = [_][]const u8{ "b", "d", "e", "zz", "h" };
 
     for ([_]bool{ false, true }) |negated| {
-        // The parser's shape: leaves joined by OR (AND for NOT IN), the set bound on the root.
-        var tree: ?ast.Filter = null;
-        for (list) |v| {
-            const leaf: ast.Filter = .{ .string = .{ .col_idx = 0, .op = if (negated) .NotEq else .Eq, .value = v } };
-            if (tree) |prev| {
-                const l = try a.create(ast.Filter);
-                const rr = try a.create(ast.Filter);
-                l.* = prev;
-                rr.* = leaf;
-                const c: ast.Composite = .{ .left = l, .right = rr };
-                tree = if (negated) .{ .and_filter = c } else .{ .or_filter = c };
-            } else tree = leaf;
-        }
+        // The parser's shape: one node of leaves joined by OR (AND for NOT IN), the set bound on it.
+        var leaves: [list.len]ast.Filter = undefined;
+        for (list, &leaves) |v, *leaf|
+            leaf.* = .{ .string = .{ .col_idx = 0, .op = if (negated) .NotEq else .Eq, .value = v } };
         const set = try a.create(in_set.InSet);
         set.* = .{ .col_idx = 0, .negated = negated, .probe = .{ .string = try .init(a, &list) } };
-        switch (tree.?) {
-            .and_filter, .or_filter => |*c| c.in_set = set,
-            else => unreachable,
-        }
-        // Also inside an AND chain with another leaf on the same coded column.
-        const in_list = try a.create(ast.Filter);
-        in_list.* = tree.?;
-        const other = try a.create(ast.Filter);
-        other.* = .{ .string = .{ .col_idx = 0, .op = .LtEq, .value = "f" } };
-        const chained: ast.Filter = .{ .and_filter = .{ .left = other, .right = in_list } };
+        const node: ast.Composite = .{ .children = &leaves, .in_set = set };
+        const tree: ?ast.Filter = if (negated) .{ .and_filter = node } else .{ .or_filter = node };
+        // Also inside an AND chain with another leaf on the same coded column: the list stays one operand.
+        const other: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .LtEq, .value = "f" } };
+        const chained = try ast.join(a, true, &.{ other, tree.? });
 
         for ([_]ast.Filter{ tree.?, chained }) |f| {
             var want = try selection.SelectionVector.init(a, n);

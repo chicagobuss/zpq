@@ -5,8 +5,8 @@
 //!
 //! Init: all-ones (every row active).
 //! AND a predicate: clear bits for rows where the predicate is false.
-//! OR composition: temp-copy, evaluate left, save, restore, evaluate
-//! right, then bitwise-OR the saved-left into the right.
+//! OR composition: snapshot the entry set, evaluate each operand from
+//! it, and bitwise-OR their results together.
 //!
 //! Why bitmask over a row-index list:
 //!   - O(rows/64) AND/OR via word-level bitops; SIMD-friendly later.

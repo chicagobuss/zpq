@@ -1,7 +1,7 @@
 //! Filter AST + Operator enum.
 //!
 //! Leaf nodes carry a typed value plus the column index they reference;
-//! composites carry pointer-to-Filter for left/right.
+//! composites carry their operands, two or more, flat (see `Composite`).
 //!
 //! Surface: =, !=, <, <=, >, >= with AND/OR.
 
@@ -54,8 +54,10 @@ pub fn applyOpStr(a: []const u8, op: Operator, b: []const u8) bool {
 }
 
 pub const Composite = struct {
-    left: *Filter,
-    right: *Filter,
+    /// The operands, two or more. Chains are flat: no operand is a composite of the same kind, except an IN list's,
+    /// which keeps its `in_set`. The filter grammar has no grouping, so a tree is at most OR, then AND, then an IN list,
+    /// then leaves deep, however long the expression: every pass over it recurses that far and no further.
+    children: []const Filter,
     /// Set on the root of an IN / NOT IN list the parser built: the list's literals bound for evaluation in one pass
     /// (see `in_set.zig`). The leaves below stay for every other reader (pruning, membership).
     in_set: ?*const in_set_mod.InSet = null,
@@ -161,13 +163,27 @@ pub const Filter = union(enum) {
             .boolean => |f| try list.append(allocator, f.col_idx),
             .null_check => |f| try list.append(allocator, f.col_idx),
             .like => |f| try list.append(allocator, f.col_idx),
-            .and_filter, .or_filter => |c| {
-                try c.left.collectColumns(list, allocator);
-                try c.right.collectColumns(list, allocator);
-            },
+            .and_filter, .or_filter => |c| for (c.children) |child| try child.collectColumns(list, allocator),
         }
     }
 };
+
+/// `operands` joined by AND (OR when `!conjunction`) into one flat node: an operand that is itself a node of the same
+/// kind, without an IN list's set, contributes its operands instead. One operand is returned as it is.
+pub fn join(arena: std.mem.Allocator, conjunction: bool, operands: []const Filter) std.mem.Allocator.Error!Filter {
+    if (operands.len == 1) return operands[0];
+    var flat: std.ArrayList(Filter) = .empty;
+    for (operands) |o| {
+        const same: ?Composite = switch (o) {
+            .and_filter => |c| if (conjunction and c.in_set == null) c else null,
+            .or_filter => |c| if (!conjunction and c.in_set == null) c else null,
+            else => null,
+        };
+        if (same) |c| try flat.appendSlice(arena, c.children) else try flat.append(arena, o);
+    }
+    const c: Composite = .{ .children = try flat.toOwnedSlice(arena) };
+    return if (conjunction) .{ .and_filter = c } else .{ .or_filter = c };
+}
 
 // ============================================================
 // Tests
@@ -207,14 +223,27 @@ test "Filter.collectColumns" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const left = try a.create(Filter);
-    left.* = .{ .int32 = .{ .col_idx = 1, .op = .Eq, .value = 7 } };
-    const right = try a.create(Filter);
-    right.* = .{ .string = .{ .col_idx = 5, .op = .Lt, .value = "hello" } };
-    const composite: Filter = .{ .and_filter = .{ .left = left, .right = right } };
+    const composite = try join(a, true, &.{
+        .{ .int32 = .{ .col_idx = 1, .op = .Eq, .value = 7 } },
+        .{ .string = .{ .col_idx = 5, .op = .Lt, .value = "hello" } },
+    });
 
     var cols: std.ArrayList(usize) = .empty;
     defer cols.deinit(a);
     try composite.collectColumns(&cols, a);
     try testing.expectEqualSlices(usize, &.{ 1, 5 }, cols.items);
+}
+
+test "join flattens chains of its own kind and keeps an IN list's node whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const x: Filter = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 1 } };
+    const inner = try join(a, true, &.{ x, x });
+    const outer = try join(a, true, &.{ inner, x, inner });
+    try testing.expectEqual(@as(usize, 5), outer.and_filter.children.len);
+    // OR under AND stays a child; a lone operand comes back as it is.
+    const either = try join(a, false, &.{ x, x });
+    try testing.expectEqual(@as(usize, 2), (try join(a, true, &.{ either, x })).and_filter.children.len);
+    try testing.expect((try join(a, true, &.{x})) == .int32);
 }

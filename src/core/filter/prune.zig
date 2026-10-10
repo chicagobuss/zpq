@@ -67,14 +67,14 @@ pub fn pruneRowGroup(
         // LIKE: prefix patterns are stat-prunable via min/max (a future
         // win); conservatively keep for now. Correctness is in eval.
         .like => .unknown,
-        .and_filter => |c| Decision.andCombine(
-            pruneRowGroup(rg, c.left.*, file_meta),
-            pruneRowGroup(rg, c.right.*, file_meta),
-        ),
-        .or_filter => |c| Decision.orCombine(
-            pruneRowGroup(rg, c.left.*, file_meta),
-            pruneRowGroup(rg, c.right.*, file_meta),
-        ),
+        .and_filter, .or_filter => |c| blk: {
+            var d = pruneRowGroup(rg, c.children[0], file_meta);
+            for (c.children[1..]) |child| {
+                const e = pruneRowGroup(rg, child, file_meta);
+                d = if (filter == .and_filter) Decision.andCombine(d, e) else Decision.orCombine(d, e);
+            }
+            break :blk d;
+        },
     };
 }
 
@@ -417,11 +417,10 @@ test "pruneRowGroup AND skips when either child skips" {
     var rg = try synthRowGroupWithStats(a, .INT32, &min_buf, &max_buf);
     defer rg.columns.deinit(a);
 
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }; // keep
-    const right = try a.create(ast.Filter);
-    right.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 999 } }; // skip
-    const composite: ast.Filter = .{ .and_filter = .{ .left = left, .right = right } };
+    const composite = try ast.join(a, true, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }, // keep
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 999 } }, // skip
+    });
 
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, composite, null));
 }
@@ -438,11 +437,10 @@ test "pruneRowGroup OR skips only when both children skip" {
     var rg = try synthRowGroupWithStats(a, .INT32, &min_buf, &max_buf);
     defer rg.columns.deinit(a);
 
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = -1 } }; // skip
-    const right = try a.create(ast.Filter);
-    right.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }; // keep
-    const composite: ast.Filter = .{ .or_filter = .{ .left = left, .right = right } };
+    const composite = try ast.join(a, false, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = -1 } }, // skip
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }, // keep
+    });
 
     try testing.expectEqual(Decision.keep, pruneRowGroup(&rg, composite, null));
 }
@@ -789,14 +787,14 @@ pub fn prunePage(
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
         .like => .unknown,
-        .and_filter => |c| Decision.andCombine(
-            prunePage(rg, page_idx, c.left.*, col_indexes, file_meta, trust_stats),
-            prunePage(rg, page_idx, c.right.*, col_indexes, file_meta, trust_stats),
-        ),
-        .or_filter => |c| Decision.orCombine(
-            prunePage(rg, page_idx, c.left.*, col_indexes, file_meta, trust_stats),
-            prunePage(rg, page_idx, c.right.*, col_indexes, file_meta, trust_stats),
-        ),
+        .and_filter, .or_filter => |c| blk: {
+            var d = prunePage(rg, page_idx, c.children[0], col_indexes, file_meta, trust_stats);
+            for (c.children[1..]) |child| {
+                const e = prunePage(rg, page_idx, child, col_indexes, file_meta, trust_stats);
+                d = if (filter == .and_filter) Decision.andCombine(d, e) else Decision.orCombine(d, e);
+            }
+            break :blk d;
+        },
     };
 }
 

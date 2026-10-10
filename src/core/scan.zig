@@ -634,8 +634,11 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
 fn skipReason(f: filter_ast.Filter, rg: *const schema.RowGroup, meta: *const schema.FileMetaData) usize {
     switch (f) {
         .and_filter => |c| {
-            const left = skipReason(c.left.*, rg, meta);
-            return if (left != 0) left else skipReason(c.right.*, rg, meta);
+            for (c.children) |child| {
+                const r = skipReason(child, rg, meta);
+                if (r != 0) return r;
+            }
+            return 0;
         },
         .or_filter => return 0,
         inline else => |leaf| {

@@ -1848,10 +1848,7 @@ const ConjunctiveLeaf = struct {
 
 fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(ConjunctiveLeaf), allocator: std.mem.Allocator) !void {
     switch (f) {
-        .and_filter => |c| {
-            try collectConjunctiveLeaves(c.left.*, list, allocator);
-            try collectConjunctiveLeaves(c.right.*, list, allocator);
-        },
+        .and_filter => |c| for (c.children) |child| try collectConjunctiveLeaves(child, list, allocator),
         .or_filter => {},
         else => {
             const col_idx = switch (f) {
@@ -2465,10 +2462,7 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !Code
 
 fn markFilterSet(set: []bool, f: filter_ast.Filter, v: bool) void {
     switch (f) {
-        .and_filter, .or_filter => |c| {
-            markFilterSet(set, c.left.*, v);
-            markFilterSet(set, c.right.*, v);
-        },
+        .and_filter, .or_filter => |c| for (c.children) |child| markFilterSet(set, child, v),
         inline else => |l| if (l.col_idx < set.len) {
             set[l.col_idx] = v;
         },
@@ -2495,14 +2489,7 @@ fn mark(set: []bool, ci: usize) void {
 
 fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
     switch (f) {
-        .and_filter => |c| {
-            markFilter(u, c.left.*);
-            markFilter(u, c.right.*);
-        },
-        .or_filter => |c| {
-            markFilter(u, c.left.*);
-            markFilter(u, c.right.*);
-        },
+        .and_filter, .or_filter => |c| for (c.children) |child| markFilter(u, child),
         .int32 => |l| mark(u.code, l.col_idx),
         .int64 => |l| mark(u.code, l.col_idx),
         .uint64 => |l| mark(u.code, l.col_idx),
@@ -5278,11 +5265,11 @@ test "recompressRowGroup over several threads writes the bytes one thread writes
         const src: RGSrc = .{ .bytes = broken, .byte_origin = 0 };
         const want = if (recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 1)) |_|
             return error.TestExpectedError
-        else |err| err;
+        else |err|
+            err;
         try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
     }
 }
-
 
 test "recompressRowGroup over several threads reports a bad page body ahead of a later chunk with no metadata" {
     const testing = std.testing;
@@ -5316,6 +5303,7 @@ test "recompressRowGroup over several threads reports a bad page body ahead of a
     const src: RGSrc = .{ .bytes = broken, .byte_origin = 0 };
     const want = if (recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 1)) |_|
         return error.TestExpectedError
-    else |err| err;
+    else |err|
+        err;
     try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
 }

@@ -159,14 +159,16 @@ fn coalesceDispatchInner(
             const same = cur.object == p.object and (window_cap == null or cur.group == p.group);
             if (same and p.start <= cur.end) {
                 if (p.end > cur.end) {
-                    charge[cur.group] += p.end - cur.end;
+                    charge[cur.group] +|= p.end - cur.end;
                     cur.end = p.end;
                 }
                 cur.gap_cap = @min(cur.gap_cap, p.gap_cap);
                 continue;
             }
         }
-        charge[p.group] += p.end - p.start;
+        // Saturating here and below: each piece lies in a chunk footer open checked, but a footer can claim many huge
+        // ones, and a sum past u64 must read as over every cap rather than wrap under one.
+        charge[p.group] +|= p.end - p.start;
         live.appendAssumeCapacity(.{
             .object = p.object,
             .group = p.group,
@@ -223,7 +225,7 @@ fn coalesceDispatchInner(
         span_len[i] = s.end - s.start;
         cap[i] = s.gap_cap;
         root_group[i] = s.group;
-        total += span_len[i];
+        total +|= span_len[i];
     }
 
     const flight = @max(in_flight, 1);
@@ -235,16 +237,16 @@ fn coalesceDispatchInner(
         const right = findRoot(parent, g.left + 1);
         const here = @min(cap[left], cap[right]);
         if (g.size > here) continue;
-        if (total + g.size > amp_cap) continue;
+        if (total +| g.size > amp_cap) continue;
         if (window_cap) |limit| {
-            const span = span_len[left] + g.size + span_len[right];
-            if (span > limit or charge[root_group[left]] + g.size > limit) continue;
+            const span = span_len[left] +| g.size +| span_len[right];
+            if (span > limit or charge[root_group[left]] +| g.size > limit) continue;
         }
         accepted[g.left] = true;
-        span_len[left] = span_len[left] + g.size + span_len[right];
+        span_len[left] = span_len[left] +| g.size +| span_len[right];
         cap[left] = here;
-        charge[root_group[left]] += g.size;
-        total += g.size;
+        charge[root_group[left]] +|= g.size;
+        total +|= g.size;
         parent[right] = left;
         count -= 1;
     }
@@ -306,6 +308,27 @@ pub fn overlapsAny(r: Range, others: []const Range) bool {
         if (r.start < o.end and o.start < r.end) return true;
     }
     return false;
+}
+
+test "a dispatch over pieces whose lengths sum past 2^64 plans them without overflow" {
+    // Three files, each claiming a chunk of 2^62.8 bytes: each lies within u64, their sum does not. Disjoint pieces of
+    // one file cannot get there; the files' totals add up in the same counters.
+    const big: u64 = 7 << 60;
+    var pieces: [6]Piece = undefined;
+    for (0..3) |f| {
+        const obj: u32 = @intCast(f);
+        pieces[2 * f] = .{ .object = obj, .group = obj, .start = 0, .end = big / 2, .gap_cap = 1 << 20 };
+        pieces[2 * f + 1] = .{ .object = obj, .group = obj, .start = big / 2 + 10, .end = big, .gap_cap = 1 << 20 };
+    }
+    for ([_]?u64{ null, 1 << 30 }) |window| {
+        const planned = try coalesceDispatch(std.testing.allocator, &pieces, 1, std.math.maxInt(u64), window);
+        defer std.testing.allocator.free(planned);
+        // Every byte still planned, each span within its file; a window keeps each piece apart.
+        var covered: [3]u64 = @splat(0);
+        for (planned) |sp| covered[sp.object] += sp.end - sp.start;
+        for (covered) |c| try std.testing.expect(c >= big - 10);
+        if (window != null) try std.testing.expectEqual(@as(usize, 6), planned.len);
+    }
 }
 
 test "coalescer: basic merging" {
@@ -597,14 +620,14 @@ fn coalesceDispatchOracle(
             const same = cur.object == p.object and (window_cap == null or cur.group == p.group);
             if (same and p.start <= cur.end) {
                 if (p.end > cur.end) {
-                    charge[cur.group] += p.end - cur.end;
+                    charge[cur.group] +|= p.end - cur.end;
                     cur.end = p.end;
                 }
                 cur.gap_cap = @min(cur.gap_cap, p.gap_cap);
                 continue;
             }
         }
-        charge[p.group] += p.end - p.start;
+        charge[p.group] +|= p.end - p.start;
         live.appendAssumeCapacity(.{
             .object = p.object,
             .group = p.group,
@@ -614,7 +637,7 @@ fn coalesceDispatchOracle(
         });
     }
     var total: u64 = 0;
-    for (live.items) |s| total += s.end - s.start;
+    for (live.items) |s| total +|= s.end - s.start;
     while (true) {
         const wave_target = std.math.divCeil(usize, live.items.len, @max(in_flight, 1)) catch unreachable;
         if (wave_target <= 1) break;
@@ -627,10 +650,10 @@ fn coalesceDispatchOracle(
             if (nxt.start < s.end) continue;
             const gap = nxt.start - s.end;
             if (gap > @min(s.gap_cap, nxt.gap_cap)) continue;
-            if (total + gap > amp_cap) continue;
+            if (total +| gap > amp_cap) continue;
             if (window_cap) |limit| {
-                const span = (s.end - s.start) + gap + (nxt.end - nxt.start);
-                if (span > limit or charge[s.group] + gap > limit) continue;
+                const span = (s.end - s.start) +| gap +| (nxt.end - nxt.start);
+                if (span > limit or charge[s.group] +| gap > limit) continue;
             }
             if (gap < best_gap) {
                 best_gap = gap;
@@ -642,8 +665,8 @@ fn coalesceDispatchOracle(
         live.items[i].end = live.items[i + 1].end;
         live.items[i].gap_cap = @min(here.gap_cap, live.items[i + 1].gap_cap);
         _ = live.orderedRemove(i + 1);
-        total += best_gap;
-        charge[here.group] += best_gap;
+        total +|= best_gap;
+        charge[here.group] +|= best_gap;
     }
     const out = try allocator.alloc(PlannedSpan, live.items.len);
     for (live.items, out) |s, *dst| {

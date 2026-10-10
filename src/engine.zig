@@ -2474,7 +2474,7 @@ fn openInputs(
             var g: usize = 0;
             for (ranges.items, 0..) |r, ri| {
                 while (g + 1 < rg_first.len and rg_first[g + 1] <= ri) g += 1;
-                selected += r.len();
+                selected +|= r.len();
                 const group: u32 = @intCast(g);
                 try all_pieces.append(arena, .{
                     .object = @intCast(fi),
@@ -2485,7 +2485,7 @@ fn openInputs(
                 });
             }
             sv.* = .{ .ranges = ranges.items, .rg_first = rg_first, .gap_cap = gap_cap, .selected = selected };
-            selected_all += selected;
+            selected_all +|= selected;
         }
         const upfront = try coalescer.coalesceDispatch(
             arena,
@@ -2858,7 +2858,7 @@ fn planLocalReads(
                 const cm = chunk.meta_data orelse continue;
                 const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
                 try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
-                planned += @intCast(cm.total_compressed_size);
+                planned +|= @intCast(cm.total_compressed_size);
                 // The scan reads a needed chunk's page index too.
                 if (chunk.column_index_offset) |o| if (chunk.column_index_length) |l| {
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });

@@ -93,13 +93,16 @@ pub const Ipv4 = [4]u8;
 
 /// Where to connect: a host's IPv4 addresses, tried from `first` on (wrapping) until one accepts the TCP connection.
 /// A refused, unreachable or silent address (`Timeouts.connect_ms`) only costs a failed connect, which is the whole
-/// of the fallback: there is no racing.
+/// of the fallback: there is no racing. `deadline_ms`, when set, is one absolute bound over every address and over
+/// both TLS contexts; each stage then waits only `min(its cap, the time left)`.
 pub const Peer = struct {
     addrs: []const Ipv4,
     first: usize = 0,
     port: u16,
     /// The connection's deadlines, from connecting on.
     timeouts: Timeouts = .{},
+    /// Absolute millisecond deadline (`monoMs`) for this whole connect. Null: each stage uses only its own cap.
+    deadline_ms: ?u64 = null,
 
     pub fn loopback(port: u16) Peer {
         return .{ .addrs = &.{.{ 127, 0, 0, 1 }}, .port = port };
@@ -203,7 +206,8 @@ pub const Connection = struct {
     }
 
     /// Verify against `preferred`'s context first; a certificate it rejects gets a new connection verified against
-    /// `fallback`, which a certificate both reject fails as usual. `fallback` is only built if it is needed.
+    /// `fallback`, which a certificate both reject fails as usual. `fallback` is only built if it is needed. Both
+    /// attempts share `peer.deadline_ms`, so a fallback does not start its own second.
     fn connectPreferring(
         allocator: std.mem.Allocator,
         preferred: ?*Preference,
@@ -240,7 +244,9 @@ pub const Connection = struct {
             return handshakeError(err);
         errdefer tls.deinit();
         var opts: SockTimeouts = .{};
-        handshake(fd, &tls, peer.timeouts.handshake_ms, &opts) catch |err| {
+        const budget = stageBudget(peer.timeouts.handshake_ms, peer.deadline_ms);
+        if (peer.deadline_ms != null and budget == 0) return error.HandshakeTimeout;
+        handshake(fd, &tls, budget, &opts) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
                 const reason = boring.tls.c.X509_verify_cert_error_string(boring.tls.c.SSL_get_verify_result(tls.ssl));
                 std.log.warn("TLS: certificate of {s} rejected: {s}", .{ serverName(host), std.mem.span(reason) });
@@ -419,8 +425,10 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     if (peer.addrs.len == 0) return error.DnsFailed;
     var last: Error = error.ConnectFailed;
     for (0..peer.addrs.len) |k| {
+        const wait = stageBudget(peer.timeouts.connect_ms, peer.deadline_ms);
+        if (peer.deadline_ms != null and wait == 0) return if (last == error.ConnectFailed) error.ConnectTimeout else last;
         const addr = peer.addrs[(peer.first +% k) % peer.addrs.len];
-        return openTcp(addr, peer.port, peer.timeouts.connect_ms) catch |err| switch (err) {
+        return openTcp(addr, peer.port, wait) catch |err| switch (err) {
             error.ConnectFailed, error.ConnectTimeout => {
                 last = err;
                 continue;
@@ -505,6 +513,19 @@ fn msLeft(deadline: u64) ?u32 {
 
 fn monoMs() u64 {
     return @intCast(@divTrunc(clock.monoNs(), std.time.ns_per_ms));
+}
+
+/// Absolute millisecond deadline `ms` from now, for `Peer.deadline_ms`.
+pub fn deadlineFromNow(ms: u32) u64 {
+    return monoMs() + ms;
+}
+
+/// `cap`, or what is left until `deadline_ms` when that is sooner. Zero means the deadline has already passed.
+fn stageBudget(cap: u32, deadline_ms: ?u64) u32 {
+    const deadline = deadline_ms orelse return cap;
+    const now = monoMs();
+    if (now >= deadline) return 0;
+    return @intCast(@min(@as(u64, cap), deadline - now));
 }
 
 fn closeFd(fd: posix.fd_t) void {

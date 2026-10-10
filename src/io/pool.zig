@@ -60,7 +60,8 @@ pub fn Pool(comptime N: usize) type {
 
         /// Handshakes `preconnect` may have in flight. Past this the rest are left for the query.
         const preconnect_threads_max: usize = 8;
-        /// A handshake still open this long after it started is abandoned and closed.
+        /// One absolute deadline from the start of a preconnect batch. Every address attempt and the TLS
+        /// handshake, preferred context and fallback included, share it. Each stage waits `min(its cap, time left)`.
         const preconnect_deadline_ms: u32 = 1000;
 
         const PreSlot = struct {
@@ -71,6 +72,8 @@ pub fn Pool(comptime N: usize) type {
             port: u16,
             use_tls: bool,
             timeouts: tls.Timeouts,
+            /// Absolute millisecond deadline for this batch, taken when `preconnect` starts it.
+            deadline_ms: u64,
 
             fn run(slot: *PreSlot) void {
                 defer _ = slot.pool.preconnect_done.fetchAdd(1, .monotonic);
@@ -338,7 +341,8 @@ pub fn Pool(comptime N: usize) type {
 
         /// Start up to `n` handshakes and return. The handshakes are network waits, so they run on their own
         /// threads, `min(n, N, 8)` of them, not on `Io`'s CPU-sized task pool. A finished one is parked for a
-        /// later `acquire`. One that is still open after `preconnect_deadline_ms` is abandoned and closed.
+        /// later `acquire`. The batch has one deadline, `preconnect_deadline_ms` from this call: a socket still
+        /// open then is abandoned and closed, whichever address or TLS context it is on.
         /// `acquire` never waits for these threads: a socket that is not parked yet is not there, and the caller
         /// opens its own. A thread that fails to spawn is skipped.
         ///
@@ -350,6 +354,7 @@ pub fn Pool(comptime N: usize) type {
 
             self.preconnect_parked.store(0, .monotonic);
             self.preconnect_done.store(0, .monotonic);
+            const deadline_ms = tls.deadlineFromNow(preconnect_deadline_ms);
             const slots = self.allocator.alloc(PreSlot, want) catch return;
             var started: usize = 0;
             for (slots) |*slot| {
@@ -366,6 +371,7 @@ pub fn Pool(comptime N: usize) type {
                     .port = criteria.port,
                     .use_tls = criteria.use_tls,
                     .timeouts = criteria.timeouts,
+                    .deadline_ms = deadline_ms,
                 };
                 const thread = std.Thread.spawn(.{}, PreSlot.run, .{slot}) catch {
                     self.allocator.free(host);
@@ -379,6 +385,8 @@ pub fn Pool(comptime N: usize) type {
             self.preconnect_slots = slots;
         }
 
+        /// Join the batch. Each thread stops at the deadline it was given, so this returns within that deadline
+        /// plus the time to close the socket and leave the thread.
         fn joinPreconnect(self: *Self) void {
             for (self.preconnect_threads[0..self.preconnect_join]) |thread| thread.join();
             const slots = self.preconnect_slots orelse {
@@ -395,10 +403,12 @@ pub fn Pool(comptime N: usize) type {
         }
 
         fn finishPreconnect(self: *Self, slot: *PreSlot) void {
-            var timeouts = slot.timeouts;
-            timeouts.connect_ms = @min(timeouts.connect_ms, preconnect_deadline_ms);
-            timeouts.handshake_ms = @min(timeouts.handshake_ms, preconnect_deadline_ms);
-            const peer: tls.Peer = .{ .addrs = slot.addrs, .port = slot.port, .timeouts = timeouts };
+            const peer: tls.Peer = .{
+                .addrs = slot.addrs,
+                .port = slot.port,
+                .timeouts = slot.timeouts,
+                .deadline_ms = slot.deadline_ms,
+            };
             const conn = if (slot.use_tls)
                 tls.Connection.connect(self.allocator, peer, slot.host) catch return
             else
@@ -710,6 +720,50 @@ test "preconnect returns without waiting for a stalled handshake" {
     try testing.expect(acquired < 50 * std.time.ns_per_ms);
     try testing.expect(!h.reused);
     p.release(io, h);
+}
+
+test "a preconnect across two addresses of a full listen queue stops within a second" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const lfd_r = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try testing.expect(std.posix.errno(lfd_r) == .SUCCESS);
+    const lfd: std.posix.fd_t = @intCast(lfd_r);
+    defer _ = std.posix.system.close(lfd);
+    var addr: std.posix.sockaddr.in = .{ .port = 0, .addr = 0 };
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    try testing.expect(std.posix.errno(std.posix.system.bind(lfd, @ptrCast(&addr), len)) == .SUCCESS);
+    try testing.expect(std.posix.errno(std.posix.system.listen(lfd, 0)) == .SUCCESS);
+    try testing.expect(std.posix.errno(std.posix.system.getsockname(lfd, @ptrCast(&addr), &len)) == .SUCCESS);
+    const port = std.mem.bigToNative(u16, addr.port);
+    var fills: [8]?tls.Connection = @splat(null);
+    defer for (&fills) |*v| if (v.*) |*c| c.deinit();
+    var full = false;
+    var filler = tls.Peer.loopback(port);
+    filler.timeouts.connect_ms = 100;
+    for (&fills) |*v| {
+        v.* = tls.Connection.connectPlain(testing.allocator, filler) catch |err| {
+            try testing.expectEqual(error.ConnectTimeout, err);
+            full = true;
+            break;
+        };
+    }
+    try testing.expect(full);
+
+    var p: Pool(1) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    const addrs = [_]tls.Ipv4{ .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 } };
+    const t0 = nowMonoNs();
+    p.preconnect(testing.io, .{
+        .host = "hold.test",
+        .addrs = &addrs,
+        .port = port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 5000 },
+    }, 1);
+    p.joinPreconnect();
+    const elapsed_ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 0), p.preconnect_parked.load(.monotonic));
+    try testing.expect(elapsed_ms < 1300);
 }
 
 fn holdAccepted(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {

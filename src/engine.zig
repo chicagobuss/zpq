@@ -64,13 +64,8 @@ const work_cursor = @import("io/work_cursor.zig");
 const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
 const meta_cache_mod = @import("io/meta_cache.zig");
 
-/// Range-coalesce gap. Adjacent column-chunk ranges within a file are
-/// physically near-contiguous on disk (parquet writes columns back-to-
-/// back in a row group, separated only by a few bytes of internal
-/// metadata). Merging anything within 64 KB collapses 27 separate GETs
-/// per file into 1 — a 27× cut in HTTP request count for the
-/// passthrough write case. The previous lambda code path used the
-/// same value (verified 2026-05-07 against the pre-rewrite numbers).
+/// Local coalesce gap. There is no first-byte latency to trade for extra bytes, so only the few bytes of metadata
+/// between adjacent column chunks are merged. S3 uses `coalescer.s3CoalesceGap` instead.
 const COALESCE_GAP: u64 = 64 * 1024;
 
 const S3Fetcher = s3_window.Fetcher(s3.Pool(POOL_SIZE));
@@ -88,7 +83,8 @@ fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
     return s3_window.windowFor(max_memory);
 }
 
-pub const POOL_SIZE: usize = 8;
+/// S3 pool permits. Data fetches may use all of them; footer fetches stay at `READ_CONCURRENCY`.
+pub const POOL_SIZE: usize = s3.S3_IN_FLIGHT;
 
 /// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
 /// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes, but never
@@ -173,10 +169,10 @@ pub const OutputLane = pool_mod.Lane(s3.Pool(POOL_SIZE), OUTPUT_POOL_SIZE);
 /// a real fetch descends into BoringSSL and libc `getaddrinfo`/NSS, whose stack use nothing here bounds.
 const READ_WORKER_STACK_SIZE: usize = 4 << 20;
 
-/// Fetch worker loops in the read stage. Equal to `POOL_SIZE` so one worker holds one permit and never parks in
-/// `acquire`. A worker sleeping in retry backoff still holds its slot, so live concurrency can dip below this while a
-/// host throttles.
-pub const READ_CONCURRENCY: usize = POOL_SIZE;
+/// Footer and metadata worker loops, and the width of the first data wave. One worker holds one permit. A worker
+/// sleeping in retry backoff still holds its slot, so live concurrency can dip below this while a host throttles.
+/// Data fetches pass `s3.S3_IN_FLIGHT` and let `fetchJobs` open the rest after this first wave is in flight.
+pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
 
 /// Bounds threads, not just sockets: the process-wide `std.Io.Threaded` has `concurrent_limit = .unlimited`, and
 /// `Io.Group.concurrent` spawns a fresh OS thread whenever every worker is busy — including one parked on a blocking
@@ -185,7 +181,7 @@ pub const READ_CONCURRENCY: usize = POOL_SIZE;
 /// still count as busy when the column stage starts. `deinit` joins every worker before the caller returns.
 fn readExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(gpa, .{
-        .concurrent_limit = .limited(READ_CONCURRENCY),
+        .concurrent_limit = .limited(s3.S3_IN_FLIGHT),
         .stack_size = READ_WORKER_STACK_SIZE,
     });
 }
@@ -2478,6 +2474,7 @@ fn openInputs(
 
             // Each row group's ranges, `ranges[rg_first[rg]..rg_first[rg + 1]]`.
             var ranges: std.ArrayList(coalescer.Range) = .empty;
+            var filter_ranges: std.ArrayList(coalescer.Range) = .empty;
             const rg_first = try arena.alloc(usize, meta.row_groups.items.len + 1);
             for (meta.row_groups.items, sp.rg_columns, 0..) |*rg, *rg_cols, ri| {
                 rg_first[ri] = ranges.items.len;
@@ -2499,7 +2496,9 @@ fn openInputs(
                     // past tail_start are satisfied by copying from the tail
                     // below (no re-fetch); only the sub-tail_start portion
                     // becomes a fetch job.
-                    try ranges.append(arena, .{ .start = start, .end = start + len });
+                    const span_r: coalescer.Range = .{ .start = start, .end = start + len };
+                    try ranges.append(arena, span_r);
+                    if (plan.isFilterCol(ci)) try filter_ranges.append(arena, span_r);
                 }
                 // A copied row group keeps its Bloom filters, so they are fetched with it.
                 if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |c, ci| {
@@ -2533,7 +2532,8 @@ fn openInputs(
                 if (!windowed and ri > 0) continue;
                 const span = if (windowed) ranges.items[rg_first[ri]..rg_first[ri + 1]] else ranges.items;
                 if (span.len == 0) continue;
-                const merged = try coalescer.Coalescer.coalesce(arena, span, COALESCE_GAP);
+                const gap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S);
+                const merged = try coalescer.Coalescer.coalesce(arena, span, gap);
                 n_ranges += span.len;
                 n_merged += merged.len;
                 if (windowed) compact_len = std.mem.alignForward(usize, compact_len, page);
@@ -2558,6 +2558,7 @@ fn openInputs(
                 if (windowed) rg_compact else null,
             );
 
+            const file_jobs_from = fetch_jobs.items.len;
             for (0..meta.row_groups.items.len) |ri| {
                 if (!windowed and ri > 0) break;
                 const span = if (windowed) sp.compact_ranges[rg_compact[ri]..rg_compact[ri + 1]] else sp.compact_ranges;
@@ -2572,14 +2573,10 @@ fn openInputs(
 
                     const fetch_end = @min(r.end, sp.tail_start);
                     if (r.start < fetch_end) {
-                        const job: s3.FetchJob = .{
-                            .bucket = sp.url.bucket,
-                            .key = sp.url.key,
-                            .range = .{ .start = r.start, .end = fetch_end },
-                            .target = dst[0..@intCast(fetch_end - r.start)],
-                        };
-                        job_bytes += job.target.len;
-                        try (if (windowed) &rg_jobs else &fetch_jobs).append(arena, job);
+                        const list = if (windowed) &rg_jobs else &fetch_jobs;
+                        const before = list.items.len;
+                        try appendSplitFetch(list, arena, sp.url.bucket, sp.url.key, r.start, fetch_end, dst[0..@intCast(fetch_end - r.start)]);
+                        for (list.items[before..]) |j| job_bytes += j.target.len;
                     }
 
                     if (r.end > sp.tail_start) {
@@ -2596,6 +2593,7 @@ fn openInputs(
                     }
                 }
                 if (copies.items.len > 0) keep_tail = true;
+                if (windowed) try orderFilterFirst(arena, rg_jobs.items, filter_ranges.items);
                 const rg_bytes = job_bytes + copy_bytes;
                 if (!windowed or rg_bytes == 0) continue;
                 // The row group's pages: from its page-aligned start to the next row group's.
@@ -2623,6 +2621,7 @@ fn openInputs(
                 };
                 sp.tail = &.{};
             }
+            if (!windowed) try orderFilterFirst(arena, fetch_jobs.items[file_jobs_from..], filter_ranges.items);
         }
         if (windowed) {
             const f = try arena.create(S3Fetcher);
@@ -2635,7 +2634,7 @@ fn openInputs(
                 },
                 .pool = pool,
                 .creds = creds,
-                .workers = READ_CONCURRENCY,
+                .workers = s3.S3_IN_FLIGHT,
                 .profiler = args.profiler,
                 .executor = readExecutor,
             };
@@ -2663,7 +2662,7 @@ fn openInputs(
                 arena,
                 creds,
                 fetch_jobs.items,
-                READ_CONCURRENCY,
+                s3.S3_IN_FLIGHT,
                 args.profiler,
             );
             fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
@@ -2823,7 +2822,13 @@ const RangePlan = union(enum) {
     aggregate: agg_plan.Plan,
     /// Write and print evaluate the filter in every row group they keep, so a kept row group needs all of `columns`.
     /// `carry`: the columns whose Bloom filters a write's byte copy keeps; null when no row group is copied.
-    projection: struct { filter: ?filter_ast.Filter, columns: []const bool, carry: ?[]const bool = null },
+    projection: struct {
+        filter: ?filter_ast.Filter,
+        columns: []const bool,
+        carry: ?[]const bool = null,
+        /// Leaves the filter reads. Empty when there is no filter.
+        filter_cols: []const bool = &.{},
+    },
 
     /// Every column some row group may fetch.
     fn columns(self: *const RangePlan) []const bool {
@@ -2862,6 +2867,14 @@ const RangePlan = union(enum) {
         if (p.filter) |f| if (filter_prune.pruneRowGroup(rg, f, meta) != .always_match) return null;
         return cols;
     }
+
+    fn isFilterCol(self: *const RangePlan, ci: usize) bool {
+        const mask = switch (self.*) {
+            .aggregate => |*p| p.filter_cols,
+            .projection => |p| p.filter_cols,
+        };
+        return ci < mask.len and mask[ci];
+    }
 };
 
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
@@ -2894,11 +2907,72 @@ fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.F
     const proj = try planProjection(arena, args, meta0);
     const copies = args.output != null and proj.select_items == null and !proj.any_computed and
         (proj.filter == null or !args.scan_all);
+    const filter = if (args.scan_all) null else proj.filter;
     return .{ .projection = .{
-        .filter = if (args.scan_all) null else proj.filter,
+        .filter = filter,
         .columns = proj.fetch,
         .carry = if (copies) proj.kept else null,
+        .filter_cols = try filterColumnMask(arena, filter, proj.fetch.len),
     } };
+}
+
+fn filterColumnMask(arena: std.mem.Allocator, filter: ?filter_ast.Filter, n: usize) ![]const bool {
+    const mask = try arena.alloc(bool, n);
+    @memset(mask, false);
+    const f = filter orelse return mask;
+    var idxs: std.ArrayList(usize) = .empty;
+    try f.collectColumns(&idxs, arena);
+    for (idxs.items) |i| {
+        if (i < n) mask[i] = true;
+    }
+    return mask;
+}
+
+/// One fetch job per `S3_RANGE_SPLIT` bytes. `target.len` is `end - start`.
+fn appendSplitFetch(
+    list: *std.ArrayList(s3.FetchJob),
+    arena: std.mem.Allocator,
+    bucket: []const u8,
+    key: []const u8,
+    start: u64,
+    end: u64,
+    target: []u8,
+) !void {
+    const len = end - start;
+    std.debug.assert(target.len == len);
+    var off: u64 = 0;
+    while (off < len) {
+        const n = @min(s3.S3_RANGE_SPLIT, len - off);
+        const o: usize = @intCast(off);
+        const nsz: usize = @intCast(n);
+        try list.append(arena, .{
+            .bucket = bucket,
+            .key = key,
+            .range = .{ .start = start + off, .end = start + off + n },
+            .target = target[o .. o + nsz],
+        });
+        off += n;
+    }
+}
+
+/// Stable partition: jobs that overlap a filter column's bytes come first, so those GETs start while output columns wait.
+fn orderFilterFirst(arena: std.mem.Allocator, jobs: []s3.FetchJob, filters: []const coalescer.Range) !void {
+    if (filters.len == 0 or jobs.len < 2) return;
+    var front: std.ArrayList(s3.FetchJob) = .empty;
+    var back: std.ArrayList(s3.FetchJob) = .empty;
+    for (jobs) |j| {
+        const r: coalescer.Range = .{ .start = j.range.start, .end = j.range.end };
+        if (coalescer.overlapsAny(r, filters)) try front.append(arena, j) else try back.append(arena, j);
+    }
+    var n: usize = 0;
+    for (front.items) |j| {
+        jobs[n] = j;
+        n += 1;
+    }
+    for (back.items) |j| {
+        jobs[n] = j;
+        n += 1;
+    }
 }
 
 const CompactRange = struct {

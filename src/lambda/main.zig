@@ -904,7 +904,7 @@ fn handleS3(
     );
 }
 
-const POOL_SIZE: usize = s3.MAX_PARTS;
+const POOL_SIZE: usize = engine.POOL_SIZE;
 
 fn initPool(
     self: *s3.Pool(POOL_SIZE),

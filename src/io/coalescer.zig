@@ -64,6 +64,26 @@ pub const Coalescer = struct {
     }
 };
 
+/// Unmeasured S3 latency uses this gap: wide enough to join nearby column chunks, under the cap below.
+pub const s3_gap_default: u64 = 1 << 20;
+/// Cap on `bandwidth × first-byte latency`.
+pub const s3_gap_max: u64 = 2 << 20;
+
+/// Gap for one S3 object. `rtt_ns == 0` has not been measured, so the default applies. A measured latency uses
+/// `min(s3_gap_max, bytes_per_s × rtt)`.
+pub fn s3CoalesceGap(rtt_ns: u64, bytes_per_s: u64) u64 {
+    if (rtt_ns == 0 or bytes_per_s == 0) return s3_gap_default;
+    const gap = bytes_per_s * rtt_ns / std.time.ns_per_s;
+    return @min(s3_gap_max, gap);
+}
+
+pub fn overlapsAny(r: Range, others: []const Range) bool {
+    for (others) |o| {
+        if (r.start < o.end and o.start < r.end) return true;
+    }
+    return false;
+}
+
 test "coalescer: basic merging" {
     const allocator = std.testing.allocator;
     
@@ -119,4 +139,15 @@ test "coalescer: large gap" {
     defer allocator.free(res);
     
     try std.testing.expectEqual(@as(usize, 2), res.len);
+}
+
+test "s3 coalesce gap is 1 MiB until latency is measured, then bandwidth times that latency" {
+    try std.testing.expectEqual(@as(u64, 1 << 20), s3CoalesceGap(0, 80_000_000));
+    try std.testing.expectEqual(@as(u64, 1 << 20), s3CoalesceGap(25 * std.time.ns_per_ms, 0));
+    // 80 MB/s × 25 ms = 2_000_000, under the 2 MiB cap.
+    try std.testing.expectEqual(@as(u64, 2_000_000), s3CoalesceGap(25 * std.time.ns_per_ms, 80_000_000));
+    // A huge product stops at 2 MiB.
+    try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(std.time.ns_per_s, 80_000_000));
+    // A short measured latency stays small: 80 MB/s × 1 ms.
+    try std.testing.expectEqual(@as(u64, 80_000), s3CoalesceGap(std.time.ns_per_ms, 80_000_000));
 }

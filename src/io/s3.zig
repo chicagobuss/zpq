@@ -52,6 +52,15 @@ pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 /// sub-ranges so we can fan out across the pool. Below it the
 /// per-request TLS handshake amortizes badly across tiny fetches.
 pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
+
+/// Most data ranges in flight on S3. More than this made the request policer slower.
+pub const S3_IN_FLIGHT: usize = 16;
+/// The first wave opens only this many. The rest start once these jobs are in flight.
+pub const S3_FIRST_WAVE: usize = 8;
+/// A data GET longer than this is split.
+pub const S3_RANGE_SPLIT: u64 = 8 << 20;
+/// Assumed bytes per second of one connection, for a coalesce gap once latency has been measured.
+pub const S3_BYTES_PER_S: u64 = 80_000_000;
 /// Target sub-range size when splitting. Kept separate from multipart
 /// write part size; reads and writes have different round-trip and
 /// buffering tradeoffs.
@@ -856,7 +865,16 @@ pub fn fetchJobs(
     // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
     // rather than as the bad argument it is.
     const n_workers = @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
-    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
+    // The first wave stays at S3_FIRST_WAVE. Further workers start once that many jobs have been
+    // handed out, so a cold batch does not open the whole ceiling at once. They then run together.
+    const first = @min(n_workers, S3_FIRST_WAVE);
+    try work_cursor.startWorkers(FetchCtx, &group, io, &shared, first, io, fetchOneTask);
+    if (n_workers > first) {
+        while (shared.cursor.load(.monotonic) < first and !shared.drained()) {
+            try io.sleep(.fromNanoseconds(50 * std.time.ns_per_us), .awake);
+        }
+        try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers - first, io, fetchOneTask);
+    }
     try group.await(io);
 
     // 5. Tally + check for failures.

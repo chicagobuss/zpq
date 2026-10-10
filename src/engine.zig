@@ -2469,13 +2469,11 @@ fn openInputs(
             rg_first[sp.meta.row_groups.items.len] = ranges.items.len;
             const gap_cap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S);
             var selected: u64 = 0;
+            var g: usize = 0;
             for (ranges.items, 0..) |r, ri| {
+                while (g + 1 < rg_first.len and rg_first[g + 1] <= ri) g += 1;
                 selected += r.len();
-                const group: u32 = blk: {
-                    var g: usize = 0;
-                    while (g + 1 < rg_first.len and rg_first[g + 1] <= ri) g += 1;
-                    break :blk @intCast(g);
-                };
+                const group: u32 = @intCast(g);
                 try all_pieces.append(arena, .{
                     .object = @intCast(fi),
                     .group = group,
@@ -2503,7 +2501,12 @@ fn openInputs(
         const win_files = try arena.alloc(s3_window.File, specs.len);
 
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
+        var span_at: usize = 0;
         for (specs, win_files, saved, 0..) |*sp, *wf, sv, fi| {
+            const obj: u32 = @intCast(fi);
+            const span_lo = span_at;
+            while (span_at < upfront.len and upfront[span_at].object == obj) span_at += 1;
+            const file_spans = upfront[span_lo..span_at];
             // The tail serves the footer parse and the copies below. A windowed copy is applied when the row group
             // is admitted, so that tail stays until the fetcher stops; every other way out frees it here.
             var keep_tail = false;
@@ -2556,8 +2559,8 @@ fn openInputs(
             var window_plan: []const coalescer.PlannedSpan = &.{};
             if (windowed) {
                 var pieces: std.ArrayList(coalescer.Piece) = .empty;
+                var g: usize = 0;
                 for (sv.ranges, 0..) |r, ri| {
-                    var g: usize = 0;
                     while (g + 1 < sv.rg_first.len and sv.rg_first[g + 1] <= ri) g += 1;
                     try pieces.append(arena, .{
                         .object = 0,
@@ -2577,30 +2580,43 @@ fn openInputs(
                 n_ranges += sv.ranges.len;
                 n_merged += window_plan.len;
             } else {
-                var count: usize = 0;
-                for (upfront) |s| {
-                    if (s.object == @as(u32, @intCast(fi))) count += 1;
-                }
                 n_ranges += sv.ranges.len;
-                n_merged += count;
-                for (upfront) |s| {
-                    if (s.object != @as(u32, @intCast(fi))) continue;
+                n_merged += file_spans.len;
+                for (file_spans) |s| {
                     if (s.end < s.start or s.end > sp.total_size) return error.BadResponse;
                     try compact.append(arena, .{ .start = s.start, .end = s.end, .dst_start = compact_len });
                     compact_len += @intCast(s.len());
                 }
             }
-            for (0..meta.row_groups.items.len + 1) |ri| {
-                if (!windowed) break;
-                rg_compact[ri] = compact.items.len;
-                if (ri == meta.row_groups.items.len) break;
-                if (sv.rg_first[ri] == sv.rg_first[ri + 1]) continue;
-                compact_len = std.mem.alignForward(usize, compact_len, page);
-                for (window_plan) |s| {
-                    if (s.group != @as(u32, @intCast(ri))) continue;
-                    if (s.end < s.start or s.end > sp.total_size) return error.BadResponse;
-                    try compact.append(arena, .{ .start = s.start, .end = s.end, .dst_start = compact_len });
-                    compact_len += @intCast(s.len());
+            if (windowed) {
+                const nrg = meta.row_groups.items.len;
+                const bucket_n = try arena.alloc(usize, nrg);
+                @memset(bucket_n, 0);
+                for (window_plan) |s| bucket_n[s.group] += 1;
+                const start_ix = try arena.alloc(usize, nrg);
+                var acc: usize = 0;
+                for (bucket_n, start_ix) |bn, *slot| {
+                    slot.* = acc;
+                    acc += bn;
+                }
+                const cursor = try arena.alloc(usize, nrg);
+                @memcpy(cursor, start_ix);
+                const order = try arena.alloc(usize, window_plan.len);
+                for (window_plan, 0..) |s, i| {
+                    order[cursor[s.group]] = i;
+                    cursor[s.group] += 1;
+                }
+                for (0..nrg + 1) |ri| {
+                    rg_compact[ri] = compact.items.len;
+                    if (ri == nrg) break;
+                    if (bucket_n[ri] == 0) continue;
+                    compact_len = std.mem.alignForward(usize, compact_len, page);
+                    for (order[start_ix[ri] .. start_ix[ri] + bucket_n[ri]]) |si| {
+                        const s = window_plan[si];
+                        if (s.end < s.start or s.end > sp.total_size) return error.BadResponse;
+                        try compact.append(arena, .{ .start = s.start, .end = s.end, .dst_start = compact_len });
+                        compact_len += @intCast(s.len());
+                    }
                 }
             }
             sp.compact_ranges = compact.items;
@@ -3635,23 +3651,33 @@ fn rebaseFetchedOffsets(
 }
 
 /// Where `[off, off + len)` of the source lands in the compact buffer, when one range holds all of it.
+/// Rightmost range with `start <= src`, when `ranges` is sorted by start and does not overlap.
+fn rangeAt(src: u64, ranges: []const CompactRange) ?CompactRange {
+    var lo: usize = 0;
+    var hi = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ranges[mid].start <= src) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return null;
+    return ranges[lo - 1];
+}
+
 fn rebaseContained(off_opt: ?i64, len_opt: ?i32, ranges: []const CompactRange) ?i64 {
     const off = std.math.cast(u64, off_opt orelse return null) orelse return null;
     const len = std.math.cast(u64, len_opt orelse return null) orelse return null;
-    for (ranges) |r| {
-        if (off >= r.start and off + len <= r.end) return @intCast(@as(u64, @intCast(r.dst_start)) + (off - r.start));
-    }
+    const r = rangeAt(off, ranges) orelse return null;
+    if (off >= r.start and off + len <= r.end) return @intCast(@as(u64, @intCast(r.dst_start)) + (off - r.start));
     return null;
 }
 
 fn rebaseOneOffset(old: i64, ranges: []const CompactRange) !i64 {
     if (old < 0) return error.BadResponse;
     const src: u64 = @intCast(old);
-    for (ranges) |r| {
-        if (src >= r.start and src < r.end) {
-            const dst: u64 = @as(u64, @intCast(r.dst_start)) + (src - r.start);
-            return @intCast(dst);
-        }
+    const r = rangeAt(src, ranges) orelse return error.BadResponse;
+    if (src >= r.start and src < r.end) {
+        const dst: u64 = @as(u64, @intCast(r.dst_start)) + (src - r.start);
+        return @intCast(dst);
     }
     return error.BadResponse;
 }

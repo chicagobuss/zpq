@@ -99,12 +99,13 @@ pub const PlannedSpan = struct {
     }
 };
 
-/// One plan for every range fetched together. The wave target is `ceil(all ranges / in_flight)`, counted across
-/// objects. The smallest within-object gap merges first, and only while it fits three limits: the object's latency
-/// cap, `amp_cap` (twice the original selected bytes of this dispatch), and `window_cap` when this dispatch is a
-/// window. A window also refuses a merge that would cross row groups, so each group's buffer is exactly the spans
-/// it is charged for, and a group's charge stays within the window. Call this once. Planning the resulting spans
-/// again would treat gap bytes as selected and read more than `amp_cap`.
+/// One plan for every range fetched together. The wave target is `ceil(spans / in_flight)`, counted across objects.
+/// Touching ranges in one object (and, for a window, one row group) join first. The remaining gaps are sorted once
+/// by size, then object, then offset, and walked in that order: a merge deletes one gap and does not change any
+/// other gap's size. A gap is kept only while it fits the latency cap, `amp_cap` (twice the original selected bytes
+/// of this dispatch), and `window_cap` when this dispatch is a window. A window also refuses a merge that would
+/// cross row groups, so each group's buffer is exactly the spans it is charged for. Call this once. Planning the
+/// resulting spans again would treat gap bytes as selected and read more than `amp_cap`.
 pub fn coalesceDispatch(
     allocator: Allocator,
     pieces: []const Piece,
@@ -112,16 +113,27 @@ pub fn coalesceDispatch(
     amp_cap: u64,
     window_cap: ?u64,
 ) ![]const PlannedSpan {
+    return coalesceDispatchInner(allocator, pieces, in_flight, amp_cap, window_cap, null);
+}
+
+fn coalesceDispatchInner(
+    allocator: Allocator,
+    pieces: []const Piece,
+    in_flight: usize,
+    amp_cap: u64,
+    window_cap: ?u64,
+    visits: ?*usize,
+) ![]const PlannedSpan {
     if (pieces.len == 0) return &.{};
 
-    const Live = struct {
+    const Node = struct {
         object: u32,
         group: u32,
         start: u64,
         end: u64,
         gap_cap: u64,
     };
-    var live: std.ArrayList(Live) = .empty;
+    var live: std.ArrayList(Node) = .empty;
     defer live.deinit(allocator);
     try live.ensureTotalCapacity(allocator, pieces.len);
     const order = try allocator.alloc(usize, pieces.len);
@@ -164,45 +176,109 @@ pub fn coalesceDispatch(
         });
     }
 
-    var total: u64 = 0;
-    for (live.items) |s| total += s.end - s.start;
-
-    while (true) {
-        const wave_target = std.math.divCeil(usize, live.items.len, @max(in_flight, 1)) catch unreachable;
-        if (wave_target <= 1) break;
-        var best_i: ?usize = null;
-        var best_gap: u64 = std.math.maxInt(u64);
-        for (live.items[0 .. live.items.len - 1], 0..) |s, i| {
-            const nxt = live.items[i + 1];
-            if (s.object != nxt.object) continue;
-            if (window_cap != null and s.group != nxt.group) continue;
-            if (nxt.start < s.end) continue;
-            const gap = nxt.start - s.end;
-            if (gap > @min(s.gap_cap, nxt.gap_cap)) continue;
-            if (total + gap > amp_cap) continue;
-            if (window_cap) |limit| {
-                const span = (s.end - s.start) + gap + (nxt.end - nxt.start);
-                if (span > limit or charge[s.group] + gap > limit) continue;
-            }
-            if (gap < best_gap) {
-                best_gap = gap;
-                best_i = i;
-            }
+    const Gap = struct {
+        size: u64,
+        object: u32,
+        offset: u64,
+        left: u32,
+    };
+    var gaps: std.ArrayList(Gap) = .empty;
+    defer gaps.deinit(allocator);
+    try gaps.ensureTotalCapacity(allocator, live.items.len);
+    for (live.items[0 .. live.items.len -| 1], 0..) |s, i| {
+        const nxt = live.items[i + 1];
+        if (s.object != nxt.object) continue;
+        if (window_cap != null and s.group != nxt.group) continue;
+        if (nxt.start < s.end) continue;
+        gaps.appendAssumeCapacity(.{
+            .size = nxt.start - s.end,
+            .object = s.object,
+            .offset = s.start,
+            .left = @intCast(i),
+        });
+    }
+    std.mem.sort(Gap, gaps.items, {}, struct {
+        fn lessThan(_: void, a: Gap, b: Gap) bool {
+            if (a.size != b.size) return a.size < b.size;
+            if (a.object != b.object) return a.object < b.object;
+            return a.offset < b.offset;
         }
-        const i = best_i orelse break;
-        const here = live.items[i];
-        live.items[i].end = live.items[i + 1].end;
-        live.items[i].gap_cap = @min(here.gap_cap, live.items[i + 1].gap_cap);
-        _ = live.orderedRemove(i + 1);
-        total += best_gap;
-        charge[here.group] += best_gap;
+    }.lessThan);
+
+    const n = live.items.len;
+    const parent = try allocator.alloc(u32, n);
+    defer allocator.free(parent);
+    const span_len = try allocator.alloc(u64, n);
+    defer allocator.free(span_len);
+    const cap = try allocator.alloc(u64, n);
+    defer allocator.free(cap);
+    const root_group = try allocator.alloc(u32, n);
+    defer allocator.free(root_group);
+    const accepted = try allocator.alloc(bool, n);
+    defer allocator.free(accepted);
+    @memset(accepted, false);
+    var total: u64 = 0;
+    for (live.items, 0..) |s, i| {
+        parent[i] = @intCast(i);
+        span_len[i] = s.end - s.start;
+        cap[i] = s.gap_cap;
+        root_group[i] = s.group;
+        total += span_len[i];
     }
 
-    const out = try allocator.alloc(PlannedSpan, live.items.len);
-    for (live.items, out) |s, *dst| {
-        dst.* = .{ .object = s.object, .group = s.group, .start = s.start, .end = s.end };
+    const flight = @max(in_flight, 1);
+    var count = n;
+    for (gaps.items) |g| {
+        if (std.math.divCeil(usize, count, flight) catch unreachable <= 1) break;
+        if (visits) |v| v.* += 1;
+        const left = findRoot(parent, g.left);
+        const right = findRoot(parent, g.left + 1);
+        const here = @min(cap[left], cap[right]);
+        if (g.size > here) continue;
+        if (total + g.size > amp_cap) continue;
+        if (window_cap) |limit| {
+            const span = span_len[left] + g.size + span_len[right];
+            if (span > limit or charge[root_group[left]] + g.size > limit) continue;
+        }
+        accepted[g.left] = true;
+        span_len[left] = span_len[left] + g.size + span_len[right];
+        cap[left] = here;
+        charge[root_group[left]] += g.size;
+        total += g.size;
+        parent[right] = left;
+        count -= 1;
     }
-    return out;
+
+    var out: std.ArrayList(PlannedSpan) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < n) {
+        const first = live.items[i];
+        var end = first.end;
+        var j = i;
+        while (j + 1 < n and accepted[j]) {
+            j += 1;
+            end = live.items[j].end;
+        }
+        try out.append(allocator, .{
+            .object = first.object,
+            .group = first.group,
+            .start = first.start,
+            .end = end,
+        });
+        i = j + 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn findRoot(parent: []u32, start: u32) u32 {
+    var i = start;
+    while (parent[i] != i) {
+        const p = parent[i];
+        parent[i] = parent[p];
+        i = p;
+    }
+    return i;
 }
 
 /// One object, one row group. Tests and any caller that already holds a single file's ranges.
@@ -479,4 +555,213 @@ test "one plan charges gap bytes once, so a second pass would read past twice th
     const twice = try coalesceDispatch(allocator, &again_src, 2, spanBytes(once) * 2, null);
     defer allocator.free(twice);
     try std.testing.expect(spanBytes(twice) > selected * 2);
+}
+
+/// The rescan planner, kept so a faster walk can be checked against the same spans. Not used on the fetch path.
+fn coalesceDispatchOracle(
+    allocator: Allocator,
+    pieces: []const Piece,
+    in_flight: usize,
+    amp_cap: u64,
+    window_cap: ?u64,
+) ![]const PlannedSpan {
+    if (pieces.len == 0) return &.{};
+    const Live = struct {
+        object: u32,
+        group: u32,
+        start: u64,
+        end: u64,
+        gap_cap: u64,
+    };
+    var live: std.ArrayList(Live) = .empty;
+    defer live.deinit(allocator);
+    try live.ensureTotalCapacity(allocator, pieces.len);
+    const order = try allocator.alloc(usize, pieces.len);
+    defer allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, pieces, struct {
+        fn lessThan(p: []const Piece, a: usize, b: usize) bool {
+            if (p[a].object != p[b].object) return p[a].object < p[b].object;
+            return p[a].start < p[b].start;
+        }
+    }.lessThan);
+    var max_group: u32 = 0;
+    for (pieces) |p| max_group = @max(max_group, p.group);
+    const charge = try allocator.alloc(u64, @as(usize, max_group) + 1);
+    defer allocator.free(charge);
+    @memset(charge, 0);
+    for (order) |idx| {
+        const p = pieces[idx];
+        if (live.items.len != 0) {
+            const cur = &live.items[live.items.len - 1];
+            const same = cur.object == p.object and (window_cap == null or cur.group == p.group);
+            if (same and p.start <= cur.end) {
+                if (p.end > cur.end) {
+                    charge[cur.group] += p.end - cur.end;
+                    cur.end = p.end;
+                }
+                cur.gap_cap = @min(cur.gap_cap, p.gap_cap);
+                continue;
+            }
+        }
+        charge[p.group] += p.end - p.start;
+        live.appendAssumeCapacity(.{
+            .object = p.object,
+            .group = p.group,
+            .start = p.start,
+            .end = p.end,
+            .gap_cap = p.gap_cap,
+        });
+    }
+    var total: u64 = 0;
+    for (live.items) |s| total += s.end - s.start;
+    while (true) {
+        const wave_target = std.math.divCeil(usize, live.items.len, @max(in_flight, 1)) catch unreachable;
+        if (wave_target <= 1) break;
+        var best_i: ?usize = null;
+        var best_gap: u64 = std.math.maxInt(u64);
+        for (live.items[0 .. live.items.len - 1], 0..) |s, i| {
+            const nxt = live.items[i + 1];
+            if (s.object != nxt.object) continue;
+            if (window_cap != null and s.group != nxt.group) continue;
+            if (nxt.start < s.end) continue;
+            const gap = nxt.start - s.end;
+            if (gap > @min(s.gap_cap, nxt.gap_cap)) continue;
+            if (total + gap > amp_cap) continue;
+            if (window_cap) |limit| {
+                const span = (s.end - s.start) + gap + (nxt.end - nxt.start);
+                if (span > limit or charge[s.group] + gap > limit) continue;
+            }
+            if (gap < best_gap) {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        const i = best_i orelse break;
+        const here = live.items[i];
+        live.items[i].end = live.items[i + 1].end;
+        live.items[i].gap_cap = @min(here.gap_cap, live.items[i + 1].gap_cap);
+        _ = live.orderedRemove(i + 1);
+        total += best_gap;
+        charge[here.group] += best_gap;
+    }
+    const out = try allocator.alloc(PlannedSpan, live.items.len);
+    for (live.items, out) |s, *dst| {
+        dst.* = .{ .object = s.object, .group = s.group, .start = s.start, .end = s.end };
+    }
+    return out;
+}
+
+fn expectSameSpans(got: []const PlannedSpan, want: []const PlannedSpan) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (got, want) |g, w| {
+        try std.testing.expectEqual(w.object, g.object);
+        try std.testing.expectEqual(w.group, g.group);
+        try std.testing.expectEqual(w.start, g.start);
+        try std.testing.expectEqual(w.end, g.end);
+    }
+}
+
+test "a sorted gap walk matches the rescan planner" {
+    const allocator = std.testing.allocator;
+    var rng = std.Random.DefaultPrng.init(0x9c5828e);
+    const random = rng.random();
+    for (0..48) |_| {
+        const objects = random.intRangeAtMost(u32, 1, 4);
+        const per = random.intRangeAtMost(usize, 1, 24);
+        const pieces = try allocator.alloc(Piece, objects * per);
+        defer allocator.free(pieces);
+        var n: usize = 0;
+        var selected: u64 = 0;
+        for (0..objects) |o| {
+            var at: u64 = random.intRangeAtMost(u64, 0, 20);
+            for (0..per) |_| {
+                const len = random.intRangeAtMost(u64, 1, 40);
+                const group = random.intRangeAtMost(u32, 0, 3);
+                pieces[n] = .{
+                    .object = @intCast(o),
+                    .group = group,
+                    .start = at,
+                    .end = at + len,
+                    .gap_cap = random.intRangeAtMost(u64, 0, 50),
+                };
+                selected += len;
+                n += 1;
+                const hole = random.intRangeAtMost(u64, 0, 30);
+                if (random.boolean()) at += len + hole else at += hole;
+            }
+        }
+        const window: ?u64 = switch (random.intRangeAtMost(u8, 0, 3)) {
+            0 => null,
+            1 => random.intRangeAtMost(u64, 1, 80),
+            2 => random.intRangeAtMost(u64, 81, 4_000),
+            else => 1 << 20,
+        };
+        const amp = switch (random.intRangeAtMost(u8, 0, 2)) {
+            0 => selected / 2,
+            1 => selected * 2,
+            else => selected * 8,
+        };
+        const flight = random.intRangeAtMost(usize, 1, 8);
+        const got = try coalesceDispatch(allocator, pieces, flight, amp, window);
+        defer allocator.free(got);
+        const want = try coalesceDispatchOracle(allocator, pieces, flight, amp, window);
+        defer allocator.free(want);
+        try expectSameSpans(got, want);
+    }
+}
+
+test "a span longer than an S3 range split still merges by span count" {
+    const allocator = std.testing.allocator;
+    // Three exact 8 MiB ranges, one byte apart. Touching ranges would already be one span. Two in flight
+    // stops after one merge, leaving two spans.
+    const span: u64 = 8 << 20;
+    const pieces = [_]Piece{
+        .{ .object = 0, .group = 0, .start = 0, .end = span, .gap_cap = span },
+        .{ .object = 0, .group = 0, .start = span + 1, .end = span * 2 + 1, .gap_cap = span },
+        .{ .object = 0, .group = 0, .start = span * 2 + 2, .end = span * 3 + 2, .gap_cap = span },
+    };
+    const got = try coalesceDispatch(allocator, &pieces, 2, span * 6, null);
+    defer allocator.free(got);
+    const want = try coalesceDispatchOracle(allocator, &pieces, 2, span * 6, null);
+    defer allocator.free(want);
+    try expectSameSpans(got, want);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+}
+
+test "planning eight objects of 128 row groups inspects each gap once" {
+    const allocator = std.testing.allocator;
+    const objects = 8;
+    const groups = 128;
+    const cols = 32;
+    const col: u64 = 2048;
+    const hole: u64 = 256;
+    const n: usize = objects * groups * cols;
+    const pieces = try allocator.alloc(Piece, n);
+    defer allocator.free(pieces);
+    var k: usize = 0;
+    for (0..objects) |o| {
+        var at: u64 = 0;
+        for (0..groups) |g| {
+            for (0..cols) |_| {
+                pieces[k] = .{
+                    .object = @intCast(o),
+                    .group = @intCast(g),
+                    .start = at,
+                    .end = at + col,
+                    .gap_cap = 2 << 20,
+                };
+                k += 1;
+                at += col + hole;
+            }
+        }
+    }
+    var visits: usize = 0;
+    const selected: u64 = n * col;
+    const planned = try coalesceDispatchInner(allocator, pieces, 16, selected * 2, null, &visits);
+    defer allocator.free(planned);
+    const bound: usize = 4 * n * @as(usize, std.math.log2_int_ceil(usize, n));
+    try std.testing.expect(visits <= bound);
+    try std.testing.expectEqual(@as(usize, 16), planned.len);
+    try std.testing.expectEqual(selected + (n - 16) * hole, spanBytes(planned));
 }

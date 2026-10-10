@@ -72,6 +72,10 @@ int zpq_abi_version(void);                      /* 1 */
   thread exits.
 - **Process-wide state.** Beyond the context, the only process-wide state is a few caches, each set once and then
   only read: the TLS client contexts (CA stores) and the io_uring and gzip-backend probes.
+- **Local files are memory-mapped.** A local input is read through `mmap`. If another process truncates the file
+  while a query reads it, the next access past the new end raises SIGBUS, which kills the host process unless it
+  handles that signal. Don't let files a query reads be truncated or rewritten in place while it runs (write a new
+  file and rename it instead). S3 inputs are unaffected.
 - **Panics.** A broken invariant inside zpq panics and aborts the process, as it would the CLI.
 
 ## Python

@@ -77,12 +77,135 @@ pub fn s3CoalesceGap(rtt_ns: u64, bytes_per_s: u64) u64 {
     return @min(s3_gap_max, gap);
 }
 
-/// Merge to cut waves, not requests. Overlaps and ranges that touch always merge. The wave target is
-/// `ceil(ranges / wave)`: how many waves this dispatch takes with `wave` ranges in flight. While that target is
-/// greater than one, the smallest gaps merge first, each at most `gap_cap`, and the bytes read stay within
-/// `byte_cap`. A set that is already one wave keeps its positive gaps. Callers pass every range that will be
-/// fetched together — the whole up-front fetch, or one admitted window — not one row group: a group of two
-/// ranges is already one wave, and nothing would merge.
+/// One range in a dispatch. `object` is the file: a merge never crosses it. `group` is the row group that will hold
+/// the bytes. `gap_cap` is that object's latency limit.
+pub const Piece = struct {
+    object: u32,
+    group: u32,
+    start: u64,
+    end: u64,
+    gap_cap: u64,
+};
+
+/// A span the dispatch will fetch and hold. `group` is the row group whose buffer contains it.
+pub const PlannedSpan = struct {
+    object: u32,
+    group: u32,
+    start: u64,
+    end: u64,
+
+    pub fn len(self: PlannedSpan) u64 {
+        return self.end - self.start;
+    }
+};
+
+/// One plan for every range fetched together. The wave target is `ceil(all ranges / in_flight)`, counted across
+/// objects. The smallest within-object gap merges first, and only while it fits three limits: the object's latency
+/// cap, `amp_cap` (twice the original selected bytes of this dispatch), and `window_cap` when this dispatch is a
+/// window. A window also refuses a merge that would cross row groups, so each group's buffer is exactly the spans
+/// it is charged for, and a group's charge stays within the window. Call this once. Planning the resulting spans
+/// again would treat gap bytes as selected and read more than `amp_cap`.
+pub fn coalesceDispatch(
+    allocator: Allocator,
+    pieces: []const Piece,
+    in_flight: usize,
+    amp_cap: u64,
+    window_cap: ?u64,
+) ![]const PlannedSpan {
+    if (pieces.len == 0) return &.{};
+
+    const Live = struct {
+        object: u32,
+        group: u32,
+        start: u64,
+        end: u64,
+        gap_cap: u64,
+    };
+    var live: std.ArrayList(Live) = .empty;
+    defer live.deinit(allocator);
+    try live.ensureTotalCapacity(allocator, pieces.len);
+    const order = try allocator.alloc(usize, pieces.len);
+    defer allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, pieces, struct {
+        fn lessThan(p: []const Piece, a: usize, b: usize) bool {
+            if (p[a].object != p[b].object) return p[a].object < p[b].object;
+            return p[a].start < p[b].start;
+        }
+    }.lessThan);
+
+    var max_group: u32 = 0;
+    for (pieces) |p| max_group = @max(max_group, p.group);
+    const charge = try allocator.alloc(u64, @as(usize, max_group) + 1);
+    defer allocator.free(charge);
+    @memset(charge, 0);
+
+    for (order) |idx| {
+        const p = pieces[idx];
+        if (live.items.len != 0) {
+            const cur = &live.items[live.items.len - 1];
+            const same = cur.object == p.object and (window_cap == null or cur.group == p.group);
+            if (same and p.start <= cur.end) {
+                if (p.end > cur.end) {
+                    charge[cur.group] += p.end - cur.end;
+                    cur.end = p.end;
+                }
+                cur.gap_cap = @min(cur.gap_cap, p.gap_cap);
+                continue;
+            }
+        }
+        charge[p.group] += p.end - p.start;
+        live.appendAssumeCapacity(.{
+            .object = p.object,
+            .group = p.group,
+            .start = p.start,
+            .end = p.end,
+            .gap_cap = p.gap_cap,
+        });
+    }
+
+    var total: u64 = 0;
+    for (live.items) |s| total += s.end - s.start;
+
+    while (true) {
+        const wave_target = std.math.divCeil(usize, live.items.len, @max(in_flight, 1)) catch unreachable;
+        if (wave_target <= 1) break;
+        var best_i: ?usize = null;
+        var best_gap: u64 = std.math.maxInt(u64);
+        for (live.items[0 .. live.items.len - 1], 0..) |s, i| {
+            const nxt = live.items[i + 1];
+            if (s.object != nxt.object) continue;
+            if (window_cap != null and s.group != nxt.group) continue;
+            if (nxt.start < s.end) continue;
+            const gap = nxt.start - s.end;
+            if (gap > @min(s.gap_cap, nxt.gap_cap)) continue;
+            if (total + gap > amp_cap) continue;
+            if (window_cap) |limit| {
+                const span = (s.end - s.start) + gap + (nxt.end - nxt.start);
+                if (span > limit or charge[s.group] + gap > limit) continue;
+            }
+            if (gap < best_gap) {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        const i = best_i orelse break;
+        const here = live.items[i];
+        live.items[i].end = live.items[i + 1].end;
+        live.items[i].gap_cap = @min(here.gap_cap, live.items[i + 1].gap_cap);
+        _ = live.orderedRemove(i + 1);
+        total += best_gap;
+        charge[here.group] += best_gap;
+    }
+
+    const out = try allocator.alloc(PlannedSpan, live.items.len);
+    for (live.items, out) |s, *dst| {
+        dst.* = .{ .object = s.object, .group = s.group, .start = s.start, .end = s.end };
+    }
+    return out;
+}
+
+/// One object, one row group. Tests and any caller that already holds a single file's ranges.
 pub fn coalesceMinWaves(
     allocator: Allocator,
     ranges: []const Range,
@@ -90,53 +213,16 @@ pub fn coalesceMinWaves(
     wave: usize,
     byte_cap: u64,
 ) ![]const Range {
-    if (ranges.len == 0) return &.{};
-
-    var sorted = try allocator.alloc(Range, ranges.len);
-    defer allocator.free(sorted);
-    @memcpy(sorted, ranges);
-    std.mem.sort(Range, sorted, {}, struct {
-        fn lessThan(_: void, a: Range, b: Range) bool {
-            return a.start < b.start;
-        }
-    }.lessThan);
-
-    var merged: std.ArrayList(Range) = .empty;
-    try merged.ensureTotalCapacity(allocator, ranges.len);
-    var current = sorted[0];
-    var total: u64 = 0;
-    for (sorted[1..]) |next| {
-        if (next.start <= current.end) {
-            if (next.end > current.end) current.end = next.end;
-        } else {
-            total += current.end - current.start;
-            merged.appendAssumeCapacity(current);
-            current = next;
-        }
+    const pieces = try allocator.alloc(Piece, ranges.len);
+    defer allocator.free(pieces);
+    for (ranges, pieces) |r, *p| {
+        p.* = .{ .object = 0, .group = 0, .start = r.start, .end = r.end, .gap_cap = gap_cap };
     }
-    total += current.end - current.start;
-    merged.appendAssumeCapacity(current);
-
-    while (true) {
-        const wave_target = std.math.divCeil(usize, merged.items.len, @max(wave, 1)) catch unreachable;
-        if (wave_target <= 1) break;
-        var best_i: usize = 0;
-        var best_gap: u64 = std.math.maxInt(u64);
-        for (merged.items[0 .. merged.items.len - 1], 0..) |r, i| {
-            const nxt = merged.items[i + 1];
-            const gap = nxt.start - r.end;
-            if (gap < best_gap) {
-                best_gap = gap;
-                best_i = i;
-            }
-        }
-        if (best_gap > gap_cap) break;
-        if (total + best_gap > byte_cap) break;
-        merged.items[best_i].end = merged.items[best_i + 1].end;
-        _ = merged.orderedRemove(best_i + 1);
-        total += best_gap;
-    }
-    return merged.toOwnedSlice(allocator);
+    const planned = try coalesceDispatch(allocator, pieces, wave, byte_cap, null);
+    defer allocator.free(planned);
+    const out = try allocator.alloc(Range, planned.len);
+    for (planned, out) |s, *r| r.* = .{ .start = s.start, .end = s.end };
+    return out;
 }
 
 pub fn overlapsAny(r: Range, others: []const Range) bool {
@@ -289,4 +375,108 @@ test "sparse ranges stay inside twice the selected bytes" {
     var got: u64 = 0;
     for (merged) |r| got += r.len();
     try std.testing.expectEqual(selected, got);
+}
+
+fn spanBytes(spans: []const PlannedSpan) u64 {
+    var n: u64 = 0;
+    for (spans) |s| n += s.len();
+    return n;
+}
+
+test "a dispatch of eight objects merges each row group's gap and not the hole between objects" {
+    const allocator = std.testing.allocator;
+    // Eight files, two row groups, two selected columns. Each file's four ranges already fit in one wave, so a
+    // per-file plan merges nothing. Together they are two waves. The 262,210-byte gap inside each row group merges;
+    // the hole between row groups is past the latency cap.
+    const objects = 8;
+    const col: u64 = 262210;
+    const intra: u64 = 262210;
+    const inter: u64 = 8 << 20;
+    var pieces: [objects * 4]Piece = undefined;
+    for (0..objects) |o| {
+        var at: u64 = 4;
+        for (0..2) |g| {
+            const base = o * 4 + g * 2;
+            pieces[base] = .{
+                .object = @intCast(o),
+                .group = @intCast(g),
+                .start = at,
+                .end = at + col,
+                .gap_cap = 2_000_000,
+            };
+            at += col + intra;
+            pieces[base + 1] = .{
+                .object = @intCast(o),
+                .group = @intCast(g),
+                .start = at,
+                .end = at + col,
+                .gap_cap = 2_000_000,
+            };
+            at += col + inter;
+        }
+    }
+    const selected: u64 = objects * 4 * col;
+    const planned = try coalesceDispatch(allocator, &pieces, 16, selected * 2, null);
+    defer allocator.free(planned);
+    try std.testing.expectEqual(@as(usize, 16), planned.len);
+    try std.testing.expectEqual(selected + 16 * intra, spanBytes(planned));
+    // One file on its own is already a single wave.
+    const alone = try coalesceDispatch(allocator, pieces[0..4], 16, 4 * col * 2, null);
+    defer allocator.free(alone);
+    try std.testing.expectEqual(@as(usize, 4), alone.len);
+}
+
+test "a window accepts a funded gap only while the row group's charge still fits" {
+    const allocator = std.testing.allocator;
+    // Seventeen selected columns, each pair split by the same 1,572,994-byte pad. One merge costs that pad and makes
+    // the group's charge 10,488,100. A 9 MiB window refuses it; an 11 MiB window takes exactly one.
+    const col: u64 = 524418;
+    const pad: u64 = 1_572_994;
+    const n = 17;
+    var pieces: [n]Piece = undefined;
+    var at: u64 = 4;
+    for (0..n) |i| {
+        pieces[i] = .{ .object = 0, .group = 0, .start = at, .end = at + col, .gap_cap = 2 << 20 };
+        at += col + pad;
+    }
+    const selected: u64 = n * col;
+    const amp = selected * 2;
+    const tight = try coalesceDispatch(allocator, &pieces, 16, amp, 9216 * 1024);
+    defer allocator.free(tight);
+    try std.testing.expectEqual(n, tight.len);
+    try std.testing.expectEqual(selected, spanBytes(tight));
+    for (tight) |s| try std.testing.expect(s.len() <= 9216 * 1024);
+
+    const open = try coalesceDispatch(allocator, &pieces, 16, amp, 11264 * 1024);
+    defer allocator.free(open);
+    try std.testing.expectEqual(@as(usize, 16), open.len);
+    try std.testing.expectEqual(selected + pad, spanBytes(open));
+    for (open) |s| try std.testing.expect(s.len() <= 11264 * 1024);
+}
+
+test "one plan charges gap bytes once, so a second pass would read past twice the selected bytes" {
+    const allocator = std.testing.allocator;
+    // Ten columns of 100 bytes. Six gaps of 50, then three of 400. In flight of 2 still wants merges after the small
+    // gaps are gone. Twice the original 1,000 bytes stops before the second large gap. Planning again from the spans,
+    // as if those gap bytes were selected, would take it.
+    var pieces: [10]Piece = undefined;
+    var at: u64 = 0;
+    for (0..10) |i| {
+        pieces[i] = .{ .object = 0, .group = 0, .start = at, .end = at + 100, .gap_cap = 10_000 };
+        const gap: u64 = if (i < 6) 50 else 400;
+        at += 100 + gap;
+    }
+    const selected: u64 = 1000;
+    const once = try coalesceDispatch(allocator, &pieces, 2, selected * 2, null);
+    defer allocator.free(once);
+    try std.testing.expectEqual(@as(usize, 3), once.len);
+    try std.testing.expectEqual(@as(u64, 1700), spanBytes(once));
+
+    var again_src: [3]Piece = undefined;
+    for (once, &again_src) |s, *p| {
+        p.* = .{ .object = 0, .group = 0, .start = s.start, .end = s.end, .gap_cap = 10_000 };
+    }
+    const twice = try coalesceDispatch(allocator, &again_src, 2, spanBytes(once) * 2, null);
+    defer allocator.free(twice);
+    try std.testing.expect(spanBytes(twice) > selected * 2);
 }

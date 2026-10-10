@@ -2432,9 +2432,9 @@ fn openInputs(
         // Bloom has already copied what it needed. Keep only suffix bytes a planned range still overlaps.
         for (specs) |*sp| trimRetainedSuffix(ctx.gpa, sp, plan, &account);
 
-        // Per file: stat-prune RGs, collect raw byte ranges for every
-        // (surviving RG) × (needed col), coalesce within the file, and
-        // emit one FetchJob per coalesced span. Coalescing matters
+        // Per file: stat-prune RGs and collect raw byte ranges for every
+        // (surviving RG) × (needed col). One planner then chooses the spans
+        // for the whole dispatch. Coalescing matters
         // because column chunks in a parquet RG are written back-to-
         // back; fetching them as separate GETs spends most of the wall
         // in HTTP round-trip overhead even though the bytes are
@@ -2446,29 +2446,64 @@ fn openInputs(
         // Over a window's worth of bytes, an aggregate fetches as its workers go (`io/s3_window.zig`): each row group's
         // chunks get their own page-aligned stretch of the buffer, filled ahead of the workers and given back behind
         // them. Under it (and off Linux), everything is fetched before the scan starts.
-        if (s3_window.supported) {
-            const limit = fetch_window.limit;
-            var need: u64 = 0;
-            // What an up-front fetch of each file would hold. The wave rule runs over every range of that fetch, so
-            // the gaps it keeps are in this total. A total past the window is fetched by admitted windows instead,
-            // and each of those windows is coalesced on its own when it is dispatched.
-            for (specs) |*sp| {
-                var file_ranges: std.ArrayList(coalescer.Range) = .empty;
-                for (sp.meta.row_groups.items) |*rg| {
-                    const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
-                    try appendRgFetchRanges(arena, &file_ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
-                }
-                if (file_ranges.items.len == 0) continue;
-                const merged = try coalesceS3Spans(arena, file_ranges.items, sp.rtt_ns, limit);
-                for (merged) |r| need += r.end - r.start;
+        // Every file's original chunks, then one plan for the up-front dispatch. The wave target counts ranges in
+        // every file. Merges stay inside a file. `need` is the bytes that plan would hold; past the window, each
+        // file is planned again under the window cap and admitted a row group at a time.
+        const Saved = struct {
+            ranges: []const coalescer.Range,
+            rg_first: []usize,
+            gap_cap: u64,
+            selected: u64,
+        };
+        const saved = try arena.alloc(Saved, specs.len);
+        var all_pieces: std.ArrayList(coalescer.Piece) = .empty;
+        var selected_all: u64 = 0;
+        for (specs, saved, 0..) |*sp, *sv, fi| {
+            var ranges: std.ArrayList(coalescer.Range) = .empty;
+            const rg_first = try arena.alloc(usize, sp.meta.row_groups.items.len + 1);
+            for (sp.meta.row_groups.items, 0..) |*rg, ri| {
+                rg_first[ri] = ranges.items.len;
+                const cols = plan.rowGroupColumns(rg, &sp.meta) orelse continue;
+                try appendRgFetchRanges(arena, &ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
             }
-            windowed = need > limit or (fetch_window.always and need > 0);
+            rg_first[sp.meta.row_groups.items.len] = ranges.items.len;
+            const gap_cap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S);
+            var selected: u64 = 0;
+            for (ranges.items, 0..) |r, ri| {
+                selected += r.len();
+                const group: u32 = blk: {
+                    var g: usize = 0;
+                    while (g + 1 < rg_first.len and rg_first[g + 1] <= ri) g += 1;
+                    break :blk @intCast(g);
+                };
+                try all_pieces.append(arena, .{
+                    .object = @intCast(fi),
+                    .group = group,
+                    .start = r.start,
+                    .end = r.end,
+                    .gap_cap = gap_cap,
+                });
+            }
+            sv.* = .{ .ranges = ranges.items, .rg_first = rg_first, .gap_cap = gap_cap, .selected = selected };
+            selected_all += selected;
+        }
+        const upfront = try coalescer.coalesceDispatch(
+            arena,
+            all_pieces.items,
+            s3.S3_IN_FLIGHT,
+            ampCap(selected_all, fetch_window.limit),
+            null,
+        );
+        if (s3_window.supported) {
+            var need: u64 = 0;
+            for (upfront) |s| need += s.len();
+            windowed = need > fetch_window.limit or (fetch_window.always and need > 0);
         }
         var win_order: std.ArrayList(*s3_window.RowGroup) = .empty;
         const win_files = try arena.alloc(s3_window.File, specs.len);
 
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
-        for (specs, win_files) |*sp, *wf| {
+        for (specs, win_files, saved, 0..) |*sp, *wf, sv, fi| {
             // The tail serves the footer parse and the copies below. A windowed copy is applied when the row group
             // is admitted, so that tail stays until the fetcher stops; every other way out frees it here.
             var keep_tail = false;
@@ -2510,40 +2545,62 @@ fn openInputs(
                 sp.file_buf = &.{};
                 continue;
             }
-            // Up front, every range of the file is one dispatch: the wave target is ceil(those ranges / in flight),
-            // so the small gap inside a row group merges even though that group alone already fits in a wave. The
-            // hole between groups merges only when it is small enough and the 2× cap still holds. A windowed fetch
-            // keeps each row group's own coalesced span (that is the admission charge) on its own page; ranges
-            // admitted into one window are merged again when that window is dispatched.
+            // Up front, `upfront` is the one plan for every file: the wave target counted all of them, and each
+            // span stays inside its file. A windowed file is planned on its own under the window cap, one row group
+            // to a buffer. That charge is what admission adds. Nothing merges again at dispatch.
             var compact: std.ArrayList(CompactRange) = .empty;
             var compact_len: usize = 0;
             const page = std.heap.pageSize();
             // Per row group, `compact.items[rg_compact[rg]..rg_compact[rg + 1]]` (windowed only).
             const rg_compact = try arena.alloc(usize, meta.row_groups.items.len + 1);
-            if (!windowed) {
-                const merged = try coalesceS3Spans(arena, ranges.items, sp.rtt_ns, fetch_window.limit);
-                n_ranges += ranges.items.len;
-                n_merged += merged.len;
-                for (merged) |r| {
-                    if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
-                    try compact.append(arena, .{ .start = r.start, .end = r.end, .dst_start = compact_len });
-                    compact_len += @intCast(r.end - r.start);
+            var window_plan: []const coalescer.PlannedSpan = &.{};
+            if (windowed) {
+                var pieces: std.ArrayList(coalescer.Piece) = .empty;
+                for (sv.ranges, 0..) |r, ri| {
+                    var g: usize = 0;
+                    while (g + 1 < sv.rg_first.len and sv.rg_first[g + 1] <= ri) g += 1;
+                    try pieces.append(arena, .{
+                        .object = 0,
+                        .group = @intCast(g),
+                        .start = r.start,
+                        .end = r.end,
+                        .gap_cap = sv.gap_cap,
+                    });
+                }
+                window_plan = try coalescer.coalesceDispatch(
+                    arena,
+                    pieces.items,
+                    s3.S3_IN_FLIGHT,
+                    sv.selected *| 2,
+                    fetch_window.limit,
+                );
+                n_ranges += sv.ranges.len;
+                n_merged += window_plan.len;
+            } else {
+                var count: usize = 0;
+                for (upfront) |s| {
+                    if (s.object == @as(u32, @intCast(fi))) count += 1;
+                }
+                n_ranges += sv.ranges.len;
+                n_merged += count;
+                for (upfront) |s| {
+                    if (s.object != @as(u32, @intCast(fi))) continue;
+                    if (s.end < s.start or s.end > sp.total_size) return error.BadResponse;
+                    try compact.append(arena, .{ .start = s.start, .end = s.end, .dst_start = compact_len });
+                    compact_len += @intCast(s.len());
                 }
             }
             for (0..meta.row_groups.items.len + 1) |ri| {
                 if (!windowed) break;
                 rg_compact[ri] = compact.items.len;
                 if (ri == meta.row_groups.items.len) break;
-                const span = ranges.items[rg_first[ri]..rg_first[ri + 1]];
-                if (span.len == 0) continue;
-                const merged = try coalesceS3Spans(arena, span, sp.rtt_ns, fetch_window.limit);
-                n_ranges += span.len;
-                n_merged += merged.len;
+                if (sv.rg_first[ri] == sv.rg_first[ri + 1]) continue;
                 compact_len = std.mem.alignForward(usize, compact_len, page);
-                for (merged) |r| {
-                    if (r.end < r.start or r.end > sp.total_size) return error.BadResponse;
-                    try compact.append(arena, .{ .start = r.start, .end = r.end, .dst_start = compact_len });
-                    compact_len += @intCast(r.end - r.start);
+                for (window_plan) |s| {
+                    if (s.group != @as(u32, @intCast(ri))) continue;
+                    if (s.end < s.start or s.end > sp.total_size) return error.BadResponse;
+                    try compact.append(arena, .{ .start = s.start, .end = s.end, .dst_start = compact_len });
+                    compact_len += @intCast(s.len());
                 }
             }
             sp.compact_ranges = compact.items;
@@ -3251,23 +3308,12 @@ fn appendRgFetchRanges(
     };
 }
 
-/// Coalesce one dispatch: every range fetched together. Positive gaps merge only while that set still takes more
-/// than one wave, each gap stays within the latency model, and the merged bytes stay within twice the selected
-/// bytes and within `budget`. Selected bytes themselves are never dropped to satisfy the budget. A single row
-/// group is the dispatch only when it is admitted on its own; an up-front fetch passes every row group of the file.
-fn coalesceS3Spans(
-    arena: std.mem.Allocator,
-    ranges: []const coalescer.Range,
-    rtt_ns: u64,
-    budget: u64,
-) ![]const coalescer.Range {
-    var selected: u64 = 0;
-    for (ranges) |r| selected += r.end -| r.start;
+/// Twice the original selected bytes, and no more than `budget`, unless the selected bytes themselves already
+/// exceed it: those are never dropped.
+fn ampCap(selected: u64, budget: u64) u64 {
     const amp = selected *| 2;
     const room = if (selected > budget) selected else budget;
-    const byte_cap = @min(amp, room);
-    const gap = coalescer.s3CoalesceGap(rtt_ns, s3.S3_BYTES_PER_S);
-    return coalescer.coalesceMinWaves(arena, ranges, gap, s3.S3_IN_FLIGHT, byte_cap);
+    return @min(amp, room);
 }
 
 fn noteSuffixOverlap(lo: *u64, hi: *u64, tail_lo: u64, tail_hi: u64, start: u64, end: u64) void {

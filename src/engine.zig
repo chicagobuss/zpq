@@ -2416,7 +2416,9 @@ fn openInputs(
         // after it prune the same row groups.
         if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
-            var src: S3Membership = .init(read_ctx, creds, pool, specs, fetch_window.limit);
+            // Bloom holds its own copies of what it probes. Cap them at the bytes the query can keep, not at the
+            // fetch window's 64 MiB floor when that floor is above `--max-memory`.
+            var src: S3Membership = .init(read_ctx, creds, pool, specs, @min(fetch_window.limit, account.limit));
             src.profiler = args.profiler;
             membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
         };
@@ -3225,6 +3227,16 @@ const S3Membership = struct {
                 o.* = &.{};
                 continue;
             }
+            // A span the tail already holds is that slice. Copying it would double the suffix in the wave's arena.
+            const tail_end = sp.tail_start + sp.tail.len;
+            if (sp.tail.len > 0 and s.start >= sp.tail_start and end <= tail_end) {
+                const off: usize = @intCast(s.start - sp.tail_start);
+                const n: usize = @intCast(end - s.start);
+                o.* = sp.tail[off..][0..n];
+                continue;
+            }
+            // Every remaining span body of this read is allocated before any of them is probed. The caller admits
+            // only a window's worth, including the joined copy `readAll` makes when a span has both a head and a tail.
             const buf = try arena.alloc(u8, @intCast(end - s.start));
             const fetch_end = @min(end, sp.tail_start);
             if (s.start < fetch_end) try jobs.append(arena, .{

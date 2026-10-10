@@ -459,6 +459,19 @@ fn joinBytes(arena: std.mem.Allocator, head: []const u8, tail: []const u8) ![]co
     return out;
 }
 
+/// One round trip of bandwidth. A contiguous run larger than this is waved, even when the fetch window would hold it.
+const one_round_bytes: u64 = 8 << 20;
+
+/// Bytes a probe of `span` allocates. The HTTP body is a buffer. A piece wholly inside the retained tail is a slice of
+/// that tail, not a new buffer. When both exist, `joinBytes` allocates a second body of the two concatenated.
+fn heldBytes(span: Span, suf: ?Span) u64 {
+    const clip = clipSuffix(span, suf);
+    const http: u64 = if (clip.http) |h| h.len() else 0;
+    const tail: u64 = if (clip.tail) |t| t.len() else 0;
+    if (http == 0) return 0;
+    return http + if (tail > 0) http + tail else 0;
+}
+
 /// Read every request through `src`. Suffix-covered bytes are copied and are not planned. What remains is merged
 /// by `kind`, then a request split across spans is reassembled. `stats.bytes` counts only what was fetched.
 fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind) !void {
@@ -636,10 +649,13 @@ pub fn load(
     const t0 = nowMonoNs();
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
+    var wave = std.heap.ArenaAllocator.init(gpa);
+    defer wave.deinit();
     var stats: Stats = .{};
     var p: Probing = .{
         .arena = arena,
         .scratch = scratch.allocator(),
+        .wave = &wave,
         .metas = metas,
         .src = src,
         .stats = &stats,
@@ -877,6 +893,8 @@ const Probing = struct {
     arena: std.mem.Allocator,
     /// Bytes read and decoded along the way.
     scratch: std.mem.Allocator,
+    /// Filter bodies of the wave in hand. Reset after the wave is probed, so the next wave does not keep them.
+    wave: *std.heap.ArenaAllocator,
     metas: []const schema.FileMetaData,
     src: Source,
     stats: *Stats,
@@ -884,6 +902,8 @@ const Probing = struct {
     opts: Options,
     verdicts: []Verdict = &.{},
     probes: ProbeCache = .{},
+    /// (file, row group) pairs already counted in `row_groups_bloom`.
+    bloom_counted: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn run(self: *Probing) !void {
         var leaves: std.ArrayList(ast.Filter) = .empty;
@@ -912,8 +932,8 @@ const Probing = struct {
         }
         const all = queue.items;
         if (all.len == 0) return;
-        // A column whose needed filters already touch is one run. The adaptive wave would cut it into two serial
-        // rounds. Scattered filters (a row-group-major run) keep the wave: eight small requests beat reading the rest.
+        // Remote bloom batches every file and column. A contiguous run is one round only when it is cheap; a larger
+        // one, and a scattered one, keeps the adaptive wave.
         if (which == .bloom and self.src.cost.remote()) {
             try self.stageBloomRemote(all);
             return;
@@ -932,11 +952,14 @@ const Probing = struct {
         _ = try self.probeWave(which, all[first_end..]);
     }
 
-    /// Remote bloom. Contiguous columns are probed in full. The rest take the adaptive wave, in row-group order.
+    /// Remote bloom. Cheap contiguous runs from every file and column share one dispatch. A run is cheap when the
+    /// buffers it allocates fit the charged window and one round trip (8 MiB). Anything larger, and every scattered
+    /// column, takes the adaptive first wave and then window-sized waves. Each wave is released before the next.
     fn stageBloomRemote(self: *Probing, all: []const *Target) !void {
         var used = try self.scratch.alloc(bool, all.len);
         @memset(used, false);
-        var scattered: std.ArrayList(*Target) = .empty;
+        var cheap: std.ArrayList(*Target) = .empty;
+        var rest: std.ArrayList(*Target) = .empty;
         var i: usize = 0;
         while (i < all.len) : (i += 1) {
             if (used[i]) continue;
@@ -948,27 +971,89 @@ const Probing = struct {
                 used[j] = true;
                 try col.append(self.scratch, all[j]);
             }
-            if (try self.columnContiguous(col.items)) {
-                _ = try self.probeWave(.bloom, col.items);
-            } else try scattered.appendSlice(self.scratch, col.items);
+            if (try self.columnContiguous(col.items) and self.heldTargets(col.items) <= self.oneRoundCap()) {
+                try cheap.appendSlice(self.scratch, col.items);
+            } else try rest.appendSlice(self.scratch, col.items);
         }
-        if (scattered.items.len == 0) return;
-        std.mem.sort(*Target, scattered.items, {}, struct {
-            fn lessThan(_: void, a: *Target, b: *Target) bool {
-                if (a.file != b.file) return a.file < b.file;
-                if (a.rg != b.rg) return a.rg < b.rg;
-                return a.col < b.col;
-            }
-        }.lessThan);
-        const first_end = waveEnd(scattered.items, self.opts.wave);
-        const first = try self.probeWave(.bloom, scattered.items[0..first_end]);
-        if (first_end == scattered.items.len) return;
+        try self.probeInCharges(cheap.items, self.oneRoundCap());
+        if (rest.items.len == 0) return;
+        std.mem.sort(*Target, rest.items, {}, targetLess);
+        const first_limit = waveEnd(rest.items, self.opts.wave);
+        const first_end = self.chargeEnd(rest.items, 0, first_limit, self.windowCap());
+        const first = try self.probeWave(.bloom, rest.items[0..first_end]);
+        self.releaseWave();
+        if (first_end == rest.items.len) return;
         const want = self.opts.min_wave_prune * @as(f64, @floatFromInt(first.row_groups));
         if (@as(f64, @floatFromInt(first.pruned)) < want) {
             self.stats.bloom_stopped = true;
             return;
         }
-        _ = try self.probeWave(.bloom, scattered.items[first_end..]);
+        var at = first_end;
+        while (at < rest.items.len) {
+            const end = self.chargeEnd(rest.items, at, rest.items.len, self.windowCap());
+            _ = try self.probeWave(.bloom, rest.items[at..end]);
+            self.releaseWave();
+            at = end;
+        }
+    }
+
+    /// One `read` per charge-sized batch. The bodies are freed before the next batch is admitted.
+    fn probeInCharges(self: *Probing, targets: []const *Target, cap: u64) !void {
+        var at: usize = 0;
+        while (at < targets.len) {
+            const end = self.chargeEnd(targets, at, targets.len, cap);
+            _ = try self.probeWave(.bloom, targets[at..end]);
+            self.releaseWave();
+            at = end;
+        }
+    }
+
+    fn releaseWave(self: *Probing) void {
+        _ = self.wave.reset(.free_all);
+    }
+
+    /// Filter bodies. A remote wave allocates them in `wave`, which is reset afterwards. A mapping keeps the scratch.
+    fn bodyAllocator(self: *Probing) std.mem.Allocator {
+        return if (self.src.cost.remote()) self.wave.allocator() else self.scratch;
+    }
+
+    fn windowCap(self: *const Probing) u64 {
+        return self.src.cost.window orelse std.math.maxInt(u64);
+    }
+
+    fn oneRoundCap(self: *const Probing) u64 {
+        return @min(self.windowCap(), one_round_bytes);
+    }
+
+    fn heldTarget(self: *const Probing, t: *const Target) u64 {
+        const s = filterSpan(t, self.metas) orelse return 0;
+        return heldBytes(s, self.src.suffix(s.file));
+    }
+
+    fn heldTargets(self: *const Probing, col: []const *Target) u64 {
+        var n: u64 = 0;
+        for (col) |t| n += self.heldTarget(t);
+        return n;
+    }
+
+    /// One past the last target of `[start, limit)` whose allocated buffers still fit in `cap`. Always advances.
+    fn chargeEnd(self: *const Probing, ts: []const *Target, start: usize, limit: usize, cap: u64) usize {
+        if (start >= ts.len) return start;
+        const last = @min(limit, ts.len);
+        var held: u64 = 0;
+        var end = start;
+        while (end < last) : (end += 1) {
+            const n = self.heldTarget(ts[end]);
+            if (end > start and held + n > cap) return end;
+            held += n;
+        }
+        return last;
+    }
+
+    fn targetLess(_: void, a: *Target, b: *Target) bool {
+        if (a.file != b.file) return a.file < b.file;
+        if (a.rg != b.rg) return a.rg < b.rg;
+        return a.col < b.col;
     }
 
     /// Known lengths, and each next filter starts where the previous one ends. An omitted length is not a run.
@@ -1004,10 +1089,20 @@ const Probing = struct {
             if (self.rowGroupSkips(t)) res.pruned += 1;
         }
         switch (which) {
-            .bloom => self.stats.row_groups_bloom += res.pruned,
+            .bloom => try self.noteBloomPruned(targets),
             .dictionary => self.stats.row_groups_dict += res.pruned,
         }
         return res;
+    }
+
+    /// Each (file, row group) counts once, across columns and across waves.
+    fn noteBloomPruned(self: *Probing, targets: []const *Target) !void {
+        for (targets) |t| {
+            if (!self.rowGroupSkips(t)) continue;
+            const key = (@as(u64, t.file) << 32) | t.rg;
+            const gop = try self.bloom_counted.getOrPut(self.scratch, key);
+            if (!gop.found_existing) self.stats.row_groups_bloom += 1;
+        }
     }
 
     fn rowGroupSkips(self: *const Probing, t: *const Target) bool {
@@ -1057,7 +1152,7 @@ const Probing = struct {
                 if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) plan = sparse;
             }
         }
-        try readAll(a, self.src, plan.reqs.items, self.stats, .dispatch);
+        try readAll(self.bodyAllocator(), self.src, plan.reqs.items, self.stats, .dispatch);
 
         if (!self.src.cost.remote()) try self.prefetchBlocks(wave, plan, spans);
 
@@ -1680,6 +1775,103 @@ const SynthFile = struct {
         }
         return .{ .bytes = bytes.items, .meta = meta };
     }
+
+    /// `n_rgs` copies of one filter that contains the literal `keep`. Building it once keeps the large-run tests cheap.
+    fn initSolid(a: std.mem.Allocator, n_rgs: usize, per_rg: usize) !SynthFile {
+        var b = try bloom.Builder.init(a, per_rg, 0.01);
+        b.insert(bloom.hashBytes("keep"));
+        // Leave it at the size `per_rg` asked for. Folding one inserted key would shrink it to a block.
+        const filt = try b.serialize(a);
+        var meta: schema.FileMetaData = .{
+            .version = 1,
+            .schema = .empty,
+            .num_rows = 0,
+            .created_by = null,
+            .row_groups = .empty,
+        };
+        try meta.schema.appendSlice(a, &.{ test_fixtures.group("schema", 1), test_fixtures.leaf("c", .BYTE_ARRAY) });
+        var bytes: std.ArrayList(u8) = .empty;
+        try bytes.appendNTimes(a, 'x', 4 + n_rgs * 64);
+        for (0..n_rgs) |i| {
+            var path: schema.StringList = .empty;
+            try path.append(a, "c");
+            var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 64, .num_rows = 1 };
+            try rg.columns.append(a, .{ .file_path = null, .file_offset = 4, .meta_data = .{
+                .type = .BYTE_ARRAY,
+                .encodings = .empty,
+                .path_in_schema = path,
+                .codec = .UNCOMPRESSED,
+                .num_values = 1,
+                .total_uncompressed_size = 64,
+                .total_compressed_size = 64,
+                .data_page_offset = @intCast(4 + i * 64),
+                .index_page_offset = null,
+                .dictionary_page_offset = null,
+                .bloom_filter_offset = @intCast(bytes.items.len),
+                .bloom_filter_length = @intCast(filt.len),
+            } });
+            try bytes.appendSlice(a, filt);
+            try meta.row_groups.append(a, rg);
+        }
+        return .{ .bytes = bytes.items, .meta = meta };
+    }
+
+    /// Two contiguous columns, `c` then `d`, each a copy of one empty filter. Both prune a key they never saw.
+    fn initPair(a: std.mem.Allocator, n_rgs: usize) !SynthFile {
+        var b = try bloom.Builder.init(a, 32, 0.01);
+        b.insert(bloom.hashBytes("present"));
+        b.foldToFpp(0.01);
+        const filt = try b.serialize(a);
+        const h = bloom.parseHeader(filt).?;
+        @memset(filt[h.len..], 0);
+        var meta: schema.FileMetaData = .{
+            .version = 1,
+            .schema = .empty,
+            .num_rows = 0,
+            .created_by = null,
+            .row_groups = .empty,
+        };
+        try meta.schema.appendSlice(a, &.{
+            test_fixtures.group("schema", 2),
+            test_fixtures.leaf("c", .BYTE_ARRAY),
+            test_fixtures.leaf("d", .BYTE_ARRAY),
+        });
+        var bytes: std.ArrayList(u8) = .empty;
+        try bytes.appendNTimes(a, 'x', 4);
+        const off_c = try a.alloc(u64, n_rgs);
+        const off_d = try a.alloc(u64, n_rgs);
+        for (0..n_rgs) |i| {
+            off_c[i] = @intCast(bytes.items.len);
+            try bytes.appendSlice(a, filt);
+        }
+        for (0..n_rgs) |i| {
+            off_d[i] = @intCast(bytes.items.len);
+            try bytes.appendSlice(a, filt);
+        }
+        for (0..n_rgs) |i| {
+            var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 64, .num_rows = 1 };
+            for ([_][]const u8{ "c", "d" }, [_]u64{ off_c[i], off_d[i] }) |name, off| {
+                var path: schema.StringList = .empty;
+                try path.append(a, name);
+                try rg.columns.append(a, .{ .file_path = null, .file_offset = 4, .meta_data = .{
+                    .type = .BYTE_ARRAY,
+                    .encodings = .empty,
+                    .path_in_schema = path,
+                    .codec = .UNCOMPRESSED,
+                    .num_values = 1,
+                    .total_uncompressed_size = 64,
+                    .total_compressed_size = 64,
+                    .data_page_offset = 4,
+                    .index_page_offset = null,
+                    .dictionary_page_offset = null,
+                    .bloom_filter_offset = @intCast(off),
+                    .bloom_filter_length = @intCast(filt.len),
+                } });
+            }
+            try meta.row_groups.append(a, rg);
+        }
+        return .{ .bytes = bytes.items, .meta = meta };
+    }
 };
 
 /// A remote stand-in: S3-like costs, and a log of what was asked for.
@@ -1985,6 +2177,107 @@ test "remote: an omitted filter length is sized by the shared header probe" {
     try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[0], f, &metas[0]) == .skip);
 }
 
+fn zeroBits(sf: SynthFile, rg: usize) void {
+    const off: usize = @intCast(filterOff(sf, rg));
+    const bits = sf.bytes[off..][0..@intCast(filterLen(sf, rg))];
+    const h = bloom.parseHeader(bits).?;
+    @memset(bits[h.len..], 0);
+}
+
+test "remote: a contiguous run over one round is waved, and a saturated one stops" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 64;
+    const sf = try SynthFile.initSolid(a, n, 200_000);
+    var total: u64 = 0;
+    for (0..n) |i| total += filterLen(sf, i);
+    try testing.expect(total > one_round_bytes);
+    // The key is only in the last filter. The first wave prunes, so the rest is read in window-sized waves.
+    for (0..n - 1) |i| zeroBits(sf, i);
+    var cost = dispatch_cost;
+    cost.window = 1 << 20;
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost };
+    const rare = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    const st = try load(a, testing.allocator, rare, &metas, remote.source(), .{});
+    try testing.expect(!st.bloom_stopped);
+    try testing.expectEqual(n, st.filters);
+    try testing.expect(remote.http_rounds > 1);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[n - 1], rare, &metas[0]) != .skip);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[0], rare, &metas[0]) == .skip);
+
+    // Saturated bits: the first wave prunes nothing, and the rest of the run stays unread.
+    paintMaybe(sf);
+    clearAbsent(&metas);
+    var stopped: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost };
+    const common = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    const st2 = try load(a, testing.allocator, common, &metas, stopped.source(), .{});
+    try testing.expect(st2.bloom_stopped);
+    try testing.expectEqual(@as(usize, 8), st2.filters);
+    try testing.expect(stopped.bytes * 2 < total);
+}
+
+test "remote: cheap runs from every file are one dispatch" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf0 = try SynthFile.init(a, 1, 64);
+    const sf1 = try SynthFile.init(a, 1, 64);
+    const metas = [_]schema.FileMetaData{ sf0.meta, sf1.meta };
+    var remote: FakeRemote = .{ .files = &.{ sf0.bytes, sf1.bytes }, .cost = dispatch_cost };
+    const f = try parser.parse(a, "c = 'k0-0'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 1), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 2), st.filters);
+    try testing.expect(!st.bloom_stopped);
+}
+
+test "remote: a straddling filter is charged with the joined copy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf = try SynthFile.initSolid(a, 2, 200_000);
+    zeroBits(sf, 0);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    const cut = filterOff(sf, 1) + filterLen(sf, 1) / 2;
+    const span0: Span = .{ .file = 0, .start = filterOff(sf, 0), .end = filterOff(sf, 0) + filterLen(sf, 0) };
+    const span1: Span = .{ .file = 0, .start = filterOff(sf, 1), .end = filterOff(sf, 1) + filterLen(sf, 1) };
+    const suf: Span = .{ .file = 0, .start = cut, .end = sf.bytes.len };
+    const http_only = heldBytes(span0, null) + (cut - filterOff(sf, 1));
+    const charged = heldBytes(span0, suf) + heldBytes(span1, suf);
+    try testing.expect(charged > http_only);
+    var cost = dispatch_cost;
+    // Fits the HTTP bodies. Does not fit them plus the joined head-and-tail copy.
+    cost.window = http_only;
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost, .suffix_start = cut };
+    const f = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 2), st.filters);
+    try testing.expectEqual(@as(usize, 2), remote.http_rounds);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[1], f, &metas[0]) != .skip);
+}
+
+test "remote: an AND counts each row group once" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 4;
+    const sf = try SynthFile.initPair(a, n);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var col_c: u64 = 0;
+    for (0..n) |i| col_c += @intCast(sf.meta.row_groups.items[i].columns.items[0].meta_data.?.bloom_filter_length.?);
+    var cost = dispatch_cost;
+    // Each column fits a round. Together they do not, so they are two waves, and the count is their union.
+    cost.window = col_c;
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost };
+    const f = try parser.parse(a, "c = 'zz' AND d = 'zz'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(@as(usize, 2), remote.http_rounds);
+    try testing.expectEqual(n, st.row_groups_bloom);
+    try testing.expectEqual(n * 2, st.filters);
+}
+
 fn pageStat(page: schema.PageType, enc: schema.Encoding, count: i32) schema.PageEncodingStats {
     return .{ .page_type = @backingInt(page), .encoding = @backingInt(enc), .count = count };
 }
@@ -2215,7 +2508,7 @@ test "regression: one file mixing header shapes; blocks count only under their o
     const a = arena_state.allocator();
     // The first filter's header is canonical and the rest carry an extra field: verifying one header per file would
     // locate every later filter's blocks wrong and miss present keys.
-    const sf = try SynthFile.initOpts(a, 16, 200_000, 1);
+    const sf = try SynthFile.initOpts(a, 16, 200_000, 1, 0);
     const metas = [_]schema.FileMetaData{sf.meta};
     var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = .{ .request_bytes = 4 << 10, .concurrency = 8 } };
     var buf: [32]u8 = undefined;

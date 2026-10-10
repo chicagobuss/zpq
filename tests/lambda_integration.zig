@@ -1074,7 +1074,9 @@ const BLOOM_FIXTURE = "ci/fixtures/parquet/bloom_keys.parquet";
 
 test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" {
     // The fixture's statistics prune no equality (tools/gen_bloom_fixture.py); its Bloom filters prune all but the
-    // group holding the key. The padding moves the filters out of the prefetched tail, so they are fetched.
+    // group holding the key. Filters the 1 MiB suffix already holds are copied from it, so that cold probe makes
+    // no HTTP GET. Filters outside the tail are fetched. By a case's third invocation a cached filter is not read
+    // again; dictionaries are.
     const a = std.testing.allocator;
     const object = try paddedParquet(a, BLOOM_FIXTURE, 128 * 1024);
     defer a.free(object);
@@ -1098,7 +1100,7 @@ test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" 
         .{ .filter = "s = 'key-001000'", .kept = 1 },
         .{ .filter = "id IN (1001, 1003, 1000)", .kept = 1 },
         .{ .filter = "cat = 'm-3'", .kept = 1, .by = "dict_pruned" },
-    }, 0..) |c, ci| {
+    }) |c| {
         const agg = "\"aggregate\":\"count(*) AS n, sum(x) AS sx\"";
         const local_body = try std.fmt.allocPrint(
             a,
@@ -1125,8 +1127,10 @@ test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" 
             const pruned = m.object.get(c.by).?.integer;
             const requests = m.object.get("requests").?.integer;
             const warm = std.mem.eql(u8, c.by, "bloom_pruned");
-            const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and pruned == 8 - c.kept and
-                (i < 2 or (requests == 0) == warm) and (ci > 0 or i > 0 or requests > 0);
+            // A suffix-served cold probe has requests == 0, which is the right answer. By the third invocation a
+            // cached Bloom filter is not fetched again; a dictionary is.
+            const warm_ok = if (i < 2) true else (requests == 0) == warm;
+            const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and pruned == 8 - c.kept and warm_ok;
             if (!ok) {
                 std.debug.print("[s3 bloom] {s} invocation {d}: {s}\n  want {s}\n", .{ c.filter, i, resp, want });
                 return error.TestUnexpectedResult;

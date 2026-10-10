@@ -266,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
                     .{},
                 ),
                 error.NestedNotSupported => std.debug.print("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
-                error.DivisionByZero => std.debug.print("zpq query: division by zero in GROUP BY expression\n", .{}),
+                error.DivisionByZero => std.debug.print("zpq query: division by zero\n", .{}),
                 error.GroupingNotSupported => std.debug.print(
                     "filter: grouping parentheses are not supported — the grammar is a flat AND/OR chain (AND binds " ++
                         "tighter than OR)\nzpq query: grouping parentheses are not supported in filter\n",

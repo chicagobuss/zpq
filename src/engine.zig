@@ -5140,6 +5140,66 @@ test "a recompressing copy drops page-index offsets that are not its chunk's, in
     try std.testing.expectEqualDeep(want.aggregate.output.aggs[0].value, got.aggregate.output.aggs[0].value);
 }
 
+test "an overflow or a zero divisor fails a query only on a row whose value it consumes" {
+    // Row 500 holds 9e18 in p (plain) and a (dictionary-coded), whose doubles overflow, and 0 in the divisor d
+    // (tools/gen_overflow_rows_fixture.py). Every query that leaves row 500 out answers as if it were absent: a WHERE
+    // that keeps the selection dense, a later conjunct, an aggregate's own FILTER, the group-key path, the coded path.
+    // Every one that takes it in still fails.
+    const fixture = "ci/fixtures/parquet/overflow_rows.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    const Case = struct {
+        aggregate: []const u8,
+        filter: ?[]const u8 = null,
+        group_by: ?[]const u8 = null,
+        /// The first aggregate's value, or with a GROUP BY the number of groups.
+        want: i128 = 0,
+        err: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .aggregate = "sum(p * 2) AS s", .filter = "p < 1000", .want = 99_000 },
+        .{ .aggregate = "sum(p * 2) AS s", .filter = "p != 9000000000000000000", .want = 99_000 },
+        .{ .aggregate = "sum(a * 2) AS s", .filter = "id != 500", .want = 99_000 },
+        .{ .aggregate = "sum(10 / d) AS s", .filter = "id != 500", .want = 3_429 },
+        .{ .aggregate = "sum(p * 2) AS s", .filter = "id >= 0 AND id <= 999 AND id != 500", .want = 99_000 },
+        .{ .aggregate = "sum(p * 2) FILTER (WHERE id != 500) AS s, count(*) AS n", .want = 99_000 },
+        .{ .aggregate = "count(*) AS n", .group_by = "p * 2 AS k", .filter = "id != 500", .want = 100 },
+        .{ .aggregate = "count(*) AS n", .group_by = "a * 2 AS k", .filter = "id != 500", .want = 100 },
+        .{ .aggregate = "count(*) AS n", .group_by = "10 / d AS k", .filter = "id != 500", .want = 5 },
+        // Consumed: still an error.
+        .{ .aggregate = "sum(p * 2) AS s", .err = error.IntegerOverflowMul },
+        .{ .aggregate = "sum(a * 2) AS s", .filter = "id >= 0", .err = error.IntegerOverflowMul },
+        .{ .aggregate = "sum(10 / d) AS s", .err = error.DivisionByZero },
+        .{ .aggregate = "sum(p * 2) AS s", .filter = "id >= 0 AND id <= 999", .err = error.IntegerOverflowMul },
+        .{ .aggregate = "sum(p * 2) FILTER (WHERE id >= 0) AS s", .err = error.IntegerOverflowMul },
+        .{ .aggregate = "count(*) AS n", .group_by = "p * 2 AS k", .err = error.IntegerOverflowMul },
+        .{ .aggregate = "count(*) AS n", .group_by = "10 / d AS k", .filter = "id >= 0", .err = error.DivisionByZero },
+    };
+    for (cases) |c| {
+        const args: QueryArgs = .{
+            .inputs = &.{fixture},
+            .aggregate = c.aggregate,
+            .filter = c.filter,
+            .group_by = c.group_by,
+        };
+        if (c.err) |want_err| {
+            try std.testing.expectError(want_err, runQuery(ctx, args));
+            continue;
+        }
+        var r = try runQuery(ctx, args);
+        defer r.deinit(gpa);
+        const got: i128 = if (c.group_by != null)
+            @intCast(r.aggregate.output.group_rows.?.len)
+        else
+            r.aggregate.output.aggs[0].value.i;
+        std.testing.expectEqual(c.want, got) catch |err| {
+            std.debug.print("case: {s} where {?s} by {?s}\n", .{ c.aggregate, c.filter, c.group_by });
+            return err;
+        };
+    }
+}
+
 test "a select output naming one column twice is rejected and named, like aggregate outputs" {
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

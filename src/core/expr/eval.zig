@@ -167,8 +167,8 @@ fn evalGroupKeyBinOp(
     const r_col = try keyOperandAs(arena, r_raw, b.right.*, b.result_type);
 
     return switch (b.result_type) {
-        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col),
-        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col),
+        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, .{ .sel = batch.sel }),
+        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col, .{ .sel = batch.sel }),
         .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
         .dec => unreachable,
     };
@@ -222,6 +222,7 @@ fn evalGroupKeyNumericBinOp(
     op: ast.Op,
     l_col: Batch.Column,
     r_col: Batch.Column,
+    consumed: Consumed,
 ) Error!Batch.Column {
     const l_vals = if (T == i64) l_col.i64.values else l_col.f64.values;
     const r_vals = if (T == i64) r_col.i64.values else r_col.f64.values;
@@ -241,7 +242,7 @@ fn evalGroupKeyNumericBinOp(
             continue;
         }
         if (def_out) |dl| dl[i] = 1;
-        out[i] = try applyScalarKernel(T, op, lv, rv);
+        out[i] = applyScalarKernel(T, op, lv, rv) catch |err| if (consumed.has(i)) return err else 0;
     }
 
     if (T == i64) {
@@ -302,33 +303,66 @@ fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .div => a / b,
         .concat => error.TypeMismatch,
     };
-    const r = switch (op) {
-        .add => @addWithOverflow(a, b),
-        .sub => @subWithOverflow(a, b),
-        .mul => @mulWithOverflow(a, b),
-        .div => {
-            if (b == 0) return error.DivisionByZero;
-            if (a == std.math.minInt(T) and b == -1) return error.IntegerOverflowDiv;
-            return @divTrunc(a, b);
-        },
-        .concat => return error.TypeMismatch,
+    if (rowFault(T, op, a, b)) |fault| return fault;
+    return switch (op) {
+        .add => a + b,
+        .sub => a - b,
+        .mul => a * b,
+        .div => @divTrunc(a, b),
+        .concat => error.TypeMismatch,
     };
-    if (r[1] != 0) return overflowError(op);
-    return r[0];
 }
 
-fn overflowError(op: ast.Op) Error {
+/// The rows whose results a query consumes: those in the batch's selection when it has one (a WHERE, an aggregate's
+/// FILTER), all of them otherwise. A row left out holds whatever its columns do, so an overflow or a zero divisor on
+/// it is not the query's to fail on. Null rows never reach the integer kernels: the vector path refuses nullable
+/// operands and the null-aware key path skips them.
+const Consumed = struct {
+    sel: ?*const selection.SelectionVector = null,
+
+    fn has(self: Consumed, i: usize) bool {
+        const s = self.sel orelse return true;
+        return s.isActive(i);
+    }
+};
+
+/// What `a op b` raises on signed integers, if anything: an overflow, or a zero divisor. The one definition the
+/// kernels check rows against.
+fn rowFault(comptime T: type, op: ast.Op, a: T, b: T) ?Error {
     return switch (op) {
-        .add => error.IntegerOverflowAdd,
-        .sub => error.IntegerOverflowSub,
-        .mul => error.IntegerOverflowMul,
-        .div, .concat => error.IntegerOverflowDiv,
+        .add => if (@addWithOverflow(a, b)[1] != 0) error.IntegerOverflowAdd else null,
+        .sub => if (@subWithOverflow(a, b)[1] != 0) error.IntegerOverflowSub else null,
+        .mul => if (@mulWithOverflow(a, b)[1] != 0) error.IntegerOverflowMul else null,
+        .div => if (b == 0)
+            error.DivisionByZero
+        else if (a == std.math.minInt(T) and b == -1)
+            error.IntegerOverflowDiv
+        else
+            null,
+        .concat => error.TypeMismatch,
     };
+}
+
+/// After a kernel saw a fault somewhere in `a op b`: the first one on a row the query consumes, if any. Rare, so a
+/// plain row loop.
+fn firstConsumedFault(comptime T: type, op: ast.Op, a: []const T, b: []const T, consumed: Consumed) Error!void {
+    for (a, b, 0..) |x, y, i| {
+        if (!consumed.has(i)) continue;
+        if (rowFault(T, op, x, y)) |fault| return fault;
+    }
 }
 
 /// `out = a op b` for `+`, `-` or `*` on signed integers, exact: a vector of lanes at a time with the hardware's
-/// overflow flags OR-ed together, and one branch for the whole slice, so the check costs next to nothing.
-fn checkedIntKernel(comptime T: type, comptime op: ast.Op, out: []T, a: []const T, b: []const T) Error!void {
+/// overflow flags OR-ed together, and one branch for the whole slice, so the check costs next to nothing. Only when a
+/// flag is set are the rows looked at, and only a consumed row's overflow fails the query.
+fn checkedIntKernel(
+    comptime T: type,
+    comptime op: ast.Op,
+    out: []T,
+    a: []const T,
+    b: []const T,
+    consumed: Consumed,
+) Error!void {
     const L = std.simd.suggestVectorLength(T) orelse 1;
     const V = @Vector(L, T);
     var overflow: @Vector(L, u1) = @splat(0);
@@ -356,7 +390,7 @@ fn checkedIntKernel(comptime T: type, comptime op: ast.Op, out: []T, a: []const 
         out[i] = r[0];
         tail |= r[1];
     }
-    if ((@reduce(.Or, overflow) | tail) != 0) return overflowError(op);
+    if ((@reduce(.Or, overflow) | tail) != 0) try firstConsumedFault(T, op, a, b, consumed);
 }
 
 /// Evaluate `e` and coerce the result to `target` if needed. Only
@@ -459,9 +493,14 @@ fn evalBinOp(
     const l_col = try evalAs(arena, batch, column_lookup, b.left.*, b.result_type);
     const r_col = try evalAs(arena, batch, column_lookup, b.right.*, b.result_type);
 
+    const consumed: Consumed = .{ .sel = batch.sel };
     return switch (b.result_type) {
-        .i64 => .{ .i64 = .{ .values = try applyKernel(i64, arena, b.op, l_col.i64.values, r_col.i64.values) } },
-        .f64 => .{ .f64 = .{ .values = try applyKernel(f64, arena, b.op, l_col.f64.values, r_col.f64.values) } },
+        .i64 => .{ .i64 = .{
+            .values = try applyKernel(i64, arena, b.op, l_col.i64.values, r_col.i64.values, consumed),
+        } },
+        .f64 => .{ .f64 = .{
+            .values = try applyKernel(f64, arena, b.op, l_col.f64.values, r_col.f64.values, consumed),
+        } },
         .str => .{ .string = .{ .values = try concatKernel(arena, l_col.string.values, r_col.string.values) } },
         .dec => unreachable,
     };
@@ -1237,20 +1276,21 @@ fn applyKernel(
     op: ast.Op,
     a: []const T,
     b: []const T,
+    consumed: Consumed,
 ) Error![]T {
     std.debug.assert(a.len == b.len);
     const out = try arena.alloc(T, a.len);
     if (@typeInfo(T) == .int) switch (op) {
         .add => {
-            try checkedIntKernel(T, .add, out, a, b);
+            try checkedIntKernel(T, .add, out, a, b, consumed);
             return out;
         },
         .sub => {
-            try checkedIntKernel(T, .sub, out, a, b);
+            try checkedIntKernel(T, .sub, out, a, b, consumed);
             return out;
         },
         .mul => {
-            try checkedIntKernel(T, .mul, out, a, b);
+            try checkedIntKernel(T, .mul, out, a, b, consumed);
             return out;
         },
         else => {},
@@ -1265,17 +1305,17 @@ fn applyKernel(
         .mul => for (a, b, 0..) |x, y, i| {
             out[i] = x * y;
         },
-        .div => {
-            const is_int = @typeInfo(T) == .int;
+        .div => if (@typeInfo(T) == .int) {
+            // A zero divisor or minInt / -1 leaves a 0 and a flag; then, as for + - *, only a consumed row fails.
+            var faulted = false;
             for (a, b, 0..) |x, y, i| {
-                if (is_int) {
-                    if (y == 0) return error.DivisionByZero;
-                    if (x == std.math.minInt(T) and y == -1) return error.IntegerOverflowDiv;
-                    out[i] = @divTrunc(x, y);
-                } else {
-                    out[i] = x / y;
-                }
+                const bad = y == 0 or (x == std.math.minInt(T) and y == -1);
+                faulted = faulted or bad;
+                out[i] = if (bad) 0 else @divTrunc(x, y);
             }
+            if (faulted) try firstConsumedFault(T, op, a, b, consumed);
+        } else for (a, b, 0..) |x, y, i| {
+            out[i] = x / y;
         },
         // String concat is dispatched via concatKernel — should never
         // reach the numeric kernel.
@@ -1547,6 +1587,57 @@ test "integer + - * / that overflow the i64 lane fail the query, in a vector or 
     try testing.expectEqualSlices(i64, &.{ max, min, max }, out.i64.values);
     const prod = try evalI64Binop(a, .mul, &.{ 3_037_000_499, -1, min }, &.{ 3_037_000_499, max, 1 });
     try testing.expectEqualSlices(i64, &.{ 9_223_372_030_926_249_001, -max, min }, prod.i64.values);
+}
+
+test "an integer fault in a null slot or an unselected row is not the query's; on a consumed row it is" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const max = std.math.maxInt(i64);
+    // Row 1 is null with maxInt left in its values lane; row 3 is present and holds maxInt.
+    const xs = [_]i64{ 1, max, 3, max };
+    const defs = [_]u32{ 1, 0, 1, 1 };
+    const zeros = [_]i64{ 2, 0, 2, 0 };
+    const cols = [_]Batch.Column{
+        .{ .i64 = .{ .values = &xs, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+        col_i64(&zeros),
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const two = try a.create(ast.Expr);
+    two.* = .{ .literal = .{ .i64 = 2 } };
+    const z = try a.create(ast.Expr);
+    z.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const times_two: ast.Expr = .{ .binop = .{ .op = .mul, .left = x, .right = two, .result_type = .i64, .depth = 2 } };
+    const over_zero: ast.Expr = .{ .binop = .{ .op = .div, .left = x, .right = z, .result_type = .i64, .depth = 2 } };
+
+    // Row 3 consumed: its overflow, and its zero divisor, fail the key. The null row's never would.
+    const all: Batch = .{ .cols = &cols, .num_rows = 4 };
+    try testing.expectError(error.IntegerOverflowMul, evalGroupKeyExpr(a, &all, &lookup, times_two));
+    try testing.expectError(error.DivisionByZero, evalGroupKeyExpr(a, &all, &lookup, over_zero));
+    // Row 3 outside the selection: only rows 0 and 2 count, and the null row stays null.
+    var sel = try selection.SelectionVector.init(a, 4);
+    sel.set(3, false);
+    const kept = all.restrictedTo(&sel);
+    const doubled = try evalGroupKeyExpr(a, &kept, &lookup, times_two);
+    try testing.expectEqual(@as(i64, 2), doubled.i64.values[0]);
+    try testing.expectEqual(@as(i64, 6), doubled.i64.values[2]);
+    try testing.expectEqual(@as(u32, 0), doubled.i64.def_levels.?[1]);
+    const halved = try evalGroupKeyExpr(a, &kept, &lookup, over_zero);
+    try testing.expectEqual(@as(i64, 0), halved.i64.values[0]);
+    // The same selection reaches the column kernel through evalExpr.
+    const plain = [_]i64{ 1, 2, 3, max };
+    const plain_cols = [_]Batch.Column{ col_i64(&plain), col_i64(&zeros) };
+    const plain_batch: Batch = .{ .cols = &plain_cols, .num_rows = 4 };
+    try testing.expectError(error.IntegerOverflowMul, evalExpr(a, &plain_batch, &lookup, times_two));
+    try testing.expectError(error.DivisionByZero, evalExpr(a, &plain_batch, &lookup, over_zero));
+    var row1_and_3_out = try selection.SelectionVector.init(a, 4);
+    row1_and_3_out.set(1, false);
+    row1_and_3_out.set(3, false);
+    const narrowed = plain_batch.restrictedTo(&row1_and_3_out);
+    try testing.expectEqual(@as(i64, 6), (try evalExpr(a, &narrowed, &lookup, times_two)).i64.values[2]);
+    try testing.expectEqual(@as(i64, 1), (try evalExpr(a, &narrowed, &lookup, over_zero)).i64.values[2]);
 }
 
 test "integer division by zero errors" {

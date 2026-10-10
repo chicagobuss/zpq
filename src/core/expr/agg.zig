@@ -897,7 +897,9 @@ const PreparedAggInput = struct {
                 try agg_coded.materialize(arena, batch.cols[p]);
         };
         const rows = if (sparse) active else batch.num_rows;
-        const values = try expr_eval.evalExpr(arena, &.{ .cols = cols, .num_rows = rows }, column_lookup, arg);
+        // Dense, the gathered columns keep every row: the selection still says which ones the result is wanted for.
+        const gathered: filter_eval.Batch = .{ .cols = cols, .num_rows = rows, .sel = if (sparse) null else sel };
+        const values = try expr_eval.evalExpr(arena, &gathered, column_lookup, arg);
         if (!sparse) return values;
         if (self.own_sel) |*s| s.deinit();
         self.own_sel = try filter_selection.SelectionVector.init(arena, active);

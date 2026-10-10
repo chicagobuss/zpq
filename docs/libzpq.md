@@ -2,86 +2,43 @@
 
 `libzpq` runs zpq queries in-process. It takes the zpq Lambda's JSON request and returns the Lambda's JSON response.
 A long-lived process, such as a service, a notebook or a benchmark harness, keeps one context open, so S3 connections
-and parquet footers stay warm between queries and no process starts per query.
+and parquet footers stay warm between queries and no process starts per query. Its answers are the CLI's and the
+Lambda's, byte for byte (see Tests).
 
-Status: spike (`spike/libzpq`), not part of a release.
+## Quick start
 
-## Build
-
-```sh
-zig build libzpq -Doptimize=ReleaseFast
-# zig-out/lib/libzpq.so, zig-out/lib/libzpq.a, zig-out/include/zpq.h
-```
-
-- `libzpq.so` carries everything it links: BoringSSL, the codecs and libc++. At run time it needs the system C
-  library alone: libc and the dynamic loader on x86_64; on aarch64 (glibc) it also declares libpthread and libdl,
-  which are part of glibc. It needs no TLS, codec or C++ library from the system.
-- It exports the five `zpq_*` functions and nothing else (`src/libzpq/libzpq.map`). Its BoringSSL cannot collide
-  with a host's own OpenSSL, such as the one a Python process loads.
-- The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
-  CLI and Lambda link are not. That makes the first build slower.
-- Linux only for now (x86_64 and aarch64 build): the export list is an ELF version script, and macOS is untried.
-- `libzpq.a` holds zpq's own objects. A static link must add the codec, BoringSSL and libc++ archives the build
-  produces; prefer the shared library.
-
-## The C ABI (`include/zpq.h`)
+C:
 
 ```c
-zpq_ctx *zpq_open(const char *options_json);   /* NULL or "" for defaults; NULL on bad options */
-int zpq_run(zpq_ctx *, const char *request_json, size_t len, char **out_json, size_t *out_len);
-void zpq_free(char *json);
-void zpq_close(zpq_ctx *);
-int zpq_abi_version(void);                      /* 1 */
+#include <stdio.h>
+#include <string.h>
+#include "zpq.h"
+
+int main(void) {
+    zpq_ctx *ctx;
+    char *err = NULL;
+    if (zpq_open("{\"max_memory\": \"4GB\"}", &ctx, &err) != ZPQ_OK) {
+        fprintf(stderr, "zpq_open: %s\n", err ? err : "out of memory");
+        zpq_free(err);
+        return 1;
+    }
+    const char *req = "{\"inputs\": [\"data.parquet\"], \"aggregate\": \"count(*) AS n\"}";
+    char *resp = NULL;
+    int rc = zpq_run(ctx, req, strlen(req), &resp, NULL);
+    if (rc == ZPQ_OK) printf("%s\n", resp); /* the Lambda's response, an {"error": ...} one included */
+    else fprintf(stderr, "zpq_run: %s: %s\n", zpq_strerror(rc), resp ? resp : "");
+    zpq_free(resp);
+    zpq_close(ctx);
+    return rc == ZPQ_OK ? 0 : 1;
+}
 ```
 
-- **Options.** An unknown option is an error.
-  - `"max_memory"`: `1073741824` or `"4GB"`. Each query's budget when its request names none. By default the
-    budget derives from available memory, as the Lambda's does.
-  - `"preconnect"`: `true` opens connections to the S3 endpoint as the context opens (`ZPQ_S3_PRECONNECT` of them,
-    default 4), as the Lambda does during init, so the first queries find them ready. Off by default: a host that
-    never reads S3 opens no connections. Failures are ignored; the queries then connect on their own.
-- **Request.** The Lambda's request (see [lambda_requests.md](lambda_requests.md)): `inputs`, `filter`,
-  `aggregate`, `group_by`, `select`, `columns`, `output_url`, `output_codec`, `max_memory`, `bloom_filters`,
-  `profile` and the rest. Inputs and `output_url` may be local paths as well as `s3://` URLs. A request must
-  aggregate (`aggregate` / `group_by`) or write (`output_url`); anything else answers
-  `{"error":"bad_request","reason":"NoOperation"}`.
-- **Return codes.**
-  - `ZPQ_OK` (0): `*out_json` is the response.
-  - `ZPQ_ERROR_RESPONSE` (1): `*out_json` is an `{"error": ...}` response, for a malformed request or a query that
-    failed.
-  - `ZPQ_EINVAL` (-1): bad arguments.
-  - `ZPQ_ENOMEM` (-2): out of memory.
-  On 0 and 1 the response is NUL-terminated and the caller frees it with `zpq_free`. Every output pointer given is
-  cleared before anything else, so a refused call leaves `*out_json` NULL and `*out_len` 0.
-- **Threads.** Any number of `zpq_run` calls may run at once on one context, from its first call on: `zpq_open`
-  sets the pool up before returning. Each query runs on threads of its own,
-  as in the CLI, and shares the context's S3 connection pool and footer cache. The `"pool"` member of a response then
-  reports the pool's running totals, not the one query's.
-- **Environment.** Each call reads the process environment as it is called: S3 credentials, endpoint and region, as
-  the CLI reads them. Don't change it with `setenv` while a call runs.
-- **Memory.** `max_memory` bounds each query, not the context; concurrent queries each have their own budget. The
-  footer cache and warm Bloom filters stay with the context until `zpq_close`.
+```sh
+zig build libzpq -Doptimize=ReleaseFast --prefix /usr/local   # installs lib/libzpq.so, lib/libzpq.a, include/zpq.h
+cc -o q q.c -lzpq
+```
 
-### What libzpq does to the process
-
-- **Signals.** While a context is open, SIGPIPE and SIGIO have no-op handlers (Zig's `std.Io.Threaded`), so a
-  closed socket fails a write instead of killing the process; `zpq_close` restores the previous handlers. Open
-  one context per process: closing two out of order can restore a stale handler.
-- **Alternate signal stack.** Threads zpq starts install Zig's alternate signal stack (256 KiB each). Under
-  AddressSanitizer, set `ASAN_OPTIONS=use_sigaltstack=0`, or ASan tries to unmap that stack as its own when the
-  thread exits.
-- **Process-wide state.** Beyond the context, the only process-wide state is a few caches, each set once and then
-  only read: the TLS client contexts (CA stores) and the io_uring and gzip-backend probes.
-- **Local files are memory-mapped.** A local input is read through `mmap`. If another process truncates the file
-  while a query reads it, the next access past the new end raises SIGBUS, which kills the host process unless it
-  handles that signal. Don't let files a query reads be truncated or rewritten in place while it runs (write a new
-  file and rename it instead). S3 inputs are unaffected.
-- **Panics.** A broken invariant inside zpq panics and aborts the process, as it would the CLI.
-
-## Python
-
-`python/zpq.py` is a ctypes binding, with no compiled extension. It loads `$ZPQ_LIB`, else `libzpq.so` next to it,
-in `../zig-out/lib`, or on the loader path.
+Python (`python/zpq.py`, a ctypes binding with no compiled extension):
 
 ```python
 import zpq
@@ -90,9 +47,152 @@ with zpq.Zpq(max_memory="4GB") as z:
     print(r["agg"])
 ```
 
-`run` returns the response as a dict and raises `zpq.ZpqError` on an `{"error": ...}` response, unless
-`check=False`. ctypes releases the GIL during the call, so threads run queries in parallel. `close` waits for the
-calls in flight and refuses new ones (`zpq.ZpqClosed`), so the C context is never freed under a running query.
+## Build and install
+
+```sh
+zig build libzpq -Doptimize=ReleaseFast [-Dtarget=...] [--prefix DIR]
+# DIR/lib/libzpq.so (libzpq.dylib on macOS), DIR/lib/libzpq.a, DIR/include/zpq.h; DIR defaults to zig-out
+```
+
+| `-Dtarget=` | library | needs at run time | status |
+|---|---|---|---|
+| (native, Linux x86_64 glibc) | `libzpq.so` | libc.so.6, at the host's glibc version | built and tested: C ABI, ASan, leak loop, Python, differential |
+| `x86_64-linux-gnu.2.28` | `libzpq.so` | glibc ≥ 2.28 (libc, libpthread, libdl) | built; C ABI test run |
+| `aarch64-linux-gnu.2.28` | `libzpq.so` | glibc ≥ 2.28 (libc, libpthread, libdl) | cross-built, exports checked |
+| `x86_64-linux-musl` | `libzpq.so` | musl's libc.so | built; C ABI test run on Alpine 3.24 |
+| `aarch64-linux-musl` | `libzpq.so` | musl's libc.so | cross-built, exports checked |
+| `aarch64-macos` | `libzpq.dylib` | libSystem; macOS ≥ 15 by default | cross-built, exports checked; not run |
+| `x86_64-macos` | `libzpq.dylib` | libSystem; macOS ≥ 15 by default | cross-built, exports checked; not run |
+
+A native build links against the host's glibc and may need that version or later. For a library to ship to other
+machines, name the oldest glibc in the target, as above (`x86_64-linux-gnu` alone also means 2.28). On macOS the
+oldest release goes in the target the same way (`-Dtarget=aarch64-macos.13.0`); the default is the toolchain's.
+Windows is not built.
+
+- The library carries everything it links: BoringSSL, the codecs and libc++. At run time it needs the system C
+  library alone, as in the table. It needs no TLS, codec or C++ library from the system.
+- On Linux it exports the six `zpq_*` functions and nothing else, under the symbol version `LIBZPQ_1`
+  (`src/libzpq/libzpq.map`; `nm -D --defined-only libzpq.so` lists them). Its BoringSSL cannot collide with a host's
+  own OpenSSL, such as the one a Python process loads.
+- On macOS, which has no version script, every archive the dylib links is compiled with hidden symbols, so it exports
+  the six functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
+  libc++'s weak `operator new` and `operator delete`, which allocate with `malloc` as the system's do.
+- The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
+  CLI and Lambda link are not. That makes the first build slower.
+- `libzpq.a` holds zpq's own objects. A static link must add the codec, BoringSSL and libc++ archives the build
+  produces; prefer the shared library.
+
+## The C ABI (`include/zpq.h`)
+
+| function | returns | the caller owns | threads |
+|---|---|---|---|
+| `int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error)` | a status | `*out_ctx` until `zpq_close`; `*out_error` (free with `zpq_free`) | any thread, any number at once |
+| `int zpq_run(zpq_ctx *, const char *request_json, size_t len, char **out_json, size_t *out_len)` | a status | `*out_json` (free with `zpq_free`) | any number at once on one context |
+| `void zpq_free(char *)` | | | any thread |
+| `void zpq_close(zpq_ctx *)` | | the context is gone when it returns | once per context |
+| `int zpq_abi_version(void)` | `1` | | any thread |
+| `const char *zpq_strerror(int)` | a static string | nothing: never free it | any thread |
+
+libzpq keeps no pointer to anything the caller passes in once the call returns: a request need not outlive its call,
+nor be NUL-terminated (only `len` bytes are read).
+
+**Status codes** (`zpq_status`, stable: a value never changes meaning, new ones are only added):
+
+| code | value | meaning | message |
+|---|---:|---|---|
+| `ZPQ_OK` | 0 | `zpq_open`: the context is in `*out_ctx`. `zpq_run`: a response was produced, **including** a query that failed (bad SQL, a missing column, an S3 403, a refused memory budget): an `{"error": ...}` document exactly as the Lambda returns it | the response |
+| `ZPQ_EINVAL` | -1 | the call itself was malformed: a NULL context or output, a NULL request with `len > 0`, a length too large, bad `zpq_open` options | `{"error":"invalid_argument","reason":...}` |
+| `ZPQ_ENOMEM` | -2 | out of memory before a result could be built | none |
+| `ZPQ_ECLOSED` | -3 | `zpq_close` has begun on this context | `{"error":"closed","reason":"Closed"}` |
+| `ZPQ_EINTERNAL` | -4 | a failure that is not the caller's: a thread that would not start, a pool or TLS set-up | `{"error":"internal","reason":...}` |
+
+Every output pointer given is cleared before anything else. On a non-OK status `*out_ctx` is NULL, and the message
+(when the caller asked for one and it could be built) is in `*out_error` / `*out_json`, to free with `zpq_free`;
+`*out_len` describes responses only and stays 0.
+
+**Options** (`zpq_open`, a JSON object; NULL or `""` for the defaults; an unknown option is `ZPQ_EINVAL`):
+
+- `"max_memory"`: the context's memory ceiling (see Memory): bytes, or a size string (`"4GB"`). Default: the memory
+  available, the CLI's default budget.
+- `"budget_wait_ms"`: how long a query waits for its memory budget when its request names no `budget_wait_ms`.
+  Default: as long as it takes.
+- `"preconnect"`: `true` opens connections to the S3 endpoint now, as the Lambda does during init, so the first
+  queries find them ready: `ZPQ_S3_PRECONNECT` of them (default 4, at most 8), one thread each, after resolving the
+  endpoint on the calling thread. Without S3 credentials in the environment it does nothing; failures are ignored
+  and the queries connect on their own. A `zpq_close` while handshakes are still in flight waits for them, at most
+  about one second. Default: `false`, so a host that never reads S3 opens no connections.
+
+**Requests and responses.** The Lambda's request (see [lambda_requests.md](lambda_requests.md)): `inputs`, `filter`,
+`aggregate`, `group_by`, `select`, `columns`, `output_url`, `output_codec`, `max_memory`, `budget_wait_ms`,
+`bloom_filters`, `profile` and the rest. Inputs and `output_url` may be local paths as well as `s3://` URLs. A request
+must aggregate (`aggregate` / `group_by`) or write (`output_url`); anything else answers
+`{"error":"bad_request","reason":"NoOperation"}`.
+
+## Threads and contexts
+
+- Any number of `zpq_run` calls may run at once on one context, from its first call on: `zpq_open` sets the pool up
+  before returning. Each query runs on threads of its own, as in the CLI, and shares the context's S3 connection
+  pool and footer cache. The `"pool"` member of a response then reports the pool's running totals.
+- `zpq_close` refuses new calls (`ZPQ_ECLOSED`), wakes the queries still waiting for their memory budget (they
+  return `ZPQ_ECLOSED`), waits for the running ones, then frees the context. A call that starts after `zpq_close` has
+  returned uses freed memory: the caller must stop calling first, as with `free`. The Python binding does this for
+  its callers.
+- One context per process is the intended use. Several work, but each sets and restores the SIGPIPE/SIGIO handlers
+  (below), so close them in the reverse order they were opened.
+
+## Memory
+
+A context's `max_memory` is a ceiling its queries share. Each query reserves its whole budget before it starts: its
+request's `max_memory`, else the whole ceiling (so one query alone runs as `zpq query` would, and queries that name no
+budget run one at a time). It returns the budget when it ends.
+
+- Reservations are granted in arrival order: a query waits while any query that arrived before it is still waiting,
+  so a large query is never starved by small ones.
+- A request asking for more than the ceiling is refused at once: `{"error":"budget","reason":"OverCeiling",...}`.
+- A wait longer than `budget_wait_ms` (the request's, else the context's) ends with
+  `{"error":"budget","reason":"WaitTimeout",...}`.
+
+To run several queries at once, give each request a `max_memory` that leaves room for the others. The footer cache
+and warm Bloom filters stay with the context until `zpq_close` and are not counted against the ceiling in 0.5.0.
+
+## What libzpq does to the process
+
+- **Signals.** While a context is open, SIGPIPE and SIGIO have no-op handlers (Zig's `std.Io.Threaded`), so a
+  closed socket fails a write instead of killing the process; `zpq_close` restores the previous handlers.
+- **Alternate signal stack.** Threads zpq starts install Zig's alternate signal stack (256 KiB each). Under
+  AddressSanitizer, set `ASAN_OPTIONS=use_sigaltstack=0`, or ASan tries to unmap that stack as its own when the
+  thread exits.
+- **Environment.** Each call reads the process environment as it is called: S3 credentials, endpoint and region, as
+  the CLI reads them. Don't change it with `setenv` while a call runs. A cleared environment (`clearenv()`) is an
+  empty one.
+- **Process-wide state.** Beyond the context, the only process-wide state is a few caches, each set once and then
+  only read: the TLS client contexts (CA stores) and the io_uring and gzip-backend probes.
+- **Local files are memory-mapped.** A local input is read through `mmap`. If another process truncates the file
+  while a query reads it, the next access past the new end raises SIGBUS, which kills the host process unless it
+  handles that signal. Don't let files a query reads be truncated or rewritten in place while it runs (write a new
+  file and rename it instead). S3 inputs are unaffected.
+- **Failures.** A bad request, a bad or hostile file, or a failing or hostile network peer is an error response, never
+  a crash: the paths a request reaches are audited for panics, and the footer, page decoding and the expression and
+  filter parsers are fuzzed. A broken internal invariant still aborts the process with a message, as it would the
+  CLI; libzpq never unwinds into the caller. Build it `ReleaseSafe` to keep those checks, `ReleaseFast` for speed.
+
+## Stable and experimental in 0.5.0
+
+Stable: the six functions, their signatures and ownership, the status codes and their meanings, the option names, and
+the request and response schema the Lambda documents. ABI version 1 only grows: new options, request fields and
+status codes may be added.
+
+Experimental: the `"pool"` and `"profile"` members of a response (their fields may change), the Python binding's
+API, and the HTTP service. The memory ceiling does not yet count the context's caches (see Memory).
+
+## Python
+
+`python/zpq.py` loads `$ZPQ_LIB`, else `libzpq.so` (`libzpq.dylib` on macOS) next to it, in `../zig-out/lib`, or on
+the loader path. `zpq.Zpq(max_memory=None, library=None, *, preconnect=False, budget_wait_ms=None)` opens a context.
+`run` returns the response as a dict and raises `zpq.ZpqError` on an `{"error": ...}` response, unless `check=False`;
+a refused call raises `ValueError`, `MemoryError`, `zpq.ZpqClosed` or `RuntimeError` with its reason. ctypes releases
+the GIL during the call, so threads run queries in parallel. `close` refuses new calls (`zpq.ZpqClosed`) and waits for
+those in flight, so the C context is never freed under a running query.
 
 `python/zpq_service.py` is a stdlib HTTP service: one process and one context, with a thread per request.
 
@@ -115,21 +215,23 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
 
 ## Tests
 
-`tests/libzpq/run.sh` builds the library (ReleaseSafe by default; `OPTIMIZE=` changes it) and runs:
+`tests/libzpq/run.sh` builds the library and the binaries (ReleaseSafe by default; `OPTIMIZE=` changes it) and runs:
 
 - `tests/libzpq/test_abi.c`, the C ABI end to end:
-  - options, round trip, a write read back, error responses and invalid arguments;
+  - options and their refusals, the round trip, a write read back, error responses, and every refused call's
+    status, message and cleared outputs;
   - 16 threads × 40 mixed calls on one context, each answer checked, on a warm context and on 8 fresh ones whose
     first calls all start together;
-  - resident memory over 10,000 calls (the second half must not grow it);
+  - queries whose budgets add up past the ceiling, all answered; close while queries wait for their budget;
+  - 1,000 open/run/close cycles, and resident memory over 10,000 calls (the second half must not grow it);
 - the same program under AddressSanitizer and LeakSanitizer, with a tenth of the calls (the system compiler builds
   it; `zig cc` has no sanitizer runtime);
-- `tests/libzpq/test_python.py`: the binding, 480 calls from 16 threads, and the HTTP service. It also checks
-  `close` and service shutdown with a query in flight and a keep-alive connection idle (no request thread may
-  still run when the context closes), and malformed `Content-Length` values.
+- `tests/libzpq/test_python.py`: the binding, its options and queued budgets, 480 calls from 16 threads, and the
+  HTTP service. It also checks `close` and service shutdown with a query in flight and a keep-alive connection idle
+  (no request thread may still run when the context closes), and malformed `Content-Length` values;
+- `tests/libzpq/differential.py`: the differential corpus (`tools/differential.py`) through libzpq, the CLI and the
+  Lambda. Every filter × projection and filter × select writes the same file, byte for byte, and every
+  filter × aggregate gives the same `"agg"` text.
 
 `tests/libzpq/overhead.sh` compares a query through a warm context with the CLI, which starts a process per query,
 in perf counters.
-
-The handler is shared: the Lambda binary and libzpq call the same `src/service/handler.zig`, so the Lambda's
-integration tests cover libzpq's request handling too.

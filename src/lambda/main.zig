@@ -143,9 +143,9 @@ const PersistentPool = struct {
     }
 };
 
-/// Open the regional endpoint's connections before the first `/next`. Best-effort: a missing
-/// configuration or a failed handshake leaves the query to connect on its own. The elapsed time
-/// is what init grew by, reported on the next profile.
+/// Start the regional endpoint's handshakes before the first `/next` and return. Best-effort: a missing
+/// configuration, a thread that does not spawn, or a handshake that fails leaves the query to connect on
+/// its own. The elapsed time is how long init spent starting them, not the handshakes.
 fn preconnectS3(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -165,7 +165,8 @@ fn preconnectS3(
         pool.preconnect_ns = @as(u64, @intCast(nowMonoNs() - t0));
         return;
     };
-    pool.preconnect_opened = @as(u64, inner.preconnect(io, criteria, n));
+    // Return as soon as the threads are started. The handshakes overlap `/next` and the first query.
+    inner.preconnect(io, criteria, n);
     pool.preconnect_ns = @as(u64, @intCast(nowMonoNs() - t0));
 }
 
@@ -279,6 +280,7 @@ fn handle(
             var meta = zpq.profile.Meta.discover(env);
             meta.query = zpq.profile.utf8Prefix(trimmed, MAX_PROFILE_QUERY);
             meta.s3_preconnect_ns = pool.preconnect_ns;
+            if (pool.initialized) pool.preconnect_opened = pool.inner.preconnect_parked.load(.monotonic);
             meta.s3_preconnect_opened = pool.preconnect_opened;
             profiler = try zpq.profile.Profiler.create(allocator, prof_opts, meta);
         }

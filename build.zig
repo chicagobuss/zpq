@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     const libzpq_step = b.step("libzpq", "Build libzpq (shared and static) and install include/zpq.h");
     for ([_]std.builtin.LinkMode{ .dynamic, .static }) |linkage| {
         const lib = b.addLibrary(.{ .name = "zpq", .linkage = linkage, .root_module = libzpq_mod });
-        if (linkage == .dynamic) {
+        if (linkage == .dynamic and target.result.ofmt == .elf) {
             lib.setVersionScript(b.path("src/libzpq/libzpq.map"));
             // Zig's own ELF linker ignores version scripts; LLD needs the LLVM backend, which Debug otherwise skips.
             lib.use_llvm = true;
@@ -335,14 +335,17 @@ const CoreDeps = struct {
         /// BoringSSL compiled from source, position-independent, for a shared library; else the pinned prebuilts.
         boringssl_from_source: bool,
     ) CoreDeps {
-        const zstd = zstdLibrary(b, target, optimize);
-        const libdeflate = libdeflateLibrary(b, target, optimize);
-        const lz4 = lz4Library(b, target, optimize);
+        // BoringSSL from source is the shared library's (libzpq) build: see `archivePic`.
+        const shared = boringssl_from_source;
+        const zstd = zstdLibrary(b, target, optimize, shared);
+        const libdeflate = libdeflateLibrary(b, target, optimize, shared);
+        const lz4 = lz4Library(b, target, optimize, shared);
 
         const liteparser_mod = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .pic = archivePic(shared),
         });
         liteparser_mod.addCSourceFiles(.{
             .root = b.path("vendor/liteparser"),
@@ -353,14 +356,14 @@ const CoreDeps = struct {
                 "lp_unparse.c",
                 "parse.c",
             },
-            .flags = &.{
+            .flags = std.mem.concat(b.allocator, []const u8, &.{ &.{
                 "-Wall",
                 "-Wextra",
                 "-Wno-unused-parameter",
                 "-Wno-sign-compare",
                 "-Wno-unused-variable",
                 "-DNDEBUG",
-            },
+            }, archiveFlags(shared) }) catch @panic("OOM"),
         });
         liteparser_mod.addIncludePath(b.path("vendor/liteparser"));
 
@@ -374,6 +377,8 @@ const CoreDeps = struct {
             .snappy = b.dependency("snappy", .{
                 .target = target,
                 .optimize = optimize,
+                .pic = archivePic(shared),
+                .@"hidden-symbols" = shared,
             }).module("snappy"),
             .zstd = zstd,
             .zstd_c = zstdCModule(b, target, optimize, zstd),
@@ -543,14 +548,35 @@ fn cHeaderModule(
     });
 }
 
+/// An archive a shared library (libzpq) links is position-independent, which musl targets otherwise are not, and
+/// hides its symbols (`archiveFlags`), so the library exports its own API alone on every target, not only where its
+/// version script applies (ELF). The CLI's and the Lambda's archives keep the target's defaults.
+fn archivePic(shared: bool) ?bool {
+    return if (shared) true else null;
+}
+
+fn archiveFlags(shared: bool) []const []const u8 {
+    return if (shared) &.{"-fvisibility=hidden"} else &.{};
+}
+
 /// libzstd from `vendor/zstd/lib`: the sources, macros and headers the allyourcodebase/zstd package built before it
 /// was vendored (compression and decompression, legacy frames from v0.5, no dictionary builder, the x86-64 Huffman
 /// decoder in assembly).
-fn zstdLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+fn zstdLibrary(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    shared: bool,
+) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "zstd",
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = archivePic(shared),
+        }),
     });
     const root = b.path("vendor/zstd/lib");
     lib.root_module.addCSourceFiles(.{ .root = root, .files = &.{
@@ -582,20 +608,24 @@ fn zstdLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "legacy/zstd_v05.c",
         "legacy/zstd_v06.c",
         "legacy/zstd_v07.c",
-    } });
+    }, .flags = archiveFlags(shared) });
     // zpq's AVX-512 Huffman encoder, wired in by patches/0001 (vendor/README.md). Every target builds it; off x86-64
     // it is a stub and zstd's own encoder runs. huf4x_check.c is for the unit tests: nothing else references it, so
     // nothing else links it.
     lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/zstd/zpq"), .files = &.{
         "huf4x_avx512.c",
         "huf4x_check.c",
-    } });
+    }, .flags = archiveFlags(shared) });
     lib.root_module.addCMacro("ZPQ_HUF4X_AVX512", "1");
     if (target.result.cpu.arch == .x86_64) {
         lib.root_module.addAssemblyFile(b.path("vendor/zstd/lib/decompress/huf_decompress_amd64.S"));
     } else {
         lib.root_module.addCMacro("ZSTD_DISABLE_ASM", "");
     }
+    // zstd marks its API default-visibility itself; empty, these leave it to -fvisibility.
+    if (shared) for ([_][]const u8{ "ZSTDLIB_VISIBLE", "ZSTDERRORLIB_VISIBLE", "ZDICTLIB_VISIBLE" }) |m| {
+        lib.root_module.addCMacro(m, "");
+    };
     lib.root_module.addCMacro("ZSTD_LEGACY_SUPPORT", "5");
     if (target.result.os.tag != .wasi) lib.root_module.addCMacro("ZSTD_MULTITHREAD", "1");
     lib.installHeader(b.path("vendor/zstd/lib/zstd.h"), "zstd.h");
@@ -621,11 +651,21 @@ fn zstdCModule(
 /// libdeflate from `vendor/libdeflate`: the decompression sources only (DEFLATE and its gzip framing, CRC-32, the
 /// allocator), with the x86 and arm CPU-feature probes, each of which compiles to nothing on other architectures.
 /// libdeflate chooses its CPU-specific paths at run time and keeps a portable one for everything else.
-fn libdeflateLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+fn libdeflateLibrary(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    shared: bool,
+) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "deflate",
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = archivePic(shared),
+        }),
     });
     lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/libdeflate/lib"), .files = &.{
         "deflate_decompress.c",
@@ -634,7 +674,9 @@ fn libdeflateLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
         "utils.c",
         "x86/cpu_features.c",
         "arm/cpu_features.c",
-    } });
+    }, .flags = archiveFlags(shared) });
+    // As for zstd, with patches/0001 (vendor/README.md) making the macro overridable.
+    if (shared) lib.root_module.addCMacro("LIBDEFLATE_EXPORT_SYM", "");
     lib.root_module.addIncludePath(b.path("vendor/libdeflate"));
     lib.installHeader(b.path("vendor/libdeflate/libdeflate.h"), "libdeflate.h");
     return lib;
@@ -652,13 +694,28 @@ fn libdeflateCModule(
 }
 
 /// liblz4 from `vendor/lz4`: `lz4.c`, the block format (no frames, no HC), as upstream builds it.
-fn lz4Library(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Step.Compile {
+fn lz4Library(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    shared: bool,
+) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "lz4",
-        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = archivePic(shared),
+        }),
     });
-    lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/lz4"), .files = &.{"lz4.c"} });
+    lib.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/lz4"),
+        .files = &.{"lz4.c"},
+        .flags = archiveFlags(shared),
+    });
+    if (shared) lib.root_module.addCMacro("LZ4LIB_VISIBILITY", ""); // as for zstd
     lib.installHeader(b.path("vendor/lz4/lz4.h"), "lz4.h");
     return lib;
 }

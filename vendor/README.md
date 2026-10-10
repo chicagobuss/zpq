@@ -21,6 +21,8 @@ sources.
 - `build.zig`: no longer passes `-mno-avx` on x86. (`b63f9c4`)
 - `build.zig`, `root.zig`: `snappy-c.h` is imported through a translate-c step (`snappy_c`) instead of `@cImport`,
   which Zig 0.17 removed; `build.zig.zon` requires Zig 0.17.0.
+- `build.zig`: `pic` and `hidden-symbols` options, which libzpq's archive sets: position-independent, with its
+  symbols hidden so the shared library does not export them.
 
 ## boring_tls (`vendor/boring_tls`, Zig bindings over BoringSSL)
 
@@ -31,6 +33,9 @@ sources.
 - `build.zig`, `src/tls.zig`: OpenSSL headers come through a translate-c step instead of `@cImport`, which Zig 0.17
   removed, and the local-prebuilt probe declares its file dependencies to the configure cache, since 0.17 runs the
   configure phase in its own process.
+- `build.zig`: a `source-build` option compiles BoringSSL from its source package instead, position-independent and
+  with its symbols hidden, for libzpq's shared library; on Darwin also with `_DARWIN_C_SOURCE`, without which
+  `_XOPEN_SOURCE` hides the BSD types the system headers use.
 
 ## zstd (`vendor/zstd`, facebook/zstd 1.5.7)
 
@@ -55,17 +60,23 @@ To check the tree against the release: unpack zstd 1.5.7, apply the patches with
 
 ## libdeflate (`vendor/libdeflate`, ebiggers/libdeflate 1.26)
 
-`COPYING`, `libdeflate.h`, `common_defs.h` and the whole of `lib/`, copied unmodified from the v1.26 tag. zpq builds
+`COPYING`, `libdeflate.h`, `common_defs.h` and the whole of `lib/`, copied from the v1.26 tag. zpq builds
 only the decompression sources (`libdeflateLibrary` in `build.zig`: `deflate_decompress.c`, `gzip_decompress.c`,
 `crc32.c`, `utils.c` and the x86 and arm `cpu_features.c`, each of which compiles to nothing on other architectures),
 to read GZIP pages; the compressor stays vendored for a later GZIP writer. libdeflate picks its CPU-specific paths at
-run time (BMI2, AVX2/AVX-512, PCLMUL/VPCLMUL on x86; PMULL/CRC32 on arm) and falls back to portable code. No local
-changes. `ZPQ_GZIP_STD` set to anything but `0` reads GZIP pages with Zig's `std.compress.flate` instead, to compare
+run time (BMI2, AVX2/AVX-512, PCLMUL/VPCLMUL on x86; PMULL/CRC32 on arm) and falls back to portable code.
+`ZPQ_GZIP_STD` set to anything but `0` reads GZIP pages with Zig's `std.compress.flate` instead, to compare
 the two or to fall back. `tools/gzip-inflate` compares libdeflate with zlib over any corpus, its portable paths
 included.
 
-To check the tree against the release: clone `ebiggers/libdeflate` at `v1.26` and compare its `lib`, `libdeflate.h`,
-`common_defs.h` and `COPYING` with `vendor/libdeflate`.
+Local changes are kept as patch files in `vendor/libdeflate/patches/`, each applied to the tree and listed here.
+
+- `0001-export-sym-overridable.patch` (`lib/lib_common.h`): a `LIBDEFLATE_EXPORT_SYM` the build defines wins over
+  the default-visibility attribute. `libdeflateLibrary` defines it empty for libzpq's archives, which are compiled
+  with hidden visibility so the shared library exports its own API alone; without it the file is upstream's.
+
+To check the tree against the release: clone `ebiggers/libdeflate` at `v1.26`, apply the patches with `patch -p1`,
+and compare its `lib`, `libdeflate.h`, `common_defs.h` and `COPYING` with `vendor/libdeflate`.
 
 ## lz4 (`vendor/lz4`, lz4/lz4 1.10.0)
 

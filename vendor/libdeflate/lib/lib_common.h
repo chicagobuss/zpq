@@ -13,7 +13,9 @@
 #  error "lib_common.h must always be included before libdeflate.h"
 #endif
 
-#if defined(LIBDEFLATE_DLL) && (defined(_WIN32) || defined(__CYGWIN__))
+#ifdef LIBDEFLATE_EXPORT_SYM
+   /* Set by the build (zpq: empty, for an archive linked into a shared library that exports its own API alone) */
+#elif defined(LIBDEFLATE_DLL) && (defined(_WIN32) || defined(__CYGWIN__))
 #  define LIBDEFLATE_EXPORT_SYM  __declspec(dllexport)
 #elif defined(__GNUC__)
 #  define LIBDEFLATE_EXPORT_SYM  __attribute__((visibility("default")))

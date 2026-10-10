@@ -152,14 +152,19 @@ fn sourceLibraries(
             return out;
         }
     };
-    const flags_c = &[_][]const u8{ "-std=c11", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700" };
-    const flags_cc = &[_][]const u8{
-        "-std=c++17",
-        "-fno-exceptions",
-        "-fno-rtti",
-        "-DBORINGSSL_IMPLEMENTATION",
-        "-D_XOPEN_SOURCE=700",
-    };
+    // _XOPEN_SOURCE alone hides the BSD types (u_int) Darwin's own headers use; _DARWIN_C_SOURCE brings them back.
+    const os_flags: []const []const u8 = if (target.result.os.tag.isDarwin()) &.{"-D_DARWIN_C_SOURCE"} else &.{};
+    // The source build is for a shared library, which should export its own API alone: OPENSSL_EXPORT is empty
+    // without BORINGSSL_SHARED_LIBRARY, so this hides all of BoringSSL's.
+    const flags_c = try std.mem.concat(b.allocator, []const u8, &.{
+        &.{ "-std=c11", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700", "-fvisibility=hidden" },
+        os_flags,
+    });
+    const flags_cc = try std.mem.concat(b.allocator, []const u8, &.{
+        &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700" },
+        &.{"-fvisibility=hidden"},
+        os_flags,
+    });
     var out: [2]*std.Build.Step.Compile = undefined;
     for ([_][]const u8{ "crypto", "ssl" }, &out) |name, *lib| {
         const mod = b.createModule(.{

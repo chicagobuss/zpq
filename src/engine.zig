@@ -5067,6 +5067,66 @@ test "a recompressing copy writes the same bytes at every parallelism and reads 
     };
 }
 
+test "a recompressing copy drops page-index offsets that are not its chunk's, instead of overflowing on them" {
+    const fixture = "ci/fixtures/parquet/null_pages.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The fixture, with every chunk's index_page_offset and its first OffsetIndex location at minInt(i64): both are
+    // the file's word, which footer open does not check. The copy subtracted the chunk's start from them.
+    const src = try metadata.readFileSlice(fixture, gpa);
+    defer gpa.free(src);
+    var meta = try metadata.open(a, src);
+    const footer_len = std.mem.readInt(u32, src[src.len - 8 ..][0..4], .little);
+    var file: std.ArrayList(u8) = .empty;
+    try file.appendSlice(a, src[0 .. src.len - 8 - footer_len]);
+    var oi_patched = false;
+    for (meta.row_groups.items) |*rg| for (rg.columns.items) |*cc| {
+        cc.meta_data.?.index_page_offset = std.math.minInt(i64);
+        if (oi_patched) continue;
+        const off: usize = @intCast(cc.offset_index_offset orelse continue);
+        const len: usize = @intCast(cc.offset_index_length.?);
+        var r = thrift.Reader.init(src[off..][0..len]);
+        var oi = try schema.OffsetIndex.read(a, &r);
+        oi.page_locations.items[0].offset = std.math.minInt(i64);
+        var w = thrift.Writer.init(a);
+        try oi.write(&w);
+        cc.offset_index_offset = @intCast(file.items.len);
+        cc.offset_index_length = @intCast(w.bytes().len);
+        try file.appendSlice(a, w.bytes());
+        oi_patched = true;
+    };
+    try std.testing.expect(oi_patched);
+    var fw = thrift.Writer.init(a);
+    try meta.write(&fw);
+    try file.appendSlice(a, fw.bytes());
+    var len_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_le, @intCast(fw.bytes().len), .little);
+    try file.appendSlice(a, &len_le);
+    try file.appendSlice(a, "PAR1");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var in_buf: [96]u8 = undefined;
+    const in = try std.fmt.bufPrint(&in_buf, ".zig-cache/tmp/{s}/in.parquet", .{tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = in, .data = file.items });
+    var out_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&out_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    var r = try runQuery(ctx, .{ .inputs = &.{in}, .output = out, .codec = .ZSTD });
+    r.deinit(gpa);
+    const agg = "count(*) AS n";
+    var want = try runQuery(ctx, .{ .inputs = &.{fixture}, .aggregate = agg });
+    defer want.aggregate.deinit(gpa);
+    var got = try runQuery(ctx, .{ .inputs = &.{out}, .aggregate = agg });
+    defer got.aggregate.deinit(gpa);
+    try std.testing.expectEqualDeep(want.aggregate.output.aggs[0].value, got.aggregate.output.aggs[0].value);
+}
+
 test "a select output naming one column twice is rejected and named, like aggregate outputs" {
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

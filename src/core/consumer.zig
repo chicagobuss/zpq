@@ -3872,10 +3872,12 @@ fn copyChunkRecompressed(
     if (m.dictionary_page_offset) |d| {
         meta.dictionary_page_offset = new_start + @as(i64, @intCast(relocated(re, d - src_base)));
     }
-    meta.index_page_offset = if (m.index_page_offset) |ip|
-        if (movedPage(re.pages, ip - src_base)) |p| new_start + @as(i64, @intCast(p.dst_off)) else null
-    else
-        null;
+    // index_page_offset and the OffsetIndex locations are the file's word, unvalidated at footer open: one that is
+    // not a page of this chunk (or not even an offset from it) drops what it would locate, as an unusable index is.
+    meta.index_page_offset = if (m.index_page_offset) |ip| blk: {
+        const rel = std.math.sub(i64, ip, src_base) catch break :blk null;
+        break :blk if (movedPage(re.pages, rel)) |p| new_start + @as(i64, @intCast(p.dst_off)) else null;
+    } else null;
     chunk.meta_data = meta;
     chunk.file_offset = meta.data_page_offset;
     chunk.offset_index_offset = null;
@@ -3893,7 +3895,8 @@ fn copyChunkRecompressed(
     var oi_reader = thrift.Reader.init(oi_bytes);
     var oi = schema.OffsetIndex.read(scratch, &oi_reader) catch return chunk;
     for (oi.page_locations.items) |*loc| {
-        const p = movedPage(re.pages, loc.offset - src_base) orelse return chunk;
+        const rel = std.math.sub(i64, loc.offset, src_base) catch return chunk;
+        const p = movedPage(re.pages, rel) orelse return chunk;
         loc.offset = new_start + @as(i64, @intCast(p.dst_off));
         loc.compressed_page_size = @intCast(p.dst_len);
     }

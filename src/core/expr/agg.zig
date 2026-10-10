@@ -210,10 +210,10 @@ pub const Accumulator = union(enum) {
     /// to merge per-thread / per-file accumulators back into a single
     /// final result after a parallel multi-file scan. A null min/max
     /// means "no values seen"; merging skips it.
-    pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) void {
+    /// A count past i64 (footers whose bounded row counts add up past it across files) is `RowCountTooLarge`.
+    pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) error{RowCountTooLarge}!void {
         switch (dst.*) {
-            // Each file's rows are bounded at its footer (`metadata.max_row_count`); saturating only across files.
-            .count => |*c| c.* +|= src.count,
+            .count => |*c| c.* = try addRowCount(c.*, src.count),
             .sum_i => |*s| if (src.sum_i) |sv| {
                 s.* = (s.* orelse 0) + sv;
             },
@@ -404,6 +404,14 @@ pub fn statsCoverageComplete(
     return true;
 }
 
+/// `a + b` for counts a footer claims: each file's is bounded (`metadata.max_row_count`), their sum across files is
+/// not. Past i64, the type count() answers in, it is an error rather than a count that cannot be written.
+fn addRowCount(a: u64, b: u64) error{RowCountTooLarge}!u64 {
+    const sum = std.math.add(u64, a, b) catch return error.RowCountTooLarge;
+    if (sum > std.math.maxInt(i64)) return error.RowCountTooLarge;
+    return sum;
+}
+
 /// Update one accumulator from a row group's metadata WITHOUT
 /// decoding. Returns true on success, false if the column's stats
 /// aren't populated (caller falls back to the decode path).
@@ -421,7 +429,7 @@ pub fn updateOneFromStats(
         .count => {
             // count(*): every row counts, regardless of null content.
             if (call.arg == null) {
-                state.count +|= @intCast(rg.num_rows);
+                state.count = try addRowCount(state.count, @intCast(rg.num_rows));
                 return true;
             }
             // count(col): strict SQL semantics — exclude nulls. Use
@@ -432,7 +440,7 @@ pub fn updateOneFromStats(
             if (col_idx >= rg.columns.items.len) return false;
             const cm = rg.columns.items[col_idx].meta_data orelse return false;
             const present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return false;
-            state.count +|= @intCast(present);
+            state.count = try addRowCount(state.count, @intCast(present));
             return true;
         },
         .min, .max => {
@@ -2203,6 +2211,23 @@ test "updateOneFromStats: count(*) uses num_rows; count(col) uses num_rows - nul
     try testing.expect(try updateOneFromStats(&star_state, star_call, &rg, &test_meta));
     try testing.expectEqual(@as(u64, 100), star_state.count);
 
+    // Counts that add up past i64 across files (each footer is bounded, their sum is not) are an error, not a
+    // saturated count nor one count() cannot answer in: from statistics, and when per-file accumulators merge.
+    var near_full = Accumulator.init(star_call);
+    near_full.count = std.math.maxInt(i64) - 50;
+    try testing.expectError(error.RowCountTooLarge, updateOneFromStats(&near_full, star_call, &rg, &test_meta));
+    near_full.count = std.math.maxInt(u64) - 50;
+    try testing.expectError(error.RowCountTooLarge, updateOneFromStats(&near_full, star_call, &rg, &test_meta));
+    near_full.count = std.math.maxInt(i64) - 100;
+    try testing.expect(try updateOneFromStats(&near_full, star_call, &rg, &test_meta));
+    try testing.expectEqual(@as(u64, std.math.maxInt(i64)), near_full.count);
+    var merged = Accumulator.init(star_call);
+    merged.count = std.math.maxInt(i64) - 50;
+    try testing.expectError(error.RowCountTooLarge, merged.merge(star_state, a));
+    merged.count = 7;
+    try merged.merge(star_state, a);
+    try testing.expectEqual(@as(u64, 107), merged.count);
+
     // count(x) → 100 - 17 = 83
     const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const col_call: AggCall = .{ .func = .count, .arg = arg, .where = null, .alias = "n", .result = .i64 };
@@ -2582,7 +2607,7 @@ test "sum/avg/min/max over no values are NULL; count is 0" {
         var state = Accumulator.init(c.call);
         try updateOne(a, a, &state, c.call, &batch, &lookup, c.sel);
         // A second, equally empty partial merged in must not turn NULL into 0.
-        state.merge(Accumulator.init(c.call), a);
+        try state.merge(Accumulator.init(c.call), a);
         const outs = try finalize(a, c.call, state);
         // avg's count column stays a REQUIRED 0; every other output is a NULL.
         for (outs) |o| {
@@ -2614,7 +2639,7 @@ test "sum/avg/min/max over no values are NULL; count is 0" {
     var empty = Accumulator.init(sum_call);
     var full = Accumulator.init(sum_call);
     try updateOne(a, a, &full, sum_call, &batch, &lookup, &all);
-    empty.merge(full, a);
+    try empty.merge(full, a);
     try testing.expectEqual(@as(?i128, 6), empty.sum_i);
 }
 

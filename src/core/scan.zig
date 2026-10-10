@@ -441,7 +441,9 @@ const BlockMerge = struct {
             for (src.keys.items, 0..) |key, g| {
                 const id = try self.merged.getOrInsert(key, self.calls, src.first.items[g]);
                 const dst = self.merged.accumulators.items[@as(usize, id) * len ..][0..len];
-                for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| mergeOwnedAccumulator(d, sa, self.gpa);
+                for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| {
+                    try mergeOwnedAccumulator(d, sa, self.gpa);
+                }
             }
             src.deinit();
             src.* = expr_agg.GroupTable.init(self.gpa, 0);
@@ -1109,7 +1111,7 @@ pub fn runMultiAggregate(
                 first = @min(first, gt.first.items[ref.group]);
                 const acc_start = @as(usize, ref.group) * agg_calls.len;
                 for (merged, gt.accumulators.items[acc_start..][0..agg_calls.len]) |*dst, *src| {
-                    mergeOwnedAccumulator(dst, src, gpa);
+                    try mergeOwnedAccumulator(dst, src, gpa);
                 }
             }
 
@@ -1161,7 +1163,7 @@ pub fn runMultiAggregate(
         // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.
         for (work_items.items) |item| {
             for (item.accumulators, 0..) |*sub_acc, i| {
-                mergeOwnedAccumulator(&accumulators[item.agg_start + i], sub_acc, gpa);
+                try mergeOwnedAccumulator(&accumulators[item.agg_start + i], sub_acc, gpa);
             }
         }
         for (workers) |w| {
@@ -1231,9 +1233,9 @@ fn mergeOwnedAccumulator(
     dst: *expr_agg.Accumulator,
     src: *expr_agg.Accumulator,
     allocator: std.mem.Allocator,
-) void {
+) error{RowCountTooLarge}!void {
     const moved = src.*;
-    dst.merge(moved, allocator);
+    try dst.merge(moved, allocator);
     switch (src.*) {
         .min_bytes => src.* = .{ .min_bytes = null },
         .max_bytes => src.* = .{ .max_bytes = null },

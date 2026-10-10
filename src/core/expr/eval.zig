@@ -40,6 +40,12 @@ pub const Error = error{
     Unsigned64OutOfRange,
     /// An exact DECIMAL result needs more digits than its type's precision (at most 38).
     DecimalOverflow,
+    /// An integer `+`, `-`, `*` or `/` whose exact result does not fit the signed 64-bit lane. The query fails rather
+    /// than wrap or turn to floating point, as DuckDB does.
+    IntegerOverflowAdd,
+    IntegerOverflowSub,
+    IntegerOverflowMul,
+    IntegerOverflowDiv,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
 } || std.mem.Allocator.Error;
@@ -289,19 +295,68 @@ fn evalGroupKeyConcatBinOp(
 }
 
 fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
-    return switch (op) {
+    if (@typeInfo(T) != .int) return switch (op) {
         .add => a + b,
         .sub => a - b,
         .mul => a * b,
-        .div => blk: {
-            if (@typeInfo(T) == .int) {
-                if (b == 0) return error.DivisionByZero;
-                break :blk @divTrunc(a, b);
-            }
-            break :blk a / b;
+        .div => a / b,
+        .concat => error.TypeMismatch,
+    };
+    const r = switch (op) {
+        .add => @addWithOverflow(a, b),
+        .sub => @subWithOverflow(a, b),
+        .mul => @mulWithOverflow(a, b),
+        .div => {
+            if (b == 0) return error.DivisionByZero;
+            if (a == std.math.minInt(T) and b == -1) return error.IntegerOverflowDiv;
+            return @divTrunc(a, b);
         },
         .concat => return error.TypeMismatch,
     };
+    if (r[1] != 0) return overflowError(op);
+    return r[0];
+}
+
+fn overflowError(op: ast.Op) Error {
+    return switch (op) {
+        .add => error.IntegerOverflowAdd,
+        .sub => error.IntegerOverflowSub,
+        .mul => error.IntegerOverflowMul,
+        .div, .concat => error.IntegerOverflowDiv,
+    };
+}
+
+/// `out = a op b` for `+`, `-` or `*` on signed integers, exact: a vector of lanes at a time with the hardware's
+/// overflow flags OR-ed together, and one branch for the whole slice, so the check costs next to nothing.
+fn checkedIntKernel(comptime T: type, comptime op: ast.Op, out: []T, a: []const T, b: []const T) Error!void {
+    const L = std.simd.suggestVectorLength(T) orelse 1;
+    const V = @Vector(L, T);
+    var overflow: @Vector(L, u1) = @splat(0);
+    var i: usize = 0;
+    while (i + L <= a.len) : (i += L) {
+        const x: V = a[i..][0..L].*;
+        const y: V = b[i..][0..L].*;
+        const r = switch (op) {
+            .add => @addWithOverflow(x, y),
+            .sub => @subWithOverflow(x, y),
+            .mul => @mulWithOverflow(x, y),
+            else => @compileError("checkedIntKernel: + - * only"),
+        };
+        out[i..][0..L].* = r[0];
+        overflow |= r[1];
+    }
+    var tail: u1 = 0;
+    while (i < a.len) : (i += 1) {
+        const r = switch (op) {
+            .add => @addWithOverflow(a[i], b[i]),
+            .sub => @subWithOverflow(a[i], b[i]),
+            .mul => @mulWithOverflow(a[i], b[i]),
+            else => unreachable,
+        };
+        out[i] = r[0];
+        tail |= r[1];
+    }
+    if ((@reduce(.Or, overflow) | tail) != 0) return overflowError(op);
 }
 
 /// Evaluate `e` and coerce the result to `target` if needed. Only
@@ -1185,6 +1240,21 @@ fn applyKernel(
 ) Error![]T {
     std.debug.assert(a.len == b.len);
     const out = try arena.alloc(T, a.len);
+    if (@typeInfo(T) == .int) switch (op) {
+        .add => {
+            try checkedIntKernel(T, .add, out, a, b);
+            return out;
+        },
+        .sub => {
+            try checkedIntKernel(T, .sub, out, a, b);
+            return out;
+        },
+        .mul => {
+            try checkedIntKernel(T, .mul, out, a, b);
+            return out;
+        },
+        else => {},
+    };
     switch (op) {
         .add => for (a, b, 0..) |x, y, i| {
             out[i] = x + y;
@@ -1200,6 +1270,7 @@ fn applyKernel(
             for (a, b, 0..) |x, y, i| {
                 if (is_int) {
                     if (y == 0) return error.DivisionByZero;
+                    if (x == std.math.minInt(T) and y == -1) return error.IntegerOverflowDiv;
                     out[i] = @divTrunc(x, y);
                 } else {
                     out[i] = x / y;
@@ -1438,6 +1509,44 @@ test "integer division truncates" {
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 3, 4, 4 }, out.i64.values);
+}
+
+/// `x op y` over two INT64 columns.
+fn evalI64Binop(a: std.mem.Allocator, op: ast.Op, xs: []const i64, ys: []const i64) Error!Batch.Column {
+    const cols = [_]Batch.Column{ col_i64(xs), col_i64(ys) };
+    const batch: Batch = .{ .cols = &cols, .num_rows = xs.len };
+    const lookup = [_]?usize{ 0, 1 };
+    const lp = try a.create(ast.Expr);
+    lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const rp = try a.create(ast.Expr);
+    rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const e: ast.Expr = .{ .binop = .{ .op = op, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
+    return evalExpr(a, &batch, &lookup, e);
+}
+
+test "integer + - * / that overflow the i64 lane fail the query, in a vector or the tail after it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    // 37 rows: whole vectors and a tail. The overflowing row sits in a vector, then in the tail.
+    for ([_]usize{ 3, 36 }) |at| {
+        var xs: [37]i64 = @splat(5);
+        var ys: [37]i64 = @splat(7);
+        xs[at] = max;
+        try testing.expectError(error.IntegerOverflowAdd, evalI64Binop(a, .add, &xs, &ys));
+        try testing.expectError(error.IntegerOverflowMul, evalI64Binop(a, .mul, &xs, &ys));
+        xs[at] = min;
+        try testing.expectError(error.IntegerOverflowSub, evalI64Binop(a, .sub, &xs, &ys));
+        ys[at] = -1;
+        try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, .div, &xs, &ys));
+    }
+    // At the edges, exact: nothing wraps and nothing is refused that fits.
+    const out = try evalI64Binop(a, .add, &.{ max - 1, min + 1, 0 }, &.{ 1, -1, max });
+    try testing.expectEqualSlices(i64, &.{ max, min, max }, out.i64.values);
+    const prod = try evalI64Binop(a, .mul, &.{ 3_037_000_499, -1, min }, &.{ 3_037_000_499, max, 1 });
+    try testing.expectEqualSlices(i64, &.{ 9_223_372_030_926_249_001, -max, min }, prod.i64.values);
 }
 
 test "integer division by zero errors" {

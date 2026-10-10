@@ -239,6 +239,10 @@ pub fn main(init: std.process.Init) !void {
                 error.BadGroupKey => std.debug.print("zpq query: corrupted GROUP BY key framing\n", .{}),
                 error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
                 error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
+                error.IntegerOverflowAdd => std.debug.print("zpq query: integer overflow in +\n", .{}),
+                error.IntegerOverflowSub => std.debug.print("zpq query: integer overflow in -\n", .{}),
+                error.IntegerOverflowMul => std.debug.print("zpq query: integer overflow in *\n", .{}),
+                error.IntegerOverflowDiv => std.debug.print("zpq query: integer overflow in /\n", .{}),
                 error.DecimalOverflow => std.debug.print(
                     "zpq query: a DECIMAL value needs more digits than its type holds (at\n" ++
                         "most 38): a result, or an operand of + or - brought to their common\n" ++

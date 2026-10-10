@@ -1027,7 +1027,12 @@ pub const ColumnChunk = struct {
             switch (field.id) {
                 1 => chunk.file_path = try reader.readString(),
                 2 => chunk.file_offset = try reader.readZigZag(i64),
-                3 => chunk.meta_data = try ColumnMetaData.read(allocator, reader),
+                3 => {
+                    // Repeated: the later one wins, and the earlier one is freed rather than leaked.
+                    const m = try ColumnMetaData.read(allocator, reader);
+                    if (chunk.meta_data) |*old| old.deinit(allocator);
+                    chunk.meta_data = m;
+                },
                 4 => chunk.offset_index_offset = try reader.readZigZag(i64),
                 5 => chunk.offset_index_length = try reader.readZigZag(i32),
                 6 => chunk.column_index_offset = try reader.readZigZag(i64),
@@ -1398,9 +1403,12 @@ pub const FileMetaData = struct {
                     }
                 },
                 6 => meta.created_by = try reader.readString(),
+                // A repeated field replaces the earlier one only once it has been read whole: freeing the old list
+                // first left it to the errdefer above to free again when the new one failed.
                 7 => if (field.type == .List) {
+                    const orders = try readColumnOrders(allocator, reader);
                     if (meta.column_orders) |*co| co.deinit(allocator);
-                    meta.column_orders = try readColumnOrders(allocator, reader);
+                    meta.column_orders = orders;
                 } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
@@ -1649,6 +1657,14 @@ pub const Levels = struct {
     max_def: i32,
     max_rep: i32,
 };
+
+test "a footer that repeats column_orders, the second cut short, fails without freeing the first twice" {
+    // Field 7 (column_orders): an empty list of structs; field 7 again (long form: type List, zigzag id 7): a list of
+    // one struct, and then the input ends.
+    const bytes = [_]u8{ 0x79, 0x0C, 0x09, 0x0E, 0x1C };
+    var reader = thrift.Reader.init(&bytes);
+    try std.testing.expect(std.meta.isError(FileMetaData.read(std.testing.allocator, &reader)));
+}
 
 test "logical-type fields a footer leaves out or overflows are rejected, not left undefined" {
     const a = std.testing.allocator;

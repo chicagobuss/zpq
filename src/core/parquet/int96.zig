@@ -24,6 +24,9 @@ const hybrid_rle = @import("encoding/hybrid_rle.zig");
 pub const Error = error{
     ShortDecode,
     UnexpectedPage,
+    /// A second dictionary page in a chunk, or one after a data page: the format allows one, first (as
+    /// `column.Error.UnexpectedDictionaryPage`).
+    UnexpectedDictionaryPage,
     DictionaryMissing,
     UnsupportedEncoding,
     UnexpectedEndOfChunk,
@@ -64,10 +67,12 @@ pub fn decodeColumnAsI64Nanos(
     var pr = page_mod.PageReader.init(chunk, codec, arena);
     var written: usize = 0;
     var has_nulls = false;
+    var data_seen = false;
 
     while (try pr.next()) |pg| {
         switch (pg.header.type) {
             .DICTIONARY_PAGE => {
+                if (dict_i64 != null or data_seen) return error.UnexpectedDictionaryPage;
                 const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
                 const dict_count: usize = @intCast(dh.num_values);
                 const expected_bytes = dict_count * INT96_WIDTH;
@@ -80,6 +85,7 @@ pub fn decodeColumnAsI64Nanos(
                 dict_i64 = dict;
             },
             .DATA_PAGE, .DATA_PAGE_V2 => {
+                data_seen = true;
                 try decodeDataPage(pg, dict_i64, levels, values, def_levels_buf, rep_levels_buf, &written, &has_nulls);
             },
             .INDEX_PAGE => continue,
@@ -265,4 +271,56 @@ test "int96ToEpochNanos matches duckdb's reference math" {
     std.mem.writeInt(i64, b[0..8], 1_000_000_000, .little); // 1s in nanos
     std.mem.writeInt(u32, b[8..12], 2440589, .little);
     try testing.expectEqual(@as(i64, 86_400_000_000_000 + 1_000_000_000), int96ToEpochNanos(&b));
+}
+
+/// A chunk of uncompressed pages: `true` a PLAIN dictionary page of `n` entries, `false` a V1 data page of `n`
+/// RLE_DICTIONARY indices; each with `body`.
+fn chunkForTest(arena: std.mem.Allocator, pages: []const struct { bool, i32, []const u8 }) ![]const u8 {
+    const thrift = @import("../thrift.zig");
+    var chunk: std.ArrayList(u8) = .empty;
+    for (pages) |pg| {
+        const dictionary, const n, const body = pg;
+        const header = schema.PageHeader{
+            .type = if (dictionary) .DICTIONARY_PAGE else .DATA_PAGE,
+            .uncompressed_page_size = @intCast(body.len),
+            .compressed_page_size = @intCast(body.len),
+            .crc = null,
+            .data_page_header = if (dictionary) null else .{
+                .num_values = n,
+                .encoding = .RLE_DICTIONARY,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            },
+            .dictionary_page_header = if (!dictionary)
+                null
+            else
+                .{ .num_values = n, .encoding = .PLAIN, .is_sorted = null },
+            .data_page_header_v2 = null,
+        };
+        var w = thrift.Writer.init(arena);
+        try header.write(&w);
+        try chunk.appendSlice(arena, w.bytes());
+        try chunk.appendSlice(arena, body);
+    }
+    return chunk.items;
+}
+
+test "a second INT96 dictionary page, after data or after the first, is a corrupt chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dict: [24]u8 = @splat(0); // two INT96 entries
+    const data = [_]u8{ 1, 2 << 1, 0 }; // two indices, bit width 1, one RLE run of 0
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    const dict_page = .{ true, 2, @as([]const u8, &dict) };
+    const data_page = .{ false, 2, @as([]const u8, &data) };
+    const back_to_back = try chunkForTest(a, &.{ dict_page, dict_page, data_page });
+    const twice = decodeColumnAsI64Nanos(a, back_to_back, .UNCOMPRESSED, levels, 2);
+    try testing.expectError(error.UnexpectedDictionaryPage, twice);
+    const after_data = try chunkForTest(a, &.{ dict_page, data_page, dict_page, data_page });
+    const late = decodeColumnAsI64Nanos(a, after_data, .UNCOMPRESSED, levels, 4);
+    try testing.expectError(error.UnexpectedDictionaryPage, late);
+    // One dictionary, first: decodes.
+    const good = try chunkForTest(a, &.{ .{ true, 2, &dict }, .{ false, 2, &data } });
+    _ = try decodeColumnAsI64Nanos(a, good, .UNCOMPRESSED, levels, 2);
 }

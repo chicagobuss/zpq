@@ -38,6 +38,9 @@ pub const Error = error{
     DictionaryMissing,
     ShortDecode,
     UnexpectedPage,
+    /// A second dictionary page in a chunk, or one after a data page: the format allows one, first (as
+    /// `column.Error.UnexpectedDictionaryPage`).
+    UnexpectedDictionaryPage,
     UnsupportedEncoding,
 } || page_mod.Error || std.mem.Allocator.Error;
 
@@ -576,10 +579,12 @@ fn decodeFlbaBackedI128(
     var pr = page_mod.PageReader.init(chunk, codec, arena);
     var written: usize = 0;
     var has_nulls = false;
+    var data_seen = false;
 
     while (try pr.next()) |pg| {
         switch (pg.header.type) {
             .DICTIONARY_PAGE => {
+                if (dict_i128 != null or data_seen) return error.UnexpectedDictionaryPage;
                 const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
                 const dict_count: usize = @intCast(dh.num_values);
                 const expected_bytes = dict_count * bw;
@@ -592,6 +597,7 @@ fn decodeFlbaBackedI128(
                 dict_i128 = dict;
             },
             .DATA_PAGE, .DATA_PAGE_V2 => {
+                data_seen = true;
                 try decodeFlbaDataPage(
                     pg,
                     bw,
@@ -1227,4 +1233,56 @@ test "scaledF64FromI128 matches decodeColumnAsF64 bit for bit" {
             for (want, got.values) |a, b| try testing.expectEqual(@as(u64, @bitCast(a)), @as(u64, @bitCast(b)));
         }
     }
+}
+
+/// A chunk of uncompressed pages: `true` a PLAIN dictionary page of `n` entries, `false` a V1 data page of `n`
+/// RLE_DICTIONARY indices; each with `body`.
+fn chunkForTest(arena: std.mem.Allocator, pages: []const struct { bool, i32, []const u8 }) ![]const u8 {
+    const thrift = @import("../thrift.zig");
+    var chunk: std.ArrayList(u8) = .empty;
+    for (pages) |pg| {
+        const dictionary, const n, const body = pg;
+        const header = schema.PageHeader{
+            .type = if (dictionary) .DICTIONARY_PAGE else .DATA_PAGE,
+            .uncompressed_page_size = @intCast(body.len),
+            .compressed_page_size = @intCast(body.len),
+            .crc = null,
+            .data_page_header = if (dictionary) null else .{
+                .num_values = n,
+                .encoding = .RLE_DICTIONARY,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            },
+            .dictionary_page_header = if (!dictionary)
+                null
+            else
+                .{ .num_values = n, .encoding = .PLAIN, .is_sorted = null },
+            .data_page_header_v2 = null,
+        };
+        var w = thrift.Writer.init(arena);
+        try header.write(&w);
+        try chunk.appendSlice(arena, w.bytes());
+        try chunk.appendSlice(arena, body);
+    }
+    return chunk.items;
+}
+
+test "a second FLBA DECIMAL dictionary page, after data or after the first, is a corrupt chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dict: [8]u8 = @splat(0); // two 4-byte entries
+    const data = [_]u8{ 1, 2 << 1, 0 };
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    const kind: Kind = .{ .scale = 2, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 4 };
+    const dict_page = .{ true, 2, @as([]const u8, &dict) };
+    const data_page = .{ false, 2, @as([]const u8, &data) };
+    const back_to_back = try chunkForTest(a, &.{ dict_page, dict_page, data_page });
+    const twice = decodeColumnAsI128(a, back_to_back, .UNCOMPRESSED, levels, 2, kind);
+    try testing.expectError(error.UnexpectedDictionaryPage, twice);
+    const after_data = try chunkForTest(a, &.{ dict_page, data_page, dict_page, data_page });
+    const late = decodeColumnAsI128(a, after_data, .UNCOMPRESSED, levels, 4, kind);
+    try testing.expectError(error.UnexpectedDictionaryPage, late);
+    const good = try chunkForTest(a, &.{ .{ true, 2, &dict }, .{ false, 2, &data } });
+    _ = try decodeColumnAsI128(a, good, .UNCOMPRESSED, levels, 2, kind);
 }

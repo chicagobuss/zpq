@@ -2061,3 +2061,71 @@ test "legacy LZ4 (codec 5): a multi-chunk Hadoop page decodes to pyarrow's value
 }
 
 // ----- File-read helper -----
+
+/// Fuzz target: arbitrary bytes as a column chunk of a chosen type, codec and level shape, decoded as values, as a
+/// code histogram or as codes; every outcome but an error is the reader's to answer for.
+fn fuzzChunk(_: void, smith: *std.testing.Smith) anyerror!void {
+    const Kind = enum(u3) { i32, i64, f64, bytes, flba, boolean };
+    const Mode = enum(u2) { values, histogram, codes };
+    const kind = smith.value(Kind);
+    const mode = smith.value(Mode);
+    const codec: schema.CompressionCodec = switch (smith.value(u2)) {
+        0 => .UNCOMPRESSED,
+        1 => .SNAPPY,
+        2 => .ZSTD,
+        3 => .GZIP,
+    };
+    const levels: schema.Levels = .{ .max_def = smith.valueRangeAtMost(u8, 0, 2), .max_rep = 0 };
+    const want: usize = smith.valueRangeAtMost(u16, 0, 512);
+    var buf: [16 * 1024]u8 = undefined;
+    const n = smith.slice(&buf);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    switch (kind) {
+        inline else => |k| {
+            const T = switch (k) {
+                .i32 => i32,
+                .i64 => i64,
+                .f64 => f64,
+                .bytes, .flba => []const u8,
+                .boolean => bool,
+            };
+            var reader = ColumnChunkReader(T).init(buf[0..n], codec, levels, arena);
+            if (k == .flba) reader.type_length = smith.valueRangeAtMost(u8, 1, 32);
+            switch (mode) {
+                .values => {
+                    const out = try arena.alloc(T, want);
+                    if (levels.max_def > 0) {
+                        const defs = try arena.alloc(u32, want);
+                        _ = reader.decodeWithLevels(out, defs) catch return;
+                    } else _ = reader.decode(out) catch return;
+                },
+                .histogram => if (T != bool) {
+                    _ = reader.readAllHistogram(want) catch return;
+                },
+                .codes => if (T != bool) {
+                    _ = reader.readAllCodes(want) catch return;
+                },
+            }
+        },
+    }
+}
+
+test "fuzz: column chunk bytes decode or fail with an error, never panic" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Seeds: a dictionary-encoded chunk and PLAIN fixed-width pages, V1 and V2, with and without nulls.
+    var dict_chunk: std.ArrayList(u8) = .empty;
+    try appendPageForTest(arena, &dict_chunk, true, 3, &std.mem.toBytes([3]i32{ 10, 20, 30 }));
+    try appendPageForTest(arena, &dict_chunk, false, 4, &.{ 2, 4 << 1, 2 });
+    const values = [_]?[]const u8{ "ab", null, "cd" };
+    const seeds = [_][]const u8{
+        dict_chunk.items,
+        try flbaPageForTest(arena, false, 2, true, &values),
+        try flbaPageForTest(arena, true, 2, true, &values),
+        try flbaPageForTest(arena, false, 2, false, &.{ "ab", "cd" }),
+    };
+    try std.testing.fuzz({}, fuzzChunk, .{ .corpus = &seeds });
+}

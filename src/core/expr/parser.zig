@@ -1264,3 +1264,34 @@ test "parse: DECIMAL limits — declared types, literal width, product scale" {
     try testing.expectEqual(@as(i128, -5), lit.literal.dec.unscaled);
     try testing.expectEqual(ast.Dec{ .precision = 3, .scale = 2 }, lit.literal.dec.spec);
 }
+
+/// Fuzz target: arbitrary text as select, aggregate, group-by, a lone expression and a filter, against a schema of
+/// every lane: each parses or fails with an error.
+fn fuzzParsers(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [1024]u8 = undefined;
+    const text = buf[0..smith.slice(&buf)];
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = try fakeFile(
+        a,
+        &.{ "a", "b", "c", "s", "f", "fl", "u" },
+        &.{ .INT32, .INT64, .DOUBLE, .BYTE_ARRAY, .BOOLEAN, .FLOAT, .FIXED_LEN_BYTE_ARRAY },
+    );
+    _ = parseSelect(a, text, &file, null) catch {};
+    _ = parseAggList(a, text, &file, null) catch {};
+    _ = parseGroupBy(a, text, &file, null) catch {};
+    _ = parseExprOnly(a, text, &file, null) catch {};
+    _ = filter_parser.parse(a, text, &file, null) catch {};
+}
+
+test "fuzz: select, aggregate, group-by and filter text parse or fail with an error, never panic" {
+    try std.testing.fuzz({}, fuzzParsers, .{ .corpus = &.{
+        "a + 1 AS x, s || 'z' AS t",
+        "count(*) AS n, sum(b * 2) AS s, avg(c) FILTER (WHERE a > 3) AS v",
+        "a, s AS k",
+        "a > 5 AND s = 'x' OR c BETWEEN 1.5 AND 2 AND NOT f = true",
+        "a IN (1, 2, 3) AND s NOT IN ('p', 'q') AND s LIKE 'ab%' AND b IS NOT NULL",
+        "coalesce(a, 0) * -(b - 3) / 2",
+    } });
+}

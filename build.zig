@@ -153,6 +153,13 @@ pub fn build(b: *std.Build) void {
     const service_tests = b.addTest(.{ .root_module = test_service_mod, .filters = test_filters });
     const run_service_tests = b.addRunArtifact(service_tests);
 
+    // The fuzz targets (`test "fuzz: ..."`) live in the core unit tests alone; `zig build fuzz --fuzz[=N]` searches
+    // them without the other test binaries, which have none and so no coverage to report. LLVM-built: the coverage
+    // instrumentation the fuzzer reads comes from that backend, not Debug's default one.
+    const fuzz_tests = b.addTest(.{ .root_module = test_zpq_mod, .filters = test_filters, .use_llvm = true });
+    const fuzz_step = b.step("fuzz", "Run the core unit tests built for `--fuzz` (with -Dtest-filter=\"fuzz:\")");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);

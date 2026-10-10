@@ -1345,3 +1345,33 @@ test "leafLabels agrees with leafLabel on random schemas of colliding names" {
         }
     }
 }
+
+/// Fuzz target: footer bytes, as a file's last 8 bytes would frame them, open or fail with an error.
+fn fuzzFooter(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [64 * 1024]u8 = undefined;
+    const n = smith.slice(&buf);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const meta = openFooter(arena.allocator(), buf[0..n]) catch return;
+    // What every query does next with a footer it accepted.
+    for (0..meta.schema.items.len -| 1) |i| _ = leafSchemaElement(&meta, i);
+}
+
+test "fuzz: footer bytes open or fail with an error, never panic" {
+    var seeds: std.ArrayList([]const u8) = .empty;
+    defer seeds.deinit(testing.allocator);
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| testing.allocator.free(f);
+        files.deinit(testing.allocator);
+    }
+    for ([_][]const u8{ "mixed_codec", "null_pages", "decimal_exact", "nested_key_shape", "dotted_twin" }) |name| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "ci/fixtures/parquet/{s}.parquet", .{name});
+        const bytes = readFileSlice(path, testing.allocator) catch continue;
+        try files.append(testing.allocator, bytes);
+        const len = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+        try seeds.append(testing.allocator, bytes[bytes.len - 8 - len .. bytes.len - 8]);
+    }
+    try std.testing.fuzz({}, fuzzFooter, .{ .corpus = seeds.items });
+}

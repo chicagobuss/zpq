@@ -101,6 +101,12 @@ pub const Request = struct {
         } else false;
         req.profile_url = try f.string("profile_url");
         req.profile = try f.boolean("profile") or req.profile_url != null;
+        // Paths go to system calls as C strings, where a NUL byte would end them early (and std asserts it never
+        // does); JSON can carry one, the command line cannot. S3 URLs are checked further by `s3.Url.parse`.
+        const inputs_field = if (parsed.value.inputs != null) "inputs" else "s3_url";
+        for (req.inputs) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad(inputs_field);
+        if (req.output_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("output_url");
+        if (req.profile_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("profile_url");
         if (try f.strings(arena, "bloom_filters", true)) |b| req.bloom_filters = b;
         if (parsed.value.max_memory) |v| req.max_memory = switch (v) {
             .null => null,
@@ -331,4 +337,22 @@ test "an unknown field is skipped, not built: a large one costs no allocation" {
         std.debug.print("peak {d} bytes for a {d}-byte body\n", .{ peak.peak, body.items.len });
         return err;
     };
+}
+
+test "a NUL byte in an input, output or profile path is a bad field" {
+    var bad: []const u8 = "";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, "{\"inputs\":[\"a\\u0000b\"]}", &bad));
+    try testing.expectEqualStrings("inputs", bad);
+    const url = "{\"s3_url\":\"s3://b/k\\u0000\"}";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, url, &bad));
+    try testing.expectEqualStrings("s3_url", bad);
+    const out = "{\"inputs\":[\"a\"],\"output_url\":\"o\\u0000\"}";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, out, &bad));
+    try testing.expectEqualStrings("output_url", bad);
+    const prof = "{\"inputs\":[\"a\"],\"profile_url\":\"s3://b/\\u0000\"}";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, prof, &bad));
+    try testing.expectEqualStrings("profile_url", bad);
+    // Other control bytes are legal in a local file name.
+    var ok = try Request.parse(testing.allocator, "{\"inputs\":[\"a\\nb\"]}", &bad);
+    ok.deinit();
 }

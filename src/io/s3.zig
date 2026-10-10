@@ -337,9 +337,30 @@ pub const Url = struct {
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadS3Url;
         if (slash == 0) return error.BadS3Url;
         if (slash + 1 >= rest.len) return error.BadS3Url;
-        return .{ .bucket = rest[0..slash], .key = rest[slash + 1 ..] };
+        const bucket = rest[0..slash];
+        const key = rest[slash + 1 ..];
+        // The bucket goes into the Host header and, path-style, the request line as it is: only the characters a
+        // bucket name may hold (AWS's, plus the uppercase and `_` of legacy and S3-compatible stores) get that far.
+        // The key is percent-encoded on the wire, but a control byte in it is refused all the same.
+        for (bucket) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_')) return error.BadS3Url;
+        }
+        for (key) |ch| if (ch < 0x20 or ch == 0x7f) return error.BadS3Url;
+        return .{ .bucket = bucket, .key = key };
     }
 };
+
+test "an S3 URL with a bucket that could break a header, or a control byte in its key, is refused" {
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt\r\nX-Injected: 1/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt evil/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt:443/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\nb"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\x00b"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\x7fb"));
+    const u = try Url.parse("s3://My_legacy.bucket-1/dir/a b+c%.parquet");
+    try std.testing.expectEqualStrings("My_legacy.bucket-1", u.bucket);
+    try std.testing.expectEqualStrings("dir/a b+c%.parquet", u.key);
+}
 
 /// Multi-fetch S3 client over a single keep-alive TLS connection.
 ///

@@ -49,6 +49,9 @@ pub const Error = error{
     PageValueCountExceedsChunk,
     /// A dictionary page claims more entries than its bytes can hold.
     DictionaryLargerThanPage,
+    /// A second dictionary page in a chunk, or one after a data page: the format allows one, first. Codes already
+    /// checked against the first dictionary would index the second.
+    UnexpectedDictionaryPage,
 } || page_mod.Error;
 
 /// Choose the right decoder shape for T at comptime.
@@ -165,6 +168,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// Cached dictionary, if the chunk has one. Populated on the
         /// first DICTIONARY_PAGE we encounter.
         dictionary: ?[]const T = null,
+        /// A data page of this chunk has been installed: a dictionary page may no longer follow.
+        data_page_seen: bool = false,
 
         active: ActiveDecoder(T) = .idle,
 
@@ -567,7 +572,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
                         for (src) |dv| present += @intFromBool(dv == max_def);
                     }
                     const idx = &self.active.rle_dict.indices;
-                    const n_dict = d.len;
+                    // Bounded by the buffer allocated, not by whatever dictionary is installed now.
+                    const n_dict = hist.len;
+                    if (n_dict == 0 or d.len != n_dict) return error.UnexpectedPage;
                     var left = present;
                     while (left > 0) {
                         if (idx.takeRleRun(left) catch return error.UnexpectedPage) |run| {
@@ -670,8 +677,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
         ) (Error || error{ShortDecode})!Leaves {
             const values = try self.arena.alloc(T, num_leaves);
             if (written > 0) {
-                const dict = self.dictionary.?;
-                for (values[0..written], codes[0..written]) |*v, k| v.* = dict[k];
+                const dict = self.dictionary orelse return error.DictionaryMissing;
+                for (values[0..written], codes[0..written]) |*v, k| {
+                    if (k >= dict.len) return error.UnexpectedPage;
+                    v.* = dict[k];
+                }
             }
             const max_def: u32 = @intCast(self.levels.max_def);
             // Values decode needs expanded levels from here on.
@@ -1021,6 +1031,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn installDictionary(self: *Self, pg: page_mod.Page) Error!void {
+            if (self.dictionary != null or self.data_page_seen) return error.UnexpectedDictionaryPage;
             const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
             const num: usize = @intCast(dh.num_values);
             // BOOLEAN never gets dictionary encoding in practice — the
@@ -1059,6 +1070,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn installDataPageDecoder(self: *Self, pg: page_mod.Page) Error!void {
+            self.data_page_seen = true;
             const dph = pg.header.data_page_header orelse return error.UnexpectedPage;
 
             const num_values: usize = @intCast(dph.num_values);
@@ -1099,6 +1111,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         ///     V2 path), so this installer can slice straight by the
         ///     header lengths.
         fn installDataPageV2Decoder(self: *Self, pg: page_mod.Page) Error!void {
+            self.data_page_seen = true;
             const dph = pg.header.data_page_header_v2 orelse return error.UnexpectedPage;
 
             const num_values: usize = @intCast(dph.num_values);
@@ -1364,6 +1377,57 @@ fn flbaPageForTest(
     try chunk.appendSlice(arena, w.bytes());
     try chunk.appendSlice(arena, body.items);
     return chunk.items;
+}
+
+/// Append one uncompressed page of `body` to `chunk`: a PLAIN dictionary page of `n` INT32 entries, or a V1 data page
+/// of `n` RLE_DICTIONARY indices.
+fn appendPageForTest(arena: std.mem.Allocator, chunk: *std.ArrayList(u8), dictionary: bool, n: i32, body: []const u8) !void {
+    const header = schema.PageHeader{
+        .type = if (dictionary) .DICTIONARY_PAGE else .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.len),
+        .compressed_page_size = @intCast(body.len),
+        .crc = null,
+        .data_page_header = if (dictionary) null else .{
+            .num_values = n,
+            .encoding = .RLE_DICTIONARY,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = if (!dictionary) null else .{ .num_values = n, .encoding = .PLAIN, .is_sorted = null },
+        .data_page_header_v2 = null,
+    };
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, body);
+}
+
+test "a second dictionary page, after data or after the first, is a corrupt chunk" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const dict3 = std.mem.toBytes([3]i32{ 10, 20, 30 });
+    const dict1 = std.mem.toBytes([1]i32{40});
+    // Four indices at bit width 2: one RLE run of 4 x index 2 (the last entry of the first dictionary).
+    const data = [_]u8{ 2, 4 << 1, 2 };
+    const empty = [_]u8{};
+
+    for ([_]bool{ false, true }) |back_to_back| for ([_]bool{ false, true }) |second_empty| {
+        var chunk: std.ArrayList(u8) = .empty;
+        try appendPageForTest(arena, &chunk, true, 3, &dict3);
+        if (!back_to_back) try appendPageForTest(arena, &chunk, false, 4, &data);
+        // The replacement is smaller, or holds no entry at all, so the first dictionary's codes overrun it.
+        if (second_empty) try appendPageForTest(arena, &chunk, true, 0, &empty) else try appendPageForTest(arena, &chunk, true, 1, &dict1);
+        try appendPageForTest(arena, &chunk, false, 4, &data);
+        const n: usize = if (back_to_back) 4 else 8;
+
+        var values_reader = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, arena);
+        var out: [8]i32 = undefined;
+        try testing.expectError(error.UnexpectedDictionaryPage, values_reader.decode(out[0..n]));
+
+        var hist_reader = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, arena);
+        try testing.expectError(error.UnexpectedDictionaryPage, hist_reader.readAllHistogram(n * 8));
+    };
 }
 
 test "PLAIN FIXED_LEN_BYTE_ARRAY decodes the same from V1 and V2 data pages" {

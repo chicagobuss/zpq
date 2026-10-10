@@ -113,6 +113,10 @@ pub const Credentials = struct {
     endpoint: ?[]const u8 = null,
     /// Connection deadlines (`tls.Timeouts`): the defaults, or `ZPQ_S3_*_TIMEOUT_MS` from the environment.
     timeouts: tls.Timeouts = .{},
+    /// Address AWS path-style on `s3.<region>.amazonaws.com`. Lambda sets this so the connections opened during
+    /// init, before any bucket is known, are the ones the query reuses. The CLI leaves it unset and stays
+    /// virtual-hosted.
+    path_style: bool = false,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
         // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
@@ -213,6 +217,7 @@ fn defaultPort(use_tls: bool) u16 {
 /// bucket without dots: AWS's certificate covers `*.s3.<region>.amazonaws.com`, one label, so `my.bucket.s3...` fails
 /// hostname verification and dotted buckets go path-style, as the AWS SDKs send them.
 pub fn virtualHosted(creds: Credentials, bucket: []const u8) bool {
+    if (creds.path_style) return false;
     return creds.endpoint == null and std.mem.indexOfScalar(u8, bucket, '.') == null;
 }
 
@@ -245,6 +250,13 @@ pub fn portFor(creds: Credentials) u16 {
 
 pub fn useTls(creds: Credentials) bool {
     return creds.endpointUseTls();
+}
+
+/// How many connections to open before the first request. `ZPQ_S3_PRECONNECT`, default 4; 0 opens none.
+/// A value that does not parse is the default.
+pub fn preconnectCount(env: std.process.Environ) usize {
+    const v = env.getPosix("ZPQ_S3_PRECONNECT") orelse return 4;
+    return std.fmt.parseInt(usize, v, 10) catch 4;
 }
 
 pub fn poolCriteria(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) !PoolCriteria {
@@ -1307,6 +1319,11 @@ test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS'
     try testing.expectEqualStrings("logs.s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs"));
     try testing.expectEqualStrings("/k.parquet", try pathFor(a, aws, "logs", "k.parquet"));
 
+    var path_style = aws;
+    path_style.path_style = true;
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try hostFor(a, path_style, "logs"));
+    try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, path_style, "logs", "k.parquet"));
+
     const r2: Credentials = .{
         .access_key = "ak",
         .secret_key = "sk",
@@ -1325,6 +1342,13 @@ fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
         break :blk &final;
     };
     return .{ .block = .{ .slice = slice } };
+}
+
+test "ZPQ_S3_PRECONNECT defaults to 4 and 0 disables it" {
+    try testing.expectEqual(@as(usize, 4), preconnectCount(testEnviron(&.{})));
+    try testing.expectEqual(@as(usize, 0), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=0"})));
+    try testing.expectEqual(@as(usize, 2), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=2"})));
+    try testing.expectEqual(@as(usize, 4), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=no"})));
 }
 
 test "S3_NO_SIGN_REQUEST yields anonymous credentials instead of NoCredentials" {

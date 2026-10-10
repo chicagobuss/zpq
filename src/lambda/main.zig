@@ -7,19 +7,21 @@
 //!   - SO_ZEROCOPY and TCP_FASTOPEN setsockopt allowed.
 //!
 //! Lifecycle (production / S3 path):
-//!   1. Receive `{"s3_url": "...", "filter": "...optional..."}`.
-//!   2. One suffix GET (`engine.footerProbeFor`) for the file size and footer. An explicit
+//!   1. Before the first `/next`, open `ZPQ_S3_PRECONNECT` connections (default 4) to the
+//!      regional endpoint and park them. Failures are ignored.
+//!   2. Receive `{"s3_url": "...", "filter": "...optional..."}`.
+//!   3. One suffix GET (`engine.footerProbeFor`) for the file size and footer. An explicit
 //!      `ZPQ_S3_FOOTER_PROBE` cannot exceed the memory budget.
-//!   3. If the footer is bigger than that suffix, fetch the missing prefix. The leading
+//!   4. If the footer is bigger than that suffix, fetch the missing prefix. The leading
 //!      PAR1 is checked only when a fetched range already covers offset 0.
-//!   4. Parse FileMetaData. If filter is present, parse it against
+//!   5. Parse FileMetaData. If filter is present, parse it against
 //!      the schema.
-//!   5. For each row group: prune via the filter's stats. For
+//!   6. For each row group: prune via the filter's stats. For
 //!      survivors, range-fetch the int8 column AND any filter
 //!      columns. Coalesce nearby ranges.
-//!   6. Decode each column into typed slices, build a SelectionVector,
+//!   7. Decode each column into typed slices, build a SelectionVector,
 //!      run filter.eval, then aggregate matched int8 values.
-//!   7. Return JSON envelope with row_groups_pruned + matched count
+//!   8. Return JSON envelope with row_groups_pruned + matched count
 //!      + min/max/sum.
 
 const std = @import("std");
@@ -82,6 +84,9 @@ const PersistentPool = struct {
     initialized: bool = false,
     output: engine.OutputLane = undefined,
     output_initialized: bool = false,
+    /// Set when init tried to pre-connect. Null when it did not (no S3 config, or the count is 0).
+    preconnect_ns: ?u64 = null,
+    preconnect_opened: u64 = 0,
 
     /// A sixteenth of the function's memory for warm Bloom filters (188 MB at 3008 MB), at most 256 MiB.
     pub fn sized(available: usize) PersistentPool {
@@ -138,6 +143,32 @@ const PersistentPool = struct {
     }
 };
 
+/// Open the regional endpoint's connections before the first `/next`. Best-effort: a missing
+/// configuration or a failed handshake leaves the query to connect on its own. The elapsed time
+/// is what init grew by, reported on the next profile.
+fn preconnectS3(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+) void {
+    const n = s3.preconnectCount(env);
+    if (n == 0) return;
+    var creds = s3.Credentials.fromEnv(env) catch return;
+    creds.path_style = true;
+    const t0 = nowMonoNs();
+    pool.preconnect_ns = 0;
+    const inner = pool.ensureForBucket(allocator, creds, "preconnect") catch return;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const criteria = s3.poolCriteria(arena_state.allocator(), creds, "preconnect") catch {
+        pool.preconnect_ns = @as(u64, @intCast(nowMonoNs() - t0));
+        return;
+    };
+    pool.preconnect_opened = @as(u64, inner.preconnect(io, criteria, n));
+    pool.preconnect_ns = @as(u64, @intCast(nowMonoNs() - t0));
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const env = init.minimal.environ;
@@ -150,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
     defer client.deinit();
 
     var pool: PersistentPool = .sized(zpq.core.system.discoverAvailableMemory(env));
+    preconnectS3(io, allocator, env, &pool);
 
     while (true) {
         var inv = client.nextInvocation() catch |err| {
@@ -246,6 +278,8 @@ fn handle(
         if (req.profile and zpq.profile.enabled) {
             var meta = zpq.profile.Meta.discover(env);
             meta.query = zpq.profile.utf8Prefix(trimmed, MAX_PROFILE_QUERY);
+            meta.s3_preconnect_ns = pool.preconnect_ns;
+            meta.s3_preconnect_opened = pool.preconnect_opened;
             profiler = try zpq.profile.Profiler.create(allocator, prof_opts, meta);
         }
 
@@ -369,7 +403,8 @@ fn uploadTrace(
     max_bytes: usize,
 ) !zpq.profile.TraceStats {
     const url = s3.Url.parse(url_str) catch return error.BadProfileUrl;
-    const creds = s3.Credentials.fromEnv(env) catch return error.NoCredentials;
+    var creds = s3.Credentials.fromEnv(env) catch return error.NoCredentials;
+    creds.path_style = true;
     var trace: std.Io.Writer.Allocating = .init(allocator);
     defer trace.deinit();
     const st = try p.writeTraceCapped(allocator, &trace.writer, max_bytes);
@@ -656,9 +691,10 @@ fn handleS3(
     const url = s3.Url.parse(s3_url) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_s3_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
-    const creds = s3.Credentials.fromEnv(env) catch |err| {
+    var creds = s3.Credentials.fromEnv(env) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
+    creds.path_style = true;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

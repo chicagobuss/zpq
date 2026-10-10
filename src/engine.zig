@@ -1367,7 +1367,13 @@ fn envDisables(env: std.process.Environ, name: []const u8) bool {
 }
 
 fn credentialsFromEnv(env: std.process.Environ) error{ NoCredentials, NoRegion }!s3.Credentials {
-    return s3.Credentials.fromEnv(env) catch |err| if (err == error.NoRegion) error.NoRegion else error.NoCredentials;
+    var creds = s3.Credentials.fromEnv(env) catch |err| {
+        return if (err == error.NoRegion) error.NoRegion else error.NoCredentials;
+    };
+    // The Lambda binary pre-connects the regional endpoint before it knows the bucket. Path-style uses that
+    // same host, so those sockets are the ones the query acquires. The CLI is not on Lambda and stays virtual-hosted.
+    if (system.onLambda(env)) creds.path_style = true;
+    return creds;
 }
 
 fn sameName(name: []const u8) []const u8 {

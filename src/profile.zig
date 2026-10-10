@@ -411,6 +411,10 @@ pub const Meta = struct {
     lambda_memory_mb: ?usize = null,
     /// The query as the caller expressed it (argv or the request), for the reader.
     query: []const u8 = "",
+    /// Set when this process opened S3 connections during init. Null when it did not try.
+    s3_preconnect_ns: ?u64 = null,
+    /// How many of those connections were parked.
+    s3_preconnect_opened: u64 = 0,
 
     pub fn discover(env: ?std.process.Environ) Meta {
         const mb: ?usize = if (env) |e|
@@ -870,6 +874,9 @@ pub const Profiler = struct {
         if (m.lambda_memory_mb) |mb| try w.print("{d}", .{mb}) else try w.writeAll("null");
         try w.print(",\"start_unix_s\":{d},\"query\":", .{self.epoch_real_s});
         try writeJsonString(w, utf8Prefix(m.query, max_query));
+        try w.writeAll(",\"s3_preconnect_ns\":");
+        if (m.s3_preconnect_ns) |ns| try w.print("{d}", .{ns}) else try w.writeAll("null");
+        try w.print(",\"s3_preconnect_opened\":{d}", .{m.s3_preconnect_opened});
         try w.writeByte('}');
     }
 };

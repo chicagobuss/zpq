@@ -86,6 +86,8 @@ zpq profile: 13.21 ms wall, 18 threads, 590 events
   0.4.0 fast x86_64-linux-gnu, 16 cpus, parallelism 16
 ```
 
+A Lambda run that opened S3 connections during init adds `s3 preconnect: N connection(s) in X.XX ms`: how long that took, and how many were parked. The same two numbers are `s3_preconnect_ns` and `s3_preconnect_opened` in the JSON metadata.
+
 Wall time is the `query` span. `cores` is process CPU over wall: how much of the machine the query used.
 
 `rss peak` is this run's peak resident memory, not the process's: a warm Lambda would otherwise report an earlier

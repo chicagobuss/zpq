@@ -305,6 +305,41 @@ pub fn Pool(comptime N: usize) type {
             self.stats = .{};
         }
 
+        /// Open up to `n` new connections for `criteria` in parallel, finish each handshake, and park them idle.
+        /// Each one is opened fresh, so a connection this call just parked is not reused to satisfy another.
+        /// One that fails to open is skipped; `n` above the permit count opens only that many. `criteria` must
+        /// outlive the call. A parked connection is fresh: `release` stamps `idle_since_ns` as now, and the idle
+        /// timeout still closes it later.
+        pub fn preconnect(self: *Self, io: Io, criteria: Criteria, n: usize) u32 {
+            const want = @min(n, N);
+            if (want == 0) return 0;
+
+            const Job = struct {
+                pool: *Self,
+                io: Io,
+                criteria: Criteria,
+                opened: *std.atomic.Value(u32),
+
+                fn run(job: *@This()) void {
+                    // `fresh`: a peer that finishes first must not satisfy the rest, or N acquires park fewer than N.
+                    const h = job.pool.acquire(job.io, job.criteria, .{ .fresh = true }) catch return;
+                    job.pool.release(job.io, h);
+                    _ = job.opened.fetchAdd(1, .monotonic);
+                }
+            };
+
+            var opened = std.atomic.Value(u32).init(0);
+            var jobs: [N]Job = undefined;
+            var group: Io.Group = .init;
+            defer group.cancel(io);
+            for (0..want) |i| {
+                jobs[i] = .{ .pool = self, .io = io, .criteria = criteria, .opened = &opened };
+                group.async(io, Job.run, .{&jobs[i]});
+            }
+            group.await(io) catch {};
+            return opened.load(.monotonic);
+        }
+
         fn destroyNode(self: *Self, slot: *Node) void {
             slot.conn.deinit();
             self.allocator.free(slot.host);
@@ -460,6 +495,65 @@ const TestListener = struct {
         return .{ .host = "127.0.0.1", .addrs = &.{.{ 127, 0, 0, 1 }}, .port = self.port, .use_tls = false };
     }
 };
+
+test "preconnect parks connections the next acquire reuses, and the idle timeout still drops them" {
+    const io = testing.io;
+    const listener = try TestListener.open();
+    defer listener.close();
+
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+
+    const addrs = [_]tls.Ipv4{.{ 127, 0, 0, 1 }};
+    const criteria: Criteria = .{
+        .host = "127.0.0.1",
+        .addrs = &addrs,
+        .port = listener.port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 500, .handshake_ms = 500 },
+    };
+
+    try testing.expectEqual(@as(u32, 0), p.preconnect(io, criteria, 0));
+    try testing.expectEqual(@as(usize, 0), p.free_len);
+
+    const opened = p.preconnect(io, criteria, 4);
+    try testing.expectEqual(@as(u32, 4), opened);
+    try testing.expectEqual(@as(usize, 4), p.free_len);
+    try testing.expectEqual(@as(u64, 4), p.snapshotStats().opens);
+
+    const again = try p.acquire(io, criteria, .{});
+    try testing.expect(again.reused);
+    p.release(io, again);
+
+    var node = p.free.first;
+    while (node) |n| {
+        const slot: *Pool(4).Node = @alignCast(@fieldParentPtr("pool_node", n));
+        slot.idle_since_ns -= p.idle_timeout_ns + std.time.ns_per_ms;
+        node = n.next;
+    }
+    const after_idle = try p.acquire(io, criteria, .{});
+    try testing.expect(!after_idle.reused);
+    p.release(io, after_idle);
+    try testing.expect(p.snapshotStats().idle_evictions >= 1);
+
+    // Nothing is listening: the failure is ignored and nothing is parked.
+    const dead = try TestListener.open();
+    const dead_port = dead.port;
+    dead.close();
+    var q: Pool(2) = undefined;
+    try q.init(testing.allocator);
+    defer q.deinit();
+    const refused: Criteria = .{
+        .host = "127.0.0.1",
+        .addrs = &addrs,
+        .port = dead_port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 200, .handshake_ms = 200 },
+    };
+    try testing.expectEqual(@as(u32, 0), q.preconnect(io, refused, 2));
+    try testing.expectEqual(@as(usize, 0), q.free_len);
+}
 
 test "acquire reuses a connection idle for less than the timeout and closes one idle for longer" {
     const io = testing.io;

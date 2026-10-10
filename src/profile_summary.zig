@@ -606,6 +606,9 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     try w.print("  {s} {s} {s}, {d} cpus, parallelism {d}{s}\n", .{
         m.version, m.build_mode, m.target, m.cpu_count, m.parallelism, lambda,
     });
+    if (m.s3_preconnect_ns) |ns| {
+        try w.print("  s3 preconnect: {d} connection(s) in {d:.2} ms\n", .{ m.s3_preconnect_opened, ms(ns) });
+    }
 
     try w.writeAll("\nphase          wall ms   busy ms  share ms  alone ms    spans\n");
     for (s.phases, 0..) |ph, i| {

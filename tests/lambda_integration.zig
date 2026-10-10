@@ -707,10 +707,11 @@ test "lambda returns a bounded profile summary inline when asked" {
     const out = "zig-out/lambda_profile_out.parquet";
     defer _ = linux.unlink(out);
     // The request is echoed cut to 512 bytes; put an `é` across that byte. The cut must fall before it.
+    // This process has a region and no keys, so pre-connect skips and those fields follow the cut query.
     const note = agg ++ ",\"note\":\"";
     const straddle = note ++ @as([511 - note.len]u8, @splat('a')) ++ "\u{e9}\"}";
     try expectResponses("lambda profile", &.{
-        .{ .body = straddle, .want = "aaaa\"},\"phases\":{" },
+        .{ .body = straddle, .want = "aaaa\",\"s3_preconnect_ns\":null,\"s3_preconnect_opened\":0},\"phases\":{" },
         // The event cap is 1/32 of the memory budget, in 72-byte events.
         .{ .body = agg ++ ",\"max_memory\":\"64MB\"}", .want = "\"dropped\":0,\"event_cap\":29127," },
         // The answer is untouched; the summary joins it, phases and engine sums included.

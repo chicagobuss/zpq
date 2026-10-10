@@ -548,17 +548,17 @@ fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Err
     try rejectUnsigned64Operand(l);
     try rejectUnsigned64Operand(r);
     var result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
+    // Op/type compatibility first: `concat` is string-only, arithmetic ops numeric-only. A `||` over DECIMAL operands
+    // must stop here, before the DECIMAL result spec below.
+    if (op == .concat and result_type != .str) return error.TypeMismatch;
+    if (op != .concat and result_type == .str) return error.TypeMismatch;
     // Exact division has no closed result scale; DECIMAL `/` is DOUBLE, as DuckDB types it.
     if (op == .div and result_type == .dec) result_type = .f64;
     const dec: ?ast.Dec = if (result_type != .dec) null else switch (op) {
         .add, .sub => ast.Dec.addSub(l.decSpec().?, r.decSpec().?),
         .mul => try ast.Dec.mul(l.decSpec().?, r.decSpec().?),
-        .div, .concat => unreachable,
+        .div, .concat => unreachable, // `.div` became f64 and `.concat` returned above
     };
-    // Op/type compatibility: `concat` is string-only, arithmetic ops
-    // are numeric-only.
-    if (op == .concat and result_type != .str) return error.TypeMismatch;
-    if (op != .concat and result_type == .str) return error.TypeMismatch;
 
     // Tree height, not parser recursion: `a + 1 + 1 + ...` parses in a loop but still grows the left spine, which the
     // evaluator does recurse over. Checking as we build rejects a runaway chain before the whole AST is allocated.
@@ -937,6 +937,17 @@ test "parse: type mismatch — string + number errors" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "name + 1", &file, null));
+}
+
+test "parse: `||` over numbers, DECIMAL ones included, is a type error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"name"}, &.{.BYTE_ARRAY});
+    // A decimal literal makes the operands DECIMAL; this reached `unreachable` in the DECIMAL result spec.
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1.5 || 2", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1 || 2.25", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1 || 2", &file, null));
 }
 
 test "parse: coalesce(col, default)" {

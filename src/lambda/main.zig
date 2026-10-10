@@ -697,6 +697,9 @@ fn handleS3(
     if (footer_actual_start < tail_start) {
         const need = try client.get(a, url.key, s3.Range.span(footer_actual_start, tail_start - 1));
         if (need.status != 206) return error.RangeStatus;
+        if (need.body.len != tail_start - footer_actual_start) return error.RangeStatus;
+        // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.
+        if (footer_actual_start == 0 and !metadata.hasLeadingMagic(need.body)) return error.NotParquet;
         @memcpy(file_buf[footer_actual_start..tail_start], need.body);
     }
     // The suffix included offset 0. Otherwise the leading magic waits for a data range that covers it.

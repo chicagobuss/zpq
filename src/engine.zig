@@ -92,10 +92,11 @@ pub const POOL_SIZE: usize = 8;
 
 /// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
 /// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes. The trailing
-/// PAR1 is always checked. The leading PAR1 is not a request of its own: it is checked when this suffix is the whole
-/// object, or when a later range already covers offset 0. A footer that does not fit is one more GET for the missing
-/// prefix, and never a third.
+/// PAR1 is always checked. The leading PAR1 is not a request of its own: it is checked when a fetched range covers
+/// offset 0, including a footer-prefix GET that starts there. A footer that does not fit is one more GET for the
+/// missing prefix, and never a third.
 pub const FOOTER_PROBE_DEFAULT: u64 = 1 << 20;
+const FOOTER_PROBE_MIN: u64 = 64 << 10;
 const FOOTER_PROBE_MAX: u64 = 16 << 20;
 
 pub fn footerProbeBytes(env: std.process.Environ) u64 {
@@ -104,6 +105,42 @@ pub fn footerProbeBytes(env: std.process.Environ) u64 {
     if (n < 8) return 8;
     return @min(n, FOOTER_PROBE_MAX);
 }
+
+/// Probe used when no `ZPQ_S3_FOOTER_PROBE` is set. Many inputs and a small budget must not each pull a 1 MiB
+/// suffix: `clamp(budget / (2 × concurrent footer fetches), 64 KiB, 1 MiB)`. The 2 counts the response buffer and
+/// the copy that may be retained.
+pub fn footerProbeFor(env: std.process.Environ, budget: u64, concurrent: usize) u64 {
+    if (env.getPosix("ZPQ_S3_FOOTER_PROBE") != null) return footerProbeBytes(env);
+    const n: u64 = @max(concurrent, 1);
+    return std.math.clamp(budget / (2 * n), FOOTER_PROBE_MIN, FOOTER_PROBE_DEFAULT);
+}
+
+/// In-flight footer responses and retained suffixes, against one resident budget. A charge that does not fit is
+/// refused: the caller drops the suffix and fetches those ranges later.
+const ByteAccount = struct {
+    limit: u64,
+    used: std.atomic.Value(u64) = .init(0),
+
+    fn add(self: *ByteAccount, n: u64) void {
+        if (n == 0) return;
+        _ = self.used.fetchAdd(n, .monotonic);
+    }
+
+    fn sub(self: *ByteAccount, n: u64) void {
+        if (n == 0) return;
+        _ = self.used.fetchSub(n, .monotonic);
+    }
+
+    fn tryAdd(self: *ByteAccount, n: u64) bool {
+        if (n == 0) return true;
+        while (true) {
+            const cur = self.used.load(.monotonic);
+            const sum = std.math.add(u64, cur, n) catch return false;
+            if (sum > self.limit) return false;
+            if (self.used.cmpxchgWeak(cur, sum, .acq_rel, .monotonic) == null) return true;
+        }
+    }
+};
 
 /// Permits for an S3 output's part uploads, apart from the input reads' so neither waits for the other, over the same
 /// pool so uploads reuse the connections reads leave idle. As many as uploads had while they shared the read permits.
@@ -2202,7 +2239,8 @@ pub fn fetchS3Schema(
     read_ctx.io = read_exec.io();
 
     var specs = [_]FetchSpec{.{ .url = url }};
-    try fetchMetaBatch(read_ctx, arena, creds, pool, &specs, null);
+    var account: ByteAccount = .{ .limit = std.math.maxInt(u64) };
+    try fetchMetaBatch(read_ctx, arena, creds, pool, &specs, null, &account);
 
     // fetchMetaBatch's parsed metadata borrows string bytes from the
     // gpa-owned footer_region (thrift readString borrows, never copies).
@@ -2313,8 +2351,13 @@ fn openInputs(
         // total file size + tail_start.
         var specs = try arena.alloc(FetchSpec, s3_urls.len);
         for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u, .file_index = s3_indices.items[k] };
+        // Retained suffixes and in-flight footer bodies share one budget: the caller's max, and never the fetch
+        // window's 64 MiB floor when that floor is higher. A suffix that does not fit is dropped and those ranges
+        // are fetched later. The streaming window (including a test's ZPQ_S3_WINDOW_KIB) stays the admission limit;
+        // a suffix the budget can hold is still reused.
+        var account: ByteAccount = .{ .limit = @min(s3_window.windowFor(args.max_memory), @as(u64, args.max_memory)) };
         const batch_span = profile.Span.begin(prof);
-        fetchMetaBatch(read_ctx, arena, creds, pool, specs, args.profiler) catch |err| {
+        fetchMetaBatch(read_ctx, arena, creds, pool, specs, args.profiler, &account) catch |err| {
             for (specs) |*sp| {
                 sp.releaseTail(ctx.gpa);
                 if (sp.file_buf.len > 0) ctx.gpa.free(sp.file_buf);
@@ -2331,6 +2374,7 @@ fn openInputs(
                 if (sp.file_buf.len > 0 and !windowed) ctx.gpa.free(sp.file_buf);
                 if (sp.footer_region.len > 0) ctx.gpa.free(sp.footer_region);
             }
+            for (s3_buffers.items) |b| ctx.gpa.free(b);
         };
 
         const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
@@ -2353,6 +2397,8 @@ fn openInputs(
         var n_rgs: usize = 0;
         var n_rgs_pruned: usize = 0;
         const plan = try planRanges(arena, args, metas_for_plan);
+        // Bloom has already copied what it needed. Keep only suffix bytes a planned range still overlaps.
+        for (specs) |*sp| trimRetainedSuffix(ctx.gpa, sp, plan, &account);
 
         // Per file: stat-prune RGs, collect raw byte ranges for every
         // (surviving RG) × (needed col), coalesce within the file, and
@@ -2386,9 +2432,10 @@ fn openInputs(
 
         var fetch_jobs: std.ArrayList(s3.FetchJob) = .empty;
         for (specs, win_files) |*sp, *wf| {
-            // The tail serves the footer parse and the copies below; every way out of this iteration frees it, a file
-            // whose row groups all prune included.
-            defer sp.releaseTail(ctx.gpa);
+            // The tail serves the footer parse and the copies below. A windowed copy is applied when the row group
+            // is admitted, so that tail stays until the fetcher stops; every other way out frees it here.
+            var keep_tail = false;
+            defer if (!keep_tail) releaseChargedTail(sp, ctx.gpa, &account);
             const meta = &sp.meta;
             sp.rg_columns = try arena.alloc(?[]const bool, meta.row_groups.items.len);
             wf.* = .{ .rgs = try arena.alloc(?*s3_window.RowGroup, meta.row_groups.items.len) };
@@ -2481,7 +2528,9 @@ fn openInputs(
                 const span = if (windowed) sp.compact_ranges[rg_compact[ri]..rg_compact[ri + 1]] else sp.compact_ranges;
                 if (span.len == 0) continue;
                 var rg_jobs: std.ArrayList(s3.FetchJob) = .empty;
-                var rg_bytes: u64 = 0;
+                var copies: std.ArrayList(s3_window.Copied) = .empty;
+                var job_bytes: u64 = 0;
+                var copy_bytes: u64 = 0;
                 for (span) |r| {
                     const source_len: usize = @intCast(r.end - r.start);
                     const dst = sp.file_buf[r.dst_start .. r.dst_start + source_len];
@@ -2494,7 +2543,7 @@ fn openInputs(
                             .range = .{ .start = r.start, .end = fetch_end },
                             .target = dst[0..@intCast(fetch_end - r.start)],
                         };
-                        rg_bytes += job.target.len;
+                        job_bytes += job.target.len;
                         try (if (windowed) &rg_jobs else &fetch_jobs).append(arena, job);
                     }
 
@@ -2504,9 +2553,15 @@ fn openInputs(
                         const tail_off: usize = @intCast(tail_copy_start - sp.tail_start);
                         const copy_len: usize = @intCast(r.end - tail_copy_start);
                         if (tail_off + copy_len > sp.tail.len) return error.BadResponse;
-                        @memcpy(dst[dst_off .. dst_off + copy_len], sp.tail[tail_off .. tail_off + copy_len]);
+                        const src = sp.tail[tail_off .. tail_off + copy_len];
+                        if (windowed) {
+                            try copies.append(arena, .{ .dst = dst[dst_off .. dst_off + copy_len], .src = src });
+                            copy_bytes += copy_len;
+                        } else @memcpy(dst[dst_off .. dst_off + copy_len], src);
                     }
                 }
+                if (copies.items.len > 0) keep_tail = true;
+                const rg_bytes = job_bytes + copy_bytes;
                 if (!windowed or rg_bytes == 0) continue;
                 // The row group's pages: from its page-aligned start to the next row group's.
                 const seg_start = span[0].dst_start;
@@ -2518,11 +2573,20 @@ fn openInputs(
                 const wrg = try arena.create(s3_window.RowGroup);
                 wrg.* = .{
                     .jobs = rg_jobs.items,
+                    .copied = copies.items,
                     .bytes = rg_bytes,
                     .seg = @alignCast(s3_mapped.items[s3_mapped.items.len - 1][seg_start..seg_end]),
                 };
                 wf.rgs[ri] = wrg;
                 try win_order.append(arena, wrg);
+            }
+            if (keep_tail) {
+                const owned: []u8 = @constCast(sp.tail);
+                s3_buffers.append(arena, owned) catch |err| {
+                    keep_tail = false;
+                    return err;
+                };
+                sp.tail = &.{};
             }
         }
         if (windowed) {
@@ -2975,6 +3039,62 @@ const S3Membership = struct {
     }
 };
 
+fn releaseChargedTail(sp: *FetchSpec, gpa: std.mem.Allocator, account: *ByteAccount) void {
+    if (sp.tail.len > 0 and sp.tail.ptr != sp.footer_region.ptr) account.sub(sp.tail.len);
+    sp.releaseTail(gpa);
+}
+
+/// Drop a retained suffix down to the span planned ranges still overlap. No overlap frees it: a count over many
+/// files keeps the footer, not a probe per file.
+fn trimRetainedSuffix(gpa: std.mem.Allocator, sp: *FetchSpec, plan: RangePlan, account: *ByteAccount) void {
+    if (sp.tail.len == 0 or sp.tail.ptr == sp.footer_region.ptr) return;
+    const tail_lo = sp.tail_start;
+    const tail_hi = tail_lo + sp.tail.len;
+    var lo: u64 = tail_hi;
+    var hi: u64 = tail_lo;
+    const meta = &sp.meta;
+    for (meta.row_groups.items) |*rg| {
+        if (plan.rowGroupColumns(rg, meta)) |cols| {
+            for (cols, 0..) |needed, ci| {
+                if (!needed or ci >= rg.columns.items.len) continue;
+                const cm = rg.columns.items[ci].meta_data orelse continue;
+                const start: u64 = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+                noteSuffixOverlap(&lo, &hi, tail_lo, tail_hi, start, start + @as(u64, @intCast(cm.total_compressed_size)));
+            }
+        }
+        if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |c, ci| {
+            if (!c or ci >= rg.columns.items.len) continue;
+            const cm = rg.columns.items[ci].meta_data orelse continue;
+            const off = cm.bloom_filter_offset orelse continue;
+            const len = cm.bloom_filter_length orelse continue;
+            if (off < 4 or len <= 0) continue;
+            const start: u64 = @intCast(off);
+            noteSuffixOverlap(&lo, &hi, tail_lo, tail_hi, start, start + @as(u64, @intCast(len)));
+        };
+    }
+    if (hi <= lo) {
+        releaseChargedTail(sp, gpa, account);
+        sp.tail_start = sp.total_size;
+        return;
+    }
+    if (lo == tail_lo and hi == tail_hi) return;
+    const off: usize = @intCast(lo - tail_lo);
+    const new_len: usize = @intCast(hi - lo);
+    const neu = gpa.dupe(u8, sp.tail[off .. off + new_len]) catch return;
+    account.sub(sp.tail.len - new_len);
+    gpa.free(@constCast(sp.tail));
+    sp.tail = neu;
+    sp.tail_start = lo;
+}
+
+fn noteSuffixOverlap(lo: *u64, hi: *u64, tail_lo: u64, tail_hi: u64, start: u64, end: u64) void {
+    const a = @max(start, tail_lo);
+    const b = @min(end, tail_hi);
+    if (a >= b) return;
+    lo.* = @min(lo.*, a);
+    hi.* = @max(hi.*, b);
+}
+
 fn fetchMetaBatch(
     ctx: Context,
     arena: std.mem.Allocator,
@@ -2982,13 +3102,17 @@ fn fetchMetaBatch(
     pool: *s3.Pool(POOL_SIZE),
     specs: []FetchSpec,
     profiler: ?*profile.Profiler,
+    account: *ByteAccount,
 ) !void {
+    const probe = footerProbeFor(ctx.env, account.limit, @min(READ_CONCURRENCY, @max(specs.len, 1)));
     const TaskCtx = struct {
         ctx: Context,
         creds: s3.Credentials,
         pool: *s3.Pool(POOL_SIZE),
         sp: *FetchSpec,
         profiler: ?*profile.Profiler,
+        account: *ByteAccount,
+        probe: u64,
         /// The fetching thread's profile buffer, set when the task runs.
         prof: ?*profile.Thread = null,
         /// 0 cold, 1 cached footer revalidated, 2 cached footer stale.
@@ -3013,6 +3137,8 @@ fn fetchMetaBatch(
         .pool = pool,
         .sp = sp,
         .profiler = profiler,
+        .account = account,
+        .probe = probe,
     };
     // One worker loop per permit rather than one task per file: `Io.Group.concurrent` grows the thread pool on every
     // submission that finds all workers busy, so a thousand-file glob spawned a thousand.
@@ -3054,10 +3180,12 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
             const t_cond = nowMonoNs();
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
-                .range = s3.Range.suffix(footerProbeBytes(t.ctx.env)),
+                .range = s3.Range.suffix(t.probe),
                 .if_none_match = entry.etag,
                 .prof = t.prof,
             });
+            t.account.add(cond.body.len);
+            defer t.account.sub(cond.body.len);
             t.cache = if (cond.status == 304) 1 else 2;
             if (cond.status == 304) {
                 sp.rtt_ns = @intCast(nowMonoNs() - t_cond);
@@ -3088,9 +3216,11 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 
     // Cold path: one suffix. A footer that does not fit costs one more GET, inside populateFromTailResponse.
     const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
-        .range = s3.Range.suffix(footerProbeBytes(t.ctx.env)),
+        .range = s3.Range.suffix(t.probe),
         .prof = t.prof,
     });
+    t.account.add(tail_resp.body.len);
+    defer t.account.sub(tail_resp.body.len);
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
     sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
@@ -3101,22 +3231,14 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 /// used by both the cold and (cache-stale → 200) paths. On entry,
 /// `sp` is empty; on success, `total_size`/`tail_start` are populated
 /// and `footer_region` contains `[footer_offset, total_size)`. Bytes of the
-/// suffix past the footer stay in `sp.tail` and satisfy later ranges with no
-/// extra GET. The leading PAR1 is checked here only when the suffix is the
-/// whole object; a later range that covers offset 0 checks it then.
+/// suffix past the footer stay in `sp.tail` when the resident budget can hold
+/// them, and satisfy later ranges with no extra GET. The leading PAR1 is
+/// checked whenever a fetched range covers offset 0, including this suffix
+/// and a footer-prefix GET that itself starts at 0.
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
     sp.tail_start = sp.total_size - tail_resp.body.len;
-    // The response body lives in the per-task scratch arena, which is
-    // freed when the fetch task returns — but openInputs reads sp.tail
-    // later to materialize tail-resident chunk bytes without re-fetching.
-    // Copy it somewhere stable; openInputs frees it after the copies.
-    sp.tail = try t.ctx.gpa.dupe(u8, tail_resp.body);
-    errdefer {
-        t.ctx.gpa.free(sp.tail);
-        sp.tail = &.{};
-    }
 
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
@@ -3138,9 +3260,13 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
             .prof = t.prof,
         });
+        t.account.add(need.body.len);
+        defer t.account.sub(need.body.len);
         if (need.status != 206) return error.BadResponse;
         const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
         if (need.body.len != missing_len) return error.BadResponse;
+        // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.
+        try ensureHeadMagic(footer_actual_start, need.body);
         @memcpy(footer_region[0..missing_len], need.body);
         @memcpy(footer_region[missing_len..], tail[0 .. footer_region_len - missing_len]);
     } else {
@@ -3151,6 +3277,18 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     const parsed_footer_len = std.mem.readInt(u32, footer_region[footer_region.len - 8 ..][0..4], .little);
     if (parsed_footer_len != footer_len) return error.BadResponse;
     if (!std.mem.eql(u8, footer_region[footer_region.len - 4 ..], &PAR1)) return error.NotParquet;
+
+    // The response buffer is already charged. Keep a second copy only when the budget still has room; otherwise
+    // later ranges are fetched on their own. Correctness does not depend on the copy.
+    if (t.account.tryAdd(tail.len)) {
+        sp.tail = t.ctx.gpa.dupe(u8, tail) catch |err| {
+            t.account.sub(tail.len);
+            return err;
+        };
+    } else {
+        sp.tail = &.{};
+        sp.tail_start = sp.total_size;
+    }
 }
 
 /// The leading PAR1, when `bytes` are the file bytes at `start` and that range covers offset 0.
@@ -5003,6 +5141,11 @@ test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
     try std.testing.expectEqual(@as(u64, 8), footerProbeBytes(.{ .block = .{ .slice = &tiny } }));
     const huge = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=999999999999"};
     try std.testing.expectEqual(FOOTER_PROBE_MAX, footerProbeBytes(.{ .block = .{ .slice = &huge } }));
+    // No override: clamp(budget / (2 × concurrent), 64 KiB, 1 MiB). An explicit probe ignores the budget.
+    try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeFor(.empty, 16 << 20, 8));
+    try std.testing.expectEqual(@as(u64, 512 << 10), footerProbeFor(.empty, 8 << 20, 8));
+    try std.testing.expectEqual(FOOTER_PROBE_MIN, footerProbeFor(.empty, 1 << 20, 8));
+    try std.testing.expectEqual(@as(u64, 65536), footerProbeFor(.{ .block = .{ .slice = &set } }, 16 << 20, 8));
 }
 
 test "an S3 footer is one suffix GET, and a bad leading magic fails only when those bytes were fetched" {
@@ -5039,6 +5182,138 @@ test "an S3 footer is one suffix GET, and a bad leading magic fails only when th
 
     // The default probe is the whole fixture, so the leading magic is in that response.
     try std.testing.expectError(error.NotParquet, fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/bad.parquet"}, q, null, &.{}));
+}
+
+test "a footer prefix that starts at offset 0 is checked for the leading magic" {
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/group_order.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    // The serialized footer and its trailer, and nothing in front of them. Not a Parquet file: no leading PAR1, no pages.
+    const footer_len: usize = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+    const footer_only = bytes[bytes.len - 8 - footer_len ..];
+    try std.testing.expect(!metadata.hasLeadingMagic(footer_only));
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/footer.parquet", footer_only);
+    const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n" };
+    // An 8-byte probe is only the trailer, so the rest of this object comes back as a GET that starts at offset 0.
+    try std.testing.expectError(error.NotParquet, fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/footer.parquet"}, q, null, &.{"ZPQ_S3_FOOTER_PROBE=8"}));
+}
+
+test "many files keep a count under the memory budget" {
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/group_order.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    const footer_len: usize = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+    const split = bytes.len - 8 - footer_len;
+    // Padding between the pages and the footer makes the default 1 MiB suffix real. The pages, and the row count, stay put.
+    const pad: usize = 1 << 20;
+    const padded = try gpa.alloc(u8, bytes.len + pad);
+    defer gpa.free(padded);
+    @memcpy(padded[0..split], bytes[0..split]);
+    @memset(padded[split .. split + pad], 0);
+    @memcpy(padded[split + pad ..], bytes[split..]);
+
+    var meta_arena = std.heap.ArenaAllocator.init(gpa);
+    defer meta_arena.deinit();
+    const meta = try metadata.open(meta_arena.allocator(), padded);
+    const n_files: usize = 48;
+    const budget: usize = 16 << 20;
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    var key_arena = std.heap.ArenaAllocator.init(gpa);
+    defer key_arena.deinit();
+    const ka = key_arena.allocator();
+    const keys = try ka.alloc([]const u8, n_files);
+    for (keys, 0..) |*k, i| {
+        k.* = try std.fmt.allocPrint(ka, "t/p{d}.parquet", .{i});
+        try fake.serveBytes(k.*, padded);
+    }
+
+    // Suffix copies and their response buffers. Excludes the read executor's 4 MiB stacks and the small footer copies.
+    const Peak = struct {
+        child: std.mem.Allocator,
+        live: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        const lo: usize = 256 << 10;
+        const hi: usize = 3 << 20;
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+
+        fn track(self: *@This(), old_len: usize, new_len: usize) void {
+            const was = old_len >= lo and old_len < hi;
+            const is = new_len >= lo and new_len < hi;
+            if (was == is and (!was or old_len == new_len)) return;
+            const now = if (is and !was)
+                self.live.fetchAdd(new_len, .monotonic) + new_len
+            else if (was and !is)
+                self.live.fetchSub(old_len, .monotonic) - old_len
+            else if (new_len >= old_len)
+                self.live.fetchAdd(new_len - old_len, .monotonic) + (new_len - old_len)
+            else
+                self.live.fetchSub(old_len - new_len, .monotonic) - (old_len - new_len);
+            var seen = self.peak.load(.monotonic);
+            while (now > seen) {
+                if (self.peak.cmpxchgWeak(seen, now, .monotonic, .monotonic) == null) break;
+                seen = self.peak.load(.monotonic);
+            }
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.track(0, len);
+            return p;
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+            self.track(memory.len, new_len);
+            return true;
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+            self.track(memory.len, new_len);
+            return p;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.track(memory.len, 0);
+            self.child.rawFree(memory, alignment, ret_addr);
+        }
+    };
+    var peak: Peak = .{ .child = gpa };
+    const q: QueryArgs = .{
+        .inputs = &.{},
+        .aggregate = "count(*) AS n",
+        .parallelism = 2,
+        .max_memory = budget,
+    };
+    const got = try fakeS3AggregateJsonEnv(peak.allocator(), &fake, keys, q, null, &.{});
+    defer peak.allocator().free(got);
+    var want_buf: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "n={d};", .{meta.num_rows * @as(i64, @intCast(n_files))});
+    try std.testing.expectEqualStrings(want, got);
+    const high = peak.peak.load(.monotonic);
+    // Retained suffixes stay inside the budget. In-flight responses and arena nodes sit on top of that, still far
+    // below one probe per file.
+    try std.testing.expect(high <= budget + (20 << 20));
+    try std.testing.expect(high < n_files * (1 << 20));
 }
 
 // ── Windowed S3 fetch ──

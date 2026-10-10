@@ -31,10 +31,18 @@ const State = struct {
     const dropped: u32 = 3;
 };
 
+pub const Copied = struct {
+    dst: []u8,
+    src: []const u8,
+};
+
 pub const RowGroup = struct {
     /// Requests filling this row group's bytes; their targets lie in `seg`.
     jobs: []s3.FetchJob,
-    /// Bytes the jobs fetch: the row group's window charge.
+    /// Suffix bytes copied into `seg` when this row group is admitted, so they count toward the window instead of
+    /// landing all at once while the fetch is planned.
+    copied: []const Copied = &.{},
+    /// Bytes the jobs fetch plus `copied`: the row group's window charge.
     bytes: u64,
     /// The page-aligned span of the file buffer only this row group's bytes occupy.
     seg: []align(page) u8,
@@ -56,7 +64,8 @@ pub const RowGroup = struct {
     }
 };
 
-/// One input file's row groups, null where nothing is fetched (pruned, or served whole from the footer tail).
+/// One input file's row groups, null where nothing is fetched (pruned). A row group served from the footer suffix still
+/// has an entry: those bytes are copied when it is admitted, so they count toward the window.
 pub const File = struct {
     rgs: []?*RowGroup,
 
@@ -118,7 +127,9 @@ pub fn Fetcher(comptime Pool: type) type {
         pub fn start(self: *Self) !void {
             for (self.window.order) |rg| {
                 rg.window = &self.window;
-                rg.pending.store(rg.bytes, .monotonic);
+                var pending: u64 = 0;
+                for (rg.jobs) |j| pending += j.target.len;
+                rg.pending.store(pending, .monotonic);
                 for (rg.jobs) |*j| j.landed = .{ .ctx = rg, .f = RowGroup.landed };
             }
             self.thread = try std.Thread.spawn(.{}, run, .{self});
@@ -173,7 +184,18 @@ pub fn Fetcher(comptime Pool: type) type {
                 const arena = arena_state.allocator();
                 var jobs: std.ArrayList(s3.FetchJob) = .empty;
                 for (w.order[first..next]) |rg| {
-                    if (rg.state.load(.acquire) == State.dropped) continue;
+                    if (rg.state.load(.acquire) == State.dropped) {
+                        if (rg.jobs.len == 0) w.release(rg);
+                        continue;
+                    }
+                    for (rg.copied) |c| @memcpy(c.dst, c.src);
+                    if (rg.jobs.len == 0) {
+                        const prev = rg.state.cmpxchgStrong(State.waiting, State.ready, .acq_rel, .acquire);
+                        if (prev) |p| {
+                            if (p == State.dropped) w.release(rg);
+                        } else wakeAll(&rg.state);
+                        continue;
+                    }
                     try jobs.appendSlice(arena, rg.jobs);
                 }
                 w.stats.bytes += try s3.fetchJobs(

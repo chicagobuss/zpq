@@ -677,16 +677,16 @@ fn decodeFlbaDataPage(
         // V1: levels are RLE-prefixed at the start of the page bytes.
         if (levels.max_rep > 0) {
             if (values_bytes.len < 4) return error.UnexpectedEndOfChunk;
-            const rep_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-            if (4 + rep_len > values_bytes.len) return error.UnexpectedEndOfChunk;
+            const rep_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+            if (rep_len > values_bytes.len - 4) return error.UnexpectedEndOfChunk;
             const rep_bytes = values_bytes[4 .. 4 + rep_len];
             try decodeLevels(rep_bytes, @intCast(levels.max_rep), page_num_values, rep_levels_buf, written.*);
             values_bytes = values_bytes[4 + rep_len ..];
         }
         if (levels.max_def > 0) {
             if (values_bytes.len < 4) return error.UnexpectedEndOfChunk;
-            const def_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-            if (4 + def_len > values_bytes.len) return error.UnexpectedEndOfChunk;
+            const def_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+            if (def_len > values_bytes.len - 4) return error.UnexpectedEndOfChunk;
             const def_bytes = values_bytes[4 .. 4 + def_len];
             try decodeLevels(def_bytes, @as(u32, @intCast(levels.max_def)), page_num_values, def_levels_buf, written.*);
             values_bytes = values_bytes[4 + def_len ..];

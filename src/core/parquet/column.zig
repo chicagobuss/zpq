@@ -926,8 +926,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
         fn installRleBoolean(self: *Self, values_bytes: []const u8) Error!void {
             if (T != bool) return error.UnsupportedEncoding;
             if (values_bytes.len < 4) return error.UnexpectedPage;
-            const rle_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-            if (4 + rle_len > values_bytes.len) return error.UnexpectedPage;
+            const rle_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+            if (rle_len > values_bytes.len - 4) return error.UnexpectedPage;
             self.active = .{ .bool_rle = hybrid_rle.BooleanRleDecoder.init(values_bytes[4 .. 4 + rle_len]) };
         }
 
@@ -1071,16 +1071,16 @@ pub fn ColumnChunkReader(comptime T: type) type {
             var values_bytes = pg.bytes;
             if (self.levels.max_rep > 0) {
                 if (values_bytes.len < 4) return error.UnexpectedPage;
-                const rep_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-                if (4 + rep_len > values_bytes.len) return error.UnexpectedPage;
+                const rep_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+                if (rep_len > values_bytes.len - 4) return error.UnexpectedPage;
 
                 try self.installRepLevels(values_bytes[4 .. 4 + rep_len], num_values);
                 values_bytes = values_bytes[4 + rep_len ..];
             }
             if (self.levels.max_def > 0) {
                 if (values_bytes.len < 4) return error.UnexpectedPage;
-                const def_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-                if (4 + def_len > values_bytes.len) return error.UnexpectedPage;
+                const def_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+                if (def_len > values_bytes.len - 4) return error.UnexpectedPage;
 
                 try self.installDefLevels(values_bytes[4 .. 4 + def_len], num_values);
                 values_bytes = values_bytes[4 + def_len ..];
@@ -1405,6 +1405,24 @@ test "PLAIN FIXED_LEN_BYTE_ARRAY decodes the same from V1 and V2 data pages" {
             }
         }
     };
+}
+
+test "a level-length prefix near 2^32 is a corrupt page, not an overflow" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const values = [_]?[]const u8{ "ab", null, "cd" };
+    for ([_]u32{ 0xFFFF_FFFC, 0xFFFF_FFFF }) |claim| {
+        const chunk = try flbaPageForTest(arena, false, 2, true, &values);
+        // The V1 body starts with the def levels' u32 length (2), then their bytes (a bit-packed run header, 0x03).
+        const at = std.mem.indexOf(u8, chunk, &.{ 2, 0, 0, 0, 3 }) orelse return error.TestUnexpectedResult;
+        std.mem.writeInt(u32, chunk[at..][0..4], claim, .little);
+        var reader = ColumnChunkReader([]const u8).init(chunk, .UNCOMPRESSED, .{ .max_def = 1, .max_rep = 0 }, arena);
+        reader.type_length = 2;
+        var got: [3][]const u8 = undefined;
+        var defs: [3]u32 = undefined;
+        try testing.expectError(error.UnexpectedPage, reader.decodeWithLevels(&got, &defs));
+    }
 }
 
 test "a reader whose scratch another reader took over fails instead of decoding overwritten buffers" {

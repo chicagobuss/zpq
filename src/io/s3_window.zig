@@ -12,6 +12,7 @@ const linux = std.os.linux;
 const s3 = @import("s3.zig");
 const profile = @import("../profile.zig");
 const scan = @import("../core/scan.zig");
+const metadata = @import("../core/parquet/metadata.zig");
 
 pub const Gate = scan.RowGroupGate;
 
@@ -185,6 +186,11 @@ pub fn Fetcher(comptime Pool: type) type {
                     self.workers,
                     self.profiler,
                 );
+                for (jobs.items) |j| {
+                    if (j.range.start == 0 and j.target.len >= 4 and !metadata.hasLeadingMagic(j.target)) {
+                        return error.NotParquet;
+                    }
+                }
                 w.stats.batches += 1;
             }
         }

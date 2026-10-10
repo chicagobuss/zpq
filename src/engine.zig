@@ -89,7 +89,21 @@ fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
 }
 
 pub const POOL_SIZE: usize = 8;
-pub const TAIL_SIZE: u64 = 64 * 1024;
+
+/// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
+/// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes. The trailing
+/// PAR1 is always checked. The leading PAR1 is not a request of its own: it is checked when this suffix is the whole
+/// object, or when a later range already covers offset 0. A footer that does not fit is one more GET for the missing
+/// prefix, and never a third.
+pub const FOOTER_PROBE_DEFAULT: u64 = 1 << 20;
+const FOOTER_PROBE_MAX: u64 = 16 << 20;
+
+pub fn footerProbeBytes(env: std.process.Environ) u64 {
+    const v = env.getPosix("ZPQ_S3_FOOTER_PROBE") orelse return FOOTER_PROBE_DEFAULT;
+    const n = std.fmt.parseInt(u64, v, 10) catch return FOOTER_PROBE_DEFAULT;
+    if (n < 8) return 8;
+    return @min(n, FOOTER_PROBE_MAX);
+}
 
 /// Permits for an S3 output's part uploads, apart from the input reads' so neither waits for the other, over the same
 /// pool so uploads reuse the connections reads leave idle. As many as uploads had while they shared the read permits.
@@ -2554,6 +2568,7 @@ fn openInputs(
                 args.profiler,
             );
             fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
+            for (fetch_jobs.items) |j| try ensureHeadMagic(j.range.start, j.target);
         }
 
         // Build scan.Inputs. bytes is the compact per-file buffer with
@@ -2801,8 +2816,9 @@ const FetchSpec = struct {
     /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
-    /// How long a tiny GET took on a connection already open (the 8-byte head read, or the revalidation): this
-    /// query's sample of a request's fixed cost.
+    /// How long a small conditional GET took on a connection already open (a 304 revalidation). Zero until one has.
+    /// The footer suffix is too large, and too often the first request on a new connection, to be that sample; zero
+    /// leaves the in-region calibration in place.
     rtt_ns: u64 = 0,
     err: ?anyerror = null,
 
@@ -2938,6 +2954,7 @@ const S3Membership = struct {
             );
             self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
+        for (spans, out) |s, o| try ensureHeadMagic(s.start, o);
     }
 
     fn cached(ctx: *anyopaque, arena: std.mem.Allocator, s: membership.Span) ?[]const u8 {
@@ -3026,10 +3043,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     const sp = t.sp;
 
     // Cache fast path: if we have a previously-cached entry, issue the
-    // tail GET with `If-None-Match`. A 304 means the object is
-    // unchanged → reuse the cached footer bytes. Skips the head GET and
-    // the footer-prefix GET entirely; column ranges still fetch later
-    // into compact buffers.
+    // suffix GET with `If-None-Match`. A 304 means the object is
+    // unchanged → reuse the cached footer bytes. Column ranges still
+    // fetch later into compact buffers.
     //
     // On 200/206 the object has changed — the cached entry is stale,
     // we proceed exactly as the cold path. The fresh entry is
@@ -3038,7 +3054,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
             const t_cond = nowMonoNs();
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
-                .range = s3.Range.suffix(TAIL_SIZE),
+                .range = s3.Range.suffix(footerProbeBytes(t.ctx.env)),
                 .if_none_match = entry.etag,
                 .prof = t.prof,
             });
@@ -3070,9 +3086,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         }
     }
 
-    // Cold path: normal tail/head/footer-prefix fetches.
+    // Cold path: one suffix. A footer that does not fit costs one more GET, inside populateFromTailResponse.
     const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
-        .range = s3.Range.suffix(TAIL_SIZE),
+        .range = s3.Range.suffix(footerProbeBytes(t.ctx.env)),
         .prof = t.prof,
     });
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
@@ -3081,10 +3097,13 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
 }
 
-/// Shared "we have the tail response, finish the metadata fetch" path
+/// Shared "we have the suffix response, finish the metadata fetch" path
 /// used by both the cold and (cache-stale → 200) paths. On entry,
 /// `sp` is empty; on success, `total_size`/`tail_start` are populated
-/// and `footer_region` contains `[footer_offset, total_size)`.
+/// and `footer_region` contains `[footer_offset, total_size)`. Bytes of the
+/// suffix past the footer stay in `sp.tail` and satisfy later ranges with no
+/// extra GET. The leading PAR1 is checked here only when the suffix is the
+/// whole object; a later range that covers offset 0 checks it then.
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
     const sp = t.sp;
     sp.total_size = try parseTotalFromContentRange(tail_resp.header("Content-Range"));
@@ -3103,31 +3122,17 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     const tail = tail_resp.body;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
+    if (footer_len + 8 > sp.total_size) return error.NotParquet;
     const footer_actual_start = sp.total_size - 8 - footer_len;
-
-    // Head: first 8 bytes (PAR1 magic). The Parquet spec requires
-    // PAR1 at both offset 0 and at the file end; we already
-    // validated the trailing PAR1 above. The previous spike
-    // synthesized the leading magic to skip this RT, but that made
-    // S3 reads more lenient than the spec — a corrupt object with
-    // a forged-looking header could pass our gate. Pay the RT and
-    // validate honestly.
-    const t_head = nowMonoNs();
-    const head = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
-        .range = s3.Range.span(0, 7),
-        .prof = t.prof,
-    });
-    sp.rtt_ns = @intCast(nowMonoNs() - t_head);
-    if (head.status != 206) return error.BadResponse;
-    if (head.body.len < PAR1.len or !std.mem.eql(u8, head.body[0..PAR1.len], &PAR1)) return error.NotParquet;
+    // The suffix included offset 0, so the leading magic is in hand.
+    if (sp.tail_start == 0) try ensureHeadMagic(0, tail);
 
     const footer_region_len: usize = @intCast(footer_len + 8);
     const footer_region = try t.ctx.gpa.alloc(u8, footer_region_len);
     sp.footer_region = footer_region;
     sp.footer_offset = footer_actual_start;
 
-    // Footer: if it doesn't all fit in the tail we just fetched, fetch
-    // the part we're missing.
+    // One more GET, and only this one, when the footer did not fit in the suffix.
     if (footer_actual_start < sp.tail_start) {
         const need = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
@@ -3146,6 +3151,12 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     const parsed_footer_len = std.mem.readInt(u32, footer_region[footer_region.len - 8 ..][0..4], .little);
     if (parsed_footer_len != footer_len) return error.BadResponse;
     if (!std.mem.eql(u8, footer_region[footer_region.len - 4 ..], &PAR1)) return error.NotParquet;
+}
+
+/// The leading PAR1, when `bytes` are the file bytes at `start` and that range covers offset 0.
+fn ensureHeadMagic(start: u64, bytes: []const u8) !void {
+    if (start != 0 or bytes.len < PAR1.len) return;
+    if (!metadata.hasLeadingMagic(bytes)) return error.NotParquet;
 }
 
 /// Insert the just-fetched object into the cache (if cache is wired
@@ -4982,6 +4993,54 @@ test "regression: releaseTail keeps aliased warm footer ownership and clears col
     cold.releaseTail(a);
 }
 
+test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
+    try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeBytes(.empty));
+    const set = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=65536"};
+    try std.testing.expectEqual(@as(u64, 65536), footerProbeBytes(.{ .block = .{ .slice = &set } }));
+    const bad = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=nope"};
+    try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeBytes(.{ .block = .{ .slice = &bad } }));
+    const tiny = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=1"};
+    try std.testing.expectEqual(@as(u64, 8), footerProbeBytes(.{ .block = .{ .slice = &tiny } }));
+    const huge = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=999999999999"};
+    try std.testing.expectEqual(FOOTER_PROBE_MAX, footerProbeBytes(.{ .block = .{ .slice = &huge } }));
+}
+
+test "an S3 footer is one suffix GET, and a bad leading magic fails only when those bytes were fetched" {
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/group_order.parquet", gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    // 16 KiB covers this fixture's footer and not offset 0. 64 bytes does not cover the footer.
+    try std.testing.expect(bytes.len > 16 * 1024);
+
+    var corrupt = try gpa.dupe(u8, bytes);
+    defer gpa.free(corrupt);
+    corrupt[0] = 'X';
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/ok.parquet", bytes);
+    try fake.serveBytes("t/bad.parquet", corrupt);
+    const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n" };
+
+    const one = try fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/ok.parquet"}, q, null, &.{"ZPQ_S3_FOOTER_PROBE=16384"});
+    defer gpa.free(one);
+    try std.testing.expectEqual(@as(u32, 1), fake.gets);
+
+    const two = try fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/ok.parquet"}, q, null, &.{"ZPQ_S3_FOOTER_PROBE=64"});
+    defer gpa.free(two);
+    try std.testing.expectEqualStrings(one, two);
+    try std.testing.expectEqual(@as(u32, 3), fake.gets);
+
+    // Offset 0 was not fetched, so a bad leading magic does not fail a statistics answer.
+    const bad = try fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/bad.parquet"}, q, null, &.{"ZPQ_S3_FOOTER_PROBE=16384"});
+    defer gpa.free(bad);
+    try std.testing.expectEqualStrings(one, bad);
+
+    // The default probe is the whole fixture, so the leading magic is in that response.
+    try std.testing.expectError(error.NotParquet, fakeS3AggregateJsonEnv(gpa, &fake, &.{"t/bad.parquet"}, q, null, &.{}));
+}
+
 // ── Windowed S3 fetch ──
 
 const fake_s3 = @import("io/fake_s3.zig");
@@ -5044,7 +5103,8 @@ fn fakeS3AggregateJsonEnv(
 test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatever the window" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    // 24 row groups of about 5 KiB: the first dozen lie before the 64 KiB footer tail, so they are really fetched.
+    // 24 row groups of about 5 KiB. The probe stays at 64 KiB, under this fixture and over its footer, so the first
+    // dozen row groups fall outside the suffix and are really fetched. The default 1 MiB probe would hold the file.
     const fixture = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
     defer gpa.free(bytes);
@@ -5066,21 +5126,57 @@ test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatev
         // A filter that prunes row groups: a pruned row group is never fetched, and its gate never waits.
         .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .filter = "i > 450" },
     };
+    const probe = [_][*:0]const u8{"ZPQ_S3_FOOTER_PROBE=65536"};
     for (queries) |q| {
-        const whole = try fakeS3AggregateJson(gpa, &fake, &keys, q, null);
+        const whole = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, null, &probe);
         defer gpa.free(whole);
         // 1 KiB is smaller than any row group, so each goes alone; 12 KiB takes a few at a time.
         for ([_]u32{ 1, 12 }) |kib| {
             const gets_before = fake.gets;
-            const windowed = try fakeS3AggregateJson(gpa, &fake, &keys, q, kib);
+            const windowed = try fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, kib, &probe);
             defer gpa.free(windowed);
-            // Past the two footer tails: row groups were fetched through the window, not served from the tails.
+            // Past the two suffixes: row groups were fetched through the window, not served from the suffix.
             if (q.filter == null) try std.testing.expect(fake.gets - gets_before > keys.len);
             std.testing.expectEqualStrings(whole, windowed) catch |err| {
                 std.debug.print("window {d} KiB, aggregate {s}\n", .{ kib, q.aggregate.? });
                 return err;
             };
         }
+    }
+}
+
+test "a suffix that covers the file serves a windowed aggregate from one GET per file" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    // Under the default 1 MiB probe, so the suffix is the whole object and no column range is fetched.
+    try std.testing.expect(bytes.len < FOOTER_PROBE_DEFAULT);
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/a.parquet", bytes);
+    try fake.serveBytes("t/b.parquet", bytes);
+    const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
+    const q: QueryArgs = .{
+        .inputs = &.{},
+        .aggregate = "count(*) AS n, sum(i) AS s, min(k) AS m, avg(x) AS a, max(x) AS x",
+    };
+
+    const before_whole = fake.gets;
+    const whole = try fakeS3AggregateJson(gpa, &fake, &keys, q, null);
+    defer gpa.free(whole);
+    try std.testing.expectEqual(@as(u32, keys.len), fake.gets - before_whole);
+
+    // 1 KiB is smaller than a row group, so a window that missed the suffix would issue a GET per row group.
+    for ([_]u32{ 1, 12 }) |kib| {
+        const before = fake.gets;
+        const windowed = try fakeS3AggregateJson(gpa, &fake, &keys, q, kib);
+        defer gpa.free(windowed);
+        try std.testing.expectEqual(@as(u32, keys.len), fake.gets - before);
+        try std.testing.expectEqualStrings(whole, windowed);
     }
 }
 
@@ -5419,9 +5515,9 @@ test "an S3 read that stalls is retried on a new connection and the query answer
 }
 
 test "the parallel range fetches take the query's first-byte and idle timeouts, windowed or not" {
-    // A stalled column-chunk range fetch (the fake stalls only an explicit range of 1 KiB or more: never the footer's
-    // suffix read or the 8-byte header read) recovers within the query's short timeout of the stalled kind, the other
-    // set long: were either ignored, recovery would wait out a default.
+    // A stalled column-chunk range fetch (the fake stalls only an explicit range of 1 KiB or more, never a suffix)
+    // recovers within the query's short timeout of the stalled kind, the other set long: were either ignored,
+    // recovery would wait out a default. The probe is smaller than the fixture so those ranges are still requested.
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
@@ -5430,8 +5526,8 @@ test "the parallel range fetches take the query's first-byte and idle timeouts, 
     const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(a) AS s, max(b) AS m", .parallelism = 2 };
     const Case = struct { at: fake_s3.FakeS3.StallAt, env: []const [*:0]const u8 };
     const cases = [_]Case{
-        .{ .at = .before_headers, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=200", "ZPQ_S3_IDLE_TIMEOUT_MS=60000" } },
-        .{ .at = .mid_body, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=60000", "ZPQ_S3_IDLE_TIMEOUT_MS=200" } },
+        .{ .at = .before_headers, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=200", "ZPQ_S3_IDLE_TIMEOUT_MS=60000", "ZPQ_S3_FOOTER_PROBE=16384" } },
+        .{ .at = .mid_body, .env = &.{ "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=60000", "ZPQ_S3_IDLE_TIMEOUT_MS=200", "ZPQ_S3_FOOTER_PROBE=16384" } },
     };
     var want: ?[]u8 = null;
     defer if (want) |w| gpa.free(w);
@@ -5491,6 +5587,8 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
         try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
         try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
         try lines.append(a, "ZPQ_S3_WINDOW_KIB=1");
+        // Smaller than the fixture, so the copy still range-fetches column chunks instead of taking them from the suffix.
+        try lines.append(a, "ZPQ_S3_FOOTER_PROBE=16384");
         for (stall_env) |e| try lines.append(a, e);
         const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
         @memcpy(block, lines.items);
@@ -5525,11 +5623,12 @@ test "a windowed S3 fetch that fails mid-scan fails the query rather than hangin
     defer fake.deinit();
     try fake.serveBytes("t/a.parquet", bytes);
     try fake.serveBytes("t/b.parquet", bytes);
-    // The footer tails (a GET per file) and a few row groups go through; the rest are refused.
+    // One suffix per file, then a few row-group ranges; the rest are refused. The probe stays under the fixture so
+    // the suffix is not the whole object.
     fake.gets_allowed = 5;
     const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
     const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .parallelism = 2 };
-    try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJson(gpa, &fake, &keys, q, 1));
+    try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, 1, &.{"ZPQ_S3_FOOTER_PROBE=16384"}));
 }
 
 test "every S3 write path writes the same bytes through a window as with everything fetched up front" {

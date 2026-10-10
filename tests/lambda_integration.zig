@@ -363,8 +363,8 @@ fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
 }
 
 /// `path` with `pad` zero bytes spliced in before its footer. Column-chunk offsets are absolute, so they still point at
-/// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the 64 KiB tail zpq reads
-/// first, so a query also runs the parallel range-fetch stage.
+/// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the footer suffix zpq
+/// reads first (1 MiB unless `ZPQ_S3_FOOTER_PROBE` is set), so a query also runs the parallel range-fetch stage.
 fn paddedParquet(allocator: std.mem.Allocator, path: []const u8, pad: usize) ![]u8 {
     const raw = try readFileSlice(allocator, path);
     defer allocator.free(raw);
@@ -1194,7 +1194,8 @@ fn errIs(r: usize) bool {
 
 test "lambda profiles an S3 query: requests, coalescing and footer fetches land in the summary" {
     const a = std.testing.allocator;
-    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    // Past the 1 MiB footer probe, so each file's chunks are outside the suffix and fetched as ranges.
+    const object = try paddedParquet(a, S3_FIXTURE, 1 << 20);
     defer a.free(object);
     var s3: FakeS3 = undefined;
     try s3.start(object, 0);
@@ -1219,7 +1220,7 @@ test "lambda profiles an S3 query: requests, coalescing and footer fetches land 
             return error.TestUnexpectedResult;
         };
         const io = prof.object.get("io").?.object;
-        // Two footers (tail + head each, cold) and at least one coalesced range per file.
+        // One suffix per file plus at least one coalesced column range per file.
         try std.testing.expect(io.get("gets").?.integer >= 4);
         try std.testing.expect(io.get("bytes").?.integer > 0);
         try std.testing.expect(io.get("merged").?.integer >= 2);

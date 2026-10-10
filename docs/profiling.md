@@ -28,7 +28,7 @@ JSON file. Open it at <https://ui.perfetto.dev> (Open trace file) or load it wit
 | `open_inputs` | open | Opening every input: mmap for local files; footer fetches, range planning and range fetches for S3. Same timestamps as the JSON `read_ms`. | `files` |
 | `open_file` | open | One local file's open, stat and mmap. | `file`, `bytes` |
 | `footer_batch` | wait | The coordinator waiting for parallel footer work. | `files` |
-| `footer_fetch` | footer | One S3 object's footer fetch (tail, head and any footer remainder), on a fetch thread. | `file`, `cache` (0 cold, 1 cached and unchanged, 2 cached but stale) |
+| `footer_fetch` | footer | One S3 object's footer fetch (one suffix, plus a remainder when the footer does not fit), on a fetch thread. | `file`, `cache` (0 cold, 1 cached and unchanged, 2 cached but stale) |
 | `footer_parse` | footer | Thrift-decoding one footer. | `file`, `bytes` |
 | `parse_query` | plan | Parsing the filter, aggregates and keys against the schema. Same timestamps as `parse_ms`. | |
 | `plan` | plan | Building the scan's work list and sizing its workers. | `work_items`, `workers`, `row_groups` |

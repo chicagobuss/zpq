@@ -78,6 +78,12 @@ pub fn open(
     return openFooter(allocator, footer_bytes);
 }
 
+/// True when `bytes` opens with the Parquet magic. A suffix fetch always checks the trailing magic; the leading
+/// magic is checked only for bytes a read already covered at offset 0.
+pub fn hasLeadingMagic(bytes: []const u8) bool {
+    return bytes.len >= MAGIC_LEN and std.mem.eql(u8, bytes[0..MAGIC_LEN], &MAGIC);
+}
+
 /// Parse a parquet footer thrift payload that was fetched separately from
 /// the full file body. S3 range reads use this to avoid materializing a
 /// virtual slice whose length is the whole object.

@@ -8,8 +8,9 @@
 //!
 //! Lifecycle (production / S3 path):
 //!   1. Receive `{"s3_url": "...", "filter": "...optional..."}`.
-//!   2. Suffix GET for the last 64 KB to discover file size + footer.
-//!   3. If the footer is bigger than 64 KB, fetch the rest.
+//!   2. One suffix GET (`engine.footerProbeBytes`) for the file size and footer.
+//!   3. If the footer is bigger than that suffix, fetch the missing prefix. The leading
+//!      PAR1 is checked only when a fetched range already covers offset 0.
 //!   4. Parse FileMetaData. If filter is present, parse it against
 //!      the schema.
 //!   5. For each row group: prune via the filter's stats. For
@@ -54,7 +55,6 @@ const filter_eval = zpq.core.filter.eval;
 const partition = zpq.core.filter.partition;
 const schema_tree = zpq.core.parquet.schema_tree;
 
-const TAIL_SIZE: u64 = 64 * 1024;
 const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 
@@ -668,8 +668,8 @@ fn handleS3(
     };
     defer client.deinit();
 
-    // 1. Tail GET to discover total size and pull the footer.
-    const tail_resp = client.get(a, url.key, s3.Range.suffix(TAIL_SIZE)) catch |err| {
+    // 1. One suffix GET for the size and the footer. A footer that does not fit costs one more GET below.
+    const tail_resp = client.get(a, url.key, s3.Range.suffix(engine.footerProbeBytes(env))) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_fetch\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     if (tail_resp.status != 206 and tail_resp.status != 200) {
@@ -699,11 +699,10 @@ fn handleS3(
         if (need.status != 206) return error.RangeStatus;
         @memcpy(file_buf[footer_actual_start..tail_start], need.body);
     }
-    const head = try client.get(a, url.key, s3.Range.span(0, 7));
-    if (head.status != 206) return error.RangeStatus;
-    @memcpy(file_buf[0..head.body.len], head.body);
+    // The suffix included offset 0. Otherwise the leading magic waits for a data range that covers it.
+    if (tail_start == 0 and !metadata.hasLeadingMagic(file_buf)) return error.NotParquet;
 
-    var meta = try metadata.open(a, file_buf);
+    var meta = try metadata.openFooter(a, file_buf[@intCast(footer_actual_start)..@intCast(total_size - 8)]);
     defer meta.deinit(a);
 
     // 4. Parse the filter (if any) against the schema.
@@ -770,6 +769,7 @@ fn handleS3(
             const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
             if (resp.status != 206) return error.RangeStatus;
             @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
+            if (r.start == 0 and !metadata.hasLeadingMagic(file_buf)) return error.NotParquet;
         }
 
         // Decode each fetch_col into a typed slice. For our demo,

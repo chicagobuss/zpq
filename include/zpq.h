@@ -41,8 +41,11 @@ typedef enum zpq_status {
 
 /*
  * Open a context. options_json may be NULL or "" for the defaults, else a JSON object:
- *   "max_memory":     a query's memory budget when its request names none: bytes, or a size string ("2GB").
- *                     Default: derived from the memory available, as the Lambda's is.
+ *   "max_memory":     the context's memory ceiling, shared by its queries: bytes, or a size string ("2GB").
+ *                     Default: the memory available, as the CLI's default budget, so one query alone runs as it would
+ *                     under `zpq query`. A request that names no "max_memory" takes the whole ceiling.
+ *   "budget_wait_ms": how long a query waits for its memory budget when its request names no "budget_wait_ms".
+ *                     Default: as long as it takes.
  *   "preconnect":     true to open connections to the S3 endpoint now (ZPQ_S3_PRECONNECT of them, default 4, at most
  *                     8), as the Lambda does during init. It resolves the endpoint on the calling thread and starts
  *                     one thread per connection; without S3 credentials in the environment it does nothing. Failures
@@ -56,11 +59,15 @@ int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error);
 /*
  * Run one request (request_json, len bytes, need not be NUL-terminated; NULL only with len 0).
  * Returns ZPQ_OK whenever a response was produced, including a query that failed (bad SQL, a missing column, an S3
- * 403): the response is then an {"error": ...} document, exactly as the Lambda returns it.
+ * 403, a refused memory budget): the response is then an {"error": ...} document, exactly as the Lambda returns it.
  * *out_json is the response, to free with zpq_free; *out_len (when out_len is not NULL) its length without the NUL.
  * The other codes are for the call itself: ZPQ_EINVAL (ctx or out_json NULL, NULL request with len > 0, len too
- * large), ZPQ_ECLOSED (zpq_close has begun), ZPQ_ENOMEM, ZPQ_EINTERNAL. With those, *out_json is an
- * {"error", "reason"} message to free with zpq_free when one could be built (never for ZPQ_ENOMEM), else NULL.
+ * large), ZPQ_ECLOSED (zpq_close has begun; a query waiting for its budget is woken with it), ZPQ_ENOMEM,
+ * ZPQ_EINTERNAL. With those, *out_json is an {"error", "reason"} message to free with zpq_free when one could be
+ * built (never for ZPQ_ENOMEM), else NULL.
+ * Memory: the query reserves its budget (its "max_memory", else the ceiling) from the context's ceiling before it
+ * starts, in arrival order, waiting while it does not fit; "budget_wait_ms" in the request bounds that wait. A
+ * budget larger than the ceiling, or a wait that runs out, is an {"error":"budget", ...} response.
  */
 int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json, size_t *out_len);
 
@@ -68,9 +75,9 @@ int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json,
 void zpq_free(char *json);
 
 /*
- * Close a context: new calls get ZPQ_ECLOSED, then zpq_close waits for the running ones to finish, joins any
- * pre-connect handshakes still in flight (up to about one second), and frees the context. Call it once; the context
- * is gone when it returns. NULL is a no-op.
+ * Close a context: new calls get ZPQ_ECLOSED, queries waiting for their budget are woken with ZPQ_ECLOSED, then
+ * zpq_close waits for the running ones to finish, joins any pre-connect handshakes still in flight (up to about one
+ * second), and frees the context. Call it once; the context is gone when it returns. NULL is a no-op.
  */
 void zpq_close(zpq_ctx *ctx);
 

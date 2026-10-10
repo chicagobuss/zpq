@@ -1,7 +1,7 @@
 //! libzpq: zpq's JSON request handler (the Lambda's request and response schema) behind a C ABI. See include/zpq.h.
 //!
-//! A context holds what outlives one request: the allocator, the `std.Io` executor, and the S3 connection pool and
-//! footer cache. Each `zpq_run` reads the process environment at call time, as the
+//! A context holds what outlives one request: the allocator, the `std.Io` executor, the S3 connection pool and footer
+//! cache, and the memory ceiling its queries share. Each `zpq_run` reads the process environment at call time, as the
 //! CLI does at start, for S3 credentials, endpoint and region. Process-wide state outside any context is limited to
 //! caches that are set once and then only read: the TLS client contexts (CA stores), and probes of the kernel's
 //! io_uring and of the gzip backend.
@@ -9,6 +9,7 @@
 const std = @import("std");
 const zpq = @import("zpq");
 const service = @import("service");
+const Budget = @import("budget.zig").Budget;
 const c = std.c;
 
 /// malloc and free, so a host's leak checker (ASan, valgrind) sees every allocation.
@@ -26,6 +27,10 @@ pub const Status = enum(c_int) {
 pub const Ctx = struct {
     threaded: std.Io.Threaded,
     pool: service.PersistentPool,
+    /// The ceiling every query's budget is reserved from.
+    budget: Budget,
+    /// How long a query waits for its budget when its request does not say; null: as long as it takes.
+    budget_wait_ms: ?u64,
     /// Guards `inflight` and `closing`.
     lock: c.pthread_mutex_t = .{},
     cond: c.pthread_cond_t = .{},
@@ -33,6 +38,24 @@ pub const Ctx = struct {
     inflight: usize = 0,
     /// Set by `zpq_close`: new calls are refused with ZPQ_ECLOSED.
     closing: bool = false,
+    /// Reserved for the ETag-validated object cache (F5). It will charge its bytes to `budget` as evictable,
+    /// register itself as `budget.reclaimer` so a waiting query can evict before it blocks, and be freed in
+    /// `zpq_close` after the queries drain. Nothing lives here yet.
+    object_cache: void = {},
+
+    fn admission(self: *Ctx) service.Admission {
+        return .{ .ctx = self, .acquireFn = admit, .releaseFn = release, .ceiling = self.budget.ceiling };
+    }
+
+    fn admit(ptr: *anyopaque, bytes: usize, wait_ms: ?u64) service.Admission.Refusal!void {
+        const self: *Ctx = @ptrCast(@alignCast(ptr));
+        return self.budget.acquire(bytes, wait_ms orelse self.budget_wait_ms);
+    }
+
+    fn release(ptr: *anyopaque, bytes: usize) void {
+        const self: *Ctx = @ptrCast(@alignCast(ptr));
+        self.budget.release(bytes);
+    }
 
     /// Count a call in, unless the context is closing.
     fn enter(self: *Ctx) bool {
@@ -53,9 +76,11 @@ pub const Ctx = struct {
 
 /// The options `zpq_open` takes. Unknown fields are an error: a misspelt option should not be silently ignored.
 const Options = struct {
-    /// Each query's memory budget when its request names none: bytes, or a size string ("2GB"). Absent, it derives
-    /// from the memory available, as the Lambda's does.
+    /// The context's memory ceiling, shared by its queries: bytes, or a size string ("2GB"). Absent: the memory
+    /// available, the CLI's default, so one query alone gets what `zpq query` would.
     max_memory: ?std.json.Value = null,
+    /// How long a query waits for its budget when its request names no `budget_wait_ms`. Absent: as long as it takes.
+    budget_wait_ms: ?std.json.Value = null,
     /// Open connections to the S3 endpoint as the context opens (`ZPQ_S3_PRECONNECT` of them, default 4), as the
     /// Lambda does during init, so the first queries find them ready. Off by default.
     preconnect: bool = false,
@@ -63,7 +88,8 @@ const Options = struct {
 
 /// `Options` as a context uses them.
 const Parsed = struct {
-    query_memory: ?usize = null,
+    ceiling: ?usize = null,
+    budget_wait_ms: ?u64 = null,
     preconnect: bool = false,
 };
 
@@ -72,13 +98,18 @@ fn parseOptions(text: []const u8) !Parsed {
     if (trimmed.len == 0) return .{};
     const parsed = try std.json.parseFromSlice(Options, gpa, trimmed, .{});
     defer parsed.deinit();
-    const query_memory: ?usize = if (parsed.value.max_memory) |v| switch (v) {
+    const ceiling: ?usize = if (parsed.value.max_memory) |v| switch (v) {
         .null => null,
         .integer => |n| if (n > 0) @intCast(n) else return error.BadMaxMemory,
         .string => |str| try zpq.core.system.parseSizeString(str),
         else => return error.BadMaxMemory,
     } else null;
-    return .{ .query_memory = query_memory, .preconnect = parsed.value.preconnect };
+    const wait: ?u64 = if (parsed.value.budget_wait_ms) |v| switch (v) {
+        .null => null,
+        .integer => |n| if (n >= 0) @intCast(n) else return error.BadBudgetWait,
+        else => return error.BadBudgetWait,
+    } else null;
+    return .{ .ceiling = ceiling, .budget_wait_ms = wait, .preconnect = parsed.value.preconnect };
 }
 
 export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*?[*:0]u8) c_int {
@@ -90,13 +121,18 @@ export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*
         else => fail(out_error, .einval, @errorName(err)),
     };
     const env = processEnviron();
+    const ceiling = opts.ceiling orelse zpq.core.system.discoverAvailableMemory(env);
     const ctx = gpa.create(Ctx) catch return fail(out_error, .enomem, "OutOfMemory");
     ctx.* = .{
         .threaded = std.Io.Threaded.init(gpa, .{}),
-        .pool = .sized(zpq.core.system.discoverAvailableMemory(env)),
+        .pool = .sized(ceiling),
+        .budget = .init(ceiling),
+        .budget_wait_ms = opts.budget_wait_ms,
     };
     ctx.pool.per_call_stats = false;
-    ctx.pool.query_memory = opts.query_memory;
+    // A request that names no max_memory takes the whole ceiling, as the CLI takes all it may.
+    ctx.pool.query_memory = ceiling;
+    ctx.pool.admission = ctx.admission();
     // Ready before any call: every query, the first ones included, gets the footer cache.
     ctx.pool.warm(gpa) catch |err| {
         ctx.threaded.deinit();
@@ -168,6 +204,8 @@ export fn zpq_close(ctx: ?*Ctx) void {
     _ = c.pthread_mutex_lock(&self.lock);
     self.closing = true;
     _ = c.pthread_mutex_unlock(&self.lock);
+    // Queries waiting for their budget leave first, with ZPQ_ECLOSED; then the running ones finish.
+    self.budget.close();
     _ = c.pthread_mutex_lock(&self.lock);
     while (self.inflight > 0) _ = c.pthread_cond_wait(&self.cond, &self.lock);
     _ = c.pthread_mutex_unlock(&self.lock);
@@ -204,13 +242,20 @@ const no_environ = [_:null]?[*:0]const u8{};
 
 const testing = std.testing;
 
-test "options: a byte count, a size string, nothing, or an error" {
+test {
+    _ = @import("budget.zig");
+}
+
+test "options: a ceiling, a wait, nothing, or an error" {
     try testing.expectEqual(Parsed{}, try parseOptions(""));
     try testing.expectEqual(Parsed{}, try parseOptions("{}"));
-    try testing.expectEqual(@as(?usize, 1 << 20), (try parseOptions("{\"max_memory\": 1048576}")).query_memory);
-    try testing.expect((try parseOptions("{\"max_memory\": \"2GB\"}")).query_memory.? > 1 << 30);
+    try testing.expectEqual(@as(?usize, 1 << 20), (try parseOptions("{\"max_memory\": 1048576}")).ceiling);
+    try testing.expect((try parseOptions("{\"max_memory\": \"2GB\"}")).ceiling.? > 1 << 30);
+    try testing.expectEqual(@as(?u64, 250), (try parseOptions("{\"budget_wait_ms\": 250}")).budget_wait_ms);
     try testing.expectError(error.UnknownField, parseOptions("{\"max_mem\": 1}"));
     try testing.expectError(error.BadMaxMemory, parseOptions("{\"max_memory\": -1}"));
+    try testing.expectError(error.BadBudgetWait, parseOptions("{\"budget_wait_ms\": -1}"));
+    try testing.expectError(error.BadBudgetWait, parseOptions("{\"budget_wait_ms\": \"1s\"}"));
 }
 
 test "options: pre-connect is off unless asked, and only a boolean" {
@@ -237,6 +282,33 @@ test "zpq_open refuses bad options with a reason, and a NULL out_ctx" {
     // No error wanted: the status alone.
     try testing.expectEqual(@as(c_int, -1), zpq_open("{\"max_memory\": 0}", &ctx, null));
     try testing.expectEqual(@as(c_int, -1), zpq_open(null, null, null));
+}
+
+test "queries whose budgets add up past the ceiling all answer, and never hold more than it" {
+    const fixture = "ci/fixtures/parquet/mixed_codec.parquet";
+    std.Io.Dir.cwd().access(testing.io, fixture, .{}) catch return error.SkipZigTest;
+    var ctx: ?*Ctx = null;
+    try testing.expectEqual(@as(c_int, 0), zpq_open("{\"max_memory\": \"64MB\"}", &ctx, null));
+    defer zpq_close(ctx);
+    const Run = struct {
+        fn one(context: *Ctx, ok: *std.atomic.Value(u32)) void {
+            const req = "{\"inputs\":[\"" ++ fixture ++ "\"],\"aggregate\":\"count(*) AS n\"," ++
+                "\"max_memory\":\"40MB\"}";
+            var out: ?[*:0]u8 = null;
+            if (zpq_run(context, req, req.len, &out, null) != 0) return;
+            defer zpq_free(out);
+            const answered = std.mem.indexOf(u8, std.mem.span(out.?), "\"agg\":{\"n\":48000}") != null;
+            if (answered) _ = ok.fetchAdd(1, .monotonic);
+        }
+    };
+    var ok = std.atomic.Value(u32).init(0);
+    var threads: [12]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Run.one, .{ ctx.?, &ok });
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, threads.len), ok.load(.monotonic));
+    // 40 MB each against 64 MB: one at a time, the peak one budget, and all of it back.
+    try testing.expectEqual(@as(usize, 40 << 20), ctx.?.budget.peak);
+    try testing.expectEqual(@as(usize, 0), ctx.?.budget.reserved);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

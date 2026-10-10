@@ -30,6 +30,7 @@ const Wire = struct {
     trust_stats: ?std.json.Value = null,
     ordered: ?std.json.Value = null,
     max_memory: ?std.json.Value = null,
+    budget_wait_ms: ?std.json.Value = null,
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
     bloom_filters: ?std.json.Value = null,
@@ -56,6 +57,8 @@ pub const Request = struct {
     unordered: bool = false,
     /// `max_memory`: a byte count, or a size string the caller parses (`"512MB"`).
     max_memory: ?MaxMemory = null,
+    /// `budget_wait_ms`: how long the query may wait for its memory budget where queries share a ceiling (libzpq).
+    budget_wait_ms: ?u64 = null,
     /// `profile`: return a profile summary in the response.
     profile: bool = false,
     /// `profile_url`: also upload the full Chrome trace to this S3 URL. Implies `profile`.
@@ -114,6 +117,11 @@ pub const Request = struct {
             .float => |x| if (x >= 0 and x < 0x1p64) .{ .bytes = @intFromFloat(x) } else return f.bad("max_memory"),
             .string => |s| .{ .text = s },
             else => return f.bad("max_memory"),
+        };
+        if (parsed.value.budget_wait_ms) |v| req.budget_wait_ms = switch (v) {
+            .null => null,
+            .integer => |n| if (n >= 0) @intCast(n) else return f.bad("budget_wait_ms"),
+            else => return f.bad("budget_wait_ms"),
         };
         return req;
     }

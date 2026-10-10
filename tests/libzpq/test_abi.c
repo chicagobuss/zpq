@@ -1,16 +1,20 @@
 /*
  * libzpq's C ABI, end to end: options, the round trip, writes, error responses, invalid arguments, concurrent calls
- * on one context, open/run/close cycles, and resident memory over many calls. Run from the repo root (fixture paths
- * are relative):
+ * on one context, the context's memory ceiling, close while queries wait for it, open/run/close cycles, and resident
+ * memory over many calls. Run from the repo root (fixture paths are relative):
  *
  *   tests/libzpq/run.sh            builds the library and this test, plain and under AddressSanitizer
  *   test_abi [loop_calls [cycles]] loop_calls (default 10000) sizes the RSS check, cycles (default 1000) the
  *                                  open/run/close loop
  */
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "zpq.h"
@@ -85,7 +89,7 @@ static zpq_ctx *open_ctx(const char *options) {
 static void test_options(void) {
     CHECK(zpq_abi_version() == 1, "abi %d", zpq_abi_version());
     const char *good[] = {NULL, "", "{}", "{\"max_memory\": 1073741824}", "{\"max_memory\": \"256MB\"}",
-                          "{\"preconnect\": false}"};
+                          "{\"budget_wait_ms\": 0}", "{\"preconnect\": false}"};
     for (size_t i = 0; i < sizeof good / sizeof *good; i++) {
         zpq_ctx *c = open_ctx(good[i]);
         CHECK(c != NULL, "options %s refused", good[i] ? good[i] : "NULL");
@@ -96,6 +100,7 @@ static void test_options(void) {
                          "{\"max_mem\": 1}",
                          "{\"max_memory\": -5}",
                          "{\"max_memory\": \"lots\"}",
+                         "{\"budget_wait_ms\": -1}",
                          "{\"preconnect\": 4}"};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         zpq_ctx *c = (zpq_ctx *)1;
@@ -217,7 +222,7 @@ static void test_invalid_arguments(zpq_ctx *c) {
 #define THREADS 16
 #define CALLS_PER_THREAD 40
 static zpq_ctx *shared;
-/* Each names a small budget of its own. */
+/* Each names a small budget, so they run at once within the context's ceiling. */
 static const char *mix_req[] = {
     "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n, sum(a) AS s\","
     "\"max_memory\":\"16MB\"}",
@@ -307,6 +312,105 @@ static double now_s(void) {
     return (double)ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+/* Queries whose budgets add up to more than the ceiling all complete: each waits for its turn. */
+struct budget_call {
+    zpq_ctx *c;
+    const char *req;
+    int rc;
+    char *out;
+};
+static void *budget_worker(void *arg) {
+    struct budget_call *b = arg;
+    b->rc = run(b->c, b->req, &b->out);
+    return NULL;
+}
+
+static void test_budget(void) {
+    zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
+    if (!c) return;
+    /* 8 x 40 MB against 64 MB: at most one runs at a time. */
+    struct budget_call calls[8];
+    pthread_t t[8];
+    for (int i = 0; i < 8; i++) {
+        calls[i] = (struct budget_call){c,
+                                        "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],"
+                                        "\"aggregate\":\"count(*) AS n\",\"max_memory\":\"40MB\"}",
+                                        -99, NULL};
+        pthread_create(&t[i], NULL, budget_worker, &calls[i]);
+    }
+    for (int i = 0; i < 8; i++) {
+        pthread_join(t[i], NULL);
+        CHECK(calls[i].rc == ZPQ_OK && calls[i].out && strstr(calls[i].out, "\"agg\":{\"n\":48000}"), "call %d: %s",
+              i, calls[i].out);
+        zpq_free(calls[i].out);
+    }
+    /* Over the ceiling: refused at once, as a response. */
+    char *out = NULL;
+    int rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\","
+                    "\"max_memory\":\"65MB\"}",
+                 &out);
+    CHECK(rc == ZPQ_OK && out && strstr(out, "\"reason\":\"OverCeiling\""), "rc %d: %s", rc, out);
+    zpq_free(out);
+    zpq_close(c);
+}
+
+/* A local endpoint that completes connections and never answers: a query reading from it holds its budget until
+   its first-byte timeout. */
+static int silent_endpoint(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000001)};
+    socklen_t n = sizeof a;
+    if (fd < 0 || bind(fd, (struct sockaddr *)&a, n) || listen(fd, 64) || getsockname(fd, (struct sockaddr *)&a, &n))
+        return -1;
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", ntohs(a.sin_port));
+    setenv("S3_ENDPOINT_URL", url, 1);
+    setenv("AWS_ACCESS_KEY_ID", "ak", 1);
+    setenv("AWS_SECRET_ACCESS_KEY", "sk", 1);
+    setenv("AWS_REGION", "us-east-1", 1);
+    /* Each attempt times out quickly; the GET is retried, charged, up to its budget, then the query fails. */
+    setenv("ZPQ_S3_FIRST_BYTE_TIMEOUT_MS", "200", 1);
+    return fd;
+}
+
+static void test_close_while_waiting(void) {
+    int lfd = silent_endpoint();
+    CHECK(lfd >= 0, "listener");
+    if (lfd < 0) return;
+    zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
+    if (!c) return;
+    /* The first holds the whole ceiling, stuck on the silent endpoint; the next two wait behind it. */
+    struct budget_call calls[3];
+    pthread_t t[3];
+    calls[0] = (struct budget_call){c, "{\"inputs\":[\"s3://bkt/k.parquet\"],\"aggregate\":\"count(*) AS n\"}", -99,
+                                    NULL};
+    for (int i = 1; i < 3; i++)
+        calls[i] = (struct budget_call){
+            c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}", -99,
+            NULL};
+    for (int i = 0; i < 3; i++) {
+        pthread_create(&t[i], NULL, budget_worker, &calls[i]);
+        usleep(100 * 1000);
+    }
+    double t0 = now_s();
+    zpq_close(c);
+    double took = now_s() - t0;
+    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+    /* The waiters were woken with ZPQ_ECLOSED; the running query finished (its timeout) before the context went. */
+    for (int i = 1; i < 3; i++) {
+        CHECK(calls[i].rc == ZPQ_ECLOSED && calls[i].out && strstr(calls[i].out, "\"error\":\"closed\""),
+              "waiter %d: rc %d %s", i, calls[i].rc, calls[i].out);
+        zpq_free(calls[i].out);
+    }
+    CHECK(calls[0].rc == ZPQ_OK && calls[0].out && strncmp(calls[0].out, "{\"error\"", 8) == 0, "runner: rc %d %s",
+          calls[0].rc, calls[0].out);
+    zpq_free(calls[0].out);
+    CHECK(took < 20.0, "zpq_close took %.1f s", took);
+    close(lfd);
+    unsetenv("S3_ENDPOINT_URL");
+    unsetenv("ZPQ_S3_FIRST_BYTE_TIMEOUT_MS");
+}
+
 /* Every context's memory comes back: open, run and close, many times (LeakSanitizer reports anything left). */
 static void test_cycles(int n) {
     for (int i = 0; i < n; i++) {
@@ -330,6 +434,8 @@ int main(int argc, char **argv) {
     int calls = argc > 1 ? atoi(argv[1]) : 10000;
     int cycles = argc > 2 ? atoi(argv[2]) : 1000;
     test_options();
+    test_budget();
+    test_close_while_waiting();
     test_cycles(cycles);
     zpq_ctx *c = open_ctx("{\"max_memory\": \"512MB\"}");
     if (!c) {

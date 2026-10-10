@@ -48,7 +48,7 @@ def test_binding(z):
 
 
 def test_threads(z):
-    # Each names a small budget of its own.
+    # Small budgets, so the calls run at once within the context's ceiling.
     reqs = [
         {"inputs": [FIX], "aggregate": "count(*) AS n, sum(a) AS s", "max_memory": "16MB"},
         {"inputs": [FIX, FIX], "aggregate": "count(*) AS n", "group_by": "b", "filter": "a < 3", "max_memory": "16MB"},
@@ -238,17 +238,28 @@ def test_bad_lengths(z):
         server.server_close()
 
 
-def test_options():
-    for bad in ({"max_memory": "lots"}, {"max_memory": -1}):
+def test_options_and_budget():
+    for bad in ({"max_memory": "lots"}, {"budget_wait_ms": -1}):
         try:
             zpq.Zpq(**bad)
             check(False, f"bad options accepted: {bad}")
         except ValueError as e:
             check("invalid_argument" in str(e), f"refusal names its reason: {e}")
+    with zpq.Zpq(max_memory="64MB", budget_wait_ms=5000) as z:
+        try:
+            z.run({"inputs": [FIX], "aggregate": "count(*) AS n", "max_memory": "65MB"})
+            check(False, "a budget over the ceiling ran")
+        except zpq.ZpqError as e:
+            check(e.response.get("reason") == "OverCeiling", f"over ceiling {e.response}")
+        # Budgets adding up to more than the ceiling: each waits its turn, all complete.
+        req = {"inputs": [FIX], "aggregate": "count(*) AS n", "max_memory": "40MB"}
+        with ThreadPoolExecutor(8) as ex:
+            got = list(ex.map(lambda _: z.run(req), range(16)))
+        check(all(r["agg"] == {"n": 48000} for r in got), "queued budgets all answered")
 
 
 def main():
-    test_options()
+    test_options_and_budget()
     with zpq.Zpq(max_memory="512MB") as z:
         test_binding(z)
         test_threads(z)

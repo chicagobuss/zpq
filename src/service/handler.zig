@@ -46,6 +46,9 @@ pub const PersistentPool = struct {
     per_call_stats: bool = true,
     /// A query's `max_memory` when its request names none; null derives it from the memory available (`queryMemory`).
     query_memory: ?usize = null,
+    /// Gates each query's budget against a ceiling its pool's queries share (libzpq's context). Null: no gate (the
+    /// Lambda runs one query at a time).
+    admission: ?Admission = null,
 
     /// A sixteenth of the function's memory for warm Bloom filters (188 MB at 3008 MB), at most 256 MiB.
     pub fn sized(available: usize) PersistentPool {
@@ -156,6 +159,18 @@ pub fn preconnectS3(
     pool.preconnect_ns = @as(u64, @intCast(nowMonoNs() - t0));
 }
 
+/// Admits a query's memory budget before it runs and takes it back after: libzpq's context budget.
+pub const Admission = struct {
+    ctx: *anyopaque,
+    /// Reserve `bytes`, waiting at most `wait_ms` (null: the gate's own default).
+    acquireFn: *const fn (ctx: *anyopaque, bytes: usize, wait_ms: ?u64) Refusal!void,
+    releaseFn: *const fn (ctx: *anyopaque, bytes: usize) void,
+    /// The gate's ceiling, for the error response that names it.
+    ceiling: usize,
+
+    pub const Refusal = error{ OverCeiling, WaitTimeout, Closed };
+};
+
 pub const Legacy = *const fn (
     allocator: std.mem.Allocator,
     env: std.process.Environ,
@@ -237,6 +252,25 @@ pub fn handle(
             pool.queryMemory(zpq.core.system.discoverAvailableMemory(env));
         // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
         const prof_opts = zpq.profile.Options.forBudget(budget);
+        // A query that aggregates or writes holds its whole budget while it runs, where a gate is set.
+        const runs = req.aggregate != null or req.group_by != null or req.output_url != null;
+        const gate: ?Admission = if (runs) pool.admission else null;
+        if (gate) |g| g.acquireFn(g.ctx, budget, req.budget_wait_ms) catch |err| switch (err) {
+            // The caller's handle is going away: no response, the ABI reports it.
+            error.Closed => return error.ContextClosed,
+            error.OverCeiling => return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"budget\",\"reason\":\"OverCeiling\",\"max_memory\":{d},\"ceiling\":{d}}}",
+                .{ budget, g.ceiling },
+            ),
+            error.WaitTimeout => return std.fmt.allocPrint(
+                allocator,
+                "{{\"error\":\"budget\",\"reason\":\"WaitTimeout\",\"max_memory\":{d},\"ceiling\":{d}}}",
+                .{ budget, g.ceiling },
+            ),
+        };
+        defer if (gate) |g| g.releaseFn(g.ctx, budget);
+
         var profiler: ?*zpq.profile.Profiler = null;
         defer if (profiler) |p| p.destroy();
         if (req.profile and zpq.profile.enabled) {

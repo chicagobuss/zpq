@@ -10,12 +10,14 @@ the GIL for the call, and each query runs on threads of its own, within the cont
 new calls (`ZpqClosed`) and waits for those in flight, including any still waiting for their memory budget, so a
 context is never freed under a running query.
 
-The library is found at $ZPQ_LIB, else as libzpq.so next to this file, in ../zig-out/lib, or on the loader path.
+The library is found at $ZPQ_LIB, else as libzpq.so (libzpq.dylib on macOS) next to this file, in ../zig-out/lib, or
+on the loader path.
 """
 
 import ctypes
 import json
 import os
+import sys
 import threading
 
 __all__ = ["Zpq", "ZpqError", "ZpqClosed", "load_library"]
@@ -41,13 +43,16 @@ class ZpqClosed(ValueError):
     """A call on a `Zpq` that is closing or closed."""
 
 
+_LIB_NAME = "libzpq.dylib" if sys.platform == "darwin" else "libzpq.so"
+
+
 def _candidates():
     if os.environ.get("ZPQ_LIB"):
         yield os.environ["ZPQ_LIB"]
     here = os.path.dirname(os.path.abspath(__file__))
-    yield os.path.join(here, "libzpq.so")
-    yield os.path.join(here, "..", "zig-out", "lib", "libzpq.so")
-    yield "libzpq.so"
+    yield os.path.join(here, _LIB_NAME)
+    yield os.path.join(here, "..", "zig-out", "lib", _LIB_NAME)
+    yield _LIB_NAME
 
 
 _lib = None
@@ -62,7 +67,7 @@ def load_library(path=None):
             return _lib
         errors = []
         for cand in [path] if path else _candidates():
-            if cand != "libzpq.so" and not os.path.exists(cand):
+            if cand != _LIB_NAME and not os.path.exists(cand):
                 continue
             try:
                 lib = ctypes.CDLL(cand)
@@ -70,7 +75,7 @@ def load_library(path=None):
             except OSError as e:
                 errors.append(f"{cand}: {e}")
         else:
-            raise OSError("libzpq.so not found; set ZPQ_LIB. " + "; ".join(errors))
+            raise OSError(_LIB_NAME + " not found; set ZPQ_LIB. " + "; ".join(errors))
         lib.zpq_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
         lib.zpq_open.restype = ctypes.c_int
         lib.zpq_run.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,

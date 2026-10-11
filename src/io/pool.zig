@@ -354,7 +354,10 @@ pub fn Pool(comptime N: usize) type {
 
             self.preconnect_parked.store(0, .monotonic);
             self.preconnect_done.store(0, .monotonic);
-            const deadline_ms = tls.deadlineFromNow(preconnect_deadline_ms);
+            const deadline_ms = if (criteria.timeouts.clock_ms) |clk|
+                clk() + preconnect_deadline_ms
+            else
+                tls.deadlineFromNow(preconnect_deadline_ms);
             const slots = self.allocator.alloc(PreSlot, want) catch return;
             var started: usize = 0;
             for (slots) |*slot| {
@@ -753,19 +756,45 @@ test "a preconnect across two addresses of a full listen queue stops without han
     try p.init(testing.allocator);
     defer p.deinit();
     const addrs = [_]tls.Ipv4{ .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 } };
+    tls.resetDeadlineHit();
+    tls.armTestClock();
+    defer tls.disarmTestClock();
+    const virtual_start = tls.testClockMs();
+    var batch_started = std.atomic.Value(bool).init(false);
+    const Gate = struct {
+        fn nap(ns: u64) void {
+            var ts: std.os.linux.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+            _ = std.os.linux.nanosleep(&ts, null);
+        }
+        fn run(pool: *Pool(1), flag: *std.atomic.Value(bool)) void {
+            while (!flag.load(.acquire)) nap(std.time.ns_per_ms);
+            nap(20 * std.time.ns_per_ms);
+            // One second is the whole batch: both addresses and the join. A longer deadline does not finish here.
+            tls.advanceTestClock(1000);
+            var left: u32 = 2000;
+            while (left > 0 and pool.preconnect_done.load(.monotonic) == 0) : (left -= 20) nap(20 * std.time.ns_per_ms);
+            if (pool.preconnect_done.load(.monotonic) == 0) tls.advanceTestClock(120_000);
+        }
+    };
+    const gate = try std.Thread.spawn(.{}, Gate.run, .{ &p, &batch_started });
     const t0 = nowMonoNs();
     p.preconnect(testing.io, .{
         .host = "hold.test",
         .addrs = &addrs,
         .port = port,
         .use_tls = false,
-        .timeouts = .{ .connect_ms = 5000 },
+        .timeouts = .{ .connect_ms = 5000, .clock_ms = &tls.testClockMs },
     }, 1);
+    batch_started.store(true, .release);
     p.joinPreconnect();
+    gate.join();
     const elapsed_ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 0), p.preconnect_parked.load(.monotonic));
-    // Both addresses refusing is the check. This only fails a hang, and it stays under the 120 s socket backstop.
-    try testing.expect(elapsed_ms < 30_000);
+    // The absolute 1 s deadline stopped every address. Wall time only catches a hang.
+    try testing.expectEqual(@as(u64, 1000), tls.testClockMs() - virtual_start);
+    try testing.expectEqual(tls.DeadlineCause.virtual, tls.deadlineHit() orelse return error.TestExpectedEqual);
+    try testing.expect(tls.deadlineHitRealMs() <= 30_000);
+    try testing.expect(elapsed_ms <= 30_000);
 }
 
 fn holdAccepted(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {

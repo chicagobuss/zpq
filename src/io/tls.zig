@@ -249,7 +249,7 @@ pub const Connection = struct {
             return handshakeError(err);
         errdefer tls.deinit();
         var opts: SockTimeouts = .{};
-        const budget = stageBudget(peer.timeouts.handshake_ms, peer.deadline_ms);
+        const budget = stageBudget(peer.timeouts.handshake_ms, peer.deadline_ms, peer.timeouts.clock_ms);
         if (peer.deadline_ms != null and budget == 0) return error.HandshakeTimeout;
         handshake(fd, &tls, budget, &opts) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
@@ -433,10 +433,10 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     if (peer.addrs.len == 0) return error.DnsFailed;
     var last: Error = error.ConnectFailed;
     for (0..peer.addrs.len) |k| {
-        const wait = stageBudget(peer.timeouts.connect_ms, peer.deadline_ms);
+        const wait = stageBudget(peer.timeouts.connect_ms, peer.deadline_ms, peer.timeouts.clock_ms);
         if (peer.deadline_ms != null and wait == 0) return if (last == error.ConnectFailed) error.ConnectTimeout else last;
         const addr = peer.addrs[(peer.first +% k) % peer.addrs.len];
-        return openTcp(addr, peer.port, wait) catch |err| switch (err) {
+        return openTcp(addr, peer.port, wait, peer.timeouts.clock_ms, peer.deadline_ms) catch |err| switch (err) {
             error.ConnectFailed, error.ConnectTimeout => {
                 last = err;
                 continue;
@@ -449,8 +449,9 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
 
 /// A connected TCP socket to `ip:port`, in blocking mode, or `error.ConnectTimeout` when the connection is not
 /// established within `timeout_ms`. The connect itself runs non-blocking under `poll`, which bounds it the same way
-/// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO).
-fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32) Error!posix.fd_t {
+/// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO). `clock_ms`, when set, is the deadline clock: the
+/// wait polls briefly and gives up when that clock passes, and a wall-clock backstop is a different failure.
+fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!posix.fd_t {
     // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
     const cloexec_flag = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
     const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
@@ -476,15 +477,39 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32) Error!posix.fd_t {
         .SUCCESS => {},
         .INPROGRESS, .INTR => {
             var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-            const deadline = monoMs() + timeout_ms;
-            while (true) {
-                const now = monoMs();
-                if (now >= deadline) return error.ConnectTimeout;
-                const pr = posix.system.poll(&pfd, 1, @intCast(@min(deadline - now, std.math.maxInt(i32))));
-                switch (posix.errno(pr)) {
-                    .SUCCESS => if (pr > 0) break else return error.ConnectTimeout,
-                    .INTR => continue,
-                    else => return error.ConnectFailed,
+            if (clock_ms) |clk| {
+                // The batch deadline, not a fresh timeout: a clock step between the budget and this wait
+                // still stops at the same instant as the other addresses.
+                const virtual_deadline = deadline_ms orelse clk() + timeout_ms;
+                const real_start = monoMs();
+                while (true) {
+                    if (clk() >= virtual_deadline) {
+                        noteDeadline(.virtual, real_start);
+                        return error.ConnectTimeout;
+                    }
+                    // A hang backstop, distinct from the virtual deadline, so a stalled test cannot pass by it.
+                    if (monoMs() - real_start > 120_000) {
+                        noteDeadline(.backstop, real_start);
+                        return error.ConnectTimeout;
+                    }
+                    const pr = posix.system.poll(&pfd, 1, 20);
+                    switch (posix.errno(pr)) {
+                        .SUCCESS => if (pr > 0) break else continue,
+                        .INTR => continue,
+                        else => return error.ConnectFailed,
+                    }
+                }
+            } else {
+                const deadline = monoMs() + timeout_ms;
+                while (true) {
+                    const now = monoMs();
+                    if (now >= deadline) return error.ConnectTimeout;
+                    const pr = posix.system.poll(&pfd, 1, @intCast(@min(deadline - now, std.math.maxInt(i32))));
+                    switch (posix.errno(pr)) {
+                        .SUCCESS => if (pr > 0) break else return error.ConnectTimeout,
+                        .INTR => continue,
+                        else => return error.ConnectFailed,
+                    }
                 }
             }
             var so_err: c_int = 0;
@@ -600,9 +625,10 @@ pub fn deadlineFromNow(ms: u32) u64 {
 }
 
 /// `cap`, or what is left until `deadline_ms` when that is sooner. Zero means the deadline has already passed.
-fn stageBudget(cap: u32, deadline_ms: ?u64) u32 {
+/// `clock_ms` is the same clock the deadline was taken on; null is wall time.
+fn stageBudget(cap: u32, deadline_ms: ?u64, clock_ms: ?*const fn () u64) u32 {
     const deadline = deadline_ms orelse return cap;
-    const now = monoMs();
+    const now = nowMs(clock_ms);
     if (now >= deadline) return 0;
     return @intCast(@min(@as(u64, cap), deadline - now));
 }

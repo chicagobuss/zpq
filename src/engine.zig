@@ -1401,6 +1401,15 @@ const ProjectionPlan = struct {
 };
 
 fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schema.FileMetaData) !ProjectionPlan {
+    for (meta0.schema.items) |elem| {
+        if (decimal_mod.kindFromSchema(&elem)) |k| {
+            if (k.precision > 38) {
+                Diag.setColumn(args.diag, elem.name);
+                return error.UnsupportedDecimalPrecision;
+            }
+        }
+    }
+
     const num_leaves = metadata.leafCount(meta0);
 
     // --columns resolves to leaf indices; --select is mutually exclusive with it (checked by the callers).
@@ -1979,7 +1988,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         for (&pages, &zstd_counts.pages) |*n, *c| n.* = c.load(.monotonic);
         const now = nowMonoNs();
         profile.record(prof, .zstd_plan, now, now, profile.args(.{
-            @intFromEnum(priority), pages[0], pages[1], pages[2], pages[3], zstd_counts.rechecked.load(.monotonic),
+            @backingInt(priority), pages[0], pages[1], pages[2], pages[3], zstd_counts.rechecked.load(.monotonic),
         }));
     }
 
@@ -2003,15 +2012,12 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         new_schema_items = try projected.writeFlatThrift(arena);
     }
 
-    // DECIMAL columns whose data went through the decode+re-encode
-    // path (any time `need_encoder` is true — i.e. there's a filter,
-    // or any column is computed) were written as DOUBLE PLAIN by the
-    // encoder, but the footer schema we built above still claims
-    // DECIMAL because it was derived from meta0. Rewrite leaves in-
-    // place so the file's schema matches the on-disk bytes. Byte-
-    // copy passthrough (need_encoder=false) preserves DECIMAL.
+    // When re-encoding, BYTE_ARRAY-backed decimals are emitted as FIXED_LEN_BYTE_ARRAY
+    // of the minimal width for their precision. Align the footer schema leaves so the
+    // schema agrees with the on-disk column chunks. Byte-copy passthrough
+    // (need_encoder=false) preserves the original BYTE_ARRAY encoding untouched.
     if (need_encoder) {
-        try coerceDecimalLeavesToDouble(arena, &new_schema_items);
+        coerceByteArrayDecimalLeavesToFlba(&new_schema_items);
         coerceFloat16LeavesToDouble(&new_schema_items);
     }
 
@@ -2082,32 +2088,20 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
 /// args so passthrough columns preserve their exact leaf metadata and
 /// computed columns match the encoder's required-column output shape.
 /// The schema leaf shape and encoded data page must agree exactly.
-/// Walk a flat thrift schema list and rewrite every DECIMAL leaf to
-/// a plain DOUBLE leaf. Used after the encode+re-encode path, where
-/// DECIMAL columns get decoded to f64 (see decimal_mod) and emitted
-/// as DOUBLE PLAIN. The file's footer must agree.
-fn coerceDecimalLeavesToDouble(
-    arena: std.mem.Allocator,
-    items: *std.ArrayListUnmanaged(schema.SchemaElement),
-) !void {
-    _ = arena;
+/// Walk a flat thrift schema list and rewrite every BYTE_ARRAY DECIMAL leaf to
+/// FIXED_LEN_BYTE_ARRAY with minimal byte width for its precision. Used after
+/// the re-encode path, where BYTE_ARRAY decimals are emitted as FLBA by the encoder.
+/// The file's footer must agree.
+fn coerceByteArrayDecimalLeavesToFlba(items: *std.ArrayListUnmanaged(schema.SchemaElement)) void {
     for (items.items) |*elem| {
         // Only leaves (no children) can be DECIMAL.
         const nc = elem.num_children orelse 0;
         if (nc != 0) continue;
         const k = decimal_mod.kindFromSchema(elem) orelse continue;
-        // INT32/INT64 (D1) and FIXED_LEN_BYTE_ARRAY (D2) decimals now ride
-        // the lossless i128 lane and keep their DECIMAL annotation. Only
-        // BYTE_ARRAY-backed decimals (rare) still decode→f64→DOUBLE.
-        if (k.physical == .INT32 or k.physical == .INT64 or
-            k.physical == .FIXED_LEN_BYTE_ARRAY) continue;
-
-        elem.type = .DOUBLE;
-        elem.type_length = null;
-        elem.converted_type = null;
-        elem.logical_type = null;
-        elem.scale = null;
-        elem.precision = null;
+        if (k.physical == .BYTE_ARRAY) {
+            elem.type = .FIXED_LEN_BYTE_ARRAY;
+            elem.type_length = decimal_mod.minBytesForPrecision(k.precision);
+        }
     }
 }
 

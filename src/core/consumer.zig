@@ -202,30 +202,26 @@ pub fn initOutputAggregator(
                 // DECIMAL source columns. INT32/INT64/FLBA-backed take the
                 // lossless integer lane: decode to unscaled i128, keep the
                 // source DECIMAL schema element, re-encode at the same
-                // physical type. Only BYTE_ARRAY-backed DECIMAL (rare)
-                // still routes through f64 → DOUBLE. Byte-copy
-                // projection (copyRG / fastpath) preserves any DECIMAL.
+                // physical type. BYTE_ARRAY-backed decimals re-encode as
+                // FIXED_LEN_BYTE_ARRAY of the minimal width for their
+                // precision. Byte-copy projection (copyRG / fastpath)
+                // preserves any DECIMAL untouched.
                 if (decimal_mod.kindFromSchema(&src_elem)) |k| {
+                    if (k.precision > 38) return error.UnsupportedDecimalPrecision;
                     if (k.physical == .INT32 or k.physical == .INT64 or
                         k.physical == .FIXED_LEN_BYTE_ARRAY)
                     {
                         schemas[i] = src_elem; // keep DECIMAL annotation
                         cols[i] = .{ .i128 = .{} };
                         continue;
+                    } else if (k.physical == .BYTE_ARRAY) {
+                        schemas[i] = src_elem;
+                        schemas[i].type = .FIXED_LEN_BYTE_ARRAY;
+                        schemas[i].type_length = decimal_mod.minBytesForPrecision(k.precision);
+                        cols[i] = .{ .i128 = .{} };
+                        continue;
                     }
-                    schemas[i] = .{
-                        .type = .DOUBLE,
-                        .type_length = null,
-                        .repetition_type = src_elem.repetition_type,
-                        .name = src_elem.name,
-                        .num_children = 0,
-                        .converted_type = null,
-                        .logical_type = null,
-                        .scale = null,
-                        .precision = null,
-                        .field_id = null,
-                    };
-                    break :blk schema.Type.DOUBLE;
+                    return error.UnsupportedDecimalPhysicalType;
                 }
 
                 // FLOAT16 is physically FLBA(2), but decode widens it to
@@ -705,9 +701,12 @@ pub const SliceReader = struct {
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
         const se = meta.getColumnSchema(cm.path_in_schema.items);
         const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
-        if (dec) |k| if (cm.type == .FIXED_LEN_BYTE_ARRAY and
-            (k.byte_width == 0 or k.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH))
-            return error.DecimalByteWidthTooLarge;
+        if (dec) |k| {
+            if (k.precision > 38) return error.UnsupportedDecimalPrecision;
+            if (cm.type == .FIXED_LEN_BYTE_ARRAY and
+                (k.byte_width == 0 or k.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH))
+                return error.DecimalByteWidthTooLarge;
+        }
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
         const len: usize = @intCast(cm.total_compressed_size);
         invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
@@ -899,6 +898,7 @@ pub const SliceReader = struct {
         col: filter_eval.ColumnT(T),
         k: decimal_mod.Kind,
     ) !filter_eval.ColumnT(f64) {
+        if (k.precision > 38) return error.UnsupportedDecimalPrecision;
         const out = try a.alloc(f64, col.values.len);
         var view: filter_eval.ColumnT(f64) = .{
             .values = out,
@@ -5310,4 +5310,158 @@ test "recompressRowGroup over several threads reports a bad page body ahead of a
     else |err|
         err;
     try testing.expectError(want, recompressRowGroup(a, testing.allocator, rg, src, null, .ZSTD, .{}, &timings, 4));
+}
+
+test "decimal: nullable BYTE_ARRAY with filter dropping rows preserves definition levels and exactness" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "balance",
+        .num_children = 0,
+        .converted_type = .DECIMAL,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 9 } },
+        .scale = 2,
+        .precision = 9,
+        .field_id = null,
+    };
+
+    const raw_strs = [_][]const u8{
+        "",
+        &[_]u8{ 0x30, 0x39 },
+        &[_]u8{ 0xEC, 0x78 },
+        "",
+        &[_]u8{ 0x0F, 0x42, 0x3F },
+        "",
+        &[_]u8{0x05},
+        "",
+    };
+    const def_levels = [_]u32{ 0, 1, 1, 0, 1, 0, 1, 0 };
+    const enc = try encoder.encodeColumn(arena, .{
+        .values = .{ .string = .{
+            .values = &raw_strs,
+            .def_levels = &def_levels,
+            .max_def = 1,
+        } },
+        .schema_elem = &elem,
+        .path_in_schema = &[_][]const u8{"balance"},
+        .codec = .UNCOMPRESSED,
+    });
+
+    const kind = decimal_mod.kindFromSchema(&elem).?;
+    const levels = schema.Levels{ .max_def = 1, .max_rep = 0 };
+
+    const decoded = try decimal_mod.decodeColumnAsI128(arena, enc.bytes, .UNCOMPRESSED, levels, 8, kind);
+    try testing.expectEqual(@as(usize, 8), decoded.values.len);
+    try testing.expect(decoded.def_levels != null);
+    try testing.expectEqualSlices(u32, &def_levels, decoded.def_levels.?);
+    try testing.expectEqual(@as(i128, 0), decoded.values[0]);
+    try testing.expectEqual(@as(i128, 12345), decoded.values[1]);
+    try testing.expectEqual(@as(i128, -5000), decoded.values[2]);
+    try testing.expectEqual(@as(i128, 0), decoded.values[3]);
+    try testing.expectEqual(@as(i128, 999999), decoded.values[4]);
+    try testing.expectEqual(@as(i128, 0), decoded.values[5]);
+    try testing.expectEqual(@as(i128, 5), decoded.values[6]);
+    try testing.expectEqual(@as(i128, 0), decoded.values[7]);
+
+    var sel = try filter_selection.SelectionVector.init(arena, 8);
+    sel.mask[0] = 0b00111100;
+    const filtered = try encoder.applySelectionI128(arena, decoded, &sel);
+    try testing.expectEqual(@as(usize, 4), filtered.values.len);
+
+    var out_elem = elem;
+    out_elem.type = .FIXED_LEN_BYTE_ARRAY;
+    out_elem.type_length = decimal_mod.minBytesForPrecision(kind.precision);
+    const re_enc = try encoder.encodeDecimalFlba(
+        arena,
+        filtered,
+        &out_elem,
+        &[_][]const u8{"balance"},
+        .UNCOMPRESSED,
+        .{},
+    );
+
+    const flba_kind = decimal_mod.kindFromSchema(&out_elem).?;
+    const back = try decimal_mod.decodeColumnAsI128(arena, re_enc.bytes, .UNCOMPRESSED, levels, 4, flba_kind);
+    try testing.expectEqual(@as(usize, 4), back.values.len);
+    try testing.expect(back.def_levels != null);
+    const want_defs = [_]u32{ 1, 0, 1, 0 };
+    try testing.expectEqualSlices(u32, &want_defs, back.def_levels.?);
+    try testing.expectEqual(@as(i128, -5000), back.values[0]);
+    try testing.expectEqual(@as(i128, 0), back.values[1]);
+    try testing.expectEqual(@as(i128, 999999), back.values[2]);
+    try testing.expectEqual(@as(i128, 0), back.values[3]);
+}
+
+test "initOutputAggregator rewrites BYTE_ARRAY decimal to FIXED_LEN_BYTE_ARRAY with minBytesForPrecision" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var file_meta = schema.FileMetaData{
+        .version = 2,
+        .schema = .empty,
+        .num_rows = 1,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try file_meta.schema.append(arena, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(arena, .{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "price",
+        .num_children = 0,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 10 } },
+        .scale = null,
+        .precision = null,
+        .field_id = 1,
+    });
+
+    var path: schema.StringList = .empty;
+    try path.append(arena, "price");
+    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try columns.append(arena, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 1,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    });
+    try file_meta.row_groups.append(arena, .{
+        .columns = columns,
+        .total_byte_size = 0,
+        .num_rows = 1,
+    });
+
+    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const agg = try initOutputAggregator(arena, &file_meta, &specs);
+    try testing.expect(agg.cols[0] == .i128);
+    try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, agg.schema_elems[0].type.?);
+    try testing.expectEqual(@as(?i32, 5), agg.schema_elems[0].type_length);
+    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, agg.schema_elems[0].repetition_type.?);
 }

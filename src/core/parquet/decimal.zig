@@ -34,6 +34,7 @@ const hybrid_rle = @import("encoding/hybrid_rle.zig");
 pub const Error = error{
     UnsupportedDecimalEncoding,
     UnsupportedDecimalPhysicalType,
+    UnsupportedDecimalPrecision,
     DecimalByteWidthTooLarge,
     DictionaryMissing,
     ShortDecode,
@@ -48,6 +49,20 @@ pub const Error = error{
 /// precision ≤ 38 (the parquet spec's max). Widths > 16 require i192+
 /// bignum handling; punt with a clear error.
 pub const MAX_FLBA_BYTE_WIDTH: usize = 16;
+
+/// Minimum byte width needed to store a decimal of precision `p` (1 <= p <= 38)
+/// as a big-endian two's complement integer in FIXED_LEN_BYTE_ARRAY.
+pub fn minBytesForPrecision(precision: i32) u8 {
+    std.debug.assert(precision >= 1 and precision <= 38);
+    const table = [38]u8{
+        1,  1,  2,  2,  3,  3,  4,  4,  4,
+        5,  5,  6,  6,  6,  7,  7,  8,  8,
+        9,  9,  9,  10, 10, 11, 11, 11, 12,
+        12, 13, 13, 13, 14, 14, 15, 15, 16,
+        16, 16,
+    };
+    return table[@intCast(precision - 1)];
+}
 
 /// What we learn from inspecting a column's SchemaElement when the
 /// column carries DECIMAL logical type.
@@ -147,6 +162,7 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
 
 /// A DECIMAL min/max statistic's exact unscaled value; the same bytes and the same refusals as `statToF64`.
 pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
+    if (kind.precision > 38) return null;
     return switch (kind.physical) {
         .INT32 => if (bytes.len < 4) null else std.mem.readInt(i32, bytes[0..4], .little),
         .INT64 => if (bytes.len < 8) null else std.mem.readInt(i64, bytes[0..8], .little),
@@ -162,6 +178,7 @@ pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
 /// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
 /// all is the caller's decision.
 pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
+    if (kind.precision > 38) return null;
     return switch (kind.physical) {
         .INT32 => {
             if (bytes.len < 4) return null;
@@ -237,6 +254,7 @@ pub fn decodeColumnAsF64WithOptions(
     decode_options: column_mod.DecodeOptions,
     scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
+    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     return switch (kind.physical) {
         .INT32 => try decodeIntBacked(
             i32,
@@ -288,6 +306,7 @@ pub fn decodeColumnExact(
     decode_options: column_mod.DecodeOptions,
     scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
+    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     if (levels.max_rep > 0) {
         return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, decode_options, scratch);
     }
@@ -386,8 +405,7 @@ const column_mod = @import("column.zig");
 /// (no scale applied) — the lossless representation the re-encode path
 /// carries so a filtered/projected decimal survives as DECIMAL, not
 /// DOUBLE. Mirror of `decodeColumnAsF64` minus the scale-apply. Wired
-/// for INT32/INT64 (D1) and FIXED_LEN_BYTE_ARRAY (D2); BYTE_ARRAY-backed
-/// decimals (rare) still route through the f64→DOUBLE path.
+/// for INT32/INT64 (D1), FIXED_LEN_BYTE_ARRAY (D2), and BYTE_ARRAY (C1).
 pub fn decodeColumnAsI128(
     arena: std.mem.Allocator,
     chunk: []const u8,
@@ -408,10 +426,12 @@ pub fn decodeColumnAsI128WithOptions(
     kind: Kind,
     decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(i128) {
+    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     return switch (kind.physical) {
         .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves, decode_options),
         .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves, decode_options),
         .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind),
+        .BYTE_ARRAY => try decodeByteArrayBackedI128(arena, chunk, codec, levels, num_leaves, decode_options, null),
         else => error.UnsupportedDecimalPhysicalType,
     };
 }
@@ -538,6 +558,44 @@ fn decodeByteArrayBacked(
         .max_def = @intCast(levels.max_def),
         .rep_levels = raw.rep_levels,
         .max_rep = @intCast(levels.max_rep),
+        .has_nulls = raw.has_nulls,
+    };
+}
+
+fn decodeByteArrayBackedI128(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.ColumnT(i128) {
+    if (levels.max_rep > 0) return error.ShortDecode;
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk,
+        codec,
+        levels,
+        arena,
+        decode_options,
+        scratch,
+    );
+    const raw = try readAll([]const u8, &reader, num_leaves);
+    const max_def: u32 = @intCast(levels.max_def);
+    const values = try arena.alloc(i128, num_leaves);
+    for (raw.values, values, 0..) |b, *v, i| {
+        const present = if (raw.def_levels) |dl| dl[i] >= max_def else true;
+        if (!present) {
+            v.* = 0;
+            continue;
+        }
+        if (b.len > MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
+        v.* = flbaToI128(b);
+    }
+    return .{
+        .values = values,
+        .def_levels = raw.def_levels,
+        .max_def = max_def,
         .has_nulls = raw.has_nulls,
     };
 }
@@ -1208,6 +1266,67 @@ test "decodeColumnAsI128 returns exact unscaled integers (int64 fixture)" {
     for (column.values, 0..) |v, i| {
         try testing.expectEqual(@as(i128, @intCast((i + 1) * 100)), v);
     }
+}
+
+test "decodeColumnAsI128 returns exact unscaled integers (byte_array fixture)" {
+    const fixture_path = "data/parquet-testing/data/byte_array_decimal.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var meta = try metadata.open(testing.allocator, file_bytes);
+    defer meta.deinit(testing.allocator);
+
+    const col = meta.row_groups.items[0].columns.items[0].meta_data.?;
+    const path: [1][]const u8 = .{"value"};
+    const elem = meta.getColumnSchema(&path) orelse return error.SchemaLookupFailed;
+    const kind = kindFromSchema(&elem) orelse return error.NotRecognisedAsDecimal;
+
+    const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
+    const chunk = file_bytes[chunk_start .. chunk_start + @as(usize, @intCast(col.total_compressed_size))];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const levels = meta.getColumnLevels(&path);
+    const column = try decodeColumnAsI128(arena.allocator(), chunk, col.codec, levels, @intCast(col.num_values), kind);
+
+    try testing.expectEqual(@as(usize, 24), column.values.len);
+    for (column.values, 0..) |v, i| {
+        try testing.expectEqual(@as(i128, @intCast((i + 1) * 100)), v);
+    }
+}
+
+test "decodeColumnAsI128 rejects precision > 38" {
+    const kind: Kind = .{
+        .scale = 2,
+        .precision = 39,
+        .physical = .BYTE_ARRAY,
+        .byte_width = 0,
+    };
+    const dummy_chunk = [_]u8{0};
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    try testing.expectError(
+        error.UnsupportedDecimalPrecision,
+        decodeColumnAsI128(testing.allocator, &dummy_chunk, .UNCOMPRESSED, levels, 0, kind),
+    );
+}
+
+test "minBytesForPrecision covers boundaries" {
+    try testing.expectEqual(@as(u8, 1), minBytesForPrecision(1));
+    try testing.expectEqual(@as(u8, 1), minBytesForPrecision(2));
+    try testing.expectEqual(@as(u8, 2), minBytesForPrecision(3));
+    try testing.expectEqual(@as(u8, 2), minBytesForPrecision(4));
+    try testing.expectEqual(@as(u8, 4), minBytesForPrecision(9));
+    try testing.expectEqual(@as(u8, 5), minBytesForPrecision(10));
+    try testing.expectEqual(@as(u8, 8), minBytesForPrecision(18));
+    try testing.expectEqual(@as(u8, 9), minBytesForPrecision(19));
+    try testing.expectEqual(@as(u8, 16), minBytesForPrecision(38));
 }
 
 test "applyScaleI128: out-of-table scale uses the pow fallback without trapping" {

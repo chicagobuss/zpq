@@ -301,6 +301,49 @@ pub const MetaCache = struct {
         return null;
     }
 
+    /// Copy a cached blob into `dest` while the cache lock is held. A borrowed pointer would dangle: a later insert
+    /// drops the least recently used blobs. The caller owns `dest` and frees it with the wave that charged it.
+    pub fn copyBlob(
+        self: *MetaCache,
+        io: Io,
+        bucket: []const u8,
+        key: []const u8,
+        etag: []const u8,
+        offset: u64,
+        dest: []u8,
+    ) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const e = self.entryFor(bucket, key, etag) orelse return false;
+        for (e.blobs.items) |b| {
+            if (b.offset == offset and b.bytes.len == dest.len) {
+                @memcpy(dest, b.bytes);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether `copyBlob` would find this range. The check and the copy are separate: an insert between them can
+    /// drop the blob, and the copy then misses.
+    pub fn hasBlob(
+        self: *MetaCache,
+        io: Io,
+        bucket: []const u8,
+        key: []const u8,
+        etag: []const u8,
+        offset: u64,
+        len: usize,
+    ) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const e = self.entryFor(bucket, key, etag) orelse return false;
+        for (e.blobs.items) |b| {
+            if (b.offset == offset and b.bytes.len == len) return true;
+        }
+        return false;
+    }
+
     /// Keep `bytes`, read at `offset` from this version (`etag`) of an object whose footer is cached, for later
     /// queries. Best effort: past the budget, blobs of the least recently used objects go first, and a blob that
     /// would need more than a quarter of the budget is not kept.

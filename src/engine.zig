@@ -3171,7 +3171,10 @@ const S3Membership = struct {
 
     const vtable: membership.Source.VTable = .{
         .read = read,
+        .read_into = readInto,
         .cached = cached,
+        .copy_cached = copyCached,
+        .has_cached = hasCached,
         .retain = retain,
         .measured = measured,
         .suffix = suffix,
@@ -3235,8 +3238,8 @@ const S3Membership = struct {
                 o.* = sp.tail[off..][0..n];
                 continue;
             }
-            // Every remaining span body of this read is allocated before any of them is probed. The caller admits
-            // only a window's worth, including the joined copy `readAll` makes when a span has both a head and a tail.
+            // A caller that has not placed its own buffer gets one of the span. Bloom bodies use `readInto` instead,
+            // so this allocation is the dictionary and header path.
             const buf = try arena.alloc(u8, @intCast(end - s.start));
             const fetch_end = @min(end, sp.tail_start);
             if (s.start < fetch_end) try jobs.append(arena, .{
@@ -3272,6 +3275,59 @@ const S3Membership = struct {
         for (spans, out) |s, o| try ensureHeadMagic(s.start, o);
     }
 
+    fn readInto(
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        spans: []const membership.Span,
+        into: [][]u8,
+    ) anyerror!void {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        var jobs: std.ArrayList(s3.FetchJob) = .empty;
+        for (spans, into) |s, dest| {
+            const sp = &self.specs[s.file];
+            const end = @min(s.end, sp.total_size);
+            if (s.start >= end) continue;
+            const n: usize = @intCast(end - s.start);
+            if (dest.len < n) return error.BadResponse;
+            const tail_end = sp.tail_start + sp.tail.len;
+            if (sp.tail.len > 0 and s.start >= sp.tail_start and end <= tail_end) {
+                const off: usize = @intCast(s.start - sp.tail_start);
+                @memcpy(dest[0..n], sp.tail[off..][0..n]);
+                continue;
+            }
+            const fetch_end = @min(end, if (sp.tail.len > 0) sp.tail_start else end);
+            if (s.start < fetch_end) try jobs.append(arena, .{
+                .bucket = sp.url.bucket,
+                .key = sp.url.key,
+                .range = .{ .start = s.start, .end = fetch_end },
+                .target = dest[0..@intCast(fetch_end - s.start)],
+            });
+            if (sp.tail.len > 0 and end > sp.tail_start) {
+                const from = @max(s.start, sp.tail_start);
+                const tail_off: usize = @intCast(from - sp.tail_start);
+                const tn: usize = @intCast(end - from);
+                if (tail_off + tn > sp.tail.len) return error.BadResponse;
+                @memcpy(dest[@intCast(from - s.start)..][0..tn], sp.tail[tail_off..][0..tn]);
+            }
+        }
+        if (jobs.items.len > 0) {
+            const t0 = nowMonoNs();
+            const got = try s3.fetchJobs(
+                self.ctx.io,
+                self.pool,
+                self.ctx.gpa,
+                arena,
+                self.creds,
+                jobs.items,
+                s3.S3_IN_FLIGHT,
+                self.profiler,
+                null,
+            );
+            self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
+        }
+        for (spans, into) |s, dest| try ensureHeadMagic(s.start, dest);
+    }
+
     fn cached(ctx: *anyopaque, arena: std.mem.Allocator, s: membership.Span) ?[]const u8 {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
         const cache = self.ctx.meta_cache orelse return null;
@@ -3279,6 +3335,22 @@ const S3Membership = struct {
         if (sp.etag_len == 0) return null;
         const len: usize = @intCast(s.end - s.start);
         return cache.getBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, len, arena);
+    }
+
+    fn hasCached(ctx: *anyopaque, s: membership.Span) bool {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        const cache = self.ctx.meta_cache orelse return false;
+        const sp = &self.specs[s.file];
+        if (sp.etag_len == 0 or s.end < s.start) return false;
+        return cache.hasBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, @intCast(s.end - s.start));
+    }
+
+    fn copyCached(ctx: *anyopaque, s: membership.Span, dest: []u8) bool {
+        const self: *S3Membership = @ptrCast(@alignCast(ctx));
+        const cache = self.ctx.meta_cache orelse return false;
+        const sp = &self.specs[s.file];
+        if (sp.etag_len == 0) return false;
+        return cache.copyBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, dest);
     }
 
     fn retain(ctx: *anyopaque, s: membership.Span, bytes: []const u8) void {
@@ -4115,11 +4187,11 @@ pub fn writeJsonFloat(writer: anytype, f: f64) !void {
 /// statistics (already counted in `row_groups_pruned`).
 pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
-        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"suffix_bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"request_kb\":{d},\"us\":{d}}}",
+        "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"suffix_bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"bloom_skipped_oversize\":{d},\"request_kb\":{d},\"us\":{d}}}",
         .{
             s.row_groups_bloom, s.row_groups_dict, s.filters,       s.dictionaries,
             s.requests,         s.bytes,           s.suffix_bytes,  s.bloom_stopped,
-            s.dict_stopped,     s.request_bytes / 1024, s.ns / std.time.ns_per_us,
+            s.dict_stopped,     s.bloom_skipped_oversize, s.request_bytes / 1024, s.ns / std.time.ns_per_us,
         },
     );
 }

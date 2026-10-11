@@ -55,9 +55,12 @@ the medium moves in that time, the requests in flight at once, and the longest r
   whole filters can be kept warm and blocks cannot.
 - On a mapping, every header page and then every block page a probe needs is requested at once (`MADV_WILLNEED`),
   so a cold page cache costs two rounds of parallel reads rather than one disk read per filter.
-- On a remote source, a contiguous run is one pass only when the buffers it allocates fit the charged window and one
-  round trip of bandwidth (8 MiB at most). That charge counts the HTTP body and, where a filter straddles the suffix,
-  the joined copy of the head and the tail. Every such run, from every file and column, is planned together. A larger
+- On a remote source, lengths the footer omits are read first, a window at a time, and those header bytes are released
+  before any filter body is admitted. A contiguous run is then one pass only when the one buffer it allocates fits
+  the charged window and one round trip of bandwidth (8 MiB at most). Split requests and a suffix tail write into
+  that buffer, so the charge is the buffer and not a second copy. A cache hit is copied into the same buffer for the
+  wave and released with it. A filter that does not fit the window is not read; its row group stays, and
+  `bloom_skipped_oversize` counts it. Every fitting run, from every file and column, is planned together. A larger
   run, and a row-group-major run, reads a first wave of at most eight row groups and stops when they prune fewer than
   a quarter; what follows is window-sized, and each wave is released before the next is read. Dictionaries keep the
   first-wave rule either way.

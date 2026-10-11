@@ -18,7 +18,7 @@ the CLI flags of the same name.
 | `compress_priority` | string | As `--compress-priority`: `size` or `speed`; anything else is `bad_json`/`BadCompressPriority`. Absent: `size`. |
 | `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats`. |
 | `ordered` | boolean | `false` is `--unordered`. Absent or `null`: ordered. |
-| `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`, which bounds the S3 fetch window (a quarter of it, 64 MiB to 1 GiB) and decoded row groups (half of it; see the README). Defaults to three quarters of the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
+| `max_memory` | positive number, or size string (`"512MB"`) | As `--max-memory`, which bounds the S3 fetch window (a quarter of it, 64 MiB to 1 GiB) and decoded row groups (half of it; see the README). Defaults to three quarters of the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
@@ -146,7 +146,7 @@ The event used to be read by searching for each field's key anywhere in the body
   - `inputs` that is not an array of strings, which used to fall back to `s3_url`;
   - `scan_all` or `trust_stats` holding anything but `true`/`false`, which used to read as false;
   - `max_memory` that is negative, not a number or size string, or a size string that does not parse, which used to
-    be ignored in favour of the detected memory.
+    be ignored in favour of the detected memory; and a `max_memory` of 0, which used to be accepted.
 - A `columns` entry naming no column. `engine`/`UnknownColumn`, naming it; it used to be dropped from the output.
 
 Accepted requests whose meaning changed: string escapes (`\"`, `\\`, `\n`, `\uXXXX`) are decoded rather than passed

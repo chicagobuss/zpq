@@ -321,6 +321,24 @@ test "queries whose budgets add up past the ceiling all answer, and never hold m
     try testing.expectEqual(@as(usize, 0), ctx.?.budget.reserved);
 }
 
+test "a request's max_memory of 0 is refused, as the context's is" {
+    var ctx: ?*Ctx = null;
+    try testing.expectEqual(@as(c_int, 0), zpq_open("{\"max_memory\": \"64MB\"}", &ctx, null));
+    defer zpq_close(ctx);
+    for ([_][]const u8{ "0", "\"0MB\"" }) |zero| {
+        var buf: [160]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "{{\"inputs\":[\"x.parquet\"],\"aggregate\":\"count(*) AS n\"," ++
+            "\"max_memory\":{s}}}", .{zero});
+        var out: ?[*:0]u8 = null;
+        try testing.expectEqual(@as(c_int, 0), zpq_run(ctx, req.ptr, req.len, &out, null));
+        defer zpq_free(out);
+        try testing.expectEqualStrings(
+            "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"max_memory\"}",
+            std.mem.span(out.?),
+        );
+    }
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 

@@ -228,14 +228,16 @@ pub fn handle(
         else
             .size;
 
+        // A budget of 0 is refused, as libzpq's context ceiling of 0 is: it can run nothing.
         const max_memory: ?usize = if (req.max_memory) |m| switch (m) {
             .bytes => |n| n,
-            .text => |t| zpq.core.system.parseSizeString(t) catch return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"max_memory\"}}",
-                .{},
-            ),
+            .text => |t| zpq.core.system.parseSizeString(t) catch 0,
         } else null;
+        if (max_memory == 0) return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"max_memory\"}}",
+            .{},
+        );
 
         const bloom_filters = try allocator.alloc(engine.BloomSpec, req.bloom_filters.len);
         defer allocator.free(bloom_filters);

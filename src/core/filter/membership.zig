@@ -618,8 +618,8 @@ fn coverOf(covers: []const Span, s: Span) ?usize {
 }
 
 /// One buffer per merged span. Split HTTP writes and the suffix tail land at their offsets. A cache hit is copied
-/// into that buffer and is not fetched. `stats.bytes` counts only HTTP. `planned` is the wave's one plan; a null
-/// plans the requests itself.
+/// into that buffer; a hit that vanishes between the check and the copy is a miss, and the GET fills the same
+/// buffer. `stats.bytes` counts only HTTP. `planned` is the wave's one plan; a null plans the requests itself.
 fn readPlaced(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind, planned: ?[]const Span) !void {
     const cost = src.currentCost();
     const covers = if (planned) |p| p else blk: {
@@ -666,7 +666,8 @@ fn readPlaced(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats,
             const off: usize = @intCast(r.span.start - c.start);
             const n: usize = @intCast(r.span.len());
             if (n > dest.len - off) continue;
-            if (!src.copyCached(r.span, dest[off..][0..n])) continue;
+            // Check, then copy. An eviction in between leaves the hole, and the GET writes this buffer.
+            if (!(src.hasCached(r.span) and src.copyCached(r.span, dest[off..][0..n]))) continue;
             http_holes = try punch(arena, http_holes, r.span);
             tail_holes = try punch(arena, tail_holes, r.span);
         }
@@ -2812,6 +2813,61 @@ test "remote: a warm cache hit is copied into the wave and charged" {
     try testing.expectEqual(@as(u64, 0), st.bytes);
     try testing.expectEqual(@as(usize, 0), remote.http_rounds);
     try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[n - 1], f, &metas[0]) != .skip);
+}
+
+test "remote: a vanished cache hit allocates the plain-miss buffer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sf = try SynthFile.initSolid(a, 1, 200_000);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var cost = dispatch_cost;
+    const flen = filterLen(sf, 0);
+    cost.window = flen;
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = cost };
+    const Seam = struct {
+        fn yes(_: *anyopaque, _: Span) bool {
+            return true;
+        }
+        fn miss(_: *anyopaque, _: Span, _: []u8) bool {
+            return false;
+        }
+        fn no(_: *anyopaque, _: Span) bool {
+            return false;
+        }
+    };
+    var vt = remote.source().vtable.*;
+    vt.has_cached = Seam.yes;
+    vt.copy_cached = Seam.miss;
+    const src: Source = .{ .ctx = &remote, .vtable = &vt, .cost = cost };
+    const f = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    var wave_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer wave_state.deinit();
+    var stats: Stats = .{};
+    var probing: Probing = .{
+        .arena = a,
+        .scratch = a,
+        .wave = &wave_state,
+        .metas = &metas,
+        .src = src,
+        .stats = &stats,
+        .filter = f,
+        .opts = .{},
+    };
+    const leaves = [_]ast.Filter{f};
+    const targets = try findTargets(a, f, &leaves, &metas);
+    const wave_targets = [_]*Target{&targets.items[0]};
+    probing.verdicts = try a.alloc(Verdict, 1);
+    @memset(probing.verdicts, .other);
+    try probing.probeBloom(&wave_targets);
+    const held = wave_state.queryCapacity();
+    try testing.expectEqual(@as(usize, 1), remote.requests);
+    _ = wave_state.reset(.free_all);
+    remote.requests = 0;
+    vt.has_cached = Seam.no;
+    try probing.probeBloom(&wave_targets);
+    try testing.expectEqual(@as(usize, 1), remote.requests);
+    try testing.expectEqual(held, wave_state.queryCapacity());
 }
 
 test "remote: a suffix-served column is planned once per wave" {

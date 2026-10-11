@@ -75,14 +75,16 @@ const FetchWindow = struct {
     always: bool = false,
 };
 
+// Large Lambda scans should overlap fetching and decoding instead of retaining a serial decode tail.
+const lambda_window_cap: u64 = 128 << 20;
+
 /// A query's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set, else budget-derived and capped on Lambda.
 fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
     if (env) |e| if (e.getPosix("ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
         return @max(1, k) << 10;
     } else |_| {};
     const derived = s3_window.windowFor(max_memory);
-    // Large Lambda scans should overlap fetching and decoding instead of retaining a serial decode tail.
-    return if (system.onLambda(env)) @min(derived, 128 << 20) else derived;
+    return if (system.onLambda(env)) @min(derived, lambda_window_cap) else derived;
 }
 
 test "S3 fetch window caps only the Lambda default and preserves explicit overrides" {
@@ -96,11 +98,11 @@ test "S3 fetch window caps only the Lambda default and preserves explicit overri
     const invalid = [_:null]?[*:0]const u8{
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008", "ZPQ_S3_WINDOW_KIB=invalid",
     };
-    try std.testing.expectEqual(@as(u64, 128 << 20), s3FetchWindow(.{ .block = .{ .slice = &lambda } }, 2 << 30));
+    try std.testing.expectEqual(lambda_window_cap, s3FetchWindow(.{ .block = .{ .slice = &lambda } }, 2 << 30));
     try std.testing.expectEqual(@as(u64, 64 << 20), s3FetchWindow(.{ .block = .{ .slice = &lambda } }, 256 << 20));
     try std.testing.expectEqual(@as(u64, 256 << 20), s3FetchWindow(.{ .block = .{ .slice = &override } }, 2 << 30));
     try std.testing.expectEqual(@as(u64, 1024), s3FetchWindow(.{ .block = .{ .slice = &small } }, 2 << 30));
-    try std.testing.expectEqual(@as(u64, 128 << 20), s3FetchWindow(.{ .block = .{ .slice = &invalid } }, 2 << 30));
+    try std.testing.expectEqual(lambda_window_cap, s3FetchWindow(.{ .block = .{ .slice = &invalid } }, 2 << 30));
     try std.testing.expectEqual(@as(u64, 512 << 20), s3FetchWindow(.empty, 2 << 30));
     try std.testing.expectEqual(@as(u64, 512 << 20), s3FetchWindow(null, 2 << 30));
 }
@@ -5934,7 +5936,7 @@ test "Lambda default fetch window streams a large projection and fetches a small
         defer opened.deinit();
         try std.testing.expectEqual(i == 1, opened.s3_fetcher != null);
         try std.testing.expectEqual(i == 1, opened.inputs[0].gate != null);
-        try std.testing.expectEqual(i == 1, opened.inputs[0].bytes.len > 128 << 20);
+        try std.testing.expectEqual(i == 1, opened.inputs[0].bytes.len > lambda_window_cap);
     }
 }
 

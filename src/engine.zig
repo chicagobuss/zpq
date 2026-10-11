@@ -75,12 +75,34 @@ const FetchWindow = struct {
     always: bool = false,
 };
 
-/// A query's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set (tuning, tests), else from its memory budget.
+/// A query's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set, else budget-derived and capped on Lambda.
 fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
     if (env) |e| if (e.getPosix("ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
         return @max(1, k) << 10;
     } else |_| {};
-    return s3_window.windowFor(max_memory);
+    const derived = s3_window.windowFor(max_memory);
+    // Large Lambda scans should overlap fetching and decoding instead of retaining a serial decode tail.
+    return if (system.onLambda(env)) @min(derived, 128 << 20) else derived;
+}
+
+test "S3 fetch window caps only the Lambda default and preserves explicit overrides" {
+    const lambda = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008"};
+    const override = [_:null]?[*:0]const u8{
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008", "ZPQ_S3_WINDOW_KIB=262144",
+    };
+    const small = [_:null]?[*:0]const u8{
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008", "ZPQ_S3_WINDOW_KIB=0",
+    };
+    const invalid = [_:null]?[*:0]const u8{
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008", "ZPQ_S3_WINDOW_KIB=invalid",
+    };
+    try std.testing.expectEqual(@as(u64, 128 << 20), s3FetchWindow(.{ .block = .{ .slice = &lambda } }, 2 << 30));
+    try std.testing.expectEqual(@as(u64, 64 << 20), s3FetchWindow(.{ .block = .{ .slice = &lambda } }, 256 << 20));
+    try std.testing.expectEqual(@as(u64, 256 << 20), s3FetchWindow(.{ .block = .{ .slice = &override } }, 2 << 30));
+    try std.testing.expectEqual(@as(u64, 1024), s3FetchWindow(.{ .block = .{ .slice = &small } }, 2 << 30));
+    try std.testing.expectEqual(@as(u64, 128 << 20), s3FetchWindow(.{ .block = .{ .slice = &invalid } }, 2 << 30));
+    try std.testing.expectEqual(@as(u64, 512 << 20), s3FetchWindow(.empty, 2 << 30));
+    try std.testing.expectEqual(@as(u64, 512 << 20), s3FetchWindow(null, 2 << 30));
 }
 
 /// S3 pool permits. Data fetches may use all of them; footer fetches stay at `READ_CONCURRENCY`.
@@ -5821,6 +5843,100 @@ test "many files keep a count under the memory budget" {
 // ── Windowed S3 fetch ──
 
 const fake_s3 = @import("io/fake_s3.zig");
+
+test "Lambda default fetch window streams a large projection and fetches a smaller one up front" {
+    if (!s3_window.supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var fixture_arena = std.heap.ArenaAllocator.init(gpa);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    // Two real uncompressed chunks let the same file cross the cap by selecting one column or both. Expressions
+    // force page reads rather than a statistics answer; no fetch needs to be stalled or timed to observe the path.
+    const values = try a.alloc(f64, (65 << 20) / @sizeOf(f64));
+    for (values, 0..) |*v, i| v.* = @floatFromInt(i);
+    const leaf: schema.SchemaElement = .{
+        .type = .DOUBLE,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "x",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const encoder = @import("core/writer/encoder.zig");
+    const encoded = try encoder.encodeColumn(a, .{
+        .values = .{ .f64 = .{ .values = values } },
+        .schema_elem = &leaf,
+        .path_in_schema = &.{"x"},
+        .codec = .UNCOMPRESSED,
+    });
+    try std.testing.expect(encoded.bytes.len > 64 << 20);
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = @intCast(values.len),
+        .row_groups = .empty,
+        .created_by = null,
+    };
+    var root = leaf;
+    root.type = null;
+    root.repetition_type = null;
+    root.name = "root";
+    root.num_children = 2;
+    try meta.schema.append(a, root);
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = meta.num_rows };
+    for ([_][]const u8{ "x", "y" }, 0..) |name, i| {
+        var elem = leaf;
+        elem.name = name;
+        try meta.schema.append(a, elem);
+        var cm = encoded.meta;
+        cm.path_in_schema = .empty;
+        try cm.path_in_schema.append(a, name);
+        cm.data_page_offset += @intCast(4 + i * encoded.bytes.len);
+        try rg.columns.append(a, .{ .file_path = null, .file_offset = cm.data_page_offset, .meta_data = cm });
+        rg.total_byte_size += cm.total_uncompressed_size;
+    }
+    try meta.row_groups.append(a, rg);
+    var footer: thrift.Writer = .init(a);
+    try meta.write(&footer);
+    const bytes = try a.alloc(u8, 4 + 2 * encoded.bytes.len + footer.bytes().len + 8);
+    @memcpy(bytes[0..4], "PAR1");
+    for (0..2) |i| @memcpy(bytes[4 + i * encoded.bytes.len ..][0..encoded.bytes.len], encoded.bytes);
+    @memcpy(bytes[4 + 2 * encoded.bytes.len ..][0..footer.bytes().len], footer.bytes());
+    std.mem.writeInt(u32, bytes[bytes.len - 8 ..][0..4], @intCast(footer.bytes().len), .little);
+    @memcpy(bytes[bytes.len - 4 ..], "PAR1");
+
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/window.parquet", bytes);
+    const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+    const env_lines = [_:null]?[*:0]const u8{
+        endpoint,
+        "AWS_REGION=us-east-1",
+        "AWS_ACCESS_KEY_ID=ak",
+        "AWS_SECRET_ACCESS_KEY=sk",
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008",
+    };
+    const env: std.process.Environ = .{ .block = .{ .slice = &env_lines } };
+    const ctx: Context = .{ .gpa = gpa, .env = env, .io = std.testing.io };
+    for ([_][]const u8{ "sum(x * x) AS s", "sum(x * x) AS s, sum(y * y) AS t" }, 0..) |aggregate, i| {
+        var query_arena = std.heap.ArenaAllocator.init(gpa);
+        defer query_arena.deinit();
+        const args: QueryArgs = .{
+            .inputs = &.{"s3://bkt/t/window.parquet"},
+            .aggregate = aggregate,
+            .max_memory = 1 << 30,
+        };
+        const window: FetchWindow = .{ .limit = s3FetchWindow(env, args.max_memory) };
+        var opened = try openInputs(ctx, query_arena.allocator(), args, window);
+        defer opened.deinit();
+        try std.testing.expectEqual(i == 1, opened.s3_fetcher != null);
+        try std.testing.expectEqual(i == 1, opened.inputs[0].gate != null);
+        try std.testing.expectEqual(i == 1, opened.inputs[0].bytes.len > 128 << 20);
+    }
+}
 
 /// An aggregate over `keys` served by `fake`, fetched within `window_kib` (null: the window from the memory budget,
 /// here larger than the files, so fetched up front). Returns the answer as JSON text, for comparing across runs.

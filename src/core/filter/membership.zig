@@ -779,6 +779,9 @@ pub const Stats = struct {
     bloom_skipped_oversize: usize = 0,
     /// Dispatch plans of bloom bodies. One per wave: a prefix loop would count once per prefix.
     planner_calls: usize = 0,
+    /// Largest bloom-wave charge, and the most the wave arena held beyond that charge (the plan).
+    wave_charge_peak: u64 = 0,
+    wave_plan_peak: u64 = 0,
     /// A request's fixed cost, in bytes, that the last plan assumed (remote sources only).
     request_bytes: u64 = 0,
     ns: u64 = 0,
@@ -796,6 +799,8 @@ pub const Stats = struct {
         self.dict_stopped = self.dict_stopped or o.dict_stopped;
         self.bloom_skipped_oversize += o.bloom_skipped_oversize;
         self.planner_calls += o.planner_calls;
+        self.wave_charge_peak = @max(self.wave_charge_peak, o.wave_charge_peak);
+        self.wave_plan_peak = @max(self.wave_plan_peak, o.wave_plan_peak);
         self.ns += o.ns;
     }
 };
@@ -1118,6 +1123,8 @@ const Probing = struct {
     probes: ProbeCache = .{},
     /// Covers of the wave in hand, allocated in `wave`. The read fills these instead of planning again.
     body_covers: ?[]const Span = null,
+    /// Bytes the wave in hand was charged, so release can separate that from the planner's arrays.
+    wave_charge: u64 = 0,
     /// (file, row group) pairs already counted in `row_groups_bloom`.
     bloom_counted: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
@@ -1176,20 +1183,32 @@ const Probing = struct {
     /// not fit the window on its own is not read.
     fn stageBloomRemote(self: *Probing, all: []const *Target) !void {
         try self.resolveOmitted(all);
-        var used = try self.scratch.alloc(bool, all.len);
+        // Every filter bigger than the window, wherever it sits. Planning orders by file offset, not row group,
+        // so a leading-only skip would plan the oversize one first and then discard the filters that fit.
+        var live: std.ArrayList(*Target) = .empty;
+        for (all) |t| {
+            if (self.bodySpan(t) == null) continue;
+            if (self.heldTarget(t) > self.windowCap()) {
+                self.stats.bloom_skipped_oversize += 1;
+                continue;
+            }
+            try live.append(self.scratch, t);
+        }
+        const fitting = live.items;
+        var used = try self.scratch.alloc(bool, fitting.len);
         @memset(used, false);
         var cheap: std.ArrayList(*Target) = .empty;
         var rest: std.ArrayList(*Target) = .empty;
         var i: usize = 0;
-        while (i < all.len) : (i += 1) {
+        while (i < fitting.len) : (i += 1) {
             if (used[i]) continue;
             var col: std.ArrayList(*Target) = .empty;
             var j: usize = i;
-            while (j < all.len) : (j += 1) {
+            while (j < fitting.len) : (j += 1) {
                 if (used[j]) continue;
-                if (all[j].file != all[i].file or all[j].col != all[i].col) continue;
+                if (fitting[j].file != fitting[i].file or fitting[j].col != fitting[i].col) continue;
                 used[j] = true;
-                try col.append(self.scratch, all[j]);
+                try col.append(self.scratch, fitting[j]);
             }
             if (try self.columnContiguous(col.items) and self.contiguousCharge(col.items) <= self.oneRoundCap()) {
                 try cheap.appendSlice(self.scratch, col.items);
@@ -1200,17 +1219,18 @@ const Probing = struct {
         try self.probeSequence(cheap.items, self.oneRoundCap());
         if (rest.items.len == 0) return;
         std.mem.sort(*Target, rest.items, {}, targetLess);
-        const at = self.skipOversize(rest.items, 0);
-        if (at >= rest.items.len) return;
-        const first_n = waveEnd(rest.items[at..], self.opts.wave);
-        const first_slice = rest.items[at..][0..first_n];
-        const cut = try self.cutWave(first_slice, self.windowCap());
-        if (cut.admitted.len == 0) return;
-        const tail = rest.items[at + first_n ..];
+        const first_n = waveEnd(rest.items, self.opts.wave);
+        const cut = try self.cutWave(rest.items[0..first_n], self.windowCap());
+        if (cut.admitted.len == 0) {
+            self.releaseWave();
+            return;
+        }
+        const tail = rest.items[first_n..];
         const cont = try self.scratch.alloc(*Target, cut.rest.len + tail.len);
         @memcpy(cont[0..cut.rest.len], cut.rest);
         @memcpy(cont[cut.rest.len..], tail);
         self.body_covers = cut.covers;
+        self.wave_charge = self.coversCharge(cut.covers);
         const first = try self.probeWave(.bloom, cut.admitted);
         self.releaseWave();
         if (cont.len == 0) return;
@@ -1242,6 +1262,13 @@ const Probing = struct {
             }
             if (n == 0) break;
             try self.probeHeaders(pending.items[at..][0..n]);
+            var charge: u64 = 0;
+            for (pending.items[at..][0..n]) |t| {
+                const s = filterSpan(t, self.metas).?;
+                const span: Span = .{ .file = s.file, .start = s.start, .end = s.start + header_probe_bytes };
+                charge += heldBytes(span, self.src.suffix(span.file));
+            }
+            self.wave_charge = charge;
             self.releaseWave();
             at += n;
         }
@@ -1274,21 +1301,17 @@ const Probing = struct {
         while (cur.len > 0) {
             if (left == 0) return;
             left -= 1;
-            const skip = self.skipOversize(cur, 0);
-            if (skip >= cur.len) return;
-            if (skip > 0) {
-                cur = cur[skip..];
-                continue;
-            }
             const cut = try self.cutWave(cur, cap);
+            // Oversize filters are already gone. An empty cut must not drop a fitting target, and the plan it just
+            // built has to die before another wave plans onto the same arena.
             if (cut.admitted.len == 0) {
-                self.stats.bloom_skipped_oversize += 1;
-                cur = cur[1..];
-                continue;
+                self.releaseWave();
+                return;
             }
             const nrest = cut.rest.len;
             @memcpy(spare[0..nrest], cut.rest);
             self.body_covers = cut.covers;
+            self.wave_charge = self.coversCharge(cut.covers);
             _ = try self.probeWave(.bloom, cut.admitted);
             self.releaseWave();
             cur = spare[0..nrest];
@@ -1406,17 +1429,18 @@ const Probing = struct {
         list.shrinkRetainingCapacity(n);
     }
 
-    /// Count and step over filters that cannot fit in `windowCap` alone. Returns the next index that might.
-    fn skipOversize(self: *Probing, ts: []const *Target, start: usize) usize {
-        var at = start;
-        const cap = self.windowCap();
-        while (at < ts.len and self.heldTarget(ts[at]) > cap) : (at += 1) {
-            self.stats.bloom_skipped_oversize += 1;
-        }
-        return at;
+    fn coversCharge(self: *const Probing, covers: []const Span) u64 {
+        var n: u64 = 0;
+        for (covers) |c| n += heldBytes(c, self.src.suffix(c.file));
+        return n;
     }
 
     fn releaseWave(self: *Probing) void {
+        const arena: u64 = @intCast(self.wave.queryCapacity());
+        if (self.wave_charge > self.stats.wave_charge_peak) self.stats.wave_charge_peak = self.wave_charge;
+        const slack = arena -| self.wave_charge;
+        if (slack > self.stats.wave_plan_peak) self.stats.wave_plan_peak = slack;
+        self.wave_charge = 0;
         self.body_covers = null;
         _ = self.wave.reset(.free_all);
     }
@@ -2898,6 +2922,255 @@ test "remote: a suffix-served column is planned once per wave" {
     try testing.expectEqual(@as(usize, 4), st2.filters);
     try testing.expectEqual(@as(usize, 4), st2.planner_calls);
     try testing.expect(!st2.bloom_stopped);
+}
+
+fn appendBloomRg(a: std.mem.Allocator, meta: *schema.FileMetaData, off: u64, flen: ?usize, data_off: u64) !void {
+    var path: schema.StringList = .empty;
+    try path.append(a, "c");
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 64, .num_rows = 1 };
+    try rg.columns.append(a, .{ .file_path = null, .file_offset = 4, .meta_data = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+        .num_values = 1,
+        .total_uncompressed_size = 64,
+        .total_compressed_size = 64,
+        .data_page_offset = @intCast(data_off),
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .bloom_filter_offset = @intCast(off),
+        .bloom_filter_length = if (flen) |n| @intCast(n) else null,
+    } });
+    try meta.row_groups.append(a, rg);
+}
+
+fn freshMeta(a: std.mem.Allocator) !schema.FileMetaData {
+    var meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try meta.schema.appendSlice(a, &.{ test_fixtures.group("schema", 1), test_fixtures.leaf("c", .BYTE_ARRAY) });
+    return meta;
+}
+
+fn bloomMissesKeep(bytes: []const u8) bool {
+    const bits = bloom.bitset(bytes) orelse return false;
+    return !bloom.mightContainScalar(bits, bloom.hashBytes("keep"));
+}
+
+fn filterLongerThan(a: std.mem.Allocator, min_len: u64) ![]u8 {
+    var ndv: u64 = 64;
+    var last: []u8 = &.{};
+    while (ndv <= 4_000_000) : (ndv *|= 2) {
+        var b = try bloom.Builder.init(a, ndv, 0.01);
+        defer b.deinit(a);
+        b.insert(bloom.hashBytes("keep"));
+        last = try b.serialize(a);
+        if (last.len > min_len) return last;
+    }
+    return last;
+}
+
+test "remote: an oversize filter stored ahead of the small ones is the only skip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n: usize = 2048;
+    var b = try bloom.Builder.init(a, 32, 0.01);
+    defer b.deinit(a);
+    b.insert(bloom.hashBytes("other"));
+    const small = try b.serialize(a);
+    const sh = bloom.parseHeader(small).?;
+    @memset(small[sh.len..], 0);
+    const sum: u64 = @as(u64, small.len) * (n - 1);
+    const window = sum + 4096;
+    var bits: u32 = bloom.block_bytes;
+    while (@as(u64, bits) + 64 <= window) bits *= 2;
+    var hdr: [bloom.max_header_bytes]u8 = undefined;
+    const hb = bloom.writeHeader(bits, &hdr);
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(a, hb);
+    try big.appendNTimes(a, 0, bits);
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendNTimes(a, 'x', 8);
+    const big_off: u64 = @intCast(bytes.items.len);
+    try bytes.appendSlice(a, big.items);
+    const small_off = try a.alloc(u64, n - 1);
+    for (small_off) |*o| {
+        o.* = @intCast(bytes.items.len);
+        try bytes.appendSlice(a, small);
+    }
+    var meta = try freshMeta(a);
+    for (small_off, 0..) |o, i| try appendBloomRg(a, &meta, o, small.len, 8 + i * 64);
+    try appendBloomRg(a, &meta, big_off, big.items.len, 8);
+    const metas = [_]schema.FileMetaData{meta};
+    var cost = dispatch_cost;
+    cost.window = window;
+    var remote: FakeRemote = .{ .files = &.{bytes.items}, .cost = cost };
+    const f = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{ .min_wave_prune = 0 });
+    try testing.expectEqual(n - 1, st.filters);
+    try testing.expectEqual(@as(usize, 1), st.bloom_skipped_oversize);
+    try testing.expectEqual(@as(usize, 1), st.planner_calls);
+    try testing.expect(!st.bloom_stopped);
+    try testing.expect(st.wave_charge_peak <= window);
+    // One plan of the fitting filters. The buried shape used to retain a plan per discarded target (~175 MB at 2048).
+    try testing.expect(st.wave_plan_peak <= 2 << 20);
+    for (0..n - 1) |i| try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[i], f, &metas[0]) == .skip);
+    try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[n - 1], f, &metas[0]) != .skip);
+}
+
+const AdmitSeam = struct {
+    fn yes(_: *anyopaque, _: Span) bool {
+        return true;
+    }
+    fn miss(_: *anyopaque, _: Span, _: []u8) bool {
+        return false;
+    }
+};
+
+fn checkBloomAdmission(seed: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const n: usize = 1 + r.uintLessThan(usize, 8);
+    const windows = [_]u64{ 32, 64, 96, 128, 256, 1024, 4096, 8192, 1 << 20, std.math.maxInt(u64) };
+    const window = windows[r.uintLessThan(usize, windows.len)];
+    const unbounded = window == std.math.maxInt(u64);
+    var pb = try bloom.Builder.init(a, 16, 0.01);
+    defer pb.deinit(a);
+    pb.insert(bloom.hashBytes("keep"));
+    const present = try pb.serialize(a);
+    var ab = try bloom.Builder.init(a, 16, 0.01);
+    defer ab.deinit(a);
+    ab.insert(bloom.hashBytes("other"));
+    const absent = try ab.serialize(a);
+    const ah = bloom.parseHeader(absent).?;
+    @memset(absent[ah.len..], 0);
+    const big: []const u8 = if (!unbounded and window <= 8192) try filterLongerThan(a, window) else present;
+
+    const order = try a.alloc(usize, n);
+    for (order, 0..) |*slot, i| slot.* = i;
+    var pi: usize = n;
+    while (pi > 1) {
+        pi -= 1;
+        const j = r.uintLessThan(usize, pi + 1);
+        const tmp = order[pi];
+        order[pi] = order[j];
+        order[j] = tmp;
+    }
+    const gap: usize = if (r.boolean()) 0 else 1 + r.uintLessThan(usize, 32);
+    const suffix_mode: usize = r.uintLessThan(usize, 3);
+    const cache_mode: usize = r.uintLessThan(usize, 3);
+    const bodies = try a.alloc([]const u8, n);
+    const offs = try a.alloc(u64, n);
+    const omit = try a.alloc(bool, n);
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendNTimes(a, 'x', 8);
+    var suffix_start: ?u64 = if (suffix_mode == 1) @as(u64, 8) else null;
+    for (order) |rg| {
+        const start: u64 = @intCast(bytes.items.len);
+        const wholly = if (suffix_start) |s| start >= s else false;
+        const want_miss = r.uintLessThan(usize, 3) == 0;
+        const small = if (want_miss) absent else present;
+        var body: []const u8 = if (wholly or small.len <= window) small else big;
+        if (!wholly and r.uintLessThan(usize, 4) == 0 and big.len > window) body = big;
+        if (!wholly and body.len > window and bloomMissesKeep(body)) body = big;
+        bodies[rg] = body;
+        offs[rg] = start;
+        omit[rg] = r.boolean() and window >= header_probe_bytes;
+        try bytes.appendSlice(a, body);
+        if (gap > 0) try bytes.appendNTimes(a, 'g', gap);
+        if (suffix_mode == 2 and suffix_start == null)
+            suffix_start = start + @as(u64, @intCast(body.len / 2));
+    }
+    var meta = try freshMeta(a);
+    for (0..n) |rg| {
+        const flen: ?usize = if (omit[rg]) null else bodies[rg].len;
+        try appendBloomRg(a, &meta, offs[rg], flen, 8);
+    }
+    var cost = dispatch_cost;
+    cost.window = if (unbounded) null else window;
+    var cached: std.ArrayList(Span) = .empty;
+    if (cache_mode == 1) {
+        for (0..n) |rg| {
+            if (!r.boolean()) continue;
+            const len: u64 = @intCast(bodies[rg].len);
+            try cached.append(a, .{ .file = 0, .start = offs[rg], .end = offs[rg] + len });
+        }
+    }
+    var remote: FakeRemote = .{
+        .files = &.{bytes.items},
+        .cost = cost,
+        .suffix_start = suffix_start,
+        .cached = cached.items,
+    };
+    var src = remote.source();
+    var vt = src.vtable.*;
+    if (cache_mode == 2) {
+        vt.has_cached = AdmitSeam.yes;
+        vt.copy_cached = AdmitSeam.miss;
+        src.vtable = &vt;
+    }
+    const metas = [_]schema.FileMetaData{meta};
+    const f = try parser.parse(a, "c = 'keep'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, src, .{ .min_wave_prune = 0 });
+    const suf: ?Span = if (suffix_start) |s| .{ .file = 0, .start = s, .end = @intCast(bytes.items.len) } else null;
+    const cap: u64 = if (unbounded) std.math.maxInt(u64) else window;
+    var expect_filters: usize = 0;
+    var expect_over: usize = 0;
+    const skipped = try a.alloc(bool, n);
+    for (0..n) |rg| {
+        const span: Span = .{ .file = 0, .start = offs[rg], .end = offs[rg] + @as(u64, @intCast(bodies[rg].len)) };
+        const over = heldBytes(span, suf) > cap;
+        if (over) expect_over += 1 else expect_filters += 1;
+        const skip = !over and bloomMissesKeep(bodies[rg]);
+        skipped[rg] = prune.pruneRowGroup(&metas[0].row_groups.items[rg], f, &metas[0]) == .skip;
+        if (skipped[rg] != skip) {
+            std.debug.print("seed {x} rg {d} prune {any} want {any}\n", .{ seed, rg, skipped[rg], skip });
+            return error.TestExpectedEqual;
+        }
+    }
+    if (st.filters != expect_filters or st.bloom_skipped_oversize != expect_over or st.bloom_stopped) {
+        std.debug.print("seed {x} filters {d}/{d} over {d}/{d} stopped {}\n", .{
+            seed, st.filters, expect_filters, st.bloom_skipped_oversize, expect_over, st.bloom_stopped,
+        });
+        return error.TestExpectedEqual;
+    }
+    if (st.wave_charge_peak > cap or st.wave_plan_peak > 8192 * @as(u64, n) + (256 << 10)) {
+        std.debug.print("seed {x} charge {d} cap {d} plan {d}\n", .{ seed, st.wave_charge_peak, cap, st.wave_plan_peak });
+        return error.TestExpectedEqual;
+    }
+    clearAbsent(&metas);
+    var wide = cost;
+    wide.window = null;
+    var remote2 = remote;
+    remote2.cost = wide;
+    var src2 = remote2.source();
+    if (cache_mode == 2) src2.vtable = &vt;
+    const st2 = try load(a, testing.allocator, f, &metas, src2, .{ .min_wave_prune = 0 });
+    _ = st2;
+    for (0..n) |rg| {
+        const skip2 = prune.pruneRowGroup(&metas[0].row_groups.items[rg], f, &metas[0]) == .skip;
+        if (skip2 != skipped[rg]) {
+            std.debug.print("seed {x} rg {d} bounded {any} unbounded {any}\n", .{ seed, rg, skipped[rg], skip2 });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "remote: bloom admission holds across order, suffix, cache, and window" {
+    for (0..256) |i| try checkBloomAdmission(0xA11CE000 + i);
+}
+
+test "fuzz: bloom admission across order, suffix, cache, and window" {
+    for (0..2048) |i| try checkBloomAdmission(0xF4000000 +% @as(u64, i));
 }
 
 test "remote: an AND counts each row group once" {

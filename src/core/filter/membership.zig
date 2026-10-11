@@ -507,10 +507,12 @@ fn planDispatch(arena: std.mem.Allocator, ranges: []const Span, cost: Cost) ![]S
 }
 
 /// The buffers `readPlaced` allocates for `ranges`: one per merged span, before any split. The same function the
-/// admission charge uses, so the bytes reserved and the bytes allocated cannot drift.
-fn coverSpans(arena: std.mem.Allocator, ranges: []const Span, cost: Cost, kind: ReadKind) ![]Span {
+/// admission charge uses, so the bytes reserved and the bytes allocated cannot drift. `plans` counts one bloom-body
+/// plan; header probes are exact and are not plans.
+fn coverSpans(arena: std.mem.Allocator, ranges: []const Span, cost: Cost, kind: ReadKind, plans: ?*usize) ![]Span {
     if (ranges.len == 0) return &.{};
     if (kind == .exact) return arena.dupe(Span, ranges);
+    if (plans) |p| p.* += 1;
     if (kind == .dispatch and cost.gap_cap > 0) return dispatchCovers(arena, ranges, cost);
     const sorted = try arena.dupe(Span, ranges);
     std.mem.sort(Span, sorted, {}, spanLess);
@@ -552,9 +554,9 @@ fn heldBytes(span: Span, suf: ?Span) u64 {
 
 /// Read every request through `src`. On a remote source each merged span is one buffer: HTTP pieces and the suffix
 /// tail write into it, and a cache hit is copied into it. A mapping still returns slices of the file.
-fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind) !void {
+fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind, planned: ?[]const Span) !void {
     if (reqs.len == 0) return;
-    if (src.cost.remote()) return readPlaced(arena, src, reqs, stats, kind);
+    if (src.cost.remote()) return readPlaced(arena, src, reqs, stats, kind, planned);
     const cost = src.currentCost();
     const Part = struct { http: ?Span, tail: ?usize };
     const parts = try arena.alloc(Part, reqs.len);
@@ -569,7 +571,7 @@ fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, ki
             try tails.append(arena, t);
         } else p.tail = null;
     }
-    const planned: []Span = if (http.items.len == 0)
+    const http_plan: []Span = if (http.items.len == 0)
         &.{}
     else if (kind == .dispatch and cost.gap_cap > 0) blk: {
         break :blk try planDispatch(arena, http.items, cost);
@@ -577,18 +579,18 @@ fn readAll(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, ki
         std.mem.sort(Span, http.items, {}, spanLess);
         break :blk try planSpans(arena, http.items, cost);
     };
-    const got = try arena.alloc([]const u8, planned.len);
-    if (planned.len > 0) try src.read(arena, planned, got);
+    const got = try arena.alloc([]const u8, http_plan.len);
+    if (http_plan.len > 0) try src.read(arena, http_plan, got);
     const tail_got = try arena.alloc([]const u8, tails.items.len);
     if (tails.items.len > 0) try src.read(arena, tails.items, tail_got);
     // A mapping reads nothing up front; the pages a probe touches fault in on their own.
     if (src.cost.remote()) {
-        stats.requests += planned.len;
+        stats.requests += http_plan.len;
         for (got) |g| stats.bytes += g.len;
         for (tail_got) |g| stats.suffix_bytes += g.len;
     }
     for (reqs, parts) |*r, p| {
-        const head = if (p.http) |h| try assemble(arena, planned, got, h) else &.{};
+        const head = if (p.http) |h| try assemble(arena, http_plan, got, h) else &.{};
         const tail = if (p.tail) |i| tail_got[i] else &.{};
         r.out = try joinBytes(arena, head, tail);
     }
@@ -615,13 +617,16 @@ fn coverOf(covers: []const Span, s: Span) ?usize {
     return null;
 }
 
-/// One buffer per merged span. Split HTTP writes and the suffix tail land at their offsets. A cache hit overwrites
-/// its request and is not fetched. `stats.bytes` counts only HTTP.
-fn readPlaced(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind) !void {
+/// One buffer per merged span. Split HTTP writes and the suffix tail land at their offsets. A cache hit is copied
+/// into that buffer and is not fetched. `stats.bytes` counts only HTTP. `planned` is the wave's one plan; a null
+/// plans the requests itself.
+fn readPlaced(arena: std.mem.Allocator, src: Source, reqs: []Req, stats: *Stats, kind: ReadKind, planned: ?[]const Span) !void {
     const cost = src.currentCost();
-    const ranges = try arena.alloc(Span, reqs.len);
-    for (reqs, ranges) |r, *s| s.* = r.span;
-    const covers = try coverSpans(arena, ranges, cost, kind);
+    const covers = if (planned) |p| p else blk: {
+        const ranges = try arena.alloc(Span, reqs.len);
+        for (reqs, ranges) |r, *s| s.* = r.span;
+        break :blk try coverSpans(arena, ranges, cost, kind, null);
+    };
     const Buf = struct {
         bytes: []u8,
         borrowed: ?[]const u8,
@@ -771,6 +776,8 @@ pub const Stats = struct {
     dict_stopped: bool = false,
     /// Filters not read because one of them would not fit in the charged window. The row group stays unpruned.
     bloom_skipped_oversize: usize = 0,
+    /// Dispatch plans of bloom bodies. One per wave: a prefix loop would count once per prefix.
+    planner_calls: usize = 0,
     /// A request's fixed cost, in bytes, that the last plan assumed (remote sources only).
     request_bytes: u64 = 0,
     ns: u64 = 0,
@@ -787,6 +794,7 @@ pub const Stats = struct {
         self.bloom_stopped = self.bloom_stopped or o.bloom_stopped;
         self.dict_stopped = self.dict_stopped or o.dict_stopped;
         self.bloom_skipped_oversize += o.bloom_skipped_oversize;
+        self.planner_calls += o.planner_calls;
         self.ns += o.ns;
     }
 };
@@ -1107,6 +1115,8 @@ const Probing = struct {
     opts: Options,
     verdicts: []Verdict = &.{},
     probes: ProbeCache = .{},
+    /// Covers of the wave in hand, allocated in `wave`. The read fills these instead of planning again.
+    body_covers: ?[]const Span = null,
     /// (file, row group) pairs already counted in `row_groups_bloom`.
     bloom_counted: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
@@ -1159,9 +1169,10 @@ const Probing = struct {
 
     /// Remote bloom. Lengths the footer omits are learned first, in window-sized header batches that are released
     /// before any filter body is admitted. Cheap contiguous runs from every file and column then share one dispatch.
-    /// A run is cheap when the buffers it allocates fit the charged window and one round trip (8 MiB). Anything
-    /// larger, and every scattered column, takes the adaptive first wave and then window-sized waves. A filter that
-    /// does not fit the window on its own is not read. Each wave is released before the next.
+    /// A run is cheap when the one buffer of its union fits the charged window and one round trip (8 MiB). Anything
+    /// larger, and every scattered column, takes the adaptive first wave and then window-sized waves. Each wave plans
+    /// its candidates once, admits a prefix of that plan, and releases the plan with the bodies. A filter that does
+    /// not fit the window on its own is not read.
     fn stageBloomRemote(self: *Probing, all: []const *Target) !void {
         try self.resolveOmitted(all);
         var used = try self.scratch.alloc(bool, all.len);
@@ -1179,42 +1190,35 @@ const Probing = struct {
                 used[j] = true;
                 try col.append(self.scratch, all[j]);
             }
-            if (try self.columnContiguous(col.items) and try self.coverCharge(col.items) <= self.oneRoundCap()) {
+            if (try self.columnContiguous(col.items) and self.contiguousCharge(col.items) <= self.oneRoundCap()) {
                 try cheap.appendSlice(self.scratch, col.items);
             } else try rest.appendSlice(self.scratch, col.items);
         }
         self.keepReadable(&cheap);
         self.keepReadable(&rest);
-        try self.probeInCharges(cheap.items, self.oneRoundCap());
+        try self.probeSequence(cheap.items, self.oneRoundCap());
         if (rest.items.len == 0) return;
         std.mem.sort(*Target, rest.items, {}, targetLess);
-        var at = self.skipOversize(rest.items, 0);
+        const at = self.skipOversize(rest.items, 0);
         if (at >= rest.items.len) return;
-        const first_limit = waveEnd(rest.items[at..], self.opts.wave) + at;
-        const first_end = try self.chargeEnd(rest.items, at, first_limit, self.windowCap());
-        if (first_end == at) return;
-        const first = try self.probeWave(.bloom, rest.items[at..first_end]);
+        const first_n = waveEnd(rest.items[at..], self.opts.wave);
+        const first_slice = rest.items[at..][0..first_n];
+        const cut = try self.cutWave(first_slice, self.windowCap());
+        if (cut.admitted.len == 0) return;
+        const tail = rest.items[at + first_n ..];
+        const cont = try self.scratch.alloc(*Target, cut.rest.len + tail.len);
+        @memcpy(cont[0..cut.rest.len], cut.rest);
+        @memcpy(cont[cut.rest.len..], tail);
+        self.body_covers = cut.covers;
+        const first = try self.probeWave(.bloom, cut.admitted);
         self.releaseWave();
-        if (first_end == rest.items.len) return;
+        if (cont.len == 0) return;
         const want = self.opts.min_wave_prune * @as(f64, @floatFromInt(first.row_groups));
         if (@as(f64, @floatFromInt(first.pruned)) < want) {
             self.stats.bloom_stopped = true;
             return;
         }
-        at = first_end;
-        while (at < rest.items.len) {
-            at = self.skipOversize(rest.items, at);
-            if (at >= rest.items.len) return;
-            const end = try self.chargeEnd(rest.items, at, rest.items.len, self.windowCap());
-            if (end == at) {
-                self.stats.bloom_skipped_oversize += 1;
-                at += 1;
-                continue;
-            }
-            _ = try self.probeWave(.bloom, rest.items[at..end]);
-            self.releaseWave();
-            at = end;
-        }
+        try self.probeSequence(cont, self.windowCap());
     }
 
     /// Header probes for every omitted length, batched under the window and released before bodies are admitted.
@@ -1249,7 +1253,7 @@ const Probing = struct {
             const s = filterSpan(t, self.metas).?;
             try reqs.append(a, .{ .span = .{ .file = s.file, .start = s.start, .end = s.start + header_probe_bytes } });
         }
-        try readAll(a, self.src, reqs.items, self.stats, .exact);
+        try readAll(a, self.src, reqs.items, self.stats, .exact, null);
         for (targets, reqs.items) |t, r| {
             const total = bloomFilterTotal(r.out) orelse continue;
             if (total == 0 or total > @as(u64, @intCast(bloom.max_filter_bytes))) continue;
@@ -1257,22 +1261,137 @@ const Probing = struct {
         }
     }
 
-    /// One `read` per charge-sized batch. The bodies are freed before the next batch is admitted.
-    fn probeInCharges(self: *Probing, targets: []const *Target, cap: u64) !void {
-        var at: usize = 0;
-        while (at < targets.len) {
-            at = self.skipOversize(targets, at);
-            if (at >= targets.len) return;
-            const end = try self.chargeEnd(targets, at, targets.len, cap);
-            if (end == at) {
-                self.stats.bloom_skipped_oversize += 1;
-                at += 1;
+    /// Window-sized waves over `targets`. Each wave plans once; the unadmitted tail is planned again as the next wave.
+    fn probeSequence(self: *Probing, targets: []const *Target, cap: u64) !void {
+        if (targets.len == 0) return;
+        const buf_a = try self.scratch.alloc(*Target, targets.len);
+        const buf_b = try self.scratch.alloc(*Target, targets.len);
+        @memcpy(buf_a, targets);
+        var cur: []*Target = buf_a[0..targets.len];
+        var spare: []*Target = buf_b;
+        var left: usize = targets.len + 1;
+        while (cur.len > 0) {
+            if (left == 0) return;
+            left -= 1;
+            const skip = self.skipOversize(cur, 0);
+            if (skip >= cur.len) return;
+            if (skip > 0) {
+                cur = cur[skip..];
                 continue;
             }
-            _ = try self.probeWave(.bloom, targets[at..end]);
+            const cut = try self.cutWave(cur, cap);
+            if (cut.admitted.len == 0) {
+                self.stats.bloom_skipped_oversize += 1;
+                cur = cur[1..];
+                continue;
+            }
+            const nrest = cut.rest.len;
+            @memcpy(spare[0..nrest], cut.rest);
+            self.body_covers = cut.covers;
+            _ = try self.probeWave(.bloom, cut.admitted);
             self.releaseWave();
-            at = end;
+            cur = spare[0..nrest];
+            spare = if (spare.ptr == buf_a.ptr) buf_b else buf_a;
         }
+    }
+
+    const WaveCut = struct {
+        admitted: []const *Target,
+        rest: []const *Target,
+        covers: []const Span,
+    };
+
+    /// One plan of `targets` on the wave arena. Spans are admitted in order until the next buffer would pass `cap`.
+    /// A span that is itself larger than `cap` (touching filters join before the window is consulted) contributes the
+    /// longest prefix of its filters whose one buffer still fits; the rest of it waits for the next wave.
+    fn cutWave(self: *Probing, targets: []const *Target, cap: u64) !WaveCut {
+        const a = self.wave.allocator();
+        if (targets.len == 0) return .{ .admitted = &.{}, .rest = &.{}, .covers = &.{} };
+        const planned = try self.planBodies(targets);
+        var held: u64 = 0;
+        var cover_n: usize = 0;
+        for (planned) |c| {
+            const ch = heldBytes(c, self.src.suffix(c.file));
+            if (held + ch > cap) break;
+            held += ch;
+            cover_n += 1;
+        }
+        var partial: []const *Target = &.{};
+        var partial_span: ?Span = null;
+        if (cover_n == 0 and planned.len > 0) {
+            const inside = try self.orderedInside(planned[0], targets);
+            const npre = self.prefixCount(inside, cap);
+            if (npre > 0) {
+                partial = inside[0..npre];
+                const s0 = self.bodySpan(inside[0]).?;
+                const s1 = self.bodySpan(inside[npre - 1]).?;
+                partial_span = .{ .file = s0.file, .start = s0.start, .end = s1.end };
+            }
+        }
+        const mark = try a.alloc(bool, targets.len);
+        @memset(mark, false);
+        for (targets, mark) |t, *m| {
+            const s = self.bodySpan(t) orelse continue;
+            for (planned[0..cover_n]) |c| {
+                if (c.file == s.file and s.start >= c.start and s.end <= c.end) {
+                    m.* = true;
+                    break;
+                }
+            }
+        }
+        for (partial) |p| for (targets, mark) |t, *m| {
+            if (t == p) m.* = true;
+        };
+        var admitted: std.ArrayList(*Target) = .empty;
+        var rest: std.ArrayList(*Target) = .empty;
+        for (targets, mark) |t, m| {
+            if (m) try admitted.append(a, t) else try rest.append(a, t);
+        }
+        var covers: std.ArrayList(Span) = .empty;
+        for (planned[0..cover_n]) |c| try covers.append(a, c);
+        if (partial_span) |s| try covers.append(a, s);
+        return .{ .admitted = admitted.items, .rest = rest.items, .covers = covers.items };
+    }
+
+    /// One dispatch plan of these filters. The arrays live in the wave arena and die at `releaseWave`.
+    fn planBodies(self: *Probing, targets: []const *Target) ![]Span {
+        const a = self.wave.allocator();
+        var spans: std.ArrayList(Span) = .empty;
+        for (targets) |t| if (self.bodySpan(t)) |s| try spans.append(a, s);
+        return coverSpans(a, spans.items, self.src.currentCost(), .dispatch, &self.stats.planner_calls);
+    }
+
+    fn orderedInside(self: *Probing, cover: Span, targets: []const *Target) ![]*Target {
+        const a = self.wave.allocator();
+        const Item = struct { t: *Target, start: u64 };
+        var items: std.ArrayList(Item) = .empty;
+        for (targets) |t| {
+            const s = self.bodySpan(t) orelse continue;
+            if (s.file == cover.file and s.start >= cover.start and s.end <= cover.end)
+                try items.append(a, .{ .t = t, .start = s.start });
+        }
+        std.mem.sort(Item, items.items, {}, struct {
+            fn less(_: void, x: Item, y: Item) bool {
+                return x.start < y.start;
+            }
+        }.less);
+        const out = try a.alloc(*Target, items.items.len);
+        for (items.items, out) |it, *slot| slot.* = it.t;
+        return out;
+    }
+
+    /// How many of `inside`, already in offset order, fit in one buffer of `cap`.
+    fn prefixCount(self: *const Probing, inside: []const *Target, cap: u64) usize {
+        if (inside.len == 0) return 0;
+        const s0 = self.bodySpan(inside[0]) orelse return 0;
+        var n: usize = 0;
+        for (inside, 0..) |t, i| {
+            const s = self.bodySpan(t) orelse break;
+            const grown: Span = .{ .file = s0.file, .start = s0.start, .end = s.end };
+            if (heldBytes(grown, self.src.suffix(grown.file)) > cap) break;
+            n = i + 1;
+        }
+        return n;
     }
 
     fn keepReadable(self: *const Probing, list: *std.ArrayList(*Target)) void {
@@ -1297,6 +1416,7 @@ const Probing = struct {
     }
 
     fn releaseWave(self: *Probing) void {
+        self.body_covers = null;
         _ = self.wave.reset(.free_all);
     }
 
@@ -1327,29 +1447,20 @@ const Probing = struct {
         return heldBytes(s, self.src.suffix(s.file));
     }
 
-    /// Bytes the read of `ts` will allocate: the merged spans `readPlaced` buffers, suffix borrows excluded.
-    fn coverCharge(self: *const Probing, ts: []const *Target) !u64 {
-        var spans: std.ArrayList(Span) = .empty;
-        for (ts) |t| if (self.bodySpan(t)) |s| try spans.append(self.scratch, s);
-        if (spans.items.len == 0) return 0;
-        const covers = try coverSpans(self.scratch, spans.items, self.src.currentCost(), .dispatch);
-        var n: u64 = 0;
-        for (covers) |c| n += heldBytes(c, self.src.suffix(c.file));
-        return n;
-    }
-
-    /// One past the last target of `[start, limit)` whose placed buffers still fit in `cap`. Does not admit a first
-    /// target that itself does not fit.
-    fn chargeEnd(self: *const Probing, ts: []const *Target, start: usize, limit: usize, cap: u64) !usize {
-        if (start >= ts.len) return start;
-        const last = @min(limit, ts.len);
-        var end = start;
-        while (end < last) {
-            const charge = try self.coverCharge(ts[start .. end + 1]);
-            if (charge > cap) break;
-            end += 1;
+    /// Charge of a contiguous column: one buffer from the first byte to the last. Touching filters join into that
+    /// span, so this is the plan's charge without planning.
+    fn contiguousCharge(self: *const Probing, col: []const *Target) u64 {
+        var lo: u64 = std.math.maxInt(u64);
+        var hi: u64 = 0;
+        var file: u32 = 0;
+        for (col) |t| {
+            const s = self.bodySpan(t) orelse return std.math.maxInt(u64);
+            file = s.file;
+            lo = @min(lo, s.start);
+            hi = @max(hi, s.end);
         }
-        return end;
+        if (hi <= lo) return 0;
+        return heldBytes(.{ .file = file, .start = lo, .end = hi }, self.src.suffix(file));
     }
 
     fn targetLess(_: void, a: *Target, b: *Target) bool {
@@ -1440,18 +1551,8 @@ const Probing = struct {
                 spans[i] = null;
             }
         }
-        if (self.src.cost.remote()) {
-            // A hit is copied into this wave's buffer and released with it. `cached` would copy onto scratch, which
-            // the wave reset does not free.
-            for (wave, spans, fetch) |_, *s, *f| {
-                const sp = s.* orelse continue;
-                if (f.* != .none or !self.src.hasCached(sp)) continue;
-                const dest = try self.bodyAllocator().alloc(u8, @intCast(sp.len()));
-                if (!self.src.copyCached(sp, dest)) continue;
-                f.* = .{ .bytes = dest };
-                s.* = null;
-            }
-        } else {
+        if (!self.src.cost.remote()) {
+            // A mapping's hit is a slice of the file. A remote hit is copied into the wave buffer in `readPlaced`.
             for (wave, spans, fetch) |_, s, *f| if (s) |sp| if (self.src.vtable.cached) |cached| {
                 if (cached(self.src.ctx, a, sp)) |bytes| f.* = .{ .bytes = bytes };
             };
@@ -1460,14 +1561,18 @@ const Probing = struct {
         // Whole filters, or just the blocks the keys select, by the source's cost model. A whole filter can serve later
         // queries from the warm cache, blocks only this one, so blocks must save a quarter of the time to be chosen.
         var plan = try self.wholePlan(wave, spans, fetch);
+        var planned_covers: ?[]const Span = if (self.src.cost.remote()) self.body_covers else null;
         if (self.src.cost.remote()) {
             if (try self.sparsePlan(wave, spans, fetch)) |sparse| {
                 const cost = self.src.currentCost();
                 const t_sparse = try estimateReqs(a, sparse.reqs.items, cost);
-                if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) plan = sparse;
+                if (t_sparse * 4 < try estimateReqs(a, plan.reqs.items, cost) * 3) {
+                    plan = sparse;
+                    planned_covers = null;
+                }
             }
         }
-        try readAll(self.bodyAllocator(), self.src, plan.reqs.items, self.stats, .dispatch);
+        try readAll(self.bodyAllocator(), self.src, plan.reqs.items, self.stats, .dispatch, planned_covers);
 
         if (!self.src.cost.remote()) try self.prefetchBlocks(wave, plan, spans);
 
@@ -1580,7 +1685,7 @@ const Probing = struct {
             try heads.append(a, .{ .span = .{ .file = sp.file, .start = sp.start, .end = sp.start + probe_len } });
             try head_of.append(a, i);
         }
-        try readAll(a, self.src, heads.items, self.stats, .cost);
+        try readAll(a, self.src, heads.items, self.stats, .cost, null);
         for (heads.items, head_of.items) |r, i| {
             const total = parse(r.out) orelse {
                 spans[i] = null;
@@ -1608,7 +1713,7 @@ const Probing = struct {
         const pages = try a.alloc(Span, reqs.items.len);
         for (reqs.items, pages) |r, *p| p.* = r.span;
         self.src.prefetch(pages);
-        try readAll(a, self.src, reqs.items, self.stats, .cost);
+        try readAll(a, self.src, reqs.items, self.stats, .cost, null);
 
         var want: std.ArrayList([]const u8) = .empty;
         for (wave, req_of) |t, ri| {
@@ -2707,6 +2812,36 @@ test "remote: a warm cache hit is copied into the wave and charged" {
     try testing.expectEqual(@as(u64, 0), st.bytes);
     try testing.expectEqual(@as(usize, 0), remote.http_rounds);
     try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[n - 1], f, &metas[0]) != .skip);
+}
+
+test "remote: a suffix-served column is planned once per wave" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n: usize = 64;
+    const sf = try SynthFile.init(a, n, 8);
+    const metas = [_]schema.FileMetaData{sf.meta};
+    var remote: FakeRemote = .{ .files = &.{sf.bytes}, .cost = dispatch_cost, .suffix_start = filterOff(sf, 0) };
+    const f = try parser.parse(a, "c = 'k1-1'", &metas[0], null);
+    const st = try load(a, testing.allocator, f, &metas, remote.source(), .{});
+    try testing.expectEqual(n, st.filters);
+    try testing.expectEqual(@as(usize, 0), st.requests);
+    try testing.expectEqual(@as(usize, 0), remote.http_rounds);
+    try testing.expectEqual(@as(usize, 1), st.planner_calls);
+
+    // A window of one filter, and the key only in the last: each wave plans the remainder once, not every prefix.
+    clearAbsent(&metas);
+    const wide = try SynthFile.initSolid(a, 4, 200_000);
+    for (0..3) |i| zeroBits(wide, i);
+    const metas2 = [_]schema.FileMetaData{wide.meta};
+    var one_cost = dispatch_cost;
+    one_cost.window = filterLen(wide, 0);
+    var remote2: FakeRemote = .{ .files = &.{wide.bytes}, .cost = one_cost };
+    const f2 = try parser.parse(a, "c = 'keep'", &metas2[0], null);
+    const st2 = try load(a, testing.allocator, f2, &metas2, remote2.source(), .{});
+    try testing.expectEqual(@as(usize, 4), st2.filters);
+    try testing.expectEqual(@as(usize, 4), st2.planner_calls);
+    try testing.expect(!st2.bloom_stopped);
 }
 
 test "remote: an AND counts each row group once" {

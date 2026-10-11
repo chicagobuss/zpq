@@ -59,11 +59,12 @@ the medium moves in that time, the requests in flight at once, and the longest r
   before any filter body is admitted. A contiguous run is then one pass only when the one buffer it allocates fits
   the charged window and one round trip of bandwidth (8 MiB at most). Split requests and a suffix tail write into
   that buffer, so the charge is the buffer and not a second copy. A cache hit is copied into the same buffer for the
-  wave and released with it. A filter that does not fit the window is not read; its row group stays, and
-  `bloom_skipped_oversize` counts it. Every fitting run, from every file and column, is planned together. A larger
-  run, and a row-group-major run, reads a first wave of at most eight row groups and stops when they prune fewer than
-  a quarter; what follows is window-sized, and each wave is released before the next is read. Dictionaries keep the
-  first-wave rule either way.
+  wave and released with it. A
+  filter that does not fit the window is not read; its row group stays, and `bloom_skipped_oversize` counts it. Each
+  wave plans its candidate filters once and admits a prefix of that plan; the planner's arrays live in the wave and
+  are released with the bodies. What does not fit is the next wave, planned once there. A larger run, and a
+  row-group-major run, reads a first wave of at most eight row groups and stops when they prune fewer than a quarter;
+  what follows is window-sized. Dictionaries keep the first-wave rule either way.
 - Whole filters are kept in the warm Lambda's metadata cache under the object's ETag, revalidated with the footer. The
   cache may hold a sixteenth of the function's memory, at most 256 MiB, and a query's default `max_memory` is what it
   leaves.

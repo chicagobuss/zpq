@@ -88,6 +88,7 @@ fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
 }
 
 test "S3 fetch window caps only the Lambda default and preserves explicit overrides" {
+    try std.testing.expectEqual(@as(u64, 128 << 20), lambda_window_cap);
     const lambda = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008"};
     const override = [_:null]?[*:0]const u8{
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008", "ZPQ_S3_WINDOW_KIB=262144",

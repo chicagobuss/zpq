@@ -6,9 +6,9 @@
 
 `run` takes the zpq Lambda's request (a dict, or JSON text) and returns its response as a dict; an {"error": ...}
 response raises `ZpqError`, unless `check=False`. One `Zpq` serves any number of threads at once: ctypes releases
-the GIL for the call, and each query runs on threads of its own, within the context's memory ceiling. `close` refuses
-new calls and ends those still waiting for their memory budget (both `ZpqClosed`), then waits for the running ones,
-so a context is never freed under a running query.
+the GIL for the call, and each query runs on threads of its own, its declared budget within the context's ceiling.
+`close` refuses new calls and ends those still waiting for their memory budget (both `ZpqClosed`), then waits for the
+running ones, so a context is never freed under a running query.
 
 The library is found at $ZPQ_LIB, else as libzpq.so (libzpq.dylib on macOS) next to this file, in ../zig-out/lib, or
 on the loader path.
@@ -102,7 +102,7 @@ class Zpq:
     """A libzpq context: warm S3 connections and footers shared by every `run` on it."""
 
     def __init__(self, max_memory=None, library=None, *, preconnect=False, budget_wait_ms=None):
-        """`max_memory`: the context's memory ceiling, shared by its queries (default: the memory available).
+        """`max_memory`: the context's ceiling on its queries' declared budgets (default: the memory available).
         `budget_wait_ms`: how long a query waits for its budget when its request does not say (default: no limit).
         `preconnect`: open connections to the S3 endpoint now, as the Lambda does during init."""
         self._lib = load_library(library)

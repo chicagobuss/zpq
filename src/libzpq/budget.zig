@@ -1,4 +1,5 @@
-//! A context's memory ceiling, shared by the queries that run on it at once.
+//! A context's ceiling on the budgets its queries declare, shared by the queries that run on it at once. It admits
+//! declared budgets; what a query then allocates is the engine's to hold to its budget (docs/libzpq.md, Memory).
 //!
 //! A query reserves its whole budget before it starts and returns it when it ends. Reservations are granted in
 //! arrival order: a query waits while any query that arrived before it is still waiting, so a large query is never

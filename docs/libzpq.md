@@ -76,7 +76,9 @@ Windows is not built.
   own OpenSSL, such as the one a Python process loads.
 - On macOS, which has no version script, every archive the dylib links is compiled with hidden symbols, so it exports
   the seven functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
-  libc++'s weak `operator new` and `operator delete`, which allocate with `malloc` as the system's do.
+  libc++'s weak `operator new` and `operator delete`. dyld coalesces weak definitions across a process, so a C++
+  host's and libzpq's allocations may bind to either copy; both allocate with `malloc`, so that is harmless. A host
+  that replaces `operator new` and `operator delete` will see its replacements used inside libzpq too.
 - The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
   CLI and Lambda link are not. That makes the first build slower.
 - `libzpq.a` holds zpq's own objects. A static link must add the codec, BoringSSL and libc++ archives the build
@@ -113,8 +115,8 @@ Every output pointer given is cleared before anything else. On a non-OK status `
 
 **Options** (`zpq_open`, a JSON object; NULL or `""` for the defaults; an unknown option is `ZPQ_EINVAL`):
 
-- `"max_memory"`: the context's memory ceiling (see Memory): bytes, or a size string (`"4GB"`). Default: the memory
-  available, the CLI's default budget.
+- `"max_memory"`: the context's ceiling on its queries' declared budgets (see Memory): bytes, or a size string
+  (`"4GB"`). Default: the memory available, the CLI's default budget.
 - `"budget_wait_ms"`: how long a query waits for its memory budget when its request names no `budget_wait_ms`.
   Default: as long as it takes.
 - `"preconnect"`: `true` opens connections to the S3 endpoint now, as the Lambda does during init, so the first
@@ -151,18 +153,29 @@ must aggregate (`aggregate` / `group_by`) or write (`output_url`); anything else
 
 ## Memory
 
-A context's `max_memory` is a ceiling its queries share. Each query reserves its whole budget before it starts: its
-request's `max_memory`, else the whole ceiling (so one query alone runs as `zpq query` would, and queries that name no
-budget run one at a time). It returns the budget when it ends.
+A context's `max_memory` is a ceiling on the **budgets its queries declare**, not on the memory they use. Each query
+reserves its budget before it starts: its request's `max_memory`, else the whole ceiling (so one query alone runs as
+`zpq query` would, and queries that name no budget run one at a time). It returns the budget when it ends.
 
 - Reservations are granted in arrival order: a query waits while any query that arrived before it is still waiting,
   so a large query is never starved by small ones.
 - A request asking for more than the ceiling is refused at once: `{"error":"budget","reason":"OverCeiling",...}`.
+  A `max_memory` of 0 is refused as a bad request.
 - A wait longer than `budget_wait_ms` (the request's, else the context's) ends with
   `{"error":"budget","reason":"WaitTimeout",...}`.
 
-To run several queries at once, give each request a `max_memory` that leaves room for the others. The footer cache
-and warm Bloom filters stay with the context until `zpq_close` and are not counted against the ceiling in 0.5.0.
+**What a budget limits.** The engine sizes some structures against a query's budget: GROUP BY state (past the budget
+the query fails with `ExceededMemoryBudget`), and how much it reads ahead and buffers. It does not hold every
+allocation to it: decoding a row group, for one, takes what that row group needs. A query can therefore use more than
+it declared, however small the declaration. As a rule of thumb, a scan's own working memory is tens of MiB per worker
+(a query has as many workers as the CPUs the process may run on), and some file layouts take over 100 MiB with a
+single worker. Declare budgets with that headroom, and keep the ceiling well inside what the host can spare.
+
+Outside the ceiling altogether:
+- the footer cache, and warm Bloom filters up to a sixteenth of the ceiling (at most 256 MiB), both held by the
+  context until `zpq_close`;
+- local inputs, which are memory-mapped: their pages count in the process's resident memory (and in a cgroup's
+  memory use) while a query reads them, as page cache the kernel can reclaim.
 
 ## What libzpq does to the process
 
@@ -192,7 +205,8 @@ the request and response schema the Lambda documents. ABI version 1 only grows: 
 status codes may be added.
 
 Experimental: the `"pool"` and `"profile"` members of a response (their fields may change), the Python binding's
-API, and the HTTP service. The memory ceiling does not yet count the context's caches (see Memory).
+API, and the HTTP service. The memory ceiling bounds declared budgets only, and does not count the context's caches
+(see Memory).
 
 ## Python
 

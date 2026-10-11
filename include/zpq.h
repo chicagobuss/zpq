@@ -43,7 +43,7 @@ typedef enum zpq_status {
 
 /*
  * Open a context. options_json may be NULL or "" for the defaults, else a JSON object:
- *   "max_memory":     the context's memory ceiling, shared by its queries: bytes, or a size string ("2GB").
+ *   "max_memory":     the context's ceiling on its queries' declared budgets: bytes, or a size string ("2GB").
  *                     Default: the memory available, as the CLI's default budget, so one query alone runs as it would
  *                     under `zpq query`. A request that names no "max_memory" takes the whole ceiling.
  *   "budget_wait_ms": how long a query waits for its memory budget when its request names no "budget_wait_ms".
@@ -69,7 +69,9 @@ int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error);
  * built (never for ZPQ_ENOMEM), else NULL.
  * Memory: the query reserves its budget (its "max_memory", else the ceiling) from the context's ceiling before it
  * starts, in arrival order, waiting while it does not fit; "budget_wait_ms" in the request bounds that wait. A
- * budget larger than the ceiling, or a wait that runs out, is an {"error":"budget", ...} response.
+ * budget larger than the ceiling, or a wait that runs out, is an {"error":"budget", ...} response, and a budget of 0
+ * a bad request. The ceiling bounds declared budgets, not memory: the engine sizes GROUP BY state and read-ahead
+ * against a query's budget but not every allocation, so a query can use more than it declared (docs/libzpq.md).
  */
 int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json, size_t *out_len);
 

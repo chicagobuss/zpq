@@ -1,10 +1,10 @@
 //! libzpq: zpq's JSON request handler (the Lambda's request and response schema) behind a C ABI. See include/zpq.h.
 //!
 //! A context holds what outlives one request: the allocator, the `std.Io` executor, the S3 connection pool and footer
-//! cache, and the memory ceiling its queries share. Each `zpq_run` reads the process environment at call time, as the
-//! CLI does at start, for S3 credentials, endpoint and region. Process-wide state outside any context is limited to
-//! caches that are set once and then only read: the TLS client contexts (CA stores), and probes of the kernel's
-//! io_uring and of the gzip backend.
+//! cache, and the ceiling on its queries' declared memory budgets. Each `zpq_run` reads the process environment at
+//! call time, as the CLI does at start, for S3 credentials, endpoint and region. Process-wide state outside any
+//! context is limited to caches that are set once and then only read: the TLS client contexts (CA stores), and probes
+//! of the kernel's io_uring and of the gzip backend.
 
 const std = @import("std");
 const zpq = @import("zpq");
@@ -85,7 +85,7 @@ pub const Ctx = struct {
 
 /// The options `zpq_open` takes. Unknown fields are an error: a misspelt option should not be silently ignored.
 const Options = struct {
-    /// The context's memory ceiling, shared by its queries: bytes, or a size string ("2GB"). Absent: the memory
+    /// The context's ceiling on its queries' declared budgets: bytes, or a size string ("2GB"). Absent: the memory
     /// available, the CLI's default, so one query alone gets what `zpq query` would.
     max_memory: ?std.json.Value = null,
     /// How long a query waits for its budget when its request names no `budget_wait_ms`. Absent: as long as it takes.

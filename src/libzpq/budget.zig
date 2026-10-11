@@ -185,7 +185,9 @@ test "reservations are granted in arrival order, and never exceed the ceiling" {
     // Hold the whole ceiling so every later thread queues, in a known order.
     try b.acquire(100, null);
     var grants = std.atomic.Value(u32).init(0);
-    const sizes = [_]usize{ 60, 10, 70, 30, 100, 5 };
+    // Any pair exceeds the ceiling, so a later acquire cannot return before the preceding caller records its grant.
+    const sizes = [_]usize{ 60, 55, 70, 80, 100, 65 };
+    for (sizes) |n| try testing.expect(n > b.ceiling / 2);
     var slots: [sizes.len]u32 = @splat(0);
     var orders: [sizes.len]Order = undefined;
     var threads: [sizes.len]std.Thread = undefined;

@@ -779,9 +779,17 @@ pub const Stats = struct {
     bloom_skipped_oversize: usize = 0,
     /// Dispatch plans of bloom bodies. One per wave: a prefix loop would count once per prefix.
     planner_calls: usize = 0,
-    /// Largest bloom-wave charge, and the most the wave arena held beyond that charge (the plan).
+    /// Largest bloom-wave charge, and the most the wave arena's capacity held beyond that charge.
     wave_charge_peak: u64 = 0,
     wave_plan_peak: u64 = 0,
+    /// Requested bytes in one wave beyond the bodies it was charged, and bytes still held after that wave was released.
+    wave_live_slack: u64 = 0,
+    wave_retained: u64 = 0,
+    /// Bytes the query scratch was asked for, and how many of those a body plan added. Planning belongs to the wave.
+    scratch_peak: u64 = 0,
+    plan_scratch: u64 = 0,
+    /// One entry per filter actually probed, in probe order. The count alone cannot see a probe moved onto another target.
+    probes: []const ProbeId = &.{},
     /// A request's fixed cost, in bytes, that the last plan assumed (remote sources only).
     request_bytes: u64 = 0,
     ns: u64 = 0,
@@ -801,7 +809,56 @@ pub const Stats = struct {
         self.planner_calls += o.planner_calls;
         self.wave_charge_peak = @max(self.wave_charge_peak, o.wave_charge_peak);
         self.wave_plan_peak = @max(self.wave_plan_peak, o.wave_plan_peak);
+        self.wave_live_slack = @max(self.wave_live_slack, o.wave_live_slack);
+        self.wave_retained = @max(self.wave_retained, o.wave_retained);
+        self.scratch_peak = @max(self.scratch_peak, o.scratch_peak);
+        self.plan_scratch = @max(self.plan_scratch, o.plan_scratch);
         self.ns += o.ns;
+    }
+};
+
+/// A filter that was probed: file, row group, column. Aggregate `filters` does not say which.
+pub const ProbeId = struct { file: u32, rg: u32, col: u32 };
+
+/// Counts bytes asked of `child`. Arena free does not give the memory back, so a free is not subtracted:
+/// the total is what the wave or the scratch still holds.
+const ByteMeter = struct {
+    child: std.mem.Allocator,
+    requested: u64 = 0,
+
+    fn allocator(self: *ByteMeter) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.requested += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) self.requested += new_len - memory.len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > memory.len) self.requested += new_len - memory.len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
     }
 };
 
@@ -870,11 +927,15 @@ pub fn load(
     defer scratch.deinit();
     var wave = std.heap.ArenaAllocator.init(gpa);
     defer wave.deinit();
+    var scratch_meter: ByteMeter = .{ .child = scratch.allocator() };
+    var wave_meter: ByteMeter = .{ .child = wave.allocator() };
     var stats: Stats = .{};
     var p: Probing = .{
         .arena = arena,
-        .scratch = scratch.allocator(),
+        .scratch = scratch_meter.allocator(),
         .wave = &wave,
+        .wave_meter = &wave_meter,
+        .scratch_meter = &scratch_meter,
         .metas = metas,
         .src = src,
         .stats = &stats,
@@ -882,6 +943,8 @@ pub fn load(
         .opts = opts,
     };
     try p.run();
+    stats.probes = p.probe_log.items;
+    stats.scratch_peak = scratch_meter.requested;
     if (src.cost.remote()) stats.request_bytes = src.currentCost().request_bytes;
     stats.ns = @intCast(nowMonoNs() - t0);
     return stats;
@@ -1114,6 +1177,10 @@ const Probing = struct {
     scratch: std.mem.Allocator,
     /// Filter bodies of the wave in hand. Reset after the wave is probed, so the next wave does not keep them.
     wave: *std.heap.ArenaAllocator,
+    /// Requested sizes of `wave` and `scratch` allocations. Null when a test drives them directly.
+    wave_meter: ?*ByteMeter = null,
+    scratch_meter: ?*ByteMeter = null,
+    probe_log: std.ArrayList(ProbeId) = .empty,
     metas: []const schema.FileMetaData,
     src: Source,
     stats: *Stats,
@@ -1329,7 +1396,7 @@ const Probing = struct {
     /// A span that is itself larger than `cap` (touching filters join before the window is consulted) contributes the
     /// longest prefix of its filters whose one buffer still fits; the rest of it waits for the next wave.
     fn cutWave(self: *Probing, targets: []const *Target, cap: u64) !WaveCut {
-        const a = self.wave.allocator();
+        const a = self.waveAlloc();
         if (targets.len == 0) return .{ .admitted = &.{}, .rest = &.{}, .covers = &.{} };
         const planned = try self.planBodies(targets);
         var held: u64 = 0;
@@ -1379,14 +1446,19 @@ const Probing = struct {
 
     /// One dispatch plan of these filters. The arrays live in the wave arena and die at `releaseWave`.
     fn planBodies(self: *Probing, targets: []const *Target) ![]Span {
-        const a = self.wave.allocator();
+        const before = if (self.scratch_meter) |m| m.requested else 0;
+        defer if (self.scratch_meter) |m| {
+            const grew = m.requested - before;
+            if (grew > self.stats.plan_scratch) self.stats.plan_scratch = grew;
+        };
+        const a = self.waveAlloc();
         var spans: std.ArrayList(Span) = .empty;
         for (targets) |t| if (self.bodySpan(t)) |s| try spans.append(a, s);
         return coverSpans(a, spans.items, self.src.currentCost(), .dispatch, &self.stats.planner_calls);
     }
 
     fn orderedInside(self: *Probing, cover: Span, targets: []const *Target) ![]*Target {
-        const a = self.wave.allocator();
+        const a = self.waveAlloc();
         const Item = struct { t: *Target, start: u64 };
         var items: std.ArrayList(Item) = .empty;
         for (targets) |t| {
@@ -1436,6 +1508,11 @@ const Probing = struct {
     }
 
     fn releaseWave(self: *Probing) void {
+        if (self.wave_meter) |m| {
+            const over = m.requested -| self.wave_charge;
+            if (over > self.stats.wave_live_slack) self.stats.wave_live_slack = over;
+            m.requested = 0;
+        }
         const arena: u64 = @intCast(self.wave.queryCapacity());
         if (self.wave_charge > self.stats.wave_charge_peak) self.stats.wave_charge_peak = self.wave_charge;
         const slack = arena -| self.wave_charge;
@@ -1443,11 +1520,22 @@ const Probing = struct {
         self.wave_charge = 0;
         self.body_covers = null;
         _ = self.wave.reset(.free_all);
+        const left: u64 = @intCast(self.wave.queryCapacity());
+        if (left > self.stats.wave_retained) self.stats.wave_retained = left;
+    }
+
+    fn waveAlloc(self: *Probing) std.mem.Allocator {
+        if (self.wave_meter) |m| return m.allocator();
+        return self.wave.allocator();
+    }
+
+    fn noteProbe(self: *Probing, t: *const Target) !void {
+        try self.probe_log.append(self.arena, .{ .file = t.file, .rg = t.rg, .col = t.col });
     }
 
     /// Filter bodies. A remote wave allocates them in `wave`, which is reset afterwards. A mapping keeps the scratch.
     fn bodyAllocator(self: *Probing) std.mem.Allocator {
-        return if (self.src.cost.remote()) self.wave.allocator() else self.scratch;
+        return if (self.src.cost.remote()) self.waveAlloc() else self.scratch;
     }
 
     fn windowCap(self: *const Probing) u64 {
@@ -1622,6 +1710,7 @@ const Probing = struct {
                         continue;
                     }
                     self.stats.filters += 1;
+                    try self.noteProbe(t);
                     const set: BlockSet = .{
                         .reqs = plan.reqs.items[b.first..b.end],
                         .blocks = b.blocks,
@@ -1662,6 +1751,7 @@ const Probing = struct {
         const bits = bloom.bitset(bytes) orelse return;
         self.noteHeader(t.file, bytes);
         self.stats.filters += 1;
+        try self.noteProbe(t);
         for (t.keys.items) |*k| {
             if (try self.keyAbsent(k, WholeSet{ .bits = bits })) try t.absent.append(self.arena, k.form(0));
         }
@@ -3020,6 +3110,19 @@ test "remote: an oversize filter stored ahead of the small ones is the only skip
     try testing.expect(st.wave_charge_peak <= window);
     // One plan of the fitting filters. The buried shape used to retain a plan per discarded target (~175 MB at 2048).
     try testing.expect(st.wave_plan_peak <= 2 << 20);
+    try testing.expectEqual(@as(u64, 0), st.wave_retained);
+    try testing.expectEqual(@as(u64, 0), st.plan_scratch);
+    try testing.expectEqual(n - 1, st.probes.len);
+    var probed = try a.alloc(u8, n);
+    @memset(probed, 0);
+    for (st.probes) |id| {
+        try testing.expectEqual(@as(u32, 0), id.file);
+        try testing.expectEqual(@as(u32, 0), id.col);
+        try testing.expect(id.rg < n);
+        probed[id.rg] += 1;
+    }
+    for (probed[0 .. n - 1]) |c| try testing.expectEqual(@as(u8, 1), c);
+    try testing.expectEqual(@as(u8, 0), probed[n - 1]);
     for (0..n - 1) |i| try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[i], f, &metas[0]) == .skip);
     try testing.expect(prune.pruneRowGroup(&metas[0].row_groups.items[n - 1], f, &metas[0]) != .skip);
 }
@@ -3039,10 +3142,12 @@ fn checkBloomAdmission(seed: u64) !void {
     const a = arena_state.allocator();
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
-    const n: usize = 1 + r.uintLessThan(usize, 8);
+    const n: usize = 1 + r.uintLessThan(usize, 16);
     const windows = [_]u64{ 32, 64, 96, 128, 256, 1024, 4096, 8192, 1 << 20, std.math.maxInt(u64) };
     const window = windows[r.uintLessThan(usize, windows.len)];
     const unbounded = window == std.math.maxInt(u64);
+    // A vanished hit on a body larger than the planner's arrays. A second buffer then cannot hide in the slack.
+    const force_wide = window >= (48 << 10);
     var pb = try bloom.Builder.init(a, 16, 0.01);
     defer pb.deinit(a);
     pb.insert(bloom.hashBytes("keep"));
@@ -3066,14 +3171,25 @@ fn checkBloomAdmission(seed: u64) !void {
         order[j] = tmp;
     }
     const gap: usize = if (r.boolean()) 0 else 1 + r.uintLessThan(usize, 32);
-    const suffix_mode: usize = r.uintLessThan(usize, 3);
-    const cache_mode: usize = r.uintLessThan(usize, 3);
+    const suffix_mode: usize = if (force_wide) 0 else r.uintLessThan(usize, 3);
+    const cache_mode: usize = if (force_wide) 2 else r.uintLessThan(usize, 3);
+    var wide_body: []const u8 = &.{};
+    if (force_wide) {
+        var hdr: [bloom.max_header_bytes]u8 = undefined;
+        const nb: u32 = 48 << 10;
+        const hb = bloom.writeHeader(nb, &hdr);
+        const buf = try a.alloc(u8, hb.len + nb);
+        @memcpy(buf[0..hb.len], hb);
+        @memset(buf[hb.len..], 0);
+        wide_body = buf;
+    }
     const bodies = try a.alloc([]const u8, n);
     const offs = try a.alloc(u64, n);
     const omit = try a.alloc(bool, n);
     var bytes: std.ArrayList(u8) = .empty;
     try bytes.appendNTimes(a, 'x', 8);
     var suffix_start: ?u64 = if (suffix_mode == 1) @as(u64, 8) else null;
+    var placed: usize = 0;
     for (order) |rg| {
         const start: u64 = @intCast(bytes.items.len);
         const wholly = if (suffix_start) |s| start >= s else false;
@@ -3082,6 +3198,8 @@ fn checkBloomAdmission(seed: u64) !void {
         var body: []const u8 = if (wholly or small.len <= window) small else big;
         if (!wholly and r.uintLessThan(usize, 4) == 0 and big.len > window) body = big;
         if (!wholly and body.len > window and bloomMissesKeep(body)) body = big;
+        if (force_wide and placed == 0) body = wide_body;
+        placed += 1;
         bodies[rg] = body;
         offs[rg] = start;
         omit[rg] = r.boolean() and window >= header_probe_bytes;
@@ -3143,8 +3261,35 @@ fn checkBloomAdmission(seed: u64) !void {
         });
         return error.TestExpectedEqual;
     }
-    if (st.wave_charge_peak > cap or st.wave_plan_peak > 8192 * @as(u64, n) + (256 << 10)) {
-        std.debug.print("seed {x} charge {d} cap {d} plan {d}\n", .{ seed, st.wave_charge_peak, cap, st.wave_plan_peak });
+    if (st.wave_charge_peak > cap) {
+        std.debug.print("seed {x} charge {d} cap {d}\n", .{ seed, st.wave_charge_peak, cap });
+        return error.TestExpectedEqual;
+    }
+    const is_over = try a.alloc(bool, n);
+    var times = try a.alloc(u8, n);
+    @memset(times, 0);
+    for (0..n) |rg| {
+        const span: Span = .{ .file = 0, .start = offs[rg], .end = offs[rg] + @as(u64, @intCast(bodies[rg].len)) };
+        is_over[rg] = heldBytes(span, suf) > cap;
+    }
+    for (st.probes) |id| {
+        if (id.file != 0 or id.col != 0 or id.rg >= n) {
+            std.debug.print("seed {x} probe {d}.{d}.{d}\n", .{ seed, id.file, id.rg, id.col });
+            return error.TestExpectedEqual;
+        }
+        times[id.rg] +|= 1;
+    }
+    for (0..n) |rg| {
+        const want: u8 = if (is_over[rg]) 0 else 1;
+        if (times[rg] != want) {
+            std.debug.print("seed {x} rg {d} probed {d} want {d}\n", .{ seed, rg, times[rg], want });
+            return error.TestExpectedEqual;
+        }
+    }
+    if (st.wave_retained != 0 or st.plan_scratch != 0 or st.wave_live_slack > (16 << 10) or st.scratch_peak > (160 << 10)) {
+        std.debug.print("seed {x} retained {d} plan_scratch {d} slack {d} scratch {d} n {d} charge {d}\n", .{
+            seed, st.wave_retained, st.plan_scratch, st.wave_live_slack, st.scratch_peak, n, st.wave_charge_peak,
+        });
         return error.TestExpectedEqual;
     }
     clearAbsent(&metas);

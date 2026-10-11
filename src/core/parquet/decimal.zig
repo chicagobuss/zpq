@@ -160,6 +160,19 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
     return applyScaleI128(@intCast(raw), scale);
 }
 
+/// 10^p for p in 0..38, exactly.
+pub fn pow10(p: i32) i128 {
+    std.debug.assert(p >= 0 and p <= 38);
+    return pow10_i128[@intCast(p)];
+}
+
+pub const pow10_i128: [39]i128 = blk: {
+    var t: [39]i128 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
 /// A DECIMAL min/max statistic's exact unscaled value; the same bytes and the same refusals as `statToF64`.
 pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
     if (kind.precision > 38) return null;
@@ -178,7 +191,6 @@ pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
 /// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
 /// all is the caller's decision.
 pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
-    if (kind.precision > 38) return null;
     return switch (kind.physical) {
         .INT32 => {
             if (bytes.len < 4) return null;
@@ -254,7 +266,6 @@ pub fn decodeColumnAsF64WithOptions(
     decode_options: column_mod.DecodeOptions,
     scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     return switch (kind.physical) {
         .INT32 => try decodeIntBacked(
             i32,
@@ -306,7 +317,6 @@ pub fn decodeColumnExact(
     decode_options: column_mod.DecodeOptions,
     scratch: ?*column_mod.DecodeScratch,
 ) Error!filter_eval.ColumnT(f64) {
-    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     if (levels.max_rep > 0) {
         return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, decode_options, scratch);
     }

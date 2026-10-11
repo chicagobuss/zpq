@@ -707,6 +707,7 @@ fn encodeRGToBuffer(
     decode_options: consumer.DecodeOptions,
     prof: ?*profile.Thread,
     bloom: consumer.BloomWrite,
+    diag: ?*Diag,
 ) !EncodedRG {
     // `rows` holds what lives for the whole row group (the aggregator's frame, the filter's columns and selection);
     // each output column is projected, encoded and written out of `work`, rewound before the next, so the working
@@ -769,7 +770,12 @@ fn encodeRGToBuffer(
             const span = profile.Span.begin(prof);
             try projected.projectColumn(&agg, i, col_arena.allocator(), &timings);
             span.end(.project, profile.args(.{ projected.surviving, 1 }));
-            try rg_enc.column(&agg, i, col_arena.allocator());
+            rg_enc.column(&agg, i, col_arena.allocator()) catch |err| {
+                if (err == error.DecimalValueExceedsPrecision) {
+                    Diag.setColumn(diag, agg.schema_elems[i].name);
+                }
+                return err;
+            };
             // Its rows lived on `col_arena`: nothing may read them after this.
             agg.cols[i] = switch (agg.cols[i]) {
                 inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
@@ -850,6 +856,7 @@ const WinCtx = struct {
     profiler: ?*profile.Profiler = null,
     /// What one producer's decoded rows may take; a row group past it is written in slices (`encodeRGSliced`).
     decode_share: usize = std.math.maxInt(usize),
+    diag: ?*Diag = null,
 };
 
 fn winProducer(w: *WinCtx, i: usize) void {
@@ -904,6 +911,7 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
         w.decode_options,
         prof,
         bloom,
+        w.diag,
     );
 }
 
@@ -993,7 +1001,14 @@ fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
             .bloom_write = .{ .fpp = w.bloom_outputs },
             .timings = &timings,
         };
-        for (0..w.output_specs.len) |i| try rg_enc.column(&agg, i, sa);
+        for (0..w.output_specs.len) |i| {
+            rg_enc.column(&agg, i, sa) catch |err| {
+                if (err == error.DecimalValueExceedsPrecision) {
+                    Diag.setColumn(w.diag, agg.schema_elems[i].name);
+                }
+                return err;
+            };
+        }
         const out = rg_enc.finish(agg.num_rows);
         try w.new_row_groups.append(w.arena, out.rg.?);
         surviving += out.surviving_rows;
@@ -1401,15 +1416,6 @@ const ProjectionPlan = struct {
 };
 
 fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schema.FileMetaData) !ProjectionPlan {
-    for (meta0.schema.items) |elem| {
-        if (decimal_mod.kindFromSchema(&elem)) |k| {
-            if (k.precision > 38) {
-                Diag.setColumn(args.diag, elem.name);
-                return error.UnsupportedDecimalPrecision;
-            }
-        }
-    }
-
     const num_leaves = metadata.leafCount(meta0);
 
     // --columns resolves to leaf indices; --select is mutually exclusive with it (checked by the callers).
@@ -1749,6 +1755,14 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                     return error.INT96ReencodeNotSupported;
                 if (meta0.getColumnLevels(cm.path_in_schema.items).max_rep > 0)
                     return error.NestedReencodeNotSupported;
+                if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem| {
+                    if (decimal_mod.kindFromSchema(&elem)) |k| {
+                        if (k.physical == .BYTE_ARRAY and k.precision > 38) {
+                            Diag.setColumn(args.diag, elem.name);
+                            return error.UnsupportedDecimalPrecision;
+                        }
+                    }
+                }
             },
             .computed => {},
         };
@@ -1964,6 +1978,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .new_row_groups = &new_row_groups,
                 .arena = arena,
                 .profiler = args.profiler,
+                .diag = args.diag,
                 // Half the budget for the producers' decoded rows (the fetch window and the encoded output in flight
                 // take a quarter each), shared among as many as -j allows. Not among those that run at once, which
                 // the host's memory sizes: the share sets a sliced row group's output layout, so it depends only on

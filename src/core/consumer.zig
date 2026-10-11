@@ -207,7 +207,6 @@ pub fn initOutputAggregator(
                 // precision. Byte-copy projection (copyRG / fastpath)
                 // preserves any DECIMAL untouched.
                 if (decimal_mod.kindFromSchema(&src_elem)) |k| {
-                    if (k.precision > 38) return error.UnsupportedDecimalPrecision;
                     if (k.physical == .INT32 or k.physical == .INT64 or
                         k.physical == .FIXED_LEN_BYTE_ARRAY)
                     {
@@ -215,10 +214,28 @@ pub fn initOutputAggregator(
                         cols[i] = .{ .i128 = .{} };
                         continue;
                     } else if (k.physical == .BYTE_ARRAY) {
-                        schemas[i] = src_elem;
-                        schemas[i].type = .FIXED_LEN_BYTE_ARRAY;
-                        schemas[i].type_length = decimal_mod.minBytesForPrecision(k.precision);
-                        cols[i] = .{ .i128 = .{} };
+                        if (k.precision <= 38) {
+                            schemas[i] = src_elem;
+                            schemas[i].type = .FIXED_LEN_BYTE_ARRAY;
+                            schemas[i].type_length = decimal_mod.minBytesForPrecision(k.precision);
+                            cols[i] = .{ .i128 = .{} };
+                        } else {
+                            // Legacy BYTE_ARRAY decimals with precision > 38 fall back to the f64 lane
+                            // (read/print path; re-encode writes are refused with the column named).
+                            schemas[i] = .{
+                                .type = .DOUBLE,
+                                .type_length = null,
+                                .repetition_type = src_elem.repetition_type,
+                                .name = src_elem.name,
+                                .num_children = 0,
+                                .converted_type = null,
+                                .logical_type = null,
+                                .scale = null,
+                                .precision = null,
+                                .field_id = src_elem.field_id,
+                            };
+                            cols[i] = .{ .f64 = .{} };
+                        }
                         continue;
                     }
                     return error.UnsupportedDecimalPhysicalType;
@@ -702,7 +719,6 @@ pub const SliceReader = struct {
         const se = meta.getColumnSchema(cm.path_in_schema.items);
         const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
         if (dec) |k| {
-            if (k.precision > 38) return error.UnsupportedDecimalPrecision;
             if (cm.type == .FIXED_LEN_BYTE_ARRAY and
                 (k.byte_width == 0 or k.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH))
                 return error.DecimalByteWidthTooLarge;
@@ -898,7 +914,6 @@ pub const SliceReader = struct {
         col: filter_eval.ColumnT(T),
         k: decimal_mod.Kind,
     ) !filter_eval.ColumnT(f64) {
-        if (k.precision > 38) return error.UnsupportedDecimalPrecision;
         const out = try a.alloc(f64, col.values.len);
         var view: filter_eval.ColumnT(f64) = .{
             .values = out,
@@ -5464,4 +5479,70 @@ test "initOutputAggregator rewrites BYTE_ARRAY decimal to FIXED_LEN_BYTE_ARRAY w
     try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, agg.schema_elems[0].type.?);
     try testing.expectEqual(@as(?i32, 5), agg.schema_elems[0].type_length);
     try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, agg.schema_elems[0].repetition_type.?);
+}
+
+test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var file_meta = schema.FileMetaData{
+        .version = 2,
+        .schema = .empty,
+        .num_rows = 1,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try file_meta.schema.append(arena, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(arena, .{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "big_dec",
+        .num_children = 0,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 40 } },
+        .scale = null,
+        .precision = null,
+        .field_id = 1,
+    });
+
+    var path: schema.StringList = .empty;
+    try path.append(arena, "big_dec");
+    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try columns.append(arena, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 1,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    });
+    try file_meta.row_groups.append(arena, .{
+        .columns = columns,
+        .total_byte_size = 0,
+        .num_rows = 1,
+    });
+
+    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const agg = try initOutputAggregator(arena, &file_meta, &specs);
+    try testing.expect(agg.cols[0] == .f64);
+    try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
 }

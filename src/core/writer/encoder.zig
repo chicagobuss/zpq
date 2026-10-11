@@ -22,6 +22,7 @@ const delta_binary_packed = @import("../parquet/encoding/delta_binary_packed.zig
 const bloom = @import("../parquet/bloom.zig");
 const agg_coded = @import("../expr/agg_coded.zig");
 const prefix16 = @import("../expr/agg.zig").prefix16;
+const decimal_mod = @import("../parquet/decimal.zig");
 
 pub const Error = error{
     NullableNotSupported,
@@ -29,6 +30,7 @@ pub const Error = error{
     TooLarge,
     CorruptInput, // from snappy (vendored google/snappy)
     OutputTooSmall, // from snappy
+    DecimalValueExceedsPrecision,
 } || std.mem.Allocator.Error || compression.Error;
 
 pub const EncodedColumn = struct {
@@ -323,8 +325,8 @@ fn pageStats(
 ) Error!std.ArrayListUnmanaged(schema.PageEncodingStats) {
     var out: std.ArrayListUnmanaged(schema.PageEncodingStats) = .empty;
     for (pages) |p| try out.append(arena, .{
-        .page_type = @intFromEnum(p.page_type),
-        .encoding = @intFromEnum(p.encoding),
+        .page_type = @backingInt(p.page_type),
+        .encoding = @backingInt(p.encoding),
         .count = 1,
     });
     return out;
@@ -379,6 +381,26 @@ pub fn encodeDecimalFlba(
     const def_levels = col.def_levels;
     const max_def = col.max_def;
     const num_present = countPresent(col.values.len, def_levels, max_def);
+
+    // Refuse when a value overflows declared precision to avoid emitting wrapped negative values or corrupt stats.
+    const dec_kind = decimal_mod.kindFromSchema(schema_elem);
+    const precision: ?i32 = if (dec_kind) |k| k.precision else schema_elem.precision;
+    if (precision) |p| {
+        if (p >= 1 and p <= 38) {
+            const bound = decimal_mod.pow10(p);
+            if (def_levels == null or max_def == 0) {
+                for (col.values) |v| {
+                    if (v >= bound or v <= -bound) return error.DecimalValueExceedsPrecision;
+                }
+            } else {
+                for (col.values, 0..) |v, i| {
+                    if (isPresent(def_levels, max_def, i)) {
+                        if (v >= bound or v <= -bound) return error.DecimalValueExceedsPrecision;
+                    }
+                }
+            }
+        }
+    }
 
     // PLAIN values: `bw` big-endian bytes per present value.
     const values_bytes = try arena.alloc(u8, num_present * bw);
@@ -1944,6 +1966,43 @@ test "statsTyped i32 all-null page emits null_count only" {
     try testing.expectEqual(@as(?i64, 4), s.null_count);
     try testing.expectEqual(@as(?[]const u8, null), s.min_value);
     try testing.expectEqual(@as(?[]const u8, null), s.max_value);
+}
+
+test "encodeDecimalFlba refuses values exceeding declared precision" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const elem = schema.SchemaElement{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 3,
+        .repetition_type = .REQUIRED,
+        .name = "d5",
+        .num_children = 0,
+        .converted_type = null,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 5 } },
+        .scale = 2,
+        .precision = 5,
+        .field_id = null,
+    };
+
+    // 100000.00 is 10^7 unscaled, which requires 6 digits (bound is 10^5 = 100000)
+    const bad_values = [_]i128{10_000_000};
+    const col_bad: filter_eval.ColumnT(i128) = .{ .values = &bad_values };
+    const err = encodeDecimalFlba(arena, col_bad, &elem, &.{}, .UNCOMPRESSED, .{});
+    try testing.expectError(error.DecimalValueExceedsPrecision, err);
+
+    // Negative overflow: -100000.00 (-10^7)
+    const neg_bad_values = [_]i128{-10_000_000};
+    const col_neg_bad: filter_eval.ColumnT(i128) = .{ .values = &neg_bad_values };
+    const neg_err = encodeDecimalFlba(arena, col_neg_bad, &elem, &.{}, .UNCOMPRESSED, .{});
+    try testing.expectError(error.DecimalValueExceedsPrecision, neg_err);
+
+    // Within bounds: 999.99 (99999 unscaled)
+    const ok_values = [_]i128{ 99_999, -99_999 };
+    const col_ok: filter_eval.ColumnT(i128) = .{ .values = &ok_values };
+    const ok_res = try encodeDecimalFlba(arena, col_ok, &elem, &.{}, .UNCOMPRESSED, .{});
+    try testing.expect(ok_res.bytes.len > 0);
 }
 
 test "statsTypedFloat f64 all-null page emits null_count only" {

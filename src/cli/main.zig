@@ -174,6 +174,10 @@ pub fn main(init: std.process.Init) !void {
                     "zpq query: column `{s}` has unsupported decimal precision (> 38)\n",
                     .{diag.column.get()},
                 ),
+                error.DecimalValueExceedsPrecision => std.debug.print(
+                    "zpq query: column `{s}` has a decimal value exceeding its declared precision\n",
+                    .{diag.column.get()},
+                ),
                 error.FooterSchemaChunkMismatch => std.debug.print("zpq query: footer schema chunk mismatch\n", .{}),
                 error.CrossBucketNotSupported => std.debug.print("zpq query: cross-bucket queries are not supported\n", .{}),
                 error.BadInputUrl => std.debug.print("zpq query: invalid input S3 URL\n", .{}),

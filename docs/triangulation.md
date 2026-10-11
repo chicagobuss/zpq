@@ -68,9 +68,12 @@ ZPQ and DuckDB run the SQL directly. Hardwood has no query engine, so the harnes
 `hardwood convert --format json -c …` and evaluates the probe in Python with SQL semantics: NULLs ignored, and `sum`,
 `min`, `max` over no values are NULL.
 
-Float `min`/`max` are judged NaN-free: ZPQ skips NaN (as Arrow compute and Polars do), DuckDB orders NaN above every
-number. The DuckDB query adds `FILTER (WHERE NOT isnan(col))` and the Hardwood evaluation drops NaN, so that convention
-difference does not mask real decode errors.
+Float `min`/`max` order NaN above every number, as ZPQ, DuckDB, Postgres and Spark do: `max` is NaN if any value is,
+`min` skips NaN unless every value is NaN. DuckDB answers that natively; the Python evaluation applies the same rule.
+
+When neither DuckDB nor Hardwood can read a file, pyarrow's decoded rows are evaluated under the same SQL semantics
+(including DECIMAL sums that overflow 38 digits, which every engine rejects). A match with pyarrow alone is `INFO`,
+never a pass; a mismatch is `FAIL`.
 
 **Referee Rule** (applied per result column):
 - If DuckDB and Hardwood agree with each other and ZPQ differs, `FAIL`.

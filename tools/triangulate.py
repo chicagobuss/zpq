@@ -32,7 +32,7 @@ except ImportError:
     print("Missing dependencies: please run via .venv/bin/python (needs pyarrow and duckdb)")
     sys.exit(2)
 
-from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, duckdb_agg, same, self_check
+from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, duckdb_agg, nan_ordered_extreme, same, self_check
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZPQ_BIN = "zig-out/bin/zpq"
@@ -715,10 +715,6 @@ def coerce_scalar(v: Any, typ: Optional["pa.DataType"]) -> Any:
     return v
 
 
-def _nan_ignoring(i: AggItem) -> bool:
-    return i.func in ("min", "max") and i.typ is not None and pa.types.is_floating(i.typ)
-
-
 def _lane(i: AggItem) -> Optional[str]:
     """zpq answers sum/min/max of a DECIMAL column from its f64 lane."""
     return F64 if i.func != "count" and i.typ is not None and pa.types.is_decimal(i.typ) else None
@@ -729,14 +725,12 @@ def _sql_item(i: AggItem, duckdb_sql: bool) -> str:
         return f"count(*) AS {i.alias}"
     if not duckdb_sql:
         return f"{i.func}({i.col}) AS {i.alias}"
-    # Float min/max are judged NaN-free (see oracle_compare), so the order convention does not drown out real decode
-    # errors.
-    return f"{duckdb_agg(i.func, i.col, i.typ is not None and pa.types.is_floating(i.typ))} AS {i.alias}"
+    return f"{duckdb_agg(i.func, i.col)} AS {i.alias}"
 
 
 def eval_probe(probe: Probe, rows: List[Dict]) -> List[Dict]:
-    """SQL aggregate semantics over Hardwood's rows: NULLs ignored, sum/min/max of no values is NULL, float min/max
-    skip NaN (see _sql_item)."""
+    """SQL aggregate semantics over decoded rows (Hardwood's, or pyarrow's as a fallback): NULLs ignored, sum/min/max
+    of no values is NULL, and float min/max order NaN above every number, as zpq and DuckDB do."""
     if probe.pred:
         rows = [r for r in rows if probe.pred(r)]
     out: Dict[str, Any] = {}
@@ -746,15 +740,19 @@ def eval_probe(probe: Probe, rows: List[Dict]) -> List[Dict]:
             continue
         if rows and it.col not in rows[0]:
             raise RuntimeError(f"Hardwood output lacks column {it.col}")
-        vals = [x for x in (coerce_scalar(r.get(it.col), it.typ) for r in rows)
-                if x is not None and not (_nan_ignoring(it) and is_nan(x))]
+        vals = [x for x in (coerce_scalar(r.get(it.col), it.typ) for r in rows) if x is not None]
         if not vals:
             out[it.alias] = None
         elif it.func == "sum":
             if isinstance(vals[0], decimal.Decimal):
                 with decimal.localcontext() as ctx:
                     ctx.prec = 80
-                    out[it.alias] = sum(vals, decimal.Decimal(0))
+                    total = sum(vals, decimal.Decimal(0))
+                # A DECIMAL sum past 38 digits overflows in every engine (zpq and DuckDB both raise); so must the oracle.
+                scale = it.typ.scale if it.typ is not None and pa.types.is_decimal(it.typ) else 0
+                if abs(total.scaleb(scale)) >= decimal.Decimal(10) ** 38:
+                    raise RuntimeError(f"DECIMAL sum of {it.col} overflows 38 digits")
+                out[it.alias] = total
             elif isinstance(vals[0], float):
                 try:
                     out[it.alias] = math.fsum(vals)
@@ -762,6 +760,8 @@ def eval_probe(probe: Probe, rows: List[Dict]) -> List[Dict]:
                     out[it.alias] = sum(vals)
             else:
                 out[it.alias] = sum(vals)
+        elif isinstance(vals[0], float):
+            out[it.alias] = nan_ordered_extreme(it.func, vals)
         else:
             out[it.alias] = (min if it.func == "min" else max)(vals)
     return [out]
@@ -784,9 +784,10 @@ def _cell(row: Dict[str, Any], alias: str) -> Tuple[bool, Any]:
 
 
 def referee(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineResult],
-            override: Dict[str, Any]) -> Tuple[str, str]:
-    """Returns (status, message). Status is OK, FAIL or INFO."""
-    status, msg = _vote(probe, z, d, h, override)
+            override: Dict[str, Any], pyarrow_rows: Optional[EngineResult] = None) -> Tuple[str, str]:
+    """Returns (status, message). Status is OK, FAIL or INFO. `pyarrow_rows` votes only when no other oracle could
+    read the file; a match with it alone is INFO, never OK."""
+    status, msg = _vote(probe, z, d, h, override, pyarrow_rows)
     if status == "FAIL" and override.get("authority") == "hardwood" and h is None and not override.get("expected"):
         # Hardwood decides this file and is absent; DuckDB alone can confirm zpq here but not overrule it.
         return "INFO", "Hardwood (authoritative) absent; " + msg
@@ -794,10 +795,12 @@ def referee(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineRe
 
 
 def _vote(probe: Probe, z: EngineResult, d: EngineResult, h: Optional[EngineResult],
-          override: Dict[str, Any]) -> Tuple[str, str]:
+          override: Dict[str, Any], pyarrow_rows: Optional[EngineResult] = None) -> Tuple[str, str]:
     expected: Dict[str, Any] = override.get("expected", {})
     hw_rules = override.get("authority") == "hardwood" and h is not None
     oracles = [("duckdb", d)] + ([("hardwood", h)] if h is not None else [])
+    if pyarrow_rows is not None:
+        oracles.append(("pyarrow", pyarrow_rows))
 
     if not z.ok:
         if hw_rules and not h.ok:
@@ -889,7 +892,15 @@ def read_correctness(hw_fixtures: Optional[str], only: Optional[str]) -> Tuple[i
                 else:
                     h = hw_rows
 
-            status, msg = referee(probe, z, d, h, override)
+            fallback = None
+            if not d.ok and (h is None or not h.ok):
+                # No other oracle could read the file: pyarrow's decoded rows, under the same SQL semantics.
+                try:
+                    rows = _arrow_rows(pq.read_table(path, columns=sorted(probe.columns) or None))
+                    fallback = EngineResult(True, _one_row(eval_probe(probe, rows)))
+                except Exception as e:
+                    fallback = EngineResult(False, err=f"pyarrow: {e}")
+            status, msg = referee(probe, z, d, h, override, fallback)
             tag = f"{label} [{probe.name}]"
             if override and status != "OK":
                 msg += f" (override: {override.get('why', '?')})"
@@ -904,8 +915,35 @@ def read_correctness(hw_fixtures: Optional[str], only: Optional[str]) -> Tuple[i
     return passes, fails, infos
 
 
+def referee_self_check() -> None:
+    """The referee's guarantees, so a loosened rule fails loudly: NaN ordering, and a pyarrow-only match is never OK
+    while a pyarrow-only mismatch always fails."""
+    item = AggItem("max", "x", "x_max", pa.float64())
+    probe = Probe("agg", [item], columns=["x"])
+    nan = float("nan")
+    rows = [{"x": 1.0}, {"x": nan}, {"x": None}]
+    assert is_nan(eval_probe(probe, rows)[0]["x_max"]), "float max must be NaN when any value is"
+    rejected = EngineResult(False, err="rejects")
+    right = EngineResult(True, {"x_max": 2.0})
+    wrong = EngineResult(True, {"x_max": 3.0})
+    assert referee(probe, right, EngineResult(True, {"x_max": 2.0}), None, {})[0] == "OK"
+    assert referee(probe, right, rejected, None, {}, right)[0] == "INFO", "a pyarrow-only match must not be OK"
+    assert referee(probe, wrong, rejected, None, {}, right)[0] == "FAIL", "a pyarrow-only mismatch must fail"
+    assert referee(probe, right, rejected, None, {}, rejected)[0] == "FAIL", "no oracle at all must fail"
+    assert referee(probe, EngineResult(True, {"x_max": nan}), EngineResult(True, {"x_max": nan}), None, {})[0] == "OK"
+    assert referee(probe, EngineResult(True, {"x_max": nan}), EngineResult(True, {"x_max": 2.0}), None, {})[0] == "FAIL"
+    big = AggItem("sum", "b", "b_sum", pa.decimal128(38, 0))
+    nines = decimal.Decimal(10) ** 38 - 1
+    try:
+        eval_probe(Probe("agg", [big], columns=["b"]), [{"b": nines}, {"b": nines}])
+        raise AssertionError("a DECIMAL sum past 38 digits must overflow, as it does in zpq and DuckDB")
+    except RuntimeError:
+        pass
+
+
 def main():
     self_check()
+    referee_self_check()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hardwood-fixtures", help="Hardwood checkout root or its core/src/test/resources "
                     "(default: $HARDWOOD_FIXTURES, then tools/hardwood/fixtures)")

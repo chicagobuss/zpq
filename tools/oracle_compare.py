@@ -11,8 +11,8 @@ One policy for tools/differential.py and tools/triangulate.py:
   DECIMAL divided, or mixed with a DOUBLE) compares as a float: pass lane=F64 there, since an integral f64 prints as
   an integer in zpq's JSON and cannot be told apart by its value.
 - Floats compare with a relative tolerance (REL_TOL, absolute below 1.0): engines sum in different orders. NaN equals
-  NaN and each infinity itself. Float min/max skip NaN in zpq, as in Arrow compute and Polars, while DuckDB orders NaN
-  above every number, so DuckDB is asked for the NaN-free extreme (duckdb_agg).
+  NaN and each infinity itself. Float min/max order NaN above every number in zpq, as in DuckDB, Postgres and Spark:
+  max is NaN if any value is, min skips NaN unless every value is NaN. DuckDB answers the same natively.
 - Booleans equal 1/0: zpq's aggregate JSON spells a BOOLEAN key or extreme as an integer.
 - Temporals compare exactly, never with a tolerance: a filter literal finer than the column's unit must select
   exactly the rows that DuckDB's typed TIMESTAMP literal selects. Timezone-aware values compare as naive UTC.
@@ -92,10 +92,18 @@ def canon(v: Any, lane: Optional[str] = None) -> Any:
     return n
 
 
-def duckdb_agg(func: str, col: str, floating: bool) -> str:
-    """DuckDB SQL for `func(col)` under zpq's semantics: float min/max over the NaN-free values."""
-    nan_free = f' FILTER (WHERE NOT isnan("{col}"))' if floating and func in ("min", "max") else ""
-    return f'{func}("{col}"){nan_free}'
+def duckdb_agg(func: str, col: str) -> str:
+    """DuckDB SQL for `func(col)`: DuckDB already orders NaN as zpq does, so no rewrite is needed."""
+    return f'{func}("{col}")'
+
+
+def nan_ordered_extreme(func: str, vals: list) -> Any:
+    """zpq's float min/max over non-NULL values: NaN sorts above every number."""
+    nans = [v for v in vals if isinstance(v, float) and math.isnan(v)]
+    nums = [v for v in vals if not (isinstance(v, float) and math.isnan(v))]
+    if func == "max":
+        return nans[0] if nans else max(nums)
+    return min(nums) if nums else nans[0]
 
 
 def self_check() -> None:
@@ -131,6 +139,11 @@ def self_check() -> None:
         if isinstance(got, float) and isinstance(want, decimal.Decimal) and lane is None:
             lane = F64  # see canon()
         assert (canon(got, lane) == canon(want, lane)) is expect, f"canon({got!r}) vs canon({want!r}), {lane}"
+    nan = float("nan")
+    assert math.isnan(nan_ordered_extreme("max", [1.0, nan, 2.0]))
+    assert nan_ordered_extreme("min", [1.0, nan, 2.0]) == 1.0
+    assert math.isnan(nan_ordered_extreme("min", [nan, nan]))
+    assert nan_ordered_extreme("max", [-math.inf, 3.0]) == 3.0
 
 
 if __name__ == "__main__":

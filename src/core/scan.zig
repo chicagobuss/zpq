@@ -1704,6 +1704,38 @@ fn countLimitGroups(
     return ids;
 }
 
+/// The keys of the only groups a LIMIT with no ORDER BY can return: groups come out in first-appearance order, so it
+/// keeps the `k` that appeared first. Each of those is among the `k` earliest groups of the table that first saw it,
+/// since any group that table saw earlier appeared earlier overall, so the union of every table's `k` earliest holds
+/// them all. Null when that would not shrink the merge.
+fn firstCandidates(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, k: usize) error{OutOfMemory}!?[]const []const u8 {
+    if (k == 0) return &.{};
+    var groups: usize = 0;
+    for (tables) |t| groups += t.groupCount();
+    if (groups <= k *| 4) return null;
+    const Item = struct { first: u64, g: u32 };
+    const later = struct {
+        fn cmp(_: void, a: Item, b: Item) std.math.Order {
+            return std.math.order(b.first, a.first);
+        }
+    }.cmp;
+    var heap: std.PriorityQueue(Item, void, later) = .empty;
+    try heap.ensureTotalCapacity(arena, k);
+    var kept: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (tables) |*t| {
+        heap.clearRetainingCapacity();
+        for (t.first.items[0..t.groupCount()], 0..) |first, g| {
+            if (heap.count() == k) {
+                if (first >= heap.peek().?.first) continue;
+                _ = heap.pop();
+            }
+            heap.push(arena, .{ .first = first, .g = @intCast(g) }) catch unreachable; // within the capacity reserved above
+        }
+        for (heap.items) |item| try kept.put(arena, t.keyAt(item.g), {});
+    }
+    return kept.keys();
+}
+
 /// The keys of the only groups that can reach the first `offset + limit` rows of an answer ordered by a COUNT,
 /// descending, first; null when the order is not such a cut. Exact, after the threshold algorithm of distributed
 /// top-k (Cao and Wang, 2004): every table nominates its own top groups, and the k-th largest exact total among the
@@ -1718,7 +1750,8 @@ fn topKCandidates(
     order: expr_ast.ResultOrder,
 ) error{OutOfMemory}!?[]const []const u8 {
     const limit = order.limit orelse return null;
-    if (order.keys.len == 0 or !order.keys[0].descending) return null;
+    if (order.keys.len == 0) return firstCandidates(arena, tables, std.math.cast(usize, order.offset +| limit) orelse return null);
+    if (!order.keys[0].descending) return null;
     const a_idx = switch (outputs[order.keys[0].column].source) {
         .agg => |a| a,
         .key => return null,
@@ -2872,6 +2905,9 @@ test "runMultiAggregate: a COUNT-descending cut merges only groups that can make
         .{ .order = .{ .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = true } }, .limit = 3, .offset = 5 }, .prunes = true },
         .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 1 }, .prunes = true },
         .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 0 }, .prunes = true },
+        // No ORDER BY: the first groups to appear.
+        .{ .order = .{ .limit = 10 }, .prunes = true },
+        .{ .order = .{ .limit = 4, .offset = 7 }, .prunes = true },
         // Not a COUNT-descending cut: merged in full.
         .{ .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 10 }, .prunes = false },
         .{ .order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 10 }, .prunes = false },
@@ -4679,5 +4715,25 @@ test "a count cut inside the merge keeps exactly the groups the full sort would,
         try testing.expectEqual(want.c, got.c);
         try testing.expectEqual(want.first, got.first);
         try testing.expectEqualStrings(want.key, got.key);
+    }
+}
+
+test "firstCandidates: every table's earliest groups hold the groups that appeared first overall" {
+    // Table 0 saw a..h at 10..17; table 1 saw d at 0 and its own keys at 100.. . The two earliest overall are d (first
+    // seen by table 1) and a (table 0), each among the two earliest of the table that first saw it.
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var tables: [2]expr_agg.GroupTable = .{ .init(testing.allocator, 1 << 20), .init(testing.allocator, 1 << 20) };
+    defer for (&tables) |*t| t.deinit();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" }, 10..) |key, pos| _ = try tables[0].getOrInsert(key, &calls, pos);
+    _ = try tables[1].getOrInsert("d", &calls, 0);
+    for ([_][]const u8{ "x", "y", "z", "w", "v", "u", "t" }, 100..) |key, pos| _ = try tables[1].getOrInsert(key, &calls, pos);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const kept = (try firstCandidates(arena_state.allocator(), &tables, 2)).?;
+    try testing.expect(kept.len <= 4);
+    for ([_][]const u8{ "d", "a" }) |want| {
+        for (kept) |k| {
+            if (std.mem.eql(u8, k, want)) break;
+        } else return error.TestExpectedKey;
     }
 }

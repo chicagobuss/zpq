@@ -376,6 +376,11 @@ pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: [
         if (k != .col_ref) continue;
         const pos = lookup[k.col_ref.col_idx] orelse continue;
         const col = &cols[pos];
+        switch (col.*) {
+            .i64 => |*ic| try codeIntRange(i64, ra, ic),
+            .i32 => |*ic| try codeIntRange(i32, ra, ic),
+            else => {},
+        }
         if (col.* != .string) continue;
         const sc = &col.string;
         if (sc.codes != null or sc.max_rep > 0 or sc.values.len == 0) continue;
@@ -411,6 +416,36 @@ pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: [
         sc.codes = codes;
         sc.dict = dict.items;
     }
+}
+
+/// Widest value range an integer key is coded over.
+const max_int_range = 4096;
+
+/// Code a plain integer key by its offset from the batch's least value, when the batch's values span fewer than
+/// `max_int_range`: the dictionary is every value of that range, and coding a row is a subtraction, not a lookup.
+fn codeIntRange(comptime T: type, ra: std.mem.Allocator, ic: *filter_eval.ColumnT(T)) !void {
+    if (ic.codes != null or ic.max_rep > 0 or ic.values.len == 0) return;
+    const present = struct {
+        fn at(c: *const filter_eval.ColumnT(T), r: usize) bool {
+            const dl = c.def_levels orelse return true;
+            return dl[r] >= c.max_def;
+        }
+    }.at;
+    var lo: T = std.math.maxInt(T);
+    var hi: T = std.math.minInt(T);
+    for (ic.values, 0..) |v, r| if (present(ic, r)) {
+        lo = @min(lo, v);
+        hi = @max(hi, v);
+    };
+    if (lo > hi) return; // every row null
+    const span = @as(i128, hi) - lo;
+    if (span >= max_int_range) return;
+    const dict = try ra.alloc(T, @intCast(span + 1));
+    for (dict, 0..) |*d, i| d.* = @intCast(@as(i128, lo) + @as(i128, @intCast(i)));
+    const codes = try ra.alloc(u32, ic.values.len);
+    for (ic.values, codes, 0..) |v, *c, r| c.* = if (present(ic, r)) @intCast(@as(i128, v) - lo) else 0;
+    ic.codes = codes;
+    ic.dict = dict;
 }
 
 pub fn groupedCoded(
@@ -1106,4 +1141,24 @@ test "codePlainKeys: codes map back to the values, nulls aside, and a key with t
     var wide = [_]Column{.{ .string = .{ .values = many } }};
     try codePlainKeys(a, &keys, &wide, &lookup);
     try std.testing.expect(wide[0].string.codes == null);
+}
+
+test "codePlainKeys: a narrow integer key is coded by its offset from the least value, nulls aside" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    const lookup = [_]?usize{0};
+    const vals = [_]i64{ -3, 7, 99, -3, 12, 7 };
+    const defs = [_]u32{ 1, 1, 0, 1, 1, 1 }; // row 2 (99) is null and must not widen the range
+    var cols = [_]Column{.{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    try codePlainKeys(a, &keys, &cols, &lookup);
+    const ic = cols[0].i64;
+    try std.testing.expectEqual(@as(usize, 16), ic.dict.len); // -3 ..= 12
+    for (vals, defs, ic.codes.?) |v, d, c| if (d == 1) try std.testing.expectEqual(v, ic.dict[c]);
+
+    const wide_vals = [_]i64{ 0, max_int_range };
+    var wide = [_]Column{.{ .i64 = .{ .values = &wide_vals } }};
+    try codePlainKeys(a, &keys, &wide, &lookup);
+    try std.testing.expect(wide[0].i64.codes == null);
 }

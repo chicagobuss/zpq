@@ -124,8 +124,8 @@ pub const MultiAggArgs = struct {
     diag: ?*Diag = null,
     /// Records the scan's spans when set; see `profile.zig`.
     profiler: ?*profile.Profiler = null,
-    /// Opt-in (`ZPQ_SKETCH_TOPK=1`): answer a COUNT-descending cut from sampled candidates and a count sketch when
-    /// the sketch certifies them; see `sketchTopK`.
+    /// Answer a COUNT-descending cut from a count pass and an admit pass where a count sketch certifies it; see
+    /// `sketchTopK`. Null runs the plain scan.
     sketch_topk: ?SketchTopK = null,
 };
 

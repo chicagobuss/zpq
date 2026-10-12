@@ -1403,13 +1403,10 @@ fn outputColumnNames(
     return names;
 }
 
-/// S3 credentials from the environment, telling a missing region apart from missing keys.
-/// Whether `name` is set to "0" in `env`.
-/// `ZPQ_SKETCH_TOPK=1` turns on the research path `scan.SketchTopK`; `ZPQ_SKETCH_ADMIT` and `ZPQ_SKETCH_BITS` tune
-/// it, and `ZPQ_SKETCH_TRACE=1` reports its decisions on stderr.
+/// The sketched count cut (`scan.SketchTopK`) runs wherever it is eligible; `ZPQ_SKETCH_TOPK=0` turns it off,
+/// `ZPQ_SKETCH_ADMIT` and `ZPQ_SKETCH_BITS` tune it, and `ZPQ_SKETCH_TRACE=1` reports its decisions on stderr.
 fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
-    const on = env.getPosix("ZPQ_SKETCH_TOPK") orelse return null;
-    if (!std.mem.eql(u8, on, "1")) return null;
+    if (envDisables(env, "ZPQ_SKETCH_TOPK")) return null;
     var cfg: scan.SketchTopK = .{};
     if (env.getPosix("ZPQ_SKETCH_ADMIT")) |v| cfg.admit_per_row = std.fmt.parseInt(usize, v, 10) catch cfg.admit_per_row;
     if (env.getPosix("ZPQ_SKETCH_BITS")) |v| cfg.cell_bits = std.math.clamp(std.fmt.parseInt(u6, v, 10) catch cfg.cell_bits, 10, 30);
@@ -1417,11 +1414,13 @@ fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
     return cfg;
 }
 
+/// Whether `name` is set to "0" in `env`.
 fn envDisables(env: std.process.Environ, name: []const u8) bool {
     const v = env.getPosix(name) orelse return false;
     return std.mem.eql(u8, v, "0");
 }
 
+/// S3 credentials from the environment, telling a missing region apart from missing keys.
 fn credentialsFromEnv(env: std.process.Environ) error{ NoCredentials, NoRegion }!s3.Credentials {
     var creds = s3.Credentials.fromEnv(env) catch |err| {
         return if (err == error.NoRegion) error.NoRegion else error.NoCredentials;

@@ -1579,54 +1579,57 @@ const MergedSlot = struct {
     idx: usize,
 };
 
-const Phase1Task = struct {
-    sources: []const *const expr_agg.DistinctSet,
-    slices: []std.ArrayListUnmanaged(u64),
-    cursor: *std.atomic.Value(usize),
-
-    fn run(t: *Phase1Task) void {
-        while (true) {
-            const m = t.cursor.fetchAdd(1, .monotonic);
-            if (m >= t.sources.len) return;
-            const ds = t.sources[m];
-            const row = t.slices[m * 16 .. (m + 1) * 16];
-            switch (ds.val_set) {
-                .none => {},
-                .inline_u64 => |s| {
-                    for (s.vals[0..s.len]) |v| {
-                        const p = (v *% 11400714819323198485) >> 60;
-                        row[p].appendAssumeCapacity(v);
-                    }
-                },
+/// Calls `f(ctx, v)` for every value of a set of u64 values, partitioned or not.
+fn eachDistinctU64(ds: *const expr_agg.DistinctSet, ctx: anytype, comptime f: fn (@TypeOf(ctx), u64) void) void {
+    const one = struct {
+        fn set(d: *const expr_agg.DistinctSet, c: @TypeOf(ctx)) void {
+            switch (d.val_set) {
+                .inline_u64 => |s| for (s.vals[0..s.len]) |v| f(c, v),
                 .u64 => |s| {
                     var it = s.keyIterator();
-                    while (it.next()) |k| {
-                        const v = k.*;
-                        const p = (v *% 11400714819323198485) >> 60;
-                        row[p].appendAssumeCapacity(v);
-                    }
+                    while (it.next()) |k| f(c, k.*);
                 },
                 else => {},
             }
-            if (ds.parts) |parts| {
-                for (parts) |part| {
-                    switch (part.val_set) {
-                        .inline_u64 => |s| for (s.vals[0..s.len]) |v| {
-                            const p = (v *% 11400714819323198485) >> 60;
-                            row[p].appendAssumeCapacity(v);
-                        },
-                        .u64 => |s| {
-                            var it = s.keyIterator();
-                            while (it.next()) |k| {
-                                const v = k.*;
-                                const p = (v *% 11400714819323198485) >> 60;
-                                row[p].appendAssumeCapacity(v);
-                            }
-                        },
-                        else => {},
-                    }
+        }
+    };
+    one.set(ds, ctx);
+    if (ds.parts) |parts| for (parts) |*part| one.set(part, ctx);
+}
+
+fn distinctSlice(v: u64) usize {
+    return @intCast((v *% 11400714819323198485) >> 60);
+}
+
+const Phase1Task = struct {
+    gpa: std.mem.Allocator,
+    sources: []const *const expr_agg.DistinctSet,
+    slices: []std.ArrayListUnmanaged(u64),
+    cursor: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+
+    /// Split each claimed source set's values into its 16 slices: counted first, so each slice is reserved at
+    /// exactly its size before it is filled.
+    fn run(t: *Phase1Task) void {
+        while (t.err == null) {
+            const m = t.cursor.fetchAdd(1, .monotonic);
+            if (m >= t.sources.len) return;
+            const row = t.slices[m * 16 .. (m + 1) * 16];
+            var sizes: [16]usize = @splat(0);
+            eachDistinctU64(t.sources[m], &sizes, struct {
+                fn f(n: *[16]usize, v: u64) void {
+                    n[distinctSlice(v)] += 1;
                 }
-            }
+            }.f);
+            for (row, sizes) |*cell, n| cell.ensureTotalCapacityPrecise(t.gpa, n) catch |e| {
+                t.err = e;
+                return;
+            };
+            eachDistinctU64(t.sources[m], row, struct {
+                fn f(r: []std.ArrayListUnmanaged(u64), v: u64) void {
+                    r[distinctSlice(v)].appendAssumeCapacity(v);
+                }
+            }.f);
         }
     }
 };
@@ -1677,12 +1680,8 @@ fn parallelDistinctCountU64(
 ) !u64 {
     const M = sources.len;
     const slices = try arena.alloc(std.ArrayListUnmanaged(u64), M * 16);
-    for (slices, 0..) |*cell, idx| {
-        cell.* = .empty;
-        const m = idx / 16;
-        const cap = sources[m].count() / 16 + 64;
-        try cell.ensureTotalCapacity(arena, cap);
-    }
+    for (slices) |*cell| cell.* = .empty;
+    defer for (slices) |*cell| cell.deinit(gpa);
 
     const n_threads = @min(n_workers, @max(M, 16));
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
@@ -1691,6 +1690,7 @@ fn parallelDistinctCountU64(
         var cursor = std.atomic.Value(usize).init(0);
         const tasks = try arena.alloc(Phase1Task, n_threads);
         for (tasks) |*task| task.* = .{
+            .gpa = gpa,
             .sources = sources,
             .slices = slices,
             .cursor = &cursor,
@@ -1698,6 +1698,7 @@ fn parallelDistinctCountU64(
         if (!spawn_util.runTree(Phase1Task, tasks, config, Phase1Task.run)) {
             Phase1Task.run(&tasks[0]);
         }
+        for (tasks) |task| if (task.err) |e| return e;
     }
 
     var counts: [16]usize = undefined;
@@ -2332,9 +2333,17 @@ fn premergeLargeDistinctSets(
                     if (acc == .distinct and acc.distinct != null) {
                         const ds = acc.distinct.?;
                         try sources.append(arena, ds);
-                        if (ds.val_set != .none and ds.val_set != .inline_u64 and ds.val_set != .u64) {
-                            is_u64 = false;
-                        }
+                        // Only sets of integers split by value here; a partition holding anything else keeps the whole set
+                        // on the merge's own path.
+                        const u64_only = struct {
+                            fn of(d: *const expr_agg.DistinctSet) bool {
+                                return d.val_set == .none or d.val_set == .inline_u64 or d.val_set == .u64;
+                            }
+                        }.of;
+                        if (!u64_only(ds)) is_u64 = false;
+                        if (ds.parts) |parts| for (parts) |*part| {
+                            if (!u64_only(part)) is_u64 = false;
+                        };
                     }
                 }
             }
@@ -5549,4 +5558,18 @@ test "sketchEligible: a filter may read the group keys, not other columns" {
     try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, false }, false));
     try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, true }, false));
     try testing.expectEqual(@as(?usize, null), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ true, true }, false));
+}
+
+test "parallelDistinctCountU64 counts the exact union of overlapping sets" {
+    const a = testing.allocator;
+    var sets: [3]expr_agg.DistinctSet = .{ .{}, .{}, .{} };
+    defer for (&sets) |*d| d.deinit(a);
+    const ranges = [_][2]u64{ .{ 0, 50_000 }, .{ 25_000, 75_000 }, .{ 60_000, 100_000 } };
+    for (&sets, ranges) |*d, r| for (r[0]..r[1]) |v| try d.insertU64(a, v * 7919);
+    const sources = [_]*const expr_agg.DistinctSet{ &sets[0], &sets[1], &sets[2] };
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    for ([_]usize{ 2, 4, 16 }) |workers| {
+        try testing.expectEqual(@as(u64, 100_000), try parallelDistinctCountU64(a, arena_state.allocator(), &sources, workers));
+    }
 }

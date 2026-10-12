@@ -1118,6 +1118,13 @@ fn scanDictionary(values: []const u8, count: usize, slot: Slot, want: []const []
         .BYTE_ARRAY => 0,
         else => return false,
     };
+    if (width == 4 or width == 8) {
+        if (values.len != count * width) return false; // more or fewer bytes than entries: corrupt, proves nothing
+        if (want.len <= max_vector_wants) {
+            if (width == 4) scanFixed(u32, values, want, found) else scanFixed(u64, values, want, found);
+            return true;
+        }
+    }
     var pos: usize = 0;
     for (0..count) |_| {
         var len = width;
@@ -1133,6 +1140,32 @@ fn scanDictionary(values: []const u8, count: usize, slot: Slot, want: []const []
     }
     // Bytes left over mean the page holds more than it says: it is corrupt, and proves nothing.
     return pos == values.len;
+}
+
+/// Wanted values a fixed-width dictionary is compared against lane-wise, instead of binary-searched per entry.
+const max_vector_wants = 8;
+
+/// `found[i]` for each `want[i]` some entry of `values` (little-endian `T`s) equals. A want of another width is never
+/// found. Entries are compared a vector at a time: a dictionary is scanned in microseconds rather than a search per
+/// entry.
+fn scanFixed(comptime T: type, values: []const u8, want: []const []const u8, found: []bool) void {
+    const lanes = 64 / @sizeOf(T);
+    const V = @Vector(lanes, T);
+    const n = values.len / @sizeOf(T);
+    for (want, found) |w, *f| {
+        if (w.len != @sizeOf(T)) continue;
+        const target = std.mem.readInt(T, w[0..@sizeOf(T)], .little);
+        const splat: V = @splat(target);
+        var i: usize = 0;
+        var hit = false;
+        while (i + lanes <= n and !hit) : (i += lanes) {
+            var chunk: V = undefined;
+            inline for (0..lanes) |l| chunk[l] = std.mem.readInt(T, values[(i + l) * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+            hit = @reduce(.Or, chunk == splat);
+        }
+        while (i < n and !hit) : (i += 1) hit = std.mem.readInt(T, values[i * @sizeOf(T) ..][0..@sizeOf(T)], .little) == target;
+        if (hit) f.* = true;
+    }
 }
 
 /// Whether a file's writer emits the canonical header, which is what lets a block be located without its header.
@@ -3673,4 +3706,37 @@ test "regression: cached probes own transient key bytes through growth" {
         try testing.expect(@reduce(.And, want.m == got.m));
     }
     try testing.expectEqual(@as(usize, 1024), cache.forms.count());
+}
+
+test "scanDictionary: the lane-wise scan of a fixed-width dictionary finds exactly what an entry-by-entry search does" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    inline for (.{ .{ u32, schema.Type.INT32 }, .{ u64, schema.Type.INT64 } }) |c| {
+        const T = c[0];
+        const w = @sizeOf(T);
+        for ([_]usize{ 0, 1, 7, 64, 129, 4097 }) |count| {
+            var values: [4097 * 8]u8 = undefined;
+            for (0..count) |i| std.mem.writeInt(T, values[i * w ..][0..w], rand.intRangeAtMost(T, 0, 300), .little);
+            // Present, absent, last-entry and wrong-width wants, sorted as the caller sorts them.
+            var bufs: [6][8]u8 = undefined;
+            var want: [6][]const u8 = undefined;
+            for (0..5) |i| {
+                const v: T = if (i == 4 and count > 0) std.mem.readInt(T, values[(count - 1) * w ..][0..w], .little) else @intCast(i * 97);
+                std.mem.writeInt(T, bufs[i][0..w], v, .little);
+                want[i] = bufs[i][0..w];
+            }
+            want[5] = bufs[5][0 .. w / 2];
+            std.mem.sort([]const u8, &want, {}, bytesLess);
+            var got: [6]bool = @splat(false);
+            const slot: Slot = .{ .physical = c[1], .type_length = null };
+            try testing.expect(scanDictionary(values[0 .. count * w], count, slot, &want, &got));
+            for (want, got) |wv, g| {
+                var expect = false;
+                for (0..count) |i| expect = expect or std.mem.eql(u8, values[i * w ..][0..w], wv);
+                try testing.expectEqual(expect, g);
+            }
+            // A page with bytes beyond its entries proves nothing.
+            if (count > 0) try testing.expect(!scanDictionary(values[0 .. count * w], count - 1, slot, &want, &got));
+        }
+    }
 }

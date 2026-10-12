@@ -998,12 +998,14 @@ pub fn runMultiAggregate(
         gt.shared = &group_budget;
         gt.fixed_stride = fixed_stride;
     }
-    defer for (group_tables) |*gt| gt.deinit();
+    // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
+    // is serial time the answer would wait for.
+    defer if (!args.leave_regions) for (group_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
     merged_table.shared = &group_budget;
     merged_table.fixed_stride = fixed_stride;
-    defer merged_table.deinit();
+    defer if (!args.leave_regions) merged_table.deinit();
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -1258,10 +1260,10 @@ pub fn runMultiAggregate(
         // Result rows own any strings they need; table keys and accumulator
         // winners can now be released before returning (the deferred deinit
         // then finds them empty).
-        for (out_tables) |*gt| {
+        if (!args.leave_regions) for (out_tables) |*gt| {
             gt.deinit();
             gt.* = expr_agg.GroupTable.init(gpa, 0);
-        }
+        };
     } else {
         // Merge each work item exactly ONCE: `work` is shared and claimed dynamically, so folding it per worker would
         // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.

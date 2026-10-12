@@ -647,23 +647,30 @@ def main():
     # is constant per row group (the statistics fold), `g` low-cardinality (dictionary codes), `n` NULL in places and
     # NULL in all of group g = 4 under the filter below.
     offs = os.path.join(tmp, "sum_offset.parquet")
-    con.execute(f"""COPY (SELECT (i // 500)::INTEGER AS c, (i % 5)::INTEGER AS g,
-        (CASE WHEN i % 9 = 0 OR i % 5 = 4 AND i > 3000 THEN NULL ELSE i - 2000 END)::INTEGER AS n,
+    # DuckDB rounds ROW_GROUP_SIZE up to its 2048-row vectors, so c is constant over 2048 rows.
+    con.execute(f"""COPY (SELECT (i // 2048)::INTEGER AS c, (i % 5)::INTEGER AS g,
+        (CASE WHEN i % 9 = 0 OR i % 5 = 4 AND i >= 2048 THEN NULL ELSE i - 2000 END)::INTEGER AS n,
         (i * 3)::BIGINT AS big
       FROM range(0, 4000) t(i)) TO '{offs}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)""")
     OFFSET_SQL = [
+        # Alone, c folds from statistics: every row group is constant.
+        "SELECT sum(c + 3) AS a, sum(c - 1) AS b FROM '{f}'",
         "SELECT sum(c + 3) AS a, sum(3 + c) AS b, sum(c - 7) AS d, sum(n + 1) AS e, sum(g + 4) AS f, sum(big + 2) AS h "
         "FROM '{f}'",
         "SELECT sum(n + 11) AS a, sum(c - 1) AS b, count(n) AS k FROM '{f}' WHERE n > 10",
         "SELECT sum(n - 5) AS a FROM '{f}' WHERE n IS NULL",
         "SELECT g, sum(n + 5) AS s, sum(c - 2) AS t, sum(g + 9) AS u FROM '{f}' GROUP BY g",
-        "SELECT g, sum(n + 5) AS s FROM '{f}' WHERE c > 5 GROUP BY g",
+        "SELECT g, sum(n + 5) AS s FROM '{f}' WHERE c > 0 GROUP BY g",
     ]
-    for i, o_sql in enumerate(OFFSET_SQL):
+    # Each also with encoded execution off, so the row folds run where the dictionary-code folds would, and with
+    # --trust-stats, so constant row groups fold from statistics.
+    modes = [("", "1", []), (" (row folds)", "0", []), (" (trust-stats)", "1", ["--trust-stats"])]
+    for i, (o_sql, (mode, encoded, flags)) in enumerate((q, m) for q in OFFSET_SQL for m in modes):
         total += 1
         sql = o_sql.format(f=offs)
-        label = f"sum-offset:{i}"
-        r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True)
+        label = f"sum-offset:{i // len(modes)}{mode}"
+        r = subprocess.run([ZPQ, "query", "--query", sql] + flags, capture_output=True, text=True,
+                           env={**os.environ, "ZPQ_ENCODED": encoded})
         try:
             if r.returncode != 0:
                 raise RuntimeError((r.stderr or r.stdout).strip()[:90])

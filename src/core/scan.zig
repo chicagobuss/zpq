@@ -547,7 +547,9 @@ const BlockMerge = struct {
 fn orderSensitive(calls: []const expr_agg.AggCall) bool {
     for (calls) |c| {
         if (c.func == .count or c.func == .count_distinct) continue;
-        if (c.result == .f64 or c.result == .avg_f64) return true;
+        if (c.result == .f64) return true;
+        // An avg sums integer values exactly (`AvgState.isum`); only a float argument's sum depends on order.
+        if (c.result == .avg_f64 and (c.arg == null or c.arg.?.typeOf() != .i64)) return true;
     }
     return false;
 }
@@ -1191,7 +1193,8 @@ pub fn runMultiAggregate(
         }
         const folded = out_tables.len > 1;
         if (folded) {
-            try mergeFoldedRefs(gpa, arena, out_tables, group_refs, agg_calls, n_workers, &slots, &merged_accs);
+            const count_cut = countCut(group_outputs.?, agg_calls, args.result_order);
+            try mergeFoldedRefs(gpa, arena, out_tables, group_refs, agg_calls, n_workers, count_cut, &slots, &merged_accs);
         } else {
             const gt = &out_tables[0];
             try slots.ensureTotalCapacity(gpa, group_refs.len);
@@ -1350,6 +1353,7 @@ fn hashMergeGroupRefs(
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
     calls: []const expr_agg.AggCall,
+    cut: ?CountCut,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
@@ -1387,13 +1391,18 @@ fn hashMergeGroupRefs(
             });
         }
     }
+    // A partition holds every copy of its keys, so its counts are final and a count cut applies here.
+    if (cut) |c| try keepCountTop(gpa, calls, c, slots, accs);
 }
 
 /// How many independent partitions the merge is worth. One partition below a few thousand refs, or with one worker:
 /// the hash table is then smaller than the cost of splitting it. Otherwise a power of two, so a key's high bits name
 /// its partition, and no larger than the worker count.
-fn mergePartitionCount(n_workers: usize, n_refs: usize) usize {
+fn mergePartitionCount(n_workers: usize, n_refs: usize, cut: bool) usize {
     if (n_workers < 2 or n_refs < 8192) return 1;
+    // Under a count cut each partition shrinks to its top groups as it finishes, so many small partitions keep only a
+    // few in flight at once instead of half the groups.
+    if (cut) return @min(512, std.math.ceilPowerOfTwoAssert(usize, n_refs / 65536 + 1));
     var p: usize = 1;
     while (p * 2 <= n_workers and p < 32) p *= 2;
     return p;
@@ -1410,6 +1419,7 @@ const MergeTask = struct {
     gpa: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     calls: []const expr_agg.AggCall,
+    cut: ?CountCut,
     parts: []MergePart,
     cursor: *std.atomic.Value(usize),
     err: ?anyerror = null,
@@ -1421,7 +1431,7 @@ const MergeTask = struct {
             const i = t.cursor.fetchAdd(1, .monotonic);
             if (i >= t.parts.len) return;
             const p = &t.parts[i];
-            hashMergeGroupRefs(t.gpa, t.tables, p.refs, p.hashes, t.calls, &p.slots, &p.accs) catch |e| {
+            hashMergeGroupRefs(t.gpa, t.tables, p.refs, p.hashes, t.calls, t.cut, &p.slots, &p.accs) catch |e| {
                 t.err = e;
                 return;
             };
@@ -1438,11 +1448,12 @@ fn mergeFoldedRefs(
     refs: []const MergeGroupRef,
     calls: []const expr_agg.AggCall,
     n_workers: usize,
+    cut: ?CountCut,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    const nparts = mergePartitionCount(n_workers, refs.len);
-    if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, slots, accs);
+    const nparts = mergePartitionCount(n_workers, refs.len, cut != null);
+    if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, slots, accs);
 
     const hashes = try arena.alloc(u64, refs.len);
     const counts = try arena.alloc(usize, nparts);
@@ -1488,6 +1499,7 @@ fn mergeFoldedRefs(
         .gpa = gpa,
         .tables = tables,
         .calls = calls,
+        .cut = cut,
         .parts = parts,
         .cursor = &cursor,
     };
@@ -1520,13 +1532,11 @@ fn mergeFoldedRefs(
 /// Group indices of the only rows a single table's `ORDER BY` one COUNT DESC LIMIT/OFFSET can keep. Null when that
 /// is not the order, or when the limit does not drop anyone. Ties break by earlier `first`, matching the stable sort
 /// the full merge would do.
-fn countLimitGroups(
-    arena: std.mem.Allocator,
-    table: *const expr_agg.GroupTable,
-    outputs: []const BoundOutputColumn,
-    agg_calls: []const expr_agg.AggCall,
-    order: expr_ast.ResultOrder,
-) error{OutOfMemory}!?[]u32 {
+/// An answer ordered by one COUNT, descending, and cut to its first `k` rows: the `k` groups with the largest counts,
+/// earlier first appearance winning a tie, are all it can return.
+const CountCut = struct { a_idx: usize, k: usize };
+
+fn countCut(outputs: []const BoundOutputColumn, agg_calls: []const expr_agg.AggCall, order: expr_ast.ResultOrder) ?CountCut {
     const limit = order.limit orelse return null;
     if (order.keys.len != 1 or !order.keys[0].descending) return null;
     const a_idx = switch (outputs[order.keys[0].column].source) {
@@ -1534,7 +1544,78 @@ fn countLimitGroups(
         .key => return null,
     };
     if (agg_calls[a_idx].func != .count) return null;
-    const k = std.math.cast(usize, order.offset +| limit) orelse return null;
+    return .{ .a_idx = a_idx, .k = std.math.cast(usize, order.offset +| limit) orelse return null };
+}
+
+/// Drop every merged group but the `cut.k` a count cut keeps (`CountCut`), freeing what the dropped ones own. The
+/// counts are final: a merge partition holds every copy of its keys.
+fn keepCountTop(
+    gpa: std.mem.Allocator,
+    calls: []const expr_agg.AggCall,
+    cut: CountCut,
+    slots: *std.ArrayList(MergedSlot),
+    accs: *std.ArrayList(expr_agg.Accumulator),
+) !void {
+    const n = slots.items.len;
+    if (n <= cut.k) return;
+    if (cut.k == 0) {
+        freeOwnedAccumulatorStrings(gpa, accs.items);
+        accs.clearRetainingCapacity();
+        slots.clearRetainingCapacity();
+        return;
+    }
+    const Item = struct { c: u64, first: u64, s: u32 };
+    const worse = struct {
+        fn cmp(_: void, a: Item, b: Item) std.math.Order {
+            if (a.c != b.c) return std.math.order(a.c, b.c);
+            return std.math.order(b.first, a.first);
+        }
+    }.cmp;
+    var heap: std.PriorityQueue(Item, void, worse) = .empty;
+    defer heap.deinit(gpa);
+    try heap.ensureTotalCapacity(gpa, cut.k);
+    const kept_accs = try gpa.alloc(expr_agg.Accumulator, cut.k * calls.len);
+    defer gpa.free(kept_accs);
+    for (slots.items, 0..) |slot, si| {
+        const item: Item = .{ .c = accs.items[slot.idx + cut.a_idx].count, .first = slot.first, .s = @intCast(si) };
+        if (heap.count() == cut.k) {
+            const w = heap.peek().?;
+            if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
+            _ = heap.pop();
+        }
+        heap.push(gpa, item) catch unreachable; // within the capacity reserved above
+    }
+    // Nothing fails from here on: the kept groups' state moves, the rest is freed.
+    const keep = try gpa.alloc(bool, n);
+    defer gpa.free(keep);
+    @memset(keep, false);
+    for (heap.items) |item| keep[item.s] = true;
+    var kept: usize = 0;
+    for (slots.items, keep) |slot, kp| {
+        const group = accs.items[slot.idx..][0..calls.len];
+        if (!kp) {
+            freeOwnedAccumulatorStrings(gpa, group);
+            continue;
+        }
+        @memcpy(kept_accs[kept * calls.len ..][0..calls.len], group);
+        slots.items[kept] = .{ .key = slot.key, .first = slot.first, .idx = kept * calls.len };
+        kept += 1;
+    }
+    slots.shrinkRetainingCapacity(kept);
+    accs.clearRetainingCapacity();
+    accs.appendSliceAssumeCapacity(kept_accs[0 .. kept * calls.len]);
+}
+
+fn countLimitGroups(
+    arena: std.mem.Allocator,
+    table: *const expr_agg.GroupTable,
+    outputs: []const BoundOutputColumn,
+    agg_calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+) error{OutOfMemory}!?[]u32 {
+    const cut = countCut(outputs, agg_calls, order) orelse return null;
+    const a_idx = cut.a_idx;
+    const k = cut.k;
     if (k == 0) return &.{};
     const n = table.groupCount();
     if (n <= k) return null;
@@ -2661,7 +2742,9 @@ test "runMultiAggregate: a COUNT-descending cut merges only groups that can make
         .{ .order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 10 }, .prunes = false },
         .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }} }, .prunes = false },
     };
-    for ([_][]const u8{ "k", "n" }) |key| {
+    // `v` is unique per row: every count ties at 1, the threshold cannot prune, and the cut falls to the merge's
+    // per-partition count heap (or the one-table heap), which must break the ties as the full sort does.
+    for ([_][]const u8{ "k", "n", "v" }) |key| {
         for ([_]usize{ 1, 2, 4, 8 }) |parallelism| {
             for (cuts) |cut| {
                 var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2683,7 +2766,9 @@ test "runMultiAggregate: a COUNT-descending cut merges only groups that can make
 
                 const all_groups = whole.output.group_rows.?.len;
                 const merged = cut_res.output.group_rows.?.len;
-                if (cut.prunes) try testing.expect(merged < all_groups / 10) else try testing.expectEqual(all_groups, merged);
+                // On unique keys only a cut by the COUNT alone shrinks the merge: a second key needs every tie.
+                const prunes = cut.prunes and !(std.mem.eql(u8, key, "v") and cut.order.keys.len > 1);
+                if (prunes) try testing.expect(merged < all_groups / 10) else try testing.expectEqual(all_groups, merged);
                 try whole.output.applyResultOrder(testing.allocator, cut.order);
                 try cut_res.output.applyResultOrder(testing.allocator, cut.order);
                 const want = whole.output.group_rows.?;
@@ -4029,7 +4114,7 @@ fn mergeOverlapAndFree(allocator: std.mem.Allocator) !void {
         freeOwnedAccumulatorStrings(allocator, accs.items);
         accs.deinit(allocator);
     }
-    try hashMergeGroupRefs(allocator, &tables, &refs, null, &calls, &slots, &accs);
+    try hashMergeGroupRefs(allocator, &tables, &refs, null, &calls, null, &slots, &accs);
     std.sort.pdq(MergedSlot, slots.items, {}, struct {
         fn lt(_: void, x: MergedSlot, y: MergedSlot) bool {
             return x.first < y.first;
@@ -4098,7 +4183,7 @@ test "parallel hash merge matches one thread, including a failed spawn" {
     var serial_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer serial_accs.deinit(testing.allocator);
     // Counts are copied by value and the source is left intact, so a second merge sees the same partials.
-    try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 1, &serial_slots, &serial_accs);
+    try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 1, null, &serial_slots, &serial_accs);
     try testing.expectEqual(n + n / 2, serial_slots.items.len);
     const half: u64 = @intCast(n / 2);
     try testing.expectEqual(half + 11 * half + 10 * half, countSum(serial_accs.items, serial_slots.items));
@@ -4117,7 +4202,7 @@ test "parallel hash merge matches one thread, including a failed spawn" {
         defer accs.deinit(testing.allocator);
         spawn_util.injectFailureAfter(fail_after);
         defer spawn_util.resetFailure();
-        try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 8, &slots, &accs);
+        try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 8, null, &slots, &accs);
         spawn_util.resetFailure();
         try testing.expectEqual(serial_slots.items.len, slots.items.len);
         std.sort.pdq(MergedSlot, slots.items, {}, Less.lt);
@@ -4408,5 +4493,56 @@ test "a decode budget slices wide row groups, FIXED_LEN_BYTE_ARRAY DECIMAL inclu
         const rows = res.output.group_rows.?;
         try testing.expectEqual(@as(usize, 3), rows.len);
         try testing.expectEqual(@as(i128, 17235000), rows[0][1].dec.v);
+    }
+}
+
+test "a count cut inside the merge keeps exactly the groups the full sort would, ties by first appearance" {
+    // Four tables over 40,000 keys, 80,000 refs: enough for the cut to split the merge into partitions. Most keys
+    // count 2 (seen by two tables); every 9973rd counts 3, so the top 25 holds the five count-3 keys and a run of the
+    // earliest count-2 keys, decided by first appearance.
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null }};
+    var tables: [4]expr_agg.GroupTable = undefined;
+    for (&tables) |*t| t.* = .init(testing.allocator, 1 << 30);
+    defer for (&tables) |*t| t.deinit();
+    var buf: [32]u8 = undefined;
+    const n_keys: usize = 40_000;
+    for (0..n_keys) |i| {
+        const key = std.fmt.bufPrint(&buf, "k{d}", .{(i * 7919) % n_keys}) catch unreachable;
+        for ([_]usize{ i % 4, (i + 1) % 4 }) |ti| {
+            const id = try tables[ti].getOrInsert(key, &calls, i * 4 + ti);
+            tables[ti].accumulators.items[id].count += if (i % 9973 == 0 and ti == i % 4) 2 else 1;
+        }
+    }
+    var refs: std.ArrayList(MergeGroupRef) = .empty;
+    defer refs.deinit(testing.allocator);
+    for (&tables, 0..) |*t, ti| for (0..t.groupCount()) |g| try refs.append(testing.allocator, .{ .table = @intCast(ti), .group = @intCast(g) });
+    try testing.expect(mergePartitionCount(8, refs.items.len, true) > 1);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Ranked = struct { c: u64, first: u64, key: []const u8 };
+    const rank = struct {
+        fn lt(_: void, a: Ranked, b: Ranked) bool {
+            return a.c > b.c or (a.c == b.c and a.first < b.first);
+        }
+    }.lt;
+    var lists: [2][]Ranked = undefined;
+    for ([_]?CountCut{ null, .{ .a_idx = 0, .k = 25 } }, &lists) |cut, *out| {
+        var slots: std.ArrayList(MergedSlot) = .empty;
+        defer slots.deinit(testing.allocator);
+        var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+        defer accs.deinit(testing.allocator);
+        try mergeFoldedRefs(testing.allocator, arena, &tables, refs.items, &calls, 8, cut, &slots, &accs);
+        if (cut != null) try testing.expectEqual(@as(usize, 25) * mergePartitionCount(8, refs.items.len, true), slots.items.len);
+        const ranked = try arena.alloc(Ranked, slots.items.len);
+        for (slots.items, ranked) |s, *r| r.* = .{ .c = accs.items[s.idx].count, .first = s.first, .key = s.key };
+        std.sort.pdq(Ranked, ranked, {}, rank);
+        out.* = ranked[0..25];
+    }
+    for (lists[0], lists[1]) |want, got| {
+        try testing.expectEqual(want.c, got.c);
+        try testing.expectEqual(want.first, got.first);
+        try testing.expectEqualStrings(want.key, got.key);
     }
 }

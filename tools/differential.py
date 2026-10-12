@@ -689,6 +689,28 @@ def main():
         else:
             print(f"  OK    {label}  ({len(got)} rows)")
 
+    # An integer avg sums exactly, so its groups take the per-worker merge, whose order varies with -j and timing. Values
+    # near 2^60 put every sum far past 2^53, where a double sum would round differently in each order: the answer
+    # must come out byte for byte the same at every -j, and match DuckDB's exact sum.
+    huge = os.path.join(tmp, "avg_huge.parquet")
+    con.execute(f"""COPY (SELECT (i % 7)::INTEGER AS g, ((1::BIGINT << 60) + i * 1000003)::BIGINT AS v,
+        (i % 1000)::INTEGER AS w FROM range(0, 60000) t(i)) TO '{huge}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""")
+    sql = f"SELECT g, avg(v) AS a, avg(w) AS b, count(*) AS n FROM '{huge}' GROUP BY g"
+    outs = set()
+    for j in ("1", "2", "4", "16"):
+        r = subprocess.run([ZPQ, "query", "--query", sql, "-j", j], capture_output=True, text=True)
+        outs.add(json.dumps(zjson(r.stdout).get("agg"), default=str) if r.returncode == 0 else f"error {r.stderr[:80]}")
+    total += 1
+    want = {row[0]: row for row in con.execute(sql.replace("avg(v)", "sum(v)::HUGEINT / count(v)")).fetchall()}
+    got = {row["g"]: row for row in json.loads(next(iter(outs)), parse_float=Decimal)} if len(outs) == 1 else {}
+    # The double of the exact sum, divided as a double: what DuckDB computes from its HUGEINT sum.
+    exact = all(float(got[g]["a"]["sum"]) / got[g]["a"]["count"] == float(want[g][1]) for g in want) if got else False
+    if len(outs) == 1 and exact:
+        print(f"  OK    avg-exact: integer avg identical at -j 1/2/4/16 and equal to the exact sum's quotient")
+    else:
+        fails += 1
+        print(f"  FAIL  avg-exact: {len(outs)} distinct answers across -j; exact={exact}")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

@@ -305,12 +305,12 @@ fn foldHist(
                 .f64 => |d| d.values,
                 .i64 => |d| blk: {
                     // Built per call; dictionaries are small.
-                    var sum: f64 = 0;
+                    var sum: i128 = 0;
                     for (hist, d.values) |h, v| {
                         if (h == 0) continue;
-                        sum += @as(f64, @floatFromInt(h)) * @as(f64, @floatFromInt(v));
+                        sum += @as(i128, h) * v;
                     }
-                    a.sum += sum;
+                    a.isum += sum;
                     a.count += total;
                     break :blk &.{};
                 },
@@ -641,8 +641,6 @@ fn foldGroupedCall(
         .i64 => |vc| {
             const v = vc.values;
             const part = try ra.alloc(i128, space);
-            const fpart = try ra.alloc(f64, space);
-            @memset(fpart, 0);
             switch (call.func) {
                 .sum, .avg => @memset(part, 0),
                 .min => @memset(part, std.math.maxInt(i128)),
@@ -657,11 +655,7 @@ fn foldGroupedCall(
                 const x: i128 = if (unsigned_64) @as(u64, @bitCast(v[r])) else v[r];
                 switch (call.func) {
                     .sum => part[cp] += x,
-                    // The exact sum serves a DECIMAL avg, the double sum any other.
-                    .avg => {
-                        part[cp] += x;
-                        fpart[cp] += @floatFromInt(v[r]);
-                    },
+                    .avg => part[cp] += x,
                     .min => part[cp] = @min(part[cp], x),
                     .max => part[cp] = @max(part[cp], x),
                     .count, .count_distinct => unreachable,
@@ -673,7 +667,7 @@ fn foldGroupedCall(
                 switch (st.*) {
                     .sum_i => |*s| s.* = (s.* orelse 0) + part[cp] + @as(i128, call.offset) * seen[cp],
                     .avg => |*a| {
-                        a.sum += fpart[cp];
+                        a.isum += part[cp];
                         a.count += seen[cp];
                     },
                     .min_i => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],

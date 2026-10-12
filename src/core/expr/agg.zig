@@ -403,6 +403,7 @@ pub const Accumulator = union(enum) {
             },
             .avg => |*a| {
                 a.sum += src.avg.sum;
+                a.isum += src.avg.isum;
                 a.count += src.avg.count;
             },
             .sum_d => |*d| d.add(src.sum_d.get(), src.sum_d.n),
@@ -417,9 +418,13 @@ pub const Accumulator = union(enum) {
     }
 };
 
+/// avg over a non-DECIMAL argument: integer values summed exactly in `isum`, float values in `sum`. An integer avg
+/// therefore never rounds before its one division, whatever order its partials merge in, so it needs no fixed merge
+/// order (`orderSensitive`). Read the sum through `avgSum`.
 pub const AvgState = struct {
     sum: f64,
     count: u64,
+    isum: i128 = 0,
 };
 
 pub const ResolveError = error{ BadAggArg, UnsupportedAggType };
@@ -1607,7 +1612,7 @@ fn foldAvg(
             // float (cost data is f64). Keep scalar; if profiling
             // shows otherwise, widen with a one-shot per-RG cast.
             for (c.values, 0..) |v, i| if (sel.isActive(i)) {
-                a.sum += @floatFromInt(v);
+                a.isum += v;
                 a.count += 1;
             };
         },
@@ -1781,7 +1786,7 @@ fn emitAvgPair(arena: std.mem.Allocator, name: []const u8, st: AvgState) Error![
 
 /// The avg pair's sum, NULL when no value was averaged.
 pub fn avgSum(st: AvgState) ?f64 {
-    return if (st.count == 0) null else st.sum;
+    return if (st.count == 0) null else st.sum + @as(f64, @floatFromInt(st.isum));
 }
 
 // ============================================================
@@ -3685,14 +3690,13 @@ fn foldMinMaxBytesGroupedOne(
 
 fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize) !void {
     if (state.* == .avg_d) return state.avg_d.add(exactAt(col, r), 1);
-    const v = switch (col) {
-        .i32 => |c| @as(f64, @floatFromInt(c.values[r])),
-        .i64 => |c| @as(f64, @floatFromInt(c.values[r])),
-        .f32 => |c| @as(f64, c.values[r]),
-        .f64 => |c| c.values[r],
+    switch (col) {
+        .i32 => |c| state.avg.isum += c.values[r],
+        .i64 => |c| state.avg.isum += c.values[r],
+        .f32 => |c| state.avg.sum += c.values[r],
+        .f64 => |c| state.avg.sum += c.values[r],
         else => return error.UnsupportedAggType,
-    };
-    state.avg.sum += v;
+    }
     state.avg.count += 1;
 }
 

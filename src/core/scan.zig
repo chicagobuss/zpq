@@ -1237,7 +1237,16 @@ pub fn runMultiAggregate(
     //    region as one wall-clock span (real elapsed decode), separate
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
-    const sketch_count: ?usize = if (args.sketch_topk) |cfg| sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks) else null;
+    // The sketch's count arrays (one per worker) are not drawn from the GROUP BY budget, so it runs only where they are
+    // a small part of it.
+    const sketch_fits = if (args.sketch_topk) |cfg|
+        (n_workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
+    else
+        false;
+    const sketch_count: ?usize = if (args.sketch_topk) |cfg| if (sketch_fits)
+        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks)
+    else
+        null else null;
     if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
         o.* = .ineligible;
     };

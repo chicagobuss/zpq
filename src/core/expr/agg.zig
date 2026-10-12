@@ -166,6 +166,7 @@ pub const DistinctSet = struct {
     max_memory_bytes: usize = 0,
     shared: ?*SharedBudget = null,
     parts: ?[]DistinctSet = null,
+    string_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn initPartitions(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget) !void {
         const p = try allocator.alloc(DistinctSet, NUM_PARTS);
@@ -192,18 +193,27 @@ pub const DistinctSet = struct {
         if (self.shared) |budget| {
             budget.release(self.max_memory_bytes);
         }
+        if (self.string_arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+            self.string_arena = null;
+        } else {
+            switch (self.val_set) {
+                .inline_bytes => |s| {
+                    for (s.vals[0..s.len]) |k| allocator.free(k);
+                },
+                .bytes => |*s| {
+                    var it = s.keyIterator();
+                    while (it.next()) |k| allocator.free(k.*);
+                },
+                else => {},
+            }
+        }
         switch (self.val_set) {
-            .none, .inline_u64, .inline_i128 => {},
-            .inline_bytes => |s| {
-                for (s.vals[0..s.len]) |k| allocator.free(k);
-            },
+            .none, .inline_u64, .inline_i128, .inline_bytes => {},
             .u64 => |*s| s.deinit(allocator),
             .i128 => |*s| s.deinit(allocator),
-            .bytes => |*s| {
-                var it = s.keyIterator();
-                while (it.next()) |k| allocator.free(k.*);
-                s.deinit(allocator);
-            },
+            .bytes => |*s| s.deinit(allocator),
         }
         self.* = .{};
     }
@@ -355,6 +365,15 @@ pub const DistinctSet = struct {
         return self.insertU64(allocator, @bitCast(f));
     }
 
+    fn getOrCreateArena(self: *DistinctSet, allocator: std.mem.Allocator) !std.mem.Allocator {
+        if (self.string_arena == null) {
+            const arena = try allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(allocator);
+            self.string_arena = arena;
+        }
+        return self.string_arena.?.allocator();
+    }
+
     pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, v);
@@ -365,7 +384,8 @@ pub const DistinctSet = struct {
             .none => {
                 const entry_size = 32 + v.len;
                 try self.drawMore(entry_size);
-                const owned = try allocator.dupe(u8, v);
+                const str_alloc = try self.getOrCreateArena(allocator);
+                const owned = try str_alloc.dupe(u8, v);
                 var s: InlineBytes = .{ .len = 1, .vals = undefined };
                 s.vals[0] = owned;
                 self.val_set = .{ .inline_bytes = s };
@@ -377,7 +397,8 @@ pub const DistinctSet = struct {
                 }
                 const entry_size = 32 + v.len;
                 try self.drawMore(entry_size);
-                const owned = try allocator.dupe(u8, v);
+                const str_alloc = try self.getOrCreateArena(allocator);
+                const owned = try str_alloc.dupe(u8, v);
                 if (s.len < INLINE_CAP) {
                     s.vals[s.len] = owned;
                     s.len += 1;
@@ -385,10 +406,7 @@ pub const DistinctSet = struct {
                     return;
                 }
                 var map: std.StringHashMapUnmanaged(void) = .empty;
-                map.ensureTotalCapacity(allocator, INLINE_CAP + 1) catch |err| {
-                    allocator.free(owned);
-                    return err;
-                };
+                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
                 map.putAssumeCapacity(owned, {});
                 self.allocated_bytes += entry_size;
@@ -402,7 +420,11 @@ pub const DistinctSet = struct {
                     _ = s.remove(v);
                     return err;
                 };
-                const owned = allocator.dupe(u8, v) catch |err| {
+                const str_alloc = self.getOrCreateArena(allocator) catch |err| {
+                    _ = s.remove(v);
+                    return err;
+                };
+                const owned = str_alloc.dupe(u8, v) catch |err| {
                     _ = s.remove(v);
                     return err;
                 };

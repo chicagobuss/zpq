@@ -293,7 +293,7 @@ pub const DistinctSet = struct {
                 };
                 self.allocated_bytes += entry_size;
             },
-            else => return,
+            else => return error.UnsupportedAggType, // one column feeds one value type: anything else is a bug, never a dropped value
         }
     }
 
@@ -341,7 +341,7 @@ pub const DistinctSet = struct {
                 };
                 self.allocated_bytes += entry_size;
             },
-            else => return,
+            else => return error.UnsupportedAggType, // one column feeds one value type: anything else is a bug, never a dropped value
         }
     }
 
@@ -409,7 +409,7 @@ pub const DistinctSet = struct {
                 gop.key_ptr.* = owned;
                 self.allocated_bytes += entry_size;
             },
-            else => return,
+            else => return error.UnsupportedAggType, // one column feeds one value type: anything else is a bug, never a dropped value
         }
     }
 

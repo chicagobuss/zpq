@@ -205,20 +205,26 @@ pub const DistinctSet = struct {
     pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
         if (self.val_set == .none) self.val_set = .{ .u64 = .empty };
         var s = &self.val_set.u64;
-        if (s.contains(v)) return;
+        const gop = try s.getOrPut(allocator, v);
+        if (gop.found_existing) return;
         const entry_size = 24;
-        try self.drawMore(entry_size);
-        try s.put(allocator, v, {});
+        self.drawMore(entry_size) catch |err| {
+            _ = s.remove(v);
+            return err;
+        };
         self.allocated_bytes += entry_size;
     }
 
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
         if (self.val_set == .none) self.val_set = .{ .i128 = .empty };
         var s = &self.val_set.i128;
-        if (s.contains(v)) return;
+        const gop = try s.getOrPut(allocator, v);
+        if (gop.found_existing) return;
         const entry_size = 32;
-        try self.drawMore(entry_size);
-        try s.put(allocator, v, {});
+        self.drawMore(entry_size) catch |err| {
+            _ = s.remove(v);
+            return err;
+        };
         self.allocated_bytes += entry_size;
     }
 
@@ -235,12 +241,18 @@ pub const DistinctSet = struct {
     pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
         if (self.val_set == .none) self.val_set = .{ .bytes = .empty };
         var s = &self.val_set.bytes;
-        if (s.contains(v)) return;
+        const gop = try s.getOrPut(allocator, v);
+        if (gop.found_existing) return;
         const entry_size = 32 + v.len;
-        try self.drawMore(entry_size);
-        const owned = try allocator.dupe(u8, v);
-        errdefer allocator.free(owned);
-        try s.put(allocator, owned, {});
+        self.drawMore(entry_size) catch |err| {
+            _ = s.remove(v);
+            return err;
+        };
+        const owned = allocator.dupe(u8, v) catch |err| {
+            _ = s.remove(v);
+            return err;
+        };
+        gop.key_ptr.* = owned;
         self.allocated_bytes += entry_size;
     }
 

@@ -362,6 +362,57 @@ const MAX_HIST: usize = 1 << 20;
 
 /// Grouped scan with every GROUP BY key a bare coded column. Fills `group_id_arr` for selected rows and folds every
 /// call. Returns false, having done nothing, when the keys don't qualify.
+/// Distinct values past which a plain string key is left as it is.
+const max_coded_plain = 256;
+/// Distinct values up to which a row's value is matched by comparing it with each, before any hashing.
+const few_plain = 16;
+
+/// Give each plain (not dictionary-coded) string GROUP BY key of the batch a dictionary built here, when the batch
+/// holds at most `max_coded_plain` distinct values of it, so `groupedCoded` groups it by code: each distinct key
+/// combination is then resolved once per batch instead of serialized and looked up for every row. Values stay as they
+/// are for everything else that reads the column.
+pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: []Column, lookup: []const ?usize) !void {
+    for (keys) |k| {
+        if (k != .col_ref) continue;
+        const pos = lookup[k.col_ref.col_idx] orelse continue;
+        const col = &cols[pos];
+        if (col.* != .string) continue;
+        const sc = &col.string;
+        if (sc.codes != null or sc.max_rep > 0 or sc.values.len == 0) continue;
+        var seen: std.StringHashMapUnmanaged(u32) = .empty;
+        try seen.ensureTotalCapacity(ra, max_coded_plain);
+        var dict: std.ArrayList([]const u8) = .empty;
+        const codes = try ra.alloc(u32, sc.values.len);
+        const coded = for (sc.values, codes, 0..) |v, *c, r| {
+            // A null row's slot holds no value; code 0 there, as decoded columns do (the levels mark it).
+            if (sc.def_levels) |dl| if (dl[r] < sc.max_def) {
+                c.* = 0;
+                continue;
+            };
+            // A few distinct values are found faster by comparing them all than by hashing the row's.
+            if (dict.items.len <= few_plain) {
+                if (for (dict.items, 0..) |d, i| {
+                    if (std.mem.eql(u8, d, v)) break i;
+                } else null) |i| {
+                    c.* = @intCast(i);
+                    continue;
+                }
+            }
+            const gop = seen.getOrPutAssumeCapacity(v);
+            if (!gop.found_existing) {
+                if (dict.items.len == max_coded_plain) break false;
+                gop.value_ptr.* = @intCast(dict.items.len);
+                try dict.append(ra, v);
+                if (seen.count() == seen.capacity()) break false;
+            }
+            c.* = gop.value_ptr.*;
+        } else true;
+        if (!coded or dict.items.len == 0) continue;
+        sc.codes = codes;
+        sc.dict = dict.items;
+    }
+}
+
 pub fn groupedCoded(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1030,4 +1081,29 @@ test "regression: grouped float min/max over coded keys and coded values order N
     try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
     try testing.expectEqual(@as(f64, 1.0), table.accumulators.items[0].min_f.?);
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
+}
+
+test "codePlainKeys: codes map back to the values, nulls aside, and a key with too many values stays plain" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vals = [_][]const u8{ "R", "", "A", "R", "N", "A", "long value past a few bytes", "A" };
+    const defs = [_]u32{ 1, 0, 1, 1, 1, 1, 1, 1 }; // row 1 is null
+    var cols = [_]Column{.{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    const lookup = [_]?usize{0};
+    try codePlainKeys(a, &keys, &cols, &lookup);
+    const sc = cols[0].string;
+    for (vals, defs, sc.codes.?) |v, d, c| {
+        if (d == 0) continue;
+        try std.testing.expectEqualStrings(v, sc.dict[c]);
+    }
+    try std.testing.expectEqual(@as(usize, 4), sc.dict.len);
+
+    // max_coded_plain + 1 distinct values: left plain.
+    const many = try a.alloc([]const u8, max_coded_plain + 1);
+    for (many, 0..) |*m, i| m.* = try std.fmt.allocPrint(a, "v{d}", .{i});
+    var wide = [_]Column{.{ .string = .{ .values = many } }};
+    try codePlainKeys(a, &keys, &wide, &lookup);
+    try std.testing.expect(wide[0].string.codes == null);
 }

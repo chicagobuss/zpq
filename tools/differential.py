@@ -711,6 +711,41 @@ def main():
         fails += 1
         print(f"  FAIL  avg-exact: {len(outs)} distinct answers across -j; exact={exact}")
 
+    # Plain-encoded (no dictionary) low-cardinality string keys: zpq codes them per batch to group by code. NULL keys,
+    # a filter, two keys, and a key with too many values to code must all group as DuckDB does.
+    import pyarrow as pa
+    plain = os.path.join(tmp, "plain_keys.parquet")
+    n = 9000
+    pq.write_table(pa.table({
+        "f": pa.array([None if i % 13 == 0 else "ARN"[i % 3] for i in range(n)], pa.string()),
+        "s": pa.array(["OF"[(i // 7) % 2] for i in range(n)], pa.string()),
+        "u": pa.array([f"user{i % 1500}" for i in range(n)], pa.string()),
+        "x": pa.array([float(i % 101) for i in range(n)], pa.float64()),
+    }), plain, use_dictionary=False, row_group_size=3000)
+    for i, q in enumerate([
+        "SELECT f, s, count(*) AS n, sum(x) AS t, avg(x) AS a FROM '{p}' GROUP BY f, s",
+        "SELECT f, count(*) AS n FROM '{p}' WHERE x > 50 GROUP BY f",
+        "SELECT u, count(*) AS n FROM '{p}' GROUP BY u",
+    ]):
+        total += 1
+        sql = q.format(p=plain)
+        r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+            rel = con.execute(sql)
+            lanes = json_lanes(rel)
+            want = canon_rows(rel.fetchall(), lanes)
+            got = canon_rows([from_zpq([fold_avg(v) for v in row.values()], lanes) for row in zjson(r.stdout)["agg"]], lanes)
+            problem = None if got == want else f"zpq={got[:3]} duck={want[:3]}"
+        except Exception as e:
+            problem = f"error: {e}"
+        if problem:
+            fails += 1
+            print(f"  FAIL  plain-keys:{i}  {problem}")
+        else:
+            print(f"  OK    plain-keys:{i}  ({len(got)} groups)")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

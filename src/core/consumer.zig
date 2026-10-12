@@ -2116,6 +2116,8 @@ pub fn scanRGForAgg(
         t.record(.decode, t_decode_start, t_decode_end, decode_args);
     }
 
+    if (target == .grouped and !staged and decode_options.encoded)
+        try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();

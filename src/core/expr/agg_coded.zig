@@ -361,8 +361,6 @@ const MAX_COMPOSITE: usize = 1 << 16;
 /// Per-call (composite × code) histograms above this fall back to the per-row typed fold.
 const MAX_HIST: usize = 1 << 20;
 
-/// Grouped scan with every GROUP BY key a bare coded column. Fills `group_id_arr` for selected rows and folds every
-/// call. Returns false, having done nothing, when the keys don't qualify.
 /// Distinct values past which a plain string key is left as it is.
 const max_coded_plain = 256;
 /// Distinct values up to which a row's value is matched by comparing it with each, before any hashing.
@@ -409,7 +407,6 @@ pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: [
                 if (dict.items.len == max_coded_plain) break false;
                 gop.value_ptr.* = @intCast(dict.items.len);
                 try dict.append(ra, v);
-                if (seen.count() == seen.capacity()) break false;
             }
             c.* = gop.value_ptr.*;
         } else true;
@@ -449,6 +446,8 @@ fn codeIntRange(comptime T: type, ra: std.mem.Allocator, ic: *filter_eval.Column
     ic.dict = dict;
 }
 
+/// Grouped scan with every GROUP BY key a bare coded column. Fills `group_id_arr` for selected rows and folds every
+/// call. Returns false, having done nothing, when the keys don't qualify.
 pub fn groupedCoded(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,

@@ -1186,13 +1186,14 @@ pub fn runMultiAggregate(
         gt.fixed_stride = fixed_stride;
     }
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
-    // is serial time the answer would wait for.
-    defer if (!args.leave_regions) for (group_tables) |*gt| gt.deinit();
+    // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
+    const leave_tables = args.leave_regions and !std.debug.runtime_safety;
+    defer if (!leave_tables) for (group_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
     merged_table.shared = &group_budget;
     merged_table.fixed_stride = fixed_stride;
-    defer if (!args.leave_regions) merged_table.deinit();
+    defer if (!leave_tables) merged_table.deinit();
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -1459,7 +1460,7 @@ pub fn runMultiAggregate(
         // Result rows own any strings they need; table keys and accumulator
         // winners can now be released before returning (the deferred deinit
         // then finds them empty).
-        if (!args.leave_regions) {
+        if (!leave_tables) {
             for (out_tables) |*gt| {
                 gt.deinit();
                 gt.* = expr_agg.GroupTable.init(gpa, 0);

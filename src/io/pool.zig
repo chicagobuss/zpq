@@ -128,7 +128,8 @@ pub fn Pool(comptime N: usize) type {
         used: std.DoublyLinkedList = .{},
         free: std.DoublyLinkedList = .{},
         free_len: usize = 0,
-        free_size: usize = 32,
+        /// Idle connections kept: as many as may be in flight, so the next wave reuses them all.
+        free_size: usize = N,
         idle_timeout_ns: i64 = IDLE_TIMEOUT_NS,
         /// Index into `Criteria.addrs` the next new connection starts at; guarded by `mutex`.
         next_addr: usize = 0,
@@ -157,7 +158,7 @@ pub fn Pool(comptime N: usize) type {
                 .used = .{},
                 .free = .{},
                 .free_len = 0,
-                .free_size = 32,
+                .free_size = N,
                 .idle_timeout_ns = IDLE_TIMEOUT_NS,
                 .next_addr = 0,
                 .stats = .{},

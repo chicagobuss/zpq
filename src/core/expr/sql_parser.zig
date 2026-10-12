@@ -533,6 +533,16 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
         if (sameColumnRef(expr, rc_expr) orelse std.mem.eql(u8, text, select_cols[idx].expr)) return idx;
         idx += 1;
     }
+    // Spelled with other letter case (`count(*)` for `COUNT(*)`): the one item that matches so, if only one does.
+    var found: ?usize = null;
+    for (select_cols, 0..) |col, i| if (std.ascii.eqlIgnoreCase(text, col.expr)) {
+        if (found != null) {
+            found = null;
+            break;
+        }
+        found = i;
+    };
+    if (found) |i| return i;
     std.debug.print("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
     return error.OrderByNotSupported;
 }
@@ -668,6 +678,8 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c DESC LIMIT 10", .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
         .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY 2 DESC, 1", .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } } },
         .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY count(*) DESC", .keys = &.{.{ .column = 1, .descending = true }} },
+        // Other letter case still names the one item it can.
+        .{ .sql = "SELECT y, COUNT(*) FROM 't' GROUP BY y ORDER BY count(*) DESC", .keys = &.{.{ .column = 1, .descending = true }} },
         .{ .sql = "SELECT Y, sum(x) AS y FROM 't' GROUP BY Y ORDER BY y", .keys = &.{.{ .column = 1, .descending = false }} },
         // A column reference matches as GROUP BY matches it: case and quoting aside.
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY \"Y\" ASC NULLS LAST", .keys = &.{.{ .column = 0, .descending = false }} },

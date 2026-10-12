@@ -486,10 +486,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     // the mapping serves both passes (the first warms the page cache for the second), where the explicit reader reads
     // each row group once and so rules the sketch out. Cold, that is ~4× faster on a skewed key; when the sketch then
     // declines, the mapping costs a few percent.
-    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null) {
-        const order = args.result_order;
-        if (order.limit != null and order.keys.len > 0 and order.keys[0].descending) io_policy.profile = .mmap;
-    }
+    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null and countCutShaped(args))
+        io_policy.profile = .mmap;
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
     const all_local = on_linux and allLocal(opened);
@@ -1409,6 +1407,17 @@ fn outputColumnNames(
         .computed => |c| c.alias,
     };
     return names;
+}
+
+/// Whether the query's answer is cut by a LIMIT ordered first by a plain COUNT, descending: the order the sketched
+/// count cut serves (`scan.sketchEligible` decides the rest once the outputs are bound).
+fn countCutShaped(args: QueryArgs) bool {
+    const order = args.result_order;
+    if (order.limit == null or order.keys.len == 0 or !order.keys[0].descending) return false;
+    const cols = args.select_cols orelse return false;
+    if (order.keys[0].column >= cols.len) return false;
+    const expr = cols[order.keys[0].column].expr;
+    return std.ascii.startsWithIgnoreCase(expr, "count(") and std.ascii.findIgnoreCase(expr, "distinct") == null;
 }
 
 /// The sketched count cut (`scan.SketchTopK`) runs wherever it is eligible; `ZPQ_SKETCH_TOPK=0` turns it off,

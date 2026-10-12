@@ -71,7 +71,7 @@ pub fn inFlight(env: ?std.process.Environ) usize {
 }
 /// Data-range requests in flight until this query's first data-range response header, unless `ZPQ_S3_FIRST_WAVE`
 /// says otherwise. Footer, metadata and Bloom requests are not part of that wave and do not raise the cap. After
-/// the header, the cap is `S3_IN_FLIGHT`. Setting the first cap to `S3_IN_FLIGHT` is no slow start.
+/// the header, the cap is `inFlight`. Setting the first cap to that is no slow start.
 pub const S3_FIRST_WAVE: usize = 8;
 
 /// The first-wave cap for this process: `ZPQ_S3_FIRST_WAVE` when it is a positive integer, otherwise
@@ -823,7 +823,7 @@ pub const Landed = struct {
 };
 
 /// The query's first data wave. At most `firstWaveCap` data-range requests are in flight until the first
-/// data-range response header of this query arrives, then at most `S3_IN_FLIGHT`. The default cap is
+/// data-range response header of this query arrives, then at most `DataWave.full` (`inFlight`). The default cap is
 /// `S3_FIRST_WAVE`; `ZPQ_S3_FIRST_WAVE=16` starts at the full cap. Footer, metadata and Bloom requests do not use
 /// a `DataWave`, so they neither take a slot nor open the gate. One query shares one value across its data fetches;
 /// a later batch in that query already sees the raised cap.

@@ -2433,7 +2433,10 @@ test "runMultiAggregate: skewed work does not let idle workers strand the budget
 }
 
 test "runMultiAggregate: --max-memory means the same thing at every -j" {
-    // 800 bytes fits exactly one group — enough at -j1, and the shared budget must make it enough at every -j.
+    // One integer group in the fixed table: 16 slots, the 9-byte key, and the accumulator and first arrays at
+    // their first growth step. That footprint has to be enough at -j1 and, because the tables share one budget,
+    // at every larger -j too.
+    const one_group = 1361;
     const files = [_][]const u8{
         "ci/fixtures/parquet/spawn_budget_a.parquet",
         "ci/fixtures/parquet/spawn_budget_b.parquet",
@@ -2464,12 +2467,12 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
             .aggregate = SPAWN_FIXTURE_AGG,
             .group_by = "group_key",
             .parallelism = parallelism,
-            .max_memory = 800,
+            .max_memory = one_group,
             .unordered = true,
         }) catch |err| {
             std.debug.print(
-                "-j{d}: a GROUP BY that fits 800 bytes at -j1 was rejected: {s}\n",
-                .{ parallelism, @errorName(err) },
+                "-j{d}: a GROUP BY that fits {d} bytes at -j1 was rejected: {s}\n",
+                .{ parallelism, one_group, @errorName(err) },
             );
             return err;
         };
@@ -2480,7 +2483,7 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
     // -j. Integer results merge in any order, so they need no more than unordered (the min/max query below).
     for ([_]usize{ 1, 2, 4 }) |parallelism| {
         for ([_]struct { agg: []const u8, budget: usize }{
-            .{ .agg = SPAWN_FIXTURE_AGG, .budget = 1600 },
+            .{ .agg = SPAWN_FIXTURE_AGG, .budget = one_group * 2 },
             .{ .agg = "count(*) AS n, min(group_key) AS lo, max(group_key) AS hi", .budget = 800 },
         }) |c| {
             var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2712,7 +2715,9 @@ test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns 
     };
     const group_by = "group_key";
     const aggregate = SPAWN_FIXTURE_AGG;
-    const budget = 2 * 1024 * 1024;
+    // A finished block stays live while it folds into the merge. Two thousand groups, with that overlap, sit a
+    // little over 2 MiB once keys are a slot array instead of a per-entry charge.
+    const budget = 2300 * 1024;
     const parallelism = 2;
 
     var bytes: [files.len][]u8 = undefined;

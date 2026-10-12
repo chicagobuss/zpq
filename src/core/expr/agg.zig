@@ -3791,12 +3791,31 @@ pub const GroupTable = struct {
         try self.accumulators.ensureTotalCapacity(self.allocator, acc_need);
         try self.first.ensureTotalCapacity(self.allocator, first_need);
 
+        // The group's state first, its count(DISTINCT) sets charged to the shared budget as the byte table's are: a
+        // failure here leaves the table as it was.
+        const acc_start = self.accumulators.items.len;
+        errdefer {
+            for (self.accumulators.items[acc_start..]) |acc| if (acc == .distinct) if (acc.distinct) |d| {
+                d.deinit(self.allocator);
+                self.allocator.destroy(d);
+            };
+            self.accumulators.shrinkRetainingCapacity(acc_start);
+        }
+        for (agg_calls) |call| {
+            var acc = Accumulator.init(call);
+            if (call.func == .count_distinct) {
+                const ds = try self.allocator.create(DistinctSet);
+                ds.* = .{ .shared = self.shared };
+                acc = .{ .distinct = ds };
+            }
+            self.accumulators.appendAssumeCapacity(acc);
+        }
+
         const id: u32 = self.fixed_len;
         @memcpy(self.fixed_keys[@as(usize, id) * stride ..][0..stride], key);
         var i = hash & (self.fixed_slots.len - 1);
         while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
         self.fixed_slots[i] = .{ .hash = hash, .id = id };
-        for (agg_calls) |call| self.accumulators.appendAssumeCapacity(Accumulator.init(call));
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
         self.allocated_bytes = self.fixedHeld();
@@ -4476,4 +4495,36 @@ test "a sketched table counts every row in the count pass and groups only admitt
         for (ids, 0..) |id, r| try std.testing.expectEqual(id < table.groupCount(), sel2.isActive(r));
         for (cells) |c| try std.testing.expectEqual(@as(u32, 0), c);
     }
+}
+
+test "fixed-width groups charge their count(DISTINCT) sets to the shared budget, and a failed insert leaves nothing" {
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 },
+        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "u", .result = .i64 },
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.fixed_stride = 9;
+    table.shared = &budget;
+    defer table.deinit();
+    var image: [32]u8 = @splat(0);
+    image[0] = 1;
+    const g = try table.getOrInsertFixed(image[0..9], &calls, 0);
+    try std.testing.expect(table.accumulators.items[g * calls.len + 1].distinct.?.shared == &budget);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var b: SharedBudget = .{ .limit = 1 << 20 };
+            var t = GroupTable.init(gpa, 0);
+            t.fixed_stride = 9;
+            t.shared = &b;
+            defer t.deinit();
+            var img: [32]u8 = @splat(0);
+            for (0..3) |i| {
+                img[0] = 1;
+                img[1] = @intCast(i);
+                _ = try t.getOrInsertFixed(img[0..9], &calls, i);
+            }
+        }
+    }.run, .{});
 }

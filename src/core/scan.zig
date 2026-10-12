@@ -1787,28 +1787,89 @@ fn mergeFoldedRefs(
     const nparts = mergePartitionCount(n_workers, refs.len, cut != null);
     if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, slots, accs);
 
-    const hashes = try arena.alloc(u64, refs.len);
-    const counts = try arena.alloc(usize, nparts);
-    @memset(counts, 0);
     // `64 - u6` does not fit in a u6 when the width is zero, so the difference stays a usize.
     const bits: usize = std.math.log2_int(usize, nparts);
     const shift: u6 = @intCast(@as(usize, 64) - bits);
-    for (refs, hashes) |ref, *h| {
-        h.* = std.hash.Wyhash.hash(0, tables[ref.table].keyAt(ref.group));
-        counts[h.* >> shift] += 1;
-    }
-    const starts = try arena.alloc(usize, nparts + 1);
-    starts[0] = 0;
-    for (counts, 0..) |c, i| starts[i + 1] = starts[i] + c;
+    const hashes = try arena.alloc(u64, refs.len);
     const ordered = try arena.alloc(MergeGroupRef, refs.len);
     const ordered_hash = try arena.alloc(u64, refs.len);
-    const fill = try arena.alloc(usize, nparts);
-    @memcpy(fill, starts[0..nparts]);
-    for (refs, hashes) |ref, h| {
-        const at = fill[h >> shift];
-        ordered[at] = ref;
-        ordered_hash[at] = h;
-        fill[h >> shift] = at + 1;
+    const starts = try arena.alloc(usize, nparts + 1);
+    // Hashed and split into partitions by chunks of refs on every worker: each chunk counts its own partitions, the
+    // counts give each chunk where it writes in each, and each chunk scatters its own refs. A partition holds its refs
+    // in input order, as one thread splitting them all would leave them.
+    const n_chunks = @max(1, @min(n_workers, refs.len / 65536));
+    const chunk_counts = try arena.alloc(usize, n_chunks * nparts);
+    @memset(chunk_counts, 0);
+    const Split = struct {
+        tables: []const expr_agg.GroupTable,
+        refs: []const MergeGroupRef,
+        hashes: []u64,
+        ordered: []MergeGroupRef,
+        ordered_hash: []u64,
+        counts: []usize,
+        nparts: usize,
+        shift: u6,
+        n_chunks: usize,
+        cursor: *std.atomic.Value(usize),
+        phase: enum { count, scatter },
+
+        /// Claim chunks until none remain: one a failed spawn left unclaimed is taken by a thread that did start.
+        fn run(t: *@This()) void {
+            while (true) {
+                const c = t.cursor.fetchAdd(1, .monotonic);
+                if (c >= t.n_chunks) return;
+                const lo = t.refs.len * c / t.n_chunks;
+                const hi = t.refs.len * (c + 1) / t.n_chunks;
+                const mine = t.counts[c * t.nparts ..][0..t.nparts];
+                switch (t.phase) {
+                    .count => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, *h| {
+                        h.* = std.hash.Wyhash.hash(0, t.tables[ref.table].keyAt(ref.group));
+                        mine[h.* >> t.shift] += 1;
+                    },
+                    // `mine` now holds where this chunk writes next in each partition.
+                    .scatter => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, h| {
+                        const at = mine[h >> t.shift];
+                        t.ordered[at] = ref;
+                        t.ordered_hash[at] = h;
+                        mine[h >> t.shift] = at + 1;
+                    },
+                }
+            }
+        }
+    };
+    var split_cursor = std.atomic.Value(usize).init(0);
+    const splits = try arena.alloc(Split, n_chunks);
+    const split_config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    for ([_]@TypeOf(splits[0].phase){ .count, .scatter }) |phase| {
+        if (phase == .scatter) {
+            // Partition p starts after every chunk's refs of the partitions before it; within p, chunk c after
+            // chunks < c.
+            var at: usize = 0;
+            for (0..nparts) |p| {
+                starts[p] = at;
+                for (0..n_chunks) |c| {
+                    const n = chunk_counts[c * nparts + p];
+                    chunk_counts[c * nparts + p] = at;
+                    at += n;
+                }
+            }
+            starts[nparts] = at;
+        }
+        split_cursor.store(0, .monotonic);
+        for (splits) |*t| t.* = .{
+            .tables = tables,
+            .refs = refs,
+            .hashes = hashes,
+            .ordered = ordered,
+            .ordered_hash = ordered_hash,
+            .counts = chunk_counts,
+            .nparts = nparts,
+            .shift = shift,
+            .n_chunks = n_chunks,
+            .cursor = &split_cursor,
+            .phase = phase,
+        };
+        if (splits.len == 1 or !spawn_util.runTree(Split, splits, split_config, Split.run)) splits[0].run();
     }
 
     const parts = try arena.alloc(MergePart, nparts);

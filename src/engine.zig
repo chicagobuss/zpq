@@ -109,7 +109,7 @@ test "S3 fetch window caps only the Lambda default and preserves explicit overri
 }
 
 /// S3 pool permits. Data fetches may use all of them; footer fetches stay at `READ_CONCURRENCY`.
-pub const POOL_SIZE: usize = s3.S3_IN_FLIGHT;
+pub const POOL_SIZE: usize = s3.S3_IN_FLIGHT_MAX;
 
 /// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
 /// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes, but never
@@ -195,7 +195,7 @@ pub const OutputLane = pool_mod.Lane(s3.Pool(POOL_SIZE), OUTPUT_POOL_SIZE);
 const READ_WORKER_STACK_SIZE: usize = 4 << 20;
 
 /// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
-/// its slot, so live concurrency can dip below this while a host throttles. Data fetches pass `s3.S3_IN_FLIGHT`;
+/// its slot, so live concurrency can dip below this while a host throttles. Data fetches pass `s3.inFlight`;
 /// `s3.DataWave` holds the first of those at `s3.firstWaveCap` (`ZPQ_S3_FIRST_WAVE`, default `S3_FIRST_WAVE`) until
 /// a data-range response header arrives.
 pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
@@ -207,7 +207,7 @@ pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
 /// still count as busy when the column stage starts. `deinit` joins every worker before the caller returns.
 fn readExecutor(gpa: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(gpa, .{
-        .concurrent_limit = .limited(s3.S3_IN_FLIGHT),
+        .concurrent_limit = .limited(s3.S3_IN_FLIGHT_MAX),
         .stack_size = READ_WORKER_STACK_SIZE,
     });
 }
@@ -2550,7 +2550,7 @@ fn openInputs(
         const upfront = try coalescer.coalesceDispatch(
             arena,
             all_pieces.items,
-            s3.S3_IN_FLIGHT,
+            s3.inFlight(ctx.env),
             ampCap(selected_all, fetch_window.limit),
             null,
         );
@@ -2635,7 +2635,7 @@ fn openInputs(
                 window_plan = try coalescer.coalesceDispatch(
                     arena,
                     pieces.items,
-                    s3.S3_IN_FLIGHT,
+                    s3.inFlight(ctx.env),
                     sv.selected *| 2,
                     fetch_window.limit,
                 );
@@ -2773,10 +2773,10 @@ fn openInputs(
                 },
                 .pool = pool,
                 .creds = creds,
-                .workers = s3.S3_IN_FLIGHT,
+                .workers = s3.inFlight(ctx.env),
                 .profiler = args.profiler,
                 .executor = readExecutor,
-                .wave = .{ .cap = .init(s3.firstWaveCap(ctx.env)) },
+                .wave = .{ .cap = .init(s3.firstWaveCap(ctx.env)), .full = s3.inFlight(ctx.env) },
             };
             s3_fetcher = f;
         }
@@ -2796,7 +2796,7 @@ fn openInputs(
         if (fetch_jobs.items.len > 0) {
             const fetch_span = profile.Span.begin(prof);
             // This call is the query's data wave. Footer and Bloom fetches do not share it.
-            var data_wave: s3.DataWave = .{ .cap = .init(s3.firstWaveCap(ctx.env)) };
+            var data_wave: s3.DataWave = .{ .cap = .init(s3.firstWaveCap(ctx.env)), .full = s3.inFlight(ctx.env) };
             const fetched = try s3.fetchJobs(
                 read_ctx.io,
                 pool,
@@ -2804,7 +2804,7 @@ fn openInputs(
                 arena,
                 creds,
                 fetch_jobs.items,
-                s3.S3_IN_FLIGHT,
+                s3.inFlight(ctx.env),
                 args.profiler,
                 &data_wave,
             );
@@ -3189,6 +3189,8 @@ const S3Membership = struct {
     bytes_per_s: ?f64 = null,
     /// The query's fetch window. Bloom gaps are charged against it.
     window: u64 = 0,
+    /// Requests kept in flight (`s3.inFlight`).
+    in_flight: usize = s3.S3_IN_FLIGHT,
 
     /// Until measured: a GET's first byte after ~25 ms at ~80 MB/s a connection, as on Lambda against S3 in-region.
     const default_rtt_ns: u64 = 25 * std.time.ns_per_ms;
@@ -3201,7 +3203,14 @@ const S3Membership = struct {
         specs: []const FetchSpec,
         window: u64,
     ) S3Membership {
-        var self: S3Membership = .{ .ctx = ctx, .creds = creds, .pool = pool, .specs = specs, .window = window };
+        var self: S3Membership = .{
+            .ctx = ctx,
+            .creds = creds,
+            .pool = pool,
+            .specs = specs,
+            .window = window,
+            .in_flight = s3.inFlight(ctx.env),
+        };
         // The fastest footer round trip: slower ones waited on a connection being opened.
         for (specs) |sp| if (sp.rtt_ns > 0) {
             self.rtt_ns = @min(self.rtt_ns orelse sp.rtt_ns, sp.rtt_ns);
@@ -3219,7 +3228,7 @@ const S3Membership = struct {
             .concurrency = READ_CONCURRENCY,
             .max_request = s3.SPLIT_THRESHOLD,
             .gap_cap = coalescer.s3CoalesceGap(rtt, if (rtt == 0) 0 else bps),
-            .in_flight = s3.S3_IN_FLIGHT,
+            .in_flight = self.in_flight,
             .split = s3.S3_RANGE_SPLIT,
             .window = if (self.window == 0) null else self.window,
         };
@@ -3265,8 +3274,8 @@ const S3Membership = struct {
     /// paid; a batch of small requests shows none.
     fn observe(self: *S3Membership, n: usize, bytes: u64, ns: u64) void {
         if (n == 0) return;
-        const lanes = @min(n, s3.S3_IN_FLIGHT);
-        const rounds = std.math.divCeil(usize, n, s3.S3_IN_FLIGHT) catch unreachable;
+        const lanes = @min(n, self.in_flight);
+        const rounds = std.math.divCeil(usize, n, self.in_flight) catch unreachable;
         const per_lane = bytes / lanes;
         if (per_lane < 128 << 10) return;
         const transfer = ns -| rounds * @max(self.rtt_ns orelse default_rtt_ns, default_rtt_ns);
@@ -3326,7 +3335,7 @@ const S3Membership = struct {
                 arena,
                 self.creds,
                 jobs.items,
-                s3.S3_IN_FLIGHT,
+                self.in_flight,
                 self.profiler,
                 null,
             );
@@ -3379,7 +3388,7 @@ const S3Membership = struct {
                 arena,
                 self.creds,
                 jobs.items,
-                s3.S3_IN_FLIGHT,
+                self.in_flight,
                 self.profiler,
                 null,
             );

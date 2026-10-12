@@ -53,8 +53,22 @@ pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 /// per-request TLS handshake amortizes badly across tiny fetches.
 pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
 
-/// Most data ranges in flight on S3. More than this made the request policer slower.
+/// Most data ranges in flight on Lambda, where more made its network policer slower.
 pub const S3_IN_FLIGHT: usize = 16;
+/// Most data ranges in flight anywhere else, and the size of the connection pool. Over a link with a long round trip
+/// (a laptop or a server far from the bucket), each request's first byte is the cost, so throughput follows how many
+/// are in flight: 16 left most of a home link idle.
+pub const S3_IN_FLIGHT_MAX: usize = 64;
+
+/// Data ranges this process keeps in flight: `ZPQ_S3_IN_FLIGHT` when it is a positive integer (at most
+/// `S3_IN_FLIGHT_MAX`), else `S3_IN_FLIGHT` on Lambda and `S3_IN_FLIGHT_MAX` elsewhere.
+pub fn inFlight(env: ?std.process.Environ) usize {
+    const e = env orelse return S3_IN_FLIGHT;
+    if (e.getPosix("ZPQ_S3_IN_FLIGHT")) |v| if (std.fmt.parseInt(usize, v, 10)) |n| {
+        if (n > 0) return @min(n, S3_IN_FLIGHT_MAX);
+    } else |_| {};
+    return if (e.getPosix("AWS_LAMBDA_FUNCTION_NAME") != null) S3_IN_FLIGHT else S3_IN_FLIGHT_MAX;
+}
 /// Data-range requests in flight until this query's first data-range response header, unless `ZPQ_S3_FIRST_WAVE`
 /// says otherwise. Footer, metadata and Bloom requests are not part of that wave and do not raise the cap. After
 /// the header, the cap is `S3_IN_FLIGHT`. Setting the first cap to `S3_IN_FLIGHT` is no slow start.
@@ -816,6 +830,8 @@ pub const Landed = struct {
 pub const DataWave = struct {
     cap: std.atomic.Value(usize) = .init(S3_FIRST_WAVE),
     in_flight: std.atomic.Value(usize) = .init(0),
+    /// The cap once the first header is in (`inFlight`).
+    full: usize = S3_IN_FLIGHT,
 
     /// Wait until fewer than `cap` data-range requests are in flight, then count this one.
     pub fn acquire(self: *DataWave, io: Io) Io.Cancelable!void {
@@ -839,7 +855,7 @@ pub const DataWave = struct {
 
     /// The first data-range response header has arrived. Later acquires may use the full cap. Idempotent.
     pub fn noteHeader(self: *DataWave) void {
-        self.cap.store(S3_IN_FLIGHT, .release);
+        self.cap.store(self.full, .release);
     }
 };
 
@@ -1904,4 +1920,13 @@ test "a server that always stalls fails the request with the timeout once the re
     try testing.expectError(error.ReadTimeout, fakeGet(&fake, arena_state.allocator(), &stats));
     try testing.expectEqual(@as(u32, retry.max_attempts), fake.stalled);
     try testing.expectEqual(@as(u64, retry.max_attempts - 1), stats.timeout_retries);
+}
+
+test "inFlight: 16 on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLIGHT within it" {
+    try testing.expectEqual(S3_IN_FLIGHT, inFlight(testEnviron(&.{"AWS_LAMBDA_FUNCTION_NAME=f"})));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"AWS_REGION=us-east-1"})));
+    try testing.expectEqual(@as(usize, 32), inFlight(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=32" })));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=1000"})));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=0"})));
+    try testing.expectEqual(S3_IN_FLIGHT, inFlight(null));
 }

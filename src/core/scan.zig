@@ -1596,6 +1596,7 @@ fn hashMergeGroupRefs(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
+    if (cut) |c| if (calls[c.a_idx].func == .count) return mergeCountCut(gpa, tables, refs, hashes, calls, c, slots, accs);
     var map = std.StringHashMap(u32).init(gpa);
     defer map.deinit();
     const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
@@ -1632,6 +1633,93 @@ fn hashMergeGroupRefs(
     }
     // A partition holds every copy of its keys, so its counts are final and a count cut applies here.
     if (cut) |c| try keepCountTop(gpa, calls, c, slots, accs);
+}
+
+/// `hashMergeGroupRefs` under a cut by a COUNT: the counts are summed first, alone, to pick the `cut.k` groups the cut
+/// keeps (largest count, earlier first appearance on a tie); only those groups' accumulators are then merged. A key
+/// seen once (the common case on a near-unique key) costs a count and a position, not a merged copy of its state.
+fn mergeCountCut(
+    gpa: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    refs: []const MergeGroupRef,
+    hashes: ?[]const u64,
+    calls: []const expr_agg.AggCall,
+    cut: CountCut,
+    slots: *std.ArrayList(MergedSlot),
+    accs: *std.ArrayList(expr_agg.Accumulator),
+) !void {
+    const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
+    var map = std.StringHashMap(u32).init(gpa);
+    defer map.deinit();
+    try map.ensureTotalCapacity(n);
+    const Group = struct { count: u64, first: u64, key: []const u8 };
+    var groups: std.ArrayList(Group) = .empty;
+    defer groups.deinit(gpa);
+    try groups.ensureTotalCapacity(gpa, refs.len);
+    const group_of = try gpa.alloc(u32, refs.len);
+    defer gpa.free(group_of);
+    for (refs, group_of, 0..) |ref, *gi, ri| {
+        const gt = &tables[ref.table];
+        const key = gt.keyAt(ref.group);
+        const gop = if (hashes) |hs| blk: {
+            const got = map.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hs[ri] }, HashKeyCtx{});
+            if (!got.found_existing) got.key_ptr.* = key;
+            break :blk got;
+        } else map.getOrPutAssumeCapacity(key);
+        const count = gt.accumulators.items[@as(usize, ref.group) * calls.len + cut.a_idx].count;
+        const first = gt.first.items[ref.group];
+        if (gop.found_existing) {
+            const g = &groups.items[gop.value_ptr.*];
+            g.count +|= count;
+            g.first = @min(g.first, first);
+        } else {
+            gop.value_ptr.* = @intCast(groups.items.len);
+            groups.appendAssumeCapacity(.{ .count = count, .first = first, .key = key });
+        }
+        gi.* = gop.value_ptr.*;
+    }
+
+    const Item = struct { c: u64, first: u64, g: u32 };
+    const worse = struct {
+        fn cmp(_: void, a: Item, b: Item) std.math.Order {
+            if (a.c != b.c) return std.math.order(a.c, b.c);
+            return std.math.order(b.first, a.first);
+        }
+    }.cmp;
+    var heap: std.PriorityQueue(Item, void, worse) = .empty;
+    defer heap.deinit(gpa);
+    const k = @min(cut.k, groups.items.len);
+    try heap.ensureTotalCapacity(gpa, k);
+    if (k > 0) for (groups.items, 0..) |g, gi| {
+        const item: Item = .{ .c = g.count, .first = g.first, .g = @intCast(gi) };
+        if (heap.count() == k) {
+            const w = heap.peek().?;
+            if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
+            _ = heap.pop();
+        }
+        heap.push(gpa, item) catch unreachable; // within the capacity reserved above
+    };
+
+    // The kept groups' state, merged from just their refs.
+    const none = std.math.maxInt(u32);
+    const out_of = try gpa.alloc(u32, groups.items.len);
+    defer gpa.free(out_of);
+    @memset(out_of, none);
+    try slots.ensureTotalCapacity(gpa, slots.items.len + heap.count());
+    try accs.ensureUnusedCapacity(gpa, heap.count() * calls.len);
+    for (heap.items) |item| {
+        const g = groups.items[item.g];
+        out_of[item.g] = @intCast(slots.items.len);
+        slots.appendAssumeCapacity(.{ .key = g.key, .first = g.first, .idx = accs.items.len });
+        for (calls) |call| accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
+    }
+    for (refs, group_of) |ref, gi| {
+        const out = out_of[gi];
+        if (out == none) continue;
+        const dst = accs.items[slots.items[out].idx..][0..calls.len];
+        const src = tables[ref.table].accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        for (dst, src) |*d, *sa| try mergeOwnedAccumulator(d, sa, gpa);
+    }
 }
 
 /// How many independent partitions the merge is worth. One partition below a few thousand refs, or with one worker:

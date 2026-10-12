@@ -484,8 +484,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
     // A GROUP BY cut by its first, descending, aggregate may take the sketched count cut, which reads the input twice:
     // the mapping serves both passes (the first warms the page cache for the second), where the explicit reader reads
-    // each row group once and so rules the sketch out. Cold, that is ~4× faster on a skewed key; when the sketch then
-    // declines, the mapping costs a few percent.
+    // each row group once and so rules the sketch out. Even cold, the two cheap passes beat one full grouping on a
+    // skewed key; when the sketch then declines, the mapping costs little.
     if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null and countCutShaped(args))
         io_policy.profile = .mmap;
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.

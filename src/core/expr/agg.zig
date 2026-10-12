@@ -69,6 +69,9 @@ pub const AggCall = struct {
     default_name: ?[]const u8 = null,
     /// Result lane resolved at parse time.
     result: ResultShape,
+    /// Added to every value `sum` folds: `sum(x + c)` folds `x` and adds `c` per value, as many times as there are
+    /// values, so the constant is never materialized per row (see the parser's `sumOffset`).
+    offset: i64 = 0,
 };
 
 /// What an aggregate emits in the final 1-row parquet:
@@ -617,7 +620,10 @@ pub fn updateOneFromStats(
                     @as(i192, decimal_mod.statToI128(plan.bounds.min, k).?) * plan.present,
                     @intCast(plan.present),
                 ),
-                .int, .float => try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present),
+                .int, .float => {
+                    try foldConstantSumStatBytes(state, plan.physical, plan.bounds.min, plan.present);
+                    if (state.* == .sum_i) state.sum_i.? += @as(i128, call.offset) * plan.present;
+                },
             }
             return true;
         },
@@ -864,7 +870,7 @@ pub fn updateOne(
     switch (call.func) {
         .count => state.count += sel.count(),
         .count_distinct => try foldDistinct(persist, state, values.?, sel),
-        .sum => try foldSum(state, values.?, sel, u64_col),
+        .sum => try foldSum(state, values.?, sel, u64_col, call.offset),
         .min => if (call.result == .bytes)
             try foldMinMaxBytes(persist, true, state, values.?, sel)
         else
@@ -1438,11 +1444,13 @@ fn foldSum(
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
     unsigned_64: bool,
+    offset: i64,
 ) Error!void {
     if (!sel.any()) return; // no values: leave a NULL sum NULL
     switch (state.*) {
         .sum_i => |*s| {
-            s.* = (s.* orelse 0) + if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
+            const sum = if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
+            s.* = (s.* orelse 0) + sum + @as(i128, offset) * sel.count();
         },
         .sum_f => |*s| {
             s.* = (s.* orelse 0) + simdSumF64(col.f64.values, sel);
@@ -3303,7 +3311,7 @@ pub fn updateOneGroupedValues(
                     }
                     try state.distinct.?.insertColRow(persist, values.?, r);
                 },
-                .sum => try foldSumGroupedOne(state, values.?, r, u64_col),
+                .sum => try foldSumGroupedOne(state, values.?, r, u64_col, call.offset),
                 .min => if (call.result == .bytes)
                     try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
                 else
@@ -3318,7 +3326,7 @@ pub fn updateOneGroupedValues(
     }
 }
 
-fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) Error!void {
+fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool, offset: i64) Error!void {
     switch (state.*) {
         .sum_i => |*s| {
             const v = switch (col) {
@@ -3326,7 +3334,7 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
                 .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
                 else => return error.UnsupportedAggType,
             };
-            s.* = (s.* orelse 0) + v;
+            s.* = (s.* orelse 0) + v + offset;
         },
         .sum_f => |*s| {
             const v = switch (col) {

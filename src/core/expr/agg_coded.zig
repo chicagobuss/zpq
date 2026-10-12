@@ -253,7 +253,7 @@ fn foldHist(
                 const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
                 acc += x * @as(i128, h);
             }
-            s.* = (s.* orelse 0) + acc;
+            s.* = (s.* orelse 0) + acc + @as(i128, call.offset) * total;
         },
         .sum_f => |*s| {
             var acc: f64 = 0;
@@ -671,7 +671,7 @@ fn foldGroupedCall(
                 if (seen[cp] == 0) continue;
                 const st = &accs[gid_of[cp] * agg_len + ai];
                 switch (st.*) {
-                    .sum_i => |*s| s.* = (s.* orelse 0) + part[cp],
+                    .sum_i => |*s| s.* = (s.* orelse 0) + part[cp] + @as(i128, call.offset) * seen[cp],
                     .avg => |*a| {
                         a.sum += fpart[cp];
                         a.count += seen[cp];

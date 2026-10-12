@@ -643,6 +643,45 @@ def main():
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
 
+    # sum(x + c) folds x and adds c once per value (`sumOffset`): every fold path must add it as often as it sums. `c`
+    # is constant per row group (the statistics fold), `g` low-cardinality (dictionary codes), `n` NULL in places and
+    # NULL in all of group g = 4 under the filter below.
+    offs = os.path.join(tmp, "sum_offset.parquet")
+    con.execute(f"""COPY (SELECT (i // 500)::INTEGER AS c, (i % 5)::INTEGER AS g,
+        (CASE WHEN i % 9 = 0 OR i % 5 = 4 AND i > 3000 THEN NULL ELSE i - 2000 END)::INTEGER AS n,
+        (i * 3)::BIGINT AS big
+      FROM range(0, 4000) t(i)) TO '{offs}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)""")
+    OFFSET_SQL = [
+        "SELECT sum(c + 3) AS a, sum(3 + c) AS b, sum(c - 7) AS d, sum(n + 1) AS e, sum(g + 4) AS f, sum(big + 2) AS h "
+        "FROM '{f}'",
+        "SELECT sum(n + 11) AS a, sum(c - 1) AS b, count(n) AS k FROM '{f}' WHERE n > 10",
+        "SELECT sum(n - 5) AS a FROM '{f}' WHERE n IS NULL",
+        "SELECT g, sum(n + 5) AS s, sum(c - 2) AS t, sum(g + 9) AS u FROM '{f}' GROUP BY g",
+        "SELECT g, sum(n + 5) AS s FROM '{f}' WHERE c > 5 GROUP BY g",
+    ]
+    for i, o_sql in enumerate(OFFSET_SQL):
+        total += 1
+        sql = o_sql.format(f=offs)
+        label = f"sum-offset:{i}"
+        r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+            duck_rel = con.execute(sql)
+            lanes = json_lanes(duck_rel)
+            want = canon_rows(duck_rel.fetchall(), lanes)
+            agg = zjson(r.stdout)["agg"]
+            zrows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
+            got = canon_rows([from_zpq(row, lanes) for row in zrows], lanes)
+            problem = None if got == want else f"zpq={got} duck={want}"
+        except Exception as e:
+            problem = f"error: {e}"
+        if problem:
+            fails += 1
+            print(f"  FAIL  {label}  {problem}")
+        else:
+            print(f"  OK    {label}  ({len(got)} rows)")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

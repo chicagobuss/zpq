@@ -724,15 +724,32 @@ fn parseAggCall(
 
     // 6. Resolve result shape from func + arg type.
     const result = try agg.resolveResult(func, arg);
+    const shifted = if (func != .sum) null else if (arg) |a| sumOffset(a) else null;
 
     return .{
         .func = func,
-        .arg = arg,
+        .arg = if (shifted) |s| s.col.* else arg,
         .where = where,
         .alias = alias,
         .default_name = default_name,
         .result = result,
+        .offset = if (shifted) |s| s.offset else 0,
     };
+}
+
+/// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
+/// a column of `x + c` per call. Only where `x + c` cannot overflow a row's 64 bits, so no query that errors today
+/// answers: `x` a column of at most 32 bits, `|c|` at most 2^62.
+fn sumOffset(arg: ast.Expr) ?struct { col: *ast.Expr, offset: i64 } {
+    if (arg != .binop) return null;
+    const b = arg.binop;
+    if (b.op != .add and b.op != .sub) return null;
+    const col, const lit = if (b.left.* == .col_ref) .{ b.left, b.right.* } else if (b.op == .add) .{ b.right, b.left.* } else return null;
+    if (col.* != .col_ref or col.col_ref.physical_type != .INT32 or col.col_ref.expr_type != .i64) return null;
+    if (lit != .literal or lit.literal != .i64) return null;
+    const c = lit.literal.i64;
+    if (@abs(c) > 1 << 62) return null;
+    return .{ .col = col, .offset = if (b.op == .add) c else -c };
 }
 
 fn resolveAggFunc(name: []const u8) ?agg.AggFunc {

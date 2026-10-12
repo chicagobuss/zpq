@@ -4365,3 +4365,93 @@ test "fixed-width group insert frees every partial allocation" {
     var fixed: NoResize = .{ .child = std.testing.allocator };
     try std.testing.checkAllAllocationFailures(fixed.allocator(), insert, .{});
 }
+
+test "a lone string key reaches the same sketch cell framed or unframed" {
+    var prng = std.Random.DefaultPrng.init(0x5ce7c4);
+    const rand = prng.random();
+    var raw: [200]u8 = undefined;
+    var framed: [205]u8 = undefined;
+    for (16..raw.len) |len| {
+        rand.bytes(raw[0..len]);
+        framed[0] = 1;
+        std.mem.writeInt(u32, framed[1..5], @intCast(len), .little);
+        @memcpy(framed[5..][0..len], raw[0..len]);
+        try std.testing.expectEqual(sketchHash(framed[0 .. len + 5]), rawSketchHash(raw[0..len]));
+    }
+}
+
+test "a sketched table counts every row in the count pass and groups only admitted cells in the admit pass" {
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    // Long keys take the unframed path, short ones the framed one; a null key is framed too.
+    const vals = [_][]const u8{
+        "http://example.com/a-long-enough-path", "short",
+        "http://example.com/a-long-enough-path", "http://example.com/another/long/path",
+        "short",                                 "",
+    };
+    const defs = [_]u32{ 1, 1, 1, 1, 1, 0 };
+    const cols = [_]filter_eval.Batch.Column{.{ .string = .{
+        .values = &vals,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const a = std.testing.allocator;
+    for ([_]u8{ 0, 9 }) |fixed| {
+        var cells: [1 << 10]u32 = @splat(0);
+        var sketch: CountSketch = .{ .cells = &cells, .shift = 64 - 10 };
+        var table = GroupTable.init(a, 1 << 20);
+        defer table.deinit();
+        table.sketch = &sketch;
+        var ids: [vals.len]u32 = undefined;
+        var sel = try filter_selection.SelectionVector.init(a, vals.len);
+        defer sel.deinit();
+        if (fixed == 0) {
+            var resolver = GroupKeyResolver.init(&cols);
+            defer resolver.deinit(a);
+            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
+        } else {
+            // A fixed-width table sketches by its own image hash.
+            table.fixed_stride = fixed;
+            for (&ids, 0..) |*id, r| {
+                var image: [9]u8 = @splat(0);
+                image[0] = @intFromBool(r != 5);
+                image[1] = @intCast(vals[r].len);
+                id.* = try table.getOrInsertFixed(&image, &calls, r);
+            }
+        }
+        sinkSketchRows(&table, &ids, &sel);
+        try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+        try std.testing.expectEqual(@as(usize, 0), sel.count());
+        var total: u64 = 0;
+        for (cells) |c| total += c;
+        try std.testing.expectEqual(@as(u64, vals.len), total);
+        // The same key always lands in the same cell.
+        try std.testing.expectEqual(ids[0], ids[2]);
+        try std.testing.expectEqual(ids[1], ids[4]);
+
+        // Admit only the first key's cell: its rows get one group, every other row is dropped uncounted.
+        var admit: [(1 << 10) / 64]u64 = @splat(0);
+        const cell = std.math.maxInt(u32) - ids[0];
+        admit[cell / 64] |= @as(u64, 1) << @intCast(cell % 64);
+        sketch.admit = &admit;
+        @memset(&cells, 0);
+        var sel2 = try filter_selection.SelectionVector.init(a, vals.len);
+        defer sel2.deinit();
+        if (fixed == 0) {
+            var resolver = GroupKeyResolver.init(&cols);
+            defer resolver.deinit(a);
+            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
+        } else for (&ids, 0..) |*id, r| {
+            var image: [9]u8 = @splat(0);
+            image[0] = @intFromBool(r != 5);
+            image[1] = @intCast(vals[r].len);
+            id.* = try table.getOrInsertFixed(&image, &calls, r);
+        }
+        sinkSketchRows(&table, &ids, &sel2);
+        try std.testing.expect(table.groupCount() >= 1);
+        try std.testing.expectEqual(@as(u32, 0), ids[0]);
+        try std.testing.expectEqual(@as(u64, 0), table.first.items[0]);
+        for (ids, 0..) |id, r| try std.testing.expectEqual(id < table.groupCount(), sel2.isActive(r));
+        for (cells) |c| try std.testing.expectEqual(@as(u32, 0), c);
+    }
+}

@@ -137,6 +137,12 @@ pub const SketchTopK = struct {
     cell_bits: u6 = 18,
     /// Report each decision on stderr.
     trace: bool = false,
+    /// Tests: false never trusts the bound, so the scan falls back after the admit pass.
+    certify: bool = true,
+    /// Tests: where the scan went.
+    outcome: ?*Outcome = null,
+
+    pub const Outcome = enum { ineligible, bailed, certified, fell_back };
 };
 
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
@@ -766,7 +772,7 @@ fn sketchEligible(
     if (calls[a_idx].func != .count) return null;
     // The admitted cells must be few beside all of them, or admitting is grouping nearly everything.
     const k = order.offset +| limit;
-    if (k == 0 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
+    if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
     for (args.inputs) |in| if (in.gate != null) return null;
     return a_idx;
 }
@@ -813,7 +819,7 @@ fn sketchTopK(
     };
     const ranked = try gpa.dupe(u32, sum);
     defer gpa.free(ranked);
-    const admit_n = @max(k * cfg.admit_per_row, 64);
+    const admit_n = @max(k * cfg.admit_per_row, @min(64, n_cells / 16));
     std.mem.sortUnstable(u32, ranked, {}, std.sort.desc(u32));
     // Admitting every cell fuller than `bound` keeps ties at it out, so `bound` is the fullest cell not admitted.
     const bound = ranked[admit_n];
@@ -822,8 +828,11 @@ fn sketchTopK(
     if (cfg.trace) std.debug.print("sketch: count_ms={d} kth_cell={d} bound={d} viable={}\n", .{
         @divTrunc(t1 - t0, 1_000_000), ranked[k - 1], bound, viable,
     });
+    if (!viable) if (cfg.outcome) |o| {
+        o.* = .bailed;
+    };
     if (viable) {
-        const admit = try arena.alloc(u64, n_cells / 64);
+        const admit = try arena.alloc(u64, (n_cells + 63) / 64);
         @memset(admit, 0);
         for (sum, 0..) |c, i| if (c > bound) {
             admit[i / 64] |= @as(u64, 1) << @intCast(i % 64);
@@ -832,11 +841,15 @@ fn sketchTopK(
         restoreCounts(workers, saved);
         try runPhase(workers, cursor);
         const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
-        const certified = bound == 0 or bound < kth;
+        const certified = cfg.certify and (bound == 0 or bound < kth);
         if (cfg.trace) std.debug.print("sketch: admit_ms={d} kth_total={d} certified={}\n", .{
             @divTrunc(nowMonoNs() - t1, 1_000_000), kth, certified,
         });
-        if (certified) return;
+        if (certified) {
+            if (cfg.outcome) |o| o.* = .certified;
+            return;
+        }
+        if (cfg.outcome) |o| o.* = .fell_back;
         for (tables) |*t| {
             const shared = t.shared;
             const stride = t.fixed_stride;
@@ -1215,6 +1228,9 @@ pub fn runMultiAggregate(
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
     const sketch_count: ?usize = if (args.sketch_topk) |cfg| sketchEligible(cfg, args, group_outputs, agg_calls, use_blocks) else null;
+    if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
+        o.* = .ineligible;
+    };
     if (sketch_count) |a_idx| {
         try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, args.result_order, a_idx, args.sketch_topk.?);
     } else {
@@ -3179,6 +3195,97 @@ test "runMultiAggregate: a COUNT-descending cut merges only groups that can make
                 for (want, got) |w, g| for (w, g) |a, b| try testing.expect(sameValue(a, b));
             }
         }
+    }
+}
+
+test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certified or not" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Outcome = SketchTopK.Outcome;
+    const cuts = [_]expr_ast.ResultOrder{
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+        // Ties at the cut broken by the key, past an offset.
+        .{ .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } }, .limit = 4, .offset = 2 },
+        // Not a COUNT-descending cut: never sketched.
+        .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 3 },
+    };
+    const configs = [_]SketchTopK{
+        .{},
+        // Few cells: collisions inflate the bound.
+        .{ .cell_bits = 8, .admit_per_row = 1 },
+        .{ .certify = false },
+    };
+    var seen = std.EnumSet(Outcome){};
+    // `k` is skewed and has nulls, `n` is a fixed-width key, `v` is unique (every count ties at 1).
+    for ([_][]const u8{ "k", "n", "v", "k, n" }) |key| for ([_]?[]const u8{ null, "n < 12" }) |filter| {
+        for ([_]usize{ 1, 3 }) |parallelism| for (cuts) |cut| for (configs) |cfg_in| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const first_key = key[0 .. std.mem.indexOfScalar(u8, key, ',') orelse key.len];
+            const select_cols = try selectList(arena, &.{ first_key, "count(*) AS c", "min(v) AS lo" });
+            var args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .filter = filter,
+                .aggregate = "count(*) AS c, min(v) AS lo",
+                .group_by = key,
+                .select_cols = if (std.mem.eql(u8, key, first_key)) select_cols else null,
+                .parallelism = parallelism,
+                .min_bytes_per_worker = 1,
+                .result_order = cut,
+            };
+            var want = try runMultiAggregate(testing.allocator, arena, args);
+            defer want.deinit(testing.allocator);
+            var outcome: Outcome = .ineligible;
+            var cfg = cfg_in;
+            cfg.outcome = &outcome;
+            args.sketch_topk = cfg;
+            var got = try runMultiAggregate(testing.allocator, arena, args);
+            defer got.deinit(testing.allocator);
+            seen.insert(outcome);
+            try testing.expectEqual(want.rows_in, got.rows_in);
+            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try want.output.applyResultOrder(testing.allocator, cut);
+            try got.output.applyResultOrder(testing.allocator, cut);
+            const w = want.output.group_rows.?;
+            const g = got.output.group_rows.?;
+            try testing.expectEqual(w.len, g.len);
+            for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
+        };
+    };
+    for ([_]Outcome{ .ineligible, .bailed, .certified, .fell_back }) |o| try testing.expect(seen.contains(o));
+}
+
+fn runSketchedAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData, certify: bool) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var res = try runMultiAggregate(gpa, arena_state.allocator(), .{
+        .inputs = inputs,
+        // Parsed up front: a footer parse reports running out of memory as a file that is not Parquet.
+        .metas = meta[0..1],
+        .aggregate = "count(*) AS c, min(s) AS lo",
+        .group_by = "s",
+        .parallelism = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 1 },
+        .sketch_topk = .{ .cell_bits = 10, .admit_per_row = 4, .certify = certify },
+    });
+    res.deinit(gpa);
+}
+
+test "runMultiAggregate: a sketched COUNT cut frees everything on any allocation failure" {
+    // One row group, string keys that own memory, one past the 16 bytes an unframed key needs.
+    const path = "ci/fixtures/parquet/json_escape.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    const meta = try metadata.open(meta_arena.allocator(), bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    for ([_]bool{ true, false }) |certify| {
+        try testing.checkAllAllocationFailures(fixed.allocator(), runSketchedAndFree, .{ &inputs, &meta, certify });
     }
 }
 

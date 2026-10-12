@@ -481,7 +481,15 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    parses.
     //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
     //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
-    const io_policy = local_reader.Policy.fromEnv(ctx.env);
+    var io_policy = local_reader.Policy.fromEnv(ctx.env);
+    // A GROUP BY cut by its first, descending, aggregate may take the sketched count cut, which reads the input twice:
+    // the mapping serves both passes (the first warms the page cache for the second), where the explicit reader reads
+    // each row group once and so rules the sketch out. Cold, that is ~4× faster on a skewed key; when the sketch then
+    // declines, the mapping costs a few percent.
+    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null) {
+        const order = args.result_order;
+        if (order.limit != null and order.keys.len > 0 and order.keys[0].descending) io_policy.profile = .mmap;
+    }
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
     const all_local = on_linux and allLocal(opened);

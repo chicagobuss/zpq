@@ -3227,6 +3227,7 @@ pub const GroupKeyResolver = struct {
         }
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
             const s = key_cols[0].string.values[row];
+            if (table.sketch != null) if (table.sketchRaw(s)) |id| return id;
             const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
             const gop = try self.memo.getOrPut(allocator, id);
             if (gop.found_existing) return gop.value_ptr.*;
@@ -3480,27 +3481,66 @@ fn splitMix64(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// The certified top-k scan's count of every row a frozen table has no group for (`GroupTable.sketch`): one cell per
-/// key-hash prefix. A key's rows all land in one cell, the same in every table, so after summing every table's cells
-/// a key's total is at most its cell's. Saturates rather than wraps, so a sum stays an upper bound.
+/// The certified top-k scan's view of a table (`GroupTable.sketch`): each key falls in one cell by its hash, the same
+/// cell in every table. In the count pass no key gets a group and each row adds one to its cell, so after summing every
+/// table's cells a key's total is at most its cell's; saturating, so a sum stays an upper bound. In an admit pass
+/// only keys in `admit` cells get groups, and every other row is dropped.
 pub const CountSketch = struct {
     cells: []u32,
-    /// `cells.len == 1 << (64 - shift)`; a key's cell is the top bits of its table hash.
+    /// `cells.len == 1 << (64 - shift)`; a key's cell is the top bits of its hash (`sketchHash`, or a fixed table's).
     shift: u6,
+    /// The admit pass's cells, one bit each; null in the count pass.
+    admit: ?[]const u64 = null,
 
     pub fn cellOf(self: *const CountSketch, hash: u64) u32 {
         return @intCast(hash >> self.shift);
     }
+
+    /// The id a row of `cell` takes instead of a group, counted down from the top of the id space so it never meets
+    /// a group an admit pass makes later.
+    pub fn sinkId(cell: u32) u32 {
+        return std.math.maxInt(u32) - cell;
+    }
+
+    fn admits(self: *const CountSketch, cell: u32) bool {
+        const a = self.admit orelse return false;
+        return (a[cell / 64] >> @intCast(cell % 64)) & 1 != 0;
+    }
 };
 
-/// The rows of `ids` past `table`'s groups are a frozen table's sketch cells (`GroupTable.getOrInsert`): count each
-/// in its cell and drop it from `sel`, so no aggregate folds it into a group.
+/// A sketched string table's cell hash: the length and four 8-byte loads (the first after a lone string key's 5-byte
+/// frame, the middle, the last two), not a pass over a long key. Keys that differ only elsewhere share a cell, which
+/// loosens the bound and never breaks it.
+pub fn sketchHash(key: []const u8) u64 {
+    if (key.len < 21) return std.hash_map.hashString(key);
+    const l = key.len;
+    return sketchMix(l, load64(key, 5), load64(key, l / 2 - 4), load64(key, l - 16), load64(key, l - 8));
+}
+
+/// `sketchHash` of a lone present string key `s` (frame `[1][u32 len]` then `s`), at least 16 bytes, unframed.
+fn rawSketchHash(s: []const u8) u64 {
+    const l = s.len + 5;
+    return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
+}
+
+fn sketchMix(len: usize, a: u64, b: u64, c: u64, d: u64) u64 {
+    const x = (a *% 0x9E3779B97F4A7C15) ^ (b *% 0xC2B2AE3D27D4EB4F) ^ (c *% 0x165667B19E3779F9) ^
+        (d *% 0xD6E8FEB86659FD93) ^ @as(u64, len);
+    return splitMix64(x);
+}
+
+fn load64(b: []const u8, at: usize) u64 {
+    return std.mem.readInt(u64, b[at..][0..8], .little);
+}
+
+/// The rows of `ids` a sketched table gave a cell instead of a group (`CountSketch.sinkId`) leave `sel`, so no
+/// aggregate folds them; in the count pass each also adds one to its cell.
 pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) void {
     const s = table.sketch orelse return;
-    const groups: u32 = @intCast(table.groupCount());
+    const floor = CountSketch.sinkId(@intCast(s.cells.len - 1));
     for (ids, 0..) |id, r| {
-        if (id < groups or !sel.isActive(r)) continue;
-        s.cells[id - groups] +|= 1;
+        if (id < floor or !sel.isActive(r)) continue;
+        if (s.admit == null) s.cells[std.math.maxInt(u32) - id] +|= 1;
         sel.set(r, false);
     }
 }
@@ -3521,8 +3561,8 @@ pub const GroupTable = struct {
     fixed_len: u32 = 0,
     fixed_keys: []u8 = &.{},
     fixed_slots: []FixedSlot = &.{},
-    /// Frozen: no group is made any more. A key without one gets id `groupCount() + cell` instead, its sketch cell
-    /// (`sinkSketchRows`), so callers that memoize ids per key stay correct.
+    /// A certified top-k pass: keys outside the admitted cells get a cell's id (`CountSketch.sinkId`) rather than a
+    /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
 
     const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
@@ -3586,26 +3626,14 @@ pub const GroupTable = struct {
         return self.findFixed(image, hashFixed(image));
     }
 
-    /// The hash a frozen table of this kind sketches `key` by, for a key as `keyAt` holds it.
-    pub fn keyHash(self: *const GroupTable, key: []const u8) u64 {
-        return if (self.fixed_stride == 0) std.hash_map.hashString(key) else hashFixed(key);
+    /// A sketched string table's id for a lone present string key given unframed when its cell is not admitted; null
+    /// when the key takes the usual path (admitted, or too short for `rawSketchHash`).
+    pub fn sketchRaw(self: *const GroupTable, raw: []const u8) ?u32 {
+        const s = self.sketch.?;
+        if (raw.len < 16) return null;
+        const cell = s.cellOf(rawSketchHash(raw));
+        return if (s.admits(cell)) null else CountSketch.sinkId(cell);
     }
-
-    /// `findKey` for a key as `keyAt` holds it, by its `keyHash`.
-    pub fn findHashed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
-        if (self.fixed_stride != 0) return self.findFixed(key, hash);
-        return self.map.getAdapted(key, Prehashed{ .h = hash });
-    }
-
-    const Prehashed = struct {
-        h: u64,
-        pub fn hash(c: Prehashed, _: []const u8) u64 {
-            return c.h;
-        }
-        pub fn eql(_: Prehashed, a: []const u8, b: []const u8) bool {
-            return std.mem.eql(u8, a, b);
-        }
-    };
 
     /// Owning thread only. A table that has stopped growing must not sit on a partly-used block while another worker
     /// is still filling, or admission depends on how row groups happened to be scheduled.
@@ -3627,11 +3655,8 @@ pub const GroupTable = struct {
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
         if (self.sketch) |s| {
-            const hash = std.hash_map.hashString(key);
-            const id = self.findHashed(key, hash) orelse
-                return @intCast(self.groupCount() + s.cellOf(hash));
-            self.first.items[id] = @min(self.first.items[id], pos);
-            return id;
+            const cell = s.cellOf(sketchHash(key));
+            if (!s.admits(cell)) return CountSketch.sinkId(cell);
         }
         if (self.map.get(key)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
@@ -3687,11 +3712,14 @@ pub const GroupTable = struct {
     pub fn getOrInsertFixed(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
         const hash = hashFixed(key);
+        if (self.sketch) |s| {
+            const cell = s.cellOf(hash);
+            if (!s.admits(cell)) return CountSketch.sinkId(cell);
+        }
         if (self.findFixed(key, hash)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
-        if (self.sketch) |s| return self.fixed_len + s.cellOf(hash);
         if (self.fixed_len == std.math.maxInt(u32)) return error.OutOfMemory;
         // A failed growth has already replaced a buffer; charge what is still held so the shared budget is not told
         // the old, smaller size.

@@ -442,7 +442,7 @@ pub fn groupedCoded(
         gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base | first_row[cp]);
     }
 
-    // A frozen table's other keys only count, in their sketch cells; the folds see just its groups' rows.
+    // A sketched table's rows outside its admitted cells take no group (`agg.sinkSketchRows`).
     var sunk: Sel = undefined;
     const fold_sel = if (table.sketch != null) blk: {
         sunk = try sel.cloneAlloc(ra);

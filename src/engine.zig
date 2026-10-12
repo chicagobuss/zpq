@@ -1405,15 +1405,14 @@ fn outputColumnNames(
 
 /// S3 credentials from the environment, telling a missing region apart from missing keys.
 /// Whether `name` is set to "0" in `env`.
-/// `ZPQ_SKETCH_TOPK=1` turns on the research path `scan.SketchTopK`; `ZPQ_SKETCH_M`, `ZPQ_SKETCH_BITS` and
-/// `ZPQ_SKETCH_STRIDE` tune it, and `ZPQ_SKETCH_TRACE=1` reports its decisions on stderr.
+/// `ZPQ_SKETCH_TOPK=1` turns on the research path `scan.SketchTopK`; `ZPQ_SKETCH_ADMIT` and `ZPQ_SKETCH_BITS` tune
+/// it, and `ZPQ_SKETCH_TRACE=1` reports its decisions on stderr.
 fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
     const on = env.getPosix("ZPQ_SKETCH_TOPK") orelse return null;
     if (!std.mem.eql(u8, on, "1")) return null;
     var cfg: scan.SketchTopK = .{};
-    if (env.getPosix("ZPQ_SKETCH_M")) |v| cfg.m = std.fmt.parseInt(usize, v, 10) catch cfg.m;
-    if (env.getPosix("ZPQ_SKETCH_BITS")) |v| cfg.cell_bits = std.math.clamp(std.fmt.parseInt(u6, v, 10) catch cfg.cell_bits, 4, 30);
-    if (env.getPosix("ZPQ_SKETCH_STRIDE")) |v| cfg.stride = std.fmt.parseInt(usize, v, 10) catch cfg.stride;
+    if (env.getPosix("ZPQ_SKETCH_ADMIT")) |v| cfg.admit_per_row = std.fmt.parseInt(usize, v, 10) catch cfg.admit_per_row;
+    if (env.getPosix("ZPQ_SKETCH_BITS")) |v| cfg.cell_bits = std.math.clamp(std.fmt.parseInt(u6, v, 10) catch cfg.cell_bits, 10, 30);
     cfg.trace = env.getPosix("ZPQ_SKETCH_TRACE") != null;
     return cfg;
 }

@@ -147,6 +147,12 @@ fn fit38(v: i192) expr_eval.Error!i128 {
 
 pub const NUM_PARTS: usize = 16;
 
+/// A value's partition, from the middle of its hash: each partition's map takes its fingerprint from the top bits and
+/// its slot from the low ones, and fixing either inside a partition would make its probes collide more.
+inline fn partOf(h: u64) usize {
+    return @intCast((h >> 32) % NUM_PARTS);
+}
+
 pub const INLINE_CAP: usize = 2;
 pub const InlineU64 = struct { len: u8, vals: [INLINE_CAP]u64 };
 pub const InlineI128 = struct { len: u8, vals: [INLINE_CAP]i128 };
@@ -278,7 +284,7 @@ pub const DistinctSet = struct {
     pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
-            const p = @as(usize, @intCast(h >> 60));
+            const p = partOf(h);
             return parts[p].insertU64(allocator, v);
         }
         switch (self.val_set) {
@@ -326,7 +332,7 @@ pub const DistinctSet = struct {
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
-            const p = @as(usize, @intCast(h >> 60));
+            const p = partOf(h);
             return parts[p].insertI128(allocator, v);
         }
         switch (self.val_set) {
@@ -393,7 +399,7 @@ pub const DistinctSet = struct {
     pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, v);
-            const p = @as(usize, @intCast(h >> 60));
+            const p = partOf(h);
             return parts[p].insertBytes(allocator, v);
         }
         switch (self.val_set) {
@@ -1236,9 +1242,11 @@ fn foldMinMaxBytes(
         const ord = std.mem.order(u8, cand, cur);
         const better = (is_min and ord == .lt) or (!is_min and ord == .gt);
         if (!better) return;
-        persist.free(cur);
     }
-    slot.* = try persist.dupe(u8, cand);
+    // Copied before the old value is freed, so a failed copy leaves the slot holding live bytes.
+    const owned = try persist.dupe(u8, cand);
+    if (slot.*) |cur| persist.free(cur);
+    slot.* = owned;
 }
 
 /// The first 16 bytes of `s` as a big-endian integer, zero-padded: a strictly lesser prefix means a strictly lesser
@@ -4061,8 +4069,9 @@ fn foldMinMaxBytesGroupedOne(
         const ord = std.mem.order(u8, sv, m_ptr.*.?);
         const condition = if (is_min) (ord == .lt) else (ord == .gt);
         if (condition) {
+            const owned = try persist.dupe(u8, sv);
             persist.free(m_ptr.*.?);
-            m_ptr.* = try persist.dupe(u8, sv);
+            m_ptr.* = owned;
         }
     }
 }
@@ -4561,4 +4570,29 @@ test "fixed-width groups charge their count(DISTINCT) sets to the shared budget,
             }
         }
     }.run, .{});
+}
+
+test "string min/max folds keep the old winner when copying a new one fails" {
+    // The second batch's winner beats the first; its copy is the allocation that fails. The slot must still hold the
+    // first winner, live, so freeing the accumulator afterwards frees it exactly once.
+    const batches = [2][2][]const u8{ .{ "m", "q" }, .{ "a", "z" } };
+    inline for (.{ true, false }) |grouped| inline for (.{ true, false }) |is_min| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        const persist = failing.allocator();
+        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
+        defer if (if (is_min) state.min_bytes else state.max_bytes) |s| persist.free(s);
+        for (batches, 0..) |vals, bi| {
+            const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals } };
+            const folded = if (grouped)
+                foldMinMaxBytesGroupedOne(persist, is_min, &state, col, if (is_min) 0 else 1)
+            else blk: {
+                var sel = try filter_selection.SelectionVector.init(std.testing.allocator, vals.len);
+                defer sel.deinit();
+                break :blk foldMinMaxBytes(persist, is_min, &state, col, &sel);
+            };
+            if (bi == 0) try folded else try std.testing.expectError(error.OutOfMemory, folded);
+        }
+        const kept = (if (is_min) state.min_bytes else state.max_bytes).?;
+        try std.testing.expectEqualStrings(if (is_min) "m" else "q", kept);
+    };
 }

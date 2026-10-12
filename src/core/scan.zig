@@ -1766,14 +1766,15 @@ fn mergeCandidates(
 
         const slot_idx = accs.items.len;
         for (calls, 0..) |call, ci| {
-            var dst = expr_agg.Accumulator.init(call);
+            // Appended before merging, so state moved out of a source is owned by `accs` even if a later merge fails.
+            accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
+            const dst = &accs.items[accs.items.len - 1];
             for (tables) |gt| {
                 if (gt.findKey(key)) |gi| {
                     const src = &gt.accumulators.items[@as(usize, gi) * calls.len + ci];
-                    try mergeOwnedAccumulator(&dst, src, gpa);
+                    try mergeOwnedAccumulator(dst, src, gpa);
                 }
             }
-            accs.appendAssumeCapacity(dst);
         }
 
         slots.appendAssumeCapacity(.{
@@ -1999,9 +2000,9 @@ fn mergeFoldedRefs(
     const nparts = mergePartitionCount(n_workers, refs.len, cut != null);
     if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, slots, accs);
 
-    // `64 - u6` does not fit in a u6 when the width is zero, so the difference stays a usize.
-    const bits: usize = std.math.log2_int(usize, nparts);
-    const shift: u6 = @intCast(@as(usize, 64) - bits);
+    // Partitions come from the middle of the hash: the map inside each takes its fingerprint from the top bits and
+    // its slot from the low ones, and a partition that fixed either would collide more.
+    const mask: u64 = nparts - 1;
     const hashes = try arena.alloc(u64, refs.len);
     const ordered = try arena.alloc(MergeGroupRef, refs.len);
     const ordered_hash = try arena.alloc(u64, refs.len);
@@ -2020,7 +2021,7 @@ fn mergeFoldedRefs(
         ordered_hash: []u64,
         counts: []usize,
         nparts: usize,
-        shift: u6,
+        mask: u64,
         n_chunks: usize,
         cursor: *std.atomic.Value(usize),
         phase: enum { count, scatter },
@@ -2036,14 +2037,14 @@ fn mergeFoldedRefs(
                 switch (t.phase) {
                     .count => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, *h| {
                         h.* = std.hash.Wyhash.hash(0, t.tables[ref.table].keyAt(ref.group));
-                        mine[h.* >> t.shift] += 1;
+                        mine[(h.* >> 32) & t.mask] += 1;
                     },
                     // `mine` now holds where this chunk writes next in each partition.
                     .scatter => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, h| {
-                        const at = mine[h >> t.shift];
+                        const at = mine[(h >> 32) & t.mask];
                         t.ordered[at] = ref;
                         t.ordered_hash[at] = h;
-                        mine[h >> t.shift] = at + 1;
+                        mine[(h >> 32) & t.mask] = at + 1;
                     },
                 }
             }
@@ -2076,7 +2077,7 @@ fn mergeFoldedRefs(
             .ordered_hash = ordered_hash,
             .counts = chunk_counts,
             .nparts = nparts,
-            .shift = shift,
+            .mask = mask,
             .n_chunks = n_chunks,
             .cursor = &split_cursor,
             .phase = phase,
@@ -3504,6 +3505,41 @@ test "topKCandidates: count_distinct keeps keys that can reach the cut and prune
             if (std.mem.eql(u8, k, want)) break;
         } else return error.TestExpectedKey;
     }
+}
+
+test "mergeCandidates: a merge that fails part-way leaks none of the sets already moved out of the tables" {
+    // Three tables share keys "a" and "b"; each key's count(DISTINCT) set is moved out of the first table and the
+    // others are folded into it, which allocates, so a failure can land after a set has left its table.
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const calls = [_]expr_agg.AggCall{
+                .{ .func = .count_distinct, .arg = null, .where = null, .alias = "u", .result = .i64 },
+                .{ .func = .count_distinct, .arg = null, .where = null, .alias = "w", .result = .i64 },
+            };
+            var tables: [3]expr_agg.GroupTable = undefined;
+            for (&tables) |*t| t.* = .init(gpa, 1 << 30);
+            defer for (&tables) |*t| t.deinit();
+            for (&tables, 0..) |*t, ti| for ([_][]const u8{ "a", "b" }) |key| {
+                const g = try t.getOrInsert(key, &calls, 0);
+                for (0..2) |ci| {
+                    const ds = t.accumulators.items[g * calls.len + ci].distinct.?;
+                    for (0..40) |v| try ds.insertU64(gpa, @intCast(ti * 30 + v));
+                }
+            };
+            var slots: std.ArrayList(MergedSlot) = .empty;
+            defer slots.deinit(gpa);
+            var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+            defer {
+                freeOwnedAccumulatorStrings(gpa, accs.items);
+                accs.deinit(gpa);
+            }
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            try mergeCandidates(gpa, arena_state.allocator(), &tables, &.{ "a", "b" }, &calls, 1, &slots, &accs);
+            try testing.expectEqual(@as(usize, 2), slots.items.len);
+            for (accs.items) |acc| try testing.expectEqual(@as(usize, 100), acc.distinct.?.count());
+        }
+    }.run, .{});
 }
 
 test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own every value once, and leak nothing" {

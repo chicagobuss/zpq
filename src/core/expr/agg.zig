@@ -2993,6 +2993,14 @@ pub const GroupKeyResolver = struct {
         agg_calls: []const AggCall,
         pos_base: u64,
     ) !u32 {
+        // Fixed-width keys never touch the scratch list: the image is a stack buffer, and the table hashes that
+        // instead of the serialized bytes.
+        if (table.fixed_stride != 0) {
+            var image: [32]u8 = undefined;
+            if (packFixedKey(key_cols, row, &image)) |n| if (n == table.fixed_stride) {
+                return table.getOrInsertFixed(image[0..n], agg_calls, pos_base | row);
+            };
+        }
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
             const s = key_cols[0].string.values[row];
             const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
@@ -3133,6 +3141,121 @@ pub const SharedBudget = struct {
     }
 };
 
+/// Byte width of one fixed-width group key, or null when a key is a string, a decimal, or wider than the inline
+/// image. Each integer or float column is a presence byte plus 8 payload bytes, the same bytes `serializeRowKey`
+/// writes for a present value. Null payload is stored as zeros so every group of a query has one width.
+pub fn fixedGroupStride(keys: []const expr_ast.Expr) ?u8 {
+    if (keys.len == 0 or keys.len > 3) return null;
+    for (keys) |k| switch (k.typeOf()) {
+        .str, .dec => return null,
+        .i64, .f64 => {},
+    };
+    return @intCast(keys.len * 9);
+}
+
+/// `serializeRowKey`'s bytes for `row`, with a null column stored as a zero presence and 8 zero payload bytes.
+/// Null when a column is not fixed-width. The width is `9 * cols.len` for the columns this accepts.
+pub fn packFixedKey(cols: []const filter_eval.Batch.Column, row: usize, out: *[32]u8) ?u8 {
+    var d: usize = 0;
+    for (cols) |col| {
+        if (d + 9 > out.len) return null;
+        switch (col) {
+            .string, .i128 => return null,
+            .i32, .i64, .f32, .f64, .boolean => {},
+        }
+        if (isRowNull(col, row)) {
+            @memset(out[d..][0..9], 0);
+            d += 9;
+            continue;
+        }
+        out[d] = 1;
+        d += 1;
+        switch (col) {
+            .i32 => |c| std.mem.writeInt(i64, out[d..][0..8], c.values[row], .little),
+            .i64 => |c| std.mem.writeInt(i64, out[d..][0..8], c.values[row], .little),
+            .boolean => |c| std.mem.writeInt(i64, out[d..][0..8], if (c.values[row]) 1 else 0, .little),
+            .f32 => |c| {
+                var f: f64 = @floatCast(c.values[row]);
+                if (std.math.isNan(f)) f = std.math.nan(f64) else if (f == 0.0) f = 0.0;
+                std.mem.writeInt(u64, out[d..][0..8], @bitCast(f), .little);
+            },
+            .f64 => |c| {
+                var f = c.values[row];
+                if (std.math.isNan(f)) f = std.math.nan(f64) else if (f == 0.0) f = 0.0;
+                std.mem.writeInt(u64, out[d..][0..8], @bitCast(f), .little);
+            },
+            .string, .i128 => unreachable,
+        }
+        d += 8;
+    }
+    return @intCast(d);
+}
+
+/// Variable-length framing (`serializeRowKey`) of a fixed image. Present columns already match; a null column drops
+/// the zero payload so `deserializeKeyColumn` sees the bytes it always has.
+pub fn canonicalKey(image: []const u8, buf: *[48]u8) []const u8 {
+    if (image.len % 9 != 0) return image;
+    var i: usize = 0;
+    while (i < image.len) : (i += 9) if (image[i] == 0) break;
+    if (i == image.len) return image;
+    var d: usize = 0;
+    i = 0;
+    while (i < image.len) : (i += 9) {
+        buf[d] = image[i];
+        d += 1;
+        if (image[i] != 0) {
+            @memcpy(buf[d..][0..8], image[i + 1 ..][0..8]);
+            d += 8;
+        }
+    }
+    return buf[0..d];
+}
+
+fn expandFixed(stride: usize, variable: []const u8, out: *[32]u8) ?[]const u8 {
+    if (stride > out.len or stride % 9 != 0) return null;
+    @memset(out[0..stride], 0);
+    var s: usize = 0;
+    var d: usize = 0;
+    while (d < stride) {
+        if (s >= variable.len) return null;
+        const pres = variable[s];
+        s += 1;
+        out[d] = pres;
+        d += 1;
+        if (pres != 0) {
+            if (s + 8 > variable.len) return null;
+            @memcpy(out[d..][0..8], variable[s..][0..8]);
+            s += 8;
+        }
+        d += 8;
+    }
+    if (s != variable.len) return null;
+    return out[0..stride];
+}
+
+/// SplitMix of each 8-byte chunk. Zero is kept: an empty slot is an id sentinel, not a hash sentinel. Stored on the
+/// slot so growing the table replays it and does not mix the key again.
+fn hashFixed(bytes: []const u8) u64 {
+    var h: u64 = 0;
+    var i: usize = 0;
+    while (i + 8 <= bytes.len) : (i += 8) {
+        h ^= splitMix64(std.mem.readInt(u64, bytes[i..][0..8], .little));
+    }
+    if (i < bytes.len) {
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. bytes.len - i], bytes[i..]);
+        h ^= splitMix64(std.mem.readInt(u64, &tail, .little));
+    }
+    return h;
+}
+
+fn splitMix64(x: u64) u64 {
+    var z = x +% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
 pub const GroupTable = struct {
     allocator: std.mem.Allocator,
     keys: std.ArrayList([]const u8),
@@ -3144,8 +3267,15 @@ pub const GroupTable = struct {
     allocated_bytes: usize,
     max_memory_bytes: usize,
     shared: ?*SharedBudget = null,
+    /// Nonzero: every key is this many bytes in `fixed_keys` (see `fixedGroupStride`), and `map` is unused.
+    fixed_stride: u8 = 0,
+    fixed_len: u32 = 0,
+    fixed_keys: []u8 = &.{},
+    fixed_slots: []FixedSlot = &.{},
 
     const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
+    const empty_id: u32 = std.math.maxInt(u32);
+    const FixedSlot = struct { hash: u64, id: u32 };
 
     pub fn init(allocator: std.mem.Allocator, max_memory_bytes: usize) GroupTable {
         return .{
@@ -3180,6 +3310,28 @@ pub const GroupTable = struct {
         }
         self.accumulators.deinit(self.allocator);
         self.map.deinit();
+        if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
+        if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
+    }
+
+    pub fn groupCount(self: *const GroupTable) usize {
+        return if (self.fixed_stride == 0) self.keys.items.len else self.fixed_len;
+    }
+
+    /// Key bytes of group `g`. For a fixed-width table this is the inline image, stable until the next insert that
+    /// grows `fixed_keys`.
+    pub fn keyAt(self: *const GroupTable, g: usize) []const u8 {
+        if (self.fixed_stride == 0) return self.keys.items[g];
+        const s: usize = self.fixed_stride;
+        return self.fixed_keys[g * s ..][0..s];
+    }
+
+    pub fn findKey(self: *const GroupTable, key: []const u8) ?u32 {
+        if (self.fixed_stride == 0) return self.map.get(key);
+        if (key.len == self.fixed_stride) return self.findFixed(key, hashFixed(key));
+        var buf: [32]u8 = undefined;
+        const image = expandFixed(self.fixed_stride, key, &buf) orelse return null;
+        return self.findFixed(image, hashFixed(image));
     }
 
     /// Owning thread only. A table that has stopped growing must not sit on a partly-used block while another worker
@@ -3195,6 +3347,12 @@ pub const GroupTable = struct {
     /// The group of `key`, made if new. `pos` is where the row asking for it sits in the input (`firstPosition`); a
     /// group remembers the least it was asked from.
     pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
+        if (self.fixed_stride != 0) {
+            if (key.len == self.fixed_stride) return self.getOrInsertFixed(key, agg_calls, pos);
+            var buf: [32]u8 = undefined;
+            const image = expandFixed(self.fixed_stride, key, &buf) orelse return error.BadGroupKey;
+            return self.getOrInsertFixed(image, agg_calls, pos);
+        }
         if (self.map.get(key)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
@@ -3243,6 +3401,109 @@ pub const GroupTable = struct {
         self.allocated_bytes += entry_size;
 
         return group_id;
+    }
+
+    /// `key` is the fixed image (`fixed_stride` bytes). Copied in; the caller may reuse its buffer.
+    pub fn getOrInsertFixed(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
+        std.debug.assert(key.len == self.fixed_stride);
+        const hash = hashFixed(key);
+        if (self.findFixed(key, hash)) |id| {
+            self.first.items[id] = @min(self.first.items[id], pos);
+            return id;
+        }
+        if (self.fixed_len == std.math.maxInt(u32)) return error.OutOfMemory;
+        // A failed growth has already replaced a buffer; charge what is still held so the shared budget is not told
+        // the old, smaller size.
+        errdefer self.allocated_bytes = self.fixedHeld();
+
+        const stride: usize = self.fixed_stride;
+        const groups_now: usize = self.fixed_len;
+        const grow_slots = self.fixed_slots.len == 0 or (groups_now + 1) * 4 > self.fixed_slots.len * 3;
+        const slot_cap: usize = if (grow_slots) @max(self.fixed_slots.len * 2, 16) else self.fixed_slots.len;
+        const key_need = (groups_now + 1) * stride;
+        const key_cap: usize = if (key_need > self.fixed_keys.len)
+            @max(key_need, self.fixed_keys.len * 2)
+        else
+            self.fixed_keys.len;
+        const acc_need = self.accumulators.items.len + agg_calls.len;
+        const acc_cap = if (self.accumulators.capacity >= acc_need)
+            self.accumulators.capacity
+        else
+            std.ArrayList(Accumulator).growCapacity(acc_need);
+        const first_need = self.first.items.len + 1;
+        const first_cap = if (self.first.capacity >= first_need)
+            self.first.capacity
+        else
+            std.ArrayList(u64).growCapacity(first_need);
+        const projected = key_cap + slot_cap * @sizeOf(FixedSlot) +
+            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator);
+        if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
+
+        if (slot_cap != self.fixed_slots.len) {
+            const grown = try self.allocator.alloc(FixedSlot, slot_cap);
+            @memset(grown, .{ .hash = 0, .id = empty_id });
+            for (self.fixed_slots) |s| {
+                if (s.id == empty_id) continue;
+                var i = s.hash & (slot_cap - 1);
+                while (grown[i].id != empty_id) i = (i + 1) & (slot_cap - 1);
+                grown[i] = s;
+            }
+            if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
+            self.fixed_slots = grown;
+        }
+        if (key_cap != self.fixed_keys.len) {
+            const grown = try self.allocator.alloc(u8, key_cap);
+            @memcpy(grown[0..self.fixed_keys.len], self.fixed_keys);
+            if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
+            self.fixed_keys = grown;
+        }
+        try self.accumulators.ensureTotalCapacity(self.allocator, acc_need);
+        try self.first.ensureTotalCapacity(self.allocator, first_need);
+
+        const id: u32 = self.fixed_len;
+        @memcpy(self.fixed_keys[@as(usize, id) * stride ..][0..stride], key);
+        var i = hash & (self.fixed_slots.len - 1);
+        while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
+        self.fixed_slots[i] = .{ .hash = hash, .id = id };
+        for (agg_calls) |call| self.accumulators.appendAssumeCapacity(Accumulator.init(call));
+        self.first.appendAssumeCapacity(pos);
+        self.fixed_len = id + 1;
+        self.allocated_bytes = self.fixedHeld();
+        return id;
+    }
+
+    fn fixedHeld(self: *const GroupTable) usize {
+        return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
+            self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator);
+    }
+
+    fn findFixed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
+        const slots = self.fixed_slots;
+        if (slots.len == 0) return null;
+        const mask = slots.len - 1;
+        const stride: usize = self.fixed_stride;
+        var i = hash & mask;
+        var n: usize = 0;
+        while (n < slots.len) : (n += 1) {
+            const s = slots[i];
+            if (s.id == empty_id) return null;
+            if (s.hash == hash and std.mem.eql(u8, self.fixed_keys[@as(usize, s.id) * stride ..][0..stride], key))
+                return s.id;
+            i = (i + 1) & mask;
+        }
+        return null;
+    }
+
+    fn admit(self: *GroupTable, entry_size: usize) !void {
+        if (self.allocated_bytes + entry_size <= self.max_memory_bytes) return;
+        const budget = self.shared orelse return error.ExceededMemoryBudget;
+        if (budget.tight()) self.releaseSlack();
+        const deficit = (self.allocated_bytes + entry_size) - self.max_memory_bytes;
+        const got = budget.draw(deficit) orelse blk: {
+            self.releaseSlack();
+            break :blk budget.draw(entry_size) orelse return error.ExceededMemoryBudget;
+        };
+        self.max_memory_bytes += got;
     }
 };
 
@@ -3690,4 +3951,109 @@ test "zero float bounds never prove sign even with known zero NaNs" {
             }
         }
     }
+}
+
+test "fixed-width group keys match the serialized framing and the byte table" {
+    const a = std.testing.allocator;
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+
+    var ints = [_]i64{ 7, -1, 7 };
+    var idef = [_]u32{ 1, 1, 0 };
+    const icol: filter_eval.Batch.Column = .{ .i64 = .{
+        .values = &ints,
+        .def_levels = &idef,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    var other = [_]i64{4};
+    const pair = [_]filter_eval.Batch.Column{ icol, .{ .i64 = .{ .values = &other } } };
+    var floats = [_]f64{ -0.0, std.math.nan(f64) };
+    const fcol: filter_eval.Batch.Column = .{ .f64 = .{ .values = &floats } };
+
+    var image: [32]u8 = undefined;
+    var ser: std.ArrayList(u8) = .empty;
+    defer ser.deinit(a);
+    const samples = [_]struct { cols: []const filter_eval.Batch.Column, row: usize }{
+        .{ .cols = &.{icol}, .row = 0 },
+        .{ .cols = &.{icol}, .row = 1 },
+        .{ .cols = &.{icol}, .row = 2 },
+        .{ .cols = &pair, .row = 0 },
+        .{ .cols = &.{fcol}, .row = 0 },
+        .{ .cols = &.{fcol}, .row = 1 },
+    };
+    for (samples) |s| {
+        const n = packFixedKey(s.cols, s.row, &image).?;
+        try serializeRowKey(&ser, a, s.cols, s.row);
+        var back: [32]u8 = undefined;
+        const expanded = expandFixed(n, ser.items, &back).?;
+        try std.testing.expectEqualSlices(u8, image[0..n], expanded);
+        var canon_buf: [48]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, ser.items, canonicalKey(image[0..n], &canon_buf));
+    }
+
+    var fixed = GroupTable.init(a, 1 << 20);
+    fixed.fixed_stride = 9;
+    defer fixed.deinit();
+    var bytes = GroupTable.init(a, 1 << 20);
+    defer bytes.deinit();
+    for ([_]usize{ 0, 2, 1, 0 }, 0..) |row, nvisit| {
+        const n = packFixedKey(&.{icol}, row, &image).?;
+        try serializeRowKey(&ser, a, &.{icol}, row);
+        // The repeated value is asked from an earlier position the second time, and must keep that one.
+        const pos: u64 = if (nvisit == 3) 40 else @intCast(100 - row);
+        const fid = try fixed.getOrInsert(ser.items, &calls, pos);
+        const bid = try bytes.getOrInsert(ser.items, &calls, pos);
+        try std.testing.expectEqual(bid, fid);
+        try std.testing.expectEqual(bytes.first.items[bid], fixed.first.items[fid]);
+        try std.testing.expectEqual(fid, fixed.findKey(image[0..n]).?);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixed.groupCount());
+    try std.testing.expectEqual(@as(u64, 40), fixed.first.items[0]);
+
+    var tiny = GroupTable.init(a, 0);
+    tiny.fixed_stride = 9;
+    defer tiny.deinit();
+    try std.testing.expectError(error.ExceededMemoryBudget, tiny.getOrInsertFixed(image[0..9], &calls, 0));
+}
+
+test "fixed-width group insert frees every partial allocation" {
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const insert = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var t = GroupTable.init(allocator, 1 << 30);
+            t.fixed_stride = 9;
+            defer t.deinit();
+            var i: u64 = 0;
+            while (i < 40) : (i += 1) {
+                var image: [9]u8 = @splat(0);
+                image[0] = 1;
+                std.mem.writeInt(u64, image[1..9], i, .little);
+                _ = try t.getOrInsertFixed(&image, &calls, i);
+                if (i % 3 == 0) _ = try t.getOrInsertFixed(&image, &calls, 1000 + i);
+            }
+            try std.testing.expectEqual(@as(usize, 40), t.groupCount());
+        }
+    }.run;
+    // In-place resize would make the failure count depend on what else the thread allocated.
+    const NoResize = struct {
+        child: std.mem.Allocator,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, alignment, ret_addr);
+        }
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(memory, alignment, ret_addr);
+        }
+    };
+    var fixed: NoResize = .{ .child = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(fixed.allocator(), insert, .{});
 }

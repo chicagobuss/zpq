@@ -524,8 +524,8 @@ const BlockMerge = struct {
         while (n < self.tables.len and self.done[n].load(.acquire)) : (n += 1) {
             const src = &self.tables[n];
             const len = self.calls.len;
-            for (src.keys.items, 0..) |key, g| {
-                const id = try self.merged.getOrInsert(key, self.calls, src.first.items[g]);
+            for (0..src.groupCount()) |g| {
+                const id = try self.merged.getOrInsert(src.keyAt(g), self.calls, src.first.items[g]);
                 const dst = self.merged.accumulators.items[@as(usize, id) * len ..][0..len];
                 for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| {
                     try mergeOwnedAccumulator(d, sa, self.gpa);
@@ -982,16 +982,21 @@ pub fn runMultiAggregate(
         break :blk n_blocks;
     };
     const group_tables = try arena.alloc(expr_agg.GroupTable, n_tables);
+    // Integer and float keys are a fixed-width image: the per-row lookup mixes those bytes in an open-addressed
+    // table instead of copying each new key into a string map. String and decimal keys stay on that map.
+    const fixed_stride: u8 = if (group_by_keys) |ks| expr_agg.fixedGroupStride(ks) orelse 0 else 0;
     for (group_tables) |*gt| {
         // Zero local ceiling: everything is drawn from the shared pool, so an idle table reserves nothing others
         // could use.
         gt.* = expr_agg.GroupTable.init(gpa, 0);
         gt.shared = &group_budget;
+        gt.fixed_stride = fixed_stride;
     }
     defer for (group_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
     merged_table.shared = &group_budget;
+    merged_table.fixed_stride = fixed_stride;
     defer merged_table.deinit();
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
@@ -1101,17 +1106,17 @@ pub fn runMultiAggregate(
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         var total_group_refs: usize = 0;
-        for (out_tables) |gt| total_group_refs += if (candidates) |keys_kept| keys_kept.len else gt.keys.items.len;
+        for (out_tables) |gt| total_group_refs += if (candidates) |keys_kept| keys_kept.len else gt.groupCount();
         const group_refs_buf = try gpa.alloc(MergeGroupRef, total_group_refs);
         defer gpa.free(group_refs_buf);
         var ref_i: usize = 0;
         for (out_tables, 0..) |gt, ti| {
             if (candidates) |keys_kept| {
-                for (keys_kept) |key| if (gt.map.get(key)) |gi| {
+                for (keys_kept) |key| if (gt.findKey(key)) |gi| {
                     group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = gi };
                     ref_i += 1;
                 };
-            } else for (0..gt.keys.items.len) |gi| {
+            } else for (0..gt.groupCount()) |gi| {
                 group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = @intCast(gi) };
                 ref_i += 1;
             }
@@ -1175,7 +1180,7 @@ pub fn runMultiAggregate(
             try slots.ensureTotalCapacity(gpa, group_refs.len);
             for (group_refs) |ref| {
                 slots.appendAssumeCapacity(.{
-                    .key = gt.keys.items[ref.group],
+                    .key = gt.keyAt(ref.group),
                     .first = gt.first.items[ref.group],
                     .idx = ref.group,
                 });
@@ -1205,7 +1210,9 @@ pub fn runMultiAggregate(
             for (outputs, row_vals) |out, *val| {
                 switch (out.source) {
                     .key => |k_idx| {
-                        val.* = try deserializeKeyColumn(gpa, slot.key, k_idx, key_types);
+                        // A fixed image pads a null column with zeros; the reader wants that payload omitted.
+                        var ser_buf: [48]u8 = undefined;
+                        val.* = try deserializeKeyColumn(gpa, expr_agg.canonicalKey(slot.key, &ser_buf), k_idx, key_types);
                     },
                     .agg => |a_idx| {
                         val.* = try materializeOne(gpa, agg_calls[a_idx], accs[a_idx]);
@@ -1337,7 +1344,7 @@ fn hashMergeGroupRefs(
 
     for (refs, 0..) |ref, ri| {
         const gt = &tables[ref.table];
-        const key = gt.keys.items[ref.group];
+        const key = gt.keyAt(ref.group);
         const gop = if (hashes) |hs| blk: {
             const got = map.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hs[ri] }, HashKeyCtx{});
             if (!got.found_existing) got.key_ptr.* = key;
@@ -1427,7 +1434,7 @@ fn mergeFoldedRefs(
     const bits: usize = std.math.log2_int(usize, nparts);
     const shift: u6 = @intCast(@as(usize, 64) - bits);
     for (refs, hashes) |ref, *h| {
-        h.* = std.hash.Wyhash.hash(0, tables[ref.table].keys.items[ref.group]);
+        h.* = std.hash.Wyhash.hash(0, tables[ref.table].keyAt(ref.group));
         counts[h.* >> shift] += 1;
     }
     const starts = try arena.alloc(usize, nparts + 1);
@@ -1516,7 +1523,7 @@ fn topKCandidates(
     const k = std.math.cast(usize, order.offset +| limit) orelse return null;
     if (k == 0) return &.{};
     var groups: usize = 0;
-    for (tables) |t| groups += t.keys.items.len;
+    for (tables) |t| groups += t.groupCount();
     if (groups <= k *| 4) return null;
 
     const stride = agg_calls.len;
@@ -1537,7 +1544,7 @@ fn topKCandidates(
     try heap.ensureTotalCapacity(arena, k);
     for (tables) |*t| {
         heap.clearRetainingCapacity();
-        for (0..t.keys.items.len) |g| {
+        for (0..t.groupCount()) |g| {
             const entry: Count = .{ .c = Count.of(t, g, a_idx, stride), .g = @intCast(g) };
             if (heap.count() == k) {
                 if (entry.c <= heap.peek().?.c) continue;
@@ -1545,7 +1552,7 @@ fn topKCandidates(
             }
             heap.push(arena, entry) catch unreachable; // within the capacity reserved above
         }
-        for (heap.items) |entry| try nominees.put(arena, t.keys.items[entry.g], {});
+        for (heap.items) |entry| try nominees.put(arena, t.keyAt(entry.g), {});
     }
     if (nominees.count() < k) return null;
 
@@ -1555,7 +1562,7 @@ fn topKCandidates(
     for (totals) |*total| {
         const key = it.next().?.*;
         total.* = 0;
-        for (tables) |*t| if (t.map.get(key)) |g| {
+        for (tables) |*t| if (t.findKey(key)) |g| {
             total.* +|= Count.of(t, g, a_idx, stride);
         };
     }
@@ -1567,13 +1574,15 @@ fn topKCandidates(
     // When most groups pass (counts nearly all equal), the plain merge is cheaper than collecting them.
     var passing: usize = 0;
     for (tables) |*t| {
-        for (0..t.keys.items.len) |g| passing += @intFromBool(Count.of(t, g, a_idx, stride) *| m >= tau);
+        for (0..t.groupCount()) |g| passing += @intFromBool(Count.of(t, g, a_idx, stride) *| m >= tau);
     }
     if (passing > groups / 4) return null;
     var kept: std.StringArrayHashMapUnmanaged(void) = .empty;
     try kept.ensureTotalCapacity(arena, passing);
     for (tables) |*t| {
-        for (t.keys.items, 0..) |key, g| if (Count.of(t, g, a_idx, stride) *| m >= tau) kept.putAssumeCapacity(key, {});
+        for (0..t.groupCount()) |g| {
+            if (Count.of(t, g, a_idx, stride) *| m >= tau) kept.putAssumeCapacity(t.keyAt(g), {});
+        }
     }
     return kept.keys();
 }

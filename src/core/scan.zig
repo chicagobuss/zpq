@@ -759,6 +759,8 @@ fn sketchEligible(
     args: MultiAggArgs,
     outputs: ?[]const BoundOutputColumn,
     calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    filter_cols: []const bool,
     use_blocks: bool,
 ) ?usize {
     const outs = outputs orelse return null;
@@ -774,6 +776,14 @@ fn sketchEligible(
     const k = order.offset +| limit;
     if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
     for (args.inputs) |in| if (in.gate != null) return null;
+    // Both passes decode every column the filter reads. Beyond the group keys, which both passes decode anyway, that
+    // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves.
+    for (filter_cols, 0..) |reads, col| if (reads) {
+        const is_key = for (keys) |key| {
+            if (key == .col_ref and key.col_ref.col_idx == col) break true;
+        } else false;
+        if (!is_key) return null;
+    };
     return a_idx;
 }
 
@@ -1227,7 +1237,7 @@ pub fn runMultiAggregate(
     //    region as one wall-clock span (real elapsed decode), separate
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
-    const sketch_count: ?usize = if (args.sketch_topk) |cfg| sketchEligible(cfg, args, group_outputs, agg_calls, use_blocks) else null;
+    const sketch_count: ?usize = if (args.sketch_topk) |cfg| sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks) else null;
     if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
         o.* = .ineligible;
     };
@@ -5074,4 +5084,20 @@ test "firstCandidates: every table's earliest groups hold the groups that appear
             if (std.mem.eql(u8, k, want)) break;
         } else return error.TestExpectedKey;
     }
+}
+
+test "sketchEligible: a filter may read the group keys, not other columns" {
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const outputs = [_]BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" } };
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    const args: MultiAggArgs = .{
+        .inputs = &.{},
+        .aggregate = "count(*) AS c",
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    const cfg: SketchTopK = .{};
+    // No filter, or one over the key column: eligible. One that also reads column 0: not.
+    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, false }, false));
+    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, true }, false));
+    try testing.expectEqual(@as(?usize, null), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ true, true }, false));
 }

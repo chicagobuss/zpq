@@ -1583,6 +1583,14 @@ fn mergeFoldedRefs(
     }
 }
 
+fn accCount(acc: expr_agg.Accumulator) u64 {
+    return switch (acc) {
+        .count => acc.count,
+        .distinct => if (acc.distinct) |d| @intCast(d.count()) else 0,
+        else => 0,
+    };
+}
+
 /// Group indices of the only rows a single table's `ORDER BY` one COUNT DESC LIMIT/OFFSET can keep. Null when that
 /// is not the order, or when the limit does not drop anyone. Ties break by earlier `first`, matching the stable sort
 /// the full merge would do.
@@ -1597,7 +1605,7 @@ fn countCut(outputs: []const BoundOutputColumn, agg_calls: []const expr_agg.AggC
         .agg => |a| a,
         .key => return null,
     };
-    if (agg_calls[a_idx].func != .count) return null;
+    if (agg_calls[a_idx].func != .count and agg_calls[a_idx].func != .count_distinct) return null;
     return .{ .a_idx = a_idx, .k = std.math.cast(usize, order.offset +| limit) orelse return null };
 }
 
@@ -1631,7 +1639,7 @@ fn keepCountTop(
     const kept_accs = try gpa.alloc(expr_agg.Accumulator, cut.k * calls.len);
     defer gpa.free(kept_accs);
     for (slots.items, 0..) |slot, si| {
-        const item: Item = .{ .c = accs.items[slot.idx + cut.a_idx].count, .first = slot.first, .s = @intCast(si) };
+        const item: Item = .{ .c = accCount(accs.items[slot.idx + cut.a_idx]), .first = slot.first, .s = @intCast(si) };
         if (heap.count() == cut.k) {
             const w = heap.peek().?;
             if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
@@ -1688,7 +1696,7 @@ fn countLimitGroups(
     try heap.ensureTotalCapacity(arena, k);
     for (0..n) |g| {
         const item: Item = .{
-            .c = table.accumulators.items[g * stride + a_idx].count,
+            .c = accCount(table.accumulators.items[g * stride + a_idx]),
             .first = table.first.items[g],
             .g = @intCast(g),
         };
@@ -1758,7 +1766,8 @@ fn topKCandidates(
         .agg => |a| a,
         .key => return null,
     };
-    if (agg_calls[a_idx].func != .count) return null;
+    if (agg_calls[a_idx].func != .count and agg_calls[a_idx].func != .count_distinct) return null;
+    const is_distinct = agg_calls[a_idx].func == .count_distinct;
     const k = std.math.cast(usize, order.offset +| limit) orelse return null;
     if (k == 0) return &.{};
     var groups: usize = 0;
@@ -1770,7 +1779,7 @@ fn topKCandidates(
         c: u64,
         g: u32,
         fn of(t: *const expr_agg.GroupTable, g: usize, at: usize, n: usize) u64 {
-            return t.accumulators.items[g * n + at].count;
+            return accCount(t.accumulators.items[g * n + at]);
         }
         fn byCount(_: void, a: @This(), b: @This()) std.math.Order {
             return std.math.order(a.c, b.c);
@@ -1795,14 +1804,20 @@ fn topKCandidates(
     }
     if (nominees.count() < k) return null;
 
-    // tau: the k-th largest exact total among the nominees.
+    // tau: a lower bound on the k-th largest total of all.
+    // For plain count, sum_i c_i is exact. For count_distinct, max_i c_i is a lower bound on the true distinct count.
     const totals = try arena.alloc(u64, nominees.count());
     var it = nominees.keyIterator();
     for (totals) |*total| {
         const key = it.next().?.*;
         total.* = 0;
         for (tables) |*t| if (t.findKey(key)) |g| {
-            total.* +|= Count.of(t, g, a_idx, stride);
+            const c = Count.of(t, g, a_idx, stride);
+            if (is_distinct) {
+                total.* = @max(total.*, c);
+            } else {
+                total.* +|= c;
+            }
         };
     }
     std.mem.sortUnstable(u64, totals, {}, std.sort.desc(u64));
@@ -1821,6 +1836,23 @@ fn topKCandidates(
     for (tables) |*t| {
         for (0..t.groupCount()) |g| {
             if (Count.of(t, g, a_idx, stride) *| m >= tau) kept.putAssumeCapacity(t.keyAt(g), {});
+        }
+    }
+    if (is_distinct) {
+        // Second-stage filter for distinct: sum_i c_i is an exact upper bound on the union cardinality.
+        // Any key where sum_i c_i < tau provably cannot reach tau.
+        var i: usize = 0;
+        while (i < kept.count()) {
+            const key = kept.keys()[i];
+            var sum_c: u64 = 0;
+            for (tables) |*t| if (t.findKey(key)) |g| {
+                sum_c +|= Count.of(t, g, a_idx, stride);
+            };
+            if (sum_c < tau) {
+                _ = kept.swapRemove(key);
+            } else {
+                i += 1;
+            }
         }
     }
     return kept.keys();
@@ -2780,6 +2812,39 @@ test "topKCandidates: keeps every key whose total can reach the cut, even one no
         .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 6 },
         .{ .keys = &.{.{ .column = 1, .descending = true }} },
     }) |other| try testing.expect(try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, other) == null);
+}
+
+test "topKCandidates: count_distinct keeps keys that can reach the cut and prunes rest" {
+    const calls = [_]expr_agg.AggCall{.{ .func = .count_distinct, .arg = null, .where = null, .alias = "u", .result = .i64 }};
+    var tables: [4]expr_agg.GroupTable = undefined;
+    for (&tables) |*t| t.* = .init(testing.allocator, 1 << 30);
+    defer for (&tables) |*t| t.deinit();
+    var name_buf: [16]u8 = undefined;
+    for (&tables, 0..) |*t, ti| {
+        for (0..5) |h| {
+            const key = try std.fmt.bufPrint(&name_buf, "h{d}", .{h});
+            const g = try t.getOrInsert(key, &calls, 0);
+            const ds = t.accumulators.items[g].distinct.?;
+            for (0..30) |v| try ds.insertU64(testing.allocator, @intCast(ti * 100 + v));
+        }
+        for (0..50) |i| {
+            const key = try std.fmt.bufPrint(&name_buf, "t{d}-{d}", .{ ti, i });
+            const g = try t.getOrInsert(key, &calls, 0);
+            const ds = t.accumulators.items[g].distinct.?;
+            try ds.insertU64(testing.allocator, @intCast(i));
+        }
+    }
+    const outputs = [_]BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "u" } };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 5 };
+    const kept = (try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, order)).?;
+    try testing.expectEqual(@as(usize, 5), kept.len);
+    for ([_][]const u8{ "h0", "h1", "h2", "h3", "h4" }) |want| {
+        for (kept) |k| {
+            if (std.mem.eql(u8, k, want)) break;
+        } else return error.TestExpectedKey;
+    }
 }
 
 test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own every value once, and leak nothing" {

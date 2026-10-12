@@ -145,6 +145,8 @@ fn fit38(v: i192) expr_eval.Error!i128 {
     return @intCast(v);
 }
 
+pub const NUM_PARTS: usize = 16;
+
 pub const DistinctSet = struct {
     val_set: union(enum) {
         none,
@@ -155,8 +157,30 @@ pub const DistinctSet = struct {
     allocated_bytes: usize = 0,
     max_memory_bytes: usize = 0,
     shared: ?*SharedBudget = null,
+    parts: ?[]DistinctSet = null,
+
+    pub fn initPartitions(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget) !void {
+        const p = try allocator.alloc(DistinctSet, NUM_PARTS);
+        for (p) |*part| {
+            part.* = .{ .shared = budget };
+        }
+        self.parts = p;
+        self.shared = budget;
+    }
+
+    pub fn setSharedBudget(self: *DistinctSet, budget: *SharedBudget) void {
+        self.shared = budget;
+        if (self.parts) |parts| {
+            for (parts) |*p| p.shared = budget;
+        }
+    }
 
     pub fn deinit(self: *DistinctSet, allocator: std.mem.Allocator) void {
+        if (self.parts) |parts| {
+            for (parts) |*p| p.deinit(allocator);
+            allocator.free(parts);
+            self.parts = null;
+        }
         if (self.shared) |budget| {
             budget.release(self.max_memory_bytes);
         }
@@ -174,6 +198,10 @@ pub const DistinctSet = struct {
     }
 
     pub fn releaseSlack(self: *DistinctSet) void {
+        if (self.parts) |parts| {
+            for (parts) |*p| p.releaseSlack();
+            return;
+        }
         const budget = self.shared orelse return;
         const slack = self.max_memory_bytes - self.allocated_bytes;
         if (slack == 0) return;
@@ -194,6 +222,11 @@ pub const DistinctSet = struct {
     }
 
     pub fn count(self: *const DistinctSet) usize {
+        if (self.parts) |parts| {
+            var total: usize = 0;
+            for (parts) |p| total += p.count();
+            return total;
+        }
         return switch (self.val_set) {
             .none => 0,
             .u64 => |s| s.count(),
@@ -203,6 +236,11 @@ pub const DistinctSet = struct {
     }
 
     pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
+        if (self.parts) |parts| {
+            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
+            const p = @as(usize, @intCast(h >> 60));
+            return parts[p].insertU64(allocator, v);
+        }
         if (self.val_set == .none) self.val_set = .{ .u64 = .empty };
         var s = &self.val_set.u64;
         const gop = try s.getOrPut(allocator, v);
@@ -216,6 +254,11 @@ pub const DistinctSet = struct {
     }
 
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
+        if (self.parts) |parts| {
+            const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
+            const p = @as(usize, @intCast(h >> 60));
+            return parts[p].insertI128(allocator, v);
+        }
         if (self.val_set == .none) self.val_set = .{ .i128 = .empty };
         var s = &self.val_set.i128;
         const gop = try s.getOrPut(allocator, v);
@@ -239,6 +282,11 @@ pub const DistinctSet = struct {
     }
 
     pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
+        if (self.parts) |parts| {
+            const h = std.hash.Wyhash.hash(0, v);
+            const p = @as(usize, @intCast(h >> 60));
+            return parts[p].insertBytes(allocator, v);
+        }
         if (self.val_set == .none) self.val_set = .{ .bytes = .empty };
         var s = &self.val_set.bytes;
         const gop = try s.getOrPut(allocator, v);
@@ -270,6 +318,38 @@ pub const DistinctSet = struct {
     }
 
     pub fn merge(self: *DistinctSet, other: *const DistinctSet, allocator: std.mem.Allocator) !void {
+        if (self.parts) |parts| {
+            if (other.parts) |oparts| {
+                for (parts, oparts) |*p, op| {
+                    try p.merge(&op, allocator);
+                }
+                return;
+            }
+            if (other.val_set != .none) {
+                switch (other.val_set) {
+                    .none => {},
+                    .u64 => |s| {
+                        var it = s.keyIterator();
+                        while (it.next()) |k| try self.insertU64(allocator, k.*);
+                    },
+                    .i128 => |s| {
+                        var it = s.keyIterator();
+                        while (it.next()) |k| try self.insertI128(allocator, k.*);
+                    },
+                    .bytes => |s| {
+                        var it = s.keyIterator();
+                        while (it.next()) |k| try self.insertBytes(allocator, k.*);
+                    },
+                }
+                return;
+            }
+        }
+        if (other.parts) |oparts| {
+            for (oparts) |op| {
+                try self.merge(&op, allocator);
+            }
+            return;
+        }
         switch (other.val_set) {
             .none => {},
             .u64 => |s| {

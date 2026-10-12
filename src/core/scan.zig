@@ -966,7 +966,11 @@ pub fn runMultiAggregate(
     for (work_items.items) |item| {
         for (item.accumulators) |*acc| {
             if (acc.* == .distinct and acc.distinct != null) {
-                acc.distinct.?.shared = &group_budget;
+                if (group_by_keys == null and n_workers > 1) {
+                    try acc.distinct.?.initPartitions(gpa, &group_budget);
+                } else {
+                    acc.distinct.?.shared = &group_budget;
+                }
             }
         }
     }
@@ -1067,7 +1071,12 @@ pub fn runMultiAggregate(
         var acc = expr_agg.Accumulator.init(call);
         if (call.func == .count_distinct) {
             const ds = try gpa.create(expr_agg.DistinctSet);
-            ds.* = .{ .shared = &group_budget };
+            ds.* = .{};
+            if (group_by_keys == null and n_workers > 1) {
+                try ds.initPartitions(gpa, &group_budget);
+            } else {
+                ds.shared = &group_budget;
+            }
             acc = .{ .distinct = ds };
         }
         accumulators[i] = acc;
@@ -1258,7 +1267,50 @@ pub fn runMultiAggregate(
         // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.
         for (work_items.items) |item| {
             for (item.accumulators, 0..) |*sub_acc, i| {
-                try mergeOwnedAccumulator(&accumulators[item.agg_start + i], sub_acc, gpa);
+                const call = agg_calls[item.agg_start + i];
+                if (call.func != .count_distinct) {
+                    try mergeOwnedAccumulator(&accumulators[item.agg_start + i], sub_acc, gpa);
+                }
+            }
+        }
+        for (agg_calls, 0..) |call, ci| {
+            if (call.func != .count_distinct) continue;
+            const dst_acc = &accumulators[ci];
+            const dst_ds = dst_acc.distinct orelse continue;
+            if (dst_ds.parts) |dst_parts| {
+                const n_threads = @min(n_workers, expr_agg.NUM_PARTS);
+                const tasks = try arena.alloc(DistinctMergeTask, n_threads);
+                var cursor = std.atomic.Value(usize).init(0);
+                for (tasks) |*task| task.* = .{
+                    .gpa = gpa,
+                    .dst_parts = dst_parts,
+                    .work_items = work_items.items,
+                    .agg_idx = ci,
+                    .cursor = &cursor,
+                };
+                const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+                if (!spawn_util.runTree(DistinctMergeTask, tasks, config, DistinctMergeTask.run)) {
+                    DistinctMergeTask.run(&tasks[0]);
+                }
+                for (tasks) |task| if (task.err) |e| return e;
+
+                for (work_items.items) |item| {
+                    if (ci >= item.agg_start and ci < item.agg_start + item.agg_len) {
+                        const sub_acc = &item.accumulators[ci - item.agg_start];
+                        if (sub_acc.* == .distinct and sub_acc.distinct != null) {
+                            sub_acc.distinct.?.deinit(gpa);
+                            gpa.destroy(sub_acc.distinct.?);
+                            sub_acc.* = .{ .distinct = null };
+                        }
+                    }
+                }
+            } else {
+                for (work_items.items) |item| {
+                    if (ci >= item.agg_start and ci < item.agg_start + item.agg_len) {
+                        const sub_acc = &item.accumulators[ci - item.agg_start];
+                        try mergeOwnedAccumulator(dst_acc, sub_acc, gpa);
+                    }
+                }
             }
         }
         for (workers) |w| {
@@ -1495,7 +1547,7 @@ fn mergeFoldedRefs(
     const n_threads = @min(n_workers, nparts);
     const tasks = try arena.alloc(MergeTask, n_threads);
     var cursor = std.atomic.Value(usize).init(0);
-    for (tasks) |*t| t.* = .{
+    for (tasks) |*task| task.* = .{
         .gpa = gpa,
         .tables = tables,
         .calls = calls,
@@ -1505,7 +1557,7 @@ fn mergeFoldedRefs(
     };
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
     if (!spawn_util.runTree(MergeTask, tasks, config, MergeTask.run)) MergeTask.run(&tasks[0]);
-    for (tasks) |t| if (t.err) |e| return e;
+    for (tasks) |task| if (task.err) |e| return e;
 
     var nslots: usize = 0;
     var naccs: usize = 0;
@@ -1738,6 +1790,63 @@ fn topKCandidates(
     }
     return kept.keys();
 }
+
+fn mergeDistinctPart(
+    dst: *expr_agg.DistinctSet,
+    src: *expr_agg.DistinctSet,
+    allocator: std.mem.Allocator,
+) !void {
+    if (src.count() == 0) {
+        src.deinit(allocator);
+        src.* = .{ .shared = dst.shared };
+        return;
+    }
+    if (dst.count() == 0) {
+        dst.* = src.*;
+        src.* = .{ .shared = dst.shared };
+        return;
+    }
+    if (dst.count() < src.count()) {
+        const tmp = dst.*;
+        dst.* = src.*;
+        src.* = tmp;
+    }
+    defer {
+        src.deinit(allocator);
+        src.* = .{ .shared = dst.shared };
+    }
+    return dst.merge(src, allocator);
+}
+
+const DistinctMergeTask = struct {
+    gpa: std.mem.Allocator,
+    dst_parts: []expr_agg.DistinctSet,
+    work_items: []const WorkItem,
+    agg_idx: usize,
+    cursor: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+
+    fn run(t: *DistinctMergeTask) void {
+        while (t.err == null) {
+            const p = t.cursor.fetchAdd(1, .monotonic);
+            if (p >= t.dst_parts.len) return;
+            const dst_part = &t.dst_parts[p];
+            for (t.work_items) |item| {
+                if (t.agg_idx < item.agg_start or t.agg_idx >= item.agg_start + item.agg_len) continue;
+                const src_acc = &item.accumulators[t.agg_idx - item.agg_start];
+                if (src_acc.* == .distinct and src_acc.distinct != null) {
+                    if (src_acc.distinct.?.parts) |src_parts| {
+                        const src_part = &src_parts[p];
+                        mergeDistinctPart(dst_part, src_part, t.gpa) catch |e| {
+                            t.err = e;
+                            return;
+                        };
+                    }
+                }
+            }
+        }
+    }
+};
 
 /// Merge an accumulator while transferring ownership of any string winner
 /// out of the source. `Accumulator.merge` intentionally consumes its
@@ -2721,6 +2830,32 @@ test "count limit on one table is the stable top, ties included" {
     for (kept_tie) |g| earliest[g] = true;
     try testing.expect(earliest[0] and earliest[1] and earliest[2]);
     try testing.expect(try countLimitGroups(arena, &table, &outputs, &calls, .{ .keys = top2.keys }) == null);
+}
+
+test "DistinctMergeTask: partitioned distinct sets merge and handle allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var dst: expr_agg.DistinctSet = .{};
+            defer dst.deinit(gpa);
+            try dst.initPartitions(gpa, null);
+
+            var src1: expr_agg.DistinctSet = .{};
+            defer src1.deinit(gpa);
+            try src1.initPartitions(gpa, null);
+            for ([_]u64{ 1, 2, 3, 100, 200, 300 }) |v| try src1.insertU64(gpa, v);
+
+            var src2: expr_agg.DistinctSet = .{};
+            defer src2.deinit(gpa);
+            try src2.initPartitions(gpa, null);
+            for ([_]u64{ 2, 3, 4, 200, 400 }) |v| try src2.insertU64(gpa, v);
+
+            for (0..expr_agg.NUM_PARTS) |p| {
+                try mergeDistinctPart(&dst.parts.?[p], &src1.parts.?[p], gpa);
+                try mergeDistinctPart(&dst.parts.?[p], &src2.parts.?[p], gpa);
+            }
+            try testing.expectEqual(@as(usize, 8), dst.count());
+        }
+    }.run, .{});
 }
 
 test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {

@@ -552,6 +552,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .leave_regions = ctx.exit_after,
         .unordered = args.unordered,
         .select_cols = args.select_cols,
+        .result_order = args.result_order,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.

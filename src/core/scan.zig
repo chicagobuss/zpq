@@ -88,6 +88,9 @@ pub const MultiAggArgs = struct {
     decode_limit: ?usize = null,
     /// The GROUP BY output columns as a select list writes them (SQL).
     select_cols: ?[]const expr_ast.SelectColumn = null,
+    /// The cut the caller applies to the GROUP BY rows (`AggOutput.applyResultOrder`): a COUNT-descending cut lets the
+    /// merge skip groups that cannot make it. The rows still arrive uncut, in their usual order.
+    result_order: expr_ast.ResultOrder = .{},
     /// Comma-separated output column names. Only used with GROUP BY when
     /// `select_cols` is unset (e.g. CLI `--column-order`). Reorders the
     /// default key-then-aggregate layout.
@@ -1080,20 +1083,25 @@ pub fn runMultiAggregate(
             table: u32,
             group: u32,
         };
+        // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
+        const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         var total_group_refs: usize = 0;
-        for (out_tables) |gt| total_group_refs += gt.keys.items.len;
-        const group_refs = try gpa.alloc(GroupRef, total_group_refs);
-        defer gpa.free(group_refs);
+        for (out_tables) |gt| total_group_refs += if (candidates) |keys_kept| keys_kept.len else gt.keys.items.len;
+        const group_refs_buf = try gpa.alloc(GroupRef, total_group_refs);
+        defer gpa.free(group_refs_buf);
         var ref_i: usize = 0;
         for (out_tables, 0..) |gt, ti| {
-            for (0..gt.keys.items.len) |gi| {
-                group_refs[ref_i] = .{
-                    .table = @intCast(ti),
-                    .group = @intCast(gi),
+            if (candidates) |keys_kept| {
+                for (keys_kept) |key| if (gt.map.get(key)) |gi| {
+                    group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = gi };
+                    ref_i += 1;
                 };
+            } else for (0..gt.keys.items.len) |gi| {
+                group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = @intCast(gi) };
                 ref_i += 1;
             }
         }
+        const group_refs = group_refs_buf[0..ref_i];
 
         const GroupRefSorter = struct {
             tables: []const expr_agg.GroupTable,
@@ -1312,6 +1320,91 @@ fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?
 /// out of the source. `Accumulator.merge` intentionally consumes its
 /// source's owned string; clear the source so its owner (a GroupTable, a
 /// work item) cannot free it a second time.
+/// The keys of the only groups that can reach the first `offset + limit` rows of an answer ordered by a COUNT,
+/// descending, first; null when the order is not such a cut. Exact, after the threshold algorithm of distributed
+/// top-k (Cao and Wang, 2004): every table nominates its own top groups, and the k-th largest exact total among the
+/// nominees, `tau`, is a floor on the k-th largest total of all. A key whose total reaches `tau` across `m` tables has
+/// at least `tau / m` in one of them, so the keys some table counts that high are all that can make the cut, ties at
+/// the cut included; the rest are never merged or materialized. Typically a handful of millions of groups survive.
+fn topKCandidates(
+    arena: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    outputs: []const BoundOutputColumn,
+    agg_calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+) error{OutOfMemory}!?[]const []const u8 {
+    const limit = order.limit orelse return null;
+    if (order.keys.len == 0 or !order.keys[0].descending) return null;
+    const a_idx = switch (outputs[order.keys[0].column].source) {
+        .agg => |a| a,
+        .key => return null,
+    };
+    if (agg_calls[a_idx].func != .count) return null;
+    const k = std.math.cast(usize, order.offset +| limit) orelse return null;
+    if (k == 0) return &.{};
+    var groups: usize = 0;
+    for (tables) |t| groups += t.keys.items.len;
+    if (groups <= k *| 4) return null;
+
+    const stride = agg_calls.len;
+    const Count = struct {
+        c: u64,
+        g: u32,
+        fn of(t: *const expr_agg.GroupTable, g: usize, at: usize, n: usize) u64 {
+            return t.accumulators.items[g * n + at].count;
+        }
+        fn byCount(_: void, a: @This(), b: @This()) std.math.Order {
+            return std.math.order(a.c, b.c);
+        }
+    };
+
+    // Nominees: each table's own k largest counts, by key.
+    var nominees: std.StringHashMapUnmanaged(void) = .empty;
+    var heap: std.PriorityQueue(Count, void, Count.byCount) = .empty;
+    try heap.ensureTotalCapacity(arena, k);
+    for (tables) |*t| {
+        heap.clearRetainingCapacity();
+        for (0..t.keys.items.len) |g| {
+            const entry: Count = .{ .c = Count.of(t, g, a_idx, stride), .g = @intCast(g) };
+            if (heap.count() == k) {
+                if (entry.c <= heap.peek().?.c) continue;
+                _ = heap.pop();
+            }
+            heap.push(arena, entry) catch unreachable; // within the capacity reserved above
+        }
+        for (heap.items) |entry| try nominees.put(arena, t.keys.items[entry.g], {});
+    }
+    if (nominees.count() < k) return null;
+
+    // tau: the k-th largest exact total among the nominees.
+    const totals = try arena.alloc(u64, nominees.count());
+    var it = nominees.keyIterator();
+    for (totals) |*total| {
+        const key = it.next().?.*;
+        total.* = 0;
+        for (tables) |*t| if (t.map.get(key)) |g| {
+            total.* +|= Count.of(t, g, a_idx, stride);
+        };
+    }
+    std.mem.sortUnstable(u64, totals, {}, std.sort.desc(u64));
+    const tau = totals[k - 1];
+    if (tau == 0) return null;
+
+    const m: u64 = tables.len;
+    // When most groups pass (counts nearly all equal), the plain merge is cheaper than collecting them.
+    var passing: usize = 0;
+    for (tables) |*t| {
+        for (0..t.keys.items.len) |g| passing += @intFromBool(Count.of(t, g, a_idx, stride) *| m >= tau);
+    }
+    if (passing > groups / 4) return null;
+    var kept: std.StringArrayHashMapUnmanaged(void) = .empty;
+    try kept.ensureTotalCapacity(arena, passing);
+    for (tables) |*t| {
+        for (t.keys.items, 0..) |key, g| if (Count.of(t, g, a_idx, stride) *| m >= tau) kept.putAssumeCapacity(key, {});
+    }
+    return kept.keys();
+}
+
 fn mergeOwnedAccumulator(
     dst: *expr_agg.Accumulator,
     src: *expr_agg.Accumulator,
@@ -2122,6 +2215,109 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
             };
             defer freeResult(res);
             try testing.expectEqual(@as(usize, 1), (res.output.group_rows orelse return error.TestUnexpectedResult).len);
+        }
+    }
+}
+
+fn sameValue(a: AggValue, b: AggValue) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .s => |x| std.mem.eql(u8, x, b.s),
+        else => std.meta.eql(a, b),
+    };
+}
+
+test "topKCandidates: keeps every key whose total can reach the cut, even one no table nominates" {
+    // Four tables. h0..h4 count 30 in each (120 in all); s0 and s1 count 26 in each (104), so a cut at 6 ends inside
+    // their tie, and each table nominates only one of them; 200 tail keys count 1. The floor is 104, a quarter of it
+    // per table: no table alone reaches 104 for any key, so the bound must be divided among the tables.
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var tables: [4]expr_agg.GroupTable = undefined;
+    for (&tables) |*t| t.* = .init(testing.allocator, 1 << 30);
+    defer for (&tables) |*t| t.deinit();
+    var name_buf: [16]u8 = undefined;
+    for (&tables, 0..) |*t, ti| {
+        const add = struct {
+            fn add(table: *expr_agg.GroupTable, key: []const u8, n: u64, c: []const expr_agg.AggCall) !void {
+                const g = try table.getOrInsert(key, c, 0);
+                table.accumulators.items[g].count += n;
+            }
+        }.add;
+        for (0..5) |h| try add(t, try std.fmt.bufPrint(&name_buf, "h{d}", .{h}), 30, &calls);
+        // Each table meets the tied pair in a different order, so which one it nominates differs.
+        const pair = [2][]const u8{ "s0", "s1" };
+        try add(t, pair[ti % 2], 26, &calls);
+        try add(t, pair[1 - ti % 2], 26, &calls);
+        for (0..50) |i| try add(t, try std.fmt.bufPrint(&name_buf, "t{d}-{d}", .{ ti, i }), 1, &calls);
+    }
+    const outputs = [_]BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" } };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 6 };
+    const kept = (try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, order)).?;
+    try testing.expectEqual(@as(usize, 7), kept.len);
+    for ([_][]const u8{ "h0", "h1", "h2", "h3", "h4", "s0", "s1" }) |want| {
+        for (kept) |k| {
+            if (std.mem.eql(u8, k, want)) break;
+        } else return error.TestExpectedKey;
+    }
+    // Ascending, a key column first, or no LIMIT: not a cut this applies to.
+    for ([_]expr_ast.ResultOrder{
+        .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 6 },
+        .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 6 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }} },
+    }) |other| try testing.expect(try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, other) == null);
+}
+
+test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Cut = struct { order: expr_ast.ResultOrder, prunes: bool };
+    const cuts = [_]Cut{
+        .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 }, .prunes = true },
+        .{ .order = .{ .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = true } }, .limit = 3, .offset = 5 }, .prunes = true },
+        .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 1 }, .prunes = true },
+        .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 0 }, .prunes = true },
+        // Not a COUNT-descending cut: merged in full.
+        .{ .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 10 }, .prunes = false },
+        .{ .order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 10 }, .prunes = false },
+        .{ .order = .{ .keys = &.{.{ .column = 1, .descending = true }} }, .prunes = false },
+    };
+    for ([_][]const u8{ "k", "n" }) |key| {
+        for ([_]usize{ 1, 2, 4, 8 }) |parallelism| {
+            for (cuts) |cut| {
+                var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const select_cols = try selectList(arena, &.{ key, "count(*) AS c", "min(v) AS lo", "max(v) AS hi" });
+                var args: MultiAggArgs = .{
+                    .inputs = &inputs,
+                    .aggregate = "count(*) AS c, min(v) AS lo, max(v) AS hi",
+                    .group_by = key,
+                    .select_cols = select_cols,
+                    .parallelism = parallelism,
+                };
+                var whole = try runMultiAggregate(testing.allocator, arena, args);
+                defer whole.deinit(testing.allocator);
+                args.result_order = cut.order;
+                var cut_res = try runMultiAggregate(testing.allocator, arena, args);
+                defer cut_res.deinit(testing.allocator);
+
+                const all_groups = whole.output.group_rows.?.len;
+                const merged = cut_res.output.group_rows.?.len;
+                if (cut.prunes) try testing.expect(merged < all_groups / 10) else try testing.expectEqual(all_groups, merged);
+                try whole.output.applyResultOrder(testing.allocator, cut.order);
+                try cut_res.output.applyResultOrder(testing.allocator, cut.order);
+                const want = whole.output.group_rows.?;
+                const got = cut_res.output.group_rows.?;
+                try testing.expectEqual(want.len, got.len);
+                for (want, got) |w, g| for (w, g) |a, b| try testing.expect(sameValue(a, b));
+            }
         }
     }
 }

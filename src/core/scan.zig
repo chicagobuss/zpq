@@ -1081,6 +1081,9 @@ pub fn runMultiAggregate(
     }
 
     var work_items: std.ArrayList(WorkItem) = .empty;
+    // Workers fold string min/max winners into the items' accumulators, and the items own count(DISTINCT) sets from
+    // here on; merging below moves both out, so this frees only what a failure leaves behind.
+    errdefer for (work_items.items) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
     for (raw_work_items.items) |raw| {
         for (chunk_columns, 0..) |cols, chunk_idx| {
             const agg_start = chunk_starts[chunk_idx];
@@ -1091,15 +1094,7 @@ pub fn runMultiAggregate(
                 try arena.alloc(expr_agg.Accumulator, 0)
             else blk: {
                 const arr = try arena.alloc(expr_agg.Accumulator, agg_len);
-                for (agg_calls[agg_start .. agg_start + agg_len], 0..) |call, ci| {
-                    var acc = expr_agg.Accumulator.init(call);
-                    if (call.func == .count_distinct) {
-                        const ds = try gpa.create(expr_agg.DistinctSet);
-                        ds.* = .{};
-                        acc = .{ .distinct = ds };
-                    }
-                    arr[ci] = acc;
-                }
+                for (agg_calls[agg_start .. agg_start + agg_len], arr) |call, *acc| acc.* = expr_agg.Accumulator.init(call);
                 break :blk arr;
             };
 
@@ -1111,6 +1106,12 @@ pub fn runMultiAggregate(
                 .columns = cols,
                 .accumulators = sub_accs,
             });
+            // The sets once the item owns them, so a failure making one frees the others.
+            for (agg_calls[agg_start..][0..sub_accs.len], sub_accs) |call, *acc| if (call.func == .count_distinct) {
+                const ds = try gpa.create(expr_agg.DistinctSet);
+                ds.* = .{};
+                acc.* = .{ .distinct = ds };
+            };
         }
     }
 
@@ -1229,9 +1230,6 @@ pub fn runMultiAggregate(
         };
     }
 
-    // Workers fold string min/max winners into the items' accumulators; merging below moves them out, so this frees
-    // only what a failure leaves behind.
-    errdefer for (work_items.items) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
 
     // 5. Spawn, join, propagate first error. Time the whole parallel
     //    region as one wall-clock span (real elapsed decode), separate

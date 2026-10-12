@@ -175,6 +175,13 @@ pub const DistinctSet = struct {
         }
         self.parts = p;
         self.shared = budget;
+        try self.charge(NUM_PARTS * @sizeOf(DistinctSet));
+    }
+
+    /// Count `bytes` this set holds outside its values (the set object itself, a partition array) against its budget.
+    pub fn charge(self: *DistinctSet, bytes: usize) error{ExceededMemoryBudget}!void {
+        try self.drawMore(bytes);
+        self.allocated_bytes += bytes;
     }
 
     /// Give this set's reservation, partitions' included, back to its budget, and forget the budget: for a set that
@@ -3731,6 +3738,10 @@ pub const GroupTable = struct {
                 const ds = try self.allocator.create(DistinctSet);
                 ds.* = .{ .shared = self.shared };
                 acc = .{ .distinct = ds };
+                self.accumulators.appendAssumeCapacity(acc);
+                // The set object is memory the group holds, as its values are.
+                try ds.charge(@sizeOf(DistinctSet));
+                continue;
             }
             self.accumulators.appendAssumeCapacity(acc);
         }
@@ -3824,6 +3835,10 @@ pub const GroupTable = struct {
                 const ds = try self.allocator.create(DistinctSet);
                 ds.* = .{ .shared = self.shared };
                 acc = .{ .distinct = ds };
+                self.accumulators.appendAssumeCapacity(acc);
+                // The set object is memory the group holds, as its values are.
+                try ds.charge(@sizeOf(DistinctSet));
+                continue;
             }
             self.accumulators.appendAssumeCapacity(acc);
         }

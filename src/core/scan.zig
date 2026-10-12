@@ -1302,6 +1302,7 @@ pub fn runMultiAggregate(
         // query at the ceiling would fail. The merge map borrows source keys and does not touch that budget.
         const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else group_tables;
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
+        try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         // One table already holds each group's final count. The groups a stable count-descending limit keeps are a
         // heap of that size; materializing every other group is the memory cost of a near-unique key.
@@ -1389,8 +1390,12 @@ pub fn runMultiAggregate(
         }
         const folded = out_tables.len > 1;
         if (folded) {
-            const count_cut = countCut(group_outputs.?, agg_calls, args.result_order);
-            try mergeFoldedRefs(gpa, arena, out_tables, group_refs, agg_calls, n_workers, count_cut, &slots, &merged_accs);
+            if (candidates) |keys_kept| {
+                try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
+            } else {
+                const count_cut = countCut(group_outputs.?, agg_calls, args.result_order);
+                try mergeFoldedRefs(gpa, arena, out_tables, group_refs, agg_calls, n_workers, count_cut, &slots, &merged_accs);
+            }
         } else {
             const gt = &out_tables[0];
             try slots.ensureTotalCapacity(gpa, group_refs.len);
@@ -1445,10 +1450,12 @@ pub fn runMultiAggregate(
         // Result rows own any strings they need; table keys and accumulator
         // winners can now be released before returning (the deferred deinit
         // then finds them empty).
-        if (!args.leave_regions) for (out_tables) |*gt| {
-            gt.deinit();
-            gt.* = expr_agg.GroupTable.init(gpa, 0);
-        };
+        if (!args.leave_regions) {
+            for (out_tables) |*gt| {
+                gt.deinit();
+                gt.* = expr_agg.GroupTable.init(gpa, 0);
+            }
+        }
     } else {
         // Merge each work item exactly ONCE: `work` is shared and claimed dynamically, so folding it per worker would
         // merge every item n_workers times — inflating sums and double-freeing the string min/max winner.
@@ -1571,6 +1578,200 @@ const MergedSlot = struct {
     /// Start of this group's accumulators in the merged list, or the source group id when nothing was folded.
     idx: usize,
 };
+
+const Phase1Task = struct {
+    sources: []const *const expr_agg.DistinctSet,
+    slices: []std.ArrayListUnmanaged(u64),
+    cursor: *std.atomic.Value(usize),
+
+    fn run(t: *Phase1Task) void {
+        while (true) {
+            const m = t.cursor.fetchAdd(1, .monotonic);
+            if (m >= t.sources.len) return;
+            const ds = t.sources[m];
+            const row = t.slices[m * 16 .. (m + 1) * 16];
+            switch (ds.val_set) {
+                .none => {},
+                .inline_u64 => |s| {
+                    for (s.vals[0..s.len]) |v| {
+                        const p = (v *% 11400714819323198485) >> 60;
+                        row[p].appendAssumeCapacity(v);
+                    }
+                },
+                .u64 => |s| {
+                    var it = s.keyIterator();
+                    while (it.next()) |k| {
+                        const v = k.*;
+                        const p = (v *% 11400714819323198485) >> 60;
+                        row[p].appendAssumeCapacity(v);
+                    }
+                },
+                else => {},
+            }
+            if (ds.parts) |parts| {
+                for (parts) |part| {
+                    switch (part.val_set) {
+                        .inline_u64 => |s| for (s.vals[0..s.len]) |v| {
+                            const p = (v *% 11400714819323198485) >> 60;
+                            row[p].appendAssumeCapacity(v);
+                        },
+                        .u64 => |s| {
+                            var it = s.keyIterator();
+                            while (it.next()) |k| {
+                                const v = k.*;
+                                const p = (v *% 11400714819323198485) >> 60;
+                                row[p].appendAssumeCapacity(v);
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+};
+
+const Phase2Task = struct {
+    gpa: std.mem.Allocator,
+    slices: []std.ArrayListUnmanaged(u64),
+    M: usize,
+    counts: []usize,
+    cursor: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+
+    fn run(t: *Phase2Task) void {
+        while (t.err == null) {
+            const p = t.cursor.fetchAdd(1, .monotonic);
+            if (p >= 16) return;
+            var total: usize = 0;
+            for (0..t.M) |m| total += t.slices[m * 16 + p].items.len;
+            if (total == 0) {
+                t.counts[p] = 0;
+                continue;
+            }
+            if (total == 1) {
+                t.counts[p] = 1;
+                continue;
+            }
+            var local_map: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer local_map.deinit(t.gpa);
+            local_map.ensureTotalCapacity(t.gpa, @intCast(total)) catch |err| {
+                t.err = err;
+                return;
+            };
+            for (0..t.M) |m| {
+                for (t.slices[m * 16 + p].items) |v| {
+                    local_map.putAssumeCapacity(v, {});
+                }
+            }
+            t.counts[p] = local_map.count();
+        }
+    }
+};
+
+fn parallelDistinctCountU64(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    sources: []const *const expr_agg.DistinctSet,
+    n_workers: usize,
+) !u64 {
+    const M = sources.len;
+    const slices = try arena.alloc(std.ArrayListUnmanaged(u64), M * 16);
+    for (slices, 0..) |*cell, idx| {
+        cell.* = .empty;
+        const m = idx / 16;
+        const cap = sources[m].count() / 16 + 64;
+        try cell.ensureTotalCapacity(arena, cap);
+    }
+
+    const n_threads = @min(n_workers, @max(M, 16));
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+
+    {
+        var cursor = std.atomic.Value(usize).init(0);
+        const tasks = try arena.alloc(Phase1Task, n_threads);
+        for (tasks) |*task| task.* = .{
+            .sources = sources,
+            .slices = slices,
+            .cursor = &cursor,
+        };
+        if (!spawn_util.runTree(Phase1Task, tasks, config, Phase1Task.run)) {
+            Phase1Task.run(&tasks[0]);
+        }
+    }
+
+    var counts: [16]usize = undefined;
+    {
+        var cursor = std.atomic.Value(usize).init(0);
+        const tasks = try arena.alloc(Phase2Task, n_threads);
+        for (tasks) |*task| task.* = .{
+            .gpa = gpa,
+            .slices = slices,
+            .M = M,
+            .counts = &counts,
+            .cursor = &cursor,
+        };
+        if (!spawn_util.runTree(Phase2Task, tasks, config, Phase2Task.run)) {
+            Phase2Task.run(&tasks[0]);
+        }
+        for (tasks) |task| if (task.err) |e| return e;
+    }
+
+    var total: u64 = 0;
+    for (counts) |c| total += c;
+    return total;
+}
+
+fn mergeCandidates(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    keys: []const []const u8,
+    calls: []const expr_agg.AggCall,
+    n_workers: usize,
+    slots: *std.ArrayList(MergedSlot),
+    accs: *std.ArrayList(expr_agg.Accumulator),
+) !void {
+    _ = arena;
+    _ = n_workers;
+    try slots.ensureTotalCapacity(gpa, keys.len);
+    try accs.ensureTotalCapacity(gpa, keys.len * calls.len);
+
+    for (keys) |key| {
+        var first: u64 = std.math.maxInt(u64);
+        var key_borrowed: []const u8 = key;
+        var found_any = false;
+
+        for (tables) |gt| {
+            if (gt.findKey(key)) |gi| {
+                found_any = true;
+                if (gt.first.items[gi] < first) {
+                    first = gt.first.items[gi];
+                    key_borrowed = gt.keyAt(gi);
+                }
+            }
+        }
+        if (!found_any) continue;
+
+        const slot_idx = accs.items.len;
+        for (calls, 0..) |call, ci| {
+            var dst = expr_agg.Accumulator.init(call);
+            for (tables) |gt| {
+                if (gt.findKey(key)) |gi| {
+                    const src = &gt.accumulators.items[@as(usize, gi) * calls.len + ci];
+                    try mergeOwnedAccumulator(&dst, src, gpa);
+                }
+            }
+            accs.appendAssumeCapacity(dst);
+        }
+
+        slots.appendAssumeCapacity(.{
+            .key = key_borrowed,
+            .first = first,
+            .idx = slot_idx,
+        });
+    }
+}
 
 const HashKey = struct { bytes: []const u8, hash: u64 };
 
@@ -2091,6 +2292,78 @@ fn firstCandidates(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable
 /// nominees, `tau`, is a floor on the k-th largest total of all. A key whose total reaches `tau` across `m` tables has
 /// at least `tau / m` in one of them, so the keys some table counts that high are all that can make the cut, ties at
 /// the cut included; the rest are never merged or materialized. Typically a few hundred groups of millions survive.
+fn premergeLargeDistinctSets(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    tables: []expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    n_workers: usize,
+) !void {
+    if (tables.len <= 1 or n_workers <= 1) return;
+
+    for (calls, 0..) |call, ci| {
+        if (call.func != .count_distinct) continue;
+
+        var large_keys: std.StringHashMapUnmanaged(void) = .empty;
+        defer large_keys.deinit(gpa);
+
+        for (tables) |gt| {
+            for (0..gt.groupCount()) |gi| {
+                const acc = gt.accumulators.items[gi * calls.len + ci];
+                if (acc == .distinct and acc.distinct != null) {
+                    if (acc.distinct.?.count() >= 16384) {
+                        try large_keys.put(gpa, gt.keyAt(gi), {});
+                    }
+                }
+            }
+        }
+
+        if (large_keys.count() == 0) continue;
+
+        var it = large_keys.keyIterator();
+        while (it.next()) |k_ptr| {
+            const key = k_ptr.*;
+            var sources: std.ArrayListUnmanaged(*const expr_agg.DistinctSet) = .empty;
+            var is_u64 = true;
+
+            for (tables) |gt| {
+                if (gt.findKey(key)) |gi| {
+                    const acc = gt.accumulators.items[gi * calls.len + ci];
+                    if (acc == .distinct and acc.distinct != null) {
+                        const ds = acc.distinct.?;
+                        try sources.append(arena, ds);
+                        if (ds.val_set != .none and ds.val_set != .inline_u64 and ds.val_set != .u64) {
+                            is_u64 = false;
+                        }
+                    }
+                }
+            }
+
+            if (!is_u64 or sources.items.len <= 1) continue;
+
+            const total = try parallelDistinctCountU64(gpa, arena, sources.items, n_workers);
+
+            var first = true;
+            for (tables) |*gt| {
+                if (gt.findKey(key)) |gi| {
+                    const acc_ptr = &gt.accumulators.items[gi * calls.len + ci];
+                    if (acc_ptr.* == .distinct and acc_ptr.distinct != null) {
+                        const ds = acc_ptr.distinct.?;
+                        ds.deinit(gpa);
+                        gpa.destroy(ds);
+                    }
+                    if (first) {
+                        acc_ptr.* = .{ .count = total };
+                        first = false;
+                    } else {
+                        acc_ptr.* = .{ .count = 0 };
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn topKCandidates(
     arena: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
@@ -2263,6 +2536,29 @@ fn mergeOwnedAccumulator(
     src: *expr_agg.Accumulator,
     allocator: std.mem.Allocator,
 ) !void {
+    if (src.* == .count and dst.* == .count) {
+        dst.count += src.count;
+        return;
+    }
+    if (src.* == .count and dst.* == .distinct) {
+        if (dst.distinct) |d| {
+            dst.* = .{ .count = d.count() + src.count };
+            d.deinit(allocator);
+            allocator.destroy(d);
+        } else {
+            dst.* = src.*;
+        }
+        return;
+    }
+    if (src.* == .distinct and dst.* == .count) {
+        if (src.distinct) |s| {
+            dst.count += s.count();
+            s.deinit(allocator);
+            allocator.destroy(s);
+            src.* = .{ .distinct = null };
+        }
+        return;
+    }
     if (src.* == .distinct) {
         // The larger set is handed over whole and the smaller folded into it, so a merge copies the fewest values.
         const theirs = src.distinct orelse return;
@@ -2688,7 +2984,11 @@ fn decValue(v: ?i128, spec: expr_ast.Dec) AggValue {
 pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     return switch (call.func) {
         .count => .{ .i = @intCast(state.count) },
-        .count_distinct => .{ .i = if (state.distinct) |d| @intCast(d.count()) else 0 },
+        .count_distinct => switch (state) {
+            .count => |cnt| .{ .i = @intCast(cnt) },
+            .distinct => |d| .{ .i = if (d) |set| @intCast(set.count()) else 0 },
+            else => .{ .i = 0 },
+        },
         // i128 carries the full sum (incl. i64 overflow + unsigned-64);
         // the JSON layer prints it directly, no narrowing/overflow error.
         // sum/min/max over no values are NULL, never a 0 or "" stand-in.

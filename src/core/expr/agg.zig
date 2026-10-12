@@ -147,9 +147,17 @@ fn fit38(v: i192) expr_eval.Error!i128 {
 
 pub const NUM_PARTS: usize = 16;
 
+pub const INLINE_CAP: usize = 2;
+pub const InlineU64 = struct { len: u8, vals: [INLINE_CAP]u64 };
+pub const InlineI128 = struct { len: u8, vals: [INLINE_CAP]i128 };
+pub const InlineBytes = struct { len: u8, vals: [INLINE_CAP][]const u8 };
+
 pub const DistinctSet = struct {
     val_set: union(enum) {
         none,
+        inline_u64: InlineU64,
+        inline_i128: InlineI128,
+        inline_bytes: InlineBytes,
         u64: std.AutoHashMapUnmanaged(u64, void),
         i128: std.AutoHashMapUnmanaged(i128, void),
         bytes: std.StringHashMapUnmanaged(void),
@@ -185,7 +193,10 @@ pub const DistinctSet = struct {
             budget.release(self.max_memory_bytes);
         }
         switch (self.val_set) {
-            .none => {},
+            .none, .inline_u64, .inline_i128 => {},
+            .inline_bytes => |s| {
+                for (s.vals[0..s.len]) |k| allocator.free(k);
+            },
             .u64 => |*s| s.deinit(allocator),
             .i128 => |*s| s.deinit(allocator),
             .bytes => |*s| {
@@ -229,6 +240,9 @@ pub const DistinctSet = struct {
         }
         return switch (self.val_set) {
             .none => 0,
+            .inline_u64 => |s| s.len,
+            .inline_i128 => |s| s.len,
+            .inline_bytes => |s| s.len,
             .u64 => |s| s.count(),
             .i128 => |s| s.count(),
             .bytes => |s| s.count(),
@@ -241,16 +255,46 @@ pub const DistinctSet = struct {
             const p = @as(usize, @intCast(h >> 60));
             return parts[p].insertU64(allocator, v);
         }
-        if (self.val_set == .none) self.val_set = .{ .u64 = .empty };
-        var s = &self.val_set.u64;
-        const gop = try s.getOrPut(allocator, v);
-        if (gop.found_existing) return;
-        const entry_size = 24;
-        self.drawMore(entry_size) catch |err| {
-            _ = s.remove(v);
-            return err;
-        };
-        self.allocated_bytes += entry_size;
+        switch (self.val_set) {
+            .none => {
+                const entry_size = 24;
+                try self.drawMore(entry_size);
+                var s: InlineU64 = .{ .len = 1, .vals = undefined };
+                s.vals[0] = v;
+                self.val_set = .{ .inline_u64 = s };
+                self.allocated_bytes += entry_size;
+            },
+            .inline_u64 => |*s| {
+                for (s.vals[0..s.len]) |existing| {
+                    if (existing == v) return;
+                }
+                const entry_size = 24;
+                try self.drawMore(entry_size);
+                if (s.len < INLINE_CAP) {
+                    s.vals[s.len] = v;
+                    s.len += 1;
+                    self.allocated_bytes += entry_size;
+                    return;
+                }
+                var map: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
+                for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
+                map.putAssumeCapacity(v, {});
+                self.allocated_bytes += entry_size;
+                self.val_set = .{ .u64 = map };
+            },
+            .u64 => |*s| {
+                const gop = try s.getOrPut(allocator, v);
+                if (gop.found_existing) return;
+                const entry_size = 24;
+                self.drawMore(entry_size) catch |err| {
+                    _ = s.remove(v);
+                    return err;
+                };
+                self.allocated_bytes += entry_size;
+            },
+            else => return,
+        }
     }
 
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
@@ -259,16 +303,46 @@ pub const DistinctSet = struct {
             const p = @as(usize, @intCast(h >> 60));
             return parts[p].insertI128(allocator, v);
         }
-        if (self.val_set == .none) self.val_set = .{ .i128 = .empty };
-        var s = &self.val_set.i128;
-        const gop = try s.getOrPut(allocator, v);
-        if (gop.found_existing) return;
-        const entry_size = 32;
-        self.drawMore(entry_size) catch |err| {
-            _ = s.remove(v);
-            return err;
-        };
-        self.allocated_bytes += entry_size;
+        switch (self.val_set) {
+            .none => {
+                const entry_size = 32;
+                try self.drawMore(entry_size);
+                var s: InlineI128 = .{ .len = 1, .vals = undefined };
+                s.vals[0] = v;
+                self.val_set = .{ .inline_i128 = s };
+                self.allocated_bytes += entry_size;
+            },
+            .inline_i128 => |*s| {
+                for (s.vals[0..s.len]) |existing| {
+                    if (existing == v) return;
+                }
+                const entry_size = 32;
+                try self.drawMore(entry_size);
+                if (s.len < INLINE_CAP) {
+                    s.vals[s.len] = v;
+                    s.len += 1;
+                    self.allocated_bytes += entry_size;
+                    return;
+                }
+                var map: std.AutoHashMapUnmanaged(i128, void) = .empty;
+                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
+                for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
+                map.putAssumeCapacity(v, {});
+                self.allocated_bytes += entry_size;
+                self.val_set = .{ .i128 = map };
+            },
+            .i128 => |*s| {
+                const gop = try s.getOrPut(allocator, v);
+                if (gop.found_existing) return;
+                const entry_size = 32;
+                self.drawMore(entry_size) catch |err| {
+                    _ = s.remove(v);
+                    return err;
+                };
+                self.allocated_bytes += entry_size;
+            },
+            else => return,
+        }
     }
 
     pub fn insertF64(self: *DistinctSet, allocator: std.mem.Allocator, val: f64) !void {
@@ -287,21 +361,56 @@ pub const DistinctSet = struct {
             const p = @as(usize, @intCast(h >> 60));
             return parts[p].insertBytes(allocator, v);
         }
-        if (self.val_set == .none) self.val_set = .{ .bytes = .empty };
-        var s = &self.val_set.bytes;
-        const gop = try s.getOrPut(allocator, v);
-        if (gop.found_existing) return;
-        const entry_size = 32 + v.len;
-        self.drawMore(entry_size) catch |err| {
-            _ = s.remove(v);
-            return err;
-        };
-        const owned = allocator.dupe(u8, v) catch |err| {
-            _ = s.remove(v);
-            return err;
-        };
-        gop.key_ptr.* = owned;
-        self.allocated_bytes += entry_size;
+        switch (self.val_set) {
+            .none => {
+                const entry_size = 32 + v.len;
+                try self.drawMore(entry_size);
+                const owned = try allocator.dupe(u8, v);
+                var s: InlineBytes = .{ .len = 1, .vals = undefined };
+                s.vals[0] = owned;
+                self.val_set = .{ .inline_bytes = s };
+                self.allocated_bytes += entry_size;
+            },
+            .inline_bytes => |*s| {
+                for (s.vals[0..s.len]) |existing| {
+                    if (std.mem.eql(u8, existing, v)) return;
+                }
+                const entry_size = 32 + v.len;
+                try self.drawMore(entry_size);
+                const owned = try allocator.dupe(u8, v);
+                if (s.len < INLINE_CAP) {
+                    s.vals[s.len] = owned;
+                    s.len += 1;
+                    self.allocated_bytes += entry_size;
+                    return;
+                }
+                var map: std.StringHashMapUnmanaged(void) = .empty;
+                map.ensureTotalCapacity(allocator, INLINE_CAP + 1) catch |err| {
+                    allocator.free(owned);
+                    return err;
+                };
+                for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
+                map.putAssumeCapacity(owned, {});
+                self.allocated_bytes += entry_size;
+                self.val_set = .{ .bytes = map };
+            },
+            .bytes => |*s| {
+                const gop = try s.getOrPut(allocator, v);
+                if (gop.found_existing) return;
+                const entry_size = 32 + v.len;
+                self.drawMore(entry_size) catch |err| {
+                    _ = s.remove(v);
+                    return err;
+                };
+                const owned = allocator.dupe(u8, v) catch |err| {
+                    _ = s.remove(v);
+                    return err;
+                };
+                gop.key_ptr.* = owned;
+                self.allocated_bytes += entry_size;
+            },
+            else => return,
+        }
     }
 
     pub fn insertColRow(self: *DistinctSet, allocator: std.mem.Allocator, col: filter_eval.Batch.Column, r: usize) !void {
@@ -328,6 +437,15 @@ pub const DistinctSet = struct {
             if (other.val_set != .none) {
                 switch (other.val_set) {
                     .none => {},
+                    .inline_u64 => |s| {
+                        for (s.vals[0..s.len]) |k| try self.insertU64(allocator, k);
+                    },
+                    .inline_i128 => |s| {
+                        for (s.vals[0..s.len]) |k| try self.insertI128(allocator, k);
+                    },
+                    .inline_bytes => |s| {
+                        for (s.vals[0..s.len]) |k| try self.insertBytes(allocator, k);
+                    },
                     .u64 => |s| {
                         var it = s.keyIterator();
                         while (it.next()) |k| try self.insertU64(allocator, k.*);
@@ -352,6 +470,15 @@ pub const DistinctSet = struct {
         }
         switch (other.val_set) {
             .none => {},
+            .inline_u64 => |s| {
+                for (s.vals[0..s.len]) |k| try self.insertU64(allocator, k);
+            },
+            .inline_i128 => |s| {
+                for (s.vals[0..s.len]) |k| try self.insertI128(allocator, k);
+            },
+            .inline_bytes => |s| {
+                for (s.vals[0..s.len]) |k| try self.insertBytes(allocator, k);
+            },
             .u64 => |s| {
                 var it = s.keyIterator();
                 while (it.next()) |k| try self.insertU64(allocator, k.*);

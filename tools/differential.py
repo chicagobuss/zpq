@@ -746,6 +746,36 @@ def main():
         else:
             print(f"  OK    plain-keys:{i}  ({len(got)} groups)")
 
+    # avg over UINT64 values at and past 2^63 sums them unsigned on every fold path: rows, dictionary codes, grouped,
+    # encoded execution on and off.
+    u64f = os.path.join(tmp, "avg_u64.parquet")
+    big = [2**64 - 1, 2**63, 2**63 + 5, 7]
+    pq.write_table(pa.table({"k": pa.array([i % 2 for i in range(4000)], pa.int32()),
+                             "u": pa.array([big[i % 4] for i in range(4000)], pa.uint64())}), u64f, row_group_size=500)
+    for i, q in enumerate(["SELECT k, avg(u) AS a FROM '{f}' GROUP BY k", "SELECT avg(u) AS a FROM '{f}'"]):
+        for encoded in ("1", "0"):
+            total += 1
+            sql = q.format(f=u64f)
+            r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True,
+                               env={**os.environ, "ZPQ_ENCODED": encoded})
+            try:
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+                want = sorted(con.execute(sql).fetchall(), key=repr)
+                agg = zjson(r.stdout)["agg"]
+                rows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
+                got = sorted([[float(v["sum"]) / v["count"] if isinstance(v, dict) else v for v in row] for row in rows], key=repr)
+                ok = len(got) == len(want) and all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr))
+                problem = None if ok else f"zpq={got} duck={want}"
+            except Exception as e:
+                problem = f"error: {e}"
+            label = f"avg-u64:{i} (encoded={encoded})"
+            if problem:
+                fails += 1
+                print(f"  FAIL  {label}  {problem}")
+            else:
+                print(f"  OK    {label}")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

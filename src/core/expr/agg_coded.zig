@@ -308,7 +308,8 @@ fn foldHist(
                     var sum: i128 = 0;
                     for (hist, d.values) |h, v| {
                         if (h == 0) continue;
-                        sum += @as(i128, h) * v;
+                        const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
+                        sum += @as(i128, h) * x;
                     }
                     a.isum += sum;
                     a.count += total;

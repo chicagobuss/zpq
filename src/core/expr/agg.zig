@@ -177,6 +177,15 @@ pub const DistinctSet = struct {
         self.shared = budget;
     }
 
+    /// Give this set's reservation, partitions' included, back to its budget, and forget the budget: for a set that
+    /// outlives the budget it drew from.
+    pub fn detach(self: *DistinctSet) void {
+        if (self.parts) |parts| for (parts) |*p| p.detach();
+        if (self.shared) |budget| budget.release(self.max_memory_bytes);
+        self.shared = null;
+        self.max_memory_bytes = 0;
+    }
+
     pub fn setSharedBudget(self: *DistinctSet, budget: *SharedBudget) void {
         self.shared = budget;
         if (self.parts) |parts| {
@@ -1125,7 +1134,7 @@ pub fn updateOne(
             try foldMinMaxBytes(persist, false, state, values.?, sel)
         else
             foldMax(state, values.?, sel, u64_col),
-        .avg => try foldAvg(state, values.?, sel),
+        .avg => try foldAvg(state, values.?, sel, u64_col),
     }
 }
 
@@ -1843,6 +1852,7 @@ fn foldAvg(
     state: *Accumulator,
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
+    unsigned_64: bool,
 ) Error!void {
     if (state.* == .avg_d) return state.avg_d.add(sumExact(col, sel), sel.count());
     const a = &state.avg;
@@ -1853,7 +1863,7 @@ fn foldAvg(
             // float (cost data is f64). Keep scalar; if profiling
             // shows otherwise, widen with a one-shot per-RG cast.
             for (c.values, 0..) |v, i| if (sel.isActive(i)) {
-                a.isum += v;
+                a.isum += if (unsigned_64) @as(u64, @bitCast(v)) else v;
                 a.count += 1;
             };
         },
@@ -3707,7 +3717,14 @@ pub const GroupTable = struct {
 
         const old_accumulators_len = self.accumulators.items.len;
         try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
-        errdefer self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
+        // A failure past here unmakes the group's state, count(DISTINCT) sets included.
+        errdefer {
+            for (self.accumulators.items[old_accumulators_len..]) |acc| if (acc == .distinct) if (acc.distinct) |d| {
+                d.deinit(self.allocator);
+                self.allocator.destroy(d);
+            };
+            self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
+        }
         for (agg_calls) |call| {
             var acc = Accumulator.init(call);
             if (call.func == .count_distinct) {
@@ -3931,7 +3948,7 @@ pub fn updateOneGroupedValues(
                     try foldMinMaxBytesGroupedOne(persist, false, state, values.?, r)
                 else
                     foldMaxGroupedOne(state, values.?, r, u64_col),
-                .avg => try foldAvgGroupedOne(state, values.?, r),
+                .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
             }
         }
     }
@@ -4033,11 +4050,11 @@ fn foldMinMaxBytesGroupedOne(
     }
 }
 
-fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize) !void {
+fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) !void {
     if (state.* == .avg_d) return state.avg_d.add(exactAt(col, r), 1);
     switch (col) {
         .i32 => |c| state.avg.isum += c.values[r],
-        .i64 => |c| state.avg.isum += c.values[r],
+        .i64 => |c| state.avg.isum += if (unsigned_64) @as(u64, @bitCast(c.values[r])) else c.values[r],
         .f32 => |c| state.avg.sum += c.values[r],
         .f64 => |c| state.avg.sum += c.values[r],
         else => return error.UnsupportedAggType,

@@ -1263,21 +1263,21 @@ pub fn runMultiAggregate(
 
     // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
-    for (agg_calls, 0..) |call, i| {
-        var acc = expr_agg.Accumulator.init(call);
-        if (call.func == .count_distinct) {
-            const ds = try gpa.create(expr_agg.DistinctSet);
-            ds.* = .{};
-            if (group_by_keys == null and n_workers > 1) {
-                try ds.initPartitions(gpa, &group_budget);
-            } else {
-                ds.shared = &group_budget;
-            }
-            acc = .{ .distinct = ds };
-        }
-        accumulators[i] = acc;
-    }
+    for (agg_calls, accumulators) |call, *acc| acc.* = expr_agg.Accumulator.init(call);
     errdefer freeOwnedAccumulatorStrings(gpa, accumulators);
+    for (agg_calls, accumulators) |call, *acc| if (call.func == .count_distinct) {
+        const ds = try gpa.create(expr_agg.DistinctSet);
+        ds.* = .{};
+        acc.* = .{ .distinct = ds };
+        if (group_by_keys == null and n_workers > 1) {
+            try ds.initPartitions(gpa, &group_budget);
+        } else {
+            ds.shared = &group_budget;
+        }
+    };
+    // These sets outlive `group_budget`, which lives in this frame: they give their reservations back to it before
+    // it goes, and forget it.
+    defer for (accumulators) |*acc| if (acc.* == .distinct) if (acc.distinct) |d| d.detach();
     var output: AggOutput = .{};
     errdefer output.deinit(gpa);
     var rows_in: i64 = 0;
@@ -5580,5 +5580,31 @@ test "parallelDistinctCountU64 counts the exact union of overlapping sets" {
     defer arena_state.deinit();
     for ([_]usize{ 2, 4, 16 }) |workers| {
         try testing.expectEqual(@as(u64, 100_000), try parallelDistinctCountU64(a, arena_state.allocator(), &sources, workers));
+    }
+}
+
+test "runMultiAggregate: returned count(DISTINCT) sets no longer point at the scan's budget" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]usize{ 1, 4 }) |parallelism| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(DISTINCT k) AS u, count(DISTINCT n) AS w",
+            .parallelism = parallelism,
+            .min_bytes_per_worker = 1,
+        });
+        defer res.deinit(testing.allocator);
+        for (res.state.accumulators) |acc| {
+            const d = acc.distinct orelse continue;
+            try testing.expect(d.shared == null);
+            if (d.parts) |parts| for (parts) |p| try testing.expect(p.shared == null);
+        }
     }
 }

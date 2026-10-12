@@ -1105,13 +1105,30 @@ pub fn runMultiAggregate(
         const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else group_tables;
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
+        // One table already holds each group's final count. The groups a stable count-descending limit keeps are a
+        // heap of that size; materializing every other group is the memory cost of a near-unique key.
+        const cut: ?[]const u32 = if (candidates == null and out_tables.len == 1)
+            try countLimitGroups(arena, &out_tables[0], group_outputs.?, agg_calls, args.result_order)
+        else
+            null;
         var total_group_refs: usize = 0;
-        for (out_tables) |gt| total_group_refs += if (candidates) |keys_kept| keys_kept.len else gt.groupCount();
+        if (cut) |ids| {
+            total_group_refs = ids.len;
+        } else if (candidates) |keys_kept| {
+            total_group_refs = keys_kept.len * out_tables.len;
+        } else for (out_tables) |gt| {
+            total_group_refs += gt.groupCount();
+        }
         const group_refs_buf = try gpa.alloc(MergeGroupRef, total_group_refs);
         defer gpa.free(group_refs_buf);
         var ref_i: usize = 0;
         for (out_tables, 0..) |gt, ti| {
-            if (candidates) |keys_kept| {
+            if (cut) |ids| {
+                if (ti == 0) for (ids) |gi| {
+                    group_refs_buf[ref_i] = .{ .table = 0, .group = gi };
+                    ref_i += 1;
+                };
+            } else if (candidates) |keys_kept| {
                 for (keys_kept) |key| if (gt.findKey(key)) |gi| {
                     group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = gi };
                     ref_i += 1;
@@ -1498,6 +1515,60 @@ fn mergeFoldedRefs(
         // The combined list now owns these winners.
         p.accs.clearRetainingCapacity();
     }
+}
+
+/// Group indices of the only rows a single table's `ORDER BY` one COUNT DESC LIMIT/OFFSET can keep. Null when that
+/// is not the order, or when the limit does not drop anyone. Ties break by earlier `first`, matching the stable sort
+/// the full merge would do.
+fn countLimitGroups(
+    arena: std.mem.Allocator,
+    table: *const expr_agg.GroupTable,
+    outputs: []const BoundOutputColumn,
+    agg_calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+) error{OutOfMemory}!?[]u32 {
+    const limit = order.limit orelse return null;
+    if (order.keys.len != 1 or !order.keys[0].descending) return null;
+    const a_idx = switch (outputs[order.keys[0].column].source) {
+        .agg => |a| a,
+        .key => return null,
+    };
+    if (agg_calls[a_idx].func != .count) return null;
+    const k = std.math.cast(usize, order.offset +| limit) orelse return null;
+    if (k == 0) return &.{};
+    const n = table.groupCount();
+    if (n <= k) return null;
+
+    const stride = agg_calls.len;
+    const Item = struct { c: u64, first: u64, g: u32 };
+    // The worst kept group is the smallest count, and within that the latest first appearance. It sits at the
+    // front of the queue so a better group can replace it.
+    const worse = struct {
+        fn cmp(_: void, a: Item, b: Item) std.math.Order {
+            if (a.c != b.c) return std.math.order(a.c, b.c);
+            return std.math.order(b.first, a.first);
+        }
+    }.cmp;
+    var heap: std.PriorityQueue(Item, void, worse) = .empty;
+    try heap.ensureTotalCapacity(arena, k);
+    for (0..n) |g| {
+        const item: Item = .{
+            .c = table.accumulators.items[g * stride + a_idx].count,
+            .first = table.first.items[g],
+            .g = @intCast(g),
+        };
+        if (heap.count() == k) {
+            const worst = heap.peek().?;
+            const better = item.c > worst.c or
+                (item.c == worst.c and item.first < worst.first);
+            if (!better) continue;
+            _ = heap.pop();
+        }
+        heap.push(arena, item) catch unreachable; // within the capacity reserved above
+    }
+    const ids = try arena.alloc(u32, heap.count());
+    for (ids, heap.items) |*id, item| id.* = item.g;
+    return ids;
 }
 
 /// The keys of the only groups that can reach the first `offset + limit` rows of an answer ordered by a COUNT,
@@ -2518,6 +2589,54 @@ test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own e
             try testing.expectEqual(@as(usize, 1), dst.distinct.?.count());
         }
     }.run, .{});
+}
+
+test "count limit on one table is the stable top, ties included" {
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var table = expr_agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer table.deinit();
+    const spec = [_]struct { key: []const u8, n: u64 }{
+        .{ .key = "a", .n = 1 },
+        .{ .key = "b", .n = 3 },
+        .{ .key = "c", .n = 3 },
+        .{ .key = "d", .n = 2 },
+        .{ .key = "e", .n = 1 },
+    };
+    for (spec, 0..) |s, i| {
+        const g = try table.getOrInsert(s.key, &calls, i);
+        table.accumulators.items[g].count = s.n;
+    }
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" },
+        .{ .source = .{ .agg = 0 }, .name = "c" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const top2: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 };
+    const kept2 = (try countLimitGroups(arena, &table, &outputs, &calls, top2)).?;
+    try testing.expectEqual(@as(usize, 2), kept2.len);
+    var saw_b = false;
+    var saw_c = false;
+    for (kept2) |g| {
+        saw_b = saw_b or std.mem.eql(u8, table.keyAt(g), "b");
+        saw_c = saw_c or std.mem.eql(u8, table.keyAt(g), "c");
+    }
+    try testing.expect(saw_b and saw_c);
+
+    // Every count ties: the cut is the earliest groups, which is what a stable sort keeps.
+    for (table.accumulators.items) |*acc| acc.count = 1;
+    const tied: expr_ast.ResultOrder = .{
+        .keys = &.{.{ .column = 1, .descending = true }},
+        .limit = 2,
+        .offset = 1,
+    };
+    const kept_tie = (try countLimitGroups(arena, &table, &outputs, &calls, tied)).?;
+    try testing.expectEqual(@as(usize, 3), kept_tie.len);
+    var earliest: [3]bool = @splat(false);
+    for (kept_tie) |g| earliest[g] = true;
+    try testing.expect(earliest[0] and earliest[1] and earliest[2]);
+    try testing.expect(try countLimitGroups(arena, &table, &outputs, &calls, .{ .keys = top2.keys }) == null);
 }
 
 test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {

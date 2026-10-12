@@ -260,6 +260,8 @@ pub const QueryArgs = struct {
     select: ?[]const u8 = null,
     /// GROUP BY output columns as a select list writes them (SQL).
     select_cols: ?[]const expr_ast.SelectColumn = null,
+    /// ORDER BY / LIMIT / OFFSET over the aggregate result rows (SQL); keys index `select_cols`.
+    result_order: expr_ast.ResultOrder = .{},
     /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
     column_order: ?[]const u8 = null,
     /// Receives what a failure was about; see `core/diag.zig`.
@@ -565,6 +567,9 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
 
     defer r.state.deinit(ctx.gpa);
     errdefer r.output.deinit(ctx.gpa);
+    // ORDER BY keys index the SELECT list, which GROUP BY rows follow column for column.
+    if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
+    try r.output.applyResultOrder(ctx.gpa, args.result_order);
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.

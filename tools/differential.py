@@ -608,6 +608,41 @@ def main():
                 print(f"  FAIL  {label}  {problem}")
             else:
                 print(f"  OK    {label}  ({len(got_rows)} rows match the JSON)")
+    # ORDER BY / LIMIT / OFFSET over GROUP BY rows. Each ORDER BY here breaks every tie, so the answer is one sequence
+    # and compares in order; NULLs sort last in both directions, as in DuckDB.
+    ORDERED = [
+        ("ord_key_desc_cut", "SELECT name, count(*) AS c FROM '{fixture}' GROUP BY name ORDER BY name DESC LIMIT 5 OFFSET 2"),
+        ("ord_position", "SELECT flag, sum(amt) AS s, avg(amt) AS a FROM '{fixture}' GROUP BY flag ORDER BY 2 DESC, 1"),
+        ("ord_null_key_desc", "SELECT nname, count(*) AS n FROM '{fixture}' GROUP BY nname ORDER BY nname DESC"),
+        ("ord_float_null", "SELECT flag, min(amt) AS mn FROM '{fixture}' WHERE amt IS NULL OR id > 0 GROUP BY flag "
+         "ORDER BY mn DESC, flag"),
+        ("ord_decimal", "SELECT flag, max(price) AS mx FROM '{fixture}' WHERE id < 1000 GROUP BY flag ORDER BY mx, flag"),
+        ("ord_expr_text", "SELECT flag, count(*) FROM '{fixture}' GROUP BY flag ORDER BY count(*), flag LIMIT 2"),
+        ("ord_offset_past_end", "SELECT flag, count(*) AS c FROM '{fixture}' GROUP BY flag ORDER BY c LIMIT 3 OFFSET 9"),
+        ("ord_no_rows", "SELECT flag, count(*) AS c FROM '{fixture}' WHERE id < -100000 GROUP BY flag ORDER BY c LIMIT 1"),
+    ]
+    for olabel, o_sql in ORDERED:
+        total += 1
+        sql = o_sql.format(fixture=fixture)
+        label = f"ordered:{olabel}"
+        r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+            duck_rel = con.execute(sql)
+            lanes = json_lanes(duck_rel)
+            want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in duck_rel.fetchall()]
+            got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq([fold_avg(v) for v in row.values()], lanes)))
+                   for row in zjson(r.stdout)["agg"]]
+            problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+        except Exception as e:
+            problem = f"error: {e}"
+        if problem:
+            fails += 1
+            print(f"  FAIL  {label}  {problem}")
+        else:
+            print(f"  OK    {label}  ({len(got)} rows, in order)")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

@@ -173,10 +173,7 @@ pub const AggOutput = struct {
         }
         gpa.free(self.aggs);
         if (self.group_rows) |rows| {
-            for (rows) |row| {
-                for (row) |v| freeValue(gpa, v);
-                gpa.free(row);
-            }
+            for (rows) |row| freeRow(gpa, row);
             gpa.free(rows);
         }
         if (self.group_cols) |cols| {
@@ -192,7 +189,93 @@ pub const AggOutput = struct {
             else => {},
         }
     }
+
+    /// Sort, then cut, the GROUP BY rows per `order`. Stable, so ties keep first-appearance order and the answer is
+    /// the same at every `-j`. The dropped rows are freed here.
+    pub fn applyResultOrder(self: *AggOutput, gpa: std.mem.Allocator, order: expr_ast.ResultOrder) error{OutOfMemory}!void {
+        const rows = self.group_rows orelse return;
+        const sorted = try gpa.alloc([]const AggValue, rows.len);
+        defer gpa.free(sorted);
+        @memcpy(sorted, rows);
+        std.sort.block([]const AggValue, sorted, order.keys, rowLessThan);
+        const start: usize = @intCast(@min(order.offset, sorted.len));
+        const end: usize = if (order.limit) |n| @intCast(@min(sorted.len, start +| n)) else sorted.len;
+        // Allocated before anything is freed, so a failure leaves the answer whole.
+        const kept = try gpa.dupe([]const AggValue, sorted[start..end]);
+        for (sorted[0..start]) |row| freeRow(gpa, row);
+        for (sorted[end..]) |row| freeRow(gpa, row);
+        gpa.free(rows);
+        self.group_rows = kept;
+    }
+
+    fn freeRow(gpa: std.mem.Allocator, row: []const AggValue) void {
+        for (row) |v| freeValue(gpa, v);
+        gpa.free(row);
+    }
+
+    fn rowLessThan(keys: []const expr_ast.OrderKey, a: []const AggValue, b: []const AggValue) bool {
+        for (keys) |key| {
+            const ord = orderValues(a[key.column], b[key.column], key.descending);
+            if (ord != .eq) return ord == .lt;
+        }
+        return false;
+    }
 };
+
+/// How two result values of one column sort. NULL last in either direction; NaN above every number, as zpq's float
+/// min/max order it; strings bytewise; DECIMAL exactly.
+fn orderValues(a: AggValue, b: AggValue, descending: bool) std.math.Order {
+    const a_null = sortKey(a) == .none;
+    const b_null = sortKey(b) == .none;
+    if (a_null or b_null) return if (a_null == b_null) .eq else if (a_null) .gt else .lt;
+    const ord = compareKeys(sortKey(a), sortKey(b));
+    return if (descending) ord.invert() else ord;
+}
+
+const SortKey = union(enum) { none, int: i128, float: f64, dec: DecValue, bytes: []const u8 };
+
+fn sortKey(v: AggValue) SortKey {
+    return switch (v) {
+        .i => |i| .{ .int = i },
+        .f => |f| .{ .float = f },
+        .avg => |a| if (a.sum) |s| .{ .float = s / @as(f64, @floatFromInt(a.count)) } else .none,
+        .dec => |d| .{ .dec = d },
+        .avg_dec => |a| if (a.mean) |m| .{ .dec = .{ .v = m, .spec = a.spec } } else .none,
+        .s => |s| .{ .bytes = s },
+        .null_val => .none,
+    };
+}
+
+fn compareKeys(a: SortKey, b: SortKey) std.math.Order {
+    return switch (a) {
+        .bytes => |x| if (b == .bytes) std.mem.order(u8, x, b.bytes) else .gt,
+        .dec => |x| if (b == .dec and b.dec.spec.scale == x.spec.scale)
+            std.math.order(x.v, b.dec.v)
+        else if (b == .bytes)
+            .lt
+        else
+            compareFloats(asFloat(a), asFloat(b)),
+        .int => |x| if (b == .int) std.math.order(x, b.int) else if (b == .bytes) .lt else compareFloats(asFloat(a), asFloat(b)),
+        .float => if (b == .bytes) .lt else compareFloats(asFloat(a), asFloat(b)),
+        .none => unreachable,
+    };
+}
+
+fn asFloat(k: SortKey) f64 {
+    return switch (k) {
+        .int => |i| @floatFromInt(i),
+        .float => |f| f,
+        .dec => |d| @as(f64, @floatFromInt(d.v)) / std.math.pow(f64, 10, @floatFromInt(d.spec.scale)),
+        .none, .bytes => unreachable,
+    };
+}
+
+fn compareFloats(a: f64, b: f64) std.math.Order {
+    if (std.math.isNan(a) or std.math.isNan(b)) {
+        return if (std.math.isNan(a) == std.math.isNan(b)) .eq else if (std.math.isNan(a)) .gt else .lt;
+    }
+    return std.math.order(a, b);
+}
 
 /// What writing the answer as Parquet needs beyond `AggOutput`. Borrowed from the `arena` passed to
 /// `runMultiAggregate`, except the string min/max winners in `accumulators`, which are in its `gpa`: `deinit` frees
@@ -1668,6 +1751,72 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
 // Compile-time API check. Behavioral coverage is via the CLI
 // regression suite + lambda integration tests.
 // ============================================================
+/// Five GROUP BY rows (name, count, mean) covering NULL, NaN, -inf and ties, in first-appearance order.
+fn testOrderRows(gpa: std.mem.Allocator) !AggOutput {
+    const nan = std.math.nan(f64);
+    const names = [_]?[]const u8{ "b", "a", null, "c", "a2" };
+    const counts = [_]?i128{ 3, 5, 5, 3, null };
+    const means = [_]?f64{ nan, 1.0, null, -std.math.inf(f64), 2.0 };
+    var out: AggOutput = .{};
+    errdefer out.deinit(gpa);
+    const rows = try gpa.alloc([]const AggValue, names.len);
+    for (rows) |*r| r.* = &.{};
+    out.group_rows = rows;
+    for (rows, names, counts, means) |*row, name, count, mean| {
+        const vals = try gpa.alloc(AggValue, 3);
+        @memset(vals, .null_val);
+        row.* = vals;
+        // Duplicated before the union is assigned: a failed dupe must not leave a `.s` holding garbage.
+        if (name) |n| {
+            const dup = try gpa.dupe(u8, n);
+            vals[0] = .{ .s = dup };
+        }
+        if (count) |n| vals[1] = .{ .i = n };
+        if (mean) |m| vals[2] = .{ .f = m };
+    }
+    return out;
+}
+
+fn expectOrderedNames(order: expr_ast.ResultOrder, want: []const ?[]const u8) !void {
+    const gpa = testing.allocator;
+    var out = try testOrderRows(gpa);
+    defer out.deinit(gpa);
+    try out.applyResultOrder(gpa, order);
+    const rows = out.group_rows.?;
+    try testing.expectEqual(want.len, rows.len);
+    for (rows, want) |row, name| {
+        if (name) |n| try testing.expectEqualStrings(n, row[0].s) else try testing.expect(row[0] == .null_val);
+    }
+}
+
+test "applyResultOrder: NULLs last both ways, NaN above numbers, stable ties, offset then limit" {
+    // count DESC, name: the two 5s tie on count and the NULL name goes last; the NULL count goes last despite DESC.
+    try expectOrderedNames(.{ .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } } }, &.{ "a", null, "b", "c", "a2" });
+    // count alone: ties keep first appearance.
+    try expectOrderedNames(.{ .keys = &.{.{ .column = 1, .descending = false }} }, &.{ "b", "c", "a", null, "a2" });
+    try expectOrderedNames(.{ .keys = &.{.{ .column = 2, .descending = false }} }, &.{ "c", "a", "a2", "b", null });
+    try expectOrderedNames(.{ .keys = &.{.{ .column = 2, .descending = true }} }, &.{ "b", "a2", "a", "c", null });
+    try expectOrderedNames(.{ .keys = &.{.{ .column = 2, .descending = false }}, .limit = 2, .offset = 1 }, &.{ "a", "a2" });
+    try expectOrderedNames(.{ .limit = 0 }, &.{});
+    try expectOrderedNames(.{ .offset = 9 }, &.{});
+    try expectOrderedNames(.{ .offset = 3, .limit = std.math.maxInt(u64) }, &.{ "c", "a2" });
+}
+
+test "applyResultOrder: an allocation failure leaves the rows whole and leaks nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var out = try testOrderRows(gpa);
+            defer out.deinit(gpa);
+            const before = out.group_rows.?.len;
+            out.applyResultOrder(gpa, .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 2 }) catch |err| {
+                try testing.expectEqual(before, out.group_rows.?.len);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 2), out.group_rows.?.len);
+        }
+    }.run, .{});
+}
+
 test "scan: API is well-typed" {
     _ = runMultiAggregate;
     _ = materializeOne;

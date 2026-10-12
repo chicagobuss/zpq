@@ -11,8 +11,11 @@ pub const ParsedQuery = struct {
     group_by_str: ?[]const u8 = null,
     /// The result columns, expression and alias apart, for GROUP BY output binding.
     select_cols: []const ast.SelectColumn = &.{},
+    /// ORDER BY / LIMIT / OFFSET of an aggregate query, applied to its result rows.
+    result_order: ast.ResultOrder = .{},
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
+        allocator.free(self.result_order.keys);
         allocator.free(self.table_name);
         if (self.select_str) |s| allocator.free(s);
         if (self.aggregate_str) |a| allocator.free(a);
@@ -144,14 +147,7 @@ fn rejectUnsupportedClauses(sel: anytype) !void {
         std.debug.print("sql: HAVING is not supported yet\n", .{});
         return error.HavingNotSupported;
     }
-    if (sel.order_by.count > 0) {
-        std.debug.print("sql: ORDER BY is not supported yet\n", .{});
-        return error.OrderByNotSupported;
-    }
-    if (sel.limit != null) {
-        std.debug.print("sql: LIMIT / OFFSET is not supported yet\n", .{});
-        return error.LimitNotSupported;
-    }
+    // ORDER BY / LIMIT / OFFSET are resolved against the result columns in `resultOrder`.
     if (sel.window_defs.count > 0) {
         std.debug.print("sql: window functions are not supported yet\n", .{});
         return error.WindowNotSupported;
@@ -339,6 +335,8 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         try selectColumn(rc, lp_arena, allocator, &select_cols[col_idx]);
         col_idx += 1;
     }
+    const result_order = try resultOrder(allocator, root.*.u.select, lp_arena, select_cols, is_aggregate, has_group_by);
+    errdefer allocator.free(result_order.keys);
 
     // Join result columns with ", "
     var joined_cols: std.ArrayList(u8) = .empty;
@@ -427,6 +425,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .filter_str = filter_str,
             .group_by_str = group_by_str,
             .select_cols = select_cols,
+            .result_order = result_order,
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
@@ -451,6 +450,95 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         .filter_str = filter_str,
         .select_cols = select_cols,
     };
+}
+
+/// ORDER BY / LIMIT / OFFSET as positions in the SELECT list. Only an aggregate's result rows are ordered: plain rows
+/// stream out as they are read, and an aggregate without GROUP BY is one row, which a LIMIT may keep but not drop.
+fn resultOrder(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    select_cols: []const ast.SelectColumn,
+    is_aggregate: bool,
+    has_group_by: bool,
+) !ast.ResultOrder {
+    const n_terms: usize = @intCast(sel.order_by.count);
+    if (!is_aggregate) {
+        if (n_terms > 0) {
+            std.debug.print("sql: ORDER BY over plain rows is not supported yet\n", .{});
+            return error.OrderByNotSupported;
+        }
+        if (sel.limit != null) {
+            std.debug.print("sql: LIMIT over plain rows is not supported yet\n", .{});
+            return error.LimitNotSupported;
+        }
+        return .{};
+    }
+
+    var order: ast.ResultOrder = .{};
+    if (sel.limit) |lim| {
+        order.limit = try nonNegativeInt(lim.*.u.limit.count orelse return error.LimitNotSupported);
+        if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
+        if (!has_group_by and (order.limit == 0 or order.offset > 0)) {
+            std.debug.print("sql: a LIMIT or OFFSET that drops the single aggregate row is not supported\n", .{});
+            return error.LimitNotSupported;
+        }
+    }
+
+    const keys = try allocator.alloc(ast.OrderKey, n_terms);
+    errdefer allocator.free(keys);
+    for (keys, 0..) |*key, t| {
+        const term = sel.order_by.items[t] orelse return error.SqlParseError;
+        // The grammar spells NULLS FIRST as LP_SORT_ASC, NULLS LAST as LP_SORT_DESC, neither as LP_SORT_UNDEFINED.
+        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
+            std.debug.print("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
+            return error.OrderByNotSupported;
+        }
+        key.* = .{
+            .column = try orderColumn(sel, lp_arena, select_cols, term.*.u.order_term.expr orelse return error.SqlParseError),
+            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+        };
+    }
+    order.keys = keys;
+    return order;
+}
+
+/// The SELECT-list position an ORDER BY term names: a 1-based position, an alias, or an expression written as in the
+/// SELECT list (a column reference matching as GROUP BY matches it). An alias wins over a column of the same name.
+fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.SelectColumn, expr: *c.LpNode) !usize {
+    if (expr.kind == c.LP_EXPR_LITERAL_INT) {
+        const pos = try nonNegativeInt(expr);
+        if (pos >= 1 and pos <= select_cols.len) return @intCast(pos - 1);
+        std.debug.print("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
+        return error.OrderByNotSupported;
+    }
+    if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.schema == null and expr.u.column_ref.table == null) {
+        const name = std.mem.span(expr.u.column_ref.column);
+        for (select_cols, 0..) |col, idx| {
+            if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) return idx;
+        }
+    }
+    const expr_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (expr_c == null) return error.UnparseError;
+    const text = std.mem.span(expr_c);
+    var idx: usize = 0;
+    for (0..@intCast(sel.result_columns.count)) |i| {
+        const rc = sel.result_columns.items[i] orelse continue;
+        const rc_expr = if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr else rc;
+        if (sameColumnRef(expr, rc_expr) orelse std.mem.eql(u8, text, select_cols[idx].expr)) return idx;
+        idx += 1;
+    }
+    std.debug.print("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
+    return error.OrderByNotSupported;
+}
+
+/// A LIMIT, OFFSET or ORDER BY position, which must be a plain non-negative integer literal.
+fn nonNegativeInt(node: *const c.LpNode) !u64 {
+    if (node.kind == c.LP_EXPR_LITERAL_INT) {
+        if (std.fmt.parseInt(u64, std.mem.span(node.u.literal.value), 10)) |v| return v else |_| {}
+    }
+    std.debug.print("sql: LIMIT, OFFSET and ORDER BY positions must be non-negative integer literals\n", .{});
+    return error.LimitNotSupported;
 }
 
 /// Whether two column references name the same segments, ignoring case and quoting (`"r"."v"` is `r.v`): which
@@ -564,6 +652,44 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
     try std.testing.expectError(error.UnsupportedStatement, parseSqlQuery(a, "SELECT x FROM 't' UNION SELECT x FROM 'u'"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY z"));
+}
+
+test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" {
+    const a = std.testing.allocator;
+    const Key = ast.OrderKey;
+    const Case = struct { sql: []const u8, keys: []const Key, limit: ?u64 = null, offset: u64 = 0 };
+    const cases = [_]Case{
+        // By alias, DESC; by position; by the expression as written; a column of the same name loses to the alias.
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c DESC LIMIT 10", .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY 2 DESC, 1", .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } } },
+        .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY count(*) DESC", .keys = &.{.{ .column = 1, .descending = true }} },
+        .{ .sql = "SELECT Y, sum(x) AS y FROM 't' GROUP BY Y ORDER BY y", .keys = &.{.{ .column = 1, .descending = false }} },
+        // A column reference matches as GROUP BY matches it: case and quoting aside.
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY \"Y\" ASC NULLS LAST", .keys = &.{.{ .column = 0, .descending = false }} },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c LIMIT 10 OFFSET 1000", .keys = &.{.{ .column = 1, .descending = false }}, .limit = 10, .offset = 1000 },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT 5", .keys = &.{}, .limit = 5 },
+        // One aggregate row: ordering it is a no-op, and a LIMIT may keep it.
+        .{ .sql = "SELECT count(*) AS c FROM 't' ORDER BY c LIMIT 1", .keys = &.{.{ .column = 0, .descending = false }}, .limit = 1 },
+    };
+    for (cases) |case| {
+        const q = try parseSqlQuery(a, case.sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualSlices(Key, case.keys, q.result_order.keys);
+        try std.testing.expectEqual(case.limit, q.result_order.limit);
+        try std.testing.expectEqual(case.offset, q.result_order.offset);
+    }
+
+    const rejected = [_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY z", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 3", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 0", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c NULLS FIRST", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT -1", .err = error.LimitNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT c", .err = error.LimitNotSupported },
+        .{ .sql = "SELECT count(*) AS c FROM 't' LIMIT 0", .err = error.LimitNotSupported },
+        .{ .sql = "SELECT count(*) AS c FROM 't' LIMIT 1 OFFSET 1", .err = error.LimitNotSupported },
+    };
+    for (rejected) |case| try std.testing.expectError(case.err, parseSqlQuery(a, case.sql));
 }
 
 test "sql_parser rejects unsupported aggregate shapes" {

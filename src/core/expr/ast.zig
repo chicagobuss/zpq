@@ -304,6 +304,20 @@ pub const SelectItem = struct {
     alias: ?[]const u8,
 };
 
+/// One ORDER BY key over an aggregate's result rows: an output column, by position in the SELECT list.
+pub const OrderKey = struct {
+    column: usize,
+    descending: bool,
+};
+
+/// ORDER BY / LIMIT / OFFSET applied to an aggregate's finished result rows. Sorting is stable, so ties keep the
+/// order the rows had (first appearance in the input); NULLs sort last in either direction, as in DuckDB.
+pub const ResultOrder = struct {
+    keys: []const OrderKey = &.{},
+    limit: ?u64 = null,
+    offset: u64 = 0,
+};
+
 /// One output column as a select list writes it, before binding: the expression's text and its `AS` alias. GROUP BY
 /// binding matches the text against key and aggregate names, so it is never parsed into an `Expr`; keeping the alias
 /// apart means no layer has to find it again in the text.

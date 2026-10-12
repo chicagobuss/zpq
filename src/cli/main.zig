@@ -342,6 +342,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var max_memory: ?usize = null;
     var group_by: ?[]const u8 = null;
     var select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null;
+    var result_order: zpq.core.expr.ast.ResultOrder = .{};
     var column_order: ?[]const u8 = null;
     var profile_out: ProfileOut = .{};
     var bloom_filters: std.ArrayList(engine.BloomSpec) = .empty;
@@ -559,6 +560,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             aggregate = pq.aggregate_str;
             group_by = pq.group_by_str;
             select_cols = pq.select_cols;
+            result_order = pq.result_order;
 
             const matches = try expandGlob(arena, io, pq.table_name, env);
             if (matches.len == 0) {
@@ -662,6 +664,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .max_memory = engine_max_mem,
             .group_by = group_by,
             .select_cols = select_cols,
+            .result_order = result_order,
             .column_order = column_order,
             .bloom_filters = bloom_filters.items,
             .diag = diag,

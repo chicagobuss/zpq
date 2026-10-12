@@ -124,13 +124,61 @@ pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
     return p == pattern.len;
 }
 
+/// Whether `needle` occurs in `hay`. The needle's first and last bytes are compared against 32 starting positions at
+/// once, and only positions where both match are checked in full, instead of a byte-by-byte search from every position.
+pub fn containsBytes(hay: []const u8, needle: []const u8) bool {
+    const n = needle.len;
+    if (n == 0) return true;
+    if (hay.len < n) return false;
+    if (n == 1) return std.mem.indexOfScalar(u8, hay, needle[0]) != null;
+    const lanes = 32;
+    const V = @Vector(lanes, u8);
+    const first: V = @splat(needle[0]);
+    const last: V = @splat(needle[n - 1]);
+    const middle = needle[1 .. n - 1];
+    // Starting positions run over [0, end); a block of them reads the last byte at `i + n - 1 + lanes - 1 < hay.len`.
+    const end = hay.len - n + 1;
+    var i: usize = 0;
+    while (i + lanes <= end) : (i += lanes) {
+        const a: V = hay[i..][0..lanes].*;
+        const b: V = hay[i + n - 1 ..][0..lanes].*;
+        var hits = @as(u32, @bitCast(a == first)) & @as(u32, @bitCast(b == last));
+        while (hits != 0) : (hits &= hits - 1) {
+            if (std.mem.eql(u8, hay[i + @ctz(hits) + 1 ..][0..middle.len], middle)) return true;
+        }
+    }
+    while (i < end) : (i += 1) {
+        if (hay[i] == needle[0] and hay[i + n - 1] == needle[n - 1] and std.mem.eql(u8, hay[i + 1 ..][0..middle.len], middle))
+            return true;
+    }
+    return false;
+}
+
+test "containsBytes finds exactly what a byte-by-byte search finds" {
+    var prng = std.Random.DefaultPrng.init(0x11ce);
+    const rand = prng.random();
+    var hay: [300]u8 = undefined;
+    var needle: [12]u8 = undefined;
+    for (0..20_000) |_| {
+        const hn = rand.uintAtMost(usize, hay.len);
+        const nn = rand.uintAtMost(usize, needle.len);
+        // A three-letter alphabet makes partial and overlapping matches common.
+        for (hay[0..hn]) |*c| c.* = "abc"[rand.uintLessThan(usize, 3)];
+        for (needle[0..nn]) |*c| c.* = "abc"[rand.uintLessThan(usize, 3)];
+        // Sometimes plant the needle, at any offset including the very end.
+        if (nn > 0 and nn <= hn and rand.boolean()) @memcpy(hay[rand.uintAtMost(usize, hn - nn)..][0..nn], needle[0..nn]);
+        const want = std.mem.indexOf(u8, hay[0..hn], needle[0..nn]) != null;
+        try std.testing.expectEqual(want, containsBytes(hay[0..hn], needle[0..nn]));
+    }
+}
+
 /// Apply a classified LIKE to one value (before the NOT flip).
 pub fn likeMatches(kind: LikeKind, operand: []const u8, value: []const u8) bool {
     return switch (kind) {
         .exact => std.mem.eql(u8, value, operand),
         .prefix => std.mem.startsWith(u8, value, operand),
         .suffix => std.mem.endsWith(u8, value, operand),
-        .contains => std.mem.indexOf(u8, value, operand) != null,
+        .contains => containsBytes(value, operand),
         .general => likeGlob(operand, value),
     };
 }

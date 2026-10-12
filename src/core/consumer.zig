@@ -2153,6 +2153,7 @@ pub fn scanRGForAgg(
                     group_id_arr[r] = try key_resolver.resolve(ra, g.table, key_cols, r, g.calls, g.pos_base);
                 }
             }
+            expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
 
             for (g.calls, 0..) |call, i| {
                 var call_arena = std.heap.ArenaAllocator.init(gpa);
@@ -2264,6 +2265,7 @@ fn scanRGSliced(
                 for (0..n) |r| if (sel.isActive(r)) {
                     ids[r] = try resolver.resolve(sa, g.table, key_cols, r, g.calls, g.pos_base + done);
                 };
+                expr_agg.sinkSketchRows(g.table, ids, &sel);
                 for (g.calls, 0..) |call, i| {
                     const accs = g.table.accumulators.items;
                     try expr_agg.updateOneGrouped(sa, gpa, accs, ids, i, g.calls.len, call, &batch, lookup, &sel);

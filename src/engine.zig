@@ -559,6 +559,7 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         .decode_limit = args.max_memory / 2,
         .diag = args.diag,
         .profiler = args.profiler,
+        .sketch_topk = sketchFromEnv(ctx.env),
     });
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -1404,6 +1405,19 @@ fn outputColumnNames(
 
 /// S3 credentials from the environment, telling a missing region apart from missing keys.
 /// Whether `name` is set to "0" in `env`.
+/// `ZPQ_SKETCH_TOPK=1` turns on the research path `scan.SketchTopK`; `ZPQ_SKETCH_M`, `ZPQ_SKETCH_BITS` and
+/// `ZPQ_SKETCH_STRIDE` tune it, and `ZPQ_SKETCH_TRACE=1` reports its decisions on stderr.
+fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
+    const on = env.getPosix("ZPQ_SKETCH_TOPK") orelse return null;
+    if (!std.mem.eql(u8, on, "1")) return null;
+    var cfg: scan.SketchTopK = .{};
+    if (env.getPosix("ZPQ_SKETCH_M")) |v| cfg.m = std.fmt.parseInt(usize, v, 10) catch cfg.m;
+    if (env.getPosix("ZPQ_SKETCH_BITS")) |v| cfg.cell_bits = std.math.clamp(std.fmt.parseInt(u6, v, 10) catch cfg.cell_bits, 4, 30);
+    if (env.getPosix("ZPQ_SKETCH_STRIDE")) |v| cfg.stride = std.fmt.parseInt(usize, v, 10) catch cfg.stride;
+    cfg.trace = env.getPosix("ZPQ_SKETCH_TRACE") != null;
+    return cfg;
+}
+
 fn envDisables(env: std.process.Environ, name: []const u8) bool {
     const v = env.getPosix(name) orelse return false;
     return std.mem.eql(u8, v, "0");

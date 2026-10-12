@@ -124,6 +124,21 @@ pub const MultiAggArgs = struct {
     diag: ?*Diag = null,
     /// Records the scan's spans when set; see `profile.zig`.
     profiler: ?*profile.Profiler = null,
+    /// Opt-in (`ZPQ_SKETCH_TOPK=1`): answer a COUNT-descending cut from sampled candidates and a count sketch when
+    /// the sketch certifies them; see `sketchTopK`.
+    sketch_topk: ?SketchTopK = null,
+};
+
+/// Tuning of `sketchTopK`.
+pub const SketchTopK = struct {
+    /// Candidates kept from the sample.
+    m: usize = 1000,
+    /// log2 of the sketch's cells per worker.
+    cell_bits: u6 = 22,
+    /// Every `stride`-th work item is the sample.
+    stride: usize = 7,
+    /// Report each decision on stderr.
+    trace: bool = false,
 };
 
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
@@ -591,6 +606,30 @@ const Worker = struct {
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
+    /// The work items this run claims, by index into `work`, when not all of them (`sketchTopK`'s phases).
+    order: ?[]const u32 = null,
+    /// Run before any work item: a sample table's other keys go into this worker's sketch.
+    spill: ?SketchSpill = null,
+};
+
+/// A sample table's groups that are not candidates, counted into the frozen table's sketch cells by their exact
+/// sample counts, so a cell bounds its keys' totals over sampled and frozen row groups alike.
+const SketchSpill = struct {
+    from: *const expr_agg.GroupTable,
+    into: *const expr_agg.GroupTable,
+    count_at: usize,
+    stride: usize,
+
+    fn run(sp: SketchSpill) void {
+        const s = sp.into.sketch.?;
+        for (0..sp.from.groupCount()) |g| {
+            const key = sp.from.keyAt(g);
+            const h = sp.into.keyHash(key);
+            if (sp.into.findHashed(key, h) != null) continue;
+            const c = sp.from.accumulators.items[g * sp.stride + sp.count_at].count;
+            s.cells[s.cellOf(h)] +|= std.math.cast(u32, c) orelse std.math.maxInt(u32);
+        }
+    }
 };
 
 fn workerRun(w: *Worker) void {
@@ -631,6 +670,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     var block_end: usize = 0;
     var block: ?usize = null;
     var table: ?*expr_agg.GroupTable = if (w.blocks == null and w.group_tables.len > 0) &w.group_tables[w.index] else null;
+    if (w.spill) |sp| sp.run();
     while (true) {
         const claimed: ?usize = if (w.blocks) |bounds| claim: {
             while (next == block_end) {
@@ -648,6 +688,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             break :claim next - 1;
         } else claim: {
             const i = w.cursor.fetchAdd(1, .monotonic);
+            if (w.order) |o| break :claim if (i < o.len) o[i] else null;
             break :claim if (i < w.work.len) i else null;
         };
         const idx = claimed orelse {
@@ -717,6 +758,227 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .budget = w.decode_budget,
         });
     }
+}
+
+fn runWorkers(workers: []Worker) void {
+    if (workers.len > 1) {
+        // Started as a tree, so the last worker is not a millisecond late. Spawn failure never returns early (running
+        // threads hold pointers into `arena` and `group_tables`); workers that never start are idle, and with no
+        // thread at all one inline runner drains the shared cursor.
+        const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+        if (!spawn_util.runTree(Worker, workers, config, workerRun)) workerRun(&workers[0]);
+    } else {
+        // Single-threaded fast path. Avoids std.Thread overhead.
+        workerRun(&workers[0]);
+    }
+}
+
+/// The COUNT call a sketched scan can certify the cut by: the first sort key is that call, descending, under a LIMIT
+/// small enough for the candidates to hold several times over. Per-worker tables only (not ordered blocks), and only
+/// inputs read whole up front: a gated input reads row groups in order once, and the sample reads them out of order.
+fn sketchEligible(
+    cfg: SketchTopK,
+    args: MultiAggArgs,
+    outputs: ?[]const BoundOutputColumn,
+    calls: []const expr_agg.AggCall,
+    use_blocks: bool,
+    n_items: usize,
+) ?usize {
+    const outs = outputs orelse return null;
+    const order = args.result_order;
+    const limit = order.limit orelse return null;
+    if (use_blocks or order.keys.len == 0 or !order.keys[0].descending) return null;
+    const a_idx = switch (outs[order.keys[0].column].source) {
+        .agg => |a| a,
+        .key => return null,
+    };
+    if (calls[a_idx].func != .count) return null;
+    const k = order.offset +| limit;
+    if (k == 0 or k *| 4 > cfg.m or cfg.stride < 2 or n_items < 2 * cfg.stride) return null;
+    for (args.inputs) |in| if (in.gate != null) return null;
+    return a_idx;
+}
+
+/// A COUNT-descending cut of `k = offset + limit` groups without a group for every key. Every `stride`-th work item
+/// is scanned as usual into `tables[0..n]`; its `m` largest groups are the candidates. The rest of the input is scanned
+/// into `tables[n..2n]`, frozen to the candidates: any other key's row only adds one to its sketch cell. A key with
+/// no candidate group totals at most its cell (its sample count is spilled into the cell too), so when the largest
+/// cell is below the k-th largest candidate total, every group the cut keeps, ties at the cut included, is a
+/// candidate with an exact total and first appearance, and merging both table sets answers exactly. Otherwise the
+/// frozen tables are dropped and the rest is scanned again as usual into the sample tables. Returns the tables the
+/// merge reads.
+fn sketchTopK(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    workers: []Worker,
+    cursor: *std.atomic.Value(usize),
+    tables: []expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    outputs: []const BoundOutputColumn,
+    order: expr_ast.ResultOrder,
+    a_idx: usize,
+    cfg: SketchTopK,
+) ![]expr_agg.GroupTable {
+    const n = workers.len;
+    const sample_tables = tables[0..n];
+    const frozen = tables[n..];
+    const k: usize = @intCast(order.offset +| order.limit.?);
+    const stride = calls.len;
+    const n_items = workers[0].work.len;
+    const sample = try arena.alloc(u32, (n_items + cfg.stride - 1) / cfg.stride);
+    const rest = try arena.alloc(u32, n_items - sample.len);
+    for (0..n_items) |i| {
+        if (i % cfg.stride == 0) sample[i / cfg.stride] = @intCast(i) else rest[i - i / cfg.stride - 1] = @intCast(i);
+    }
+    const t0 = nowMonoNs();
+    try runPhase(workers, cursor, sample);
+    const t1 = nowMonoNs();
+
+    const cands = try sketchCandidates(arena, sample_tables, outputs, calls, order, a_idx, cfg.m);
+    // The k-th sample count against the largest left out: too close and a left-out key will likely beat the cut.
+    const viable = cands.keys.len > 0 and cands.kth(k) > 2 *| cands.next;
+    const t2 = nowMonoNs();
+    if (cfg.trace) std.debug.print("sketch: sample items={d} cands={d} kth={d} next={d} viable={} sample_ms={d} pick_ms={d}\n", .{
+        sample.len, cands.keys.len, cands.kth(k), cands.next, viable, @divTrunc(t1 - t0, 1_000_000), @divTrunc(t2 - t1, 1_000_000),
+    });
+    if (!viable) {
+        try runPhase(workers, cursor, rest);
+        return sample_tables;
+    }
+
+    const cells = @as(usize, 1) << cfg.cell_bits;
+    const sketches = try arena.alloc(expr_agg.CountSketch, n);
+    var made: usize = 0;
+    defer for (sketches[0..made]) |s| gpa.free(s.cells);
+    for (sketches) |*s| {
+        s.* = .{ .cells = try gpa.alloc(u32, cells), .shift = @intCast(@as(u7, 64) - cfg.cell_bits) };
+        made += 1;
+        @memset(s.cells, 0);
+    }
+    for (frozen, sketches) |*t, *s| {
+        for (cands.keys) |key| _ = try t.getOrInsert(key, calls, std.math.maxInt(u64));
+        t.sketch = s;
+    }
+    const Stats = struct { rows_in: i64, rows_kept: i64, rgs_in: usize, rgs_pruned: usize, rgs_full_match: usize };
+    const saved = try arena.alloc(Stats, n);
+    for (workers, saved, sample_tables, frozen) |*w, *st, *from, *into| {
+        st.* = .{
+            .rows_in = w.rows_in,
+            .rows_kept = w.rows_kept,
+            .rgs_in = w.rgs_in,
+            .rgs_pruned = w.rgs_pruned,
+            .rgs_full_match = w.rgs_full_match,
+        };
+        w.group_tables = frozen;
+        w.spill = .{ .from = from, .into = into, .count_at = a_idx, .stride = stride };
+    }
+    const t3 = nowMonoNs();
+    try runPhase(workers, cursor, rest);
+    const t4 = nowMonoNs();
+    for (workers, frozen) |*w, *t| {
+        w.group_tables = sample_tables;
+        w.spill = null;
+        t.sketch = null;
+    }
+
+    const sum = sketches[0].cells;
+    for (sketches[1..]) |s| for (sum, s.cells) |*a, b| {
+        a.* +|= b;
+    };
+    const max_cell = std.mem.max(u32, sum);
+    const totals = try arena.alloc(u64, cands.keys.len);
+    for (totals, cands.keys, 0..) |*total, key, ci| {
+        total.* = 0;
+        for (sample_tables) |*t| if (t.findKey(key)) |g| {
+            total.* +|= t.accumulators.items[g * stride + a_idx].count;
+        };
+        for (frozen) |*t| total.* +|= t.accumulators.items[ci * stride + a_idx].count;
+    }
+    std.mem.sortUnstable(u64, totals, {}, std.sort.desc(u64));
+    const kth: u64 = if (totals.len >= k) totals[k - 1] else 0;
+    // Saturated, the largest cell is no bound, and never below a total.
+    const certified = max_cell == 0 or (max_cell != std.math.maxInt(u32) and max_cell < kth);
+    if (cfg.trace) std.debug.print("sketch: max_cell={d} kth_total={d} certified={} freeze_ms={d} frozen_ms={d} certify_ms={d}\n", .{
+        max_cell, kth, certified, @divTrunc(t3 - t2, 1_000_000), @divTrunc(t4 - t3, 1_000_000), @divTrunc(nowMonoNs() - t4, 1_000_000),
+    });
+    if (certified) return tables;
+
+    for (workers, saved) |*w, st| {
+        w.rows_in = st.rows_in;
+        w.rows_kept = st.rows_kept;
+        w.rgs_in = st.rgs_in;
+        w.rgs_pruned = st.rgs_pruned;
+        w.rgs_full_match = st.rgs_full_match;
+    }
+    try runPhase(workers, cursor, rest);
+    return sample_tables;
+}
+
+/// One pass of `workers` over the work items `items`, from a fresh cursor.
+fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize), items: []const u32) !void {
+    cursor.store(0, .monotonic);
+    for (workers) |*w| w.order = items;
+    runWorkers(workers);
+    for (workers) |w| if (w.err) |e| return e;
+}
+
+const SketchCandidates = struct {
+    /// The candidates' keys, largest sample count first.
+    keys: []const []const u8,
+    counts: []const u64,
+    /// The largest sample count of a key left out, 0 when none is.
+    next: u64,
+
+    fn kth(c: SketchCandidates, k: usize) u64 {
+        return if (c.counts.len >= k) c.counts[k - 1] else 0;
+    }
+};
+
+/// The `m` keys of the sample tables with the largest totals (ties by key bytes, so any -j picks the same). The
+/// threshold cut nominates them without totalling every key; with too few keys for it to apply, all are totalled.
+fn sketchCandidates(
+    arena: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    outputs: []const BoundOutputColumn,
+    calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+    a_idx: usize,
+    m: usize,
+) !SketchCandidates {
+    var nominate = order;
+    nominate.offset = 0;
+    nominate.limit = m + 1;
+    var groups: usize = 0;
+    for (tables) |t| groups += t.groupCount();
+    const keys: []const []const u8 = try topKCandidates(arena, tables, outputs, calls, nominate) orelse blk: {
+        // Too flat for the cut to prune: far more keys than candidates means the sketch would not certify anyway.
+        if (groups > (m + 1) *| 4) return .{ .keys = &.{}, .counts = &.{}, .next = 0 };
+        var all: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (tables) |*t| for (0..t.groupCount()) |g| try all.put(arena, t.keyAt(g), {});
+        break :blk all.keys();
+    };
+    const Entry = struct { key: []const u8, c: u64 };
+    const entries = try arena.alloc(Entry, keys.len);
+    for (entries, keys) |*e, key| {
+        e.* = .{ .key = key, .c = 0 };
+        for (tables) |*t| if (t.findKey(key)) |g| {
+            e.c +|= t.accumulators.items[g * calls.len + a_idx].count;
+        };
+    }
+    std.mem.sortUnstable(Entry, entries, {}, struct {
+        fn gt(_: void, a: Entry, b: Entry) bool {
+            if (a.c != b.c) return a.c > b.c;
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.gt);
+    const kept = @min(m, entries.len);
+    const out_keys = try arena.alloc([]const u8, kept);
+    const counts = try arena.alloc(u64, kept);
+    for (entries[0..kept], out_keys, counts) |e, *key, *c| {
+        key.* = e.key;
+        c.* = e.c;
+    }
+    return .{ .keys = out_keys, .counts = counts, .next = if (entries.len > kept) entries[kept].c else 0 };
 }
 
 /// The filter column whose statistics alone exclude `rg`, as leaf index + 1 (0 when only a combination does), for the
@@ -950,7 +1212,7 @@ pub fn runMultiAggregate(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
-    var workers = try arena.alloc(Worker, n_workers);
+    const workers = try arena.alloc(Worker, n_workers);
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -987,7 +1249,13 @@ pub fn runMultiAggregate(
         block_bounds = bounds;
         break :blk n_blocks;
     };
-    const group_tables = try arena.alloc(expr_agg.GroupTable, n_tables);
+    const sketch_count: ?usize = if (args.sketch_topk) |cfg|
+        sketchEligible(cfg, args, group_outputs, agg_calls, use_blocks, work_items.items.len)
+    else
+        null;
+    // The sketch's frozen tables follow the sample's, one per worker each.
+    const group_tables = try arena.alloc(expr_agg.GroupTable, if (sketch_count != null) 2 * n_tables else n_tables);
+    var scan_tables = group_tables[0..n_tables];
     // Integer and float keys are a fixed-width image: the per-row lookup mixes those bytes in an open-addressed
     // table instead of copying each new key into a string map. String and decimal keys stay on that map.
     const fixed_stride: u8 = if (group_by_keys) |ks| expr_agg.fixedGroupStride(ks) orelse 0 else 0;
@@ -1051,15 +1319,10 @@ pub fn runMultiAggregate(
     //    region as one wall-clock span (real elapsed decode), separate
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
-    if (n_workers > 1) {
-        // Started as a tree, so the last worker is not a millisecond late. Spawn failure never returns early (running
-        // threads hold pointers into `arena` and `group_tables`); workers that never start are idle, and with no
-        // thread at all one inline runner drains the shared cursor.
-        const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
-        if (!spawn_util.runTree(Worker, workers, config, workerRun)) workerRun(&workers[0]);
+    if (sketch_count) |a_idx| {
+        scan_tables = try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, group_outputs.?, args.result_order, a_idx, args.sketch_topk.?);
     } else {
-        // Single-threaded fast path. Avoids std.Thread overhead.
-        workerRun(&workers[0]);
+        runWorkers(workers);
     }
     const t_decode_end = nowMonoNs();
     t.decode_wall_ns = @intCast(t_decode_end - t_decode);
@@ -1115,7 +1378,7 @@ pub fn runMultiAggregate(
         //
         // A second GroupTable would draw another --max-memory reservation while the sources still hold theirs, so a
         // query at the ceiling would fail. The merge map borrows source keys and does not touch that budget.
-        const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else group_tables;
+        const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else scan_tables;
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         // One table already holds each group's final count. The groups a stable count-descending limit keeps are a

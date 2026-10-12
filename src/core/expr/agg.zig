@@ -3480,6 +3480,31 @@ fn splitMix64(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
+/// The certified top-k scan's count of every row a frozen table has no group for (`GroupTable.sketch`): one cell per
+/// key-hash prefix. A key's rows all land in one cell, the same in every table, so after summing every table's cells
+/// a key's total is at most its cell's. Saturates rather than wraps, so a sum stays an upper bound.
+pub const CountSketch = struct {
+    cells: []u32,
+    /// `cells.len == 1 << (64 - shift)`; a key's cell is the top bits of its table hash.
+    shift: u6,
+
+    pub fn cellOf(self: *const CountSketch, hash: u64) u32 {
+        return @intCast(hash >> self.shift);
+    }
+};
+
+/// The rows of `ids` past `table`'s groups are a frozen table's sketch cells (`GroupTable.getOrInsert`): count each
+/// in its cell and drop it from `sel`, so no aggregate folds it into a group.
+pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) void {
+    const s = table.sketch orelse return;
+    const groups: u32 = @intCast(table.groupCount());
+    for (ids, 0..) |id, r| {
+        if (id < groups or !sel.isActive(r)) continue;
+        s.cells[id - groups] +|= 1;
+        sel.set(r, false);
+    }
+}
+
 pub const GroupTable = struct {
     allocator: std.mem.Allocator,
     keys: std.ArrayList([]const u8),
@@ -3496,6 +3521,9 @@ pub const GroupTable = struct {
     fixed_len: u32 = 0,
     fixed_keys: []u8 = &.{},
     fixed_slots: []FixedSlot = &.{},
+    /// Frozen: no group is made any more. A key without one gets id `groupCount() + cell` instead, its sketch cell
+    /// (`sinkSketchRows`), so callers that memoize ids per key stay correct.
+    sketch: ?*CountSketch = null,
 
     const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
     const empty_id: u32 = std.math.maxInt(u32);
@@ -3558,6 +3586,27 @@ pub const GroupTable = struct {
         return self.findFixed(image, hashFixed(image));
     }
 
+    /// The hash a frozen table of this kind sketches `key` by, for a key as `keyAt` holds it.
+    pub fn keyHash(self: *const GroupTable, key: []const u8) u64 {
+        return if (self.fixed_stride == 0) std.hash_map.hashString(key) else hashFixed(key);
+    }
+
+    /// `findKey` for a key as `keyAt` holds it, by its `keyHash`.
+    pub fn findHashed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
+        if (self.fixed_stride != 0) return self.findFixed(key, hash);
+        return self.map.getAdapted(key, Prehashed{ .h = hash });
+    }
+
+    const Prehashed = struct {
+        h: u64,
+        pub fn hash(c: Prehashed, _: []const u8) u64 {
+            return c.h;
+        }
+        pub fn eql(_: Prehashed, a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
     /// Owning thread only. A table that has stopped growing must not sit on a partly-used block while another worker
     /// is still filling, or admission depends on how row groups happened to be scheduled.
     pub fn releaseSlack(self: *GroupTable) void {
@@ -3576,6 +3625,13 @@ pub const GroupTable = struct {
             var buf: [32]u8 = undefined;
             const image = expandFixed(self.fixed_stride, key, &buf) orelse return error.BadGroupKey;
             return self.getOrInsertFixed(image, agg_calls, pos);
+        }
+        if (self.sketch) |s| {
+            const hash = std.hash_map.hashString(key);
+            const id = self.findHashed(key, hash) orelse
+                return @intCast(self.groupCount() + s.cellOf(hash));
+            self.first.items[id] = @min(self.first.items[id], pos);
+            return id;
         }
         if (self.map.get(key)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
@@ -3635,6 +3691,7 @@ pub const GroupTable = struct {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
+        if (self.sketch) |s| return self.fixed_len + s.cellOf(hash);
         if (self.fixed_len == std.math.maxInt(u32)) return error.OutOfMemory;
         // A failed growth has already replaced a buffer; charge what is still held so the shared budget is not told
         // the old, smaller size.

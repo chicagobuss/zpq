@@ -442,10 +442,19 @@ pub fn groupedCoded(
         gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base | first_row[cp]);
     }
 
+    // A frozen table's other keys only count, in their sketch cells; the folds see just its groups' rows.
+    var sunk: Sel = undefined;
+    const fold_sel = if (table.sketch != null) blk: {
+        sunk = try sel.cloneAlloc(ra);
+        const ids = try ra.alloc(u32, num_rows);
+        for (ids, comp) |*id, cp| id.* = gid_of[cp];
+        agg.sinkSketchRows(table, ids, &sunk);
+        break :blk &sunk;
+    } else sel;
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
         const accs = table.accumulators.items;
-        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, sel);
+        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel);
     }
     return true;
 }

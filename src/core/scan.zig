@@ -1472,16 +1472,12 @@ fn mergeFoldedRefs(
     }
 }
 
-/// Merge an accumulator while transferring ownership of any string winner
-/// out of the source. `Accumulator.merge` intentionally consumes its
-/// source's owned string; clear the source so its owner (a GroupTable, a
-/// work item) cannot free it a second time.
 /// The keys of the only groups that can reach the first `offset + limit` rows of an answer ordered by a COUNT,
 /// descending, first; null when the order is not such a cut. Exact, after the threshold algorithm of distributed
 /// top-k (Cao and Wang, 2004): every table nominates its own top groups, and the k-th largest exact total among the
 /// nominees, `tau`, is a floor on the k-th largest total of all. A key whose total reaches `tau` across `m` tables has
 /// at least `tau / m` in one of them, so the keys some table counts that high are all that can make the cut, ties at
-/// the cut included; the rest are never merged or materialized. Typically a handful of millions of groups survive.
+/// the cut included; the rest are never merged or materialized. Typically a few hundred groups of millions survive.
 fn topKCandidates(
     arena: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
@@ -1561,6 +1557,10 @@ fn topKCandidates(
     return kept.keys();
 }
 
+/// Merge an accumulator while transferring ownership of any string winner
+/// out of the source. `Accumulator.merge` intentionally consumes its
+/// source's owned string; clear the source so its owner (a GroupTable, a
+/// work item) cannot free it a second time.
 fn mergeOwnedAccumulator(
     dst: *expr_agg.Accumulator,
     src: *expr_agg.Accumulator,

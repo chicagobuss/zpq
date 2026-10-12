@@ -1453,12 +1453,17 @@ fn hashMergeGroupRefs(
 /// the hash table is then smaller than the cost of splitting it. Otherwise a power of two, so a key's high bits name
 /// its partition, and no larger than the worker count.
 fn mergePartitionCount(n_workers: usize, n_refs: usize, cut: bool) usize {
-    if (n_workers < 2 or n_refs < 8192) return 1;
-    // Under a count cut each partition shrinks to its top groups as it finishes, so many small partitions keep only a
-    // few in flight at once instead of half the groups.
-    if (cut) return @min(512, std.math.ceilPowerOfTwoAssert(usize, n_refs / 65536 + 1));
+    if (n_workers < 2 or n_refs < 16) return 1;
     var p: usize = 1;
     while (p * 2 <= n_workers and p < 32) p *= 2;
+    // Under a count cut each partition shrinks to its top groups as it finishes, so many small partitions keep only a
+    // few in flight at once instead of half the groups. Even with small n_refs (e.g. after top-k candidate pruning),
+    // each remaining group may hold large distinct sets that benefit from parallel workers.
+    if (cut) {
+        const cut_parts = std.math.ceilPowerOfTwoAssert(usize, n_refs / 65536 + 1);
+        return @min(512, @max(p, cut_parts));
+    }
+    if (n_refs < 8192) return 1;
     return p;
 }
 

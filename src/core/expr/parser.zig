@@ -646,7 +646,7 @@ fn parseAggCall(
     const name_tok = try lex.next();
     if (name_tok.kind != .ident) return error.ExpectedAggFunc;
     const call_start = @intFromPtr(name_tok.text.ptr) - @intFromPtr(lex.src.ptr);
-    const func = resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
+    var func = resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
 
     // 2. Open paren.
     const lp = try lex.next();
@@ -659,6 +659,10 @@ fn parseAggCall(
         if (func != .count) return error.StarOnlyValidInCount;
         _ = try lex.next();
     } else {
+        if (func == .count and peek.kind == .ident and asciiEqIgnoreCase(peek.text, "DISTINCT")) {
+            _ = try lex.next();
+            func = .count_distinct;
+        }
         lex.depth += 1;
         if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
         arg = try parseExpr(arena, lex, file);
@@ -733,6 +737,7 @@ fn parseAggCall(
 
 fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "count")) return .count;
+    if (asciiEqIgnoreCase(name, "count_distinct")) return .count_distinct;
     if (asciiEqIgnoreCase(name, "sum")) return .sum;
     if (asciiEqIgnoreCase(name, "min")) return .min;
     if (asciiEqIgnoreCase(name, "max")) return .max;
@@ -1022,6 +1027,22 @@ test "agg: count(*) with default alias" {
     try testing.expectEqualStrings("count", items[0].alias);
     try testing.expect(items[0].arg == null);
     try testing.expect(items[0].where == null);
+}
+
+test "agg: count(DISTINCT col) and count_distinct(col)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"uid"}, &.{.INT64});
+    const items1 = try parseAggList(a, "count(DISTINCT uid) AS u", &file, null);
+    try testing.expectEqual(@as(usize, 1), items1.len);
+    try testing.expectEqual(agg.AggFunc.count_distinct, items1[0].func);
+    try testing.expectEqualStrings("u", items1[0].alias);
+
+    const items2 = try parseAggList(a, "count_distinct(uid)", &file, null);
+    try testing.expectEqual(@as(usize, 1), items2.len);
+    try testing.expectEqual(agg.AggFunc.count_distinct, items2[0].func);
+    try testing.expectEqualStrings("count_distinct", items2[0].alias);
 }
 
 test "agg: sum with column ref + alias" {

@@ -546,7 +546,7 @@ const BlockMerge = struct {
 /// differently, and a float min or max may come out -0 or +0. Integer and string results never do.
 fn orderSensitive(calls: []const expr_agg.AggCall) bool {
     for (calls) |c| {
-        if (c.func == .count) continue;
+        if (c.func == .count or c.func == .count_distinct) continue;
         if (c.result == .f64 or c.result == .avg_f64) return true;
     }
     return false;
@@ -904,7 +904,13 @@ pub fn runMultiAggregate(
             else blk: {
                 const arr = try arena.alloc(expr_agg.Accumulator, agg_len);
                 for (agg_calls[agg_start .. agg_start + agg_len], 0..) |call, ci| {
-                    arr[ci] = expr_agg.Accumulator.init(call);
+                    var acc = expr_agg.Accumulator.init(call);
+                    if (call.func == .count_distinct) {
+                        const ds = try gpa.create(expr_agg.DistinctSet);
+                        ds.* = .{};
+                        acc = .{ .distinct = ds };
+                    }
+                    arr[ci] = acc;
                 }
                 break :blk arr;
             };
@@ -955,6 +961,13 @@ pub fn runMultiAggregate(
         .limit = args.max_memory,
         .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
     };
+    for (work_items.items) |item| {
+        for (item.accumulators) |*acc| {
+            if (acc.* == .distinct and acc.distinct != null) {
+                acc.distinct.?.shared = &group_budget;
+            }
+        }
+    }
 
     // GROUP BY tables. One per worker, unless results depend on the order partials merge in and order is asked for:
     // then one per fixed block of the work list, so which rows fold into which table, and the order the tables merge
@@ -1043,7 +1056,15 @@ pub fn runMultiAggregate(
 
     // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
-    for (agg_calls, 0..) |call, i| accumulators[i] = expr_agg.Accumulator.init(call);
+    for (agg_calls, 0..) |call, i| {
+        var acc = expr_agg.Accumulator.init(call);
+        if (call.func == .count_distinct) {
+            const ds = try gpa.create(expr_agg.DistinctSet);
+            ds.* = .{ .shared = &group_budget };
+            acc = .{ .distinct = ds };
+        }
+        accumulators[i] = acc;
+    }
     errdefer freeOwnedAccumulatorStrings(gpa, accumulators);
     var output: AggOutput = .{};
     errdefer output.deinit(gpa);
@@ -1565,7 +1586,23 @@ fn mergeOwnedAccumulator(
     dst: *expr_agg.Accumulator,
     src: *expr_agg.Accumulator,
     allocator: std.mem.Allocator,
-) error{RowCountTooLarge}!void {
+) !void {
+    if (src.* == .distinct) {
+        // The larger set is handed over whole and the smaller folded into it, so a merge copies the fewest values.
+        const theirs = src.distinct orelse return;
+        src.* = .{ .distinct = null };
+        const ours = dst.distinct orelse {
+            dst.* = .{ .distinct = theirs };
+            return;
+        };
+        const big, const small = if (ours.count() >= theirs.count()) .{ ours, theirs } else .{ theirs, ours };
+        dst.* = .{ .distinct = big };
+        defer {
+            small.deinit(allocator);
+            allocator.destroy(small);
+        }
+        return big.merge(small, allocator);
+    }
     const moved = src.*;
     try dst.merge(moved, allocator);
     switch (src.*) {
@@ -1579,9 +1616,20 @@ fn freeOwnedAccumulatorStrings(
     allocator: std.mem.Allocator,
     accumulators: []expr_agg.Accumulator,
 ) void {
-    for (accumulators) |acc| switch (acc) {
-        .min_bytes => |s| if (s) |owned| allocator.free(owned),
-        .max_bytes => |s| if (s) |owned| allocator.free(owned),
+    for (accumulators) |*acc| switch (acc.*) {
+        .min_bytes => |s| if (s) |owned| {
+            allocator.free(owned);
+            acc.min_bytes = null;
+        },
+        .max_bytes => |s| if (s) |owned| {
+            allocator.free(owned);
+            acc.max_bytes = null;
+        },
+        .distinct => |*d| if (d.*) |set| {
+            set.deinit(allocator);
+            allocator.destroy(set);
+            d.* = null;
+        },
         else => {},
     };
 }
@@ -1964,6 +2012,7 @@ fn decValue(v: ?i128, spec: expr_ast.Dec) AggValue {
 pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     return switch (call.func) {
         .count => .{ .i = @intCast(state.count) },
+        .count_distinct => .{ .i = if (state.distinct) |d| @intCast(d.count()) else 0 },
         // i128 carries the full sum (incl. i64 overflow + unsigned-64);
         // the JSON layer prints it directly, no narrowing/overflow error.
         // sum/min/max over no values are NULL, never a 0 or "" stand-in.

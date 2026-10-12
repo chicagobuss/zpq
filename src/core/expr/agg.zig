@@ -36,6 +36,7 @@ pub const Error = error{
     UnsupportedAggType,
     EmptyAggregate,
     DivideByZero,
+    ExceededMemoryBudget,
     /// An integer aggregate result (i128 internally) exceeds the i64 range of
     /// the 1-row result *parquet* column. The JSON output path has no such
     /// limit; this only affects `--aggregate -o out.parquet`.
@@ -44,6 +45,7 @@ pub const Error = error{
 
 pub const AggFunc = enum {
     count,
+    count_distinct,
     sum,
     min,
     max,
@@ -140,11 +142,143 @@ fn fit38(v: i192) expr_eval.Error!i128 {
     return @intCast(v);
 }
 
+pub const DistinctSet = struct {
+    val_set: union(enum) {
+        none,
+        u64: std.AutoHashMapUnmanaged(u64, void),
+        i128: std.AutoHashMapUnmanaged(i128, void),
+        bytes: std.StringHashMapUnmanaged(void),
+    } = .none,
+    allocated_bytes: usize = 0,
+    max_memory_bytes: usize = 0,
+    shared: ?*SharedBudget = null,
+
+    pub fn deinit(self: *DistinctSet, allocator: std.mem.Allocator) void {
+        if (self.shared) |budget| {
+            budget.release(self.max_memory_bytes);
+        }
+        switch (self.val_set) {
+            .none => {},
+            .u64 => |*s| s.deinit(allocator),
+            .i128 => |*s| s.deinit(allocator),
+            .bytes => |*s| {
+                var it = s.keyIterator();
+                while (it.next()) |k| allocator.free(k.*);
+                s.deinit(allocator);
+            },
+        }
+        self.* = .{};
+    }
+
+    pub fn releaseSlack(self: *DistinctSet) void {
+        const budget = self.shared orelse return;
+        const slack = self.max_memory_bytes - self.allocated_bytes;
+        if (slack == 0) return;
+        self.max_memory_bytes = self.allocated_bytes;
+        budget.release(slack);
+    }
+
+    pub fn drawMore(self: *DistinctSet, need: usize) error{ExceededMemoryBudget}!void {
+        if (self.allocated_bytes + need <= self.max_memory_bytes) return;
+        const budget = self.shared orelse return;
+        if (budget.tight()) self.releaseSlack();
+        const deficit = (self.allocated_bytes + need) - self.max_memory_bytes;
+        const got = budget.draw(deficit) orelse blk: {
+            self.releaseSlack();
+            break :blk budget.draw(need) orelse return error.ExceededMemoryBudget;
+        };
+        self.max_memory_bytes += got;
+    }
+
+    pub fn count(self: *const DistinctSet) usize {
+        return switch (self.val_set) {
+            .none => 0,
+            .u64 => |s| s.count(),
+            .i128 => |s| s.count(),
+            .bytes => |s| s.count(),
+        };
+    }
+
+    pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
+        if (self.val_set == .none) self.val_set = .{ .u64 = .empty };
+        var s = &self.val_set.u64;
+        if (s.contains(v)) return;
+        const entry_size = 24;
+        try self.drawMore(entry_size);
+        try s.put(allocator, v, {});
+        self.allocated_bytes += entry_size;
+    }
+
+    pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
+        if (self.val_set == .none) self.val_set = .{ .i128 = .empty };
+        var s = &self.val_set.i128;
+        if (s.contains(v)) return;
+        const entry_size = 32;
+        try self.drawMore(entry_size);
+        try s.put(allocator, v, {});
+        self.allocated_bytes += entry_size;
+    }
+
+    pub fn insertF64(self: *DistinctSet, allocator: std.mem.Allocator, val: f64) !void {
+        var f = val;
+        if (std.math.isNan(f)) {
+            f = std.math.nan(f64);
+        } else if (f == 0.0) {
+            f = 0.0;
+        }
+        return self.insertU64(allocator, @bitCast(f));
+    }
+
+    pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
+        if (self.val_set == .none) self.val_set = .{ .bytes = .empty };
+        var s = &self.val_set.bytes;
+        if (s.contains(v)) return;
+        const entry_size = 32 + v.len;
+        try self.drawMore(entry_size);
+        const owned = try allocator.dupe(u8, v);
+        errdefer allocator.free(owned);
+        try s.put(allocator, owned, {});
+        self.allocated_bytes += entry_size;
+    }
+
+    pub fn insertColRow(self: *DistinctSet, allocator: std.mem.Allocator, col: filter_eval.Batch.Column, r: usize) !void {
+        if (isRowNull(col, r)) return;
+        switch (col) {
+            .i32 => |c| try self.insertU64(allocator, @as(u64, @bitCast(@as(i64, c.values[r])))),
+            .i64 => |c| try self.insertU64(allocator, @as(u64, @bitCast(c.values[r]))),
+            .f32 => |c| try self.insertF64(allocator, @as(f64, c.values[r])),
+            .f64 => |c| try self.insertF64(allocator, c.values[r]),
+            .string => |c| try self.insertBytes(allocator, c.values[r]),
+            .boolean => |c| try self.insertU64(allocator, if (c.values[r]) 1 else 0),
+            .i128 => |c| try self.insertI128(allocator, c.values[r]),
+        }
+    }
+
+    pub fn merge(self: *DistinctSet, other: *const DistinctSet, allocator: std.mem.Allocator) !void {
+        switch (other.val_set) {
+            .none => {},
+            .u64 => |s| {
+                var it = s.keyIterator();
+                while (it.next()) |k| try self.insertU64(allocator, k.*);
+            },
+            .i128 => |s| {
+                var it = s.keyIterator();
+                while (it.next()) |k| try self.insertI128(allocator, k.*);
+            },
+            .bytes => |s| {
+                var it = s.keyIterator();
+                while (it.next()) |k| try self.insertBytes(allocator, k.*);
+            },
+        }
+    }
+};
+
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
 /// kernel at update time without re-checking AggFunc + arg type.
 pub const Accumulator = union(enum) {
     count: u64,
+    distinct: ?*DistinctSet,
     /// Integer sum, i128. Keeps i64-column sums precise on big datasets
     /// (10^9 rows × 10^9 values = 10^18) and carries unsigned-64 sums and
     /// i64-overflowing sums (e.g. wide DELTA columns) without wrapping. The
@@ -182,6 +316,7 @@ pub const Accumulator = union(enum) {
     pub fn init(call: AggCall) Accumulator {
         return switch (call.func) {
             .count => .{ .count = 0 },
+            .count_distinct => .{ .distinct = null },
             .sum => switch (call.result) {
                 .i64 => .{ .sum_i = null },
                 .f64 => .{ .sum_f = null },
@@ -211,9 +346,16 @@ pub const Accumulator = union(enum) {
     /// final result after a parallel multi-file scan. A null min/max
     /// means "no values seen"; merging skips it.
     /// A count past i64 (footers whose bounded row counts add up past it across files) is `RowCountTooLarge`.
-    pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) error{RowCountTooLarge}!void {
+    pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) !void {
         switch (dst.*) {
             .count => |*c| c.* = try addRowCount(c.*, src.count),
+            .distinct => |*d| if (src.distinct) |src_set| {
+                if (d.* == null) {
+                    d.* = try allocator.create(DistinctSet);
+                    d.*.?.* = .{ .shared = src_set.shared };
+                }
+                try d.*.?.merge(src_set, allocator);
+            },
             .sum_i => |*s| if (src.sum_i) |sv| {
                 s.* = (s.* orelse 0) + sv;
             },
@@ -285,6 +427,10 @@ pub const ResolveError = error{ BadAggArg, UnsupportedAggType };
 pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShape {
     return switch (func) {
         .count => .i64,
+        .count_distinct => blk: {
+            _ = arg orelse return error.BadAggArg;
+            break :blk .i64;
+        },
         .avg => if (arg != null and arg.?.typeOf() == .dec) .avg_dec else .avg_f64,
         .sum => blk: {
             const e = arg orelse return error.BadAggArg;
@@ -322,6 +468,7 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
 /// falls back to decode. `updateOneFromStats` returns false in that
 /// case.
 pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: bool) bool {
+    if (call.func == .count_distinct) return false;
     if (has_outer_filter) return false;
     if (call.where != null) return false;
     // count(*) is answered from RowGroup.num_rows — structural, always exact.
@@ -343,6 +490,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
     }
     return switch (call.func) {
         .count => true,
+        .count_distinct => false,
         // String min/max can't trust row-group stats: `min_value`/`max_value`
         // may be TRUNCATED (a rounded bound, not a present value), and this
         // stats path doesn't consult the `is_*_value_exact` flags — so
@@ -426,6 +574,7 @@ pub fn updateOneFromStats(
     file_meta: *const schema.FileMetaData,
 ) !bool {
     switch (call.func) {
+        .count_distinct => return false,
         .count => {
             // count(*): every row counts, regardless of null content.
             if (call.arg == null) {
@@ -714,6 +863,7 @@ pub fn updateOne(
 
     switch (call.func) {
         .count => state.count += sel.count(),
+        .count_distinct => try foldDistinct(persist, state, values.?, sel),
         .sum => try foldSum(state, values.?, sel, u64_col),
         .min => if (call.result == .bytes)
             try foldMinMaxBytes(persist, true, state, values.?, sel)
@@ -724,6 +874,24 @@ pub fn updateOne(
         else
             foldMax(state, values.?, sel, u64_col),
         .avg => try foldAvg(state, values.?, sel),
+    }
+}
+
+fn foldDistinct(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+) Error!void {
+    if (state.distinct == null) {
+        state.distinct = try persist.create(DistinctSet);
+        state.distinct.?.* = .{};
+    }
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (sel.isActive(r)) {
+            try state.distinct.?.insertColRow(persist, col, r);
+        }
     }
 }
 
@@ -1471,6 +1639,7 @@ pub fn finalize(
 ) Error![]OutputCol {
     return switch (call.func) {
         .count => try emitOneI64(arena, call.alias, @intCast(state.count), false),
+        .count_distinct => try emitOneI64(arena, call.alias, if (state.distinct) |d| @intCast(d.count()) else 0, false),
         .sum => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, state.sum_i, true),
             .f64 => try emitOneF64(arena, call.alias, state.sum_f),
@@ -1673,6 +1842,93 @@ test "count over all rows" {
     var state = Accumulator.init(call);
     try updateOne(a, a, &state, call, &batch, &lookup, &sel);
     try testing.expectEqual(@as(u64, 100), state.count);
+}
+
+test "count_distinct: basic functionality over ints, strings, and nulls" {
+    const a = testing.allocator;
+    var set_int = DistinctSet{};
+    defer set_int.deinit(a);
+
+    const defs = [_]u32{ 1, 1, 0, 1, 1 }; // row 2 is null
+    const vals = [_]i64{ 10, 20, 999, 10, 30 };
+    const col: filter_eval.Batch.Column = .{
+        .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true },
+    };
+    for (0..vals.len) |r| {
+        try set_int.insertColRow(a, col, r);
+    }
+    try testing.expectEqual(@as(usize, 3), set_int.count());
+
+    var set_other = DistinctSet{};
+    defer set_other.deinit(a);
+    const other_vals = [_]i64{ 30, 40, 50 };
+    const col2: filter_eval.Batch.Column = .{
+        .i64 = .{ .values = &other_vals },
+    };
+    for (0..other_vals.len) |r| {
+        try set_other.insertColRow(a, col2, r);
+    }
+    try set_int.merge(&set_other, a);
+    try testing.expectEqual(@as(usize, 5), set_int.count());
+}
+
+test "count_distinct: allocation failure leaves no leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var set = DistinctSet{};
+            defer set.deinit(gpa);
+            const vals = [_]i64{ 1, 2, 3, 2, 1, 4, 5 };
+            const col: filter_eval.Batch.Column = .{
+                .i64 = .{ .values = &vals },
+            };
+            for (0..vals.len) |r| {
+                try set.insertColRow(gpa, col, r);
+            }
+            try testing.expectEqual(@as(usize, 5), set.count());
+        }
+    }.run, .{});
+}
+
+test "count_distinct: string allocation failure leaves no leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var set = DistinctSet{};
+            defer set.deinit(gpa);
+            const vals = [_][]const u8{ "apple", "banana", "apple", "cherry", "banana" };
+            const col: filter_eval.Batch.Column = .{
+                .string = .{ .values = &vals },
+            };
+            for (0..vals.len) |r| {
+                try set.insertColRow(gpa, col, r);
+            }
+            try testing.expectEqual(@as(usize, 3), set.count());
+        }
+    }.run, .{});
+}
+
+test "count_distinct: memory budget enforcement returns ExceededMemoryBudget" {
+    const a = testing.allocator;
+    var budget = SharedBudget{
+        .limit = 64,
+        .block = 64,
+    };
+    var set = DistinctSet{ .shared = &budget };
+    defer set.deinit(a);
+
+    var vals: [1000]i64 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @intCast(i);
+    const col: filter_eval.Batch.Column = .{
+        .i64 = .{ .values = &vals },
+    };
+    var err_encountered = false;
+    for (0..vals.len) |r| {
+        set.insertColRow(a, col, r) catch |err| {
+            try testing.expectEqual(error.ExceededMemoryBudget, err);
+            err_encountered = true;
+            break;
+        };
+    }
+    try testing.expect(err_encountered);
 }
 
 test "sum i64 column" {
@@ -2903,10 +3159,14 @@ pub const GroupTable = struct {
         self.keys.deinit(self.allocator);
         self.first.deinit(self.allocator);
 
-        for (self.accumulators.items) |acc| {
-            switch (acc) {
+        for (self.accumulators.items) |*acc| {
+            switch (acc.*) {
                 .min_bytes => |mb| if (mb) |s| self.allocator.free(s),
                 .max_bytes => |mb| if (mb) |s| self.allocator.free(s),
+                .distinct => |d| if (d) |set| {
+                    set.deinit(self.allocator);
+                    self.allocator.destroy(set);
+                },
                 else => {},
             }
         }
@@ -2956,7 +3216,13 @@ pub const GroupTable = struct {
         try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
         errdefer self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
         for (agg_calls) |call| {
-            self.accumulators.appendAssumeCapacity(Accumulator.init(call));
+            var acc = Accumulator.init(call);
+            if (call.func == .count_distinct) {
+                const ds = try self.allocator.create(DistinctSet);
+                ds.* = .{ .shared = self.shared };
+                acc = .{ .distinct = ds };
+            }
+            self.accumulators.appendAssumeCapacity(acc);
         }
 
         try self.map.put(key_copy, group_id);
@@ -2994,7 +3260,7 @@ pub fn updateOneGrouped(
 ) Error!void {
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false);
     defer input.deinit(arena);
-    return updateOneGroupedValues(
+    try updateOneGroupedValues(
         arena,
         persist,
         accs,
@@ -3029,6 +3295,14 @@ pub fn updateOneGroupedValues(
             const state = &accs[gid * agg_len + agg_idx];
             switch (call.func) {
                 .count => state.count += 1,
+                .count_distinct => {
+                    if (state.distinct == null) {
+                        const ds = try persist.create(DistinctSet);
+                        ds.* = .{};
+                        state.distinct = ds;
+                    }
+                    try state.distinct.?.insertColRow(persist, values.?, r);
+                },
                 .sum => try foldSumGroupedOne(state, values.?, r, u64_col),
                 .min => if (call.result == .bytes)
                     try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)

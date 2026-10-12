@@ -67,17 +67,22 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
     switch (node.kind) {
         c.LP_EXPR_FUNCTION => {
             var is_agg = false;
+            var is_count = false;
             if (node.u.function.name) |nm| {
                 const name = std.mem.span(nm);
-                if (std.ascii.eqlIgnoreCase(name, "sum") or
-                    std.ascii.eqlIgnoreCase(name, "count") or
+                if (std.ascii.eqlIgnoreCase(name, "count")) {
+                    is_agg = true;
+                    is_count = true;
+                } else if (std.ascii.eqlIgnoreCase(name, "sum") or
                     std.ascii.eqlIgnoreCase(name, "avg") or
                     std.ascii.eqlIgnoreCase(name, "min") or
                     std.ascii.eqlIgnoreCase(name, "max")) is_agg = true;
             }
             if (is_agg) info.has_agg = true;
             if (node.u.function.over != null) info.has_window = true; // `f() OVER (...)`
-            if (node.u.function.distinct != 0) info.has_func_distinct = true; // `count(DISTINCT x)`
+            if (node.u.function.distinct != 0) {
+                if (!is_count) info.has_func_distinct = true; // `sum(DISTINCT x)`
+            }
             var child: ExprInfo = .{};
             var i: usize = 0;
             while (i < @as(usize, @intCast(node.u.function.args.count))) : (i += 1) {
@@ -694,8 +699,8 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
 
 test "sql_parser rejects unsupported aggregate shapes" {
     const a = std.testing.allocator;
-    // count(DISTINCT x) — distinct on the function node (was silently dropped).
-    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT count(DISTINCT x) AS c FROM 't'"));
+    // sum(DISTINCT x) — distinct on non-count functions is not supported.
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT sum(DISTINCT x) AS c FROM 't'"));
     // Bare column inside an aggregate column: `sum(a) + b` is implicit GROUP BY.
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT sum(a) + b AS x FROM 't'"));
     // Aggregate in WHERE is illegal.
@@ -704,6 +709,14 @@ test "sql_parser rejects unsupported aggregate shapes" {
     try std.testing.expectError(error.MultipleStatements, parseSqlQuery(a, "SELECT x FROM 't'; SELECT y FROM 'u'"));
     // Subquery in WHERE.
     try std.testing.expectError(error.SubqueryNotSupported, parseSqlQuery(a, "SELECT x FROM 't' WHERE x IN (SELECT y FROM 'u')"));
+}
+
+test "sql_parser accepts count(DISTINCT x)" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT count(DISTINCT x) AS c FROM 't'");
+    defer q.deinit(a);
+    try std.testing.expect(q.is_aggregate);
+    try std.testing.expectEqualStrings("count(DISTINCT x) AS c", q.aggregate_str.?);
 }
 
 test "sql_parser aggregate select" {

@@ -147,10 +147,70 @@ pub fn updateOneCoded(
     var own = try selectWithNulls(arena, call, col, batch, lookup, outer_sel);
     defer if (own) |*s| s.deinit();
     const sel: *const Sel = if (own) |*s| s else outer_sel;
+    if (call.func == .count_distinct) {
+        const dict = try widenDict(arena, col, c);
+        try foldDistinctCoded(arena, persist, state, col.codes().?, col.dictLen(), dict, sel);
+        return true;
+    }
     const hist = try histogram(arena, col.codes().?, col.dictLen(), sel);
     const dict = try widenDict(arena, col, c);
     try foldHist(persist, state, call, dict, hist, c.unsigned_64);
     return true;
+}
+
+inline fn setBit(bs: []u64, code: u32) void {
+    bs[code / 64] |= @as(u64, 1) << @truncate(code % 64);
+}
+
+fn foldDistinctCoded(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    codes: []const u32,
+    n_dict: usize,
+    dict: Column,
+    sel: *const Sel,
+) Error!void {
+    const n_words = (n_dict + 63) / 64;
+    const bitset = try arena.alloc(u64, n_words);
+    @memset(bitset, 0);
+
+    const n = codes.len;
+    var w: usize = 0;
+    while ((w + 1) * 64 <= n) : (w += 1) {
+        const word = sel.mask[w];
+        const base = w * 64;
+        if (word == std.math.maxInt(u64)) {
+            var r: usize = base;
+            while (r < base + 64) : (r += 4) {
+                setBit(bitset, codes[r]);
+                setBit(bitset, codes[r + 1]);
+                setBit(bitset, codes[r + 2]);
+                setBit(bitset, codes[r + 3]);
+            }
+        } else if (word != 0) {
+            var bits = word;
+            while (bits != 0) {
+                const i: usize = @ctz(bits);
+                setBit(bitset, codes[base + i]);
+                bits &= bits - 1;
+            }
+        }
+    }
+    for (w * 64..n) |r| if (sel.isActive(r)) {
+        setBit(bitset, codes[r]);
+    };
+
+    if (state.distinct == null) {
+        const ds = try persist.create(agg.DistinctSet);
+        ds.* = .{};
+        state.distinct = ds;
+    }
+    for (0..n_dict) |k| {
+        if ((bitset[k / 64] & (@as(u64, 1) << @truncate(k % 64))) != 0) {
+            try state.distinct.?.insertColRow(persist, dict, k);
+        }
+    }
 }
 
 /// Fold one histogram over a (widened) dictionary into `state`, matching the row folds' semantics.
@@ -167,6 +227,19 @@ fn foldHist(
     switch (call.func) {
         .count => {
             state.count += total;
+            return;
+        },
+        .count_distinct => {
+            if (state.distinct == null) {
+                const ds = try persist.create(agg.DistinctSet);
+                ds.* = .{};
+                state.distinct = ds;
+            }
+            for (hist, 0..) |h, k| {
+                if (h > 0) {
+                    try state.distinct.?.insertColRow(persist, dict, k);
+                }
+            }
             return;
         },
         else => {},
@@ -276,6 +349,7 @@ fn foldHist(
             }
         },
         .count => unreachable,
+        .distinct => unreachable,
     }
 }
 
@@ -509,7 +583,7 @@ fn foldGroupedCall(
         else => |e| vals_col = try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
-    const is_numeric_sum_like = (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes;
+    const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes;
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -528,7 +602,7 @@ fn foldGroupedCall(
                 // Each order's identity (`agg.minTotal`/`maxTotal`): NaN for min, -inf for max.
                 .min => @memset(part, std.math.nan(f64)),
                 .max => @memset(part, -std.math.inf(f64)),
-                .count => unreachable,
+                .count, .count_distinct => unreachable,
             }
             switch (call.func) {
                 .sum, .avg => forEachActive(sel, comp.len, struct {
@@ -547,7 +621,7 @@ fn foldGroupedCall(
                         part[cp] = if (is_min) agg.minTotal(part[cp], v[r]) else agg.maxTotal(part[cp], v[r]);
                     }
                 },
-                .count => unreachable,
+                .count, .count_distinct => unreachable,
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
@@ -573,7 +647,7 @@ fn foldGroupedCall(
                 .sum, .avg => @memset(part, 0),
                 .min => @memset(part, std.math.maxInt(i128)),
                 .max => @memset(part, std.math.minInt(i128)),
-                .count => unreachable,
+                .count, .count_distinct => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -590,7 +664,7 @@ fn foldGroupedCall(
                     },
                     .min => part[cp] = @min(part[cp], x),
                     .max => part[cp] = @max(part[cp], x),
-                    .count => unreachable,
+                    .count, .count_distinct => unreachable,
                 }
             }
             for (0..space) |cp| {
@@ -622,7 +696,7 @@ fn foldGroupedCall(
                 .sum, .avg => {},
                 .min => @memset(ext, std.math.maxInt(i128)),
                 .max => @memset(ext, std.math.minInt(i128)),
-                .count => unreachable,
+                .count, .count_distinct => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -633,7 +707,7 @@ fn foldGroupedCall(
                     .sum, .avg => sums[cp] += v[r],
                     .min => ext[cp] = @min(ext[cp], v[r]),
                     .max => ext[cp] = @max(ext[cp], v[r]),
-                    .count => unreachable,
+                    .count, .count_distinct => unreachable,
                 }
             }
             for (0..space) |cp| {

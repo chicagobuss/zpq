@@ -1438,9 +1438,11 @@ pub fn runMultiAggregate(
             for (outputs, row_vals) |out, *val| {
                 switch (out.source) {
                     .key => |k_idx| {
-                        // A fixed image pads a null column with zeros; the reader wants that payload omitted.
+                        // A fixed image pads a null column with zeros; the reader wants that payload omitted. Only a
+                        // fixed-width table's keys are images: a string key is already in its framing.
                         var ser_buf: [48]u8 = undefined;
-                        val.* = try deserializeKeyColumn(gpa, expr_agg.canonicalKey(slot.key, &ser_buf), k_idx, key_types);
+                        const key_bytes = if (out_tables[0].fixed_stride != 0) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
+                        val.* = try deserializeKeyColumn(gpa, key_bytes, k_idx, key_types);
                     },
                     .agg => |a_idx| {
                         val.* = try materializeOne(gpa, agg_calls[a_idx], accs[a_idx]);
@@ -2831,16 +2833,17 @@ fn resolveOutputColumn(
 ) Error!ColSource {
     const expr_name = exprName(spec);
     const alias_name = aliasName(spec);
+    // A key by the item's expression first, then by its alias: in `g AS k ... GROUP BY k, g` the column is `g`,
+    // named `k`, and a match on the alias alone would show the key `k` instead.
     var key: ?usize = null;
-    for (0..keys.items.len) |k_idx| {
-        const label = try keys.label(k_idx);
-        const source = try keys.source(k_idx);
-        if (std.ascii.eqlIgnoreCase(expr_name, label) or std.ascii.eqlIgnoreCase(alias_name, label) or
-            std.ascii.eqlIgnoreCase(expr_name, source) or std.ascii.eqlIgnoreCase(alias_name, source))
-        {
-            key = k_idx;
-            break;
+    for ([_][]const u8{ expr_name, alias_name }) |name| {
+        for (0..keys.items.len) |k_idx| {
+            if (std.ascii.eqlIgnoreCase(name, try keys.label(k_idx)) or std.ascii.eqlIgnoreCase(name, try keys.source(k_idx))) {
+                key = k_idx;
+                break;
+            }
         }
+        if (key != null) break;
     }
     var agg: ?usize = null;
     for (agg_calls, 0..) |call, a_idx| {

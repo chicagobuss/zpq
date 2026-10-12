@@ -776,6 +776,46 @@ def main():
             else:
                 print(f"  OK    {label}")
 
+    # Multi-column string keys whose framed length is a multiple of 9 (NULLs, short and long strings, a NUL byte), and
+    # an alias that names another GROUP BY key: the keys print as stored, and the aliased column is its expression's.
+    keyf = os.path.join(tmp, "string_keys.parquet")
+    pq.write_table(pa.table({
+        "a": pa.array([None, "r", "xy", "xy", None, "x"] * 50, pa.string()),
+        "b": pa.array(["abc", "abc", "abcdef", "abcdefg", "y" * 57, "y" * 57] * 50, pa.string()),
+        "h": pa.array([None, 1, 2, None, 3, 4] * 50, pa.int64()),
+        "s": pa.array(["abcX\x01\x00\x00\x00Qjkl", "q", "", "zz", "abcX\x01\x00\x00\x00Qjkl", "w"] * 50, pa.string()),
+        "g": pa.array([5, 1, 3, 1, 2, 4] * 50, pa.int32()),
+    }), keyf)
+    for i, q in enumerate([
+        "SELECT a, b, count(*) AS n FROM '{f}' GROUP BY a, b",
+        "SELECT h, s, count(*) AS n FROM '{f}' GROUP BY h, s",
+        "SELECT a AS aa, g AS a, count(*) AS c FROM '{f}' GROUP BY a, g",
+        "SELECT a AS g, g AS a, count(*) AS c FROM '{f}' GROUP BY a, g ORDER BY g, a",
+    ]):
+        total += 1
+        sql = q.format(f=keyf)
+        r = subprocess.run([ZPQ, "query", "--query", sql], capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+            rel = con.execute(sql)
+            lanes = json_lanes(rel)
+            rows = [from_zpq(list(row.values()), lanes) for row in zjson(r.stdout)["agg"]]
+            if "ORDER BY" in q:
+                want = [tuple(canon(v) for v in row) for row in rel.fetchall()]
+                got = [tuple(canon(v) for v in row) for row in rows]
+            else:
+                want = canon_rows(rel.fetchall(), lanes)
+                got = canon_rows(rows, lanes)
+            problem = None if got == want else f"zpq={got[:3]} duck={want[:3]}"
+        except Exception as e:
+            problem = f"error: {e}"
+        if problem:
+            fails += 1
+            print(f"  FAIL  key-framing:{i}  {problem}")
+        else:
+            print(f"  OK    key-framing:{i}  ({len(got)} rows)")
+
     # `-o` keeps the parquet type of pass-through columns: bare GROUP BY keys and min/max of a column come back as
     # the source type (DATE, STRING, INT8, UINT64, ...), not the evaluation lane's plain INT64 / BYTE_ARRAY. DECIMAL
     # stays DOUBLE (its f64 value); computed columns keep their computed type.

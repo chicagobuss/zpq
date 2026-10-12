@@ -3458,7 +3458,9 @@ pub fn packFixedKey(cols: []const filter_eval.Batch.Column, row: usize, out: *[3
 /// Variable-length framing (`serializeRowKey`) of a fixed image. Present columns already match; a null column drops
 /// the zero payload so `deserializeKeyColumn` sees the bytes it always has.
 pub fn canonicalKey(image: []const u8, buf: *[48]u8) []const u8 {
-    if (image.len % 9 != 0) return image;
+    // Only a fixed-width image (`fixedGroupStride`: at most three 9-byte columns) is reframed; a caller holding
+    // variable-length keys must not ask.
+    std.debug.assert(image.len % 9 == 0 and image.len <= 27);
     var i: usize = 0;
     while (i < image.len) : (i += 9) if (image[i] == 0) break;
     if (i == image.len) return image;

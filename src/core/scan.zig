@@ -2474,6 +2474,43 @@ test "topKCandidates: keeps every key whose total can reach the cut, even one no
     }) |other| try testing.expect(try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, other) == null);
 }
 
+test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own every value once, and leak nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn set(gpa: std.mem.Allocator, vals: []const u64) !*expr_agg.DistinctSet {
+            const ds = try gpa.create(expr_agg.DistinctSet);
+            ds.* = .{};
+            errdefer {
+                ds.deinit(gpa);
+                gpa.destroy(ds);
+            }
+            for (vals) |v| try ds.insertU64(gpa, v);
+            return ds;
+        }
+        fn run(gpa: std.mem.Allocator) !void {
+            for ([_][2][]const u64{
+                .{ &.{ 1, 2 }, &.{ 2, 3, 4, 5 } }, // theirs larger: handed over
+                .{ &.{ 1, 2, 3, 4 }, &.{ 4, 5 } }, // ours larger
+                .{ &.{}, &.{ 1, 2, 3, 4, 5 } },
+            }) |c| {
+                var dst: expr_agg.Accumulator = .{ .distinct = null };
+                defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
+                if (c[0].len > 0) dst = .{ .distinct = try set(gpa, c[0]) };
+                var src: expr_agg.Accumulator = .{ .distinct = try set(gpa, c[1]) };
+                defer freeOwnedAccumulatorStrings(gpa, (&src)[0..1]);
+                try mergeOwnedAccumulator(&dst, &src, gpa);
+                try testing.expect(src.distinct == null);
+                try testing.expectEqual(@as(usize, 5), dst.distinct.?.count());
+            }
+            // Nothing seen on the source side: the destination is untouched.
+            var dst: expr_agg.Accumulator = .{ .distinct = try set(gpa, &.{7}) };
+            defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
+            var none: expr_agg.Accumulator = .{ .distinct = null };
+            try mergeOwnedAccumulator(&dst, &none, gpa);
+            try testing.expectEqual(@as(usize, 1), dst.distinct.?.count());
+        }
+    }.run, .{});
+}
+
 test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {
     const path = "ci/fixtures/parquet/topk_skew.parquet";
     const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {

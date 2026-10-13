@@ -990,15 +990,17 @@ fn filterSmall(metas: []const schema.FileMetaData, work: []const WorkItem, keys:
     return extra <= key_bytes *| 4;
 }
 
-/// Empties `tables` for a pass that starts over.
+/// Empties `tables` for a pass that starts over, keeping their budget, key width and sketch (all three).
 fn clearTables(gpa: std.mem.Allocator, tables: []expr_agg.GroupTable) void {
     for (tables) |*t| {
         const shared = t.shared;
         const stride = t.fixed_stride;
+        const sketch = t.sketch;
         t.deinit();
         t.* = expr_agg.GroupTable.init(gpa, 0);
         t.shared = shared;
         t.fixed_stride = stride;
+        t.sketch = sketch;
     }
 }
 
@@ -6302,6 +6304,37 @@ test "a decode budget that slices row groups keeps where each group first appear
         try testing.expectEqual(w.len, g.len);
         for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
     };
+}
+
+test "a first-keys cut under a decode budget ends inside a later slice where the full scan does" {
+    // Keys 3-9 count 7; the ninth group to appear is key 8 (tools/gen_census_fixture.py).
+    const path = "ci/fixtures/parquet/census_sliced.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]?usize{ 100, 150, null }) |limit| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .group_by = "k",
+            .aggregate = "count(*) AS c",
+            .parallelism = 1,
+            .decode_limit = limit,
+            .result_order = .{ .limit = 1, .offset = 8 },
+        };
+        for ([_]?SketchTopK{ null, .{} }) |sketch| {
+            args.sketch_topk = sketch;
+            var res = try runMultiAggregate(testing.allocator, arena, args);
+            defer res.deinit(testing.allocator);
+            try res.output.applyResultOrder(testing.allocator, args.result_order);
+            const rows = res.output.group_rows.?;
+            try testing.expectEqual(@as(usize, 1), rows.len);
+            try testing.expectEqual(@as(i128, 8), rows[0][0].i);
+            try testing.expectEqual(@as(i128, 7), rows[0][1].i);
+        }
+    }
 }
 
 test "a count cut inside the merge keeps exactly the groups the full sort would, ties by first appearance" {

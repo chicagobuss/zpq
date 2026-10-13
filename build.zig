@@ -160,6 +160,14 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the core unit tests built for `--fuzz` (with -Dtest-filter=\"fuzz:\")");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
+    // The core unit tests alone, one binary: the loop to keep under `--watch -fincremental` while editing. Linked
+    // against BoringSSL built from source: the pinned prebuilt archives repeat members, which lld tolerates and the
+    // self-hosted linker that incremental builds use does not.
+    const dev_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
+    const dev_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = test_filters });
+    const test_core_step = b.step("test-core", "Run the core unit tests only (src/zpq.zig and what it imports)");
+    test_core_step.dependOn(&b.addRunArtifact(dev_tests).step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);

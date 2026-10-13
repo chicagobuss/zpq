@@ -10,6 +10,10 @@ Columns:
   s  utf8, u spelled as a 20-byte string (past the 16 bytes an unframed sketch key needs)
   n  int64, NULL through the first row group and 1 after: count(n) gives the first keys to appear 0
 
+Also `census_sliced.parquet`: key `k` = 0..39, then 3..9 six more times, in row groups of 20. Keys 3-9 count 7 and
+the ninth to appear is 8, so `LIMIT 1 OFFSET 8` under a decode budget that slices row groups ends inside a later
+slice.
+
 Usage:  .venv/bin/python tools/gen_census_fixture.py
 """
 
@@ -47,6 +51,10 @@ def main() -> None:
     })
     pq.write_table(table, OUT, row_group_size=ROWS_PER_GROUP, use_dictionary=False, compression="snappy")
     print(f"wrote {OUT}")
+    sliced = OUT.with_name("census_sliced.parquet")
+    k = list(range(40)) + list(range(3, 10)) * 6
+    pq.write_table(pa.table({"k": pa.array(k, pa.int64())}), sliced, row_group_size=20, use_dictionary=False)
+    print(f"wrote {sliced}")
 
 
 if __name__ == "__main__":

@@ -3833,6 +3833,8 @@ pub const GroupTable = struct {
     fixed_len: u32 = 0,
     fixed_keys: []u8 = &.{},
     fixed_slots: []FixedSlot = &.{},
+    /// Bytes of the count(DISTINCT) set objects a fixed-width table has made, charged with its other memory.
+    set_objects: usize = 0,
     /// A certified top-k pass: keys outside the admitted cells get a cell's id (`CountSketch.sinkId`) rather than a
     /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
@@ -3938,7 +3940,10 @@ pub const GroupTable = struct {
             return id;
         }
 
-        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead;
+        // A count(DISTINCT) set object is memory the group holds, as its values are; the table draws for it in blocks
+        // with the rest of the group, not the set on its own.
+        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead +
+            distinctCalls(agg_calls) * @sizeOf(DistinctSet);
         if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
             const budget = self.shared orelse return error.ExceededMemoryBudget;
             // Checked on the draw path rather than per new group, to keep the shared atomic off the insertion path.
@@ -3974,10 +3979,6 @@ pub const GroupTable = struct {
                 const ds = try self.allocator.create(DistinctSet);
                 ds.* = .{ .shared = self.shared };
                 acc = .{ .distinct = ds };
-                self.accumulators.appendAssumeCapacity(acc);
-                // The set object is memory the group holds, as its values are.
-                try ds.charge(@sizeOf(DistinctSet));
-                continue;
             }
             self.accumulators.appendAssumeCapacity(acc);
         }
@@ -4027,8 +4028,9 @@ pub const GroupTable = struct {
             self.first.capacity
         else
             std.ArrayList(u64).growCapacity(first_need);
+        const new_sets = distinctCalls(agg_calls) * @sizeOf(DistinctSet);
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) +
-            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator);
+            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) + self.set_objects + new_sets;
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
 
         if (slot_cap != self.fixed_slots.len) {
@@ -4068,10 +4070,6 @@ pub const GroupTable = struct {
                 const ds = try self.allocator.create(DistinctSet);
                 ds.* = .{ .shared = self.shared };
                 acc = .{ .distinct = ds };
-                self.accumulators.appendAssumeCapacity(acc);
-                // The set object is memory the group holds, as its values are.
-                try ds.charge(@sizeOf(DistinctSet));
-                continue;
             }
             self.accumulators.appendAssumeCapacity(acc);
         }
@@ -4083,13 +4081,20 @@ pub const GroupTable = struct {
         self.fixed_slots[i] = .{ .hash = hash, .id = id };
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
+        self.set_objects += new_sets;
         self.allocated_bytes = self.fixedHeld();
         return id;
     }
 
     fn fixedHeld(self: *const GroupTable) usize {
         return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
-            self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator);
+            self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator) + self.set_objects;
+    }
+
+    fn distinctCalls(agg_calls: []const AggCall) usize {
+        var n: usize = 0;
+        for (agg_calls) |call| n += @intFromBool(call.func == .count_distinct);
+        return n;
     }
 
     fn findFixed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
@@ -4833,4 +4838,35 @@ test "fullestCells picks the fullest cells, fullest first" {
         fullestCells(cells, out[0..n]);
         try std.testing.expectEqualSlices(u32, sorted[0..n], out[0..n]);
     }
+}
+
+test "a table charges each group's count(DISTINCT) set object, fixed-width keys or not" {
+    const calls = [_]AggCall{
+        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "u", .result = .i64 },
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+    };
+    const n = 500;
+    var plain = GroupTable.init(std.testing.allocator, 1 << 30);
+    defer plain.deinit();
+    var without = GroupTable.init(std.testing.allocator, 1 << 30);
+    defer without.deinit();
+    var fixed = GroupTable.init(std.testing.allocator, 1 << 30);
+    fixed.fixed_stride = 9;
+    defer fixed.deinit();
+    var fixed_without = GroupTable.init(std.testing.allocator, 1 << 30);
+    fixed_without.fixed_stride = 9;
+    defer fixed_without.deinit();
+    for (0..n) |i| {
+        var image: [9]u8 = undefined;
+        image[0] = 1;
+        std.mem.writeInt(i64, image[1..9], @intCast(i), .little);
+        _ = try plain.getOrInsert(&image, &calls, i);
+        _ = try without.getOrInsert(&image, calls[1..], i);
+        _ = try fixed.getOrInsertFixed(&image, &calls, i);
+        _ = try fixed_without.getOrInsertFixed(&image, calls[1..], i);
+    }
+    // Beyond the second call's accumulator, each group holds one set object.
+    const extra = n * (@sizeOf(DistinctSet) + @sizeOf(Accumulator));
+    try std.testing.expect(plain.allocated_bytes >= without.allocated_bytes + extra);
+    try std.testing.expect(fixed.allocated_bytes >= fixed_without.allocated_bytes + n * @sizeOf(DistinctSet));
 }

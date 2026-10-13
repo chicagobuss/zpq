@@ -112,8 +112,49 @@ const usage_text =
     \\
 ;
 
+var machine_diagnostics = false;
+var diagnostic_buffer: [16 * 1024]u8 = undefined;
+var diagnostic_len: usize = 0;
+
+pub const std_options: std.Options = .{ .logFn = cliLog };
+fn cliLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime fmt: []const u8, args: anytype) void {
+    if (!machine_diagnostics) std.log.defaultLog(level, scope, fmt, args);
+}
+
+fn wantsJsonSummary(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    while (it.next()) |a| if (std.mem.eql(u8, a, "--summary=json")) return true;
+    return false;
+}
+
+fn captureSqlDiagnostic(message: []const u8) void {
+    const n = @min(message.len, diagnostic_buffer.len - diagnostic_len);
+    @memcpy(diagnostic_buffer[diagnostic_len..][0..n], message[0..n]);
+    diagnostic_len += n;
+}
+
+fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
+    if (!machine_diagnostics) {
+        std.debug.print(fmt, args);
+        return;
+    }
+    const written = std.fmt.bufPrint(diagnostic_buffer[diagnostic_len..], fmt, args) catch return;
+    diagnostic_len += written.len;
+}
+
+fn emitError(err: anyerror) !void {
+    var w: StdoutWriter = .{ .fd = 2 };
+    try w.writeAll("{\"type\":\"error\",\"ok\":false,\"code\":\"");
+    try writeJsonString(&w, @errorName(err));
+    try w.writeAll("\",\"message\":\"");
+    try writeJsonString(&w, if (diagnostic_len > 0) diagnostic_buffer[0..diagnostic_len] else @errorName(err));
+    try w.writeAll("\"}\n");
+    try w.flush();
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    machine_diagnostics = wantsJsonSummary(init.minimal.args);
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
@@ -144,169 +185,170 @@ pub fn main(init: std.process.Init) !void {
             printDetail(&diag);
             switch (err) {
                 error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
-                error.NoInputs => std.debug.print("zpq query: no input files specified\n", .{}),
-                error.Unsigned64OutOfRange => std.debug.print(
+                error.NoInputs => diagnosticPrint("zpq query: no input files specified\n", .{}),
+                error.Unsigned64OutOfRange => diagnosticPrint(
                     "zpq query: an unsigned 64-bit value of 2^63 or more cannot be used in\n" ++
                         "  integer arithmetic; mix in a float (e.g. `col * 1.0`) to compute in DOUBLE\n",
                     .{},
                 ),
-                error.DuplicateOutputColumn => std.debug.print(
+                error.DuplicateOutputColumn => diagnosticPrint(
                     "zpq query: output column `{s}` is defined more than once;\n" ++
                         "  give each output column (aggregate, GROUP BY key or select item) a distinct name\n",
                     .{diag.column.get()},
                 ),
-                error.AmbiguousOutputColumn => std.debug.print(
+                error.AmbiguousOutputColumn => diagnosticPrint(
                     "zpq query: output column `{s}` names both a GROUP BY key\n" ++
                         "  and an aggregate; rename the aggregate alias\n",
                     .{diag.column.get()},
                 ),
-                error.EmptyAggregate => std.debug.print("zpq query: empty aggregate expression\n", .{}),
-                error.EmptyColumnList => std.debug.print("zpq query: --columns names no column\n", .{}),
-                error.AggregateMutexWithSelect => std.debug.print("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
-                error.MissingOutputOrAggregate => std.debug.print("zpq query: missing --output or --aggregate\n", .{}),
-                error.SchemaMismatch => std.debug.print("zpq query: schema mismatch across inputs\n", .{}),
-                error.NestedRowOutputNotSupported => std.debug.print(
+                error.EmptyAggregate => diagnosticPrint("zpq query: empty aggregate expression\n", .{}),
+                error.EmptyColumnList => diagnosticPrint("zpq query: --columns names no column\n", .{}),
+                error.AggregateMutexWithSelect => diagnosticPrint("zpq query: aggregate functions are mutually exclusive with --select / --columns\n", .{}),
+                error.MissingOutputOrAggregate => diagnosticPrint("zpq query: missing --output or --aggregate\n", .{}),
+                error.SchemaMismatch => diagnosticPrint("zpq query: schema mismatch across inputs\n", .{}),
+                error.NestedRowOutputNotSupported => diagnosticPrint(
                     "zpq query: nested LIST/MAP columns are not supported in row output yet\n",
                     .{},
                 ),
-                error.UnlabelledColumn => std.debug.print(
+                error.UnlabelledColumn => diagnosticPrint(
                     "zpq query: nested column {s} has no output name of its own:\n" ++
                         "  a top-level column is named like it; name it with --select and AS\n",
                     .{diag.column.get()},
                 ),
-                error.NestedReencodeNotSupported => std.debug.print("zpq query: nested re-encoding is not supported yet\n", .{}),
-                error.INT96ReencodeNotSupported => std.debug.print("zpq query: INT96 re-encoding is not supported yet\n", .{}),
-                error.UnsupportedDecimalPrecision => std.debug.print(
+                error.NestedReencodeNotSupported => diagnosticPrint("zpq query: nested re-encoding is not supported yet\n", .{}),
+                error.INT96ReencodeNotSupported => diagnosticPrint("zpq query: INT96 re-encoding is not supported yet\n", .{}),
+                error.UnsupportedDecimalPrecision => diagnosticPrint(
                     "zpq query: column `{s}` has unsupported decimal precision (> 38)\n",
                     .{diag.column.get()},
                 ),
-                error.DecimalValueExceedsPrecision => std.debug.print(
+                error.DecimalValueExceedsPrecision => diagnosticPrint(
                     "zpq query: column `{s}` has a decimal value exceeding its declared precision\n",
                     .{diag.column.get()},
                 ),
-                error.FooterSchemaChunkMismatch => std.debug.print("zpq query: footer schema chunk mismatch\n", .{}),
-                error.CrossBucketNotSupported => std.debug.print("zpq query: cross-bucket queries are not supported\n", .{}),
-                error.BadInputUrl => std.debug.print("zpq query: invalid input S3 URL\n", .{}),
-                error.BadOutputUrl => std.debug.print("zpq query: invalid output S3 URL\n", .{}),
-                error.NoCredentials => std.debug.print("zpq query: missing AWS credentials for S3 query\n", .{}),
-                error.NoRegion => std.debug.print("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
-                error.BadResponse => std.debug.print("zpq query: bad S3 HTTP response\n", .{}),
-                error.TailTooSmall => std.debug.print("zpq query: file footer metadata tail too small\n", .{}),
-                error.NotParquet, error.BadMagic => if (diag.input) |in| std.debug.print(
+                error.FooterSchemaChunkMismatch => diagnosticPrint("zpq query: footer schema chunk mismatch\n", .{}),
+                error.CrossBucketNotSupported => diagnosticPrint("zpq query: cross-bucket queries are not supported\n", .{}),
+                error.BadInputUrl => diagnosticPrint("zpq query: invalid input S3 URL\n", .{}),
+                error.BadOutputUrl => diagnosticPrint("zpq query: invalid output S3 URL\n", .{}),
+                error.NoCredentials => diagnosticPrint("zpq query: missing AWS credentials for S3 query\n", .{}),
+                error.NoRegion => diagnosticPrint("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
+                error.BadResponse => diagnosticPrint("zpq query: bad S3 HTTP response\n", .{}),
+                error.TailTooSmall => diagnosticPrint("zpq query: file footer metadata tail too small\n", .{}),
+                error.NotParquet, error.BadMagic => if (diag.input) |in| diagnosticPrint(
                     "zpq query: input file {s} is not a valid Parquet file ({s})\n",
                     .{ in, causeName(&diag) },
-                ) else std.debug.print("zpq query: input file is not a valid Parquet file\n", .{}),
-                error.AggSumOverflow => std.debug.print("zpq query: aggregate sum overflowed integer limits\n", .{}),
+                ) else diagnosticPrint("zpq query: input file is not a valid Parquet file\n", .{}),
+                error.AggSumOverflow => diagnosticPrint("zpq query: aggregate sum overflowed integer limits\n", .{}),
                 error.OpenFailed => if (diag.input) |in|
-                    std.debug.print("zpq query: failed to open input file {s} ({s})\n", .{ in, causeName(&diag) })
+                    diagnosticPrint("zpq query: failed to open input file {s} ({s})\n", .{ in, causeName(&diag) })
                 else
-                    std.debug.print("zpq query: failed to open input file\n", .{}),
+                    diagnosticPrint("zpq query: failed to open input file\n", .{}),
                 error.EmptyFile => if (diag.input) |in|
-                    std.debug.print("zpq query: input file {s} is empty\n", .{in})
+                    diagnosticPrint("zpq query: input file {s} is empty\n", .{in})
                 else
-                    std.debug.print("zpq query: input file is empty\n", .{}),
+                    diagnosticPrint("zpq query: input file is empty\n", .{}),
                 error.PathTooLong => if (diag.input) |in|
-                    std.debug.print("zpq query: input file path {s} too long\n", .{in})
+                    diagnosticPrint("zpq query: input file path {s} too long\n", .{in})
                 else
-                    std.debug.print("zpq query: input file path too long\n", .{}),
-                error.EmptyExpr => std.debug.print("zpq query: empty expression\n", .{}),
-                error.UnexpectedChar => std.debug.print("zpq query: unexpected character in expression\n", .{}),
-                error.UnexpectedEnd => std.debug.print("zpq query: unexpected end of expression\n", .{}),
-                error.BadNumber => std.debug.print("zpq query: invalid number in expression\n", .{}),
-                error.UnsupportedCodec => std.debug.print("zpq query: input uses a compression codec zpq cannot decompress\n", .{}),
+                    diagnosticPrint("zpq query: input file path too long\n", .{}),
+                error.EmptyExpr => diagnosticPrint("zpq query: empty expression\n", .{}),
+                error.UnexpectedChar => diagnosticPrint("zpq query: unexpected character in expression\n", .{}),
+                error.UnexpectedEnd => diagnosticPrint("zpq query: unexpected end of expression\n", .{}),
+                error.BadNumber => diagnosticPrint("zpq query: invalid number in expression\n", .{}),
+                error.UnsupportedCodec => diagnosticPrint("zpq query: input uses a compression codec zpq cannot decompress\n", .{}),
                 error.UnknownColumn => if (diag.column.len > 0)
-                    std.debug.print("zpq query: unknown column `{s}`\n", .{diag.column.get()})
+                    diagnosticPrint("zpq query: unknown column `{s}`\n", .{diag.column.get()})
                 else
-                    std.debug.print("zpq query: unknown column referenced in expression\n", .{}),
+                    diagnosticPrint("zpq query: unknown column referenced in expression\n", .{}),
                 // A parser's ambiguity was named in full by `printDetail`.
                 error.AmbiguousColumn => if (diag.column.len > 0 and diag.detail != .ambiguous_column)
-                    std.debug.print("zpq query: ambiguous column name `{s}`\n", .{diag.column.get()})
+                    diagnosticPrint("zpq query: ambiguous column name `{s}`\n", .{diag.column.get()})
                 else
-                    std.debug.print("zpq query: ambiguous column name\n", .{}),
-                error.UnsupportedColumnType => std.debug.print("zpq query: unsupported column type\n", .{}),
-                error.UnterminatedString => std.debug.print("zpq query: unterminated string literal in expression\n", .{}),
-                error.TypeMismatch => std.debug.print("zpq query: type mismatch in expression\n", .{}),
-                error.UnknownFunction => std.debug.print("zpq query: unknown scalar function in expression\n", .{}),
-                error.UnknownAggFunc => std.debug.print("zpq query: unknown aggregate function in expression\n", .{}),
-                error.WrongArity => std.debug.print("zpq query: wrong number of arguments for function\n", .{}),
-                error.BadAggArg => std.debug.print("zpq query: invalid argument for aggregate function\n", .{}),
-                error.ExpectedLParen => std.debug.print("zpq query: expected '(' in expression\n", .{}),
-                error.ExpectedRParen => std.debug.print("zpq query: expected ')' in expression\n", .{}),
-                error.ExpressionTooDeep => std.debug.print(
+                    diagnosticPrint("zpq query: ambiguous column name\n", .{}),
+                error.UnsupportedColumnType => diagnosticPrint("zpq query: unsupported column type\n", .{}),
+                error.UnterminatedString => diagnosticPrint("zpq query: unterminated string literal in expression\n", .{}),
+                error.TypeMismatch => diagnosticPrint("zpq query: type mismatch in expression\n", .{}),
+                error.UnknownFunction => diagnosticPrint("zpq query: unknown scalar function in expression\n", .{}),
+                error.UnknownAggFunc => diagnosticPrint("zpq query: unknown aggregate function in expression\n", .{}),
+                error.WrongArity => diagnosticPrint("zpq query: wrong number of arguments for function\n", .{}),
+                error.BadAggArg => diagnosticPrint("zpq query: invalid argument for aggregate function\n", .{}),
+                error.ExpectedLParen => diagnosticPrint("zpq query: expected '(' in expression\n", .{}),
+                error.ExpectedRParen => diagnosticPrint("zpq query: expected ')' in expression\n", .{}),
+                error.ExpressionTooDeep => diagnosticPrint(
                     "zpq query: expression nests too deeply (limit {d}). Each nesting level\n" ++
                         "materializes another full intermediate column, so very deep expressions\n" ++
                         "can exhaust memory; split the expression or precompute part of it.\n",
                     .{zpq.core.expr.parser.MAX_EXPR_DEPTH},
                 ),
-                error.Unsigned64Operand => std.debug.print(
+                error.Unsigned64Operand => diagnosticPrint(
                     "zpq query: arithmetic and functions over a UINT64 column are not\n" ++
                         "supported (values >= 2^63 do not fit the signed 64-bit expression\n" ++
                         "type). Select, filter, group by or aggregate the column directly.\n",
                     .{},
                 ),
-                error.ExpectedIdentifier => std.debug.print("zpq query: expected column identifier in expression\n", .{}),
-                error.ExpectedWhere => std.debug.print("zpq query: expected WHERE keyword in expression\n", .{}),
-                error.ExpectedAggFunc => std.debug.print("zpq query: expected aggregate function\n", .{}),
-                error.StarOnlyValidInCount => std.debug.print("zpq query: '*' is only valid inside count(*)\n", .{}),
-                error.TrailingTokens => std.debug.print("zpq query: trailing tokens after expression\n", .{}),
-                error.GroupKeyAliasRequired => std.debug.print("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
-                error.BadGroupKey => std.debug.print("zpq query: corrupted GROUP BY key framing\n", .{}),
-                error.ExceededMemoryBudget => std.debug.print("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
-                error.NullableNotSupported => std.debug.print("zpq query: nullable values are not supported in this expression\n", .{}),
-                error.IntegerOverflowAdd => std.debug.print("zpq query: integer overflow in +\n", .{}),
-                error.IntegerOverflowSub => std.debug.print("zpq query: integer overflow in -\n", .{}),
-                error.IntegerOverflowMul => std.debug.print("zpq query: integer overflow in *\n", .{}),
-                error.IntegerOverflowDiv => std.debug.print("zpq query: integer overflow in /\n", .{}),
-                error.DecimalOverflow => std.debug.print(
+                error.ExpectedIdentifier => diagnosticPrint("zpq query: expected column identifier in expression\n", .{}),
+                error.ExpectedWhere => diagnosticPrint("zpq query: expected WHERE keyword in expression\n", .{}),
+                error.ExpectedAggFunc => diagnosticPrint("zpq query: expected aggregate function\n", .{}),
+                error.StarOnlyValidInCount => diagnosticPrint("zpq query: '*' is only valid inside count(*)\n", .{}),
+                error.TrailingTokens => diagnosticPrint("zpq query: trailing tokens after expression\n", .{}),
+                error.GroupKeyAliasRequired => diagnosticPrint("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
+                error.BadGroupKey => diagnosticPrint("zpq query: corrupted GROUP BY key framing\n", .{}),
+                error.ExceededMemoryBudget => diagnosticPrint("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
+                error.NullableNotSupported => diagnosticPrint("zpq query: nullable values are not supported in this expression\n", .{}),
+                error.IntegerOverflowAdd => diagnosticPrint("zpq query: integer overflow in +\n", .{}),
+                error.IntegerOverflowSub => diagnosticPrint("zpq query: integer overflow in -\n", .{}),
+                error.IntegerOverflowMul => diagnosticPrint("zpq query: integer overflow in *\n", .{}),
+                error.IntegerOverflowDiv => diagnosticPrint("zpq query: integer overflow in /\n", .{}),
+                error.DecimalOverflow => diagnosticPrint(
                     "zpq query: a DECIMAL value needs more digits than its type holds (at\n" ++
                         "most 38): a result, or an operand of + or - brought to their common\n" ++
                         "type; zpq stops rather than return a rounded or wrapped value\n",
                     .{},
                 ),
-                error.RowGroupTooLarge => std.debug.print(
+                error.RowGroupTooLarge => diagnosticPrint(
                     "zpq query: a row group needs more memory to decode than --max-memory\n" ++
                         "allows, even one aggregate or slice of rows at a time; raise\n" ++
                         "--max-memory or rewrite the file with smaller row groups\n",
                     .{},
                 ),
-                error.DecimalScaleTooLarge => std.debug.print(
+                error.DecimalScaleTooLarge => diagnosticPrint(
                     "zpq query: a DECIMAL product would have more than 38 digits after the\n" ++
                         "point; cast an operand to DOUBLE (divide by 1.0) to compute it inexactly\n",
                     .{},
                 ),
-                error.InvalidDecimalType => std.debug.print(
+                error.InvalidDecimalType => diagnosticPrint(
                     "zpq query: a DECIMAL column declares a precision/scale no DECIMAL can\n" ++
                         "have (precision 1..38, scale 0..precision)\n",
                     .{},
                 ),
-                error.NestedNotSupported => std.debug.print("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
-                error.DivisionByZero => std.debug.print("zpq query: division by zero\n", .{}),
-                error.GroupingNotSupported => std.debug.print(
+                error.NestedNotSupported => diagnosticPrint("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
+                error.DivisionByZero => diagnosticPrint("zpq query: division by zero\n", .{}),
+                error.GroupingNotSupported => diagnosticPrint(
                     "filter: grouping parentheses are not supported — the grammar is a flat AND/OR chain (AND binds " ++
                         "tighter than OR)\nzpq query: grouping parentheses are not supported in filter\n",
                     .{},
                 ),
-                error.BadOperator => std.debug.print("zpq query: invalid operator in filter\n", .{}),
-                error.BadValue => std.debug.print("zpq query: invalid value in filter\n", .{}),
-                error.UnsupportedType => std.debug.print("zpq query: unsupported type in filter\n", .{}),
-                error.BloomFilterUnsupportedColumn => std.debug.print(
+                error.BadOperator => diagnosticPrint("zpq query: invalid operator in filter\n", .{}),
+                error.BadValue => diagnosticPrint("zpq query: invalid value in filter\n", .{}),
+                error.UnsupportedType => diagnosticPrint("zpq query: unsupported type in filter\n", .{}),
+                error.BloomFilterUnsupportedColumn => diagnosticPrint(
                     "zpq query: --bloom-filter cannot apply to `{s}`: BOOLEAN, INT96, nested\n" ++
                         "  and FIXED_LEN_BYTE_ARRAY DECIMAL columns take no Bloom filter\n",
                     .{diag.column.get()},
                 ),
-                error.BloomFilterNeedsRows => std.debug.print(
+                error.BloomFilterNeedsRows => diagnosticPrint(
                     "zpq query: --bloom-filter applies to written rows, not to an aggregate\n",
                     .{},
                 ),
-                else => std.debug.print("zpq query: {s}\n", .{@errorName(err)}),
+                else => diagnosticPrint("zpq query: {s}\n", .{@errorName(err)}),
             }
+            if (machine_diagnostics) try emitError(err);
             std.process.exit(queryExitCode(err));
         };
         return;
     }
     if (std.mem.eql(u8, cmd, "conform")) {
         const path = iter.next() orelse {
-            std.debug.print("conform: missing path\n", .{});
+            diagnosticPrint("conform: missing path\n", .{});
             std.process.exit(1);
         };
         try runConform(gpa, path);
@@ -314,14 +356,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "schema")) {
         const path = iter.next() orelse {
-            std.debug.print("schema: missing path\n", .{});
+            diagnosticPrint("schema: missing path\n", .{});
             std.process.exit(1);
         };
         try runSchema(init, path);
         return;
     }
-    std.debug.print("unknown subcommand: {s}\n", .{cmd});
-    std.process.exit(1);
+    diagnosticPrint("unknown subcommand: {s}\n", .{cmd});
+    std.process.exit(2);
 }
 
 fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Diag) !void {
@@ -345,6 +387,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var fast_levels: bool = false;
     var unordered: bool = false;
     var format: ?engine.PrintFormat = null;
+    var summary = false;
     var limit: ?usize = null;
     var max_memory: ?usize = null;
     var group_by: ?[]const u8 = null;
@@ -364,39 +407,39 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             return;
         } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
             output = iter.next() orelse {
-                std.debug.print("zpq query: --output requires a value\n", .{});
+                diagnosticPrint("zpq query: --output requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
             filter = iter.next() orelse {
-                std.debug.print("zpq query: --filter requires a value\n", .{});
+                diagnosticPrint("zpq query: --filter requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
             columns_csv = iter.next() orelse {
-                std.debug.print("zpq query: --columns requires a value\n", .{});
+                diagnosticPrint("zpq query: --columns requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--select") or std.mem.eql(u8, tok, "-s")) {
             select = iter.next() orelse {
-                std.debug.print("zpq query: --select requires a value\n", .{});
+                diagnosticPrint("zpq query: --select requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--explain")) {
             explain = true;
         } else if (std.mem.eql(u8, tok, "--aggregate") or std.mem.eql(u8, tok, "-a")) {
             aggregate = iter.next() orelse {
-                std.debug.print("zpq query: --aggregate requires a value\n", .{});
+                diagnosticPrint("zpq query: --aggregate requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--query") or std.mem.eql(u8, tok, "-q")) {
             query = iter.next() orelse {
-                std.debug.print("zpq query: --query requires a value\n", .{});
+                diagnosticPrint("zpq query: --query requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--codec")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --codec requires a value\n", .{});
+                diagnosticPrint("zpq query: --codec requires a value\n", .{});
                 return error.BadArgs;
             };
             if (std.ascii.eqlIgnoreCase(v, "zstd")) {
@@ -410,34 +453,34 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             } else if (std.ascii.eqlIgnoreCase(v, "snappy")) {
                 codec = .SNAPPY;
             } else {
-                std.debug.print("zpq query: invalid codec: {s}\n", .{v});
+                diagnosticPrint("zpq query: invalid codec: {s}\n", .{v});
                 return error.BadArgs;
             }
         } else if (std.mem.eql(u8, tok, "--compress-priority")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --compress-priority requires a value\n", .{});
+                diagnosticPrint("zpq query: --compress-priority requires a value\n", .{});
                 return error.BadArgs;
             };
             compress_priority = std.meta.stringToEnum(engine.CompressPriority, v) orelse {
-                std.debug.print("zpq query: invalid compress priority: {s} (size or speed)\n", .{v});
+                diagnosticPrint("zpq query: invalid compress priority: {s} (size or speed)\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --threads requires a value\n", .{});
+                diagnosticPrint("zpq query: --threads requires a value\n", .{});
                 return error.BadArgs;
             };
             parallelism = std.fmt.parseInt(usize, v, 10) catch {
-                std.debug.print("zpq query: invalid threads value: {s}\n", .{v});
+                diagnosticPrint("zpq query: invalid threads value: {s}\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--bloom-filter")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --bloom-filter requires a value\n", .{});
+                diagnosticPrint("zpq query: --bloom-filter requires a value\n", .{});
                 return error.BadArgs;
             };
             try bloom_filters.append(gpa, engine.BloomSpec.parse(v) catch {
-                std.debug.print("zpq query: invalid --bloom-filter: {s} (want COL or COL:FPP, 0 < FPP < 1)\n", .{v});
+                diagnosticPrint("zpq query: invalid --bloom-filter: {s} (want COL or COL:FPP, 0 < FPP < 1)\n", .{v});
                 return error.BadArgs;
             });
         } else if (std.mem.eql(u8, tok, "--scan-all")) {
@@ -450,58 +493,69 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             unordered = true; // valueless: GROUP BY order and float bits may vary
         } else if (std.mem.eql(u8, tok, "--format")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --format requires a value\n", .{});
+                diagnosticPrint("zpq query: --format requires a value\n", .{});
                 return error.BadArgs;
             };
             if (std.ascii.eqlIgnoreCase(v, "csv")) {
-                format = .csv;
-            } else if (std.ascii.eqlIgnoreCase(v, "jsonl")) {
+                diagnosticPrint("zpq query: csv output is not supported yet\n", .{});
+                return error.BadArgs;
+            } else if (std.ascii.eqlIgnoreCase(v, "jsonl") or std.ascii.eqlIgnoreCase(v, "ndjson")) {
                 format = .jsonl;
+            } else if (std.ascii.eqlIgnoreCase(v, "json")) {
+                format = .json;
+            } else if (std.ascii.eqlIgnoreCase(v, "parquet")) {
+                format = .parquet;
             } else {
-                std.debug.print("zpq query: invalid format: {s} (supported: csv, jsonl)\n", .{v});
+                diagnosticPrint("zpq query: invalid format: {s}\n", .{v});
                 return error.BadArgs;
             }
+        } else if (std.mem.eql(u8, tok, "--summary=json")) {
+            summary = true;
         } else if (std.mem.eql(u8, tok, "--limit")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --limit requires a value\n", .{});
+                diagnosticPrint("zpq query: --limit requires a value\n", .{});
                 return error.BadArgs;
             };
+            if (limit != null) {
+                diagnosticPrint("zpq query: duplicate --limit\n", .{});
+                return error.BadArgs;
+            }
             limit = std.fmt.parseInt(usize, v, 10) catch {
-                std.debug.print("zpq query: invalid limit value: {s}\n", .{v});
+                diagnosticPrint("zpq query: invalid limit value: {s}\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--group-by")) {
             group_by = iter.next() orelse {
-                std.debug.print("zpq query: --group-by requires a value\n", .{});
+                diagnosticPrint("zpq query: --group-by requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--column-order")) {
             column_order = iter.next() orelse {
-                std.debug.print("zpq query: --column-order requires a value\n", .{});
+                diagnosticPrint("zpq query: --column-order requires a value\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--max-memory")) {
             const v = iter.next() orelse {
-                std.debug.print("zpq query: --max-memory requires a value\n", .{});
+                diagnosticPrint("zpq query: --max-memory requires a value\n", .{});
                 return error.BadArgs;
             };
             max_memory = zpq.core.system.parseSizeString(v) catch {
-                std.debug.print("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
+                diagnosticPrint("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--profile")) {
             profile_out.trace_path = iter.next() orelse {
-                std.debug.print("zpq query: --profile requires a path\n", .{});
+                diagnosticPrint("zpq query: --profile requires a path\n", .{});
                 return error.BadArgs;
             };
         } else if (std.mem.eql(u8, tok, "--profile-summary") or std.mem.startsWith(u8, tok, "--profile-summary=")) {
             const v = if (tok.len > "--profile-summary".len) tok["--profile-summary=".len..] else "text";
             profile_out.summary = std.meta.stringToEnum(ProfileOut.Format, v) orelse {
-                std.debug.print("zpq query: invalid --profile-summary format: {s} (supported: text, json)\n", .{v});
+                diagnosticPrint("zpq query: invalid --profile-summary format: {s} (supported: text, json)\n", .{v});
                 return error.BadArgs;
             };
         } else if (std.mem.startsWith(u8, tok, "-")) {
-            std.debug.print("zpq query: unrecognized option: {s}\n", .{tok});
+            diagnosticPrint("zpq query: unrecognized option: {s}\n", .{tok});
             return error.BadArgs;
         } else {
             try inputs_raw.append(gpa, tok);
@@ -510,42 +564,34 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
 
     if (query != null) {
         if (inputs_raw.items.len > 0) {
-            std.debug.print("zpq query: cannot specify input files on the command line when using --query\n", .{});
+            diagnosticPrint("zpq query: cannot specify input files on the command line when using --query\n", .{});
             return error.BadArgs;
         }
-        if (select != null or aggregate != null or filter != null or columns_csv != null or format != null or limit != null or group_by != null or column_order != null) {
-            std.debug.print("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit / --group-by / --column-order\n", .{});
+        if (select != null or aggregate != null or filter != null or columns_csv != null or group_by != null or column_order != null) {
+            diagnosticPrint("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit / --group-by / --column-order\n", .{});
             return error.BadArgs;
         }
     } else {
         if (inputs_raw.items.len == 0) {
-            std.debug.print("zpq query: missing <input.parquet> [more.parquet ...]\n", .{});
+            diagnosticPrint("zpq query: missing <input.parquet> [more.parquet ...]\n", .{});
             return error.BadArgs;
         }
-        if (aggregate != null and (select != null or columns_csv != null or format != null)) {
-            std.debug.print("zpq query: --aggregate is mutually exclusive with --select / --columns / --format\n", .{});
+        if (aggregate != null and (select != null or columns_csv != null)) {
+            diagnosticPrint("zpq query: --aggregate is mutually exclusive with --select / --columns / --format\n", .{});
             return error.BadArgs;
         }
-        if (group_by != null and (select != null or columns_csv != null or format != null)) {
-            std.debug.print("zpq query: --group-by is mutually exclusive with --select / --columns / --format\n", .{});
+        if (group_by != null and (select != null or columns_csv != null)) {
+            diagnosticPrint("zpq query: --group-by is mutually exclusive with --select / --columns / --format\n", .{});
             return error.BadArgs;
         }
         if (column_order != null and group_by == null) {
-            std.debug.print("zpq query: --column-order requires --group-by\n", .{});
-            return error.BadArgs;
-        }
-        if (format != null and output != null) {
-            std.debug.print("zpq query: --format is mutually exclusive with --output\n", .{});
-            return error.BadArgs;
-        }
-        if (limit != null and format == null) {
-            std.debug.print("zpq query: --limit is only supported with --format\n", .{});
+            diagnosticPrint("zpq query: --column-order requires --group-by\n", .{});
             return error.BadArgs;
         }
     }
 
     if (bloom_filters.items.len > 0 and output == null) {
-        std.debug.print("zpq query: --bloom-filter requires --output\n", .{});
+        diagnosticPrint("zpq query: --bloom-filter requires --output\n", .{});
         return error.BadArgs;
     }
 
@@ -564,6 +610,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         // Zig skips analysis of the untaken branch for a comptime-known
         // condition, which is what keeps the minimal build compiling.
         if (comptime build_options.enable_sql) {
+            if (machine_diagnostics) zpq.core.expr.sql_parser.diagnostic_fn = captureSqlDiagnostic;
+            defer zpq.core.expr.sql_parser.diagnostic_fn = null;
             const pq = try zpq.core.expr.sql_parser.parseSqlQuery(arena, q_str);
             filter = pq.filter_str;
             select = pq.select_str;
@@ -571,33 +619,58 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             group_by = pq.group_by_str;
             select_cols = pq.select_cols;
             result_order = pq.result_order;
+            if (limit != null and result_order.limit != null) {
+                diagnosticPrint("zpq query: --limit conflicts with SQL LIMIT\n", .{});
+                return error.BadArgs;
+            }
+            if (limit == null) if (result_order.limit) |n| {
+                limit = @intCast(n);
+            };
 
             const matches = try expandGlob(arena, io, pq.table_name, env);
             if (matches.len == 0) {
-                std.debug.print("zpq query: no files matched FROM table: {s}\n", .{pq.table_name});
+                diagnosticPrint("zpq query: no files matched FROM table: {s}\n", .{pq.table_name});
                 return error.NoMatches;
             }
             for (matches) |m| try inputs_list.append(arena, m);
         } else {
             // Referencing q_str here keeps it "used" in the minimal build,
             // where the comptime-true branch above is eliminated.
-            std.debug.print("zpq: this build has no SQL frontend — `query` ({s}) needs a build with -Dsql=true\n", .{q_str});
+            diagnosticPrint("zpq: this build has no SQL frontend — `query` ({s}) needs a build with -Dsql=true\n", .{q_str});
             return error.SqlNotCompiledIn;
         }
     } else {
         for (inputs_raw.items) |pat| {
             const matches = try expandGlob(arena, io, pat, env);
             if (matches.len == 0) {
-                std.debug.print("zpq query: no files matched: {s}\n", .{pat});
+                diagnosticPrint("zpq query: no files matched: {s}\n", .{pat});
                 return error.NoMatches;
             }
             for (matches) |m| try inputs_list.append(arena, m);
         }
     }
     const inputs = inputs_list.items;
+    const fmt = format orelse if (output != null and !std.mem.eql(u8, output.?, "-"))
+        engine.PrintFormat.parquet
+    else
+        engine.PrintFormat.jsonl;
+    const to_stdout = output == null or std.mem.eql(u8, output.?, "-");
+    if (!explain and fmt != .parquet and output != null and std.mem.startsWith(u8, output.?, "s3://")) {
+        diagnosticPrint("zpq query: text output does not support S3 destinations\n", .{});
+        return error.BadArgs;
+    }
+    if (!explain and fmt == .parquet and to_stdout and try std.Io.File.stdout().isTty(io)) {
+        diagnosticPrint("zpq query: refusing to write Parquet to a terminal\n", .{});
+        return error.BadArgs;
+    }
+    if (summary and profile_out.summary == .text) {
+        diagnosticPrint("zpq query: --summary=json requires --profile-summary=json\n", .{});
+        return error.BadArgs;
+    }
+    if (group_by != null) result_order.limit = if (limit) |n| @intCast(n) else result_order.limit;
     var publication: OutputPublication = .{};
     defer publication.abort();
-    const engine_output = if (explain) output else try publication.prepare(io, output, inputs);
+    const engine_output = if (explain) output else if (to_stdout) null else try publication.prepare(io, output, inputs);
     const max_mem_limit = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
 
     var profiler: ?*zpq.profile.Profiler = null;
@@ -608,7 +681,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     defer profile_out.close();
     if (profile_out.wanted()) {
         if (comptime !zpq.profile.enabled) {
-            std.debug.print("zpq query: this build has no profiler (built with -Dprofile=false)\n", .{});
+            diagnosticPrint("zpq query: this build has no profiler (built with -Dprofile=false)\n", .{});
             return error.BadArgs;
         }
         // Before the query, so an unwritable path costs nothing and a query that succeeds exits 0.
@@ -622,7 +695,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
 
     if (explain) {
         if (aggregate == null and group_by == null) {
-            std.debug.print("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});
+            diagnosticPrint("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});
             return error.BadArgs;
         }
         const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
@@ -651,168 +724,16 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         return;
     }
 
-    if (format) |fmt| {
-        const cols = if (columns_csv) |csv|
-            try splitCsv(arena, csv)
-        else
-            null;
-        try engine.runPrint(.{
-            .gpa = gpa,
-            .env = env,
-            .io = io,
-        }, .{
-            .inputs = inputs,
-            .output = null,
-            .filter = filter,
-            .columns = cols,
-            .select = select,
-            .codec = codec,
-            .compress_priority = compress_priority,
-            .parallelism = parallelism,
-            .scan_all = scan_all,
-            .trust_stats = trust_stats,
-            .fast_levels = fast_levels,
-            .unordered = unordered,
-            .max_memory = engine_max_mem,
-            .group_by = group_by,
-            .select_cols = select_cols,
-            .column_order = column_order,
-            .diag = diag,
-            .profiler = profiler,
-        }, fmt, limit);
-        if (profiler) |p| try profile_out.emit(gpa, io, p);
-        return;
-    }
-
-    // Aggregate path: -o is OPTIONAL (JSON-only mode is the default).
-    if (aggregate != null or group_by != null) {
-        const agg_str = aggregate orelse "";
-        const t_start_a = nowMonoNs();
-        var result = try engine.runQuery(.{
-            .gpa = gpa,
-            .env = env,
-            .io = io,
-            .exit_after = true,
-        }, .{
-            .inputs = inputs,
-            .output = engine_output,
-            .filter = filter,
-            .aggregate = agg_str,
-            .codec = codec,
-            .compress_priority = compress_priority,
-            .parallelism = parallelism,
-            .scan_all = scan_all,
-            .trust_stats = trust_stats,
-            .fast_levels = fast_levels,
-            .unordered = unordered,
-            .max_memory = engine_max_mem,
-            .group_by = group_by,
-            .select_cols = select_cols,
-            .result_order = result_order,
-            .column_order = column_order,
-            .bloom_filters = bloom_filters.items,
-            .diag = diag,
-            .profiler = profiler,
-        });
-        defer result.deinit(gpa);
-        try publication.commit();
-        const ar = result.aggregate;
-        const answer = ar.output;
-        const total_ns_a = nowMonoNs() - t_start_a;
-
-        var ws: StdoutWriter = .{ .fd = 1 };
-        defer ws.flush() catch {};
-        try ws.print("{{\"ok\":true,\"files_in\":{d}", .{ar.files_in});
-        if (ar.files_in == 1) {
-            try ws.print(",\"input\":\"", .{});
-            try writeJsonString(&ws, inputs[0]);
-            try ws.print("\"", .{});
-        }
-        if (output) |op| {
-            try ws.print(",\"output\":\"", .{});
-            try writeJsonString(&ws, op);
-            try ws.print("\"", .{});
-        }
-        if (answer.group_rows) |rows| {
-            try ws.print(
-                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"agg\":[",
-                .{
-                    ar.rows_in,       ar.rows_kept,         ar.bytes_in,              ar.bytes_out,
-                    ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
-                },
-            );
-            for (rows, 0..) |row_vals, row_idx| {
-                if (row_idx > 0) try ws.print(",", .{});
-                try ws.print("{{", .{});
-                for (answer.group_cols.?, 0..) |col_name, col_idx| {
-                    if (col_idx > 0) try ws.print(",", .{});
-                    try ws.print("\"", .{});
-                    try writeJsonString(&ws, col_name);
-                    try ws.print("\":", .{});
-                    try engine.writeAggValueJson(&ws, row_vals[col_idx]);
-                }
-                try ws.print("}}", .{});
-            }
-            try ws.writeAll("],");
-        } else {
-            try ws.print(
-                ",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"agg\":{{",
-                .{
-                    ar.rows_in,       ar.rows_kept,         ar.bytes_in,              ar.bytes_out,
-                    ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
-                },
-            );
-            for (answer.aggs, 0..) |item, i| {
-                if (i > 0) try ws.print(",", .{});
-                try ws.print("\"", .{});
-                try writeJsonString(&ws, item.alias);
-                try ws.print("\":", .{});
-                try engine.writeAggValueJson(&ws, item.value);
-            }
-            try ws.writeAll("},");
-        }
-        try engine.writeMembershipJson(&ws, ar.membership);
-        try ws.print(
-            ",\"total_ms\":{d},\"total_us\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}}}}\n",
-            .{
-                @divTrunc(total_ns_a, std.time.ns_per_ms),
-                @divTrunc(total_ns_a, std.time.ns_per_us),
-                ar.timings.read_ns / std.time.ns_per_ms,
-                ar.timings.parse_ns / std.time.ns_per_ms,
-                ar.timings.core.decode_ns / std.time.ns_per_ms,
-                ar.timings.decode_wall_ns / std.time.ns_per_ms,
-                ar.timings.core.eval_ns / std.time.ns_per_ms,
-                ar.timings.core.encode_ns / std.time.ns_per_ms,
-            },
-        );
-        // The answer first, then the profile (stderr): flush stdout before the summary goes out.
-        try ws.flush();
-        if (profiler) |p| try profile_out.emit(gpa, io, p);
-        return;
-    }
-
-    const out = output orelse {
-        std.debug.print("zpq query: missing --output <path>\n", .{});
-        return error.BadArgs;
-    };
-
-    const cols: ?[]const []const u8 = if (columns_csv) |csv|
-        try splitCsv(arena, csv)
-    else
-        null;
-
-    const t_start = nowMonoNs();
-    const result = (try engine.runQuery(.{
-        .gpa = gpa,
-        .env = env,
-        .io = io,
-        .exit_after = true,
-    }, .{
+    const query_args: engine.QueryArgs = .{
         .inputs = inputs,
-        .output = engine_output,
+        .output = if (fmt == .parquet) engine_output orelse "-" else null,
+        .output_fd = if (fmt == .parquet and to_stdout) 1 else null,
+        .quiet_diagnostics = machine_diagnostics,
+        .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
         .filter = filter,
-        .columns = cols,
+        .columns = if (columns_csv) |csv| try splitCsv(arena, csv) else null,
         .select = select,
+        .aggregate = aggregate,
         .codec = codec,
         .compress_priority = compress_priority,
         .parallelism = parallelism,
@@ -821,64 +742,160 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .fast_levels = fast_levels,
         .unordered = unordered,
         .max_memory = engine_max_mem,
+        .group_by = group_by,
+        .select_cols = select_cols,
+        .result_order = result_order,
+        .column_order = column_order,
         .bloom_filters = bloom_filters.items,
         .diag = diag,
         .profiler = profiler,
-    })).write;
+    };
+    const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io, .exit_after = true };
+    const started = nowMonoNs();
+    var rows: usize = 0;
+    var stats: SummaryStats = .{};
+    var output_ns: u64 = 0;
+    var text_bytes_out: u64 = 0;
+    if (aggregate != null or group_by != null) {
+        var result = try engine.runQuery(ctx, query_args);
+        defer result.deinit(gpa);
+        const ar = result.aggregate;
+        const answer = ar.output;
+        rows = if (answer.group_rows) |groups| groups.len else if (query_args.empty_scalar) 0 else 1;
+        if (fmt != .parquet) {
+            const output_start = nowMonoNs();
+            var fd: local_fs.fd_t = 1;
+            var owns_fd = false;
+            defer if (owns_fd) local_fs.close(fd);
+            if (!to_stdout) {
+                fd = try local_fs.createFile(engine_output.?);
+                owns_fd = true;
+            }
+            var w: StdoutWriter = .{ .fd = fd };
+            if (fmt == .json) try w.writeByte('[');
+            if (answer.group_rows) |groups| {
+                for (groups, 0..) |values, ri| {
+                    if (fmt == .json and ri > 0) try w.writeByte(',');
+                    try w.writeByte('{');
+                    for (answer.group_cols.?, values, 0..) |name, value, ci| {
+                        if (ci > 0) try w.writeByte(',');
+                        try w.writeByte('"');
+                        try writeJsonString(&w, name);
+                        try w.writeAll("\":");
+                        try engine.writeAggValueJson(&w, value);
+                    }
+                    try w.writeAll(if (fmt == .json) "}" else "}\n");
+                }
+            } else if (rows > 0) {
+                try w.writeByte('{');
+                for (answer.aggs, 0..) |item, ci| {
+                    if (ci > 0) try w.writeByte(',');
+                    try w.writeByte('"');
+                    try writeJsonString(&w, item.alias);
+                    try w.writeAll("\":");
+                    try engine.writeAggValueJson(&w, item.value);
+                }
+                try w.writeAll(if (fmt == .json) "}" else "}\n");
+            }
+            if (fmt == .json) try w.writeAll("]\n");
+            try w.flush();
+            text_bytes_out = if (w.inner) |inner| inner.bytes_written else 0;
+            if (owns_fd) {
+                owns_fd = false;
+                try local_fs.closeChecked(fd);
+            }
+            output_ns = @intCast(nowMonoNs() - output_start);
+        }
+        output_ns = if (fmt == .parquet) ar.timings.core.encode_ns + ar.timings.core.sink_ns + ar.timings.footer_ns else output_ns;
+        stats = .{ .rows_in = ar.rows_in, .rows_kept = ar.rows_kept, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
+    } else if (fmt == .parquet and limit == null and result_order.offset == 0) {
+        const result = (try engine.runQuery(ctx, query_args)).write;
+        rows = @intCast(result.rows_kept);
+        output_ns = result.timings.core.encode_ns + result.timings.core.sink_ns + result.timings.footer_ns;
+        stats = .{ .rows_in = result.rows_in, .rows_kept = result.rows_kept, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .membership = result.membership, .timings = result.timings, .codec = result.codec };
+    } else {
+        if (!to_stdout and std.mem.startsWith(u8, engine_output.?, "s3://")) {
+            diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
+            return error.BadArgs;
+        }
+        var fd: local_fs.fd_t = 1;
+        var owns_fd = false;
+        defer if (owns_fd) local_fs.close(fd);
+        if (!to_stdout) {
+            fd = try local_fs.createFile(engine_output.?);
+            owns_fd = true;
+        }
+        const printed = try engine.runPrintTo(ctx, query_args, fmt, limit, fd, @intCast(result_order.offset));
+        if (owns_fd) {
+            owns_fd = false;
+            try local_fs.closeChecked(fd);
+        }
+        rows = printed.rows;
+        output_ns = printed.output_ns;
+        stats = .{ .rows_in = @intCast(printed.rows_in), .rows_kept = @intCast(printed.rows), .bytes_out = printed.bytes_out, .files_in = inputs.len, .membership = printed.membership, .timings = printed.timings };
+    }
+    const publication_start = nowMonoNs();
     try publication.commit();
-    const in = inputs[0]; // first input — used in the JSON envelope below
-    const total_ns = nowMonoNs() - t_start;
+    output_ns += @intCast(nowMonoNs() - publication_start);
+    stats.output_ns = output_ns;
+    const total_ns = nowMonoNs() - started;
+    if (profiler) |p| try profile_out.emit(gpa, io, p);
+    if (summary) try writeSummary(if (to_stdout) null else output, rows, stats, total_ns);
+}
 
-    // JSON envelope to stderr — same shape as the Lambda response.
+const SummaryStats = struct {
+    output_ns: u64 = 0,
+    rows_in: i64 = 0,
+    rows_kept: i64 = 0,
+    bytes_in: u64 = 0,
+    bytes_out: u64 = 0,
+    files_in: usize = 0,
+    row_groups_in: usize = 0,
+    row_groups_pruned: usize = 0,
+    row_groups_full_match: usize = 0,
+    cols_stat_pruned: usize = 0,
+    membership: zpq.core.filter.membership.Stats = .{},
+    timings: engine.Timings = .{},
+    codec: ?schema.CompressionCodec = null,
+};
+
+fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64) !void {
     var w: StdoutWriter = .{ .fd = 2 };
-    defer w.flush() catch {};
-    try w.print(
-        \\{{"ok":true,"input":"
-    , .{});
-    try writeJsonString(&w, in);
-    try w.print(
-        \\","output":"
-    , .{});
-    try writeJsonString(&w, out);
-    try w.print(
-        \\","codec":"{s}","rows_in":{d},"rows_kept":{d},"bytes_in":{d},"bytes_out":{d},"row_groups_in":{d},"row_groups_kept":{d},
-    , .{
-        if (result.codec) |c| @tagName(c) else "MIXED",
-        result.rows_in,
-        result.rows_kept,
-        result.bytes_in,
-        result.bytes_out,
-        result.row_groups_in,
-        result.row_groups_kept,
+    try w.print("{{\"type\":\"summary\",\"ok\":true,\"rows\":{d},\"output\":", .{rows});
+    if (output) |path| {
+        try w.writeByte('"');
+        try writeJsonString(&w, path);
+        try w.writeByte('"');
+    } else try w.writeAll("null");
+    try w.print(",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":\"{s}\",", .{
+        s.rows_in,           s.rows_kept,             s.bytes_in,         s.bytes_out,                                       s.files_in, s.row_groups_in,
+        s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned, if (s.codec) |codec| @tagName(codec) else "MIXED",
     });
-    try engine.writeMembershipJson(&w, result.membership);
-    try w.print(
-        \\,"total_ms":{d},"total_us":{d},"phase":{{"read_ms":{d},"parse_ms":{d},"decode_ms":{d},"eval_ms":{d},"encode_ms":{d},"sink_ms":{d},"footer_ms":{d}}}}}
-        \\
-    , .{
-        @divTrunc(total_ns, std.time.ns_per_ms),
-        @divTrunc(total_ns, std.time.ns_per_us),
-        result.timings.read_ns / std.time.ns_per_ms,
-        result.timings.parse_ns / std.time.ns_per_ms,
-        result.timings.core.decode_ns / std.time.ns_per_ms,
-        result.timings.core.eval_ns / std.time.ns_per_ms,
-        result.timings.core.encode_ns / std.time.ns_per_ms,
-        result.timings.core.sink_ns / std.time.ns_per_ms,
-        result.timings.footer_ns / std.time.ns_per_ms,
+    try engine.writeMembershipJson(&w, s.membership);
+    try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}\n", .{
+        @divTrunc(elapsed, std.time.ns_per_ms),        @divTrunc(elapsed, std.time.ns_per_us),      s.output_ns / std.time.ns_per_us,
+        s.timings.read_ns / std.time.ns_per_ms,        s.timings.parse_ns / std.time.ns_per_ms,     s.timings.core.decode_ns / std.time.ns_per_ms,
+        s.timings.decode_wall_ns / std.time.ns_per_ms, s.timings.core.eval_ns / std.time.ns_per_ms, s.timings.core.encode_ns / std.time.ns_per_ms,
+        s.timings.core.sink_ns / std.time.ns_per_ms,   s.timings.footer_ns / std.time.ns_per_ms,
     });
     try w.flush();
-    if (profiler) |p| {
-        try w.flush();
-        try profile_out.emit(gpa, io, p);
-    }
 }
 
 fn queryExitCode(err: anyerror) u8 {
-    return switch (err) {
-        error.BrokenPipe => 141,
-        error.BadArgs, error.NoInputs, error.NoMatches, error.SqlNotCompiledIn, error.UnknownColumn, error.UnknownFunction, error.UnknownAggFunc, error.WrongArity, error.EmptyExpr, error.EmptyAggregate, error.EmptyColumnList, error.UnexpectedChar, error.UnexpectedEnd, error.BadNumber, error.UnterminatedString, error.TypeMismatch, error.ExpectedLParen, error.ExpectedRParen, error.ExpectedIdentifier, error.ExpectedWhere, error.ExpectedAggFunc, error.StarOnlyValidInCount, error.TrailingTokens, error.BadAggArg, error.AggregateMutexWithSelect, error.DuplicateOutputColumn, error.AmbiguousOutputColumn, error.AmbiguousColumn, error.ExpressionTooDeep, error.GroupKeyAliasRequired => 2,
-        else => 1,
+    if (err == error.BrokenPipe) return 141;
+    const usage = [_][]const u8{
+        "BadArgs",                     "NoInputs",              "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",            "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",            "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",          "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",             "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",           "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",         "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",           "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn", "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",        "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",       "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",             "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported",     "NestedNotSupported",
+        "NestedRowOutputNotSupported", "GroupingNotSupported",  "UnsupportedType",              "DecimalScaleTooLarge", "MissingOutputOrAggregate",
     };
+    for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
+    return 1;
 }
 
 // Publication belongs to the CLI: service callers retain their own destination lifecycle.
@@ -900,14 +917,14 @@ const OutputPublication = struct {
         const cwd = std.Io.Dir.cwd();
         if (cwd.statFile(io, target, .{})) |st| {
             if (st.kind != .file) {
-                std.debug.print("zpq query: output must be a regular file\n", .{});
+                diagnosticPrint("zpq query: output must be a regular file\n", .{});
                 return error.BadArgs;
             }
             for (inputs) |input| {
                 if (std.mem.startsWith(u8, input, "s3://")) continue;
-                const ist = cwd.statFile(io, input, .{}) catch continue;
-                if (st.inode == ist.inode) {
-                    std.debug.print("zpq query: input and output must be different files\n", .{});
+                const same = local_fs.sameFile(input, target) catch continue;
+                if (same) {
+                    diagnosticPrint("zpq query: input and output must be different files\n", .{});
                     return error.BadArgs;
                 }
             }
@@ -959,23 +976,23 @@ const ProfileOut = struct {
         if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
             if (st.kind != .file) {
                 const why = if (st.kind == .directory) "IsDir" else "NotAFile";
-                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, why });
+                diagnosticPrint("zpq query: cannot write profile {s}: {s}\n", .{ path, why });
                 return error.BadArgs;
             }
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => {
-                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+                diagnosticPrint("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
                 return error.BadArgs;
             },
         }
         const pid: u32 = @bitCast(std.posix.system.getpid());
         const tmp = std.fmt.bufPrint(&self.tmp_buf, "{s}.{d}.zpq-tmp", .{ path, pid }) catch {
-            std.debug.print("zpq query: cannot write profile {s}: NameTooLong\n", .{path});
+            diagnosticPrint("zpq query: cannot write profile {s}: NameTooLong\n", .{path});
             return error.BadArgs;
         };
         self.trace_fd = local_fs.createNewFile(tmp) catch |err| {
-            std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq query: cannot write profile {s}: {s}\n", .{ path, @errorName(err) });
             return error.BadArgs;
         };
         self.tmp_len = tmp.len;
@@ -1004,15 +1021,18 @@ const ProfileOut = struct {
             const wrote = if (p.writeTrace(gpa, &fw.interface)) fw.interface.flush() else |err| err;
             wrote catch |err| {
                 const why = if (fw.err) |e| @errorName(e) else @errorName(err);
-                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, why });
-                return error.BadArgs;
+                diagnosticPrint("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, why });
+                return error.ProfileWriteFailed;
             };
-            local_fs.close(fd);
             self.trace_fd = null;
+            local_fs.closeChecked(fd) catch |err| {
+                local_fs.removeFile(self.tmpPath());
+                return err;
+            };
             local_fs.rename(self.tmpPath(), self.trace_path.?) catch |err| {
                 local_fs.removeFile(self.tmpPath());
-                std.debug.print("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, @errorName(err) });
-                return error.BadArgs;
+                diagnosticPrint("zpq query: cannot write profile {s}: {s}\n", .{ self.trace_path.?, @errorName(err) });
+                return error.ProfileWriteFailed;
             };
         }
         if (self.summary) |fmt| {
@@ -1028,7 +1048,10 @@ const ProfileOut = struct {
             }
             var w: StdoutWriter = .{ .fd = 2 };
             defer w.flush() catch {};
-            try w.writeAll(aw.written());
+            if (machine_diagnostics and fmt == .json) {
+                try w.writeAll("{\"type\":\"profile\",");
+                try w.writeAll(aw.written()[1..]);
+            } else try w.writeAll(aw.written());
             try w.flush();
         }
     }
@@ -1087,12 +1110,12 @@ fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env: st
     const basename: []const u8 = if (last_slash) |i| pattern[i + 1 ..] else pattern;
 
     if (std.mem.indexOfScalar(u8, dir_path, '*') != null) {
-        std.debug.print("zpq query: glob in directory portion not supported: {s}\n", .{pattern});
+        diagnosticPrint("zpq query: glob in directory portion not supported: {s}\n", .{pattern});
         return error.BadArgs;
     }
 
     const names = local_fs.listFiles(arena, io, dir_path) catch {
-        std.debug.print("zpq query: cannot open dir {s}\n", .{dir_path});
+        diagnosticPrint("zpq query: cannot open dir {s}\n", .{dir_path});
         return error.OpenFailed;
     };
     var out: std.ArrayList([]const u8) = .empty;
@@ -1132,11 +1155,11 @@ fn expandS3Glob(
     // sits before the wildcard.
     const star_pos = std.mem.indexOfScalar(u8, pattern, '*').?;
     const last_slash = std.mem.lastIndexOfScalar(u8, pattern[0..star_pos], '/') orelse {
-        std.debug.print("zpq query: s3 glob needs a prefix path: {s}\n", .{pattern});
+        diagnosticPrint("zpq query: s3 glob needs a prefix path: {s}\n", .{pattern});
         return error.BadArgs;
     };
     if (std.mem.indexOfScalar(u8, pattern[last_slash + 1 ..], '/') != null) {
-        std.debug.print("zpq query: s3 glob in directory portion not supported: {s}\n", .{pattern});
+        diagnosticPrint("zpq query: s3 glob in directory portion not supported: {s}\n", .{pattern});
         return error.BadArgs;
     }
     const prefix_part = pattern[0 .. last_slash + 1]; // includes trailing '/'
@@ -1146,13 +1169,13 @@ fn expandS3Glob(
     // with "s3://" so let the existing parser handle the URL structure.
     const url_for_prefix = try std.fmt.allocPrint(arena, "{s}placeholder", .{prefix_part});
     const url = s3.Url.parse(url_for_prefix) catch |err| {
-        std.debug.print("zpq query: bad s3 url {s}: {s}\n", .{ pattern, @errorName(err) });
+        diagnosticPrint("zpq query: bad s3 url {s}: {s}\n", .{ pattern, @errorName(err) });
         return err;
     };
     const list_prefix = url.key[0 .. url.key.len - "placeholder".len];
 
     const creds = s3.Credentials.fromEnv(env) catch |err| {
-        std.debug.print(
+        diagnosticPrint(
             "zpq query: s3 glob requires S3_*/AWS_* env vars: {s}\n",
             .{@errorName(err)},
         );
@@ -1163,7 +1186,7 @@ fn expandS3Glob(
 
     const entries = try s3.listAll(arena, &client, list_prefix);
     if (entries.len == 0) {
-        std.debug.print("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
+        diagnosticPrint("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
     }
 
     var out: std.ArrayList([]const u8) = .empty;
@@ -1360,19 +1383,19 @@ fn printDetail(diag: *const Diag) void {
     const name = diag.column.get();
     switch (diag.detail) {
         .none => {},
-        .ambiguous_column => |a| std.debug.print(
+        .ambiguous_column => |a| diagnosticPrint(
             "{s}: column `{s}` is ambiguous: {s}\n",
             .{ @tagName(a.parser), name, a.hint },
         ),
-        .schema_mismatch => |m| std.debug.print("schema mismatch: file 0 ({s}) vs file {d} ({s}): '{s}' vs '{s}'\n", .{
+        .schema_mismatch => |m| diagnosticPrint("schema mismatch: file 0 ({s}) vs file {d} ({s}): '{s}' vs '{s}'\n", .{
             m.first_input, m.file, diag.input.?, name, m.other.get(),
         }),
-        .is_operand => std.debug.print("filter: only `IS NULL` / `IS NOT NULL` are supported after IS\n", .{}),
-        .like_non_string => |l| std.debug.print(
+        .is_operand => diagnosticPrint("filter: only `IS NULL` / `IS NOT NULL` are supported after IS\n", .{}),
+        .like_non_string => |l| diagnosticPrint(
             "filter: LIKE applies only to string columns (got {s} for `{s}`)\n",
             .{ l.type_name, name },
         ),
-        .float16_filter => std.debug.print(
+        .float16_filter => diagnosticPrint(
             "filter: FLOAT16 column `{s}` is not yet supported for filtering\n",
             .{name},
         ),
@@ -1495,18 +1518,18 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
             .env = init.minimal.environ,
             .io = init.io,
         }, path, arena) catch |err| {
-            std.debug.print("zpq schema: failed to fetch S3 schema for {s}: {s}\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq schema: failed to fetch S3 schema for {s}: {s}\n", .{ path, @errorName(err) });
             std.process.exit(1);
         };
     } else {
         const bytes = readFile(gpa, path) catch |err| {
-            std.debug.print("zpq schema: failed to open input file {s}: {s}\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq schema: failed to open input file {s}: {s}\n", .{ path, @errorName(err) });
             std.process.exit(1);
         };
         file_bytes = bytes;
 
         meta = metadata.open(arena, bytes) catch |err| {
-            std.debug.print("zpq schema: input file {s} is not a valid Parquet file ({s})\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq schema: input file {s} is not a valid Parquet file ({s})\n", .{ path, @errorName(err) });
             std.process.exit(1);
         };
     }
@@ -1524,7 +1547,7 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
     try ws.print("rows: {d}, row_groups: {d}, codec: {s}\n", .{ meta.num_rows, meta.row_groups.items.len, codec_name });
 
     const tree = schema_tree.SchemaTree.build(arena, meta.schema.items) catch |err| {
-        std.debug.print("zpq schema: schema tree build failed: {s}\n", .{@errorName(err)});
+        diagnosticPrint("zpq schema: schema tree build failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 

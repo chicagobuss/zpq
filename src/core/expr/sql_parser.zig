@@ -2,6 +2,15 @@ const std = @import("std");
 const c = @import("liteparser_c");
 const ast = @import("ast.zig");
 
+// CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
+pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
+fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
+    if (diagnostic_fn) |report| {
+        var buffer: [2048]u8 = undefined;
+        report(std.fmt.bufPrint(&buffer, fmt, args) catch return);
+    } else std.debug.print(fmt, args);
+}
+
 pub const ParsedQuery = struct {
     table_name: []const u8,
     is_aggregate: bool,
@@ -144,21 +153,21 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
 /// forbidden forever, so the messages say "not yet".
 fn rejectUnsupportedClauses(sel: anytype) !void {
     if (sel.distinct != 0) {
-        std.debug.print("sql: DISTINCT is not supported yet\n", .{});
+        diagnosticPrint("sql: DISTINCT is not supported yet\n", .{});
         return error.DistinctNotSupported;
     }
     // GROUP BY is supported
     if (sel.having != null) {
-        std.debug.print("sql: HAVING is not supported yet\n", .{});
+        diagnosticPrint("sql: HAVING is not supported yet\n", .{});
         return error.HavingNotSupported;
     }
     // ORDER BY / LIMIT / OFFSET are resolved against the result columns in `resultOrder`.
     if (sel.window_defs.count > 0) {
-        std.debug.print("sql: window functions are not supported yet\n", .{});
+        diagnosticPrint("sql: window functions are not supported yet\n", .{});
         return error.WindowNotSupported;
     }
     if (sel.with != null) {
-        std.debug.print("sql: WITH / CTE is not supported yet\n", .{});
+        diagnosticPrint("sql: WITH / CTE is not supported yet\n", .{});
         return error.CteNotSupported;
     }
 }
@@ -228,11 +237,11 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // anything but exactly one.
     const stmts = c.lp_parse_all(sql_c, lp_arena, &error_msg);
     if (stmts == null or stmts.*.count == 0) {
-        if (error_msg) |msg| std.debug.print("sql parse error: {s}\n", .{std.mem.span(msg)});
+        if (error_msg) |msg| diagnosticPrint("sql parse error: {s}\n", .{std.mem.span(msg)});
         return error.SqlParseError;
     }
     if (stmts.*.count > 1) {
-        std.debug.print("sql: only a single statement is supported (found {d})\n", .{stmts.*.count});
+        diagnosticPrint("sql: only a single statement is supported (found {d})\n", .{stmts.*.count});
         return error.MultipleStatements;
     }
     const root = stmts.*.items[0] orelse return error.SqlParseError;
@@ -240,7 +249,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // Only single-table SELECT. UNION/INSERT/etc. arrive as a non-SELECT
     // root; joins and subqueries arrive as a non-LP_FROM_TABLE `from`.
     if (root.*.kind != c.LP_STMT_SELECT) {
-        std.debug.print("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
+        diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
     // Reject clauses we'd otherwise silently drop → wrong answers.
@@ -249,19 +258,19 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
-            std.debug.print("sql: window functions are not supported yet\n", .{});
+            diagnosticPrint("sql: window functions are not supported yet\n", .{});
             return error.WindowNotSupported;
         }
         if (wi.has_subquery) {
-            std.debug.print("sql: subqueries are not supported yet\n", .{});
+            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
             return error.SubqueryNotSupported;
         }
         if (wi.has_func_distinct) {
-            std.debug.print("sql: DISTINCT inside a function is not supported yet\n", .{});
+            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
             return error.DistinctNotSupported;
         }
         if (wi.has_agg) {
-            std.debug.print("sql: aggregates are not allowed in WHERE\n", .{});
+            diagnosticPrint("sql: aggregates are not allowed in WHERE\n", .{});
             return error.AggregateInWhere;
         }
     }
@@ -290,15 +299,15 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         const info = analyzeExpr(rc);
         if (info.has_window) {
-            std.debug.print("sql: window functions (OVER) are not supported yet\n", .{});
+            diagnosticPrint("sql: window functions (OVER) are not supported yet\n", .{});
             return error.WindowNotSupported;
         }
         if (info.has_subquery) {
-            std.debug.print("sql: subqueries are not supported yet\n", .{});
+            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
             return error.SubqueryNotSupported;
         }
         if (info.has_func_distinct) {
-            std.debug.print("sql: DISTINCT inside a function is not supported yet\n", .{});
+            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
             return error.DistinctNotSupported;
         }
         if (info.has_agg) has_agg = true;
@@ -309,7 +318,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
 
     if (is_aggregate) {
         if (has_bare and !has_group_by) {
-            std.debug.print("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
+            diagnosticPrint("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
             return error.MixedSelectNotSupported;
         }
         if (has_group_by) {
@@ -445,6 +454,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .select_str = null,
             .aggregate_str = null,
             .filter_str = filter_str,
+            .result_order = result_order,
         };
     }
     return .{
@@ -454,6 +464,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         .aggregate_str = null,
         .filter_str = filter_str,
         .select_cols = select_cols,
+        .result_order = result_order,
     };
 }
 
@@ -465,29 +476,20 @@ fn resultOrder(
     lp_arena: *c.arena_t,
     select_cols: []const ast.SelectColumn,
     is_aggregate: bool,
-    has_group_by: bool,
+    _: bool,
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
     if (!is_aggregate) {
         if (n_terms > 0) {
-            std.debug.print("sql: ORDER BY over plain rows is not supported yet\n", .{});
+            diagnosticPrint("sql: ORDER BY over plain rows is not supported yet\n", .{});
             return error.OrderByNotSupported;
         }
-        if (sel.limit != null) {
-            std.debug.print("sql: LIMIT over plain rows is not supported yet\n", .{});
-            return error.LimitNotSupported;
-        }
-        return .{};
     }
 
     var order: ast.ResultOrder = .{};
     if (sel.limit) |lim| {
         order.limit = try nonNegativeInt(lim.*.u.limit.count orelse return error.LimitNotSupported);
         if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
-        if (!has_group_by and (order.limit == 0 or order.offset > 0)) {
-            std.debug.print("sql: a LIMIT or OFFSET that drops the single aggregate row is not supported\n", .{});
-            return error.LimitNotSupported;
-        }
     }
 
     const keys = try allocator.alloc(ast.OrderKey, n_terms);
@@ -496,7 +498,7 @@ fn resultOrder(
         const term = sel.order_by.items[t] orelse return error.SqlParseError;
         // The grammar spells NULLS FIRST as LP_SORT_ASC, NULLS LAST as LP_SORT_DESC, neither as LP_SORT_UNDEFINED.
         if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
-            std.debug.print("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
+            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
             return error.OrderByNotSupported;
         }
         key.* = .{
@@ -514,7 +516,7 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
     if (expr.kind == c.LP_EXPR_LITERAL_INT) {
         const pos = try nonNegativeInt(expr);
         if (pos >= 1 and pos <= select_cols.len) return @intCast(pos - 1);
-        std.debug.print("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
+        diagnosticPrint("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
         return error.OrderByNotSupported;
     }
     if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.schema == null and expr.u.column_ref.table == null) {
@@ -543,7 +545,7 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
         found = i;
     };
     if (found) |i| return i;
-    std.debug.print("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
+    diagnosticPrint("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
     return error.OrderByNotSupported;
 }
 
@@ -552,7 +554,7 @@ fn nonNegativeInt(node: *const c.LpNode) !u64 {
     if (node.kind == c.LP_EXPR_LITERAL_INT) {
         if (std.fmt.parseInt(u64, std.mem.span(node.u.literal.value), 10)) |v| return v else |_| {}
     }
-    std.debug.print("sql: LIMIT, OFFSET and ORDER BY positions must be non-negative integer literals\n", .{});
+    diagnosticPrint("sql: LIMIT, OFFSET and ORDER BY positions must be non-negative integer literals\n", .{});
     return error.LimitNotSupported;
 }
 
@@ -622,7 +624,7 @@ fn validateGroupBy(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.aren
             }
 
             if (!found) {
-                std.debug.print("sql: result column '{s}' must be in the GROUP BY list\n", .{expr_sql});
+                diagnosticPrint("sql: result column '{s}' must be in the GROUP BY list\n", .{expr_sql});
                 return error.ColumnMustBeGrouped;
             }
         }
@@ -661,7 +663,9 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     try std.testing.expectEqualStrings("s", q_gb_mixed.select_cols[1].alias.?);
 
     try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x"));
-    try std.testing.expectError(error.LimitNotSupported, parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5"));
+    const limited = try parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5");
+    defer limited.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 5), limited.result_order.limit);
     try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT x FROM 't'"));
     try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' HAVING sum(x) > 1"));
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
@@ -703,8 +707,6 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c NULLS FIRST", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT -1", .err = error.LimitNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT c", .err = error.LimitNotSupported },
-        .{ .sql = "SELECT count(*) AS c FROM 't' LIMIT 0", .err = error.LimitNotSupported },
-        .{ .sql = "SELECT count(*) AS c FROM 't' LIMIT 1 OFFSET 1", .err = error.LimitNotSupported },
     };
     for (rejected) |case| try std.testing.expectError(case.err, parseSqlQuery(a, case.sql));
 }
@@ -789,7 +791,7 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
         "SELECT \"k\", count(*) AS n FROM 't' GROUP BY K",
     }) |sql| {
         const q = parseSqlQuery(a, sql) catch |err| {
-            std.debug.print("{s}: {s}\n", .{ sql, @errorName(err) });
+            diagnosticPrint("{s}: {s}\n", .{ sql, @errorName(err) });
             return err;
         };
         q.deinit(a);

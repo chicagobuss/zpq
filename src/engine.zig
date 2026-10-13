@@ -257,6 +257,10 @@ pub const QueryArgs = struct {
     partagg: bool = false,
     inputs: []const []const u8, // raw paths/URLs (pre-glob — caller globs)
     output: ?[]const u8 = null,
+    /// CLI-only: an already-open sink and an empty scalar result cut.
+    output_fd: ?local_fs.fd_t = null,
+    empty_scalar: bool = false,
+    quiet_diagnostics: bool = false,
     filter: ?[]const u8 = null,
     aggregate: ?[]const u8 = null,
     group_by: ?[]const u8 = null,
@@ -488,6 +492,7 @@ fn executeAggregate(
     agg_str: []const u8,
     comptime explain: bool,
 ) !if (explain) AggregateExplanation else AggResult {
+    const empty_result = args.empty_scalar or args.result_order.limit == 0;
     var t: Timings = .{};
 
     // 1. Open all inputs — local mmap or s3 parallel range-fetch.
@@ -499,7 +504,7 @@ fn executeAggregate(
     const t_open = nowMonoNs();
     var opened = try openInputs(ctx, arena, args, .{
         .limit = s3FetchWindow(ctx.env, args.max_memory),
-        .footer_only = explain,
+        .footer_only = explain or empty_result,
     });
     defer opened.deinit();
     const t_open_end = nowMonoNs();
@@ -528,13 +533,13 @@ fn executeAggregate(
     const plan_io = all_local and (io_policy.profile == .pread or io_policy.profile == .uring or
         (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
-    const metas: ?[]const schema.FileMetaData = if (explain or opened.has_preparsed_meta or plan_io) blk: {
+    const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io) blk: {
         const m = try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
         else
             null;
-        if (!explain) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
+        if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
         break :blk m;
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
@@ -571,6 +576,9 @@ fn executeAggregate(
         .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
         .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
     };
+    if (args.quiet_diagnostics) if (scan_args.sketch_topk) |*cfg| {
+        cfg.trace = false;
+    };
     if (explain) {
         if (io_mode != .mmap) {
             const gated = try arena.dupe(scan.Input, opened.inputs);
@@ -592,7 +600,7 @@ fn executeAggregate(
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (reader) |rd| rd.destroy();
-    const scan_inputs = if (io_mode == .mmap) opened.inputs else try startLocalReader(
+    const scan_inputs = if (io_mode == .mmap or empty_result) opened.inputs else try startLocalReader(
         ctx,
         arena,
         opened,
@@ -619,6 +627,14 @@ fn executeAggregate(
         }));
     }
     scan_args.inputs = scan_inputs;
+    if (empty_result) {
+        const empty_metas = try arena.dupe(schema.FileMetaData, metas.?);
+        for (empty_metas) |*m| {
+            m.num_rows = 0;
+            m.row_groups = .empty;
+        }
+        scan_args.metas = empty_metas;
+    }
     var r = try scan.runMultiAggregate(ctx.gpa, arena, scan_args);
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
@@ -644,9 +660,9 @@ fn executeAggregate(
         const codec = args.codec orelse .SNAPPY;
         const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
         bytes_out = if (r.output.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd)
+            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd, args.output_fd)
         else
-            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, codec, zstd);
+            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, codec, zstd, args.output_fd, args.empty_scalar);
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
@@ -1815,9 +1831,9 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             .write_fn = multipart_sink.sinkWriteFn,
         };
     } else {
-        fd_sink.fd = try createFile(out_path);
-        remove_on_error = true;
-        sink_owns_fd = true;
+        fd_sink.fd = args.output_fd orelse try createFile(out_path);
+        remove_on_error = args.output_fd == null;
+        sink_owns_fd = args.output_fd == null;
         sink = .{
             .ctx = @ptrCast(&fd_sink),
             .write_fn = FdSink.writeFn,
@@ -4021,11 +4037,13 @@ fn writeOneRowParquet(
     sources: []const ?schema.SchemaElement,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    output_fd: ?local_fs.fd_t,
+    empty: bool,
 ) !u64 {
-    const fd = try createFile(out_path);
-    var fd_open = true;
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
-    errdefer local_fs.removeFile(out_path);
+    errdefer if (output_fd == null) local_fs.removeFile(out_path);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
 
@@ -4034,9 +4052,17 @@ fn writeOneRowParquet(
         const cols = try expr_agg.finalize(arena, call, accumulators[i]);
         for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
     }
-    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, 1, codec, zstd);
-    fd_open = false;
-    try local_fs.closeChecked(fd);
+    if (empty) for (all_outs.items) |*out| switch (out.col) {
+        inline else => |*col| {
+            col.values = col.values[0..0];
+            if (col.def_levels) |levels| col.def_levels = levels[0..0];
+        },
+    };
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
     return written;
 }
 
@@ -4050,6 +4076,7 @@ fn writeGroupedParquet(
     rows: []const []const scan.AggValue,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    output_fd: ?local_fs.fd_t,
 ) !u64 {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (cols, types, 0..) |name, ty, ci| switch (ty.lane) {
@@ -4079,14 +4106,16 @@ fn writeGroupedParquet(
         },
     };
 
-    const fd = try createFile(out_path);
-    var fd_open = true;
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
     const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd);
-    fd_open = false;
-    try local_fs.closeChecked(fd);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
     return written;
 }
 
@@ -4261,15 +4290,17 @@ fn createFile(path: []const u8) !local_fs.fd_t {
 // Print path - CSV / JSONL streaming row output
 // ============================================================
 
-pub const PrintFormat = enum {
-    csv,
-    jsonl,
-};
+pub const PrintFormat = enum { csv, jsonl, json, parquet };
 
 pub const StdoutWriter = struct {
     fd: local_fs.fd_t = 1,
     buf: [4096]u8 = undefined,
     pos: usize = 0,
+    output_ns: u64 = 0,
+    bytes_written: u64 = 0,
+    json_array: bool = false,
+    skip_remaining: usize = 0,
+    parquet: ?*ParquetPrint = null,
 
     pub fn writeAll(self: *StdoutWriter, bytes: []const u8) !void {
         var i: usize = 0;
@@ -4298,6 +4329,7 @@ pub const StdoutWriter = struct {
         const pending = self.buf[0..self.pos];
         self.pos = 0;
         try local_fs.writeAll(self.fd, pending);
+        self.bytes_written += pending.len;
     }
 };
 
@@ -4766,6 +4798,12 @@ fn flushAggregator(
     limit: ?usize,
     total_printed: *usize,
 ) !void {
+    const output_start = nowMonoNs();
+    defer writer.output_ns += @intCast(nowMonoNs() - output_start);
+    if (writer.parquet) |pq| {
+        try pq.append(agg, limit, total_printed, &writer.skip_remaining);
+        return;
+    }
     if (agg.num_rows == 0) return;
 
     var row_idx: usize = 0;
@@ -4774,7 +4812,12 @@ fn flushAggregator(
             if (total_printed.* >= lim) break;
         }
 
+        if (writer.skip_remaining > 0) {
+            writer.skip_remaining -= 1;
+            continue;
+        }
         if (is_jsonl) {
+            if (writer.json_array and total_printed.* > 0) try writer.writeByte(',');
             try writer.writeAll("{");
             for (agg.cols, 0..) |col, col_idx| {
                 if (col_idx > 0) try writer.writeAll(",");
@@ -4782,7 +4825,7 @@ fn flushAggregator(
                 try writer.writeByte(':');
                 try printCell(writer, col, row_idx, agg.schema_elems[col_idx], true);
             }
-            try writer.writeAll("}\n");
+            try writer.writeAll(if (writer.json_array) "}" else "}\n");
         } else {
             for (agg.cols, 0..) |col, col_idx| {
                 if (col_idx > 0) try writer.writeAll(",");
@@ -4794,11 +4837,94 @@ fn flushAggregator(
     }
 }
 
+// The limited row sink shares decode/encode with printing, but keeps only footer metadata between slices.
+const ParquetPrint = struct {
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    fd_sink: FdSink,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    schema_items: std.ArrayListUnmanaged(schema.SchemaElement),
+    rgs: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
+    out_offset: u64 = 0,
+
+    fn sink(self: *ParquetPrint) streaming.Sink {
+        return .{ .ctx = @ptrCast(&self.fd_sink), .write_fn = FdSink.writeFn };
+    }
+
+    fn start(self: *ParquetPrint) !void {
+        try self.sink().write("PAR1");
+        self.out_offset = 4;
+    }
+
+    fn append(self: *ParquetPrint, agg: *consumer.OutputAggregator, limit: ?usize, total: *usize, skip: *usize) !void {
+        const start_row = @min(skip.*, agg.num_rows);
+        skip.* -= start_row;
+        const n = @min(agg.num_rows - start_row, if (limit) |lim| lim -| total.* else agg.num_rows);
+        if (n == 0) return;
+        const saved = try self.gpa.dupe(consumer.OutputAggregator.ColumnBuf, agg.cols);
+        defer self.gpa.free(saved);
+        const old_rows = agg.num_rows;
+        defer {
+            @memcpy(agg.cols, saved);
+            agg.num_rows = old_rows;
+        }
+        for (agg.cols) |*col| switch (col.*) {
+            inline else => |*buf| {
+                buf.values.items = buf.values.items[start_row..][0..n];
+                if (buf.def_levels.items.len > 0) buf.def_levels.items = buf.def_levels.items[start_row..][0..n];
+            },
+        };
+        agg.num_rows = n;
+        var timings: consumer.Timings = .{};
+        const out = try consumer.encodeAggregator(agg, self.arena, self.gpa, self.sink(), &self.out_offset, self.codec, self.zstd, &timings, 1, true, .{});
+        if (out.rg) |rg| try self.rgs.append(self.arena, rg);
+        total.* += n;
+    }
+
+    fn finish(self: *ParquetPrint, rows: usize) !void {
+        const meta: schema.FileMetaData = .{
+            .version = 2,
+            .schema = self.schema_items,
+            .num_rows = @intCast(rows),
+            .row_groups = self.rgs,
+            .created_by = "zpq",
+            .column_orders = try schema.FileMetaData.outputColumnOrders(self.arena, invariant.footerLeafCount(self.schema_items.items), null, &.{}),
+        };
+        var writer: thrift.Writer = .init(self.arena);
+        defer writer.deinit();
+        try meta.write(&writer);
+        const footer = writer.bytes();
+        try self.sink().write(footer);
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(footer.len), .little);
+        try self.sink().write(&len);
+        try self.sink().write("PAR1");
+        self.out_offset += footer.len + 8;
+    }
+};
+
+pub const PrintResult = struct {
+    output_ns: u64 = 0,
+    rows_in: usize = 0,
+    rows: usize = 0,
+    bytes_out: u64 = 0,
+    membership: membership.Stats = .{},
+    timings: Timings = .{},
+};
+
 pub fn runPrint(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
-    try runPrintInternal(ctx, args, format, limit);
+    _ = try runPrintTo(ctx, args, format, limit, 1, 0);
 }
 
-fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
+pub fn runPrintTo(
+    ctx: Context,
+    args: QueryArgs,
+    format: PrintFormat,
+    limit: ?usize,
+    fd: local_fs.fd_t,
+    offset: usize,
+) !PrintResult {
     const t_start = nowMonoNs();
     const prof = profile.threadOf(args.profiler, .main);
     const query_span = profile.Span.begin(prof);
@@ -4814,13 +4940,14 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     var opened = try openInputs(ctx, arena, args, .{
         .limit = s3FetchWindow(ctx.env, args.max_memory),
         .always = limit != null,
+        .footer_only = limit == 0,
     });
     defer opened.deinit();
     open_span.end(.open_inputs, profile.args(.{args.inputs.len}));
 
     const parse_span = profile.Span.begin(prof);
     const metas = try materializeMetas(arena, opened, args.diag, prof);
-    if (metas.len == 0) return;
+    if (metas.len == 0) return .{};
     const meta0 = &metas[0];
 
     for (metas[1..]) |*m| {
@@ -4842,7 +4969,7 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
     const filter_opt = proj.filter;
     const fetch_arr = proj.fetch;
     const output_specs = proj.output_specs;
-    _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all);
+    if (limit != 0) _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all);
     parse_span.end(.parse_query, profile.args(.{}));
     if (args.profiler) |p| p.setColumnsFromMeta(meta0);
 
@@ -4874,11 +5001,28 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
 
     var agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
 
-    var stdout_writer = StdoutWriter{ .fd = 1 };
+    var parquet: ParquetPrint = .{
+        .arena = arena,
+        .gpa = ctx.gpa,
+        .fd_sink = .{ .fd = fd },
+        .codec = args.codec orelse .SNAPPY,
+        .zstd = .{ .lambda = args.compress_priority.lambda() },
+        .schema_items = try buildSelectSchema(arena, meta0, output_specs),
+    };
+    coerceByteArrayDecimalLeavesToFlba(&parquet.schema_items);
+    coerceFloat16LeavesToDouble(&parquet.schema_items);
+    if (format == .parquet) try parquet.start();
+    var stdout_writer = StdoutWriter{
+        .fd = fd,
+        .json_array = format == .json,
+        .skip_remaining = offset,
+        .parquet = if (format == .parquet) &parquet else null,
+    };
     defer stdout_writer.flush() catch {};
 
     const names = try proj.names(arena);
-    const is_jsonl = (format == .jsonl);
+    const is_jsonl = format != .csv;
+    if (format == .json) try stdout_writer.writeByte('[');
     if (!is_jsonl) {
         for (names, 0..) |name, col_idx| {
             if (col_idx > 0) try stdout_writer.writeAll(",");
@@ -4962,13 +5106,13 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
         }
     }
 
+    const finish_start = nowMonoNs();
+    if (format == .json) try stdout_writer.writeAll("]\n");
+    if (format == .parquet) try parquet.finish(total_printed);
     try stdout_writer.flush();
-
-    // JSON envelope to stderr
-    var stderr_writer = StdoutWriter{ .fd = 2 };
-    defer stderr_writer.flush() catch {};
-    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
-    stderr_writer.print("{{\"ok\":true,\"rows_in\":{d},\"rows_printed\":{d},\"total_ms\":{d}}}\n", .{ rows_in, total_printed, total_ms }) catch {};
+    stdout_writer.output_ns += @intCast(nowMonoNs() - finish_start);
+    _ = t_start;
+    return .{ .rows_in = rows_in, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
 }
 
 // ============================================================
@@ -6981,4 +7125,53 @@ test "explainAggregate: partitioned force agrees for API and environment" {
         defer json.deinit();
         try std.testing.expectEqualStrings("shared_partitions", json.value.object.get("merge").?.string);
     }
+}
+
+test "limited Parquet row sink restores borrowed buffers on every allocation failure" {
+    const Test = struct {
+        fn run(gpa: std.mem.Allocator, fd: local_fs.fd_t) !void {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            var values = [_]i64{ 11, 22, 33 };
+            var borrowed: std.ArrayList(i64) = .empty;
+            borrowed.items = &values;
+            borrowed.capacity = values.len;
+            var columns = [_]consumer.OutputAggregator.ColumnBuf{
+                .{ .i64 = .{ .values = borrowed } },
+            };
+            var elems = [_]schema.SchemaElement{
+                .{ .name = "v", .type = .INT64, .repetition_type = .REQUIRED, .type_length = null, .num_children = null, .scale = null, .precision = null, .field_id = null },
+            };
+            const name = [_][]const u8{"v"};
+            var paths = [_][]const []const u8{&name};
+            var agg: consumer.OutputAggregator = .{
+                .arena = arena.allocator(),
+                .cols = &columns,
+                .schema_elems = &elems,
+                .paths = &paths,
+                .num_rows = values.len,
+                .captured = true,
+            };
+            var sink: ParquetPrint = .{
+                .arena = arena.allocator(),
+                .gpa = gpa,
+                .fd_sink = .{ .fd = fd },
+                .codec = .UNCOMPRESSED,
+                .zstd = .{ .lambda = CompressPriority.size.lambda() },
+                .schema_items = .empty,
+            };
+            var total: usize = 0;
+            var skip: usize = 1;
+            defer {
+                std.debug.assert(agg.num_rows == values.len);
+                std.debug.assert(agg.cols[0].i64.values.items.ptr == &values);
+                std.debug.assert(agg.cols[0].i64.values.items.len == values.len);
+            }
+            try sink.append(&agg, 1, &total, &skip);
+            try std.testing.expectEqual(@as(usize, 1), total);
+        }
+    };
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    defer local_fs.close(fd);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{fd});
 }

@@ -28,6 +28,26 @@ pub fn openRead(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 }
 
+/// Inodes are only unique within a device; follow aliases so hard links are also rejected.
+pub fn sameFile(a: []const u8, b: []const u8) !bool {
+    const az = try posix.toPosixPath(a);
+    const bz = try posix.toPosixPath(b);
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var ast = std.mem.zeroes(linux.Statx);
+        var bst = std.mem.zeroes(linux.Statx);
+        if (linux.errno(linux.statx(linux.AT.FDCWD, &az, 0, .{ .INO = true }, &ast)) != .SUCCESS or
+            linux.errno(linux.statx(linux.AT.FDCWD, &bz, 0, .{ .INO = true }, &bst)) != .SUCCESS)
+            return error.StatFailed;
+        return ast.ino == bst.ino and ast.dev_major == bst.dev_major and ast.dev_minor == bst.dev_minor;
+    }
+    var ast: posix.system.Stat = undefined;
+    var bst: posix.system.Stat = undefined;
+    if (posix.errno(posix.system.stat(&az, &ast)) != .SUCCESS or
+        posix.errno(posix.system.stat(&bz, &bst)) != .SUCCESS) return error.StatFailed;
+    return ast.ino == bst.ino and ast.dev == bst.dev;
+}
+
 /// Create or truncate `path` for writing, mode 0644.
 pub fn createFile(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);

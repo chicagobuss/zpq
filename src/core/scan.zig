@@ -474,6 +474,7 @@ pub const Reason = enum {
     small_ndv,
     unknown_ndv,
     census_needs_uniqueness_evidence,
+    census_fixed_width_bail,
     high_cardinality_strings,
     worker_copy_memory,
     dictionary_union,
@@ -508,6 +509,7 @@ pub const AggregateDispatch = struct {
     count_agg: ?usize,
     census_allowed: bool,
     census_fused: bool,
+    census_cell_repeat_gate: bool = false,
 };
 
 /// Fixed-size decision; census and plain fallback remain conditional runtime transitions.
@@ -585,9 +587,10 @@ fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strat
     plan.dispatch.count_columns = false;
     plan.dispatch.census_allowed = false;
     plan.dispatch.census_fused = false;
+    plan.dispatch.census_cell_repeat_gate = false;
     for ([_]Reason{
-        .sketch_count_cut,                 .first_keys_cut, .census_fused, .census_on_sketch_bail,
-        .census_needs_uniqueness_evidence,
+        .sketch_count_cut,                 .first_keys_cut,          .census_fused, .census_on_sketch_bail,
+        .census_needs_uniqueness_evidence, .census_fixed_width_bail,
     }) |r|
         plan.reasons.remove(r);
     plan.reasons.insert(.plain_scan);
@@ -611,28 +614,42 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     if (!state_unknown) plan.plain_bytes = copies else plan.reasons.insert(.state_memory_unknown);
     const small = stat.confidence == .upper_bound and stat.hi <= 1 << 20 and
         !state_unknown and copies <= in.args.max_memory / 8;
-    // Encoded width is not evidence of uniqueness. An explicit fusion knob still exercises the census executor;
-    // automatic census needs independent strong evidence, which these upper bounds cannot supply.
+    const bounded_census = stat.confidence == .upper_bound and stat.hi <= 1 << 20;
+    const tiny = bounded_census and stat.hi <= 1 << 14;
+    const keys = in.keys orelse &.{};
+    // Few local dictionary entries make clustered/skewed R1 scans cheap. Composite marginal bounds cannot
+    // establish that cost; the census repeat cap can still admit their proven moderate tuple bound.
+    const cheap_r1 = small and (tiny or (keys.len == 1 and (in.calls.len == 1 or
+        stat.dictionary_bytes <= (stat.hi *| stat.key_bytes) *| 4)));
+    const fixed_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
+        expr_agg.fixedGroupStride(keys) != null and !tiny and !cheap_r1;
+    // Dictionary bounds never authorize automatic fusion. A census after a bail is a separate, certified cost bet.
     const explicit_census = if (in.args.sketch_topk) |cfg| cfg.fuse_census != null else false;
     if (!explicit_census) {
         plan.dispatch.keys_unique = false;
-        plan.dispatch.census_allowed = false;
+        plan.dispatch.census_allowed = fixed_census;
         plan.dispatch.census_fused = false;
+        plan.dispatch.census_cell_repeat_gate = fixed_census and !bounded_census;
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
-        if (plan.dispatch.strategy == .sketch) plan.reasons.insert(.census_needs_uniqueness_evidence);
+        if (plan.dispatch.strategy == .sketch) {
+            if (fixed_census) {
+                plan.reasons.insert(.census_fixed_width_bail);
+                plan.reasons.insert(.census_on_sketch_bail);
+            } else plan.reasons.insert(.census_needs_uniqueness_evidence);
+        }
     }
     if (plan.dispatch.strategy == .partitioned_hash) return; // Explicit force has precedence over profitability.
     if (plan.dispatch.strategy == .first_keys) return; // Prefix discovery avoids grouping every key, even a cheap one.
-    if (small) {
+    if (small and !fixed_census) {
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.small_ndv);
         return;
     }
     if (stat.source == .unknown or stat.covered_rows != stat.rows) {
         plan.reasons.insert(.unknown_ndv);
-        // Numeric unknown keys retain a useful sketch cost bet (zipf11); its exact fallback is plain, never census.
+        // Numeric unknown keys retain the sketch (zipf11); a census bail also needs a sparse-repeat cell hint.
         // Complete string dictionary fallback makes grouping expensive. Partial coverage can still have useful
         // skew (ClickBench), so retain that sketch cost bet, with a plain fallback rather than automatic census.
         if (stat.string_keys and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
@@ -1196,7 +1213,11 @@ fn sketchTopK(
     if (!viable) if (cfg.outcome) |o| {
         o.* = .bailed;
     };
-    if (!viable and censuses.len > 0) {
+    const census_try = !viable and censuses.len > 0 and
+        (!decision.census_cell_repeat_gate or censusCellBet(sum, workers[0].group_by_keys.?.len == 1, calls.len > 1));
+    if (cfg.trace and !viable and decision.census_cell_repeat_gate)
+        std.debug.print("census: cell_repeat_load={d} try={}\n", .{ cellRepeatLoad(sum), census_try });
+    if (census_try) {
         if (!fused or dropped.load(.monotonic)) {
             // The census did not ride along, or a worker's cells misjudged the whole: count again, census only.
             for (censuses) |*c| {
@@ -1262,6 +1283,41 @@ fn keysLookUnique(metas: []const schema.FileMetaData, work: []const WorkItem, ke
         if (md.total_uncompressed_size *| 4 >= rg.num_rows *| width *| 3) return true;
     }
     return false;
+}
+
+/// Cost hint only: with B uniform hash cells, E[sum((cell - mean)^2)] = (1 - 1/B) * sum(key_count^2).
+/// Dividing by row count approaches one for sparse repeats. Hash noise/collisions never certify an answer;
+/// the census still uses its exact admission certificate and plain fallback. Saturated/empty cells give no hint.
+fn cellRepeatLoad(cells: []const u32) f64 {
+    if (cells.len < 2) return std.math.inf(f64);
+    var rows: f64 = 0;
+    for (cells) |c| {
+        if (c == std.math.maxInt(u32)) return std.math.inf(f64);
+        rows += @floatFromInt(c);
+    }
+    if (rows == 0) return std.math.inf(f64);
+    const bins: f64 = @floatFromInt(cells.len);
+    const mean = rows / bins;
+    var dispersion: f64 = 0;
+    for (cells) |c| {
+        const delta = @as(f64, @floatFromInt(c)) - mean;
+        dispersion += delta * delta;
+    }
+    return dispersion * (bins / (bins - 1)) / rows;
+}
+
+fn censusCellBet(cells: []const u32, single_key: bool, payload: bool) bool {
+    var rows: f64 = 0;
+    for (cells) |c| rows += @floatFromInt(c);
+    // A selective narrow COUNT can merge directly more cheaply than recounting all filter columns.
+    if (!payload and rows <= 1 << 20) return false;
+    const load = cellRepeatLoad(cells);
+    if (!std.math.isFinite(load)) return false;
+    if (load <= 17.0 / 16.0) return true;
+    // F1^2/F2 estimates effective cardinality, biased low by skew. Try it only for single keys:
+    // large skewed composite tails can exceed the census repeat cap even with a small effective cardinality.
+    if (!single_key) return false;
+    return rows / load <= 1 << 20;
 }
 
 /// Whether the columns a filter reads beyond the group keys are small beside the keys in the first row group read:
@@ -7965,7 +8021,8 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     in.ndv_stat = .{ .rows = 30_000_000, .encoding_stats_rows = 30_000_000, .hi = 30_000_000, .key_bytes = 9 };
     plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy); // Unknown numeric zipf11.
-    try testing.expect(!plan.dispatch.census_allowed and !plan.dispatch.keys_unique);
+    try testing.expect(plan.dispatch.census_allowed and !plan.dispatch.keys_unique);
+    try testing.expect(plan.dispatch.census_cell_repeat_gate and !plan.dispatch.census_fused);
     in.ndv_stat.?.string_keys = true;
     in.ndv_stat.?.key_bytes = 15;
     try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy); // Short fallback strings.
@@ -7997,4 +8054,117 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     in.args.max_memory = 16 << 30;
     // A composite dictionary product is only an upper bound, even when every union completed.
     try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+}
+
+test "planAggregate: census bail cost bets keep cheap R1 and require fixed keys" {
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = .{ .col_ref = .{
+            .col_idx = 0,
+            .physical_type = .INT64,
+            .expr_type = .i64,
+        } }, .where = null, .alias = "s", .result = .i64 },
+    };
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 } },
+    };
+    const outputs = [_]BoundOutputColumn{.{ .source = .{ .agg = 0 }, .name = "c" }};
+    var in: PlanInputs = .{
+        .args = .{
+            .inputs = &.{},
+            .aggregate = "count(*)",
+            .sketch_topk = .{},
+            .max_memory = 12 << 30,
+            .result_order = .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 10 },
+        },
+        .metas = &.{},
+        .work = &.{},
+        .calls = &calls,
+        .keys = keys[0..1],
+        .outputs = &outputs,
+        .filter_cols = &.{false},
+        .workers = 16,
+        .ndv_stat = .{
+            .source = .dictionary_union,
+            .confidence = .upper_bound,
+            .hi = 100_000,
+            .rows = 30_000_000,
+            .covered_rows = 30_000_000,
+            .key_bytes = 9,
+            .dictionary_bytes = 23 << 20,
+            .union_complete = true,
+        },
+    };
+    var plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy);
+    try testing.expect(plan.dispatch.census_allowed and !plan.dispatch.census_fused);
+    // Both fit a small global bound, but tiny/skewed/clustered dictionaries make the plain scan cheap.
+    for ([_]struct { hi: u64, bytes: u64 }{
+        .{ .hi = 1000, .bytes = 233_000 },
+        .{ .hi = 100_000, .bytes = 857_000 },
+        .{ .hi = 129_231, .bytes = 3_292_000 },
+    }) |c| {
+        in.ndv_stat.?.hi = c.hi;
+        in.ndv_stat.?.dictionary_bytes = c.bytes;
+        plan = planAggregate(in);
+        try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+        try testing.expect(!plan.dispatch.census_allowed);
+    }
+    in.calls = calls[0..1];
+    in.ndv_stat.?.hi = 100_000;
+    in.ndv_stat.?.dictionary_bytes = 23 << 20;
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy);
+    in.keys = &keys;
+    in.ndv_stat.?.hi = 1_000_000;
+    in.ndv_stat.?.key_bytes = 18;
+    plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy);
+    try testing.expect(plan.dispatch.census_allowed and !plan.dispatch.census_fused);
+    in.args.sketch_topk.?.census = false;
+    try testing.expect(!planAggregate(in).dispatch.census_allowed);
+    in.args.sketch_topk.?.census = true;
+    in.args.max_memory = 64 << 20;
+    try testing.expect(!planAggregate(in).dispatch.census_allowed);
+    in.args.max_memory = 12 << 30;
+    const string_key = [_]expr_ast.Expr{.{
+        .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str },
+    }};
+    in.keys = &string_key;
+    in.ndv_stat = .{
+        .rows = 30_000_000,
+        .hi = 30_000_000,
+        .string_keys = true,
+        .key_bytes = 14,
+        .encoding_stats_rows = 30_000_000,
+    };
+    plan = planAggregate(in);
+    try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+    try testing.expect(!plan.dispatch.census_allowed);
+}
+
+test "census cell cost hint distinguishes sparse repeats without proving uniqueness" {
+    var cells: [1 << 12]u32 = @splat(0);
+    for (0..1 << 16) |i| {
+        const key: u64 = i;
+        const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
+        cells[hash >> 52] += 1;
+    }
+    try testing.expect(censusCellBet(&cells, false, true));
+    try testing.expect(!censusCellBet(&cells, false, false));
+    for (&cells) |*c| c.* *= 3;
+    try testing.expect(!censusCellBet(&cells, false, true));
+    try testing.expect(censusCellBet(&cells, true, true));
+    @memset(&cells, 0);
+    for (0..1 << 21) |i| {
+        const key: u64 = i;
+        const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
+        cells[hash >> 52] += 3;
+    }
+    try testing.expect(!censusCellBet(&cells, true, true));
+    @memset(&cells, 0);
+    try testing.expect(std.math.isInf(cellRepeatLoad(&cells)));
+    cells[0] = std.math.maxInt(u32);
+    try testing.expect(std.math.isInf(cellRepeatLoad(&cells)));
+    try testing.expect(std.math.isInf(cellRepeatLoad(&.{1})));
 }

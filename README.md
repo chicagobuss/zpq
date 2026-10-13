@@ -124,7 +124,10 @@ when footer coverage and byte budgets allow it, dictionary pages to tighten thos
 the planner also chooses them for large string keys or worker-copy pressure supported by a lower bound or a
 single-key dictionary-union cost estimate. Composite upper bounds only prove smallness. Prefix LIMIT plans retain
 `first_keys` precedence and skip the union probe. Memory estimates remain estimates;
-execution enforces the GROUP BY budget.
+execution enforces the GROUP BY budget. COUNT cuts may permit an unfused census after a sketch bail for fixed-width
+keys. Tiny bounds and cheap clustered/skewed R1 scans keep plain grouping. Unknown or high NDV also needs a
+cell-dispersion cost hint: sparse repeats, or moderate effective cardinality for a single key. These hints never prove
+uniqueness; census admission remains certified, with an exact plain fallback. Explain reports this conditional repeat gate.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
 compute in scaled 128-bit integers, never through a double. Result types follow Trino's (Athena's) rules: `a + b` /

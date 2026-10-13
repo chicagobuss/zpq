@@ -4417,9 +4417,9 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     if (d.count_agg) |idx| try writer.print("{d}", .{idx}) else try writer.writeAll("null");
     try writer.writeAll(",\"sketch\":");
     if (explanation.sketch) |cfg| {
-        try writer.print("{{\"cell_bits\":{d},\"admit_per_row\":{d},\"certify\":{},\"census_allowed\":{},\"census_fused\":{},\"census_fp_bits\":{d},\"census_check_rows\":{d}}}", .{
-            cfg.cell_bits,      cfg.admit_per_row,     cfg.certify, d.census_allowed, d.census_fused,
-            cfg.census_fp_bits, cfg.census_check_rows,
+        try writer.print("{{\"cell_bits\":{d},\"admit_per_row\":{d},\"certify\":{},\"census_allowed\":{},\"census_fused\":{},\"census_cell_repeat_gate\":{},\"census_fp_bits\":{d},\"census_check_rows\":{d}}}", .{
+            cfg.cell_bits,             cfg.admit_per_row,  cfg.certify,           d.census_allowed, d.census_fused,
+            d.census_cell_repeat_gate, cfg.census_fp_bits, cfg.census_check_rows,
         });
     } else try writer.writeAll("null");
     try writer.writeAll(",\"passes\":[");
@@ -4436,6 +4436,8 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
                 try writer.writeAll(",");
                 try writeExplainPass(writer, "census_count", if (d.census_fused)
                     "sketch_bails_and_fused_census_dropped"
+                else if (d.census_cell_repeat_gate)
+                    "sketch_bails_and_cells_favor_census"
                 else
                     "sketch_bails", a.column_names, a.count_columns.?);
             }

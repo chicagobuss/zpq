@@ -84,4 +84,40 @@ assert not plan["ndv"]["union_attempted"] and plan["ndv"]["estimate"] is None, p
 # Unknown DISTINCT state must not be admitted by the small-group memory estimate.
 plan = run(f"SELECT k, count(DISTINCT v) AS c FROM '{bounded}' GROUP BY k", explain=True)
 assert plan["plain_bytes_estimate"] is None and "state_memory_unknown" in plan["reasons"], plan
-print("planner check: bounded NDV, no data-page reads, and partitioned answers agree with DuckDB")
+# Repeated fixed keys with payloads: census-after-bail stays certified and honours the disable knob.
+moderate = Path(directory) / "planner_census.parquet"
+pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
+                         "v": [(i % 201) - 100 for i in range(400_000)], "pos": range(400_000)}),
+               moderate, row_group_size=25_000)
+sql = (f"SELECT k, count(*) AS c, sum(v) AS s, avg(v) AS av, min(v) AS mn, max(v) AS mx "
+       f"FROM '{moderate}' GROUP BY k ORDER BY c DESC LIMIT 10")
+plan = run(sql, explain=True)
+assert plan["strategy"] == "sketch" and plan["sketch"]["census_allowed"], plan
+assert not plan["sketch"]["census_fused"] and not plan["sketch"]["census_cell_repeat_gate"], plan
+assert "census_fixed_width_bail" in plan["reasons"], plan
+truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
+for workers in (1, 4):
+    for census in ("0", "1"):
+        result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census})
+        rows = result["agg"]
+        for row in rows:
+            avg = row["av"]
+            row["av"] = avg["sum"] / avg["count"] if avg["count"] else None
+        assert [tuple(row[c] for c in ("k", "c", "s", "av", "mn", "mx")) for row in rows] == truth, result
+
+# Raw fixed-width keys can permit a conditional census, without claiming uniqueness in explain.
+raw = Path(directory) / "planner_census_raw.parquet"
+pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
+                         "f": [i // 25_000 for i in range(400_000)], "pos": range(400_000)}),
+               raw, row_group_size=25_000, use_dictionary=False)
+for group in ("k", "k, f"):
+    sql = f"SELECT {group}, count(*) AS c FROM '{raw}' GROUP BY {group} ORDER BY c DESC LIMIT 10"
+    plan = run(sql, explain=True)
+    assert plan["strategy"] == "sketch" and plan["sketch"]["census_cell_repeat_gate"], plan
+    assert not plan["sketch"]["census_fused"] and plan["sketch"]["census_allowed"], plan
+    truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
+    cols = [*group.split(", "), "c"]
+    for workers in (1, 4):
+        rows = run(sql, workers)["agg"]
+        assert [tuple(row[c] for c in cols) for row in rows] == truth, rows
+print("planner check: bounded NDV, prefix precedence, census bail and partitioned answers agree with DuckDB")

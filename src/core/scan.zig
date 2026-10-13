@@ -2049,7 +2049,11 @@ fn prepareAggregate(
     // budget.
     var group_budget = expr_agg.SharedBudget{
         .limit = args.max_memory,
-        .block = expr_agg.SharedBudget.blockFor(args.max_memory, n_workers),
+        // Shared partitions retain their own reservation slack alongside the workers' local tables.
+        .block = expr_agg.SharedBudget.blockFor(
+            args.max_memory,
+            n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
+        ),
     };
     for (work_items.items) |item| {
         for (item.accumulators) |*acc| {
@@ -4554,6 +4558,32 @@ test "partagg: same GROUP BY answer as the per-worker tables at every -j" {
             return err;
         };
     };
+}
+
+test "partagg: shared partitions fit the small GROUP BY budget" {
+    // Round 6 repro: one worker plus 32 shared tables. Worker-only block sizing strands quota during the flush.
+    const path = "ci/fixtures/parquet/partagg_budget.parquet";
+    const bytes = try metadata.readFileSlice(path, testing.allocator);
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const res = try runMultiAggregate(testing.allocator, arena.allocator(), .{
+        .inputs = &inputs,
+        .group_by = "k",
+        .aggregate = "count(*) AS c",
+        .partagg = true,
+        .parallelism = 1,
+        .max_memory = 256000,
+    });
+    defer freeResult(res);
+    try testing.expect(res.part_agg);
+    const rows = res.output.group_rows.?;
+    try testing.expectEqual(@as(usize, 1000), rows.len);
+    for (rows, 0..) |row, i| {
+        try testing.expectEqual(@as(i64, @intCast(i)), row[0].i);
+        try testing.expectEqual(@as(i64, 1), row[1].i);
+    }
 }
 
 test "partagg: a spawn failure does not change the answer" {

@@ -4390,7 +4390,7 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     }
     try writer.writeAll("],\"ndv\":");
     if (a.plan.ndv_stat) |stat| {
-        try writer.print("{{\"source\":\"{s}\",\"lo\":{d},\"hi\":{d},\"rows\":{d},\"covered_rows\":{d},\"encoding_stats_rows\":{d},\"confidence\":\"{s}\",\"dictionary_bytes\":{d},\"column_bytes\":{d},\"key_bytes_estimate\":{d},\"union_attempted\":{},\"union_complete\":{}}}", .{
+        try writer.print("{{\"source\":\"{s}\",\"lo\":{d},\"hi\":{d},\"rows\":{d},\"covered_rows\":{d},\"encoding_stats_rows\":{d},\"confidence\":\"{s}\",\"dictionary_bytes\":{d},\"column_bytes\":{d},\"key_bytes_estimate\":{d},\"union_attempted\":{},\"union_complete\":{}", .{
             @tagName(stat.source),
             stat.lo,
             stat.hi,
@@ -4404,6 +4404,10 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
             stat.union_attempted,
             stat.union_complete,
         });
+        // Separate a cost estimate from a proven upper bound, especially for composite keys.
+        try writer.writeAll(",\"estimate\":");
+        if (stat.estimate) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
+        try writer.writeAll("}");
     } else try writer.writeAll("null");
     try writer.writeAll(",\"plain_bytes_estimate\":");
     if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");

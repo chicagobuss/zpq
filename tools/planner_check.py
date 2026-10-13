@@ -75,9 +75,11 @@ bounded.write_bytes(b)
 plan = run(f"SELECT k, count(*) AS c FROM '{bounded}' GROUP BY k ORDER BY c DESC LIMIT 10", explain=True)
 assert plan["strategy"] == "plain_hash" and "small_ndv" in plan["reasons"], plan
 assert plan["ndv"]["hi"] == 100 and plan["ndv"]["union_complete"], plan
+assert plan["ndv"]["estimate"] == 100 and plan["ndv"]["lo"] == 0, plan
 assert len(plan["passes"]) == 1 and plan["count_agg"] is None, plan
 plan = run(f"SELECT k, count(*) AS c FROM '{bounded}' GROUP BY k LIMIT 10", explain=True)
-assert plan["strategy"] == "plain_hash" and "small_ndv" in plan["reasons"], plan
+assert plan["strategy"] == "first_keys" and "first_keys_cut" in plan["reasons"], plan
+assert not plan["ndv"]["union_attempted"] and plan["ndv"]["estimate"] is None, plan
 
 # Unknown DISTINCT state must not be admitted by the small-group memory estimate.
 plan = run(f"SELECT k, count(DISTINCT v) AS c FROM '{bounded}' GROUP BY k", explain=True)

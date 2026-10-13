@@ -14,6 +14,8 @@ pub const Stat = struct {
     source: enum { unknown, dictionary_headers, dictionary_union } = .unknown,
     lo: u64 = 0,
     hi: u64 = 0,
+    /// Cost hint from a single-key union, never a proof: dictionaries can contain unused entries.
+    estimate: ?u64 = null,
     rows: u64 = 0,
     covered_rows: u64 = 0,
     encoding_stats_rows: u64 = 0,
@@ -171,10 +173,11 @@ pub fn collect(
             stat.union_budget_exceeded = true;
         if (allow_union and gated and max_memory >= 1024 * 1024) {
             stat.union_attempted = true;
-            if (try unionBound(gpa, arena, files, metas, refs.items, key.col_ref.col_idx, workers, max_memory)) |n|
-                sums[ki] = @min(sums[ki], n + nulls[ki])
-            else
-                full[ki] = false;
+            if (try unionBound(gpa, arena, files, metas, refs.items, key.col_ref.col_idx, workers, max_memory)) |n| {
+                sums[ki] = @min(sums[ki], n + nulls[ki]);
+                // Multiplying marginal cardinalities does not estimate the number of observed tuples.
+                if (keys.len == 1) stat.estimate = @min(stat.rows, n + nulls[ki]);
+            } else full[ki] = false;
         } else full[ki] = false;
         union_product *|= sums[ki];
     }
@@ -358,12 +361,14 @@ test "ndv: repeated dictionaries tighten an upper bound, including nulls and com
         const unioned = try collect(a, arena, &files, &.{meta}, keys[0..1], workers, 512 << 20, true);
         try std.testing.expectEqual(.dictionary_union, unioned.source);
         try std.testing.expectEqual(@as(u64, 9295), unioned.hi);
+        try std.testing.expectEqual(@as(?u64, 9295), unioned.estimate);
         try std.testing.expect(unioned.hi < headers.hi);
         try std.testing.expectEqual(@as(u64, 0), unioned.lo); // Unused dictionary entries cannot prove a lower bound.
         if (workers > 1) try std.testing.expect(spawn.failuresInjected() > 0);
     }
     const composite = try collect(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true);
     try std.testing.expect(composite.hi >= 9295 and composite.hi <= composite.rows);
+    try std.testing.expect(composite.estimate == null);
 }
 
 test "ndv: partial coverage, missing null counts, unavailable pages and probe budgets stay conservative" {

@@ -121,7 +121,9 @@ It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports 
 conditional fallbacks and NDV upper bounds without reading data pages. Local planning can read dictionary headers and,
 when footer coverage and byte budgets allow it, dictionary pages to tighten those bounds. S3 explain reads only footers.
 `ZPQ_NDV_UNION=0` disables the optional union probe. `ZPQ_PARTAGG=1` forces eligible plain GROUP BY through shared tables;
-the planner also chooses them for large string keys or estimated worker-copy pressure. Memory estimates remain estimates;
+the planner also chooses them for large string keys or worker-copy pressure supported by a lower bound or a
+single-key dictionary-union cost estimate. Composite upper bounds only prove smallness. Prefix LIMIT plans retain
+`first_keys` precedence and skip the union probe. Memory estimates remain estimates;
 execution enforces the GROUP BY budget.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),

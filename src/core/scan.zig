@@ -609,7 +609,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const single = stat.hi *| per_group;
     const copies = single *| plan.dispatch.tables;
     if (!state_unknown) plan.plain_bytes = copies else plan.reasons.insert(.state_memory_unknown);
-    const small = stat.confidence == .upper_bound and stat.hi <= (1 << 20) and
+    const small = stat.confidence == .upper_bound and stat.hi <= 1 << 20 and
         !state_unknown and copies <= in.args.max_memory / 8;
     // Encoded width is not evidence of uniqueness. An explicit fusion knob still exercises the census executor;
     // automatic census needs independent strong evidence, which these upper bounds cannot supply.
@@ -624,6 +624,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         if (plan.dispatch.strategy == .sketch) plan.reasons.insert(.census_needs_uniqueness_evidence);
     }
     if (plan.dispatch.strategy == .partitioned_hash) return; // Explicit force has precedence over profitability.
+    if (plan.dispatch.strategy == .first_keys) return; // Prefix discovery avoids grouping every key, even a cheap one.
     if (small) {
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.small_ndv);
@@ -639,8 +640,11 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
             plainDispatch(plan, .plain_hash);
     }
     const long_strings = stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536;
-    // A row-count upper bound alone would route large integer scans to the slower scatter executor.
-    const memory_pressure = stat.union_complete and !state_unknown and copies > in.args.max_memory / 2 and
+    // Upper bounds can certify small tables, but cannot establish pressure. A single-key union is a cost hint;
+    // composite products remain bounds only. Execution still enforces the budget on either path.
+    const pressure_groups = @max(stat.lo, stat.estimate orelse 0);
+    const pressure_copies = (pressure_groups *| per_group) *| plan.dispatch.tables;
+    const memory_pressure = !state_unknown and pressure_copies > in.args.max_memory / 2 and
         single <= in.args.max_memory;
     if ((long_strings or memory_pressure) and partAggSupported(in.args, in.calls, in.keys != null)) {
         // A known union can expose worker-copy pressure even in a sketch's eventual plain fallback.
@@ -1993,18 +1997,7 @@ fn prepareAggregate(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
-    var ndv_stat: ?NdvStat = null;
-    if (args.ndv_policy) if (group_by_keys) |keys| {
-        const files = try arena.alloc(ndv.File, args.inputs.len);
-        for (args.inputs, files) |input, *file| file.* = .{
-            .bytes = input.bytes,
-            .local = !std.mem.startsWith(u8, input.name, "s3://") and
-                (input.logical_size == 0 or input.logical_size == input.bytes.len),
-        };
-        ndv_stat = try ndv.collect(gpa, arena, files, metas, keys, n_workers, args.max_memory, args.ndv_union);
-    };
-    const plan_inputs: PlanInputs = .{
-        .ndv_stat = ndv_stat,
+    var plan_inputs: PlanInputs = .{
         .args = args,
         .metas = metas,
         .work = work_items.items,
@@ -2014,6 +2007,19 @@ fn prepareAggregate(
         .filter_cols = plan.filter_cols,
         .workers = n_workers,
     };
+    var ndv_stat: ?NdvStat = null;
+    if (args.ndv_policy) if (group_by_keys) |keys| {
+        const files = try arena.alloc(ndv.File, args.inputs.len);
+        for (args.inputs, files) |input, *file| file.* = .{
+            .bytes = input.bytes,
+            .local = !std.mem.startsWith(u8, input.name, "s3://") and
+                (input.logical_size == 0 or input.logical_size == input.bytes.len),
+        };
+        // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
+        const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
+        ndv_stat = try ndv.collect(gpa, arena, files, metas, keys, n_workers, args.max_memory, args.ndv_union and !prefix);
+    };
+    plan_inputs.ndv_stat = ndv_stat;
     const scan_plan = planAggregate(plan_inputs);
     if (@import("builtin").is_test and !args.partagg and ndv_stat == null)
         try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
@@ -3602,6 +3608,9 @@ fn topKCandidates(
             if (Count.of(t, g, a_idx, stride) *| m >= tau) kept.putAssumeCapacity(t.keyAt(g), {});
         }
     }
+    // Candidate merging probes every table for the first position and each aggregate, plus ref construction.
+    // Leave broad sets to the parallel count-cut merge before doing another serial DISTINCT pass.
+    if ((kept.count() *| tables.len) *| (agg_calls.len +| 2) > groups / 2) return null;
     if (is_distinct) {
         // Second-stage filter for distinct: sum_i c_i is an exact upper bound on the union cardinality.
         // Any key where sum_i c_i < tau provably cannot reach tau.
@@ -4806,6 +4815,27 @@ test "topKCandidates: keeps every key whose total can reach the cut, even one no
         .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 6 },
         .{ .keys = &.{.{ .column = 1, .descending = true }} },
     }) |other| try testing.expect(try topKCandidates(arena_state.allocator(), &tables, &outputs, &calls, other) == null);
+}
+
+test "topKCandidates: dense candidate probes use the ordinary merge" {
+    // A heavy table passes a quarter of all refs, but probing those keys across every table saves no merge work.
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var tables: [4]expr_agg.GroupTable = undefined;
+    for (&tables) |*t| t.* = .init(testing.allocator, 1 << 30);
+    defer for (&tables) |*t| t.deinit();
+    var name_buf: [32]u8 = undefined;
+    for (&tables, 0..) |*t, ti| for (0..100) |i| {
+        const key = try std.fmt.bufPrint(&name_buf, "{d}-{d}", .{ ti, i });
+        const g = try t.getOrInsert(key, &calls, ti * 100 + i);
+        t.accumulators.items[g].count = if (ti == 0) 10 else 1;
+    };
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" },
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    try testing.expect(try topKCandidates(arena.allocator(), &tables, &outputs, &calls, order) == null);
 }
 
 test "topKCandidates: count_distinct keeps keys that can reach the cut and prunes rest" {
@@ -7912,6 +7942,26 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(plan.reasons.contains(.small_ndv));
     try testing.expect(!plan.dispatch.count_columns and !plan.dispatch.census_allowed);
+    in.args.result_order = .{ .limit = 10 };
+    // First-prefix discovery must keep precedence even with a proven tiny upper bound.
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/partagg_budget.parquet", testing.allocator);
+    defer testing.allocator.free(bytes);
+    const meta = try metadata.open(meta_arena.allocator(), bytes);
+    in.metas = &.{meta};
+    in.work = &.{.{
+        .file = 0,
+        .rg = 0,
+        .agg_start = 0,
+        .agg_len = 1,
+        .columns = .{ .read = &.{}, .consumed = &.{} },
+        .accumulators = &.{},
+    }};
+    try testing.expectEqual(.first_keys, planAggregate(in).dispatch.strategy);
+    in.work = &.{};
+    in.metas = &.{};
+    in.args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
     in.ndv_stat = .{ .rows = 30_000_000, .encoding_stats_rows = 30_000_000, .hi = 30_000_000, .key_bytes = 9 };
     plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy); // Unknown numeric zipf11.
@@ -7930,6 +7980,7 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
         .source = .dictionary_union,
         .confidence = .upper_bound,
         .hi = 100_000,
+        .estimate = 100_000,
         .rows = 30_000_000,
         .covered_rows = 30_000_000,
         .key_bytes = 9,
@@ -7940,4 +7991,10 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     try testing.expect(plan.reasons.contains(.worker_copy_memory));
     in.args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
     try testing.expectEqual(.partitioned_hash, planAggregate(in).dispatch.strategy);
+    in.ndv_stat.?.hi = 30_000_000;
+    in.ndv_stat.?.estimate = null;
+    in.ndv_stat.?.key_bytes = 18;
+    in.args.max_memory = 16 << 30;
+    // A composite dictionary product is only an upper bound, even when every union completed.
+    try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
 }

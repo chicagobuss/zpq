@@ -59,6 +59,9 @@ pub const FakeS3 = struct {
     /// When set, object GETs past this many are refused (403), as a revoked credential or a deleted object would be.
     gets_allowed: ?u32 = null,
     gets: u32 = 0,
+    /// Object byte ranges served by GETs, for metadata-only and range-planning assertions.
+    get_bytes: u64 = 0,
+    lowest_get_offset: ?usize = null,
     /// Substring of "METHOD target" on whose next `stalls_left` matches the server goes silent (`stall_at`), holding
     /// the connection open until the client closes it or the server stops.
     stall: ?[]const u8 = null,
@@ -466,6 +469,8 @@ pub const FakeS3 = struct {
             };
             if (lo > hi) return self.reply(fd, lose, 416, "", "", null);
             if (status == 200) extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag});
+            self.get_bytes += hi - lo;
+            self.lowest_get_offset = @min(self.lowest_get_offset orelse lo, lo);
             resp_body = data[lo..hi];
         } else if (std.mem.eql(u8, method, "HEAD")) {
             var found: ?Object = null;

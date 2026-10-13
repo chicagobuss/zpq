@@ -73,6 +73,8 @@ const S3Fetcher = s3_window.Fetcher(s3.Pool(POOL_SIZE));
 const FetchWindow = struct {
     limit: u64,
     always: bool = false,
+    /// Explain fetches the trailer and exact footer only, and never starts a data fetcher.
+    footer_only: bool = false,
 };
 
 // Large Lambda scans should overlap fetching and decoding instead of retaining a serial decode tail.
@@ -455,11 +457,35 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
 // Aggregate path
 // ============================================================
 
+pub const AggregateExplanation = struct {
+    aggregate: scan.AggregateExplanation,
+    io_mode: enum { mmap, pread, uring, s3_buffered, s3_windowed },
+    encoded: bool,
+    max_memory: usize,
+    sketch: ?scan.SketchTopK,
+};
+
+/// Planning shares the execution path, with caller-owned arena storage and metadata-only input opening.
+pub fn explainAggregate(ctx: Context, arena: std.mem.Allocator, args: QueryArgs) !AggregateExplanation {
+    if (args.inputs.len == 0) return error.NoInputs;
+    if (args.aggregate == null and args.group_by == null) return error.MissingOutputOrAggregate;
+    if (args.select != null or args.columns != null) return error.AggregateMutuallyExclusive;
+    return executeAggregate(ctx, arena, args, args.aggregate orelse "", true);
+}
+
 fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    return executeAggregate(ctx, arena_state.allocator(), args, agg_str, false);
+}
 
+fn executeAggregate(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    agg_str: []const u8,
+    comptime explain: bool,
+) !if (explain) AggregateExplanation else AggResult {
     var t: Timings = .{};
 
     // 1. Open all inputs — local mmap or s3 parallel range-fetch.
@@ -469,7 +495,10 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     //    needs.
     const prof = profile.threadOf(args.profiler, .main);
     const t_open = nowMonoNs();
-    var opened = try openInputs(ctx, arena, args, .{ .limit = s3FetchWindow(ctx.env, args.max_memory) });
+    var opened = try openInputs(ctx, arena, args, .{
+        .limit = s3FetchWindow(ctx.env, args.max_memory),
+        .footer_only = explain,
+    });
     defer opened.deinit();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
@@ -497,13 +526,13 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     const plan_io = all_local and (io_policy.profile == .pread or io_policy.profile == .uring or
         (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
-    const metas: ?[]const schema.FileMetaData = if (opened.has_preparsed_meta or plan_io) blk: {
+    const metas: ?[]const schema.FileMetaData = if (explain or opened.has_preparsed_meta or plan_io) blk: {
         const m = try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
         else
             null;
-        probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
+        if (!explain) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
         break :blk m;
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
@@ -515,6 +544,47 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
         @as(u64, @intFromFloat(resident * 1000)),
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
     }));
+    var scan_args: scan.MultiAggArgs = .{
+        .inputs = opened.inputs,
+        .metas = metas,
+        .filter = args.filter,
+        .aggregate = agg_str,
+        .group_by = args.group_by,
+        .parallelism = args.parallelism,
+        .scan_all = args.scan_all,
+        .trust_stats = args.trust_stats,
+        .fast_levels = args.fast_levels,
+        .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
+        .leave_regions = ctx.exit_after,
+        .unordered = args.unordered,
+        .select_cols = args.select_cols,
+        .result_order = args.result_order,
+        .column_order = args.column_order,
+        .max_memory = args.max_memory,
+        // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
+        .decode_limit = args.max_memory / 2,
+        .diag = args.diag,
+        .profiler = args.profiler,
+        .sketch_topk = sketchFromEnv(ctx.env),
+    };
+    if (explain) {
+        if (io_mode != .mmap) {
+            const gated = try arena.dupe(scan.Input, opened.inputs);
+            for (gated) |*in| in.gate = metadataGate();
+            scan_args.inputs = gated;
+        }
+        return .{
+            .aggregate = try scan.explainAggregate(ctx.gpa, arena, scan_args),
+            .io_mode = if (allLocal(opened)) switch (io_mode) {
+                .mmap => .mmap,
+                .pread => .pread,
+                .uring => .uring,
+            } else if (hasGatedInputs(opened.inputs)) .s3_windowed else .s3_buffered,
+            .encoded = scan_args.encoded,
+            .max_memory = args.max_memory,
+            .sketch = scan_args.sketch_topk,
+        };
+    }
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (reader) |rd| rd.destroy();
@@ -544,29 +614,8 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
             b.buffered_files,
         }));
     }
-    var r = try scan.runMultiAggregate(ctx.gpa, arena, .{
-        .inputs = scan_inputs,
-        .metas = metas,
-        .filter = args.filter,
-        .aggregate = agg_str,
-        .group_by = args.group_by,
-        .parallelism = args.parallelism,
-        .scan_all = args.scan_all,
-        .trust_stats = args.trust_stats,
-        .fast_levels = args.fast_levels,
-        .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
-        .leave_regions = ctx.exit_after,
-        .unordered = args.unordered,
-        .select_cols = args.select_cols,
-        .result_order = args.result_order,
-        .column_order = args.column_order,
-        .max_memory = args.max_memory,
-        // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
-        .decode_limit = args.max_memory / 2,
-        .diag = args.diag,
-        .profiler = args.profiler,
-        .sketch_topk = sketchFromEnv(ctx.env),
-    });
+    scan_args.inputs = scan_inputs;
+    var r = try scan.runMultiAggregate(ctx.gpa, arena, scan_args);
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
     t.decode_wall_ns = r.timings.decode_wall_ns;
@@ -2451,7 +2500,11 @@ fn openInputs(
         // parallel. After this the per-file meta is parsed and we know
         // total file size + tail_start.
         var specs = try arena.alloc(FetchSpec, s3_urls.len);
-        for (s3_urls, 0..) |u, k| specs[k] = .{ .url = u, .file_index = s3_indices.items[k] };
+        for (s3_urls, 0..) |u, k| specs[k] = .{
+            .url = u,
+            .file_index = s3_indices.items[k],
+            .footer_only = fetch_window.footer_only,
+        };
         // Retained suffixes and in-flight footer bodies share one budget: the caller's max, and never the fetch
         // window's 64 MiB floor when that floor is higher. A suffix that does not fit is dropped and those ranges
         // are fetched later. The streaming window (including a test's ZPQ_S3_WINDOW_KIB) stays the admission limit;
@@ -2484,7 +2537,7 @@ fn openInputs(
 
         // Bloom filters first: what they prove lands on the footers' chunks, so the plan below and the scan workers
         // after it prune the same row groups.
-        if (!args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
+        if (!fetch_window.footer_only and !args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
             const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
             // Bloom holds its own copies of what it probes. Cap them at the bytes the query can keep, not at the
             // fetch window's 64 MiB floor when that floor is above `--max-memory`.
@@ -2568,6 +2621,37 @@ fn openInputs(
             var need: u64 = 0;
             for (upfront) |s| need += s.len();
             windowed = need > fetch_window.limit or (fetch_window.always and need > 0);
+        }
+        if (fetch_window.footer_only) {
+            for (specs, 0..) |*sp, k| {
+                const idx = s3_indices.items[k];
+                inputs[idx] = .{
+                    .name = paths[idx],
+                    .bytes = &.{},
+                    .logical_size = sp.total_size,
+                    .gate = if (windowed) metadataGate() else null,
+                };
+                // Copy borrowed footer strings into the arena, then release both responses.
+                const copy = try arena.dupe(u8, sp.footer_region[0 .. sp.footer_region.len - 8]);
+                metas[idx] = try metadata.openFooter(arena, copy);
+                meta_ready[idx] = true;
+                releaseChargedTail(sp, ctx.gpa, &account);
+                ctx.gpa.free(sp.footer_region);
+                sp.footer_region = &.{};
+            }
+            specs_returned = true;
+            return .{
+                .gpa = ctx.gpa,
+                .inputs = inputs,
+                .metas = metas,
+                .meta_ready = meta_ready,
+                .has_preparsed_meta = true,
+                .mmaps = mmaps,
+                .owned_pools = owned_pools.items,
+                .s3_buffers = &.{},
+                .leave_mappings = ctx.exit_after,
+                .footer_resident_peak = footer_resident_peak,
+            };
         }
         var win_order: std.ArrayList(*s3_window.RowGroup) = .empty;
         const win_files = try arena.alloc(s3_window.File, specs.len);
@@ -2869,6 +2953,24 @@ fn openInputs(
     };
 }
 
+fn hasGatedInputs(inputs: []const scan.Input) bool {
+    for (inputs) |in| if (in.gate != null) return true;
+    return false;
+}
+
+fn metadataGate() scan.RowGroupGate {
+    const Gate = struct {
+        var marker: u8 = 0;
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            return error.MetadataOnly;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            unreachable;
+        }
+    };
+    return .{ .ctx = &Gate.marker, .wait = Gate.wait, .done = Gate.done };
+}
+
 /// How the scan reads this query's local files: `policy`'s choice, given how much of them the page cache holds.
 /// The mapping when there are none, or when any input is remote (the S3 path plans its own reads).
 fn allLocal(opened: OpenedInputs) bool {
@@ -3146,6 +3248,7 @@ const FetchSpec = struct {
     url: s3.Url,
     /// Index into the query's inputs, for profile spans.
     file_index: usize = 0,
+    footer_only: bool = false,
     meta: schema.FileMetaData = undefined,
     file_buf: []u8 = &.{},
     compact_ranges: []CompactRange = &.{},
@@ -3543,7 +3646,8 @@ fn fetchMetaBatch(
     profiler: ?*profile.Profiler,
     account: *ByteAccount,
 ) !void {
-    const probe = footerProbeFor(ctx.env, account.limit, @min(READ_CONCURRENCY, @max(specs.len, 1)));
+    const permits = @min(READ_CONCURRENCY, @max(specs.len, 1));
+    const probe = if (specs.len > 0 and specs[0].footer_only) 8 else footerProbeFor(ctx.env, account.limit, permits);
     const TaskCtx = struct {
         ctx: Context,
         creds: s3.Credentials,
@@ -3615,7 +3719,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // On 200/206 the object has changed — the cached entry is stale,
     // we proceed exactly as the cold path. The fresh entry is
     // installed at the end of the cold path.
-    if (t.ctx.meta_cache) |cache| {
+    if (!sp.footer_only) if (t.ctx.meta_cache) |cache| {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
                 .range = s3.Range.suffix(t.probe),
@@ -3650,7 +3754,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             }
             return error.BadResponse;
         }
-    }
+    };
 
     // Cold path: one suffix. A footer that does not fit costs one more GET, inside populateFromTailResponse.
     const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
@@ -4260,6 +4364,89 @@ fn writeCsvString(writer: anytype, s: []const u8) !void {
     }
 }
 
+/// The same single-object JSON convention as query results. Passes describe permitted work, not a runtime trace.
+pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
+    const a = explanation.aggregate;
+    const d = a.plan.dispatch;
+    const merge = if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
+    try writer.print("{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\",\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[", .{
+        @tagName(d.strategy), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
+        a.work_items,         explanation.max_memory, explanation.encoded,
+    });
+    var sep: []const u8 = "";
+    var reasons = a.plan.reasons.iterator();
+    while (reasons.next()) |reason| {
+        try writer.print("{s}\"{s}\"", .{ sep, @tagName(reason) });
+        sep = ",";
+    }
+    try writer.writeAll("],\"count_agg\":");
+    if (d.count_agg) |idx| try writer.print("{d}", .{idx}) else try writer.writeAll("null");
+    try writer.writeAll(",\"sketch\":");
+    if (explanation.sketch) |cfg| {
+        try writer.print("{{\"cell_bits\":{d},\"admit_per_row\":{d},\"certify\":{},\"census_allowed\":{},\"census_fused\":{},\"census_fp_bits\":{d},\"census_check_rows\":{d}}}", .{
+            cfg.cell_bits,      cfg.admit_per_row,     cfg.certify, d.census_allowed, d.census_fused,
+            cfg.census_fp_bits, cfg.census_check_rows,
+        });
+    } else try writer.writeAll("null");
+    try writer.writeAll(",\"passes\":[");
+    switch (d.strategy) {
+        .scalar, .plain_hash => try writeExplainPass(writer, "aggregate", null, a.column_names, a.columns),
+        .first_keys => {
+            try writeExplainPass(writer, "discover_prefix", null, a.column_names, a.columns);
+            try writer.writeAll(",");
+            try writeExplainPass(writer, "admit", "discovery_did_not_read_all", a.column_names, a.columns);
+        },
+        .sketch => {
+            try writeExplainPass(writer, "count", null, a.column_names, a.count_columns.?);
+            if (d.census_allowed) {
+                try writer.writeAll(",");
+                try writeExplainPass(writer, "census_count", if (d.census_fused)
+                    "sketch_bails_and_fused_census_dropped"
+                else
+                    "sketch_bails", a.column_names, a.count_columns.?);
+            }
+            try writer.writeAll(",");
+            try writeExplainPass(writer, "admit", "sketch_or_census_cut_viable", a.column_names, a.columns);
+            try writer.writeAll(",");
+            try writeExplainPass(
+                writer,
+                "aggregate",
+                "cut_not_viable_or_certificate_failed",
+                a.column_names,
+                a.columns,
+            );
+        },
+    }
+    try writer.writeAll("],\"runtime\":{\"batch_encoding\":true,\"slicing\":true,\"bloom_probing\":\"execution_only\"}}\n");
+}
+
+fn writeExplainPass(
+    writer: anytype,
+    kind: []const u8,
+    condition: ?[]const u8,
+    names: []const []const u8,
+    columns: agg_plan.Columns,
+) !void {
+    try writer.print("{{\"kind\":\"{s}\",\"condition\":", .{kind});
+    if (condition) |c| try writeJsonQuoted(writer, c) else try writer.writeAll("null");
+    try writer.writeAll(",\"columns\":");
+    try writeExplainColumns(writer, names, columns.read);
+    try writer.writeAll(",\"full_match_columns\":");
+    try writeExplainColumns(writer, names, columns.consumed);
+    try writer.writeAll("}");
+}
+
+fn writeExplainColumns(writer: anytype, names: []const []const u8, mask: []const bool) !void {
+    try writer.writeAll("[");
+    var sep: []const u8 = "";
+    for (names, mask) |name, reads| if (reads) {
+        try writer.writeAll(sep);
+        try writeJsonQuoted(writer, name);
+        sep = ",";
+    };
+    try writer.writeAll("]");
+}
+
 /// A JSON number for `f`. Aggregates can be non-finite (a NaN or ±inf input), and JSON has no literal for that: a bare
 /// `nan` is invalid and `null` would read as "no value". Write the strings "NaN", "Infinity" and "-Infinity", as
 /// `--format jsonl` does and DuckDB/pyarrow surface them.
@@ -4275,8 +4462,8 @@ pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     try writer.print(
         "\"membership\":{{\"bloom_pruned\":{d},\"dict_pruned\":{d},\"filters\":{d},\"dictionaries\":{d},\"requests\":{d},\"bytes\":{d},\"suffix_bytes\":{d},\"bloom_stopped\":{},\"dict_stopped\":{},\"bloom_skipped_oversize\":{d},\"request_kb\":{d},\"us\":{d}}}",
         .{
-            s.row_groups_bloom, s.row_groups_dict, s.filters,       s.dictionaries,
-            s.requests,         s.bytes,           s.suffix_bytes,  s.bloom_stopped,
+            s.row_groups_bloom, s.row_groups_dict,        s.filters,              s.dictionaries,
+            s.requests,         s.bytes,                  s.suffix_bytes,         s.bloom_stopped,
             s.dict_stopped,     s.bloom_skipped_oversize, s.request_bytes / 1024, s.ns / std.time.ns_per_us,
         },
     );
@@ -6658,4 +6845,68 @@ test "every S3 write path writes the same bytes through a window as with everyth
             };
         }
     }
+}
+
+test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
+    const gpa = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", gpa);
+    defer gpa.free(bytes);
+    const footer_len = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+    const footer_start = bytes.len - 8 - footer_len;
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/explain.parquet", bytes);
+    fake.gets_allowed = 2;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+    const lines = [_:null]?[*:0]const u8{
+        endpoint,              "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk",
+        "ZPQ_IO_PROFILE=mmap", "ZPQ_SKETCH_BITS=10",
+    };
+    const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+    const explained = try explainAggregate(ctx, a, .{
+        .inputs = &.{"s3://bkt/t/explain.parquet"},
+        .group_by = "k",
+        .aggregate = "count(*) AS c",
+        .filter = "n < 12",
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+    });
+    try std.testing.expectEqual(@as(u32, 2), fake.gets);
+    try std.testing.expectEqual(@as(u64, footer_len + 8), fake.get_bytes);
+    try std.testing.expectEqual(footer_start, fake.lowest_get_offset.?);
+    try std.testing.expectEqual(.sketch, explained.aggregate.plan.dispatch.strategy);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try writeAggregateExplanationJson(&out.writer, explained);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.written(), .{});
+    defer parsed.deinit();
+    const pass = parsed.value.object.get("passes").?.array.items[0].object;
+    try std.testing.expectEqualStrings("count", pass.get("kind").?.string);
+    try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
+}
+
+test "explainAggregate: local IO and environment knobs preserve dispatch eligibility" {
+    const gpa = std.testing.allocator;
+    const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
+    for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const lines = [_:null]?[*:0]const u8{
+            mode, if (disabled) "ZPQ_SKETCH_TOPK=0" else "ZPQ_SKETCH_TOPK=1", "ZPQ_ENCODED=0", "ZPQ_SKETCH_BITS=10",
+        };
+        const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+        const explained = try explainAggregate(ctx, arena_state.allocator(), .{
+            .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
+            .group_by = "k",
+            .aggregate = "count(*) AS c",
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+        });
+        const eligible = i == 0 and !disabled;
+        const expected: @FieldType(scan.AggregateDispatch, "strategy") = if (eligible) .sketch else .plain_hash;
+        try std.testing.expectEqual(expected, explained.aggregate.plan.dispatch.strategy);
+        try std.testing.expect(!explained.encoded);
+    };
 }

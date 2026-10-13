@@ -116,6 +116,10 @@ copy), over S3 and locally alike, so a scan larger than memory completes:
 It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default is 80%
 of available memory, three quarters of a cgroup's memory limit or a Lambda's memory size where those are lower.
 
+Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
+It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reads file footers, including exact footer ranges
+for S3 inputs, and reports the strategy, reasons, column passes and conditional fallbacks without reading data pages.
+
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
 compute in scaled 128-bit integers, never through a double. Result types follow Trino's (Athena's) rules: `a + b` /
 `a - b` take the larger scale and one more integer digit, both sides first brought to their common type (the larger

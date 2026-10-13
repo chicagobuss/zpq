@@ -39,6 +39,39 @@ t = pa.table({
 pq.write_table(t, f"{d}/in.parquet", compression="snappy")
 PY
 
+# Explain accepts both front doors, reports column passes, and creates no requested output.
+# Poison the pages so accidentally executing or probing page headers cannot succeed.
+"$PY" - "$ZPQ" "$DIR" <<'PY'
+import json, os, struct, subprocess, sys
+zpq, d = sys.argv[1:]
+src = f"{d}/in.parquet"
+b = bytearray(open(src, "rb").read())
+footer = len(b) - 8 - struct.unpack_from("<I", b, len(b) - 8)[0]
+b[4:footer] = bytes(footer - 4)
+poison = f"{d}/explain_only.parquet"
+open(poison, "wb").write(b)
+out = f"{d}/explain_output.parquet"
+env = dict(os.environ, ZPQ_IO_PROFILE="mmap", ZPQ_SKETCH_TOPK="1", ZPQ_SKETCH_BITS="10")
+def explain(*args):
+    p = subprocess.run([zpq, "query", *args, "--explain", "--max-memory", "512MB", "-o", out],
+                       env=env, check=True, capture_output=True, text=True)
+    assert len(p.stdout.splitlines()) == 1, p.stdout
+    assert not os.path.exists(out)
+    return json.loads(p.stdout)
+legacy = explain(poison, "--aggregate", "count(*) AS n", "--group-by", "name", "--filter", "i32 >= 0")
+sql = explain("--query", f"SELECT name, count(*) AS n FROM '{poison}' WHERE i32 >= 0 GROUP BY name")
+assert legacy == sql, (legacy, sql)
+assert legacy["ok"] and legacy["strategy"] == "plain_hash", legacy
+assert legacy["passes"][0]["columns"] == ["i32", "name"], legacy
+cut = explain("--query", f"SELECT name, count(*) AS n FROM '{poison}' GROUP BY name ORDER BY n DESC LIMIT 3")
+assert cut["strategy"] == "sketch" and cut["passes"][0]["columns"] == ["name"], cut
+scalar = explain(poison, "--aggregate", "count(*) AS n")
+assert scalar["strategy"] == "scalar" and scalar["passes"][0]["columns"] == [], scalar
+bad = subprocess.run([zpq, "query", poison, "--explain"], capture_output=True, text=True)
+assert bad.returncode and not bad.stdout and "--explain requires" in bad.stderr, bad
+print("Footer-only explain SQL and flag checks passed")
+PY
+
 # 1. Filter + projection.
 "$ZPQ" query "$DIR/in.parquet" -o "$DIR/filtered.parquet" \
   --filter "i32 >= 0" --columns i32,i64,name

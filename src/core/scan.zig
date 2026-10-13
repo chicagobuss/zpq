@@ -437,6 +437,119 @@ const WorkItem = struct {
     accumulators: []expr_agg.Accumulator,
 };
 
+/// Bound query and footer facts only: choosing a strategy neither allocates nor reads the input.
+pub const PlanInputs = struct {
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+    outputs: ?[]const BoundOutputColumn,
+    filter_cols: []const bool,
+    workers: usize,
+};
+
+pub const Reason = enum {
+    sketch_disabled,
+    sketch_memory_limit,
+    sketch_ineligible,
+    sketch_count_cut,
+    keys_look_unique,
+    filter_small,
+    ordered_blocks,
+    first_keys_cut,
+    plain_scan,
+    census_disabled,
+    census_memory_or_work_limit,
+    census_fused,
+    census_on_sketch_bail,
+};
+
+pub const AggregateDispatch = struct {
+    strategy: enum { scalar, plain_hash, sketch, first_keys },
+    use_blocks: bool,
+    tables: usize,
+    count_columns: bool,
+    sketch_fits: bool,
+    keys_unique: bool,
+    filter_small: bool,
+    count_agg: ?usize,
+    census_allowed: bool,
+    census_fused: bool,
+};
+
+/// Fixed-size decision; census and plain fallback remain conditional runtime transitions.
+pub const ScanPlan = struct {
+    dispatch: AggregateDispatch,
+    reasons: std.EnumSet(Reason) = .{},
+};
+
+pub fn planAggregate(in: PlanInputs) ScanPlan {
+    const args = in.args;
+    const keys = in.keys orelse &.{};
+    const use_blocks = in.keys != null and !args.unordered and orderSensitive(in.calls);
+    const blocks = @max(1, @min(in.work.len, group_blocks_max));
+    const tables: usize = if (in.keys == null) 0 else if (!use_blocks) in.workers else blocks;
+    const sketch_fits = if (args.sketch_topk) |cfg|
+        (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
+    else
+        false;
+    const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
+    const filter_small = args.sketch_topk != null and filterSmall(in.metas, in.work, keys, in.filter_cols);
+    const count_agg = if (args.sketch_topk) |cfg| if (sketch_fits)
+        sketchEligible(cfg, args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, keys_unique or filter_small)
+    else
+        null else null;
+    const first_cut = count_agg == null and args.sketch_topk != null and args.sketch_topk.?.census and
+        firstCutEligible(args, use_blocks, in.work.len, tables);
+    const census_allowed = count_agg != null and args.sketch_topk.?.census and
+        censusFits(in.metas, in.work, in.workers, args.max_memory);
+    const census_fused = census_allowed and (args.sketch_topk.?.fuse_census orelse keys_unique);
+    const fallback: @FieldType(AggregateDispatch, "strategy") = if (in.keys != null) .plain_hash else .scalar;
+    var result: ScanPlan = .{ .dispatch = .{
+        .strategy = if (first_cut) .first_keys else if (count_agg != null) .sketch else fallback,
+        .use_blocks = use_blocks,
+        .tables = tables,
+        .count_columns = args.sketch_topk != null and in.keys != null,
+        .sketch_fits = sketch_fits,
+        .keys_unique = keys_unique,
+        .filter_small = filter_small,
+        .count_agg = count_agg,
+        .census_allowed = census_allowed,
+        .census_fused = census_fused,
+    } };
+    const sketch_reason: Reason = blk: {
+        if (args.sketch_topk == null) break :blk .sketch_disabled;
+        if (!sketch_fits) break :blk .sketch_memory_limit;
+        break :blk if (count_agg == null) .sketch_ineligible else .sketch_count_cut;
+    };
+    result.reasons.insert(sketch_reason);
+    if (keys_unique) result.reasons.insert(.keys_look_unique);
+    if (filter_small) result.reasons.insert(.filter_small);
+    if (use_blocks) result.reasons.insert(.ordered_blocks);
+    if (first_cut) result.reasons.insert(.first_keys_cut);
+    if (count_agg == null and !first_cut) result.reasons.insert(.plain_scan);
+    if (count_agg != null) {
+        const census_reason: Reason = blk: {
+            if (!args.sketch_topk.?.census) break :blk .census_disabled;
+            if (!census_allowed) break :blk .census_memory_or_work_limit;
+            break :blk if (census_fused) .census_fused else .census_on_sketch_bail;
+        };
+        result.reasons.insert(census_reason);
+    }
+    return result;
+}
+
+pub const AggregateExplanation = struct {
+    plan: ScanPlan,
+    /// Names copied into the caller's arena: parsed footer scratch may already be gone.
+    column_names: []const []const u8,
+    columns: agg_plan.Columns,
+    count_columns: ?agg_plan.Columns,
+    workers: usize,
+    work_items: usize,
+};
+
 /// Ordered GROUP BY folds the work list in at most this many fixed blocks, each into a table of its own (see
 /// `MultiAggArgs.unordered`). Fixed, not the worker count: the blocks, and so the order partial sums meet in, must not
 /// depend on `-j`. Enough that 32 workers share them evenly; few enough that their tables cost little more than one
@@ -875,8 +988,7 @@ fn sketchTopK(
     order: expr_ast.ResultOrder,
     a_idx: usize,
     cfg: SketchTopK,
-    max_memory: usize,
-    fuse_census: bool,
+    decision: AggregateDispatch,
 ) !void {
     const k: usize = @intCast(order.offset +| order.limit.?);
     const n_cells = @as(usize, 1) << cfg.cell_bits;
@@ -897,7 +1009,7 @@ fn sketchTopK(
     // cells too even to bound anything need no second count pass. It fills the cells too, and stops early wherever a
     // worker's own cells already separate the cut, as the cells will then do without it.
     var dropped: std.atomic.Value(bool) = .init(false);
-    const censuses: []expr_agg.Census = if (cfg.census and censusFits(workers, max_memory)) blk: {
+    const censuses: []expr_agg.Census = if (decision.census_allowed) blk: {
         const item_rows = try arena.alloc(u64, workers[0].work.len);
         @memset(item_rows, 0);
         const cs = try arena.alloc(expr_agg.Census, workers.len);
@@ -913,7 +1025,7 @@ fn sketchTopK(
         break :blk cs;
     } else &.{};
     defer for (censuses) |*c| c.deinit();
-    const fused = (cfg.fuse_census orelse fuse_census) and censuses.len > 0;
+    const fused = decision.census_fused;
     if (fused) for (sketches, censuses) |*s, *c| {
         s.census = c;
     };
@@ -1054,15 +1166,14 @@ fn clearTables(gpa: std.mem.Allocator, tables: []expr_agg.GroupTable) void {
 /// Whether a census of every row the work list can give (`censusTopK`) is a small part of `max_memory`: eight bytes a
 /// row, and a chunk per partition per worker being filled. Its entries name work items in 24 bits, and an item must
 /// be a whole row group (as a grouped scan's are), so each row is counted once.
-fn censusFits(workers: []const Worker, max_memory: usize) bool {
-    const w = workers[0];
-    if (w.work.len >= expr_agg.Census.max_items) return false;
+fn censusFits(metas: []const schema.FileMetaData, work: []const WorkItem, n_workers: usize, max_memory: usize) bool {
+    if (work.len >= expr_agg.Census.max_items) return false;
     var rows: u64 = 0;
-    for (w.work) |item| {
+    for (work) |item| {
         if (item.agg_start != 0) return false;
-        rows +|= @intCast(@max(0, w.metas[item.file].row_groups.items[item.rg].num_rows));
+        rows +|= @intCast(@max(0, metas[item.file].row_groups.items[item.rg].num_rows));
     }
-    const open = workers.len * expr_agg.Census.N_PARTS * @sizeOf(expr_agg.Census.Chunk);
+    const open = n_workers * expr_agg.Census.N_PARTS * @sizeOf(expr_agg.Census.Chunk);
     return (rows *| 8) +| open <= max_memory / 4;
 }
 
@@ -1534,11 +1645,21 @@ fn footerLen(bytes: []const u8) usize {
 /// `MultiAggResult.state` and the parsed metas live in this arena. The
 /// answer, `MultiAggResult.output`, is gpa-owned; `MultiAggResult.deinit`
 /// frees both.
-pub fn runMultiAggregate(
+pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !MultiAggResult {
+    return prepareAggregate(gpa, arena, args, false);
+}
+
+/// Shares all binding and work sizing with execution, but stops before allocating workers or aggregate tables.
+pub fn explainAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !AggregateExplanation {
+    return prepareAggregate(gpa, arena, args, true);
+}
+
+fn prepareAggregate(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     args: MultiAggArgs,
-) !MultiAggResult {
+    comptime explain: bool,
+) !if (explain) AggregateExplanation else MultiAggResult {
     if (args.inputs.len == 0) return error.NoInputs;
 
     var t: Timings = .{};
@@ -1636,7 +1757,7 @@ pub fn runMultiAggregate(
 
     // 3b. Bloom filters, before any worker decides a row group: every decision then reads the same footers.
     var membership_stats: membership.Stats = .{};
-    if (filter_opt) |f| if (probesMembership(args)) {
+    if (!explain) if (filter_opt) |f| if (probesMembership(args)) {
         const files = try arena.alloc([]const u8, args.inputs.len);
         for (args.inputs, files) |in, *b| b.* = in.bytes;
         const mapped: membership.MappedSource = .{ .files = files };
@@ -1687,7 +1808,7 @@ pub fn runMultiAggregate(
             const agg_len = chunk_starts[chunk_idx + 1] - agg_start;
 
             // Initialize accumulators for this chunk
-            const sub_accs = if (group_by_keys != null)
+            const sub_accs = if (explain or group_by_keys != null)
                 try arena.alloc(expr_agg.Accumulator, 0)
             else blk: {
                 const arr = try arena.alloc(expr_agg.Accumulator, agg_len);
@@ -1734,11 +1855,39 @@ pub fn runMultiAggregate(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
-    const workers = try arena.alloc(Worker, n_workers);
-    const count_columns: ?agg_plan.Columns = if (args.sketch_topk != null and group_by_keys != null)
+    const plan_inputs: PlanInputs = .{
+        .args = args,
+        .metas = metas,
+        .work = work_items.items,
+        .calls = agg_calls,
+        .keys = group_by_keys,
+        .outputs = group_outputs,
+        .filter_cols = plan.filter_cols,
+        .workers = n_workers,
+    };
+    const scan_plan = planAggregate(plan_inputs);
+    if (@import("builtin").is_test) try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
+    const decision = scan_plan.dispatch;
+    const count_columns: ?agg_plan.Columns = if (decision.count_columns)
         try plan.forCalls(arena, &.{})
     else
         null;
+    if (explain) {
+        const names = try arena.alloc([]const u8, plan.columns.read.len);
+        const labels = try metadata.leafLabels(arena, meta0);
+        for (labels.names, names, 0..) |label, *name, i| {
+            name.* = if (label) |n| try arena.dupe(u8, n) else try std.fmt.allocPrint(arena, "#{d}", .{i});
+        }
+        return .{
+            .plan = scan_plan,
+            .column_names = names,
+            .columns = plan.columns,
+            .count_columns = count_columns,
+            .workers = n_workers,
+            .work_items = work_items.items.len,
+        };
+    }
+    const workers = try arena.alloc(Worker, n_workers);
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -1767,14 +1916,13 @@ pub fn runMultiAggregate(
     // then one per fixed block of the work list, so which rows fold into which table, and the order the tables merge
     // in, doesn't depend on the number of workers or their timing (see `BlockMerge`).
     var block_bounds: ?[]usize = null;
-    const use_blocks = group_by_keys != null and !args.unordered and orderSensitive(agg_calls);
-    const n_tables: usize = if (group_by_keys == null) 0 else if (!use_blocks) n_workers else blk: {
-        const n_blocks = @max(1, @min(work_items.items.len, group_blocks_max));
-        const bounds = try arena.alloc(usize, n_blocks + 1);
-        for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_blocks;
+    const use_blocks = decision.use_blocks;
+    const n_tables = decision.tables;
+    if (use_blocks) {
+        const bounds = try arena.alloc(usize, n_tables + 1);
+        for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_tables;
         block_bounds = bounds;
-        break :blk n_blocks;
-    };
+    }
     const group_tables = try arena.alloc(expr_agg.GroupTable, n_tables);
     // Integer and float keys are a fixed-width image: the per-row lookup mixes those bytes in an open-addressed
     // table instead of copying each new key into a string map. String and decimal keys stay on that map.
@@ -1833,34 +1981,29 @@ pub fn runMultiAggregate(
         };
     }
 
-
     // 5. Spawn, join, propagate first error. Time the whole parallel
     //    region as one wall-clock span (real elapsed decode), separate
     //    from the per-worker CPU sum in `core.decode_ns`.
     const t_decode = nowMonoNs();
-    // The sketch's count arrays (one per worker) are not drawn from the GROUP BY budget, so it runs only where they are
-    // a small part of it.
-    const sketch_fits = if (args.sketch_topk) |cfg|
-        (n_workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
-    else
-        false;
-    const keys_unique = args.sketch_topk != null and keysLookUnique(metas, work_items.items, group_by_keys orelse &.{});
-    const sketch_count: ?usize = if (args.sketch_topk) |cfg| if (sketch_fits)
-        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks, keys_unique or
-            filterSmall(metas, work_items.items, group_by_keys orelse &.{}, plan.filter_cols))
-    else
-        null else null;
-    if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
+    if (decision.count_agg == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
         o.* = .ineligible;
     };
-    const first_cut = sketch_count == null and args.sketch_topk != null and args.sketch_topk.?.census and
-        firstCutEligible(args, use_blocks, work_items.items.len, group_tables.len);
-    if (first_cut) {
-        try firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, args.result_order, args.sketch_topk.?);
-    } else if (sketch_count) |a_idx| {
-        try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, args.result_order, a_idx, args.sketch_topk.?, args.max_memory, keys_unique);
-    } else {
-        runWorkers(workers);
+    const order = args.result_order;
+    switch (decision.strategy) {
+        .first_keys => try firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, order, args.sketch_topk.?),
+        .sketch => try sketchTopK(
+            gpa,
+            arena,
+            workers,
+            &work_cursor,
+            group_tables,
+            agg_calls,
+            order,
+            decision.count_agg.?,
+            args.sketch_topk.?,
+            decision,
+        ),
+        .scalar, .plain_hash => runWorkers(workers),
     }
     const t_decode_end = nowMonoNs();
     t.decode_wall_ns = @intCast(t_decode_end - t_decode);
@@ -7101,5 +7244,165 @@ test "runMultiAggregate: returned count(DISTINCT) sets no longer point at the sc
             try testing.expect(d.shared == null);
             if (d.parts) |parts| for (parts) |p| try testing.expect(p.shared == null);
         }
+    }
+}
+
+/// Frozen pre-planner dispatch, kept only for decision-equivalence tests. In particular, the census check is the
+/// executor's old check rather than a call back into the new chooser.
+fn referenceDispatch(in: PlanInputs) AggregateDispatch {
+    const args = in.args;
+    const use_blocks = in.keys != null and !args.unordered and orderSensitive(in.calls);
+    const blocks = @max(1, @min(in.work.len, group_blocks_max));
+    const tables: usize = if (in.keys == null) 0 else if (!use_blocks) in.workers else blocks;
+    const sketch_fits = if (args.sketch_topk) |cfg|
+        (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
+    else
+        false;
+    const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, in.keys orelse &.{});
+    const sketch_count: ?usize = if (args.sketch_topk) |cfg| if (sketch_fits)
+        sketchEligible(cfg, args, in.outputs, in.calls, in.keys orelse &.{}, in.filter_cols, use_blocks, keys_unique or
+            filterSmall(in.metas, in.work, in.keys orelse &.{}, in.filter_cols))
+    else
+        null else null;
+    const first_cut = sketch_count == null and args.sketch_topk != null and args.sketch_topk.?.census and
+        firstCutEligible(args, use_blocks, in.work.len, tables);
+    const census_fits = blk: {
+        if (in.work.len >= expr_agg.Census.max_items) break :blk false;
+        var rows: u64 = 0;
+        for (in.work) |item| {
+            if (item.agg_start != 0) break :blk false;
+            rows +|= @intCast(@max(0, in.metas[item.file].row_groups.items[item.rg].num_rows));
+        }
+        const open = in.workers * expr_agg.Census.N_PARTS * @sizeOf(expr_agg.Census.Chunk);
+        break :blk (rows *| 8) +| open <= args.max_memory / 4;
+    };
+    const census_allowed = sketch_count != null and args.sketch_topk.?.census and census_fits;
+    const fallback: @FieldType(AggregateDispatch, "strategy") = if (in.keys != null) .plain_hash else .scalar;
+    return .{
+        .strategy = if (first_cut) .first_keys else if (sketch_count != null) .sketch else fallback,
+        .use_blocks = use_blocks,
+        .tables = tables,
+        .count_columns = args.sketch_topk != null and in.keys != null,
+        .sketch_fits = sketch_fits,
+        .keys_unique = keys_unique,
+        .filter_small = args.sketch_topk != null and
+            filterSmall(in.metas, in.work, in.keys orelse &.{}, in.filter_cols),
+        .count_agg = sketch_count,
+        .census_allowed = census_allowed,
+        .census_fused = census_allowed and (args.sketch_topk.?.fuse_census orelse keys_unique),
+    };
+}
+
+test "planAggregate: frozen dispatch agrees across fixtures, knobs, filters and cuts" {
+    // The shared binder compares the frozen dispatch and planner; empty input bytes also forbid reading any pages.
+    spawn_util.injectFailureAfter(0);
+    defer spawn_util.resetFailure();
+    const fixtures = [_]struct { path: []const u8, keys: []const []const u8, filters: []const ?[]const u8 }{
+        .{
+            .path = "ci/fixtures/parquet/topk_skew.parquet",
+            .keys = &.{ "k", "n", "v", "k, n", "n + 1 AS shifted" },
+            .filters = &.{ null, "n < 12", "v > '10'", "k LIKE '%a%'" },
+        },
+        .{
+            .path = "ci/fixtures/parquet/census_topk.parquet",
+            .keys = &.{ "u", "t", "s", "u, s" },
+            .filters = &.{ null, "u > 300000000000", "s LIKE '%x%'" },
+        },
+    };
+    const configs = [_]?SketchTopK{
+        null,
+        .{},
+        .{ .cell_bits = 3 },
+        .{ .cell_bits = 8, .admit_per_row = 1 },
+        .{ .census = false },
+        .{ .fuse_census = true },
+        .{ .fuse_census = false },
+        .{ .certify = false, .census_fp_bits = 3, .census_check_rows = 64 },
+    };
+    const orders = [_]expr_ast.ResultOrder{
+        .{},
+        .{ .limit = 3 },
+        .{ .limit = 0 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+        .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 3 },
+        .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 3 },
+    };
+    var seen = std.EnumSet(@FieldType(AggregateDispatch, "strategy")){};
+    for (fixtures) |fixture| {
+        const bytes = (try loadFixture(fixture.path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer meta_arena.deinit();
+        const metas = [_]schema.FileMetaData{try metadata.open(meta_arena.allocator(), bytes)};
+        const inputs = [_]Input{.{ .name = fixture.path, .bytes = &.{} }};
+        for (fixture.keys) |key| for (fixture.filters) |filter| for (configs) |cfg| for (orders) |order| {
+            for ([_]usize{ 1, 3 }) |parallelism| for ([_]usize{ 1024, 512 << 20 }) |max_memory| {
+                var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena_state.deinit();
+                const explained = try explainAggregate(testing.allocator, arena_state.allocator(), .{
+                    .inputs = &inputs,
+                    .metas = &metas,
+                    .aggregate = "count(*) AS c",
+                    .group_by = key,
+                    .filter = filter,
+                    .parallelism = parallelism,
+                    .min_bytes_per_worker = 1,
+                    .sketch_topk = cfg,
+                    .result_order = order,
+                    .max_memory = max_memory,
+                });
+                seen.insert(explained.plan.dispatch.strategy);
+            };
+        };
+    }
+    for ([_]@FieldType(AggregateDispatch, "strategy"){ .plain_hash, .sketch, .first_keys }) |strategy|
+        try testing.expect(seen.contains(strategy));
+    try testing.expectEqual(@as(usize, 0), spawn_util.failuresInjected());
+}
+
+test "planAggregate: scalar, ordered blocks, empty work and gated input stay unchanged" {
+    const Gate = struct {
+        var marker: u8 = 0;
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            return error.UnexpectedPageRead;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            unreachable;
+        }
+    };
+    for ([_][]const u8{ "group_order", "no_row_groups" }) |fixture| {
+        var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer meta_arena.deinit();
+        const path = try std.fmt.allocPrint(meta_arena.allocator(), "ci/fixtures/parquet/{s}.parquet", .{fixture});
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const metas = [_]schema.FileMetaData{try metadata.open(meta_arena.allocator(), bytes)};
+        for ([_]bool{ false, true }) |gated| for ([_]bool{ false, true }) |unordered| {
+            for ([_]bool{ false, true }) |grouped| for ([_]bool{ false, true }) |scan_all| {
+                var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena_state.deinit();
+                const inputs = [_]Input{.{ .name = path, .bytes = &.{}, .gate = if (gated)
+                    .{ .ctx = &Gate.marker, .wait = Gate.wait, .done = Gate.done }
+                else
+                    null }};
+                const has_float = std.mem.eql(u8, fixture, "group_order");
+                const explained = try explainAggregate(testing.allocator, arena_state.allocator(), .{
+                    .inputs = &inputs,
+                    .metas = &metas,
+                    .aggregate = if (has_float) "count(*) AS c, sum(x) AS s" else "count(*) AS c",
+                    .group_by = if (grouped) (if (std.mem.eql(u8, fixture, "group_order")) "k" else "s") else null,
+                    .parallelism = 3,
+                    .min_bytes_per_worker = 1,
+                    .sketch_topk = .{},
+                    .result_order = .{ .limit = 3 },
+                    .unordered = unordered,
+                    .scan_all = scan_all,
+                });
+                if (!grouped) try testing.expectEqual(.scalar, explained.plan.dispatch.strategy);
+                if (gated) try testing.expect(explained.plan.dispatch.count_agg == null);
+                if (grouped and !unordered and std.mem.eql(u8, fixture, "group_order"))
+                    try testing.expect(explained.plan.dispatch.use_blocks);
+            };
+        };
     }
 }

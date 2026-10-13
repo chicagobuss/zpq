@@ -44,12 +44,12 @@ const usage_text =
     \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
     \\            [--bloom-filter COL[:FPP] ...]
     \\            [--format csv|jsonl] [--limit N]
-    \\            [--profile TRACE.json] [--profile-summary[=text|json]]
+    \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
     \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
     \\            [--compress-priority size|speed]
     \\            [--scan-all] [--trust-stats]
-    \\            [--profile TRACE.json] [--profile-summary[=text|json]]
+    \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq schema <file.parquet>
     \\  zpq conform <file.parquet>
     \\
@@ -100,6 +100,8 @@ const usage_text =
     \\                 time. Output contents are identical; row-group
     \\                 boundaries may depend on --max-memory (and -j) for
     \\                 filtered or computed writes.
+    \\  --explain      print an aggregate plan as JSON using only file footers;
+    \\                 accepts SQL or --aggregate / --group-by, then exits.
     \\  --profile      write a Chrome Trace Event JSON trace of the query
     \\                 (open it at https://ui.perfetto.dev): per-thread spans
     \\                 for every phase, in-flight counters, RSS.
@@ -329,6 +331,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     var columns_csv: ?[]const u8 = null;
     var select: ?[]const u8 = null;
     var aggregate: ?[]const u8 = null;
+    var explain: bool = false;
     var query: ?[]const u8 = null;
     var codec: ?schema.CompressionCodec = null;
     var compress_priority: engine.CompressPriority = .size;
@@ -374,6 +377,8 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
                 std.debug.print("zpq query: --select requires a value\n", .{});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--explain")) {
+            explain = true;
         } else if (std.mem.eql(u8, tok, "--aggregate") or std.mem.eql(u8, tok, "-a")) {
             aggregate = iter.next() orelse {
                 std.debug.print("zpq query: --aggregate requires a value\n", .{});
@@ -605,6 +610,36 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         const opts = zpq.profile.Options.forBudget(max_mem_limit);
         profiler = try zpq.profile.Profiler.create(gpa, opts, meta);
         engine_max_mem = max_mem_limit -| opts.reservedBytes();
+    }
+
+    if (explain) {
+        if (aggregate == null and group_by == null) {
+            std.debug.print("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});
+            return error.BadArgs;
+        }
+        const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
+            .inputs = inputs,
+            .output = output,
+            .filter = filter,
+            .aggregate = aggregate orelse "",
+            .parallelism = parallelism,
+            .scan_all = scan_all,
+            .trust_stats = trust_stats,
+            .fast_levels = fast_levels,
+            .unordered = unordered,
+            .max_memory = engine_max_mem,
+            .group_by = group_by,
+            .select_cols = select_cols,
+            .result_order = result_order,
+            .column_order = column_order,
+            .diag = diag,
+            .profiler = profiler,
+        });
+        var ws: StdoutWriter = .{ .fd = 1 };
+        defer ws.flush();
+        try engine.writeAggregateExplanationJson(&ws, explanation);
+        if (profiler) |p| try profile_out.emit(gpa, io, p);
+        return;
     }
 
     if (format) |fmt| {

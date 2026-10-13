@@ -15,6 +15,15 @@ pub fn close(fd: fd_t) void {
     _ = posix.system.close(fd);
 }
 
+/// A successful output must surface delayed write failures; never retry close on a reused descriptor.
+pub fn closeChecked(fd: fd_t) !void {
+    switch (posix.errno(posix.system.close(fd))) {
+        .SUCCESS => {},
+        .NOSPC, .DQUOT => return error.NoSpaceLeft,
+        else => return error.CloseFailed,
+    }
+}
+
 pub fn openRead(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 }
@@ -61,13 +70,15 @@ pub fn fileSize(fd: fd_t) !usize {
     return @intCast(end);
 }
 
-pub fn writeAll(fd: fd_t, bytes: []const u8) error{WriteFailed}!void {
+pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoSpaceLeft }!void {
     var i: usize = 0;
     while (i < bytes.len) {
         const rc = posix.system.write(fd, bytes[i..].ptr, bytes.len - i);
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
+            .PIPE => return error.BrokenPipe,
+            .NOSPC, .DQUOT => return error.NoSpaceLeft,
             else => return error.WriteFailed,
         }
         const n: usize = @intCast(rc);
@@ -206,4 +217,15 @@ test "mapFile rejects an empty file" {
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/empty", .{tmp.sub_path});
     close(try createFile(path));
     try testing.expectError(error.EmptyFile, mapFile(path));
+}
+
+test "writeAll distinguishes a full device from a broken pipe" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const fd = try posix.openat(posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
+    defer close(fd);
+    try testing.expectError(error.NoSpaceLeft, writeAll(fd, "x"));
+    const pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    close(pipe[0]);
+    defer close(pipe[1]);
+    try testing.expectError(error.BrokenPipe, writeAll(pipe[1], "x"));
 }

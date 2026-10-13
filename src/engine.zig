@@ -2190,13 +2190,17 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     t.footer_ns += @intCast(nowMonoNs() - t_footer);
     footer_span.end(.footer_write, profile.args(.{footer_bytes.len + 8}));
 
-    // 7. Close s3 multipart upload (commits the parts). Local fd
-    //     closes via defer.
+    // Publish only after the sink has reported completion.
     if (mp_sink) |*ms| {
         try ms.close();
         const mp_stats = ms.snapshotStats();
         t.mp_complete_ns = mp_stats.complete_ns;
         t.mp_await_ns = mp_stats.await_ns;
+    }
+
+    if (sink_owns_fd) {
+        sink_owns_fd = false;
+        try local_fs.closeChecked(fd_sink.fd);
     }
 
     return .{
@@ -4019,7 +4023,8 @@ fn writeOneRowParquet(
     zstd: compression.ZstdPlan,
 ) !u64 {
     const fd = try createFile(out_path);
-    defer local_fs.close(fd);
+    var fd_open = true;
+    defer if (fd_open) local_fs.close(fd);
     errdefer local_fs.removeFile(out_path);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
@@ -4030,6 +4035,8 @@ fn writeOneRowParquet(
         for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
     }
     const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, 1, codec, zstd);
+    fd_open = false;
+    try local_fs.closeChecked(fd);
     return written;
 }
 
@@ -4073,10 +4080,14 @@ fn writeGroupedParquet(
     };
 
     const fd = try createFile(out_path);
-    defer local_fs.close(fd);
+    var fd_open = true;
+    defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
-    return consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd);
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd);
+    fd_open = false;
+    try local_fs.closeChecked(fd);
+    return written;
 }
 
 /// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a
@@ -4286,7 +4297,7 @@ pub const StdoutWriter = struct {
         if (self.pos == 0) return;
         const pending = self.buf[0..self.pos];
         self.pos = 0;
-        local_fs.writeAll(self.fd, pending) catch return error.BrokenPipe;
+        try local_fs.writeAll(self.fd, pending);
     }
 };
 
@@ -4784,12 +4795,7 @@ fn flushAggregator(
 }
 
 pub fn runPrint(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
-    runPrintInternal(ctx, args, format, limit) catch |err| {
-        if (err == error.BrokenPipe) {
-            return;
-        }
-        return err;
-    };
+    try runPrintInternal(ctx, args, format, limit);
 }
 
 fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
@@ -4955,6 +4961,8 @@ fn runPrintInternal(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?
             consumer.resetAggregator(&agg);
         }
     }
+
+    try stdout_writer.flush();
 
     // JSON envelope to stderr
     var stderr_writer = StdoutWriter{ .fd = 2 };

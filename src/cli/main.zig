@@ -118,25 +118,29 @@ pub fn main(init: std.process.Init) !void {
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
         var ws: StdoutWriter = .{};
-        defer ws.flush();
+        defer ws.flush() catch {};
         try ws.writeAll(usage_text);
+        try ws.flush();
         return;
     };
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
         var ws: StdoutWriter = .{};
-        defer ws.flush();
+        defer ws.flush() catch {};
         try ws.writeAll(usage_text);
+        try ws.flush();
         return;
     }
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V") or std.mem.eql(u8, cmd, "version")) {
         var ws: StdoutWriter = .{};
-        defer ws.flush();
+        defer ws.flush() catch {};
         try ws.print("zpq {s}\n", .{build_options.version});
+        try ws.flush();
         return;
     }
     if (std.mem.eql(u8, cmd, "query")) {
         var diag: Diag = .{};
         runQuery(init, &iter, &diag) catch |err| {
+            if (err == error.BrokenPipe) std.process.exit(141);
             printDetail(&diag);
             switch (err) {
                 error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
@@ -294,9 +298,9 @@ pub fn main(init: std.process.Init) !void {
                     "zpq query: --bloom-filter applies to written rows, not to an aggregate\n",
                     .{},
                 ),
-                else => return err,
+                else => std.debug.print("zpq query: {s}\n", .{@errorName(err)}),
             }
-            std.process.exit(1);
+            std.process.exit(queryExitCode(err));
         };
         return;
     }
@@ -354,8 +358,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     while (iter.next()) |tok| {
         if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
             var ws: StdoutWriter = .{};
-            defer ws.flush();
+            defer ws.flush() catch {};
             try ws.writeAll(usage_text);
+            try ws.flush();
             return;
         } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
             output = iter.next() orelse {
@@ -590,6 +595,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         }
     }
     const inputs = inputs_list.items;
+    var publication: OutputPublication = .{};
+    defer publication.abort();
+    const engine_output = if (explain) output else try publication.prepare(io, output, inputs);
     const max_mem_limit = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
 
     var profiler: ?*zpq.profile.Profiler = null;
@@ -619,7 +627,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         }
         const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
             .inputs = inputs,
-            .output = output,
+            .output = engine_output,
             .filter = filter,
             .aggregate = aggregate orelse "",
             .parallelism = parallelism,
@@ -636,8 +644,9 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .profiler = profiler,
         });
         var ws: StdoutWriter = .{ .fd = 1 };
-        defer ws.flush();
+        defer ws.flush() catch {};
         try engine.writeAggregateExplanationJson(&ws, explanation);
+        try ws.flush();
         if (profiler) |p| try profile_out.emit(gpa, io, p);
         return;
     }
@@ -686,7 +695,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .exit_after = true,
         }, .{
             .inputs = inputs,
-            .output = output,
+            .output = engine_output,
             .filter = filter,
             .aggregate = agg_str,
             .codec = codec,
@@ -706,12 +715,13 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             .profiler = profiler,
         });
         defer result.deinit(gpa);
+        try publication.commit();
         const ar = result.aggregate;
         const answer = ar.output;
         const total_ns_a = nowMonoNs() - t_start_a;
 
         var ws: StdoutWriter = .{ .fd = 1 };
-        defer ws.flush();
+        defer ws.flush() catch {};
         try ws.print("{{\"ok\":true,\"files_in\":{d}", .{ar.files_in});
         if (ar.files_in == 1) {
             try ws.print(",\"input\":\"", .{});
@@ -776,7 +786,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             },
         );
         // The answer first, then the profile (stderr): flush stdout before the summary goes out.
-        ws.flush();
+        try ws.flush();
         if (profiler) |p| try profile_out.emit(gpa, io, p);
         return;
     }
@@ -799,7 +809,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .exit_after = true,
     }, .{
         .inputs = inputs,
-        .output = out,
+        .output = engine_output,
         .filter = filter,
         .columns = cols,
         .select = select,
@@ -815,12 +825,13 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .diag = diag,
         .profiler = profiler,
     })).write;
+    try publication.commit();
     const in = inputs[0]; // first input — used in the JSON envelope below
     const total_ns = nowMonoNs() - t_start;
 
     // JSON envelope to stderr — same shape as the Lambda response.
     var w: StdoutWriter = .{ .fd = 2 };
-    defer w.flush();
+    defer w.flush() catch {};
     try w.print(
         \\{{"ok":true,"input":"
     , .{});
@@ -855,11 +866,75 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         result.timings.core.sink_ns / std.time.ns_per_ms,
         result.timings.footer_ns / std.time.ns_per_ms,
     });
+    try w.flush();
     if (profiler) |p| {
-        w.flush();
+        try w.flush();
         try profile_out.emit(gpa, io, p);
     }
 }
+
+fn queryExitCode(err: anyerror) u8 {
+    return switch (err) {
+        error.BrokenPipe => 141,
+        error.BadArgs, error.NoInputs, error.NoMatches, error.SqlNotCompiledIn, error.UnknownColumn, error.UnknownFunction, error.UnknownAggFunc, error.WrongArity, error.EmptyExpr, error.EmptyAggregate, error.EmptyColumnList, error.UnexpectedChar, error.UnexpectedEnd, error.BadNumber, error.UnterminatedString, error.TypeMismatch, error.ExpectedLParen, error.ExpectedRParen, error.ExpectedIdentifier, error.ExpectedWhere, error.ExpectedAggFunc, error.StarOnlyValidInCount, error.TrailingTokens, error.BadAggArg, error.AggregateMutexWithSelect, error.DuplicateOutputColumn, error.AmbiguousOutputColumn, error.AmbiguousColumn, error.ExpressionTooDeep, error.GroupKeyAliasRequired => 2,
+        else => 1,
+    };
+}
+
+// Publication belongs to the CLI: service callers retain their own destination lifecycle.
+const OutputPublication = struct {
+    target: ?[]const u8 = null,
+    buffer: [std.fs.max_path_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn path(self: *const OutputPublication) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn prepare(self: *OutputPublication, io: std.Io, output: ?[]const u8, inputs: []const []const u8) !?[]const u8 {
+        const target = output orelse return null;
+        if (std.mem.startsWith(u8, target, "s3://")) {
+            for (inputs) |input| if (std.mem.eql(u8, input, target)) return error.BadArgs;
+            return target;
+        }
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.statFile(io, target, .{})) |st| {
+            if (st.kind != .file) {
+                std.debug.print("zpq query: output must be a regular file\n", .{});
+                return error.BadArgs;
+            }
+            for (inputs) |input| {
+                if (std.mem.startsWith(u8, input, "s3://")) continue;
+                const ist = cwd.statFile(io, input, .{}) catch continue;
+                if (st.inode == ist.inode) {
+                    std.debug.print("zpq query: input and output must be different files\n", .{});
+                    return error.BadArgs;
+                }
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        const pid: u32 = @bitCast(std.posix.system.getpid());
+        const tmp = try std.fmt.bufPrint(&self.buffer, "{s}.{d}.zpq-tmp", .{ target, pid });
+        const fd = try local_fs.createNewFile(tmp);
+        self.len = tmp.len;
+        self.target = target;
+        try local_fs.closeChecked(fd);
+        return self.path();
+    }
+
+    fn commit(self: *OutputPublication) !void {
+        const target = self.target orelse return;
+        try local_fs.rename(self.path(), target);
+        self.target = null;
+    }
+
+    fn abort(self: *OutputPublication) void {
+        if (self.target != null) local_fs.removeFile(self.path());
+        self.target = null;
+    }
+};
 
 /// Where `--profile` and `--profile-summary` send a finished profile.
 const ProfileOut = struct {
@@ -952,8 +1027,9 @@ const ProfileOut = struct {
                 },
             }
             var w: StdoutWriter = .{ .fd = 2 };
-            defer w.flush();
+            defer w.flush() catch {};
             try w.writeAll(aw.written());
+            try w.flush();
         }
     }
 };
@@ -1142,7 +1218,7 @@ fn runConform(gpa: std.mem.Allocator, path: []const u8) !void {
     };
 
     var w: StdoutWriter = .{};
-    defer w.flush();
+    defer w.flush() catch {};
 
     try w.writeAll("{\"path\":\"");
     try writeJsonString(&w, path);
@@ -1266,7 +1342,7 @@ fn decodeOne(
 
 fn jsonFatal(gpa: std.mem.Allocator, kind: []const u8, reason: []const u8) !void {
     var w: StdoutWriter = .{};
-    defer w.flush();
+    defer w.flush() catch {};
     _ = gpa;
     try w.writeAll("{\"error\":\"");
     try writeJsonString(&w, kind);
@@ -1332,10 +1408,8 @@ const StdoutWriter = struct {
         try self.getInner().writeByte(c);
     }
 
-    pub fn flush(self: *StdoutWriter) void {
-        if (self.inner) |*in| {
-            in.flush() catch {};
-        }
+    pub fn flush(self: *StdoutWriter) !void {
+        if (self.inner) |*in| try in.flush();
     }
 };
 
@@ -1438,7 +1512,7 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
     }
 
     var ws: StdoutWriter = .{};
-    defer ws.flush();
+    defer ws.flush() catch {};
 
     var codec_name: []const u8 = "UNCOMPRESSED";
     if (meta.row_groups.items.len > 0 and meta.row_groups.items[0].columns.items.len > 0) {

@@ -3892,6 +3892,11 @@ pub const GroupTable = struct {
         return self.fixed_keys[g * s ..][0..s];
     }
 
+    /// The hash a sketch or census routes group `g`'s key by.
+    pub fn routeHash(self: *const GroupTable, g: usize) u64 {
+        return if (self.fixed_stride != 0) hashFixed(self.keyAt(g)) else sketchHash(self.keyAt(g));
+    }
+
     pub fn findKey(self: *const GroupTable, key: []const u8) ?u32 {
         if (self.fixed_stride == 0) return self.map.get(key);
         if (key.len == self.fixed_stride) return self.findFixed(key, hashFixed(key));

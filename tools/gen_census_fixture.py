@@ -8,6 +8,7 @@ Columns:
   u  int64, unique but for three keys seen twice: a cut of 10 ties at 1
   t  int64, four keys seen five times and twelve seen three times, the rest once: a cut of 10 ties at 3
   s  utf8, u spelled as a 20-byte string (past the 16 bytes an unframed sketch key needs)
+  n  int64, NULL through the first row group and 1 after: count(n) gives the first keys to appear 0
 
 Usage:  .venv/bin/python tools/gen_census_fixture.py
 """
@@ -37,7 +38,13 @@ def main() -> None:
     t += rng.sample(range(1, 10**8), n - len(t))
     rng.shuffle(t)
     s = [f"key-{v:015d}" for v in u]
-    table = pa.table({"u": pa.array(u, pa.int64()), "t": pa.array(t, pa.int64()), "s": pa.array(s, pa.string())})
+    nulls = [None] * ROWS_PER_GROUP + [1] * (n - ROWS_PER_GROUP)
+    table = pa.table({
+        "u": pa.array(u, pa.int64()),
+        "t": pa.array(t, pa.int64()),
+        "s": pa.array(s, pa.string()),
+        "n": pa.array(nulls, pa.int64()),
+    })
     pq.write_table(table, OUT, row_group_size=ROWS_PER_GROUP, use_dictionary=False, compression="snappy")
     print(f"wrote {OUT}")
 

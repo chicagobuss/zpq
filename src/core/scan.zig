@@ -1143,7 +1143,7 @@ const CensusTask = struct {
 /// whose fingerprint totals at least `t`, the k-th largest fingerprint total. A key left out totals below `t`, so
 /// when the k-th largest grouped total reaches `t`, every group the cut keeps, ties at the cut included, is grouped.
 ///
-/// When `t` is 2 and the cut orders by the count alone, the admit pass also groups every key asked for in a prefix of
+/// When `t` is 2 and the cut orders by a plain count(*) alone, the admit pass also groups every key asked for in a prefix of
 /// the input holding at least k rows of keys seen once. Every key left out is then a single row asked for later
 /// than those, and a tie at the cut keeps the first to appear, so the cut is certified at a tie of 1 too.
 /// Grouping a key from the prefix is exact, as it has one row. Returns false, with the tables empty, when the census
@@ -1207,7 +1207,10 @@ fn censusTopK(
 
     const items = repeats.items;
     const t: u64 = if (items.len >= k) items[k - 1].count else 2;
-    const prefix = t == 2 and order.keys.len == 1;
+    // The census counts rows, so only a plain count(*) gives each early row's key exactly 1; a count of a column or
+    // under FILTER can give it 0, and must certify by the totals.
+    const call = calls[a_idx];
+    const prefix = t == 2 and order.keys.len == 1 and call.arg == null and call.where == null;
     var n_admit: usize = 0;
     var admit_rows: u64 = 0;
     while (n_admit < items.len and items[n_admit].count >= t) : (n_admit += 1) admit_rows += items[n_admit].count;
@@ -1284,6 +1287,107 @@ fn censusTopK(
     for (workers) |*w| w.skip = null;
     clearTables(gpa, tables);
     return false;
+}
+
+/// A LIMIT with no ORDER BY over a grouped scan of whole inputs (`firstKeysCut`).
+fn firstCutEligible(args: MultiAggArgs, use_blocks: bool, n_items: usize, n_tables: usize) bool {
+    const order = args.result_order;
+    const limit = order.limit orelse return false;
+    if (use_blocks or n_tables == 0 or order.keys.len != 0 or order.offset +| limit == 0) return false;
+    if (n_items == 0 or n_items >= expr_agg.Census.max_items) return false;
+    for (args.inputs) |in| if (in.gate != null) return false;
+    return true;
+}
+
+/// A LIMIT with no ORDER BY returns the first `k = offset + limit` groups to appear, so only those need their
+/// aggregates. A discovery pass groups the first work items, twice as many each time, until k keys have appeared; the
+/// k-th key's first row ends a prefix, which holds exactly the first k keys. The admit pass then groups every row of
+/// the prefix, and every later row whose key's fingerprint is one of the k (`expr_agg.Census`, admitting). A key that
+/// shares a fingerprint with one of them gets a group too, but it first appears after the prefix, so the cut never
+/// keeps it. When the discovery has read everything, its tables are the answer.
+fn firstKeysCut(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    workers: []Worker,
+    cursor: *std.atomic.Value(usize),
+    tables: []expr_agg.GroupTable,
+    order: expr_ast.ResultOrder,
+    cfg: SketchTopK,
+) !void {
+    const k: usize = @intCast(order.offset +| order.limit.?);
+    const work = workers[0].work;
+    const saved = try arena.dupe(Worker, workers);
+    const skip = try arena.alloc(bool, work.len);
+    defer for (workers) |*w| {
+        w.skip = null;
+    };
+    const First = struct { first: u64, table: usize, g: u32 };
+    var firsts: std.ArrayList(First) = .empty;
+    defer firsts.deinit(gpa);
+    var m: usize = 1;
+    while (true) : (m *|= 2) {
+        for (skip, 0..) |*sk, i| sk.* = i >= m;
+        for (workers) |*w| w.skip = if (m >= work.len) null else skip;
+        restoreCounts(workers, saved);
+        try runPhase(workers, cursor);
+        if (m >= work.len) {
+            if (cfg.trace) std.debug.print("first: discovery read everything\n", .{});
+            return;
+        }
+        // Each key's first appearance over every table.
+        var seen: std.StringArrayHashMapUnmanaged(First) = .empty;
+        defer seen.deinit(gpa);
+        for (tables, 0..) |*t, ti| for (0..t.groupCount()) |g| {
+            const e = try seen.getOrPut(gpa, t.keyAt(g));
+            const f: First = .{ .first = t.first.items[g], .table = ti, .g = @intCast(g) };
+            if (!e.found_existing or f.first < e.value_ptr.first) e.value_ptr.* = f;
+        };
+        if (seen.count() < k) {
+            clearTables(gpa, tables);
+            continue;
+        }
+        firsts.clearRetainingCapacity();
+        try firsts.appendSlice(gpa, seen.values());
+        break;
+    }
+    std.mem.sortUnstable(First, firsts.items, {}, struct {
+        fn earlier(_: void, a: First, b: First) bool {
+            return a.first < b.first;
+        }
+    }.earlier);
+    const last = firsts.items[k - 1].first;
+
+    const censuses = try arena.alloc(expr_agg.Census, workers.len);
+    for (censuses) |*c| c.* = .{ .gpa = gpa, .item_rows = &.{}, .prefix_item = last >> 32, .prefix_row = (last & 0xffff_ffff) + 1 };
+    defer for (censuses) |*c| c.deinit();
+    var set: expr_agg.FingerprintSet = .{ .filter = undefined, .map = .empty };
+    defer set.map.deinit(gpa);
+    const filter = try gpa.alloc(u64, (1 << expr_agg.FingerprintSet.filter_bits) / 64);
+    defer gpa.free(filter);
+    @memset(filter, 0);
+    try set.map.ensureTotalCapacity(gpa, @intCast(k));
+    for (firsts.items[0..k]) |f| {
+        const fp = censuses[0].fingerprint(tables[f.table].routeHash(f.g));
+        set.map.putAssumeCapacity(fp, {});
+        const b = fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
+        filter[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+    }
+    set.filter = filter;
+    for (censuses) |*c| c.admitted = &set;
+
+    var no_cells = [1]u32{0};
+    const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
+    for (sketches, censuses) |*s, *c| s.* = .{ .cells = &no_cells, .shift = 63, .census = c };
+    clearTables(gpa, tables);
+    for (tables, sketches) |*t, *s| t.sketch = s;
+    defer for (tables) |*t| {
+        t.sketch = null;
+    };
+    for (workers) |*w| w.skip = null;
+    restoreCounts(workers, saved);
+    const t0 = nowMonoNs();
+    try runPhase(workers, cursor);
+    if (cfg.trace) std.debug.print("first: discovery_items={d} admit_ms={d}\n", .{ m, @divTrunc(nowMonoNs() - t0, 1_000_000) });
 }
 
 /// Puts back the row and row-group counts a discarded pass added.
@@ -1662,7 +1766,11 @@ pub fn runMultiAggregate(
     if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
         o.* = .ineligible;
     };
-    if (sketch_count) |a_idx| {
+    const first_cut = sketch_count == null and args.sketch_topk != null and args.sketch_topk.?.census and
+        firstCutEligible(args, use_blocks, work_items.items.len, group_tables.len);
+    if (first_cut) {
+        try firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, args.result_order, args.sketch_topk.?);
+    } else if (sketch_count) |a_idx| {
         try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, args.result_order, a_idx, args.sketch_topk.?, args.max_memory, keys_unique);
     } else {
         runWorkers(workers);
@@ -4216,16 +4324,20 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
         .{ .census = false },
     };
     var seen = std.EnumSet(Outcome){};
-    for ([_][]const u8{ "u", "t", "s" }) |key| for ([_]?[]const u8{ null, "u > 300000000000" }) |filter| {
+    // A count of a column, or under FILTER, can give the first keys to appear 0 (`n` is NULL through the first row
+    // group): the census counts rows, an upper bound only.
+    const counts = [_][]const u8{ "count(*) AS c", "count(n) AS c", "count(*) FILTER (WHERE n = 1) AS c" };
+    for ([_][]const u8{ "u", "t", "s" }) |key| for ([_]?[]const u8{ null, "u > 300000000000" }) |filter| for (counts) |count| {
         for ([_]usize{ 1, 3 }) |parallelism| for (cuts) |cut| for (configs) |cfg_in| {
             var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            const select_cols = try selectList(arena, &.{ key, "count(*) AS c", "min(s) AS lo", "sum(t) AS st" });
+            const select_cols = try selectList(arena, &.{ key, count, "min(s) AS lo", "sum(t) AS st" });
+            const aggregate = try std.fmt.allocPrint(arena, "{s}, min(s) AS lo, sum(t) AS st", .{count});
             var args: MultiAggArgs = .{
                 .inputs = &inputs,
                 .filter = if (filter != null and std.mem.eql(u8, key, "u")) filter else null,
-                .aggregate = "count(*) AS c, min(s) AS lo, sum(t) AS st",
+                .aggregate = aggregate,
                 .group_by = key,
                 .select_cols = select_cols,
                 .parallelism = parallelism,
@@ -4282,6 +4394,86 @@ test "runMultiAggregate: a sketched COUNT cut frees everything on any allocation
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     for ([_]bool{ true, false }) |certify| {
         try testing.checkAllAllocationFailures(fixed.allocator(), runSketchedAndFree, .{ &inputs, &meta, certify });
+    }
+}
+
+test "runMultiAggregate: a LIMIT with no ORDER BY answers as the full scan through the first-keys cut" {
+    for ([_][]const u8{ "ci/fixtures/parquet/topk_skew.parquet", "ci/fixtures/parquet/census_topk.parquet" }) |path| {
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+        const census = std.mem.indexOf(u8, path, "census") != null;
+        const keys: []const []const u8 = if (census) &.{ "u", "t", "s", "t, u" } else &.{ "k", "n", "v", "k, n" };
+        const filter: []const u8 = if (census) "u > 300000000000" else "n < 12";
+        for (keys) |key| for ([_]?[]const u8{ null, filter }) |f| for ([_]usize{ 1, 3 }) |parallelism| {
+            // Within one row group, past it (the discovery doubles), past every key, and none.
+            for ([_]expr_ast.ResultOrder{
+                .{ .limit = 10 },
+                .{ .limit = 4, .offset = 7 },
+                .{ .limit = 1500 },
+                .{ .limit = 30000 },
+                .{ .limit = 0 },
+            }) |cut| {
+                var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const agg = if (census) "count(*) AS c, min(s) AS lo, sum(t) AS st" else "count(*) AS c, min(v) AS lo";
+                var args: MultiAggArgs = .{
+                    .inputs = &inputs,
+                    .filter = f,
+                    .aggregate = agg,
+                    .group_by = key,
+                    .parallelism = parallelism,
+                    .min_bytes_per_worker = 1,
+                    .result_order = cut,
+                };
+                var want = try runMultiAggregate(testing.allocator, arena, args);
+                defer want.deinit(testing.allocator);
+                args.sketch_topk = .{};
+                var got = try runMultiAggregate(testing.allocator, arena, args);
+                defer got.deinit(testing.allocator);
+                try testing.expectEqual(want.rows_in, got.rows_in);
+                try testing.expectEqual(want.rows_kept, got.rows_kept);
+                try want.output.applyResultOrder(testing.allocator, cut);
+                try got.output.applyResultOrder(testing.allocator, cut);
+                const w = want.output.group_rows.?;
+                const g = got.output.group_rows.?;
+                try testing.expectEqual(w.len, g.len);
+                for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
+            }
+        };
+    }
+}
+
+fn runFirstCutAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData, limit: u64) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var res = try runMultiAggregate(gpa, arena_state.allocator(), .{
+        .inputs = inputs,
+        .metas = meta[0..1],
+        .aggregate = "count(*) AS c, min(s) AS lo",
+        .group_by = "n",
+        .parallelism = 1,
+        .result_order = .{ .limit = limit },
+        .sketch_topk = .{},
+    });
+    res.deinit(gpa);
+}
+
+test "runMultiAggregate: a first-keys cut frees everything on any allocation failure" {
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    var meta = try metadata.open(meta_arena.allocator(), bytes);
+    // Three row groups of key `n`: NULL through the first, 1 after. A cut of 1 ends inside the first; one of 2 makes
+    // the discovery read two, then the admit pass reads the third; one of 3 has the discovery read everything.
+    meta.row_groups.items.len = 3;
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    for ([_]u64{ 1, 2, 3 }) |limit| {
+        try testing.checkAllAllocationFailures(fixed.allocator(), runFirstCutAndFree, .{ &inputs, &meta, limit });
     }
 }
 

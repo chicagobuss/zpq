@@ -430,7 +430,12 @@ fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) !
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(err)});
+    // Sink details are CLI diagnostics; keep the public service/ABI error vocabulary stable.
+    const public_err = switch (err) {
+        error.NoSpaceLeft, error.BrokenPipe, error.CloseFailed => error.WriteFailed,
+        else => err,
+    };
+    try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(public_err)});
     if (diag.column.len > 0) {
         try w.writeAll(",\"column\":");
         try engine.writeJsonQuoted(w, diag.column.get());
@@ -785,4 +790,12 @@ test "an engine error names the failed S3 request, its phase, and its error or s
     try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"CreateMultipartFailed\"," ++
         "\"s3\":{\"op\":\"CreateMultipartUpload\",\"phase\":\"response\",\"attempts\":1,\"status\":503," ++
         "\"code\":\"SlowDown\"}}", slow);
+}
+
+test "sink error details retain the service WriteFailed reason" {
+    for ([_]anyerror{ error.NoSpaceLeft, error.BrokenPipe, error.CloseFailed }) |err| {
+        const response = try engineError(std.testing.allocator, err, &.{});
+        defer std.testing.allocator.free(response);
+        try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"WriteFailed\"}", response);
+    }
 }

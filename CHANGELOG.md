@@ -11,6 +11,8 @@
   across formats and destinations; LIMIT 0 retains schema without decoding pages. Local outputs publish through a
   sibling temporary and atomic rename, preserving old targets on failure and rejecting input/output aliases.
   Checked flushes distinguish closed pipes (141) from disk-full failures (1); invalid or unsupported queries exit 2.
+  Overwrites preserve existing file modes; a destination symlink is replaced itself, leaving its referent untouched.
+  Scripts must replace `.agg` extraction with row parsing.
   CSV is reserved but deferred. The libzpq, service and Lambda response envelopes are unchanged.
 
 - DECIMAL is exact. `sum` / `min` / `max` / `avg` over DECIMAL columns and DECIMAL arithmetic (`+`, `-`, `*`, e.g.

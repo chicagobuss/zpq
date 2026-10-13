@@ -219,7 +219,9 @@ zpq query input.parquet --summary=json > rows.ndjson 2> diagnostics.ndjson
 
 A named `-o FILE` defaults to Parquet regardless of its extension and leaves stdout empty. Explicit `--format`
 overrides that default. `-o -` selects stdout and defaults to NDJSON; explicit Parquet also streams to stdout without
-`-o`. Binary stdout refuses a terminal. Existing S3 write support is unchanged; text formats, aggregate writes and limited Parquet S3 writes
+`-o`. Binary stdout refuses a terminal. Limited Parquet row output rejects nested leaves and INT96; unlimited passthrough preserves both.
+Parquet aggregate output rejects integer sums outside int64; text output retains exact i128 sums.
+Existing S3 write support is unchanged; text formats, aggregate writes and limited Parquet S3 writes
 are unsupported. `--explain` still prints one aggregate plan JSON object without executing or writing an answer,
 even when `-o` is supplied.
 

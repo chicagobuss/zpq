@@ -30,6 +30,26 @@ with tempfile.TemporaryDirectory(prefix="zpq-publication-") as d:
     os.link(src, alias)
     p = subprocess.run([binary, "query", str(src), "-o", str(alias)], capture_output=True)
     assert p.returncode == 2 and not p.stdout
+    for mode in (0o600, 0o444, 0o754):
+        dst.chmod(0o644)
+        dst.write_bytes(b"earlier")
+        dst.chmod(mode)
+        p = subprocess.run([binary, "query", str(src), "-o", str(dst)], capture_output=True)
+        assert p.returncode == 0 and not p.stdout, p.stderr
+        assert dst.stat().st_mode & 0o7777 == mode
+        assert pq.read_table(dst).num_rows == 3
+    referent = root / "referent"
+    referent.write_bytes(b"referent unchanged")
+    referent.chmod(0o600)
+    symlink = root / "link.parquet"
+    symlink.symlink_to(referent)
+    p = subprocess.run([binary, "query", str(src), "-o", str(symlink)], capture_output=True)
+    assert p.returncode == 0 and not p.stdout and not symlink.is_symlink(), p.stderr
+    assert referent.read_bytes() == b"referent unchanged"
+    assert symlink.stat().st_mode & 0o7777 == 0o600
+    assert pq.read_table(symlink).num_rows == 3
+    p = subprocess.run([binary, "query", "s3://bucket/input", "-o", "s3://bucket/input"], capture_output=True)
+    assert p.returncode == 2 and b"input and output" in p.stderr
     damaged = root / "damaged.parquet"
     pq.write_table(pa.table({"v": list(range(10_000))}), damaged, row_group_size=5_000,
                    use_dictionary=False)

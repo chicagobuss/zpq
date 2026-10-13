@@ -4,7 +4,6 @@ answer the same values with exact decimal parsing. The CLI and the Lambda are th
 fake runtime API in this process. Run from the repo root with ZPQ_LIB pointing at libzpq.so (tests/libzpq/run.sh does).
 """
 
-from decimal import Decimal
 import http.server
 import json
 import os
@@ -17,7 +16,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))
 import differential as corpus  # noqa: E402
-from cli_output import read_one
 import duckdb  # noqa: E402
 import zpq  # noqa: E402
 
@@ -145,9 +143,9 @@ def main():
             if not (lib.startswith('{"error"') and lam_resp.startswith('{"error"')):
                 failures.append(f"{label}: the CLI refused ({r.stderr.strip()[:60]}) but libzpq or the lambda answered")
             return
-        got = {"cli": read_one(r.stdout, parse_float=Decimal),
-               "lib": json.loads(agg_text(lib), parse_float=Decimal),
-               "lambda": json.loads(agg_text(lam_resp), parse_float=Decimal)}
+        got = {"cli": r.stdout.rstrip("\n"),
+               "lib": agg_text(lib),
+               "lambda": agg_text(lam_resp)}
         if not got["cli"] == got["lib"] == got["lambda"]:
             failures.append(f"{label}: agg differs: {got}")
 

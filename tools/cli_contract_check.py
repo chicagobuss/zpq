@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """CLI channels, destinations, limits, and publication checked with independent readers."""
 import io
+import datetime
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -115,6 +117,112 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
             p = run(poisoned, *args, '--limit', '0', '--format', fmt)
             if fmt == 'parquet':
                 assert pq.read_table(io.BytesIO(p.stdout)).num_rows == 0
+    # Exact numerics, widened sums, Float16 coercion, and nulls across every sink.
+    typed = root / 'typed.parquet'
+    typed_table = pa.table({
+        'wide': pa.array([2**63 - 1, 2**63 - 2, None], pa.int64()),
+        'd': pa.array([Decimal('1.10'), None, Decimal('-2.20')], pa.decimal128(12, 2)),
+        'big': pa.array([Decimal('12345678901234567890.123456789'), None, Decimal('0.000000001')],
+                        pa.decimal128(38, 9)),
+        'h': pa.array([1.5, None, -2.0], pa.float16()),
+    })
+    pq.write_table(typed_table, typed, row_group_size=2)
+
+    def exact_rows(body, fmt):
+        return json.loads(body, parse_float=Decimal) if fmt == 'json' else [
+            json.loads(line, parse_float=Decimal) for line in body.splitlines()]
+
+    def destinations(source, args, wanted, formats=('ndjson', 'json', 'parquet')):
+        for fmt in formats:
+            for dest in (None, '-', str(root / 'typed-answer')):
+                flags = [] if dest is None else ['-o', dest]
+                p = run(source, *args, '--format', fmt, *flags, '--summary=json')
+                body = p.stdout if dest in (None, '-') else Path(dest).read_bytes()
+                assert dest in (None, '-') or not p.stdout
+                summary = json.loads(p.stderr)
+                assert summary['codec'] == ('SNAPPY' if fmt == 'parquet' else None)
+                if fmt == 'parquet':
+                    got = pq.read_table(io.BytesIO(body)).to_pylist()
+                    strict = root / 'strict.parquet'
+                    strict.write_bytes(body)
+                    cur = con.execute(f"SELECT * FROM read_parquet('{strict}')")
+                    assert [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()] == wanted
+                else:
+                    got = exact_rows(body, fmt)
+                assert got == wanted, (source, args, fmt, dest, got, wanted)
+
+    for args, wanted in (([], typed_table.to_pylist()), (['--limit', '2'], typed_table.to_pylist()[:2]),
+                         (['--limit', '0'], [])):
+        destinations(typed, args, wanted)
+    destinations('--query', [f"SELECT * FROM '{typed}' LIMIT 2 OFFSET 1"], typed_table.to_pylist()[1:])
+    wide_sum = 2**64 - 3
+    scalar = [{'s': wide_sum, 'd': Decimal('-1.10')}]
+    for args, wanted in (([], scalar), (['--limit', '1'], scalar), (['--limit', '0'], [])):
+        destinations(typed, ['--aggregate', 'sum(wide) AS s, sum(d) AS d', *args], wanted, ('ndjson', 'json'))
+    destinations('--query', [f"SELECT sum(wide) AS s, sum(d) AS d FROM '{typed}' LIMIT 1 OFFSET 1"], [])
+    for args, wanted in (([], [{'d': Decimal('-1.10')}]), (['--limit', '1'], [{'d': Decimal('-1.10')}]),
+                         (['--limit', '0'], [])):
+        destinations(typed, ['--aggregate', 'sum(d) AS d', *args], wanted)
+    for args in ([], ['--limit', '1']):
+        for dest in (None, '-', str(root / 'wide-rejected')):
+            flags = [] if dest is None else ['-o', dest]
+            if dest not in (None, '-'):
+                Path(dest).write_bytes(b'earlier')
+            p = run(typed, '--aggregate', 'sum(wide) AS s', *args, '--format', 'parquet', *flags, code=2)
+            assert b'AggIntTooWide' in p.stderr and not p.stdout
+            assert dest in (None, '-') or Path(dest).read_bytes() == b'earlier'
+
+
+    # Unlimited passthrough retains nested trees and INT96. The limited row encoder
+    # must refuse those representations without replacing an earlier file.
+    nested, int96 = root / 'nested.parquet', root / 'int96.parquet'
+    nested_table = pa.table({'a': pa.array([{'v': 1}, None, {'v': 3}], pa.struct([('v', pa.int64())])),
+                            'b': pa.array([{'v': 10}, {'v': None}, {'v': 30}], pa.struct([('v', pa.int64())]))})
+    pq.write_table(nested_table, nested)
+    ts_table = pa.table({'t': pa.array([datetime.datetime(2020, 1, 1), None, datetime.datetime(1999, 12, 31)],
+                                     pa.timestamp('ns'))})
+    pq.write_table(ts_table, int96, use_deprecated_int96_timestamps=True)
+    for source, table_, reason in ((nested, nested_table, b'nested re-encoding'),
+                                   (int96, ts_table, b'INT96 re-encoding')):
+        text_rows = ([{'a.v': 1, 'b.v': 10}, {'a.v': None, 'b.v': None}, {'a.v': 3, 'b.v': 30}]
+                     if source == nested else [{'t': 1577836800000000000}, {'t': None}, {'t': 946598400000000000}])
+        for args, wanted in (([], text_rows), (['--limit', '2'], text_rows[:2]), (['--limit', '0'], [])):
+            destinations(source, args, wanted, ('ndjson', 'json'))
+        destinations('--query', [f"SELECT * FROM '{source}' LIMIT 2 OFFSET 1"], text_rows[1:], ('ndjson', 'json'))
+        for dest in (None, '-', str(root / 'passthrough')):
+            flags = [] if dest is None else ['-o', dest]
+            p = run(source, '--format', 'parquet', *flags)
+            body = p.stdout if dest in (None, '-') else Path(dest).read_bytes()
+            assert pq.read_table(io.BytesIO(body)).to_pylist() == table_.to_pylist()
+            strict = root / 'strict.parquet'
+            strict.write_bytes(body)
+            assert con.execute(f"SELECT count(*) FROM read_parquet('{strict}')").fetchone()[0] == 3
+        for args in (['--limit', '2'], ['--limit', '0']):
+            for dest in (None, '-', str(root / 'rejected')):
+                flags = [] if dest is None else ['-o', dest]
+                if dest not in (None, '-'):
+                    Path(dest).write_bytes(b'earlier')
+                p = run(source, *args, '--format', 'parquet', *flags, code=2)
+                assert reason in p.stderr and not p.stdout
+                assert dest in (None, '-') or Path(dest).read_bytes() == b'earlier'
+        for dest in (None, '-', str(root / 'rejected')):
+            flags = [] if dest is None else ['-o', dest]
+            p = run('--query', f"SELECT * FROM '{source}' LIMIT 2 OFFSET 1", '--format', 'parquet',
+                    *flags, code=2)
+            assert reason in p.stderr and not p.stdout
+
+    for args in (['--format', 'ndjson'], ['--format', 'json'], ['--limit', '1']):
+        p = run(src, '-o', str(root / 'bloom'), '--bloom-filter', 'k', *args, code=2)
+        assert b'--bloom-filter' in p.stderr
+    for sql in (f"SELECT * FROM '{src}'; SELECT * FROM '{src}'",
+                f"WITH x AS (SELECT * FROM '{src}') SELECT * FROM x",
+                f"SELECT * FROM '{src}' WHERE count(*) > 0"):
+        p = run('--query', sql, '--summary=json', code=2)
+        assert json.loads(p.stderr)['type'] == 'error'
+    p = subprocess.run([binary, 'schema', '--summary=json'], capture_output=True)
+    assert p.returncode != 0 and p.stderr
+    p = run('--query', '--summary=json', code=2)
+    assert p.stderr and not p.stderr.startswith(b'{"type":')
     master, slave = pty.openpty()
     try:
         p = subprocess.run([binary, 'query', str(src), '--format', 'parquet'], stdout=slave,

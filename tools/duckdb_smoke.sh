@@ -242,10 +242,11 @@ scan_all_parity "scan-all == default: RG-prune filter (id < 100)" \
 echo "C4.x stats-as-answer matrix (cell = default==scan-all OK + [stats|decode] verdict):"
 mrow() {
   local label="$1" agg="$2"
-  local zdef zsaw
-  zdef=$("$ZPQ" query "$F" --aggregate "$agg AS r" 2>/dev/null)
+  local zdef zsaw stats
+  stats=$(mktemp)
+  zdef=$("$ZPQ" query "$F" --aggregate "$agg AS r" --summary=json 2>"$stats")
   zsaw=$("$ZPQ" query "$F" --aggregate "$agg AS r" --scan-all 2>/dev/null)
-  if python3 - "$label" "$zdef" "$zsaw" <<'PY'
+  if python3 - "$label" "$zdef" "$zsaw" "$stats" <<'PY'
 import sys, json
 label, zdef, zsaw = sys.argv[1:4]
 try:
@@ -254,11 +255,13 @@ except Exception as e:
     print(f"  FAIL  {label:11} (bad json: {e})"); sys.exit(1)
 def norm(xs): return [round(float(x), 4) if isinstance(x, (int, float)) else str(x) for x in xs]
 agree = norm(list(a.values())) == norm(list(b.values()))
-verdict = "stats " if a.get("cols_stat_pruned", 0) > 0 else "decode"
+summary = json.load(open(sys.argv[4]))
+verdict = "stats " if summary["cols_stat_pruned"] > 0 else "decode"
 print(("  OK   " if agree else "  FAIL ") + f"{label:11} [{verdict}] = {list(a.values())}")
 sys.exit(0 if agree else 1)
 PY
   then :; else fail=1; fi
+  rm -f "$stats"
 }
 #     label          aggregate          (type)
 mrow "count(id)"   "count(id)"   # INT32

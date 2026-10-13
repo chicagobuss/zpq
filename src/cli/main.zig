@@ -58,6 +58,7 @@ const usage_text =
     \\
     \\  --output / -o  named destination: default Parquet, stdout stays empty.
     \\                 `-o -` writes stdout (default NDJSON).
+    \\                 Overwrites keep file mode and replace symlinks themselves.
     \\  --format       NDJSON rows by default (`jsonl` is an alias); `json`
     \\                 is an array of row objects. `parquet` can stream to
     \\                 stdout, but refuses a terminal. No extension inference.
@@ -76,7 +77,7 @@ const usage_text =
     \\                 and a plain copy keeps each chunk's codec; with it, a
     \\                 plain copy recompresses chunks stored in another one.
     \\                 The summary's "codec" is the one every written chunk
-    \\                 uses, or "MIXED" when a copy keeps several.
+    \\                 uses, or "MIXED" when a copy keeps several. Text has null.
     \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
     \\                 deprecated LZ4 codec but never compresses to it.
     \\  --compress-priority
@@ -142,7 +143,22 @@ fn cliLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptim
 
 fn wantsJsonSummary(args: std.process.Args) bool {
     var it = std.process.Args.Iterator.init(args);
-    while (it.next()) |a| if (std.mem.eql(u8, a, "--summary=json")) return true;
+    _ = it.next();
+    const command = it.next() orelse return false;
+    if (!std.mem.eql(u8, command, "query")) return false;
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--summary=json")) return true;
+        // Values are opaque, even when their text happens to spell a flag.
+        const values = [_][]const u8{
+            "--output",       "-o",       "--filter", "-f",         "--columns",      "-c",                  "--select",  "-s",
+            "--aggregate",    "-a",       "--query",  "-q",         "--codec",        "--compress-priority", "--threads", "-j",
+            "--bloom-filter", "--format", "--limit",  "--group-by", "--column-order", "--max-memory",        "--profile",
+        };
+        for (values) |flag| if (std.mem.eql(u8, a, flag)) {
+            _ = it.next();
+            break;
+        };
+    }
     return false;
 }
 
@@ -587,7 +603,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             return error.BadArgs;
         }
         if (select != null or aggregate != null or filter != null or columns_csv != null or group_by != null or column_order != null) {
-            diagnosticPrint("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --format / --limit / --group-by / --column-order\n", .{});
+            diagnosticPrint("zpq query: --query is mutually exclusive with --select / --aggregate / --filter / --columns / --group-by / --column-order\n", .{});
             return error.BadArgs;
         }
     } else {
@@ -596,11 +612,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
             return error.BadArgs;
         }
         if (aggregate != null and (select != null or columns_csv != null)) {
-            diagnosticPrint("zpq query: --aggregate is mutually exclusive with --select / --columns / --format\n", .{});
+            diagnosticPrint("zpq query: --aggregate is mutually exclusive with --select / --columns\n", .{});
             return error.BadArgs;
         }
         if (group_by != null and (select != null or columns_csv != null)) {
-            diagnosticPrint("zpq query: --group-by is mutually exclusive with --select / --columns / --format\n", .{});
+            diagnosticPrint("zpq query: --group-by is mutually exclusive with --select / --columns\n", .{});
             return error.BadArgs;
         }
         if (column_order != null and group_by == null) {
@@ -674,6 +690,10 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
     else
         engine.PrintFormat.jsonl;
     const to_stdout = output == null or std.mem.eql(u8, output.?, "-");
+    if (bloom_filters.items.len > 0 and (fmt != .parquet or limit != null or result_order.offset != 0)) {
+        diagnosticPrint("zpq query: --bloom-filter requires unlimited Parquet output\n", .{});
+        return error.BadArgs;
+    }
     if (!explain and fmt != .parquet and output != null and std.mem.startsWith(u8, output.?, "s3://")) {
         diagnosticPrint("zpq query: text output does not support S3 destinations\n", .{});
         return error.BadArgs;
@@ -854,8 +874,11 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         stats = .{ .rows_in = @intCast(printed.rows_in), .rows_kept = @intCast(printed.rows), .bytes_out = printed.bytes_out, .files_in = inputs.len, .membership = printed.membership, .timings = printed.timings };
     }
     const publication_start = nowMonoNs();
-    try publication.commit();
+    try publication.commit(io);
     output_ns += @intCast(nowMonoNs() - publication_start);
+    if (fmt == .parquet and (aggregate != null or group_by != null or limit != null or result_order.offset != 0))
+        stats.codec = codec orelse .SNAPPY;
+    stats.codec_applicable = fmt == .parquet;
     stats.output_ns = output_ns;
     const total_ns = nowMonoNs() - started;
     if (profiler) |p| try profile_out.emit(gpa, io, p);
@@ -876,6 +899,7 @@ const SummaryStats = struct {
     membership: zpq.core.filter.membership.Stats = .{},
     timings: engine.Timings = .{},
     codec: ?schema.CompressionCodec = null,
+    codec_applicable: bool = false,
 };
 
 fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64) !void {
@@ -886,10 +910,11 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
         try writeJsonString(&w, path);
         try w.writeByte('"');
     } else try w.writeAll("null");
-    try w.print(",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":\"{s}\",", .{
-        s.rows_in,           s.rows_kept,             s.bytes_in,         s.bytes_out,                                       s.files_in, s.row_groups_in,
-        s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned, if (s.codec) |codec| @tagName(codec) else "MIXED",
+    try w.print(",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":", .{
+        s.rows_in,           s.rows_kept,             s.bytes_in,         s.bytes_out, s.files_in, s.row_groups_in,
+        s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned,
     });
+    if (s.codec) |codec| try w.print("\"{s}\",", .{@tagName(codec)}) else try w.writeAll(if (s.codec_applicable) "\"MIXED\"," else "null,");
     try engine.writeMembershipJson(&w, s.membership);
     try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}\n", .{
         @divTrunc(elapsed, std.time.ns_per_ms),        @divTrunc(elapsed, std.time.ns_per_us),      s.output_ns / std.time.ns_per_us,
@@ -903,15 +928,18 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
 fn queryExitCode(err: anyerror) u8 {
     if (err == error.BrokenPipe) return 141;
     const usage = [_][]const u8{
-        "BadArgs",                     "NoInputs",              "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",            "UnknownFunction",
-        "UnknownAggFunc",              "WrongArity",            "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",          "UnexpectedChar",
-        "UnexpectedEnd",               "BadNumber",             "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",           "ExpectedRParen",
-        "ExpectedIdentifier",          "ExpectedWhere",         "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",           "BadAggArg",
-        "AggregateMutexWithSelect",    "DuplicateOutputColumn", "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",        "GroupKeyAliasRequired",
-        "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",       "MixedSelectNotSupported",
-        "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",             "BadOperator",
-        "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported",     "NestedNotSupported",
-        "NestedRowOutputNotSupported", "GroupingNotSupported",  "UnsupportedType",              "DecimalScaleTooLarge", "MissingOutputOrAggregate",
+        "BadArgs",                     "NoInputs",                  "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",            "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",                "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",          "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",                 "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",           "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",             "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",           "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn",     "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",        "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",       "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",       "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",      "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",             "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",      "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported",     "NestedNotSupported",
+        "NestedRowOutputNotSupported", "GroupingNotSupported",      "UnsupportedType",              "DecimalScaleTooLarge", "MissingOutputOrAggregate", "MultipleStatements",
+        "CteNotSupported",             "AggregateInWhere",          "MissingFromClause",            "MissingTableName",     "UnsupportedFromClause",    "BadColumn",
+        "BadGroupKey",                 "InvalidDecimalType",        "UnsupportedAggType",           "UnsupportedCoalesce",  "UnsupportedColumnType",    "UnlabelledColumn",
+        "AggIntTooWide",               "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;
@@ -920,6 +948,7 @@ fn queryExitCode(err: anyerror) u8 {
 // Publication belongs to the CLI: service callers retain their own destination lifecycle.
 const OutputPublication = struct {
     target: ?[]const u8 = null,
+    permissions: ?std.Io.File.Permissions = null,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
 
@@ -930,11 +959,15 @@ const OutputPublication = struct {
     fn prepare(self: *OutputPublication, io: std.Io, output: ?[]const u8, inputs: []const []const u8) !?[]const u8 {
         const target = output orelse return null;
         if (std.mem.startsWith(u8, target, "s3://")) {
-            for (inputs) |input| if (std.mem.eql(u8, input, target)) return error.BadArgs;
+            for (inputs) |input| if (std.mem.eql(u8, input, target)) {
+                diagnosticPrint("zpq query: input and output must be different files\n", .{});
+                return error.BadArgs;
+            };
             return target;
         }
         const cwd = std.Io.Dir.cwd();
         if (cwd.statFile(io, target, .{})) |st| {
+            self.permissions = st.permissions;
             if (st.kind != .file) {
                 diagnosticPrint("zpq query: output must be a regular file\n", .{});
                 return error.BadArgs;
@@ -960,8 +993,13 @@ const OutputPublication = struct {
         return self.path();
     }
 
-    fn commit(self: *OutputPublication) !void {
+    fn commit(self: *OutputPublication, io: std.Io) !void {
         const target = self.target orelse return;
+        if (self.permissions) |permissions| {
+            const file = try std.Io.Dir.cwd().openFile(io, self.path(), .{});
+            defer file.close(io);
+            try file.setPermissions(io, permissions);
+        }
         try local_fs.rename(self.path(), target);
         self.target = null;
     }

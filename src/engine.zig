@@ -4999,6 +4999,17 @@ pub fn runPrintTo(
         }
     }
 
+    // The row sink has a flat schema and no repetition-level buffer. Keep unsupported
+    // leaves out rather than publishing a footer that misdescribes their encoded pages.
+    if (format == .parquet) for (output_specs) |spec| switch (spec) {
+        .passthrough => |ci| {
+            const leaf = tree0.leaves[ci];
+            if (leaf.type == .INT96) return error.INT96ReencodeNotSupported;
+            if (leaf.path.len > 1 or leaf.max_rep > 0) return error.NestedReencodeNotSupported;
+        },
+        .computed => {},
+    };
+
     var agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
 
     var parquet: ParquetPrint = .{

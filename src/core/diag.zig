@@ -13,6 +13,8 @@ pub const Diag = struct {
     /// The lower-level error behind the one returned: why `input` could not be opened or read as Parquet.
     cause: ?anyerror = null,
     detail: Detail = .none,
+    /// Binding errors can share tags with failures caused by decoded data.
+    execution_started: bool = false,
 
     pub fn setColumn(diag: ?*Diag, name: []const u8) void {
         const d = diag orelse return;

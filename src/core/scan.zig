@@ -1968,6 +1968,9 @@ fn prepareAggregate(
         try checkAggAliases(agg_calls, args.diag);
         break :blk null;
     };
+    if (!explain) if (args.diag) |diag| {
+        diag.execution_started = true;
+    };
     const t_parse_end = nowMonoNs();
     t.parse_ns = @intCast(t_parse_end - t_parse);
     profile.record(prof, .parse_query, t_parse, t_parse_end, profile.args(.{}));

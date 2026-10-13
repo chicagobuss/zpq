@@ -1912,6 +1912,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     var win_slots: []Slot = &.{};
     defer for (win_slots) |*s| s.meta_arena.deinit();
 
+    if (args.diag) |diag| diag.execution_started = true;
     const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
     if (!need_encoder and args.codec != null and anyChunkNeedsRecompress(metas, kept_opt, args.codec.?)) {
         // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
@@ -5042,6 +5043,7 @@ pub fn runPrintTo(
         try stdout_writer.writeAll("\n");
     }
 
+    if (args.diag) |diag| diag.execution_started = true;
     var total_printed: usize = 0;
     var rows_in: usize = 0;
 

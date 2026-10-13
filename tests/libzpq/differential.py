@@ -1,6 +1,7 @@
 """libzpq against the CLI and the Lambda on the differential corpus (tools/differential.py), byte for byte: every
 filter x projection and filter x select written by all three must be the same file, and every filter x aggregate
-answer the same values with exact decimal parsing. The CLI and the Lambda are the built zig-out/bin binaries; the Lambda runs behind a
+answer must have identical bytes, including numeric text and key order. The CLI and the Lambda are the built
+zig-out/bin binaries; the Lambda runs behind a
 fake runtime API in this process. Run from the repo root with ZPQ_LIB pointing at libzpq.so (tests/libzpq/run.sh does).
 """
 

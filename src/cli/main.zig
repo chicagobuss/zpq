@@ -377,7 +377,7 @@ pub fn main(init: std.process.Init) !void {
                 else => diagnosticPrint("zpq query: {s}\n", .{@errorName(err)}),
             }
             if (machine_diagnostics) try emitError(err);
-            std.process.exit(queryExitCode(err));
+            std.process.exit(queryExitCode(err, diag.execution_started));
         };
         return;
     }
@@ -925,21 +925,21 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
     try w.flush();
 }
 
-fn queryExitCode(err: anyerror) u8 {
+fn queryExitCode(err: anyerror, execution_started: bool) u8 {
     if (err == error.BrokenPipe) return 141;
+    if (execution_started) return 1;
     const usage = [_][]const u8{
-        "BadArgs",                     "NoInputs",                  "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",            "UnknownFunction",
-        "UnknownAggFunc",              "WrongArity",                "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",          "UnexpectedChar",
-        "UnexpectedEnd",               "BadNumber",                 "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",           "ExpectedRParen",
-        "ExpectedIdentifier",          "ExpectedWhere",             "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",           "BadAggArg",
-        "AggregateMutexWithSelect",    "DuplicateOutputColumn",     "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",        "GroupKeyAliasRequired",
-        "SqlParseError",               "OrderByNotSupported",       "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",       "MixedSelectNotSupported",
-        "UnsupportedStatement",        "SubqueryNotSupported",      "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",             "BadOperator",
-        "BadValue",                    "BloomFilterNeedsRows",      "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported",     "NestedNotSupported",
-        "NestedRowOutputNotSupported", "GroupingNotSupported",      "UnsupportedType",              "DecimalScaleTooLarge", "MissingOutputOrAggregate", "MultipleStatements",
-        "CteNotSupported",             "AggregateInWhere",          "MissingFromClause",            "MissingTableName",     "UnsupportedFromClause",    "BadColumn",
-        "BadGroupKey",                 "InvalidDecimalType",        "UnsupportedAggType",           "UnsupportedCoalesce",  "UnsupportedColumnType",    "UnlabelledColumn",
-        "AggIntTooWide",               "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
+        "BadArgs",                     "NoInputs",              "NoMatches",                    "SqlNotCompiledIn",          "UnknownColumn",              "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",            "EmptyExpr",                    "EmptyAggregate",            "EmptyColumnList",            "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",             "UnterminatedString",           "TypeMismatch",              "ExpectedLParen",             "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",         "ExpectedAggFunc",              "StarOnlyValidInCount",      "TrailingTokens",             "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn", "AmbiguousOutputColumn",        "AmbiguousColumn",           "ExpressionTooDeep",          "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",      "HavingNotSupported",         "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",       "BadOutputUrl",               "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",         "NullableNotSupported",       "NestedNotSupported",
+        "NestedRowOutputNotSupported", "GroupingNotSupported",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
+        "CteNotSupported",             "AggregateInWhere",      "MissingFromClause",            "MissingTableName",          "UnsupportedFromClause",      "UnsupportedAggType",
+        "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

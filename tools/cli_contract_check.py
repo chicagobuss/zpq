@@ -168,7 +168,7 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
             flags = [] if dest is None else ['-o', dest]
             if dest not in (None, '-'):
                 Path(dest).write_bytes(b'earlier')
-            p = run(typed, '--aggregate', 'sum(wide) AS s', *args, '--format', 'parquet', *flags, code=2)
+            p = run(typed, '--aggregate', 'sum(wide) AS s', *args, '--format', 'parquet', *flags, code=1)
             assert b'AggIntTooWide' in p.stderr and not p.stdout
             assert dest in (None, '-') or Path(dest).read_bytes() == b'earlier'
 
@@ -211,6 +211,11 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
                     *flags, code=2)
             assert reason in p.stderr and not p.stdout
 
+    # Type errors from binding are usage failures; null-dependent evaluation errors are runtime failures.
+    p = run(src, '--select', 's + 1 AS bad', '--summary=json', code=2)
+    assert json.loads(p.stderr)['code'] == 'TypeMismatch'
+    p = run(src, '--select', 'v + 1 AS bad', '--summary=json', code=1)
+    assert json.loads(p.stderr)['code'] == 'NullableNotSupported'
     for args in (['--format', 'ndjson'], ['--format', 'json'], ['--limit', '1']):
         p = run(src, '-o', str(root / 'bloom'), '--bloom-filter', 'k', *args, code=2)
         assert b'--bloom-filter' in p.stderr

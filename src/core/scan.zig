@@ -224,6 +224,7 @@ pub const AggOutput = struct {
     /// the same at every `-j`. The dropped rows are freed here.
     pub fn applyResultOrder(self: *AggOutput, gpa: std.mem.Allocator, order: expr_ast.ResultOrder) error{OutOfMemory}!void {
         const rows = self.group_rows orelse return;
+        if (order.limit) |n| if (n > 0 and order.offset +| n < rows.len / 2) return self.keepFirst(gpa, order, @intCast(order.offset +| n));
         const sorted = try gpa.alloc([]const AggValue, rows.len);
         defer gpa.free(sorted);
         @memcpy(sorted, rows);
@@ -234,6 +235,52 @@ pub const AggOutput = struct {
         const kept = try gpa.dupe([]const AggValue, sorted[start..end]);
         for (sorted[0..start]) |row| freeRow(gpa, row);
         for (sorted[end..]) |row| freeRow(gpa, row);
+        gpa.free(rows);
+        self.group_rows = kept;
+    }
+
+    /// `applyResultOrder` for a cut of `m` rows well short of all of them: the `m` least rows by the order, ties by
+    /// their place in the answer (as the stable sort breaks them), kept in a heap of `m` instead of sorting everything.
+    fn keepFirst(self: *AggOutput, gpa: std.mem.Allocator, order: expr_ast.ResultOrder, m: usize) error{OutOfMemory}!void {
+        const rows = self.group_rows.?;
+        const Item = struct { row: []const AggValue, i: usize };
+        const Ctx = struct {
+            keys: []const expr_ast.OrderKey,
+            fn before(keys: []const expr_ast.OrderKey, a: Item, b: Item) bool {
+                if (rowLessThan(keys, a.row, b.row)) return true;
+                if (rowLessThan(keys, b.row, a.row)) return false;
+                return a.i < b.i;
+            }
+            // The heap's top is the last row kept, so a row that sorts before it replaces it.
+            fn later(ctx: @This(), a: Item, b: Item) std.math.Order {
+                if (before(ctx.keys, b, a)) return .lt;
+                if (before(ctx.keys, a, b)) return .gt;
+                return .eq;
+            }
+        };
+        var heap: std.PriorityQueue(Item, Ctx, Ctx.later) = .initContext(.{ .keys = order.keys });
+        defer heap.deinit(gpa);
+        try heap.ensureTotalCapacity(gpa, m);
+        for (rows, 0..) |row, i| {
+            const item: Item = .{ .row = row, .i = i };
+            if (heap.count() == m) {
+                if (!Ctx.before(order.keys, item, heap.peek().?)) continue;
+                _ = heap.pop();
+            }
+            heap.push(gpa, item) catch unreachable; // within the capacity reserved above
+        }
+        const items = heap.items;
+        std.mem.sortUnstable(Item, items, order.keys, Ctx.before);
+        const start: usize = @intCast(@min(order.offset, items.len));
+        const keep = try gpa.alloc(bool, rows.len);
+        defer gpa.free(keep);
+        const kept = try gpa.alloc([]const AggValue, items.len - start);
+        @memset(keep, false);
+        for (items[start..], kept) |item, *k| {
+            k.* = item.row;
+            keep[item.i] = true;
+        }
+        for (rows, keep) |row, kp| if (!kp) freeRow(gpa, row);
         gpa.free(rows);
         self.group_rows = kept;
     }
@@ -3669,6 +3716,59 @@ test "applyResultOrder: an allocation failure leaves the rows whole and leaks no
                 return err;
             };
             try testing.expectEqual(@as(usize, 2), out.group_rows.?.len);
+        }
+    }.run, .{});
+}
+
+fn testTieRows(gpa: std.mem.Allocator, n: usize) !AggOutput {
+    var prng = std.Random.DefaultPrng.init(42);
+    var out: AggOutput = .{};
+    errdefer out.deinit(gpa);
+    const rows = try gpa.alloc([]const AggValue, n);
+    for (rows) |*r| r.* = &.{};
+    out.group_rows = rows;
+    for (rows, 0..) |*row, i| {
+        const vals = try gpa.alloc(AggValue, 3);
+        @memset(vals, .null_val);
+        row.* = vals;
+        vals[0] = .{ .i = @intCast(i) }; // where the row was, to compare orders
+        const r = prng.random().uintLessThan(u32, 12);
+        if (r != 11) vals[1] = .{ .i = r }; // many ties, some NULL
+        vals[2] = .{ .f = @floatFromInt(prng.random().uintLessThan(u32, 3)) };
+    }
+    return out;
+}
+
+test "applyResultOrder: a short cut keeps the rows and order a full sort would" {
+    const gpa = testing.allocator;
+    for ([_][]const expr_ast.OrderKey{
+        &.{.{ .column = 1, .descending = true }},
+        &.{.{ .column = 1, .descending = false }},
+        &.{ .{ .column = 2, .descending = true }, .{ .column = 1, .descending = false } },
+    }) |keys| for ([_][2]u64{ .{ 10, 0 }, .{ 7, 30 }, .{ 1, 0 }, .{ 99, 100 } }) |lo| {
+        var whole = try testTieRows(gpa, 500);
+        defer whole.deinit(gpa);
+        var cut = try testTieRows(gpa, 500);
+        defer cut.deinit(gpa);
+        try whole.applyResultOrder(gpa, .{ .keys = keys });
+        try cut.applyResultOrder(gpa, .{ .keys = keys, .limit = lo[0], .offset = lo[1] });
+        const want = whole.group_rows.?[lo[1]..][0..lo[0]];
+        const got = cut.group_rows.?;
+        try testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| try testing.expectEqual(w[0].i, g[0].i);
+    };
+}
+
+test "applyResultOrder: a short cut that fails to allocate leaves the rows whole and leaks nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var out = try testTieRows(gpa, 40);
+            defer out.deinit(gpa);
+            out.applyResultOrder(gpa, .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 }) catch |err| {
+                try testing.expectEqual(@as(usize, 40), out.group_rows.?.len);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 3), out.group_rows.?.len);
         }
     }.run, .{});
 }

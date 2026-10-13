@@ -3687,7 +3687,7 @@ fn detachOwned(acc: *expr_agg.Accumulator) void {
     switch (acc.*) {
         .min_bytes => acc.* = .{ .min_bytes = null },
         .max_bytes => acc.* = .{ .max_bytes = null },
-        .distinct => acc.* = .{ .distinct = null },
+        .distinct => acc.* = .{ .distinct = .{} },
         else => {},
     }
 }

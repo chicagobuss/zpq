@@ -535,7 +535,9 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
     const filter_small = args.sketch_topk != null and filterSmall(in.metas, in.work, keys, in.filter_cols);
     const count_agg = if (args.sketch_topk) |cfg| if (sketch_fits)
-        sketchEligible(cfg, args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, keys_unique or filter_small)
+        // With NDV statistics, the plain-width guess only decides where a census counts (`applyCostRules`), never
+        // whether an expensive filter is decoded twice for a sketch.
+        sketchEligible(cfg, args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, (keys_unique and in.ndv_stat == null) or filter_small)
     else
         null else null;
     const first_cut = count_agg == null and args.sketch_topk != null and args.sketch_topk.?.census and
@@ -8067,6 +8069,53 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     in.args.max_memory = 16 << 30;
     // A composite dictionary product is only an upper bound, even when every union completed.
     try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+}
+
+test "planAggregate: a plain-width key may fuse a census but never sketch through a wide filter" {
+    const path = "ci/fixtures/parquet/census_widefilter.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    const meta = try metadata.open(meta_arena.allocator(), bytes);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    const outputs = [_]BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" } };
+    const work = [_]WorkItem{.{
+        .file = 0,
+        .rg = 0,
+        .agg_start = 0,
+        .agg_len = 1,
+        .columns = .{ .read = &.{}, .consumed = &.{} },
+        .accumulators = &.{},
+    }};
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    // The filter reads only `p`, which is far wider than the key.
+    for ([_]bool{ false, true }) |census| {
+        var in: PlanInputs = .{
+            .args = .{
+                .inputs = &.{},
+                .aggregate = "count(*)",
+                .sketch_topk = .{ .census = census },
+                .max_memory = 64 << 20,
+                .result_order = order,
+            },
+            .metas = &.{meta},
+            .work = &work,
+            .calls = &calls,
+            .keys = &keys,
+            .outputs = &outputs,
+            .filter_cols = &.{ false, true },
+            .workers = 1,
+            .ndv_stat = .{ .rows = 12000, .encoding_stats_rows = 12000, .hi = 12000, .key_bytes = 9 },
+        };
+        const plan = planAggregate(in);
+        try testing.expect(plan.dispatch.strategy != .sketch);
+        try testing.expect(!plan.dispatch.census_fused);
+        // Without NDV statistics the guess keeps its old role of admitting the sketch through the filter.
+        in.ndv_stat = null;
+        try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+    }
 }
 
 test "planAggregate: census bail cost bets preserve R1 and gate key types" {

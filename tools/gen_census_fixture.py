@@ -14,6 +14,8 @@ Also `census_sliced.parquet`: key `k` = 0..39, then 3..9 six more times, in row 
 the ninth to appear is 8, so `LIMIT 1 OFFSET 8` under a decode budget that slices row groups ends inside a later
 slice.
 
+Also `census_widefilter.parquet`: a plain int64 key and a 200-byte string filter column.
+
 Usage:  .venv/bin/python tools/gen_census_fixture.py
 """
 
@@ -55,6 +57,15 @@ def main() -> None:
     k = list(range(40)) + list(range(3, 10)) * 6
     pq.write_table(pa.table({"k": pa.array(k, pa.int64())}), sliced, row_group_size=20, use_dictionary=False)
     print(f"wrote {sliced}")
+    # A plain-width integer key beside a wide filter column: the plain-width guess may fuse a census but must not make
+    # the sketch decode an expensive filter twice.
+    wide = OUT.with_name("census_widefilter.parquet")
+    nk = 12000
+    pq.write_table(pa.table({
+        "k": pa.array(range(nk), pa.int64()),
+        "p": pa.array([("yes" if i % 2 else "no") + "x" * 200 for i in range(nk)], pa.string()),
+    }), wide, use_dictionary=False, compression="NONE", write_statistics=False)
+    print(f"wrote {wide}")
     dict_fixture = OUT.with_name("census_dictionary_review.parquet")
     dict_table = table.set_column(1, "t", pa.array([i % 7 for i in range(table.num_rows)], pa.int64()))
     pq.write_table(dict_table, dict_fixture, row_group_size=ROWS_PER_GROUP, use_dictionary=True, compression="snappy")

@@ -55,6 +55,10 @@ def main() -> None:
     k = list(range(40)) + list(range(3, 10)) * 6
     pq.write_table(pa.table({"k": pa.array(k, pa.int64())}), sliced, row_group_size=20, use_dictionary=False)
     print(f"wrote {sliced}")
+    dict_fixture = OUT.with_name("census_dictionary_review.parquet")
+    dict_table = table.set_column(1, "t", pa.array([i % 7 for i in range(table.num_rows)], pa.int64()))
+    pq.write_table(dict_table, dict_fixture, row_group_size=ROWS_PER_GROUP, use_dictionary=True, compression="snappy")
+    print(f"wrote {dict_fixture}")
 
 
 if __name__ == "__main__":

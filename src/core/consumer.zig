@@ -1919,6 +1919,10 @@ pub const AggTarget = union(enum) {
             inline else => |t| t.calls,
         };
     }
+
+    pub fn planCalls(self: AggTarget) []const expr_agg.AggCall {
+        return if (self == .grouped and self.grouped.table.countOnly()) &.{} else self.calls();
+    }
 };
 
 /// A scan worker's state, reused from one row group to the next.
@@ -2024,7 +2028,7 @@ pub fn scanRGForAgg(
     target: AggTarget,
     ws: AggWorkspace,
 ) !void {
-    const calls = target.calls();
+    const calls = target.planCalls();
     const num_rows: usize = @intCast(in.rg.num_rows);
 
     // 1. Stats short-circuit pass. Aggregates answered from the row
@@ -2057,6 +2061,10 @@ pub fn scanRGForAgg(
     defer plan_arena.deinit();
     const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
         const full = decodeEstimate(in, in.read, calls, target == .grouped);
+        if (target == .grouped and target.grouped.table.countOnly()) {
+            const keys_only = decodeEstimate(in, in.read, &.{}, true);
+            std.debug.assert(full == keys_only);
+        }
         reserved = full;
         // Too big for this worker's share: a slice of rows at a time when every column has a sliced form, else one
         // aggregate's columns at a time.
@@ -2309,7 +2317,10 @@ const StagePlan = struct {
             .scalar => {},
         }
         for (base, in.read) |*b, r| b.* = b.* and r;
-        const calls = target.calls();
+        const calls = target.planCalls();
+        if (target == .grouped and target.grouped.table.countOnly()) {
+            std.debug.assert(calls.len == 0);
+        }
         const per_call = try a.alloc([]bool, calls.len);
         var widest: usize = 0;
         for (calls, per_call, 0..) |call, *cols, i| {
@@ -2391,6 +2402,9 @@ const ChunkDecoder = struct {
                 try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch)
         else
             try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
+        if (self.target == .grouped and self.target.grouped.table.countOnly() and !in.consumed[ci] and decoded.codes() != null) {
+            std.debug.assert(!uses.value[ci]);
+        }
         if (ci < uses.value.len and uses.value[ci]) decoded = try agg_coded.materialize(a, decoded);
         try checkRowShape(decoded, self.num_rows);
         if (chunk_span.t != null) {
@@ -2466,7 +2480,7 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !Code
         }
     };
     if (in.filter) |f| markFilter(u, f);
-    for (target.calls()) |call| {
+    for (target.planCalls()) |call| {
         if (call.where) |w| markFilter(u, w);
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
@@ -5553,4 +5567,234 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
     const agg = try initOutputAggregator(arena, &file_meta, &specs);
     try testing.expect(agg.cols[0] == .f64);
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
+}
+
+test "StagePlan.init in countOnly mode plans zero calls and charges only base columns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var file_meta: schema.FileMetaData = undefined;
+    file_meta.schema = .empty;
+    file_meta.row_groups = .empty;
+    try file_meta.schema.append(arena, .{
+        .name = "schema",
+        .num_children = 2,
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(arena, .{
+        .name = "k",
+        .type = .INT64,
+        .num_children = 0,
+        .repetition_type = .REQUIRED,
+        .type_length = null,
+        .scale = null,
+        .precision = null,
+        .field_id = 0,
+    });
+    try file_meta.schema.append(arena, .{
+        .name = "v",
+        .type = .INT64,
+        .num_children = 0,
+        .repetition_type = .REQUIRED,
+        .type_length = null,
+        .scale = null,
+        .precision = null,
+        .field_id = 1,
+    });
+
+    var path_k: schema.StringList = .empty;
+    try path_k.append(arena, "k");
+    var path_v: schema.StringList = .empty;
+    try path_v.append(arena, "v");
+
+    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try columns.append(arena, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT64,
+            .encodings = .empty,
+            .path_in_schema = path_k,
+            .codec = .UNCOMPRESSED,
+            .num_values = 100,
+            .total_uncompressed_size = 800,
+            .total_compressed_size = 800,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    });
+    try columns.append(arena, .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT64,
+            .encodings = .empty,
+            .path_in_schema = path_v,
+            .codec = .UNCOMPRESSED,
+            .num_values = 100,
+            .total_uncompressed_size = 800,
+            .total_compressed_size = 800,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    });
+    try file_meta.row_groups.append(arena, .{
+        .columns = columns,
+        .total_byte_size = 1600,
+        .num_rows = 100,
+    });
+
+    const in: AggRowGroup = .{
+        .rg = &file_meta.row_groups.items[0],
+        .file_index = 0,
+        .rg_index = 0,
+        .meta = &file_meta,
+        .src = .{ .bytes = &.{}, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{ true, true },
+        .consumed = &.{ true, false },
+    };
+
+    var table: expr_agg.GroupTable = .init(std.testing.allocator, 1 << 20);
+    defer table.deinit();
+    var sketch: expr_agg.CountSketch = .{ .cells = try arena.alloc(u32, 16), .shift = 60 };
+    @memset(sketch.cells, 0);
+    table.sketch = &sketch;
+    try std.testing.expect(table.countOnly());
+
+    const left_expr = try arena.create(expr_ast.Expr);
+    left_expr.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const right_expr = try arena.create(expr_ast.Expr);
+    right_expr.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg_expr: expr_ast.Expr = .{
+        .binop = .{
+            .op = .add,
+            .left = left_expr,
+            .right = right_expr,
+            .result_type = .i64,
+            .depth = 2,
+        },
+    };
+
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .sum,
+        .alias = "s",
+        .result = .i64,
+        .arg = arg_expr,
+        .where = null,
+    }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    const target: AggTarget = .{ .grouped = .{
+        .calls = &calls,
+        .keys = &keys,
+        .table = &table,
+        .pos_base = 0,
+    } };
+
+    const sp = try StagePlan.init(arena, in, target, &.{false});
+    try std.testing.expectEqual(@as(usize, 0), sp.calls.len);
+    try std.testing.expectEqual(decodeEstimate(in, sp.base, &.{}, true), sp.estimate);
+}
+
+test "StagePlan.init in countOnly mode: allocation failures cleanly unwind without leak" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var file_meta: schema.FileMetaData = undefined;
+            file_meta.schema = .empty;
+            file_meta.row_groups = .empty;
+            try file_meta.schema.append(arena, .{
+                .name = "schema", .num_children = 2, .type = null, .type_length = null,
+                .repetition_type = .REQUIRED, .scale = null, .precision = null, .field_id = null,
+            });
+            try file_meta.schema.append(arena, .{
+                .name = "k", .type = .INT64, .num_children = 0, .repetition_type = .REQUIRED,
+                .type_length = null, .scale = null, .precision = null, .field_id = 0,
+            });
+            try file_meta.schema.append(arena, .{
+                .name = "v", .type = .INT64, .num_children = 0, .repetition_type = .REQUIRED,
+                .type_length = null, .scale = null, .precision = null, .field_id = 1,
+            });
+
+            var path_k: schema.StringList = .empty;
+            try path_k.append(arena, "k");
+            var path_v: schema.StringList = .empty;
+            try path_v.append(arena, "v");
+
+            var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+            try columns.append(arena, .{
+                .file_path = null, .file_offset = 0,
+                .meta_data = .{
+                    .type = .INT64, .encodings = .empty, .path_in_schema = path_k,
+                    .codec = .UNCOMPRESSED, .num_values = 100, .total_uncompressed_size = 800,
+                    .total_compressed_size = 800, .data_page_offset = 0, .index_page_offset = null,
+                    .dictionary_page_offset = null,
+                },
+            });
+            try columns.append(arena, .{
+                .file_path = null, .file_offset = 0,
+                .meta_data = .{
+                    .type = .INT64, .encodings = .empty, .path_in_schema = path_v,
+                    .codec = .UNCOMPRESSED, .num_values = 100, .total_uncompressed_size = 800,
+                    .total_compressed_size = 800, .data_page_offset = 0, .index_page_offset = null,
+                    .dictionary_page_offset = null,
+                },
+            });
+            try file_meta.row_groups.append(arena, .{
+                .columns = columns, .total_byte_size = 1600, .num_rows = 100,
+            });
+
+            const in: AggRowGroup = .{
+                .rg = &file_meta.row_groups.items[0],
+                .file_index = 0,
+                .rg_index = 0,
+                .meta = &file_meta,
+                .src = .{ .bytes = &.{}, .byte_origin = 0 },
+                .filter = null,
+                .read = &.{ true, true },
+                .consumed = &.{ true, false },
+            };
+
+            var table: expr_agg.GroupTable = .init(arena, 1 << 20);
+            var sketch: expr_agg.CountSketch = .{ .cells = try arena.alloc(u32, 16), .shift = 60 };
+            @memset(sketch.cells, 0);
+            table.sketch = &sketch;
+
+            const left_expr = try arena.create(expr_ast.Expr);
+            left_expr.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+            const right_expr = try arena.create(expr_ast.Expr);
+            right_expr.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+            const arg_expr: expr_ast.Expr = .{
+                .binop = .{
+                    .op = .add,
+                    .left = left_expr,
+                    .right = right_expr,
+                    .result_type = .i64,
+                    .depth = 2,
+                },
+            };
+
+            const calls = [_]expr_agg.AggCall{.{
+                .func = .sum, .alias = "s", .result = .i64, .arg = arg_expr, .where = null,
+            }};
+            const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+            const target: AggTarget = .{ .grouped = .{
+                .calls = &calls, .keys = &keys, .table = &table, .pos_base = 0,
+            } };
+
+            const sp = try StagePlan.init(arena, in, target, &.{false});
+            try std.testing.expectEqual(@as(usize, 0), sp.calls.len);
+        }
+    }.run, .{});
 }

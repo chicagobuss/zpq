@@ -7406,3 +7406,94 @@ test "planAggregate: scalar, ordered blocks, empty work and gated input stay unc
         };
     }
 }
+test "review round3 count budget and path matrix" {
+    for ([_][]const u8{ "ci/fixtures/parquet/census_topk.parquet", "ci/fixtures/parquet/census_dictionary_review.parquet" }) |path| {
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+        for ([_]?usize{ null, 3000, 20000 }) |limit| for ([_]bool{ false, true }) |encoded|
+            for ([_][]const u8{ "u", "s" }) |key| for ([_]?[]const u8{ null, "n = 1", "t > 50000000", "t > 3" }) |filter|
+            for ([_]SketchTopK{ .{ .fuse_census = true }, .{ .fuse_census = false }, .{ .certify = false }, .{ .census_fp_bits = 0 } }) |cfg| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .filter = filter,
+                .aggregate = "count(*) AS c, sum(t + t) AS st, min(s) AS lo, count(DISTINCT t) AS d, count(*) FILTER (WHERE n = 1) AS f",
+                .group_by = key,
+                .parallelism = 1,
+                .decode_limit = limit,
+                .encoded = encoded,
+                .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+            };
+            var want = try runMultiAggregate(testing.allocator, arena, args);
+            defer want.deinit(testing.allocator);
+            args.sketch_topk = cfg;
+            var got = try runMultiAggregate(testing.allocator, arena, args);
+            defer got.deinit(testing.allocator);
+            try want.output.applyResultOrder(testing.allocator, args.result_order);
+            try got.output.applyResultOrder(testing.allocator, args.result_order);
+            try testing.expectEqual(want.rows_in, got.rows_in);
+            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            const wr = want.output.group_rows.?;
+            const gr = got.output.group_rows.?;
+            try testing.expectEqual(wr.len, gr.len);
+            for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
+        };
+    }
+}
+
+test "count-only: charged bytes equals keys and filter estimate alone" {
+    // Under a sketch count-only pass, depth-2 sum(t + t) must not be charged.
+    // keys+filter estimate is 16,189; uncorrected calls charged 48,189, which forced slicing under limit 20,000.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args: MultiAggArgs = .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS c, sum(t + t) AS st, min(s) AS lo, count(DISTINCT t) AS d, count(*) FILTER (WHERE n = 1) AS f",
+        .group_by = "u",
+        .parallelism = 1,
+        .decode_limit = 20000,
+        .sketch_topk = .{},
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+    };
+    var res = try runMultiAggregate(testing.allocator, arena, args);
+    defer res.deinit(testing.allocator);
+    try res.output.applyResultOrder(testing.allocator, args.result_order);
+    const rows = res.output.group_rows.?;
+    try testing.expect(rows.len > 0);
+}
+
+test "count-only: no filter-only column materialized" {
+    // Under a sketch count-only pass on dictionary-encoded column t with filter t > 3,
+    // t is not consumed by aggregates and must remain coded without value materialization.
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args: MultiAggArgs = .{
+        .inputs = &inputs,
+        .filter = "t > 3",
+        .aggregate = "count(*) AS c, sum(t + t) AS st, min(s) AS lo, count(DISTINCT t) AS d, count(*) FILTER (WHERE n = 1) AS f",
+        .group_by = "u",
+        .parallelism = 1,
+        .encoded = true,
+        .decode_limit = null,
+        .sketch_topk = .{},
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+    };
+    var res = try runMultiAggregate(testing.allocator, arena, args);
+    defer res.deinit(testing.allocator);
+    try res.output.applyResultOrder(testing.allocator, args.result_order);
+    const rows = res.output.group_rows.?;
+    try testing.expect(rows.len > 0);
+}

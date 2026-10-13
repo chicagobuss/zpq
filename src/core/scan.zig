@@ -475,6 +475,7 @@ pub const Reason = enum {
     unknown_ndv,
     census_needs_uniqueness_evidence,
     census_fixed_width_bail,
+    census_short_string_composite,
     high_cardinality_strings,
     worker_copy_memory,
     dictionary_union,
@@ -589,8 +590,9 @@ fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strat
     plan.dispatch.census_fused = false;
     plan.dispatch.census_cell_repeat_gate = false;
     for ([_]Reason{
-        .sketch_count_cut,                 .first_keys_cut,          .census_fused, .census_on_sketch_bail,
-        .census_needs_uniqueness_evidence, .census_fixed_width_bail,
+        .sketch_count_cut,              .first_keys_cut,                   .census_fused,
+        .census_on_sketch_bail,         .census_needs_uniqueness_evidence, .census_fixed_width_bail,
+        .census_short_string_composite,
     }) |r|
         plan.reasons.remove(r);
     plan.reasons.insert(.plain_scan);
@@ -621,28 +623,32 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     // establish that cost; the census repeat cap can still admit their proven moderate tuple bound.
     const cheap_r1 = small and (tiny or (keys.len == 1 and (in.calls.len == 1 or
         stat.dictionary_bytes <= (stat.hi *| stat.key_bytes) *| 4)));
-    const fixed_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
-        expr_agg.fixedGroupStride(keys) != null and !tiny and !cheap_r1;
+    // Short string tuples may have sparse repeats even when their string marginal repeats heavily. Keep
+    // payloads and long keys on the existing path; only the runtime sparse-repeat hint can justify this census.
+    const short_composite = !small and stat.string_keys and keys.len > 1 and
+        stat.key_bytes < 32 and in.calls.len == 1;
+    const bail_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
+        (expr_agg.fixedGroupStride(keys) != null or short_composite) and !tiny and !cheap_r1;
     // Dictionary bounds never authorize automatic fusion. A census after a bail is a separate, certified cost bet.
     const explicit_census = if (in.args.sketch_topk) |cfg| cfg.fuse_census != null else false;
     if (!explicit_census) {
         plan.dispatch.keys_unique = false;
-        plan.dispatch.census_allowed = fixed_census;
+        plan.dispatch.census_allowed = bail_census;
         plan.dispatch.census_fused = false;
-        plan.dispatch.census_cell_repeat_gate = fixed_census and !bounded_census;
+        plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
         if (plan.dispatch.strategy == .sketch) {
-            if (fixed_census) {
-                plan.reasons.insert(.census_fixed_width_bail);
+            if (bail_census) {
+                plan.reasons.insert(if (short_composite) .census_short_string_composite else .census_fixed_width_bail);
                 plan.reasons.insert(.census_on_sketch_bail);
             } else plan.reasons.insert(.census_needs_uniqueness_evidence);
         }
     }
     if (plan.dispatch.strategy == .partitioned_hash) return; // Explicit force has precedence over profitability.
     if (plan.dispatch.strategy == .first_keys) return; // Prefix discovery avoids grouping every key, even a cheap one.
-    if (small and !fixed_census) {
+    if (small and !bail_census) {
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.small_ndv);
         return;
@@ -650,10 +656,10 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     if (stat.source == .unknown or stat.covered_rows != stat.rows) {
         plan.reasons.insert(.unknown_ndv);
         // Numeric unknown keys retain the sketch (zipf11); a census bail also needs a sparse-repeat cell hint.
-        // Complete string dictionary fallback makes grouping expensive. Partial coverage can still have useful
-        // skew (ClickBench), so retain that sketch cost bet, with a plain fallback rather than automatic census.
+        // Recounting unknown string marginals can lose even when grouping is expensive. Keep only the short-tuple
+        // sparse-repeat bet here; partial coverage may still retain a useful sketch for skew (ClickBench).
         if (stat.string_keys and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
-            plan.dispatch.strategy == .sketch)
+            plan.dispatch.strategy == .sketch and !(short_composite and bail_census))
             plainDispatch(plan, .plain_hash);
     }
     const long_strings = stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536;
@@ -8056,7 +8062,7 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
 }
 
-test "planAggregate: census bail cost bets keep cheap R1 and require fixed keys" {
+test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     const calls = [_]expr_agg.AggCall{
         .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
         .{ .func = .sum, .arg = .{ .col_ref = .{
@@ -8141,6 +8147,28 @@ test "planAggregate: census bail cost bets keep cheap R1 and require fixed keys"
     plan = planAggregate(in);
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(!plan.dispatch.census_allowed);
+
+    // Short string composites can have a sparse repeat tail even when the marginal NDV is unknown.
+    const short_composite = [_]expr_ast.Expr{ string_key[0], keys[1] };
+    in.keys = &short_composite;
+    in.ndv_stat.?.key_bytes = 24;
+    plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy);
+    try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_cell_repeat_gate);
+    try testing.expect(!plan.dispatch.keys_unique and !plan.dispatch.census_fused);
+    in.args.sketch_topk.?.census = false;
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy);
+    in.args.sketch_topk.?.census = true;
+    in.ndv_stat.?.key_bytes = 64;
+    try testing.expectEqual(.partitioned_hash, planAggregate(in).dispatch.strategy);
+    in.ndv_stat.?.key_bytes = 24;
+    in.ndv_stat.?.confidence = .upper_bound;
+    in.ndv_stat.?.hi = 100_000;
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy); // Preserve proven-small R1.
+    in.ndv_stat.?.confidence = .unknown;
+    in.ndv_stat.?.hi = 30_000_000;
+    in.calls = &calls;
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy); // Payloads keep the string guard.
 }
 
 test "census cell cost hint distinguishes sparse repeats without proving uniqueness" {

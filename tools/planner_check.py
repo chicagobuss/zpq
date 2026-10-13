@@ -21,11 +21,13 @@ pq.write_table(pa.table({"k": keys, "v": [(i % 17) - 8 for i in range(n)], "pos"
 con = duckdb.connect()
 env = dict(os.environ, ZPQ_IO_PROFILE="mmap", ZPQ_SKETCH_TOPK="1")
 
-def run(sql, workers=4, explain=False, extra=(), overrides=None):
+def run(sql, workers=4, explain=False, extra=(), overrides=None, trace_expect=()):
     command = [zpq, "query", "--query", sql, "-j", str(workers), "--max-memory", "512MB", *extra]
     if explain:
         command.append("--explain")
     result = subprocess.run(command, env=env | (overrides or {}), capture_output=True, text=True, check=True)
+    for fragment in trace_expect:
+        assert fragment in result.stderr, result.stderr
     return json.loads(result.stdout)
 
 
@@ -120,4 +122,24 @@ for group in ("k", "k, f"):
     for workers in (1, 4):
         rows = run(sql, workers)["agg"]
         assert [tuple(row[c] for c in cols) for row in rows] == truth, rows
+# A short string marginal can repeat while the composite tuple is almost unique.
+strings = Path(directory) / "planner_string_census.parquet"
+n = 1_100_000
+indices = [*range(n), *range(20)]
+pq.write_table(pa.table({"k": [None if i == 0 else "k" + str(i % 400_000) for i in indices],
+                         "f": [i // 400_000 for i in indices], "pos": range(len(indices))}),
+               strings, row_group_size=100_000, use_dictionary=False)
+sql = f"SELECT k, f, count(*) AS c FROM '{strings}' GROUP BY k, f ORDER BY c DESC LIMIT 10"
+plan = run(sql, explain=True)
+assert plan["strategy"] == "sketch" and plan["sketch"]["census_cell_repeat_gate"], plan
+assert "census_short_string_composite" in plan["reasons"] and not plan["sketch"]["census_fused"], plan
+truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
+for workers in (1, 4):
+    for census in ("0", "1"):
+        result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census, "ZPQ_SKETCH_TRACE": "1"},
+                     trace_expect=("try=true", "certified=true") if census == "1" else ())
+        assert [tuple(row[c] for c in ("k", "f", "c")) for row in result["agg"]] == truth, result
+for sql in (f"SELECT k, count(*) AS c FROM '{strings}' GROUP BY k ORDER BY c DESC LIMIT 10",
+            f"SELECT k, f, count(*) AS c, sum(pos) AS s FROM '{strings}' GROUP BY k, f ORDER BY c DESC LIMIT 10"):
+    assert run(sql, explain=True)["strategy"] == "plain_hash"
 print("planner check: bounded NDV, prefix precedence, census bail and partitioned answers agree with DuckDB")

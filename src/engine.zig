@@ -569,6 +569,7 @@ fn executeAggregate(
         .profiler = args.profiler,
         .sketch_topk = sketchFromEnv(ctx.env),
         .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
+        .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
     };
     if (explain) {
         if (io_mode != .mmap) {
@@ -4387,7 +4388,28 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         try writer.print("{s}\"{s}\"", .{ sep, @tagName(reason) });
         sep = ",";
     }
-    try writer.writeAll("],\"count_agg\":");
+    try writer.writeAll("],\"ndv\":");
+    if (a.plan.ndv_stat) |stat| {
+        try writer.print("{{\"source\":\"{s}\",\"lo\":{d},\"hi\":{d},\"rows\":{d},\"covered_rows\":{d},\"encoding_stats_rows\":{d},\"confidence\":\"{s}\",\"dictionary_bytes\":{d},\"column_bytes\":{d},\"key_bytes_estimate\":{d},\"union_attempted\":{},\"union_complete\":{}}}", .{
+            @tagName(stat.source),
+            stat.lo,
+            stat.hi,
+            stat.rows,
+            stat.covered_rows,
+            stat.encoding_stats_rows,
+            @tagName(stat.confidence),
+            stat.dictionary_bytes,
+            stat.column_bytes,
+            stat.key_bytes,
+            stat.union_attempted,
+            stat.union_complete,
+        });
+    } else try writer.writeAll("null");
+    try writer.writeAll(",\"plain_bytes_estimate\":");
+    if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
+    try writer.print(",\"shared_tables\":{d},\"count_agg\":", .{
+        @as(usize, if (d.strategy == .partitioned_hash) 32 else 0),
+    });
     if (d.count_agg) |idx| try writer.print("{d}", .{idx}) else try writer.writeAll("null");
     try writer.writeAll(",\"sketch\":");
     if (explanation.sketch) |cfg| {
@@ -6885,14 +6907,14 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqual(@as(u32, 2), fake.gets);
     try std.testing.expectEqual(@as(u64, footer_len + 8), fake.get_bytes);
     try std.testing.expectEqual(footer_start, fake.lowest_get_offset.?);
-    try std.testing.expectEqual(.sketch, explained.aggregate.plan.dispatch.strategy);
+    try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try writeAggregateExplanationJson(&out.writer, explained);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.written(), .{});
     defer parsed.deinit();
     const pass = parsed.value.object.get("passes").?.array.items[0].object;
-    try std.testing.expectEqualStrings("count", pass.get("kind").?.string);
+    try std.testing.expectEqualStrings("aggregate", pass.get("kind").?.string);
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
 
@@ -6912,9 +6934,9 @@ test "explainAggregate: local IO and environment knobs preserve dispatch eligibi
             .aggregate = "count(*) AS c",
             .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
         });
-        const eligible = i == 0 and !disabled;
-        const expected: @FieldType(scan.AggregateDispatch, "strategy") = if (eligible) .sketch else .plain_hash;
-        try std.testing.expectEqual(expected, explained.aggregate.plan.dispatch.strategy);
+        _ = i;
+        try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
+        try std.testing.expect(explained.aggregate.plan.reasons.contains(.small_ndv));
         try std.testing.expect(!explained.encoded);
     };
 }

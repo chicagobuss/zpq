@@ -117,8 +117,12 @@ It is a working budget, not a hard cap: the binary, page buffers and output in f
 of available memory, three quarters of a cgroup's memory limit or a Lambda's memory size where those are lower.
 
 Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
-It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reads file footers, including exact footer ranges
-for S3 inputs, and reports the strategy, reasons, column passes and conditional fallbacks without reading data pages.
+It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,
+conditional fallbacks and NDV upper bounds without reading data pages. Local planning can read dictionary headers and,
+when footer coverage and byte budgets allow it, dictionary pages to tighten those bounds. S3 explain reads only footers.
+`ZPQ_NDV_UNION=0` disables the optional union probe. `ZPQ_PARTAGG=1` forces eligible plain GROUP BY through shared tables;
+the planner also chooses them for large string keys or estimated worker-copy pressure. Memory estimates remain estimates;
+execution enforces the GROUP BY budget.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
 compute in scaled 128-bit integers, never through a double. Result types follow Trino's (Athena's) rules: `a + b` /

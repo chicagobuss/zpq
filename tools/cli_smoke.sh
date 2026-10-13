@@ -40,7 +40,7 @@ pq.write_table(t, f"{d}/in.parquet", compression="snappy")
 PY
 
 # Explain accepts both front doors, reports column passes, and creates no requested output.
-# Poison the pages so accidentally executing or probing page headers cannot succeed.
+# Poison the pages: failed optional dictionary refinement must fall back without reading data pages.
 "$PY" - "$ZPQ" "$DIR" <<'PY'
 import json, os, struct, subprocess, sys
 zpq, d = sys.argv[1:]
@@ -64,7 +64,8 @@ assert legacy == sql, (legacy, sql)
 assert legacy["ok"] and legacy["strategy"] == "plain_hash", legacy
 assert legacy["passes"][0]["columns"] == ["i32", "name"], legacy
 cut = explain("--query", f"SELECT name, count(*) AS n FROM '{poison}' GROUP BY name ORDER BY n DESC LIMIT 3")
-assert cut["strategy"] == "sketch" and cut["passes"][0]["columns"] == ["name"], cut
+assert cut["strategy"] == "plain_hash" and cut["passes"][0]["columns"] == ["name"], cut
+assert cut["ndv"]["source"] == "unknown" and not cut["sketch"]["census_allowed"], cut
 scalar = explain(poison, "--aggregate", "count(*) AS n")
 assert scalar["strategy"] == "scalar" and scalar["passes"][0]["columns"] == [], scalar
 bad = subprocess.run([zpq, "query", poison, "--explain"], capture_output=True, text=True)
@@ -522,3 +523,5 @@ fi
 
 # Row and group order across thread counts (tools/order_check.py says what is checked).
 "$PY" tools/order_check.py "$ZPQ" "$DIR/order"
+
+"$PY" tools/planner_check.py "$ZPQ" "$DIR"

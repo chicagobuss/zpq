@@ -113,6 +113,7 @@ test {
     _ = @import("core/expr/eval.zig");
     _ = @import("core/expr/agg.zig");
     _ = @import("core/partagg.zig");
+    _ = @import("core/ndv.zig");
     _ = @import("core/expr/agg_coded.zig");
     _ = @import("core/expr/sql_parser.zig");
     _ = @import("core/writer/fastpath.zig");

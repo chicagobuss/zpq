@@ -32,6 +32,8 @@ const expr_ast = @import("expr/ast.zig");
 const expr_parser = @import("expr/parser.zig");
 const expr_agg = @import("expr/agg.zig");
 const partagg = @import("partagg.zig");
+const ndv = @import("ndv.zig");
+pub const NdvStat = ndv.Stat;
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
@@ -135,6 +137,10 @@ pub const MultiAggArgs = struct {
     /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
     /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
     partagg: bool = false,
+    /// Disable profitability rules when exercising the legacy cut executors.
+    ndv_policy: bool = true,
+    /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
+    ndv_union: bool = true,
     /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
@@ -453,6 +459,7 @@ const WorkItem = struct {
 
 /// Bound query and footer facts only: choosing a strategy neither allocates nor reads the input.
 pub const PlanInputs = struct {
+    ndv_stat: ?NdvStat = null,
     args: MultiAggArgs,
     metas: []const schema.FileMetaData,
     work: []const WorkItem,
@@ -464,6 +471,15 @@ pub const PlanInputs = struct {
 };
 
 pub const Reason = enum {
+    small_ndv,
+    unknown_ndv,
+    census_needs_uniqueness_evidence,
+    high_cardinality_strings,
+    worker_copy_memory,
+    dictionary_union,
+    dictionary_union_budget,
+    dictionary_union_incomplete,
+    state_memory_unknown,
     partitioned_forced,
     partitioned_ineligible,
     sketch_disabled,
@@ -496,6 +512,8 @@ pub const AggregateDispatch = struct {
 
 /// Fixed-size decision; census and plain fallback remain conditional runtime transitions.
 pub const ScanPlan = struct {
+    ndv_stat: ?NdvStat = null,
+    plain_bytes: ?u64 = null,
     dispatch: AggregateDispatch,
     reasons: std.EnumSet(Reason) = .{},
 };
@@ -511,7 +529,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
     else
         false;
-    const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
+    const keys_unique = in.ndv_stat == null and args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
     const filter_small = args.sketch_topk != null and filterSmall(in.metas, in.work, keys, in.filter_cols);
     const count_agg = if (args.sketch_topk) |cfg| if (sketch_fits)
         sketchEligible(cfg, args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, keys_unique or filter_small)
@@ -557,7 +575,83 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         };
         result.reasons.insert(census_reason);
     }
+    if (in.ndv_stat) |stat| applyCostRules(in, stat, &result);
     return result;
+}
+
+fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strategy")) void {
+    plan.dispatch.strategy = strategy;
+    plan.dispatch.count_agg = null;
+    plan.dispatch.count_columns = false;
+    plan.dispatch.census_allowed = false;
+    plan.dispatch.census_fused = false;
+    for ([_]Reason{
+        .sketch_count_cut,                 .first_keys_cut, .census_fused, .census_on_sketch_bail,
+        .census_needs_uniqueness_evidence,
+    }) |r|
+        plan.reasons.remove(r);
+    plan.reasons.insert(.plain_scan);
+}
+
+fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
+    plan.ndv_stat = stat;
+    if (stat.union_complete) {
+        plan.reasons.insert(.dictionary_union);
+    } else if (stat.union_attempted) {
+        plan.reasons.insert(.dictionary_union_incomplete);
+    }
+    if (stat.union_budget_exceeded) plan.reasons.insert(.dictionary_union_budget);
+    var state_unknown = false;
+    for (in.calls) |call| {
+        state_unknown = state_unknown or call.func == .count_distinct or call.result == .bytes;
+    }
+    const per_group = (stat.key_bytes +| (@as(u64, @sizeOf(expr_agg.Accumulator)) *| in.calls.len) +| 32) *| 2;
+    const single = stat.hi *| per_group;
+    const copies = single *| plan.dispatch.tables;
+    if (!state_unknown) plan.plain_bytes = copies else plan.reasons.insert(.state_memory_unknown);
+    const small = stat.confidence == .upper_bound and stat.hi <= (1 << 20) and
+        !state_unknown and copies <= in.args.max_memory / 8;
+    // Encoded width is not evidence of uniqueness. An explicit fusion knob still exercises the census executor;
+    // automatic census needs independent strong evidence, which these upper bounds cannot supply.
+    const explicit_census = if (in.args.sketch_topk) |cfg| cfg.fuse_census != null else false;
+    if (!explicit_census) {
+        plan.dispatch.keys_unique = false;
+        plan.dispatch.census_allowed = false;
+        plan.dispatch.census_fused = false;
+        plan.reasons.remove(.keys_look_unique);
+        plan.reasons.remove(.census_fused);
+        plan.reasons.remove(.census_on_sketch_bail);
+        if (plan.dispatch.strategy == .sketch) plan.reasons.insert(.census_needs_uniqueness_evidence);
+    }
+    if (plan.dispatch.strategy == .partitioned_hash) return; // Explicit force has precedence over profitability.
+    if (small) {
+        plainDispatch(plan, .plain_hash);
+        plan.reasons.insert(.small_ndv);
+        return;
+    }
+    if (stat.source == .unknown or stat.covered_rows != stat.rows) {
+        plan.reasons.insert(.unknown_ndv);
+        // Numeric unknown keys retain a useful sketch cost bet (zipf11); its exact fallback is plain, never census.
+        // Complete string dictionary fallback makes grouping expensive. Partial coverage can still have useful
+        // skew (ClickBench), so retain that sketch cost bet, with a plain fallback rather than automatic census.
+        if (stat.string_keys and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
+            plan.dispatch.strategy == .sketch)
+            plainDispatch(plan, .plain_hash);
+    }
+    const long_strings = stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536;
+    // A row-count upper bound alone would route large integer scans to the slower scatter executor.
+    const memory_pressure = stat.union_complete and !state_unknown and copies > in.args.max_memory / 2 and
+        single <= in.args.max_memory;
+    if ((long_strings or memory_pressure) and partAggSupported(in.args, in.calls, in.keys != null)) {
+        // A known union can expose worker-copy pressure even in a sketch's eventual plain fallback.
+        if (plan.dispatch.strategy == .plain_hash or (memory_pressure and plan.dispatch.strategy == .sketch) or
+            (long_strings and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
+                plan.dispatch.strategy == .sketch))
+        {
+            plainDispatch(plan, .partitioned_hash);
+            plan.reasons.insert(if (long_strings) .high_cardinality_strings else .worker_copy_memory);
+        }
+    }
 }
 
 pub const AggregateExplanation = struct {
@@ -756,13 +850,15 @@ fn partAggWanted(
     grouped: bool,
     outputs: ?[]const BoundOutputColumn,
 ) bool {
-    if (!args.partagg or !grouped) return false;
-    if (orderSensitive(calls)) return false;
-    for (calls) |c| if (c.func == .count_distinct) return false;
-    const order = args.result_order;
-    if (order.limit != null and order.keys.len == 0) return false;
-    if (outputs) |outs| if (countCut(outs, calls, order) != null) return false;
+    if (!args.partagg or !partAggSupported(args, calls, grouped)) return false;
+    if (outputs) |outs| if (countCut(outs, calls, args.result_order) != null) return false;
     return true;
+}
+
+fn partAggSupported(args: MultiAggArgs, calls: []const expr_agg.AggCall, grouped: bool) bool {
+    if (!grouped or orderSensitive(calls)) return false;
+    for (calls) |c| if (c.func == .count_distinct) return false;
+    return args.result_order.limit == null or args.result_order.keys.len > 0;
 }
 
 /// Whether merging partial results in another order can change their bits: float sums and averages round
@@ -1897,7 +1993,18 @@ fn prepareAggregate(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
+    var ndv_stat: ?NdvStat = null;
+    if (args.ndv_policy) if (group_by_keys) |keys| {
+        const files = try arena.alloc(ndv.File, args.inputs.len);
+        for (args.inputs, files) |input, *file| file.* = .{
+            .bytes = input.bytes,
+            .local = !std.mem.startsWith(u8, input.name, "s3://") and
+                (input.logical_size == 0 or input.logical_size == input.bytes.len),
+        };
+        ndv_stat = try ndv.collect(gpa, arena, files, metas, keys, n_workers, args.max_memory, args.ndv_union);
+    };
     const plan_inputs: PlanInputs = .{
+        .ndv_stat = ndv_stat,
         .args = args,
         .metas = metas,
         .work = work_items.items,
@@ -1908,7 +2015,7 @@ fn prepareAggregate(
         .workers = n_workers,
     };
     const scan_plan = planAggregate(plan_inputs);
-    if (@import("builtin").is_test and !args.partagg)
+    if (@import("builtin").is_test and !args.partagg and ndv_stat == null)
         try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
     const decision = scan_plan.dispatch;
     const part_on = decision.strategy == .partitioned_hash;
@@ -2209,7 +2316,16 @@ fn prepareAggregate(
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
         // borrowed until the rows are built.
         if (part_state) |*ps| {
-            try fillFromPartitions(gpa, ps.parts, agg_calls, &slots, &merged_accs);
+            try fillFromPartitions(
+                gpa,
+                arena,
+                ps.parts,
+                agg_calls,
+                group_outputs.?,
+                args.result_order,
+                &slots,
+                &merged_accs,
+            );
             folded = true;
         } else if (folded) {
             if (candidates) |keys_kept| {
@@ -3579,20 +3695,28 @@ fn detachOwned(acc: *expr_agg.Accumulator) void {
 /// Move each partition's groups into `slots` / `accs`. Keys stay borrowed from the partition tables.
 fn fillFromPartitions(
     gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
     parts: []partagg.Part,
     calls: []const expr_agg.AggCall,
+    outputs: []const BoundOutputColumn,
+    order: expr_ast.ResultOrder,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     var total: usize = 0;
-    for (parts) |*p| total += p.table.groupCount();
+    for (parts) |*p| total += if (countCut(outputs, calls, order) != null)
+        @min(p.table.groupCount(), order.limit.? +| order.offset)
+    else
+        p.table.groupCount();
     try slots.ensureTotalCapacity(gpa, total);
     try accs.ensureTotalCapacity(gpa, total * calls.len);
     const len = calls.len;
     for (parts) |*p| {
         const gt = &p.table;
-        const n = gt.groupCount();
-        for (0..n) |g| {
+        const cut = try countLimitGroups(arena, gt, outputs, calls, order);
+        const n = if (cut) |ids| ids.len else gt.groupCount();
+        for (0..n) |i| {
+            const g = if (cut) |ids| ids[i] else i;
             const src = gt.accumulators.items[g * len ..][0..len];
             const idx = accs.items.len;
             try accs.appendSlice(gpa, src);
@@ -4928,6 +5052,7 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
             const select_cols = try selectList(arena, &.{ first_key, "count(*) AS c", "min(v) AS lo" });
             var args: MultiAggArgs = .{
                 .inputs = &inputs,
+                .ndv_policy = false,
                 .filter = filter,
                 .aggregate = "count(*) AS c, min(v) AS lo",
                 .group_by = key,
@@ -4994,6 +5119,7 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
             const aggregate = try std.fmt.allocPrint(arena, "{s}, min(s) AS lo, sum(t) AS st", .{count});
             var args: MultiAggArgs = .{
                 .inputs = &inputs,
+                .ndv_policy = false,
                 .filter = if (filter != null and std.mem.eql(u8, key, "u")) filter else null,
                 .aggregate = aggregate,
                 .group_by = key,
@@ -7513,6 +7639,7 @@ test "planAggregate: frozen dispatch agrees across fixtures, knobs, filters and 
                 defer arena_state.deinit();
                 const explained = try explainAggregate(testing.allocator, arena_state.allocator(), .{
                     .inputs = &inputs,
+                    .ndv_policy = false,
                     .metas = &metas,
                     .aggregate = "count(*) AS c",
                     .group_by = key,
@@ -7708,4 +7835,79 @@ test "planAggregate: forced partitions obey aggregate and cut eligibility" {
     in.args.result_order = .{};
     in.keys = null;
     try testing.expectEqual(.scalar, planAggregate(in).dispatch.strategy);
+}
+
+test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .count,
+        .arg = null,
+        .where = null,
+        .alias = "c",
+        .result = .i64,
+    }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+    } }};
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" },
+    };
+    var in: PlanInputs = .{
+        .args = .{
+            .inputs = &.{},
+            .aggregate = "count(*)",
+            .sketch_topk = .{},
+            .max_memory = 16 << 30,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        },
+        .metas = &.{},
+        .work = &.{},
+        .calls = &calls,
+        .keys = &keys,
+        .outputs = &outputs,
+        .filter_cols = &.{false},
+        .workers = 16,
+        .ndv_stat = .{
+            .source = .dictionary_union,
+            .confidence = .upper_bound,
+            .rows = 30_000_000,
+            .covered_rows = 30_000_000,
+            .hi = 1000,
+            .key_bytes = 9,
+            .union_complete = true,
+        },
+    };
+    var plan = planAggregate(in);
+    try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+    try testing.expect(plan.reasons.contains(.small_ndv));
+    try testing.expect(!plan.dispatch.count_columns and !plan.dispatch.census_allowed);
+    in.ndv_stat = .{ .rows = 30_000_000, .encoding_stats_rows = 30_000_000, .hi = 30_000_000, .key_bytes = 9 };
+    plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy); // Unknown numeric zipf11.
+    try testing.expect(!plan.dispatch.census_allowed and !plan.dispatch.keys_unique);
+    in.ndv_stat.?.string_keys = true;
+    in.ndv_stat.?.key_bytes = 15;
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy); // Short fallback strings.
+    in.ndv_stat.?.covered_rows = 100_000;
+    try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy); // Partial ClickBench coverage.
+    in.ndv_stat.?.covered_rows = 0;
+    in.ndv_stat.?.key_bytes = 128;
+    try testing.expectEqual(.partitioned_hash, planAggregate(in).dispatch.strategy);
+    in.args.result_order = .{};
+    in.args.max_memory = 128 << 20;
+    in.ndv_stat = .{
+        .source = .dictionary_union,
+        .confidence = .upper_bound,
+        .hi = 100_000,
+        .rows = 30_000_000,
+        .covered_rows = 30_000_000,
+        .key_bytes = 9,
+        .union_complete = true,
+    };
+    plan = planAggregate(in);
+    try testing.expectEqual(.partitioned_hash, plan.dispatch.strategy);
+    try testing.expect(plan.reasons.contains(.worker_copy_memory));
+    in.args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    try testing.expectEqual(.partitioned_hash, planAggregate(in).dispatch.strategy);
 }

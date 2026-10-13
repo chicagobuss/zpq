@@ -26,6 +26,7 @@ Usage:
   # Pure-local (no network): omit --s3; ZPQ reads local files too.
   .venv/bin/python tools/corpus_diff.py --local data/parquet-testing/data
 """
+from cli_output import read_one
 import argparse
 import math
 import os
@@ -80,7 +81,7 @@ def zpq_agg(path: str, agg: str, where: str | None) -> dict | None:
     if proc.returncode != 0:
         return None
     try:
-        return json.loads(proc.stdout).get("agg")
+        return read_one(proc.stdout)
     except json.JSONDecodeError:
         return None
 
@@ -300,6 +301,7 @@ def run_write(files, args):
                 mism += 1
                 failures.append((f.name, proj, where, f"zpq write error: {err[:90]}", None))
                 continue
+            assert not proc.stdout, proc.stdout
             checked += 1
             collist = ", ".join(f'"{c}"' for c in proj)
             wsql = f" WHERE {where}" if where else ""

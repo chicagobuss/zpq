@@ -175,7 +175,9 @@ PY
 # the quoted path "a"."b" rather than a second "a.b": one name per column, and
 # each name binds back through --columns, --filter and expressions.
 "$PY" - "$ZPQ" "$DIR" <<'PY'
-import csv, io, json, subprocess, sys
+import json, subprocess, sys
+sys.path.insert(0, "tools")
+from cli_output import read_rows
 import pyarrow as pa, pyarrow.parquet as pq
 zpq, d = sys.argv[1], sys.argv[2]
 src = f"{d}/dotted_twin.parquet"
@@ -196,8 +198,7 @@ def jsonl(*args):
 rows = jsonl()
 assert rows == [{"a.b": 1, Q: 10}, {"a.b": None, Q: 20}, {"a.b": 3, Q: None}], rows
 assert [list(r) for r in rows] == [["a.b", Q]] * 3
-table = list(csv.reader(io.StringIO(run(src, "--format", "csv"))))
-assert table == [["a.b", Q], ["1", "10"], ["", "20"], ["3", ""]], table
+assert json.loads(run(src, "--format", "json")) == rows
 
 # Every printed name selects, and filters on, the column printed under it.
 for name, values in (("a.b", [1, None, 3]), (Q, [10, 20, None])):
@@ -208,7 +209,7 @@ assert jsonl("--filter", f"{Q} > 10") == [{"a.b": None, Q: 20}]
 
 # GROUP BY on each column, and on both: the aggregate JSON keys and the grouped parquet.
 def agg(*args):
-    return json.loads(run(src, *args), object_pairs_hook=no_dup_keys)["agg"]
+    return read_rows(run(src, *args), object_pairs_hook=no_dup_keys)
 # Groups list where they first appear: rows (a.b, "a"."b") are (1, 10), (null, 20), (3, null).
 assert agg("--group-by", "b", "--aggregate", "count(*) AS n") == [{Q: 10, "n": 1}, {Q: 20, "n": 1}, {Q: None, "n": 1}]
 assert agg("--group-by", Q, "--aggregate", 'max("a.b") AS m') == [
@@ -260,11 +261,13 @@ def written(*args):
     t = pq.read_table(out)
     return t.schema.names, t.to_pylist()
 
+sys.path.insert(0, "tools")
+from cli_output import read_rows
 nested, top = [10, 20, None], [1, None, 3]  # as the groups first appear
 for name, keys in (("b", nested), ('"a"."b"', nested), ("a.b", top), ('"a.b"', top)):
     # The key is named by its label however the reference is spelled, in SQL and with the flag.
-    sql = json.loads(run("--query", f"SELECT {name}, count(*) AS n FROM '{src}' GROUP BY {name}"))["agg"]
-    flag = json.loads(run(src, "--group-by", name, "--aggregate", "count(*) AS n"))["agg"]
+    sql = read_rows(run("--query", f"SELECT {name}, count(*) AS n FROM '{src}' GROUP BY {name}"))
+    flag = read_rows(run(src, "--group-by", name, "--aggregate", "count(*) AS n"))
     label = '"a"."b"' if keys == nested else "a.b"
     assert sql == flag and [r[label] for r in sql] == keys, (name, sql, flag)
     sql = written("--query", f"SELECT * FROM '{src}' WHERE {name} IS NOT NULL")
@@ -276,13 +279,13 @@ pq.write_table(pa.table({"r": pa.array([{"v": 1}, {"v": 2}, {"v": 1}], type=pa.s
                f"{d}/plain_nested.parquet")
 want = [{"r.v": 1, "n": 2}, {"r.v": 2, "n": 1}]
 for name in ("v", "r.v", '"r"."v"', '"r".v'):
-    sql = json.loads(run("--query", f"SELECT {name}, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY {name}"))
-    assert sql["agg"] == want, (name, sql["agg"])
+    sql = read_rows(run("--query", f"SELECT {name}, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY {name}"))
+    assert sql == want, (name, sql)
     if name != '"r".v':  # SQL's mixed spelling; the flag forms quote every segment or none
-        flag = json.loads(run(f"{d}/plain_nested.parquet", "--group-by", name, "--aggregate", "count(*) AS n"))
-        assert flag["agg"] == want, (name, flag["agg"])
-sql = json.loads(run("--query", f"SELECT \"r\".\"v\" AS k, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY r.v"))
-assert sql["agg"] == [{"k": 1, "n": 2}, {"k": 2, "n": 1}], sql["agg"]
+        flag = read_rows(run(f"{d}/plain_nested.parquet", "--group-by", name, "--aggregate", "count(*) AS n"))
+        assert flag == want, (name, flag)
+sql = read_rows(run("--query", f"SELECT \"r\".\"v\" AS k, count(*) AS n FROM '{d}/plain_nested.parquet' GROUP BY r.v"))
+assert sql == [{"k": 1, "n": 2}, {"k": 2, "n": 1}], sql
 print("SQL identifier binding checks passed")
 PY
 
@@ -293,7 +296,7 @@ import os, subprocess, sys
 zpq, d = sys.argv[1], sys.argv[2]
 src, out = f"{d}/dotted_twin.parquet", f"{d}/unknown_cols.parquet"
 for cols in ("nope", "a.b,nope", '"a"."c"', "a.c"):
-    for args in (["-o", out], ["--format", "jsonl"], ["--format", "csv"]):
+    for args in (["-o", out], ["--format", "jsonl"], ["--format", "json"]):
         p = subprocess.run([zpq, "query", src, "--columns", cols, *args], capture_output=True, text=True)
         bad = cols.split(",")[-1]
         assert p.returncode != 0 and not p.stdout and f"unknown column `{bad}`" in p.stderr, (cols, args, p)
@@ -377,13 +380,13 @@ pq.write_table(t, f"{d}/pages.parquet", compression="snappy", data_page_version=
                data_page_size=4096, write_page_index=True, row_group_size=10_000)
 pq.write_table(t, f"{d}/zstd_src.parquet", compression="zstd")
 PY
-"$ZPQ" query "$DIR/in.parquet" -o "$DIR/to_zstd.parquet" --codec zstd 2> "$DIR/to_zstd.json"
-"$ZPQ" query "$DIR/in.parquet" -o "$DIR/proj_gzip.parquet" --columns i32,name --codec gzip 2> "$DIR/proj_gzip.json"
-"$ZPQ" query "$DIR/pages.parquet" -o "$DIR/pages_zstd.parquet" --codec zstd 2> "$DIR/pages_zstd.json"
-"$ZPQ" query "$DIR/pages.parquet" -o "$DIR/pages_raw.parquet" --codec uncompressed 2> "$DIR/pages_raw.json"
-"$ZPQ" query "$DIR/zstd_src.parquet" -o "$DIR/kept.parquet" 2> "$DIR/kept.json"
-"$ZPQ" query "$DIR/in.parquet" "$DIR/to_zstd.parquet" -o "$DIR/mixed.parquet" 2> "$DIR/mixed.json"
-"$ZPQ" query "$DIR/in.parquet" "$DIR/to_zstd.parquet" -o "$DIR/unmixed.parquet" --codec gzip 2> "$DIR/unmixed.json"
+"$ZPQ" query "$DIR/in.parquet" -o "$DIR/to_zstd.parquet" --codec zstd --summary=json 2> "$DIR/to_zstd.json"
+"$ZPQ" query "$DIR/in.parquet" -o "$DIR/proj_gzip.parquet" --columns i32,name --codec gzip --summary=json 2> "$DIR/proj_gzip.json"
+"$ZPQ" query "$DIR/pages.parquet" -o "$DIR/pages_zstd.parquet" --codec zstd --summary=json 2> "$DIR/pages_zstd.json"
+"$ZPQ" query "$DIR/pages.parquet" -o "$DIR/pages_raw.parquet" --codec uncompressed --summary=json 2> "$DIR/pages_raw.json"
+"$ZPQ" query "$DIR/zstd_src.parquet" -o "$DIR/kept.parquet" --summary=json 2> "$DIR/kept.json"
+"$ZPQ" query "$DIR/in.parquet" "$DIR/to_zstd.parquet" -o "$DIR/mixed.parquet" --summary=json 2> "$DIR/mixed.json"
+"$ZPQ" query "$DIR/in.parquet" "$DIR/to_zstd.parquet" -o "$DIR/unmixed.parquet" --codec gzip --summary=json 2> "$DIR/unmixed.json"
 "$ZPQ" query "$DIR/in.parquet" -o "$DIR/same_snappy.parquet" --codec snappy 2> /dev/null
 "$ZPQ" query "$DIR/in.parquet" -o "$DIR/no_codec.parquet" 2> /dev/null
 for src in in pages; do
@@ -432,8 +435,8 @@ assert open(f"{d}/same_snappy.parquet", "rb").read() == open(f"{d}/no_codec.parq
     "--codec snappy on snappy chunks did not take the byte-copy path"
 # ZPQ reads its recompressed output, page index included, to the same answer.
 for src, out in (("in", "to_zstd"), ("pages", "pages_zstd")):
-    a = json.loads(open(f"{d}/agg_{src}.json").read().strip().splitlines()[-1])["agg"]
-    b = json.loads(open(f"{d}/agg_{out}.json").read().strip().splitlines()[-1])["agg"]
+    a = json.loads(open(f"{d}/agg_{src}.json").read().strip().splitlines()[-1])
+    b = json.loads(open(f"{d}/agg_{out}.json").read().strip().splitlines()[-1])
     assert a == b, f"{out}: filtered aggregate {b} != source {a}"
 
 print("All --codec copy checks passed")
@@ -468,7 +471,7 @@ fi
 import glob, json, os, sys
 d = sys.argv[1]
 both = open(f"{d}/prof_both.txt").read()
-answer, summary = both.find('{"ok":true'), both.find("zpq profile:")
+answer, summary = both.find('{"n":'), both.find("zpq profile:")
 assert 0 <= answer < summary, f"the summary came before the answer:\n{both}"
 assert "rss peak" in both, both
 trace = json.load(open(f"{d}/trace.json"))
@@ -525,3 +528,7 @@ fi
 "$PY" tools/order_check.py "$ZPQ" "$DIR/order"
 
 "$PY" tools/planner_check.py "$ZPQ" "$DIR"
+
+"$PY" tools/cli_contract_check.py "$ZPQ"
+"$PY" tools/cli_publication_check.py "$ZPQ"
+echo "CLI smoke: PASS"

@@ -15,6 +15,7 @@ NULL, integers and DECIMAL (zpq's JSON digits read as Decimal), tolerant for flo
 
 Usage: .venv/bin/python tools/differential.py
 """
+from cli_output import read_one, read_rows, read_summary
 import duckdb, subprocess, os, sys, tempfile, json
 import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
@@ -266,12 +267,12 @@ def stats_order_checks(con, tmp):
         for flags in ([[]] if zf is not None else [[], ["--trust-stats"]]):
             total += 1
             tag = f"{label} × agg{' trust' if flags else ''}"
-            cmd = [ZPQ, "query", fixture, "--aggregate", za] + filt + flags
+            cmd = [ZPQ, "query", fixture, "--aggregate", za, "--summary=json"] + filt + flags
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 report(False, tag, f"ZPQ error: {r.stderr.strip()[:70]}")
                 continue
-            zvals = from_zpq(list(zjson(r.stdout)["agg"].values()), agg_lanes)
+            zvals = from_zpq(list(read_one(r.stdout, parse_float=Decimal).values()), agg_lanes)
             ok = len(zvals) == len(want_agg) and all(same(z, w, lane) for z, w, lane in zip(zvals, want_agg, agg_lanes))
             report(ok, tag, f"zpq={zvals} {src}={want_agg}")
 
@@ -462,7 +463,7 @@ def main():
                                ("no_rows", "id < -100000", "id < -100000"),
                                ("amt_isnull", "amt IS NULL", "amt IS NULL")]:
             total += 1
-            cmd = [ZPQ, "query", fixture, "--aggregate", za]
+            cmd = [ZPQ, "query", fixture, "--aggregate", za, "--summary=json"]
             if zf is not None:
                 cmd += ["--filter", zf]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -473,9 +474,9 @@ def main():
                 continue
 
             try:
-                zout = zjson(r.stdout)
-                zvals = [fold_avg(v) for v in zout["agg"].values()]
-                proven = zout.get("row_groups_full_match", 0)
+                zout = read_one(r.stdout, parse_float=Decimal)
+                zvals = [fold_avg(v) for v in zout.values()]
+                proven = read_summary(r.stderr).get("row_groups_full_match", 0)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
                 fails += 1
@@ -536,7 +537,7 @@ def main():
                 continue
 
             try:
-                zrows_raw = zjson(r.stdout)["agg"]
+                zrows_raw = read_rows(r.stdout, parse_float=Decimal)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
                 fails += 1
@@ -575,6 +576,7 @@ def main():
             if os.path.exists(out):
                 os.remove(out)
             r = subprocess.run(cmd + ["-o", out], capture_output=True, text=True)
+            assert not r.stdout, r.stdout
             label = f"groupby-o:{glabel:13} × {flabel:6}"
             want_cols, want_rows = [], []
             for c, v in (zrows_raw[0].items() if zrows_raw else []):
@@ -633,7 +635,7 @@ def main():
             lanes = json_lanes(duck_rel)
             want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in duck_rel.fetchall()]
             got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq([fold_avg(v) for v in row.values()], lanes)))
-                   for row in zjson(r.stdout)["agg"]]
+                   for row in read_rows(r.stdout, parse_float=Decimal)]
             problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
         except Exception as e:
             problem = f"error: {e}"
@@ -677,7 +679,7 @@ def main():
             duck_rel = con.execute(sql)
             lanes = json_lanes(duck_rel)
             want = canon_rows(duck_rel.fetchall(), lanes)
-            agg = zjson(r.stdout)["agg"]
+            agg = read_rows(r.stdout, parse_float=Decimal)
             zrows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
             got = canon_rows([from_zpq(row, lanes) for row in zrows], lanes)
             problem = None if got == want else f"zpq={got} duck={want}"
@@ -699,7 +701,7 @@ def main():
     outs = set()
     for j in ("1", "2", "4", "16"):
         r = subprocess.run([ZPQ, "query", "--query", sql, "-j", j], capture_output=True, text=True)
-        outs.add(json.dumps(zjson(r.stdout).get("agg"), default=str) if r.returncode == 0 else f"error {r.stderr[:80]}")
+        outs.add(json.dumps(read_rows(r.stdout, parse_float=Decimal), default=str) if r.returncode == 0 else f"error {r.stderr[:80]}")
     total += 1
     want = {row[0]: row for row in con.execute(sql.replace("avg(v)", "sum(v)::HUGEINT / count(v)")).fetchall()}
     got = {row["g"]: row for row in json.loads(next(iter(outs)), parse_float=Decimal)} if len(outs) == 1 else {}
@@ -736,7 +738,7 @@ def main():
             rel = con.execute(sql)
             lanes = json_lanes(rel)
             want = canon_rows(rel.fetchall(), lanes)
-            got = canon_rows([from_zpq([fold_avg(v) for v in row.values()], lanes) for row in zjson(r.stdout)["agg"]], lanes)
+            got = canon_rows([from_zpq([fold_avg(v) for v in row.values()], lanes) for row in read_rows(r.stdout, parse_float=Decimal)], lanes)
             problem = None if got == want else f"zpq={got[:3]} duck={want[:3]}"
         except Exception as e:
             problem = f"error: {e}"
@@ -762,7 +764,7 @@ def main():
                 if r.returncode != 0:
                     raise RuntimeError((r.stderr or r.stdout).strip()[:90])
                 want = sorted(con.execute(sql).fetchall(), key=repr)
-                agg = zjson(r.stdout)["agg"]
+                agg = read_rows(r.stdout, parse_float=Decimal)
                 rows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
                 got = sorted([[float(v["sum"]) / v["count"] if isinstance(v, dict) else v for v in row] for row in rows], key=repr)
                 ok = len(got) == len(want) and all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr))
@@ -800,7 +802,7 @@ def main():
                 raise RuntimeError((r.stderr or r.stdout).strip()[:90])
             rel = con.execute(sql)
             lanes = json_lanes(rel)
-            rows = [from_zpq(list(row.values()), lanes) for row in zjson(r.stdout)["agg"]]
+            rows = [from_zpq(list(row.values()), lanes) for row in read_rows(r.stdout, parse_float=Decimal)]
             if "ORDER BY" in q:
                 want = [tuple(canon(v) for v in row) for row in rel.fetchall()]
                 got = [tuple(canon(v) for v in row) for row in rows]
@@ -950,7 +952,7 @@ def main():
                     # LIMIT without ORDER BY: compare to the file's first rows in order.
                     want = canon_rows(con.execute(f"SELECT * FROM '{big}'").fetchmany(7), lanes)
             else:
-                agg = zjson(r.stdout)["agg"]
+                agg = read_rows(r.stdout, parse_float=Decimal)
                 rows = agg if isinstance(agg, list) else [agg]
                 got = canon_rows([from_zpq([fold_avg(row.get(c)) for c in cols], lanes) for row in rows], lanes)
             if got != want:
@@ -963,7 +965,7 @@ def main():
     r = subprocess.run([ZPQ, "query", big, "--aggregate", "sum(price) AS s", "--max-memory", "100K"],
                        capture_output=True, text=True)
     want_s = con.execute(f"SELECT sum(price) FROM '{big}'").fetchone()[0]
-    streamed = r.returncode == 0 and zjson(r.stdout)["agg"]["s"] == want_s
+    streamed = r.returncode == 0 and read_one(r.stdout, parse_float=Decimal)["s"] == want_s
     print(f"  {'OK  ' if streamed else 'FAIL'}  sliced:tiny-budget  {(r.stderr or r.stdout).strip()[:70]}")
     fails += 0 if streamed else 1
     # INT96 (no DuckDB writer) and FLOAT16 lanes: printed in slices exactly as printed whole.
@@ -1010,7 +1012,7 @@ def main():
                 for r in outs:
                     if r.returncode != 0:
                         raise RuntimeError((r.stderr or r.stdout).strip()[:70])
-                enc, plain = (zjson(r.stdout)["agg"] for r in outs)
+                enc, plain = (read_one(r.stdout, parse_float=Decimal) for r in outs)
                 if enc != plain:
                     raise RuntimeError(f"encoded {enc} vs ZPQ_ENCODED=0 {plain}")
                 want = con.execute(f"SELECT count({col}) FROM '{path}'").fetchone()[0]
@@ -1061,8 +1063,9 @@ def main():
             # object_pairs_hook keeps duplicate keys visible instead of letting the last one win.
             class Pairs(list):
                 pass
-            agg = dict(json.loads(r.stdout, object_pairs_hook=Pairs))["agg"]
-            got = [k for k, _ in (agg if isinstance(agg, Pairs) else agg[0])]
+            rows = read_rows(r.stdout, object_pairs_hook=Pairs)
+            got = [k for k, _ in rows[0]]
+            assert all([k for k, _ in row] == got for row in rows)
         except Exception as e:
             got = f"error: {e}; {r.stderr.strip()[:60]}"
         if got == want:

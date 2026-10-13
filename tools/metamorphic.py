@@ -38,6 +38,7 @@ Usage:
 """
 import argparse
 import json
+from cli_output import read_one
 import os
 import random
 import subprocess
@@ -141,7 +142,7 @@ def zpq_agg(path: str, agg: str, where: str | None, *, scan_all: bool):
     if proc.returncode != 0:
         return ("error", (proc.stderr or proc.stdout).strip()[:120])
     try:
-        return ("ok", json.loads(proc.stdout).get("agg"))
+        return ("ok", read_one(proc.stdout))
     except json.JSONDecodeError:
         return ("error", "json-decode")
 

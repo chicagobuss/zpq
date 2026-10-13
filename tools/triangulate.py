@@ -11,6 +11,7 @@ import argparse
 import datetime
 import decimal
 import json
+from cli_output import read_rows
 import math
 import os
 import re
@@ -277,6 +278,7 @@ def run_zpq_write(in_path: str, out_path: str, extra: List[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S)
     if proc.returncode != 0:
         raise RuntimeError(f"ZPQ Write Error: {proc.stderr.strip()[:200]}")
+    assert not proc.stdout, proc.stdout
 
 
 def run_zpq_agg(path: str, agg: str, flt: Optional[str] = None) -> List[Dict]:
@@ -285,10 +287,10 @@ def run_zpq_agg(path: str, agg: str, flt: Optional[str] = None) -> List[Dict]:
     if proc.returncode != 0:
         raise RuntimeError(f"ZPQ Read Error: {proc.stderr.strip()[:200]}")
     try:
-        data = json.loads(proc.stdout)
+        data = read_rows(proc.stdout)
     except json.JSONDecodeError:
         raise RuntimeError(f"ZPQ JSON Error: {proc.stdout[:200]}")
-    return [data["agg"]] if "agg" in data else []
+    return data
 
 
 def _hardwood_error(stderr: str) -> str:

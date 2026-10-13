@@ -42,7 +42,7 @@ compare() {
   if python3 - "$1" "$2" "$3" <<'PY'
 import sys, json
 desc, zjson, dcsv = sys.argv[1], sys.argv[2], sys.argv[3]
-zvals = list(json.loads(zjson)["agg"].values())
+zvals = list(json.loads(zjson).values())
 dvals = dcsv.strip().split(",")
 ok = len(zvals) == len(dvals)
 for zv, dv in zip(zvals, dvals):
@@ -139,7 +139,7 @@ if [[ -f "$TP" ]]; then
     "$("$ZPQ" query "$TP" --filter 'id >= 0' --aggregate 'sum(id) AS s, max(id) AS m' --trust-stats 2>/dev/null)" \
     "$("$DUCKDB" -noheader -csv -c "SELECT sum(id), max(id) FROM '$TP' WHERE id >= 0")"
   groups=$("$ZPQ" query "$TP" --filter 'id IS NOT NULL' --group-by id --aggregate 'count(*) AS n' 2>/dev/null \
-    | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["agg"]))')
+    | python3 -c 'import sys,json; print(len([json.loads(line) for line in sys.stdin if line.strip()]))')
   want=$("$DUCKDB" -noheader -csv -c "SELECT count(DISTINCT id) FROM '$TP'")
   if [[ "$groups" == "$want" ]]; then
     echo "  OK    always-match pages feed GROUP BY keys (corpus: tiny_pages)   groups=$groups"
@@ -179,7 +179,7 @@ scan_all_parity() {
 import sys, json
 desc, a, b = sys.argv[1:4]
 try:
-    aa, bb = json.loads(a)["agg"], json.loads(b)["agg"]
+    aa, bb = json.loads(a), json.loads(b)
 except Exception as e:
     print(f"  FAIL  {desc}   (bad json: {e})"); sys.exit(1)
 ok = aa == bb
@@ -253,9 +253,9 @@ try:
 except Exception as e:
     print(f"  FAIL  {label:11} (bad json: {e})"); sys.exit(1)
 def norm(xs): return [round(float(x), 4) if isinstance(x, (int, float)) else str(x) for x in xs]
-agree = norm(list(a["agg"].values())) == norm(list(b["agg"].values()))
+agree = norm(list(a.values())) == norm(list(b.values()))
 verdict = "stats " if a.get("cols_stat_pruned", 0) > 0 else "decode"
-print(("  OK   " if agree else "  FAIL ") + f"{label:11} [{verdict}] = {list(a['agg'].values())}")
+print(("  OK   " if agree else "  FAIL ") + f"{label:11} [{verdict}] = {list(a.values())}")
 sys.exit(0 if agree else 1)
 PY
   then :; else fail=1; fi

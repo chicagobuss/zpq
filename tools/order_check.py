@@ -3,13 +3,14 @@
 
   tools/order_check.py ZPQ [WORKDIR]
 
-For every output that lists rows (jsonl and csv print, -o writes plain, filtered, projected and recompressed, several
+For every output that lists rows (NDJSON and JSON print, -o writes plain, filtered, projected and recompressed, several
 inputs) the output must be byte-identical at -j 1, 2, 8 and 32 and list rows in the input's order: files in the order
 given, then row groups, then rows (pyarrow reading the same inputs in the same order is the reference). GROUP BY must
 list groups where they first appear in the input and give the same bits for every aggregate at every -j, while
 --unordered must give the same groups and integer values. Set ZPQ_IO_PROFILE to run the checks on one I/O backend.
 """
 import json
+from cli_output import read_rows
 import os
 import subprocess
 import sys
@@ -63,6 +64,8 @@ def run(zpq, args, out=None):
     p = subprocess.run([zpq, "query", *args], capture_output=True)
     if p.returncode != 0:
         raise SystemExit(f"zpq {' '.join(args)} failed: {p.stderr.decode()[-500:]}")
+    if out is not None:
+        assert not p.stdout, p.stdout
     return p.stdout if out is None else open(out, "rb").read()
 
 
@@ -75,29 +78,27 @@ def main():
     bad = 0
 
     def same_everywhere(name, args, out=None, answer=False):
-        """`answer`: compare the aggregate answer only, not the timings beside it."""
+        """`answer`: compare parsed rows across worker counts."""
         nonlocal bad
         outs = {}
         for j in THREADS:
             dst = os.path.join(d, f"{name}.j{j}.parquet") if out else None
             outs[j] = run(zpq, [*args, "-j", str(j)] + (["-o", dst] if dst else []), dst)
             if answer:
-                outs[j] = json.dumps(json.loads(outs[j])["agg"]).encode()
+                outs[j] = json.dumps(read_rows(outs[j].decode())).encode()
         if len(set(outs.values())) != 1:
             bad += 1
             print(f"FAIL {name}: output differs across -j {THREADS}")
         return outs[1], (os.path.join(d, f"{name}.j1.parquet") if out else None)
 
     # Printed rows, in input order.
-    for fmt in ("jsonl", "csv"):
+    for fmt in ("jsonl", "json"):
         body, _ = same_everywhere(f"print-{fmt}", [*paths, "--format", fmt, "--filter", "n >= 3"])
         want = ref.filter(pc.greater_equal(ref["n"], 3))["id"].to_pylist()
         if fmt == "jsonl":
             got = [json.loads(line)["id"] for line in body.decode().splitlines() if line.strip()]
         else:
-            lines = body.decode().splitlines()
-            col = lines[0].split(",").index("id")
-            got = [int(line.split(",")[col]) for line in lines[1:]]
+            got = [row["id"] for row in json.loads(body)]
         if got != want:
             bad += 1
             print(f"FAIL print-{fmt}: rows out of input order")
@@ -135,7 +136,7 @@ def main():
         if got_keys != first_seen:
             bad += 1
             print(f"FAIL {name}: groups {got_keys}, want first appearance {first_seen}")
-        un = json.loads(run(zpq, [*inputs, *agg, "--unordered", "-j", "32"]))["agg"]
+        un = read_rows(run(zpq, [*inputs, *agg, "--unordered", "-j", "32"]).decode())
         if sorted((r["k"], r["c"]) for r in un) != sorted((r["k"], r["c"]) for r in rows):
             bad += 1
             print(f"FAIL {name} --unordered: different groups or counts")

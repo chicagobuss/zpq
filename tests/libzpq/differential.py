@@ -1,9 +1,10 @@
 """libzpq against the CLI and the Lambda on the differential corpus (tools/differential.py), byte for byte: every
 filter x projection and filter x select written by all three must be the same file, and every filter x aggregate
-answer the same `"agg"` text. The CLI and the Lambda are the built zig-out/bin binaries; the Lambda runs behind a
+answer the same values with exact decimal parsing. The CLI and the Lambda are the built zig-out/bin binaries; the Lambda runs behind a
 fake runtime API in this process. Run from the repo root with ZPQ_LIB pointing at libzpq.so (tests/libzpq/run.sh does).
 """
 
+from decimal import Decimal
 import http.server
 import json
 import os
@@ -16,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))
 import differential as corpus  # noqa: E402
+from cli_output import read_one
 import duckdb  # noqa: E402
 import zpq  # noqa: E402
 
@@ -128,6 +130,7 @@ def main():
                 refusals = f"cli rc {r.returncode}, libzpq {lib.get('error')}, lambda {lam_resp.get('error')}"
                 failures.append(f"{label}: {refusals}")
             return
+        assert r.stdout == "", r.stdout
         files = {k: read(p) for k, p in outs.items()}
         if not files["cli"] == files["lib"] == files["lambda"]:
             failures.append(f"{label}: written files differ ({', '.join(f'{k} {len(v)} B' for k, v in files.items())})")
@@ -142,7 +145,9 @@ def main():
             if not (lib.startswith('{"error"') and lam_resp.startswith('{"error"')):
                 failures.append(f"{label}: the CLI refused ({r.stderr.strip()[:60]}) but libzpq or the lambda answered")
             return
-        got = {"cli": agg_text(r.stdout), "lib": agg_text(lib), "lambda": agg_text(lam_resp)}
+        got = {"cli": read_one(r.stdout, parse_float=Decimal),
+               "lib": json.loads(agg_text(lib), parse_float=Decimal),
+               "lambda": json.loads(agg_text(lam_resp), parse_float=Decimal)}
         if not got["cli"] == got["lib"] == got["lambda"]:
             failures.append(f"{label}: agg differs: {got}")
 
@@ -168,7 +173,7 @@ def main():
     if failures:
         print(f"{len(failures)} of {checks} differ", file=sys.stderr)
         sys.exit(1)
-    print(f"libzpq differential: {checks}/{checks} byte-identical to the CLI and the Lambda")
+    print(f"libzpq differential: {checks}/{checks} files byte-identical; exact answers agree with CLI and Lambda")
 
 
 if __name__ == "__main__":

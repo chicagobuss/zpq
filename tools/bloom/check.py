@@ -26,6 +26,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sbbf  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cli_output import read_one, read_summary
 
 EPOCH = dt.datetime(2020, 1, 1)
 
@@ -130,9 +132,8 @@ class Zpq:
 
     def count(self, path, filt, scan_all=False):
         extra = ["--scan-all"] if scan_all else []
-        out = self.run(path, "--filter", filt, "--aggregate", "count(*) AS n", *extra).stdout
-        j = json.loads(out.strip().splitlines()[-1])
-        return int(j["agg"]["n"]), j["membership"]
+        result = self.run(path, "--filter", filt, "--aggregate", "count(*) AS n", "--summary=json", *extra)
+        return int(read_one(result.stdout)["n"]), read_summary(result.stderr)["membership"]
 
     def write(self, src, out, *args):
         self.run(src, "-o", out, *args)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check planner decisions and partitioned answers against DuckDB, without measuring performance."""
 import json
+from cli_output import read_rows
 import os
 from pathlib import Path
 import struct
@@ -28,7 +29,7 @@ def run(sql, workers=4, explain=False, extra=(), overrides=None, trace_expect=()
     result = subprocess.run(command, env=env | (overrides or {}), capture_output=True, text=True, check=True)
     for fragment in trace_expect:
         assert fragment in result.stderr, result.stderr
-    return json.loads(result.stdout)
+    return json.loads(result.stdout) if explain else read_rows(result.stdout)
 
 
 queries = [
@@ -54,11 +55,11 @@ for template in queries:
     for workers in (1, 3, 8):
         for encoded in ("0", "1"):
             result = run(sql, workers, overrides={"ZPQ_ENCODED": encoded})
-            for row in result["agg"]:
+            for row in result:
                 if isinstance(row.get("av"), dict):
                     avg = row["av"]
                     row["av"] = avg["sum"] / avg["count"] if avg["count"] else None
-            assert result["agg"] == truth, (workers, encoded, sql, result["agg"][:3], truth[:3])
+            assert result == truth, (workers, encoded, sql, result[:3], truth[:3])
 
 # Dictionary statistics must never need a data page. Preserve dictionaries, poison all data-page spans.
 bounded = Path(directory) / "planner_bounded.parquet"
@@ -101,7 +102,7 @@ truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) AS
 for workers in (1, 4):
     for census in ("0", "1"):
         result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census})
-        rows = result["agg"]
+        rows = result
         for row in rows:
             avg = row["av"]
             row["av"] = avg["sum"] / avg["count"] if avg["count"] else None
@@ -120,7 +121,7 @@ for group in ("k", "k, f"):
     truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
     cols = [*group.split(", "), "c"]
     for workers in (1, 4):
-        rows = run(sql, workers)["agg"]
+        rows = run(sql, workers)
         assert [tuple(row[c] for c in cols) for row in rows] == truth, rows
 # A short string marginal can repeat while the composite tuple is almost unique.
 strings = Path(directory) / "planner_string_census.parquet"
@@ -138,7 +139,7 @@ for workers in (1, 4):
     for census in ("0", "1"):
         result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census, "ZPQ_SKETCH_TRACE": "1"},
                      trace_expect=("try=true", "certified=true") if census == "1" else ())
-        assert [tuple(row[c] for c in ("k", "f", "c")) for row in result["agg"]] == truth, result
+        assert [tuple(row[c] for c in ("k", "f", "c")) for row in result] == truth, result
 for sql in (f"SELECT k, count(*) AS c FROM '{strings}' GROUP BY k ORDER BY c DESC LIMIT 10",
             f"SELECT k, f, count(*) AS c, sum(pos) AS s FROM '{strings}' GROUP BY k, f ORDER BY c DESC LIMIT 10"):
     assert run(sql, explain=True)["strategy"] == "plain_hash"

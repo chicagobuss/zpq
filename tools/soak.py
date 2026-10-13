@@ -6,6 +6,7 @@ fixtures but are not worth adding to the critical path test suite.
 """
 
 import json
+from cli_output import read_one
 import os
 import subprocess
 import sys
@@ -69,7 +70,7 @@ def check_nullable_flba_decimal_aggregates(tmpdir):
     if proc.returncode != 0:
         raise RuntimeError(f"ZPQ failed: {(proc.stderr or proc.stdout).strip()}")
 
-    got = json.loads(proc.stdout)["agg"]
+    got = read_one(proc.stdout)
     con = duckdb.connect()
     want_row = con.execute(
         f"SELECT sum(price) AS s, count(price) AS c, min(price) AS lo, max(price) AS hi FROM '{path}'"

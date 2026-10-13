@@ -204,14 +204,9 @@ fn foldDistinctCoded(
         setBit(bitset, codes[r]);
     };
 
-    if (state.distinct == null) {
-        const ds = try persist.create(agg.DistinctSet);
-        ds.* = .{};
-        state.distinct = ds;
-    }
     for (0..n_dict) |k| {
         if ((bitset[k / 64] & (@as(u64, 1) << @truncate(k % 64))) != 0) {
-            try state.distinct.?.insertColRow(persist, dict, k);
+            try state.distinct.insertColRow(persist, dict, k);
         }
     }
 }
@@ -233,15 +228,8 @@ fn foldHist(
             return;
         },
         .count_distinct => {
-            if (state.distinct == null) {
-                const ds = try persist.create(agg.DistinctSet);
-                ds.* = .{};
-                state.distinct = ds;
-            }
             for (hist, 0..) |h, k| {
-                if (h > 0) {
-                    try state.distinct.?.insertColRow(persist, dict, k);
-                }
+                if (h > 0) try state.distinct.insertColRow(persist, dict, k);
             }
             return;
         },

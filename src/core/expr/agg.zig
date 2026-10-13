@@ -543,12 +543,206 @@ pub const DistinctSet = struct {
     }
 };
 
+/// Grouped count(DISTINCT) held in the accumulator itself.
+///
+/// `raw[1..]` stores up to `cap` u64 values. `raw[0]` is an 8-aligned pointer — the group's shared budget, or a
+/// spilled `DistinctSet` — with a 3-bit tag in the low bits (0..cap inline, `heap_mark` spilled). `DistinctSet` and
+/// `SharedBudget` are both at least 8-aligned, so those bits are free, and 32 bytes is the payload `DecSum` already
+/// forces: a group of one to three values costs no heap object and no budget draw. The fourth u64, or any i128 or
+/// byte value, spills to a `DistinctSet`, which charges its own object.
+pub const DistinctAcc = struct {
+    raw: [4]u64 = .{ 0, 0, 0, 0 },
+
+    pub const cap: u8 = 3;
+    const heap_mark: u64 = 7;
+
+    comptime {
+        if (@sizeOf(DistinctAcc) > @sizeOf(DecSum)) @compileError("DistinctAcc grew past the accumulator payload");
+        if (@alignOf(DistinctSet) < 8 or @alignOf(SharedBudget) < 8) @compileError("tag bits need 8-aligned pointees");
+    }
+
+    pub fn initEmpty(budget: ?*SharedBudget) DistinctAcc {
+        return .{ .raw = .{ @intFromPtr(budget), 0, 0, 0 } };
+    }
+
+    pub fn fromSet(ds: *DistinctSet) DistinctAcc {
+        return .{ .raw = .{ @intFromPtr(ds) | heap_mark, 0, 0, 0 } };
+    }
+
+    fn tag(self: DistinctAcc) u8 {
+        return @intCast(self.raw[0] & 7);
+    }
+
+    pub fn heap(self: DistinctAcc) ?*DistinctSet {
+        if ((self.raw[0] & 7) != heap_mark) return null;
+        return @ptrFromInt(self.raw[0] & ~@as(u64, 7));
+    }
+
+    /// Budget stashed while the values are inline; a spilled set keeps it on the set.
+    pub fn budgetPtr(self: DistinctAcc) ?*SharedBudget {
+        if ((self.raw[0] & 7) == heap_mark) return if (self.heap()) |ds| ds.shared else null;
+        const p = self.raw[0] & ~@as(u64, 7);
+        if (p == 0) return null;
+        return @ptrFromInt(p);
+    }
+
+    fn setBudget(self: *DistinctAcc, budget: ?*SharedBudget) void {
+        self.raw[0] = @intFromPtr(budget) | (self.raw[0] & 7);
+    }
+
+    pub fn count(self: DistinctAcc) usize {
+        if (self.heap()) |ds| return ds.count();
+        return self.tag();
+    }
+
+    pub fn deinit(self: *DistinctAcc, allocator: std.mem.Allocator) void {
+        if (self.heap()) |ds| {
+            ds.deinit(allocator);
+            allocator.destroy(ds);
+        }
+        self.* = .{};
+    }
+
+    pub fn detach(self: *DistinctAcc) void {
+        if (self.heap()) |ds| ds.detach();
+    }
+
+    pub fn insertU64(self: *DistinctAcc, allocator: std.mem.Allocator, v: u64) !void {
+        const t = self.tag();
+        if (t == heap_mark) return self.heap().?.insertU64(allocator, v);
+        var i: u8 = 0;
+        while (i < t) : (i += 1) {
+            if (self.raw[1 + @as(usize, i)] == v) return;
+        }
+        if (t < cap) {
+            self.raw[1 + @as(usize, t)] = v;
+            self.raw[0] = (self.raw[0] & ~@as(u64, 7)) | @as(u64, t + 1);
+            return;
+        }
+        const ds = try self.ensureHeap(allocator);
+        try ds.insertU64(allocator, v);
+    }
+
+    pub fn insertF64(self: *DistinctAcc, allocator: std.mem.Allocator, val: f64) !void {
+        var f = val;
+        if (std.math.isNan(f)) {
+            f = std.math.nan(f64);
+        } else if (f == 0.0) {
+            f = 0.0;
+        }
+        return self.insertU64(allocator, @bitCast(f));
+    }
+
+    pub fn insertI128(self: *DistinctAcc, allocator: std.mem.Allocator, v: i128) !void {
+        if (self.tag() != 0 and self.tag() != heap_mark) return error.UnsupportedAggType;
+        const ds = try self.ensureHeap(allocator);
+        try ds.insertI128(allocator, v);
+    }
+
+    pub fn insertBytes(self: *DistinctAcc, allocator: std.mem.Allocator, v: []const u8) !void {
+        if (self.tag() != 0 and self.tag() != heap_mark) return error.UnsupportedAggType;
+        const ds = try self.ensureHeap(allocator);
+        try ds.insertBytes(allocator, v);
+    }
+
+    pub fn insertColRow(
+        self: *DistinctAcc,
+        allocator: std.mem.Allocator,
+        col: filter_eval.Batch.Column,
+        r: usize,
+    ) !void {
+        if (isRowNull(col, r)) return;
+        switch (col) {
+            .i32 => |c| try self.insertU64(allocator, @as(u64, @bitCast(@as(i64, c.values[r])))),
+            .i64 => |c| try self.insertU64(allocator, @bitCast(c.values[r])),
+            .f32 => |c| try self.insertF64(allocator, @floatCast(c.values[r])),
+            .f64 => |c| try self.insertF64(allocator, c.values[r]),
+            .boolean => |c| try self.insertU64(allocator, if (c.values[r]) 1 else 0),
+            .string => |c| try self.insertBytes(allocator, c.values[r]),
+            .i128 => |c| try self.insertI128(allocator, c.values[r]),
+        }
+    }
+
+    /// Spill inline values into a heap set. Already-spilled state is returned as it is. On failure the inline
+    /// values are still here.
+    pub fn ensureHeap(self: *DistinctAcc, allocator: std.mem.Allocator) !*DistinctSet {
+        if (self.heap()) |ds| return ds;
+        const budget = self.budgetPtr();
+        const n = self.tag();
+        var saved: [cap]u64 = undefined;
+        var i: u8 = 0;
+        while (i < n) : (i += 1) saved[i] = self.raw[1 + @as(usize, i)];
+
+        const ds = try allocator.create(DistinctSet);
+        errdefer allocator.destroy(ds);
+        ds.* = .{ .shared = budget };
+        errdefer ds.deinit(allocator);
+        // The object is memory the group now holds. Charged on the set, which releases it, rather than up front on
+        // every group that never spills.
+        try ds.charge(@sizeOf(DistinctSet));
+        i = 0;
+        while (i < n) : (i += 1) try ds.insertU64(allocator, saved[i]);
+        self.* = .fromSet(ds);
+        return ds;
+    }
+
+    /// Copy `src`'s values in. `src` keeps whatever it owns.
+    pub fn mergeFrom(self: *DistinctAcc, src: DistinctAcc, allocator: std.mem.Allocator) !void {
+        if (src.heap()) |ss| {
+            const dst = try self.ensureHeap(allocator);
+            try dst.merge(ss, allocator);
+            return;
+        }
+        const n = src.tag();
+        var i: u8 = 0;
+        while (i < n) : (i += 1) try self.insertU64(allocator, src.raw[1 + @as(usize, i)]);
+    }
+
+    /// Move `src` into `self`, leaving `src` empty. The larger spilled set is kept and the smaller folded in.
+    pub fn takeFrom(self: *DistinctAcc, src: *DistinctAcc, allocator: std.mem.Allocator) !void {
+        if (src.tag() == 0) return;
+        if (self.tag() == 0) {
+            const budget = self.budgetPtr();
+            self.* = src.*;
+            src.* = .{};
+            if (self.heap() == null and self.budgetPtr() == null) self.setBudget(budget);
+            return;
+        }
+        if (self.heap() == null and src.heap() == null) {
+            const n = src.tag();
+            var i: u8 = 0;
+            while (i < n) : (i += 1) try self.insertU64(allocator, src.raw[1 + @as(usize, i)]);
+            src.* = .{};
+            return;
+        }
+        const dst_set = try self.ensureHeap(allocator);
+        if (src.heap()) |ss| {
+            src.* = .{};
+            if (ss.count() > dst_set.count()) {
+                const tmp = dst_set.*;
+                dst_set.* = ss.*;
+                ss.* = tmp;
+            }
+            defer {
+                ss.deinit(allocator);
+                allocator.destroy(ss);
+            }
+            try dst_set.merge(ss, allocator);
+            return;
+        }
+        const n = src.tag();
+        var i: u8 = 0;
+        while (i < n) : (i += 1) try self.insertU64(allocator, src.raw[1 + @as(usize, i)]);
+        src.* = .{};
+    }
+};
+
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
 /// kernel at update time without re-checking AggFunc + arg type.
 pub const Accumulator = union(enum) {
     count: u64,
-    distinct: ?*DistinctSet,
+    distinct: DistinctAcc,
     /// Integer sum, i128. Keeps i64-column sums precise on big datasets
     /// (10^9 rows × 10^9 values = 10^18) and carries unsigned-64 sums and
     /// i64-overflowing sums (e.g. wide DELTA columns) without wrapping. The
@@ -586,7 +780,7 @@ pub const Accumulator = union(enum) {
     pub fn init(call: AggCall) Accumulator {
         return switch (call.func) {
             .count => .{ .count = 0 },
-            .count_distinct => .{ .distinct = null },
+            .count_distinct => .{ .distinct = .{} },
             .sum => switch (call.result) {
                 .i64 => .{ .sum_i = null },
                 .f64 => .{ .sum_f = null },
@@ -619,13 +813,7 @@ pub const Accumulator = union(enum) {
     pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) !void {
         switch (dst.*) {
             .count => |*c| c.* = try addRowCount(c.*, src.count),
-            .distinct => |*d| if (src.distinct) |src_set| {
-                if (d.* == null) {
-                    d.* = try allocator.create(DistinctSet);
-                    d.*.?.* = .{ .shared = src_set.shared };
-                }
-                try d.*.?.merge(src_set, allocator);
-            },
+            .distinct => |*d| try d.mergeFrom(src.distinct, allocator),
             .sum_i => |*s| if (src.sum_i) |sv| {
                 s.* = (s.* orelse 0) + sv;
             },
@@ -1161,15 +1349,9 @@ fn foldDistinct(
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    if (state.distinct == null) {
-        state.distinct = try persist.create(DistinctSet);
-        state.distinct.?.* = .{};
-    }
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
-        if (sel.isActive(r)) {
-            try state.distinct.?.insertColRow(persist, col, r);
-        }
+        if (sel.isActive(r)) try state.distinct.insertColRow(persist, col, r);
     }
 }
 
@@ -1922,7 +2104,7 @@ pub fn finalize(
 ) Error![]OutputCol {
     return switch (call.func) {
         .count => try emitOneI64(arena, call.alias, @intCast(state.count), false),
-        .count_distinct => try emitOneI64(arena, call.alias, if (state.distinct) |d| @intCast(d.count()) else 0, false),
+        .count_distinct => try emitOneI64(arena, call.alias, @intCast(state.distinct.count()), false),
         .sum => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, state.sum_i, true),
             .f64 => try emitOneF64(arena, call.alias, state.sum_f),
@@ -3843,8 +4025,6 @@ pub const GroupTable = struct {
     fixed_len: u32 = 0,
     fixed_keys: []u8 = &.{},
     fixed_slots: []FixedSlot = &.{},
-    /// Bytes of the count(DISTINCT) set objects a fixed-width table has made, charged with its other memory.
-    set_objects: usize = 0,
     /// A certified top-k pass: keys outside the admitted cells get a cell's id (`CountSketch.sinkId`) rather than a
     /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
@@ -3877,10 +4057,7 @@ pub const GroupTable = struct {
             switch (acc.*) {
                 .min_bytes => |mb| if (mb) |s| self.allocator.free(s),
                 .max_bytes => |mb| if (mb) |s| self.allocator.free(s),
-                .distinct => |d| if (d) |set| {
-                    set.deinit(self.allocator);
-                    self.allocator.destroy(set);
-                },
+                .distinct => |*d| d.deinit(self.allocator),
                 else => {},
             }
         }
@@ -3960,10 +4137,8 @@ pub const GroupTable = struct {
             return id;
         }
 
-        // A count(DISTINCT) set object is memory the group holds, as its values are; the table draws for it in blocks
-        // with the rest of the group, not the set on its own.
-        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead +
-            distinctCalls(agg_calls) * @sizeOf(DistinctSet);
+        // Inline distinct values live in the accumulator. A spilled set charges itself (`DistinctAcc.ensureHeap`).
+        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead;
         if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
             const budget = self.shared orelse return error.ExceededMemoryBudget;
             // Checked on the draw path rather than per new group, to keep the shared atomic off the insertion path.
@@ -3987,19 +4162,14 @@ pub const GroupTable = struct {
         try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
         // A failure past here unmakes the group's state, count(DISTINCT) sets included.
         errdefer {
-            for (self.accumulators.items[old_accumulators_len..]) |acc| if (acc == .distinct) if (acc.distinct) |d| {
-                d.deinit(self.allocator);
-                self.allocator.destroy(d);
-            };
+            for (self.accumulators.items[old_accumulators_len..]) |*acc| {
+                if (acc.* == .distinct) acc.distinct.deinit(self.allocator);
+            }
             self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
         }
         for (agg_calls) |call| {
             var acc = Accumulator.init(call);
-            if (call.func == .count_distinct) {
-                const ds = try self.allocator.create(DistinctSet);
-                ds.* = .{ .shared = self.shared };
-                acc = .{ .distinct = ds };
-            }
+            if (call.func == .count_distinct) acc = .{ .distinct = .initEmpty(self.shared) };
             self.accumulators.appendAssumeCapacity(acc);
         }
 
@@ -4048,9 +4218,8 @@ pub const GroupTable = struct {
             self.first.capacity
         else
             std.ArrayList(u64).growCapacity(first_need);
-        const new_sets = distinctCalls(agg_calls) * @sizeOf(DistinctSet);
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) +
-            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) + self.set_objects + new_sets;
+            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator);
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
 
         if (slot_cap != self.fixed_slots.len) {
@@ -4078,19 +4247,14 @@ pub const GroupTable = struct {
         // failure here leaves the table as it was.
         const acc_start = self.accumulators.items.len;
         errdefer {
-            for (self.accumulators.items[acc_start..]) |acc| if (acc == .distinct) if (acc.distinct) |d| {
-                d.deinit(self.allocator);
-                self.allocator.destroy(d);
-            };
+            for (self.accumulators.items[acc_start..]) |*acc| {
+                if (acc.* == .distinct) acc.distinct.deinit(self.allocator);
+            }
             self.accumulators.shrinkRetainingCapacity(acc_start);
         }
         for (agg_calls) |call| {
             var acc = Accumulator.init(call);
-            if (call.func == .count_distinct) {
-                const ds = try self.allocator.create(DistinctSet);
-                ds.* = .{ .shared = self.shared };
-                acc = .{ .distinct = ds };
-            }
+            if (call.func == .count_distinct) acc = .{ .distinct = .initEmpty(self.shared) };
             self.accumulators.appendAssumeCapacity(acc);
         }
 
@@ -4101,20 +4265,13 @@ pub const GroupTable = struct {
         self.fixed_slots[i] = .{ .hash = hash, .id = id };
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
-        self.set_objects += new_sets;
         self.allocated_bytes = self.fixedHeld();
         return id;
     }
 
     fn fixedHeld(self: *const GroupTable) usize {
         return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
-            self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator) + self.set_objects;
-    }
-
-    fn distinctCalls(agg_calls: []const AggCall) usize {
-        var n: usize = 0;
-        for (agg_calls) |call| n += @intFromBool(call.func == .count_distinct);
-        return n;
+            self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator);
     }
 
     fn findFixed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
@@ -4197,6 +4354,9 @@ pub fn updateOneGroupedValues(
     u64_col: bool,
 ) Error!void {
     _ = arena;
+    if (call.func == .count_distinct) {
+        return foldDistinctGrouped(persist, accs, group_id_arr, agg_idx, agg_len, values.?, sel);
+    }
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (sel.isActive(r)) {
@@ -4204,14 +4364,7 @@ pub fn updateOneGroupedValues(
             const state = &accs[gid * agg_len + agg_idx];
             switch (call.func) {
                 .count => state.count += 1,
-                .count_distinct => {
-                    if (state.distinct == null) {
-                        const ds = try persist.create(DistinctSet);
-                        ds.* = .{};
-                        state.distinct = ds;
-                    }
-                    try state.distinct.?.insertColRow(persist, values.?, r);
-                },
+                .count_distinct => unreachable,
                 .sum => try foldSumGroupedOne(state, values.?, r, u64_col, call.offset),
                 .min => if (call.result == .bytes)
                     try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
@@ -4224,6 +4377,131 @@ pub fn updateOneGroupedValues(
                 .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
             }
         }
+    }
+}
+
+/// One column type for the whole batch. i64/i32/f64 stay inline in the accumulator until a group spills.
+fn foldDistinctGrouped(
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+) Error!void {
+    switch (col) {
+        .i64 => |c| try foldDistinctU64(
+            persist,
+            accs,
+            group_id_arr,
+            agg_idx,
+            agg_len,
+            c.values,
+            c.def_levels,
+            c.max_def,
+            sel,
+            struct {
+                fn bit(v: i64) u64 {
+                    return @bitCast(v);
+                }
+            }.bit,
+        ),
+        .i32 => |c| try foldDistinctU64(
+            persist,
+            accs,
+            group_id_arr,
+            agg_idx,
+            agg_len,
+            c.values,
+            c.def_levels,
+            c.max_def,
+            sel,
+            struct {
+                fn bit(v: i32) u64 {
+                    return @as(u64, @bitCast(@as(i64, v)));
+                }
+            }.bit,
+        ),
+        .f64 => |c| try foldDistinctU64(
+            persist,
+            accs,
+            group_id_arr,
+            agg_idx,
+            agg_len,
+            c.values,
+            c.def_levels,
+            c.max_def,
+            sel,
+            struct {
+                fn bit(v: f64) u64 {
+                    var f = v;
+                    if (std.math.isNan(f)) f = std.math.nan(f64) else if (f == 0.0) f = 0.0;
+                    return @bitCast(f);
+                }
+            }.bit,
+        ),
+        .f32 => |c| try foldDistinctU64(
+            persist,
+            accs,
+            group_id_arr,
+            agg_idx,
+            agg_len,
+            c.values,
+            c.def_levels,
+            c.max_def,
+            sel,
+            struct {
+                fn bit(v: f32) u64 {
+                    var f: f64 = v;
+                    if (std.math.isNan(f)) f = std.math.nan(f64) else if (f == 0.0) f = 0.0;
+                    return @bitCast(f);
+                }
+            }.bit,
+        ),
+        .boolean => |c| try foldDistinctU64(
+            persist,
+            accs,
+            group_id_arr,
+            agg_idx,
+            agg_len,
+            c.values,
+            c.def_levels,
+            c.max_def,
+            sel,
+            struct {
+                fn bit(v: bool) u64 {
+                    return if (v) 1 else 0;
+                }
+            }.bit,
+        ),
+        .string, .i128 => {
+            var r: usize = 0;
+            while (r < sel.len) : (r += 1) {
+                if (!sel.isActive(r)) continue;
+                try accs[group_id_arr[r] * agg_len + agg_idx].distinct.insertColRow(persist, col, r);
+            }
+        },
+    }
+}
+
+fn foldDistinctU64(
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    values: anytype,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    sel: *const filter_selection.SelectionVector,
+    comptime bit: fn (@typeInfo(@TypeOf(values)).pointer.child) u64,
+) Error!void {
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (!sel.isActive(r)) continue;
+        if (def_levels) |dl| if (dl[r] < max_def) continue;
+        try accs[group_id_arr[r] * agg_len + agg_idx].distinct.insertU64(persist, bit(values[r]));
     }
 }
 
@@ -4801,7 +5079,9 @@ test "fixed-width groups charge their count(DISTINCT) sets to the shared budget,
     var image: [32]u8 = @splat(0);
     image[0] = 1;
     const g = try table.getOrInsertFixed(image[0..9], &calls, 0);
-    try std.testing.expect(table.accumulators.items[g * calls.len + 1].distinct.?.shared == &budget);
+    const slot = &table.accumulators.items[g * calls.len + 1].distinct;
+    try std.testing.expect(slot.heap() == null);
+    try std.testing.expect(slot.budgetPtr() == &budget);
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(gpa: std.mem.Allocator) !void {
@@ -4885,8 +5165,108 @@ test "a table charges each group's count(DISTINCT) set object, fixed-width keys 
         _ = try fixed.getOrInsertFixed(&image, &calls, i);
         _ = try fixed_without.getOrInsertFixed(&image, calls[1..], i);
     }
-    // Beyond the second call's accumulator, each group holds one set object.
-    const extra = n * (@sizeOf(DistinctSet) + @sizeOf(Accumulator));
-    try std.testing.expect(plain.allocated_bytes >= without.allocated_bytes + extra);
-    try std.testing.expect(fixed.allocated_bytes >= fixed_without.allocated_bytes + n * @sizeOf(DistinctSet));
+    // String-key accounting is per entry, so the only extra is the distinct accumulator: no set object yet.
+    try std.testing.expectEqual(without.allocated_bytes + n * @sizeOf(Accumulator), plain.allocated_bytes);
+    for ([_]*const GroupTable{ &plain, &fixed }) |t| {
+        for (t.accumulators.items) |acc| {
+            if (acc == .distinct) try std.testing.expect(acc.distinct.heap() == null);
+        }
+    }
+}
+
+test "inline distinct matches a set, spills at the fourth value, and charges that object" {
+    const a = testing.allocator;
+    var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
+    var acc = DistinctAcc.initEmpty(&budget);
+    defer acc.deinit(a);
+    const used0 = budget.used.load(.monotonic);
+    try acc.insertU64(a, 10);
+    try acc.insertU64(a, 10);
+    try acc.insertU64(a, 20);
+    try acc.insertU64(a, 30);
+    try std.testing.expect(acc.heap() == null);
+    try std.testing.expectEqual(@as(usize, 3), acc.count());
+    try std.testing.expectEqual(used0, budget.used.load(.monotonic));
+
+    try acc.insertU64(a, 40);
+    try std.testing.expect(acc.heap() != null);
+    try std.testing.expectEqual(@as(usize, 4), acc.count());
+    try std.testing.expect(acc.heap().?.shared == &budget);
+    try std.testing.expect(budget.used.load(.monotonic) >= used0 + @sizeOf(DistinctSet));
+    try std.testing.expect(acc.heap().?.allocated_bytes >= @sizeOf(DistinctSet));
+
+    // Same values through a set: the count agrees, duplicates included.
+    var set = DistinctSet{};
+    defer set.deinit(a);
+    for ([_]u64{ 10, 10, 20, 30, 40, 40 }) |v| try set.insertU64(a, v);
+    try std.testing.expectEqual(set.count(), acc.count());
+}
+
+test "inline distinct merge stays exact below and above the spill" {
+    const a = testing.allocator;
+    var dst = DistinctAcc.initEmpty(null);
+    defer dst.deinit(a);
+    var src = DistinctAcc.initEmpty(null);
+    defer src.deinit(a);
+    try dst.insertU64(a, 1);
+    try dst.insertU64(a, 2);
+    try src.insertU64(a, 2);
+    try src.insertU64(a, 3);
+    try dst.takeFrom(&src, a);
+    try std.testing.expect(dst.heap() == null);
+    try std.testing.expectEqual(@as(usize, 3), dst.count());
+    try std.testing.expectEqual(@as(usize, 0), src.count());
+
+    var more = DistinctAcc.initEmpty(null);
+    defer more.deinit(a);
+    try more.insertU64(a, 4);
+    try dst.takeFrom(&more, a);
+    try std.testing.expect(dst.heap() != null);
+    try std.testing.expectEqual(@as(usize, 4), dst.count());
+}
+
+test "inline distinct: allocation failure while spilling leaves no leak" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var acc = DistinctAcc.initEmpty(null);
+            defer acc.deinit(gpa);
+            for (0..6) |i| try acc.insertU64(gpa, i);
+            try testing.expectEqual(@as(usize, 6), acc.count());
+            var bytes = DistinctAcc.initEmpty(null);
+            defer bytes.deinit(gpa);
+            const vals = [_][]const u8{ "a", "b", "a" };
+            for (vals) |v| try bytes.insertBytes(gpa, v);
+            try testing.expectEqual(@as(usize, 2), bytes.count());
+        }
+    }.run, .{});
+}
+
+test "inline distinct: a budget that fits three values refuses the spill" {
+    const a = testing.allocator;
+    // Three inline values draw nothing. The spill needs the set object; a ceiling under that fails and keeps the three.
+    var budget = SharedBudget{ .limit = @sizeOf(DistinctSet) / 2, .block = 1 };
+    var acc = DistinctAcc.initEmpty(&budget);
+    defer acc.deinit(a);
+    try acc.insertU64(a, 1);
+    try acc.insertU64(a, 2);
+    try acc.insertU64(a, 3);
+    try std.testing.expectError(error.ExceededMemoryBudget, acc.insertU64(a, 4));
+    try std.testing.expect(acc.heap() == null);
+    try std.testing.expectEqual(@as(usize, 3), acc.count());
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "inline distinct canonicalizes float nan and zero like DistinctSet" {
+    const a = testing.allocator;
+    var acc = DistinctAcc.initEmpty(null);
+    defer acc.deinit(a);
+    var set = DistinctSet{};
+    defer set.deinit(a);
+    const vals = [_]f64{ 1.0, -0.0, 0.0, std.math.nan(f64), -std.math.nan(f64), 1.0 };
+    for (vals) |v| {
+        try acc.insertF64(a, v);
+        try set.insertF64(a, v);
+    }
+    try std.testing.expectEqual(set.count(), acc.count());
+    try std.testing.expect(acc.heap() == null);
 }

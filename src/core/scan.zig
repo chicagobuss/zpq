@@ -1832,7 +1832,7 @@ fn prepareAggregate(
             for (agg_calls[agg_start..][0..sub_accs.len], sub_accs) |call, *acc| if (call.func == .count_distinct) {
                 const ds = try gpa.create(expr_agg.DistinctSet);
                 ds.* = .{};
-                acc.* = .{ .distinct = ds };
+                acc.* = .{ .distinct = .fromSet(ds) };
             };
         }
     }
@@ -1906,13 +1906,13 @@ fn prepareAggregate(
     };
     for (work_items.items) |item| {
         for (item.accumulators) |*acc| {
-            if (acc.* == .distinct and acc.distinct != null) {
+            if (acc.* == .distinct) if (acc.distinct.heap()) |ds| {
                 if (group_by_keys == null and n_workers > 1) {
-                    try acc.distinct.?.initPartitions(gpa, &group_budget);
+                    try ds.initPartitions(gpa, &group_budget);
                 } else {
-                    acc.distinct.?.shared = &group_budget;
+                    ds.shared = &group_budget;
                 }
-            }
+            };
         }
     }
 
@@ -2022,7 +2022,7 @@ fn prepareAggregate(
     for (agg_calls, accumulators) |call, *acc| if (call.func == .count_distinct) {
         const ds = try gpa.create(expr_agg.DistinctSet);
         ds.* = .{};
-        acc.* = .{ .distinct = ds };
+        acc.* = .{ .distinct = .fromSet(ds) };
         if (group_by_keys == null and n_workers > 1) {
             try ds.initPartitions(gpa, &group_budget);
         } else {
@@ -2031,7 +2031,7 @@ fn prepareAggregate(
     };
     // These sets outlive `group_budget`, which lives in this frame: they give their reservations back to it before
     // it goes, and forget it.
-    defer for (accumulators) |*acc| if (acc.* == .distinct) if (acc.distinct) |d| d.detach();
+    defer for (accumulators) |*acc| if (acc.* == .distinct) acc.distinct.detach();
     var output: AggOutput = .{};
     errdefer output.deinit(gpa);
     var rows_in: i64 = 0;
@@ -2215,7 +2215,7 @@ fn prepareAggregate(
         for (agg_calls, 0..) |call, ci| {
             if (call.func != .count_distinct) continue;
             const dst_acc = &accumulators[ci];
-            const dst_ds = dst_acc.distinct orelse continue;
+            const dst_ds = dst_acc.distinct.heap() orelse continue;
             if (dst_ds.parts) |dst_parts| {
                 const n_threads = @min(n_workers, expr_agg.NUM_PARTS);
                 const tasks = try arena.alloc(DistinctMergeTask, n_threads);
@@ -2236,11 +2236,11 @@ fn prepareAggregate(
                 for (work_items.items) |item| {
                     if (ci >= item.agg_start and ci < item.agg_start + item.agg_len) {
                         const sub_acc = &item.accumulators[ci - item.agg_start];
-                        if (sub_acc.* == .distinct and sub_acc.distinct != null) {
-                            sub_acc.distinct.?.deinit(gpa);
-                            gpa.destroy(sub_acc.distinct.?);
-                            sub_acc.* = .{ .distinct = null };
-                        }
+                        if (sub_acc.* == .distinct) if (sub_acc.distinct.heap()) |ds| {
+                            ds.deinit(gpa);
+                            gpa.destroy(ds);
+                            sub_acc.* = .{ .distinct = .{} };
+                        };
                     }
                 }
             } else {
@@ -3096,7 +3096,7 @@ const ConcatTask = struct {
 fn accCount(acc: expr_agg.Accumulator) u64 {
     return switch (acc) {
         .count => acc.count,
-        .distinct => if (acc.distinct) |d| @intCast(d.count()) else 0,
+        .distinct => |d| @intCast(d.count()),
         else => 0,
     };
 }
@@ -3280,10 +3280,8 @@ fn premergeLargeDistinctSets(
         for (tables) |gt| {
             for (0..gt.groupCount()) |gi| {
                 const acc = gt.accumulators.items[gi * calls.len + ci];
-                if (acc == .distinct and acc.distinct != null) {
-                    if (acc.distinct.?.count() >= 16384) {
-                        try large_keys.put(gpa, gt.keyAt(gi), {});
-                    }
+                if (acc == .distinct and acc.distinct.count() >= 16384) {
+                    try large_keys.put(gpa, gt.keyAt(gi), {});
                 }
             }
         }
@@ -3296,24 +3294,24 @@ fn premergeLargeDistinctSets(
             var sources: std.ArrayListUnmanaged(*const expr_agg.DistinctSet) = .empty;
             var is_u64 = true;
 
-            for (tables) |gt| {
+            for (tables) |*gt| {
                 if (gt.findKey(key)) |gi| {
-                    const acc = gt.accumulators.items[gi * calls.len + ci];
-                    if (acc == .distinct and acc.distinct != null) {
-                        const ds = acc.distinct.?;
-                        try sources.append(arena, ds);
-                        // Only sets of integers split by value here; a partition holding anything else keeps the whole set
-                        // on the merge's own path.
-                        const u64_only = struct {
-                            fn of(d: *const expr_agg.DistinctSet) bool {
-                                return d.val_set == .none or d.val_set == .inline_u64 or d.val_set == .u64;
-                            }
-                        }.of;
-                        if (!u64_only(ds)) is_u64 = false;
-                        if (ds.parts) |parts| for (parts) |*part| {
-                            if (!u64_only(part)) is_u64 = false;
-                        };
-                    }
+                    const acc = &gt.accumulators.items[gi * calls.len + ci];
+                    if (acc.* != .distinct or acc.distinct.count() == 0) continue;
+                    // A sibling that never spilled still holds its values inline; the union count needs them too.
+                    const ds = try acc.distinct.ensureHeap(gpa);
+                    try sources.append(arena, ds);
+                    // Only sets of integers split by value here; a partition holding anything else keeps the whole set
+                    // on the merge's own path.
+                    const u64_only = struct {
+                        fn of(d: *const expr_agg.DistinctSet) bool {
+                            return d.val_set == .none or d.val_set == .inline_u64 or d.val_set == .u64;
+                        }
+                    }.of;
+                    if (!u64_only(ds)) is_u64 = false;
+                    if (ds.parts) |parts| for (parts) |*part| {
+                        if (!u64_only(part)) is_u64 = false;
+                    };
                 }
             }
 
@@ -3325,11 +3323,7 @@ fn premergeLargeDistinctSets(
             for (tables) |*gt| {
                 if (gt.findKey(key)) |gi| {
                     const acc_ptr = &gt.accumulators.items[gi * calls.len + ci];
-                    if (acc_ptr.* == .distinct and acc_ptr.distinct != null) {
-                        const ds = acc_ptr.distinct.?;
-                        ds.deinit(gpa);
-                        gpa.destroy(ds);
-                    }
+                    if (acc_ptr.* == .distinct) acc_ptr.distinct.deinit(gpa);
                     if (first) {
                         acc_ptr.* = .{ .count = total };
                         first = false;
@@ -3491,15 +3485,15 @@ const DistinctMergeTask = struct {
             for (t.work_items) |item| {
                 if (t.agg_idx < item.agg_start or t.agg_idx >= item.agg_start + item.agg_len) continue;
                 const src_acc = &item.accumulators[t.agg_idx - item.agg_start];
-                if (src_acc.* == .distinct and src_acc.distinct != null) {
-                    if (src_acc.distinct.?.parts) |src_parts| {
+                if (src_acc.* == .distinct) if (src_acc.distinct.heap()) |ds| {
+                    if (ds.parts) |src_parts| {
                         const src_part = &src_parts[p];
                         mergeDistinctPart(dst_part, src_part, t.gpa) catch |e| {
                             t.err = e;
                             return;
                         };
                     }
-                }
+                };
             }
         }
     }
@@ -3519,39 +3513,20 @@ fn mergeOwnedAccumulator(
         return;
     }
     if (src.* == .count and dst.* == .distinct) {
-        if (dst.distinct) |d| {
-            dst.* = .{ .count = d.count() + src.count };
-            d.deinit(allocator);
-            allocator.destroy(d);
-        } else {
-            dst.* = src.*;
-        }
+        const n = dst.distinct.count() + src.count;
+        dst.distinct.deinit(allocator);
+        dst.* = .{ .count = n };
         return;
     }
     if (src.* == .distinct and dst.* == .count) {
-        if (src.distinct) |s| {
-            dst.count += s.count();
-            s.deinit(allocator);
-            allocator.destroy(s);
-            src.* = .{ .distinct = null };
-        }
+        dst.count += src.distinct.count();
+        src.distinct.deinit(allocator);
+        src.* = .{ .distinct = .{} };
         return;
     }
-    if (src.* == .distinct) {
-        // The larger set is handed over whole and the smaller folded into it, so a merge copies the fewest values.
-        const theirs = src.distinct orelse return;
-        src.* = .{ .distinct = null };
-        const ours = dst.distinct orelse {
-            dst.* = .{ .distinct = theirs };
-            return;
-        };
-        const big, const small = if (ours.count() >= theirs.count()) .{ ours, theirs } else .{ theirs, ours };
-        dst.* = .{ .distinct = big };
-        defer {
-            small.deinit(allocator);
-            allocator.destroy(small);
-        }
-        return big.merge(small, allocator);
+    if (src.* == .distinct and dst.* == .distinct) {
+        // The larger spilled set is handed over whole and the smaller folded into it.
+        return dst.distinct.takeFrom(&src.distinct, allocator);
     }
     const moved = src.*;
     try dst.merge(moved, allocator);
@@ -3575,11 +3550,7 @@ fn freeOwnedAccumulatorStrings(
             allocator.free(owned);
             acc.max_bytes = null;
         },
-        .distinct => |*d| if (d.*) |set| {
-            set.deinit(allocator);
-            allocator.destroy(set);
-            d.* = null;
-        },
+        .distinct => |*d| d.deinit(allocator),
         else => {},
     };
 }
@@ -3965,7 +3936,7 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         .count => .{ .i = @intCast(state.count) },
         .count_distinct => switch (state) {
             .count => |cnt| .{ .i = @intCast(cnt) },
-            .distinct => |d| .{ .i = if (d) |set| @intCast(set.count()) else 0 },
+            .distinct => |d| .{ .i = @intCast(d.count()) },
             else => .{ .i = 0 },
         },
         // i128 carries the full sum (incl. i64 overflow + unsigned-64);
@@ -4495,14 +4466,13 @@ test "topKCandidates: count_distinct keeps keys that can reach the cut and prune
         for (0..5) |h| {
             const key = try std.fmt.bufPrint(&name_buf, "h{d}", .{h});
             const g = try t.getOrInsert(key, &calls, 0);
-            const ds = t.accumulators.items[g].distinct.?;
-            for (0..30) |v| try ds.insertU64(testing.allocator, @intCast(ti * 100 + v));
+            var slot = &t.accumulators.items[g].distinct;
+            for (0..30) |v| try slot.insertU64(testing.allocator, @intCast(ti * 100 + v));
         }
         for (0..50) |i| {
             const key = try std.fmt.bufPrint(&name_buf, "t{d}-{d}", .{ ti, i });
             const g = try t.getOrInsert(key, &calls, 0);
-            const ds = t.accumulators.items[g].distinct.?;
-            try ds.insertU64(testing.allocator, @intCast(i));
+            try t.accumulators.items[g].distinct.insertU64(testing.allocator, @intCast(i));
         }
     }
     const outputs = [_]BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "u" } };
@@ -4533,8 +4503,8 @@ test "mergeCandidates: a merge that fails part-way leaks none of the sets alread
             for (&tables, 0..) |*t, ti| for ([_][]const u8{ "a", "b" }) |key| {
                 const g = try t.getOrInsert(key, &calls, 0);
                 for (0..2) |ci| {
-                    const ds = t.accumulators.items[g * calls.len + ci].distinct.?;
-                    for (0..40) |v| try ds.insertU64(gpa, @intCast(ti * 30 + v));
+                    var slot = &t.accumulators.items[g * calls.len + ci].distinct;
+                    for (0..40) |v| try slot.insertU64(gpa, @intCast(ti * 30 + v));
                 }
             };
             var slots: std.ArrayList(MergedSlot) = .empty;
@@ -4548,7 +4518,7 @@ test "mergeCandidates: a merge that fails part-way leaks none of the sets alread
             defer arena_state.deinit();
             try mergeCandidates(gpa, arena_state.allocator(), &tables, &.{ "a", "b" }, &calls, 1, &slots, &accs);
             try testing.expectEqual(@as(usize, 2), slots.items.len);
-            for (accs.items) |acc| try testing.expectEqual(@as(usize, 100), acc.distinct.?.count());
+            for (accs.items) |acc| try testing.expectEqual(@as(usize, 100), acc.distinct.count());
         }
     }.run, .{});
 }
@@ -4571,21 +4541,21 @@ test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own e
                 .{ &.{ 1, 2, 3, 4 }, &.{ 4, 5 } }, // ours larger
                 .{ &.{}, &.{ 1, 2, 3, 4, 5 } },
             }) |c| {
-                var dst: expr_agg.Accumulator = .{ .distinct = null };
+                var dst: expr_agg.Accumulator = .{ .distinct = .{} };
                 defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
-                if (c[0].len > 0) dst = .{ .distinct = try set(gpa, c[0]) };
-                var src: expr_agg.Accumulator = .{ .distinct = try set(gpa, c[1]) };
+                if (c[0].len > 0) dst = .{ .distinct = .fromSet(try set(gpa, c[0])) };
+                var src: expr_agg.Accumulator = .{ .distinct = .fromSet(try set(gpa, c[1])) };
                 defer freeOwnedAccumulatorStrings(gpa, (&src)[0..1]);
                 try mergeOwnedAccumulator(&dst, &src, gpa);
-                try testing.expect(src.distinct == null);
-                try testing.expectEqual(@as(usize, 5), dst.distinct.?.count());
+                try testing.expect(src.distinct.heap() == null);
+                try testing.expectEqual(@as(usize, 5), dst.distinct.count());
             }
             // Nothing seen on the source side: the destination is untouched.
-            var dst: expr_agg.Accumulator = .{ .distinct = try set(gpa, &.{7}) };
+            var dst: expr_agg.Accumulator = .{ .distinct = .fromSet(try set(gpa, &.{7})) };
             defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
-            var none: expr_agg.Accumulator = .{ .distinct = null };
+            var none: expr_agg.Accumulator = .{ .distinct = .{} };
             try mergeOwnedAccumulator(&dst, &none, gpa);
-            try testing.expectEqual(@as(usize, 1), dst.distinct.?.count());
+            try testing.expectEqual(@as(usize, 1), dst.distinct.count());
         }
     }.run, .{});
 }
@@ -7244,7 +7214,7 @@ test "runMultiAggregate: returned count(DISTINCT) sets no longer point at the sc
         });
         defer res.deinit(testing.allocator);
         for (res.state.accumulators) |acc| {
-            const d = acc.distinct orelse continue;
+            const d = acc.distinct.heap() orelse continue;
             try testing.expect(d.shared == null);
             if (d.parts) |parts| for (parts) |p| try testing.expect(p.shared == null);
         }

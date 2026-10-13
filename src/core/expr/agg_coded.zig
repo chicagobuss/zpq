@@ -525,7 +525,7 @@ pub fn groupedCoded(
             rem %= strides[i];
         }
         try serializeKeyAt(&scratch, ra, kd_cols, rows);
-        gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base | first_row[cp]);
+        gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base + first_row[cp]);
     }
 
     // A sketched table's rows outside its admitted cells take no group (`agg.sinkSketchRows`).
@@ -535,6 +535,7 @@ pub fn groupedCoded(
         const ids = try ra.alloc(u32, num_rows);
         for (ids, comp) |*id, cp| id.* = gid_of[cp];
         try agg.sinkSketchRows(table, ids, &sunk);
+        if (table.countOnly()) return true;
         break :blk &sunk;
     } else sel;
     const agg_len = calls.len;

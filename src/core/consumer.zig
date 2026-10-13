@@ -2135,8 +2135,11 @@ pub fn scanRGForAgg(
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
                 return;
             }
-            // The row path reads values: gather any column decoded as codes only.
-            for (batch_cols.items) |*bc| bc.* = try agg_coded.materialize(ra, bc.*);
+            // The row path reads values: gather any column decoded as codes only, but not one only the outer filter
+            // read, which it has evaluated already.
+            for (lookup, 0..) |at, ci| if (at) |pos| if (ci < in.consumed.len and in.consumed[ci]) {
+                batch_cols.items[pos] = try agg_coded.materialize(ra, batch_cols.items[pos]);
+            };
             var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
             for (g.keys, 0..) |key_expr, idx| {
                 key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(&sel), lookup, key_expr);
@@ -2157,7 +2160,8 @@ pub fn scanRGForAgg(
             }
             try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
 
-            for (g.calls, 0..) |call, i| {
+            // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
+            if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
                 var call_arena = std.heap.ArenaAllocator.init(gpa);
                 defer call_arena.deinit();
                 const ca = if (staged) call_arena.allocator() else ra;
@@ -2177,7 +2181,7 @@ pub fn scanRGForAgg(
                     cb.lookup,
                     &sel,
                 );
-            }
+            };
         },
         .scalar => |s| {
             // Update only the aggs that weren't handled via stats. The agg's
@@ -2268,10 +2272,10 @@ fn scanRGSliced(
                     ids[r] = try resolver.resolve(sa, g.table, key_cols, r, g.calls, g.pos_base + done);
                 };
                 try expr_agg.sinkSketchRows(g.table, ids, &sel);
-                for (g.calls, 0..) |call, i| {
+                if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
                     const accs = g.table.accumulators.items;
                     try expr_agg.updateOneGrouped(sa, gpa, accs, ids, i, g.calls.len, call, &batch, lookup, &sel);
-                }
+                };
             },
         }
     }

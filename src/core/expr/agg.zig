@@ -3269,7 +3269,7 @@ pub const GroupKeyResolver = struct {
         if (table.fixed_stride != 0) {
             var image: [32]u8 = undefined;
             if (packFixedKey(key_cols, row, &image)) |n| if (n == table.fixed_stride) {
-                return table.getOrInsertFixed(image[0..n], agg_calls, pos_base | row);
+                return table.getOrInsertFixed(image[0..n], agg_calls, pos_base + row);
             };
         }
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
@@ -3281,13 +3281,13 @@ pub const GroupKeyResolver = struct {
             // On error the entry just reserved would hold an undefined value.
             errdefer _ = self.memo.remove(id);
             try serializeRowKey(&self.scratch, allocator, key_cols, row);
-            const gid = try table.getOrInsert(self.scratch.items, agg_calls, pos_base | row);
+            const gid = try table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
             gop.value_ptr.* = gid;
             return gid;
         }
 
         try serializeRowKey(&self.scratch, allocator, key_cols, row);
-        return table.getOrInsert(self.scratch.items, agg_calls, pos_base | row);
+        return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
     }
 };
 
@@ -3542,6 +3542,12 @@ pub const CountSketch = struct {
     admit: ?[]const u64 = null,
     /// Set when the cells could not separate the keys: the census decides instead, and `cells` and `admit` are unused.
     census: ?*Census = null,
+
+    /// A count pass: rows only add to the cells (or the census), and no aggregate needs its inputs.
+    pub fn counting(self: *const CountSketch) bool {
+        if (self.admit != null) return false;
+        return if (self.census) |c| c.admitted == null else true;
+    }
 
     /// The sink id a key with `hash`, asked for at `pos`, takes instead of a group; null when it gets a group.
     inline fn route(self: *CountSketch, hash: u64, pos: u64) !?u32 {
@@ -3890,6 +3896,11 @@ pub const GroupTable = struct {
         if (self.fixed_stride == 0) return self.keys.items[g];
         const s: usize = self.fixed_stride;
         return self.fixed_keys[g * s ..][0..s];
+    }
+
+    /// Whether a sketch's count pass is running: rows take no group, and aggregates neither fold nor read.
+    pub fn countOnly(self: *const GroupTable) bool {
+        return if (self.sketch) |s| s.counting() else false;
     }
 
     /// The hash a sketch or census routes group `g`'s key by.

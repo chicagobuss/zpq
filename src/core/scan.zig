@@ -594,6 +594,8 @@ const Worker = struct {
     cursor: *std.atomic.Value(usize),
     /// Items a census admit pass passes over (`censusTopK`).
     skip: ?[]const bool = null,
+    /// What a sketch's count pass reads: the outer filter's columns and the keys, no aggregate's (`Plan.forCalls`).
+    count_columns: ?agg_plan.Columns = null,
     agg_calls: []const expr_agg.AggCall,
     plan: *const agg_plan.Plan,
     decode_options: consumer.DecodeOptions,
@@ -722,6 +724,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
+        // A sketch's count pass reads only the filter's columns and the keys.
+        const columns = if (table != null and table.?.countOnly()) w.count_columns.? else item.columns;
         // A census notes the item each row was read in, and how many rows each item gave it.
         const census: ?*expr_agg.Census = if (table) |gt| if (gt.sketch) |s| s.census else null else null;
         const recorded_before = if (census) |c| c.recorded else 0;
@@ -745,8 +749,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .meta = meta,
             .src = rg_src,
             .filter = w.plan.filterFor(decision),
-            .read = item.columns.forRowGroup(decision),
-            .consumed = item.columns.consumed,
+            .read = columns.forRowGroup(decision),
+            .consumed = columns.consumed,
         }, w.plan.stats, w.decode_options, target, .{
             .scratch = &scratch,
             .rg_arena = &rg_decode_arena,
@@ -780,7 +784,7 @@ fn sketchEligible(
     keys: []const expr_ast.Expr,
     filter_cols: []const bool,
     use_blocks: bool,
-    keys_unique: bool,
+    filter_ok: bool,
 ) ?usize {
     const outs = outputs orelse return null;
     const order = args.result_order;
@@ -796,9 +800,10 @@ fn sketchEligible(
     if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
     for (args.inputs) |in| if (in.gate != null) return null;
     // Both passes decode every column the filter reads. Beyond the group keys, which both passes decode anyway, that
-    // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves. Not so
-    // against grouping keys that look unique (`keysLookUnique`), which costs far more than a second decode.
-    if (!keys_unique) for (filter_cols, 0..) |reads, col| if (reads) {
+    // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves. Not so for
+    // a filter over columns small beside the keys, or against grouping keys that look unique (`keysLookUnique`),
+    // which costs far more than a second decode (`filter_ok`).
+    if (!filter_ok) for (filter_cols, 0..) |reads, col| if (reads) {
         const is_key = for (keys) |key| {
             if (key == .col_ref and key.col_ref.col_idx == col) break true;
         } else false;
@@ -956,6 +961,33 @@ fn keysLookUnique(metas: []const schema.FileMetaData, work: []const WorkItem, ke
         if (md.total_uncompressed_size *| 4 >= rg.num_rows *| width *| 3) return true;
     }
     return false;
+}
+
+/// Whether the columns a filter reads beyond the group keys are small beside the keys in the first row group read:
+/// at most four times their bytes, uncompressed. A sketched scan decodes those columns twice.
+fn filterSmall(metas: []const schema.FileMetaData, work: []const WorkItem, keys: []const expr_ast.Expr, filter_cols: []const bool) bool {
+    if (work.len == 0) return false;
+    const rg = &metas[work[0].file].row_groups.items[work[0].rg];
+    const size = struct {
+        fn of(r: *const schema.RowGroup, col: usize) i64 {
+            if (col >= r.columns.items.len) return 0;
+            const md = r.columns.items[col].meta_data orelse return 0;
+            return @max(0, md.total_uncompressed_size);
+        }
+    }.of;
+    var key_bytes: i64 = 0;
+    for (keys) |key| {
+        if (key != .col_ref) return false;
+        key_bytes +|= size(rg, key.col_ref.col_idx);
+    }
+    var extra: i64 = 0;
+    for (filter_cols, 0..) |reads, col| if (reads) {
+        const is_key = for (keys) |key| {
+            if (key.col_ref.col_idx == col) break true;
+        } else false;
+        if (!is_key) extra +|= size(rg, col);
+    };
+    return extra <= key_bytes *| 4;
 }
 
 /// Empties `tables` for a pass that starts over.
@@ -1654,6 +1686,10 @@ pub fn runMultiAggregate(
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
     const workers = try arena.alloc(Worker, n_workers);
+    const count_columns: ?agg_plan.Columns = if (args.sketch_topk != null and group_by_keys != null)
+        try plan.forCalls(arena, &.{})
+    else
+        null;
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -1742,6 +1778,7 @@ pub fn runMultiAggregate(
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
             .items_per_rg = chunks_per_rg,
+            .count_columns = count_columns,
             .leave_region = args.leave_regions,
             .decode_budget = if (decode_budget) |*b| b else null,
         };
@@ -1760,7 +1797,8 @@ pub fn runMultiAggregate(
         false;
     const keys_unique = args.sketch_topk != null and keysLookUnique(metas, work_items.items, group_by_keys orelse &.{});
     const sketch_count: ?usize = if (args.sketch_topk) |cfg| if (sketch_fits)
-        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks, keys_unique)
+        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks, keys_unique or
+            filterSmall(metas, work_items.items, group_by_keys orelse &.{}, plan.filter_cols))
     else
         null else null;
     if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
@@ -6228,6 +6266,42 @@ test "a decode budget slices wide row groups, FIXED_LEN_BYTE_ARRAY DECIMAL inclu
         try testing.expectEqual(@as(usize, 3), rows.len);
         try testing.expectEqual(@as(i128, 17235000), rows[0][1].dec.v);
     }
+}
+
+test "a decode budget that slices row groups keeps where each group first appeared" {
+    // Unique keys in shuffled order: a LIMIT with no ORDER BY, or a count tied at 1, returns the first to appear. A
+    // cut of 300 ends past the first slices of the first row group.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]expr_ast.ResultOrder{
+        .{ .limit = 300 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 300 },
+    }) |cut| for ([_][]const u8{ "u", "s" }) |key| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "count(*) AS c, sum(t) AS st",
+            .group_by = key,
+            .select_cols = try selectList(arena, &.{ key, "count(*) AS c", "sum(t) AS st" }),
+            .parallelism = 1,
+            .result_order = cut,
+        };
+        var want = try runMultiAggregate(testing.allocator, arena, args);
+        defer want.deinit(testing.allocator);
+        args.decode_limit = 3000;
+        var got = try runMultiAggregate(testing.allocator, arena, args);
+        defer got.deinit(testing.allocator);
+        try want.output.applyResultOrder(testing.allocator, cut);
+        try got.output.applyResultOrder(testing.allocator, cut);
+        const w = want.output.group_rows.?;
+        const g = got.output.group_rows.?;
+        try testing.expectEqual(w.len, g.len);
+        for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
+    };
 }
 
 test "a count cut inside the merge keeps exactly the groups the full sort would, ties by first appearance" {

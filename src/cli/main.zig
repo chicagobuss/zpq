@@ -9,9 +9,9 @@
 //!         [--codec snappy|zstd|gzip|uncompressed]
 //!     — local-file query: decode → filter → re-encode → write,
 //!       OR aggregate (sum/count/min/max/avg with optional FILTER).
-//!       Aggregate mode emits JSON to stdout; -o also writes a 1-row
-//!       parquet. --aggregate is mutually exclusive with --select / --columns.
-//!       JSON envelope with phase timings goes to stderr.
+//!       Queries emit NDJSON rows by default; named -o selects a file only.
+//!       --aggregate is mutually exclusive with --select / --columns.
+//!       --summary=json opts into typed diagnostics on stderr.
 //!
 //!   zpq conform <file.parquet>   — emit a JSON report of what ZPQ
 //!                                  sees in this file. Used by the
@@ -39,19 +39,38 @@ const usage_text =
     \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
     \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
     \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
-    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
+    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
+    \\            [--threads N | -j N]
     \\            [--compress-priority size|speed]
     \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
     \\            [--bloom-filter COL[:FPP] ...]
-    \\            [--format csv|jsonl] [--limit N]
+    \\            [--format ndjson|json|parquet] [--limit N] [--summary=json]
     \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
     \\  zpq query --query "<sql query>" [--output <out.parquet>]
-    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed] [--threads N | -j N]
+    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
+    \\            [--threads N | -j N]
     \\            [--compress-priority size|speed]
     \\            [--scan-all] [--trust-stats]
     \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
+    \\            [--format ndjson|json|parquet] [--limit N] [--summary=json]
     \\  zpq schema <file.parquet>
     \\  zpq conform <file.parquet>
+    \\
+    \\  --output / -o  named destination: default Parquet, stdout stays empty.
+    \\                 `-o -` writes stdout (default NDJSON).
+    \\  --format       NDJSON rows by default (`jsonl` is an alias); `json`
+    \\                 is an array of row objects. `parquet` can stream to
+    \\                 stdout, but refuses a terminal. No extension inference.
+    \\                 CSV is reserved and not supported yet (exit 2).
+    \\  --limit        cap final answer rows, including aggregates and files.
+    \\                 SQL LIMIT has the same meaning; do not combine them.
+    \\  --summary=json emit a typed summary on stderr after output completes;
+    \\                 errors and JSON profiles are typed too. No default
+    \\                 success summary. Text profile summaries conflict.
+    \\  exit codes     0 success; 1 read/decode/write failure; 2 invalid or
+    \\                 unsupported query/options; 141 closed stdout pipe.
+    \\                 Local files publish atomically; failed stdout can
+    \\                 contain a partial result. Check pipeline status.
     \\
     \\  --codec        output codec. Without it, re-encoded output is snappy
     \\                 and a plain copy keeps each chunk's codec; with it, a

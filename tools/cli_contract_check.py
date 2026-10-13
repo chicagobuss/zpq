@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """CLI channels, destinations, limits, and publication checked with independent readers."""
+import io
 import json
 import os
 from pathlib import Path

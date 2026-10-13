@@ -4,6 +4,15 @@
 
 ### Behaviour changes
 
+- CLI queries now emit answer-only NDJSON rows by default for every query kind. `jsonl` remains an alias;
+  `--format json` emits an array, and `parquet` supports binary stdout (refusing a terminal). Named `-o` defaults to
+  Parquet regardless of extension and leaves stdout empty; `-o -` defaults to NDJSON. Success summaries are opt-in
+  with `--summary=json`, which also types stderr errors and JSON profiles. `--limit` and SQL LIMIT cap final rows
+  across formats and destinations; LIMIT 0 retains schema without decoding pages. Local outputs publish through a
+  sibling temporary and atomic rename, preserving old targets on failure and rejecting input/output aliases.
+  Checked flushes distinguish closed pipes (141) from disk-full failures (1); invalid or unsupported queries exit 2.
+  CSV is reserved but deferred. The libzpq, service and Lambda response envelopes are unchanged.
+
 - DECIMAL is exact. `sum` / `min` / `max` / `avg` over DECIMAL columns and DECIMAL arithmetic (`+`, `-`, `*`, e.g.
   `price * (1 - discount) * (1 + tax)`) compute in scaled 128-bit integers with the result types DuckDB and Trino use,
   where they answered in f64 before (a TPC-H Q1 sum was a cent off at SF30). Numeric literals with a decimal point are

@@ -200,6 +200,51 @@ zpq query data.parquet -o out.parquet \
   --select "name, qty * price AS revenue, coalesce(notes, '') AS notes"
 ```
 
+## CLI output contract
+
+Every query emits answer rows as NDJSON by default, including scans, projections, scalar aggregates and grouped
+aggregates. Each line is a row object; scalar aggregates produce one row. `jsonl` remains an alias for `ndjson`.
+`--format json` emits an array of row objects, and `--format parquet` emits Parquet. These flags apply to SQL and
+flag queries alike. CSV is deferred: `--format csv` exits 2 with `csv output is not supported yet`.
+
+```sh
+zpq query input.parquet --limit 10                          # NDJSON rows
+zpq query input.parquet --aggregate 'count(*) AS n'          # {"n":...}
+zpq query --query "SELECT k, count(*) AS n FROM 'input.parquet' GROUP BY k" --format json
+zpq query input.parquet -o answer.parquet                    # file only; stdout empty
+zpq query input.parquet -o answer.json --format json         # JSON file
+zpq query input.parquet -o - --format parquet > answer.parquet
+zpq query input.parquet --summary=json > rows.ndjson 2> diagnostics.ndjson
+```
+
+A named `-o FILE` defaults to Parquet regardless of its extension and leaves stdout empty. Explicit `--format`
+overrides that default. `-o -` selects stdout and defaults to NDJSON; explicit Parquet also streams to stdout without
+`-o`. Binary stdout refuses a terminal. Existing S3 write support is unchanged; text formats, aggregate writes and limited Parquet S3 writes
+are unsupported. `--explain` still prints one aggregate plan JSON object without executing or writing an answer,
+even when `-o` is supplied.
+
+`--limit N` caps final result rows for every format and destination, after grouping and ordering. SQL LIMIT has the
+same semantics; combining it with `--limit` is an error. LIMIT 0 validates the query and schema without decoding data
+pages. Empty NDJSON is zero bytes, empty JSON is `[]` followed by a newline, and empty Parquet retains its schema.
+A scalar aggregate over empty input still emits one row unless the final limit or offset excludes it. Column order,
+input/group order, exact numeric digits, nulls, and the existing AVG representation are preserved: JSON keeps
+`{sum,count}` (DECIMAL AVG also has `avg`); Parquet retains its split AVG columns. Grouped results still materialize.
+
+Successful queries are silent on stderr unless diagnostics were requested. `--summary=json` emits one typed
+`{"type":"summary","ok":true,"rows":N,"output":...}` line after the answer is flushed and a named file is published.
+It includes input statistics, membership and phase counters; `rows` counts emitted rows, distinct from `rows_kept`.
+`total_us` includes formatting, flushing and publication, excludes writing the summary, and `output_us` records
+output work separately. In this mode failures emit a typed `error` line and JSON profile summaries a typed `profile`
+line; text profile summaries are rejected. The libzpq, service and Lambda envelopes are unchanged.
+
+Exit status is 0 for success, 1 for read/decode/write failure, 2 for invalid or unsupported options/queries, and 141
+when a consumer closes stdout. Disk-full errors remain failures. Named local outputs use an exclusive sibling
+temporary file and atomic rename: failures remove the temporary and preserve the old target. Input/output aliases,
+including hard links, are rejected. This guarantees atomic visibility, not crash durability. S3 success follows PUT
+or multipart completion; network errors can leave completion ambiguous and do not promise POSIX rename semantics.
+Stdout and shell redirection cannot roll back: a failed NDJSON stream may end mid-record, JSON may lack its closing
+bracket, and Parquet may lack its footer. Check exit status, including `set -o pipefail` in shell pipelines.
+
 ## Statistics: trust is opt-in
 
 Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate — but

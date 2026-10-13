@@ -86,7 +86,7 @@ assert not plan["ndv"]["union_attempted"] and plan["ndv"]["estimate"] is None, p
 # Unknown DISTINCT state must not be admitted by the small-group memory estimate.
 plan = run(f"SELECT k, count(DISTINCT v) AS c FROM '{bounded}' GROUP BY k", explain=True)
 assert plan["plain_bytes_estimate"] is None and "state_memory_unknown" in plan["reasons"], plan
-# Repeated fixed keys with payloads: census-after-bail stays certified and honours the disable knob.
+# The base planner fuses an allowed census on a plain-width hint; certification and disable remain exact.
 moderate = Path(directory) / "planner_census.parquet"
 pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
                          "v": [(i % 201) - 100 for i in range(400_000)], "pos": range(400_000)}),
@@ -95,7 +95,7 @@ sql = (f"SELECT k, count(*) AS c, sum(v) AS s, avg(v) AS av, min(v) AS mn, max(v
        f"FROM '{moderate}' GROUP BY k ORDER BY c DESC LIMIT 10")
 plan = run(sql, explain=True)
 assert plan["strategy"] == "sketch" and plan["sketch"]["census_allowed"], plan
-assert not plan["sketch"]["census_fused"] and not plan["sketch"]["census_cell_repeat_gate"], plan
+assert plan["sketch"]["census_fused"] and not plan["sketch"]["census_cell_repeat_gate"], plan
 assert "census_fixed_width_bail" in plan["reasons"], plan
 truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
 for workers in (1, 4):
@@ -116,7 +116,7 @@ for group in ("k", "k, f"):
     sql = f"SELECT {group}, count(*) AS c FROM '{raw}' GROUP BY {group} ORDER BY c DESC LIMIT 10"
     plan = run(sql, explain=True)
     assert plan["strategy"] == "sketch" and plan["sketch"]["census_cell_repeat_gate"], plan
-    assert not plan["sketch"]["census_fused"] and plan["sketch"]["census_allowed"], plan
+    assert plan["sketch"]["census_fused"] and plan["sketch"]["census_allowed"], plan
     truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
     cols = [*group.split(", "), "c"]
     for workers in (1, 4):

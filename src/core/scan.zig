@@ -532,7 +532,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
     else
         false;
-    const keys_unique = in.ndv_stat == null and args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
+    const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
     const filter_small = args.sketch_topk != null and filterSmall(in.metas, in.work, keys, in.filter_cols);
     const count_agg = if (args.sketch_topk) |cfg| if (sketch_fits)
         sketchEligible(cfg, args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, keys_unique or filter_small)
@@ -629,16 +629,23 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         stat.key_bytes < 32 and in.calls.len == 1;
     const bail_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
         (expr_agg.fixedGroupStride(keys) != null or short_composite) and !tiny and !cheap_r1;
-    // Dictionary bounds never authorize automatic fusion. A census after a bail is a separate, certified cost bet.
+    // Dictionary bounds never authorize automatic fusion. A census after a bail is a separate, certified cost bet; it
+    // rides along the count pass when a fixed-width key is stored at plain width (`keysLookUnique`), a guess that only
+    // decides where the census counts: each worker still drops it once its own cells separate the cut.
     const explicit_census = if (in.args.sketch_topk) |cfg| cfg.fuse_census != null else false;
     if (!explicit_census) {
-        plan.dispatch.keys_unique = false;
+        const looks_unique = plan.dispatch.keys_unique and bail_census and !short_composite;
+        plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
-        plan.dispatch.census_fused = false;
+        plan.dispatch.census_fused = looks_unique;
         plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
+        if (looks_unique) {
+            plan.reasons.insert(.keys_look_unique);
+            plan.reasons.insert(.census_fused);
+        }
         if (plan.dispatch.strategy == .sketch) {
             if (bail_census) {
                 plan.reasons.insert(if (short_composite) .census_short_string_composite else .census_fixed_width_bail);

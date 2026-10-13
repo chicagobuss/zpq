@@ -1428,6 +1428,7 @@ fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
     if (env.getPosix("ZPQ_SKETCH_ADMIT")) |v| cfg.admit_per_row = std.fmt.parseInt(usize, v, 10) catch cfg.admit_per_row;
     if (env.getPosix("ZPQ_SKETCH_BITS")) |v| cfg.cell_bits = std.math.clamp(std.fmt.parseInt(u6, v, 10) catch cfg.cell_bits, 10, 30);
     cfg.trace = env.getPosix("ZPQ_SKETCH_TRACE") != null;
+    cfg.census = !envDisables(env, "ZPQ_SKETCH_CENSUS");
     return cfg;
 }
 

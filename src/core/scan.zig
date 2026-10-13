@@ -141,8 +141,16 @@ pub const SketchTopK = struct {
     certify: bool = true,
     /// Tests: where the scan went.
     outcome: ?*Outcome = null,
+    /// When the cells bail, try a census of key fingerprints (`censusTopK`) before the plain scan.
+    census: bool = true,
+    /// Tests: whether the census rides along the cell count pass, in place of `keysLookUnique`.
+    fuse_census: ?bool = null,
+    /// Tests: rows a worker records before its cells judge whether a riding census is needed.
+    census_check_rows: u64 = expr_agg.Census.check_rows,
+    /// Tests: fingerprint bits below the partition's (40), fewer to make keys collide.
+    census_fp_bits: u6 = 40,
 
-    pub const Outcome = enum { ineligible, bailed, certified, fell_back };
+    pub const Outcome = enum { ineligible, bailed, certified, fell_back, census };
 };
 
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
@@ -584,6 +592,8 @@ const Worker = struct {
     /// Relaxed ordering suffices: this only hands out disjoint indices, and the post-join merge is the real
     /// synchronization edge.
     cursor: *std.atomic.Value(usize),
+    /// Items a census admit pass passes over (`censusTopK`).
+    skip: ?[]const bool = null,
     agg_calls: []const expr_agg.AggCall,
     plan: *const agg_plan.Plan,
     decode_options: consumer.DecodeOptions,
@@ -673,6 +683,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             release_span = .begin(prof);
             break;
         };
+        if (w.skip) |skip| if (skip[idx]) continue;
         items.* += 1;
         const item = w.work[idx];
         const gate = w.inputs[item.file].gate;
@@ -711,6 +722,13 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
+        // A census notes the item each row was read in, and how many rows each item gave it.
+        const census: ?*expr_agg.Census = if (table) |gt| if (gt.sketch) |s| s.census else null else null;
+        const recorded_before = if (census) |c| c.recorded else 0;
+        if (census) |c| c.item = idx;
+        defer if (census) |c| if (c.admitted == null) {
+            c.item_rows[idx] = c.recorded - recorded_before;
+        };
         const target: consumer.AggTarget = if (table) |gt|
             .{ .grouped = .{
                 .calls = sub_agg_calls,
@@ -762,6 +780,7 @@ fn sketchEligible(
     keys: []const expr_ast.Expr,
     filter_cols: []const bool,
     use_blocks: bool,
+    keys_unique: bool,
 ) ?usize {
     const outs = outputs orelse return null;
     const order = args.result_order;
@@ -777,8 +796,9 @@ fn sketchEligible(
     if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
     for (args.inputs) |in| if (in.gate != null) return null;
     // Both passes decode every column the filter reads. Beyond the group keys, which both passes decode anyway, that
-    // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves.
-    for (filter_cols, 0..) |reads, col| if (reads) {
+    // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves. Not so
+    // against grouping keys that look unique (`keysLookUnique`), which costs far more than a second decode.
+    if (!keys_unique) for (filter_cols, 0..) |reads, col| if (reads) {
         const is_key = for (keys) |key| {
             if (key == .col_ref and key.col_ref.col_idx == col) break true;
         } else false;
@@ -803,6 +823,8 @@ fn sketchTopK(
     order: expr_ast.ResultOrder,
     a_idx: usize,
     cfg: SketchTopK,
+    max_memory: usize,
+    fuse_census: bool,
 ) !void {
     const k: usize = @intCast(order.offset +| order.limit.?);
     const n_cells = @as(usize, 1) << cfg.cell_bits;
@@ -818,10 +840,39 @@ fn sketchTopK(
     defer for (tables) |*t| {
         t.sketch = null;
     };
+    const admit_n = @max(k * cfg.admit_per_row, @min(64, n_cells / 16));
+    // A census (`censusTopK`) rides along the count pass when it fits and the keys look unique (`keysLookUnique`), so
+    // cells too even to bound anything need no second count pass. It fills the cells too, and stops early wherever a
+    // worker's own cells already separate the cut, as the cells will then do without it.
+    var dropped: std.atomic.Value(bool) = .init(false);
+    const censuses: []expr_agg.Census = if (cfg.census and censusFits(workers, max_memory)) blk: {
+        const item_rows = try arena.alloc(u64, workers[0].work.len);
+        @memset(item_rows, 0);
+        const cs = try arena.alloc(expr_agg.Census, workers.len);
+        for (cs) |*c| c.* = .{
+            .gpa = gpa,
+            .item_rows = item_rows,
+            .dropped = &dropped,
+            .cut_k = k,
+            .admit_n = admit_n,
+            .check_after = cfg.census_check_rows,
+            .fp_mask = censusMask(cfg),
+        };
+        break :blk cs;
+    } else &.{};
+    defer for (censuses) |*c| c.deinit();
+    const fused = (cfg.fuse_census orelse fuse_census) and censuses.len > 0;
+    if (fused) for (sketches, censuses) |*s, *c| {
+        s.census = c;
+    };
+    defer for (sketches) |*s| {
+        s.census = null;
+    };
     const saved = try arena.dupe(Worker, workers);
     const t0 = nowMonoNs();
     try runPhase(workers, cursor);
-    const t1 = nowMonoNs();
+    var t1 = nowMonoNs();
+    for (sketches) |*s| s.census = null;
 
     const sum = sketches[0].cells;
     for (sketches[1..]) |s| for (sum, s.cells) |*a, b| {
@@ -829,18 +880,35 @@ fn sketchTopK(
     };
     const ranked = try gpa.dupe(u32, sum);
     defer gpa.free(ranked);
-    const admit_n = @max(k * cfg.admit_per_row, @min(64, n_cells / 16));
     std.mem.sortUnstable(u32, ranked, {}, std.sort.desc(u32));
     // Admitting every cell fuller than `bound` keeps ties at it out, so `bound` is the fullest cell not admitted.
     const bound = ranked[admit_n];
-    // Cells as full at the cut as past the admitted ones: the keys are too even for a bound to separate them.
-    const viable = bound == 0 or ranked[k - 1] / 2 > bound;
-    if (cfg.trace) std.debug.print("sketch: count_ms={d} kth_cell={d} bound={d} viable={}\n", .{
-        @divTrunc(t1 - t0, 1_000_000), ranked[k - 1], bound, viable,
+    const viable = expr_agg.cellsSeparate(ranked, k, admit_n);
+    if (cfg.trace) std.debug.print("sketch: count_ms={d} kth_cell={d} bound={d} viable={} census_dropped={}\n", .{
+        @divTrunc(t1 - t0, 1_000_000), ranked[k - 1], bound, viable, dropped.load(.monotonic),
     });
     if (!viable) if (cfg.outcome) |o| {
         o.* = .bailed;
     };
+    if (!viable and censuses.len > 0) {
+        if (!fused or dropped.load(.monotonic)) {
+            // The census did not ride along, or a worker's cells misjudged the whole: count again, census only.
+            for (censuses) |*c| {
+                c.deinit();
+                c.* = .{ .gpa = gpa, .item_rows = c.item_rows, .fp_mask = censusMask(cfg) };
+            }
+            @memset(censuses[0].item_rows, 0);
+            for (sketches, censuses) |*s, *c| s.census = c;
+            restoreCounts(workers, saved);
+            const t2 = nowMonoNs();
+            try runPhase(workers, cursor);
+            t1 = nowMonoNs();
+            for (sketches) |*s| s.census = null;
+            if (cfg.trace) std.debug.print("census: recount_ms={d}\n", .{@divTrunc(t1 - t2, 1_000_000)});
+        }
+        if (try censusTopK(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, t1 - t0)) return;
+    }
+    for (censuses) |*c| c.deinit();
     if (viable) {
         const admit = try arena.alloc(u64, (n_cells + 63) / 64);
         @memset(admit, 0);
@@ -860,18 +928,362 @@ fn sketchTopK(
             return;
         }
         if (cfg.outcome) |o| o.* = .fell_back;
-        for (tables) |*t| {
-            const shared = t.shared;
-            const stride = t.fixed_stride;
-            t.deinit();
-            t.* = expr_agg.GroupTable.init(gpa, 0);
-            t.shared = shared;
-            t.fixed_stride = stride;
-        }
+        clearTables(gpa, tables);
     }
     for (tables) |*t| t.sketch = null;
     restoreCounts(workers, saved);
     try runPhase(workers, cursor);
+}
+
+/// Whether a census should ride along the sketch's cell count pass: some fixed-width key column is stored at nearly its
+/// plain width in the first row group read, so its values barely repeat there. Keys that barely repeat leave the cells
+/// too even to certify a cut. Otherwise the cells count alone, and the census counts in a pass of its own only if
+/// they bail.
+fn keysLookUnique(metas: []const schema.FileMetaData, work: []const WorkItem, keys: []const expr_ast.Expr) bool {
+    if (work.len == 0) return false;
+    const rg = &metas[work[0].file].row_groups.items[work[0].rg];
+    if (rg.num_rows <= 0) return false;
+    for (keys) |key| {
+        if (key != .col_ref) continue;
+        const col = key.col_ref.col_idx;
+        if (col >= rg.columns.items.len) continue;
+        const md = rg.columns.items[col].meta_data orelse continue;
+        const width: i64 = switch (md.type) {
+            .INT32, .FLOAT => 4,
+            .INT64, .DOUBLE => 8,
+            else => continue,
+        };
+        if (md.total_uncompressed_size *| 4 >= rg.num_rows *| width *| 3) return true;
+    }
+    return false;
+}
+
+/// Empties `tables` for a pass that starts over.
+fn clearTables(gpa: std.mem.Allocator, tables: []expr_agg.GroupTable) void {
+    for (tables) |*t| {
+        const shared = t.shared;
+        const stride = t.fixed_stride;
+        t.deinit();
+        t.* = expr_agg.GroupTable.init(gpa, 0);
+        t.shared = shared;
+        t.fixed_stride = stride;
+    }
+}
+
+/// Whether a census of every row the work list can give (`censusTopK`) is a small part of `max_memory`: eight bytes a
+/// row, and a chunk per partition per worker being filled. Its entries name work items in 24 bits, and an item must
+/// be a whole row group (as a grouped scan's are), so each row is counted once.
+fn censusFits(workers: []const Worker, max_memory: usize) bool {
+    const w = workers[0];
+    if (w.work.len >= expr_agg.Census.max_items) return false;
+    var rows: u64 = 0;
+    for (w.work) |item| {
+        if (item.agg_start != 0) return false;
+        rows +|= @intCast(@max(0, w.metas[item.file].row_groups.items[item.rg].num_rows));
+    }
+    const open = workers.len * expr_agg.Census.N_PARTS * @sizeOf(expr_agg.Census.Chunk);
+    return (rows *| 8) +| open <= max_memory / 4;
+}
+
+fn censusMask(cfg: SketchTopK) u64 {
+    return (@as(u64, 1) << @min(cfg.census_fp_bits, 40)) - 1;
+}
+
+/// A fingerprint seen more than once, and the work items its rows were read in: `items[at..][0..n]` of the task that
+/// found it.
+const Repeat = struct { fp: u64, count: u64, task: u32, at: u32, n: u32 };
+
+/// Folds the census partitions claimed from `cursor`: each partition's fingerprints from every worker, sorted, give
+/// the fingerprints seen more than once. Stops once all tasks together have found more than `cap`.
+const CensusTask = struct {
+    gpa: std.mem.Allocator,
+    censuses: []expr_agg.Census,
+    cursor: *std.atomic.Value(usize),
+    found: *std.atomic.Value(usize),
+    cap: usize,
+    index: u32 = 0,
+    out: std.ArrayList(Repeat) = .empty,
+    items: std.ArrayList(u32) = .empty,
+    sorted: std.ArrayList(u64) = .empty,
+    table: std.ArrayList(u64) = .empty,
+    err: ?anyerror = null,
+
+    fn run(t: *CensusTask) void {
+        t.fold() catch |e| {
+            t.err = e;
+        };
+    }
+
+    fn fold(t: *CensusTask) !void {
+        while (t.found.load(.monotonic) <= t.cap) {
+            const p = t.cursor.fetchAdd(1, .monotonic);
+            if (p >= expr_agg.Census.N_PARTS) return;
+            // Every worker's entries for the partition, bucketed by the top byte straight from the chunks, so each
+            // bucket is small enough to stay in cache.
+            var starts: [257]usize = @splat(0);
+            for (t.censuses) |*c| {
+                for (c.full[p].items) |chunk| for (chunk) |e| {
+                    starts[(e >> 56) + 1] += 1;
+                };
+                if (c.open[p]) |chunk| for (chunk[0..c.fill[p]]) |e| {
+                    starts[(e >> 56) + 1] += 1;
+                };
+            }
+            for (1..257) |b| starts[b] += starts[b - 1];
+            try t.sorted.resize(t.gpa, starts[256]);
+            const entries = t.sorted.items;
+            var next = starts;
+            for (t.censuses) |*c| {
+                for (c.full[p].items) |chunk| scatter(entries, &next, chunk);
+                if (c.open[p]) |chunk| scatter(entries, &next, chunk[0..c.fill[p]]);
+                c.freeChunks(&c.full[p]);
+                c.open[p] = null;
+                c.fill[p] = 0;
+            }
+            var found: usize = 0;
+            for (0..256) |b| found += try t.repeatsIn(p, entries[starts[b]..starts[b + 1]]);
+            _ = t.found.fetchAdd(found, .monotonic);
+        }
+    }
+
+    fn scatter(entries: []u64, next: *[257]usize, chunk: []const u64) void {
+        for (chunk) |e| {
+            const b: usize = @intCast(e >> 56);
+            entries[next[b]] = e;
+            next[b] += 1;
+        }
+    }
+
+    /// The fingerprints of `bucket` seen more than once. A table of its fingerprints finds them in one pass; a bucket
+    /// with more than a few is sorted instead, so their rows come together.
+    fn repeatsIn(t: *CensusTask, p: usize, bucket: []u64) !usize {
+        const IB = expr_agg.Census.ITEM_BITS;
+        if (bucket.len < 2) return 0;
+        const size = std.math.ceilPowerOfTwoAssert(usize, bucket.len * 2);
+        try t.table.resize(t.gpa, size);
+        const table = t.table.items;
+        @memset(table, 0);
+        const used: u64 = 1 << 63;
+        const seen_twice: u64 = 1 << 62;
+        var reps: [8]u64 = undefined;
+        var n_reps: usize = 0;
+        for (bucket) |e| {
+            const fp = e >> IB;
+            var i: usize = @intCast(fp & (size - 1));
+            while (true) : (i = (i + 1) & (size - 1)) {
+                const slot = table[i];
+                if (slot == 0) {
+                    table[i] = fp | used;
+                    break;
+                }
+                if (slot & ~seen_twice != fp | used) continue;
+                if (slot & seen_twice == 0) {
+                    if (n_reps == reps.len) return t.repeatsSorted(p, bucket);
+                    table[i] |= seen_twice;
+                    reps[n_reps] = fp;
+                    n_reps += 1;
+                }
+                break;
+            }
+        }
+        for (reps[0..n_reps]) |fp| {
+            const at = t.items.items.len;
+            var count: u64 = 0;
+            for (bucket) |e| if (e >> IB == fp) {
+                count += 1;
+                try t.items.append(t.gpa, @intCast(e & ((1 << IB) - 1)));
+            };
+            try t.emit(p, fp, count, at);
+        }
+        return n_reps;
+    }
+
+    fn repeatsSorted(t: *CensusTask, p: usize, bucket: []u64) !usize {
+        const IB = expr_agg.Census.ITEM_BITS;
+        std.mem.sortUnstable(u64, bucket, {}, std.sort.asc(u64));
+        var i: usize = 0;
+        var found: usize = 0;
+        while (i < bucket.len) {
+            const fp = bucket[i] >> IB;
+            var j = i + 1;
+            while (j < bucket.len and bucket[j] >> IB == fp) j += 1;
+            if (j - i > 1) {
+                const at = t.items.items.len;
+                for (bucket[i..j]) |e| try t.items.append(t.gpa, @intCast(e & ((1 << IB) - 1)));
+                try t.emit(p, fp, j - i, at);
+                found += 1;
+            }
+            i = j;
+        }
+        return found;
+    }
+
+    /// Records a repeated fingerprint whose rows' items were appended from `at`, kept once each, in order.
+    fn emit(t: *CensusTask, p: usize, fp: u64, count: u64, at: usize) !void {
+        const its = t.items.items[at..];
+        std.mem.sortUnstable(u32, its, {}, std.sort.asc(u32));
+        var n: usize = 0;
+        for (its) |it| if (n == 0 or its[n - 1] != it) {
+            its[n] = it;
+            n += 1;
+        };
+        t.items.shrinkRetainingCapacity(at + n);
+        try t.out.append(t.gpa, .{
+            .fp = (@as(u64, p) << 40) | fp,
+            .count = count,
+            .task = t.index,
+            .at = @intCast(at),
+            .n = @intCast(n),
+        });
+    }
+};
+
+/// The sketch's fallback when its cells are too even to bound anything, as with near-unique keys. A census of every
+/// row's key fingerprint (`expr_agg.Census`) bounds each key's total almost exactly. The admit pass groups each key
+/// whose fingerprint totals at least `t`, the k-th largest fingerprint total. A key left out totals below `t`, so
+/// when the k-th largest grouped total reaches `t`, every group the cut keeps, ties at the cut included, is grouped.
+///
+/// When `t` is 2 and the cut orders by the count alone, the admit pass also groups every key asked for in a prefix of
+/// the input holding at least k rows of keys seen once. Every key left out is then a single row asked for later
+/// than those, and a tie at the cut keeps the first to appear, so the cut is certified at a tie of 1 too.
+/// Grouping a key from the prefix is exact, as it has one row. Returns false, with the tables empty, when the census
+/// cannot certify the cut.
+fn censusTopK(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    workers: []Worker,
+    cursor: *std.atomic.Value(usize),
+    tables: []expr_agg.GroupTable,
+    sketches: []expr_agg.CountSketch,
+    censuses: []expr_agg.Census,
+    calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+    a_idx: usize,
+    cfg: SketchTopK,
+    count_ns: i128,
+) !bool {
+    const k: usize = @intCast(order.offset +| order.limit.?);
+    const work = workers[0].work;
+    const item_rows = censuses[0].item_rows;
+    const t1 = nowMonoNs();
+    const count_ms = @divTrunc(count_ns, 1_000_000);
+
+    // Repeated fingerprints, gathered from every partition.
+    const cap = @max(k *| cfg.admit_per_row *| 64, 1 << 20);
+    var cursor_p: std.atomic.Value(usize) = .init(0);
+    var found: std.atomic.Value(usize) = .init(0);
+    const tasks = try arena.alloc(CensusTask, @min(workers.len, expr_agg.Census.N_PARTS));
+    for (tasks, 0..) |*t, ti| t.* = .{
+        .gpa = gpa,
+        .censuses = censuses,
+        .cursor = &cursor_p,
+        .found = &found,
+        .cap = cap,
+        .index = @intCast(ti),
+    };
+    defer for (tasks) |*t| {
+        t.out.deinit(gpa);
+        t.items.deinit(gpa);
+        t.sorted.deinit(gpa);
+        t.table.deinit(gpa);
+    };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (tasks.len == 1 or !spawn_util.runTree(CensusTask, tasks, config, CensusTask.run)) tasks[0].run();
+    for (tasks) |t| if (t.err) |e| return e;
+    if (cfg.trace) std.debug.print("census: reduce_ms={d}\n", .{@divTrunc(nowMonoNs() - t1, 1_000_000)});
+    if (found.load(.monotonic) > cap) {
+        if (cfg.trace) std.debug.print("census: count_ms={d} repeated>{d}, too many\n", .{ count_ms, cap });
+        return false;
+    }
+    var repeats: std.ArrayList(Repeat) = .empty;
+    defer repeats.deinit(gpa);
+    try repeats.ensureTotalCapacity(gpa, found.load(.monotonic));
+    for (tasks) |t| repeats.appendSliceAssumeCapacity(t.out.items);
+    std.mem.sortUnstable(Repeat, repeats.items, {}, struct {
+        fn more(_: void, a: Repeat, b: Repeat) bool {
+            return a.count > b.count or (a.count == b.count and a.fp < b.fp);
+        }
+    }.more);
+
+    const items = repeats.items;
+    const t: u64 = if (items.len >= k) items[k - 1].count else 2;
+    const prefix = t == 2 and order.keys.len == 1;
+    var n_admit: usize = 0;
+    var admit_rows: u64 = 0;
+    while (n_admit < items.len and items[n_admit].count >= t) : (n_admit += 1) admit_rows += items[n_admit].count;
+    const admit_cap = @max(k *| cfg.admit_per_row *| 16, 1 << 16);
+    if (n_admit > admit_cap or (items.len < k and !prefix)) {
+        if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d}, cannot cut\n", .{
+            count_ms, items.len, t, n_admit,
+        });
+        return false;
+    }
+
+    var set: expr_agg.FingerprintSet = .{ .filter = undefined, .map = .empty };
+    defer set.map.deinit(gpa);
+    const filter = try gpa.alloc(u64, (1 << expr_agg.FingerprintSet.filter_bits) / 64);
+    defer gpa.free(filter);
+    @memset(filter, 0);
+    try set.map.ensureTotalCapacity(gpa, @intCast(n_admit));
+    for (items[0..n_admit]) |r| {
+        set.map.putAssumeCapacity(r.fp, {});
+        const b = r.fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
+        filter[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+    }
+    set.filter = filter;
+
+    // The prefix ends where the rows given to the census pass `k` beyond the admitted keys' rows. In a row group whose
+    // rows all reached the census, at that row; otherwise at the end of it.
+    var lo: u64 = 0;
+    var row: u64 = 0;
+    if (prefix) {
+        const need = k + admit_rows;
+        lo = std.math.maxInt(u32);
+        var seen: u64 = 0;
+        for (item_rows, 0..) |n, i| {
+            if (seen + n < need) {
+                seen += n;
+                continue;
+            }
+            const rg_rows = workers[0].metas[work[i].file].row_groups.items[work[i].rg].num_rows;
+            lo = i;
+            row = if (rg_rows >= 0 and n == @as(u64, @intCast(rg_rows))) need - seen else std.math.maxInt(u64);
+            break;
+        }
+    }
+    for (censuses) |*c| {
+        c.admitted = &set;
+        c.prefix_item = lo;
+        c.prefix_row = row;
+    }
+    for (sketches, censuses) |*s, *c| s.census = c;
+    // The admit pass reads only the prefix and the items holding an admitted key's rows. The count pass's row counts
+    // stand.
+    const skip = try arena.alloc(bool, work.len);
+    for (skip, 0..) |*sk, i| sk.* = i > lo or (i == lo and row == 0);
+    for (items[0..n_admit]) |r| for (tasks[r.task].items.items[r.at..][0..r.n]) |item| {
+        skip[item] = false;
+    };
+    const counted = try arena.dupe(Worker, workers);
+    for (workers) |*w| w.skip = skip;
+    defer for (workers) |*w| {
+        w.skip = null;
+    };
+    try runPhase(workers, cursor);
+    restoreCounts(workers, counted);
+    const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
+    const certified = cfg.certify and (prefix or kth >= t);
+    if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d} prefix={} admit_ms={d} kth_total={d} certified={}\n", .{
+        count_ms, items.len, t, n_admit, prefix, @divTrunc(nowMonoNs() - t1, 1_000_000), kth, certified,
+    });
+    if (certified) {
+        if (cfg.outcome) |o| o.* = .census;
+        return true;
+    }
+    if (cfg.outcome) |o| o.* = .fell_back;
+    for (workers) |*w| w.skip = null;
+    clearTables(gpa, tables);
+    return false;
 }
 
 /// Puts back the row and row-group counts a discarded pass added.
@@ -1242,15 +1654,16 @@ pub fn runMultiAggregate(
         (n_workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
     else
         false;
+    const keys_unique = args.sketch_topk != null and keysLookUnique(metas, work_items.items, group_by_keys orelse &.{});
     const sketch_count: ?usize = if (args.sketch_topk) |cfg| if (sketch_fits)
-        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks)
+        sketchEligible(cfg, args, group_outputs, agg_calls, group_by_keys orelse &.{}, plan.filter_cols, use_blocks, keys_unique)
     else
         null else null;
     if (sketch_count == null) if (args.sketch_topk) |cfg| if (cfg.outcome) |o| {
         o.* = .ineligible;
     };
     if (sketch_count) |a_idx| {
-        try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, args.result_order, a_idx, args.sketch_topk.?);
+        try sketchTopK(gpa, arena, workers, &work_cursor, group_tables, agg_calls, args.result_order, a_idx, args.sketch_topk.?, args.max_memory, keys_unique);
     } else {
         runWorkers(workers);
     }
@@ -3731,6 +4144,12 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
         // Few cells: collisions inflate the bound.
         .{ .cell_bits = 8, .admit_per_row = 1 },
         .{ .certify = false },
+        // When the cells bail: the census riding along the count pass, then dropped early by a worker's cells, then
+        // counting in a pass of its own, and none.
+        .{ .cell_bits = 8, .admit_per_row = 1, .fuse_census = true },
+        .{ .cell_bits = 8, .admit_per_row = 1, .fuse_census = true, .census_check_rows = 64 },
+        .{ .cell_bits = 8, .admit_per_row = 1, .fuse_census = false },
+        .{ .cell_bits = 8, .admit_per_row = 1, .census = false },
     };
     var seen = std.EnumSet(Outcome){};
     // `k` is skewed and has nulls, `n` is a fixed-width key, `v` is unique (every count ties at 1).
@@ -3770,7 +4189,69 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
             for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
         };
     };
-    for ([_]Outcome{ .ineligible, .bailed, .certified, .fell_back }) |o| try testing.expect(seen.contains(o));
+    for ([_]Outcome{ .ineligible, .bailed, .certified, .fell_back, .census }) |o| try testing.expect(seen.contains(o));
+}
+
+test "runMultiAggregate: a census cut answers as the full scan, certified or not" {
+    // Near-unique keys in shuffled order (tools/gen_census_fixture.py): the cells bail, and the census decides.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Outcome = SketchTopK.Outcome;
+    const cuts = [_]expr_ast.ResultOrder{
+        // `u` and `s` tie at 1 inside the cut, `t` at 3.
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+        // Ties broken by the key, which first appearance does not follow.
+        .{ .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } }, .limit = 10 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 30 },
+    };
+    const configs = [_]SketchTopK{
+        .{ .fuse_census = true },
+        .{ .fuse_census = false },
+        // Colliding fingerprints inflate every total: the census must not trust a cut they make up.
+        .{ .fuse_census = true, .census_fp_bits = 3 },
+        .{ .fuse_census = false, .census_fp_bits = 0 },
+        .{ .census = false },
+    };
+    var seen = std.EnumSet(Outcome){};
+    for ([_][]const u8{ "u", "t", "s" }) |key| for ([_]?[]const u8{ null, "u > 300000000000" }) |filter| {
+        for ([_]usize{ 1, 3 }) |parallelism| for (cuts) |cut| for (configs) |cfg_in| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const select_cols = try selectList(arena, &.{ key, "count(*) AS c", "min(s) AS lo", "sum(t) AS st" });
+            var args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .filter = if (filter != null and std.mem.eql(u8, key, "u")) filter else null,
+                .aggregate = "count(*) AS c, min(s) AS lo, sum(t) AS st",
+                .group_by = key,
+                .select_cols = select_cols,
+                .parallelism = parallelism,
+                .min_bytes_per_worker = 1,
+                .result_order = cut,
+            };
+            var want = try runMultiAggregate(testing.allocator, arena, args);
+            defer want.deinit(testing.allocator);
+            var outcome: Outcome = .ineligible;
+            var cfg = cfg_in;
+            cfg.outcome = &outcome;
+            args.sketch_topk = cfg;
+            var got = try runMultiAggregate(testing.allocator, arena, args);
+            defer got.deinit(testing.allocator);
+            seen.insert(outcome);
+            try testing.expectEqual(want.rows_in, got.rows_in);
+            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try want.output.applyResultOrder(testing.allocator, cut);
+            try got.output.applyResultOrder(testing.allocator, cut);
+            const w = want.output.group_rows.?;
+            const g = got.output.group_rows.?;
+            try testing.expectEqual(w.len, g.len);
+            for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
+        };
+    };
+    for ([_]Outcome{ .bailed, .fell_back, .census }) |o| try testing.expect(seen.contains(o));
 }
 
 fn runSketchedAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData, certify: bool) !void {
@@ -3801,6 +4282,43 @@ test "runMultiAggregate: a sketched COUNT cut frees everything on any allocation
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     for ([_]bool{ true, false }) |certify| {
         try testing.checkAllAllocationFailures(fixed.allocator(), runSketchedAndFree, .{ &inputs, &meta, certify });
+    }
+}
+
+fn runCensusAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData, cfg: SketchTopK) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var res = try runMultiAggregate(gpa, arena_state.allocator(), .{
+        .inputs = inputs,
+        .metas = meta[0..1],
+        .aggregate = "count(*) AS c, min(s) AS lo",
+        .group_by = "s",
+        .parallelism = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 4 },
+        .sketch_topk = cfg,
+    });
+    res.deinit(gpa);
+}
+
+test "runMultiAggregate: a census cut frees everything on any allocation failure" {
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer meta_arena.deinit();
+    var meta = try metadata.open(meta_arena.allocator(), bytes);
+    // The first row group alone: every failure point runs the query again.
+    meta.row_groups.items.len = 1;
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    // Riding along the count pass and dropped early, riding along, alone, and falling back after the admit pass.
+    for ([_]SketchTopK{
+        .{ .fuse_census = true, .census_check_rows = 64 },
+        .{ .fuse_census = true },
+        .{ .fuse_census = false },
+        .{ .fuse_census = false, .certify = false },
+    }) |cfg| {
+        try testing.checkAllAllocationFailures(fixed.allocator(), runCensusAndFree, .{ &inputs, &meta, cfg });
     }
 }
 
@@ -5602,9 +6120,11 @@ test "sketchEligible: a filter may read the group keys, not other columns" {
     };
     const cfg: SketchTopK = .{};
     // No filter, or one over the key column: eligible. One that also reads column 0: not.
-    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, false }, false));
-    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, true }, false));
-    try testing.expectEqual(@as(?usize, null), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ true, true }, false));
+    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, false }, false, false));
+    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ false, true }, false, false));
+    try testing.expectEqual(@as(?usize, null), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ true, true }, false, false));
+    // Keys that look unique take the cut even through a filter on another column.
+    try testing.expectEqual(@as(?usize, 0), sketchEligible(cfg, args, &outputs, &calls, &keys, &.{ true, true }, false, true));
 }
 
 test "parallelDistinctCountU64 counts the exact union of overlapping sets" {

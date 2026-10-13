@@ -534,7 +534,7 @@ pub fn groupedCoded(
         sunk = try sel.cloneAlloc(ra);
         const ids = try ra.alloc(u32, num_rows);
         for (ids, comp) |*id, cp| id.* = gid_of[cp];
-        agg.sinkSketchRows(table, ids, &sunk);
+        try agg.sinkSketchRows(table, ids, &sunk);
         break :blk &sunk;
     } else sel;
     const agg_len = calls.len;

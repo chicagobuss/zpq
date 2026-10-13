@@ -3274,7 +3274,7 @@ pub const GroupKeyResolver = struct {
         }
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
             const s = key_cols[0].string.values[row];
-            if (table.sketch != null) if (table.sketchRaw(s)) |id| return id;
+            if (table.sketch != null) if (try table.sketchRaw(s)) |id| return id;
             const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
             const gop = try self.memo.getOrPut(allocator, id);
             if (gop.found_existing) return gop.value_ptr.*;
@@ -3540,6 +3540,18 @@ pub const CountSketch = struct {
     shift: u6,
     /// The admit pass's cells, one bit each; null in the count pass.
     admit: ?[]const u64 = null,
+    /// Set when the cells could not separate the keys: the census decides instead, and `cells` and `admit` are unused.
+    census: ?*Census = null,
+
+    /// The sink id a key with `hash`, asked for at `pos`, takes instead of a group; null when it gets a group.
+    inline fn route(self: *CountSketch, hash: u64, pos: u64) !?u32 {
+        if (self.census) |c| if (!c.off) {
+            if (c.admitted == null) return try c.slot(hash);
+            return if (c.admits(hash, pos)) null else sinkId(0);
+        };
+        const cell = self.cellOf(hash);
+        return if (self.admits(cell)) null else sinkId(cell);
+    }
 
     pub fn cellOf(self: *const CountSketch, hash: u64) u32 {
         return @intCast(hash >> self.shift);
@@ -3554,6 +3566,202 @@ pub const CountSketch = struct {
     fn admits(self: *const CountSketch, cell: u32) bool {
         const a = self.admit orelse return false;
         return (a[cell / 64] >> @intCast(cell % 64)) & 1 != 0;
+    }
+};
+
+/// The count pass a sketched top-k falls back to when its cells are too even to bound anything (near-unique keys).
+/// Each row records its key's 48-bit fingerprint (`fingerprint`), partitioned by the top 8 bits, with the work item it
+/// was read in, so an admit pass reads only the items that hold a key it admits. Two keys share a
+/// fingerprint only by a hash collision, so a fingerprint's total bounds the total of every key under it, as a cell's
+/// does, but almost exactly. In the count pass a key takes a slot id (`slot`) naming its hash in `batch`, and
+/// `sinkSketchRows` records a fingerprint per row and adds it to its cell too, so one count pass serves both. In the
+/// admit pass a key gets a group when its fingerprint is in `admitted`, or when it is asked for in the prefix: any
+/// work item before `prefix_item`, or a row before `prefix_row` of that item.
+pub const Census = struct {
+    pub const PART_BITS = 8;
+    pub const N_PARTS = 1 << PART_BITS;
+    pub const CHUNK = 1024;
+    /// An entry: the fingerprint's low 40 bits (its partition gives the rest), then the work item in the low 24.
+    pub const Chunk = [CHUNK]u64;
+    pub const ITEM_BITS = 24;
+    /// Chunks are carved from slabs this many at a time, so recording rarely calls the allocator.
+    pub const SLAB = 64;
+    pub const max_items = 1 << ITEM_BITS;
+    /// Rows a worker records before its own cells judge whether the census is needed (`dropped`).
+    pub const check_rows = 1 << 18;
+
+    gpa: std.mem.Allocator,
+    /// Rows recorded while scanning each work item, by item; shared by every worker's census.
+    item_rows: []u64,
+    /// The hashes of this batch's keys, by slot.
+    batch: std.ArrayList(u64) = .empty,
+    /// Filled chunks of entries, by partition.
+    full: [N_PARTS]std.ArrayList(*Chunk) = @splat(.empty),
+    /// Where every chunk lives; `slab_used` of the last are handed out.
+    slabs: std.ArrayList([]Chunk) = .empty,
+    slab_used: usize = 0,
+    /// The chunk each partition is filling, and how much of it is filled.
+    open: [N_PARTS]?*Chunk = @splat(null),
+    fill: [N_PARTS]u16 = @splat(0),
+    /// The work item being scanned.
+    item: u64 = 0,
+    recorded: u64 = 0,
+    /// Riding along a cell count pass: once `check_rows` rows in, a worker whose own cells already separate the cut
+    /// (`cellsSeparate`) sets `dropped`, and every census stops (`off`) and frees what it holds, as the cells will
+    /// do. Null for a census counting alone.
+    dropped: ?*std.atomic.Value(bool) = null,
+    cut_k: usize = 0,
+    admit_n: usize = 0,
+    check_after: u64 = check_rows,
+    /// Tests: the fingerprint bits kept below the partition's, fewer to make keys collide.
+    fp_mask: u64 = (1 << 40) - 1,
+    checked: bool = false,
+    off: bool = false,
+    /// Set for the admit pass.
+    admitted: ?*const FingerprintSet = null,
+    prefix_item: u64 = 0,
+    prefix_row: u64 = 0,
+
+    pub fn fingerprint(self: *const Census, hash: u64) u64 {
+        return (hash >> 16) & (0xff_00_0000_0000 | self.fp_mask);
+    }
+
+    /// Frees every chunk; safe to call again.
+    pub fn deinit(self: *Census) void {
+        self.batch.deinit(self.gpa);
+        self.batch = .empty;
+        const off = self.off;
+        self.stop();
+        self.off = off;
+    }
+
+    /// Forgets a partition's filled chunks; their memory goes with the slabs.
+    pub fn freeChunks(self: *Census, f: *std.ArrayList(*Chunk)) void {
+        f.deinit(self.gpa);
+        f.* = .empty;
+    }
+
+    fn newChunk(self: *Census) !*Chunk {
+        if (self.slabs.items.len == 0 or self.slab_used == SLAB) {
+            try self.slabs.ensureUnusedCapacity(self.gpa, 1);
+            self.slabs.appendAssumeCapacity(try self.gpa.alloc(Chunk, SLAB));
+            self.slab_used = 0;
+        }
+        defer self.slab_used += 1;
+        return &self.slabs.items[self.slabs.items.len - 1][self.slab_used];
+    }
+
+    /// The fingerprints recorded in partition `p`: whole chunks, then the open one's filled part.
+    pub fn partLen(self: *const Census, p: usize) usize {
+        return self.full[p].items.len * CHUNK + self.fill[p];
+    }
+
+    fn slot(self: *Census, hash: u64) !u32 {
+        const i = self.batch.items.len;
+        try self.batch.append(self.gpa, hash);
+        return std.math.maxInt(u32) - @as(u32, @intCast(i));
+    }
+
+    fn hasPrefix(self: *const Census) bool {
+        return self.prefix_item != 0 or self.prefix_row != 0;
+    }
+
+    /// `pos` is a `firstPosition`: the work item above, the row in its row group below.
+    fn admits(self: *const Census, hash: u64, pos: u64) bool {
+        const item = pos >> 32;
+        if (item < self.prefix_item or (item == self.prefix_item and (pos & 0xffff_ffff) < self.prefix_row)) return true;
+        return self.admitted.?.contains(self.fingerprint(hash));
+    }
+
+    /// Once, `check_rows` in: drops the census for every worker if this worker's cells already separate the cut.
+    fn judge(self: *Census, cells: []const u32) !void {
+        self.checked = true;
+        const ranked = try self.gpa.alloc(u32, self.admit_n + 1);
+        defer self.gpa.free(ranked);
+        fullestCells(cells, ranked);
+        if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
+        self.dropped.?.store(true, .monotonic);
+        self.stop();
+    }
+
+    /// Stops recording and frees the fingerprints; the batch's slots stay readable.
+    fn stop(self: *Census) void {
+        self.off = true;
+        for (&self.full, &self.open) |*f, *o| {
+            self.freeChunks(f);
+            o.* = null;
+        }
+        for (self.slabs.items) |slab| self.gpa.free(slab);
+        self.slabs.deinit(self.gpa);
+        self.slabs = .empty;
+        self.slab_used = 0;
+    }
+
+    fn record(self: *Census, hash: u64) !void {
+        const fp = self.fingerprint(hash);
+        const p: usize = @intCast(fp >> 40);
+        if (self.open[p] == null or self.fill[p] == CHUNK) {
+            if (self.open[p]) |c| {
+                try self.full[p].append(self.gpa, c);
+                self.open[p] = null;
+            }
+            self.open[p] = try self.newChunk();
+            self.fill[p] = 0;
+        }
+        self.open[p].?[self.fill[p]] = ((fp & ((1 << 40) - 1)) << ITEM_BITS) | self.item;
+        self.fill[p] += 1;
+        self.recorded += 1;
+    }
+};
+
+/// The `out.len` fullest of `cells`, fullest first: a min-heap of them, so most cells cost one compare.
+pub fn fullestCells(cells: []const u32, out: []u32) void {
+    const n = out.len;
+    std.debug.assert(cells.len >= n);
+    @memcpy(out, cells[0..n]);
+    const Heap = struct {
+        fn down(h: []u32, start: usize) void {
+            var i = start;
+            while (true) {
+                const l = 2 * i + 1;
+                if (l >= h.len) return;
+                const c = if (l + 1 < h.len and h[l + 1] < h[l]) l + 1 else l;
+                if (h[i] <= h[c]) return;
+                std.mem.swap(u32, &h[i], &h[c]);
+                i = c;
+            }
+        }
+    };
+    var i = n / 2;
+    while (i > 0) {
+        i -= 1;
+        Heap.down(out, i);
+    }
+    for (cells[n..]) |v| if (v > out[0]) {
+        out[0] = v;
+        Heap.down(out, 0);
+    };
+    std.mem.sortUnstable(u32, out, {}, std.sort.desc(u32));
+}
+
+/// Whether cells, sorted fullest first, can certify a cut of `k` by admitting the `admit_n` fullest: `bound`, the
+/// fullest cell left out, must sit well below the k-th fullest, or the keys are too even for it to separate them.
+pub fn cellsSeparate(ranked: []const u32, k: usize, admit_n: usize) bool {
+    const bound = ranked[admit_n];
+    return bound == 0 or ranked[k - 1] / 2 > bound;
+}
+
+/// The fingerprints a census admits. A bit per value of a fingerprint's low `filter_bits` turns most rows away with
+/// one load.
+pub const FingerprintSet = struct {
+    pub const filter_bits = 20;
+    filter: []const u64,
+    map: std.AutoHashMapUnmanaged(u64, void),
+
+    pub fn contains(self: *const FingerprintSet, fp: u64) bool {
+        const b = fp & ((1 << filter_bits) - 1);
+        if ((self.filter[b / 64] >> @intCast(b % 64)) & 1 == 0) return false;
+        return self.map.contains(fp);
     }
 };
 
@@ -3584,12 +3792,27 @@ fn load64(b: []const u8, at: usize) u64 {
 
 /// The rows of `ids` a sketched table gave a cell instead of a group (`CountSketch.sinkId`) leave `sel`, so no
 /// aggregate folds them; in the count pass each also adds one to its cell.
-pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) void {
+pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) !void {
     const s = table.sketch orelse return;
+    if (s.census) |c| if (c.admitted == null and !c.off) {
+        // Count pass: every row holds a slot naming its hash, which it records and adds to its cell.
+        defer c.batch.clearRetainingCapacity();
+        for (ids, 0..) |id, r| if (sel.isActive(r)) {
+            const hash = c.batch.items[std.math.maxInt(u32) - id];
+            if (!c.off) {
+                try c.record(hash);
+                if (!c.checked and c.dropped != null and c.recorded >= c.check_after) try c.judge(s.cells);
+            }
+            s.cells[s.cellOf(hash)] +|= 1;
+            sel.set(r, false);
+        };
+        if (c.dropped) |d| if (!c.off and d.load(.monotonic)) c.stop();
+        return;
+    };
     const floor = CountSketch.sinkId(@intCast(s.cells.len - 1));
     for (ids, 0..) |id, r| {
         if (id < floor or !sel.isActive(r)) continue;
-        if (s.admit == null) s.cells[std.math.maxInt(u32) - id] +|= 1;
+        if (s.admit == null and (if (s.census) |c| c.off else true)) s.cells[std.math.maxInt(u32) - id] +|= 1;
         sel.set(r, false);
     }
 }
@@ -3677,10 +3900,16 @@ pub const GroupTable = struct {
 
     /// A sketched string table's id for a lone present string key given unframed when its cell is not admitted; null
     /// when the key takes the usual path (admitted, or too short for `rawSketchHash`).
-    pub fn sketchRaw(self: *const GroupTable, raw: []const u8) ?u32 {
+    pub fn sketchRaw(self: *const GroupTable, raw: []const u8) !?u32 {
         const s = self.sketch.?;
         if (raw.len < 16) return null;
-        const cell = s.cellOf(rawSketchHash(raw));
+        const hash = rawSketchHash(raw);
+        if (s.census) |c| if (!c.off) {
+            if (c.admitted == null) return try c.slot(hash);
+            // Whether a key is early enough to be grouped anyway takes its position, which the usual path has.
+            if (!c.off) return if (c.hasPrefix() or c.admits(hash, 0)) null else CountSketch.sinkId(0);
+        };
+        const cell = s.cellOf(hash);
         return if (s.admits(cell)) null else CountSketch.sinkId(cell);
     }
 
@@ -3703,10 +3932,7 @@ pub const GroupTable = struct {
             const image = expandFixed(self.fixed_stride, key, &buf) orelse return error.BadGroupKey;
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
-        if (self.sketch) |s| {
-            const cell = s.cellOf(sketchHash(key));
-            if (!s.admits(cell)) return CountSketch.sinkId(cell);
-        }
+        if (self.sketch) |s| if (try s.route(sketchHash(key), pos)) |id| return id;
         if (self.map.get(key)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
@@ -3772,10 +3998,7 @@ pub const GroupTable = struct {
     pub fn getOrInsertFixed(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
         const hash = hashFixed(key);
-        if (self.sketch) |s| {
-            const cell = s.cellOf(hash);
-            if (!s.admits(cell)) return CountSketch.sinkId(cell);
-        }
+        if (self.sketch) |s| if (try s.route(hash, pos)) |id| return id;
         if (self.findFixed(key, hash)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
@@ -4503,7 +4726,7 @@ test "a sketched table counts every row in the count pass and groups only admitt
                 id.* = try table.getOrInsertFixed(&image, &calls, r);
             }
         }
-        sinkSketchRows(&table, &ids, &sel);
+        try sinkSketchRows(&table, &ids, &sel);
         try std.testing.expectEqual(@as(usize, 0), table.groupCount());
         try std.testing.expectEqual(@as(usize, 0), sel.count());
         var total: u64 = 0;
@@ -4531,7 +4754,7 @@ test "a sketched table counts every row in the count pass and groups only admitt
             image[1] = @intCast(vals[r].len);
             id.* = try table.getOrInsertFixed(&image, &calls, r);
         }
-        sinkSketchRows(&table, &ids, &sel2);
+        try sinkSketchRows(&table, &ids, &sel2);
         try std.testing.expect(table.groupCount() >= 1);
         try std.testing.expectEqual(@as(u32, 0), ids[0]);
         try std.testing.expectEqual(@as(u64, 0), table.first.items[0]);
@@ -4595,4 +4818,19 @@ test "string min/max folds keep the old winner when copying a new one fails" {
         const kept = (if (is_min) state.min_bytes else state.max_bytes).?;
         try std.testing.expectEqualStrings(if (is_min) "m" else "q", kept);
     };
+}
+
+test "fullestCells picks the fullest cells, fullest first" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const cells = try std.testing.allocator.alloc(u32, 5000);
+    defer std.testing.allocator.free(cells);
+    for (cells) |*c| c.* = prng.random().uintLessThan(u32, 300);
+    const sorted = try std.testing.allocator.dupe(u32, cells);
+    defer std.testing.allocator.free(sorted);
+    std.mem.sortUnstable(u32, sorted, {}, std.sort.desc(u32));
+    for ([_]usize{ 1, 2, 17, 161, 5000 }) |n| {
+        var out: [5000]u32 = undefined;
+        fullestCells(cells, out[0..n]);
+        try std.testing.expectEqualSlices(u32, sorted[0..n], out[0..n]);
+    }
 }

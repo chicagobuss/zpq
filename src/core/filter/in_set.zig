@@ -14,6 +14,7 @@
 //! row matches neither IN nor NOT IN.
 
 const std = @import("std");
+const keyEql = @import("../bytes.zig").keyEql;
 
 /// Literals compared all at once, as one vector.
 pub const simd_max = 8;
@@ -261,7 +262,7 @@ pub const StrSet = struct {
 
     pub inline fn contains(self: *const StrSet, v: []const u8) bool {
         if (self.hashes.len == 0) {
-            for (self.values) |lit| if (std.mem.eql(u8, lit, v)) return true;
+            for (self.values) |lit| if (keyEql(lit, v)) return true;
             return false;
         }
         const h = hash(v);
@@ -284,7 +285,7 @@ pub const StrSet = struct {
             i = self.index[at + @ctz(hit)] - 1;
         }
         while (i < self.values.len and hash(self.values[i]) == h) : (i += 1) {
-            if (std.mem.eql(u8, self.values[i], v)) return true;
+            if (keyEql(self.values[i], v)) return true;
         }
         return false;
     }

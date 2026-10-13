@@ -22,6 +22,9 @@ const Sel = filter_selection.SelectionVector;
 const Accumulator = agg.Accumulator;
 const AggCall = agg.AggCall;
 const Error = agg.Error;
+const core_bytes = @import("../bytes.zig");
+const keyEql = core_bytes.keyEql;
+const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
 
 /// The coded column a bare col_ref argument names, or null when the call can't take the coded path.
 pub fn codedArg(call: AggCall, batch: *const filter_eval.Batch, lookup: []const ?usize) ?Column {
@@ -383,7 +386,7 @@ pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: [
         if (col.* != .string) continue;
         const sc = &col.string;
         if (sc.codes != null or sc.max_rep > 0 or sc.values.len == 0) continue;
-        var seen: std.StringHashMapUnmanaged(u32) = .empty;
+        var seen: KeyHashMapUnmanaged(u32) = .empty;
         try seen.ensureTotalCapacity(ra, max_coded_plain);
         var dict: std.ArrayList([]const u8) = .empty;
         const codes = try ra.alloc(u32, sc.values.len);
@@ -396,7 +399,7 @@ pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: [
             // A few distinct values are found faster by comparing them all than by hashing the row's.
             if (dict.items.len <= few_plain) {
                 if (for (dict.items, 0..) |d, i| {
-                    if (std.mem.eql(u8, d, v)) break i;
+                    if (keyEql(d, v)) break i;
                 } else null) |i| {
                     c.* = @intCast(i);
                     continue;

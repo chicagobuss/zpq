@@ -30,6 +30,10 @@ const expr_eval = @import("eval.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const agg_coded = @import("agg_coded.zig");
 const statistics = @import("../parquet/statistics.zig");
+const core_bytes = @import("../bytes.zig");
+const keyEql = core_bytes.keyEql;
+const KeyHashMap = core_bytes.KeyHashMap;
+const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
 
 pub const Error = error{
     BadAggArg,
@@ -166,7 +170,7 @@ pub const DistinctSet = struct {
         inline_bytes: InlineBytes,
         u64: std.AutoHashMapUnmanaged(u64, void),
         i128: std.AutoHashMapUnmanaged(i128, void),
-        bytes: std.StringHashMapUnmanaged(void),
+        bytes: KeyHashMapUnmanaged(void),
     } = .none,
     allocated_bytes: usize = 0,
     max_memory_bytes: usize = 0,
@@ -415,7 +419,7 @@ pub const DistinctSet = struct {
             },
             .inline_bytes => |*s| {
                 for (s.vals[0..s.len]) |existing| {
-                    if (std.mem.eql(u8, existing, v)) return;
+                    if (keyEql(existing, v)) return;
                 }
                 const entry_size = 32 + v.len;
                 try self.drawMore(entry_size);
@@ -427,7 +431,7 @@ pub const DistinctSet = struct {
                     self.allocated_bytes += entry_size;
                     return;
                 }
-                var map: std.StringHashMapUnmanaged(void) = .empty;
+                var map: KeyHashMapUnmanaged(void) = .empty;
                 try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
                 map.putAssumeCapacity(owned, {});
@@ -3830,7 +3834,7 @@ pub const GroupTable = struct {
     /// output lists groups in this order.
     first: std.ArrayList(u64) = .empty,
     accumulators: std.ArrayList(Accumulator),
-    map: std.StringHashMap(u32),
+    map: KeyHashMap(u32),
     allocated_bytes: usize,
     max_memory_bytes: usize,
     shared: ?*SharedBudget = null,
@@ -3854,7 +3858,7 @@ pub const GroupTable = struct {
             .allocator = allocator,
             .keys = .empty,
             .accumulators = .empty,
-            .map = std.StringHashMap(u32).init(allocator),
+            .map = KeyHashMap(u32).init(allocator),
             .allocated_bytes = 0,
             .max_memory_bytes = max_memory_bytes,
         };
@@ -4123,7 +4127,7 @@ pub const GroupTable = struct {
         while (n < slots.len) : (n += 1) {
             const s = slots[i];
             if (s.id == empty_id) return null;
-            if (s.hash == hash and std.mem.eql(u8, self.fixed_keys[@as(usize, s.id) * stride ..][0..stride], key))
+            if (s.hash == hash and keyEql(self.fixed_keys[@as(usize, s.id) * stride ..][0..stride], key))
                 return s.id;
             i = (i + 1) & mask;
         }

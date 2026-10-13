@@ -36,6 +36,10 @@ const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
 const membership = @import("filter/membership.zig");
 const Diag = @import("diag.zig").Diag;
+const core_bytes = @import("bytes.zig");
+const keyEql = core_bytes.keyEql;
+const KeyHashMap = core_bytes.KeyHashMap;
+const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
 
 pub const Error = error{
     NoInputs,
@@ -2720,7 +2724,7 @@ const HashKeyCtx = struct {
         return k.hash;
     }
     pub fn eql(_: @This(), k: HashKey, stored: []const u8) bool {
-        return std.mem.eql(u8, k.bytes, stored);
+        return keyEql(k.bytes, stored);
     }
 };
 
@@ -2738,7 +2742,7 @@ fn hashMergeGroupRefs(
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     if (cut) |c| if (calls[c.a_idx].func == .count) return mergeCountCut(gpa, tables, refs, hashes, calls, c, slots, accs);
-    var map = std.StringHashMap(u32).init(gpa);
+    var map = KeyHashMap(u32).init(gpa);
     defer map.deinit();
     const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
     try map.ensureTotalCapacity(n);
@@ -2790,7 +2794,7 @@ fn mergeCountCut(
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
-    var map = std.StringHashMap(u32).init(gpa);
+    var map = KeyHashMap(u32).init(gpa);
     defer map.deinit();
     try map.ensureTotalCapacity(n);
     const Group = struct { count: u64, first: u64, key: []const u8 };
@@ -3270,7 +3274,7 @@ fn premergeLargeDistinctSets(
     for (calls, 0..) |call, ci| {
         if (call.func != .count_distinct) continue;
 
-        var large_keys: std.StringHashMapUnmanaged(void) = .empty;
+        var large_keys: KeyHashMapUnmanaged(void) = .empty;
         defer large_keys.deinit(gpa);
 
         for (tables) |gt| {
@@ -3373,7 +3377,7 @@ fn topKCandidates(
     };
 
     // Nominees: each table's own k largest counts, by key.
-    var nominees: std.StringHashMapUnmanaged(void) = .empty;
+    var nominees: KeyHashMapUnmanaged(void) = .empty;
     var heap: std.PriorityQueue(Count, void, Count.byCount) = .empty;
     try heap.ensureTotalCapacity(arena, k);
     for (tables) |*t| {

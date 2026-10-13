@@ -6,6 +6,7 @@
 //! Surface: =, !=, <, <=, >, >= with AND/OR.
 
 const std = @import("std");
+const keyEql = @import("../bytes.zig").keyEql;
 
 pub const Operator = enum {
     Eq,
@@ -144,11 +145,11 @@ pub fn containsBytes(hay: []const u8, needle: []const u8) bool {
         const b: V = hay[i + n - 1 ..][0..lanes].*;
         var hits = @as(u32, @bitCast(a == first)) & @as(u32, @bitCast(b == last));
         while (hits != 0) : (hits &= hits - 1) {
-            if (std.mem.eql(u8, hay[i + @ctz(hits) + 1 ..][0..middle.len], middle)) return true;
+            if (keyEql(hay[i + @ctz(hits) + 1 ..][0..middle.len], middle)) return true;
         }
     }
     while (i < end) : (i += 1) {
-        if (hay[i] == needle[0] and hay[i + n - 1] == needle[n - 1] and std.mem.eql(u8, hay[i + 1 ..][0..middle.len], middle))
+        if (hay[i] == needle[0] and hay[i + n - 1] == needle[n - 1] and keyEql(hay[i + 1 ..][0..middle.len], middle))
             return true;
     }
     return false;
@@ -175,7 +176,7 @@ test "containsBytes finds exactly what a byte-by-byte search finds" {
 /// Apply a classified LIKE to one value (before the NOT flip).
 pub fn likeMatches(kind: LikeKind, operand: []const u8, value: []const u8) bool {
     return switch (kind) {
-        .exact => std.mem.eql(u8, value, operand),
+        .exact => keyEql(value, operand),
         .prefix => std.mem.startsWith(u8, value, operand),
         .suffix => std.mem.endsWith(u8, value, operand),
         .contains => containsBytes(value, operand),

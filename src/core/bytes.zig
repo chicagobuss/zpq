@@ -55,3 +55,111 @@ test readUleb128 {
     try std.testing.expectError(error.Truncated, readUleb128(&.{}));
     try std.testing.expectError(error.Truncated, readUleb128(&nine_cont));
 }
+
+/// Fast equality comparison for byte slices / string keys.
+///
+/// Under native compilation (znver5 / AVX-512 / AVX2), Zig 0.17's `std.mem.eql` emits a byte-at-a-time
+/// vector-insert loop for slices longer than 64 bytes. `keyEql` compares in 32-byte `@Vector` chunks with
+/// overlapping tails for lengths >= 32, and unaligned 64-bit integer loads for lengths >= 8.
+pub inline fn keyEql(a: []const u8, b: []const u8) bool {
+    if (a.ptr == b.ptr and a.len == b.len) return true;
+    if (a.len != b.len) return false;
+    const n = a.len;
+    if (n >= 32) {
+        const V = @Vector(32, u8);
+        var i: usize = 0;
+        while (i + 32 <= n) : (i += 32) {
+            const x: V = a[i..][0..32].*;
+            const y: V = b[i..][0..32].*;
+            if (@reduce(.Or, x != y)) return false;
+        }
+        if (i < n) {
+            const x: V = a[n - 32 ..][0..32].*;
+            const y: V = b[n - 32 ..][0..32].*;
+            if (@reduce(.Or, x != y)) return false;
+        }
+        return true;
+    }
+    if (n >= 8) {
+        var i: usize = 0;
+        while (i + 8 <= n) : (i += 8) {
+            if (readLe(u64, a[i..][0..8]) != readLe(u64, b[i..][0..8])) return false;
+        }
+        return readLe(u64, a[n - 8 ..][0..8]) == readLe(u64, b[n - 8 ..][0..8]);
+    }
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
+pub const KeyContext = struct {
+    pub inline fn hash(_: @This(), s: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, s);
+    }
+    pub inline fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return keyEql(a, b);
+    }
+};
+
+pub fn KeyHashMap(comptime V: type) type {
+    return std.HashMap([]const u8, V, KeyContext, std.hash_map.default_max_load_percentage);
+}
+
+pub fn KeyHashMapUnmanaged(comptime V: type) type {
+    return std.HashMapUnmanaged([]const u8, V, KeyContext, std.hash_map.default_max_load_percentage);
+}
+
+test "keyEql: exhaustive equality vs std.mem.eql over lengths 0..200" {
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    var buf1: [256]u8 = undefined;
+    var buf2: [256]u8 = undefined;
+    prng.random().bytes(&buf1);
+
+    for (0..201) |len| {
+        @memcpy(buf2[0..len], buf1[0..len]);
+        const s1 = buf1[0..len];
+        const s2 = buf2[0..len];
+
+        // Same contents, different addresses
+        try std.testing.expect(keyEql(s1, s2));
+        try std.testing.expect(keyEql(s2, s1));
+        // Same address
+        try std.testing.expect(keyEql(s1, s1));
+
+        // Compare against std.mem.eql
+        try std.testing.expectEqual(std.mem.eql(u8, s1, s2), keyEql(s1, s2));
+
+        // Different lengths
+        if (len > 0) {
+            try std.testing.expect(!keyEql(buf1[0..len], buf2[0 .. len - 1]));
+            try std.testing.expect(!keyEql(buf1[0 .. len - 1], buf2[0..len]));
+        }
+
+        // Single byte mismatch at every position
+        for (0..len) |pos| {
+            buf2[pos] ^= 0x5a;
+            try std.testing.expect(!keyEql(buf1[0..len], buf2[0..len]));
+            try std.testing.expect(!keyEql(buf2[0..len], buf1[0..len]));
+            try std.testing.expectEqual(std.mem.eql(u8, buf1[0..len], buf2[0..len]), keyEql(buf1[0..len], buf2[0..len]));
+            buf2[pos] ^= 0x5a; // restore
+        }
+    }
+}
+
+test "KeyHashMap: allocation failure leaves no leaks" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var map = KeyHashMap(u32).init(allocator);
+            defer map.deinit();
+
+            try map.put("short", 1);
+            try map.put("medium_length_string_key_12345", 2);
+            try map.put("very_long_string_key_exceeding_vector_width_32_bytes_with_some_suffix_data", 3);
+
+            try std.testing.expectEqual(@as(?u32, 1), map.get("short"));
+            try std.testing.expectEqual(@as(?u32, 2), map.get("medium_length_string_key_12345"));
+            try std.testing.expectEqual(@as(?u32, 3), map.get("very_long_string_key_exceeding_vector_width_32_bytes_with_some_suffix_data"));
+            try std.testing.expectEqual(@as(?u32, null), map.get("nonexistent_key"));
+        }
+    }.run, .{});
+}
+

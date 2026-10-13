@@ -2023,42 +2023,22 @@ pub fn runMultiAggregate(
                 });
             }
         }
-        // `first` is the input row that created the group, so it is unique per group: an unstable sort is enough.
-        if (!args.unordered) {
-            std.sort.pdq(MergedSlot, slots.items, {}, struct {
-                fn lt(_: void, a: MergedSlot, b: MergedSlot) bool {
-                    return a.first < b.first;
-                }
-            }.lt);
-        }
+        if (!args.unordered) try sortSlotsByFirst(gpa, slots.items, n_workers);
 
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
         // answer: unbuilt rows are empty, unbuilt values NULL.
         const rows = try gpa.alloc([]const AggValue, slots.items.len);
         @memset(rows, &.{});
         output.group_rows = rows;
-        const acc_base = if (folded) merged_accs.items else out_tables[0].accumulators.items;
-        for (slots.items, rows) |slot, *row| {
-            const row_vals = try gpa.alloc(AggValue, outputs.len);
-            @memset(row_vals, .null_val);
-            row.* = row_vals;
-            const acc_at: usize = if (folded) slot.idx else slot.idx * agg_calls.len;
-            const accs = acc_base[acc_at..][0..agg_calls.len];
-            for (outputs, row_vals) |out, *val| {
-                switch (out.source) {
-                    .key => |k_idx| {
-                        // A fixed image pads a null column with zeros; the reader wants that payload omitted. Only a
-                        // fixed-width table's keys are images: a string key is already in its framing.
-                        var ser_buf: [48]u8 = undefined;
-                        const key_bytes = if (out_tables[0].fixed_stride != 0) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
-                        val.* = try deserializeKeyColumn(gpa, key_bytes, k_idx, key_types);
-                    },
-                    .agg => |a_idx| {
-                        val.* = try materializeOne(gpa, agg_calls[a_idx], accs[a_idx]);
-                    },
-                }
-            }
-        }
+        try buildGroupRows(gpa, .{
+            .slots = slots.items,
+            .outputs = outputs,
+            .calls = agg_calls,
+            .key_types = key_types,
+            .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
+            .folded = folded,
+            .fixed_keys = out_tables[0].fixed_stride != 0,
+        }, rows, n_workers);
 
         const cols = try gpa.alloc([]const u8, outputs.len);
         @memset(cols, "");
@@ -2195,6 +2175,203 @@ const MergedSlot = struct {
     first: u64,
     /// Start of this group's accumulators in the merged list, or the source group id when nothing was folded.
     idx: usize,
+};
+
+const radix_bits = 11;
+const radix_buckets = 1 << radix_bits;
+/// Fewer slots than this per chunk sort on fewer threads: a chunk's pass over its 2048 buckets would cost more than
+/// its share of the slots.
+const radix_chunk_min = 1 << 16;
+
+/// Sort `slots` by `first`, the input row that created each group, so unique per group: answers list groups in
+/// first-appearance order, the same at every `-j`. An LSD radix sort, so every pass splits into chunks of slots each
+/// worker counts and scatters on its own. `first` packs a row group ordinal above a row index (`firstPosition`), so
+/// most of its 64 bits are the same in every slot, and a digit that is costs no pass.
+fn sortSlotsByFirst(gpa: std.mem.Allocator, slots: []MergedSlot, n_workers: usize) error{OutOfMemory}!void {
+    if (slots.len < 2) return;
+    const n_chunks = @max(1, @min(n_workers, slots.len / radix_chunk_min));
+    const scratch = try gpa.alloc(MergedSlot, slots.len);
+    defer gpa.free(scratch);
+    const counts = try gpa.alloc(usize, n_chunks * radix_buckets);
+    defer gpa.free(counts);
+    const spans = try gpa.alloc(SlotRadix.Span, n_chunks);
+    defer gpa.free(spans);
+    const tasks = try gpa.alloc(SlotRadix.Task, n_chunks);
+    defer gpa.free(tasks);
+
+    var sort: SlotRadix = .{ .src = slots, .dst = scratch, .counts = counts, .spans = spans, .n_chunks = n_chunks };
+    for (tasks) |*t| t.* = .{ .sort = &sort };
+    sort.runPhase(tasks, .span);
+    var any: u64 = 0;
+    var all: u64 = std.math.maxInt(u64);
+    for (spans) |s| {
+        any |= s.any;
+        all &= s.all;
+    }
+    const varying = any ^ all;
+
+    var shift: usize = 0;
+    while (shift < 64) : (shift += radix_bits) {
+        sort.shift = @intCast(shift);
+        if ((varying >> sort.shift) & (radix_buckets - 1) == 0) continue;
+        sort.runPhase(tasks, .count);
+        // Bucket b starts after every chunk's slots of the buckets below it; within b, chunk c's after chunks < c, so
+        // each pass is stable, as LSD needs.
+        var at: usize = 0;
+        for (0..radix_buckets) |b| {
+            for (0..n_chunks) |c| {
+                const n = counts[c * radix_buckets + b];
+                counts[c * radix_buckets + b] = at;
+                at += n;
+            }
+        }
+        sort.runPhase(tasks, .scatter);
+        std.mem.swap([]MergedSlot, &sort.src, &sort.dst);
+    }
+    if (sort.src.ptr != slots.ptr) {
+        sort.dst = slots;
+        sort.runPhase(tasks, .copy);
+    }
+}
+
+const SlotRadix = struct {
+    src: []MergedSlot,
+    dst: []MergedSlot,
+    /// Per chunk, a count per bucket of the current digit, then where the chunk writes its next slot of that bucket.
+    counts: []usize,
+    spans: []Span,
+    n_chunks: usize,
+    shift: u6 = 0,
+    phase: Phase = .span,
+    cursor: std.atomic.Value(usize) = .init(0),
+
+    /// The bits set in any of a chunk's `first`s, and in all of them.
+    const Span = struct { any: u64, all: u64 };
+    const Phase = enum { span, count, scatter, copy };
+    const Task = struct { sort: *SlotRadix };
+
+    fn runPhase(s: *SlotRadix, tasks: []Task, phase: Phase) void {
+        s.phase = phase;
+        s.cursor.store(0, .monotonic);
+        const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+        if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, config, run)) run(&tasks[0]);
+    }
+
+    /// Claim chunks until none remain: one a failed spawn left unclaimed is taken by a thread that did start.
+    fn run(t: *Task) void {
+        const s = t.sort;
+        while (true) {
+            const c = s.cursor.fetchAdd(1, .monotonic);
+            if (c >= s.n_chunks) return;
+            const lo = s.src.len * c / s.n_chunks;
+            const hi = s.src.len * (c + 1) / s.n_chunks;
+            const mine = s.counts[c * radix_buckets ..][0..radix_buckets];
+            switch (s.phase) {
+                .span => {
+                    var span: Span = .{ .any = 0, .all = std.math.maxInt(u64) };
+                    for (s.src[lo..hi]) |slot| {
+                        span.any |= slot.first;
+                        span.all &= slot.first;
+                    }
+                    s.spans[c] = span;
+                },
+                .count => {
+                    @memset(mine, 0);
+                    for (s.src[lo..hi]) |slot| mine[s.digit(slot.first)] += 1;
+                },
+                .scatter => for (s.src[lo..hi]) |slot| {
+                    const d = s.digit(slot.first);
+                    s.dst[mine[d]] = slot;
+                    mine[d] += 1;
+                },
+                .copy => @memcpy(s.dst[lo..hi], s.src[lo..hi]),
+            }
+        }
+    }
+
+    fn digit(s: *const SlotRadix, first: u64) usize {
+        return @intCast((first >> s.shift) & (radix_buckets - 1));
+    }
+};
+
+/// What the GROUP BY answer's rows are built from: the merged groups and the output columns they fill.
+const RowSource = struct {
+    slots: []const MergedSlot,
+    outputs: []const BoundOutputColumn,
+    calls: []const expr_agg.AggCall,
+    key_types: []const KeyType,
+    /// The merged accumulators, a group's starting at `slot.idx`, when worker tables were folded; else the one
+    /// table's, starting at `slot.idx * calls.len`.
+    accs: []const expr_agg.Accumulator,
+    folded: bool,
+    /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
+    fixed_keys: bool,
+
+    /// Fill `row` for `slot`. It is set as soon as it is allocated and each value only once built, so on an error it
+    /// holds what was built and NULLs, and `AggOutput.freeRow` frees it.
+    fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, row: *[]const AggValue) !void {
+        const vals = try gpa.alloc(AggValue, s.outputs.len);
+        @memset(vals, .null_val);
+        row.* = vals;
+        const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
+        const accs = s.accs[at..][0..s.calls.len];
+        // A fixed image pads a null column with zeros; the reader wants that payload omitted.
+        var ser_buf: [48]u8 = undefined;
+        const key_bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
+        for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
+            .key => |k_idx| try deserializeKeyColumn(gpa, key_bytes, k_idx, s.key_types),
+            .agg => |a_idx| try materializeOne(gpa, s.calls[a_idx], accs[a_idx]),
+        };
+    }
+};
+
+/// Rows a build task claims at a time.
+const row_block = 4096;
+
+/// Build `rows[i]` for `src.slots[i]`, on up to `n_workers` threads. `rows` must start empty; on an error each row
+/// holds what was built of it (see `RowSource.buildRow`), so the `AggOutput` owning it frees it whole, and the error
+/// is the one the lowest failing row gave, as a serial build would return.
+fn buildGroupRows(gpa: std.mem.Allocator, src: RowSource, rows: [][]const AggValue, n_workers: usize) !void {
+    std.debug.assert(rows.len == src.slots.len);
+    if (rows.len == 0) return;
+    const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, rows.len, row_block) catch unreachable));
+    const tasks = try gpa.alloc(RowBuildTask, n_threads);
+    defer gpa.free(tasks);
+    var cursor: std.atomic.Value(usize) = .init(0);
+    for (tasks) |*t| t.* = .{ .gpa = gpa, .src = &src, .rows = rows, .cursor = &cursor };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (tasks.len == 1 or !spawn_util.runTree(RowBuildTask, tasks, config, RowBuildTask.run)) RowBuildTask.run(&tasks[0]);
+    // Every block below the lowest failing row was claimed and built whole, so that row's error is a serial build's.
+    var failed: ?*const RowBuildTask = null;
+    for (tasks) |*t| if (t.err != null and (failed == null or t.err_row < failed.?.err_row)) {
+        failed = t;
+    };
+    if (failed) |t| return t.err.?;
+}
+
+const RowBuildTask = struct {
+    gpa: std.mem.Allocator,
+    src: *const RowSource,
+    rows: [][]const AggValue,
+    cursor: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+    err_row: usize = 0,
+
+    /// Claim blocks of rows until none remain or one fails. A thread that never starts leaves its blocks on the
+    /// cursor, so a failed spawn cannot leave a row unbuilt.
+    fn run(t: *RowBuildTask) void {
+        while (true) {
+            const lo = t.cursor.fetchAdd(row_block, .monotonic);
+            if (lo >= t.rows.len) return;
+            for (lo..@min(t.rows.len, lo + row_block)) |i| {
+                t.src.buildRow(t.gpa, t.src.slots[i], &t.rows[i]) catch |e| {
+                    t.err = e;
+                    t.err_row = i;
+                    return;
+                };
+            }
+        }
+    }
 };
 
 /// Calls `f(ctx, v)` for every value of a set of u64 values, partitioned or not.
@@ -2566,6 +2743,9 @@ const MergePart = struct {
     hashes: []const u64,
     slots: std.ArrayList(MergedSlot) = .empty,
     accs: std.ArrayList(expr_agg.Accumulator) = .empty,
+    /// Where this partition's slots and accumulators start in the combined lists.
+    slot_at: usize = 0,
+    acc_at: usize = 0,
 };
 
 const MergeTask = struct {
@@ -2721,27 +2901,50 @@ fn mergeFoldedRefs(
     if (!spawn_util.runTree(MergeTask, tasks, config, MergeTask.run)) MergeTask.run(&tasks[0]);
     for (tasks) |task| if (task.err) |e| return e;
 
-    var nslots: usize = 0;
-    var naccs: usize = 0;
-    for (parts) |p| {
+    // Each partition is copied to its place in the combined lists on every worker: on one thread the copy of a large
+    // merge costs more than sorting it.
+    var nslots: usize = slots.items.len;
+    var naccs: usize = accs.items.len;
+    for (parts) |*p| {
+        p.slot_at = nslots;
+        p.acc_at = naccs;
         nslots += p.slots.items.len;
         naccs += p.accs.items.len;
     }
     try slots.ensureTotalCapacity(gpa, nslots);
     try accs.ensureTotalCapacity(gpa, naccs);
-    var acc_at: usize = 0;
-    for (parts) |*p| {
-        for (p.slots.items) |s| slots.appendAssumeCapacity(.{
-            .key = s.key,
-            .first = s.first,
-            .idx = s.idx + acc_at,
-        });
-        accs.appendSliceAssumeCapacity(p.accs.items);
-        acc_at += p.accs.items.len;
-        // The combined list now owns these winners.
-        p.accs.clearRetainingCapacity();
-    }
+    // Nothing fails from here on, so the lists never hold an entry no partition wrote.
+    slots.items.len = nslots;
+    accs.items.len = naccs;
+    const copies = try arena.alloc(ConcatTask, n_threads);
+    cursor.store(0, .monotonic);
+    for (copies) |*c| c.* = .{ .parts = parts, .slots = slots.items, .accs = accs.items, .cursor = &cursor };
+    if (!spawn_util.runTree(ConcatTask, copies, config, ConcatTask.run)) ConcatTask.run(&copies[0]);
+    // The combined list now owns these winners.
+    for (parts) |*p| p.accs.clearRetainingCapacity();
 }
+
+/// Copies the partitions it claims to their place in the combined lists, offsetting each slot's accumulators.
+const ConcatTask = struct {
+    parts: []const MergePart,
+    slots: []MergedSlot,
+    accs: []expr_agg.Accumulator,
+    cursor: *std.atomic.Value(usize),
+
+    fn run(t: *ConcatTask) void {
+        while (true) {
+            const i = t.cursor.fetchAdd(1, .monotonic);
+            if (i >= t.parts.len) return;
+            const p = &t.parts[i];
+            for (p.slots.items, t.slots[p.slot_at..][0..p.slots.items.len]) |s, *d| d.* = .{
+                .key = s.key,
+                .first = s.first,
+                .idx = s.idx + p.acc_at,
+            };
+            @memcpy(t.accs[p.acc_at..][0..p.accs.items.len], p.accs.items);
+        }
+    }
+};
 
 fn accCount(acc: expr_agg.Accumulator) u64 {
     return switch (acc) {
@@ -6092,6 +6295,341 @@ test "hash merge of worker tables: overlapping keys, first appearance, allocatio
     try mergeOverlapAndFree(testing.allocator);
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     try testing.checkAllAllocationFailures(fixed.allocator(), mergeOverlapAndFree, .{});
+}
+
+fn slotFirstLess(_: void, a: MergedSlot, b: MergedSlot) bool {
+    return a.first < b.first;
+}
+
+test "sortSlotsByFirst: a comparison sort's order at every -j, and when spawns fail" {
+    var prng = std.Random.DefaultPrng.init(0x51075);
+    const random = prng.random();
+    const Spread = enum {
+        /// `firstPosition`s over 29 row groups: four digits differ, the row group's straddling two.
+        positions,
+        /// Every bit differs: all six digits, the top one short.
+        wide,
+        /// Below 2^11: one pass, so the answer is left in the scratch and copied back.
+        narrow,
+    };
+    for ([_]usize{ 0, 1, 2, 1000, 300_000 }) |n| for (std.enums.values(Spread)) |spread| {
+        if (spread == .narrow and n > radix_buckets) continue;
+        const input = try testing.allocator.alloc(MergedSlot, n);
+        defer testing.allocator.free(input);
+        for (input, 0..) |*s, i| s.* = .{
+            .key = "",
+            .first = switch (spread) {
+                .positions => expr_agg.firstPosition(i % 29, i / 29),
+                // An odd multiplier permutes the u64s, so these stay unique.
+                .wide => @as(u64, i) *% 0x9E3779B97F4A7C15,
+                .narrow => i,
+            },
+            .idx = i,
+        };
+        random.shuffle(MergedSlot, input);
+        const want = try testing.allocator.dupe(MergedSlot, input);
+        defer testing.allocator.free(want);
+        std.sort.pdq(MergedSlot, want, {}, slotFirstLess);
+
+        const Run = struct { j: usize, fail_after: ?usize = null };
+        for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 0 }, .{ .j = 8, .fail_after = 1 }, .{ .j = 8, .fail_after = 2 } }) |run| {
+            const got = try testing.allocator.dupe(MergedSlot, input);
+            defer testing.allocator.free(got);
+            if (run.fail_after) |f| spawn_util.injectFailureAfter(f);
+            defer spawn_util.resetFailure();
+            try sortSlotsByFirst(testing.allocator, got, run.j);
+            // Only the largest input has the chunks to spread over threads.
+            if (run.fail_after != null and n >= 2 * radix_chunk_min) try testing.expect(spawn_util.failuresInjected() > 0);
+            for (want, got) |w, g| {
+                try testing.expectEqual(w.first, g.first);
+                try testing.expectEqual(w.idx, g.idx);
+            }
+        }
+    };
+}
+
+test "sortSlotsByFirst: an allocation failure leaves the slots as they were" {
+    var slots: [5]MergedSlot = undefined;
+    for (&slots, 0..) |*s, i| s.* = .{ .key = "", .first = 40 - i, .idx = i };
+    const before = slots;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        sortSlotsByFirst(failing.allocator(), &slots, 1) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            for (before, slots) |b, s| try testing.expectEqual(b.idx, s.idx);
+            continue;
+        };
+        break;
+    }
+    try testing.expect(fail_index > 0);
+    for (slots, 0..) |s, i| try testing.expectEqual(slots.len - 1 - i, s.idx);
+}
+
+/// `n` groups for the row-build tests, laid out as one table's: group i has the string key `g<i>`, a count of i and
+/// a string min of `m<i>`.
+const RowFixture = struct {
+    keys: [][]u8,
+    accs: []expr_agg.Accumulator,
+    slots: []MergedSlot,
+
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
+        .{ .func = .min, .alias = "m", .result = .bytes, .arg = null, .where = null },
+    };
+    /// Not in key-then-aggregate order, so a row filled by position would show.
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .agg = 1 }, .name = "m" },
+        .{ .source = .{ .key = 0 }, .name = "g" },
+        .{ .source = .{ .agg = 0 }, .name = "n" },
+    };
+
+    fn init(n: usize) !RowFixture {
+        const gpa = testing.allocator;
+        const keys = try gpa.alloc([]u8, n);
+        @memset(keys, &.{});
+        const accs = try gpa.alloc(expr_agg.Accumulator, n * calls.len);
+        for (0..n) |i| accs[i * calls.len ..][0..2].* = .{ .{ .count = i }, .{ .min_bytes = null } };
+        const slots = try gpa.alloc(MergedSlot, n);
+        var f: RowFixture = .{ .keys = keys, .accs = accs, .slots = slots };
+        errdefer f.deinit();
+        var buf: [32]u8 = undefined;
+        for (0..n) |i| {
+            const name = try std.fmt.bufPrint(&buf, "g{d}", .{i});
+            // The serialized framing of one present string column: a flag, the length, the bytes.
+            keys[i] = try gpa.alloc(u8, 5 + name.len);
+            keys[i][0] = 1;
+            std.mem.writeInt(u32, keys[i][1..5], @intCast(name.len), .little);
+            @memcpy(keys[i][5..], name);
+            accs[i * calls.len + 1] = .{ .min_bytes = try std.fmt.allocPrint(gpa, "m{d}", .{i}) };
+            slots[i] = .{ .key = keys[i], .first = i, .idx = i };
+        }
+        return f;
+    }
+
+    fn deinit(f: *RowFixture) void {
+        const gpa = testing.allocator;
+        for (f.keys) |k| gpa.free(k);
+        gpa.free(f.keys);
+        freeOwnedAccumulatorStrings(gpa, f.accs);
+        gpa.free(f.accs);
+        gpa.free(f.slots);
+    }
+
+    fn source(f: *const RowFixture) RowSource {
+        return .{
+            .slots = f.slots,
+            .outputs = &outputs,
+            .calls = &calls,
+            .key_types = &.{.string},
+            .accs = f.accs,
+            .folded = false,
+            .fixed_keys = false,
+        };
+    }
+
+    /// Build every row into a fresh answer on `gpa`, which owns it whatever happens.
+    fn build(f: *const RowFixture, gpa: std.mem.Allocator, out: *AggOutput, n_workers: usize) !void {
+        const rows = try gpa.alloc([]const AggValue, f.slots.len);
+        @memset(rows, &.{});
+        out.group_rows = rows;
+        try buildGroupRows(gpa, f.source(), rows, n_workers);
+    }
+
+    fn expectRows(rows: []const []const AggValue) !void {
+        var buf: [32]u8 = undefined;
+        for (rows, 0..) |row, i| {
+            try testing.expectEqual(@as(usize, 3), row.len);
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "m{d}", .{i}), row[0].s);
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "g{d}", .{i}), row[1].s);
+            try testing.expectEqual(@as(i128, @intCast(i)), row[2].i);
+        }
+    }
+};
+
+/// Fails every allocation once `left` have succeeded, and any of exactly `poison_len` bytes, on whichever thread asks:
+/// `FailingAllocator` counts without atomics, so it cannot fail one allocation among several threads.
+const SharedFailing = struct {
+    child: std.mem.Allocator,
+    left: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    poison_len: ?usize = null,
+
+    fn allocator(self: *SharedFailing) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SharedFailing = @ptrCast(@alignCast(ctx));
+        if (self.poison_len == len) return null;
+        var left = self.left.load(.monotonic);
+        while (left != 0) left = self.left.cmpxchgWeak(left, left - 1, .monotonic, .monotonic) orelse
+            return self.child.rawAlloc(len, alignment, ret_addr);
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SharedFailing = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "buildGroupRows: the same rows at every -j, and when spawns fail" {
+    // Five blocks of rows, so up to five threads build them.
+    var f = try RowFixture.init(4 * row_block + 123);
+    defer f.deinit();
+    const Run = struct { j: usize, fail_after: ?usize = null };
+    for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 0 }, .{ .j = 8, .fail_after = 1 }, .{ .j = 8, .fail_after = 2 } }) |run| {
+        var out: AggOutput = .{};
+        defer out.deinit(testing.allocator);
+        if (run.fail_after) |n| spawn_util.injectFailureAfter(n);
+        defer spawn_util.resetFailure();
+        try f.build(testing.allocator, &out, run.j);
+        if (run.fail_after != null) try testing.expect(spawn_util.failuresInjected() > 0);
+        try RowFixture.expectRows(out.group_rows.?);
+    }
+}
+
+test "buildGroupRows: an allocation failure leaves every row freeable" {
+    // One thread: every allocation failed in turn.
+    var small = try RowFixture.init(3);
+    defer small.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, f: *const RowFixture) !void {
+            var out: AggOutput = .{};
+            defer out.deinit(gpa);
+            try f.build(gpa, &out, 1);
+        }
+    }.run, .{&small});
+
+    // Eight threads: the failure lands in whichever row a thread happens to be building.
+    var f = try RowFixture.init(4 * row_block + 123);
+    defer f.deinit();
+    for ([_]usize{ 0, 1, 2, 3, 100, 3 * row_block, 3 * f.slots.len }) |left| {
+        var failing: SharedFailing = .{ .child = testing.allocator, .left = .init(left) };
+        const gpa = failing.allocator();
+        var out: AggOutput = .{};
+        defer out.deinit(gpa);
+        try testing.expectError(error.OutOfMemory, f.build(gpa, &out, 8));
+    }
+}
+
+test "buildGroupRows: the error the lowest failing row gives, at every -j" {
+    var f = try RowFixture.init(4 * row_block + 123);
+    defer f.deinit();
+    // A truncated key fails to read back; a min of `poison_len` bytes fails to copy.
+    const poison_len = 77;
+    const poisoned: [poison_len]u8 = @splat('x');
+    const truncated = [_]u8{1};
+    for ([_][2]usize{ .{ 15_000, 7_000 }, .{ 7_000, 15_000 }, .{ 9, 4 * row_block + 100 } }) |at| {
+        const bad_key, const bad_min = at;
+        const old_key = f.slots[bad_key].key;
+        defer f.slots[bad_key].key = old_key;
+        f.slots[bad_key].key = &truncated;
+        const min_acc = &f.accs[bad_min * RowFixture.calls.len + 1];
+        const old_min = min_acc.min_bytes;
+        defer min_acc.min_bytes = old_min;
+        min_acc.min_bytes = &poisoned;
+        const want: anyerror = if (bad_key < bad_min) error.BadGroupKey else error.OutOfMemory;
+        for ([_]usize{ 1, 3, 8 }) |j| {
+            var failing: SharedFailing = .{ .child = testing.allocator, .poison_len = poison_len };
+            const gpa = failing.allocator();
+            var out: AggOutput = .{};
+            defer out.deinit(gpa);
+            try testing.expectError(want, f.build(gpa, &out, j));
+        }
+    }
+}
+
+test "runMultiAggregate: a big GROUP BY answers the same rows in the same order at every -j" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{ .{ .name = path, .bytes = bytes }, .{ .name = path, .bytes = bytes } };
+    // `v` is unique per row (20000 groups, so several blocks of rows), `n` a fixed-width key, `k` skewed with nulls.
+    for ([_][]const u8{ "v", "n", "k, v" }) |key| for ([_]bool{ false, true }) |unordered| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var base: ?MultiAggResult = null;
+        defer if (base) |b| freeResult(b);
+        const Run = struct { j: usize, fail_after: ?usize = null };
+        for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 1 }, .{ .j = 8, .fail_after = 5 } }) |run| {
+            if (run.fail_after) |n| spawn_util.injectFailureAfter(n);
+            defer spawn_util.resetFailure();
+            var res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .aggregate = "count(*) AS c, min(v) AS lo, sum(n) AS s",
+                .group_by = key,
+                .parallelism = run.j,
+                .min_bytes_per_worker = 1,
+                .unordered = unordered,
+            });
+            if (run.fail_after != null) try testing.expect(spawn_util.failuresInjected() > 0);
+            const rows = res.output.group_rows.?;
+            if (std.mem.eql(u8, key, "v")) try testing.expectEqual(@as(usize, 20_000), rows.len);
+            const b = base orelse {
+                base = res;
+                continue;
+            };
+            defer res.deinit(testing.allocator);
+            const want = b.output.group_rows.?;
+            try testing.expectEqual(want.len, rows.len);
+            if (unordered) {
+                // Unordered rows follow the merge's partitions, which change with -j: compare as sets.
+                const Less = struct {
+                    fn lt(_: void, x: []const AggValue, y: []const AggValue) bool {
+                        for (x, y) |xv, yv| {
+                            const o = orderValues(xv, yv, false);
+                            if (o != .eq) return o == .lt;
+                        }
+                        return false;
+                    }
+                };
+                const w = try testing.allocator.dupe([]const AggValue, want);
+                defer testing.allocator.free(w);
+                const g = try testing.allocator.dupe([]const AggValue, rows);
+                defer testing.allocator.free(g);
+                std.sort.pdq([]const AggValue, w, {}, Less.lt);
+                std.sort.pdq([]const AggValue, g, {}, Less.lt);
+                for (w, g) |wr, gr| for (wr, gr) |x, y| try testing.expect(sameValue(x, y));
+            } else for (want, rows) |wr, gr| for (wr, gr) |x, y| try testing.expect(sameValue(x, y));
+        }
+    };
+}
+
+test "runMultiAggregate: a NULL first key of two fixed-width keys still reads the second back" {
+    // A fixed-width key image pads a NULL column's payload with zeros; read as framing, the pad would be taken for
+    // the next column's flag and `id` would come back NULL.
+    const bytes = (try loadFixture(null_pages_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = null_pages_fixture, .bytes = bytes }};
+    for ([_]usize{ 1, 3 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(*) AS c",
+            .group_by = "v, id",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+        });
+        defer res.deinit(testing.allocator);
+        // `id` is unique and never NULL; `v` is NULL in 650 of the 2000 rows.
+        const rows = res.output.group_rows.?;
+        try testing.expectEqual(@as(usize, 2000), rows.len);
+        var null_v: usize = 0;
+        var id_sum: i128 = 0;
+        for (rows) |row| {
+            if (row[0] == .null_val) null_v += 1;
+            id_sum += row[1].i;
+        }
+        try testing.expectEqual(@as(usize, 650), null_v);
+        try testing.expectEqual(@as(i128, 1999 * 2000 / 2), id_sum);
+    }
 }
 
 test "regression: ordered grouping retains the small-query memory budget at one worker" {

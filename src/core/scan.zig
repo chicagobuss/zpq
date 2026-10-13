@@ -31,6 +31,7 @@ const metadata = @import("parquet/metadata.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_parser = @import("expr/parser.zig");
 const expr_agg = @import("expr/agg.zig");
+const partagg = @import("partagg.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
@@ -131,6 +132,13 @@ pub const MultiAggArgs = struct {
     /// Answer a COUNT-descending cut from a count pass and an admit pass where a count sketch certifies it; see
     /// `sketchTopK`. Null runs the plain scan.
     sketch_topk: ?SketchTopK = null,
+    /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
+    /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
+    partagg: bool = false,
+    /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
+    /// `partagg.local_cap` and `partagg.probe_rows`.
+    part_cap: usize = 0,
+    part_probe: u64 = 0,
 };
 
 /// Tuning of `sketchTopK`.
@@ -411,6 +419,8 @@ pub const MultiAggResult = struct {
     timings: Timings,
     /// The answer. A caller keeping it takes it and leaves `state` to `ScanState.deinit`.
     output: AggOutput,
+    /// The shared-partition GROUP BY executor ran. False when the query kept the per-worker tables.
+    part_agg: bool = false,
     state: ScanState,
 
     pub fn deinit(self: *MultiAggResult, gpa: std.mem.Allocator) void {
@@ -454,6 +464,8 @@ pub const PlanInputs = struct {
 };
 
 pub const Reason = enum {
+    partitioned_forced,
+    partitioned_ineligible,
     sketch_disabled,
     sketch_memory_limit,
     sketch_ineligible,
@@ -470,7 +482,7 @@ pub const Reason = enum {
 };
 
 pub const AggregateDispatch = struct {
-    strategy: enum { scalar, plain_hash, sketch, first_keys },
+    strategy: enum { scalar, plain_hash, partitioned_hash, sketch, first_keys },
     use_blocks: bool,
     tables: usize,
     count_columns: bool,
@@ -491,6 +503,7 @@ pub const ScanPlan = struct {
 pub fn planAggregate(in: PlanInputs) ScanPlan {
     const args = in.args;
     const keys = in.keys orelse &.{};
+    const part_on = partAggWanted(args, in.calls, in.keys != null, in.outputs);
     const use_blocks = in.keys != null and !args.unordered and orderSensitive(in.calls);
     const blocks = @max(1, @min(in.work.len, group_blocks_max));
     const tables: usize = if (in.keys == null) 0 else if (!use_blocks) in.workers else blocks;
@@ -511,7 +524,9 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     const census_fused = census_allowed and (args.sketch_topk.?.fuse_census orelse keys_unique);
     const fallback: @FieldType(AggregateDispatch, "strategy") = if (in.keys != null) .plain_hash else .scalar;
     var result: ScanPlan = .{ .dispatch = .{
-        .strategy = if (first_cut) .first_keys else if (count_agg != null) .sketch else fallback,
+        .strategy = if (part_on) .partitioned_hash else if (first_cut)
+            .first_keys
+        else if (count_agg != null) .sketch else fallback,
         .use_blocks = use_blocks,
         .tables = tables,
         .count_columns = args.sketch_topk != null and in.keys != null,
@@ -528,6 +543,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         break :blk if (count_agg == null) .sketch_ineligible else .sketch_count_cut;
     };
     result.reasons.insert(sketch_reason);
+    if (args.partagg) result.reasons.insert(if (part_on) .partitioned_forced else .partitioned_ineligible);
     if (keys_unique) result.reasons.insert(.keys_look_unique);
     if (filter_small) result.reasons.insert(.filter_small);
     if (use_blocks) result.reasons.insert(.ordered_blocks);
@@ -733,6 +749,22 @@ const BlockMerge = struct {
     }
 };
 
+/// Plain GROUP BY that the shared partitions can answer exactly, with the same bits at every `-j`.
+fn partAggWanted(
+    args: MultiAggArgs,
+    calls: []const expr_agg.AggCall,
+    grouped: bool,
+    outputs: ?[]const BoundOutputColumn,
+) bool {
+    if (!args.partagg or !grouped) return false;
+    if (orderSensitive(calls)) return false;
+    for (calls) |c| if (c.func == .count_distinct) return false;
+    const order = args.result_order;
+    if (order.limit != null and order.keys.len == 0) return false;
+    if (outputs) |outs| if (countCut(outs, calls, order) != null) return false;
+    return true;
+}
+
 /// Whether merging partial results in another order can change their bits: float sums and averages round
 /// differently, and a float min or max may come out -0 or +0. Integer and string results never do.
 fn orderSensitive(calls: []const expr_agg.AggCall) bool {
@@ -773,6 +805,9 @@ const Worker = struct {
     /// GROUP BY tables, shared by every worker: one per worker when unordered (this worker's is `index`), else one per
     /// block of `blocks`.
     group_tables: []expr_agg.GroupTable = &.{},
+    /// Shared partitioned tables, with this worker's pre-aggregation state. Null keeps today's per-worker table.
+    part: ?*partagg.PartAgg = null,
+    local: partagg.Local = .{},
     /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
     /// whole through `block_cursor` and folded in order into `group_tables[b]`.
     blocks: ?[]const usize = null,
@@ -903,6 +938,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 .keys = w.group_by_keys.?,
                 .table = gt,
                 .pos_base = expr_agg.firstPosition(idx, 0),
+                .part = w.part,
+                .local = if (w.part != null) &w.local else null,
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
@@ -922,6 +959,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .budget = w.decode_budget,
         });
     }
+    if (w.part) |p| if (w.blocks == null and w.group_tables.len > 0) try p.flush(&w.group_tables[w.index]);
 }
 
 fn runWorkers(workers: []Worker) void {
@@ -1870,8 +1908,10 @@ fn prepareAggregate(
         .workers = n_workers,
     };
     const scan_plan = planAggregate(plan_inputs);
-    if (@import("builtin").is_test) try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
+    if (@import("builtin").is_test and !args.partagg)
+        try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
     const decision = scan_plan.dispatch;
+    const part_on = decision.strategy == .partitioned_hash;
     const count_columns: ?agg_plan.Columns = if (decision.count_columns)
         try plan.forCalls(arena, &.{})
     else
@@ -1947,6 +1987,19 @@ fn prepareAggregate(
     merged_table.shared = &group_budget;
     merged_table.fixed_stride = fixed_stride;
     defer if (!leave_tables) merged_table.deinit();
+    var part_state: ?partagg.PartAgg = null;
+    defer if (!leave_tables) if (part_state) |*p| p.deinit();
+    if (part_on) {
+        part_state = try partagg.PartAgg.init(
+            gpa,
+            &group_budget,
+            agg_calls,
+            fixed_stride,
+            mergeAccOwned,
+            args.part_cap,
+            args.part_probe,
+        );
+    }
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -1975,6 +2028,7 @@ fn prepareAggregate(
             .index = wi,
             .group_by_keys = group_by_keys,
             .group_tables = group_tables,
+            .part = if (part_state) |*p| p else null,
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
@@ -2007,7 +2061,7 @@ fn prepareAggregate(
             args.sketch_topk.?,
             decision,
         ),
-        .scalar, .plain_hash => runWorkers(workers),
+        .scalar, .plain_hash, .partitioned_hash => runWorkers(workers),
     }
     const t_decode_end = nowMonoNs();
     t.decode_wall_ns = @intCast(t_decode_end - t_decode);
@@ -2151,8 +2205,13 @@ fn prepareAggregate(
             freeOwnedAccumulatorStrings(gpa, merged_accs.items);
             merged_accs.deinit(gpa);
         }
-        const folded = out_tables.len > 1;
-        if (folded) {
+        var folded = out_tables.len > 1;
+        // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
+        // borrowed until the rows are built.
+        if (part_state) |*ps| {
+            try fillFromPartitions(gpa, ps.parts, agg_calls, &slots, &merged_accs);
+            folded = true;
+        } else if (folded) {
             if (candidates) |keys_kept| {
                 try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
             } else {
@@ -2184,7 +2243,7 @@ fn prepareAggregate(
             .key_types = key_types,
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
-            .fixed_keys = out_tables[0].fixed_stride != 0,
+            .fixed_keys = if (part_state != null) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
         }, rows, n_workers);
 
         const cols = try gpa.alloc([]const u8, outputs.len);
@@ -2294,6 +2353,7 @@ fn prepareAggregate(
         .membership = membership_stats,
         .timings = t,
         .output = output,
+        .part_agg = part_on,
         .state = .{
             .accumulators = accumulators,
             .agg_calls = agg_calls,
@@ -3503,6 +3563,49 @@ const DistinctMergeTask = struct {
 /// out of the source. `Accumulator.merge` intentionally consumes its
 /// source's owned string; clear the source so its owner (a GroupTable, a
 /// work item) cannot free it a second time.
+fn mergeAccOwned(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, allocator: std.mem.Allocator) anyerror!void {
+    return mergeOwnedAccumulator(dst, src, allocator);
+}
+
+fn detachOwned(acc: *expr_agg.Accumulator) void {
+    switch (acc.*) {
+        .min_bytes => acc.* = .{ .min_bytes = null },
+        .max_bytes => acc.* = .{ .max_bytes = null },
+        .distinct => acc.* = .{ .distinct = null },
+        else => {},
+    }
+}
+
+/// Move each partition's groups into `slots` / `accs`. Keys stay borrowed from the partition tables.
+fn fillFromPartitions(
+    gpa: std.mem.Allocator,
+    parts: []partagg.Part,
+    calls: []const expr_agg.AggCall,
+    slots: *std.ArrayList(MergedSlot),
+    accs: *std.ArrayList(expr_agg.Accumulator),
+) !void {
+    var total: usize = 0;
+    for (parts) |*p| total += p.table.groupCount();
+    try slots.ensureTotalCapacity(gpa, total);
+    try accs.ensureTotalCapacity(gpa, total * calls.len);
+    const len = calls.len;
+    for (parts) |*p| {
+        const gt = &p.table;
+        const n = gt.groupCount();
+        for (0..n) |g| {
+            const src = gt.accumulators.items[g * len ..][0..len];
+            const idx = accs.items.len;
+            try accs.appendSlice(gpa, src);
+            for (src) |*a| detachOwned(a);
+            slots.appendAssumeCapacity(.{
+                .key = gt.keyAt(g),
+                .first = gt.first.items[g],
+                .idx = idx,
+            });
+        }
+    }
+}
+
 fn mergeOwnedAccumulator(
     dst: *expr_agg.Accumulator,
     src: *expr_agg.Accumulator,
@@ -4278,6 +4381,101 @@ test "runMultiAggregate: injected spawn failures don't change the answer" {
             }
         } else {
             baseline = got;
+        }
+    }
+}
+
+test "partagg: same GROUP BY answer as the per-worker tables at every -j" {
+    const bytes = (try loadFixture(full_match_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+    const Q = struct {
+        aggregate: []const u8,
+        group_by: []const u8,
+        /// False: the query must stay on the per-worker tables (float merge, or count distinct).
+        part: bool,
+        cap: usize = 0,
+        probe: u64 = 0,
+    };
+    const queries = [_]Q{
+        .{ .aggregate = "count(*) AS c, sum(ts) AS sm, min(ts) AS mn, max(ts) AS mx, avg(ts) AS a", .group_by = "b", .part = true },
+        .{ .aggregate = "count(*) AS c, min(s) AS mn, max(s) AS mx", .group_by = "b", .part = true, .cap = 40, .probe = 80 },
+        .{ .aggregate = "count(*) AS c, sum(ts) AS sm", .group_by = "s", .part = true, .cap = 30, .probe = 50 },
+        .{ .aggregate = "count(*) AS c, sum(ts) AS sm", .group_by = "n", .part = true, .cap = 40, .probe = 80 },
+        .{ .aggregate = "sum(x) AS sx", .group_by = "b", .part = false },
+        .{ .aggregate = "count(DISTINCT ts) AS d", .group_by = "b", .part = false },
+    };
+    for (queries) |q| for ([_]usize{ 1, 3, 8 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const base: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = q.aggregate,
+            .group_by = q.group_by,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .scan_all = true,
+        };
+        const want = try runMultiAggregate(testing.allocator, arena_state.allocator(), base);
+        defer freeResult(want);
+        var args = base;
+        args.partagg = true;
+        args.part_cap = q.cap;
+        args.part_probe = q.probe;
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), args);
+        defer freeResult(got);
+        try testing.expectEqual(q.part, got.part_agg);
+        expectSameAnswer(want, got) catch |err| {
+            std.debug.print("partagg -j{d} {s} GROUP BY {s}\n", .{ j, q.aggregate, q.group_by });
+            return err;
+        };
+    };
+}
+
+test "partagg: a spawn failure does not change the answer" {
+    const bytes = (try loadFixture(full_match_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+    // The baseline's accumulators borrow its arena, so that arena outlives the comparisons.
+    var base_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer base_arena.deinit();
+    const baseline = try runMultiAggregate(testing.allocator, base_arena.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS c, sum(ts) AS sm, min(s) AS mn",
+        .group_by = "n",
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .partagg = true,
+        .part_cap = 40,
+        .part_probe = 80,
+        .scan_all = true,
+    });
+    defer freeResult(baseline);
+    try testing.expect(baseline.part_agg);
+    for ([_]usize{ 0, 1, 3 }) |fail_after| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        spawn_util.injectFailureAfter(fail_after);
+        defer spawn_util.resetFailure();
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(*) AS c, sum(ts) AS sm, min(s) AS mn",
+            .group_by = "n",
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .partagg = true,
+            .part_cap = 40,
+            .part_probe = 80,
+            .scan_all = true,
+        });
+        defer freeResult(got);
+        expectSameAnswer(baseline, got) catch |err| {
+            std.debug.print("partagg spawn fail_after={d}\n", .{fail_after});
+            return err;
+        };
+        if (spawn_util.failuresInjected() == 0) {
+            std.debug.print("partagg spawn injection never fired (fail_after={d})\n", .{fail_after});
+            return error.TestUnexpectedResult;
         }
     }
 }
@@ -7387,34 +7585,34 @@ test "review round3 count budget and path matrix" {
         const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
         for ([_]?usize{ null, 3000, 20000 }) |limit| for ([_]bool{ false, true }) |encoded|
             for ([_][]const u8{ "u", "s" }) |key| for ([_]?[]const u8{ null, "n = 1", "t > 50000000", "t > 3" }) |filter|
-            for ([_]SketchTopK{ .{ .fuse_census = true }, .{ .fuse_census = false }, .{ .certify = false }, .{ .census_fp_bits = 0 } }) |cfg| {
-            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            var args: MultiAggArgs = .{
-                .inputs = &inputs,
-                .filter = filter,
-                .aggregate = "count(*) AS c, sum(t + t) AS st, min(s) AS lo, count(DISTINCT t) AS d, count(*) FILTER (WHERE n = 1) AS f",
-                .group_by = key,
-                .parallelism = 1,
-                .decode_limit = limit,
-                .encoded = encoded,
-                .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
-            };
-            var want = try runMultiAggregate(testing.allocator, arena, args);
-            defer want.deinit(testing.allocator);
-            args.sketch_topk = cfg;
-            var got = try runMultiAggregate(testing.allocator, arena, args);
-            defer got.deinit(testing.allocator);
-            try want.output.applyResultOrder(testing.allocator, args.result_order);
-            try got.output.applyResultOrder(testing.allocator, args.result_order);
-            try testing.expectEqual(want.rows_in, got.rows_in);
-            try testing.expectEqual(want.rows_kept, got.rows_kept);
-            const wr = want.output.group_rows.?;
-            const gr = got.output.group_rows.?;
-            try testing.expectEqual(wr.len, gr.len);
-            for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
-        };
+                for ([_]SketchTopK{ .{ .fuse_census = true }, .{ .fuse_census = false }, .{ .certify = false }, .{ .census_fp_bits = 0 } }) |cfg| {
+                    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                    defer arena_state.deinit();
+                    const arena = arena_state.allocator();
+                    var args: MultiAggArgs = .{
+                        .inputs = &inputs,
+                        .filter = filter,
+                        .aggregate = "count(*) AS c, sum(t + t) AS st, min(s) AS lo, count(DISTINCT t) AS d, count(*) FILTER (WHERE n = 1) AS f",
+                        .group_by = key,
+                        .parallelism = 1,
+                        .decode_limit = limit,
+                        .encoded = encoded,
+                        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+                    };
+                    var want = try runMultiAggregate(testing.allocator, arena, args);
+                    defer want.deinit(testing.allocator);
+                    args.sketch_topk = cfg;
+                    var got = try runMultiAggregate(testing.allocator, arena, args);
+                    defer got.deinit(testing.allocator);
+                    try want.output.applyResultOrder(testing.allocator, args.result_order);
+                    try got.output.applyResultOrder(testing.allocator, args.result_order);
+                    try testing.expectEqual(want.rows_in, got.rows_in);
+                    try testing.expectEqual(want.rows_kept, got.rows_kept);
+                    const wr = want.output.group_rows.?;
+                    const gr = got.output.group_rows.?;
+                    try testing.expectEqual(wr.len, gr.len);
+                    for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
+                };
     }
 }
 
@@ -7470,4 +7668,44 @@ test "count-only: no filter-only column materialized" {
     try res.output.applyResultOrder(testing.allocator, args.result_order);
     const rows = res.output.group_rows.?;
     try testing.expect(rows.len > 0);
+}
+
+test "planAggregate: forced partitions obey aggregate and cut eligibility" {
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .count,
+        .arg = null,
+        .where = null,
+        .alias = "c",
+        .result = .i64,
+    }};
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" },
+    };
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .BYTE_ARRAY,
+        .expr_type = .str,
+    } }};
+    var in: PlanInputs = .{
+        .args = .{ .inputs = &.{}, .aggregate = "count(*)", .partagg = true },
+        .metas = &.{},
+        .work = &.{},
+        .calls = &calls,
+        .keys = &keys,
+        .outputs = &outputs,
+        .filter_cols = &.{false},
+        .workers = 3,
+    };
+    var got = planAggregate(in);
+    try testing.expectEqual(.partitioned_hash, got.dispatch.strategy);
+    try testing.expect(got.reasons.contains(.partitioned_forced));
+    in.args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 };
+    got = planAggregate(in);
+    try testing.expectEqual(.plain_hash, got.dispatch.strategy);
+    try testing.expect(got.reasons.contains(.partitioned_ineligible));
+    in.args.result_order = .{ .limit = 3 };
+    try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy);
+    in.args.result_order = .{};
+    in.keys = null;
+    try testing.expectEqual(.scalar, planAggregate(in).dispatch.strategy);
 }

@@ -47,6 +47,7 @@ const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
 const agg_coded = @import("expr/agg_coded.zig");
+const partagg = @import("partagg.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
@@ -1912,6 +1913,9 @@ pub const AggTarget = union(enum) {
         table: *expr_agg.GroupTable,
         /// `expr_agg.firstPosition` of the row group's row 0.
         pos_base: u64,
+        /// Set together: fold through shared partitions instead of leaving every group in `table`.
+        part: ?*partagg.PartAgg = null,
+        local: ?*partagg.Local = null,
     },
 
     fn calls(self: AggTarget) []const expr_agg.AggCall {
@@ -2007,6 +2011,234 @@ pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_a
         total +|= rows *| 16 *| a.depth();
     };
     return total +| if (grouped) rows *| 4 else 0;
+}
+
+/// A window of `sel`, rows `[lo, lo + n)`, as its own selection. Bits past `n` stay clear.
+fn selWindow(
+    a: std.mem.Allocator,
+    sel: *const filter_selection.SelectionVector,
+    lo: usize,
+    n: usize,
+) !filter_selection.SelectionVector {
+    var w = try filter_selection.SelectionVector.init(a, n);
+    var copied: usize = 0;
+    while (copied < n) {
+        const src_bit = lo + copied;
+        const src_word = sel.mask[src_bit / 64];
+        const sshift: u6 = @intCast(src_bit % 64);
+        const dshift: u6 = @intCast(copied % 64);
+        var take = @min(n - copied, @as(usize, 64) - sshift);
+        take = @min(take, @as(usize, 64) - dshift);
+        const di = copied / 64;
+        if (take == 64) {
+            w.mask[di] = src_word;
+        } else {
+            const mask = (@as(u64, 1) << @as(u6, @intCast(take))) - 1;
+            const bits = (src_word >> sshift) & mask;
+            w.mask[di] = (w.mask[di] & ~(mask << dshift)) | (bits << dshift);
+        }
+        copied += take;
+    }
+    return w;
+}
+
+fn sliceColumn(col: filter_eval.Batch.Column, lo: usize, n: usize) filter_eval.Batch.Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            var o = c;
+            if (c.codes) |codes| if (codes.len >= lo + n) {
+                o.codes = codes[lo..][0..n];
+            };
+            if (c.values.len >= lo + n) o.values = c.values[lo..][0..n];
+            if (c.def_levels) |dl| if (dl.len >= lo + n) {
+                o.def_levels = dl[lo..][0..n];
+            };
+            if (c.rep_levels) |rl| if (rl.len >= lo + n) {
+                o.rep_levels = rl[lo..][0..n];
+            };
+            if (c.unscaled) |u| o.unscaled = switch (u) {
+                .i32 => |v| if (v.len >= lo + n) .{ .i32 = v[lo..][0..n] } else u,
+                .i64 => |v| if (v.len >= lo + n) .{ .i64 = v[lo..][0..n] } else u,
+                .i128 => |v| if (v.len >= lo + n) .{ .i128 = v[lo..][0..n] } else u,
+            };
+            if (o.levels_only_rows != 0) o.levels_only_rows = n;
+            break :blk @unionInit(filter_eval.Batch.Column, @tagName(tag), o);
+        },
+    };
+}
+
+/// Hash of the key `row` would be stored under, matching `GroupTable.routeHash` after insert.
+fn routeRowHash(
+    ra: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
+    table: *const expr_agg.GroupTable,
+    key_cols: []const filter_eval.Batch.Column,
+    row: usize,
+) !u64 {
+    if (table.fixed_stride != 0) {
+        var image: [32]u8 = undefined;
+        if (expr_agg.packFixedKey(key_cols, row, &image)) |nb| if (nb == table.fixed_stride) {
+            return table.hashRoute(image[0..nb]);
+        };
+    }
+    try expr_agg.serializeRowKey(scratch, ra, key_cols, row);
+    return table.hashRoute(scratch.items);
+}
+
+fn insertRow(
+    ra: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
+    table: *expr_agg.GroupTable,
+    key_cols: []const filter_eval.Batch.Column,
+    row: usize,
+    calls: []const expr_agg.AggCall,
+    pos: u64,
+) !u32 {
+    if (table.fixed_stride != 0) {
+        var image: [32]u8 = undefined;
+        if (expr_agg.packFixedKey(key_cols, row, &image)) |nb| if (nb == table.fixed_stride) {
+            return table.getOrInsertFixed(image[0..nb], calls, pos + row);
+        };
+    }
+    try expr_agg.serializeRowKey(scratch, ra, key_cols, row);
+    return table.getOrInsert(scratch.items, calls, pos + row);
+}
+
+/// Abandoned pre-aggregation: one hash per row into the shared partition, under that partition's lock.
+fn scatterGrouped(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    g: @FieldType(AggTarget, "grouped"),
+    part: *partagg.PartAgg,
+    cols: []filter_eval.Batch.Column,
+    lookup: []const ?usize,
+    win_sel: *const filter_selection.SelectionVector,
+    consumed: []const bool,
+    prepared_values: *bool,
+    pos: u64,
+    off: usize,
+    n: usize,
+) !void {
+    if (!prepared_values.*) {
+        for (lookup, 0..) |at, ci| if (at) |p| if (ci < consumed.len and consumed[ci]) {
+            cols[p] = try agg_coded.materialize(ra, cols[p]);
+        };
+        prepared_values.* = true;
+    }
+    const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
+    for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
+    var win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
+    const key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
+    const keyed = win.restrictedTo(win_sel);
+    for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(ra, &keyed, lookup, k);
+
+    const which = try ra.alloc(u8, n);
+    var counts: [partagg.n_parts]u32 = @splat(0);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(ra);
+    for (0..n) |r| {
+        if (!win_sel.isActive(r)) continue;
+        const h = try routeRowHash(ra, &scratch, g.table, key_cols, r);
+        const p: u8 = @intCast(part.indexOf(h));
+        which[r] = p;
+        counts[p] += 1;
+    }
+    var start: [partagg.n_parts + 1]u32 = undefined;
+    start[0] = 0;
+    for (0..partagg.n_parts) |p| start[p + 1] = start[p] + counts[p];
+    const order = try ra.alloc(u32, start[partagg.n_parts]);
+    var at = start;
+    for (0..n) |r| {
+        if (!win_sel.isActive(r)) continue;
+        const p = which[r];
+        order[at[p]] = @intCast(r);
+        at[p] += 1;
+    }
+    const ids = try ra.alloc(u32, n);
+    var preps = try expr_agg.prepareGrouped(ra, g.calls, &win, lookup, win_sel);
+    defer preps.deinit();
+    for (part.parts, 0..) |*pt, p| {
+        const lo = start[p];
+        const hi = start[p + 1];
+        if (lo == hi) continue;
+        partagg.PartAgg.lock(pt);
+        defer partagg.PartAgg.unlock(pt);
+        for (order[lo..hi]) |r| {
+            ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
+        }
+        try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls);
+    }
+}
+
+/// Fold `cols` through the worker's local table in windows, flushing into `g.part` when the local table fills or
+/// stops reducing. One window is what `groupedCoded` or the row path already know how to fold.
+fn foldGroupedWindows(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    target: AggTarget,
+    cols: []filter_eval.Batch.Column,
+    lookup: []const ?usize,
+    sel: *const filter_selection.SelectionVector,
+    consumed: []const bool,
+    encoded: bool,
+) !void {
+    const g = switch (target) {
+        .grouped => |grouped| grouped,
+        .scalar => return,
+    };
+    const part = g.part orelse return;
+    const local = g.local orelse return;
+    var prepared_values = false;
+    var off: usize = 0;
+    while (off < sel.len) {
+        if (part.needsFlush(local, g.table)) try part.pump(local, g.table, 0);
+        const n = part.nextSpan(local, g.table, sel.len - off);
+        if (n == 0) break;
+        var win_sel = try selWindow(ra, sel, off, n);
+        defer win_sel.deinit();
+        const pos = g.pos_base + @as(u64, @intCast(off));
+        // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
+        if (local.abandoned) {
+            try scatterGrouped(ra, gpa, g, part, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
+            off += n;
+            continue;
+        }
+        if (!prepared_values and encoded) {
+            const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
+            for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
+            const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
+            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel)) {
+                try part.pump(local, g.table, @intCast(win_sel.count()));
+                off += n;
+                continue;
+            }
+        }
+        if (!prepared_values) {
+            for (lookup, 0..) |at, ci| if (at) |p| if (ci < consumed.len and consumed[ci]) {
+                cols[p] = try agg_coded.materialize(ra, cols[p]);
+            };
+            prepared_values = true;
+        }
+        const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
+        for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
+        var win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
+        const key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
+        const keyed = win.restrictedTo(&win_sel);
+        for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(ra, &keyed, lookup, k);
+        const ids = try ra.alloc(u32, n);
+        @memset(ids, 0);
+        var resolver = expr_agg.GroupKeyResolver.init(key_cols);
+        defer resolver.deinit(ra);
+        for (0..n) |r| if (win_sel.isActive(r)) {
+            ids[r] = try resolver.resolve(ra, g.table, key_cols, r, g.calls, pos);
+        };
+        try expr_agg.sinkSketchRows(g.table, ids, &win_sel);
+        if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
+            try expr_agg.updateOneGrouped(ra, gpa, g.table.accumulators.items, ids, i, g.calls.len, call, &win, lookup, &win_sel);
+        };
+        try part.pump(local, g.table, @intCast(win_sel.count()));
+        off += n;
+    }
 }
 
 /// Per-RG aggregator update. Answers what statistics can, then decodes
@@ -2135,6 +2367,13 @@ pub fn scanRGForAgg(
 
     switch (target) {
         .grouped => |g| {
+            if (g.part != null and !staged) {
+                try foldGroupedWindows(ra, gpa, target, batch_cols.items, lookup, &sel, in.consumed, decode_options.encoded);
+                const t_agg_end = nowMonoNs();
+                ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
+                profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+                return;
+            }
             if (!staged and decode_options.encoded and
                 try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel))
             {
@@ -2190,6 +2429,9 @@ pub fn scanRGForAgg(
                     &sel,
                 );
             };
+            // The windowed path returned above. A staged row group folded whole still has to enter the partitions
+            // before the next row group, or one worker's local table keeps every key it has seen.
+            if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
         },
         .scalar => |s| {
             // Update only the aggs that weren't handled via stats. The agg's
@@ -2268,6 +2510,12 @@ fn scanRGSliced(
                 try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
             },
             .grouped => |g| {
+                if (g.part != null) {
+                    var shifted = target;
+                    shifted.grouped.pos_base = g.pos_base + @as(u64, @intCast(done));
+                    try foldGroupedWindows(sa, gpa, shifted, cols, lookup, &sel, in.consumed, decode_options.encoded);
+                    continue;
+                }
                 const key_cols = try sa.alloc(filter_eval.Batch.Column, g.keys.len);
                 const keyed = batch.restrictedTo(&sel);
                 for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(sa, &keyed, lookup, k);
@@ -5715,16 +5963,34 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
             file_meta.schema = .empty;
             file_meta.row_groups = .empty;
             try file_meta.schema.append(arena, .{
-                .name = "schema", .num_children = 2, .type = null, .type_length = null,
-                .repetition_type = .REQUIRED, .scale = null, .precision = null, .field_id = null,
+                .name = "schema",
+                .num_children = 2,
+                .type = null,
+                .type_length = null,
+                .repetition_type = .REQUIRED,
+                .scale = null,
+                .precision = null,
+                .field_id = null,
             });
             try file_meta.schema.append(arena, .{
-                .name = "k", .type = .INT64, .num_children = 0, .repetition_type = .REQUIRED,
-                .type_length = null, .scale = null, .precision = null, .field_id = 0,
+                .name = "k",
+                .type = .INT64,
+                .num_children = 0,
+                .repetition_type = .REQUIRED,
+                .type_length = null,
+                .scale = null,
+                .precision = null,
+                .field_id = 0,
             });
             try file_meta.schema.append(arena, .{
-                .name = "v", .type = .INT64, .num_children = 0, .repetition_type = .REQUIRED,
-                .type_length = null, .scale = null, .precision = null, .field_id = 1,
+                .name = "v",
+                .type = .INT64,
+                .num_children = 0,
+                .repetition_type = .REQUIRED,
+                .type_length = null,
+                .scale = null,
+                .precision = null,
+                .field_id = 1,
             });
 
             var path_k: schema.StringList = .empty;
@@ -5734,25 +6000,41 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
 
             var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
             try columns.append(arena, .{
-                .file_path = null, .file_offset = 0,
+                .file_path = null,
+                .file_offset = 0,
                 .meta_data = .{
-                    .type = .INT64, .encodings = .empty, .path_in_schema = path_k,
-                    .codec = .UNCOMPRESSED, .num_values = 100, .total_uncompressed_size = 800,
-                    .total_compressed_size = 800, .data_page_offset = 0, .index_page_offset = null,
+                    .type = .INT64,
+                    .encodings = .empty,
+                    .path_in_schema = path_k,
+                    .codec = .UNCOMPRESSED,
+                    .num_values = 100,
+                    .total_uncompressed_size = 800,
+                    .total_compressed_size = 800,
+                    .data_page_offset = 0,
+                    .index_page_offset = null,
                     .dictionary_page_offset = null,
                 },
             });
             try columns.append(arena, .{
-                .file_path = null, .file_offset = 0,
+                .file_path = null,
+                .file_offset = 0,
                 .meta_data = .{
-                    .type = .INT64, .encodings = .empty, .path_in_schema = path_v,
-                    .codec = .UNCOMPRESSED, .num_values = 100, .total_uncompressed_size = 800,
-                    .total_compressed_size = 800, .data_page_offset = 0, .index_page_offset = null,
+                    .type = .INT64,
+                    .encodings = .empty,
+                    .path_in_schema = path_v,
+                    .codec = .UNCOMPRESSED,
+                    .num_values = 100,
+                    .total_uncompressed_size = 800,
+                    .total_compressed_size = 800,
+                    .data_page_offset = 0,
+                    .index_page_offset = null,
                     .dictionary_page_offset = null,
                 },
             });
             try file_meta.row_groups.append(arena, .{
-                .columns = columns, .total_byte_size = 1600, .num_rows = 100,
+                .columns = columns,
+                .total_byte_size = 1600,
+                .num_rows = 100,
             });
 
             const in: AggRowGroup = .{
@@ -5786,11 +6068,18 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
             };
 
             const calls = [_]expr_agg.AggCall{.{
-                .func = .sum, .alias = "s", .result = .i64, .arg = arg_expr, .where = null,
+                .func = .sum,
+                .alias = "s",
+                .result = .i64,
+                .arg = arg_expr,
+                .where = null,
             }};
             const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
             const target: AggTarget = .{ .grouped = .{
-                .calls = &calls, .keys = &keys, .table = &table, .pos_base = 0,
+                .calls = &calls,
+                .keys = &keys,
+                .table = &table,
+                .pos_base = 0,
             } };
 
             const sp = try StagePlan.init(arena, in, target, &.{false});

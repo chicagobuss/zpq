@@ -4163,7 +4163,18 @@ pub const GroupTable = struct {
 
     /// The hash a sketch or census routes group `g`'s key by.
     pub fn routeHash(self: *const GroupTable, g: usize) u64 {
-        return if (self.fixed_stride != 0) hashFixed(self.keyAt(g)) else sketchHash(self.keyAt(g));
+        return self.hashRoute(self.keyAt(g));
+    }
+
+    /// `routeHash` for a key that is not in the table yet: the fixed image, or the bytes `getOrInsert` stores.
+    pub fn hashRoute(self: *const GroupTable, key: []const u8) u64 {
+        if (self.fixed_stride != 0) {
+            if (key.len == self.fixed_stride) return hashFixed(key);
+            var buf: [32]u8 = undefined;
+            const image = expandFixed(self.fixed_stride, key, &buf) orelse return hashFixed(key);
+            return hashFixed(image);
+        }
+        return sketchHash(key);
     }
 
     pub fn findKey(self: *const GroupTable, key: []const u8) ?u32 {
@@ -4441,24 +4452,93 @@ pub fn updateOneGroupedValues(
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (sel.isActive(r)) {
-            const gid = group_id_arr[r];
-            const state = &accs[gid * agg_len + agg_idx];
-            switch (call.func) {
-                .count => state.count += 1,
-                .count_distinct => unreachable,
-                .sum => try foldSumGroupedOne(state, values.?, r, u64_col, call.offset),
-                .min => if (call.result == .bytes)
-                    try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
-                else
-                    foldMinGroupedOne(state, values.?, r, u64_col),
-                .max => if (call.result == .bytes)
-                    try foldMinMaxBytesGroupedOne(persist, false, state, values.?, r)
-                else
-                    foldMaxGroupedOne(state, values.?, r, u64_col),
-                .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+            const state = &accs[group_id_arr[r] * agg_len + agg_idx];
+            try applyGrouped(persist, state, call, values, r, u64_col);
+        }
+    }
+}
+
+fn applyGrouped(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    call: AggCall,
+    values: ?filter_eval.Batch.Column,
+    r: usize,
+    u64_col: bool,
+) !void {
+    switch (call.func) {
+        .count => state.count += 1,
+        // count(DISTINCT) folds through `foldDistinctGrouped`, whose inline sets this row-at-a-time path does not know;
+        // the partitioned executor never takes it.
+        .count_distinct => return error.UnsupportedAggType,
+        .sum => try foldSumGroupedOne(state, values.?, r, u64_col, call.offset),
+        .min => if (call.result == .bytes)
+            try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
+        else
+            foldMinGroupedOne(state, values.?, r, u64_col),
+        .max => if (call.result == .bytes)
+            try foldMinMaxBytesGroupedOne(persist, false, state, values.?, r)
+        else
+            foldMaxGroupedOne(state, values.?, r, u64_col),
+        .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+    }
+}
+
+/// One prepared aggregate call, reused across partition locks so a scattered window does not re-read its columns.
+pub const GroupedPreps = struct {
+    mem: []PreparedAggInput,
+    arena: std.mem.Allocator,
+
+    pub fn deinit(self: *GroupedPreps) void {
+        for (self.mem) |*p| p.deinit(self.arena);
+        self.arena.free(self.mem);
+        self.* = undefined;
+    }
+
+    /// Add `rows` into `accs`. A row the call's own filter or a null argument dropped is skipped.
+    pub fn fold(
+        self: *const GroupedPreps,
+        persist: std.mem.Allocator,
+        accs: []Accumulator,
+        group_id_arr: []const u32,
+        rows: []const u32,
+        calls: []const AggCall,
+    ) !void {
+        for (calls, self.mem, 0..) |call, prep, i| {
+            const sel = prep.selection();
+            for (rows) |r| {
+                const ri: usize = r;
+                if (!sel.isActive(ri)) continue;
+                const state = &accs[group_id_arr[ri] * calls.len + i];
+                try applyGrouped(persist, state, call, prep.values, ri, prep.unsigned_64);
             }
         }
     }
+};
+
+pub fn prepareGrouped(
+    arena: std.mem.Allocator,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    outer_sel: *const filter_selection.SelectionVector,
+) !GroupedPreps {
+    const mem = try arena.alloc(PreparedAggInput, calls.len);
+    errdefer arena.free(mem);
+    var n: usize = 0;
+    errdefer for (mem[0..n]) |*p| p.deinit(arena);
+    for (calls) |call| {
+        mem[n] = try PreparedAggInput.init(
+            arena,
+            call,
+            batch,
+            column_lookup,
+            outer_sel,
+            false,
+        );
+        n += 1;
+    }
+    return .{ .mem = mem, .arena = arena };
 }
 
 /// One column type for the whole batch. i64/i32/f64 stay inline in the accumulator until a group spills.

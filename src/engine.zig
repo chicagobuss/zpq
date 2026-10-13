@@ -253,6 +253,8 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 pub const QueryArgs = struct {
+    /// Force eligible GROUP BY queries through shared partitions.
+    partagg: bool = false,
     inputs: []const []const u8, // raw paths/URLs (pre-glob — caller globs)
     output: ?[]const u8 = null,
     filter: ?[]const u8 = null,
@@ -566,6 +568,7 @@ fn executeAggregate(
         .diag = args.diag,
         .profiler = args.profiler,
         .sketch_topk = sketchFromEnv(ctx.env),
+        .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
     };
     if (explain) {
         if (io_mode != .mmap) {
@@ -1482,6 +1485,11 @@ fn sketchFromEnv(env: std.process.Environ) ?scan.SketchTopK {
 }
 
 /// Whether `name` is set to "0" in `env`.
+fn envFlag(env: std.process.Environ, name: []const u8) bool {
+    const value = env.getPosix(name) orelse return false;
+    return std.mem.eql(u8, value, "1");
+}
+
 fn envDisables(env: std.process.Environ, name: []const u8) bool {
     const v = env.getPosix(name) orelse return false;
     return std.mem.eql(u8, v, "0");
@@ -4368,7 +4376,7 @@ fn writeCsvString(writer: anytype, s: []const u8) !void {
 pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
     const a = explanation.aggregate;
     const d = a.plan.dispatch;
-    const merge = if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
+    const merge = if (d.strategy == .partitioned_hash) "shared_partitions" else if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
     try writer.print("{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\",\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[", .{
         @tagName(d.strategy), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
         a.work_items,         explanation.max_memory, explanation.encoded,
@@ -4390,7 +4398,7 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     } else try writer.writeAll("null");
     try writer.writeAll(",\"passes\":[");
     switch (d.strategy) {
-        .scalar, .plain_hash => try writeExplainPass(writer, "aggregate", null, a.column_names, a.columns),
+        .scalar, .plain_hash, .partitioned_hash => try writeExplainPass(writer, "aggregate", null, a.column_names, a.columns),
         .first_keys => {
             try writeExplainPass(writer, "discover_prefix", null, a.column_names, a.columns);
             try writer.writeAll(",");
@@ -6909,4 +6917,32 @@ test "explainAggregate: local IO and environment knobs preserve dispatch eligibi
         try std.testing.expectEqual(expected, explained.aggregate.plan.dispatch.strategy);
         try std.testing.expect(!explained.encoded);
     };
+}
+
+test "explainAggregate: partitioned force agrees for API and environment" {
+    for ([_]bool{ false, true }) |api| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const lines = [_:null]?[*:0]const u8{
+            "ZPQ_IO_PROFILE=mmap", if (api) "ZPQ_PARTAGG=0" else "ZPQ_PARTAGG=1",
+        };
+        const ctx: Context = .{
+            .gpa = std.testing.allocator,
+            .env = .{ .block = .{ .slice = &lines } },
+            .io = std.testing.io,
+        };
+        const got = try explainAggregate(ctx, arena.allocator(), .{
+            .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
+            .group_by = "k",
+            .aggregate = "count(*) AS c",
+            .partagg = api,
+        });
+        try std.testing.expectEqual(.partitioned_hash, got.aggregate.plan.dispatch.strategy);
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try writeAggregateExplanationJson(&out.writer, got);
+        const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer json.deinit();
+        try std.testing.expectEqualStrings("shared_partitions", json.value.object.get("merge").?.string);
+    }
 }

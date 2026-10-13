@@ -3549,7 +3549,13 @@ fn resultCutReason(
     const call = calls[a];
     if (call.result == .f64 or (call.result == .avg_f64 and
         (call.arg == null or call.arg.?.typeOf() != .i64))) return .result_cut_float;
-    if (call.func != .sum or call.result != .i64) return .result_cut_unsupported;
+    const numeric = switch (call.func) {
+        .sum, .min, .max => call.result == .i64 or call.result == .dec,
+        .avg => call.result == .avg_dec or (call.result == .avg_f64 and call.arg != null and
+            call.arg.?.typeOf() == .i64),
+        else => false,
+    };
+    if (!numeric) return .result_cut_unsupported;
     // Finalizing a losing DECIMAL sum/mean can error. Until its lane is also reduced, keep the full path.
     for (calls, 0..) |payload, i| if (i != a and
         (payload.result == .avg_dec or (payload.result == .dec and payload.func == .sum)))
@@ -3576,8 +3582,22 @@ fn resultCut(
 }
 
 fn rankValue(acc: expr_agg.Accumulator, call: expr_agg.AggCall) !SortKey {
-    _ = call;
-    return if (acc.sum_i) |v| .{ .int = v } else .none;
+    return switch (acc) {
+        .sum_i, .min_i, .max_i => |v| if (v) |i| .{ .int = i } else .none,
+        // Match sortKey(.avg): rounding the exact integer sum once, then dividing, also defines its ties.
+        .avg => |a| if (expr_agg.avgSum(a)) |sum|
+            .{ .float = sum / @as(f64, @floatFromInt(a.count)) }
+        else
+            .none,
+        .sum_d => |d| decimalRank(try d.result(), call),
+        .avg_d => |d| decimalRank(try d.mean(), call),
+        .min_d, .max_d => |v| decimalRank(v, call),
+        else => unreachable,
+    };
+}
+
+fn decimalRank(v: ?i128, call: expr_agg.AggCall) SortKey {
+    return if (v) |i| .{ .dec = .{ .v = i, .spec = expr_agg.resultDec(call) } } else .none;
 }
 
 const RankItem = struct { value: SortKey, first: u64, g: u32 };
@@ -8818,4 +8838,150 @@ test "result cut SUM: one-table and retained winner capacities share and return 
         slots.capacity * @sizeOf(MergedSlot) + accs.capacity * @sizeOf(expr_agg.Accumulator),
         budget.used.load(.monotonic),
     );
+}
+
+test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys including rounded ties" {
+    const int_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const dec_arg: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 4 },
+    } };
+    const states = [_]expr_agg.Accumulator{
+        .{ .min_i = -(@as(i128, 1) << 100) }, .{ .max_i = (@as(i128, 1) << 100) },
+        .{ .avg = .{ .isum = 9007199254740993, .sum = 0, .count = 1 } }, // Distinct exact sums tie after f64 rounding.
+        .{ .avg = .{ .isum = 9007199254740992, .sum = 0, .count = 1 } },
+        .{ .avg = .{ .sum = 0, .count = 0 } },
+        .{ .min_d = -10001 },
+        .{ .max_d = null },
+        .{ .sum_d = .{ .lo = 12345, .n = 2 } },
+        .{ .avg_d = .{ .lo = @bitCast(@as(i128, -5)), .hi = -1, .n = 2 } },
+    };
+    for (states) |state| {
+        const dec = state == .min_d or state == .max_d or state == .sum_d or state == .avg_d;
+        const func: expr_agg.AggFunc = switch (state) {
+            .min_i, .min_d => .min,
+            .max_i, .max_d => .max,
+            .sum_d => .sum,
+            else => .avg,
+        };
+        const call: expr_agg.AggCall = .{
+            .func = func,
+            .arg = if (dec) dec_arg else int_arg,
+            .where = null,
+            .alias = "v",
+            .result = if (func == .avg)
+                (if (dec) .avg_dec else .avg_f64)
+            else
+                (if (dec) .dec else .i64),
+        };
+        const got = try rankValue(state, call);
+        const want = sortKey(try materializeOne(testing.allocator, call, state));
+        for ([_]bool{ false, true }) |desc| try testing.expectEqual(.eq, orderSortKeys(want, got, desc));
+    }
+    const avg_call: expr_agg.AggCall = .{
+        .func = .avg,
+        .arg = int_arg,
+        .where = null,
+        .alias = "a",
+        .result = .avg_f64,
+    };
+    try testing.expectEqual(.eq, orderSortKeys(
+        try rankValue(states[2], avg_call),
+        try rankValue(states[3], avg_call),
+        true,
+    ));
+    const dec_call: expr_agg.AggCall = .{
+        .func = .avg,
+        .arg = dec_arg,
+        .where = null,
+        .alias = "a",
+        .result = .avg_dec,
+    };
+    const rounded = try rankValue(states[8], dec_call);
+    try testing.expectEqual(@as(i128, -3), rounded.dec.v);
+    try testing.expectEqual(@as(u8, 4), rounded.dec.spec.scale);
+}
+
+test "result cut extrema AVG DECIMAL: scans match full stable order at j1 j3 j8" {
+    const fixtures = [_]struct { path: []const u8, keys: []const []const u8, aggs: []const []const u8 }{
+        .{
+            .path = "ci/fixtures/parquet/census_topk.parquet",
+            .keys = &.{"s"},
+            .aggs = &.{
+                "min(t - 30) FILTER (WHERE n = 1) AS rank", "max(t - 30) FILTER (WHERE n = 1) AS rank",
+                "avg(t - 30) FILTER (WHERE n = 1) AS rank",
+            },
+        },
+        .{
+            .path = decimal_exact_fixture,
+            .keys = &.{ "k", "i" },
+            .aggs = &.{ "sum(d38) AS rank", "min(dn) AS rank", "max(dn) AS rank", "avg(dn) AS rank" },
+        },
+    };
+    for (fixtures) |fixture| {
+        const bytes = (try loadFixture(fixture.path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = fixture.path, .bytes = bytes }};
+        for (fixture.keys) |key| for (fixture.aggs) |ranking| for ([_]usize{ 1, 3, 8 }) |jobs| {
+            for ([_]bool{ false, true }) |part| for ([_]bool{ false, true }) |desc| {
+                var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const aggregate = try std.fmt.allocPrint(arena, "{s}, count(*) AS c", .{ranking});
+                var args: MultiAggArgs = .{
+                    .inputs = &inputs,
+                    .aggregate = aggregate,
+                    .group_by = key,
+                    .parallelism = jobs,
+                    .partagg = part,
+                    .min_bytes_per_worker = 1,
+                    .sketch_topk = null,
+                    .select_cols = try selectList(arena, &.{ key, ranking, "count(*) AS c" }),
+                };
+                var want = try runMultiAggregate(testing.allocator, arena, args);
+                defer want.deinit(testing.allocator);
+                args.result_order = .{ .keys = &.{.{ .column = 1, .descending = desc }}, .limit = 1, .offset = 1 };
+                var got = try runMultiAggregate(testing.allocator, arena, args);
+                defer got.deinit(testing.allocator);
+                try want.output.applyResultOrder(testing.allocator, args.result_order);
+                try got.output.applyResultOrder(testing.allocator, args.result_order);
+                try testing.expectEqual(want.output.group_rows.?.len, got.output.group_rows.?.len);
+                for (want.output.group_rows.?, got.output.group_rows.?) |w, g|
+                    for (w, g) |a, b| try testing.expect(sameValue(a, b));
+            };
+        };
+    }
+}
+
+test "result cut DECIMAL: loser and zero-limit overflow stays observable, payload falls back" {
+    const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = decimal_exact_fixture, .bytes = bytes }};
+    for ([_]usize{ 1, 3, 8 }) |jobs| for ([_]u64{ 0, 1 }) |limit| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        // c's sum fits and ranks first ASC; a and b overflow but still have to be finalized.
+        try testing.expectError(error.DecimalOverflow, runMultiAggregate(testing.allocator, arena, .{
+            .inputs = &inputs,
+            .aggregate = "sum(big) AS rank",
+            .group_by = "k",
+            .parallelism = jobs,
+            .min_bytes_per_worker = 1,
+            .select_cols = try selectList(arena, &.{ "k", "sum(big) AS rank" }),
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = limit },
+        }));
+        // c also ranks first by min(i) DESC; the losing SUM(big) payload must keep the full-path error.
+        try testing.expectError(error.DecimalOverflow, runMultiAggregate(testing.allocator, arena, .{
+            .inputs = &inputs,
+            .aggregate = "min(i) AS rank, sum(big) AS payload",
+            .group_by = "k",
+            .parallelism = jobs,
+            .min_bytes_per_worker = 1,
+            .select_cols = try selectList(arena, &.{ "k", "min(i) AS rank", "sum(big) AS payload" }),
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = limit },
+        }));
+    };
 }

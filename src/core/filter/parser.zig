@@ -1,18 +1,19 @@
 //! Filter expression parser.
 //!
-//! Grammar:
+//! Grammar (keywords case-insensitive):
 //!
 //!   expr        := disjunction
-//!   disjunction := conjunction ( " OR " conjunction )*
-//!   conjunction := leaf ( " AND " leaf )*
-//!   leaf        := identifier OP value
-//!   OP          := "!=" | "<=" | ">=" | "=" | "<" | ">"
+//!   disjunction := conjunction ( OR conjunction )*
+//!   conjunction := negation ( AND negation )*
+//!   negation    := NOT negation | "(" disjunction ")" | leaf
+//!   leaf        := identifier OP value | identifier [NOT] IN (v, ...) | identifier [NOT] BETWEEN x AND y
+//!                | identifier [NOT] LIKE pattern | identifier IS [NOT] NULL
+//!   OP          := "!=" | "<>" | "<=" | ">=" | "=" | "<" | ">"
 //!
-//! No parens, no NOT, no nested expressions. Matches what the prior
-//! implementation supported; sufficient for the demo + much real-world
-//! usage. Add when needed.
-//!
-//! AND binds tighter than OR — we split on " OR " first, then on " AND ".
+//! Structure is found by scanning, never by plain substring search: quoted spans ('...' and "...", a doubled quote
+//! escaping itself) and parenthesized groups are stepped over, so a keyword or operator inside a string literal, a
+//! quoted identifier or an IN list is never mistaken for one. A chain of any length parses in a loop; only grouping
+//! parentheses recurse, and they nest at most `MAX_GROUP_DEPTH` deep, which bounds every recursive walk of the tree.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -30,10 +31,16 @@ pub const Error = error{
     BadOperator,
     BadValue,
     UnsupportedType,
-    /// Grouping parentheses aren't supported — the grammar is flat
-    /// AND/OR. (Parens are only valid inside an `IN (...)` list.)
-    GroupingNotSupported,
+    /// A parenthesis outside a quoted span without its partner.
+    UnbalancedParentheses,
+    /// Grouping parentheses nest deeper than `MAX_GROUP_DEPTH`.
+    FilterTooDeep,
 } || std.mem.Allocator.Error;
+
+/// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
+/// row selection once per OR level, so this caps the tree height every walker (evaluation, pruning, negation,
+/// membership) recurses through and the selections live at once.
+pub const MAX_GROUP_DEPTH: u32 = 32;
 
 /// Parse a filter expression against the file's schema.
 ///
@@ -47,98 +54,224 @@ pub fn parse(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+    const trimmed = trimSpace(expr);
     if (trimmed.len == 0) return error.EmptyExpr;
-    return try parseDisjunction(arena, trimmed, file, diag);
+    return try parseDisjunction(arena, trimmed, file, diag, 0);
 }
 
-/// Split at every top-level ` OR ` into one flat OR node: a loop, not recursion, so a chain of any length costs no stack.
+fn trimSpace(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r\n");
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The index just past the quoted span opening at `src[i]`. A doubled quote inside escapes itself. An unterminated
+/// quote is an ordinary byte, as the unquoted literal forms (`name = O'Brien`) have always read it.
+fn skipQuoted(src: []const u8, i: usize) usize {
+    const q = src[i];
+    var j = i + 1;
+    while (j < src.len) : (j += 1) {
+        if (src[j] != q) continue;
+        if (j + 1 < src.len and src[j + 1] == q) {
+            j += 1;
+            continue;
+        }
+        return j + 1;
+    }
+    return i + 1;
+}
+
+/// A word of the outermost level: letters, digits and `_`, with whitespace, a parenthesis or an end on both sides.
+const Word = struct { start: usize, end: usize };
+
+/// Walks the outermost level of `src`, stepping over quoted spans and parenthesized groups.
+const Cursor = struct {
+    src: []const u8,
+    i: usize = 0,
+    depth: u32 = 0,
+
+    fn boundary(self: *const Cursor, at: usize) bool {
+        return at >= self.src.len or isSpace(self.src[at]) or self.src[at] == '(' or self.src[at] == ')';
+    }
+
+    fn nextWord(self: *Cursor) Error!?Word {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            switch (c) {
+                '\'', '"' => self.i = skipQuoted(src, self.i),
+                '(' => {
+                    self.depth += 1;
+                    self.i += 1;
+                },
+                ')' => {
+                    if (self.depth == 0) return error.UnbalancedParentheses;
+                    self.depth -= 1;
+                    self.i += 1;
+                },
+                else => {
+                    const starts = self.depth == 0 and isWordByte(c) and (self.i == 0 or self.boundary(self.i - 1));
+                    if (!starts) {
+                        self.i += 1;
+                        continue;
+                    }
+                    const start = self.i;
+                    while (self.i < src.len and isWordByte(src[self.i])) self.i += 1;
+                    if (self.boundary(self.i)) return .{ .start = start, .end = self.i };
+                },
+            }
+        }
+        if (self.depth != 0) return error.UnbalancedParentheses;
+        return null;
+    }
+
+    /// The next outermost-level position of `needle`, compared case-insensitively.
+    fn find(self: *Cursor, needle: []const u8) Error!?usize {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            if (self.depth == 0 and self.i + needle.len <= src.len and
+                std.ascii.eqlIgnoreCase(src[self.i .. self.i + needle.len], needle))
+            {
+                const at = self.i;
+                self.i += needle.len;
+                return at;
+            }
+            switch (c) {
+                '\'', '"' => self.i = skipQuoted(src, self.i),
+                '(' => {
+                    self.depth += 1;
+                    self.i += 1;
+                },
+                ')' => {
+                    if (self.depth == 0) return error.UnbalancedParentheses;
+                    self.depth -= 1;
+                    self.i += 1;
+                },
+                else => self.i += 1,
+            }
+        }
+        return null;
+    }
+};
+
+/// The first outermost-level position of `needle` in `src` (case-insensitive), or null.
+fn topLevelIndexOf(src: []const u8, needle: []const u8) Error!?usize {
+    var cur: Cursor = .{ .src = src };
+    return cur.find(needle);
+}
+
+fn isKeyword(src: []const u8, w: Word, kw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(src[w.start..w.end], kw);
+}
+
+/// Split at every outermost ` OR ` into one flat OR node: a loop, not recursion, so a chain of any length costs no
+/// stack.
 fn parseDisjunction(
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
+    depth: u32,
 ) Error!ast.Filter {
     var terms: std.ArrayList(ast.Filter) = .empty;
-    var rest = expr;
-    while (std.mem.indexOf(u8, rest, " OR ")) |i| {
-        try terms.append(arena, try parseConjunction(arena, std.mem.trim(u8, rest[0..i], " "), file, diag));
-        rest = std.mem.trim(u8, rest[i + 4 ..], " ");
+    var cur: Cursor = .{ .src = expr };
+    var start: usize = 0;
+    while (try cur.nextWord()) |w| {
+        if (!isKeyword(expr, w, "OR")) continue;
+        try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+        start = w.end;
     }
-    try terms.append(arena, try parseConjunction(arena, rest, file, diag));
+    try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..]), file, diag, depth));
     return ast.join(arena, false, terms.items);
 }
 
+/// Split at every outermost ` AND ` that does not pair with a `BETWEEN`: the next AND after each BETWEEN belongs to
+/// its bounds.
 fn parseConjunction(
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
+    depth: u32,
 ) Error!ast.Filter {
-    // Find a top-level " AND " — one that doesn't pair with a BETWEEN.
-    // For each " BETWEEN " in the expression, the *next* " AND " after
-    // it belongs to the BETWEEN bounds, not to a conjunction. Skip
-    // over them.
     var terms: std.ArrayList(ast.Filter) = .empty;
-    var rest = expr;
-    while (findTopLevelAnd(rest)) |i| {
-        try terms.append(arena, try parseLeaf(arena, std.mem.trim(u8, rest[0..i], " "), file, diag));
-        rest = std.mem.trim(u8, rest[i + 5 ..], " ");
+    var cur: Cursor = .{ .src = expr };
+    var start: usize = 0;
+    var bounds_pending: usize = 0;
+    while (try cur.nextWord()) |w| {
+        if (isKeyword(expr, w, "BETWEEN")) {
+            bounds_pending += 1;
+        } else if (isKeyword(expr, w, "AND")) {
+            if (bounds_pending > 0) {
+                bounds_pending -= 1;
+                continue;
+            }
+            try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+            start = w.end;
+        }
     }
-    try terms.append(arena, try parseLeaf(arena, rest, file, diag));
+    try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..]), file, diag, depth));
     // A BETWEEN's two bounds join the chain they sit in.
     return ast.join(arena, true, terms.items);
 }
 
-/// Find the first ` AND ` token in `expr` that is NOT part of a
-/// `BETWEEN x AND y` clause. Returns its byte index, or null if every
-/// ` AND ` belongs to a BETWEEN (or none exist).
-fn findTopLevelAnd(expr: []const u8) ?usize {
-    // Walk left-to-right tracking a "skip-next-AND" counter that we
-    // bump each time we see a `BETWEEN` keyword. Each subsequent
-    // ` AND ` decrements the counter (consumed by that BETWEEN's
-    // bounds) until it hits zero — then the next ` AND ` is the
-    // top-level conjunction split.
-    var i: usize = 0;
-    var skip: usize = 0;
-    while (i + 5 <= expr.len) {
-        // Check for ` BETWEEN ` (case-insensitive). The leading space
-        // disambiguates from identifiers like `between_threshold`.
-        if (i + " BETWEEN ".len <= expr.len and asciiEqIgnoreCase(expr[i .. i + " BETWEEN ".len], " BETWEEN ")) {
-            skip += 1;
-            i += " BETWEEN ".len;
-            continue;
-        }
-        if (asciiEqIgnoreCase(expr[i .. i + 5], " AND ")) {
-            if (skip > 0) {
-                skip -= 1;
-                i += 5;
-                continue;
-            }
-            return i;
-        }
-        i += 1;
+/// A run of leading NOTs, then a parenthesized group or a leaf. The run is counted, not recursed into: only its
+/// parity matters, and `NOT NOT ... x` must not cost a stack frame per NOT. NOT is structural (operator flip on
+/// leaves, De Morgan on composites), never a complement of the rows that passed, so a row whose operand is NULL
+/// (UNKNOWN) fails both `p` and `NOT p`.
+fn parseNegation(
+    arena: std.mem.Allocator,
+    expr: []const u8,
+    file: *const schema.FileMetaData,
+    diag: ?*Diag,
+    depth: u32,
+) Error!ast.Filter {
+    var negated = false;
+    var body = expr;
+    while (body.len > 3 and std.ascii.eqlIgnoreCase(body[0..3], "NOT") and (isSpace(body[3]) or body[3] == '(')) {
+        body = trimSpace(body[3..]);
+        negated = !negated;
     }
-    return null;
+    if (body.len == 0) return error.BadOperator;
+    const inner = if (try groupBody(body)) |group| blk: {
+        if (depth + 1 > MAX_GROUP_DEPTH) return error.FilterTooDeep;
+        break :blk try parseDisjunction(arena, group, file, diag, depth + 1);
+    } else try parseLeafBody(arena, body, file, diag);
+    return if (negated) negateFilter(arena, inner) else inner;
 }
 
-fn asciiEqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        const xl = if (x >= 'A' and x <= 'Z') x + 32 else x;
-        const yl = if (y >= 'A' and y <= 'Z') y + 32 else y;
-        if (xl != yl) return false;
+/// The inside of `term` when the whole of it is one parenthesized group, else null.
+fn groupBody(term: []const u8) Error!?[]const u8 {
+    if (term[0] != '(') return null;
+    var cur: Cursor = .{ .src = term, .i = 1, .depth = 1 };
+    while (cur.i < term.len) {
+        switch (term[cur.i]) {
+            '\'', '"' => cur.i = skipQuoted(term, cur.i),
+            '(' => {
+                cur.depth += 1;
+                cur.i += 1;
+            },
+            ')' => {
+                cur.depth -= 1;
+                if (cur.depth == 0) {
+                    if (cur.i + 1 != term.len) return null;
+                    const inner = trimSpace(term[1..cur.i]);
+                    if (inner.len == 0) return error.EmptyExpr;
+                    return inner;
+                }
+                cur.i += 1;
+            },
+            else => cur.i += 1,
+        }
     }
-    return true;
-}
-
-fn caseInsensitiveIndexOf(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
+    return error.UnbalancedParentheses;
 }
 
 /// Resolve a (possibly double-quoted) column name to its leaf index. See
@@ -154,30 +287,6 @@ fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) 
     };
 }
 
-fn parseLeaf(
-    arena: std.mem.Allocator,
-    expr: []const u8,
-    file: *const schema.FileMetaData,
-    diag: ?*Diag,
-) Error!ast.Filter {
-    // Leading `NOT <leaf>` → negate the parsed leaf (operator-flip on leaves,
-    // De Morgan on composites). `col NOT IN (...)` is handled by the IN path
-    // below (its NOT is mid-expression, not leading). A run of NOTs is counted, not recursed into: only its parity
-    // matters, and `NOT NOT ... x` must not cost a stack frame per NOT.
-    var negated = false;
-    var body = expr;
-    while (body.len > 4 and asciiEqIgnoreCase(body[0..4], "NOT ")) {
-        body = std.mem.trim(u8, body[4..], " ");
-        if (body.len == 0) return error.BadOperator;
-        negated = !negated;
-    }
-    if (body.len != expr.len) {
-        const inner = try parseLeafBody(arena, body, file, diag);
-        return if (negated) negateFilter(arena, inner) else inner;
-    }
-    return parseLeafBody(arena, expr, file, diag);
-}
-
 fn parseLeafBody(
     arena: std.mem.Allocator,
     expr: []const u8,
@@ -190,22 +299,25 @@ fn parseLeafBody(
 
     // `col LIKE 'pat'` / `col NOT LIKE 'pat'` — SQL wildcard match.
     // " NOT LIKE " must be checked first (it contains " LIKE ").
-    if (caseInsensitiveIndexOf(expr, " NOT LIKE ")) |i| {
-        return parseLike(expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
+    if (try topLevelIndexOf(expr, " NOT LIKE ")) |i| {
+        return parseLike(arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
     }
-    if (caseInsensitiveIndexOf(expr, " LIKE ")) |i| {
-        return parseLike(expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
+    if (try topLevelIndexOf(expr, " LIKE ")) |i| {
+        return parseLike(arena, expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
     }
 
     // `col [NOT] IN (v1, v2, ...)` → OR-of-equalities (or AND-of-inequalities
     // for NOT IN), reusing the typed leaf builder per value.
-    if (findInClause(expr)) |inc| {
+    if (try findInClause(expr)) |inc| {
         return parseInList(arena, expr, inc, file, diag);
     }
     // BETWEEN runs before operator detection — `col BETWEEN x AND y` has no
-    // binary op the comparison-finder would recognize.
-    if (caseInsensitiveIndexOf(expr, " BETWEEN ")) |_| {
-        return parseBetween(arena, expr, file, diag);
+    // binary op the comparison-finder would recognize. `col NOT BETWEEN x AND y` is its negation.
+    if (try topLevelIndexOf(expr, " NOT BETWEEN ")) |i| {
+        return negateFilter(arena, try parseBetween(arena, expr, i, " NOT BETWEEN ".len, file, diag));
+    }
+    if (try topLevelIndexOf(expr, " BETWEEN ")) |i| {
+        return parseBetween(arena, expr, i, " BETWEEN ".len, file, diag);
     }
     return parseComparisonLeaf(arena, expr, file, diag);
 }
@@ -219,19 +331,19 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
     const null_ = " IS NULL";
     var col_part: []const u8 = undefined;
     var is_not: bool = undefined;
-    if (expr.len >= not_null.len and asciiEqIgnoreCase(expr[expr.len - not_null.len ..], not_null)) {
+    if (expr.len >= not_null.len and std.ascii.eqlIgnoreCase(expr[expr.len - not_null.len ..], not_null)) {
         col_part = expr[0 .. expr.len - not_null.len];
         is_not = true;
-    } else if (expr.len >= null_.len and asciiEqIgnoreCase(expr[expr.len - null_.len ..], null_)) {
+    } else if (expr.len >= null_.len and std.ascii.eqlIgnoreCase(expr[expr.len - null_.len ..], null_)) {
         col_part = expr[0 .. expr.len - null_.len];
         is_not = false;
-    } else if (caseInsensitiveIndexOf(expr, " IS ")) |_| {
+    } else if (try topLevelIndexOf(expr, " IS ")) |_| {
         if (diag) |d| d.detail = .is_operand;
         return error.BadOperator;
     } else {
         return null;
     }
-    const col_name = std.mem.trim(u8, col_part, " ");
+    const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
     const col_idx = try resolveCol(file, col_name, diag);
     return ast.Filter{ .null_check = .{ .col_idx = col_idx, .is_not = is_not } };
@@ -242,15 +354,16 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
 /// general matcher. LIKE is text-only — non-string columns are a clear
 /// error rather than a confusing type mismatch later.
 fn parseLike(
+    arena: std.mem.Allocator,
     col_part: []const u8,
     pat_part: []const u8,
     negate: bool,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const col_name = std.mem.trim(u8, col_part, " ");
+    const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
-    const pattern = stripStringQuotes(std.mem.trim(u8, pat_part, " "));
+    const pattern = try unquoteLiteral(arena, trimSpace(pat_part));
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
@@ -287,10 +400,10 @@ fn classifyLike(pat: []const u8) struct { kind: ast.LikeKind, operand: []const u
 
 const InClause = struct { col_end: usize, vals_start: usize, negated: bool };
 
-fn findInClause(expr: []const u8) ?InClause {
-    if (caseInsensitiveIndexOf(expr, " NOT IN ")) |i|
+fn findInClause(expr: []const u8) Error!?InClause {
+    if (try topLevelIndexOf(expr, " NOT IN ")) |i|
         return .{ .col_end = i, .vals_start = i + " NOT IN ".len, .negated = true };
-    if (caseInsensitiveIndexOf(expr, " IN ")) |i|
+    if (try topLevelIndexOf(expr, " IN ")) |i|
         return .{ .col_end = i, .vals_start = i + " IN ".len, .negated = false };
     return null;
 }
@@ -302,14 +415,11 @@ fn parseInList(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const col_name = std.mem.trim(u8, expr[0..inc.col_end], " ");
-    var vals = std.mem.trim(u8, expr[inc.vals_start..], " ");
-    if (col_name.len == 0) return error.BadOperator;
-    // Require a parenthesized list. (Commas inside quoted string values
-    // aren't supported — a documented limitation of the simple split.)
-    if (vals.len < 2 or vals[0] != '(' or vals[vals.len - 1] != ')') return error.BadOperator;
-    vals = std.mem.trim(u8, vals[1 .. vals.len - 1], " ");
-    if (vals.len == 0) return error.BadValue; // empty list
+    const col_name = trimSpace(expr[0..inc.col_end]);
+    const list = trimSpace(expr[inc.vals_start..]);
+    if (col_name.len == 0 or list.len == 0) return error.BadOperator;
+    // A parenthesized list, split at its outermost commas: a comma inside a quoted value is part of the value.
+    const vals = (try groupBody(list)) orelse return error.BadOperator;
 
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
@@ -317,11 +427,14 @@ fn parseInList(
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
     var leaves: std.ArrayList(ast.Filter) = .empty;
-    var it = std.mem.splitScalar(u8, vals, ',');
-    while (it.next()) |raw| {
-        const v = std.mem.trim(u8, raw, " ");
+    var cur: Cursor = .{ .src = vals };
+    var start: usize = 0;
+    while (true) {
+        const comma = try cur.find(",");
+        const v = trimSpace(vals[start .. comma orelse vals.len]);
         if (v.len == 0) return error.BadValue;
         try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
+        start = (comma orelse break) + 1;
     }
     // One node for the whole list, however long: OR of `= v` (AND of `!= v`), with its set bound beside the leaves.
     if (leaves.items.len == 1) return leaves.items[0];
@@ -426,21 +539,22 @@ fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     };
 }
 
-/// Parse `col BETWEEN x AND y` into the conjunction `(col >= x AND col <= y)`.
-/// SQL semantics: BETWEEN is inclusive on both sides.
+/// Parse `col BETWEEN x AND y` (the keyword at `between_at`, `kw_len` long) into the conjunction
+/// `(col >= x AND col <= y)`. SQL semantics: BETWEEN is inclusive on both sides.
 fn parseBetween(
     arena: std.mem.Allocator,
     expr: []const u8,
+    between_at: usize,
+    kw_len: usize,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const between_at = caseInsensitiveIndexOf(expr, " BETWEEN ") orelse return error.BadOperator;
-    const after_between = between_at + " BETWEEN ".len;
-    const and_at = caseInsensitiveIndexOf(expr[after_between..], " AND ") orelse return error.BadOperator;
+    const after_between = between_at + kw_len;
+    const and_at = (try topLevelIndexOf(expr[after_between..], " AND ")) orelse return error.BadOperator;
 
-    const col_name = std.mem.trim(u8, expr[0..between_at], " ");
-    const x_str = std.mem.trim(u8, expr[after_between .. after_between + and_at], " ");
-    const y_str = std.mem.trim(u8, expr[after_between + and_at + " AND ".len ..], " ");
+    const col_name = trimSpace(expr[0..between_at]);
+    const x_str = trimSpace(expr[after_between .. after_between + and_at]);
+    const y_str = trimSpace(expr[after_between + and_at + " AND ".len ..]);
     if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
 
     const col_idx = try resolveCol(file, col_name, diag);
@@ -460,55 +574,62 @@ fn parseComparisonLeaf(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    // Stray parens reach here only as grouping attempts — IN-list parens
-    // were consumed upstream. Without this, `(a OR b)` splits into the
-    // fragment `(a` and fails with a misleading UnknownColumn.
-    if (std.mem.indexOfScalar(u8, expr, '(') != null or std.mem.indexOfScalar(u8, expr, ')') != null) {
-        return error.GroupingNotSupported;
-    }
-    // Find the operator. Two-char ops checked first so "<=" doesn't
-    // match the "<" arm.
-    const ops_2c = [_]struct { tok: []const u8, op: ast.Operator }{
-        .{ .tok = "!=", .op = .NotEq },
-        .{ .tok = "<=", .op = .LtEq },
-        .{ .tok = ">=", .op = .GtEq },
-    };
-    const ops_1c = [_]struct { tok: []const u8, op: ast.Operator }{
-        .{ .tok = "=", .op = .Eq },
-        .{ .tok = "<", .op = .Lt },
-        .{ .tok = ">", .op = .Gt },
-    };
+    const found = (try findComparison(expr)) orelse return error.BadOperator;
+    const op = found.op;
+    const found_at = found.at;
+    const found_len = found.len;
 
-    var found_op: ?ast.Operator = null;
-    var found_at: usize = 0;
-    var found_len: usize = 0;
-    for (ops_2c) |o| {
-        if (std.mem.indexOf(u8, expr, o.tok)) |i| {
-            found_op = o.op;
-            found_at = i;
-            found_len = o.tok.len;
-            break;
-        }
-    }
-    if (found_op == null) {
-        for (ops_1c) |o| {
-            if (std.mem.indexOf(u8, expr, o.tok)) |i| {
-                found_op = o.op;
-                found_at = i;
-                found_len = o.tok.len;
-                break;
-            }
-        }
-    }
-    const op = found_op orelse return error.BadOperator;
-
-    const col_name = std.mem.trim(u8, expr[0..found_at], " ");
-    const val_str = std.mem.trim(u8, expr[found_at + found_len ..], " ");
+    const col_name = trimSpace(expr[0..found_at]);
+    const val_str = trimSpace(expr[found_at + found_len ..]);
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
+    // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
+    if (std.mem.indexOfScalar(u8, col_name, '(') != null) return error.BadOperator;
 
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     return try buildTypedComparison(arena, col_idx, &elem, op, val_str, diag);
+}
+
+const Comparison = struct { op: ast.Operator, at: usize, len: usize };
+
+/// The first outermost-level comparison operator in `expr`, the two-byte ones taking precedence at a position.
+fn findComparison(expr: []const u8) Error!?Comparison {
+    var i: usize = 0;
+    var depth: u32 = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+        switch (c) {
+            '\'', '"' => {
+                i = skipQuoted(expr, i);
+                continue;
+            },
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return error.UnbalancedParentheses;
+                depth -= 1;
+            },
+            '!', '<', '>', '=' => if (depth == 0) {
+                const next: u8 = if (i + 1 < expr.len) expr[i + 1] else 0;
+                const two: ?ast.Operator = switch (c) {
+                    '!' => if (next == '=') .NotEq else null,
+                    '<' => if (next == '=') .LtEq else if (next == '>') .NotEq else null,
+                    '>' => if (next == '=') .GtEq else null,
+                    else => null,
+                };
+                if (two) |op| return .{ .op = op, .at = i, .len = 2 };
+                const one: ?ast.Operator = switch (c) {
+                    '=' => .Eq,
+                    '<' => .Lt,
+                    '>' => .Gt,
+                    else => null,
+                };
+                if (one) |op| return .{ .op = op, .at = i, .len = 1 };
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return null;
 }
 
 /// Build a single typed comparison leaf, honoring DECIMAL columns (decoded
@@ -552,6 +673,10 @@ fn buildTypedComparison(
         return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = bytes } });
     }
     const ptype = elem.type orelse return error.UnsupportedType;
+    if (ptype == .BYTE_ARRAY or ptype == .FIXED_LEN_BYTE_ARRAY) {
+        const value = try unquoteLiteral(arena, val_str);
+        return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = value } });
+    }
     return markStored(try buildLeafFilter(col_idx, op, val_str, ptype));
 }
 
@@ -817,6 +942,25 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
 /// Bare/unquoted literals pass through unchanged (back-compat with the
 /// original syntax). Without this, quoted string filters silently matched
 /// nothing — found by the duckdb cross-impl smoke, 2026-06-13.
+/// A string literal's value: `stripStringQuotes`, with a doubled quote inside a quoted literal read as one quote, as
+/// SQL writes `'it''s'`. Borrows `s` unless there is a doubled quote to undo.
+fn unquoteLiteral(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
+    const inner = stripStringQuotes(s);
+    if (inner.len == s.len) return s;
+    const q = s[0];
+    const doubled = [2]u8{ q, q };
+    if (std.mem.indexOf(u8, inner, &doubled) == null) return inner;
+    const out = try arena.alloc(u8, inner.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        out[n] = inner[i];
+        n += 1;
+        if (inner[i] == q and i + 1 < inner.len and inner[i + 1] == q) i += 1;
+    }
+    return out[0..n];
+}
+
 fn stripStringQuotes(s: []const u8) []const u8 {
     if (s.len >= 2) {
         const q = s[0];
@@ -1530,11 +1674,198 @@ test "parse rejects unsupported syntax with specific errors" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // Grouping parens get a named error (not the old misleading UnknownColumn).
-    try testing.expectError(error.GroupingNotSupported, parse(a, "(id > 1 OR id < 5)", &meta, null));
-    try testing.expectError(error.GroupingNotSupported, parse(a, "id > 1 AND (score < 5 OR id > 9)", &meta, null));
+    try testing.expectError(error.UnbalancedParentheses, parse(a, "(id > 1 OR id < 5", &meta, null));
+    try testing.expectError(error.UnbalancedParentheses, parse(a, "id > 1) OR (id < 5", &meta, null));
+    try testing.expectError(error.EmptyExpr, parse(a, "id > 1 AND ()", &meta, null));
+    // What parentheses remain inside a leaf are no grouping this grammar has.
+    try testing.expectError(error.BadOperator, parse(a, "(id + 1) = 2", &meta, null));
     // LIKE on a non-string column is a clear error.
     try testing.expectError(error.UnsupportedType, parse(a, "id LIKE '5%'", &meta, null));
+
+    var deep: std.ArrayList(u8) = .empty;
+    for (0..MAX_GROUP_DEPTH) |_| try deep.appendSlice(a, "(");
+    try deep.appendSlice(a, "id > 1");
+    for (0..MAX_GROUP_DEPTH) |_| try deep.appendSlice(a, ")");
+    _ = try parse(a, deep.items, &meta, null);
+    const deeper = try std.fmt.allocPrint(a, "NOT ({s})", .{deep.items});
+    try testing.expectError(error.FilterTooDeep, parse(a, deeper, &meta, null));
+}
+
+test "parse groups with parentheses, quotes and NOT as SQL does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // `(a OR b) AND c` keeps the OR beneath the AND.
+    const f = try parse(a, "(id = 1 OR id = 2) AND status = 'a'", &meta, null);
+    try testing.expect(f == .and_filter);
+    try testing.expect(f.and_filter.children[0] == .or_filter);
+    // Keywords and operators inside quotes are the value's, and a doubled quote is one quote.
+    const q = try parse(a, "status = 'x OR y AND z' OR status = 'it''s' OR status = 'a<b'", &meta, null);
+    try testing.expectEqual(@as(usize, 3), q.or_filter.children.len);
+    try testing.expectEqualStrings("x OR y AND z", q.or_filter.children[0].string.value);
+    try testing.expectEqualStrings("it's", q.or_filter.children[1].string.value);
+    try testing.expectEqualStrings("a<b", q.or_filter.children[2].string.value);
+    const in_quotes = try parse(a, "status IN ('a,b', 'c) OR (d')", &meta, null);
+    try testing.expectEqualStrings("a,b", in_quotes.or_filter.children[0].string.value);
+    try testing.expectEqualStrings("c) OR (d", in_quotes.or_filter.children[1].string.value);
+    // NOT applies to the group: De Morgan, not to its first leaf.
+    const n = try parse(a, "NOT (id = 1 AND status = 'a')", &meta, null);
+    try testing.expect(n == .or_filter);
+    try testing.expectEqual(ast.Operator.NotEq, n.or_filter.children[0].int32.op);
+    // Lower-case keywords split as upper-case ones do.
+    const lc = try parse(a, "id = 1 or not (id = 2 and id = 3)", &meta, null);
+    try testing.expect(lc == .or_filter);
+    // NOT BETWEEN is the complement of BETWEEN's range.
+    const nb = try parse(a, "id NOT BETWEEN 2 AND 4", &meta, null);
+    try testing.expect(nb == .or_filter);
+    try testing.expectEqual(ast.Operator.Lt, nb.or_filter.children[0].int32.op);
+    try testing.expectEqual(ast.Operator.Gt, nb.or_filter.children[1].int32.op);
+}
+
+/// Three-valued truth of a generated predicate for one row: null is UNKNOWN.
+const Tri = ?bool;
+
+fn triAnd(x: Tri, y: Tri) Tri {
+    if (x == false or y == false) return false;
+    if (x == null or y == null) return null;
+    return true;
+}
+
+fn triOr(x: Tri, y: Tri) Tri {
+    if (x == true or y == true) return true;
+    if (x == null or y == null) return null;
+    return false;
+}
+
+fn triNot(x: Tri) Tri {
+    return if (x) |v| !v else null;
+}
+
+const GenRow = struct { id: ?i32, status: ?[]const u8 };
+
+/// Writes a random predicate over `id` and `status` to `out` and returns its truth for each of `rows`.
+fn genPredicate(
+    a: std.mem.Allocator,
+    rand: std.Random,
+    out: *std.ArrayList(u8),
+    rows: []const GenRow,
+    depth: u32,
+) ![]Tri {
+    const truth = try a.alloc(Tri, rows.len);
+    const kw = struct {
+        fn word(r: std.Random, upper: []const u8, lower: []const u8) []const u8 {
+            return if (r.boolean()) upper else lower;
+        }
+    };
+    const pick = if (depth >= 4) rand.uintLessThan(u8, 9) else rand.uintLessThan(u8, 13);
+    switch (pick) {
+        0...8 => {
+            const v: i32 = rand.uintLessThan(u8, 4);
+            const w: i32 = v + rand.uintLessThan(u8, 3);
+            const strs = [_][]const u8{ "a", "it''s", "x OR y", "b" };
+            const vals = [_][]const u8{ "a", "it's", "x OR y", "b" };
+            const s = rand.uintLessThan(usize, strs.len);
+            switch (pick) {
+                0 => try out.print(a, "id = {d}", .{v}),
+                1 => try out.print(a, "id != {d}", .{v}),
+                2 => try out.print(a, "id < {d}", .{v}),
+                3 => try out.print(a, "id {s} ({d}, {d})", .{ kw.word(rand, "IN", "in"), v, w }),
+                4 => try out.print(a, "id NOT IN ({d}, {d})", .{ v, w }),
+                5 => try out.print(a, "id {s} {d} {s} {d}", .{ kw.word(rand, "BETWEEN", "between"), v, kw.word(rand, "AND", "and"), w }),
+                6 => try out.print(a, "id {s}", .{kw.word(rand, "IS NULL", "IS NOT NULL")}),
+                7 => try out.print(a, "status = '{s}'", .{strs[s]}),
+                8 => try out.print(a, "status LIKE '%{s}%'", .{strs[s][0..1]}),
+                else => unreachable,
+            }
+            const is_null_kw = pick == 6 and std.mem.endsWith(u8, out.items, "IS NULL");
+            for (rows, truth) |row, *t| t.* = switch (pick) {
+                0 => if (row.id) |x| x == v else null,
+                1 => if (row.id) |x| x != v else null,
+                2 => if (row.id) |x| x < v else null,
+                3 => if (row.id) |x| x == v or x == w else null,
+                4 => if (row.id) |x| x != v and x != w else null,
+                5 => if (row.id) |x| x >= v and x <= w else null,
+                6 => if (is_null_kw) row.id == null else row.id != null,
+                7 => if (row.status) |x| std.mem.eql(u8, x, vals[s]) else null,
+                8 => if (row.status) |x| std.mem.indexOf(u8, x, vals[s][0..1]) != null else null,
+                else => unreachable,
+            };
+        },
+        9 => {
+            try out.appendSlice(a, kw.word(rand, "NOT ", "not "));
+            try out.appendSlice(a, "(");
+            const inner = try genPredicate(a, rand, out, rows, depth + 1);
+            try out.appendSlice(a, ")");
+            for (inner, truth) |x, *t| t.* = triNot(x);
+        },
+        else => {
+            const conj = pick != 12;
+            const n = 2 + rand.uintLessThan(usize, 2);
+            try out.appendSlice(a, "(");
+            for (0..n) |k| {
+                if (k > 0) try out.appendSlice(a, if (conj) kw.word(rand, " AND ", " and ") else kw.word(rand, " OR ", " or "));
+                const part = try genPredicate(a, rand, out, rows, depth + 1);
+                for (part, truth) |x, *t| t.* = if (k == 0) x else if (conj) triAnd(t.*, x) else triOr(t.*, x);
+            }
+            try out.appendSlice(a, ")");
+        },
+    }
+    return truth;
+}
+
+test "fuzz-lite: nested predicates select exactly the rows three-valued logic passes" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    var rows: [64]GenRow = undefined;
+    var prng = std.Random.DefaultPrng.init(0x9a7e);
+    const rand = prng.random();
+    const statuses = [_]?[]const u8{ "a", "it's", "x OR y", "b", "ab", null };
+    for (&rows) |*r| r.* = .{
+        .id = if (rand.uintLessThan(u8, 5) == 0) null else @as(i32, rand.uintLessThan(u8, 6)),
+        .status = statuses[rand.uintLessThan(usize, statuses.len)],
+    };
+    var ids: [rows.len]i32 = undefined;
+    var id_def: [rows.len]u32 = undefined;
+    var strs: [rows.len][]const u8 = undefined;
+    var str_def: [rows.len]u32 = undefined;
+    for (rows, 0..) |r, i| {
+        ids[i] = r.id orelse 0;
+        id_def[i] = if (r.id == null) 0 else 1;
+        strs[i] = r.status orelse "";
+        str_def[i] = if (r.status == null) 0 else 1;
+    }
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs, .def_levels = &str_def, .max_def = 1, .has_nulls = true } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = rows.len };
+
+    for (0..400) |_| {
+        var text: std.ArrayList(u8) = .empty;
+        const want = try genPredicate(a, rand, &text, &rows, 0);
+        const f = parse(a, text.items, &meta, null) catch |err| {
+            std.debug.print("parse failed: {s}: {s}\n", .{ text.items, @errorName(err) });
+            return err;
+        };
+        var sel = try selection.SelectionVector.init(a, rows.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (want, 0..) |w, i| {
+            if (sel.isActive(i) != (w == true)) {
+                std.debug.print("row {d} {?d} {?s}: {s}\n", .{ i, rows[i].id, rows[i].status, text.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 test "parse LIKE → classified like node (+ NOT LIKE)" {

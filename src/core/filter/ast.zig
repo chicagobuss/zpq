@@ -56,8 +56,8 @@ pub fn applyOpStr(a: []const u8, op: Operator, b: []const u8) bool {
 
 pub const Composite = struct {
     /// The operands, two or more. Chains are flat: no operand is a composite of the same kind, except an IN list's,
-    /// which keeps its `in_set`. The filter grammar has no grouping, so a tree is at most OR, then AND, then an IN list,
-    /// then leaves deep, however long the expression: every pass over it recurses that far and no further.
+    /// which keeps its `in_set`. Only grouping parentheses deepen a tree, and the parser bounds their nesting
+    /// (`parser.MAX_GROUP_DEPTH`), so every recursive pass over it is bounded however long the expression.
     children: []const Filter,
     /// Set on the root of an IN / NOT IN list the parser built: the list's literals bound for evaluation in one pass
     /// (see `in_set.zig`). The leaves below stay for every other reader (pruning, membership).

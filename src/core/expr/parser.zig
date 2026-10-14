@@ -683,10 +683,8 @@ fn parseAggCall(
         const lp2 = try lex.next();
         if (lp2.kind != .lparen) return error.ExpectedLParen;
 
-        // Scan source for matching closing paren. The filter parser
-        // doesn't support nested parens in predicates, but we still
-        // walk depth so a future "filter parser with parens" would
-        // compose without changes here.
+        // The matching closing paren, stepping over quoted spans (a doubled quote escaping itself), so a parenthesis
+        // inside a string literal or quoted name neither opens nor closes the body.
         const body_start = lex.pos;
         var depth: usize = 1;
         var i = body_start;
@@ -696,6 +694,13 @@ fn parseAggCall(
                 ')' => {
                     depth -= 1;
                     if (depth == 0) break;
+                },
+                '\'', '"' => |q| {
+                    i += 1;
+                    while (i < lex.src.len) : (i += 1) {
+                        if (lex.src[i] != q) continue;
+                        if (i + 1 < lex.src.len and lex.src[i + 1] == q) i += 1 else break;
+                    }
                 },
                 else => {},
             }

@@ -357,10 +357,10 @@ pub fn main(init: std.process.Init) !void {
                 ),
                 error.NestedNotSupported => diagnosticPrint("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
                 error.DivisionByZero => diagnosticPrint("zpq query: division by zero\n", .{}),
-                error.GroupingNotSupported => diagnosticPrint(
-                    "filter: grouping parentheses are not supported — the grammar is a flat AND/OR chain (AND binds " ++
-                        "tighter than OR)\nzpq query: grouping parentheses are not supported in filter\n",
-                    .{},
+                error.UnbalancedParentheses => diagnosticPrint("zpq query: unbalanced parentheses in filter\n", .{}),
+                error.FilterTooDeep => diagnosticPrint(
+                    "zpq query: filter parentheses nest too deeply (limit {d})\n",
+                    .{zpq.core.filter.parser.MAX_GROUP_DEPTH},
                 ),
                 error.BadOperator => diagnosticPrint("zpq query: invalid operator in filter\n", .{}),
                 error.BadValue => diagnosticPrint("zpq query: invalid value in filter\n", .{}),
@@ -937,7 +937,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",      "HavingNotSupported",         "MixedSelectNotSupported",
         "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",       "BadOutputUrl",               "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",         "NullableNotSupported",       "NestedNotSupported",
-        "NestedRowOutputNotSupported", "GroupingNotSupported",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
         "CteNotSupported",             "AggregateInWhere",      "MissingFromClause",            "MissingTableName",          "UnsupportedFromClause",      "UnsupportedAggType",
         "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };

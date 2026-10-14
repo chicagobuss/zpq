@@ -192,6 +192,55 @@ fn quoteWholePaths(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
+/// Push every NOT down to the leaves (De Morgan; `NOT NOT p` is `p`), in place. liteparser prints a NOT's operand
+/// without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the filter grammar (as SQL) reads as
+/// `(NOT a) AND b`: a different predicate. With NOT only above leaves, every unparsed predicate (WHERE, aggregate
+/// FILTER) means what it was written as. Rewriting at enter, before the walker reads the node's children, means the
+/// NOTs it creates are visited and pushed further in turn.
+fn pushNotsDown(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
+    const Visit = struct {
+        failed: bool = false,
+        arena: *anyopaque,
+
+        fn isNot(n: *const c.LpNode) bool {
+            return n.kind == c.LP_EXPR_UNARY_OP and n.u.unary.op == c.LP_UOP_NOT and n.u.unary.operand != null;
+        }
+        fn enter(visitor: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
+            const arena: *c.arena_t = @ptrCast(@alignCast(self.arena));
+            while (isNot(node)) {
+                const operand: *c.LpNode = node.*.u.unary.operand;
+                if (isNot(operand)) {
+                    node.* = operand.u.unary.operand.*;
+                    continue;
+                }
+                if (operand.kind != c.LP_EXPR_BINARY_OP) break;
+                const op = operand.u.binary.op;
+                if (op != c.LP_OP_AND and op != c.LP_OP_OR) break;
+                const left = c.lp_node_alloc(arena, c.LP_EXPR_UNARY_OP) orelse {
+                    self.failed = true;
+                    return 2;
+                };
+                const right = c.lp_node_alloc(arena, c.LP_EXPR_UNARY_OP) orelse {
+                    self.failed = true;
+                    return 2;
+                };
+                left.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.left };
+                right.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.right };
+                node.* = operand.*;
+                node.*.u.binary.op = if (op == c.LP_OP_AND) c.LP_OP_OR else c.LP_OP_AND;
+                node.*.u.binary.left = left;
+                node.*.u.binary.right = right;
+            }
+            return 0;
+        }
+    };
+    var state: Visit = .{ .arena = lp_arena };
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(root, &visitor);
+    if (state.failed) return error.OutOfMemory;
+}
+
 fn unparseResultColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocator) ![]const u8 {
     // NOTE: lp_ast_to_sql aborts if handed a result-column wrapper — it must
     // get the inner expression. So unparse the expr, then append the alias.
@@ -255,6 +304,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     quoteWholePaths(root);
+    try pushNotsDown(root, lp_arena);
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
@@ -798,4 +848,20 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
     }
     const other = "SELECT \"r\".\"w\", count(*) FROM 't' GROUP BY r.v";
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, other));
+}
+
+test "sql_parser hands NOT over groups on as the predicate written" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, filter: []const u8 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT x FROM 't' WHERE NOT (a = 1 AND b = 2)", .filter = "NOT a = 1 OR NOT b = 2" },
+        .{ .sql = "SELECT x FROM 't' WHERE NOT ((a = 1 OR b = 2) AND c = 3)", .filter = "NOT a = 1 AND NOT b = 2 OR NOT c = 3" },
+        .{ .sql = "SELECT x FROM 't' WHERE NOT NOT (a = 1 OR b = 2) AND c = 3", .filter = "(a = 1 OR b = 2) AND c = 3" },
+        .{ .sql = "SELECT x FROM 't' WHERE (a = 1 OR b = 2) AND NOT c IN (1, 2)", .filter = "(a = 1 OR b = 2) AND NOT c IN (1, 2)" },
+    };
+    for (cases) |case| {
+        const q = try parseSqlQuery(a, case.sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualStrings(case.filter, q.filter_str.?);
+    }
 }

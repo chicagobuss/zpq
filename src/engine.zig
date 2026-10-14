@@ -470,6 +470,25 @@ pub const AggregateExplanation = struct {
     encoded: bool,
     max_memory: usize,
     sketch: ?scan.SketchTopK,
+    result: ResultExplanation = .{},
+};
+
+/// The result program's part of a plan: HAVING, hidden ORDER BY/HAVING columns, and whether the strategies may cut by
+/// the LIMIT (`masked` under HAVING, `none` without one).
+pub const ResultExplanation = struct {
+    having: bool = false,
+    hidden: usize = 0,
+    order_keys: usize = 0,
+    cut_limit: enum { none, kept, masked } = .none,
+
+    fn of(order: expr_ast.ResultOrder) ResultExplanation {
+        return .{
+            .having = order.having != null,
+            .hidden = order.hidden.len,
+            .order_keys = order.keys.len,
+            .cut_limit = if (order.limit == null) .none else if (ResultProgram.cutOrder(order).limit == null) .masked else .kept,
+        };
+    }
 };
 
 /// Planning shares the execution path, with caller-owned arena storage and metadata-only input opening.
@@ -599,6 +618,7 @@ fn executeAggregate(
             .encoded = scan_args.encoded,
             .max_memory = args.max_memory,
             .sketch = scan_args.sketch_topk,
+            .result = .of(args.result_order),
         };
     }
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
@@ -4523,7 +4543,12 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
             );
         },
     }
-    try writer.writeAll("],\"runtime\":{\"batch_encoding\":true,\"slicing\":true,\"bloom_probing\":\"execution_only\"}}\n");
+    // The stage every strategy feeds (`ResultProgram`): what it keeps, ranks and drops after the groups are complete.
+    const r = explanation.result;
+    try writer.print("],\"result_program\":{{\"having\":{},\"hidden_columns\":{d},\"order_keys\":{d},\"cut_limit\":\"{s}\"}}", .{
+        r.having, r.hidden, r.order_keys, @tagName(r.cut_limit),
+    });
+    try writer.writeAll(",\"runtime\":{\"batch_encoding\":true,\"slicing\":true,\"bloom_probing\":\"execution_only\"}}\n");
 }
 
 fn writeExplainPass(

@@ -548,14 +548,15 @@ fn executeAggregate(
     // (under HAVING, no limit), and the shape is decided from the query bound to the footer, as the scan binds it.
     var cut_args = args;
     cut_args.result_order = ResultProgram.cutOrder(args.result_order);
+    // The footers, parsed once here when the cut shape needs one, serve the scan below as well.
+    var steer_metas: ?[]const schema.FileMetaData = null;
     if (io_policy.profile == .auto and args.group_by != null and cut_args.result_order.limit != null and
         !empty_result and allLocal(opened))
         if (sketchFromEnv(ctx.env)) |cfg| steer: {
             // A footer that does not parse is reported where the scan parses it; it steers nothing here.
-            const meta0 = if (opened.meta_ready[0])
-                opened.metas[0]
-            else
-                metadata.open(arena, opened.inputs[0].bytes) catch break :steer;
+            const m = materializeMetas(arena, opened, null, prof) catch break :steer;
+            steer_metas = m;
+            const meta0 = m[0];
             var probe_args: scan.MultiAggArgs = .{
                 .inputs = &.{},
                 .aggregate = agg_str,
@@ -581,8 +582,9 @@ fn executeAggregate(
     const plan_io = all_local and (io_policy.profile == .pread or io_policy.profile == .uring or
         (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
-    const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io) blk: {
-        const m = try materializeMetas(arena, opened, args.diag, prof);
+    const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
+        steer_metas != null) blk: {
+        const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
         else

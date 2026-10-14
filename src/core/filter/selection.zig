@@ -67,6 +67,11 @@ pub const SelectionVector = struct {
         return false;
     }
 
+    /// Deselect every row.
+    pub fn clearAll(self: *SelectionVector) void {
+        @memset(self.mask, 0);
+    }
+
     /// Replace this bitmask with `mask AND other`.
     pub fn intersect(self: *SelectionVector, other: *const SelectionVector) void {
         std.debug.assert(self.len == other.len);

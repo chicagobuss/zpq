@@ -463,6 +463,7 @@ pub fn evaluate(
             evalLike(col.string.values, col.string.def_levels, col.string.max_def, m, sel);
         },
         .and_filter => |c| {
+            if (c.neverTrue(true)) return sel.clearAll();
             if (c.in_set) |s| return evalInList(filter, s, batch, sel, column_lookup, arena);
             // Leaves of one AND chain that test the same coded column combine into one
             // per-entry match table and a single pass over the rows.
@@ -471,6 +472,7 @@ pub fn evaluate(
             for (c.children) |child| try evaluate(child, batch, sel, column_lookup, arena);
         },
         .or_filter => |c| {
+            if (c.neverTrue(false)) return sel.clearAll();
             if (c.in_set) |s| return evalInList(filter, s, batch, sel, column_lookup, arena);
             // OR: every operand evaluates against the same entry set; their results are merged.
             var entry = try sel.cloneAlloc(arena);
@@ -593,7 +595,7 @@ fn evalCodedLeaf(
 fn flattenAnd(f: ast.Filter, out: *std.ArrayList(ast.Filter), arena: std.mem.Allocator) Error!void {
     switch (f) {
         // A NOT IN list stays whole: its set tests it in one pass, its `!=` leaves one pass each.
-        .and_filter => |c| if (c.in_set != null) try out.append(arena, f) else {
+        .and_filter => |c| if (c.in_set != null or c.null_member) try out.append(arena, f) else {
             for (c.children) |child| try flattenAnd(child, out, arena);
         },
         else => try out.append(arena, f),

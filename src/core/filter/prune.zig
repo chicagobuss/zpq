@@ -68,6 +68,7 @@ pub fn pruneRowGroup(
         // win); conservatively keep for now. Correctness is in eval.
         .like => .unknown,
         .and_filter, .or_filter => |c| blk: {
+            if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = pruneRowGroup(rg, c.children[0], file_meta);
             for (c.children[1..]) |child| {
                 const e = pruneRowGroup(rg, child, file_meta);
@@ -788,6 +789,7 @@ pub fn prunePage(
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
         .like => .unknown,
         .and_filter, .or_filter => |c| blk: {
+            if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = prunePage(rg, page_idx, c.children[0], col_indexes, file_meta, trust_stats);
             for (c.children[1..]) |child| {
                 const e = prunePage(rg, page_idx, child, col_indexes, file_meta, trust_stats);

@@ -60,6 +60,14 @@ FILTERS = [
     ("amt_isnull",    "amt IS NULL",            "amt IS NULL"),
     ("flag_isnull",   "flag IS NULL",           "flag IS NULL"),
     ("empty_name",    "name = ''",              "name = ''"),
+    # A NULL member of an IN list matches nothing and makes every non-match UNKNOWN: IN keeps its matches, NOT IN
+    # (and NOT over IN) keeps no row. On strings, NULL is the NULL literal, not the text 'NULL'.
+    ("in_null_str",   "name IN ('n5', NULL, 'n7')",     "name IN ('n5', NULL, 'n7')"),
+    ("not_in_null_str", "name NOT IN ('n5', NULL)",     "name NOT IN ('n5', NULL)"),
+    ("in_null_num",   "id IN (1, NULL, 5)",             "id IN (1, NULL, 5)"),
+    ("not_in_null_num", "id NOT IN (1, null)",          "id NOT IN (1, null)"),
+    ("not_group_in_null", "NOT (id IN (1, NULL)) OR id = 7", "NOT (id IN (1, NULL)) OR id = 7"),
+    ("not_not_in_null", "NOT (id NOT IN (1, NULL))",    "NOT (id NOT IN (1, NULL))"),
     # Grouping, NOT over a group, and keywords or parentheses inside quoted literals.
     ("paren_not",     "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')",
                       "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')"),

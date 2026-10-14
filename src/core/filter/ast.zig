@@ -62,6 +62,16 @@ pub const Composite = struct {
     /// Set on the root of an IN / NOT IN list the parser built: the list's literals bound for evaluation in one pass
     /// (see `in_set.zig`). The leaves below stay for every other reader (pruning, membership).
     in_set: ?*const in_set_mod.InSet = null,
+    /// A NULL member of an IN list (or a comparison with NULL): UNKNOWN for every row no other member matches. The OR
+    /// form (`x IN (1, NULL)`) is then exactly the OR of its children, which may be none (`x = NULL`); the AND form
+    /// (`x NOT IN (1, NULL)`, or a negated IN) is never TRUE. Negation flips the form and keeps the flag, and such a
+    /// node is never flattened into a chain around it, whose negation would lose it.
+    null_member: bool = false,
+
+    /// Whether this node, an AND, can pass no row whatever its children say.
+    pub fn neverTrue(self: Composite, conjunction: bool) bool {
+        return self.null_member and (conjunction or self.children.len == 0);
+    }
 };
 
 const in_set_mod = @import("in_set.zig");
@@ -249,7 +259,7 @@ pub fn eql(a: Filter, b: Filter) bool {
     return switch (a) {
         .and_filter, .or_filter => |ca| blk: {
             const cb = if (a == .and_filter) b.and_filter else b.or_filter;
-            if (ca.children.len != cb.children.len) break :blk false;
+            if (ca.children.len != cb.children.len or ca.null_member != cb.null_member) break :blk false;
             for (ca.children, cb.children) |x, y| if (!eql(x, y)) break :blk false;
             break :blk true;
         },
@@ -284,8 +294,8 @@ pub fn join(arena: std.mem.Allocator, conjunction: bool, operands: []const Filte
     var flat: std.ArrayList(Filter) = .empty;
     for (operands) |o| {
         const same: ?Composite = switch (o) {
-            .and_filter => |c| if (conjunction and c.in_set == null) c else null,
-            .or_filter => |c| if (!conjunction and c.in_set == null) c else null,
+            .and_filter => |c| if (conjunction and c.in_set == null and !c.null_member) c else null,
+            .or_filter => |c| if (!conjunction and c.in_set == null and !c.null_member) c else null,
             else => null,
         };
         if (same) |c| try flat.appendSlice(arena, c.children) else try flat.append(arena, o);

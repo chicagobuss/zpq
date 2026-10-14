@@ -430,23 +430,35 @@ fn parseInList(
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
     var leaves: std.ArrayList(ast.Filter) = .empty;
+    var null_member = false;
     var cur: Cursor = .{ .src = vals };
     var start: usize = 0;
     while (true) {
         const comma = try cur.find(",");
         const v = trimSpace(vals[start .. comma orelse vals.len]);
         if (v.len == 0) return error.BadValue;
-        try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
+        // The NULL literal is no value to compare with, on a string column as on any other.
+        if (isNullLiteral(v)) null_member = true else {
+            try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
+        }
         start = (comma orelse break) + 1;
     }
     // One node for the whole list, however long: OR of `= v` (AND of `!= v`), with its set bound beside the leaves.
-    if (leaves.items.len == 1) return leaves.items[0];
+    if (leaves.items.len == 1 and !null_member) return leaves.items[0];
     const c: ast.Composite = .{
         .children = leaves.items,
-        .in_set = try bindInSet(arena, col_idx, inc.negated, leaves.items),
+        .in_set = if (leaves.items.len > 1) try bindInSet(arena, col_idx, inc.negated, leaves.items) else null,
+        .null_member = null_member,
     };
     return if (inc.negated) .{ .and_filter = c } else .{ .or_filter = c };
 }
+
+fn isNullLiteral(v: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(v, "NULL");
+}
+
+/// `x op NULL`: UNKNOWN for every row, which neither it nor its negation passes.
+const unknown: ast.Filter = .{ .or_filter = .{ .children = &.{}, .null_member = true } };
 
 /// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't hold
 /// (boolean) or one of them isn't a plain `=` (`!=` for NOT IN) or a constant, which then evaluate leaf by leaf.
@@ -536,6 +548,7 @@ fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
             const flipped: ast.Composite = .{
                 .children = children,
                 .in_set = if (c.in_set) |s| try s.negate(arena) else null,
+                .null_member = c.null_member,
             };
             break :blk if (f == .and_filter) .{ .or_filter = flipped } else .{ .and_filter = flipped };
         },
@@ -585,6 +598,10 @@ fn parseComparisonLeaf(
     const col_name = trimSpace(expr[0..found_at]);
     const val_str = trimSpace(expr[found_at + found_len ..]);
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
+    if (isNullLiteral(val_str)) {
+        _ = try resolveCol(file, col_name, diag);
+        return unknown;
+    }
     // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
     if (std.mem.indexOfScalar(u8, col_name, '(') != null) return error.BadOperator;
 
@@ -1822,6 +1839,46 @@ fn genPredicate(
         },
     }
     return truth;
+}
+
+test "a NULL in an IN list matches nothing and leaves NOT IN true for no row, under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ids = [_]i32{ 1, 2, 5, 0 };
+    const id_def = [_]u32{ 1, 1, 1, 0 };
+    const strs = [_][]const u8{ "foo", "NULL", "bar", "" };
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "id IN (1, NULL, 5)", .want = .{ true, false, true, false } },
+        .{ .filter = "id NOT IN (1, NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (id IN (1, NULL))", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (id NOT IN (1, NULL))", .want = .{ true, false, false, false } },
+        .{ .filter = "id IN (NULL) OR id = 2", .want = .{ false, true, false, false } },
+        .{ .filter = "id = NULL OR NOT (id != NULL)", .want = .{ false, false, false, false } },
+        // On a string column, NULL is the NULL literal, never the text 'NULL'.
+        .{ .filter = "status NOT IN ('foo', NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "status IN ('NULL', null)", .want = .{ false, true, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
 }
 
 test "fuzz-lite: nested predicates select exactly the rows three-valued logic passes" {

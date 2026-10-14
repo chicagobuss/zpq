@@ -523,7 +523,10 @@ fn executeAggregate(
     // the mapping serves both passes (the first warms the page cache for the second), where the explicit reader reads
     // each row group once and so rules the sketch out. Even cold, the two cheap passes beat one full grouping on a
     // skewed key; when the sketch then declines, the mapping costs little.
-    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null and countCutShaped(args))
+    // What the strategies may cut by (`ResultProgram.cutOrder`): under HAVING, no limit.
+    var cut_args = args;
+    cut_args.result_order = ResultProgram.cutOrder(args.result_order);
+    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null and countCutShaped(cut_args))
         io_policy.profile = .mmap;
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
@@ -566,7 +569,7 @@ fn executeAggregate(
         .leave_regions = ctx.exit_after,
         .unordered = args.unordered,
         .select_cols = args.select_cols,
-        .result_order = args.result_order,
+        .result_order = cut_args.result_order,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
@@ -649,6 +652,8 @@ fn executeAggregate(
     if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
     const program: ResultProgram = .{ .order = args.result_order, .visible = r.visible_cols };
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
+    // Without GROUP BY, the aggregates shown: the hidden HAVING terms follow them.
+    const n_aggs = if (r.output.group_rows == null) r.visible_cols orelse r.state.agg_calls.len else r.state.agg_calls.len;
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.
@@ -664,7 +669,7 @@ fn executeAggregate(
         bytes_out = if (r.output.group_rows) |rows|
             try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd, args.output_fd)
         else
-            try writeOneRowParquet(arena, out_path, st.agg_calls, st.accumulators, st.agg_sources, codec, zstd, args.output_fd, args.empty_scalar);
+            try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));

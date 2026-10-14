@@ -22,9 +22,15 @@ pub const ParsedQuery = struct {
     select_cols: []const ast.SelectColumn = &.{},
     /// ORDER BY / LIMIT / OFFSET of an aggregate query, applied to its result rows.
     result_order: ast.ResultOrder = .{},
+    /// Holds `result_order.having`.
+    having_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
         freeResultOrder(allocator, self.result_order);
+        if (self.having_arena) |ha| {
+            ha.deinit();
+            allocator.destroy(ha);
+        }
         allocator.free(self.table_name);
         if (self.select_str) |s| allocator.free(s);
         if (self.aggregate_str) |a| allocator.free(a);
@@ -161,11 +167,7 @@ fn rejectUnsupportedClauses(sel: anytype) !void {
         diagnosticPrint("sql: DISTINCT is not supported yet\n", .{});
         return error.DistinctNotSupported;
     }
-    // GROUP BY is supported
-    if (sel.having != null) {
-        diagnosticPrint("sql: HAVING is not supported yet\n", .{});
-        return error.HavingNotSupported;
-    }
+    // GROUP BY and HAVING are supported.
     // ORDER BY / LIMIT / OFFSET are resolved against the result columns in `resultOrder`.
     if (sel.window_defs.count > 0) {
         diagnosticPrint("sql: window functions are not supported yet\n", .{});
@@ -406,8 +408,42 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         if (has_group_by) select_cols[col_idx].role = if (analyzeExpr(rc).has_agg) .agg else .key;
         col_idx += 1;
     }
-    const result_order = try resultOrder(allocator, root.*.u.select, lp_arena, select_cols, is_aggregate, has_group_by);
-    errdefer freeResultOrder(allocator, result_order);
+    var hidden: std.ArrayList(ast.SelectColumn) = .empty;
+    defer {
+        freeSelectCols(allocator, hidden.items);
+        hidden.deinit(allocator);
+    }
+    const sel = root.*.u.select;
+    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden);
+    errdefer allocator.free(result_order.keys);
+    var having_arena: ?*std.heap.ArenaAllocator = null;
+    errdefer if (having_arena) |ha| {
+        ha.deinit();
+        allocator.destroy(ha);
+    };
+    if (sel.having) |having| {
+        if (!is_aggregate) {
+            diagnosticPrint("sql: HAVING needs an aggregate or GROUP BY\n", .{});
+            return error.HavingNotSupported;
+        }
+        const ha = try allocator.create(std.heap.ArenaAllocator);
+        ha.* = .init(allocator);
+        having_arena = ha;
+        var ctx: HavingBuilder(@TypeOf(sel)) = .{
+            .allocator = allocator,
+            .arena = ha.allocator(),
+            .sel = sel,
+            .lp_arena = lp_arena,
+            .select_cols = select_cols,
+            .has_group_by = has_group_by,
+            .hidden = &hidden,
+        };
+        const tree = try ha.allocator().create(ast.Having);
+        tree.* = try ctx.build(having, 0);
+        result_order.having = tree;
+    }
+    result_order.hidden = try hidden.toOwnedSlice(allocator);
+    errdefer freeSelectCols(allocator, result_order.hidden);
 
     // Join result columns with ", "
     var joined_cols: std.ArrayList(u8) = .empty;
@@ -490,6 +526,18 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             }
             aggregate_str = try joined_agg.toOwnedSlice(allocator);
         }
+    } else if (is_aggregate) {
+        // Without GROUP BY every SELECT item is an aggregate; hidden HAVING aggregates follow them.
+        var joined: std.ArrayList(u8) = .empty;
+        errdefer joined.deinit(allocator);
+        try joined.appendSlice(allocator, columns_str);
+        for (result_order.hidden, 0..) |h, n| if (h.role == .agg) {
+            try joined.print(allocator, ", {s} AS {s}{d}", .{ h.expr, hidden_alias, n });
+        };
+        if (joined.items.len != columns_str.len) {
+            aggregate_str = try joined.toOwnedSlice(allocator);
+            allocator.free(columns_str);
+        } else joined.deinit(allocator);
     }
 
     if (is_aggregate) {
@@ -502,6 +550,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .group_by_str = group_by_str,
             .select_cols = select_cols,
             .result_order = result_order,
+            .having_arena = having_arena,
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
@@ -517,6 +566,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .aggregate_str = null,
             .filter_str = filter_str,
             .result_order = result_order,
+            .having_arena = having_arena,
         };
     }
     return .{
@@ -527,6 +577,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         .filter_str = filter_str,
         .select_cols = select_cols,
         .result_order = result_order,
+        .having_arena = having_arena,
     };
 }
 
@@ -545,6 +596,7 @@ fn resultOrder(
     select_cols: []const ast.SelectColumn,
     is_aggregate: bool,
     has_group_by: bool,
+    hidden: *std.ArrayList(ast.SelectColumn),
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
     if (!is_aggregate) {
@@ -560,11 +612,6 @@ fn resultOrder(
         if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
     }
 
-    var hidden: std.ArrayList(ast.SelectColumn) = .empty;
-    defer {
-        freeSelectCols(allocator, hidden.items);
-        hidden.deinit(allocator);
-    }
     const keys = try allocator.alloc(ast.OrderKey, n_terms);
     errdefer allocator.free(keys);
     for (keys, 0..) |*key, t| {
@@ -576,39 +623,42 @@ fn resultOrder(
         }
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
-            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, &hidden);
+            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden);
         key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
     }
     order.keys = keys;
-    order.hidden = try hidden.toOwnedSlice(allocator);
     return order;
 }
 
-/// Add ORDER BY term `expr`, which names no SELECT column, to `hidden` (once: a term written alike is reused); its
-/// index there. Only a GROUP BY query has
-/// such a term: an aggregate, or an expression whose columns are all grouped.
+const Clause = enum { order_by, having };
+
+/// Add ORDER BY or HAVING term `expr`, which names no SELECT column, to `hidden` (once: an equal term already there is
+/// reused); its index there. Under GROUP BY such a term is an aggregate or an expression whose columns are all
+/// grouped; without GROUP BY, HAVING may read an aggregate the SELECT list lacks, and ORDER BY nothing.
 fn hiddenTerm(
     allocator: std.mem.Allocator,
     sel: anytype,
     lp_arena: *c.arena_t,
     expr: *c.LpNode,
     has_group_by: bool,
+    clause: Clause,
     hidden: *std.ArrayList(ast.SelectColumn),
 ) !usize {
     const text_c = c.lp_ast_to_sql(expr, lp_arena);
     if (text_c == null) return error.UnparseError;
     const text = std.mem.span(text_c);
-    if (!has_group_by) {
-        diagnosticPrint("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
-        return error.OrderByNotSupported;
-    }
+    const name = if (clause == .order_by) "ORDER BY" else "HAVING";
     const info = analyzeExpr(expr);
+    if (!has_group_by and (clause == .order_by or !info.has_agg)) {
+        diagnosticPrint("sql: {s} {s} must name a result column (by position, alias or expression)\n", .{ name, text });
+        return if (clause == .order_by) error.OrderByNotSupported else error.ColumnMustBeGrouped;
+    }
     if (info.has_window or info.has_subquery or info.has_func_distinct) {
-        diagnosticPrint("sql: ORDER BY {s} is not supported yet\n", .{text});
-        return error.OrderByNotSupported;
+        diagnosticPrint("sql: {s} {s} is not supported yet\n", .{ name, text });
+        return if (clause == .order_by) error.OrderByNotSupported else error.HavingNotSupported;
     }
     if (!info.has_agg and info.has_bare_col and !try groupedExpr(allocator, sel, lp_arena, expr)) {
-        diagnosticPrint("sql: ORDER BY {s} must be in the GROUP BY list or aggregated\n", .{text});
+        diagnosticPrint("sql: {s} {s} must be in the GROUP BY list or aggregated\n", .{ name, text });
         return error.ColumnMustBeGrouped;
     }
     // Written alike, one slot: `ORDER BY count(*) DESC, count(*)` computes one aggregate.
@@ -616,6 +666,138 @@ fn hiddenTerm(
     try hidden.ensureUnusedCapacity(allocator, 1);
     hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
     return hidden.items.len - 1;
+}
+
+/// Lowers a HAVING clause, its NOTs already at the leaves (`pushNotsDown`), to an `ast.Having` over result row
+/// columns: each leaf compares one result (a SELECT column by alias or expression, else a hidden term) with a literal.
+/// Chains build in a loop; only grouping recurses, bounded as the filter grammar bounds it.
+fn HavingBuilder(comptime Sel: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        sel: Sel,
+        lp_arena: *c.arena_t,
+        select_cols: []const ast.SelectColumn,
+        has_group_by: bool,
+        hidden: *std.ArrayList(ast.SelectColumn),
+
+        const Self = @This();
+        const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
+
+        fn unsupported(self: *Self, node: *c.LpNode) anyerror {
+            const text = c.lp_ast_to_sql(node, self.lp_arena);
+            if (text == null) return error.UnparseError;
+            diagnosticPrint("sql: HAVING {s} is not supported yet (compare an aggregate or key with a literal)\n", .{
+                std.mem.span(text),
+            });
+            return error.HavingNotSupported;
+        }
+
+        fn build(self: *Self, node: *c.LpNode, depth: u32) anyerror!ast.Having {
+            if (depth > max_depth) return error.FilterTooDeep;
+            switch (node.kind) {
+                c.LP_EXPR_BINARY_OP => {
+                    const op = node.u.binary.op;
+                    if (op == c.LP_OP_AND or op == c.LP_OP_OR) return self.chain(node, op, depth);
+                    const left = node.u.binary.left orelse return self.unsupported(node);
+                    const right = node.u.binary.right orelse return self.unsupported(node);
+                    if (op == c.LP_OP_IS or op == c.LP_OP_ISNOT) {
+                        if (right.*.kind != c.LP_EXPR_LITERAL_NULL) return self.unsupported(node);
+                        return .{ .null_check = .{ .column = try self.term(left), .is_not = op == c.LP_OP_ISNOT } };
+                    }
+                    const cmp: ast.CmpOp = switch (op) {
+                        c.LP_OP_EQ => .eq,
+                        c.LP_OP_NE => .ne,
+                        c.LP_OP_LT => .lt,
+                        c.LP_OP_LE => .le,
+                        c.LP_OP_GT => .gt,
+                        c.LP_OP_GE => .ge,
+                        else => return self.unsupported(node),
+                    };
+                    if (try self.literal(right)) |lit| {
+                        if (try self.literal(left) != null) return self.unsupported(node);
+                        return .{ .cmp = .{ .column = try self.term(left), .op = cmp, .literal = lit } };
+                    }
+                    const lit = try self.literal(left) orelse return self.unsupported(node);
+                    return .{ .cmp = .{ .column = try self.term(right), .op = cmp.flip(), .literal = lit } };
+                },
+                c.LP_EXPR_UNARY_OP => {
+                    if (node.u.unary.op != c.LP_UOP_NOT) return self.unsupported(node);
+                    const inner = try self.build(node.u.unary.operand orelse return self.unsupported(node), depth + 1);
+                    return inner.negated(self.arena);
+                },
+                c.LP_EXPR_BETWEEN => {
+                    const b = node.u.between;
+                    const column = try self.term(b.expr orelse return self.unsupported(node));
+                    const lo = try self.literal(b.low orelse return self.unsupported(node)) orelse return self.unsupported(node);
+                    const hi = try self.literal(b.high orelse return self.unsupported(node)) orelse return self.unsupported(node);
+                    const terms = try self.arena.alloc(ast.Having, 2);
+                    terms[0] = .{ .cmp = .{ .column = column, .op = .ge, .literal = lo } };
+                    terms[1] = .{ .cmp = .{ .column = column, .op = .le, .literal = hi } };
+                    const range: ast.Having = .{ .all = terms };
+                    return if (b.is_not != 0) range.negated(self.arena) else range;
+                },
+                c.LP_EXPR_IN => {
+                    const in = node.u.in;
+                    if (in.select != null or in.values.count == 0) return self.unsupported(node);
+                    const column = try self.term(in.expr orelse return self.unsupported(node));
+                    const terms = try self.arena.alloc(ast.Having, @intCast(in.values.count));
+                    for (terms, 0..) |*t, i| {
+                        const v = in.values.items[i] orelse return self.unsupported(node);
+                        const lit = try self.literal(v) orelse return self.unsupported(node);
+                        t.* = .{ .cmp = .{ .column = column, .op = .eq, .literal = lit } };
+                    }
+                    const list: ast.Having = .{ .any = terms };
+                    return if (in.is_not != 0) list.negated(self.arena) else list;
+                },
+                else => return self.unsupported(node),
+            }
+        }
+
+        /// A chain of one operator, its operands gathered with a stack rather than recursion: left-deep chains of any
+        /// length cost no parse depth.
+        fn chain(self: *Self, node: *c.LpNode, op: anytype, depth: u32) anyerror!ast.Having {
+            var stack: std.ArrayList(*c.LpNode) = .empty;
+            defer stack.deinit(self.allocator);
+            var operands: std.ArrayList(ast.Having) = .empty;
+            try stack.append(self.allocator, node);
+            while (stack.pop()) |n| {
+                if (n.kind == c.LP_EXPR_BINARY_OP and n.u.binary.op == op) {
+                    try stack.append(self.allocator, n.u.binary.right orelse return self.unsupported(n));
+                    try stack.append(self.allocator, n.u.binary.left orelse return self.unsupported(n));
+                    continue;
+                }
+                try operands.append(self.arena, try self.build(n, depth + 1));
+            }
+            return if (op == c.LP_OP_AND) .{ .all = operands.items } else .{ .any = operands.items };
+        }
+
+        /// `node` as a HAVING literal, or null when it is none: a number (a minus sign folded in), a string or NULL.
+        fn literal(self: *Self, node: *c.LpNode) !?ast.HavingLiteral {
+            switch (node.kind) {
+                c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT => {
+                    return .{ .number = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)) };
+                },
+                c.LP_EXPR_LITERAL_STRING => return .{ .string = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)) },
+                c.LP_EXPR_LITERAL_NULL => return .null,
+                c.LP_EXPR_UNARY_OP => {
+                    if (node.u.unary.op != c.LP_UOP_MINUS) return null;
+                    const operand = node.u.unary.operand orelse return null;
+                    if (operand.*.kind != c.LP_EXPR_LITERAL_INT and operand.*.kind != c.LP_EXPR_LITERAL_FLOAT) return null;
+                    const text = std.mem.span(operand.*.u.literal.value);
+                    return .{ .number = try std.fmt.allocPrint(self.arena, "-{s}", .{text}) };
+                },
+                else => return null,
+            }
+        }
+
+        /// The result row column a HAVING operand reads: a SELECT column it names, else a hidden term.
+        fn term(self: *Self, node: *c.LpNode) !usize {
+            if (try orderColumn(self.sel, self.lp_arena, self.select_cols, node)) |i| return i;
+            return self.select_cols.len +
+                try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden);
+        }
+    };
 }
 
 /// The SELECT-list position an ORDER BY term names: a 1-based position, an alias, or an expression written as in the
@@ -787,7 +969,7 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     defer limited.deinit(a);
     try std.testing.expectEqual(@as(?u64, 5), limited.result_order.limit);
     try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT x FROM 't'"));
-    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' HAVING sum(x) > 1"));
+    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT x FROM 't' HAVING x > 1"));
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
     try std.testing.expectError(error.UnsupportedStatement, parseSqlQuery(a, "SELECT x FROM 't' UNION SELECT x FROM 'u'"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY z"));
@@ -982,4 +1164,33 @@ test "sql_parser hands NOT over groups on as the predicate written" {
         defer q.deinit(a);
         try std.testing.expectEqualStrings(case.filter, q.filter_str.?);
     }
+}
+
+test "sql_parser lowers HAVING to result columns, hidden terms and literals" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k, count(*) AS c FROM 't' GROUP BY k HAVING c > 100000 AND NOT (sum(x) BETWEEN -1 AND 2.5 OR k IS NULL) ORDER BY sum(x)");
+    defer q.deinit(a);
+    const h = q.result_order.having.?.*;
+    // NOT (range OR null) pushes down to (outside the range AND not null), which joins the top chain.
+    try std.testing.expectEqual(@as(usize, 3), h.all.len);
+    try std.testing.expectEqual(@as(usize, 1), h.all[0].cmp.column);
+    try std.testing.expectEqual(ast.CmpOp.gt, h.all[0].cmp.op);
+    try std.testing.expectEqualStrings("100000", h.all[0].cmp.literal.number);
+    // The hidden sum(x) is shared with ORDER BY.
+    try std.testing.expectEqual(ast.CmpOp.lt, h.all[1].any[0].cmp.op);
+    try std.testing.expectEqualStrings("-1", h.all[1].any[0].cmp.literal.number);
+    try std.testing.expectEqual(@as(usize, 2), h.all[1].any[0].cmp.column);
+    try std.testing.expect(h.all[2].null_check.is_not);
+    try std.testing.expectEqual(@as(usize, 1), q.result_order.hidden.len);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.keys[0].column);
+
+    // Without GROUP BY a HAVING aggregate may be hidden; a literal on the left flips.
+    const g = try parseSqlQuery(a, "SELECT count(*) FROM 't' HAVING 5 < sum(x)");
+    defer g.deinit(a);
+    try std.testing.expectEqual(ast.CmpOp.gt, g.result_order.having.?.cmp.op);
+    try std.testing.expectEqual(@as(usize, 1), g.result_order.having.?.cmp.column);
+    try std.testing.expectEqualStrings("count(*), sum(x) AS " ++ hidden_alias ++ "0", g.aggregate_str.?);
+
+    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > sum(x)"));
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING z > 1"));
 }

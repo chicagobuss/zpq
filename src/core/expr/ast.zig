@@ -340,9 +340,93 @@ pub const ResultOrder = struct {
     keys: []const OrderKey = &.{},
     limit: ?u64 = null,
     offset: u64 = 0,
-    /// ORDER BY terms no SELECT column gives (SQL `GROUP BY k ORDER BY count(*)` without `count(*)` selected): result
-    /// row columns after the SELECT list's, ranked by and then dropped before the answer is shown.
+    /// ORDER BY and HAVING terms no SELECT column gives (SQL `GROUP BY k ORDER BY count(*)` without `count(*)`
+    /// selected): result row columns after the SELECT list's, read and then dropped before the answer is shown.
     hidden: []const SelectColumn = &.{},
+    /// HAVING, over result row columns; rows it does not make TRUE are dropped before ORDER BY ranks them.
+    having: ?*const Having = null,
+};
+
+/// A comparison operator of a HAVING leaf.
+pub const CmpOp = enum {
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+
+    pub fn negate(self: CmpOp) CmpOp {
+        return switch (self) {
+            .eq => .ne,
+            .ne => .eq,
+            .lt => .ge,
+            .le => .gt,
+            .gt => .le,
+            .ge => .lt,
+        };
+    }
+
+    /// The operator with its operands swapped: `5 < x` is `x > 5`.
+    pub fn flip(self: CmpOp) CmpOp {
+        return switch (self) {
+            .eq, .ne => self,
+            .lt => .gt,
+            .le => .ge,
+            .gt => .lt,
+            .ge => .le,
+        };
+    }
+
+    pub fn holds(self: CmpOp, ord: std.math.Order) bool {
+        return switch (self) {
+            .eq => ord == .eq,
+            .ne => ord != .eq,
+            .lt => ord == .lt,
+            .le => ord != .gt,
+            .gt => ord == .gt,
+            .ge => ord != .lt,
+        };
+    }
+};
+
+/// A HAVING literal as written: a number's text, typed only against the result column it meets (an integer, an
+/// exact decimal or a double), a string's bytes, or NULL.
+pub const HavingLiteral = union(enum) {
+    null,
+    number: []const u8,
+    string: []const u8,
+};
+
+/// A HAVING predicate over a result row's columns (`OrderKey.column` positions). NOT is pushed to the leaves, so a
+/// row whose column is NULL fails a leaf and its negation alike (UNKNOWN), and only TRUE keeps a row.
+pub const Having = union(enum) {
+    all: []const Having,
+    any: []const Having,
+    cmp: struct { column: usize, op: CmpOp, literal: HavingLiteral },
+    null_check: struct { column: usize, is_not: bool },
+
+    /// The predicate's negation, structurally (De Morgan, leaves flipped), never a complement of the rows it passes.
+    pub fn negated(self: Having, arena: std.mem.Allocator) std.mem.Allocator.Error!Having {
+        return switch (self) {
+            .all, .any => |terms| blk: {
+                const out = try arena.alloc(Having, terms.len);
+                for (terms, out) |t, *o| o.* = try t.negated(arena);
+                break :blk if (self == .all) .{ .any = out } else .{ .all = out };
+            },
+            .cmp => |c| .{ .cmp = .{ .column = c.column, .op = c.op.negate(), .literal = c.literal } },
+            .null_check => |n| .{ .null_check = .{ .column = n.column, .is_not = !n.is_not } },
+        };
+    }
+
+    /// Call `f` on every column a leaf reads.
+    pub fn eachColumn(self: Having, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) void {
+        switch (self) {
+            .all, .any => |terms| for (terms) |t| t.eachColumn(ctx, f),
+            .cmp => |c| f(ctx, c.column),
+            .null_check => |n| f(ctx, n.column),
+        }
+    }
 };
 
 /// One output column as a select list writes it, before binding: the expression's text and its `AS` alias. GROUP BY

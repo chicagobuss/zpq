@@ -670,6 +670,65 @@ def main():
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
 
+    # HAVING keeps the complete groups it makes TRUE, then ORDER BY / LIMIT cut once: a cut taken before HAVING (count
+    # cut, sketch, census, TPUT, ResultCut) would rank the wrong set and underfill. g = floor(sqrt(i)) gives group g
+    # 2g + 1 rows, so the largest counts are exactly the ones HAVING drops. x is NULL in places, all NULL in group 7.
+    hav = os.path.join(tmp, "having.parquet")
+    con.execute(f"""COPY (SELECT floor(sqrt(i))::INTEGER AS g, (i % 3)::INTEGER AS h, i::BIGINT AS v,
+        (CASE WHEN i % 11 = 0 OR floor(sqrt(i)) = 7 THEN NULL ELSE i * 1.5 END)::DOUBLE AS x,
+        CAST(i AS DECIMAL(18,2)) AS p, ('s' || (i % 17)) AS s
+      FROM range(0, 1000000) t(i)) TO '{hav}' (FORMAT PARQUET, ROW_GROUP_SIZE 65536)""")
+    HAVING_SQL = [
+        "SELECT g, count(*) AS c FROM '{f}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
+        "SELECT g, count(*) AS c FROM '{f}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
+        "SELECT g FROM '{f}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
+        "SELECT g, max(v) AS m FROM '{f}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
+        # NULL is UNKNOWN: neither a predicate on sum(x) nor its negation keeps group 7.
+        "SELECT g, count(*) AS c FROM '{f}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
+        "SELECT g, count(*) AS c FROM '{f}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
+        "SELECT g, count(*) AS c FROM '{f}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
+        # Exact DECIMAL and integer comparisons, an IN list, a string key, an AVG mean.
+        "SELECT g, sum(p) AS sp FROM '{f}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) "
+        "ORDER BY g",
+        "SELECT s, count(*) AS c FROM '{f}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
+        "SELECT h, s, count(*) AS c FROM '{f}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
+        # LIMIT without ORDER BY under HAVING: the first qualifying groups, not the first groups then filtered.
+        ("SELECT g, count(*) AS c FROM '{f}' GROUP BY g HAVING count(*) > 300 LIMIT 4",
+         "SELECT g, count(*) AS c FROM '{f}' GROUP BY g HAVING count(*) > 300 ORDER BY g LIMIT 4"),
+        # Without GROUP BY: one group, kept or dropped; on empty input, count(*) is 0 and the group still exists.
+        "SELECT count(*) AS c, sum(v) AS sv FROM '{f}' HAVING count(*) > 5",
+        "SELECT count(*) AS c FROM '{f}' HAVING sum(v) < 0",
+        "SELECT count(*) AS c FROM '{f}' WHERE v < 0 HAVING count(*) = 0",
+        "SELECT count(*) AS c FROM '{f}' WHERE v < 0 HAVING count(*) > 0",
+    ]
+    for i, h_sql in enumerate(HAVING_SQL):
+        # A pair: zpq's query and DuckDB's, which orders by g where zpq answers in first-appearance order (g grows
+        # with i, so the two agree).
+        h_sql, d_sql = h_sql if isinstance(h_sql, tuple) else (h_sql, h_sql)
+        sql = h_sql.format(f=hav)
+        duck_rel = con.execute(d_sql.format(f=hav))
+        lanes = json_lanes(duck_rel)
+        want = [tuple(canon(v, lanes[k]) for k, v in enumerate(row)) for row in duck_rel.fetchall()]
+        for j in ("1", "3", "16"):
+            total += 1
+            label = f"having:{i} -j{j}"
+            r = subprocess.run([ZPQ, "query", "--query", sql, "-j", j], capture_output=True, text=True)
+            try:
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+                agg = read_rows(r.stdout, parse_float=Decimal)
+                zrows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
+                got = [tuple(canon(v, lanes[k]) for k, v in enumerate(from_zpq([fold_avg(v) for v in row], lanes)))
+                       for row in zrows]
+                problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+            except Exception as e:
+                problem = f"error: {e}"
+            if problem:
+                fails += 1
+                print(f"  FAIL  {label}  {problem}  [{h_sql[:60]}]")
+            else:
+                print(f"  OK    {label}  ({len(got)} rows)")
+
     # sum(x + c) folds x and adds c once per value (`sumOffset`): every fold path must add it as often as it sums. `c`
     # is constant per row group (the statistics fold), `g` low-cardinality (dictionary codes), `n` NULL in places and
     # NULL in all of group g = 4 under the filter below.

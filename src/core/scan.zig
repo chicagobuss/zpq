@@ -60,6 +60,8 @@ pub const Error = error{
     AmbiguousOutputColumn,
     /// A SQL result column outside an aggregate is no GROUP BY key.
     ColumnMustBeGrouped,
+    /// A HAVING literal its result column cannot compare with (a string against a number, or the reverse).
+    HavingTypeMismatch,
 } || std.mem.Allocator.Error;
 
 /// One file's contribution to a multi-file scan. Bytes can come from
@@ -215,6 +217,8 @@ pub const AggOutput = struct {
     aggs: []AggOutputItem = &.{},
     group_cols: ?[]const []const u8 = null,
     group_rows: ?[]const []const AggValue = null,
+    /// Without GROUP BY: HAVING failed the one group, so the answer has no row (`aggs` still holds its values).
+    no_row: bool = false,
 
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
@@ -1975,6 +1979,7 @@ fn prepareAggregate(
         try checkAggAliases(agg_calls, args.diag);
         break :blk null;
     };
+    if (args.result_order.having) |h| try checkHavingLanes(arena, h.*, group_outputs, agg_calls, group_by_keys);
     if (!explain) if (args.diag) |diag| {
         diag.execution_started = true;
     };
@@ -2611,7 +2616,7 @@ fn prepareAggregate(
         .timings = t,
         .output = output,
         .part_agg = part_on,
-        .visible_cols = if (group_outputs != null and args.result_order.hidden.len > 0) args.select_cols.?.len else null,
+        .visible_cols = if (args.result_order.hidden.len > 0) args.select_cols.?.len else null,
         .state = .{
             .accumulators = accumulators,
             .agg_calls = agg_calls,
@@ -4453,6 +4458,36 @@ fn bindGroupOutputs(
     }
     try checkDistinctOutputNames(BoundOutputColumn, bound, boundName, args.diag);
     return bound;
+}
+
+/// Refuse a HAVING literal its result column cannot compare with, before any row is read.
+fn checkHavingLanes(
+    arena: std.mem.Allocator,
+    having: expr_ast.Having,
+    outputs: ?[]const BoundOutputColumn,
+    agg_calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+) !void {
+    const result_program = @import("result_program.zig");
+    const Lane = result_program.Lane;
+    const aggLane = struct {
+        fn of(call: expr_agg.AggCall) Lane {
+            return if (call.result == .bytes) .string else .number;
+        }
+    }.of;
+    const lanes = if (outputs) |outs| blk: {
+        const l = try arena.alloc(Lane, outs.len);
+        for (outs, l) |o, *lane| lane.* = switch (o.source) {
+            .key => |k| if (keyTypeFromExpr(keys.?[k]) == .string) .string else .number,
+            .agg => |a| aggLane(agg_calls[a]),
+        };
+        break :blk l;
+    } else blk: {
+        const l = try arena.alloc(Lane, agg_calls.len);
+        for (agg_calls, l) |call, *lane| lane.* = aggLane(call);
+        break :blk l;
+    };
+    try result_program.checkHaving(having, lanes);
 }
 
 /// Whether `select_cols` are a SQL select list, which binds by role (`SelectColumn.Role`) rather than by name.

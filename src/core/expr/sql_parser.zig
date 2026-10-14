@@ -285,8 +285,9 @@ fn splitsFlatGrammar(s: []const u8) bool {
         std.ascii.findIgnoreCase(s, " BETWEEN ") != null;
 }
 
-/// Whether a normalized leaf unparses to text the filter grammar reads back as this leaf alone: no AND, OR or NOT
-/// below it, and no literal or name the grammar's splitting would cut (an IN list also splits on every comma).
+/// Whether a normalized leaf unparses to text the filter grammar reads back as this leaf alone: no AND, OR, NOT or
+/// LIKE ESCAPE below it, and no literal or name the grammar's splitting would cut (an IN list also splits on every
+/// comma).
 fn flatLeaf(leaf: *c.LpNode) bool {
     const Visit = struct {
         ok: bool = true,
@@ -297,6 +298,8 @@ fn flatLeaf(leaf: *c.LpNode) bool {
             switch (node.*.kind) {
                 c.LP_EXPR_BINARY_OP => {
                     if (node.*.u.binary.op == c.LP_OP_AND or node.*.u.binary.op == c.LP_OP_OR) self.ok = false;
+                    // The grammar has no ESCAPE: `ESCAPE '#'` would be read as part of the pattern.
+                    if (node.*.u.binary.escape != null) self.ok = false;
                 },
                 c.LP_EXPR_UNARY_OP => if (node.*.u.unary.op == c.LP_UOP_NOT) {
                     self.ok = false;
@@ -340,7 +343,8 @@ fn checkFlatPredicate(pred: *c.LpNode) error{GroupingNotSupported}!void {
             if (isBool(leaf, c.LP_OP_OR) or !flatLeaf(leaf)) {
                 std.debug.print("sql: this predicate needs grouping the flat AND/OR filter grammar cannot\n" ++
                     "  express (an OR inside an AND, after pushing NOT down), or a literal or name\n" ++
-                    "  holds a quote, ' AND ', ' OR ' or ' BETWEEN '; rewrite it as an OR of ANDs\n", .{});
+                    "  holds a quote, ' AND ', ' OR ' or ' BETWEEN ', or LIKE has an ESCAPE;\n" ++
+                    "  rewrite it as an OR of ANDs\n", .{});
                 return error.GroupingNotSupported;
             }
             if (conj == leaf) break;
@@ -897,6 +901,7 @@ test "sql_parser refuses predicates the flat filter grammar cannot hold as writt
         "s = 'O''Brien'",
         "s IN ('a,b', 'c')",
         "\"a OR b\" = 1",
+        "s LIKE 'a#%' ESCAPE '#'",
     };
     for (wheres) |where| {
         errdefer std.debug.print("WHERE {s}\n", .{where});

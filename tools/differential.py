@@ -715,6 +715,7 @@ def main():
         "id > 0 AND (amt > 5 OR nname LIKE 'v2%')",
         "NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%'",
         "nname = 'a OR id > 0'",
+        "name LIKE 'n1%' ESCAPE '#'",
     ]
     for where in SQL_NOTS + SQL_REFUSED:
         for fmt, sel in (("where", "count(*) AS c, sum(id) AS s"),

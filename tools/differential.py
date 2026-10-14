@@ -709,6 +709,8 @@ def main():
         "NOT (nname IS NULL OR amt IS NULL)",
         "NOT (amt <= 10 AND amt >= -10)",
         "amt > 0 OR (id < -1000 OR nname IS NULL)",
+        "NOT (id > -5 AND amt < 1.5E+3)",
+        "NOT (price > 1e2 OR d >= '2020-06-01') OR ts < '2020-01-01 00:00:00.0995'",
     ]
     SQL_REFUSED = [
         "NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')",
@@ -716,6 +718,12 @@ def main():
         "NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%'",
         "nname = 'a OR id > 0'",
         "name LIKE 'n1%' ESCAPE '#'",
+        # NULL and non-literal values: the grammar would read NULL as the string 'NULL', the rest as bare strings.
+        "nname NOT IN ('v1', NULL)",
+        "NOT (nname IN ('v1', NULL))",
+        "nname != NULL",
+        "name = nname",
+        "name = 'n' || '1'",
     ]
     for where in SQL_NOTS + SQL_REFUSED:
         for fmt, sel in (("where", "count(*) AS c, sum(id) AS s"),

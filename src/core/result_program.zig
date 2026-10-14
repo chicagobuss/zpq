@@ -492,3 +492,23 @@ test "slab rows: a cut keeps a few, compaction releases the rest, strings stay o
         try std.testing.expect(std.mem.startsWith(u8, row[1].s, "k"));
     }
 }
+
+test "slab rows: compaction that runs out of memory leaves the rows as they were and leaks nothing" {
+    const gpa = std.testing.allocator;
+    for (0..2) |fail_at| {
+        var out: scan.AggOutput = .{};
+        defer out.deinit(gpa);
+        const slab = try gpa.alloc(scan.AggValue, 8192);
+        @memset(slab, .null_val);
+        out.slab = slab;
+        slab[100] = .{ .i = 7 };
+        const rows = try gpa.alloc([]const scan.AggValue, 1);
+        rows[0] = slab[100..101];
+        out.group_rows = rows;
+        // The slab far outsizes its one live cell, so compaction runs and fails at its first or second allocation.
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        try std.testing.expectError(error.OutOfMemory, out.compactRows(failing.allocator()));
+        try std.testing.expectEqual(slab.ptr, out.slab.ptr);
+        try std.testing.expectEqual(@as(i128, 7), out.group_rows.?[0][0].i);
+    }
+}

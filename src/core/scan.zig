@@ -278,6 +278,7 @@ pub const AggOutput = struct {
         }
         if (!loose and self.slab.len <= 2 * cells + 4096) return;
         const fresh = try gpa.alloc(AggValue, cells);
+        errdefer gpa.free(fresh);
         const views = try gpa.alloc([]const AggValue, rows.len);
         var at: usize = 0;
         for (rows, views) |row, *v| {

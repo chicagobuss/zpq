@@ -72,6 +72,7 @@ SELECTS = [
     ("id_plus1",  "id + 1 AS x",            "id + 1 AS x"),
     ("concat",    "name || '_z' AS x",      "name || '_z' AS x"),
     ("coalesce",  "coalesce(nname, 'NA') AS x", "coalesce(nname, 'NA') AS x"),
+    ("strlen",    "strlen(nname) AS x",     "strlen(nname) AS x"),
     # Raw arithmetic over a NULLABLE column (e.g. `amt * 2`) is a documented
     # limitation: eval.zig returns NullableNotSupported (clean error, not wrong
     # answer). Coalesce IS null-aware.
@@ -85,6 +86,9 @@ AGGS = [
     # count(*) alone needs no column at all in a row group statistics prove fully matching.
     ("count_star", "count(*) AS n, sum(amt) AS s", "count(*), sum(amt)"),
     ("avg",       "avg(amt) AS a, min(name) AS mn", "avg(amt), min(name)"),
+    # A computed argument that is NULL where its column is: skipped, as a bare column's NULLs are.
+    ("strlen",    "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+                  "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))"),
 ]
 # (label, columns_csv | None) — None = all columns (passthrough fast path).
 PROJECTIONS = [
@@ -640,6 +644,7 @@ def main():
         # SQL binds `GROUP BY name` to the column and `AS name` names the aggregate: no clash, as in DuckDB.
         ("grp_key_vs_alias", "SELECT name AS k, sum(amt) AS name FROM '{fixture}' WHERE id < -1990 GROUP BY name "
          "ORDER BY k"),
+        ("grp_strlen", "SELECT strlen(nname) AS k, count(*) AS c FROM '{fixture}' GROUP BY k ORDER BY k"),
         ("grp_constant", "SELECT 1, flag, count(*) AS c FROM '{fixture}' GROUP BY 1, flag ORDER BY flag"),
         # Grouped WHERE under SQL, whose NOT the front end pushes to the leaves.
         ("where_paren_not", "SELECT flag, count(*) AS c FROM '{fixture}' WHERE NOT (id > 500 AND nname IS NULL) "

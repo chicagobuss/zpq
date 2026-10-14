@@ -488,6 +488,10 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
                     .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
                     .dec = dec,
+                    .nullable = blk: {
+                        const path = (try metadata.leafPathSegments(arena, file, col_idx)) orelse break :blk true;
+                        break :blk file.getColumnLevels(path).max_def > 0;
+                    },
                 },
             };
         },
@@ -560,6 +564,7 @@ fn parseCall(
 
 fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "coalesce")) return .coalesce;
+    if (asciiEqIgnoreCase(name, "strlen")) return .strlen;
     return null;
 }
 
@@ -576,6 +581,11 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
                 t = ast.Type.promote(t, a.typeOf()) orelse return error.TypeMismatch;
             }
             return t;
+        },
+        .strlen => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            return .i64;
         },
     }
 }

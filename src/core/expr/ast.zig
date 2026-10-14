@@ -195,6 +195,8 @@ pub const ColRef = struct {
     unsigned_32: bool = false,
     /// The column's DECIMAL type when `expr_type == .dec`.
     dec: ?Dec = null,
+    /// The column can hold NULL (a definition level above zero). Unknown is assumed nullable.
+    nullable: bool = true,
 };
 
 pub const BinOp = struct {
@@ -216,6 +218,8 @@ pub const BinOp = struct {
 /// to whichever Func tag matches the name (case-insensitive).
 pub const Func = enum {
     coalesce,
+    /// A string's length in bytes, as DuckDB's `strlen`; NULL for NULL.
+    strlen,
 };
 
 pub const Call = struct {
@@ -296,6 +300,22 @@ pub const Expr = union(enum) {
                 if (ca.func != b.call.func or ca.args.len != b.call.args.len) break :blk false;
                 for (ca.args, b.call.args) |x, y| if (!x.eql(y.*)) break :blk false;
                 break :blk true;
+            },
+        };
+    }
+
+    /// Whether a value of this expression can be NULL, as a written column must declare: a NULL-propagating function
+    /// of a nullable operand. Arithmetic refuses nullable operands (the evaluator errors), and `coalesce` is NULL only
+    /// where every argument is.
+    pub fn mayBeNull(self: Expr) bool {
+        return switch (self) {
+            .literal, .binop => false,
+            .col_ref => |c| c.nullable,
+            .call => |c| switch (c.func) {
+                .strlen => c.args[0].mayBeNull(),
+                .coalesce => for (c.args) |a| {
+                    if (!a.mayBeNull()) break false;
+                } else true,
             },
         };
     }

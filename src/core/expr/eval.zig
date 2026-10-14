@@ -858,7 +858,34 @@ fn evalCall(
 ) Error!Batch.Column {
     switch (c.func) {
         .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type, c.dec),
+        .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
     }
+}
+
+/// Byte length of each string; a NULL string's row stays NULL (its definition level carries over). A dictionary-coded
+/// column is measured once per entry and looked up by code.
+fn evalStrlen(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
+    // A bare column is read as decoded, codes and all; anything else evaluates first.
+    const col = if (arg == .col_ref)
+        batch.cols[column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn]
+    else
+        try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const s = switch (col) {
+        .string => |s| s,
+        else => return error.TypeMismatch,
+    };
+    if (s.max_rep > 0) return error.NestedNotSupported;
+    const rows = s.rowCount();
+    const out = try arena.alloc(i64, rows);
+    if (s.codes) |codes| {
+        const lens = try arena.alloc(i64, s.dict.len);
+        defer arena.free(lens);
+        for (s.dict, lens) |v, *l| l.* = @intCast(v.len);
+        for (codes, out) |code, *o| o.* = if (code < lens.len) lens[code] else 0;
+    } else for (s.values, out) |v, *o| {
+        o.* = @intCast(v.len);
+    }
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
 }
 
 fn evalCoalesce(
@@ -2049,4 +2076,26 @@ test "select/agg expression: unsigned 64-bit operands convert by value or are re
     r.* = .{ .literal = .{ .i64 = 0 } };
     const plus: ast.Expr = .{ .binop = .{ .op = .add, .left = l, .right = r, .result_type = .i64, .depth = 2 } };
     try testing.expectError(error.Unsigned64OutOfRange, evalExpr(a, &batch, &lookup, plus));
+}
+
+test "strlen counts bytes, keeps NULL rows NULL and reads dictionary codes per entry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const strs = [_][]const u8{ "", "abc", "x", "héllo" };
+    const def = [_]u32{ 1, 1, 0, 1 };
+    const plain: Batch.Column = .{ .string = .{ .values = &strs, .def_levels = &def, .max_def = 1, .has_nulls = true } };
+    const dict = [_][]const u8{ "ab", "héllo" };
+    const codes = [_]u32{ 1, 0, 0, 1 };
+    const coded: Batch.Column = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } };
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const args = [_]*const ast.Expr{&arg};
+    const call: ast.Expr = .{ .call = .{ .func = .strlen, .args = @ptrCast(&args), .result_type = .i64, .depth = 2 } };
+    const lookup = [_]?usize{0};
+
+    const got = try evalExpr(a, &.{ .cols = &.{plain}, .num_rows = 4 }, &lookup, call);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 3, 1, 6 }, got.i64.values);
+    try std.testing.expectEqualSlices(u32, &def, got.i64.def_levels.?);
+    const via_codes = try evalExpr(a, &.{ .cols = &.{coded}, .num_rows = 4 }, &lookup, call);
+    try std.testing.expectEqualSlices(i64, &.{ 6, 2, 2, 6 }, via_codes.i64.values);
 }

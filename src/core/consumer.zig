@@ -1619,11 +1619,13 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
 /// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
 pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
     const expr_type = c.expr.typeOf();
+    // A computed column that can be NULL (`strlen` of a nullable column) must say so, or its NULLs misdescribe it.
+    const repetition: schema.FieldRepetitionType = if (c.expr.mayBeNull() and c.expr != .col_ref) .OPTIONAL else .REQUIRED;
     if (expr_type == .dec) {
         var elem: schema.SchemaElement = .{
             .type = null,
             .type_length = null,
-            .repetition_type = .REQUIRED,
+            .repetition_type = repetition,
             .name = c.alias,
             .num_children = 0,
             .converted_type = null,
@@ -1641,7 +1643,7 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
     return .{
         .type = expr_type.toParquet(),
         .type_length = null,
-        .repetition_type = .REQUIRED,
+        .repetition_type = repetition,
         .name = c.alias,
         .num_children = 0,
         .converted_type = if (expr_type == .str) .UTF8 else if (unsigned_64) .UINT_64 else null,

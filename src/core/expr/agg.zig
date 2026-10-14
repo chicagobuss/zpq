@@ -1544,10 +1544,17 @@ const PreparedAggInput = struct {
         // to the general evaluator, which still rejects nullable inputs.
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
-            else => in.values = if (rowless)
-                try in.evalArg(arena, batch, column_lookup, arg)
-            else
-                try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg),
+            else => {
+                in.values = if (rowless)
+                    try in.evalArg(arena, batch, column_lookup, arg)
+                else
+                    try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
+                // A computed value may be NULL (`strlen` of a NULL): skipped, as a bare column's NULLs are.
+                if (columnHasNulls(in.values.?)) {
+                    if (in.own_sel == null) in.own_sel = try in.outer_sel.cloneAlloc(arena);
+                    intersectPresentMask(&in.own_sel.?, in.values.?);
+                }
+            },
         };
         return in;
     }

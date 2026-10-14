@@ -4017,26 +4017,27 @@ pub const FingerprintSet = struct {
 /// frame, the middle, the last two), not a pass over a long key. Keys that differ only elsewhere share a cell, which
 /// loosens the bound and never breaks it.
 pub fn sketchHash(key: []const u8) u64 {
-    // A short key is hashed whole: sampling it would let keys that differ only between the samples (a composite's
-    // short string beside a number) share cells and fingerprints, which loosens every bound built on them.
-    if (key.len <= full_hash_max) return std.hash.Wyhash.hash(0, key);
+    if (key.len < 21) return std.hash_map.hashString(key);
+    // A short composite key is hashed whole: sampling it lets keys that differ only between the samples (a short
+    // string beside a number) share cells and fingerprints, which loosens every bound built on them. A lone string
+    // keeps the samples, as its unframed form (`rawSketchHash`) does: whole, a URL key's count pass cost a fifth more.
+    if (key.len <= full_hash_max and !loneString(key)) return std.hash.Wyhash.hash(0, key);
     const l = key.len;
     return sketchMix(l, load64(key, 5), load64(key, l / 2 - 4), load64(key, l - 16), load64(key, l - 8));
 }
 
-/// Serialized keys up to this many bytes are hashed whole (`sketchHash`); longer ones are sampled.
+/// Composite serialized keys up to this many bytes are hashed whole (`sketchHash`); longer ones are sampled.
 const full_hash_max = 64;
+
+/// Whether a serialized key is one present string's frame (`[1][u32 len]` then the bytes) and nothing more.
+fn loneString(key: []const u8) bool {
+    return key[0] == 1 and std.mem.readInt(u32, key[1..5], .little) == key.len - 5;
+}
 
 /// `sketchHash` of a lone present string key `s` (frame `[1][u32 len]` then `s`), at least 16 bytes, unframed.
 fn rawSketchHash(s: []const u8) u64 {
     const l = s.len + 5;
-    if (l > full_hash_max) return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
-    var frame: [5]u8 = .{ 1, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, frame[1..5], @intCast(s.len), .little);
-    var hash = std.hash.Wyhash.init(0);
-    hash.update(&frame);
-    hash.update(s);
-    return hash.final();
+    return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
 }
 
 fn sketchMix(len: usize, a: u64, b: u64, c: u64, d: u64) u64 {
@@ -5602,4 +5603,25 @@ test "round 4: owned merges preserve reservations on allocation failure" {
         Helper.run(failing.allocator(), dn, sn) catch |err| if (err != error.OutOfMemory) return err;
         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     };
+}
+
+test "short composite keys hash whole: keys differing only between the samples get distinct fingerprints" {
+    // (i64, string) composites whose strings differ only in a byte the sampled hash never reads.
+    var a: [9 + 5 + 20]u8 = undefined;
+    a[0] = 1;
+    std.mem.writeInt(u64, a[1..9], 42, .little);
+    a[9] = 1;
+    std.mem.writeInt(u32, a[10..14], 20, .little);
+    @memset(a[14..], 'x');
+    var b = a;
+    b[14 + 3] = 'y';
+    try std.testing.expect(!loneString(&a));
+    try std.testing.expect(sketchHash(&a) != sketchHash(&b));
+    // A lone string keeps the sampled hash its unframed form computes.
+    var lone: [5 + 30]u8 = undefined;
+    lone[0] = 1;
+    std.mem.writeInt(u32, lone[1..5], 30, .little);
+    for (lone[5..], 0..) |*c, i| c.* = @intCast('a' + i % 26);
+    try std.testing.expect(loneString(&lone));
+    try std.testing.expectEqual(rawSketchHash(lone[5..]), sketchHash(&lone));
 }

@@ -2770,6 +2770,13 @@ fn markExprSet(set: []bool, e: expr_ast.Expr, v: bool) void {
             markExprSet(set, b.right.*, v);
         },
         .call => |c| for (c.args) |a| markExprSet(set, a.*, v),
+        .case_ => |c| {
+            for (c.whens) |w| {
+                markFilterSet(set, w.cond, v);
+                if (w.then) |t| markExprSet(set, t.*, v);
+            }
+            if (c.else_) |other| markExprSet(set, other.*, v);
+        },
     }
 }
 
@@ -2801,6 +2808,14 @@ fn markExprValues(u: CodeUses, e: expr_ast.Expr) void {
             markExprValues(u, b.right.*);
         },
         .call => |c| for (c.args) |a| markExprValues(u, a.*),
+        // A condition reads values too: the CASE evaluates it over the row values it gives its branches.
+        .case_ => |c| {
+            for (c.whens) |w| {
+                markFilterSet(u.value, w.cond, true);
+                if (w.then) |t| markExprValues(u, t.*);
+            }
+            if (c.else_) |other| markExprValues(u, other.*);
+        },
     }
 }
 

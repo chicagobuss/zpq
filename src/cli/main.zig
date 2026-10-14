@@ -358,6 +358,11 @@ pub fn main(init: std.process.Init) !void {
                 error.NestedNotSupported => diagnosticPrint("zpq query: nested columns are not supported in GROUP BY keys\n", .{}),
                 error.DivisionByZero => diagnosticPrint("zpq query: division by zero\n", .{}),
                 error.UnbalancedParentheses => diagnosticPrint("zpq query: unbalanced parentheses in filter\n", .{}),
+                error.UnsupportedCase => diagnosticPrint(
+                    "zpq query: only searched CASE (CASE WHEN cond THEN v ... END) is supported, with\n" ++
+                        "branches of one common type (DECIMAL branches of one DECIMAL type)\n",
+                    .{},
+                ),
                 error.HavingTypeMismatch => diagnosticPrint(
                     "zpq query: HAVING compares a result with a literal of another type\n",
                     .{},
@@ -941,7 +946,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",      "HavingNotSupported",         "MixedSelectNotSupported",
         "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",       "BadOutputUrl",               "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",         "NullableNotSupported",       "NestedNotSupported",
-        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "AggregateInGroupBy", "HavingTypeMismatch",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "AggregateInGroupBy", "HavingTypeMismatch", "UnsupportedCase",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
         "CteNotSupported",             "AggregateInWhere",      "MissingFromClause",            "MissingTableName",          "UnsupportedFromClause",      "UnsupportedAggType",
         "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };

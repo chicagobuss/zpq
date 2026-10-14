@@ -48,6 +48,8 @@ pub const Error = error{
     IntegerOverflowDiv,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
+    /// A CASE condition over a repeated (nested) column.
+    NestedFilterNotSupported,
 } || std.mem.Allocator.Error;
 
 const Batch = filter_eval.Batch;
@@ -68,6 +70,7 @@ pub fn evalExpr(
         .col_ref => |c| try colRefAsColumn(arena, batch, column_lookup, c),
         .binop => |b| try evalBinOp(arena, batch, column_lookup, b),
         .call => |c| try evalCall(arena, batch, column_lookup, c),
+        .case_ => |c| try evalCase(arena, batch, column_lookup, c, false),
     };
 }
 
@@ -85,6 +88,106 @@ pub fn evalGroupKeyExpr(
         .col_ref => |c| try colRefAsGroupKeyColumn(arena, batch, column_lookup, c),
         .binop => |b| try evalGroupKeyBinOp(arena, batch, column_lookup, b),
         .call => |c| try evalCall(arena, batch, column_lookup, c),
+        .case_ => |c| try evalCase(arena, batch, column_lookup, c, true),
+    };
+}
+
+/// A searched CASE over the batch's wanted rows (`batch.sel`, else all). Each WHEN's condition is evaluated over the
+/// rows no earlier WHEN took, its branch over just the rows it takes, so a branch's faults (`1 / 0`) count only where
+/// it is chosen; ELSE takes the rest, and without one they are NULL. A row the batch does not want is NULL. Branches
+/// evaluate as the caller does: `key` with the null-aware key evaluator.
+fn evalCase(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    c: ast.Case,
+    key: bool,
+) Error!Batch.Column {
+    const n = batch.num_rows;
+    var remaining = if (batch.sel) |s| try s.cloneAlloc(arena) else try selection.SelectionVector.init(arena, n);
+    const def = try arena.alloc(u32, n);
+    @memset(def, 0);
+    const Lane = union(enum) { i64: []i64, f64: []f64, str: [][]const u8, dec: []i128 };
+    const out: Lane = switch (c.result_type) {
+        .i64 => blk: {
+            const v = try arena.alloc(i64, n);
+            @memset(v, 0);
+            break :blk .{ .i64 = v };
+        },
+        .f64 => blk: {
+            const v = try arena.alloc(f64, n);
+            @memset(v, 0);
+            break :blk .{ .f64 = v };
+        },
+        .str => blk: {
+            const v = try arena.alloc([]const u8, n);
+            @memset(v, "");
+            break :blk .{ .str = v };
+        },
+        .dec => blk: {
+            const v = try arena.alloc(i128, n);
+            @memset(v, 0);
+            break :blk .{ .dec = v };
+        },
+    };
+    for (0..c.whens.len + 1) |w| {
+        if (!remaining.any()) break;
+        const is_else = w == c.whens.len;
+        var taken = try remaining.cloneAlloc(arena);
+        if (!is_else) {
+            const unrestricted: Batch = .{ .cols = batch.cols, .num_rows = n };
+            try filter_eval.evaluate(c.whens[w].cond, &unrestricted, &taken, column_lookup, arena);
+        }
+        for (remaining.mask, taken.mask) |*r, t| r.* &= ~t;
+        const branch = (if (is_else) c.else_ else c.whens[w].then) orelse continue;
+        if (!taken.any()) continue;
+        const restricted = batch.restrictedTo(&taken);
+        const col = if (key)
+            try evalGroupKeyExpr(arena, &restricted, column_lookup, branch.*)
+        else
+            try evalExpr(arena, &restricted, column_lookup, branch.*);
+        const scale: u8 = if (branch.typeOf() == .dec) branch.decSpec().?.scale else 0;
+        for (0..n) |i| {
+            if (!taken.isActive(i) or rowIsNull(col, i)) continue;
+            def[i] = 1;
+            switch (out) {
+                .i64 => |v| v[i] = switch (col) {
+                    .i64 => |x| x.values[i],
+                    else => return error.TypeMismatch,
+                },
+                .f64 => |v| v[i] = switch (col) {
+                    .f64 => |x| x.values[i],
+                    .i64 => |x| @floatFromInt(x.values[i]),
+                    .i128 => |x| @as(f64, @floatFromInt(x.values[i])) / std.math.pow(f64, 10, @floatFromInt(scale)),
+                    else => return error.TypeMismatch,
+                },
+                .str => |v| v[i] = switch (col) {
+                    .string => |x| if (x.codes) |codes| x.dict[codes[i]] else x.values[i],
+                    else => return error.TypeMismatch,
+                },
+                // To the result's scale, exactly; a value its precision cannot hold is an error, never rounded.
+                .dec => |v| {
+                    const spec = c.dec.?;
+                    const raw: i128 = switch (col) {
+                        .i128 => |x| x.values[i],
+                        .i64 => |x| x.values[i],
+                        .i32 => |x| x.values[i],
+                        else => return error.TypeMismatch,
+                    };
+                    const scaled = std.math.mul(i128, raw, ast.pow10(spec.scale - scale)) catch return error.DecimalOverflow;
+                    if (@abs(scaled) >= @as(u128, @intCast(spec.bound()))) return error.DecimalOverflow;
+                    v[i] = scaled;
+                },
+            }
+        }
+    }
+    const has_nulls = std.mem.indexOfScalar(u32, def, 0) != null;
+    const levels: ?[]const u32 = if (has_nulls) def else null;
+    return switch (out) {
+        .i64 => |v| .{ .i64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+        .f64 => |v| .{ .f64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+        .str => |v| .{ .string = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+        .dec => |v| .{ .i128 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
     };
 }
 

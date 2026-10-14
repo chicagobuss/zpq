@@ -929,9 +929,10 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
         .BOOLEAN => .{ .boolean = .{
             .col_idx = col_idx,
             .op = op,
-            .value = if (std.mem.eql(u8, val_str, "true") or std.mem.eql(u8, val_str, "1"))
+            // Any letter case: SQL prints the literal as TRUE.
+            .value = if (std.ascii.eqlIgnoreCase(val_str, "true") or std.mem.eql(u8, val_str, "1"))
                 true
-            else if (std.mem.eql(u8, val_str, "false") or std.mem.eql(u8, val_str, "0"))
+            else if (std.ascii.eqlIgnoreCase(val_str, "false") or std.mem.eql(u8, val_str, "0"))
                 false
             else
                 return error.BadValue,

@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const schema = @import("../schema.zig");
+const filter_ast = @import("../filter/ast.zig");
 
 /// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`) work on
 /// `i64` or `f64`; `concat` works on `str` and is the SQL `||`
@@ -232,11 +233,26 @@ pub const Call = struct {
     dec: ?Dec = null,
 };
 
+/// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
+/// the value (UNKNOWN is not TRUE), else ELSE, else NULL. A branch is evaluated only over the rows that select it,
+/// so a fault in one no row takes (`1 / 0`) is no error. A null branch is SQL NULL.
+pub const Case = struct {
+    whens: []const When,
+    else_: ?*Expr,
+    result_type: Type,
+    depth: u32,
+    /// The result's DECIMAL type when `result_type == .dec`: every non-NULL branch has this one.
+    dec: ?Dec = null,
+
+    pub const When = struct { cond: filter_ast.Filter, then: ?*Expr };
+};
+
 pub const Expr = union(enum) {
     literal: Literal,
     col_ref: ColRef,
     binop: BinOp,
     call: Call,
+    case_: Case,
 
     pub fn typeOf(self: Expr) Type {
         return switch (self) {
@@ -244,6 +260,7 @@ pub const Expr = union(enum) {
             .col_ref => |c| c.expr_type,
             .binop => |b| b.result_type,
             .call => |c| c.result_type,
+            .case_ => |c| c.result_type,
         };
     }
 
@@ -257,6 +274,7 @@ pub const Expr = union(enum) {
                 .col_ref => |c| c.dec.?,
                 .binop => |b| b.dec.?,
                 .call => |c| c.dec.?,
+                .case_ => |c| c.dec.?,
             },
             .i64 => switch (self) {
                 .literal => |l| Dec.ofInt(if (std.math.cast(i32, l.i64) != null) 10 else 19),
@@ -278,6 +296,7 @@ pub const Expr = union(enum) {
             .literal, .col_ref => 1,
             .binop => |b| b.depth,
             .call => |c| c.depth,
+            .case_ => |c| c.depth,
         };
     }
 
@@ -301,7 +320,21 @@ pub const Expr = union(enum) {
                 for (ca.args, b.call.args) |x, y| if (!x.eql(y.*)) break :blk false;
                 break :blk true;
             },
+            .case_ => |ca| blk: {
+                const cb = b.case_;
+                if (ca.whens.len != cb.whens.len or !optEql(ca.else_, cb.else_)) break :blk false;
+                for (ca.whens, cb.whens) |x, y| {
+                    if (!filter_ast.eql(x.cond, y.cond) or !optEql(x.then, y.then)) break :blk false;
+                }
+                break :blk true;
+            },
         };
+    }
+
+    fn optEql(a: ?*Expr, b: ?*Expr) bool {
+        const x = a orelse return b == null;
+        const y = b orelse return false;
+        return x.eql(y.*);
     }
 
     /// Whether a value of this expression can be NULL, as a written column must declare: a NULL-propagating function
@@ -311,6 +344,15 @@ pub const Expr = union(enum) {
         return switch (self) {
             .literal, .binop => false,
             .col_ref => |c| c.nullable,
+            .case_ => |c| blk: {
+                const e = c.else_ orelse break :blk true;
+                if (e.mayBeNull()) break :blk true;
+                for (c.whens) |w| {
+                    const t = w.then orelse break :blk true;
+                    if (t.mayBeNull()) break :blk true;
+                }
+                break :blk false;
+            },
             .call => |c| switch (c.func) {
                 .strlen => c.args[0].mayBeNull(),
                 .coalesce => for (c.args) |a| {
@@ -334,6 +376,13 @@ pub const Expr = union(enum) {
                 b.right.collectColumns(fetch_arr);
             },
             .call => |c| for (c.args) |arg| arg.collectColumns(fetch_arr),
+            .case_ => |c| {
+                for (c.whens) |w| {
+                    filter_ast.markColumns(w.cond, fetch_arr);
+                    if (w.then) |t| t.collectColumns(fetch_arr);
+                }
+                if (c.else_) |e| e.collectColumns(fetch_arr);
+            },
         }
     }
 };

@@ -237,6 +237,37 @@ pub fn markNonMandatoryColumns(f: Filter, cols: []bool) void {
     }
 }
 
+/// Mark every column a leaf of `f` reads.
+pub fn markColumns(f: Filter, cols: []bool) void {
+    markAllColumns(f, cols);
+}
+
+/// Whether two trees are the same predicate as bound: the same shape, columns, operators and literal values. An IN
+/// list's set is derived from its leaves, so it is not compared.
+pub fn eql(a: Filter, b: Filter) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .and_filter, .or_filter => |ca| blk: {
+            const cb = if (a == .and_filter) b.and_filter else b.or_filter;
+            if (ca.children.len != cb.children.len) break :blk false;
+            for (ca.children, cb.children) |x, y| if (!eql(x, y)) break :blk false;
+            break :blk true;
+        },
+        .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and std.mem.eql(u8, l.value, b.string.value),
+        .float => |l| l.col_idx == b.float.col_idx and l.op == b.float.op and
+            @as(u32, @bitCast(l.value)) == @as(u32, @bitCast(b.float.value)),
+        .double => |l| l.col_idx == b.double.col_idx and l.op == b.double.op and
+            @as(u64, @bitCast(l.value)) == @as(u64, @bitCast(b.double.value)),
+        .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not,
+        .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
+            std.mem.eql(u8, m.operand, b.like.operand),
+        inline .int32, .int64, .uint64, .boolean => |l, tag| blk: {
+            const o = @field(b, @tagName(tag));
+            break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value;
+        },
+    };
+}
+
 fn markAllColumns(f: Filter, cols: []bool) void {
     switch (f) {
         .and_filter, .or_filter => |c| for (c.children) |child| markAllColumns(child, cols),

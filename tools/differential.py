@@ -37,6 +37,7 @@ FILTERS = [
     ("nname_isnull",  "nname IS NULL",          "nname IS NULL"),
     ("nname_notnull", "nname IS NOT NULL",      "nname IS NOT NULL"),
     ("flag_true",     "flag = true",            "flag = true"),
+    ("flag_upper",    "flag = TRUE OR flag = False", "flag = TRUE OR flag = False"),
     ("id_in",         "id IN (1, 5, 999)",      "id IN (1, 5, 999)"),
     ("id_between",    "id BETWEEN 100 AND 200", "id BETWEEN 100 AND 200"),
     ("price_between", "price BETWEEN 100.5 AND 200", "price BETWEEN 100.5 AND 200"),
@@ -73,6 +74,13 @@ SELECTS = [
     ("concat",    "name || '_z' AS x",      "name || '_z' AS x"),
     ("coalesce",  "coalesce(nname, 'NA') AS x", "coalesce(nname, 'NA') AS x"),
     ("strlen",    "strlen(nname) AS x",     "strlen(nname) AS x"),
+    # Searched CASE: the first TRUE WHEN (a NULL condition is not TRUE), ELSE or NULL; a branch only where taken.
+    ("case_str",  "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x",
+                  "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x"),
+    ("case_dead_div", "CASE WHEN id = 0 THEN -1 ELSE 100 / id END AS x",
+                  "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x"),
+    ("case_dec",  "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x",
+                  "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x"),
     # Raw arithmetic over a NULLABLE column (e.g. `amt * 2`) is a documented
     # limitation: eval.zig returns NullableNotSupported (clean error, not wrong
     # answer). Coalesce IS null-aware.
@@ -89,6 +97,8 @@ AGGS = [
     # A computed argument that is NULL where its column is: skipped, as a bare column's NULLs are.
     ("strlen",    "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
                   "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))"),
+    ("case_arg",  "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+                  "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)"),
 ]
 # (label, columns_csv | None) — None = all columns (passthrough fast path).
 PROJECTIONS = [
@@ -644,6 +654,11 @@ def main():
         # SQL binds `GROUP BY name` to the column and `AS name` names the aggregate: no clash, as in DuckDB.
         ("grp_key_vs_alias", "SELECT name AS k, sum(amt) AS name FROM '{fixture}' WHERE id < -1990 GROUP BY name "
          "ORDER BY k"),
+        # CASE as a GROUP BY key, by its alias (ClickBench Q39's shape); a NULL flag is not TRUE, so it takes ELSE.
+        ("grp_case", "SELECT flag, CASE WHEN (flag = true AND id > 0) THEN name ELSE '' END AS Src, count(*) AS c "
+         "FROM '{fixture}' WHERE id BETWEEN -10 AND 30 GROUP BY flag, Src ORDER BY Src, flag"),
+        ("grp_case_null", "SELECT CASE WHEN id < 0 AND nname IS NOT NULL THEN nname END AS k, count(*) AS c "
+         "FROM '{fixture}' WHERE id BETWEEN -50 AND 50 GROUP BY k ORDER BY k"),
         ("grp_strlen", "SELECT strlen(nname) AS k, count(*) AS c FROM '{fixture}' GROUP BY k ORDER BY k"),
         ("grp_constant", "SELECT 1, flag, count(*) AS c FROM '{fixture}' GROUP BY 1, flag ORDER BY flag"),
         # Grouped WHERE under SQL, whose NOT the front end pushes to the leaves.

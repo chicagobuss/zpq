@@ -199,6 +199,31 @@ fn quoteWholePaths(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
+/// The grammar reads an unquoted `true` / `false` as a column name, which the unparser then quotes (`"true"`), and
+/// no column of that name exists: make each such reference the boolean literal SQL means. A quoted `"true"` stays a
+/// column.
+fn boolLiterals(root: *c.LpNode) void {
+    const Visit = struct {
+        fn enter(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            if (node.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
+            const ref = &node.*.u.column_ref;
+            if (ref.quoted != 0 or ref.schema != null or ref.table != null or ref.column == null) return 0;
+            const name = std.mem.span(ref.column);
+            const value: [*c]const u8 = if (std.ascii.eqlIgnoreCase(name, "true"))
+                "TRUE"
+            else if (std.ascii.eqlIgnoreCase(name, "false"))
+                "FALSE"
+            else
+                return 0;
+            node.*.kind = c.LP_EXPR_LITERAL_BOOL;
+            node.*.u = .{ .literal = .{ .value = @constCast(value) } };
+            return 0;
+        }
+    };
+    var visitor: c.LpVisitor = .{ .user_data = null, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(root, &visitor);
+}
+
 /// Push every NOT down to the leaves (De Morgan; `NOT NOT p` is `p`), in place. liteparser prints a NOT's operand
 /// without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the filter grammar (as SQL) reads as
 /// `(NOT a) AND b`: a different predicate. With NOT only above leaves, every unparsed predicate (WHERE, aggregate
@@ -310,6 +335,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     }
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
+    boolLiterals(root);
     quoteWholePaths(root);
     try pushNotsDown(root, lp_arena);
     if (root.*.u.select.where) |w| {
@@ -1194,3 +1220,11 @@ test "sql_parser lowers HAVING to result columns, hidden terms and literals" {
     try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > sum(x)"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING z > 1"));
 }
+
+test "sql_parser reads unquoted true and false as boolean literals" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT x FROM 't' WHERE flag = true AND NOT b = False AND \"true\" = 1");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("flag = TRUE AND NOT b = FALSE AND \"true\" = 1", q.filter_str.?);
+}
+

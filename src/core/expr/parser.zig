@@ -57,6 +57,9 @@ pub const Error = error{
     InvalidDecimalType,
     /// A GROUP BY term names an aggregate (by a SELECT alias or position).
     AggregateInGroupBy,
+    /// A CASE zpq does not evaluate: the simple form (`CASE x WHEN 1 ...`), branches of types with no common one, or
+    /// every branch NULL.
+    UnsupportedCase,
 } || std.mem.Allocator.Error || filter_parser.Error;
 
 /// A bare UINT64 reference is fine on its own (selected, grouped by, aggregated); as an operand it is not.
@@ -448,6 +451,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                 _ = try lex.next(); // consume '('
                 return parseCall(arena, lex, file, tk.text);
             }
+            if (asciiEqIgnoreCase(tk.text, "CASE")) return parseCase(arena, lex, file);
             const col_idx = metadata.resolveColumn(file, tk.text) catch |err| {
                 if (err == error.AmbiguousColumn) Diag.set(lex.diag, tk.text, .{ .ambiguous_column = .{
                     .parser = .expression,
@@ -560,6 +564,112 @@ fn parseCall(
         .depth = depth,
         .dec = dec,
     } };
+}
+
+/// A searched `CASE WHEN cond THEN value ... [ELSE value] END`, `CASE` already read. Each condition is a predicate
+/// in the filter grammar, bound by the filter parser (its text runs to the THEN that closes it); each value an
+/// expression or NULL. The result type is the branches' common one.
+fn parseCase(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
+    lex.depth += 1;
+    defer lex.depth -= 1;
+    if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    var whens: std.ArrayList(ast.Case.When) = .empty;
+    var first = try lex.next();
+    if (first.kind != .ident or !asciiEqIgnoreCase(first.text, "WHEN")) return error.UnsupportedCase;
+    var else_: ?*ast.Expr = null;
+    while (true) {
+        const cond_start = lex.pos;
+        const then_at = (try findThen(lex.src, cond_start)) orelse return error.UnsupportedCase;
+        const cond = try filter_parser.parse(arena, lex.src[cond_start..then_at], file, lex.diag);
+        lex.pos = then_at + "THEN".len;
+        try whens.append(arena, .{ .cond = cond, .then = try caseValue(arena, lex, file) });
+        first = try lex.next();
+        if (first.kind != .ident) return error.UnsupportedCase;
+        if (asciiEqIgnoreCase(first.text, "WHEN")) continue;
+        if (asciiEqIgnoreCase(first.text, "ELSE")) {
+            else_ = try caseValue(arena, lex, file);
+            first = try lex.next();
+        }
+        if (first.kind != .ident or !asciiEqIgnoreCase(first.text, "END")) return error.UnsupportedCase;
+        break;
+    }
+    // The common type of the non-NULL branches: strings with strings, numbers promoted; a DECIMAL result holds every
+    // branch's digits (`Dec.common`), integers widened as SQL widens them.
+    var result: ?ast.Type = null;
+    var dec: ?ast.Dec = null;
+    var deepest: u32 = 0;
+    const Branches = struct {
+        whens: []const ast.Case.When,
+        else_: ?*ast.Expr,
+        fn at(self: @This(), i: usize) ?*ast.Expr {
+            return if (i < self.whens.len) self.whens[i].then else self.else_;
+        }
+    };
+    const branches: Branches = .{ .whens = whens.items, .else_ = else_ };
+    for (0..whens.items.len + 1) |i| {
+        const v = branches.at(i) orelse continue;
+        deepest = @max(deepest, v.depth());
+        try rejectUnsigned64Operand(v.*);
+        const t = v.typeOf();
+        result = if (result) |r| ast.Type.promote(r, t) orelse return error.UnsupportedCase else t;
+        if (v.decSpec()) |spec| dec = if (dec) |d| ast.Dec.common(d, spec) else spec;
+    }
+    const result_type = result orelse return error.UnsupportedCase;
+    const depth = 1 + deepest;
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    return .{ .case_ = .{
+        .whens = whens.items,
+        .else_ = else_,
+        .result_type = result_type,
+        .depth = depth,
+        .dec = if (result_type == .dec) dec else null,
+    } };
+}
+
+/// A CASE branch value: NULL (null), or an expression.
+fn caseValue(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!?*ast.Expr {
+    const tk = try lex.peek();
+    if (tk.kind == .ident and asciiEqIgnoreCase(tk.text, "NULL")) {
+        _ = try lex.next();
+        return null;
+    }
+    const v = try arena.create(ast.Expr);
+    v.* = try parseExpr(arena, lex, file);
+    return v;
+}
+
+/// Where the THEN closing a WHEN condition that starts at `from` sits: the first outermost-level word THEN, quoted
+/// spans and parentheses stepped over, and a nested CASE's own THENs skipped until its END.
+fn findThen(src: []const u8, from: usize) Error!?usize {
+    var i = from;
+    var parens: usize = 0;
+    var cases: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '\'' or c == '"') {
+            i += 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] != c) continue;
+                if (i + 1 < src.len and src[i + 1] == c) i += 1 else break;
+            }
+            if (i >= src.len) return error.UnterminatedString;
+            i += 1;
+            continue;
+        }
+        if (c == '(') parens += 1;
+        if (c == ')') parens -|= 1;
+        if (parens == 0 and isIdentStart(c) and (i == 0 or !isIdentCont(src[i - 1]))) {
+            const start = i;
+            while (i < src.len and isIdentCont(src[i])) i += 1;
+            const word = src[start..i];
+            if (asciiEqIgnoreCase(word, "CASE")) cases += 1;
+            if (asciiEqIgnoreCase(word, "END")) cases -|= 1;
+            if (cases == 0 and asciiEqIgnoreCase(word, "THEN")) return start;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
 }
 
 fn resolveFunc(name: []const u8) ?ast.Func {
@@ -819,6 +929,7 @@ fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
 
 const testing = std.testing;
 const test_fixtures = @import("../parquet/test_fixtures.zig");
+const filter_eval_mod = @import("../filter/eval.zig");
 
 fn fakeFile(arena: std.mem.Allocator, names: []const []const u8, types: []const schema.Type) !schema.FileMetaData {
     // Build a minimal FileMetaData with a flat schema: one root group +
@@ -1021,6 +1132,44 @@ test "parse: `||` over numbers, DECIMAL ones included, is a type error" {
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1.5 || 2", &file, null));
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1 || 2.25", &file, null));
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "1 || 2", &file, null));
+}
+
+test "parse and evaluate: searched CASE takes the first TRUE WHEN and evaluates branches only where taken" {
+    const expr_eval = @import("eval.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = try fakeFile(a, &.{ "a", "s" }, &.{ .INT64, .BYTE_ARRAY });
+    const av = [_]i64{ 1, 3, 4, 5 };
+    const sv = [_][]const u8{ "xa", "b", "c", "xd" };
+    const batch: filter_eval_mod.Batch = .{ .cols = &.{ .{ .i64 = .{ .values = &av } }, .{ .string = .{ .values = &sv } } }, .num_rows = 4 };
+    const lookup = [_]?usize{ 0, 1 };
+
+    // The row a = 3 divides by zero in the second branch, which the first WHEN takes it from.
+    const num = try parseExprOnly(a, "CASE WHEN a = 3 THEN 0 WHEN a > 2 THEN 10 / (a - 3) ELSE -1 END", &file, null);
+    const got = try expr_eval.evalExpr(a, &batch, &lookup, num);
+    try testing.expectEqualSlices(i64, &.{ -1, 0, 10, 5 }, got.i64.values);
+    try testing.expect(got.i64.def_levels == null);
+    // Without ELSE a row no WHEN takes is NULL; a string literal joins a string column.
+    const str = try parseExprOnly(a, "CASE WHEN s LIKE 'x%' AND (a < 2 OR a > 4) THEN s WHEN a = 3 THEN 'three' END", &file, null);
+    const sg = try expr_eval.evalExpr(a, &batch, &lookup, str);
+    try testing.expectEqualStrings("xa", sg.string.values[0]);
+    try testing.expectEqualStrings("three", sg.string.values[1]);
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 0, 1 }, sg.string.def_levels.?);
+    try testing.expect(str.mayBeNull());
+    try testing.expect(!num.mayBeNull());
+    // A DECIMAL and an integer branch meet in the DECIMAL holding both, the integer rescaled exactly; the same CASE
+    // parsed twice is one bound expression.
+    const mixed = try parseExprOnly(a, "CASE WHEN a > 3 THEN a * 1.5 ELSE 2 END", &file, null);
+    try testing.expectEqual(ast.Type.dec, mixed.typeOf());
+    const mg = try expr_eval.evalExpr(a, &batch, &lookup, mixed);
+    try testing.expectEqualSlices(i128, &.{ 20, 20, 60, 75 }, mg.i128.values);
+    try testing.expect(str.eql(try parseExprOnly(a, "case when s like 'x%' and (a < 2 or a > 4) then s when a = 3 then 'three' end", &file, null)));
+    try testing.expect(!str.eql(mixed));
+
+    try testing.expectError(error.UnsupportedCase, parseExprOnly(a, "CASE a WHEN 1 THEN 2 END", &file, null));
+    try testing.expectError(error.UnsupportedCase, parseExprOnly(a, "CASE WHEN a > 1 THEN s ELSE 1 END", &file, null));
+    try testing.expectError(error.UnsupportedCase, parseExprOnly(a, "CASE WHEN a > 1 THEN NULL END", &file, null));
 }
 
 test "parse: coalesce(col, default)" {

@@ -455,6 +455,8 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
         return .{ .aggregate = try runAggregate(ctx, args, agg_str) };
     }
     if (args.output) |out_path| {
+        // The write streams row groups as they come; an ORDER BY over the rows goes through `runPrintTo`.
+        if (args.result_order.rows.len > 0) return error.OrderByNotSupported;
         return .{ .write = try runWrite(ctx, args, out_path) };
     }
     return error.MissingOutputOrAggregate;
@@ -1645,20 +1647,23 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         }
     }
     const row_keys = try arena.alloc(RowSortKey, args.result_order.rows.len);
-    for (args.result_order.rows, row_keys) |rk, *key| {
-        const ident = metadata.unquoteIdent(rk.column);
-        const ci = metadata.resolveColumn(meta0, ident) catch |err| {
-            Diag.setColumn(args.diag, ident);
-            return err;
-        };
-        const path = (try metadata.leafPathSegments(arena, meta0, ci)) orelse return error.UnknownColumn;
-        if (meta0.getColumnLevels(path).max_rep > 0) {
-            Diag.setColumn(args.diag, ident);
-            return error.NestedRowOutputNotSupported;
+    for (args.result_order.rows, row_keys, 0..) |rk, *key, k| {
+        const e = try expr_parser.parseExprOnly(arena, rk.expr, meta0, args.diag);
+        e.collectColumns(fetch);
+        if (e == .col_ref) {
+            const ci = e.col_ref.col_idx;
+            const path = (try metadata.leafPathSegments(arena, meta0, ci)) orelse return error.UnknownColumn;
+            if (meta0.getColumnLevels(path).max_rep > 0) {
+                Diag.setColumn(args.diag, rk.expr);
+                return error.NestedRowOutputNotSupported;
+            }
+            const elem = metadata.leafSchemaElement(meta0, ci) orelse return error.UnknownColumn;
+            key.* = .{ .spec = .{ .passthrough = ci }, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
+        } else {
+            // Computed as a written column would be; its lane is signed (arithmetic refuses UINT64 operands).
+            const alias = try std.fmt.allocPrint(arena, "__order_{d}", .{k});
+            key.* = .{ .spec = .{ .computed = .{ .expr = e, .alias = alias } }, .descending = rk.descending, .unsigned = false };
         }
-        const elem = metadata.leafSchemaElement(meta0, ci) orelse return error.UnknownColumn;
-        key.* = .{ .col_idx = ci, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
-        fetch[ci] = true;
     }
     // A --select names its outputs, so two may clash, as aggregate and GROUP BY outputs may; a plain copy keeps the
     // source's own names and is not checked.
@@ -4748,7 +4753,8 @@ fn printCell(
 
 /// A plain-row ORDER BY key bound to its input column (`expr_ast.RowKey`).
 const RowSortKey = struct {
-    col_idx: usize,
+    /// The key as an output column of the row: a passthrough leaf, or an expression computed like a written column.
+    spec: consumer.OutputCol,
     descending: bool,
     /// An unsigned integer column: its lane holds raw bits, compared as unsigned.
     unsigned: bool,
@@ -4822,6 +4828,8 @@ const TopRows = struct {
     keys: []const RowSortKey,
     key_specs: []consumer.OutputCol,
     h: usize,
+    /// Bytes the kept rows and their heap may take; past it the query fails cleanly (no spilling).
+    budget: usize,
     /// The rows admitted so far, their output columns copied; a heap entry indexes one. Rows evicted stay until
     /// `compact` drops them.
     store_arena: *std.heap.ArenaAllocator,
@@ -4843,10 +4851,11 @@ const TopRows = struct {
         specs: []const consumer.OutputCol,
         keys: []const RowSortKey,
         h: usize,
+        budget: usize,
     ) !TopRows {
         const key_specs = try gpa.alloc(consumer.OutputCol, keys.len);
         errdefer gpa.free(key_specs);
-        for (keys, key_specs) |k, *spec| spec.* = .{ .passthrough = k.col_idx };
+        for (keys, key_specs) |k, *spec| spec.* = k.spec;
         const store_arena = try gpa.create(std.heap.ArenaAllocator);
         store_arena.* = .init(gpa);
         errdefer {
@@ -4860,6 +4869,7 @@ const TopRows = struct {
             .keys = keys,
             .key_specs = key_specs,
             .h = h,
+            .budget = budget,
             .store_arena = store_arena,
             .store = try consumer.initOutputAggregator(store_arena.allocator(), meta, specs),
             .heap = .empty,
@@ -4935,7 +4945,9 @@ const TopRows = struct {
             try copyRow(&self.store, &outputs, e.pos.ord);
             e.row = self.store.num_rows - 1;
         };
-        if (self.store.num_rows > 2 * self.h + 1024) try self.compact();
+        if (self.store.num_rows > 2 *| self.h +| 1024) try self.compact();
+        const held = self.store_arena.queryCapacity() + self.heap.cap * @sizeOf(Entry);
+        if (held > self.budget) return error.ExceededMemoryBudget;
     }
 
     fn ownCell(arena: std.mem.Allocator, c: SortCell) !SortCell {
@@ -5360,8 +5372,9 @@ pub fn runPrintTo(
     t.core.prof = prof;
 
     if (proj.row_keys.len > 0) {
-        // ORDER BY over plain rows only ever comes with a LIMIT (the SQL front end requires one).
-        var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, offset +| (limit orelse 0));
+        // Without a LIMIT every row is kept and sorted, within half the memory budget (as decoded rows are).
+        const keep = if (limit) |l| offset +| l else std.math.maxInt(usize);
+        var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory / 2);
         defer top.deinit();
         if (limit != 0) for (opened.inputs, metas, 0..) |in, *meta_i, file_i| {
             for (meta_i.row_groups.items, 0..) |*src_rg, rg_i| {

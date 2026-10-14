@@ -767,6 +767,15 @@ def main():
         ("SELECT id, flag FROM '{f}' ORDER BY flag DESC LIMIT 6 OFFSET 1000",
          "SELECT id, flag FROM read_parquet('{f}', file_row_number=true) ORDER BY flag DESC, file_row_number "
          "LIMIT 6 OFFSET 1000"),
+        # Without a LIMIT every row is sorted; keys may be expressions of the row.
+        "SELECT id, name FROM '{f}' WHERE id BETWEEN -30 AND 30 ORDER BY name DESC, id",
+        "SELECT * FROM '{f}' ORDER BY ts DESC, id",
+        ("SELECT flag, id FROM '{f}' WHERE id < 0 ORDER BY flag",
+         "SELECT flag, id FROM read_parquet('{f}', file_row_number=true) WHERE id < 0 ORDER BY flag, file_row_number"),
+        "SELECT id FROM '{f}' ORDER BY id * -1 LIMIT 5",
+        "SELECT name, id FROM '{f}' ORDER BY strlen(name) DESC, id LIMIT 8 OFFSET 2",
+        "SELECT id, flag FROM '{f}' WHERE id BETWEEN 0 AND 40 ORDER BY CASE WHEN flag = true THEN 0 ELSE 1 END, id",
+        "SELECT name FROM '{f}' ORDER BY coalesce(nname, 'zz') DESC, id LIMIT 6",
         ("SELECT name, d FROM '{f}' WHERE id > 0 ORDER BY d DESC LIMIT 5",
          "SELECT name, d FROM read_parquet('{f}', file_row_number=true) WHERE id > 0 ORDER BY d DESC, "
          "file_row_number LIMIT 5"),
@@ -812,6 +821,32 @@ def main():
                 print(f"  FAIL  {label}  {problem}  [{z_sql[:60]}]")
             else:
                 print(f"  OK    {label}  ({len(got)} rows, in order)")
+
+    # A full sort holds every row: past its share of --max-memory it fails cleanly instead of running out.
+    total += 1
+    r = subprocess.run([ZPQ, "query", "--query", f"SELECT * FROM '{fixture}' ORDER BY name", "--max-memory", "300000"],
+                       capture_output=True, text=True)
+    if r.returncode == 1 and not r.stdout and "max-memory" in r.stderr:
+        print("  OK    top-rows:budget  (refused cleanly)")
+    else:
+        fails += 1
+        print(f"  FAIL  top-rows:budget  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr[:90]!r}")
+
+    # GROUP BY binds a name to the column before a SELECT alias (DuckDB 1.5 and 2.0 alike): `amt AS name` then is no
+    # key of `GROUP BY name`, and both engines refuse the query.
+    total += 1
+    alias_sql = f"SELECT amt AS name, count(*) AS c FROM '{fixture}' GROUP BY name"
+    r = subprocess.run([ZPQ, "query", "--query", alias_sql], capture_output=True, text=True)
+    try:
+        con.execute(alias_sql).fetchall()
+        duck_refused = False
+    except duckdb.Error:
+        duck_refused = True
+    if duck_refused and r.returncode == 2 and not r.stdout:
+        print("  OK    group-by:column-before-alias  (both refuse)")
+    else:
+        fails += 1
+        print(f"  FAIL  group-by:column-before-alias  duck_refused={duck_refused} rc={r.returncode} {r.stdout[:60]!r}")
 
     # sum(x + c) folds x and adds c once per value (`sumOffset`): every fold path must add it as often as it sums. `c`
     # is constant per row group (the statistics fold), `g` low-cardinality (dictionary codes), `n` NULL in places and

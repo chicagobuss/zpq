@@ -856,7 +856,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         }
         output_ns = if (fmt == .parquet) ar.timings.core.encode_ns + ar.timings.core.sink_ns + ar.timings.footer_ns else output_ns;
         stats = .{ .rows_in = ar.rows_in, .rows_kept = ar.rows_kept, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
-    } else if (fmt == .parquet and limit == null and result_order.offset == 0) {
+    } else if (fmt == .parquet and limit == null and result_order.offset == 0 and result_order.rows.len == 0) {
         const result = (try engine.runQuery(ctx, query_args)).write;
         rows = @intCast(result.rows_kept);
         output_ns = result.timings.core.encode_ns + result.timings.core.sink_ns + result.timings.footer_ns;

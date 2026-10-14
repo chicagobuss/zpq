@@ -35,6 +35,8 @@ pub const Error = error{
     UnbalancedParentheses,
     /// Grouping parentheses nest deeper than `MAX_GROUP_DEPTH`.
     FilterTooDeep,
+    /// A quote opens a string literal or quoted name that never closes.
+    UnterminatedString,
 } || std.mem.Allocator.Error;
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
@@ -71,9 +73,10 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// The index just past the quoted span opening at `src[i]`. A doubled quote inside escapes itself. An unterminated
-/// quote is an ordinary byte, as the unquoted literal forms (`name = O'Brien`) have always read it.
-fn skipQuoted(src: []const u8, i: usize) usize {
+/// The index just past the quoted span opening at `src[i]`. A doubled quote inside escapes itself, as SQL writes
+/// `'O''Reilly'`. An unterminated quote is an error: read as an ordinary byte, it would let the rest of a mistyped
+/// literal (`'O\'Reilly' AND ...`) split as structure.
+fn skipQuoted(src: []const u8, i: usize) Error!usize {
     const q = src[i];
     var j = i + 1;
     while (j < src.len) : (j += 1) {
@@ -84,7 +87,7 @@ fn skipQuoted(src: []const u8, i: usize) usize {
         }
         return j + 1;
     }
-    return i + 1;
+    return error.UnterminatedString;
 }
 
 /// A word of the outermost level: letters, digits and `_`, with whitespace, a parenthesis or an end on both sides.
@@ -105,7 +108,7 @@ const Cursor = struct {
         while (self.i < src.len) {
             const c = src[self.i];
             switch (c) {
-                '\'', '"' => self.i = skipQuoted(src, self.i),
+                '\'', '"' => self.i = try skipQuoted(src, self.i),
                 '(' => {
                     self.depth += 1;
                     self.i += 1;
@@ -144,7 +147,7 @@ const Cursor = struct {
                 return at;
             }
             switch (c) {
-                '\'', '"' => self.i = skipQuoted(src, self.i),
+                '\'', '"' => self.i = try skipQuoted(src, self.i),
                 '(' => {
                     self.depth += 1;
                     self.i += 1;
@@ -253,7 +256,7 @@ fn groupBody(term: []const u8) Error!?[]const u8 {
     var cur: Cursor = .{ .src = term, .i = 1, .depth = 1 };
     while (cur.i < term.len) {
         switch (term[cur.i]) {
-            '\'', '"' => cur.i = skipQuoted(term, cur.i),
+            '\'', '"' => cur.i = try skipQuoted(term, cur.i),
             '(' => {
                 cur.depth += 1;
                 cur.i += 1;
@@ -600,7 +603,7 @@ fn findComparison(expr: []const u8) Error!?Comparison {
         const c = expr[i];
         switch (c) {
             '\'', '"' => {
-                i = skipQuoted(expr, i);
+                i = try skipQuoted(expr, i);
                 continue;
             },
             '(' => depth += 1,
@@ -1677,6 +1680,10 @@ test "parse rejects unsupported syntax with specific errors" {
     try testing.expectError(error.UnbalancedParentheses, parse(a, "(id > 1 OR id < 5", &meta, null));
     try testing.expectError(error.UnbalancedParentheses, parse(a, "id > 1) OR (id < 5", &meta, null));
     try testing.expectError(error.EmptyExpr, parse(a, "id > 1 AND ()", &meta, null));
+    // A quote that never closes is an error, never a literal that swallows or splits the rest.
+    try testing.expectError(error.UnterminatedString, parse(a, "status = 'O\\'Reilly' AND id = 1", &meta, null));
+    try testing.expectError(error.UnterminatedString, parse(a, "status = 'abc", &meta, null));
+    try testing.expectError(error.UnterminatedString, parse(a, "\"status = 1", &meta, null));
     // What parentheses remain inside a leaf are no grouping this grammar has.
     try testing.expectError(error.BadOperator, parse(a, "(id + 1) = 2", &meta, null));
     // LIKE on a non-string column is a clear error.

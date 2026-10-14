@@ -584,7 +584,8 @@ fn resultOrder(
     return order;
 }
 
-/// Add ORDER BY term `expr`, which names no SELECT column, to `hidden`; its index there. Only a GROUP BY query has
+/// Add ORDER BY term `expr`, which names no SELECT column, to `hidden` (once: a term written alike is reused); its
+/// index there. Only a GROUP BY query has
 /// such a term: an aggregate, or an expression whose columns are all grouped.
 fn hiddenTerm(
     allocator: std.mem.Allocator,
@@ -610,6 +611,8 @@ fn hiddenTerm(
         diagnosticPrint("sql: ORDER BY {s} must be in the GROUP BY list or aggregated\n", .{text});
         return error.ColumnMustBeGrouped;
     }
+    // Written alike, one slot: `ORDER BY count(*) DESC, count(*)` computes one aggregate.
+    for (hidden.items, 0..) |h, i| if (std.mem.eql(u8, h.expr, text)) return i;
     try hidden.ensureUnusedCapacity(allocator, 1);
     hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
     return hidden.items.len - 1;
@@ -953,6 +956,16 @@ test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result column
     }, q.result_order.keys);
     // The hidden aggregate is a call of its own, after the SELECT list's.
     try std.testing.expectEqualStrings("count(*) AS " ++ hidden_alias ++ "0", q.aggregate_str.?);
+
+    // A term written twice is one hidden column and one call.
+    const twice = try parseSqlQuery(a, "SELECT b FROM 't' GROUP BY b ORDER BY count(*) DESC, count(*) ASC");
+    defer twice.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), twice.result_order.hidden.len);
+    try std.testing.expectEqualSlices(ast.OrderKey, &.{
+        .{ .column = 1, .descending = true },
+        .{ .column = 1, .descending = false },
+    }, twice.result_order.keys);
+    try std.testing.expectEqualStrings("count(*) AS " ++ hidden_alias ++ "0", twice.aggregate_str.?);
 }
 
 test "sql_parser hands NOT over groups on as the predicate written" {

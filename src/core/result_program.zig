@@ -132,3 +132,45 @@ test "finish leaves the answer whole when it runs out of memory" {
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
+
+test "finish leaves every row as it was when an allocation fails part way" {
+    const gpa = std.testing.allocator;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var out: scan.AggOutput = .{};
+        defer out.deinit(gpa);
+        const rows = try gpa.alloc([]const scan.AggValue, 4);
+        @memset(rows, &.{});
+        out.group_rows = rows;
+        for (rows, 0..) |*row, i| {
+            const r = try gpa.alloc(scan.AggValue, 2);
+            r[0] = .{ .i = @intCast(i) };
+            r[1] = .null_val;
+            row.* = r;
+            const owned = try gpa.dupe(u8, "hidden");
+            r[1] = .{ .s = owned };
+        }
+        const cols = try gpa.alloc([]const u8, 2);
+        @memset(cols, "");
+        out.group_cols = cols;
+        for (cols) |*c| c.* = try gpa.dupe(u8, "c");
+
+        var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        const program: ResultProgram = .{ .visible = 1 };
+        program.finish(failing.allocator(), &out, null) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // Untouched: every row still wide, the hidden strings still owned.
+            try std.testing.expectEqual(@as(usize, 2), out.group_cols.?.len);
+            for (out.group_rows.?, 0..) |row, i| {
+                try std.testing.expectEqual(@as(usize, 2), row.len);
+                try std.testing.expectEqual(@as(i128, @intCast(i)), row[0].i);
+                try std.testing.expectEqualStrings("hidden", row[1].s);
+            }
+            continue;
+        };
+        for (out.group_rows.?) |row| try std.testing.expectEqual(@as(usize, 1), row.len);
+        break;
+    }
+    try std.testing.expect(fail_index > 0);
+}
+

@@ -16,6 +16,7 @@ NULL, integers and DECIMAL (zpq's JSON digits read as Decimal), tolerant for flo
 Usage: .venv/bin/python tools/differential.py
 """
 from cli_output import read_one, read_rows, read_summary
+import datetime
 import duckdb, subprocess, os, sys, tempfile, json
 import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
@@ -748,6 +749,69 @@ def main():
                 print(f"  FAIL  {label}  {problem}  [{h_sql[:60]}]")
             else:
                 print(f"  OK    {label}  ({len(got)} rows)")
+
+    # ORDER BY over plain rows, with a LIMIT: the first OFFSET + LIMIT rows by the keys, NULLs last either way, ties
+    # by input position (DuckDB ranks those by file_row_number to say the same).
+    TOP_ROWS = [
+        "SELECT name, id FROM '{f}' WHERE name LIKE 'n1%' ORDER BY id DESC LIMIT 7",
+        "SELECT name FROM '{f}' ORDER BY ts LIMIT 10",
+        "SELECT name FROM '{f}' ORDER BY ts DESC LIMIT 4",
+        "SELECT * FROM '{f}' WHERE amt > 0 ORDER BY amt DESC, id LIMIT 5 OFFSET 3",
+        "SELECT nname, id FROM '{f}' ORDER BY nname DESC, id LIMIT 12",
+        "SELECT name, price FROM '{f}' ORDER BY price DESC LIMIT 3",
+        "SELECT id AS k, name FROM '{f}' ORDER BY k LIMIT 3 OFFSET 2",
+        "SELECT id FROM '{f}' WHERE id < -100000 ORDER BY id LIMIT 3",
+        "SELECT id FROM '{f}' ORDER BY id LIMIT 0",
+        ("SELECT id, flag FROM '{f}' ORDER BY flag LIMIT 6",
+         "SELECT id, flag FROM read_parquet('{f}', file_row_number=true) ORDER BY flag, file_row_number LIMIT 6"),
+        ("SELECT id, flag FROM '{f}' ORDER BY flag DESC LIMIT 6 OFFSET 1000",
+         "SELECT id, flag FROM read_parquet('{f}', file_row_number=true) ORDER BY flag DESC, file_row_number "
+         "LIMIT 6 OFFSET 1000"),
+        ("SELECT name, d FROM '{f}' WHERE id > 0 ORDER BY d DESC LIMIT 5",
+         "SELECT name, d FROM read_parquet('{f}', file_row_number=true) WHERE id > 0 ORDER BY d DESC, "
+         "file_row_number LIMIT 5"),
+    ]
+    for i, t_sql in enumerate(TOP_ROWS):
+        z_sql, d_sql = t_sql if isinstance(t_sql, tuple) else (t_sql, t_sql)
+        for fmt in ("jsonl", "parquet"):
+            total += 1
+            label = f"top-rows:{i} {fmt}"
+            out = os.path.join(tmp, "top.parquet")
+            cmd = [ZPQ, "query", "--query", z_sql.format(f=fixture)]
+            if fmt == "parquet":
+                cmd += ["-o", out]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+                duck_rel = con.execute(d_sql.format(f=fixture))
+                lanes = json_lanes(duck_rel)
+                drows = duck_rel.fetchall()
+                if fmt == "jsonl":
+                    # JSON prints a DATE as its days and a TIMESTAMP_MS as its milliseconds since the epoch.
+                    def stored(v):
+                        if isinstance(v, datetime.datetime):
+                            return (v - datetime.datetime(1970, 1, 1)) // datetime.timedelta(milliseconds=1)
+                        if isinstance(v, datetime.date):
+                            return (v - datetime.date(1970, 1, 1)).days
+                        return v
+                    drows = [tuple(stored(v) for v in row) for row in drows]
+                want = [tuple(canon(v, lanes[k]) for k, v in enumerate(row)) for row in drows]
+                if fmt == "parquet":
+                    pq.read_table(out)  # the strict reader must accept it
+                    zrows = [list(row) for row in con.execute(f"SELECT * FROM '{out}'").fetchall()]
+                    got = [tuple(canon(v, lanes[k]) for k, v in enumerate(row)) for row in zrows]
+                else:
+                    got = [tuple(canon(v, lanes[k]) for k, v in enumerate(from_zpq(list(row.values()), lanes)))
+                           for row in read_rows(r.stdout, parse_float=Decimal)]
+                problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+            except Exception as e:
+                problem = f"error: {e}"
+            if problem:
+                fails += 1
+                print(f"  FAIL  {label}  {problem}  [{z_sql[:60]}]")
+            else:
+                print(f"  OK    {label}  ({len(got)} rows, in order)")
 
     # sum(x + c) folds x and adds c once per value (`sumOffset`): every fold path must add it as often as it sums. `c`
     # is constant per row group (the statistics fold), `g` low-cardinality (dictionary codes), `n` NULL in places and

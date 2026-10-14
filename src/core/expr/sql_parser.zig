@@ -42,6 +42,8 @@ pub const ParsedQuery = struct {
 
 fn freeResultOrder(allocator: std.mem.Allocator, order: ast.ResultOrder) void {
     allocator.free(order.keys);
+    for (order.rows) |k| allocator.free(k.column);
+    allocator.free(order.rows);
     freeSelectCols(allocator, order.hidden);
 }
 
@@ -625,17 +627,14 @@ fn resultOrder(
     hidden: *std.ArrayList(ast.SelectColumn),
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
-    if (!is_aggregate) {
-        if (n_terms > 0) {
-            diagnosticPrint("sql: ORDER BY over plain rows is not supported yet\n", .{});
-            return error.OrderByNotSupported;
-        }
-    }
-
     var order: ast.ResultOrder = .{};
     if (sel.limit) |lim| {
         order.limit = try nonNegativeInt(lim.*.u.limit.count orelse return error.LimitNotSupported);
         if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
+    }
+    if (!is_aggregate) {
+        if (n_terms > 0) order.rows = try rowOrder(allocator, sel, lp_arena, select_cols, order.limit != null);
+        return order;
     }
 
     const keys = try allocator.alloc(ast.OrderKey, n_terms);
@@ -657,6 +656,71 @@ fn resultOrder(
 }
 
 const Clause = enum { order_by, having };
+
+/// ORDER BY over plain rows: each term a flat input column, named directly, through a SELECT alias or by position
+/// (which must name a bare column). A sort without LIMIT over every row is not supported.
+fn rowOrder(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    select_cols: []const ast.SelectColumn,
+    has_limit: bool,
+) ![]const ast.RowKey {
+    if (!has_limit) {
+        diagnosticPrint("sql: ORDER BY over plain rows needs a LIMIT (only the top rows are kept)\n", .{});
+        return error.OrderByNotSupported;
+    }
+    const n_terms: usize = @intCast(sel.order_by.count);
+    const keys = try allocator.alloc(ast.RowKey, n_terms);
+    var made: usize = 0;
+    errdefer {
+        for (keys[0..made]) |k| allocator.free(k.column);
+        allocator.free(keys);
+    }
+    for (keys) |*key| {
+        const term = sel.order_by.items[made] orelse return error.SqlParseError;
+        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
+            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
+            return error.OrderByNotSupported;
+        }
+        var expr: *c.LpNode = term.*.u.order_term.expr orelse return error.SqlParseError;
+        // A position or a SELECT alias stands for that item's expression.
+        if (expr.kind == c.LP_EXPR_LITERAL_INT) {
+            const pos = try nonNegativeInt(expr);
+            if (pos < 1 or pos > select_cols.len) {
+                diagnosticPrint("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
+                return error.OrderByNotSupported;
+            }
+            expr = selectExpr(sel, @intCast(pos - 1)) orelse return error.SqlParseError;
+        } else if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
+            const name = std.mem.span(expr.u.column_ref.column);
+            for (select_cols, 0..) |col, idx| if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) {
+                expr = selectExpr(sel, idx) orelse return error.SqlParseError;
+                break;
+            };
+        }
+        if (expr.kind != c.LP_EXPR_COLUMN_REF) {
+            const text = c.lp_ast_to_sql(expr, lp_arena);
+            diagnosticPrint("sql: ORDER BY over plain rows takes columns only, not {s}\n", .{std.mem.span(text)});
+            return error.OrderByNotSupported;
+        }
+        const text_c = c.lp_ast_to_sql(expr, lp_arena);
+        if (text_c == null) return error.UnparseError;
+        key.* = .{
+            .column = try allocator.dupe(u8, std.mem.span(text_c)),
+            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+        };
+        made += 1;
+    }
+    return keys;
+}
+
+/// The expression of SELECT item `i`, `*` excepted.
+fn selectExpr(sel: anytype, i: usize) ?*c.LpNode {
+    if (i >= @as(usize, @intCast(sel.result_columns.count))) return null;
+    const rc = sel.result_columns.items[i] orelse return null;
+    return if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr else rc;
+}
 
 /// Add ORDER BY or HAVING term `expr`, which names no SELECT column, to `hidden` (once: an equal term already there is
 /// reused); its index there. Under GROUP BY such a term is an aggregate or an expression whose columns are all
@@ -1228,3 +1292,19 @@ test "sql_parser reads unquoted true and false as boolean literals" {
     try std.testing.expectEqualStrings("flag = TRUE AND NOT b = FALSE AND \"true\" = 1", q.filter_str.?);
 }
 
+
+test "sql_parser binds ORDER BY over plain rows to columns, LIMIT required" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT SearchPhrase AS p FROM 't' WHERE SearchPhrase <> '' ORDER BY EventTime, p DESC, 1 LIMIT 10 OFFSET 2");
+    defer q.deinit(a);
+    const rows = q.result_order.rows;
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("EventTime", rows[0].column);
+    try std.testing.expectEqualStrings("SearchPhrase", rows[1].column);
+    try std.testing.expect(rows[1].descending);
+    try std.testing.expectEqualStrings("SearchPhrase", rows[2].column);
+    try std.testing.expectEqual(@as(?u64, 10), q.result_order.limit);
+    try std.testing.expectEqual(@as(u64, 2), q.result_order.offset);
+    try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x"));
+    try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x + 1 LIMIT 3"));
+}

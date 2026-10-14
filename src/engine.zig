@@ -1547,9 +1547,11 @@ const ProjectionPlan = struct {
     output_specs: []const consumer.OutputCol,
     /// Some output column is an expression or a renamed leaf rather than a leaf copied under its own name.
     any_computed: bool,
-    /// Leaves to decode: those the output references plus the filter's.
+    /// Leaves to decode: those the output references plus the filter's and the row sort keys'.
     fetch: []const bool,
     labels: Labels,
+    /// SQL ORDER BY over plain rows (`ResultOrder.rows`), bound to input leaves.
+    row_keys: []const RowSortKey = &.{},
 
     /// The name each output column is printed under.
     fn names(self: *ProjectionPlan, arena: std.mem.Allocator) ![]const []const u8 {
@@ -1622,6 +1624,22 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
             if (ci < num_leaves) fetch[ci] = true;
         }
     }
+    const row_keys = try arena.alloc(RowSortKey, args.result_order.rows.len);
+    for (args.result_order.rows, row_keys) |rk, *key| {
+        const ident = metadata.unquoteIdent(rk.column);
+        const ci = metadata.resolveColumn(meta0, ident) catch |err| {
+            Diag.setColumn(args.diag, ident);
+            return err;
+        };
+        const path = (try metadata.leafPathSegments(arena, meta0, ci)) orelse return error.UnknownColumn;
+        if (meta0.getColumnLevels(path).max_rep > 0) {
+            Diag.setColumn(args.diag, ident);
+            return error.NestedRowOutputNotSupported;
+        }
+        const elem = metadata.leafSchemaElement(meta0, ci) orelse return error.UnknownColumn;
+        key.* = .{ .col_idx = ci, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
+        fetch[ci] = true;
+    }
     // A --select names its outputs, so two may clash, as aggregate and GROUP BY outputs may; a plain copy keeps the
     // source's own names and is not checked.
     if (select_items != null) {
@@ -1638,6 +1656,7 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         .any_computed = any_computed,
         .fetch = fetch,
         .labels = labels,
+        .row_keys = row_keys,
     };
 }
 
@@ -4702,6 +4721,264 @@ fn printCell(
     }
 }
 
+/// A plain-row ORDER BY key bound to its input column (`expr_ast.RowKey`).
+const RowSortKey = struct {
+    col_idx: usize,
+    descending: bool,
+    /// An unsigned integer column: its lane holds raw bits, compared as unsigned.
+    unsigned: bool,
+};
+
+/// One sort key value of a row. NULL sorts last in either direction.
+const SortCell = union(enum) {
+    null,
+    int: i128,
+    float: f64,
+    str: []const u8,
+
+    fn order(a: SortCell, b: SortCell) std.math.Order {
+        if (a == .null or b == .null) return if (a == .null and b == .null) .eq else if (a == .null) .gt else .lt;
+        return switch (a) {
+            .int => |x| std.math.order(x, b.int),
+            .float => |x| floatOrder(x, b.float),
+            .str => |x| std.mem.order(u8, x, b.str),
+            .null => unreachable,
+        };
+    }
+
+    fn floatOrder(a: f64, b: f64) std.math.Order {
+        if (std.math.isNan(a) or std.math.isNan(b)) {
+            return if (std.math.isNan(a) == std.math.isNan(b)) .eq else if (std.math.isNan(a)) .gt else .lt;
+        }
+        return std.math.order(a, b);
+    }
+};
+
+/// Key `k`'s value in row `row` of a buffer holding the key columns, borrowed from it.
+fn sortCell(buf: consumer.OutputAggregator.ColumnBuf, row: usize, unsigned: bool) SortCell {
+    switch (buf) {
+        inline else => |tb, tag| {
+            if (tb.def_levels.items.len > 0 and tb.def_levels.items[row] < tb.max_def) return .null;
+            const v = tb.values.items[row];
+            return switch (tag) {
+                .i32 => .{ .int = if (unsigned) @as(u32, @bitCast(v)) else v },
+                .i64 => .{ .int = if (unsigned) @as(u64, @bitCast(v)) else v },
+                .i128 => .{ .int = v },
+                .boolean => .{ .int = @intFromBool(v) },
+                .f32, .f64 => .{ .float = v },
+                .string => .{ .str = v },
+            };
+        },
+    }
+}
+
+/// Where a row stands in the input, for ties: file, row group, and its place among the row group's filtered rows.
+const RowPos = struct {
+    file: u32,
+    rg: u32,
+    ord: u32 = 0,
+
+    fn order(a: RowPos, b: RowPos) std.math.Order {
+        if (a.file != b.file) return std.math.order(a.file, b.file);
+        if (a.rg != b.rg) return std.math.order(a.rg, b.rg);
+        return std.math.order(a.ord, b.ord);
+    }
+};
+
+/// Keeps the first `h` (OFFSET + LIMIT) plain rows by a SQL ORDER BY across row groups, ties by input position, as a
+/// stable sort of every row would. A row group's filter and key columns decode first; only a row group holding a row
+/// that enters the heap decodes its output columns, and those rows are copied out, owned, before it is released. The
+/// heap's top is the last row kept, so a row that sorts before it replaces it; one that ties it comes later in the
+/// input and does not.
+const TopRows = struct {
+    gpa: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    specs: []const consumer.OutputCol,
+    keys: []const RowSortKey,
+    key_specs: []consumer.OutputCol,
+    h: usize,
+    /// The rows admitted so far, their output columns copied; a heap entry indexes one. Rows evicted stay until
+    /// `compact` drops them.
+    store_arena: *std.heap.ArenaAllocator,
+    store: consumer.OutputAggregator,
+    heap: std.PriorityQueue(Entry, *const TopRows, later),
+
+    const pending = std.math.maxInt(usize);
+
+    const Entry = struct {
+        cells: []SortCell,
+        pos: RowPos,
+        /// Its row in `store`, or `pending` until its row group's output columns are copied.
+        row: usize,
+    };
+
+    fn init(
+        gpa: std.mem.Allocator,
+        meta: *const schema.FileMetaData,
+        specs: []const consumer.OutputCol,
+        keys: []const RowSortKey,
+        h: usize,
+    ) !TopRows {
+        const key_specs = try gpa.alloc(consumer.OutputCol, keys.len);
+        errdefer gpa.free(key_specs);
+        for (keys, key_specs) |k, *spec| spec.* = .{ .passthrough = k.col_idx };
+        const store_arena = try gpa.create(std.heap.ArenaAllocator);
+        store_arena.* = .init(gpa);
+        errdefer {
+            store_arena.deinit();
+            gpa.destroy(store_arena);
+        }
+        return .{
+            .gpa = gpa,
+            .meta = meta,
+            .specs = specs,
+            .keys = keys,
+            .key_specs = key_specs,
+            .h = h,
+            .store_arena = store_arena,
+            .store = try consumer.initOutputAggregator(store_arena.allocator(), meta, specs),
+            .heap = .empty,
+        };
+    }
+
+    fn deinit(self: *TopRows) void {
+        self.heap.deinit(self.gpa);
+        self.store_arena.deinit();
+        self.gpa.destroy(self.store_arena);
+        self.gpa.free(self.key_specs);
+    }
+
+    /// Whether row (`a_cells`, `a_pos`) sorts before row (`b_cells`, `b_pos`). NULL is last in either direction.
+    fn before(keys: []const RowSortKey, a_cells: []const SortCell, a_pos: RowPos, b_cells: []const SortCell, b_pos: RowPos) bool {
+        for (keys, a_cells, b_cells) |k, a, b| {
+            var ord = a.order(b);
+            if (k.descending and a != .null and b != .null) ord = ord.invert();
+            if (ord != .eq) return ord == .lt;
+        }
+        return a_pos.order(b_pos) == .lt;
+    }
+
+    fn later(self: *const TopRows, a: Entry, b: Entry) std.math.Order {
+        if (before(self.keys, b.cells, b.pos, a.cells, a.pos)) return .lt;
+        if (before(self.keys, a.cells, a.pos, b.cells, b.pos)) return .gt;
+        return .eq;
+    }
+
+    /// Offer one row group's filtered rows.
+    fn offer(
+        self: *TopRows,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: consumer.RGSrc,
+        filter: ?filter_ast.Filter,
+        fetch: []const bool,
+        at: RowPos,
+        timings: *consumer.Timings,
+        options: consumer.DecodeOptions,
+    ) !void {
+        if (self.h == 0) return;
+        var rg_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer rg_arena.deinit();
+        const ra = rg_arena.allocator();
+        var keyed = try consumer.initOutputAggregator(ra, meta, self.key_specs);
+        const n = try consumer.appendProjectedRGWithOptions(&keyed, self.gpa, rg, meta, src, filter, fetch, self.key_specs, timings, options);
+        if (n == 0) return;
+
+        self.heap.context = self;
+        const scratch = try ra.alloc(SortCell, self.keys.len);
+        var admitted = false;
+        for (0..n) |i| {
+            for (self.keys, keyed.cols, scratch) |k, buf, *cell| cell.* = sortCell(buf, i, k.unsigned);
+            const pos: RowPos = .{ .file = at.file, .rg = at.rg, .ord = @intCast(i) };
+            if (self.heap.count() == self.h) {
+                const top = self.heap.peek().?;
+                if (!before(self.keys, scratch, pos, top.cells, top.pos)) continue;
+                _ = self.heap.pop();
+            }
+            const cells = try self.store_arena.allocator().alloc(SortCell, self.keys.len);
+            for (scratch, cells) |c, *d| d.* = try ownCell(self.store_arena.allocator(), c);
+            try self.heap.push(self.gpa, .{ .cells = cells, .pos = pos, .row = pending });
+            admitted = true;
+        }
+        if (!admitted) return;
+
+        // The rows that entered and are still kept: copy their output columns, decoded once for the row group.
+        var outputs = try consumer.initOutputAggregator(ra, meta, self.specs);
+        const m = try consumer.appendProjectedRGWithOptions(&outputs, self.gpa, rg, meta, src, filter, fetch, self.specs, timings, options);
+        if (m != n) return error.ShortDecode;
+        for (self.heap.items) |*e| if (e.row == pending) {
+            try copyRow(&self.store, &outputs, e.pos.ord);
+            e.row = self.store.num_rows - 1;
+        };
+        if (self.store.num_rows > 2 * self.h + 1024) try self.compact();
+    }
+
+    fn ownCell(arena: std.mem.Allocator, c: SortCell) !SortCell {
+        return if (c == .str) .{ .str = try arena.dupe(u8, c.str) } else c;
+    }
+
+    /// Rebuild `store` with only the rows the heap still keeps.
+    fn compact(self: *TopRows) !void {
+        const fresh = try self.gpa.create(std.heap.ArenaAllocator);
+        fresh.* = .init(self.gpa);
+        errdefer {
+            fresh.deinit();
+            self.gpa.destroy(fresh);
+        }
+        const fa = fresh.allocator();
+        var store = try consumer.initOutputAggregator(fa, self.meta, self.specs);
+        const cells = try fa.alloc([]SortCell, self.heap.items.len);
+        for (self.heap.items, cells) |e, *dst| {
+            try copyRow(&store, &self.store, e.row);
+            dst.* = try fa.alloc(SortCell, e.cells.len);
+            for (e.cells, dst.*) |c, *d| d.* = try ownCell(fa, c);
+        }
+        // Nothing can fail from here: swap the rows in.
+        for (self.heap.items, cells, 0..) |*e, c, i| {
+            e.cells = c;
+            e.row = i;
+        }
+        self.store_arena.deinit();
+        self.gpa.destroy(self.store_arena);
+        self.store_arena = fresh;
+        self.store = store;
+    }
+
+    /// The kept rows in their order, on `arena`.
+    fn ranked(self: *TopRows, arena: std.mem.Allocator) !consumer.OutputAggregator {
+        const entries = try arena.dupe(Entry, self.heap.items);
+        std.mem.sortUnstable(Entry, entries, self.keys, struct {
+            fn lt(keys: []const RowSortKey, a: Entry, b: Entry) bool {
+                return before(keys, a.cells, a.pos, b.cells, b.pos);
+            }
+        }.lt);
+        var out = try consumer.initOutputAggregator(arena, self.meta, self.specs);
+        for (entries) |e| try copyRow(&out, &self.store, e.row);
+        return out;
+    }
+};
+
+/// Append row `row` of `src` to `dst`, both built for the same output columns, its strings copied onto `dst`'s arena.
+/// A column whose rows so far carried no definition levels gains them, all present, once one row does.
+fn copyRow(dst: *consumer.OutputAggregator, src: *const consumer.OutputAggregator, row: usize) !void {
+    for (dst.cols, src.cols) |*d, s| switch (d.*) {
+        inline else => |*dt, tag| {
+            const st = @field(s, @tagName(tag));
+            std.debug.assert(!st.coded);
+            var v = st.values.items[row];
+            if (@TypeOf(v) == []const u8) v = try dst.arena.dupe(u8, v);
+            try dt.values.append(dst.arena, v);
+            if (st.def_levels.items.len > 0 or dt.def_levels.items.len > 0) {
+                dt.max_def = @max(dt.max_def, st.max_def);
+                while (dt.def_levels.items.len + 1 < dt.values.items.len) try dt.def_levels.append(dst.arena, dt.max_def);
+                const level = if (st.def_levels.items.len > 0) st.def_levels.items[row] else dt.max_def;
+                try dt.def_levels.append(dst.arena, level);
+            }
+        },
+    };
+    dst.num_rows += 1;
+}
+
 const SlicedPrint = struct {
     names: []const []const u8,
     writer: *StdoutWriter,
@@ -5057,7 +5334,32 @@ pub fn runPrintTo(
     var t: Timings = .{};
     t.core.prof = prof;
 
-    for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
+    if (proj.row_keys.len > 0) {
+        // ORDER BY over plain rows only ever comes with a LIMIT (the SQL front end requires one).
+        var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, offset +| (limit orelse 0));
+        defer top.deinit();
+        if (limit != 0) for (opened.inputs, metas, 0..) |in, *meta_i, file_i| {
+            for (meta_i.row_groups.items, 0..) |*src_rg, rg_i| {
+                rows_in += @intCast(src_rg.num_rows);
+                if (filter_opt) |f| if (!args.scan_all) {
+                    if (filter_prune.pruneRowGroup(src_rg, f, meta_i) == .skip) {
+                        skipRowGroup(in, rg_i);
+                        continue;
+                    }
+                };
+                if (in.gate) |g| try g.wait(g.ctx, rg_i);
+                defer skipRowGroup(in, rg_i);
+                try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
+                    .file = @intCast(file_i),
+                    .rg = @intCast(rg_i),
+                }, &t.core, .{ .fast_levels = args.fast_levels });
+            }
+        };
+        var ranked = try top.ranked(arena);
+        const print_span = profile.Span.begin(prof);
+        try flushAggregator(&ranked, names, &stdout_writer, is_jsonl, limit, &total_printed);
+        print_span.end(.sink_write, profile.args(.{ranked.num_rows}));
+    } else for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
         const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
         const meta_const = meta_i;
         for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {

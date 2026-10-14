@@ -414,6 +414,15 @@ pub const ResultOrder = struct {
     hidden: []const SelectColumn = &.{},
     /// HAVING, over result row columns; rows it does not make TRUE are dropped before ORDER BY ranks them.
     having: ?*const Having = null,
+    /// ORDER BY over plain rows (no aggregate), by flat columns of the input, selected or not; `keys` is then empty.
+    /// Only with a LIMIT: the engine keeps the first OFFSET + LIMIT rows by these keys, ties by input position.
+    rows: []const RowKey = &.{},
+};
+
+/// One ORDER BY key over plain rows: an input column as SQL names it, bound by the engine like any column name.
+pub const RowKey = struct {
+    column: []const u8,
+    descending: bool,
 };
 
 /// A comparison operator of a HAVING leaf.

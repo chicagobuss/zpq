@@ -39,30 +39,44 @@ pub const ResultProgram = struct {
         if (self.order.having) |h| try applyHaving(gpa, out, h.*);
         try out.applyResultOrder(gpa, self.order);
         if (out.group_rows == null) return self.projectScalar(gpa, out);
-        const n = self.visible orelse return;
+        try project(self.visible, gpa, out, col_types);
+        // A cut leaves few of the rows the slab was built for: release the rest. Only memory is at stake, so a
+        // refused allocation keeps the larger slab rather than fail an answer already final.
+        out.compactRows(gpa) catch {};
+    }
+
+    /// Drop each row's columns past the first `visible`, building the narrowed rows in one new slab before anything
+    /// is released, so a failure leaves `out` as it was. They take over the visible values (and the strings those
+    /// own) from the old rows.
+    fn project(
+        visible: ?usize,
+        gpa: std.mem.Allocator,
+        out: *scan.AggOutput,
+        col_types: ?*?[]const scan.GroupColType,
+    ) error{OutOfMemory}!void {
+        const n = visible orelse return;
         const rows = out.group_rows orelse return;
         const cols = out.group_cols.?;
         if (n >= cols.len) return;
-        // The narrowed rows are built before anything is released, so a failure leaves `out` as it was. They take
-        // over the visible values (and the strings those own) from the old rows.
+        const slab = try gpa.alloc(scan.AggValue, rows.len * n);
+        errdefer gpa.free(slab);
         const narrowed = try gpa.alloc([]const scan.AggValue, rows.len);
-        var built: usize = 0;
-        errdefer {
-            for (narrowed[0..built]) |row| gpa.free(row);
-            gpa.free(narrowed);
-        }
-        for (rows, narrowed) |row, *dst| {
-            dst.* = try gpa.dupe(scan.AggValue, row[0..n]);
-            built += 1;
-        }
+        errdefer gpa.free(narrowed);
         const names = try gpa.dupe([]const u8, cols[0..n]);
+        for (rows, narrowed, 0..) |row, *dst, i| {
+            const cells = slab[i * n ..][0..n];
+            @memcpy(cells, row[0..n]);
+            dst.* = cells;
+        }
         for (rows) |row| {
             for (row[n..]) |v| freeValue(gpa, v);
-            gpa.free(row);
+            out.releaseRowSlice(gpa, row);
         }
         gpa.free(rows);
+        gpa.free(out.slab);
         for (cols[n..]) |c| gpa.free(c);
         gpa.free(cols);
+        out.slab = slab;
         out.group_rows = narrowed;
         out.group_cols = names;
         if (col_types) |ct| if (ct.*) |types| {
@@ -112,10 +126,7 @@ pub const ResultProgram = struct {
             if (truth(having, Row{ .row = row }) == true) {
                 kept[k] = row;
                 k += 1;
-            } else {
-                for (row) |v| freeValue(gpa, v);
-                gpa.free(row);
-            }
+            } else out.releaseRow(gpa, row);
         }
         gpa.free(rows);
         out.group_rows = kept;
@@ -447,4 +458,37 @@ test "HAVING keeps only TRUE groups before the cut; without GROUP BY it may leav
     try global.finish(gpa, &scalar, null);
     try std.testing.expect(scalar.no_row);
     try std.testing.expectEqual(@as(usize, 1), scalar.aggs.len);
+}
+
+test "slab rows: a cut keeps a few, compaction releases the rest, strings stay owned" {
+    const gpa = std.testing.allocator;
+    var out: scan.AggOutput = .{};
+    defer out.deinit(gpa);
+    const n_rows = 10_000;
+    const rows = try gpa.alloc([]const scan.AggValue, n_rows);
+    @memset(rows, &.{});
+    out.group_rows = rows;
+    const slab = try gpa.alloc(scan.AggValue, n_rows * 2);
+    @memset(slab, .null_val);
+    out.slab = slab;
+    for (rows, 0..) |*row, i| {
+        const cells = slab[i * 2 ..][0..2];
+        cells[0] = .{ .i = @intCast(i) };
+        row.* = cells;
+        const owned = try std.fmt.allocPrint(gpa, "k{d}", .{i});
+        cells[1] = .{ .s = owned };
+    }
+    const cols = try gpa.alloc([]const u8, 2);
+    @memset(cols, "");
+    out.group_cols = cols;
+    for (cols) |*c| c.* = try gpa.dupe(u8, "c");
+    const program: ResultProgram = .{ .order = .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 3 } };
+    try program.finish(gpa, &out, null);
+    try std.testing.expectEqual(@as(usize, 3), out.group_rows.?.len);
+    // Compacted: the slab holds just the kept rows.
+    try std.testing.expectEqual(@as(usize, 6), out.slab.len);
+    for (out.group_rows.?, 0..) |row, j| {
+        try std.testing.expectEqual(@as(i128, n_rows - 1 - @as(i128, @intCast(j))), row[0].i);
+        try std.testing.expect(std.mem.startsWith(u8, row[1].s, "k"));
+    }
 }

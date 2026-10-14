@@ -219,6 +219,10 @@ pub const AggOutput = struct {
     group_rows: ?[]const []const AggValue = null,
     /// Without GROUP BY: HAVING failed the one group, so the answer has no row (`aggs` still holds its values).
     no_row: bool = false,
+    /// One allocation the GROUP BY rows are views into, instead of one allocation a row. A row outside it (built
+    /// alone, as tests build them) is its own allocation; `releaseRow` frees a row either way. The strings values own
+    /// are always their own allocations.
+    slab: []AggValue = &.{},
 
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
@@ -227,14 +231,59 @@ pub const AggOutput = struct {
         }
         gpa.free(self.aggs);
         if (self.group_rows) |rows| {
-            for (rows) |row| freeRow(gpa, row);
+            for (rows) |row| self.releaseRow(gpa, row);
             gpa.free(rows);
         }
+        gpa.free(self.slab);
         if (self.group_cols) |cols| {
             for (cols) |c| gpa.free(c);
             gpa.free(cols);
         }
         self.* = .{};
+    }
+
+    /// Free what row `row` owns: its values' strings, and the row itself unless it lies in `slab`.
+    pub fn releaseRow(self: *const AggOutput, gpa: std.mem.Allocator, row: []const AggValue) void {
+        for (row) |v| freeValue(gpa, v);
+        self.releaseRowSlice(gpa, row);
+    }
+
+    /// Free row `row`'s own allocation, its values left alone (taken over elsewhere or already freed).
+    pub fn releaseRowSlice(self: *const AggOutput, gpa: std.mem.Allocator, row: []const AggValue) void {
+        if (!self.inSlab(row)) gpa.free(row);
+    }
+
+    fn inSlab(self: *const AggOutput, row: []const AggValue) bool {
+        if (row.len == 0 or self.slab.len == 0) return row.len == 0;
+        const lo = @intFromPtr(self.slab.ptr);
+        const at = @intFromPtr(row.ptr);
+        return at >= lo and at < lo + self.slab.len * @sizeOf(AggValue);
+    }
+
+    /// Move the rows into a slab sized to them when the one they lie in is mostly rows a cut dropped (or they lie in
+    /// none), so a short answer does not hold every group's memory. All or nothing: on a failure `self` is unchanged.
+    pub fn compactRows(self: *AggOutput, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        const rows = self.group_rows orelse return;
+        var cells: usize = 0;
+        var loose = false;
+        for (rows) |row| {
+            cells += row.len;
+            loose = loose or !self.inSlab(row);
+        }
+        if (!loose and self.slab.len <= 2 * cells + 4096) return;
+        const fresh = try gpa.alloc(AggValue, cells);
+        const views = try gpa.alloc([]const AggValue, rows.len);
+        var at: usize = 0;
+        for (rows, views) |row, *v| {
+            @memcpy(fresh[at..][0..row.len], row);
+            v.* = fresh[at..][0..row.len];
+            at += row.len;
+        }
+        for (rows) |row| self.releaseRowSlice(gpa, row);
+        gpa.free(rows);
+        gpa.free(self.slab);
+        self.slab = fresh;
+        self.group_rows = views;
     }
 
     fn freeValue(gpa: std.mem.Allocator, v: AggValue) void {
@@ -257,8 +306,8 @@ pub const AggOutput = struct {
         const end: usize = if (order.limit) |n| @intCast(@min(sorted.len, start +| n)) else sorted.len;
         // Allocated before anything is freed, so a failure leaves the answer whole.
         const kept = try gpa.dupe([]const AggValue, sorted[start..end]);
-        for (sorted[0..start]) |row| freeRow(gpa, row);
-        for (sorted[end..]) |row| freeRow(gpa, row);
+        for (sorted[0..start]) |row| self.releaseRow(gpa, row);
+        for (sorted[end..]) |row| self.releaseRow(gpa, row);
         gpa.free(rows);
         self.group_rows = kept;
     }
@@ -304,14 +353,9 @@ pub const AggOutput = struct {
             k.* = item.row;
             keep[item.i] = true;
         }
-        for (rows, keep) |row, kp| if (!kp) freeRow(gpa, row);
+        for (rows, keep) |row, kp| if (!kp) self.releaseRow(gpa, row);
         gpa.free(rows);
         self.group_rows = kept;
-    }
-
-    fn freeRow(gpa: std.mem.Allocator, row: []const AggValue) void {
-        for (row) |v| freeValue(gpa, v);
-        gpa.free(row);
     }
 
     fn rowLessThan(keys: []const expr_ast.OrderKey, a: []const AggValue, b: []const AggValue) bool {
@@ -2535,11 +2579,11 @@ fn prepareAggregate(
         if (!args.unordered) try sortSlotsByFirst(gpa, slots.items, n_workers);
 
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
-        // answer: unbuilt rows are empty, unbuilt values NULL.
+        // answer: unbuilt values NULL. One slab holds every row's cells (`AggOutput.slab`), not an allocation a row.
         const rows = try gpa.alloc([]const AggValue, slots.items.len);
         @memset(rows, &.{});
         output.group_rows = rows;
-        try buildGroupRows(gpa, .{
+        try buildGroupRows(gpa, &output.slab, .{
             .slots = slots.items,
             .outputs = outputs,
             .calls = agg_calls,
@@ -2818,12 +2862,9 @@ const RowSource = struct {
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
 
-    /// Fill `row` for `slot`. It is set as soon as it is allocated and each value only once built, so on an error it
-    /// holds what was built and NULLs, and `AggOutput.freeRow` frees it.
-    fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, row: *[]const AggValue) !void {
-        const vals = try gpa.alloc(AggValue, s.outputs.len);
-        @memset(vals, .null_val);
-        row.* = vals;
+    /// Fill `vals`, the row's slab cells, all NULL, for `slot`. Each value is set only once built, so on an error the
+    /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
+    fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
         const accs = s.accs[at..][0..s.calls.len];
         // A fixed image pads a null column with zeros; the reader wants that payload omitted.
@@ -2842,9 +2883,21 @@ const row_block = 4096;
 /// Build `rows[i]` for `src.slots[i]`, on up to `n_workers` threads. `rows` must start empty; on an error each row
 /// holds what was built of it (see `RowSource.buildRow`), so the `AggOutput` owning it frees it whole, and the error
 /// is the one the lowest failing row gave, as a serial build would return.
-fn buildGroupRows(gpa: std.mem.Allocator, src: RowSource, rows: [][]const AggValue, n_workers: usize) !void {
+fn buildGroupRows(
+    gpa: std.mem.Allocator,
+    /// Receives the slab the rows are views into, owned by the caller (`AggOutput.slab`) from allocation on.
+    slab: *[]AggValue,
+    src: RowSource,
+    rows: [][]const AggValue,
+    n_workers: usize,
+) !void {
     std.debug.assert(rows.len == src.slots.len);
     if (rows.len == 0) return;
+    const width = src.outputs.len;
+    const cells = try gpa.alloc(AggValue, rows.len * width);
+    @memset(cells, .null_val);
+    slab.* = cells;
+    for (rows, 0..) |*row, i| row.* = cells[i * width ..][0..width];
     const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, rows.len, row_block) catch unreachable));
     const tasks = try gpa.alloc(RowBuildTask, n_threads);
     defer gpa.free(tasks);
@@ -2875,7 +2928,7 @@ const RowBuildTask = struct {
             const lo = t.cursor.fetchAdd(row_block, .monotonic);
             if (lo >= t.rows.len) return;
             for (lo..@min(t.rows.len, lo + row_block)) |i| {
-                t.src.buildRow(t.gpa, t.src.slots[i], &t.rows[i]) catch |e| {
+                t.src.buildRow(t.gpa, t.src.slots[i], @constCast(t.rows[i])) catch |e| {
                     t.err = e;
                     t.err_row = i;
                     return;
@@ -7687,7 +7740,7 @@ const RowFixture = struct {
         const rows = try gpa.alloc([]const AggValue, f.slots.len);
         @memset(rows, &.{});
         out.group_rows = rows;
-        try buildGroupRows(gpa, f.source(), rows, n_workers);
+        try buildGroupRows(gpa, &out.slab, f.source(), rows, n_workers);
     }
 
     fn expectRows(rows: []const []const AggValue) !void {
@@ -7763,7 +7816,8 @@ test "buildGroupRows: an allocation failure leaves every row freeable" {
     // Eight threads: the failure lands in whichever row a thread happens to be building.
     var f = try RowFixture.init(4 * row_block + 123);
     defer f.deinit();
-    for ([_]usize{ 0, 1, 2, 3, 100, 3 * row_block, 3 * f.slots.len }) |left| {
+    // Rows are slab views now, so what fails is the slab or a row's own strings (at least one a row).
+    for ([_]usize{ 0, 1, 2, 3, 100, 3 * row_block, f.slots.len - 1 }) |left| {
         var failing: SharedFailing = .{ .child = testing.allocator, .left = .init(left) };
         const gpa = failing.allocator();
         var out: AggOutput = .{};

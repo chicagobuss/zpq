@@ -4017,15 +4017,26 @@ pub const FingerprintSet = struct {
 /// frame, the middle, the last two), not a pass over a long key. Keys that differ only elsewhere share a cell, which
 /// loosens the bound and never breaks it.
 pub fn sketchHash(key: []const u8) u64 {
-    if (key.len < 21) return std.hash_map.hashString(key);
+    // A short key is hashed whole: sampling it would let keys that differ only between the samples (a composite's
+    // short string beside a number) share cells and fingerprints, which loosens every bound built on them.
+    if (key.len <= full_hash_max) return std.hash.Wyhash.hash(0, key);
     const l = key.len;
     return sketchMix(l, load64(key, 5), load64(key, l / 2 - 4), load64(key, l - 16), load64(key, l - 8));
 }
 
+/// Serialized keys up to this many bytes are hashed whole (`sketchHash`); longer ones are sampled.
+const full_hash_max = 64;
+
 /// `sketchHash` of a lone present string key `s` (frame `[1][u32 len]` then `s`), at least 16 bytes, unframed.
 fn rawSketchHash(s: []const u8) u64 {
     const l = s.len + 5;
-    return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
+    if (l > full_hash_max) return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
+    var frame: [5]u8 = .{ 1, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, frame[1..5], @intCast(s.len), .little);
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(&frame);
+    hash.update(s);
+    return hash.final();
 }
 
 fn sketchMix(len: usize, a: u64, b: u64, c: u64, d: u64) u64 {

@@ -1253,7 +1253,7 @@ fn sketchTopK(
         o.* = .bailed;
     };
     const census_try = !viable and censuses.len > 0 and
-        (!decision.census_cell_repeat_gate or censusCellBet(sum, workers[0].group_by_keys.?.len == 1, calls.len > 1));
+        (!decision.census_cell_repeat_gate or censusCellBet(sum, calls.len > 1));
     if (cfg.trace and !viable and decision.census_cell_repeat_gate)
         std.debug.print("census: cell_repeat_load={d} try={}\n", .{ cellRepeatLoad(sum), census_try });
     if (census_try) {
@@ -1345,18 +1345,14 @@ fn cellRepeatLoad(cells: []const u32) f64 {
     return dispersion * (bins / (bins - 1)) / rows;
 }
 
-fn censusCellBet(cells: []const u32, single_key: bool, payload: bool) bool {
+/// Whether a census after a sketch bail is worth recounting for. Its repeats no longer bound its use (the census keeps
+/// each partition's most frequent and certifies against the rest), so the only reason left not to is a selective
+/// narrow COUNT, which merges directly more cheaply than recounting every filter column.
+fn censusCellBet(cells: []const u32, payload: bool) bool {
+    if (payload) return true;
     var rows: f64 = 0;
     for (cells) |c| rows += @floatFromInt(c);
-    // A selective narrow COUNT can merge directly more cheaply than recounting all filter columns.
-    if (!payload and rows <= 1 << 20) return false;
-    const load = cellRepeatLoad(cells);
-    if (!std.math.isFinite(load)) return false;
-    if (load <= 17.0 / 16.0) return true;
-    // F1^2/F2 estimates effective cardinality, biased low by skew. Try it only for single keys:
-    // large skewed composite tails can exceed the census repeat cap even with a small effective cardinality.
-    if (!single_key) return false;
-    return rows / load <= 1 << 20;
+    return rows > 1 << 20;
 }
 
 /// Whether the columns a filter reads beyond the group keys are small beside the keys in the first row group read:
@@ -1423,7 +1419,10 @@ fn censusMask(cfg: SketchTopK) u64 {
 const Repeat = struct { fp: u64, count: u64, task: u32, at: u32, n: u32 };
 
 /// Folds the census partitions claimed from `cursor`: each partition's fingerprints from every worker, sorted, give
-/// the fingerprints seen more than once. Stops once all tasks together have found more than `cap`.
+/// the fingerprints seen more than once. Every copy of a fingerprint lands in one partition, so its count there is
+/// complete. A partition keeps at most `keep` of them, its most frequent, and records in `omitted` the largest count
+/// it dropped: every fingerprint not kept has a count at most that, a bound the cut must clear. Stops once all tasks
+/// together have found more than `cap`.
 const CensusTask = struct {
     gpa: std.mem.Allocator,
     censuses: []expr_agg.Census,
@@ -1431,11 +1430,19 @@ const CensusTask = struct {
     found: *std.atomic.Value(usize),
     cap: usize,
     index: u32 = 0,
+    keep: usize = std.math.maxInt(usize),
+    /// The largest count of a repeated fingerprint some partition dropped; 1 when none was (a single row each).
+    omitted: u64 = 1,
     out: std.ArrayList(Repeat) = .empty,
     items: std.ArrayList(u32) = .empty,
     sorted: std.ArrayList(u64) = .empty,
     table: std.ArrayList(u64) = .empty,
+    /// One partition's repeats, before the most frequent `keep` are emitted.
+    pending: std.ArrayList(Pending) = .empty,
     err: ?anyerror = null,
+
+    /// A repeated fingerprint whose rows are `sorted.items[lo..hi]`.
+    const Pending = struct { fp: u64, count: u64, lo: usize, hi: usize };
 
     fn run(t: *CensusTask) void {
         t.fold() catch |e| {
@@ -1470,9 +1477,31 @@ const CensusTask = struct {
                 c.fill[p] = 0;
             }
             var found: usize = 0;
-            for (0..256) |b| found += try t.repeatsIn(p, entries[starts[b]..starts[b + 1]]);
+            t.pending.clearRetainingCapacity();
+            for (0..256) |b| found += try t.repeatsIn(p, entries, starts[b], starts[b + 1]);
+            if (t.pending.items.len > 0) found += try t.emitMostFrequent(p);
             _ = t.found.fetchAdd(found, .monotonic);
         }
+    }
+
+    /// Emit the partition's `keep` most frequent pending repeats, recording the largest count left out.
+    fn emitMostFrequent(t: *CensusTask, p: usize) !usize {
+        const IB = expr_agg.Census.ITEM_BITS;
+        const all = t.pending.items;
+        // Most frequent first, ties by fingerprint so the choice does not depend on scheduling.
+        std.mem.sortUnstable(Pending, all, {}, struct {
+            fn more(_: void, a: Pending, b: Pending) bool {
+                return a.count > b.count or (a.count == b.count and a.fp < b.fp);
+            }
+        }.more);
+        const kept = all[0..@min(all.len, t.keep)];
+        if (kept.len < all.len) t.omitted = @max(t.omitted, all[kept.len].count);
+        for (kept) |r| {
+            const at = t.items.items.len;
+            for (t.sorted.items[r.lo..r.hi]) |e| try t.items.append(t.gpa, @intCast(e & ((1 << IB) - 1)));
+            try t.emit(p, r.fp, r.count, at);
+        }
+        return kept.len;
     }
 
     fn scatter(entries: []u64, next: *[257]usize, chunk: []const u64) void {
@@ -1483,10 +1512,12 @@ const CensusTask = struct {
         }
     }
 
-    /// The fingerprints of `bucket` seen more than once. A table of its fingerprints finds them in one pass; a bucket
-    /// with more than a few is sorted instead, so their rows come together.
-    fn repeatsIn(t: *CensusTask, p: usize, bucket: []u64) !usize {
+    /// The fingerprints of `entries[lo..hi]` seen more than once. A table of its fingerprints finds them in one pass;
+    /// a bucket with more than a few is sorted instead, so their rows come together and wait in `pending`. Returns
+    /// how many it emitted itself.
+    fn repeatsIn(t: *CensusTask, p: usize, entries: []u64, lo: usize, hi: usize) !usize {
         const IB = expr_agg.Census.ITEM_BITS;
+        const bucket = entries[lo..hi];
         if (bucket.len < 2) return 0;
         const size = std.math.ceilPowerOfTwoAssert(usize, bucket.len * 2);
         try t.table.resize(t.gpa, size);
@@ -1507,7 +1538,7 @@ const CensusTask = struct {
                 }
                 if (slot & ~seen_twice != fp | used) continue;
                 if (slot & seen_twice == 0) {
-                    if (n_reps == reps.len) return t.repeatsSorted(p, bucket);
+                    if (n_reps == reps.len) return t.repeatsSorted(entries, lo, hi);
                     table[i] |= seen_twice;
                     reps[n_reps] = fp;
                     n_reps += 1;
@@ -1527,24 +1558,20 @@ const CensusTask = struct {
         return n_reps;
     }
 
-    fn repeatsSorted(t: *CensusTask, p: usize, bucket: []u64) !usize {
+    /// The repeats of a bucket with many, sorted so each one's rows are a run; they wait in `pending` for the
+    /// partition's most frequent to be chosen.
+    fn repeatsSorted(t: *CensusTask, entries: []u64, lo: usize, hi: usize) !usize {
         const IB = expr_agg.Census.ITEM_BITS;
-        std.mem.sortUnstable(u64, bucket, {}, std.sort.asc(u64));
-        var i: usize = 0;
-        var found: usize = 0;
-        while (i < bucket.len) {
-            const fp = bucket[i] >> IB;
+        std.mem.sortUnstable(u64, entries[lo..hi], {}, std.sort.asc(u64));
+        var i = lo;
+        while (i < hi) {
+            const fp = entries[i] >> IB;
             var j = i + 1;
-            while (j < bucket.len and bucket[j] >> IB == fp) j += 1;
-            if (j - i > 1) {
-                const at = t.items.items.len;
-                for (bucket[i..j]) |e| try t.items.append(t.gpa, @intCast(e & ((1 << IB) - 1)));
-                try t.emit(p, fp, j - i, at);
-                found += 1;
-            }
+            while (j < hi and entries[j] >> IB == fp) j += 1;
+            if (j - i > 1) try t.pending.append(t.gpa, .{ .fp = fp, .count = j - i, .lo = i, .hi = j });
             i = j;
         }
-        return found;
+        return 0;
     }
 
     /// Records a repeated fingerprint whose rows' items were appended from `at`, kept once each, in order.
@@ -1609,12 +1636,15 @@ fn censusTopK(
         .found = &found,
         .cap = cap,
         .index = @intCast(ti),
+        // Dense repeats are reduced to the most frequent per partition, never all emitted (`CensusTask`).
+        .keep = @max(k *| cfg.admit_per_row, 1),
     };
     defer for (tasks) |*t| {
         t.out.deinit(gpa);
         t.items.deinit(gpa);
         t.sorted.deinit(gpa);
         t.table.deinit(gpa);
+        t.pending.deinit(gpa);
     };
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
     if (tasks.len == 1 or !spawn_util.runTree(CensusTask, tasks, config, CensusTask.run)) tasks[0].run();
@@ -1636,6 +1666,17 @@ fn censusTopK(
 
     const items = repeats.items;
     const t: u64 = if (items.len >= k) items[k - 1].count else 2;
+    // A fingerprint a partition dropped totals at most `omitted`, and a key at most its fingerprint (a collision only
+    // adds rows to it). Only with every dropped one below `t` does admitting the fingerprints totalling `t` or more
+    // admit every key that can reach the cut; the exact k-th total must still reach `t` to certify it.
+    var omitted: u64 = 1;
+    for (tasks) |task| omitted = @max(omitted, task.omitted);
+    if (omitted >= t) {
+        if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} omitted={d}, cannot cut\n", .{
+            count_ms, items.len, t, omitted,
+        });
+        return false;
+    }
     // The census counts rows, so only a plain count(*) gives each early row's key exactly 1; a count of a column or
     // under FILTER can give it 0, and must certify by the totals.
     const call = calls[a_idx];
@@ -5720,6 +5761,10 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
         .{ .fuse_census = true, .census_fp_bits = 3 },
         .{ .fuse_census = false, .census_fp_bits = 0 },
         .{ .census = false },
+        // Each partition keeps only k fingerprints: the census must certify against the largest count it dropped, or
+        // refuse, and collisions on top only make it refuse more.
+        .{ .fuse_census = false, .admit_per_row = 1 },
+        .{ .fuse_census = true, .admit_per_row = 1, .census_fp_bits = 6 },
     };
     var seen = std.EnumSet(Outcome){};
     // A count of a column, or under FILTER, can give the first keys to appear 0 (`n` is NULL through the first row
@@ -8801,25 +8846,19 @@ test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy); // Payloads keep the string guard.
 }
 
-test "census cell cost hint distinguishes sparse repeats without proving uniqueness" {
+test "census after a sketch bail: worth recounting unless a selective narrow COUNT" {
     var cells: [1 << 12]u32 = @splat(0);
     for (0..1 << 16) |i| {
         const key: u64 = i;
         const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
         cells[hash >> 52] += 1;
     }
-    try testing.expect(censusCellBet(&cells, false, true));
-    try testing.expect(!censusCellBet(&cells, false, false));
-    for (&cells) |*c| c.* *= 3;
-    try testing.expect(!censusCellBet(&cells, false, true));
-    try testing.expect(censusCellBet(&cells, true, true));
-    @memset(&cells, 0);
-    for (0..1 << 21) |i| {
-        const key: u64 = i;
-        const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
-        cells[hash >> 52] += 3;
-    }
-    try testing.expect(!censusCellBet(&cells, true, true));
+    // Few rows: a payload still pays for a census, a bare COUNT merges directly.
+    try testing.expect(censusCellBet(&cells, true));
+    try testing.expect(!censusCellBet(&cells, false));
+    // Dense repeats no longer argue against it: the census keeps the most frequent and certifies against the rest.
+    for (&cells) |*c| c.* *= 32;
+    try testing.expect(censusCellBet(&cells, false));
     @memset(&cells, 0);
     try testing.expect(std.math.isInf(cellRepeatLoad(&cells)));
     cells[0] = std.math.maxInt(u32);

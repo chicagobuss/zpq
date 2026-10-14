@@ -80,17 +80,26 @@ DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY
 codecs, plus the deprecated LZ4 codec in each container writers used for it (parquet-mr's Hadoop framing, a bare LZ4
 block, an LZ4 frame); all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
 
-**Filter** with `= != < <= > >=`, `IN` / `NOT IN`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and
-Hive-partition pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals
+**Filter** with `= != <> < <= > >=`, `IN` / `NOT IN`, `[NOT] BETWEEN x AND y`, `[NOT] LIKE`, `IS [NOT] NULL`, `AND` /
+`OR` / `NOT` and grouping parentheses (nested at most 32 deep), plus row-group stat pruning and Hive-partition pruning
+before any bytes are fetched. Keywords and parentheses inside a quoted literal are the literal's; a quote inside one is
+doubled (`'O''Reilly'`), and an unterminated quote is an error. NOT is three-valued: a row whose operand is NULL
+passes neither `p` nor `NOT p`. DATE / TIME / TIMESTAMP columns take quoted literals
 (`'2024-01-01'`, `'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is
 not rounded to it.
 
 **Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
-`coalesce(col, default)`, parens, unary minus. DECIMAL arithmetic is exact (see below).
+`coalesce(col, default)`, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ... [ELSE v] END`, parens,
+unary minus. A CASE evaluates a branch only on the rows that take it, so a fault in a branch no row reaches is no
+error; the simple form (`CASE x WHEN ...`) is not supported. DECIMAL arithmetic is exact (see below).
 
-**Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`.
+**Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`. In SQL,
+GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a column of the name wins,
+as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group; without GROUP BY the one
+group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks. Plain rows take
+`ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.
 As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet; avg's
 `{"sum", "count"}` pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
 `-o out.parquet` writes the result as parquet: one row, or one row per group with the same columns and values as the

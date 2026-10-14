@@ -1098,6 +1098,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .filter = w.plan.filterFor(decision),
             .read = columns.forRowGroup(decision),
             .consumed = columns.consumed,
+            .preserve = columns.preserve,
         }, w.plan.stats, w.decode_options, target, .{
             .scratch = &scratch,
             .rg_arena = &rg_decode_arena,
@@ -6177,6 +6178,45 @@ fn loadFullMatchFixture() !?[]u8 {
     };
 }
 
+test "min-fill: a column the filter also reads under an OR decodes the pages its conjunct is proven on" {
+    // ci/fixtures/parquet/min_fill_or.parquet (tools/gen_min_fill_fixture.py): c alternates 1, 2 with no nulls, in
+    // pages of 50 with a page index; b is 1 on every seventh row. Each page proves `c IS NOT NULL` (and, trusting
+    // statistics, `c >= 0`); standing the page minimum in for c would drop every c = 2 row the OR keeps.
+    const path = "ci/fixtures/parquet/min_fill_or.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Case = struct { filter: []const u8, trust: bool, n: i128, sx: i128 };
+    const cases = [_]Case{
+        .{ .filter = "c IS NOT NULL AND (c = 2 OR b = 1)", .trust = false, .n = 572, .sx = 285784 },
+        .{ .filter = "c >= 0 AND (c = 2 OR b = 1)", .trust = true, .n = 572, .sx = 285784 },
+        .{ .filter = "(c = 2 OR b = 1) AND c IS NOT NULL", .trust = true, .n = 572, .sx = 285784 },
+        // A column only mandatory conjuncts read may still be filled: the answer is the same either way.
+        .{ .filter = "c IS NOT NULL AND b = 1", .trust = false, .n = 143, .sx = 71071 },
+    };
+    for (cases) |case| for ([_]usize{ 1, 3 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var r = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = case.filter,
+            .aggregate = "count(*) AS n, sum(x) AS sx",
+            .parallelism = j,
+            .trust_stats = case.trust,
+            .min_bytes_per_worker = 1,
+        });
+        defer r.deinit(testing.allocator);
+        testing.expectEqual(case.n, r.output.aggs[0].value.i) catch |err| {
+            std.debug.print("min-fill: {s} at -j {d}\n", .{ case.filter, j });
+            return err;
+        };
+        try testing.expectEqual(case.sx, r.output.aggs[1].value.i);
+    };
+}
+
 test "full match: proven row groups answer like --scan-all" {
     const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
@@ -8416,7 +8456,7 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
         .rg = 0,
         .agg_start = 0,
         .agg_len = 1,
-        .columns = .{ .read = &.{}, .consumed = &.{} },
+        .columns = .{ .read = &.{}, .consumed = &.{}, .preserve = &.{} },
         .accumulators = &.{},
     }};
     try testing.expectEqual(.first_keys, planAggregate(in).dispatch.strategy);
@@ -8476,7 +8516,7 @@ test "planAggregate: a plain-width key may fuse a census but never sketch throug
         .rg = 0,
         .agg_start = 0,
         .agg_len = 1,
-        .columns = .{ .read = &.{}, .consumed = &.{} },
+        .columns = .{ .read = &.{}, .consumed = &.{}, .preserve = &.{} },
         .accumulators = &.{},
     }};
     const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };

@@ -1899,6 +1899,8 @@ pub const AggRowGroup = struct {
     /// Columns whose values an aggregate argument, a per-aggregate FILTER or a GROUP BY key consumes
     /// (`agg_plan.Columns.consumed`); any other column in `read` only the outer filter reads.
     consumed: []const bool,
+    /// Columns that must decode their stored values (`agg_plan.Columns.preserve`). Null preserves every column.
+    preserve: ?[]const bool = null,
 };
 
 /// What `scanRGForAgg` folds a row group's surviving rows into. The caller owns the state, which persists across
@@ -2624,7 +2626,7 @@ const ChunkDecoder = struct {
 
         const chunk_span = profile.Span.begin(prof);
         const prune_info: ?PruningInfo = if (self.page_indexes[ci]) |pi|
-            try pagePruning(a, pi, self.filter_pages, ci, in.consumed[ci], sel, self.num_rows, cm, start)
+            try pagePruning(a, pi, self.filter_pages, ci, if (in.preserve) |p| p[ci] else true, sel, self.num_rows, cm, start)
         else
             null;
         // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
@@ -3260,13 +3262,15 @@ fn pruneFilterPages(
 
 /// How to decode column `ci` page by page. A column no filter leaf tests skips just the pages left with no active
 /// row. The always-match shortcut in `decodeWithReaderPruned` fills a page with the ColumnIndex minimum instead of
-/// decoding it, which is only sound when the filter is the sole reader of the values: never for a `consumed` column.
+/// decoding it, which is only sound when the filter's mandatory conjuncts are the sole readers of the values: never
+/// for a `preserve`d column. In `c >= 0 AND (c = 2 OR b = 1)` a page of c=[1,2] proves `c >= 0`, and filling it with 1
+/// would fail the row c=2, b=0 that passes.
 fn pagePruning(
     ra: std.mem.Allocator,
     pi: PageIndex,
     filter_pages: FilterPages,
     ci: usize,
-    consumed: bool,
+    preserve: bool,
     sel: *const filter_selection.SelectionVector,
     num_rows: usize,
     cm: schema.ColumnMetaData,
@@ -3301,7 +3305,7 @@ fn pagePruning(
         skipped = s;
         always = a;
     }
-    if (consumed) {
+    if (preserve) {
         const a = try ra.alloc(bool, locs.len);
         @memset(a, false);
         always = a;

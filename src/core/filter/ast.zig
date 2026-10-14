@@ -217,6 +217,35 @@ pub const Filter = union(enum) {
     }
 };
 
+/// The column a leaf reads; null for a composite.
+pub fn leafColumn(f: Filter) ?usize {
+    return switch (f) {
+        .and_filter, .or_filter => null,
+        inline else => |leaf| leaf.col_idx,
+    };
+}
+
+/// Mark every column some leaf of `f` reads outside its mandatory conjuncts: beneath an OR, where a row may pass
+/// although the leaf fails. What a page proves of a mandatory conjunct holds for every row that passes; a leaf under
+/// an OR proves nothing of its siblings, so a reader that stands proven values in for a column's real ones
+/// (consumer's page min-fill) must decode every column marked here.
+pub fn markNonMandatoryColumns(f: Filter, cols: []bool) void {
+    switch (f) {
+        .and_filter => |c| for (c.children) |child| markNonMandatoryColumns(child, cols),
+        .or_filter => |c| for (c.children) |child| markAllColumns(child, cols),
+        else => {},
+    }
+}
+
+fn markAllColumns(f: Filter, cols: []bool) void {
+    switch (f) {
+        .and_filter, .or_filter => |c| for (c.children) |child| markAllColumns(child, cols),
+        else => if (leafColumn(f)) |ci| if (ci < cols.len) {
+            cols[ci] = true;
+        },
+    }
+}
+
 /// `operands` joined by AND (OR when `!conjunction`) into one flat node: an operand that is itself a node of the same
 /// kind, without an IN list's set, contributes its operands instead. One operand is returned as it is.
 pub fn join(arena: std.mem.Allocator, conjunction: bool, operands: []const Filter) std.mem.Allocator.Error!Filter {

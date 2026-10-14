@@ -47,6 +47,10 @@ pub const Columns = struct {
     /// only the outer filter reads. It is all a row group proven fully matching reads, and the set whose pages the
     /// page-level always-match shortcut must still decode for real.
     consumed: []const bool,
+    /// Columns whose decoded values must be the stored ones: `consumed`, and every column the outer filter reads
+    /// outside its mandatory conjuncts (`filter_ast.markNonMandatoryColumns`). Only the rest may have a page the filter
+    /// is proven to pass filled with a stand-in value instead of decoded.
+    preserve: []const bool,
 
     /// The columns to read under `decision`, which must not be `.skip`.
     pub fn forRowGroup(self: Columns, decision: Decision) []const bool {
@@ -117,7 +121,7 @@ pub const Plan = struct {
             .query = query,
             .stats = stats,
             .filter_cols = filter_cols,
-            .columns = .{ .read = read, .consumed = consumed },
+            .columns = .{ .read = read, .consumed = consumed, .preserve = try preserveColumns(arena, query, consumed) },
             .cols_stat_pruned = cols_stat_pruned,
         };
     }
@@ -131,7 +135,7 @@ pub const Plan = struct {
             r.* = whole and (f or c.*);
             c.* = whole and c.*;
         }
-        return .{ .read = read, .consumed = consumed };
+        return .{ .read = read, .consumed = consumed, .preserve = try preserveColumns(arena, self.query, consumed) };
     }
 
     /// Prune one row group against the outer filter. The S3 planner and the scan workers both call this on the same
@@ -151,6 +155,12 @@ pub const Plan = struct {
         return if (decision == .full_match) null else self.query.filter;
     }
 };
+
+fn preserveColumns(arena: std.mem.Allocator, query: Query, consumed: []const bool) ![]const bool {
+    const preserve = try arena.dupe(bool, consumed);
+    if (query.filter) |f| filter_ast.markNonMandatoryColumns(f, preserve);
+    return preserve;
+}
 
 /// Columns `calls`' arguments and FILTERs, and the GROUP BY keys, read.
 fn consumedColumns(

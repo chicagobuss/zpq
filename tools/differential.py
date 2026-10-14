@@ -58,6 +58,11 @@ FILTERS = [
     ("amt_isnull",    "amt IS NULL",            "amt IS NULL"),
     ("flag_isnull",   "flag IS NULL",           "flag IS NULL"),
     ("empty_name",    "name = ''",              "name = ''"),
+    # Grouping, NOT over a group, and keywords or parentheses inside quoted literals.
+    ("paren_not",     "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')",
+                      "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')"),
+    ("quoted_kw",     "name = 'n1 OR id > 0' OR (id = 7 AND name != 'x) AND (y')",
+                      "name = 'n1 OR id > 0' OR (id = 7 AND name != 'x) AND (y')"),
 ]
 
 # (label, zpq_select_expr, duckdb_select_expr) — projection of COMPUTED columns,
@@ -622,6 +627,26 @@ def main():
         ("ord_expr_text", "SELECT flag, count(*) FROM '{fixture}' GROUP BY flag ORDER BY count(*), flag LIMIT 2"),
         ("ord_offset_past_end", "SELECT flag, count(*) AS c FROM '{fixture}' GROUP BY flag ORDER BY c LIMIT 3 OFFSET 9"),
         ("ord_no_rows", "SELECT flag, count(*) AS c FROM '{fixture}' WHERE id < -100000 GROUP BY flag ORDER BY c LIMIT 1"),
+        # ORDER BY terms the SELECT list lacks rank the rows and are not shown.
+        ("ord_hidden_agg", "SELECT flag FROM '{fixture}' GROUP BY flag ORDER BY count(*) DESC, flag"),
+        ("ord_hidden_key", "SELECT count(*) AS c FROM '{fixture}' GROUP BY flag ORDER BY flag DESC"),
+        ("ord_hidden_cut", "SELECT name FROM '{fixture}' WHERE id > 1500 GROUP BY name ORDER BY sum(amt) DESC, name "
+         "LIMIT 4 OFFSET 1"),
+        # GROUP BY keys bound as expressions, by alias and by position.
+        ("grp_expr_key", "SELECT id - 1, count(*) AS c FROM '{fixture}' WHERE id BETWEEN 0 AND 20 GROUP BY id - 1 "
+         "ORDER BY 1"),
+        ("grp_alias", "SELECT name AS k, count(*) AS c FROM '{fixture}' WHERE id < -1990 GROUP BY k ORDER BY k"),
+        ("grp_position", "SELECT flag, count(*) AS c FROM '{fixture}' GROUP BY 1 ORDER BY 1"),
+        # SQL binds `GROUP BY name` to the column and `AS name` names the aggregate: no clash, as in DuckDB.
+        ("grp_key_vs_alias", "SELECT name AS k, sum(amt) AS name FROM '{fixture}' WHERE id < -1990 GROUP BY name "
+         "ORDER BY k"),
+        ("grp_constant", "SELECT 1, flag, count(*) AS c FROM '{fixture}' GROUP BY 1, flag ORDER BY flag"),
+        # Grouped WHERE under SQL, whose NOT the front end pushes to the leaves.
+        ("where_paren_not", "SELECT flag, count(*) AS c FROM '{fixture}' WHERE NOT (id > 500 AND nname IS NULL) "
+         "AND (amt < 0 OR name LIKE 'n1%') GROUP BY flag ORDER BY flag"),
+        # A page proving `c IS NOT NULL` must still decode c for the OR beside it (min-fill counterexample).
+        ("min_fill_or", "SELECT b, count(*) AS n, sum(x) AS s FROM 'ci/fixtures/parquet/min_fill_or.parquet' "
+         "WHERE c IS NOT NULL AND (c = 2 OR b = 1) GROUP BY b ORDER BY b"),
     ]
     for olabel, o_sql in ORDERED:
         total += 1
@@ -1028,7 +1053,6 @@ def main():
         ("key_vs_alias", ["--group-by", "name AS k", "--aggregate", "sum(amt) AS name"], "name"),
         ("dup_alias", ["--aggregate", "sum(amt) AS a, min(amt) AS a"], "a"),
         ("dup_alias_gb", ["--group-by", "flag", "--aggregate", "count(*) AS c, sum(amt) AS C"], "C"),
-        ("sql_key_vs_alias", ["--query", "SELECT name AS k, sum(amt) AS name FROM '{fixture}' GROUP BY name"], "name"),
         ("sql_dup_alias", ["--query", "SELECT flag, count(*) AS c, sum(amt) AS c FROM '{fixture}' GROUP BY flag"], "c"),
     ]
     for clabel, cargs, col in CLASHES:

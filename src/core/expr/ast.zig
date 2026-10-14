@@ -327,7 +327,8 @@ pub const SelectItem = struct {
     alias: ?[]const u8,
 };
 
-/// One ORDER BY key over an aggregate's result rows: an output column, by position in the SELECT list.
+/// One ORDER BY key over an aggregate's result rows: a result row column, by position in the SELECT list followed by
+/// `ResultOrder.hidden`.
 pub const OrderKey = struct {
     column: usize,
     descending: bool,
@@ -339,6 +340,9 @@ pub const ResultOrder = struct {
     keys: []const OrderKey = &.{},
     limit: ?u64 = null,
     offset: u64 = 0,
+    /// ORDER BY terms no SELECT column gives (SQL `GROUP BY k ORDER BY count(*)` without `count(*)` selected): result
+    /// row columns after the SELECT list's, ranked by and then dropped before the answer is shown.
+    hidden: []const SelectColumn = &.{},
 };
 
 /// One output column as a select list writes it, before binding: the expression's text and its `AS` alias. GROUP BY

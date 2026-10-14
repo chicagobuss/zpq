@@ -24,7 +24,7 @@ pub const ParsedQuery = struct {
     result_order: ast.ResultOrder = .{},
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
-        allocator.free(self.result_order.keys);
+        freeResultOrder(allocator, self.result_order);
         allocator.free(self.table_name);
         if (self.select_str) |s| allocator.free(s);
         if (self.aggregate_str) |a| allocator.free(a);
@@ -33,6 +33,11 @@ pub const ParsedQuery = struct {
         freeSelectCols(allocator, self.select_cols);
     }
 };
+
+fn freeResultOrder(allocator: std.mem.Allocator, order: ast.ResultOrder) void {
+    allocator.free(order.keys);
+    freeSelectCols(allocator, order.hidden);
+}
 
 fn freeSelectCols(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
     for (cols) |col| {
@@ -402,7 +407,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         col_idx += 1;
     }
     const result_order = try resultOrder(allocator, root.*.u.select, lp_arena, select_cols, is_aggregate, has_group_by);
-    errdefer allocator.free(result_order.keys);
+    errdefer freeResultOrder(allocator, result_order);
 
     // Join result columns with ", "
     var joined_cols: std.ArrayList(u8) = .empty;
@@ -467,6 +472,11 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
             try agg_list.append(allocator, col_sql);
         }
+        // Hidden ORDER BY aggregates follow, in order, so they are the calls after the SELECT list's.
+        for (result_order.hidden, 0..) |h, n| if (h.role == .agg) {
+            try agg_list.ensureUnusedCapacity(allocator, 1);
+            agg_list.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s} AS {s}{d}", .{ h.expr, hidden_alias, n }));
+        };
 
         allocator.free(columns_str);
         if (agg_list.items.len == 0) {
@@ -520,15 +530,21 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     };
 }
 
+/// The alias a hidden ORDER BY aggregate's call carries (followed by its position among the hidden terms): never
+/// printed, as its result column is dropped once the rows are ranked.
+pub const hidden_alias = "__zpq_order_";
+
 /// ORDER BY / LIMIT / OFFSET as positions in the SELECT list. Only an aggregate's result rows are ordered: plain rows
 /// stream out as they are read, and an aggregate without GROUP BY is one row, which a LIMIT may keep but not drop.
+/// Under GROUP BY a term no SELECT column gives becomes a hidden result column (`ResultOrder.hidden`): an aggregate,
+/// computed as a call of its own, or an expression of the GROUP BY keys.
 fn resultOrder(
     allocator: std.mem.Allocator,
     sel: anytype,
     lp_arena: *c.arena_t,
     select_cols: []const ast.SelectColumn,
     is_aggregate: bool,
-    _: bool,
+    has_group_by: bool,
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
     if (!is_aggregate) {
@@ -544,6 +560,11 @@ fn resultOrder(
         if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
     }
 
+    var hidden: std.ArrayList(ast.SelectColumn) = .empty;
+    defer {
+        freeSelectCols(allocator, hidden.items);
+        hidden.deinit(allocator);
+    }
     const keys = try allocator.alloc(ast.OrderKey, n_terms);
     errdefer allocator.free(keys);
     for (keys, 0..) |*key, t| {
@@ -553,18 +574,51 @@ fn resultOrder(
             diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
             return error.OrderByNotSupported;
         }
-        key.* = .{
-            .column = try orderColumn(sel, lp_arena, select_cols, term.*.u.order_term.expr orelse return error.SqlParseError),
-            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
-        };
+        const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
+        const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
+            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, &hidden);
+        key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
     }
     order.keys = keys;
+    order.hidden = try hidden.toOwnedSlice(allocator);
     return order;
+}
+
+/// Add ORDER BY term `expr`, which names no SELECT column, to `hidden`; its index there. Only a GROUP BY query has
+/// such a term: an aggregate, or an expression whose columns are all grouped.
+fn hiddenTerm(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    expr: *c.LpNode,
+    has_group_by: bool,
+    hidden: *std.ArrayList(ast.SelectColumn),
+) !usize {
+    const text_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (text_c == null) return error.UnparseError;
+    const text = std.mem.span(text_c);
+    if (!has_group_by) {
+        diagnosticPrint("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
+        return error.OrderByNotSupported;
+    }
+    const info = analyzeExpr(expr);
+    if (info.has_window or info.has_subquery or info.has_func_distinct) {
+        diagnosticPrint("sql: ORDER BY {s} is not supported yet\n", .{text});
+        return error.OrderByNotSupported;
+    }
+    if (!info.has_agg and info.has_bare_col and !try groupedExpr(allocator, sel, lp_arena, expr)) {
+        diagnosticPrint("sql: ORDER BY {s} must be in the GROUP BY list or aggregated\n", .{text});
+        return error.ColumnMustBeGrouped;
+    }
+    try hidden.ensureUnusedCapacity(allocator, 1);
+    hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
+    return hidden.items.len - 1;
 }
 
 /// The SELECT-list position an ORDER BY term names: a 1-based position, an alias, or an expression written as in the
 /// SELECT list (a column reference matching as GROUP BY matches it). An alias wins over a column of the same name.
-fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.SelectColumn, expr: *c.LpNode) !usize {
+/// Null for an expression no SELECT column gives.
+fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.SelectColumn, expr: *c.LpNode) !?usize {
     if (expr.kind == c.LP_EXPR_LITERAL_INT) {
         const pos = try nonNegativeInt(expr);
         if (pos >= 1 and pos <= select_cols.len) return @intCast(pos - 1);
@@ -596,9 +650,7 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
         }
         found = i;
     };
-    if (found) |i| return i;
-    diagnosticPrint("sql: ORDER BY {s} must name a result column (by position, alias or expression)\n", .{text});
-    return error.OrderByNotSupported;
+    return found;
 }
 
 /// A LIMIT, OFFSET or ORDER BY position, which must be a plain non-negative integer literal.
@@ -766,7 +818,8 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
     }
 
     const rejected = [_]struct { sql: []const u8, err: anyerror }{
-        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY z", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY z", .err = error.ColumnMustBeGrouped },
+        .{ .sql = "SELECT count(*) AS c FROM 't' ORDER BY sum(x)", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 3", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 0", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c NULLS FIRST", .err = error.OrderByNotSupported },
@@ -883,6 +936,23 @@ test "sql_parser binds GROUP BY aliases and positions to SELECT items, as DuckDB
     }
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 3"));
     try std.testing.expectError(error.AggregateInGroupBy, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 2"));
+}
+
+test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k FROM 't' GROUP BY k, g ORDER BY count(*) DESC, g, k LIMIT 3");
+    defer q.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.hidden.len);
+    try std.testing.expectEqualStrings("count(*)", q.result_order.hidden[0].expr);
+    try std.testing.expectEqual(ast.SelectColumn.Role.agg, q.result_order.hidden[0].role);
+    try std.testing.expectEqual(ast.SelectColumn.Role.key, q.result_order.hidden[1].role);
+    try std.testing.expectEqualSlices(ast.OrderKey, &.{
+        .{ .column = 1, .descending = true },
+        .{ .column = 2, .descending = false },
+        .{ .column = 0, .descending = false },
+    }, q.result_order.keys);
+    // The hidden aggregate is a call of its own, after the SELECT list's.
+    try std.testing.expectEqualStrings("count(*) AS " ++ hidden_alias ++ "0", q.aggregate_str.?);
 }
 
 test "sql_parser hands NOT over groups on as the predicate written" {

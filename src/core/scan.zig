@@ -2611,6 +2611,7 @@ fn prepareAggregate(
         .timings = t,
         .output = output,
         .part_agg = part_on,
+        .visible_cols = if (group_outputs != null and args.result_order.hidden.len > 0) args.select_cols.?.len else null,
         .state = .{
             .accumulators = accumulators,
             .agg_calls = agg_calls,
@@ -4461,7 +4462,8 @@ fn sqlBound(select_cols: ?[]const expr_ast.SelectColumn) bool {
     return false;
 }
 
-/// Bind a SQL select list to slots: each aggregate item is the next aggregate call, in order; any other item
+/// Bind a SQL select list, then the hidden ORDER BY terms (`ResultOrder.hidden`) after it, to slots: each aggregate
+/// item is the next aggregate call, in order (the hidden ones are the calls after the SELECT list's); any other item
 /// is the GROUP BY key it equals as a bound expression (`Expr.eql`: `"r"."v"` and `r.v` are one key exactly when
 /// they bind one column). Visible names: an alias, else a column key's label, else the item as written. Hidden
 /// columns have no name and are dropped before any output sees them.
@@ -4472,10 +4474,11 @@ fn bindSqlOutputs(
     args: MultiAggArgs,
 ) ![]const BoundOutputColumn {
     const visible = args.select_cols.?;
-    const bound = try arena.alloc(BoundOutputColumn, visible.len);
+    const hidden = args.result_order.hidden;
+    const bound = try arena.alloc(BoundOutputColumn, visible.len + hidden.len);
     var next_agg: usize = 0;
     for (bound, 0..) |*out, i| {
-        const spec = visible[i];
+        const spec = if (i < visible.len) visible[i] else hidden[i - visible.len];
         const source: ColSource = switch (spec.role) {
             .agg => blk: {
                 if (next_agg >= agg_calls.len) return error.EmptyAggregate;
@@ -4489,7 +4492,7 @@ fn bindSqlOutputs(
                 return error.ColumnMustBeGrouped;
             },
         };
-        const name: []const u8 = if (spec.alias != null) aliasName(spec) else switch (source) {
+        const name: []const u8 = if (i >= visible.len) "" else if (spec.alias != null) aliasName(spec) else switch (source) {
             .key => |k| if (keys.items[k].expr == .col_ref) try keys.label(k) else exprName(spec),
             .agg => exprName(spec),
         };

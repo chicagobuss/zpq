@@ -124,6 +124,9 @@ pub const MultiAggArgs = struct {
     fast_levels: bool = false,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
+    /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
+    /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
+    typed_answer: bool = false,
     /// `--unordered`: GROUP BY output in no particular order, with floating-point aggregates summed in whatever order
     /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
     /// at every `-j`; see `group_blocks_max`.
@@ -223,6 +226,8 @@ pub const AggOutput = struct {
     /// alone, as tests build them) is its own allocation; `releaseRow` frees a row either way. The strings values own
     /// are always their own allocations.
     slab: []AggValue = &.{},
+    /// The GROUP BY answer as typed columns instead of rows (`MultiAggArgs.typed_answer`); `group_rows` is then null.
+    typed: ?TypedAnswer = null,
 
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
@@ -235,6 +240,7 @@ pub const AggOutput = struct {
             gpa.free(rows);
         }
         gpa.free(self.slab);
+        if (self.typed) |*t| t.deinit(gpa);
         if (self.group_cols) |cols| {
             for (cols) |c| gpa.free(c);
             gpa.free(cols);
@@ -2580,10 +2586,7 @@ fn prepareAggregate(
 
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
         // answer: unbuilt values NULL. One slab holds every row's cells (`AggOutput.slab`), not an allocation a row.
-        const rows = try gpa.alloc([]const AggValue, slots.items.len);
-        @memset(rows, &.{});
-        output.group_rows = rows;
-        try buildGroupRows(gpa, &output.slab, .{
+        const row_src: RowSource = .{
             .slots = slots.items,
             .outputs = outputs,
             .calls = agg_calls,
@@ -2591,7 +2594,18 @@ fn prepareAggregate(
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
             .fixed_keys = if (part_state != null) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
-        }, rows, n_workers);
+        };
+        const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
+            order.hidden.len == 0;
+        if (args.typed_answer and as_is) {
+            output.typed = .{ .rows = 0, .columns = &.{} };
+            try buildGroupColumns(gpa, &output.typed.?, row_src, col_types, n_workers);
+        } else {
+            const rows = try gpa.alloc([]const AggValue, slots.items.len);
+            @memset(rows, &.{});
+            output.group_rows = rows;
+            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers);
+        }
 
         const cols = try gpa.alloc([]const u8, outputs.len);
         @memset(cols, "");
@@ -2912,6 +2926,261 @@ fn buildGroupRows(
     };
     if (failed) |t| return t.err.?;
 }
+
+/// A GROUP BY answer as typed columns, one per output column in `group_cols` order, built straight from the merged
+/// groups for a Parquet write, so no row of `AggValue`s (112 bytes a value) is ever held. Values are made by the same
+/// functions the rows are (`RowSource`) and narrowed by the rules the row writer applies, so the file and the error a
+/// query stops with are the same either way. Strings are owned, a present one each.
+pub const TypedAnswer = struct {
+    rows: usize,
+    columns: []TypedColumn,
+
+    pub fn Lane(comptime T: type) type {
+        return struct {
+            values: []T,
+            /// 1 present, 0 NULL.
+            defs: []u32,
+            nulls: bool = false,
+        };
+    }
+
+    pub const TypedColumn = union(enum) {
+        i64: Lane(i64),
+        f64: Lane(f64),
+        string: Lane([]const u8),
+        dec: Lane(i128),
+        /// avg's re-aggregatable pair, written as `<name>__sum` and `<name>__count`.
+        avg: struct { sum: Lane(f64), count: []i64 },
+        avg_dec: struct { sum: Lane(i128), count: []i64 },
+    };
+
+    pub fn deinit(self: *TypedAnswer, gpa: std.mem.Allocator) void {
+        for (self.columns) |*col| switch (col.*) {
+            .i64 => |l| freeLane(gpa, i64, l),
+            .f64 => |l| freeLane(gpa, f64, l),
+            .dec => |l| freeLane(gpa, i128, l),
+            .string => |l| {
+                for (l.values, l.defs) |v, d| if (d == 1) gpa.free(v);
+                freeLane(gpa, []const u8, l);
+            },
+            .avg => |a| {
+                freeLane(gpa, f64, a.sum);
+                gpa.free(a.count);
+            },
+            .avg_dec => |a| {
+                freeLane(gpa, i128, a.sum);
+                gpa.free(a.count);
+            },
+        };
+        gpa.free(self.columns);
+        self.* = .{ .rows = 0, .columns = &.{} };
+    }
+
+    fn freeLane(gpa: std.mem.Allocator, comptime T: type, l: Lane(T)) void {
+        gpa.free(l.values);
+        gpa.free(l.defs);
+    }
+
+    fn lane(gpa: std.mem.Allocator, comptime T: type, n: usize) !Lane(T) {
+        const values = try gpa.alloc(T, n);
+        errdefer gpa.free(values);
+        const defs = try gpa.alloc(u32, n);
+        @memset(defs, 0);
+        @memset(values, std.mem.zeroes(T));
+        return .{ .values = values, .defs = defs };
+    }
+
+    /// Columns typed by `types`, every cell NULL, owned by the caller's answer from the first allocation on.
+    fn init(gpa: std.mem.Allocator, types: []const GroupColType, n: usize, out: *TypedAnswer) !void {
+        out.* = .{ .rows = n, .columns = try gpa.alloc(TypedColumn, types.len) };
+        // Each column is valid (empty) until allocated, so a failure leaves `deinit` something to free.
+        for (out.columns) |*c| c.* = .{ .i64 = .{ .values = &.{}, .defs = &.{} } };
+        for (types, out.columns) |ty, *col| col.* = switch (ty.lane) {
+            .i64 => .{ .i64 = try lane(gpa, i64, n) },
+            .f64 => .{ .f64 = try lane(gpa, f64, n) },
+            .string => .{ .string = try lane(gpa, []const u8, n) },
+            .dec => .{ .dec = try lane(gpa, i128, n) },
+            .avg => blk: {
+                const sum = try lane(gpa, f64, n);
+                const count = gpa.alloc(i64, n) catch |e| {
+                    freeLane(gpa, f64, sum);
+                    return e;
+                };
+                @memset(count, 0);
+                break :blk .{ .avg = .{ .sum = sum, .count = count } };
+            },
+            .avg_dec => blk: {
+                const sum = try lane(gpa, i128, n);
+                const count = gpa.alloc(i64, n) catch |e| {
+                    freeLane(gpa, i128, sum);
+                    return e;
+                };
+                @memset(count, 0);
+                break :blk .{ .avg_dec = .{ .sum = sum, .count = count } };
+            },
+        };
+    }
+
+    /// Store value `v` of row `i` in column `col`, narrowed as the row writer narrows it. A string's ownership passes
+    /// to the column at once, so an error after leaves it freed with the rest. The error is the row writer's.
+    fn put(col: *TypedColumn, ty: GroupColType, i: usize, v: AggValue) !void {
+        if (v == .null_val) return;
+        switch (col.*) {
+            .i64 => |*l| {
+                const x = switch (v) {
+                    .i => |x| x,
+                    else => return error.TypeMismatch,
+                };
+                const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
+                l.values[i] = if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
+                    @bitCast(@as(u64, @intCast(x)))
+                else
+                    std.math.cast(i64, x) orelse return error.AggIntTooWide;
+                l.defs[i] = 1;
+            },
+            .f64 => |*l| {
+                l.values[i] = switch (v) {
+                    .f => |x| x,
+                    else => return error.TypeMismatch,
+                };
+                l.defs[i] = 1;
+            },
+            .string => |*l| {
+                l.values[i] = switch (v) {
+                    .s => |x| x,
+                    else => return error.TypeMismatch,
+                };
+                l.defs[i] = 1;
+            },
+            .dec => |*l| {
+                l.values[i] = switch (v) {
+                    .dec => |x| x.v,
+                    else => return error.TypeMismatch,
+                };
+                l.defs[i] = 1;
+            },
+            .avg => |*a| switch (v) {
+                .avg => |p| {
+                    a.count[i] = p.count;
+                    if (p.sum) |s| {
+                        a.sum.values[i] = s;
+                        a.sum.defs[i] = 1;
+                    }
+                },
+                else => return error.TypeMismatch,
+            },
+            .avg_dec => |*a| switch (v) {
+                .avg_dec => |p| {
+                    a.count[i] = p.count;
+                    // The `__sum` column is DECIMAL(38, s): a wider exact sum cannot be stored, and is not rounded.
+                    if (p.sum) |x| {
+                        if (@abs(x) >= @as(u192, @intCast(ty.dec.?.sum().bound()))) return error.DecimalOverflow;
+                        a.sum.values[i] = @intCast(x);
+                        a.sum.defs[i] = 1;
+                    }
+                },
+                else => return error.TypeMismatch,
+            },
+        }
+    }
+
+    /// Flag the columns that hold a NULL, and refuse one its type says cannot: the row writer's check.
+    fn seal(self: *TypedAnswer, types: []const GroupColType) !void {
+        for (self.columns, types) |*col, ty| switch (col.*) {
+            inline .i64, .f64, .string, .dec => |*l| {
+                l.nulls = std.mem.indexOfScalar(u32, l.defs, 0) != null;
+                if (l.nulls and !ty.nullable) return error.UnexpectedNull;
+            },
+            inline .avg, .avg_dec => |*a| a.sum.nulls = std.mem.indexOfScalar(u32, a.sum.defs, 0) != null,
+        };
+    }
+};
+
+/// Build the GROUP BY answer as typed columns (`TypedAnswer`), on up to `n_workers` threads. The error is the row
+/// path's: a value that fails to build at the lowest such row; else, by column, the first row that does not narrow.
+fn buildGroupColumns(
+    gpa: std.mem.Allocator,
+    out: *TypedAnswer,
+    src: RowSource,
+    types: []const GroupColType,
+    n_workers: usize,
+) !void {
+    try TypedAnswer.init(gpa, types, src.slots.len, out);
+    const n = src.slots.len;
+    if (n == 0) return;
+    const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, n, row_block) catch unreachable));
+    const tasks = try gpa.alloc(ColumnBuildTask, n_threads);
+    defer gpa.free(tasks);
+    var cursor: std.atomic.Value(usize) = .init(0);
+    const vals = try gpa.alloc(AggValue, n_threads * src.outputs.len);
+    defer gpa.free(vals);
+    for (tasks, 0..) |*t, ti| t.* = .{
+        .gpa = gpa,
+        .src = &src,
+        .types = types,
+        .answer = out,
+        .cursor = &cursor,
+        .vals = vals[ti * src.outputs.len ..][0..src.outputs.len],
+    };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (tasks.len == 1 or !spawn_util.runTree(ColumnBuildTask, tasks, config, ColumnBuildTask.run)) ColumnBuildTask.run(&tasks[0]);
+    var failed: ?*const ColumnBuildTask = null;
+    for (tasks) |*t| if (t.err != null and (failed == null or t.err_row < failed.?.err_row)) {
+        failed = t;
+    };
+    if (failed) |t| return t.err.?;
+    // Narrowing errors in column order, each column's first failing row, as the row writer meets them.
+    var narrow: ?struct { col: usize, row: usize, err: anyerror } = null;
+    for (tasks) |t| if (t.narrow_err) |e| {
+        if (narrow == null or t.narrow_col < narrow.?.col or (t.narrow_col == narrow.?.col and t.narrow_row < narrow.?.row))
+            narrow = .{ .col = t.narrow_col, .row = t.narrow_row, .err = e };
+    };
+    if (narrow) |e| return e.err;
+    try out.seal(types);
+}
+
+const ColumnBuildTask = struct {
+    gpa: std.mem.Allocator,
+    src: *const RowSource,
+    types: []const GroupColType,
+    answer: *TypedAnswer,
+    cursor: *std.atomic.Value(usize),
+    /// One row's values, built then stored a row at a time.
+    vals: []AggValue,
+    err: ?anyerror = null,
+    err_row: usize = 0,
+    narrow_err: ?anyerror = null,
+    narrow_col: usize = 0,
+    narrow_row: usize = 0,
+
+    fn run(t: *ColumnBuildTask) void {
+        const n = t.src.slots.len;
+        while (true) {
+            const lo = t.cursor.fetchAdd(row_block, .monotonic);
+            if (lo >= n) return;
+            for (lo..@min(n, lo + row_block)) |i| {
+                @memset(t.vals, .null_val);
+                const built = t.src.buildRow(t.gpa, t.src.slots[i], t.vals);
+                // Every value built passes to its column, whatever happens to the rest of the row.
+                for (t.answer.columns, t.types, t.vals, 0..) |*col, ty, v, ci| {
+                    TypedAnswer.put(col, ty, i, v) catch |e| {
+                        if (v == .s) t.gpa.free(v.s);
+                        if (t.narrow_err == null or ci < t.narrow_col or (ci == t.narrow_col and i < t.narrow_row)) {
+                            t.narrow_err = e;
+                            t.narrow_col = ci;
+                            t.narrow_row = i;
+                        }
+                    };
+                }
+                built catch |e| {
+                    t.err = e;
+                    t.err_row = i;
+                    return;
+                };
+            }
+        }
+    }
+};
 
 const RowBuildTask = struct {
     gpa: std.mem.Allocator,
@@ -7824,6 +8093,52 @@ test "buildGroupRows: an allocation failure leaves every row freeable" {
         defer out.deinit(gpa);
         try testing.expectError(error.OutOfMemory, f.build(gpa, &out, 8));
     }
+}
+
+test "buildGroupColumns: the rows' values as typed columns at every -j; freeable on any allocation failure" {
+    const types = [_]GroupColType{
+        .{ .lane = .string, .nullable = true },
+        .{ .lane = .string, .nullable = true },
+        .{ .lane = .i64, .nullable = false },
+    };
+    var f = try RowFixture.init(3 * row_block + 77);
+    defer f.deinit();
+    for ([_]usize{ 1, 3, 8 }) |j| {
+        var out: AggOutput = .{};
+        defer out.deinit(testing.allocator);
+        out.typed = .{ .rows = 0, .columns = &.{} };
+        try buildGroupColumns(testing.allocator, &out.typed.?, f.source(), &types, j);
+        const t = out.typed.?;
+        try testing.expectEqual(f.slots.len, t.rows);
+        var buf: [32]u8 = undefined;
+        for (0..t.rows) |i| {
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "m{d}", .{i}), t.columns[0].string.values[i]);
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "g{d}", .{i}), t.columns[1].string.values[i]);
+            try testing.expectEqual(@as(i64, @intCast(i)), t.columns[2].i64.values[i]);
+        }
+        try testing.expect(!t.columns[2].i64.nulls);
+    }
+    var small = try RowFixture.init(3);
+    defer small.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, fx: *const RowFixture, ty: []const GroupColType) !void {
+            var out: AggOutput = .{};
+            defer out.deinit(gpa);
+            out.typed = .{ .rows = 0, .columns = &.{} };
+            try buildGroupColumns(gpa, &out.typed.?, fx.source(), ty, 1);
+        }
+    }.run, .{ &small, &types });
+    // A count column that may not be NULL refuses a NULL as the row writer does; a narrowing error is the first
+    // column's, by row.
+    const strict = [_]GroupColType{
+        .{ .lane = .string, .nullable = false },
+        .{ .lane = .string, .nullable = true },
+        .{ .lane = .f64, .nullable = true },
+    };
+    var out: AggOutput = .{};
+    defer out.deinit(testing.allocator);
+    out.typed = .{ .rows = 0, .columns = &.{} };
+    try testing.expectError(error.TypeMismatch, buildGroupColumns(testing.allocator, &out.typed.?, f.source(), &strict, 8));
 }
 
 test "buildGroupRows: the error the lowest failing row gives, at every -j" {

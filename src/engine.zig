@@ -260,6 +260,9 @@ pub const QueryArgs = struct {
     output: ?[]const u8 = null,
     /// CLI-only: an already-open sink and an empty scalar result cut.
     output_fd: ?local_fs.fd_t = null,
+    /// CLI-only: the answer is only written to Parquet, so a GROUP BY may build it as typed columns
+    /// (`scan.MultiAggArgs.typed_answer`), never read back as rows.
+    typed_answer: bool = false,
     empty_scalar: bool = false,
     quiet_diagnostics: bool = false,
     filter: ?[]const u8 = null,
@@ -616,6 +619,7 @@ fn executeAggregate(
         .unordered = args.unordered,
         .select_cols = args.select_cols,
         .result_order = cut_args.result_order,
+        .typed_answer = args.typed_answer and args.output != null,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
@@ -713,7 +717,9 @@ fn executeAggregate(
         const st = r.state;
         const codec = args.codec orelse .SNAPPY;
         const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
-        bytes_out = if (r.output.group_rows) |rows|
+        bytes_out = if (r.output.typed) |typed|
+            try writeTypedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, typed, codec, zstd, args.output_fd)
+        else if (r.output.group_rows) |rows|
             try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd, args.output_fd)
         else
             try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
@@ -4183,6 +4189,93 @@ fn writeGroupedParquet(
         try local_fs.closeChecked(fd);
     }
     return written;
+}
+
+/// `writeGroupedParquet` for an answer built as typed columns (`scan.TypedAnswer`): the same columns, names, types and
+/// file, with no row of values in between.
+fn writeTypedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    answer: scan.TypedAnswer,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    output_fd: ?local_fs.fd_t,
+) !u64 {
+    var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
+    for (cols, types, answer.columns) |name, ty, col| switch (col) {
+        inline .i64, .f64, .string => |l, tag| {
+            const phys: schema.Type = switch (tag) {
+                .i64 => .INT64,
+                .f64 => .DOUBLE,
+                .string => .BYTE_ARRAY,
+                else => unreachable,
+            };
+            const out = typedColumn(@FieldType(@TypeOf(l), "values"), name, ty.nullable, l, phys);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, out, src) else out);
+        },
+        .avg => |a| {
+            try outs.append(arena, typedColumn([]f64, try std.fmt.allocPrint(arena, "{s}__sum", .{name}), true, a.sum, .DOUBLE));
+            try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
+        },
+        .dec => |l| try outs.append(arena, decColumn(name, l, ty.dec.?)),
+        .avg_dec => |a| {
+            try outs.append(arena, decColumn(try std.fmt.allocPrint(arena, "{s}__sum", .{name}), a.sum, ty.dec.?.sum()));
+            try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
+        },
+    };
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(answer.rows), codec, zstd);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
+    return written;
+}
+
+fn typedColumn(comptime S: type, name: []const u8, nullable: bool, l: anytype, parquet_type: schema.Type) expr_agg.OutputCol {
+    const T = @typeInfo(S).pointer.child;
+    const col: filter_eval.ColumnT(T) = .{
+        .values = l.values,
+        .def_levels = if (l.nulls) l.defs else null,
+        .max_def = @intFromBool(nullable),
+        .has_nulls = l.nulls,
+    };
+    return .{
+        .name = name,
+        .col = switch (T) {
+            i64 => .{ .i64 = col },
+            f64 => .{ .f64 = col },
+            []const u8 => .{ .string = col },
+            else => unreachable,
+        },
+        .parquet_type = parquet_type,
+        .nullable = nullable,
+    };
+}
+
+fn countColumn(name: []const u8, counts: []const i64) expr_agg.OutputCol {
+    return .{ .name = name, .col = .{ .i64 = .{ .values = counts, .max_def = 0 } }, .parquet_type = .INT64, .nullable = false };
+}
+
+fn decColumn(name: []const u8, l: scan.TypedAnswer.Lane(i128), spec: expr_ast.Dec) expr_agg.OutputCol {
+    return .{
+        .name = name,
+        .col = .{ .i128 = .{
+            .values = l.values,
+            .def_levels = if (l.nulls) l.defs else null,
+            .max_def = 1,
+            .has_nulls = l.nulls,
+        } },
+        .parquet_type = spec.physical(),
+        .nullable = true,
+        .dec = spec,
+    };
 }
 
 /// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a

@@ -776,6 +776,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         .inputs = inputs,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet and to_stdout) 1 else null,
+        .typed_answer = fmt == .parquet,
         .quiet_diagnostics = machine_diagnostics,
         .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
         .filter = filter,
@@ -809,7 +810,7 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         defer result.deinit(gpa);
         const ar = result.aggregate;
         const answer = ar.output;
-        rows = if (answer.group_rows) |groups| groups.len else if (query_args.empty_scalar or answer.no_row) 0 else 1;
+        rows = if (answer.group_rows) |groups| groups.len else if (answer.typed) |t| t.rows else if (query_args.empty_scalar or answer.no_row) 0 else 1;
         if (fmt != .parquet) {
             const output_start = nowMonoNs();
             var fd: local_fs.fd_t = 1;

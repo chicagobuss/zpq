@@ -689,6 +689,60 @@ def main():
             fails += 1
             print(f"  FAIL  {label}  got {got} want {want}")
 
+    # SQL NOT over groups, through the SQL front end (which unparses WHERE and FILTER bodies to the flat grammar).
+    # amt and nname hold NULLs: NOT of an UNKNOWN leaf stays UNKNOWN, so those rows must stay out. Each count and sum
+    # must match DuckDB at every parallelism.
+    SQL_NOTS = [
+        "NOT (amt > 5 AND id < 3)",
+        "NOT (amt > 5 OR id < -1000)",
+        "NOT NOT (amt > 5 OR id < -1000)",
+        "id > 0 AND NOT (amt > 1000 OR nname LIKE 'v3%')",
+        "NOT (amt > 1000 OR nname LIKE 'v3%') AND id > 0",
+        "id < -1500 OR NOT (amt > 0 AND nname IS NOT NULL)",
+        "NOT ((amt > 0 OR nname LIKE 'v2%') AND (id > 100 OR nname IS NULL))",
+        "NOT (id IN (1, 5, 999) AND amt > 0)",
+        "NOT (id NOT IN (1, 5, 999) OR nname IS NULL)",
+        "NOT (amt NOT BETWEEN -100 AND 100)",
+        "amt NOT BETWEEN -100 AND 100 AND id > 0",
+        "NOT (amt BETWEEN -100 AND 100 OR id > 1000)",
+        "NOT (nname LIKE 'v1%' AND name NOT LIKE '%3')",
+        "NOT (nname IS NULL OR amt IS NULL)",
+        "NOT (amt <= 10 AND amt >= -10)",
+        "amt > 0 OR (id < -1000 OR nname IS NULL)",
+    ]
+    SQL_REFUSED = [
+        "NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')",
+        "id > 0 AND (amt > 5 OR nname LIKE 'v2%')",
+        "NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%'",
+        "nname = 'a OR id > 0'",
+    ]
+    for where in SQL_NOTS + SQL_REFUSED:
+        for fmt, sel in (("where", "count(*) AS c, sum(id) AS s"),
+                         ("agg_filter", f"count(*) FILTER (WHERE {where}) AS c, sum(id) FILTER (WHERE {where}) AS s")):
+            dsql = f"SELECT count(*) AS c, sum(id) AS s FROM '{fixture}' WHERE {where}"
+            zsql = (f"SELECT {sel} FROM '{fixture}'" + (f" WHERE {where}" if fmt == "where" else ""))
+            want = None if where in SQL_REFUSED else list(con.execute(dsql).fetchone())
+            for j in ("1", "4", "16"):
+                total += 1
+                r = subprocess.run([ZPQ, "query", "--query", zsql, "-j", j], capture_output=True, text=True)
+                label = f"sql-not:{fmt} -j{j:2} {where}"
+                if want is None:
+                    if r.returncode != 0 and not r.stdout:
+                        print(f"  OK    {label}  (refused)")
+                    else:
+                        fails += 1
+                        print(f"  FAIL  {label}  not refused: rc={r.returncode} stdout={r.stdout[:60]!r}")
+                    continue
+                try:
+                    got = list(json.loads(r.stdout)["agg"].values())
+                except Exception as e:
+                    got = f"error: {e}; {r.stderr.strip()[:80]}"
+                if got == want:
+                    print(f"  OK    {label}  {got}")
+                else:
+                    fails += 1
+                    print(f"  FAIL  {label}  zpq={got} duck={want}")
+
     # ZPQ must preserve INPUT row order through filter+write (Iceberg compaction /
     # S3-to-S3 passthrough expect determinism; parallel per-RG workers must not
     # scramble). Compared in FILE order vs the input filtered in file order — this

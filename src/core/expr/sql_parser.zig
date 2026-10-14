@@ -182,6 +182,196 @@ fn quoteWholePaths(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
+fn isNot(n: *const c.LpNode) bool {
+    return n.kind == c.LP_EXPR_UNARY_OP and n.u.unary.op == c.LP_UOP_NOT and n.u.unary.operand != null;
+}
+
+fn isBool(n: *const c.LpNode, op: c.LpBinOp) bool {
+    return n.kind == c.LP_EXPR_BINARY_OP and n.u.binary.op == op and n.u.binary.left != null and
+        n.u.binary.right != null;
+}
+
+/// Rewrite predicates, in place, into the shape the flat filter grammar reads back exactly. liteparser prints a NOT's
+/// operand without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the grammar reads as
+/// `(NOT a) AND b`: a different predicate. So every NOT is pushed to the leaves (De Morgan; `NOT NOT p` is `p`;
+/// `NOT x NOT IN/BETWEEN` drops both NOTs), which keeps three-valued logic: a NULL operand leaves the leaf UNKNOWN
+/// either way. Right-nested `a OR (b OR c)` unparses with parentheses the grammar rejects, so same-operator chains are
+/// re-associated to the left (AND and OR are associative in three-valued logic too) once the children are final.
+/// Pushing NOTs at enter, before the walker reads the node's children, means the NOTs it creates are pushed in turn.
+fn normalizePredicates(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
+    const Visit = struct {
+        failed: bool = false,
+        arena: *c.arena_t,
+
+        fn enter(visitor: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
+            // The grammar reads `NOT x BETWEEN` but not `x NOT BETWEEN`.
+            if (node.*.kind == c.LP_EXPR_BETWEEN and node.*.u.between.is_not != 0) {
+                const between = c.lp_node_alloc(self.arena, c.LP_EXPR_BETWEEN) orelse {
+                    self.failed = true;
+                    return 2;
+                };
+                between.* = node.*;
+                between.*.u.between.is_not = 0;
+                node.*.kind = c.LP_EXPR_UNARY_OP;
+                node.*.u = .{ .unary = .{ .op = c.LP_UOP_NOT, .operand = between } };
+                return 0;
+            }
+            while (true) {
+                if (isNot(node)) {
+                    const operand: *c.LpNode = node.*.u.unary.operand;
+                    if (isNot(operand)) {
+                        node.* = operand.u.unary.operand.*;
+                        continue;
+                    }
+                    if ((operand.kind == c.LP_EXPR_IN and operand.u.in.is_not != 0) or
+                        (operand.kind == c.LP_EXPR_BETWEEN and operand.u.between.is_not != 0))
+                    {
+                        node.* = operand.*;
+                        if (node.*.kind == c.LP_EXPR_IN) node.*.u.in.is_not = 0 else node.*.u.between.is_not = 0;
+                        continue;
+                    }
+                    if (!isBool(operand, c.LP_OP_AND) and !isBool(operand, c.LP_OP_OR)) break;
+                    const op = operand.u.binary.op;
+                    const left = c.lp_node_alloc(self.arena, c.LP_EXPR_UNARY_OP) orelse {
+                        self.failed = true;
+                        return 2;
+                    };
+                    const right = c.lp_node_alloc(self.arena, c.LP_EXPR_UNARY_OP) orelse {
+                        self.failed = true;
+                        return 2;
+                    };
+                    left.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.left };
+                    right.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.right };
+                    node.* = operand.*;
+                    node.*.u.binary.op = if (op == c.LP_OP_AND) c.LP_OP_OR else c.LP_OP_AND;
+                    node.*.u.binary.left = left;
+                    node.*.u.binary.right = right;
+                    continue;
+                }
+                break;
+            }
+            return 0;
+        }
+
+        /// Children are final here. Rotating `a op (b op c)` to `(a op b) op c` reuses the inner node for
+        /// `(a op b)`, whose `b` may itself be an `op` chain, so walk down the left spine.
+        fn leave(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            inline for (.{ c.LP_OP_AND, c.LP_OP_OR }) |op| {
+                var n: *c.LpNode = node;
+                while (isBool(n, op)) : (n = n.u.binary.left) {
+                    while (isBool(n.u.binary.right, op)) {
+                        const inner: *c.LpNode = n.u.binary.right;
+                        n.u.binary.right = inner.u.binary.right;
+                        inner.u.binary.right = inner.u.binary.left;
+                        inner.u.binary.left = n.u.binary.left;
+                        n.u.binary.left = inner;
+                    }
+                }
+            }
+            return 0;
+        }
+    };
+    var state: Visit = .{ .arena = lp_arena };
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = Visit.leave };
+    c.lp_ast_walk(root, &visitor);
+    if (state.failed) return error.OutOfMemory;
+}
+
+/// Whether the filter grammar's raw-substring splitting would cut `s`: it splits on ` OR ` (case-sensitive) and on
+/// ` AND ` / ` BETWEEN ` (case-insensitive) without regard to quoting.
+fn splitsFlatGrammar(s: []const u8) bool {
+    return std.mem.indexOf(u8, s, " OR ") != null or std.ascii.findIgnoreCase(s, " AND ") != null or
+        std.ascii.findIgnoreCase(s, " BETWEEN ") != null;
+}
+
+/// Whether a normalized leaf unparses to text the filter grammar reads back as this leaf alone: no AND, OR or NOT
+/// below it, and no literal or name the grammar's splitting would cut (an IN list also splits on every comma).
+fn flatLeaf(leaf: *c.LpNode) bool {
+    const Visit = struct {
+        ok: bool = true,
+        in_list: usize = 0,
+
+        fn enter(visitor: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
+            switch (node.*.kind) {
+                c.LP_EXPR_BINARY_OP => {
+                    if (node.*.u.binary.op == c.LP_OP_AND or node.*.u.binary.op == c.LP_OP_OR) self.ok = false;
+                },
+                c.LP_EXPR_UNARY_OP => if (node.*.u.unary.op == c.LP_UOP_NOT) {
+                    self.ok = false;
+                },
+                c.LP_EXPR_IN => self.in_list += 1,
+                c.LP_EXPR_LITERAL_STRING => if (node.*.u.literal.value) |v| {
+                    const s = std.mem.span(v);
+                    // The grammar reads an escaped quote (`''`) as two quotes of data.
+                    if (splitsFlatGrammar(s) or std.mem.indexOfScalar(u8, s, '\'') != null or
+                        (self.in_list > 0 and std.mem.indexOfScalar(u8, s, ',') != null)) self.ok = false;
+                },
+                c.LP_EXPR_COLUMN_REF => {
+                    const ref = node.*.u.column_ref;
+                    for ([_][*c]u8{ ref.schema, ref.table, ref.column }) |part| {
+                        if (part) |p| if (splitsFlatGrammar(std.mem.span(p))) {
+                            self.ok = false;
+                        };
+                    }
+                },
+                else => {},
+            }
+            return if (self.ok) 0 else 2;
+        }
+    };
+    var state: Visit = .{};
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    // A NOT directly over the leaf is the grammar's own leading `NOT <leaf>`.
+    c.lp_ast_walk(if (isNot(leaf)) leaf.u.unary.operand else leaf, &visitor);
+    return state.ok;
+}
+
+/// Refuse a normalized predicate the flat AND/OR grammar cannot hold as written: an OR under an AND (it needs
+/// grouping), or a leaf whose text would not read back as itself. Evaluating it anyway would answer another query.
+fn checkFlatPredicate(pred: *c.LpNode) error{GroupingNotSupported}!void {
+    var disj: *c.LpNode = pred;
+    while (true) {
+        const term: *c.LpNode = if (isBool(disj, c.LP_OP_OR)) disj.u.binary.right else disj;
+        var conj: *c.LpNode = term;
+        while (true) {
+            const leaf: *c.LpNode = if (isBool(conj, c.LP_OP_AND)) conj.u.binary.right else conj;
+            if (isBool(leaf, c.LP_OP_OR) or !flatLeaf(leaf)) {
+                std.debug.print("sql: this predicate needs grouping the flat AND/OR filter grammar cannot\n" ++
+                    "  express (an OR inside an AND, after pushing NOT down), or a literal or name\n" ++
+                    "  holds a quote, ' AND ', ' OR ' or ' BETWEEN '; rewrite it as an OR of ANDs\n", .{});
+                return error.GroupingNotSupported;
+            }
+            if (conj == leaf) break;
+            conj = conj.u.binary.left;
+        }
+        if (disj == term) break;
+        disj = disj.u.binary.left;
+    }
+}
+
+/// Check every aggregate FILTER body under `node`: like WHERE, it reaches the flat grammar as unparsed text.
+fn checkAggFilters(node: *c.LpNode) error{GroupingNotSupported}!void {
+    const Visit = struct {
+        ok: bool = true,
+        fn enter(visitor: [*c]c.LpVisitor, n: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
+            if (n.*.kind == c.LP_EXPR_FUNCTION) if (n.*.u.function.filter) |f| {
+                checkFlatPredicate(f) catch {
+                    self.ok = false;
+                    return 2;
+                };
+            };
+            return 0;
+        }
+    };
+    var state: Visit = .{};
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(node, &visitor);
+    if (!state.ok) return error.GroupingNotSupported;
+}
+
 fn unparseResultColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocator) ![]const u8 {
     // NOTE: lp_ast_to_sql aborts if handed a result-column wrapper — it must
     // get the inner expression. So unparse the expr, then append the alias.
@@ -245,6 +435,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     quoteWholePaths(root);
+    try normalizePredicates(root, lp_arena);
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
@@ -263,6 +454,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             std.debug.print("sql: aggregates are not allowed in WHERE\n", .{});
             return error.AggregateInWhere;
         }
+        try checkFlatPredicate(w);
     }
 
     // Extract table name from FROM clause
@@ -300,6 +492,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             std.debug.print("sql: DISTINCT inside a function is not supported yet\n", .{});
             return error.DistinctNotSupported;
         }
+        try checkAggFilters(rc);
         if (info.has_agg) has_agg = true;
         if (info.has_bare_col) has_bare = true;
     }
@@ -645,4 +838,73 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
     }
     const other = "SELECT \"r\".\"w\", count(*) FROM 't' GROUP BY r.v";
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, other));
+}
+
+test "sql_parser pushes NOT to the leaves so the flat filter grammar reads the predicate as written" {
+    // liteparser unparses `NOT (a AND b)` as `NOT a AND b`, which the grammar reads as `(NOT a) AND b`.
+    const a = std.testing.allocator;
+    const Case = struct { where: []const u8, filter: []const u8 };
+    const cases = [_]Case{
+        .{ .where = "NOT (x > 5 AND y < 3)", .filter = "NOT x > 5 OR NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3)", .filter = "NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT NOT (x > 5 OR y < 3)", .filter = "x > 5 OR y < 3" },
+        .{ .where = "NOT NOT NOT x > 5", .filter = "NOT x > 5" },
+        .{ .where = "z = 1 AND NOT (x > 5 OR y < 3)", .filter = "z = 1 AND NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3) AND z = 1", .filter = "NOT x > 5 AND NOT y < 3 AND z = 1" },
+        .{ .where = "NOT (x > 5 AND y < 3) OR z = 1", .filter = "NOT x > 5 OR NOT y < 3 OR z = 1" },
+        .{ .where = "z = 1 OR NOT (x > 5 AND y < 3)", .filter = "z = 1 OR NOT x > 5 OR NOT y < 3" },
+        // De Morgan into an OR of ANDs.
+        .{ .where = "NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))", .filter = "NOT x > 5 AND NOT y < 3 OR NOT z = 1 AND NOT x = 2" },
+        .{ .where = "NOT (x IN (1, 2) AND y = 1)", .filter = "NOT x IN (1, 2) OR NOT y = 1" },
+        .{ .where = "NOT (x NOT IN (1, 2) OR y = 1)", .filter = "x IN (1, 2) AND NOT y = 1" },
+        .{ .where = "NOT (x NOT BETWEEN 1 AND 3)", .filter = "x BETWEEN 1 AND 3" },
+        .{ .where = "x NOT BETWEEN 1 AND 3 OR y = 1", .filter = "NOT x BETWEEN 1 AND 3 OR y = 1" },
+        .{ .where = "NOT (x BETWEEN 1 AND 3 OR y = 1)", .filter = "NOT x BETWEEN 1 AND 3 AND NOT y = 1" },
+        .{ .where = "NOT (s LIKE 'a%' AND s NOT LIKE '%b')", .filter = "NOT s LIKE 'a%' OR s LIKE '%b'" },
+        .{ .where = "NOT (s IS NULL OR s IS NOT NULL)", .filter = "NOT s IS NULL AND NOT s IS NOT NULL" },
+        // Right-nested chains unparse with parentheses the grammar rejects; they are re-associated instead.
+        .{ .where = "x = 1 OR (y = 2 OR z = 3)", .filter = "x = 1 OR y = 2 OR z = 3" },
+        .{ .where = "x = 1 AND (y = 2 AND (z = 3 AND x = 4))", .filter = "x = 1 AND y = 2 AND z = 3 AND x = 4" },
+        .{ .where = "(x = 1 AND y = 2) OR z = 3", .filter = "x = 1 AND y = 2 OR z = 3" },
+        .{ .where = "x BETWEEN 1 AND 2 OR s = 'a or b'", .filter = "x BETWEEN 1 AND 2 OR s = 'a or b'" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("WHERE {s}\n", .{case.where});
+        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{case.where});
+        defer a.free(sql);
+        const q = try parseSqlQuery(a, sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualStrings(case.filter, q.filter_str.?);
+    }
+    // An aggregate FILTER body reaches the same grammar as text.
+    const q = try parseSqlQuery(a, "SELECT count(*) FILTER (WHERE NOT (x > 5 AND y < 3)) AS c FROM 't'");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("count(*) FILTER (WHERE NOT x > 5 OR NOT y < 3) AS c", q.aggregate_str.?);
+}
+
+test "sql_parser refuses predicates the flat filter grammar cannot hold as written" {
+    const a = std.testing.allocator;
+    const wheres = [_][]const u8{
+        "NOT ((x > 5 AND y < 3) OR z = 1)", // (NOT x > 5 OR NOT y < 3) AND NOT z = 1
+        "x = 1 AND (y = 2 OR z = 3)",
+        "(x = 1 OR y = 2) AND z = 3",
+        "NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5",
+        "NOT (x = 1 AND y = 2) AND z = 3",
+        // Literals and names the grammar's raw-substring splitting would cut.
+        "s = 'a OR b = 1'",
+        "s = 'rock AND roll'",
+        "s = 'x BETWEEN y'",
+        "s = 'O''Brien'",
+        "s IN ('a,b', 'c')",
+        "\"a OR b\" = 1",
+    };
+    for (wheres) |where| {
+        errdefer std.debug.print("WHERE {s}\n", .{where});
+        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{where});
+        defer a.free(sql);
+        try std.testing.expectError(error.GroupingNotSupported, parseSqlQuery(a, sql));
+    }
+    try std.testing.expectError(error.GroupingNotSupported, parseSqlQuery(a,
+        \\SELECT count(*) FILTER (WHERE NOT ((x > 5 AND y < 3) OR z = 1)) AS c FROM 't'
+    ));
 }

@@ -1980,6 +1980,16 @@ pub const DecodeBudget = struct {
     pub fn release(self: *DecodeBudget, bytes: usize) void {
         _ = self.used.fetchSub(bytes, .release);
     }
+
+    /// `acquire` without waiting: false, holding nothing, when the bytes do not fit now. For optional scratch whose
+    /// caller has a path that needs none.
+    pub fn tryAcquire(self: *DecodeBudget, bytes: usize) bool {
+        while (true) {
+            const cur = self.used.load(.monotonic);
+            if (cur + bytes > self.limit) return false;
+            if (self.used.cmpxchgWeak(cur, cur + bytes, .acquire, .monotonic) == null) return true;
+        }
+    }
 };
 
 /// Bytes decoding `cols` of `in` takes, from its metadata: each leaf's values in its batch lane (a string as a slice
@@ -2211,7 +2221,7 @@ fn foldGroupedWindows(
             const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel)) {
+            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, null)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -2379,7 +2389,7 @@ pub fn scanRGForAgg(
                 return;
             }
             if (!staged and decode_options.encoded and
-                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel))
+                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget))
             {
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);

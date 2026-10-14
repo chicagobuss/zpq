@@ -16,6 +16,7 @@ const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
 const agg = @import("agg.zig");
+const DecodeBudget = @import("../consumer.zig").DecodeBudget;
 
 const Column = filter_eval.Batch.Column;
 const Sel = filter_selection.SelectionVector;
@@ -347,8 +348,21 @@ fn foldHist(
 
 // ------------------------------------------------------------------ grouped
 
-/// Composite spaces above this fall back to the row path.
+/// Composite spaces up to this group by code at no charge: their scratch is small beside a row group's decode.
 const MAX_COMPOSITE: usize = 1 << 16;
+/// Larger spaces up to this group by code only where it pays and fits: the space is at most twice the row group's
+/// rows (its arrays are walked whole per row group), and the scratch they take is reserved from the decode budget
+/// before any group is touched. Otherwise, and above it, the row path.
+pub const MAX_CHARGED_COMPOSITE: usize = 1 << 20;
+
+/// What grouping by code over `space` composites holds on the row group's arena, kept on the high side: the
+/// composite-to-group map, first rows and their order, then per call a count, partial and seen-count array (a
+/// histogram call its (composite, code) table instead).
+fn chargedScratch(space: usize, calls: []const AggCall) usize {
+    var bytes = space *| 12;
+    for (calls) |_| bytes +|= @max(space *| 32, MAX_HIST *| 8);
+    return bytes;
+}
 /// Per-call (composite × code) histograms above this fall back to the per-row typed fold.
 const MAX_HIST: usize = 1 << 20;
 
@@ -450,6 +464,8 @@ pub fn groupedCoded(
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     sel: *const Sel,
+    /// Charged for a composite space past `MAX_COMPOSITE`; null keeps grouping by code to the free spaces.
+    budget: ?*DecodeBudget,
 ) !bool {
     const num_rows = batch.num_rows;
     const key_cols = try ra.alloc(Column, keys.len);
@@ -463,8 +479,17 @@ pub fn groupedCoded(
         key_cols[i] = col;
         strides[i] = space;
         space *= col.dictLen() + 1; // + the null slot
-        if (space > MAX_COMPOSITE) return false;
+        if (space > MAX_CHARGED_COMPOSITE) return false;
     }
+    const wide = space > MAX_COMPOSITE;
+    var charged: usize = 0;
+    if (wide) {
+        if (space > 2 * num_rows) return false;
+        const b = budget orelse return false;
+        charged = chargedScratch(space, calls);
+        if (!b.tryAcquire(charged)) return false;
+    }
+    defer if (charged > 0) budget.?.release(charged);
 
     // Composite code per selected row.
     const comp = try ra.alloc(u32, num_rows);
@@ -532,7 +557,7 @@ pub fn groupedCoded(
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
         const accs = table.accumulators.items;
-        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel);
+        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, wide);
     }
     return true;
 }
@@ -590,6 +615,9 @@ fn foldGroupedCall(
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     outer: *const Sel,
+    /// A space past `MAX_COMPOSITE`: a float SUM/AVG then keeps the per-row fold, its sums added in row order as the
+    /// row path adds them, rather than reassociated through per-composite partials or count × value.
+    wide: bool,
 ) !void {
     // Selection for this call: outer, narrowed by FILTER and the argument's nulls.
     var own: ?Sel = null;
@@ -622,7 +650,10 @@ fn foldGroupedCall(
         return;
     }
 
-    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST) {
+    const float_sum = (call.func == .sum or call.func == .avg) and call.arg.?.typeOf() == .f64;
+    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
+        !(wide and float_sum))
+    {
         // (composite, code) histogram, then fold each entry once per group.
         const col = arg_col.?;
         const c = call.arg.?.col_ref;
@@ -670,7 +701,8 @@ fn foldGroupedCall(
         else => |e| vals_col = try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
-    const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes;
+    const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
+        !(wide and float_sum);
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -1074,7 +1106,7 @@ test "regression: grouped coded keys do not invent infinities for all-NaN values
     defer table.deinit();
     var sel = try Sel.init(a, vals.len);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vals.len };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null));
     try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
 }
@@ -1105,7 +1137,7 @@ test "regression: grouped float min/max over coded keys and coded values order N
     defer table.deinit();
     var sel = try Sel.init(a, vcodes.len);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vcodes.len };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null));
     try testing.expectEqual(@as(f64, 1.0), table.accumulators.items[0].min_f.?);
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
 }
@@ -1153,4 +1185,58 @@ test "codePlainKeys: a narrow integer key is coded by its offset from the least 
     var wide = [_]Column{.{ .i64 = .{ .values = &wide_vals } }};
     try codePlainKeys(a, &keys, &wide, &lookup);
     try std.testing.expect(wide[0].i64.codes == null);
+}
+
+test "a composite space past 2^16 groups by code only when its scratch is reserved, float sums in row order" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n_keys = 70_000;
+    const n_rows = 2 * n_keys;
+    const dict = try a.alloc(i64, n_keys);
+    for (dict, 0..) |*d, i| d.* = @intCast(i * 3);
+    const codes = try a.alloc(u32, n_rows);
+    const vals = try a.alloc(f64, n_rows);
+    for (codes, vals, 0..) |*c, *v, i| {
+        c.* = @intCast(i % n_keys);
+        v.* = 0.1 * @as(f64, @floatFromInt(i)) + 1e-9;
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = &.{}, .codes = codes, .dict = dict } },
+        .{ .f64 = .{ .values = vals } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .sum, .arg = arg, .result = .f64, .where = null, .alias = "s" },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n_rows };
+    var sel = try Sel.init(a, n_rows);
+
+    // Refused (no budget, or one too small): nothing is grouped, so the row path can run in its place.
+    for ([_]?usize{ null, 1024 }) |limit| {
+        var table = agg.GroupTable.init(testing.allocator, 1 << 28);
+        defer table.deinit();
+        var budget: DecodeBudget = .{ .limit = limit orelse 0 };
+        try testing.expect(!try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, if (limit != null) &budget else null));
+        try testing.expectEqual(@as(usize, 0), table.groupCount());
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+
+    var table = agg.GroupTable.init(testing.allocator, 1 << 28);
+    defer table.deinit();
+    var budget: DecodeBudget = .{ .limit = 1 << 30 };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, &budget));
+    // Released once grouped.
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try testing.expectEqual(@as(usize, n_keys), table.groupCount());
+    for ([_]usize{ 0, 1, 12_345, n_keys - 1 }) |g| {
+        const accs = table.accumulators.items[g * calls.len ..][0..calls.len];
+        try testing.expectEqual(@as(u64, 2), accs[0].count);
+        // Exactly the two values added in row order, as the row path adds them.
+        try testing.expectEqual(vals[g] + vals[g + n_keys], accs[1].sum_f.?);
+    }
 }

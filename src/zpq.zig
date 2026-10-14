@@ -96,6 +96,7 @@ test {
     _ = @import("core/consumer.zig");
     _ = @import("core/scan.zig");
     _ = @import("core/agg_plan.zig");
+    _ = @import("core/result_program.zig");
     _ = @import("core/huge_pages.zig");
     _ = @import("core/spawn.zig");
     _ = @import("core/invariant.zig");

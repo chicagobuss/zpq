@@ -33,6 +33,7 @@ const huge_pages = @import("core/huge_pages.zig");
 const consumer = @import("core/consumer.zig");
 const invariant = @import("core/invariant.zig");
 const scan = @import("core/scan.zig");
+const ResultProgram = @import("core/result_program.zig").ResultProgram;
 const Diag = @import("core/diag.zig").Diag;
 const agg_plan = @import("core/agg_plan.zig");
 const system = @import("core/system.zig");
@@ -644,9 +645,10 @@ fn executeAggregate(
 
     defer r.state.deinit(ctx.gpa);
     errdefer r.output.deinit(ctx.gpa);
-    // ORDER BY keys index the SELECT list, which GROUP BY rows follow column for column.
+    // ORDER BY keys index the SELECT list then the hidden terms, which GROUP BY rows follow column for column.
     if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
-    try r.output.applyResultOrder(ctx.gpa, args.result_order);
+    const program: ResultProgram = .{ .order = args.result_order, .visible = r.visible_cols };
+    try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.

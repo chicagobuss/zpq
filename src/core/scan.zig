@@ -433,6 +433,9 @@ pub const MultiAggResult = struct {
     output: AggOutput,
     /// The shared-partition GROUP BY executor ran. False when the query kept the per-worker tables.
     part_agg: bool = false,
+    /// How many of each GROUP BY row's leading columns are shown; the rest are hidden ORDER BY inputs
+    /// (`ResultOrder.hidden`) the result program drops once it has ranked the rows. Null shows every column.
+    visible_cols: ?usize = null,
     state: ScanState,
 
     pub fn deinit(self: *MultiAggResult, gpa: std.mem.Allocator) void {

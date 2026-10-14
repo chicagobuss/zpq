@@ -55,6 +55,8 @@ pub const Error = error{
     DecimalScaleTooLarge,
     /// A DECIMAL column whose declared precision/scale no DECIMAL can have (precision 1..38, scale 0..precision).
     InvalidDecimalType,
+    /// A GROUP BY term names an aggregate (by a SELECT alias or position).
+    AggregateInGroupBy,
 } || std.mem.Allocator.Error || filter_parser.Error;
 
 /// A bare UINT64 reference is fine on its own (selected, grouped by, aggregated); as an operand it is not.
@@ -267,6 +269,19 @@ pub fn parseGroupBy(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error![]ast.SelectItem {
+    return parseGroupByOf(arena, src, file, diag, &.{});
+}
+
+/// `parseGroupBy` for a SQL GROUP BY over `select`: a bare name no column has, but a SELECT item's alias gives
+/// (case-insensitively), is that item's expression, as DuckDB binds `SELECT URL AS Dst ... GROUP BY Dst`. A column of
+/// the name wins over the alias. An alias of an aggregate cannot be a key.
+pub fn parseGroupByOf(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    file: *const schema.FileMetaData,
+    diag: ?*Diag,
+    select: []const ast.SelectColumn,
+) Error![]ast.SelectItem {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
 
@@ -274,7 +289,7 @@ pub fn parseGroupBy(
     var lex: Lexer = .{ .src = trimmed, .diag = diag };
 
     while (true) {
-        const e = try parseExpr(arena, &lex, file);
+        const e = if (try aliasKey(arena, &lex, file, select)) |aliased| aliased else try parseExpr(arena, &lex, file);
         var alias: ?[]const u8 = null;
         const after = try lex.peek();
         if (after.kind == .ident and asciiEqIgnoreCase(after.text, "AS")) {
@@ -293,6 +308,27 @@ pub fn parseGroupBy(
         }
     }
     return items.items;
+}
+
+/// The SELECT item a GROUP BY term at `lex` names by its alias, consumed: a lone undotted name, no column's, that
+/// ends the term. Null (and `lex` untouched) for any other term.
+fn aliasKey(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData, select: []const ast.SelectColumn) Error!?ast.Expr {
+    if (select.len == 0) return null;
+    const save = lex.pos;
+    const tok = try lex.next();
+    const end = try lex.peek();
+    lex.pos = save;
+    if (tok.kind != .ident or std.mem.indexOfScalar(u8, tok.text, '.') != null) return null;
+    if (end.kind != .comma and end.kind != .eof) return null;
+    if (metadata.resolveColumn(file, tok.text)) |_| return null else |err| if (err != error.UnknownColumn) return null;
+    for (select) |item| {
+        const alias = item.alias orelse continue;
+        if (!asciiEqIgnoreCase(std.mem.trim(u8, alias, " "), tok.text)) continue;
+        if (item.role == .agg) return error.AggregateInGroupBy;
+        _ = try lex.next();
+        return try parseExprOnly(arena, item.expr, file, lex.diag);
+    }
+    return null;
 }
 
 /// Parse a single expression. Convenience for callers that already

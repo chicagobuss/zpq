@@ -937,7 +937,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",      "HavingNotSupported",         "MixedSelectNotSupported",
         "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",       "BadOutputUrl",               "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",         "NullableNotSupported",       "NestedNotSupported",
-        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "AggregateInGroupBy",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
         "CteNotSupported",             "AggregateInWhere",      "MissingFromClause",            "MissingTableName",          "UnsupportedFromClause",      "UnsupportedAggType",
         "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };

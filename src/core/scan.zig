@@ -58,6 +58,8 @@ pub const Error = error{
     DuplicateOutputColumn,
     /// An output column name refers to both a GROUP BY key and an aggregate.
     AmbiguousOutputColumn,
+    /// A SQL result column outside an aggregate is no GROUP BY key.
+    ColumnMustBeGrouped,
 } || std.mem.Allocator.Error;
 
 /// One file's contribution to a multi-file scan. Bytes can come from
@@ -1951,7 +1953,7 @@ fn prepareAggregate(
         if (expr_str.len > 0) filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
     }
     const group_by_items = if (args.group_by) |gb_str|
-        try expr_parser.parseGroupBy(arena, gb_str, meta0, args.diag)
+        try expr_parser.parseGroupByOf(arena, gb_str, meta0, args.diag, args.select_cols orelse &.{})
     else
         null;
     const group_by_keys = if (group_by_items) |items| blk: {
@@ -1960,6 +1962,7 @@ fn prepareAggregate(
         break :blk exprs;
     } else null;
     var key_names = try KeyNames.init(arena, meta0, group_by_items orelse &.{});
+    key_names.sql = sqlBound(args.select_cols);
     try nameUnaliasedAggs(arena, agg_calls, &key_names);
     const agg_sources = try arena.alloc(?schema.SchemaElement, agg_calls.len);
     for (agg_calls, agg_sources) |call, *src| src.* = passThroughSource(call, meta0);
@@ -4279,6 +4282,9 @@ const KeyNames = struct {
     items: []const expr_ast.SelectItem,
     labels: []?[]const u8,
     sources: []?[]const u8,
+    /// SQL names its result columns from the SELECT list; an unaliased expression key it does not select has no name
+    /// to give and needs none.
+    sql: bool = false,
 
     fn init(arena: std.mem.Allocator, meta: *const schema.FileMetaData, items: []const expr_ast.SelectItem) !KeyNames {
         const labels = try arena.alloc(?[]const u8, items.len);
@@ -4294,7 +4300,7 @@ const KeyNames = struct {
         const item = self.items[k];
         const l = item.alias orelse switch (item.expr) {
             .col_ref => |ref| try leafLabel(self.arena, self.meta, ref.col_idx),
-            else => return error.GroupKeyAliasRequired,
+            else => if (self.sql) "" else return error.GroupKeyAliasRequired,
         };
         self.labels[k] = l;
         return l;
@@ -4423,7 +4429,7 @@ fn bindGroupOutputs(
     agg_calls: []const expr_agg.AggCall,
     meta: *const schema.FileMetaData,
     args: MultiAggArgs,
-) Error![]const BoundOutputColumn {
+) ![]const BoundOutputColumn {
     try checkAggAliases(agg_calls, args.diag);
     for (keys.items, 0..) |item, k| if (item.alias == null and item.expr == .col_ref) {
         _ = keys.label(k) catch |err| {
@@ -4434,6 +4440,7 @@ fn bindGroupOutputs(
             return err;
         };
     };
+    if (sqlBound(args.select_cols)) return bindSqlOutputs(arena, keys, agg_calls, args);
     const specs = try groupOutputSpecs(arena, keys, agg_calls, args.select_cols, args.column_order);
     const bound = try arena.alloc(BoundOutputColumn, specs.len);
     for (specs, bound) |spec, *out| {
@@ -4441,6 +4448,51 @@ fn bindGroupOutputs(
         out.* = .{ .source = src, .name = try groupOutputName(keys, spec, src) };
     }
     try checkDistinctOutputNames(BoundOutputColumn, bound, boundName, args.diag);
+    return bound;
+}
+
+/// Whether `select_cols` are a SQL select list, which binds by role (`SelectColumn.Role`) rather than by name.
+fn sqlBound(select_cols: ?[]const expr_ast.SelectColumn) bool {
+    const cols = select_cols orelse return false;
+    for (cols) |col| if (col.role != .named) return true;
+    return false;
+}
+
+/// Bind a SQL select list to slots: each aggregate item is the next aggregate call, in order; any other item
+/// is the GROUP BY key it equals as a bound expression (`Expr.eql`: `"r"."v"` and `r.v` are one key exactly when
+/// they bind one column). Visible names: an alias, else a column key's label, else the item as written. Hidden
+/// columns have no name and are dropped before any output sees them.
+fn bindSqlOutputs(
+    arena: std.mem.Allocator,
+    keys: *KeyNames,
+    agg_calls: []const expr_agg.AggCall,
+    args: MultiAggArgs,
+) ![]const BoundOutputColumn {
+    const visible = args.select_cols.?;
+    const bound = try arena.alloc(BoundOutputColumn, visible.len);
+    var next_agg: usize = 0;
+    for (bound, 0..) |*out, i| {
+        const spec = visible[i];
+        const source: ColSource = switch (spec.role) {
+            .agg => blk: {
+                if (next_agg >= agg_calls.len) return error.EmptyAggregate;
+                next_agg += 1;
+                break :blk .{ .agg = next_agg - 1 };
+            },
+            .key, .named => blk: {
+                const e = try expr_parser.parseExprOnly(arena, spec.expr, keys.meta, args.diag);
+                for (keys.items, 0..) |item, k| if (item.expr.eql(e)) break :blk .{ .key = k };
+                Diag.setColumn(args.diag, exprName(spec));
+                return error.ColumnMustBeGrouped;
+            },
+        };
+        const name: []const u8 = if (spec.alias != null) aliasName(spec) else switch (source) {
+            .key => |k| if (keys.items[k].expr == .col_ref) try keys.label(k) else exprName(spec),
+            .agg => exprName(spec),
+        };
+        out.* = .{ .source = source, .name = name };
+    }
+    try checkDistinctOutputNames(BoundOutputColumn, bound[0..visible.len], boundName, args.diag);
     return bound;
 }
 
@@ -6215,6 +6267,57 @@ test "min-fill: a column the filter also reads under an OR decodes the pages its
         };
         try testing.expectEqual(case.sx, r.output.aggs[1].value.i);
     };
+}
+
+test "SQL GROUP BY binds SELECT items to keys as bound expressions, not text" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+    const Col = expr_ast.SelectColumn;
+    const Case = struct { group_by: []const u8, select: []const Col, names: []const []const u8, groups: usize };
+    const cases = [_]Case{
+        // An unaliased expression key, named as written (ClickBench Q35's shape).
+        .{
+            .group_by = "b, b - 1",
+            .select = &.{ .{ .expr = "b - 1", .role = .key }, .{ .expr = "\"b\"", .role = .key }, .{ .expr = "count(*)", .role = .agg } },
+            .names = &.{ "b - 1", "b", "count(*)" },
+            .groups = 16,
+        },
+        // A key the SELECT list names by its alias (`SELECT b * 2 AS k ... GROUP BY k`), and a constant key.
+        .{
+            .group_by = "k, 1",
+            .select = &.{ .{ .expr = "1", .role = .key }, .{ .expr = "b * 2", .alias = "k", .role = .key }, .{ .expr = "count(*)", .alias = "n", .role = .agg } },
+            .names = &.{ "1", "k", "n" },
+            .groups = 16,
+        },
+    };
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var r = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(*)",
+            .group_by = case.group_by,
+            .select_cols = case.select,
+        });
+        defer r.deinit(testing.allocator);
+        const cols = r.output.group_cols.?;
+        try testing.expectEqual(case.names.len, cols.len);
+        for (case.names, cols) |want, got| try testing.expectEqualStrings(want, got);
+        try testing.expectEqual(case.groups, r.output.group_rows.?.len);
+        var total: i128 = 0;
+        for (r.output.group_rows.?) |row| total += row[2].i;
+        try testing.expectEqual(@as(i128, 1600), total);
+    }
+    // `b + 1` is no key of `GROUP BY b - 1`, however alike the text.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.ColumnMustBeGrouped, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(*)",
+        .group_by = "b - 1",
+        .select_cols = &.{ .{ .expr = "b + 1", .role = .key }, .{ .expr = "count(*)", .role = .agg } },
+    }));
 }
 
 test "full match: proven row groups answer like --scan-all" {

@@ -3171,7 +3171,7 @@ fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.F
         else
             null;
         const group_keys: ?[]const expr_ast.Expr = if (args.group_by) |gb| blk: {
-            const items = try expr_parser.parseGroupBy(arena, gb, meta0, args.diag);
+            const items = try expr_parser.parseGroupByOf(arena, gb, meta0, args.diag, args.select_cols orelse &.{});
             const keys = try arena.alloc(expr_ast.Expr, items.len);
             for (items, keys) |item, *key| key.* = item.expr;
             break :blk keys;

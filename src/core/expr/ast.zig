@@ -277,6 +277,29 @@ pub const Expr = union(enum) {
         };
     }
 
+    /// Whether `a` and `b` are the same bound expression: the same columns, operators, functions and literals, the
+    /// literals compared by their exact value (a string's bytes, a DECIMAL's unscaled digits and type, a double's bits).
+    /// What GROUP BY binding compares, never the text either was written as.
+    pub fn eql(a: Expr, b: Expr) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .literal => |la| switch (la) {
+                .i64 => |v| b.literal == .i64 and b.literal.i64 == v,
+                .f64 => |v| b.literal == .f64 and @as(u64, @bitCast(b.literal.f64)) == @as(u64, @bitCast(v)),
+                .str => |v| b.literal == .str and std.mem.eql(u8, b.literal.str, v),
+                .dec => |v| b.literal == .dec and b.literal.dec.unscaled == v.unscaled and
+                    std.meta.eql(b.literal.dec.spec, v.spec),
+            },
+            .col_ref => |ca| ca.col_idx == b.col_ref.col_idx,
+            .binop => |ba| ba.op == b.binop.op and ba.left.eql(b.binop.left.*) and ba.right.eql(b.binop.right.*),
+            .call => |ca| blk: {
+                if (ca.func != b.call.func or ca.args.len != b.call.args.len) break :blk false;
+                for (ca.args, b.call.args) |x, y| if (!x.eql(y.*)) break :blk false;
+                break :blk true;
+            },
+        };
+    }
+
     /// Walk the expression and mark every referenced column index in
     /// `fetch_arr`. Used by drivers (CLI + Lambda) to compute the set
     /// of columns to decode for a given expression.
@@ -324,6 +347,12 @@ pub const ResultOrder = struct {
 pub const SelectColumn = struct {
     expr: []const u8,
     alias: ?[]const u8 = null,
+    /// How a GROUP BY output binds. SQL knows which items aggregate: one does not bind by name but takes the next
+    /// aggregate call, in order; any other must equal a GROUP BY key, compared as bound expressions (column, operator,
+    /// literal), never as text. The flag forms (`--column-order`) bind names.
+    role: Role = .named,
+
+    pub const Role = enum { named, key, agg };
 
     /// `name` or `expr AS name`, as a `--column-order` entry spells it. Splits at the last ` AS `.
     pub fn parse(text: []const u8) SelectColumn {

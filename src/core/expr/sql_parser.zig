@@ -372,6 +372,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             return error.MixedSelectNotSupported;
         }
         if (has_group_by) {
+            try substituteGroupRefs(root.*.u.select);
             try validateGroupBy(allocator, root.*.u.select, lp_arena);
         }
     }
@@ -397,6 +398,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         try selectColumn(rc, lp_arena, allocator, &select_cols[col_idx]);
+        if (has_group_by) select_cols[col_idx].role = if (analyzeExpr(rc).has_agg) .agg else .key;
         col_idx += 1;
     }
     const result_order = try resultOrder(allocator, root.*.u.select, lp_arena, select_cols, is_aggregate, has_group_by);
@@ -623,60 +625,73 @@ fn partEql(a: [*c]const u8, b: [*c]const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.span(a), std.mem.span(b));
 }
 
+/// Rewrite each GROUP BY integer constant into the SELECT item at that 1-based position, as DuckDB binds `GROUP BY 1`.
+/// A name a SELECT alias gives binds in the engine, which knows whether a column of the name wins
+/// (`expr_parser.parseGroupByOf`).
+fn substituteGroupRefs(sel: anytype) !void {
+    const n_cols: usize = @intCast(sel.result_columns.count);
+    for (0..@intCast(sel.group_by.count)) |g| {
+        const term = sel.group_by.items[g] orelse continue;
+        if (term.*.kind != c.LP_EXPR_LITERAL_INT) continue;
+        const pos = std.fmt.parseInt(u64, std.mem.span(term.*.u.literal.value), 10) catch 0;
+        if (pos < 1 or pos > n_cols) {
+            diagnosticPrint("sql: GROUP BY position {s} is not in the SELECT list\n", .{std.mem.span(term.*.u.literal.value)});
+            return error.ColumnMustBeGrouped;
+        }
+        const rc = sel.result_columns.items[@intCast(pos - 1)] orelse return error.SqlParseError;
+        const expr = if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr orelse return error.SqlParseError else rc;
+        if (analyzeExpr(expr).has_agg) {
+            diagnosticPrint("sql: GROUP BY cannot refer to an aggregate\n", .{});
+            return error.AggregateInGroupBy;
+        }
+        sel.group_by.items[g] = expr;
+    }
+}
+
+/// Whether `expr` is one of the GROUP BY terms: the same column reference (case and quoting aside, as the engine
+/// binds names) or the same expression text.
+fn groupedExpr(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !bool {
+    _ = allocator;
+    const expr_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (expr_c == null) return error.UnparseError;
+    const a = stripQuotes(std.mem.trim(u8, std.mem.span(expr_c), " "));
+    for (0..@intCast(sel.group_by.count)) |g| {
+        const gb_node = sel.group_by.items[g] orelse continue;
+        if (try sameTerm(lp_arena, expr, a, gb_node)) return true;
+        // A term naming a SELECT alias may stand for that item's expression (the engine decides; see
+        // `substituteGroupRefs`).
+        if (gb_node.*.kind != c.LP_EXPR_COLUMN_REF or gb_node.*.u.column_ref.table != null) continue;
+        const name = std.mem.span(gb_node.*.u.column_ref.column);
+        for (0..@intCast(sel.result_columns.count)) |i| {
+            const rc = sel.result_columns.items[i] orelse continue;
+            if (rc.*.kind != c.LP_RESULT_COLUMN or rc.*.u.result_column.alias == null) continue;
+            if (!std.ascii.eqlIgnoreCase(std.mem.span(rc.*.u.result_column.alias), name)) continue;
+            if (try sameTerm(lp_arena, expr, a, rc.*.u.result_column.expr orelse continue)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `expr` (unparsed as `text`, quotes stripped) is the term `other`: the same column reference, case and
+/// quoting aside, or the same expression text.
+fn sameTerm(lp_arena: *c.arena_t, expr: *c.LpNode, text: []const u8, other: *c.LpNode) !bool {
+    if (sameColumnRef(expr, other)) |same| return same;
+    const other_c = c.lp_ast_to_sql(other, lp_arena);
+    if (other_c == null) return error.UnparseError;
+    return std.ascii.eqlIgnoreCase(text, stripQuotes(std.mem.trim(u8, std.mem.span(other_c), " ")));
+}
+
+/// Reject a SELECT item that reads a column outside an aggregate unless it is a GROUP BY term. The engine binds the
+/// items again, structurally against the bound keys; this catches what plainly cannot bind before any file opens.
 fn validateGroupBy(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t) !void {
-    // 1. Unparse and collect all GROUP BY expressions
-    var group_by_list: std.ArrayList([]const u8) = .empty;
-    var group_by_nodes: std.ArrayList(*const c.LpNode) = .empty;
-    defer {
-        for (group_by_list.items) |col| allocator.free(col);
-        group_by_list.deinit(allocator);
-        group_by_nodes.deinit(allocator);
-    }
-    var i: usize = 0;
-    while (i < @as(usize, @intCast(sel.group_by.count))) : (i += 1) {
-        const gb_node = sel.group_by.items[i] orelse continue;
-        const gb_c = c.lp_ast_to_sql(gb_node, lp_arena);
-        if (gb_c == null) return error.UnparseError;
-        const gb_sql = try allocator.dupe(u8, std.mem.span(gb_c));
-        try group_by_list.append(allocator, gb_sql);
-        try group_by_nodes.append(allocator, gb_node);
-    }
-
-    // 2. Validate each SELECT result column
-    i = 0;
-    while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
+    for (0..@intCast(sel.result_columns.count)) |i| {
         const rc = sel.result_columns.items[i] orelse continue;
-        const info = analyzeExpr(rc);
-        if (info.has_bare_col) {
-            // Result column contains a bare column. We must unparse the expression
-            // itself (not including the AS alias, which is at the result_column level).
-            const expr_node = rc.*.u.result_column.expr orelse continue;
+        if (!analyzeExpr(rc).has_bare_col) continue;
+        const expr_node = rc.*.u.result_column.expr orelse continue;
+        if (!try groupedExpr(allocator, sel, lp_arena, expr_node)) {
             const expr_c = c.lp_ast_to_sql(expr_node, lp_arena);
-            if (expr_c == null) return error.UnparseError;
-            const expr_sql = std.mem.span(expr_c);
-
-            // Check if this raw expression SQL exists in our group_by list (case-insensitively).
-            var found = false;
-            for (group_by_list.items, group_by_nodes.items) |gb, gb_node| {
-                if (sameColumnRef(expr_node, gb_node)) |same| {
-                    if (same) {
-                        found = true;
-                        break;
-                    }
-                    continue;
-                }
-                const a = stripQuotes(std.mem.trim(u8, expr_sql, " "));
-                const b = stripQuotes(std.mem.trim(u8, gb, " "));
-                if (std.ascii.eqlIgnoreCase(a, b)) {
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                diagnosticPrint("sql: result column '{s}' must be in the GROUP BY list\n", .{expr_sql});
-                return error.ColumnMustBeGrouped;
-            }
+            diagnosticPrint("sql: result column '{s}' must be in the GROUP BY list\n", .{std.mem.span(expr_c)});
+            return error.ColumnMustBeGrouped;
         }
     }
 }
@@ -848,6 +863,26 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
     }
     const other = "SELECT \"r\".\"w\", count(*) FROM 't' GROUP BY r.v";
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, other));
+}
+
+test "sql_parser binds GROUP BY aliases and positions to SELECT items, as DuckDB does" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, group_by: []const u8 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT 1, URL, count(*) AS c FROM 't' GROUP BY 1, URL", .group_by = "1, URL" },
+        // An alias binds in the engine, where a column of its name wins.
+        .{ .sql = "SELECT URL AS Dst, count(*) AS c FROM 't' GROUP BY Dst", .group_by = "Dst" },
+        .{ .sql = "SELECT a + 1 AS k, count(*) FROM 't' GROUP BY 1", .group_by = "a + 1" },
+        .{ .sql = "SELECT a - 1, count(*) FROM 't' GROUP BY a - 1", .group_by = "a - 1" },
+    };
+    for (cases) |case| {
+        const q = try parseSqlQuery(a, case.sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualStrings(case.group_by, q.group_by_str.?);
+        for (q.select_cols) |col| try std.testing.expect(col.role != .named);
+    }
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 3"));
+    try std.testing.expectError(error.AggregateInGroupBy, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 2"));
 }
 
 test "sql_parser hands NOT over groups on as the predicate written" {

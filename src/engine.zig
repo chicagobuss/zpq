@@ -540,15 +540,38 @@ fn executeAggregate(
     //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
     //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
-    // A GROUP BY cut by its first, descending, aggregate may take the sketched count cut, which reads the input twice:
-    // the mapping serves both passes (the first warms the page cache for the second), where the explicit reader reads
-    // each row group once and so rules the sketch out. Even cold, the two cheap passes beat one full grouping on a
-    // skewed key; when the sketch then declines, the mapping costs little.
-    // What the strategies may cut by (`ResultProgram.cutOrder`): under HAVING, no limit.
+    // A GROUP BY cut by a plain COUNT first and descending (sketch, census), or by a LIMIT with no ORDER BY (first
+    // keys), reads the input twice: the mapping serves both passes (the first warms the page cache for the second),
+    // where the explicit reader reads each row group once and so rules those cuts out. Even cold, the two cheap
+    // passes beat one full grouping; when the cut then declines, the mapping costs little. Only `auto` is steered:
+    // an explicit pread/io_uring keeps its exact fallback. What the strategies may cut by is `ResultProgram.cutOrder`
+    // (under HAVING, no limit), and the shape is decided from the query bound to the footer, as the scan binds it.
     var cut_args = args;
     cut_args.result_order = ResultProgram.cutOrder(args.result_order);
-    if (io_policy.profile == .auto and args.group_by != null and sketchFromEnv(ctx.env) != null and countCutShaped(cut_args))
-        io_policy.profile = .mmap;
+    if (io_policy.profile == .auto and args.group_by != null and cut_args.result_order.limit != null and
+        !empty_result and allLocal(opened))
+        if (sketchFromEnv(ctx.env)) |cfg| steer: {
+            // A footer that does not parse is reported where the scan parses it; it steers nothing here.
+            const meta0 = if (opened.meta_ready[0])
+                opened.metas[0]
+            else
+                metadata.open(arena, opened.inputs[0].bytes) catch break :steer;
+            var probe_args: scan.MultiAggArgs = .{
+                .inputs = &.{},
+                .aggregate = agg_str,
+                .group_by = args.group_by,
+                .select_cols = args.select_cols,
+                .result_order = cut_args.result_order,
+            };
+            probe_args.column_order = args.column_order;
+            switch (scan.cutShape(arena, &meta0, probe_args)) {
+                .count => io_policy.profile = .mmap,
+                .first_keys => if (cfg.census) {
+                    io_policy.profile = .mmap;
+                },
+                .none => {},
+            }
+        };
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
     const all_local = on_linux and allLocal(opened);
@@ -1505,17 +1528,6 @@ fn outputColumnNames(
         .computed => |c| c.alias,
     };
     return names;
-}
-
-/// Whether the query's answer is cut by a LIMIT ordered first by a plain COUNT, descending: the order the sketched
-/// count cut serves (`scan.sketchEligible` decides the rest once the outputs are bound).
-fn countCutShaped(args: QueryArgs) bool {
-    const order = args.result_order;
-    if (order.limit == null or order.keys.len == 0 or !order.keys[0].descending) return false;
-    const cols = args.select_cols orelse return false;
-    if (order.keys[0].column >= cols.len) return false;
-    const expr = cols[order.keys[0].column].expr;
-    return std.ascii.startsWithIgnoreCase(expr, "count(") and std.ascii.findIgnoreCase(expr, "distinct") == null;
 }
 
 /// The sketched count cut (`scan.SketchTopK`) runs wherever it is eligible; `ZPQ_SKETCH_TOPK=0` turns it off,

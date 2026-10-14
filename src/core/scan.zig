@@ -4531,6 +4531,41 @@ fn checkHavingLanes(
     try result_program.checkHaving(having, lanes);
 }
 
+/// The cut a GROUP BY's order allows that reads its input twice, so a read policy can keep the input mapped for it:
+/// a plain COUNT ranking first, descending (the sketch and census), or a LIMIT with no ORDER BY (first keys). Decided
+/// from the query bound to `meta` exactly as the scan binds it, never from its text. A query that does not bind is
+/// `.none` here; the scan reports why.
+pub const CutShape = enum { none, count, first_keys };
+
+pub fn cutShape(arena: std.mem.Allocator, meta: *const schema.FileMetaData, args: MultiAggArgs) CutShape {
+    const order = args.result_order;
+    const limit = order.limit orelse return .none;
+    const gb = args.group_by orelse return .none;
+    if (order.keys.len == 0) return if (order.offset +| limit > 0) .first_keys else .none;
+    if (!order.keys[0].descending) return .none;
+    return countFirst(arena, meta, args, gb) catch .none;
+}
+
+fn countFirst(arena: std.mem.Allocator, meta: *const schema.FileMetaData, args: MultiAggArgs, gb: []const u8) !CutShape {
+    const calls: []expr_agg.AggCall = if (args.aggregate.len == 0)
+        &.{}
+    else
+        try expr_parser.parseAggList(arena, args.aggregate, meta, null);
+    const items = try expr_parser.parseGroupByOf(arena, gb, meta, null, args.select_cols orelse &.{});
+    var keys = try KeyNames.init(arena, meta, items);
+    keys.sql = sqlBound(args.select_cols);
+    try nameUnaliasedAggs(arena, calls, &keys);
+    var quiet = args;
+    quiet.diag = null;
+    const outputs = try bindGroupOutputs(arena, &keys, calls, meta, quiet);
+    const first = args.result_order.keys[0].column;
+    if (first >= outputs.len) return .none;
+    return switch (outputs[first].source) {
+        .agg => |a| if (calls[a].func == .count) .count else .none,
+        .key => .none,
+    };
+}
+
 /// Whether `select_cols` are a SQL select list, which binds by role (`SelectColumn.Role`) rather than by name.
 fn sqlBound(select_cols: ?[]const expr_ast.SelectColumn) bool {
     const cols = select_cols orelse return false;
@@ -6404,6 +6439,34 @@ test "SQL GROUP BY binds SELECT items to keys as bound expressions, not text" {
         .group_by = "b - 1",
         .select_cols = &.{ .{ .expr = "b + 1", .role = .key }, .{ .expr = "count(*)", .role = .agg } },
     }));
+}
+
+test "cutShape names the cut a GROUP BY order allows from the bound query, never its text" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const meta = try metadata.open(a, bytes);
+    const Col = expr_ast.SelectColumn;
+    const desc1: []const expr_ast.OrderKey = &.{.{ .column = 1, .descending = true }};
+    const Case = struct { aggregate: []const u8, select: []const Col, order: expr_ast.ResultOrder, want: CutShape };
+    const cases = [_]Case{
+        .{ .aggregate = "COUNT(*) AS n", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "COUNT(*)", .alias = "n", .role = .agg } }, .order = .{ .keys = desc1, .limit = 5 }, .want = .count },
+        // A hidden ORDER BY count binds like a selected one.
+        .{ .aggregate = "count(*) AS __h0", .select = &.{.{ .expr = "b", .role = .key }}, .order = .{ .keys = desc1, .limit = 5, .hidden = &.{.{ .expr = "count(*)", .role = .agg }} }, .want = .count },
+        .{ .aggregate = "count(DISTINCT x) AS d", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "count(DISTINCT x)", .alias = "d", .role = .agg } }, .order = .{ .keys = desc1, .limit = 5 }, .want = .none },
+        .{ .aggregate = "sum(x) AS s", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "sum(x)", .alias = "s", .role = .agg } }, .order = .{ .keys = desc1, .limit = 5 }, .want = .none },
+        .{ .aggregate = "count(*) AS n", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "count(*)", .alias = "n", .role = .agg } }, .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 5 }, .want = .none },
+        .{ .aggregate = "count(*) AS n", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "count(*)", .alias = "n", .role = .agg } }, .order = .{ .limit = 5 }, .want = .first_keys },
+        .{ .aggregate = "count(*) AS n", .select = &.{ .{ .expr = "b", .role = .key }, .{ .expr = "count(*)", .alias = "n", .role = .agg } }, .order = .{ .limit = 0 }, .want = .none },
+        // A query that does not bind steers nothing.
+        .{ .aggregate = "count(*) AS n", .select = &.{ .{ .expr = "nope", .role = .key }, .{ .expr = "count(*)", .alias = "n", .role = .agg } }, .order = .{ .keys = desc1, .limit = 5 }, .want = .none },
+    };
+    for (cases) |case| {
+        const got = cutShape(a, &meta, .{ .inputs = &.{}, .aggregate = case.aggregate, .group_by = "b", .select_cols = case.select, .result_order = case.order });
+        try testing.expectEqual(case.want, got);
+    }
 }
 
 test "full match: proven row groups answer like --scan-all" {

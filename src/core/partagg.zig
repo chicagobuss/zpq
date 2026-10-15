@@ -295,7 +295,6 @@ pub const PartAgg = struct {
             run.accs.items.len + len > run.accs.capacity or (self.stride == 0 and run.ends.items.len == run.ends.capacity))
         {
             const want = @max(run.first.items.len * 2, 4);
-            const before = run.held();
             const extra = (want - run.first.items.len) *
                 (@max(key.len, self.stride) + @sizeOf(u64) + @sizeOf(u32) + len * @sizeOf(expr_agg.Accumulator));
             const got = self.budget.drawExact(extra) orelse return error.ExceededMemoryBudget;
@@ -304,12 +303,9 @@ pub const PartAgg = struct {
             try run.keys.ensureTotalCapacity(self.gpa, @max(run.keys.items.len + key.len, want * @max(key.len, 1)));
             if (self.stride == 0) try run.ends.ensureTotalCapacity(self.gpa, want);
             try run.accs.ensureTotalCapacity(self.gpa, want * len);
-            // What the allocator handed out beyond the estimate is charged too, so the budget sees what is held.
-            const grown = run.held() - before;
-            if (grown > got) {
-                const more = self.budget.drawExact(grown - got) orelse return error.ExceededMemoryBudget;
-                run.charged += more;
-            }
+            // Settle the charge on what is held: the estimate ignores spare capacity some lists already had and the
+            // allocator's rounding. An over-charge left standing would fail budgets the runs fit in.
+            try self.settle(run);
         }
         const at = run.first.items.len;
         run.keys.appendSliceAssumeCapacity(key);
@@ -317,6 +313,17 @@ pub const PartAgg = struct {
         run.first.appendAssumeCapacity(first);
         for (self.calls) |call| run.accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
         return at;
+    }
+
+    /// Make `run.charged` equal what its lists hold: draw what is missing, give back the rest.
+    fn settle(self: *PartAgg, run: *Run) !void {
+        const held = run.held();
+        if (held > run.charged) {
+            run.charged += self.budget.drawExact(held - run.charged) orelse return error.ExceededMemoryBudget;
+        } else if (held < run.charged) {
+            self.budget.release(run.charged - held);
+            run.charged = held;
+        }
     }
 
     pub fn indexOf(self: *const PartAgg, hash: u64) usize {
@@ -485,4 +492,24 @@ test "partagg: an allocation failure leaks nothing" {
             try std.testing.expectEqual(@as(u64, 10), total);
         }
     }.run, .{});
+}
+
+test "partagg: a run's budget charge is exactly what its lists hold after every growth" {
+    const a = std.testing.allocator;
+    var budget = expr_agg.SharedBudget{ .limit = 1 << 24, .block = 1 << 16 };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    for ([_]u8{ 0, 8 }) |stride| {
+        var part = try PartAgg.init(a, &budget, &calls, stride, countMerge, 0, 0, 1, false);
+        defer part.deinit();
+        const run = &part.runs[0][0];
+        var buf: [8]u8 = undefined;
+        for (0..5000) |i| {
+            std.mem.writeInt(u64, &buf, i, .little);
+            // Variable keys of changing length grow the key bytes apart from the other lists.
+            const key = if (stride == 0) buf[0 .. 1 + i % 8] else buf[0..];
+            _ = try part.append(run, key, i);
+            try std.testing.expectEqual(run.held(), run.charged);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }

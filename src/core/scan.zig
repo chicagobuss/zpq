@@ -175,7 +175,7 @@ pub const SketchTopK = struct {
     /// Tests: fingerprint bits below the partition's (40), fewer to make keys collide.
     census_fp_bits: u6 = 40,
 
-    pub const Outcome = enum { ineligible, bailed, certified, fell_back, census };
+    pub const Outcome = enum { ineligible, bailed, certified, fell_back, census, census_short };
 };
 
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
@@ -1756,52 +1756,79 @@ fn censusTopK(
     }
     set.filter = filter;
 
-    // The prefix ends where the rows given to the census pass `k` beyond the admitted keys' rows. In a row group whose
-    // rows all reached the census, at that row; otherwise at the end of it.
-    var lo: u64 = 0;
-    var row: u64 = 0;
-    if (prefix) {
-        const need = k + admit_rows;
-        lo = std.math.maxInt(u32);
-        var seen: u64 = 0;
-        for (item_rows, 0..) |n, i| {
-            if (seen + n < need) {
-                seen += n;
-                continue;
-            }
-            const rg_rows = workers[0].metas[work[i].file].row_groups.items[work[i].rg].num_rows;
-            lo = i;
-            row = if (rg_rows >= 0 and n == @as(u64, @intCast(rg_rows))) need - seen else std.math.maxInt(u64);
-            break;
-        }
-    }
-    for (censuses) |*c| {
-        c.admitted = &set;
-        c.prefix_item = lo;
-        c.prefix_row = row;
-    }
-    for (sketches, censuses) |*s, *c| s.census = c;
-    // The admit pass reads only the prefix and the items holding an admitted key's rows. The count pass's row counts
-    // stand.
-    const skip = try arena.alloc(bool, work.len);
-    for (skip, 0..) |*sk, i| sk.* = i > lo or (i == lo and row == 0);
-    for (items[0..n_admit]) |r| for (tasks[r.task].items.items[r.at..][0..r.n]) |item| {
-        skip[item] = false;
-    };
+    // The prefix ends where the rows given to the census pass `need`. In a row group whose rows all reached the
+    // census, at that row; otherwise at the end of it. `k` rows beyond every admitted key's rows always hold k keys
+    // seen once, but heavy keys can make that most of the input. So a fixed-width table first tries a prefix sized by
+    // the admitted keys' share of the rows, certified only when the admit pass grouped k keys it did not admit.
+    var total_rows: u64 = 0;
+    for (item_rows) |n| total_rows += n;
+    const sure_need = k + admit_rows;
+    const short_need: u64 = if (total_rows > admit_rows and tables.len > 0 and tables[0].fixed_stride != 0)
+        @min(sure_need, 2 * k * total_rows / (total_rows - admit_rows) + 1)
+    else
+        sure_need;
     const counted = try arena.dupe(Worker, workers);
-    for (workers) |*w| w.skip = skip;
     defer for (workers) |*w| {
         w.skip = null;
     };
-    try runPhase(workers, cursor);
-    restoreCounts(workers, counted);
-    const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
-    const certified = cfg.certify and (prefix or kth >= t);
-    if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d} prefix={} admit_ms={d} kth_total={d} certified={}\n", .{
-        count_ms, items.len, t, n_admit, prefix, @divTrunc(nowMonoNs() - t1, 1_000_000), kth, certified,
-    });
+    const skip = try arena.alloc(bool, work.len);
+    var need: u64 = if (prefix) short_need else 0;
+    var short = false;
+    const certified = while (true) {
+        var lo: u64 = 0;
+        var row: u64 = 0;
+        if (prefix) {
+            lo = std.math.maxInt(u32);
+            var seen: u64 = 0;
+            for (item_rows, 0..) |n, i| {
+                if (seen + n < need) {
+                    seen += n;
+                    continue;
+                }
+                const rg_rows = workers[0].metas[work[i].file].row_groups.items[work[i].rg].num_rows;
+                lo = i;
+                row = if (rg_rows >= 0 and n == @as(u64, @intCast(rg_rows))) need - seen else std.math.maxInt(u64);
+                break;
+            }
+        }
+        for (censuses) |*c| {
+            c.admitted = &set;
+            c.prefix_item = lo;
+            c.prefix_row = row;
+        }
+        for (sketches, censuses) |*s, *c| s.census = c;
+        // The admit pass reads only the prefix and the items holding an admitted key's rows. The count pass's row
+        // counts stand.
+        for (skip, 0..) |*sk, i| sk.* = i > lo or (i == lo and row == 0);
+        for (items[0..n_admit]) |r| for (tasks[r.task].items.items[r.at..][0..r.n]) |item| {
+            skip[item] = false;
+        };
+        for (workers) |*w| w.skip = skip;
+        try runPhase(workers, cursor);
+        restoreCounts(workers, counted);
+        if (!prefix or need >= sure_need) {
+            const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
+            if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d} prefix={} need={d} admit_ms={d} kth_total={d}\n", .{
+                count_ms, items.len, t, n_admit, prefix, need, @divTrunc(nowMonoNs() - t1, 1_000_000), kth,
+            });
+            break cfg.certify and (prefix or kth >= t);
+        }
+        // A key grouped though not admitted had its one row in the prefix: one group in one table, earlier than any
+        // key left out. k of them, with the admitted keys counted exactly, certify the cut.
+        var fresh: usize = 0;
+        for (tables) |*tb| fresh += tb.unadmittedGroups(&censuses[0]);
+        if (cfg.trace) std.debug.print("census: short prefix need={d} fresh={d} admit_ms={d}\n", .{
+            need, fresh, @divTrunc(nowMonoNs() - t1, 1_000_000),
+        });
+        if (fresh >= k) {
+            short = true;
+            break cfg.certify;
+        }
+        clearTables(gpa, tables);
+        need = sure_need;
+    };
     if (certified) {
-        if (cfg.outcome) |o| o.* = .census;
+        if (cfg.outcome) |o| o.* = if (short) .census_short else .census;
         return true;
     }
     if (cfg.outcome) |o| o.* = .fell_back;
@@ -6166,6 +6193,54 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
         };
     };
     for ([_]Outcome{ .bailed, .fell_back, .census }) |o| try testing.expect(seen.contains(o));
+}
+
+test "runMultiAggregate: behind heavy keys a census cut certifies on a short prefix, and answers as the full scan" {
+    // tools/gen_census_fixture.py: three keys hold 4500 of 8000 rows, the rest are unique, so a cut of 10 ties at 1.
+    const path = "ci/fixtures/parquet/census_heavy.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Outcome = SketchTopK.Outcome;
+    var seen = std.EnumSet(Outcome){};
+    const cuts = [_]expr_ast.ResultOrder{
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 4, .offset = 3 },
+        // More than the short prefix can hold: it must widen to the sure one, not certify short.
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 400 },
+    };
+    for ([_][]const u8{ "h", "g" }) |key| for ([_]usize{ 1, 3 }) |parallelism| for (cuts) |cut| {
+        for ([_]bool{ true, false }) |fuse| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .ndv_policy = false,
+                .aggregate = "count(*) AS c, min(v) AS lo, sum(v) AS sv",
+                .group_by = key,
+                .select_cols = try selectList(arena, &.{ key, "count(*) AS c", "min(v) AS lo", "sum(v) AS sv" }),
+                .parallelism = parallelism,
+                .min_bytes_per_worker = 1,
+                .result_order = cut,
+            };
+            var want = try runMultiAggregate(testing.allocator, arena, args);
+            defer want.deinit(testing.allocator);
+            var outcome: Outcome = .ineligible;
+            args.sketch_topk = .{ .fuse_census = fuse, .outcome = &outcome };
+            var got = try runMultiAggregate(testing.allocator, arena, args);
+            defer got.deinit(testing.allocator);
+            seen.insert(outcome);
+            try want.output.applyResultOrder(testing.allocator, cut);
+            try got.output.applyResultOrder(testing.allocator, cut);
+            const w = want.output.group_rows.?;
+            const g = got.output.group_rows.?;
+            try testing.expectEqual(w.len, g.len);
+            for (w, g) |wr, gr| for (wr, gr) |a, b| try testing.expect(sameValue(a, b));
+        }
+    };
+    try testing.expect(seen.contains(.census_short));
+    try testing.expect(seen.contains(.census));
 }
 
 fn runSketchedAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData, certify: bool) !void {

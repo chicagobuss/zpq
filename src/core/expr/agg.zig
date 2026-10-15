@@ -4175,6 +4175,17 @@ pub const GroupTable = struct {
         return self.fixed_keys[g * s ..][0..s];
     }
 
+    /// After a census admit pass over a fixed-width table: the groups whose fingerprint `census` did not admit. Each
+    /// was grouped only for its row in the prefix, so with a census bound below 2 it is a key of that one row.
+    pub fn unadmittedGroups(self: *const GroupTable, census: *const Census) usize {
+        std.debug.assert(self.fixed_stride != 0);
+        var n: usize = 0;
+        for (0..self.groupCount()) |g| {
+            if (!census.admitted.?.contains(census.fingerprint(hashFixed(self.keyAt(g))))) n += 1;
+        }
+        return n;
+    }
+
     /// Whether a sketch's count pass is running: rows take no group, and aggregates neither fold nor read.
     pub fn countOnly(self: *const GroupTable) bool {
         return if (self.sketch) |s| s.counting() else false;

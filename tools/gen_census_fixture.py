@@ -14,6 +14,11 @@ Also `census_sliced.parquet`: key `k` = 0..39, then 3..9 six more times, in row 
 the ninth to appear is 8, so `LIMIT 1 OFFSET 8` under a decode budget that slices row groups ends inside a later
 slice.
 
+Also `census_heavy.parquet`: key `h`, three keys seen 1500 times each and the other 3500 rows unique, shuffled, in
+8 row groups of 1000. A cut of 10 ties at 1 behind the heavy keys, and the prefix that must hold k rows beyond every
+heavy row is most of the file; the census first tries a far shorter one. `g` is `h` with the heavy rows first, so the
+short prefix holds no unique key and the census must widen it.
+
 Also `census_widefilter.parquet`: a plain int64 key and a 200-byte string filter column.
 
 Usage:  .venv/bin/python tools/gen_census_fixture.py
@@ -66,6 +71,14 @@ def main() -> None:
         "p": pa.array([("yes" if i % 2 else "no") + "x" * 200 for i in range(nk)], pa.string()),
     }), wide, use_dictionary=False, compression="NONE", write_statistics=False)
     print(f"wrote {wide}")
+    heavy = OUT.with_name("census_heavy.parquet")
+    h = [7, 8, 9] * 1500 + rng.sample(range(10**3, 10**12), n - 4500)
+    rng.shuffle(h)
+    g = sorted(h, key=lambda x: x >= 10**3)
+    pq.write_table(pa.table({"h": pa.array(h, pa.int64()), "g": pa.array(g, pa.int64()),
+                             "v": pa.array(range(n), pa.int64())}), heavy,
+                   row_group_size=ROWS_PER_GROUP, use_dictionary=False, compression="snappy")
+    print(f"wrote {heavy}")
     dict_fixture = OUT.with_name("census_dictionary_review.parquet")
     dict_table = table.set_column(1, "t", pa.array([i % 7 for i in range(table.num_rows)], pa.int64()))
     pq.write_table(dict_table, dict_fixture, row_group_size=ROWS_PER_GROUP, use_dictionary=True, compression="snappy")

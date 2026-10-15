@@ -29,7 +29,7 @@ pub const core = struct {
         pub const parser = @import("core/expr/parser.zig");
         pub const eval = @import("core/expr/eval.zig");
         pub const agg = @import("core/expr/agg.zig");
-        // CLI-only: the SQL frontend (liteparser) is excluded from the Lambda
+        // The SQL frontend (CLI and libzpq) is excluded from the Lambda
         // build, so the module isn't compiled there (no @cImport, no C dep).
         pub const sql_parser = if (@import("build_options").enable_sql)
             @import("core/expr/sql_parser.zig")
@@ -66,6 +66,7 @@ pub const core = struct {
     };
 };
 
+pub const frontend = @import("frontend.zig");
 pub const engine = @import("engine.zig");
 pub const clock = @import("clock.zig");
 pub const profile = @import("profile.zig");

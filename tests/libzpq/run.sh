@@ -9,8 +9,8 @@ CYCLES=${CYCLES:-1000}
 PY=${PYTHON:-python3}
 ZIG=${ZIG:-zig} # may be a command with a prefix, e.g. "zpq-heavy zig"
 OPT=${OPTIMIZE:-ReleaseSafe}
-$ZIG build libzpq -Doptimize="$OPT"
-$ZIG build -Doptimize="$OPT" # the CLI and the Lambda the differential compares with
+$ZIG build libzpq -Doptimize="$OPT" -j8
+$ZIG build -Doptimize="$OPT" -j8 # the CLI and the Lambda the differential compares with
 lib=$PWD/zig-out/lib
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
@@ -24,3 +24,5 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:use_sigaltstack=0 "$out/test_abi_as
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/test_python.py
 # The differential corpus needs DuckDB and pyarrow (tools/differential.py), as the repository's own gate does.
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/differential.py
+
+ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/sql_differential.py

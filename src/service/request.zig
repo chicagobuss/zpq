@@ -8,13 +8,16 @@ const std = @import("std");
 pub const Error = error{
     /// A known field holds the wrong JSON type; `Request.parse` names it.
     BadFieldType,
-    /// Neither `inputs` nor `s3_url`.
+    /// None of `inputs`, `s3_url` or `sql`.
     MissingField,
+    ConflictingSqlFields,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// The fields the handler reads, each kept as a JSON value until checked so a wrong type can be named. JSON null
 /// parses as absent.
 const Wire = struct {
+    sql: ?std.json.Value = null,
+    parallelism: ?std.json.Value = null,
     inputs: ?std.json.Value = null,
     s3_url: ?std.json.Value = null,
     columns: ?std.json.Value = null,
@@ -38,6 +41,8 @@ const Wire = struct {
 
 pub const Request = struct {
     parsed: std.json.Parsed(Wire),
+    sql: ?[]const u8 = null,
+    parallelism: usize = 0,
     /// `inputs`, or the single `s3_url`.
     inputs: []const []const u8,
     /// `columns`, names trimmed and empty ones dropped; null when absent or empty.
@@ -77,13 +82,41 @@ pub const Request = struct {
         const f: Fields = .{ .wire = &parsed.value, .bad_field = bad_field };
 
         var req: Request = .{ .parsed = parsed, .inputs = &.{} };
+        req.sql = try f.string("sql");
+        if (req.sql != null) {
+            inline for (.{
+                "inputs",
+                "s3_url",
+                "filter",
+                "columns",
+                "select",
+                "aggregate",
+                "group_by",
+                "column_order",
+                "output_url",
+                "output_codec",
+                "compress_priority",
+                "bloom_filters",
+            }) |name| {
+                if (@field(parsed.value, name)) |v| if (v != .null) {
+                    bad_field.* = name;
+                    return error.ConflictingSqlFields;
+                };
+            }
+            if (std.mem.indexOfScalar(u8, req.sql.?, 0) != null) return f.bad("sql");
+        }
+        if (parsed.value.parallelism) |v| req.parallelism = switch (v) {
+            .null => 0,
+            .integer => |n| if (n >= 0) @intCast(n) else return f.bad("parallelism"),
+            else => return f.bad("parallelism"),
+        };
         if (try f.strings(arena, "inputs", false)) |inputs| {
             req.inputs = inputs;
         } else if (try f.string("s3_url")) |url| {
             const one = try arena.alloc([]const u8, 1);
             one[0] = url;
             req.inputs = one;
-        } else return error.MissingField;
+        } else if (req.sql == null) return error.MissingField;
         if (try f.strings(arena, "columns", true)) |cols| {
             if (cols.len > 0) req.columns = cols;
         }
@@ -363,4 +396,33 @@ test "a NUL byte in an input, output or profile path is a bad field" {
     // Other control bytes are legal in a local file name.
     var ok = try Request.parse(testing.allocator, "{\"inputs\":[\"a\\nb\"]}", &bad);
     ok.deinit();
+}
+
+test "SQL excludes structured fields, validates options and releases partial allocations" {
+    const Check = struct {
+        fn parse(a: std.mem.Allocator) !void {
+            var bad: []const u8 = "";
+            var req = try Request.parse(a, "{\"sql\":\"SELECT count(*) FROM 'a'\",\"parallelism\":3}", &bad);
+            defer req.deinit();
+            try testing.expectEqual(@as(usize, 3), req.parallelism);
+            try testing.expectEqual(@as(usize, 0), req.inputs.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.parse, .{});
+    var bad: []const u8 = "";
+    inline for (.{
+        "inputs",       "s3_url",     "filter",       "columns",           "select",        "aggregate", "group_by",
+        "column_order", "output_url", "output_codec", "compress_priority", "bloom_filters",
+    }) |name| {
+        const body = "{\"sql\":\"SELECT * FROM 'a'\",\"" ++ name ++ "\":false}";
+        try testing.expectError(error.ConflictingSqlFields, Request.parse(testing.allocator, body, &bad));
+        try testing.expectEqualStrings(name, bad);
+    }
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, "{\"sql\":1}", &bad));
+    try testing.expectEqualStrings("sql", bad);
+    const nul = "{\"sql\":\"SELECT * FROM 'a\\u0000b'\"}";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, nul, &bad));
+    const negative = "{\"sql\":\"SELECT * FROM 'a'\",\"parallelism\":-1}";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, negative, &bad));
+    try testing.expectEqualStrings("parallelism", bad);
 }

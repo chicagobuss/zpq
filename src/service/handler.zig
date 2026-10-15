@@ -203,7 +203,8 @@ pub fn handle(
         var bad_field: []const u8 = "";
         var req = request.Request.parse(allocator, trimmed, &bad_field) catch |err| {
             if (err == error.OutOfMemory) return err;
-            if (err == error.BadFieldType) return rejectResponse(allocator, "bad_json", @errorName(err), "field", bad_field);
+            if (err == error.BadFieldType or err == error.ConflictingSqlFields)
+                return rejectResponse(allocator, "bad_json", @errorName(err), "field", bad_field);
             return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}", .{@errorName(err)});
         };
         defer req.deinit();
@@ -255,7 +256,7 @@ pub fn handle(
         // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
         const prof_opts = zpq.profile.Options.forBudget(budget);
         // A query that aggregates or writes holds its whole budget while it runs, where a gate is set.
-        const runs = req.aggregate != null or req.group_by != null or req.output_url != null;
+        const runs = req.sql != null or req.aggregate != null or req.group_by != null or req.output_url != null;
         const gate: ?Admission = if (runs) pool.admission else null;
         if (gate) |g| g.acquireFn(g.ctx, budget, req.budget_wait_ms) catch |err| switch (err) {
             // The caller's handle is going away: no response, the ABI reports it.
@@ -287,6 +288,7 @@ pub fn handle(
 
         var qa: engine.QueryArgs = .{
             .inputs = req.inputs,
+            .parallelism = req.parallelism,
             .filter = req.filter,
             .output = req.output_url,
             .columns = req.columns,
@@ -303,6 +305,12 @@ pub fn handle(
             .bloom_filters = bloom_filters,
         };
         qa.profiler = profiler;
+
+        if (req.sql) |sql| {
+            const response = try runSql(io, allocator, env, pool, qa, sql);
+            const p = profiler orelse return response;
+            return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
+        }
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
         if (qa.aggregate != null or qa.group_by != null) {
@@ -329,6 +337,119 @@ pub fn handle(
     const f = legacy orelse
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"NotAnObject\"}}", .{});
     return f(allocator, env, null, null, body);
+}
+
+// Each caller owns diagnostics and parsing state; concurrent requests must never share query state.
+threadlocal var sql_message: [16 * 1024]u8 = undefined;
+threadlocal var sql_message_len: usize = 0;
+
+fn captureSqlMessage(message: []const u8) void {
+    const n = @min(message.len, sql_message.len - sql_message_len);
+    @memcpy(sql_message[sql_message_len..][0..n], message[0..n]);
+    sql_message_len += n;
+}
+
+fn runSql(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    options: engine.QueryArgs,
+    sql: []const u8,
+) ![]u8 {
+    if (comptime !@hasDecl(zpq.core.expr.sql_parser, "parseSqlQuery")) {
+        return rejectResponse(allocator, "engine", "SqlNotCompiledIn", "message", "SQL is not compiled in");
+    } else {
+        const parser = zpq.core.expr.sql_parser;
+        const old_parser = parser.diagnostic_fn;
+        const old_frontend = zpq.frontend.diagnostic_fn;
+        parser.diagnostic_fn = captureSqlMessage;
+        zpq.frontend.diagnostic_fn = captureSqlMessage;
+        defer {
+            parser.diagnostic_fn = old_parser;
+            zpq.frontend.diagnostic_fn = old_frontend;
+        }
+        sql_message_len = 0;
+        var diag: Diag = .{};
+        var parse_arena = std.heap.ArenaAllocator.init(allocator);
+        defer parse_arena.deinit();
+        return executeSql(io, allocator, parse_arena.allocator(), env, pool, options, sql, &diag) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            zpq.frontend.queryError(err, &diag);
+            const base = try engineError(allocator, err, &diag);
+            defer allocator.free(base);
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try out.writer.writeAll(base[0 .. base.len - 1]);
+            try out.writer.writeAll(",\"message\":");
+            const message = if (sql_message_len > 0) sql_message[0..sql_message_len] else @errorName(err);
+            try engine.writeJsonQuoted(&out.writer, message);
+            try out.writer.writeByte('}');
+            return out.toOwnedSlice();
+        };
+    }
+}
+
+fn executeSql(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    options: engine.QueryArgs,
+    sql: []const u8,
+    diag: *Diag,
+) ![]u8 {
+    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(arena, sql);
+    const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env);
+    if (inputs.len == 0) {
+        zpq.frontend.noSqlMatches(pq.table_name);
+        return error.NoMatches;
+    }
+    var qa = options;
+    qa.inputs = inputs;
+    qa.filter = pq.filter_str;
+    qa.select = pq.select_str;
+    qa.aggregate = pq.aggregate_str;
+    qa.group_by = pq.group_by_str;
+    qa.select_cols = pq.select_cols;
+    qa.result_order = pq.result_order;
+    qa.empty_scalar = pq.group_by_str == null and (pq.result_order.limit == 0 or pq.result_order.offset > 0);
+    qa.quiet_diagnostics = true;
+    qa.diag = diag;
+    var registry = persistentPoolAdapter(pool);
+    const ctx: engine.Context = .{
+        .gpa = allocator,
+        .env = env,
+        .io = io,
+        .pool_registry = &registry,
+        .meta_cache = pool.metaCache(),
+    };
+    var rows: std.Io.Writer.Allocating = .init(allocator);
+    defer rows.deinit();
+    if (qa.aggregate != null or qa.group_by != null) {
+        var result = try engine.runQuery(ctx, qa);
+        defer result.deinit(allocator);
+        const answer = result.aggregate.output;
+        const n: usize = if (answer.group_rows) |groups| groups.len else if (qa.empty_scalar or answer.no_row) 0 else 1;
+        try engine.writeAggregateText(&rows.writer, answer, n, .jsonl);
+    } else {
+        _ = try engine.runPrintSink(
+            ctx,
+            qa,
+            .jsonl,
+            if (pq.result_order.limit) |n| @intCast(n) else null,
+            1,
+            @intCast(pq.result_order.offset),
+            &rows.writer,
+        );
+    }
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"ok\":true,\"ndjson\":");
+    try engine.writeJsonQuoted(&out.writer, rows.written());
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 /// Bytes of the request echoed into a profile's metadata.

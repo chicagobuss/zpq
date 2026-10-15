@@ -4463,8 +4463,39 @@ fn createFile(path: []const u8) !local_fs.fd_t {
 
 pub const PrintFormat = enum { csv, jsonl, json, parquet };
 
+/// Shared text serialization keeps SQL ABI responses byte-identical to CLI rows.
+pub fn writeAggregateText(writer: anytype, answer: scan.AggOutput, rows: usize, format: PrintFormat) !void {
+    if (format == .json) try writer.writeByte('[');
+    if (answer.group_rows) |groups| {
+        for (groups, 0..) |values, ri| {
+            if (format == .json and ri > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            for (answer.group_cols.?, values, 0..) |name, value, ci| {
+                if (ci > 0) try writer.writeByte(',');
+                try writer.writeByte('"');
+                try writeJsonString(writer, name);
+                try writer.writeAll("\":");
+                try writeAggValueJson(writer, value);
+            }
+            try writer.writeAll(if (format == .json) "}" else "}\n");
+        }
+    } else if (rows > 0) {
+        try writer.writeByte('{');
+        for (answer.aggs, 0..) |item, ci| {
+            if (ci > 0) try writer.writeByte(',');
+            try writer.writeByte('"');
+            try writeJsonString(writer, item.alias);
+            try writer.writeAll("\":");
+            try writeAggValueJson(writer, item.value);
+        }
+        try writer.writeAll(if (format == .json) "}" else "}\n");
+    }
+    if (format == .json) try writer.writeAll("]\n");
+}
+
 pub const StdoutWriter = struct {
     fd: local_fs.fd_t = 1,
+    sink: ?*std.Io.Writer = null,
     buf: [4096]u8 = undefined,
     pos: usize = 0,
     output_ns: u64 = 0,
@@ -4499,7 +4530,7 @@ pub const StdoutWriter = struct {
         if (self.pos == 0) return;
         const pending = self.buf[0..self.pos];
         self.pos = 0;
-        try local_fs.writeAll(self.fd, pending);
+        if (self.sink) |sink| try sink.writeAll(pending) else try local_fs.writeAll(self.fd, pending);
         self.bytes_written += pending.len;
     }
 };
@@ -6195,6 +6226,19 @@ pub fn runPrintTo(
     fd: local_fs.fd_t,
     offset: usize,
 ) !PrintResult {
+    return runPrintSink(ctx, args, format, limit, fd, offset, null);
+}
+
+/// Text output may target memory in an embedding process; no stdout redirection or temporary files.
+pub fn runPrintSink(
+    ctx: Context,
+    args: QueryArgs,
+    format: PrintFormat,
+    limit: ?usize,
+    fd: local_fs.fd_t,
+    offset: usize,
+    sink: ?*std.Io.Writer,
+) !PrintResult {
     const t_start = nowMonoNs();
     const prof = profile.threadOf(args.profiler, .main);
     const query_span = profile.Span.begin(prof);
@@ -6295,6 +6339,7 @@ pub fn runPrintTo(
     if (format == .parquet) try parquet.start();
     var stdout_writer = StdoutWriter{
         .fd = fd,
+        .sink = sink,
         .json_array = format == .json,
         .skip_remaining = offset,
         .parquet = if (format == .parquet) &parquet else null,
@@ -8940,4 +8985,20 @@ test "the parallel plain-row Top-N answers within the memory budget wherever rea
         // Its own reservations stay within half the budget; decoding the row group and the printed answer are the rest.
         try std.testing.expect(peak.peak < 8 << 20);
     }
+}
+
+test "in-process text sink flushes across buffer boundaries and allocation failures" {
+    const Check = struct {
+        fn write(gpa: std.mem.Allocator) !void {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            var w: StdoutWriter = .{ .sink = &out.writer };
+            const bytes: [5000]u8 = @splat('x');
+            w.writeAll(&bytes) catch return error.OutOfMemory;
+            w.flush() catch return error.OutOfMemory;
+            try std.testing.expectEqualStrings(&bytes, out.written());
+            try std.testing.expectEqual(@as(u64, bytes.len), w.bytes_written);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.write, .{});
 }

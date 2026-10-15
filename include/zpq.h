@@ -3,7 +3,10 @@
  *
  * A request is the JSON the zpq Lambda takes (see docs/libzpq.md): "inputs" (local paths or s3:// URLs), and an
  * "aggregate" / "group_by", or an "output_url" to write to, with "filter", "select", "columns", "max_memory" and the
- * rest as the Lambda reads them. The response is the JSON the Lambda returns, an {"error": ...} document included.
+ * rest as the Lambda reads them. Or use {"sql":"SELECT ...", "parallelism":3}: SQL excludes structured query
+ * fields and returns {"ok":true,"ndjson":"..."}, containing the CLI's exact NDJSON rows. SQL request/response
+ * shapes are EXPERIMENTAL in 0.5.0, with no stability guarantee. See docs/libzpq.md.
+ * Structured requests keep the Lambda response. Query failures return an {"error": ...} document.
  *
  * Ownership: every char * libzpq hands out (a response, an error message) is malloc'd, NUL-terminated, owned by the
  * caller from then on, and freed with zpq_free. zpq_strerror's strings are static: never free them. libzpq keeps no

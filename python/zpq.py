@@ -10,6 +10,9 @@ the GIL for the call, and each query runs on threads of its own, its declared bu
 `close` refuses new calls and ends those still waiting for their memory budget (both `ZpqClosed`), then waits for the
 running ones, so a context is never freed under a running query.
 
+SQL requests are EXPERIMENTAL in 0.5.0, with no stability guarantee for their request or response shape.
+`query` and `query_raw` are thin pass-throughs to the CLI frontend.
+
 The library is found at $ZPQ_LIB, else as libzpq.so (libzpq.dylib on macOS) next to this file, in ../zig-out/lib, or
 on the loader path.
 """
@@ -173,6 +176,22 @@ class Zpq:
         if check and isinstance(response, dict) and "error" in response:
             raise ZpqError(response)
         return response
+
+    def query_raw(self, sql, **options):
+        """EXPERIMENTAL in 0.5.0: thin CLI SQL pass-through returning exact NDJSON text.
+
+        The SQL request and response shapes have no stability guarantee. Options are common JSON request options.
+        """
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a string")
+        return self.run({**options, "sql": sql})["ndjson"]
+
+    def query(self, sql, **options):
+        """EXPERIMENTAL in 0.5.0: thin CLI SQL pass-through returning a list of row dicts.
+
+        The SQL request and response shapes have no stability guarantee. `parallelism` selects workers (0: automatic).
+        """
+        return [json.loads(line) for line in self.query_raw(sql, **options).splitlines()]
 
     def close(self):
         """Refuse new calls, end those waiting for their memory budget (`ZpqClosed`), wait for the running ones, then

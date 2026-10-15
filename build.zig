@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     // the codec and BoringSSL archives; see docs/libzpq.md). Opt-in: `zig build libzpq`.
     var libzpq_deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, true);
     libzpq_deps.profile = profile;
-    const libzpq_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = false });
+    const libzpq_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
     const libzpq_mod = b.createModule(.{
         .root_source_file = b.path("src/libzpq/libzpq.zig"),
         .target = target,
@@ -181,6 +181,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&b.addRunArtifact(dev_tests).step);
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(test_cli_step);
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_service_tests.step);

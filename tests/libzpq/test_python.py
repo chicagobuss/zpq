@@ -29,6 +29,11 @@ def check(cond, msg):
 def test_binding(z):
     r = z.run({"inputs": [FIX], "aggregate": "count(*) AS n, sum(a) AS s", "filter": "a >= 100"})
     check(r["ok"] and r["agg"] == {"n": 47900, "s": 1151971050}, f"aggregate {r}")
+    check(z.query(f"SELECT count(*) AS n FROM '{FIX}'", parallelism=3) == [{"n": 48000}], "SQL rows")
+    check(z.query(f"SELECT * FROM '{FIX}' LIMIT 0") == [], "SQL empty rows")
+    check(z.query_raw(f"SELECT a FROM '{FIX}' LIMIT 1") == '{"a":0}\n', "SQL raw bytes")
+    prof = z.run({"sql": f"SELECT count(*) AS n FROM '{FIX}'", "profile": True})
+    check(prof["ndjson"] == '{"n":48000}\n' and "profile" in prof, "SQL profile")
     # JSON text and bytes work too.
     r2 = z.run(json.dumps({"inputs": [FIX], "aggregate": "count(*) AS n"}).encode())
     check(r2["agg"] == {"n": 48000}, f"bytes request {r2}")
@@ -80,6 +85,8 @@ def test_service(z):
 
         status, body = post({"inputs": [FIX], "aggregate": "count(*) AS n"})
         check(status == 200 and body["agg"] == {"n": 48000}, f"POST /query {status} {body}")
+        status, body = post({"sql": f"SELECT count(*) AS n FROM '{FIX}'"})
+        check(status == 200 and body["ndjson"] == '{"n":48000}\n', "SQL POST")
         status, body = post({"inputs": ["no/such.parquet"], "aggregate": "count(*) AS n"})
         check(status == 400 and body["error"] == "engine", f"error POST {status} {body}")
         with ThreadPoolExecutor(8) as ex:
@@ -107,7 +114,7 @@ def wait_inflight(z, timeout=10):
 def wait_running(z, timeout=10):
     """Wait until a query holds the whole ceiling: a probe that may not wait for its budget is then refused. Counting
     the binding's own calls is not enough, as close ends a call that has not yet been admitted."""
-    probe = {"inputs": [FIX], "aggregate": "count(*) AS n", "budget_wait_ms": 0}
+    probe = {"sql": f"SELECT count(*) AS n FROM '{FIX}'", "budget_wait_ms": 0}
     end = time.monotonic() + timeout
     while z.run(probe, check=False).get("reason") != "WaitTimeout":
         if time.monotonic() > end:

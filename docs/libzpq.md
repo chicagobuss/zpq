@@ -47,6 +47,43 @@ with zpq.Zpq(max_memory="4GB") as z:
     print(r["agg"])
 ```
 
+## SQL (EXPERIMENTAL in 0.5.0)
+
+The SQL request and response shapes are **EXPERIMENTAL** in 0.5.0 and have no stability guarantee. This is a thin
+pass-through to the CLI frontend; Parquet I/O remains the engine's focus.
+
+`zpq_run` also accepts `{"sql":"SELECT ... FROM 'data.parquet'", "parallelism":3}`. It uses the CLI's SQL
+frontend, binder, planner, path expansion (local and S3 globs), and NDJSON serializers. Successful responses are
+`{"ok":true,"ndjson":"{\"n\":42}\n"}`: the decoded `ndjson` string is byte-identical to the CLI's stdout for
+that SQL and options. Empty results carry an empty string. The seven C exports and ABI version 1 are unchanged.
+
+```python
+with zpq.Zpq(max_memory="1GB") as z:
+    rows = z.query("SELECT k, count(*) AS n FROM 'data.parquet' GROUP BY k ORDER BY n DESC LIMIT 10",
+                   parallelism=3)
+    exact_cli_text = z.query_raw("SELECT count(*) AS n FROM 'data.parquet'")
+```
+
+`query()` returns a list of row dicts; `query_raw()` returns exact NDJSON. The binding has no Arrow export path.
+Python's JSON decoder uses its usual integer/float types; use the raw text with a Decimal-aware decoder to retain
+all DECIMAL digits. `run()` continues to return the response envelope, including for SQL.
+
+SQL excludes the structured fields `inputs`, `s3_url`, `filter`, `columns`, `select`, `aggregate`, `group_by`,
+`column_order`, `output_url`, `output_codec`, `compress_priority`, and `bloom_filters` (null counts as absent).
+`parallelism` is a nonnegative integer (0 chooses automatically). Common options remain available: `max_memory`,
+`budget_wait_ms`, `ordered`, `scan_all`, `trust_stats`, `profile`, and `profile_url`. Read mode is selected through
+`ZPQ_IO_PROFILE`, exactly as for the CLI. Shutdown has the existing semantics: queued queries are refused; running
+queries finish. No per-query cancellation API exists.
+
+SQL failures use the existing `ZPQ_OK` plus error envelope contract. Parser/binder/engine errors carry
+`"error":"engine"`, `"reason"`, and `"message"` with the CLI's diagnostic text; the existing column/input details
+remain available. SQL and structured fields together yield `ConflictingSqlFields`. The Lambda build excludes SQL
+and answers `SqlNotCompiledIn` for a SQL request. The shared library always includes SQL, even with `-Dsql=false`
+(which controls the CLI).
+
+Each context retains its executor, allocator and S3/metadata pools. Each SQL request owns its parsing arena and result
+buffers, which are released on success or failure; no SQL state survives into another request. Calls may overlap.
+
 ## Build and install
 
 ```sh
@@ -204,9 +241,9 @@ Stable: the seven functions, their signatures and ownership, the status codes an
 the request and response schema the Lambda documents. ABI version 1 only grows: new options, request fields and
 status codes may be added.
 
-Experimental: the `"pool"` and `"profile"` members of a response (their fields may change), the Python binding's
-API, and the HTTP service. The memory ceiling bounds declared budgets only, and does not count the context's caches
-(see Memory).
+Experimental: the SQL request and response shapes (no stability guarantee in 0.5.0), the `"pool"` and `"profile"`
+members of a response (their fields may change), the Python binding's API, and the HTTP service. The memory ceiling
+bounds declared budgets only, and does not count the context's caches (see Memory).
 
 ## Python
 
@@ -260,3 +297,8 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
 
 `tests/libzpq/overhead.sh` compares a query through a warm context with the CLI, which starts a process per query,
 in perf counters.
+
+`tests/libzpq/sql_differential.py` compares SQL NDJSON bytes at `-j1/3/16`, mixes 1,000 queries in one context
+with RSS checks, compares CLI error messages, and overlaps successful and failed SQL on 16 caller threads.
+Set `ZPQ_CLICKBENCH` to the sub1 parquet path and `ZPQ_CLICKBENCH_QUERIES` to the ClickBench queries.sql to
+include its 20-query slice alongside the 30 study shapes. `run.sh` invokes it after the existing gates.

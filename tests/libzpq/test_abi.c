@@ -375,12 +375,13 @@ static int silent_endpoint(void) {
 
 /* The first call holds the whole ceiling, stuck on the silent endpoint; the next two wait behind it. */
 static void start_stuck_and_waiters(zpq_ctx *c, struct budget_call calls[3], pthread_t t[3]) {
-    calls[0] = (struct budget_call){c, "{\"inputs\":[\"s3://bkt/k.parquet\"],\"aggregate\":\"count(*) AS n\"}", -99,
+    calls[0] = (struct budget_call){c, "{\"sql\":\"SELECT count(*) AS n FROM 's3://bkt/k.parquet'\"}", -99,
                                     NULL};
     for (int i = 1; i < 3; i++)
         calls[i] = (struct budget_call){
             c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}", -99,
             NULL};
+    calls[2].req = "{\"sql\":\"SELECT count(*) AS n FROM 'ci/fixtures/parquet/mixed_codec.parquet'\"}";
     for (int i = 0; i < 3; i++) {
         pthread_create(&t[i], NULL, budget_worker, &calls[i]);
         usleep(100 * 1000);
@@ -455,9 +456,11 @@ static void test_cycles(int n) {
         zpq_ctx *c = open_ctx("{\"max_memory\": \"64MB\"}");
         if (!c) return;
         char *out = NULL;
-        int rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}",
-                     &out);
-        if (rc != ZPQ_OK || !out || !strstr(out, "\"n\":48000")) {
+        const char *req = i % 2 == 0
+            ? "{\"sql\":\"SELECT count(*) AS n FROM 'ci/fixtures/parquet/mixed_codec.parquet'\"}"
+            : "{\"inputs\":[\"ci/fixtures/parquet/mixed_codec.parquet\"],\"aggregate\":\"count(*) AS n\"}";
+        int rc = run(c, req, &out);
+        if (rc != ZPQ_OK || !out || !(strstr(out, "\"n\":48000") || strstr(out, "n\\\":48000"))) {
             CHECK(0, "cycle %d rc %d: %s", i, rc, out);
             zpq_free(out);
             zpq_close(c);
@@ -465,6 +468,47 @@ static void test_cycles(int n) {
         }
         zpq_free(out);
         zpq_close(c);
+    }
+}
+
+static void test_sql(zpq_ctx *c) {
+    const char *requests[] = {
+        "{\"sql\":\"SELECT count(*) AS n FROM 'ci/fixtures/parquet/mixed_codec.parquet'\",\"parallelism\":3}",
+        "{\"sql\":\"SELECT a FROM 'ci/fixtures/parquet/mixed_codec.parquet' ORDER BY a LIMIT 2 OFFSET 1\"}",
+        "{\"sql\":\"SELECT b, count(*) AS n FROM 'ci/fixtures/parquet/mixed_codec.parquet' "
+            "WHERE a < 3 GROUP BY b HAVING count(*) > 0 ORDER BY b DESC LIMIT 1\"}",
+        "{\"sql\":\"SELECT count(*) AS n FROM 'ci/fixtures/parquet/mixed_codec.parquet' LIMIT 0\"}",
+    };
+    const char *answers[] = {
+        "{\"ok\":true,\"ndjson\":\"{\\\"n\\\":48000}\\n\"}",
+        "{\"ok\":true,\"ndjson\":\"{\\\"a\\\":1}\\n{\\\"a\\\":2}\\n\"}",
+        "{\"ok\":true,\"ndjson\":\"{\\\"b\\\":\\\"s2\\\",\\\"n\\\":1}\\n\"}",
+        "{\"ok\":true,\"ndjson\":\"\"}",
+    };
+    long half = 0;
+    for (int i = 0; i < 1000; i++) {
+        char *out = NULL;
+        int k = i % 4;
+        int rc = run(c, requests[k], &out);
+        CHECK(rc == ZPQ_OK && out && strcmp(out, answers[k]) == 0, "SQL %d rc %d: %s", i, rc, out);
+        zpq_free(out);
+        if (i == 499) half = rss_kb();
+    }
+    long end = rss_kb();
+    printf("SQL RSS: at 500 %ld KB, at 1000 %ld KB\n", half, end);
+#ifndef __SANITIZE_ADDRESS__
+    CHECK(end - half < 2048, "SQL RSS grew %ld KB", end - half);
+#endif
+    const char *bad[] = {
+        "{\"sql\":3}", "{\"sql\":\"select\",\"inputs\":[]}",
+        "{\"sql\":\"SELECT absent FROM 'ci/fixtures/parquet/mixed_codec.parquet'\"}",
+        "{\"sql\":\"SELECT * FROM 'no/such.parquet'\"}",
+        "{\"sql\":\"SELECT count(*) FROM 'ci/fixtures/parquet/mixed_codec.parquet'\",\"max_memory\":\"1TB\"}",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        char *out = NULL;
+        CHECK(run(c, bad[i], &out) == ZPQ_OK && out && strstr(out, "\"error\":"), "SQL error: %s", out);
+        zpq_free(out);
     }
 }
 
@@ -481,6 +525,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "zpq_open failed\n");
         return 1;
     }
+    test_sql(c);
     test_round_trip(c);
     test_write(c);
     test_errors(c);

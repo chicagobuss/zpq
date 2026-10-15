@@ -13,6 +13,7 @@ SRC = REPO / "src"
 # One per test artifact in build.zig.
 TEST_ROOTS = (
     SRC / "zpq.zig",
+    SRC / "cli" / "main.zig",
     SRC / "lambda" / "main.zig",
     SRC / "service" / "handler.zig",
     SRC / "libzpq" / "libzpq.zig",

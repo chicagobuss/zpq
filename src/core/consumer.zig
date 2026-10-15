@@ -694,6 +694,28 @@ pub fn appendColumnRows(
     try appendSelected(buf, col, &sel, rows, arena, false, scratch);
 }
 
+/// The dictionary of flat BYTE_ARRAY chunk `ci`, on `a`, when every one of its data pages is dictionary-encoded, so
+/// that each of its values is an entry; null otherwise. Reads no data page's body.
+pub fn chunkDictionary(
+    a: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    ci: usize,
+) !?[]const []const u8 {
+    const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+    if (cm.type != .BYTE_ARRAY) return null;
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    if (levels.max_rep > 0) return null;
+    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+    const len: usize = @intCast(cm.total_compressed_size);
+    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
+    const buf_off = start - @as(usize, @intCast(src.byte_origin));
+    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
+    var r = column_mod.ColumnChunkReader([]const u8).init(src.bytes[buf_off..][0..len], cm.codec, levels, a);
+    return r.dictionaryOfEveryPage();
+}
+
 /// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
 /// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
 /// slice of values plus a page per column (and a byte-array column's dictionary): fixed-width readers recycle theirs
@@ -6434,6 +6456,40 @@ test "SliceReader.skip reads the rows after it as decoding every row would, pass
                 }
             }
             try testing.expect(sparse.pages_passed > 0);
+        }
+    }
+}
+
+test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {
+    const testing = std.testing;
+    for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {
+        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+        for (meta.row_groups.items) |*rg| {
+            // `s` outgrows its dictionary page and turns PLAIN; `c` stays coded; `id` is not a string.
+            try testing.expect(try chunkDictionary(a, rg, &meta, src, 2) == null);
+            try testing.expect(try chunkDictionary(a, rg, &meta, src, 0) == null);
+            const dict = (try chunkDictionary(a, rg, &meta, src, 7)).?;
+            // Eight values (those ending 0 or 5 fall on the rows holding '') and the empty string; NULL is no entry.
+            try testing.expectEqual(@as(usize, 9), dict.len);
+            var whole = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 7, .{})).?;
+            defer whole.deinit();
+            const col = (try whole.next(a, @intCast(rg.num_rows))).string;
+            for (col.values, 0..) |v, i| {
+                if (col.def_levels.?[i] < col.max_def) continue;
+                for (dict) |d| {
+                    if (std.mem.eql(u8, d, v)) break;
+                } else return error.TestValueNotInDictionary;
+            }
         }
     }
 }

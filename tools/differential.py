@@ -1062,7 +1062,10 @@ def main():
                                "topn_gather_*.parquet")
     for order, where, tail in (("s DESC", "k > 3", "LIMIT 9 OFFSET 4"), ("f", "", "LIMIT 12"),
                                ("f DESC", "", "LIMIT 12"), ("u DESC", "", "LIMIT 5"), ("dec DESC, id", "", "LIMIT 8"),
-                               ("k DESC, s", "s LIKE 's01%'", "LIMIT 20"), ("ts", "", "LIMIT 1500")):
+                               ("k DESC, s", "s LIKE 's01%'", "LIMIT 20"), ("ts", "", "LIMIT 1500"),
+                               # A string key coded by its dictionary throughout: the dictionary bounds each group.
+                               ("c", "c != ''", "LIMIT 6"), ("c DESC", "c != ''", "LIMIT 6 OFFSET 2"),
+                               ("c, k DESC", "k > 30", "LIMIT 9")):
         for j in ("1", "16"):
             total += 1
             label = f"top-rows:gather {order} {where} {tail} -j{j}"

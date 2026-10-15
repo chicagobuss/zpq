@@ -820,6 +820,35 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return self.advancePage();
         }
 
+        /// The chunk's dictionary, when it opens with one and every data page after it is dictionary-encoded; null
+        /// otherwise (a PLAIN page after the dictionary outgrew its page holds values the dictionary lacks). Reads
+        /// every page header first, and the dictionary page only once they all qualify; never a data page's body.
+        /// For a fresh reader.
+        pub fn dictionaryOfEveryPage(self: *Self) Error!?[]const T {
+            try self.holdScratch();
+            var dict_at: ?usize = null;
+            while (try self.pages.peek()) |p| {
+                switch (p.header.type) {
+                    .DICTIONARY_PAGE => {
+                        if (dict_at != null) return error.UnexpectedDictionaryPage;
+                        dict_at = self.pages.pos;
+                    },
+                    .INDEX_PAGE => {},
+                    .DATA_PAGE, .DATA_PAGE_V2 => {
+                        if (dict_at == null) return null;
+                        const encoding = if (p.header.data_page_header) |h|
+                            h.encoding
+                        else if (p.header.data_page_header_v2) |h| h.encoding else return error.UnexpectedPage;
+                        if (encoding != .RLE_DICTIONARY and encoding != .PLAIN_DICTIONARY) return null;
+                    },
+                }
+                self.pages.pass(p);
+            }
+            self.pages.pos = dict_at orelse return null;
+            try self.installDictionary((try self.pages.next()).?);
+            return self.dictionary;
+        }
+
         /// With the current page drained, pass over the next data page of this flat chunk by its header alone, never
         /// decompressing it, when it holds at most `max_rows` rows; a dictionary page in the way is installed first.
         /// The rows passed over, or null when the next page must be installed to be read (it holds more rows, or the

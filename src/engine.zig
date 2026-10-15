@@ -5278,6 +5278,8 @@ const RankShared = struct {
     key_specs: []const consumer.OutputCol,
     h: usize,
     prune: bool,
+    /// The first key is a bare string column (`dictionaryBest`), and whether the filter reads that column alone.
+    dict_key: ?DictKey,
     options: consumer.DecodeOptions,
     profiler: ?*profile.Profiler,
     cursor: work_cursor.AtomicWorkCursor(RankedRG),
@@ -5296,6 +5298,8 @@ const RankShared = struct {
         if (self.cut) |c| if (c == .str) self.gpa.free(c.str);
     }
 };
+
+const DictKey = struct { ci: usize, filtered: bool };
 
 const RankEntry = struct {
     cells: []SortCell,
@@ -5372,6 +5376,13 @@ const RankWorker = struct {
         if (s.prune) if (s.filter) |f| if (filter_prune.pruneRowGroup(rg, f, meta) == .skip) return;
         try w.refreshCut();
         if (item.best) |best| if (w.cut) |c| if (sortsAfter(s.keys[0], best, c)) return;
+        if (s.dict_key != null) if (w.cut) |c| {
+            var dict_mem = std.heap.ArenaAllocator.init(s.gpa);
+            defer dict_mem.deinit();
+            if (try w.dictionaryBest(dict_mem.allocator(), rg, meta, item.*)) |best| {
+                if (sortsAfter(s.keys[0], best, c)) return;
+            }
+        };
         try w.rank(rg, meta, item.*);
         try w.publishCut();
         const held = w.store.queryCapacity() + w.heap.capacity() * @sizeOf(RankEntry) + w.cut_buf.capacity;
@@ -5422,6 +5433,40 @@ const RankWorker = struct {
             }
         }
         if (w.since_compact > 2 *| s.h +| 1024) try w.compact();
+    }
+
+    /// The best first key any row of a row group can have, from its string key chunk's dictionary: the smallest entry
+    /// ascending, the largest descending, among those the filter keeps when it reads that column alone. NULL when no
+    /// entry qualifies (the group's rows then have a NULL key or none qualifies). A safe bound whether or not a row
+    /// uses the entry; null when the chunk is not dictionary-encoded throughout, so a value may not be an entry.
+    fn dictionaryBest(
+        w: *RankWorker,
+        ra: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        item: RankedRG,
+    ) !?SortCell {
+        const s = w.shared;
+        const dk = s.dict_key.?;
+        const src: consumer.RGSrc = .{ .bytes = s.inputs[item.file].bytes, .byte_origin = 0 };
+        const dict = (try consumer.chunkDictionary(ra, rg, meta, src, dk.ci)) orelse return null;
+        var kept: ?filter_selection.SelectionVector = null;
+        if (dk.filtered) if (s.filter) |f| {
+            const cols = [_]filter_eval.Batch.Column{.{ .string = .{ .values = dict } }};
+            const lookup = try ra.alloc(?usize, meta.schema.items.len);
+            @memset(lookup, null);
+            lookup[dk.ci] = 0;
+            var sel = try filter_selection.SelectionVector.init(ra, dict.len);
+            try filter_eval.evaluate(f, &.{ .cols = &cols, .num_rows = dict.len }, &sel, lookup, ra);
+            kept = sel;
+        };
+        var best: ?[]const u8 = null;
+        const want: std.math.Order = if (s.keys[0].descending) .gt else .lt;
+        for (dict, 0..) |v, k| {
+            if (kept) |sel| if (!sel.isActive(k)) continue;
+            if (best == null or std.mem.order(u8, v, best.?) == want) best = v;
+        }
+        return if (best) |b| .{ .str = b } else .null;
     }
 
     /// Copy the shared cutoff when it changed since this worker last looked.
@@ -5539,6 +5584,28 @@ fn runAll(comptime Ctx: type, ctxs: []Ctx, comptime func: fn (*Ctx) void) void {
     func(&ctxs[0]);
 }
 
+/// Leaf `ci` when the first sort key is a bare string column, whose dictionary bounds a row group's keys
+/// (`RankWorker.dictionaryBest`): BYTE_ARRAY, not DECIMAL (whose lane is numeric), compared as raw bytes as its
+/// `SortCell` is. `filtered` when the filter reads that column alone, so it can judge each dictionary entry.
+fn dictionaryKey(meta: *const schema.FileMetaData, key: RowSortKey, filter: ?filter_ast.Filter) ?DictKey {
+    const ci = switch (key.spec) {
+        .passthrough => |ci| ci,
+        .computed => return null,
+    };
+    var leaves: schema.LeafIterator = .init(meta.schema.items);
+    const leaf = while (leaves.next()) |l| {
+        if (l.index == ci) break l;
+    } else return null;
+    if (leaf.element.type != .BYTE_ARRAY or leaf.max_rep > 0 or decimal_mod.kindFromSchema(leaf.element) != null) return null;
+    const f = filter orelse return .{ .ci = ci, .filtered = false };
+    var buf: [64]usize = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&buf));
+    var cols: std.ArrayList(usize) = .empty;
+    f.collectColumns(&cols, fba.allocator()) catch return .{ .ci = ci, .filtered = false };
+    for (cols.items) |c| if (c != ci) return .{ .ci = ci, .filtered = false };
+    return .{ .ci = ci, .filtered = true };
+}
+
 /// Whether the plain-row Top-N can rank in parallel and gather its winners (`RankShared`): a LIMIT keeping at most
 /// `max_gather_rows`, bare output columns and keys (a computed one can fail on a row, and passing over its row group
 /// would answer where reading it raises the error), flat outputs (read a slice at a time), and every input's bytes
@@ -5601,6 +5668,7 @@ fn rankAndGather(
         .key_specs = key_specs,
         .h = h,
         .prune = !args.scan_all,
+        .dict_key = dictionaryKey(&metas[0], keys[0], filter),
         .options = .{ .fast_levels = args.fast_levels },
         .profiler = args.profiler,
         .cursor = .{ .items = items },
@@ -8403,6 +8471,28 @@ test "RankedRG.sooner reads unbounded row groups first in input order, then the 
     }
 }
 
+test "dictionaryKey takes a bare string first key, judged by the filter only when it reads that column alone" {
+    std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[0], .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const meta = try metadata.open(a, try metadata.readFileSlice(topn_gather_inputs[0], a));
+    const key = struct {
+        fn of(ci: usize) RowSortKey {
+            return .{ .spec = .{ .passthrough = ci }, .descending = false, .unsigned = false };
+        }
+    }.of;
+    const on_c = try filter_parser.parse(a, "c != ''", &meta, null);
+    const on_k = try filter_parser.parse(a, "c != '' AND k > 3", &meta, null);
+    try std.testing.expectEqual(DictKey{ .ci = 7, .filtered = true }, dictionaryKey(&meta, key(7), on_c).?);
+    try std.testing.expectEqual(DictKey{ .ci = 7, .filtered = false }, dictionaryKey(&meta, key(7), on_k).?);
+    try std.testing.expectEqual(DictKey{ .ci = 2, .filtered = false }, dictionaryKey(&meta, key(2), null).?);
+    // Not strings: an integer, and a DECIMAL whose lane is numeric.
+    try std.testing.expect(dictionaryKey(&meta, key(0), null) == null);
+    try std.testing.expect(dictionaryKey(&meta, key(5), null) == null);
+}
+
 test "allPassthrough keeps a computed output or key off the bound-first Top-N" {
     const testing = std.testing;
     const bare = [_]consumer.OutputCol{ .{ .passthrough = 0 }, .{ .passthrough = 3 } };
@@ -8476,6 +8566,16 @@ test "the parallel plain-row Top-N prints what reading every row group in order 
         // More rows than a row group holds, and an OFFSET reaching the last rows.
         .{ .select = "id, ts, s", .keys = &.{.{ .expr = "ts", .descending = false }}, .limit = 1500 },
         .{ .select = "id", .keys = &.{.{ .expr = "k", .descending = false }}, .limit = 5, .offset = 5990 },
+        // A string key coded by its dictionary throughout, whose footer minimum ('') proves nothing: the dictionary
+        // bounds each row group, judged by a filter on that column alone, by one on others, or by none.
+        .{ .select = "id, c", .filter = "c != ''", .keys = &.{.{ .expr = "c", .descending = false }}, .limit = 6 },
+        .{ .select = "id, c", .filter = "c != ''", .keys = &.{.{ .expr = "c", .descending = true }}, .limit = 6, .offset = 2 },
+        .{ .select = "c, k", .filter = "k > 30", .keys = &.{
+            .{ .expr = "c", .descending = false },
+            .{ .expr = "k", .descending = true },
+        }, .limit = 9 },
+        .{ .select = "id, c", .keys = &.{.{ .expr = "c", .descending = false }}, .limit = 4 },
+        .{ .select = "id, c", .filter = "c IS NULL OR c > 'c55'", .keys = &.{.{ .expr = "c", .descending = false }}, .limit = 30 },
         // No row survives the filter.
         .{ .select = "id", .filter = "id < 0", .keys = &.{.{ .expr = "id", .descending = false }}, .limit = 3 },
     };

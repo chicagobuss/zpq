@@ -13,6 +13,9 @@ Columns (i is the row's index in its file):
   f    double, nullable: NaN on every 17th row, NULL on every 19th
   dec  decimal(9,2): negative on every third row
   ts   timestamp[ms]
+  c    string, nullable, dictionary-encoded throughout: '' on every fifth row, NULL on every seventh, else
+       'c' + two digits from a range of ten that rises with the row group (so its footer minimum is '' and proves
+       nothing, while its dictionary bounds the group once '' is filtered out)
 
 Usage:  .venv/bin/python tools/gen_topn_gather_fixture.py
 """
@@ -39,6 +42,8 @@ def table(file: int) -> pa.Table:
         "dec": pa.array([decimal.Decimal((i * 13) % 900 - (600 if i % 3 == 0 else 0)) / 100 for i in ids],
                         type=pa.decimal128(9, 2)),
         "ts": pa.array([1_600_000_000_000 + ((i * 104729) % 5000) * 1000 for i in ids], type=pa.timestamp("ms")),
+        "c": pa.array([None if i % 7 == 0 else "" if i % 5 == 0
+                       else f"c{(i // 1000) * 10 + (i * 31) % 10 + 30 * file:02d}" for i in ids]),
     })
 
 

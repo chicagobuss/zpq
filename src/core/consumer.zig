@@ -1562,7 +1562,7 @@ const ChunkPlacer = struct {
         self.timings.sink_ns += @intCast(t_sink_end - t_sink_start);
         profile.record(self.timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.bytes.len}));
         self.out_offset.* += enc.bytes.len;
-        self.total.* += @intCast(enc.bytes.len);
+        self.total.* += enc.meta.total_uncompressed_size;
 
         // One data page per freshly encoded chunk → one OffsetIndex + ColumnIndex entry, from the stats the
         // encoder already computed, so a filtered re-encode keeps page-level pruning too.
@@ -1804,7 +1804,7 @@ pub fn writeAggregateRows(
         };
         try sink.write(enc.bytes);
         off += enc.bytes.len;
-        rg_total += @intCast(enc.bytes.len);
+        rg_total += em.total_uncompressed_size;
         try rg_columns.append(arena, .{
             .file_path = null,
             .file_offset = col_start,
@@ -3650,7 +3650,7 @@ pub fn copyRG(
                 );
                 try requestedFilter(out_arena, &written, rg, ci, src, bloom_write);
                 try new_cols.append(out_arena, written);
-                rg_total += written.meta_data.?.total_compressed_size;
+                rg_total += written.meta_data.?.total_uncompressed_size;
                 continue;
             };
             const delta = offsetDelta(out.pos(), range.start);
@@ -3659,7 +3659,7 @@ pub fn copyRG(
             var copied = try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index);
             try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
             try new_cols.append(out_arena, copied);
-            rg_total += @intCast(range.len);
+            rg_total += m.total_uncompressed_size;
         }
 
         return .{
@@ -3702,7 +3702,7 @@ pub fn copyRG(
         .surviving_rows = rg.num_rows,
         .rg = .{
             .columns = cols,
-            .total_byte_size = @intCast(range.len),
+            .total_byte_size = fastpath.uncompressedBytes(cols.items),
             .num_rows = rg.num_rows,
         },
     };
@@ -5041,7 +5041,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
             .path_in_schema = path,
             .codec = .UNCOMPRESSED,
             .num_values = 10,
-            .total_uncompressed_size = 20,
+            .total_uncompressed_size = 50,
             .total_compressed_size = 20,
             .data_page_offset = 100,
             .index_page_offset = null,
@@ -5057,7 +5057,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
             .path_in_schema = path,
             .codec = .UNCOMPRESSED,
             .num_values = 10,
-            .total_uncompressed_size = 20,
+            .total_uncompressed_size = 30,
             .total_compressed_size = 20,
             .data_page_offset = 140,
             .index_page_offset = null,
@@ -5115,9 +5115,9 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
     try testing.expectEqual(@as(u64, 60), out_offset);
     // Content should match buf[100..160] exactly (the stamped pattern).
     try testing.expectEqualSlices(u8, buf[100..160], cap.bytes.items);
-    // Output RG carries the new bounding-box size.
+    // The output RG's total_byte_size is its chunks' uncompressed bytes (50 + 30), not the 60 bytes copied.
     try testing.expect(out.rg != null);
-    try testing.expectEqual(@as(i64, 60), out.rg.?.total_byte_size);
+    try testing.expectEqual(@as(i64, 80), out.rg.?.total_byte_size);
     try testing.expectEqual(@as(i64, 10), out.rg.?.num_rows);
     // Column offsets must be shifted to point into the output stream.
     // Column 0 was at source offset 100; output bounding box starts at

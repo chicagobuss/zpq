@@ -587,7 +587,8 @@ fn executeAggregate(
         (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
-        steer_metas != null) blk: {
+        steer_metas != null)
+    blk: {
         const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
@@ -6647,6 +6648,50 @@ test "a write builds the Bloom filters asked for, in re-encoded and copied row g
         .aggregate = "count(*) AS n",
         .bloom_filters = &.{.{ .column = "id" }},
     }));
+}
+
+test "every write path records a row group's uncompressed bytes as its total_byte_size" {
+    const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const Case = struct {
+        filter: ?[]const u8 = null,
+        columns: ?[]const []const u8 = null,
+        codec: ?schema.CompressionCodec = null,
+    };
+    // A filter re-encodes row group 0 and copies the rest whole; --columns copies chunks one by one; --codec
+    // recompresses pages. The snappy fixture compresses, so the uncompressed and compressed sums differ everywhere.
+    const cases = [_]Case{
+        .{ .filter = "id >= 2" },
+        .{ .columns = &.{ "id", "x" } },
+        .{ .codec = .ZSTD },
+        .{ .filter = "id >= 2", .columns = &.{ "x", "cat" } },
+    };
+    for (cases) |c| {
+        var r = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fixture},
+            .output = out,
+            .filter = c.filter,
+            .columns = c.columns,
+            .codec = c.codec,
+        });
+        defer r.deinit(gpa);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const bytes = try metadata.readFileSlice(out, arena_state.allocator());
+        const meta = try metadata.open(arena_state.allocator(), bytes);
+        try std.testing.expect(meta.row_groups.items.len > 0);
+        for (meta.row_groups.items) |rg| {
+            var compressed: i64 = 0;
+            for (rg.columns.items) |col| compressed += col.meta_data.?.total_compressed_size;
+            try std.testing.expectEqual(fastpath.uncompressedBytes(rg.columns.items), rg.total_byte_size);
+            try std.testing.expect(rg.total_byte_size != compressed);
+        }
+    }
 }
 
 test "BloomSpec.parse: a column, optionally with a probability" {

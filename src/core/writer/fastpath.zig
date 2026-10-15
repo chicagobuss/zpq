@@ -227,9 +227,19 @@ fn copyRowGroup(
     };
 }
 
+/// A row group's `total_byte_size`: the format defines it as the uncompressed bytes of its column data, the sum of
+/// its chunks' `total_uncompressed_size` (what other writers store), not the bytes it occupies in the file.
+pub fn uncompressedBytes(columns: []const schema.ColumnChunk) i64 {
+    var total: i64 = 0;
+    for (columns) |c| if (c.meta_data) |m| {
+        total += m.total_uncompressed_size;
+    };
+    return total;
+}
+
 /// Copy only the kept column chunks of one row group, contiguously,
 /// each followed by its page index. The new RG's `total_byte_size` is
-/// the sum of kept column sizes; `num_rows` is unchanged from the source.
+/// the kept chunks' uncompressed size; `num_rows` is unchanged from the source.
 fn copyProjectedRowGroup(
     arena: std.mem.Allocator,
     out: anytype,
@@ -241,18 +251,16 @@ fn copyProjectedRowGroup(
     errdefer new_cols.deinit(arena);
     try new_cols.ensureTotalCapacity(arena, kept.len);
 
-    var rg_total: i64 = 0;
     for (kept) |col_idx| {
         const range = try projectedChunkRange(src_rg, col_idx, input.len);
         const delta = offsetDelta(out.pos(), range.start);
         try out.write(input[range.start .. range.start + range.len]);
         new_cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &src_rg.columns.items[col_idx], delta));
-        rg_total += @intCast(range.len);
     }
 
     return .{
         .columns = new_cols,
-        .total_byte_size = rg_total,
+        .total_byte_size = uncompressedBytes(new_cols.items),
         .num_rows = src_rg.num_rows,
     };
 }
@@ -687,6 +695,34 @@ test "build with projection emits only kept columns" {
         "[fastpath] projected [int8, int32_sorted]: in={d}B out={d}B (~{d:.0}%)\n",
         .{ file_bytes.len, out.len, @as(f64, @floatFromInt(out.len)) * 100.0 / @as(f64, @floatFromInt(file_bytes.len)) },
     );
+}
+
+test "a projected byte copy records its kept chunks' uncompressed bytes as total_byte_size" {
+    const fixture_path = "ci/fixtures/parquet/bloom_keys.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try metadata.open(arena, file_bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    const kept = [_]usize{ 0, 3 };
+    const out_meta = try metadata.open(arena, try build(arena, file_bytes, &meta, survivors, &kept));
+    for (out_meta.row_groups.items, meta.row_groups.items) |rg, src| {
+        var compressed: i64 = 0;
+        var uncompressed: i64 = 0;
+        for (kept) |c| {
+            compressed += src.columns.items[c].meta_data.?.total_compressed_size;
+            uncompressed += src.columns.items[c].meta_data.?.total_uncompressed_size;
+        }
+        try testing.expectEqual(uncompressed, rg.total_byte_size);
+        try testing.expectEqual(uncompressedBytes(rg.columns.items), rg.total_byte_size);
+        try testing.expect(uncompressed != compressed);
+    }
 }
 
 test "buildMulti with N=10 copies of the same file" {

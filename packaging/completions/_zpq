@@ -1,0 +1,39 @@
+#compdef zpq
+# Generated; edit src/cli/help.txt.
+if (( CURRENT == 2 )); then _values command conform help inspect query schema version; return; fi
+_arguments '*:file:_files' \
+  '--aggregate[zpq option]' \
+  '--bloom-filter[zpq option]' \
+  '--codec[zpq option]' \
+  '--column-order[zpq option]' \
+  '--columns[zpq option]' \
+  '--compress-priority[zpq option]' \
+  '--detail[zpq option]' \
+  '--explain[zpq option]' \
+  '--fast-levels[zpq option]' \
+  '--filter[zpq option]' \
+  '--format[zpq option]' \
+  '--group-by[zpq option]' \
+  '--help[zpq option]' \
+  '--limit[zpq option]' \
+  '--max-memory[zpq option]' \
+  '--output[zpq option]' \
+  '--profile[zpq option]' \
+  '--profile-summary[zpq option]' \
+  '--query[zpq option]' \
+  '--scan-all[zpq option]' \
+  '--select[zpq option]' \
+  '--summary=json[zpq option]' \
+  '--threads[zpq option]' \
+  '--trust-stats[zpq option]' \
+  '--unordered[zpq option]' \
+  '--version[zpq option]' \
+  '-V[zpq option]' \
+  '-a[zpq option]' \
+  '-c[zpq option]' \
+  '-f[zpq option]' \
+  '-g[zpq option]' \
+  '-h[zpq option]' \
+  '-j[zpq option]' \
+  '-o[zpq option]' \
+  '-s[zpq option]'

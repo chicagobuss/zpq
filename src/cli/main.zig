@@ -32,105 +32,7 @@ const s3 = zpq.io.s3;
 const local_fs = zpq.local_fs;
 const Diag = zpq.core.diag.Diag;
 
-const usage_text =
-    \\usage:
-    \\  zpq query <input.parquet> [--output <out.parquet>]
-    \\            [--filter EXPR] [--columns COL1,COL2,...]
-    \\            [--select "EXPR1 [AS name], EXPR2 [AS name], ..."]
-    \\            [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
-    \\            [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
-    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
-    \\            [--threads N | -j N]
-    \\            [--compress-priority size|speed]
-    \\            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
-    \\            [--bloom-filter COL[:FPP] ...]
-    \\            [--format ndjson|json|parquet] [--limit N] [--summary=json]
-    \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
-    \\  zpq query --query "<sql query>" [--output <out.parquet>]
-    \\            [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
-    \\            [--threads N | -j N]
-    \\            [--compress-priority size|speed]
-    \\            [--scan-all] [--trust-stats]
-    \\            [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
-    \\            [--format ndjson|json|parquet] [--limit N] [--summary=json]
-    \\  zpq schema <file.parquet>
-    \\  zpq conform <file.parquet>
-    \\
-    \\  --output / -o  named destination: default Parquet, stdout stays empty.
-    \\                 `-o -` writes stdout (default NDJSON).
-    \\                 Overwrites keep file mode and replace symlinks themselves.
-    \\  --format       NDJSON rows by default (`jsonl` is an alias); `json`
-    \\                 is an array of row objects. `parquet` can stream to
-    \\                 stdout, but refuses a terminal. No extension inference.
-    \\                 CSV is reserved and not supported yet (exit 2).
-    \\  --limit        cap final answer rows, including aggregates and files.
-    \\                 SQL LIMIT has the same meaning; do not combine them.
-    \\  --summary=json emit a typed summary on stderr after output completes;
-    \\                 errors and JSON profiles are typed too. No default
-    \\                 success summary. Text profile summaries conflict.
-    \\  exit codes     0 success; 1 read/decode/write failure; 2 invalid or
-    \\                 unsupported query/options; 141 closed stdout pipe.
-    \\                 Local files publish atomically; failed stdout can
-    \\                 contain a partial result. Check pipeline status.
-    \\
-    \\  --codec        output codec. Without it, re-encoded output is snappy
-    \\                 and a plain copy keeps each chunk's codec; with it, a
-    \\                 plain copy recompresses chunks stored in another one.
-    \\                 The summary's "codec" is the one every written chunk
-    \\                 uses, or "MIXED" when a copy keeps several. Text has null.
-    \\                 `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
-    \\                 deprecated LZ4 codec but never compresses to it.
-    \\  --compress-priority
-    \\                 how hard zstd works. `size` (default): level 3 for
-    \\                 every page. `speed`: each page stored raw, as
-    \\                 entropy-coded literals, or at level 1 or 3, whichever
-    \\                 a sample says costs least; less CPU, but a page can
-    \\                 come out uncompressed where level 3 would shrink it
-    \\                 (see README).
-    \\  --scan-all     decode every page/byte: disables all stats shortcuts
-    \\                 (row-group pruning, stats-as-answer). Slower but
-    \\                 thorough — use when you don't trust a file's stats.
-    \\  --trust-stats  answer min/max/sum from file statistics instead of
-    \\                 decoding (fast, but trusts the writer's stats — off
-    \\                 by default; count(*) is always answered from metadata).
-    \\  --bloom-filter write a split-block Bloom filter for output column COL
-    \\                 (repeatable), at false-positive probability FPP
-    \\                 (default 0.01). Readers then skip row groups an `=`
-    \\                 or `IN` on COL cannot match. A copied chunk keeps the
-    \\                 filter its source has. Not for BOOLEAN columns.
-    \\  --fast-levels  skip materializing definition levels for data pages
-    \\                 whose level stream proves every value is present.
-    \\                 Helps supported flat OPTIONAL primitive columns that
-    \\                 hold no nulls; off by default while it is new.
-    \\  --unordered    GROUP BY rows in no set order, and float sums and
-    \\                 averages free to differ in their last bits from run
-    \\                 to run. By default groups come in the order they
-    \\                 first appear in the input and the same bits come out
-    \\                 at every -j.
-    \\  --max-memory   ceiling on accounted GROUP BY entries across all worker
-    \\                 tables. Allocator capacity overhead, finalization
-    \\                 scratch, and materialized output rows are outside this
-    \\                 entry budget. Workers draw from it in blocks rather
-    \\                 than each owning fixed slices, so raising -j does not
-    \\                 shrink what a query may use. Partly-used blocks can
-    \\                 collectively strand at most ~5% of the budget, so give
-    \\                 it headroom rather than tuning to the exact byte.
-    \\                 It also bounds working memory on every path: a row
-    \\                 group too big for it is read a slice of rows at a
-    \\                 time. Output contents are identical; row-group
-    \\                 boundaries may depend on --max-memory (and -j) for
-    \\                 filtered or computed writes.
-    \\  --explain      print an aggregate plan as JSON using only file footers;
-    \\                 accepts SQL or --aggregate / --group-by, then exits.
-    \\  --profile      write a Chrome Trace Event JSON trace of the query
-    \\                 (open it at https://ui.perfetto.dev): per-thread spans
-    \\                 for every phase, in-flight counters, RSS.
-    \\  --profile-summary
-    \\                 print a compact profile summary to stderr: time and
-    \\                 wall share per phase, costliest column chunks, I/O and
-    \\                 pruning counts. `=json` prints it as one JSON line.
-    \\
-;
+const usage_text = @embedFile("help.txt");
 
 var machine_diagnostics = false;
 var diagnostic_buffer: [16 * 1024]u8 = undefined;
@@ -209,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V") or std.mem.eql(u8, cmd, "version")) {
         var ws: StdoutWriter = .{};
         defer ws.flush() catch {};
-        try ws.print("zpq {s}\n", .{build_options.version});
+        try ws.print("zpq {s} ({s})\n", .{ build_options.version, @import("cli_version").revision });
         try ws.flush();
         return;
     }
@@ -398,11 +300,29 @@ pub fn main(init: std.process.Init) !void {
         try runConform(gpa, path);
         return;
     }
+    if (std.mem.eql(u8, cmd, "inspect")) {
+        runInspect(init, &iter) catch |err| {
+            if (err == error.BrokenPipe) std.process.exit(141);
+            diagnosticPrint("zpq inspect: {s}; use `zpq --help` for usage\n", .{@errorName(err)});
+            std.process.exit(if (err == error.BadArgs or err == error.NoInputs) @as(u8, 2) else @as(u8, 1));
+        };
+        return;
+    }
     if (std.mem.eql(u8, cmd, "schema")) {
         const path = iter.next() orelse {
-            diagnosticPrint("schema: missing path\n", .{});
-            std.process.exit(1);
+            diagnosticPrint("zpq schema: give one Parquet path or s3:// URL\n", .{});
+            std.process.exit(2);
         };
+        if (std.mem.eql(u8, path, "--help") or std.mem.eql(u8, path, "-h")) {
+            var ws: StdoutWriter = .{};
+            try ws.writeAll(usage_text);
+            try ws.flush();
+            return;
+        }
+        if (iter.next() != null or std.mem.startsWith(u8, path, "-")) {
+            diagnosticPrint("zpq schema: use one path; use inspect for multiple files\n", .{});
+            std.process.exit(2);
+        }
         try runSchema(init, path);
         return;
     }
@@ -939,17 +859,18 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
     if (err == error.BrokenPipe) return 141;
     if (execution_started) return 1;
     const usage = [_][]const u8{
-        "BadArgs",                     "NoInputs",              "NoMatches",                    "SqlNotCompiledIn",          "UnknownColumn",              "UnknownFunction",
-        "UnknownAggFunc",              "WrongArity",            "EmptyExpr",                    "EmptyAggregate",            "EmptyColumnList",            "UnexpectedChar",
-        "UnexpectedEnd",               "BadNumber",             "UnterminatedString",           "TypeMismatch",              "ExpectedLParen",             "ExpectedRParen",
-        "ExpectedIdentifier",          "ExpectedWhere",         "ExpectedAggFunc",              "StarOnlyValidInCount",      "TrailingTokens",             "BadAggArg",
-        "AggregateMutexWithSelect",    "DuplicateOutputColumn", "AmbiguousOutputColumn",        "AmbiguousColumn",           "ExpressionTooDeep",          "GroupKeyAliasRequired",
-        "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",      "HavingNotSupported",         "MixedSelectNotSupported",
-        "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",       "BadOutputUrl",               "BadOperator",
-        "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",         "NullableNotSupported",       "NestedNotSupported",
-        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",         "AggregateInGroupBy", "HavingTypeMismatch", "UnsupportedCase",  "UnsupportedType",              "DecimalScaleTooLarge",      "MissingOutputOrAggregate",   "MultipleStatements",
-        "CteNotSupported",             "AggregateInWhere",      "MissingFromClause",            "MissingTableName",          "UnsupportedFromClause",      "UnsupportedAggType",
-        "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
+        "BadArgs",                     "NoInputs",                  "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",        "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",                "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",      "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",                 "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",       "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",             "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",       "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn",     "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",    "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",       "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",   "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",      "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",         "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",      "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported", "NestedNotSupported",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses",     "FilterTooDeep",                "AggregateInGroupBy",   "HavingTypeMismatch",   "UnsupportedCase",
+        "UnsupportedType",             "DecimalScaleTooLarge",      "MissingOutputOrAggregate",     "MultipleStatements",   "CteNotSupported",      "AggregateInWhere",
+        "MissingFromClause",           "MissingTableName",          "UnsupportedFromClause",        "UnsupportedAggType",   "UnsupportedCoalesce",  "UnsupportedColumnType",
+        "UnlabelledColumn",            "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;
@@ -1627,4 +1548,95 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
         try printLogicalOrConverted(&ws, leaf);
         try ws.writeAll("\n");
     }
+}
+
+fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    var json = false;
+    var detail = false;
+    while (iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--format")) {
+            if (!std.mem.eql(u8, iter.next() orelse return error.BadArgs, "json")) return error.BadArgs;
+            json = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            var help: StdoutWriter = .{};
+            try help.writeAll(usage_text);
+            try help.flush();
+            return;
+        } else if (std.mem.eql(u8, arg, "--detail")) {
+            detail = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.BadArgs;
+        } else {
+            const expanded = try expandGlob(arena, init.io, arg, init.minimal.environ);
+            if (expanded.len == 0) {
+                diagnosticPrint("zpq inspect: no matches for {s}; check the basename wildcard\n", .{arg});
+                return error.BadArgs;
+            }
+            try paths.appendSlice(arena, expanded);
+        }
+    }
+    if (paths.items.len == 0) return error.NoInputs;
+    var ws: StdoutWriter = .{};
+    if (json) try ws.writeAll("{\"schema_version\":1,\"files\":[");
+    var failures: usize = 0;
+    for (paths.items, 0..) |path, i| {
+        if (json and i != 0) try ws.writeByte(',');
+        var file_arena = std.heap.ArenaAllocator.init(init.gpa);
+        defer file_arena.deinit();
+        const report = @import("inspect.zig").inspect(file_arena.allocator(), init.minimal.environ, path, detail) catch |err| {
+            failures += 1;
+            if (json) {
+                try ws.writeAll(try std.json.Stringify.valueAlloc(file_arena.allocator(), .{
+                    .path = path,
+                    .status = "error",
+                    .cause = @errorName(err),
+                }, .{}));
+            } else try ws.print("{s}: {s} (check the path, credentials or Parquet footer)\n", .{ path, @errorName(err) });
+            continue;
+        };
+        if (json) {
+            try ws.writeAll(try std.json.Stringify.valueAlloc(file_arena.allocator(), report, .{}));
+        } else {
+            try ws.print("{s}: Parquet v{d}, {d} rows, {d} bytes, {d} row groups\n", .{
+                path, report.parquet_version, report.rows, report.bytes, report.row_groups.len,
+            });
+            try ws.print("  created_by: {s}; sorting_columns: unsupported\n", .{report.created_by orelse "unknown"});
+            for (report.row_groups) |group| {
+                try ws.print("  row group {d}: {d} rows, {d} uncompressed bytes\n", .{
+                    group.ordinal, group.rows, group.uncompressed_bytes,
+                });
+                for (group.columns) |col| {
+                    try ws.writeAll("    ");
+                    for (col.path, 0..) |part, pi| {
+                        if (pi != 0) try ws.writeByte('.');
+                        try ws.writeAll(part);
+                    }
+                    try ws.print(" {s} {s}: {d}/{d} compressed/uncompressed bytes\n", .{
+                        col.physical_type, col.codec, col.compressed_bytes, col.uncompressed_bytes,
+                    });
+                    try ws.print("      min={s} ({s}) max={s} ({s}); nulls=", .{
+                        col.min.value orelse col.min.state, col.min.exactness,
+                        col.max.value orelse col.max.state, col.max.exactness,
+                    });
+                    if (col.null_count) |n| try ws.print("{d}\n", .{n}) else try ws.writeAll("unknown\n");
+                    try ws.print("      index={s}/{s}, Bloom={s}, dictionary fallback={s}\n", .{
+                        col.column_index.state, col.offset_index.state, col.bloom_filter.state, col.dictionary_fallback,
+                    });
+                    for (col.hints) |hint| try ws.print("      hint: {s}\n", .{hint});
+                }
+            }
+            try ws.writeAll("  Use --format json for full types/offsets/encodings; --detail is bounded.\n");
+        }
+    }
+    if (json) try ws.writeAll("]}\n");
+    try ws.flush();
+    if (failures != 0) return error.InspectionFailed;
+}
+
+test {
+    _ = @import("inspect.zig");
 }

@@ -13,6 +13,56 @@ Workloads it's intended for:
 Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
 vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
 
+## First five minutes
+
+Download the CLI for your OS/architecture from a published release, or build it with
+`zig build cli -Doptimize=ReleaseFast` using Zig 0.17.0. `zpq --version` prints the version and build revision.
+The Homebrew formula is staged in `packaging/homebrew/`; it is not a published tap yet.
+
+```sh
+# Answers are NDJSON rows, ready for Unix tools (jq is a separate install).
+zpq query trips.parquet --columns VendorID,trip_distance --limit 5 | jq .
+
+# Filter and project into a Parquet file; named -o leaves stdout empty.
+zpq query trips.parquet --filter 'trip_distance > 10' \
+  --columns VendorID,trip_distance -o selected.parquet
+
+# Inspect footer metadata without decoding the data pages.
+zpq inspect trips.parquet
+zpq inspect 'daily/*.parquet' --format json | jq '.files[].row_groups'
+zpq inspect trips.parquet --detail --format json
+
+# The same paths work with configured S3 credentials and region.
+zpq schema s3://my-bucket/trips.parquet
+zpq inspect s3://my-bucket/trips.parquet
+zpq query s3://my-bucket/trips.parquet --aggregate 'count(*) AS rows'
+```
+
+Quote a glob so zpq expands it: **one `*` in the basename**, with lexically sorted matches. Directory wildcards,
+`**`, `?` and character classes are not supported by zpq. Query and inspect accept multiple explicit paths or these
+globs (including S3 prefix listings); schema takes exactly one local path or S3 URL. An empty match is an error.
+Multiple inspect inputs produce one `files` array in JSON, or one text report per file. A file error is retained
+in that array and makes the command exit 1. See [the inspection schema](docs/inspect.md).
+
+Python can hand filtered Parquet to DuckDB without parsing a console table:
+
+```python
+import subprocess
+import duckdb
+
+subprocess.run(["zpq", "query", "trips.parquet", "--filter", "trip_distance > 10",
+                "--columns", "VendorID,trip_distance", "-o", "selected.parquet"], check=True)
+rows = duckdb.sql("SELECT VendorID, sum(trip_distance) FROM 'selected.parquet' GROUP BY VendorID").fetchall()
+```
+
+This stages a file; its write/read costs are part of the hand-off. For the separately built in-process binding,
+see [libzpq](docs/libzpq.md). `--format json` emits an array, and `--summary=json` opts into a typed stderr summary.
+CSV is reserved. Set `pipefail` when downstream consumers must detect partial output or a closed pipe (exit 141).
+Completions and a manual are in `packaging/`: source `packaging/completions/zpq.bash`, put `_zpq` on zsh's `fpath`
+before `compinit`, or copy `zpq.fish` into fish's completions directory. For example, `zpq --<TAB>` lists options.
+`man -l packaging/man/zpq.1` opens the manual. Regenerate these files with `python3 tools/generate_cli_docs.py`;
+`--check` rejects drift from the embedded help source.
+
 ## On AWS Lambda: built for cold starts
 
 `zpq-lambda` is a static binary for the `provided.al2023` runtime, and its cold start is the point. On 2026-10-05 in

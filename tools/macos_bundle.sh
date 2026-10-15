@@ -17,24 +17,27 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 OUT_DIR="$(mkdir -p "${1:-zig-out/macos-check}" && cd "${1:-zig-out/macos-check}" && pwd)"
-TARGETS="aarch64-macos x86_64-macos"
+TARGETS="${ZPQ_MAC_TARGETS:-aarch64-macos}"
 PY="${PYTHON:-}"
 if [ -z "$PY" ]; then if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi
 "$PY" -c 'import pyarrow' 2> /dev/null || { echo "need a python with pyarrow (set PYTHON=...)" >&2; exit 2; }
 
 REV="$(git describe --always --dirty 2> /dev/null || echo unknown)"
 NAME="zpq-macos-check-$REV"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/zpq-macos-bundle.XXXXXX")"
+TMP="$(mktemp -d "$OUT_DIR/.stage.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 STAGE="$TMP/$NAME"
 mkdir -p "$STAGE/bin" "$STAGE/smoke" "$STAGE/data" "$STAGE/ci"
+
+# All local TLS overrides must match the checked-in provenance before linking.
+python3 tools/verify_tls.py
 
 # ---- binaries: ReleaseFast CLI (what release.yml ships) + Debug test executables (what `zig build test` runs)
 for t in $TARGETS native; do
   tgt=(); [ "$t" = native ] || tgt=(-Dtarget="$t")
   echo "== building $t" >&2
-  zig build "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
-  zig build "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
+  zig build -j"${ZPQ_BUILD_JOBS:-8}" "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
+  zig build -j"${ZPQ_BUILD_JOBS:-8}" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
 done
 for t in $TARGETS; do
   mkdir -p "$STAGE/bin/$t"

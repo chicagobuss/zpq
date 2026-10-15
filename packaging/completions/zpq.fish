@@ -1,0 +1,37 @@
+# Generated; edit src/cli/help.txt.
+complete -c zpq -n '__fish_use_subcommand' -a 'conform help inspect query schema version'
+complete -c zpq -l aggregate
+complete -c zpq -l bloom-filter
+complete -c zpq -l codec
+complete -c zpq -l column-order
+complete -c zpq -l columns
+complete -c zpq -l compress-priority
+complete -c zpq -l detail
+complete -c zpq -l explain
+complete -c zpq -l fast-levels
+complete -c zpq -l filter
+complete -c zpq -l format
+complete -c zpq -l group-by
+complete -c zpq -l help
+complete -c zpq -l limit
+complete -c zpq -l max-memory
+complete -c zpq -l output
+complete -c zpq -l profile
+complete -c zpq -l profile-summary
+complete -c zpq -l query
+complete -c zpq -l scan-all
+complete -c zpq -l select
+complete -c zpq -l threads
+complete -c zpq -l trust-stats
+complete -c zpq -l unordered
+complete -c zpq -l version
+complete -c zpq -a '--summary=json'
+complete -c zpq -s V
+complete -c zpq -s a
+complete -c zpq -s c
+complete -c zpq -s f
+complete -c zpq -s g
+complete -c zpq -s h
+complete -c zpq -s j
+complete -c zpq -s o
+complete -c zpq -s s

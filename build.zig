@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
 
     // ----- CLI binary -----
     const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql);
+    const cli_version = b.addOptions();
+    var revision_status: u8 = 0;
+    const revision_args: []const []const u8 = &.{ "git", "describe", "--always", "--dirty", "--exclude=*", "--abbrev=12" };
+    const revision = b.runAllowFail(revision_args, &revision_status, .ignore) catch "unknown";
+    cli_version.addOption([]const u8, "revision", std.mem.trim(u8, revision, "\r\n"));
+    cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{
         .name = "zpq",
         .root_module = cli_zpq.root,
@@ -50,6 +56,10 @@ pub fn build(b: *std.Build) void {
 
     const cli_step = b.step("cli", "Build the CLI binary (zpq)");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+
+    const cli_tests = b.addTest(.{ .root_module = cli_zpq.root });
+    const test_cli_step = b.step("test-cli", "Run CLI inspection tests");
+    test_cli_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // ----- Lambda binary -----
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, sql);

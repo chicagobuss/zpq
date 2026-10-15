@@ -84,7 +84,7 @@ fail() {
 }
 
 # Timings and per-run numbers are the only nondeterministic part of an output.
-normalize() { sed -e 's/,"total_ms":.*$//'; }
+normalize() { cat; }
 
 # compare <golden> <file> [case]: record <file> as expected/<golden>, or diff it against that.
 compare() {
@@ -116,15 +116,15 @@ case_out() {
   if zq "$@"; then compare "$name" "$WORK/log/$name.out"; else fail "$name" "zpq exited $?" "$WORK/log/$name.err"; fi
 }
 
-# case_write <name> <golden> <codec or -> <args...>: zpq writes out/<name>.parquet; its content (dumped as CSV by
+# case_write <name> <golden> <codec or -> <args...>: zpq writes out/<name>.parquet; its content (dumped as NDJSON by
 # zpq) is compared against <golden>, and the codec it reports against <codec>.
 case_write() {
   local name="$1" golden="$2" codec="$3"; shift 3
-  if ! zq "$name" query "$@" -o "out/$name.parquet"; then fail "$name" "write failed" "$WORK/log/$name.err"; return; fi
+  if ! zq "$name" query "$@" --summary=json -o "out/$name.parquet"; then fail "$name" "write failed" "$WORK/log/$name.err"; return; fi
   if [ "$codec" != - ] && ! grep -q "\"codec\":\"$codec\"" "$WORK/log/$name.err"; then
     fail "$name" "reported codec is not $codec" "$WORK/log/$name.err"; return
   fi
-  if zq "$name.dump" query "out/$name.parquet" --format csv; then
+  if zq "$name.dump" query "out/$name.parquet" --format ndjson; then
     compare "$golden" "$WORK/log/$name.dump.out" "$name"
   else
     fail "$name" "zpq cannot read back its own output" "$WORK/log/$name.dump.err"
@@ -134,7 +134,7 @@ case_write() {
 # case_fail <name> <args...>: zpq must fail, and leave no out/<name>.parquet behind.
 case_fail() {
   local name="$1"; shift
-  if zq "$name" query "$@" -o "out/$name.parquet"; then fail "$name" "expected a failure"; return; fi
+  if zq "$name" query "$@" --summary=json -o "out/$name.parquet"; then fail "$name" "expected a failure"; return; fi
   if [ -e "$WORK/out/$name.parquet" ]; then fail "$name" "left a partial output file"; return; fi
   pass "$name"
 }
@@ -203,12 +203,14 @@ done
 case_out sql query --query "SELECT cat, count(*) AS n, sum(qty) AS s FROM 'smoke/part-*.parquet' WHERE qty > 50 GROUP BY cat"
 
 # Row output.
-case_out csv query 'smoke/part-*.parquet' --format csv --filter 'opt IS NULL' --columns id,qty,name,opt,day --limit 500 -j 4
-case_out jsonl query 'smoke/part-*.parquet' --format jsonl --select "id, qty * 2 AS q2, name || '-' || cat AS nc" --filter 'qty < 3' --limit 300
-if (cd "$WORK" && "$ZPQ" query 'smoke/part-*.parquet' --format csv 2> /dev/null | head -n 1) > "$WORK/log/csv_pipe.out"; then
-  compare csv_pipe "$WORK/log/csv_pipe.out"
+case_out ndjson query 'smoke/part-*.parquet' --format ndjson --filter 'opt IS NULL' --columns id,qty,name,opt,day --limit 500 -j 4
+case_out jsonl_alias query 'smoke/part-*.parquet' --format jsonl --select "id, qty * 2 AS q2, name || '-' || cat AS nc" --filter 'qty < 3' --limit 300
+case_out json_array query smoke/part-0.parquet --columns id,qty --format json --limit 3
+case_out inspect_json inspect smoke/part-0.parquet --format json
+if (cd "$WORK" && "$ZPQ" query 'smoke/part-*.parquet' --format ndjson 2> /dev/null | head -n 1) > "$WORK/log/ndjson_pipe.out"; then
+  compare ndjson_pipe "$WORK/log/ndjson_pipe.out"
 else
-  fail csv_pipe "zpq into a closed pipe failed"
+  fail ndjson_pipe "zpq into a closed pipe failed"
 fi
 
 # Writes: each codec, multi-file at several -j, a computed select, an aggregate.
@@ -222,7 +224,7 @@ done
 case_write w_select write_select - smoke/part-2.parquet --select 'id, price * 2 AS p2, coalesce(opt, -1) AS o' --filter "cat = 'blue'"
 case_write w_copy write_copy - smoke/part-3.parquet smoke/part-0.parquet
 if zq w_agg query 'smoke/part-*.parquet' --group-by cat -a 'count(*) AS n, sum(qty) AS s' -o out/w_agg.parquet \
-  && zq w_agg.dump query out/w_agg.parquet --format csv; then
+  && zq w_agg.dump query out/w_agg.parquet --format ndjson; then
   compare write_agg "$WORK/log/w_agg.dump.out" w_agg
 else
   fail w_agg "aggregate write or read-back failed" "$WORK/log/w_agg.err"

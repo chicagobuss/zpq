@@ -3920,6 +3920,8 @@ pub const Census = struct {
     /// Tests: the fingerprint bits kept below the partition's, fewer to make keys collide.
     fp_mask: u64 = (1 << 40) - 1,
     checked: bool = false,
+    /// A count(DISTINCT) census has judged its first keys asked for (`sampleSkew`).
+    sampled: bool = false,
     off: bool = false,
     /// Set for the admit pass.
     admitted: ?*const FingerprintSet = null,
@@ -3962,6 +3964,10 @@ pub const Census = struct {
 
     fn slot(self: *Census, hash: u64) !u32 {
         const i = self.batch.items.len;
+        if (self.distinct) if (self.dropped) |d| {
+            if (i % 4096 == 0 and d.load(.monotonic)) return error.CensusAbandoned;
+            if (!self.sampled and i == self.check_after) try self.sampleSkew();
+        };
         try self.batch.append(self.gpa, hash);
         return std.math.maxInt(u32) - @as(u32, @intCast(i));
     }
@@ -3991,6 +3997,33 @@ pub const Census = struct {
         } else if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
         self.dropped.?.store(true, .monotonic);
         self.stop();
+    }
+
+    /// The row path asks a slot of every row before any reaches the cells, a whole row group at a time: judged from the
+    /// hashes asked for so far, a skewed census is abandoned before the rest are. A coded batch asks once a code, so
+    /// its hashes repeat too little to abandon anything, and `judge` decides from the cells as usual.
+    fn sampleSkew(self: *Census) !void {
+        self.sampled = true;
+        const hashes = try self.gpa.dupe(u64, self.batch.items);
+        defer self.gpa.free(hashes);
+        std.mem.sortUnstable(u64, hashes, {}, std.sort.asc(u64));
+        const runs = try self.gpa.alloc(u64, hashes.len);
+        defer self.gpa.free(runs);
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < hashes.len) {
+            var j = i + 1;
+            while (j < hashes.len and hashes[j] == hashes[i]) j += 1;
+            runs[n] = j - i;
+            n += 1;
+            i = j;
+        }
+        std.mem.sortUnstable(u64, runs[0..n], {}, std.sort.desc(u64));
+        var held: u64 = 0;
+        for (runs[0..@min(n, self.admit_n)]) |r| held += r;
+        if (held *| 4 <= hashes.len) return;
+        self.dropped.?.store(true, .monotonic);
+        return error.CensusAbandoned;
     }
 
     /// Stops recording and frees the fingerprints; the batch's slots stay readable.
@@ -4132,6 +4165,8 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
         // An abandoned count(DISTINCT) census needs nothing more from this pass: stop mid row group.
         if (c.distinct) if (c.dropped) |d| if (d.load(.monotonic)) return error.CensusAbandoned;
         for (ids, 0..) |id, r| if (sel.isActive(r)) {
+            // Any worker may abandon it meanwhile; a row group is a million rows, too long to finish first.
+            if (c.distinct and r % 4096 == 0) if (c.dropped.?.load(.monotonic)) return error.CensusAbandoned;
             const hash = c.batch.items[std.math.maxInt(u32) - id];
             if (!c.off) {
                 try c.record(hash);

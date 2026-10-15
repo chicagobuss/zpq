@@ -629,7 +629,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     else
         null else null;
     const first_cut = count_agg == null and args.sketch_topk != null and args.sketch_topk.?.census and
-        firstCutEligible(args, use_blocks, in.work.len, tables);
+        firstCutEligible(args, in.calls, use_blocks, in.work.len, tables);
     const distinct_agg = if (count_agg == null)
         distinctCensusEligible(in, use_blocks, sketch_fits, (keys_unique and in.ndv_stat == null) or filter_small)
     else
@@ -1303,6 +1303,7 @@ fn rankingCall(
         .key => return null,
     };
     if (calls[a_idx].func != func) return null;
+    if (!callsTotal(calls)) return null;
     // The admitted cells must be few beside all of them, or admitting is grouping nearly everything.
     const k = order.offset +| limit;
     if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
@@ -1327,16 +1328,16 @@ fn distinctCensusEligible(in: PlanInputs, use_blocks: bool, sketch_fits: bool, f
     const cfg = in.args.sketch_topk orelse return null;
     const keys = in.keys orelse return null;
     if (!cfg.census or !sketch_fits) return null;
-    if (!callsTotal(in.calls)) return null;
     const a_idx = rankingCall(.count_distinct, cfg, in.args, in.outputs, in.calls, keys, in.filter_cols, use_blocks, filter_ok) orelse
         return null;
     return if (censusFits(in.metas, in.work, in.workers, in.args.max_memory)) a_idx else null;
 }
 
 /// Whether folding `calls` can never fail on a row. An argument computed from the row can (`1e12 / q` divides by
-/// zero, arithmetic overflows), and so can a DECIMAL sum or mean, past its precision. A cut that never reads some rows'
-/// aggregate inputs would drop their errors and answer where the full scan fails, so it takes only these calls. Keys
-/// and the outer filter are read on every row by the count pass, and filter leaves never fail.
+/// zero, arithmetic overflows), and so can a DECIMAL sum or mean, past its precision. The sketch, census and
+/// first-keys cuts never read some rows' aggregate inputs, and would drop their errors and answer where the full scan
+/// fails, so they take only these calls. Keys and the outer filter are read on every row by the count or discovery
+/// pass, and filter leaves never fail.
 fn callsTotal(calls: []const expr_agg.AggCall) bool {
     for (calls) |call| {
         if (call.arg) |arg| switch (arg) {
@@ -2159,8 +2160,10 @@ fn kthDistinct(
 }
 
 /// A LIMIT with no ORDER BY over a grouped scan of whole inputs (`firstKeysCut`).
-fn firstCutEligible(args: MultiAggArgs, use_blocks: bool, n_items: usize, n_tables: usize) bool {
+fn firstCutEligible(args: MultiAggArgs, calls: []const expr_agg.AggCall, use_blocks: bool, n_items: usize, n_tables: usize) bool {
     const order = args.result_order;
+    // Rows after the prefix are read only for the keys it found: a failing call on another key's row must not vanish.
+    if (!callsTotal(calls)) return false;
     const limit = order.limit orelse return false;
     if (use_blocks or n_tables == 0 or order.keys.len != 0 or order.offset +| limit == 0) return false;
     if (n_items == 0 or n_items >= expr_agg.Census.max_items) return false;
@@ -6883,6 +6886,39 @@ test "runMultiAggregate: a count(DISTINCT) census never drops the error a comput
     };
 }
 
+test "runMultiAggregate: count and first-keys cuts never drop the error a computed argument raises" {
+    // u = 573290335422 is the last row's, under a key of `t` seen once: neither a key the count cut admits nor one in
+    // the first keys' prefix.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const top: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    const Case = struct { aggregate: []const u8, order: expr_ast.ResultOrder };
+    const cases = [_]Case{
+        .{ .aggregate = "count(*) AS c, sum(100 / (u - 573290335422)) AS s", .order = top },
+        .{ .aggregate = "sum(100 / (u - 573290335422)) AS s", .order = .{ .limit = 3 } },
+    };
+    for (cases) |case| for ([_]?bool{ true, false }) |fuse| for ([_]usize{ 1, 3, 16 }) |parallelism| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .ndv_policy = false,
+            .aggregate = case.aggregate,
+            .group_by = "t",
+            .parallelism = parallelism,
+            .min_bytes_per_worker = 1,
+            .result_order = case.order,
+            .sketch_topk = .{ .fuse_census = fuse },
+        };
+        const ex = try explainAggregate(testing.allocator, arena, args);
+        try testing.expectEqual(.plain_hash, ex.plan.dispatch.strategy);
+        try testing.expectError(error.DivisionByZero, runMultiAggregate(testing.allocator, arena, args));
+    };
+}
+
 test "callsTotal: bare columns and literals cannot fail, computed arguments and DECIMAL sums can" {
     const col: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const ok = [_]expr_agg.AggCall{
@@ -9627,7 +9663,7 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
     else
         null else null;
     const first_cut = sketch_count == null and args.sketch_topk != null and args.sketch_topk.?.census and
-        firstCutEligible(args, use_blocks, in.work.len, tables);
+        firstCutEligible(args, in.calls, use_blocks, in.work.len, tables);
     const census_fits = blk: {
         if (in.work.len >= expr_agg.Census.max_items) break :blk false;
         var rows: u64 = 0;
@@ -9638,7 +9674,7 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
         const open = in.workers * expr_agg.Census.N_PARTS * @sizeOf(expr_agg.Census.Chunk);
         break :blk (rows *| 8) +| open <= args.max_memory / 4;
     };
-    const distinct_count: ?usize = if (sketch_count == null and sketch_fits and census_fits and callsTotal(in.calls)) if (args.sketch_topk) |cfg|
+    const distinct_count: ?usize = if (sketch_count == null and sketch_fits and census_fits) if (args.sketch_topk) |cfg|
         if (cfg.census) rankingCall(.count_distinct, cfg, args, in.outputs, in.calls, in.keys orelse &.{}, in.filter_cols, use_blocks, keys_unique or
             filterSmall(in.metas, in.work, in.keys orelse &.{}, in.filter_cols)) else null
     else null else null;

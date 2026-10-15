@@ -969,6 +969,9 @@ def main():
         f"SELECT k, count(DISTINCT 1000000000000 / q) AS d FROM '{cut_err}' GROUP BY k ORDER BY d DESC LIMIT 10",
         f"SELECT k, count(DISTINCT q) AS d, sum(1000000000000 / q) AS s FROM '{cut_err}' GROUP BY k "
         "ORDER BY d DESC LIMIT 10",
+        # The COUNT census reads aggregate inputs only for the keys it admits, too (first keys: the scan.zig tests,
+        # whose fixture keeps the failing row out of the prefix).
+        f"SELECT k, count(*) AS c, sum(1000000000000 / q) AS s FROM '{cut_err}' GROUP BY k ORDER BY c DESC LIMIT 10",
     ]
     for i, sql in enumerate(CUT_ERRORS):
         for j in ("1", "3", "16"):

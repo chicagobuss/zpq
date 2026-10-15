@@ -5171,6 +5171,13 @@ fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ke
     }
 }
 
+/// Whether every output column and sort key is a bare input column, which no row can fail to produce.
+fn allPassthrough(specs: []const consumer.OutputCol, keys: []const RowSortKey) bool {
+    for (specs) |spec| if (spec == .computed) return false;
+    for (keys) |key| if (key.spec == .computed) return false;
+    return true;
+}
+
 /// A row group of the plain-row Top-N scan, and the best first key its statistics allow (`rowGroupBest`).
 const RankedRG = struct {
     file: u32,
@@ -5593,8 +5600,10 @@ pub fn runPrintTo(
         var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory / 2);
         defer top.deinit();
         // With a LIMIT, row groups go most promising first, and one whose statistics cannot beat the heap's last row
-        // is passed over. Ties keep their input positions (`RowPos`), so the order read changes no answer.
-        const bounded = limit != null and !args.scan_all;
+        // is passed over. Ties keep their input positions (`RowPos`), so the order read changes no answer. Only over
+        // bare columns: a computed output or key can fail on a row (`100 / id`), and passing over its group would
+        // answer where reading in order raises the error. Filter leaves compare a column with a literal and never fail.
+        const bounded = limit != null and !args.scan_all and allPassthrough(output_specs, proj.row_keys);
         if (limit != 0) for (try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded)) |item| {
             const in = opened.inputs[item.file];
             const meta_i = &metas[item.file];
@@ -7875,4 +7884,14 @@ test "RankedRG.sooner reads unbounded row groups first in input order, then the 
             try testing.expectEqual(w[1], r.rg);
         }
     }
+}
+
+test "allPassthrough keeps a computed output or key off the bound-first Top-N" {
+    const testing = std.testing;
+    const bare = [_]consumer.OutputCol{ .{ .passthrough = 0 }, .{ .passthrough = 3 } };
+    const key: RowSortKey = .{ .spec = .{ .passthrough = 1 }, .descending = false, .unsigned = false };
+    try testing.expect(allPassthrough(&bare, &.{key}));
+    const computed: consumer.OutputCol = .{ .computed = .{ .expr = undefined, .alias = "z" } };
+    try testing.expect(!allPassthrough(&.{ bare[0], computed }, &.{key}));
+    try testing.expect(!allPassthrough(&bare, &.{ key, .{ .spec = computed, .descending = true, .unsigned = false } }));
 }

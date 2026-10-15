@@ -939,6 +939,22 @@ def main():
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
 
+    # A computed output that fails on a row whose group statistics would pass it over: the error must stand, as it
+    # does reading in input order, whatever the order and pruning a bare-column Top-N may use.
+    err_file = os.path.join(tmp, "topn_error.parquet")
+    import pyarrow as pa_err  # `pa` is local to main (imported again below), unbound here
+    pq.write_table(pa_err.table({"id": [0, 1], "k": [100, 0]}), err_file, row_group_size=1, use_dictionary=False)
+    for extra in ([], ["--scan-all"]):
+        total += 1
+        r = subprocess.run([ZPQ, "query", "--query", f"SELECT 100 / id AS z FROM '{err_file}' ORDER BY k LIMIT 1"]
+                           + extra, capture_output=True, text=True)
+        label = f"top-rows:fallible-output {' '.join(extra) or 'default'}"
+        if r.returncode == 1 and not r.stdout and "division by zero" in r.stderr:
+            print(f"  OK    {label}  (fails as in input order)")
+        else:
+            fails += 1
+            print(f"  FAIL  {label}  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr[:90]!r}")
+
     # A full sort holds every row: past its share of --max-memory it fails cleanly instead of running out.
     total += 1
     r = subprocess.run([ZPQ, "query", "--query", f"SELECT * FROM '{fixture}' ORDER BY name", "--max-memory", "300000"],

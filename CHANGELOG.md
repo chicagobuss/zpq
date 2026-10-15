@@ -115,3 +115,12 @@
 - S3: the fetched file tail is freed when every row group prunes, and the connection pool is freed when opening an
   input fails.
 - `--profile` checks its path before the query runs, and replaces the file only once the trace is complete.
+- Rewrites write non-decimal FIXED_LEN_BYTE_ARRAY columns (UUID, fixed binary) correctly. A dictionary-encoded one
+  carried a length before each dictionary entry, which FLBA's PLAIN form does not have, so other readers returned
+  incorrect values without an error; 0.4.1 did the same. One without a dictionary could be written as
+  DELTA_LENGTH_BYTE_ARRAY, which the format allows for BYTE_ARRAY only, and strict readers refused the file. FLBA now
+  writes bare values, as DELTA_BYTE_ARRAY where shared prefixes pay and as PLAIN otherwise.
+- Written float statistics follow the format's rules: NaN never enters min or max (a chunk whose first value was NaN
+  wrote NaN as both, so no reader could prune it), an all-NaN chunk writes no bounds, and a zero bound is written as
+  `-0.0` (min) or `+0.0` (max). A row group's `total_byte_size` is its uncompressed column bytes, as the format
+  defines it, where it was the compressed size. 0.4.1 had both. Byte-copied chunks keep their source's statistics.

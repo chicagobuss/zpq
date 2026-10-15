@@ -210,9 +210,10 @@ keys over nullable DECIMAL columns are exact.
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
 arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and
-DELTA_LENGTH_BYTE_ARRAY otherwise. DECIMAL columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never a lossy detour through
-DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes currently omit them and
-readers fall back to row-group pruning.
+DELTA_LENGTH_BYTE_ARRAY otherwise (PLAIN for FIXED_LEN_BYTE_ARRAY, which DELTA_LENGTH_BYTE_ARRAY does not allow).
+DECIMAL columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never
+a lossy detour through DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes
+currently omit them and readers fall back to row-group pruning.
 
 `--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
 codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names

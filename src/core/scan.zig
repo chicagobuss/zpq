@@ -2095,7 +2095,7 @@ fn prepareAggregate(
         const files = try arena.alloc([]const u8, args.inputs.len);
         for (args.inputs, files) |in, *b| b.* = in.bytes;
         const mapped: membership.MappedSource = .{ .files = files };
-        membership_stats = try membership.load(arena, gpa, f, metas, mapped.source(), .{});
+        membership_stats = try membership.load(arena, gpa, f, metas, mapped.source(), .{ .threads = args.parallelism });
     };
 
     // 4. Build the flat row-group work list. If we have fewer row groups

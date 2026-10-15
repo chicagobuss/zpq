@@ -25,6 +25,7 @@ const compression = @import("../parquet/compression.zig");
 const thrift = @import("../thrift.zig");
 const coalescer = @import("../../io/coalescer.zig");
 const nowMonoNs = @import("../../clock.zig").monoNs;
+const spawn_util = @import("../spawn.zig");
 
 // ============================================================
 // Literal keys: the one place a bound literal becomes stored bytes
@@ -759,6 +760,8 @@ pub const Options = struct {
     /// rest are left unread: that bounds what filters cost a query they cannot help.
     wave: usize = 8,
     min_wave_prune: f64 = 0.25,
+    /// Threads that decompress and scan a wave's dictionaries; 0 means one per CPU. The verdicts do not depend on it.
+    threads: usize = 0,
 };
 
 pub const Stats = struct {
@@ -933,6 +936,7 @@ pub fn load(
     var p: Probing = .{
         .arena = arena,
         .scratch = scratch_meter.allocator(),
+        .gpa = gpa,
         .wave = &wave,
         .wave_meter = &wave_meter,
         .scratch_meter = &scratch_meter,
@@ -1094,6 +1098,14 @@ fn dictionaryValues(
     page: []const u8,
     codec: schema.CompressionCodec,
 ) ?struct { bytes: []const u8, count: usize } {
+    const d = dictionaryPayload(page) orelse return null;
+    const values = compression.decompress(scratch, d.payload, codec, d.size) catch return null;
+    return .{ .bytes = values, .count = d.count };
+}
+
+/// The compressed PLAIN values of the dictionary page `page` holds, with their decompressed size and count, or null
+/// for anything else (another page, another encoding, a truncated or corrupt header).
+fn dictionaryPayload(page: []const u8) ?struct { payload: []const u8, size: usize, count: usize } {
     var r = thrift.Reader.init(page);
     const h = schema.PageHeader.read(&r) catch return null;
     if (h.type != .DICTIONARY_PAGE) return null;
@@ -1102,11 +1114,57 @@ fn dictionaryValues(
     if (dh.num_values < 0 or h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return null;
     const csize: usize = @intCast(h.compressed_page_size);
     if (csize > page.len - r.pos) return null;
-    const payload = page[r.pos..][0..csize];
-    const size: usize = @intCast(h.uncompressed_page_size);
-    const values = compression.decompress(scratch, payload, codec, size) catch return null;
-    return .{ .bytes = values, .count = @intCast(dh.num_values) };
+    return .{
+        .payload = page[r.pos..][0..csize],
+        .size = @intCast(h.uncompressed_page_size),
+        .count = @intCast(dh.num_values),
+    };
 }
+
+/// One dictionary of a wave: what it is looked up for, and whether it could be read at all.
+const DictJob = struct {
+    page: []const u8,
+    codec: schema.CompressionCodec,
+    slot: Slot,
+    /// Sorted, distinct stored forms; `found[i]` is set for each the dictionary holds.
+    want: []const []const u8,
+    found: []bool,
+    /// Decompressed, then scanned. Without `ok` nothing is proven about the chunk.
+    decoded: bool = false,
+    ok: bool = false,
+};
+
+/// Decompresses and scans dictionary jobs claimed through `cursor`, each into the one buffer it reuses.
+const DictWorker = struct {
+    jobs: []DictJob,
+    cursor: *std.atomic.Value(usize),
+    buf: []u8,
+    gpa: std.mem.Allocator,
+
+    fn run(w: *DictWorker) void {
+        // Only GZIP keeps codec state, so this arena stays empty for the other codecs.
+        var codec_state = std.heap.ArenaAllocator.init(w.gpa);
+        defer codec_state.deinit();
+        while (true) {
+            const i = w.cursor.fetchAdd(1, .monotonic);
+            if (i >= w.jobs.len) return;
+            const job = &w.jobs[i];
+            const d = dictionaryPayload(job.page) orelse continue;
+            if (d.size > w.buf.len) continue;
+            const out = w.buf[0..d.size];
+            const values: []const u8 = if (d.size == 0) out else if (job.codec == .UNCOMPRESSED) blk: {
+                if (d.payload.len != d.size) continue;
+                break :blk d.payload;
+            } else blk: {
+                compression.decompressInto(codec_state.allocator(), d.payload, job.codec, out) catch continue;
+                break :blk out;
+            };
+            _ = codec_state.reset(.retain_capacity);
+            job.decoded = true;
+            job.ok = scanDictionary(values, d.count, job.slot, job.want, job.found);
+        }
+    }
+};
 
 /// Mark `found[i]` for every `want[i]` (sorted, distinct stored forms) among the `count` PLAIN values `values` holds.
 /// False when the values do not parse as `count` entries of the slot's type: then nothing can be concluded.
@@ -1205,6 +1263,8 @@ const Probing = struct {
     arena: std.mem.Allocator,
     /// Bytes read and decoded along the way.
     scratch: std.mem.Allocator,
+    /// Thread-safe, for the dictionary threads' codec state only.
+    gpa: std.mem.Allocator = std.heap.page_allocator,
     /// Filter bodies of the wave in hand. Reset after the wave is probed, so the next wave does not keep them.
     wave: *std.heap.ArenaAllocator,
     /// Requested sizes of `wave` and `scratch` allocations. Null when a test drives them directly.
@@ -1860,16 +1920,19 @@ const Probing = struct {
         self.src.prefetch(pages);
         try readAll(a, self.src, reqs.items, self.stats, .cost, null);
 
-        var want: std.ArrayList([]const u8) = .empty;
-        for (wave, req_of) |t, ri| {
+        // Every form of every key still open per dictionary, sorted so each entry costs one binary search. Only what
+        // earlier waves proved is sorted; this one appends after the scan.
+        const jobs = try a.alloc(DictJob, wave.len);
+        const job_of = try a.alloc(?usize, wave.len);
+        var n_jobs: usize = 0;
+        var max_size: usize = 0;
+        for (wave, req_of, job_of) |t, ri, *ji| {
+            ji.* = null;
             const page = reqs.items[ri orelse continue].out;
-            const cm = t.chunk(self.metas).meta_data.?;
-            const values = dictionaryValues(a, page, cm.codec) orelse continue;
-            self.stats.dictionaries += 1;
-            // Every form of every key still open, sorted so each entry costs one binary search. Only what earlier
-            // waves proved is sorted; this one appends below.
+            const d = dictionaryPayload(page) orelse continue;
+            const slot = chunkSlot(t.rowGroup(self.metas), t.col, &self.metas[t.file]) orelse continue;
             const proven = t.absent.items;
-            want.clearRetainingCapacity();
+            var want: std.ArrayList([]const u8) = .empty;
             for (t.keys.items) |*k| {
                 if (isAbsent(proven, k)) continue;
                 for (0..k.n) |fi| try want.append(a, k.form(fi));
@@ -1882,21 +1945,56 @@ const Probing = struct {
                 want.items[n] = w;
                 n += 1;
             }
-            want.shrinkRetainingCapacity(n);
-            const found = try a.alloc(bool, want.items.len);
+            const found = try a.alloc(bool, n);
             @memset(found, false);
-            const slot = chunkSlot(t.rowGroup(self.metas), t.col, &self.metas[t.file]) orelse continue;
-            if (!scanDictionary(values.bytes, values.count, slot, want.items, found)) continue;
+            jobs[n_jobs] = .{
+                .page = page,
+                .codec = t.chunk(self.metas).meta_data.?.codec,
+                .slot = slot,
+                .want = want.items[0..n],
+                .found = found,
+            };
+            ji.* = n_jobs;
+            n_jobs += 1;
+            max_size = @max(max_size, d.size);
+        }
+        try self.scanDictionaries(jobs[0..n_jobs], max_size);
+
+        for (wave, job_of) |t, ji| {
+            const job = jobs[ji orelse continue];
+            if (job.decoded) self.stats.dictionaries += 1;
+            if (!job.ok) continue;
+            const proven = t.absent.items;
             for (t.keys.items) |*k| {
                 if (isAbsent(proven, k)) continue;
                 const held = for (0..k.n) |fi| {
-                    const at = std.sort.binarySearch([]const u8, want.items, k.form(fi), orderBytes).?;
-                    if (found[at]) break true;
+                    const at = std.sort.binarySearch([]const u8, job.want, k.form(fi), orderBytes).?;
+                    if (job.found[at]) break true;
                 } else false;
                 if (!held) try t.absent.append(self.arena, k.form(0));
             }
         }
     }
+
+    /// Run `jobs` over up to `opts.threads` threads, each reusing one buffer of `max_size` bytes. A wave this small,
+    /// or one that has no thread to spare, runs here.
+    fn scanDictionaries(self: *Probing, jobs: []DictJob, max_size: usize) !void {
+        const want_threads = if (self.opts.threads == 0) std.Thread.getCpuCount() catch 1 else self.opts.threads;
+        const n_threads = @min(want_threads, jobs.len, max_threads);
+        var cursor: std.atomic.Value(usize) = .init(0);
+        var workers: [max_threads]DictWorker = undefined;
+        for (workers[0..@max(n_threads, 1)]) |*w| w.* = .{
+            .jobs = jobs,
+            .cursor = &cursor,
+            .buf = try self.scratch.alloc(u8, max_size),
+            .gpa = self.gpa,
+        };
+        const config: std.Thread.SpawnConfig = .{ .stack_size = 1 << 20 };
+        if (n_threads <= 1 or !spawn_util.runTree(DictWorker, workers[0..n_threads], config, DictWorker.run))
+            workers[0].run();
+    }
+
+    const max_threads = 16;
 
     /// The blocks the keys select in each filter of known length, located through the canonical header, plus that
     /// filter's real header to check the location by. Filters it cannot locate stay whole; null when it locates none.
@@ -3432,12 +3530,13 @@ test "dictionaries prune what statistics and Bloom filters cannot, and compose w
         .{ .e = "cat = 'm-3' AND id = 1001", .kept = &.{}, .dict = 0 },
         .{ .e = "cat != 'm-3'", .kept = &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, .dict = 0 },
     };
-    for (cases) |c| {
+    // The dictionaries of a wave are scanned on however many threads; what they prove must not depend on it.
+    for ([_]usize{ 1, 3, 0 }) |threads| for (cases) |c| {
         for (metas[0].row_groups.items) |rg| for (rg.columns.items) |*ch| {
             ch.absent = &.{};
         };
         const f = try parser.parse(a, c.e, &metas[0], null);
-        const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{});
+        const st = try load(a, testing.allocator, f, &metas, mapped.source(), .{ .threads = threads });
         for (metas[0].row_groups.items, 0..) |*rg, i| {
             const keep = std.mem.indexOfScalar(usize, c.kept, i) != null;
             testing.expectEqual(keep, prune.pruneRowGroup(rg, f, &metas[0]) != .skip) catch |err| {
@@ -3446,7 +3545,7 @@ test "dictionaries prune what statistics and Bloom filters cannot, and compose w
             };
         }
         try testing.expectEqual(c.dict, st.row_groups_dict);
-    }
+    };
 }
 
 test "zpq's own dictionary chunks say they cover their values" {

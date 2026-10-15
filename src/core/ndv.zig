@@ -418,6 +418,7 @@ fn unionBound(
     // Binding permits schema evolution across inputs. Raw dictionary images only union safely when their
     // physical/logical interpretation matches; otherwise the sum of per-RG bounds remains valid.
     var page_need: u64 = 1;
+    var max_entries: u64 = 0;
     if (refs.len > 0) {
         const first = refs[0];
         const cm0 = metas[first.file].row_groups.items[first.rg].columns.items[col].meta_data.?;
@@ -429,6 +430,7 @@ fn unionBound(
             const h = header(bytes) orelse return null;
             page_need = @max(page_need, @as(u64, @intCast(h.uncompressed_page_size)) +|
                 (@as(u64, @intCast(h.dictionary_page_header.?.num_values)) *| 32));
+            max_entries = @max(max_entries, @as(u64, @intCast(h.dictionary_page_header.?.num_values)));
             if (cm.type != cm0.type or se.converted_type != se0.converted_type or
                 !std.meta.eql(se.logical_type, se0.logical_type) or se.scale != se0.scale or
                 se.precision != se0.precision or se.type_length != se0.type_length) return null;
@@ -468,7 +470,20 @@ fn unionBound(
         shared.dropped = .init(false);
         shared.retain_limit = max_memory / 16;
         shared.strict = strict;
-        for (&parts) |*p| p.mapped = true;
+        // The largest dictionary is a floor on the domain: its share of it, sized once, spares each map its growth.
+        const each: u32 = @intCast(@min(max_entries, agg_dense.max_ids) / P + 64);
+        for (&parts) |*p| {
+            p.mapped = true;
+            if (!shared.charge(@as(usize, each) * 32)) break;
+            p.ids.ensureTotalCapacity(gpa, each) catch {
+                _ = shared.drop();
+                break;
+            };
+            p.vals.ensureTotalCapacity(gpa, each) catch {
+                _ = shared.drop();
+                break;
+            };
+        }
     }
     defer if (shared.trans.len > 0) {
         for (shared.trans) |t| gpa.free(t);

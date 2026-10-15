@@ -1817,17 +1817,18 @@ fn censusTopK(
         restoreCounts(workers, counted);
         if (!prefix or need >= sure_need) {
             const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
-            if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d} prefix={} need={d} admit_ms={d} kth_total={d}\n", .{
-                count_ms, items.len, t, n_admit, prefix, need, @divTrunc(nowMonoNs() - t1, 1_000_000), kth,
+            const sure = cfg.certify and (prefix or kth >= t);
+            if (cfg.trace) std.debug.print("census: count_ms={d} repeated={d} t={d} admit={d} prefix={} need={d} admit_ms={d} kth_total={d} certified={}\n", .{
+                count_ms, items.len, t, n_admit, prefix, need, @divTrunc(nowMonoNs() - t1, 1_000_000), kth, sure,
             });
-            break cfg.certify and (prefix or kth >= t);
+            break sure;
         }
         // A key grouped though not admitted had its one row in the prefix: one group in one table, earlier than any
         // key left out. k of them, with the admitted keys counted exactly, certify the cut.
         var fresh: usize = 0;
         for (tables) |*tb| fresh += tb.unadmittedGroups(&censuses[0]);
-        if (cfg.trace) std.debug.print("census: short prefix need={d} fresh={d} admit_ms={d}\n", .{
-            need, fresh, @divTrunc(nowMonoNs() - t1, 1_000_000),
+        if (cfg.trace) std.debug.print("census: short prefix need={d} fresh={d} admit_ms={d} certified={}\n", .{
+            need, fresh, @divTrunc(nowMonoNs() - t1, 1_000_000), cfg.certify and fresh >= k,
         });
         if (fresh >= k) {
             short = true;

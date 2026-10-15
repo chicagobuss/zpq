@@ -517,22 +517,12 @@ pub fn groupedCoded(
     }
     var scratch: std.ArrayList(u8) = .empty;
     const rows = try ra.alloc(usize, keys.len);
-    // One pass finds each composite's first selected row; only composites that occur get resolved, in the order they
-    // first occur, so a new group's position is where it first appears.
+    // One pass finds each composite's first selected row; only composites that occur get resolved, each at that
+    // row, so a new group's position is where it first appears. Resolved in code order: a group keeps the least
+    // position it is asked for and the answer orders by that, so the order groups are made in decides nothing.
     const first_row = try compositeFirstRows(ra, comp, space, sel);
-    const order = try ra.alloc(u32, space);
-    var n_occur: usize = 0;
     for (first_row, 0..) |fr, cp| {
         if (fr == no_row) continue;
-        order[n_occur] = @intCast(cp);
-        n_occur += 1;
-    }
-    std.mem.sort(u32, order[0..n_occur], first_row, struct {
-        fn lt(fr: []const u32, a: u32, b: u32) bool {
-            return fr[a] < fr[b];
-        }
-    }.lt);
-    for (order[0..n_occur]) |cp| {
         var rem: usize = cp;
         var i: usize = keys.len;
         while (i > 0) {

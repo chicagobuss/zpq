@@ -382,6 +382,120 @@ def stats_order_checks(con, tmp):
     return total, fails
 
 
+def writer_wire_checks(con, tmp):
+    """Re-encoded FIXED_LEN_BYTE_ARRAY columns, float statistics and row-group sizes, read back by both readers.
+
+    FLBA's PLAIN form carries no lengths (a dictionary page with them reads back as incorrect values in every reader)
+    and DELTA_LENGTH_BYTE_ARRAY is BYTE_ARRAY-only (strict readers reject it). Float bounds exclude NaN and write a zero
+    min as -0.0 and a zero max as +0.0. total_byte_size is the uncompressed column data. Returns (total, fails)."""
+    import math, random, uuid
+    total = fails = 0
+
+    def report(ok, label, detail=""):
+        nonlocal total, fails
+        total += 1
+        fails += not ok
+        print(f"  {'OK  ' if ok else 'FAIL'}  writer-wire:{label:34} {detail}")
+
+    def norm(v):
+        if isinstance(v, uuid.UUID):
+            return v.bytes
+        if isinstance(v, float):
+            return ("nan",) if math.isnan(v) else (v, math.copysign(1, v))
+        return v
+
+    rnd = random.Random(11)
+    n = 400
+    nan = float("nan")
+    flba = os.path.join(tmp, "ww_flba.parquet")
+    pq.write_table(pa.table({
+        "id": pa.array(range(n), pa.int32()),
+        "lo": pa.array([bytes([i % 3]) * 4 for i in range(n)], pa.binary(4)),
+        "lo_null": pa.array([None if i % 7 == 0 else bytes([i % 5]) * 4 for i in range(n)], pa.binary(4)),
+        "rand": pa.array([rnd.randbytes(16) for _ in range(n)], pa.binary(16)),
+        "rand_null": pa.array([None if i % 3 == 0 else rnd.randbytes(16) for i in range(n)], pa.binary(16)),
+        "pre": pa.array([bytes(12) + i.to_bytes(4, "big") for i in range(n)], pa.binary(16)),
+        "uuid": pa.array([rnd.randbytes(16) for _ in range(n)], pa.binary(16)).cast(pa.uuid()),
+    }), flba, use_dictionary=False)
+    floats = os.path.join(tmp, "ww_floats.parquet")
+    pq.write_table(pa.table({
+        "id": pa.array(range(n), pa.int32()),
+        "nan_first": pa.array([nan if i % 4 == 1 else float(i % 50 - 20) for i in range(n)], pa.float64()),
+        "nan_first32": pa.array([nan if i % 4 == 1 else float(i % 50 - 20) for i in range(n)], pa.float32()),
+        "all_nan": pa.array([nan] * n, pa.float64()),
+        "zero_min": pa.array([0.0 if i % 2 else float(i) for i in range(n)], pa.float64()),
+        "zero_max": pa.array([-0.0 if i % 2 else -float(i) for i in range(n)], pa.float64()),
+        "dict_nan": pa.array([[nan, 0.0, 2.5][i % 3] for i in range(n)], pa.float64()),
+        "nulls_nan": pa.array([None if i % 2 else (nan if i % 3 else 1.5) for i in range(n)], pa.float64()),
+    }), floats, use_dictionary=False)
+
+    # (label, fixture, zpq args, rows kept): a filter re-encodes, --codec alone recompresses, --columns byte-copies.
+    cases = [
+        ("flba re-encode", flba, ["--filter", "id >= 1"], "id >= 1"),
+        ("floats re-encode", floats, ["--filter", "id >= 1"], "id >= 1"),
+        ("floats recompress", floats, ["--codec", "zstd"], None),
+        ("flba copy columns", flba, ["--columns", "id,rand,lo"], None),
+    ]
+    for label, fixture, args, where in cases:
+        out = os.path.join(tmp, "ww_out.parquet")
+        if os.path.exists(out):
+            os.remove(out)
+        r = subprocess.run([ZPQ, "query", fixture, "-o", out] + args, capture_output=True, text=True)
+        if r.returncode != 0:
+            report(False, label, f"ZPQ error: {r.stderr.strip()[:70]}")
+            continue
+        cols = pq.ParquetFile(out).schema_arrow.names
+        sel = ", ".join(cols)
+        cond = f" WHERE {where}" if where else ""
+        want = sorted([tuple(norm(v) for v in row)
+                       for row in con.execute(f"SELECT {sel} FROM '{fixture}'{cond}").fetchall()], key=repr)
+        try:
+            got_pa = sorted([tuple(norm(r[c]) for c in cols) for r in pq.read_table(out).to_pylist()], key=repr)
+            report(got_pa == want, f"{label} × pyarrow values", f"{len(got_pa)} rows")
+        except Exception as e:
+            report(False, f"{label} × pyarrow values", str(e)[:70])
+        try:
+            got_dk = sorted([tuple(norm(v) for v in row)
+                             for row in con.execute(f"SELECT {sel} FROM '{out}'").fetchall()], key=repr)
+            report(got_dk == want, f"{label} × duckdb values", f"{len(got_dk)} rows")
+        except Exception as e:
+            report(False, f"{label} × duckdb values", str(e)[:70])
+
+        meta = pq.ParquetFile(out).metadata
+        sizes_ok = all(meta.row_group(g).total_byte_size ==
+                       sum(meta.row_group(g).column(c).total_uncompressed_size for c in range(meta.num_columns))
+                       for g in range(meta.num_row_groups))
+        report(sizes_ok, f"{label} × total_byte_size")
+        encs_ok = all("DELTA_LENGTH_BYTE_ARRAY" not in meta.row_group(g).column(c).encodings
+                      for g in range(meta.num_row_groups) for c in range(meta.num_columns)
+                      if meta.row_group(g).column(c).physical_type == "FIXED_LEN_BYTE_ARRAY")
+        report(encs_ok, f"{label} × FLBA encodings")
+
+        try:
+            tbl = pq.read_table(out)
+        except Exception:
+            continue
+        bad = []
+        for c in range(meta.num_columns):
+            cc = meta.row_group(0).column(c)
+            if cc.physical_type not in ("FLOAT", "DOUBLE"):
+                continue
+            vals = [v for v in tbl.column(cc.path_in_schema).to_pylist() if v is not None and not math.isnan(v)]
+            st = cc.statistics
+            if not vals:
+                if st.has_min_max:
+                    bad.append(f"{cc.path_in_schema}: bounds on an all-NaN chunk")
+                continue
+            lo, hi = min(vals), max(vals)
+            lo = -0.0 if lo == 0 else lo
+            hi = 0.0 if hi == 0 else hi
+            if norm(st.min) != norm(lo) or norm(st.max) != norm(hi):
+                bad.append(f"{cc.path_in_schema}: [{st.min}, {st.max}] want [{lo}, {hi}]")
+        if "floats" in label and "recompress" not in label:
+            report(not bad, f"{label} × float bounds", "; ".join(bad)[:70])
+    return total, fails
+
+
 def main():
     self_check()
     con = duckdb.connect()
@@ -1506,6 +1620,10 @@ def main():
     so_total, so_fails = stats_order_checks(con, tmp)
     total += so_total
     fails += so_fails
+
+    ww_total, ww_fails = writer_wire_checks(con, tmp)
+    total += ww_total
+    fails += ww_fails
 
     print(f"\ndifferential: {total - fails}/{total} checks match (strict pyarrow read + DuckDB value diff + order)")
     sys.exit(1 if fails else 0)

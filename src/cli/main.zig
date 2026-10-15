@@ -117,7 +117,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "query")) {
         var diag: Diag = .{};
-        runQuery(init, &iter, &diag) catch |err| {
+        // Failed-input diagnostics borrow expanded SQL paths through error emission below.
+        var query_arena = std.heap.ArenaAllocator.init(gpa);
+        defer query_arena.deinit();
+        runQuery(init, &iter, &diag, query_arena.allocator()) catch |err| {
             if (err == error.BrokenPipe) std.process.exit(141);
             printDetail(&diag);
             switch (err) {
@@ -330,7 +333,12 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(2);
 }
 
-fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Diag) !void {
+fn runQuery(
+    init: std.process.Init,
+    iter: *std.process.Args.Iterator,
+    diag: *Diag,
+    arena: std.mem.Allocator,
+) !void {
     const gpa = init.gpa;
     const env = init.minimal.environ;
     const io = init.io;
@@ -558,10 +566,6 @@ fn runQuery(init: std.process.Init, iter: *std.process.Args.Iterator, diag: *Dia
         diagnosticPrint("zpq query: --bloom-filter requires --output\n", .{});
         return error.BadArgs;
     }
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     // Expand glob patterns. `data/*.parquet` → list of matching files;
     // literal paths pass through. Sorted within each pattern for

@@ -531,4 +531,5 @@ fi
 
 "$PY" tools/cli_contract_check.py "$ZPQ"
 "$PY" tools/cli_publication_check.py "$ZPQ"
+"$PY" tests/cli_diagnostics.py "$ZPQ"
 echo "CLI smoke: PASS"

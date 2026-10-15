@@ -245,11 +245,11 @@ if [ "$RECORD" = 1 ]; then
   :
 elif [ "$USE_PY" = 0 ]; then
   skip pyarrow "--no-python"
-elif ! command -v "$PY" > /dev/null 2>&1 || ! "$PY" -c 'import pyarrow' > /dev/null 2>&1; then
-  skip pyarrow "no python3 with pyarrow"
+elif ! command -v "$PY" > /dev/null 2>&1 || ! "$PY" -c 'import pyarrow, duckdb' > /dev/null 2>&1; then
+  skip pyarrow "install pyarrow and duckdb for independent validation"
 else
   if "$PY" - "$WORK" > "$WORK/log/pyarrow.out" 2>&1 <<'PY'
-import sys, pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq
+import sys, pathlib, collections, duckdb, pyarrow as pa, pyarrow.compute as pc, pyarrow.parquet as pq
 w = sys.argv[1]
 parts = [pq.read_table(f"{w}/smoke/part-{i}.parquet") for i in range(4)]
 cols = ["id", "qty", "price", "name", "opt", "day"]
@@ -281,7 +281,21 @@ assert got["p2"].to_pylist() == [v * 2 for v in p2["price"].to_pylist()]
 assert got["o"].to_pylist() == [-1 if v is None else v for v in p2["opt"].to_pylist()]
 
 same("w_copy", pq.read_table(f"{w}/out/w_copy.parquet"), pa.concat_tables([parts[3], parts[0]]))
-print("pyarrow: every written file reads back with the expected codec and values")
+groups = collections.defaultdict(lambda: [0, 0])
+for row in allp.select(["cat", "qty"]).to_pylist():
+    groups[row["cat"]][0] += 1
+    groups[row["cat"]][1] += row["qty"]
+agg = pq.read_table(f"{w}/out/w_agg.parquet").to_pylist()
+assert {row["cat"]: [row["n"], row["s"]] for row in agg} == dict(groups)
+con = duckdb.connect(config={"threads": 4})
+for path in sorted(pathlib.Path(w, "out").glob("*.parquet")):
+    con.register("arrow_output", pq.read_table(path))
+    sql = f"SELECT * FROM read_parquet('{path}')"
+    missing = con.execute(f"SELECT count(*) FROM (({sql}) EXCEPT ALL SELECT * FROM arrow_output)").fetchone()[0]
+    extra = con.execute(f"SELECT count(*) FROM (SELECT * FROM arrow_output EXCEPT ALL ({sql}))").fetchone()[0]
+    assert missing == extra == 0, (path.name, missing, extra)
+con.close()
+print("pyarrow + duckdb: every written file fully decoded; codec, values and multiset agree")
 PY
   then pass "pyarrow ($(tail -n 1 "$WORK/log/pyarrow.out"))"; else fail pyarrow "cross-check failed" "$WORK/log/pyarrow.out"; fi
 fi

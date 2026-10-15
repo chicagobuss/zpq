@@ -25,6 +25,8 @@ on:
     paths:
       - "**.zig"
       - "build.zig.zon"
+      - "src/cli/help.txt"
+      - "packaging/**"
       - "vendor/**"
       - "tools/**"
       - "tests/**"
@@ -34,6 +36,8 @@ on:
     paths:
       - "**.zig"
       - "build.zig.zon"
+      - "src/cli/help.txt"
+      - "packaging/**"
       - "vendor/**"
       - "tools/**"
       - "tests/**"
@@ -87,6 +91,12 @@ jobs:
           # so a meaningful build-graph change invalidates correctly.
           key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
           restore-keys: ${{ runner.os }}-x86_64-zig-
+
+      - name: Check generated CLI documentation
+        run: python3 tools/generate_cli_docs.py --check
+
+      - name: Test CLI inspection
+        run: zig build test-cli --summary all -j8
 
       - name: Fetch parquet-testing corpus
         run: |

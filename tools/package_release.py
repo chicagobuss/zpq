@@ -11,7 +11,7 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos")
+TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos")
 
 
 def sha(path):
@@ -22,7 +22,7 @@ def sha(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="zig-out/release")
-    parser.add_argument("--targets", default=",".join(TARGETS))
+    parser.add_argument("--targets", default=",".join(TARGETS[:3]))
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()
     out = Path(args.out).resolve()
@@ -75,6 +75,7 @@ def main():
                     entry.mode = 0o755 if filename == "bin/zpq" else 0o644
                     tar.addfile(entry, io.BytesIO(body))
         manifest["artifacts"][target] = {"file": name, "sha256": sha(artifact), "binary_sha256": sha(binary)}
+        (out / (name + ".sha256")).write_text(sha(artifact) + "  " + name + "\n")
         (out / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(target, name, manifest["artifacts"][target]["sha256"], flush=True)
 

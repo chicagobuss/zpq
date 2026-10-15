@@ -27,9 +27,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-linux
+          - target: x86_64-linux-musl
             artifact: zpq-linux-x86_64
-          - target: aarch64-linux
+          - target: aarch64-linux-musl
             artifact: zpq-linux-arm64
           - target: x86_64-macos
             artifact: zpq-macos-x86_64
@@ -49,22 +49,16 @@ jobs:
 
       # The build downloads the target's pinned BoringSSL prebuilts and
       # checks them against vendor/boring_tls/prebuilt.sha256.
-      - name: Build CLI
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast cli --summary all
-
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp zig-out/bin/zpq dist/
-          cd dist
-          tar -czvf ${{ matrix.artifact }}.tar.gz zpq
-          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+      - name: Build and package CLI with revision and TLS provenance
+        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/release.json
 
   release:
     name: Create Release
@@ -83,9 +77,27 @@ jobs:
           path: artifacts
 
       - name: Stage release directory
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
+          python3 - <<'PY_MERGE'
+          import json
+          from pathlib import Path
+          merged = None
+          for p in sorted(Path("artifacts").rglob("release.json")):
+              part = json.loads(p.read_text())
+              if merged is None:
+                  merged = {**part, "artifacts": {}}
+              for key in ("version", "revision", "zig", "tls_manifest_sha256"):
+                  assert merged[key] == part[key], (key, p)
+              merged["artifacts"].update(part["artifacts"])
+          assert merged is not None
+          Path("release/release.json").write_text(json.dumps(merged, indent=2) + "\n")
+          PY_MERGE
+          python3 tools/homebrew_formula.py release/release.json --out release/zpq.rb \
+            --base-url "https://github.com/chicagobuss/zpq/releases/download/${TAG}"
           ls -la release/
 
       - name: Upload to R2 (public)

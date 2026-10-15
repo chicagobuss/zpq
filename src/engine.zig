@@ -5262,6 +5262,55 @@ fn sortsAfter(key: RowSortKey, a: SortCell, b: SortCell) bool {
 /// Every worker holds a heap of that many keys, so it bounds the heaps as well as the gather.
 const max_gather_rows = 1 << 16;
 
+/// Bytes the parallel plain-row Top-N may hold at once: its heaps and their key copies, the merge, and the winners'
+/// gathered columns. Each is reserved before it is allocated and given back when freed, so a refusal comes before the
+/// memory does; it sends the query to `TopRows`, which answers the same. Row group decoding is not counted here, as it
+/// is not for `TopRows`.
+const Reservation = struct {
+    limit: usize,
+    used: std.atomic.Value(usize) = .init(0),
+
+    fn take(self: *Reservation, n: usize) error{ExceededMemoryBudget}!void {
+        var cur = self.used.load(.monotonic);
+        while (true) {
+            const next = std.math.add(usize, cur, n) catch return error.ExceededMemoryBudget;
+            if (next > self.limit) return error.ExceededMemoryBudget;
+            cur = self.used.cmpxchgWeak(cur, next, .monotonic, .monotonic) orelse return;
+        }
+    }
+
+    fn give(self: *Reservation, n: usize) void {
+        _ = self.used.fetchSub(n, .monotonic);
+    }
+};
+
+/// Exact blocks on `gpa`, each reserved before it is allocated: no arena, whose next block grows with the last, so
+/// what is held is what was reserved. One thread's at a time.
+const ReservedMem = struct {
+    gpa: std.mem.Allocator,
+    res: *Reservation,
+    blocks: std.ArrayList([]align(16) u8) = .empty,
+
+    fn alloc(m: *ReservedMem, comptime T: type, n: usize) ![]T {
+        comptime std.debug.assert(@alignOf(T) <= 16);
+        const size = std.math.mul(usize, n, @sizeOf(T)) catch return error.ExceededMemoryBudget;
+        try m.res.take(size);
+        errdefer m.res.give(size);
+        try m.blocks.ensureUnusedCapacity(m.gpa, 1);
+        const b = try m.gpa.alignedAlloc(u8, .@"16", size);
+        m.blocks.appendAssumeCapacity(b);
+        return @alignCast(std.mem.bytesAsSlice(T, b));
+    }
+
+    fn deinit(m: *ReservedMem) void {
+        for (m.blocks.items) |b| {
+            m.res.give(b.len);
+            m.gpa.free(b);
+        }
+        m.blocks.deinit(m.gpa);
+    }
+};
+
 /// The plain-row Top-N over inputs whose bytes are all in, in two passes. Workers rank row groups by their filter and
 /// key columns alone, each into a heap of its best `h` (keys, physical row position): a row outside a worker's best h
 /// has h rows ahead of it overall, so the heaps together hold the answer. They share the best cutoff any full heap has
@@ -5283,9 +5332,7 @@ const RankShared = struct {
     options: consumer.DecodeOptions,
     profiler: ?*profile.Profiler,
     cursor: work_cursor.AtomicWorkCursor(RankedRG),
-    /// What every worker's heap and key copies may take together.
-    budget: usize,
-    held: std.atomic.Value(usize) = .init(0),
+    res: *Reservation,
     /// A worker failed: the others stop taking row groups.
     failed: std.atomic.Value(bool) = .init(false),
     /// Bumped with every new cutoff, so a worker copies it only when it changed.
@@ -5295,7 +5342,10 @@ const RankShared = struct {
     cut: ?SortCell = null,
 
     fn deinit(self: *RankShared) void {
-        if (self.cut) |c| if (c == .str) self.gpa.free(c.str);
+        if (self.cut) |c| if (c == .str) {
+            self.res.give(c.str.len);
+            self.gpa.free(c.str);
+        };
     }
 };
 
@@ -5305,6 +5355,8 @@ const RankEntry = struct {
     cells: []SortCell,
     /// `ord` is the row's physical place in its row group, before the filter.
     pos: RowPos,
+    /// `cells` and their strings: one block on `gpa`, reserved, freed when the entry leaves the heap.
+    block: []align(@alignOf(SortCell)) u8,
 
     fn later(keys: []const RowSortKey, a: RankEntry, b: RankEntry) std.math.Order {
         if (TopRows.before(keys, b.cells, b.pos, a.cells, a.pos)) return .lt;
@@ -5320,12 +5372,8 @@ const RankEntry = struct {
 const RankWorker = struct {
     shared: *RankShared,
     index: usize,
+    /// Its capacity, `h`, reserved and allocated up front: a push never grows it.
     heap: std.PriorityQueue(RankEntry, []const RowSortKey, RankEntry.later),
-    /// The heap's cells and their strings. Evicted ones stay until `compact`.
-    store: std.heap.ArenaAllocator,
-    since_compact: usize = 0,
-    /// What this worker last added to `shared.held`.
-    held: usize = 0,
     /// This worker's copy of the shared cutoff, as of `cut_seen`; its string on `cut_buf`.
     cut: ?SortCell = null,
     cut_buf: std.ArrayList(u8) = .empty,
@@ -5337,19 +5385,22 @@ const RankWorker = struct {
     /// Row groups whose rows this worker offered, for its profile span.
     ranked: usize = 0,
 
-    fn init(shared: *RankShared, index: usize) RankWorker {
-        return .{
-            .shared = shared,
-            .index = index,
-            .heap = .initContext(shared.keys),
-            .store = .init(shared.gpa),
-        };
+    fn init(shared: *RankShared, index: usize) !RankWorker {
+        const size = std.math.mul(usize, shared.h, @sizeOf(RankEntry)) catch return error.ExceededMemoryBudget;
+        try shared.res.take(size);
+        errdefer shared.res.give(size);
+        var heap: std.PriorityQueue(RankEntry, []const RowSortKey, RankEntry.later) = .initContext(shared.keys);
+        try heap.ensureTotalCapacityPrecise(shared.gpa, shared.h);
+        return .{ .shared = shared, .index = index, .heap = heap };
     }
 
     fn deinit(w: *RankWorker) void {
-        w.heap.deinit(w.shared.gpa);
-        w.store.deinit();
-        w.cut_buf.deinit(w.shared.gpa);
+        const s = w.shared;
+        for (w.heap.items) |e| w.free(e);
+        s.res.give(w.heap.capacity() * @sizeOf(RankEntry));
+        w.heap.deinit(s.gpa);
+        s.res.give(w.cut_buf.capacity);
+        w.cut_buf.deinit(s.gpa);
     }
 
     fn run(w: *RankWorker) void {
@@ -5385,13 +5436,6 @@ const RankWorker = struct {
         };
         try w.rank(rg, meta, item.*);
         try w.publishCut();
-        const held = w.store.queryCapacity() + w.heap.capacity() * @sizeOf(RankEntry) + w.cut_buf.capacity;
-        const total = if (held >= w.held)
-            s.held.fetchAdd(held - w.held, .monotonic) + (held - w.held)
-        else
-            s.held.fetchSub(w.held - held, .monotonic) - (w.held - held);
-        w.held = held;
-        if (total > s.budget) return error.ExceededMemoryBudget;
     }
 
     /// Offer one row group's filtered rows to the heap, by their keys alone.
@@ -5411,7 +5455,6 @@ const RankWorker = struct {
         keyed.num_rows += p.surviving;
 
         const scratch = try ra.alloc(SortCell, s.keys.len);
-        const store = w.store.allocator();
         var i: usize = 0;
         for (p.sel.mask, 0..) |word, wi| {
             var bits = word;
@@ -5424,15 +5467,41 @@ const RankWorker = struct {
                 if (w.heap.count() == s.h) {
                     const top = w.heap.peek().?;
                     if (!TopRows.before(s.keys, scratch, pos, top.cells, top.pos)) continue;
-                    _ = w.heap.pop();
+                    w.free(w.heap.pop().?);
                 }
-                const cells = try store.alloc(SortCell, s.keys.len);
-                for (scratch, cells) |c, *d| d.* = try TopRows.ownCell(store, c);
-                try w.heap.push(s.gpa, .{ .cells = cells, .pos = pos });
-                w.since_compact += 1;
+                try w.admit(scratch, pos);
             }
         }
-        if (w.since_compact > 2 *| s.h +| 1024) try w.compact();
+    }
+
+    /// Push a row into the heap (which has room), its cells and strings copied into one reserved block.
+    fn admit(w: *RankWorker, cells_in: []const SortCell, pos: RowPos) !void {
+        const s = w.shared;
+        const head = cells_in.len * @sizeOf(SortCell);
+        var size = head;
+        for (cells_in) |c| if (c == .str) {
+            size += c.str.len;
+        };
+        try s.res.take(size);
+        errdefer s.res.give(size);
+        const block = try s.gpa.alignedAlloc(u8, .of(SortCell), size);
+        const cells: []SortCell = @alignCast(std.mem.bytesAsSlice(SortCell, block[0..head]));
+        var tail = block[head..];
+        for (cells_in, cells) |c, *d| {
+            d.* = c;
+            if (c == .str) {
+                @memcpy(tail[0..c.str.len], c.str);
+                d.* = .{ .str = tail[0..c.str.len] };
+                tail = tail[c.str.len..];
+            }
+        }
+        std.debug.assert(w.heap.count() < w.heap.capacity());
+        w.heap.push(s.gpa, .{ .cells = cells, .pos = pos, .block = block }) catch unreachable;
+    }
+
+    fn free(w: *RankWorker, e: RankEntry) void {
+        w.shared.res.give(e.block.len);
+        w.shared.gpa.free(e.block);
     }
 
     /// The best first key any row of a row group can have, from its string key chunk's dictionary: the smallest entry
@@ -5476,9 +5545,17 @@ const RankWorker = struct {
         s.cut_mutex.lockUncancelable(s.io);
         defer s.cut_mutex.unlock(s.io);
         const c = s.cut orelse return;
+        if (c == .str and c.str.len > w.cut_buf.capacity) {
+            const grow = c.str.len - w.cut_buf.capacity;
+            try s.res.take(grow);
+            w.cut_buf.ensureTotalCapacityPrecise(s.gpa, c.str.len) catch |e| {
+                s.res.give(grow);
+                return e;
+            };
+        }
         w.cut_buf.clearRetainingCapacity();
         w.cut = if (c == .str) .{ .str = blk: {
-            try w.cut_buf.appendSlice(s.gpa, c.str);
+            w.cut_buf.appendSliceAssumeCapacity(c.str);
             break :blk w.cut_buf.items;
         } } else c;
         w.cut_seen = s.cut_version.load(.monotonic);
@@ -5493,26 +5570,19 @@ const RankWorker = struct {
         s.cut_mutex.lockUncancelable(s.io);
         defer s.cut_mutex.unlock(s.io);
         if (s.cut) |c| if (!sortsAfter(s.keys[0], c, mine)) return;
-        const owned: SortCell = if (mine == .str) .{ .str = try s.gpa.dupe(u8, mine.str) } else mine;
-        if (s.cut) |c| if (c == .str) s.gpa.free(c.str);
+        const owned: SortCell = if (mine == .str) blk: {
+            try s.res.take(mine.str.len);
+            break :blk .{ .str = s.gpa.dupe(u8, mine.str) catch |e| {
+                s.res.give(mine.str.len);
+                return e;
+            } };
+        } else mine;
+        if (s.cut) |c| if (c == .str) {
+            s.res.give(c.str.len);
+            s.gpa.free(c.str);
+        };
         s.cut = owned;
         _ = s.cut_version.fetchAdd(1, .release);
-    }
-
-    /// Rebuild `store` with only the cells the heap still keeps.
-    fn compact(w: *RankWorker) !void {
-        var fresh = std.heap.ArenaAllocator.init(w.shared.gpa);
-        errdefer fresh.deinit();
-        const fa = fresh.allocator();
-        const cells = try fa.alloc([]SortCell, w.heap.items.len);
-        for (w.heap.items, cells) |e, *dst| {
-            dst.* = try fa.alloc(SortCell, e.cells.len);
-            for (e.cells, dst.*) |c, *d| d.* = try TopRows.ownCell(fa, c);
-        }
-        for (w.heap.items, cells) |*e, c| e.cells = c;
-        w.store.deinit();
-        w.store = fresh;
-        w.since_compact = 0;
     }
 };
 
@@ -5524,17 +5594,25 @@ const GatherGroup = struct {
 };
 
 /// One output column of one row group holding winners: its winners' values, read a run of rows at a time with the
-/// pages between them passed over (`consumer.SliceReader.skip`).
+/// pages between them passed over (`consumer.SliceReader.skip`). Its buffers are sized once, for its rows, and every
+/// byte is reserved first.
 const GatherTask = struct {
-    gpa: std.mem.Allocator,
     inputs: []const scan.Input,
     metas: []const schema.FileMetaData,
     group: *const GatherGroup,
     ci: usize,
     options: consumer.DecodeOptions,
+    /// In the output column's lane; a string's values point into `bytes` once `read` returns.
     buf: consumer.OutputAggregator.ColumnBuf,
-    arena: std.heap.ArenaAllocator,
+    mem: ReservedMem,
+    bytes: std.ArrayList(u8) = .empty,
     err: ?anyerror = null,
+
+    fn deinit(t: *GatherTask) void {
+        t.mem.res.give(t.bytes.capacity);
+        t.bytes.deinit(t.mem.gpa);
+        t.mem.deinit();
+    }
 
     fn run(t: *GatherTask) void {
         t.read() catch |e| {
@@ -5544,29 +5622,80 @@ const GatherTask = struct {
 
     fn read(t: *GatherTask) !void {
         const g = t.group;
+        const n = g.rows.len;
         const meta = &t.metas[g.file];
         const rg = &meta.row_groups.items[g.rg];
         const src: consumer.RGSrc = .{ .bytes = t.inputs[g.file].bytes, .byte_origin = 0 };
-        var held = std.heap.ArenaAllocator.init(t.gpa);
+        const cm = rg.columns.items[t.ci].meta_data orelse return error.ColumnMetaMissing;
+        const max_def = meta.getColumnLevels(cm.path_in_schema.items).max_def;
+        // A string's byte offsets into `bytes`, one past each value.
+        var ends: []usize = &.{};
+        switch (t.buf) {
+            inline else => |*tb| {
+                const T = @typeInfo(@TypeOf(tb.values.items)).pointer.child;
+                tb.values = .initBuffer(try t.mem.alloc(T, n));
+                if (max_def > 0) tb.def_levels = .initBuffer(try t.mem.alloc(u32, n));
+                if (T == []const u8) ends = try t.mem.alloc(usize, n);
+            },
+        }
+        var held = std.heap.ArenaAllocator.init(t.mem.gpa);
         defer held.deinit();
-        var r = (try consumer.SliceReader.init(held.allocator(), t.gpa, rg, meta, src, t.ci, t.options)) orelse
+        var r = (try consumer.SliceReader.init(held.allocator(), t.mem.gpa, rg, meta, src, t.ci, t.options)) orelse
             return error.NestedRowOutputNotSupported;
         defer r.deinit();
         var at: usize = 0;
         var i: usize = 0;
-        while (i < g.rows.len) {
+        while (i < n) {
             var j = i + 1;
-            while (j < g.rows.len and g.rows[j] == g.rows[j - 1] + 1) j += 1;
-            // Fresh per run: an arena reset that keeps its capacity swallows a failed allocation.
-            var slice = std.heap.ArenaAllocator.init(t.gpa);
+            while (j < n and g.rows[j] == g.rows[j - 1] + 1) j += 1;
+            var slice = std.heap.ArenaAllocator.init(t.mem.gpa);
             defer slice.deinit();
             const sa = slice.allocator();
             try r.skip(sa, g.rows[i] - at);
-            const col = try r.next(sa, j - i);
-            try consumer.appendColumnRows(&t.buf, col, j - i, t.arena.allocator(), sa);
+            const col = try consumer.outputLane(t.buf, try r.next(sa, j - i), sa);
+            switch (col) {
+                inline else => |c, tag| {
+                    if (!std.mem.eql(u8, @tagName(std.meta.activeTag(t.buf)), @tagName(tag))) return error.TypeMismatch;
+                    const tb = &@field(t.buf, @tagName(tag));
+                    if (@TypeOf(c.values) == []const []const u8) {
+                        var run_bytes: usize = 0;
+                        for (c.values) |v| run_bytes += v.len;
+                        try t.growBytes(run_bytes);
+                        for (c.values, ends[i..j]) |v, *e| {
+                            t.bytes.appendSliceAssumeCapacity(v);
+                            e.* = t.bytes.items.len;
+                        }
+                        tb.values.items.len += c.values.len;
+                    } else tb.values.appendSliceAssumeCapacity(c.values);
+                    if (max_def > 0) {
+                        if (c.def_levels) |dl| tb.def_levels.appendSliceAssumeCapacity(dl) else {
+                            tb.def_levels.appendNTimesAssumeCapacity(c.max_def, j - i);
+                        }
+                        tb.max_def = c.max_def;
+                    }
+                },
+            }
             at = g.rows[j - 1] + 1;
             i = j;
         }
+        if (t.buf == .string) for (t.buf.string.values.items, ends, 0..) |*v, end, k| {
+            v.* = t.bytes.items[if (k == 0) 0 else ends[k - 1]..end];
+        };
+    }
+
+    /// Room for `more` string bytes, the grown buffer reserved before it is allocated.
+    fn growBytes(t: *GatherTask, more: usize) !void {
+        const need = t.bytes.items.len + more;
+        if (need <= t.bytes.capacity) return;
+        const old = t.bytes.capacity;
+        const cap = @max(need, old *| 2);
+        // Both blocks while the bytes move.
+        try t.mem.res.take(cap);
+        t.bytes.ensureTotalCapacityPrecise(t.mem.gpa, cap) catch |e| {
+            t.mem.res.give(cap);
+            return e;
+        };
+        t.mem.res.give(old);
     }
 };
 
@@ -5631,8 +5760,23 @@ fn gatherEligible(
     return true;
 }
 
-/// The plain-row Top-N's first `h` rows in order (`TopRows.ranked`'s answer), ranked in parallel and gathered (see
-/// `RankShared`). Null when the heaps outgrow the budget; the caller then runs `TopRows`, which holds one.
+/// The parallel plain-row Top-N's answer: the first `h` rows in order (`TopRows.ranked`'s), held in reserved memory
+/// on `gpa` until `deinit`.
+const Gathered = struct {
+    out: consumer.OutputAggregator,
+    /// The answer's columns and the merge's arrays.
+    mem: ReservedMem,
+    /// The winners' columns per row group; the answer's strings point into them.
+    tasks: []GatherTask = &.{},
+
+    fn deinit(g: *Gathered) void {
+        for (g.tasks) |*t| t.deinit();
+        g.mem.deinit();
+    }
+};
+
+/// The plain-row Top-N ranked in parallel and gathered (see `RankShared`). Null when its memory would pass the
+/// budget, refused before it is allocated and with everything given back; the caller then runs `TopRows`.
 fn rankAndGather(
     ctx: Context,
     arena: std.mem.Allocator,
@@ -5646,15 +5790,45 @@ fn rankAndGather(
     h: usize,
     items: []RankedRG,
     t: *Timings,
-) !?consumer.OutputAggregator {
+) !?Gathered {
+    const res = try arena.create(Reservation);
+    res.* = .{ .limit = args.max_memory / 2 };
+    var g: Gathered = .{
+        .out = try consumer.initOutputAggregator(arena, &metas[0], specs),
+        .mem = .{ .gpa = ctx.gpa, .res = res },
+    };
+    gatherInto(&g, ctx, arena, args, inputs, metas, filter, fetch, specs, keys, h, items, t) catch |e| {
+        g.deinit();
+        return if (e == error.ExceededMemoryBudget) null else e;
+    };
+    return g;
+}
+
+fn gatherInto(
+    g: *Gathered,
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    inputs: []const scan.Input,
+    metas: []const schema.FileMetaData,
+    filter: ?filter_ast.Filter,
+    fetch: []const bool,
+    specs: []const consumer.OutputCol,
+    keys: []const RowSortKey,
+    h: usize,
+    items: []RankedRG,
+    t: *Timings,
+) !void {
     const gpa = ctx.gpa;
+    const res = g.mem.res;
     const prof = profile.threadOf(args.profiler, .main);
-    var out = try consumer.initOutputAggregator(arena, &metas[0], specs);
-    if (items.len == 0) return out;
+    if (items.len == 0) return;
     const key_specs = try arena.alloc(consumer.OutputCol, keys.len);
     for (keys, key_specs) |k, *spec| spec.* = k.spec;
     const threads = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    const n_workers = std.math.clamp(threads, 1, items.len);
+    // Every worker holds a heap of h: fewer workers rather than heaps taking more than a quarter of the budget.
+    var n_workers = std.math.clamp(threads, 1, items.len);
+    while (n_workers > 1 and n_workers *| h *| @sizeOf(RankEntry) > res.limit / 4) n_workers -= 1;
 
     const t_rank = nowMonoNs();
     var shared: RankShared = .{
@@ -5672,12 +5846,16 @@ fn rankAndGather(
         .options = .{ .fast_levels = args.fast_levels },
         .profiler = args.profiler,
         .cursor = .{ .items = items },
-        .budget = args.max_memory / 2,
+        .res = res,
     };
     defer shared.deinit();
-    const workers = try arena.alloc(RankWorker, n_workers);
-    for (workers, 0..) |*w, i| w.* = .init(&shared, i);
-    defer for (workers) |*w| w.deinit();
+    const workers = try g.mem.alloc(RankWorker, n_workers);
+    var live: usize = 0;
+    defer for (workers[0..live]) |*w| w.deinit();
+    for (workers) |*w| {
+        w.* = try .init(&shared, live);
+        live += 1;
+    }
     runAll(RankWorker, workers, RankWorker.run);
     const t_merge = nowMonoNs();
     profile.record(prof, .scan, t_rank, t_merge, profile.args(.{n_workers}));
@@ -5688,14 +5866,11 @@ fn rankAndGather(
         t.core.eval_ns += w.timings.eval_ns;
         if (w.err != null and (failed == null or w.err_at < failed.?.err_at)) failed = w;
     }
-    if (failed) |w| {
-        if (w.err.? == error.ExceededMemoryBudget) return null;
-        return w.err.?;
-    }
+    if (failed) |w| return w.err.?;
 
     var n_entries: usize = 0;
     for (workers) |w| n_entries += w.heap.count();
-    const entries = try arena.alloc(RankEntry, n_entries);
+    const entries = try g.mem.alloc(RankEntry, n_entries);
     var at: usize = 0;
     for (workers) |w| {
         @memcpy(entries[at..][0..w.heap.count()], w.heap.items);
@@ -5704,11 +5879,11 @@ fn rankAndGather(
     std.mem.sortUnstable(RankEntry, entries, keys, RankEntry.lessThan);
     const winners = entries[0..@min(h, entries.len)];
     profile.record(prof, .merge, t_merge, nowMonoNs(), profile.args(.{ n_entries, winners.len }));
-    if (winners.len == 0) return out;
+    if (winners.len == 0) return;
 
-    // Winners by place in the input, grouped by row group; `slot[k]` is winner k's group and row within it.
+    // Winners by place in the input, grouped by row group; `slots[k]` is winner k's group and row within it.
     const t_gather = nowMonoNs();
-    const by_pos = try arena.alloc(u32, winners.len);
+    const by_pos = try g.mem.alloc(u32, winners.len);
     for (by_pos, 0..) |*b, k| b.* = @intCast(k);
     std.mem.sortUnstable(u32, by_pos, winners, struct {
         fn lt(ws: []const RankEntry, a: u32, b: u32) bool {
@@ -5716,61 +5891,77 @@ fn rankAndGather(
         }
     }.lt);
     const WinnerSlot = struct { group: u32, row: u32 };
-    const slots = try arena.alloc(WinnerSlot, winners.len);
-    var groups: std.ArrayList(GatherGroup) = .empty;
-    const rows = try arena.alloc(u32, winners.len);
+    const slots = try g.mem.alloc(WinnerSlot, winners.len);
+    const rows = try g.mem.alloc(u32, winners.len);
+    var n_groups: usize = 0;
+    for (by_pos, 0..) |k, n| {
+        if (n == 0 or winners[k].pos.file != winners[by_pos[n - 1]].pos.file or
+            winners[k].pos.rg != winners[by_pos[n - 1]].pos.rg) n_groups += 1;
+    }
+    const groups = try g.mem.alloc(GatherGroup, n_groups);
+    var gi: usize = 0;
     var start: usize = 0;
     for (by_pos, 0..) |k, n| {
         const p = winners[k].pos;
         rows[n] = p.ord;
-        if (n > start and (p.file != winners[by_pos[start]].pos.file or p.rg != winners[by_pos[start]].pos.rg)) {
-            const first = winners[by_pos[start]].pos;
-            try groups.append(arena, .{ .file = first.file, .rg = first.rg, .rows = rows[start..n] });
-            start = n;
+        const last = n + 1 == by_pos.len or winners[by_pos[n + 1]].pos.file != p.file or
+            winners[by_pos[n + 1]].pos.rg != p.rg;
+        slots[k] = .{ .group = @intCast(gi), .row = @intCast(n - start) };
+        if (last) {
+            groups[gi] = .{ .file = p.file, .rg = p.rg, .rows = rows[start .. n + 1] };
+            gi += 1;
+            start = n + 1;
         }
-        slots[k] = .{ .group = @intCast(groups.items.len), .row = @intCast(n - start) };
     }
-    const last = winners[by_pos[start]].pos;
-    try groups.append(arena, .{ .file = last.file, .rg = last.rg, .rows = rows[start..] });
+    // Only positions are needed from here: the heaps go before the winners' columns are read.
+    for (workers[0..live]) |*w| w.deinit();
+    live = 0;
 
-    const tasks = try arena.alloc(GatherTask, groups.items.len * specs.len);
-    for (groups.items, 0..) |*g, gi| for (specs, out.cols, 0..) |spec, col, ci| {
-        tasks[gi * specs.len + ci] = .{
-            .gpa = gpa,
+    const tasks = try g.mem.alloc(GatherTask, groups.len * specs.len);
+    for (groups, 0..) |*grp, k| for (specs, g.out.cols, 0..) |spec, col, ci| {
+        tasks[k * specs.len + ci] = .{
             .inputs = inputs,
             .metas = metas,
-            .group = g,
+            .group = grp,
             .ci = spec.passthrough,
             .options = .{ .fast_levels = args.fast_levels },
             .buf = switch (col) {
                 inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
             },
-            .arena = .init(gpa),
+            .mem = .{ .gpa = gpa, .res = res },
         };
     };
-    defer for (tasks) |*task| task.arena.deinit();
+    g.tasks = tasks;
     var cursor: work_cursor.AtomicWorkCursor(GatherTask) = .{ .items = tasks };
     const runners = try arena.alloc(GatherRunner, std.math.clamp(threads, 1, tasks.len));
     for (runners) |*r| r.* = .{ .cursor = &cursor };
     runAll(GatherRunner, runners, GatherRunner.run);
-    var gathered: usize = 0;
-    for (tasks) |*task| {
-        if (task.err) |e| return e;
-        gathered += task.arena.queryCapacity();
-    }
-    if (gathered > args.max_memory / 2) return error.ExceededMemoryBudget;
+    // The first failure in task order, so the error does not depend on which thread met it first.
+    for (tasks) |*task| if (task.err) |e| return e;
 
-    const cols = try arena.alloc(consumer.OutputAggregator.ColumnBuf, tasks.len);
-    for (tasks, cols) |task, *c| c.* = task.buf;
-    var view = out;
-    for (winners, 0..) |_, k| {
-        const s = slots[k];
-        view.cols = cols[s.group * specs.len ..][0..specs.len];
-        try copyRow(&out, &view, s.row);
-    }
+    // The answer's columns, in rank order, borrowing the tasks' strings.
+    for (g.out.cols, 0..) |*col, ci| switch (col.*) {
+        inline else => |*ob, tag| {
+            const T = @typeInfo(@TypeOf(ob.values.items)).pointer.child;
+            const first = &@field(tasks[ci].buf, @tagName(tag));
+            const vals = try g.mem.alloc(T, winners.len);
+            const defs: ?[]u32 = if (first.def_levels.capacity > 0) try g.mem.alloc(u32, winners.len) else null;
+            for (slots, 0..) |s, k| {
+                const src = &@field(tasks[s.group * specs.len + ci].buf, @tagName(tag));
+                vals[k] = src.values.items[s.row];
+                if (defs) |d| d[k] = src.def_levels.items[s.row];
+            }
+            ob.values = .initBuffer(vals);
+            ob.values.items.len = vals.len;
+            if (defs) |d| {
+                ob.def_levels = .initBuffer(d);
+                ob.def_levels.items.len = d.len;
+            }
+            ob.max_def = first.max_def;
+        },
+    };
+    g.out.num_rows = winners.len;
     profile.record(prof, .project, t_gather, nowMonoNs(), profile.args(.{ winners.len, specs.len }));
-
-    return out;
 }
 
 const SlicedPrint = struct {
@@ -6138,11 +6329,12 @@ pub fn runPrintTo(
         const bounded = limit != null and !args.scan_all and allPassthrough(output_specs, proj.row_keys);
         const items = if (limit != 0) try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded) else try arena.alloc(RankedRG, 0);
         for (items) |item| rows_in += @intCast(metas[item.file].row_groups.items[item.rg].num_rows);
-        const gathered = if (gatherEligible(ctx.env, opened.inputs, meta0, limit, keep, output_specs, proj.row_keys))
+        var gathered = if (gatherEligible(ctx.env, opened.inputs, meta0, limit, keep, output_specs, proj.row_keys))
             try rankAndGather(ctx, arena, args, opened.inputs, metas, filter_opt, fetch_arr, output_specs, proj.row_keys, keep, items, &t)
         else
             null;
-        var ranked = gathered orelse ranked: {
+        defer if (gathered) |*g| g.deinit();
+        var ranked = if (gathered) |g| g.out else ranked: {
             var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory / 2);
             defer top.deinit();
             for (items) |item| {
@@ -8509,6 +8701,8 @@ const topn_gather_inputs = [_][]const u8{
 };
 
 const TopnCase = struct {
+    inputs: []const []const u8 = &topn_gather_inputs,
+    max_memory: ?usize = null,
     select: ?[]const u8,
     filter: ?[]const u8 = null,
     keys: []const expr_ast.RowKey,
@@ -8521,13 +8715,15 @@ fn topnPrint(gpa: std.mem.Allocator, env: std.process.Environ, c: TopnCase, j: u
     const fd = try local_fs.createFile(path);
     {
         defer local_fs.close(fd);
-        _ = try runPrintTo(.{ .gpa = gpa, .env = env, .io = std.testing.io }, .{
-            .inputs = &topn_gather_inputs,
+        var args: QueryArgs = .{
+            .inputs = c.inputs,
             .select = c.select,
             .filter = c.filter,
             .result_order = .{ .rows = c.keys, .limit = c.limit, .offset = c.offset },
             .parallelism = j,
-        }, .jsonl, c.limit, fd, c.offset);
+        };
+        if (c.max_memory) |m| args.max_memory = m;
+        _ = try runPrintTo(.{ .gpa = gpa, .env = env, .io = std.testing.io }, args, .jsonl, c.limit, fd, c.offset);
     }
     return metadata.readFileSlice(path, gpa);
 }
@@ -8621,12 +8817,127 @@ test "the parallel plain-row Top-N fails an allocation cleanly wherever it happe
     const items = try rankRowGroups(sa, &inputs, &metas, proj.row_keys[0], true);
     try std.testing.checkAllAllocationFailures(gpa, struct {
         fn run(a: std.mem.Allocator, x: QueryArgs, ins: []const scan.Input, ms: []const schema.FileMetaData, p: ProjectionPlan, its: []RankedRG) !void {
-            var arena = std.heap.ArenaAllocator.init(a);
+            // An arena that may grow a block in place allocates a varying number of times, by where the heap left
+            // room; refusing every resize keeps the count fixed from run to run.
+            var fixed: NoResizeAllocator = .{ .child = a };
+            const fa = fixed.allocator();
+            var arena = std.heap.ArenaAllocator.init(fa);
             defer arena.deinit();
             var t: Timings = .{};
-            const ctx: Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
-            const out = (try rankAndGather(ctx, arena.allocator(), x, ins, ms, p.filter, p.fetch, p.output_specs, p.row_keys, 4, its, &t)).?;
-            try std.testing.expectEqual(@as(usize, 4), out.num_rows);
+            const ctx: Context = .{ .gpa = fa, .env = .empty, .io = std.testing.io };
+            var g = (try rankAndGather(ctx, arena.allocator(), x, ins, ms, p.filter, p.fetch, p.output_specs, p.row_keys, 4, its, &t)).?;
+            defer g.deinit();
+            try std.testing.expectEqual(@as(usize, 4), g.out.num_rows);
         }
     }.run, .{ args, @as([]const scan.Input, &inputs), @as([]const schema.FileMetaData, &metas), proj, items });
+}
+
+/// Passes allocations through and refuses to grow or move one in place.
+const NoResizeAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *NoResizeAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *NoResizeAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(n, a, ra);
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *NoResizeAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+/// Counts the bytes held through it and the most held at once.
+const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    held: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn note(self: *PeakAllocator, old: usize, new: usize) void {
+        self.held = self.held - old + new;
+        self.peak = @max(self.peak, self.held);
+    }
+
+    fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(n, a, ra) orelse return null;
+        self.note(0, n);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, a, n, ra)) return false;
+        self.note(m.len, n);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(m, a, n, ra) orelse return null;
+        self.note(m.len, n);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+        self.note(m.len, 0);
+    }
+};
+
+test "the parallel plain-row Top-N answers within the memory budget wherever reading in order does" {
+    // Review repros: winners scattered through one dictionary-coded row group, so the gather reads many short runs.
+    const small = "ci/fixtures/parquet/topn_budget_80.parquet";
+    const wide = "ci/fixtures/parquet/topn_budget_12k.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, wide, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    const serial_block = try gpa.allocSentinel(?[*:0]const u8, 1, null);
+    defer gpa.free(serial_block);
+    serial_block[0] = "ZPQ_TOPN_GATHER=0";
+    const serial: std.process.Environ = .{ .block = .{ .slice = serial_block } };
+    const by_s: []const expr_ast.RowKey = &.{.{ .expr = "s", .descending = false }};
+
+    for ([_]usize{ 10, 20, 40, 80 }) |limit| for ([_]usize{ 8192, 16384, 32768, 65536, 131072 }) |budget| {
+        const c: TopnCase = .{ .inputs = &.{small}, .max_memory = budget, .select = null, .keys = by_s, .limit = limit };
+        const want = topnPrint(gpa, serial, c, 1, path) catch |err| switch (err) {
+            error.ExceededMemoryBudget => continue,
+            else => return err,
+        };
+        defer gpa.free(want);
+        for ([_]usize{ 1, 3, 16 }) |j| {
+            const got = try topnPrint(gpa, .empty, c, j, path);
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+    };
+
+    for ([_]usize{ 100, 500, 1000, 2000 }) |limit| {
+        const c: TopnCase = .{ .inputs = &.{wide}, .max_memory = 8 << 20, .select = null, .keys = by_s, .limit = limit };
+        const want = try topnPrint(gpa, serial, c, 1, path);
+        defer gpa.free(want);
+        var peak: PeakAllocator = .{ .child = gpa };
+        const got = try topnPrint(peak.allocator(), .empty, c, 1, path);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(want, got);
+        // Its own reservations stay within half the budget; decoding the row group and the printed answer are the rest.
+        try std.testing.expect(peak.peak < 8 << 20);
+    }
 }

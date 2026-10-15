@@ -675,23 +675,15 @@ pub fn appendSliceRows(
     return surviving;
 }
 
-/// Append every row of `col`, a passthrough output's rows as `SliceReader.next` reads them, to `buf` (on `arena`),
-/// as `appendSliceRows` would.
-pub fn appendColumnRows(
-    buf: *OutputAggregator.ColumnBuf,
-    col_in: filter_eval.Batch.Column,
-    rows: usize,
-    arena: std.mem.Allocator,
+/// `col`, a passthrough output's rows as `SliceReader.next` reads them, in the lane of the output buffer `buf`, as
+/// `appendSliceRows` would write it: a DECIMAL written losslessly as its exact integers.
+pub fn outputLane(
+    buf: OutputAggregator.ColumnBuf,
+    col: filter_eval.Batch.Column,
     scratch: std.mem.Allocator,
-) !void {
-    if (rows == 0) return;
-    var col = col_in;
-    if (buf.* == .i128 and col == .f64) {
-        const exact = try expr_eval.unscaledView(scratch, col);
-        col = .{ .i128 = exact };
-    }
-    const sel = try filter_selection.SelectionVector.init(scratch, rows);
-    try appendSelected(buf, col, &sel, rows, arena, false, scratch);
+) !filter_eval.Batch.Column {
+    if (buf == .i128 and col == .f64) return .{ .i128 = try expr_eval.unscaledView(scratch, col) };
+    return col;
 }
 
 /// The dictionary of flat BYTE_ARRAY chunk `ci`, on `a`, when every one of its data pages is dictionary-encoded, so

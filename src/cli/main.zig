@@ -38,7 +38,7 @@ var machine_diagnostics = false;
 var diagnostic_buffer: [16 * 1024]u8 = undefined;
 var diagnostic_len: usize = 0;
 
-pub const std_options: std.Options = .{ .logFn = cliLog };
+pub const std_options: std.Options = .{ .logFn = cliLog, .signal_stack_size = zpq.core.spawn.signal_stack_size };
 fn cliLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime fmt: []const u8, args: anytype) void {
     if (!machine_diagnostics) std.log.defaultLog(level, scope, fmt, args);
 }

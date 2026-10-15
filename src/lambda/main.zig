@@ -58,6 +58,8 @@ const filter_eval = zpq.core.filter.eval;
 const partition = zpq.core.filter.partition;
 const schema_tree = zpq.core.parquet.schema_tree;
 
+pub const std_options: std.Options = .{ .signal_stack_size = zpq.core.spawn.signal_stack_size };
+
 const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 

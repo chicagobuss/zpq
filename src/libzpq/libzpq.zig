@@ -15,6 +15,8 @@ const c = std.c;
 /// malloc and free, so a host's leak checker (ASan, valgrind) sees every allocation.
 const gpa = std.heap.c_allocator;
 
+pub const std_options: std.Options = .{ .signal_stack_size = zpq.core.spawn.signal_stack_size };
+
 /// The status codes of include/zpq.h. Stable: a value is never reused for another meaning.
 pub const Status = enum(c_int) {
     ok = 0,

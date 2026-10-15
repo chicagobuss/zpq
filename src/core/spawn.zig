@@ -34,6 +34,14 @@ pub fn failuresInjected() usize {
     return injected_count.load(.monotonic);
 }
 
+/// For the binaries' `std_options`. std reserves this alternate signal stack as static TLS, which the C library
+/// zero-fills at every thread start (scan workers start per pass); only a safety-checked build's segfault handler runs
+/// on it, so other builds go without.
+pub const signal_stack_size: ?u64 = if (std.debug.default_enable_segfault_handler)
+    (std.Options{}).signal_stack_size
+else
+    null;
+
 pub fn spawn(
     config: std.Thread.SpawnConfig,
     comptime function: anytype,

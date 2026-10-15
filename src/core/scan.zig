@@ -2775,7 +2775,7 @@ fn prepareAggregate(
         };
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
         const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
-        const want = args.dense and !explain and agg_dense.shapeOk(agg_calls, keys);
+        const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
         ndv_stat = try ndv.collectRetaining(
             gpa,
             arena,

@@ -187,13 +187,17 @@ pub fn collectRetaining(
         // Footer gate plus an absolute ceiling on scratch even when 5% admits a large compressed column.
         const gated = total_gate and full[ki] and
             (dict_sizes[ki] <= max_input or dict_sizes[ki] <= col_sizes[ki] / 20);
-        if (allow_union and full[ki] and (!gated or max_memory < 1024 * 1024))
-            stat.union_budget_exceeded = true;
-        if (allow_union and gated and max_memory >= 1024 * 1024) {
+        // A key a retained domain can fold (`agg_dense`) takes the union past the cost gate: its scan would otherwise
+        // resolve every dictionary entry of every row group itself. Past the gate the union gives up, bound-less as if
+        // gated, as soon as its values outgrow a domain, so a large key pays for a few dictionaries at most.
+        const retain = if (domain != null and keys.len == 1 and
+            (key.col_ref.physical_type == .INT32 or key.col_ref.physical_type == .INT64)) domain else null;
+        const run = allow_union and full[ki] and max_memory >= 1024 * 1024 and (gated or retain != null);
+        if (allow_union and full[ki] and !run) stat.union_budget_exceeded = true;
+        if (run) {
             stat.union_attempted = true;
-            const retain = if (domain != null and keys.len == 1) domain else null;
             const col = key.col_ref.col_idx;
-            if (try unionBound(gpa, arena, files, metas, refs.items, col, workers, max_memory, retain)) |n| {
+            if (try unionBound(gpa, arena, files, metas, refs.items, col, workers, max_memory, retain, !gated)) |n| {
                 sums[ki] = @min(sums[ki], n + nulls[ki]);
                 // Multiplying marginal cardinalities does not estimate the number of observed tuples.
                 if (keys.len == 1) stat.estimate = @min(stat.rows, n + nulls[ki]);
@@ -257,8 +261,10 @@ const Shared = struct {
     dropped: std.atomic.Value(bool) = .init(true),
     retained: std.atomic.Value(usize) = .init(0),
     retain_limit: usize = 0,
-    /// Values all partitions hold, retained past `agg_dense.max_ids` of them by none.
+    /// Values all partitions hold, and whether passing `agg_dense.max_ids` of them (or dropping retention) fails the
+    /// union.
     distinct: std.atomic.Value(usize) = .init(0),
+    strict: bool = false,
 
     fn retaining(s: *const Shared) bool {
         return !s.dropped.load(.monotonic);
@@ -272,6 +278,7 @@ const Shared = struct {
 
     fn drop(s: *Shared) bool {
         s.dropped.store(true, .monotonic);
+        if (s.strict) s.failed.store(true, .monotonic);
         return false;
     }
 };
@@ -405,6 +412,8 @@ fn unionBound(
     workers: usize,
     max_memory: usize,
     retain: ?*?agg_dense.Domain,
+    /// Past the cost gate: fail (no bound) rather than outgrow a domain or give retention up.
+    strict: bool,
 ) !?u64 {
     // Binding permits schema evolution across inputs. Raw dictionary images only union safely when their
     // physical/logical interpretation matches; otherwise the sum of per-RG bounds remains valid.
@@ -452,11 +461,13 @@ fn unionBound(
         .INT32, .INT64 => true,
         else => false,
     };
+    if (strict and (retain == null or !int_key)) return null;
     if (retain != null and int_key) {
         shared.trans = try gpa.alloc([]u32, refs.len);
         @memset(shared.trans, &.{});
         shared.dropped = .init(false);
         shared.retain_limit = max_memory / 16;
+        shared.strict = strict;
         for (&parts) |*p| p.mapped = true;
     }
     defer if (shared.trans.len > 0) {
@@ -731,6 +742,16 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
     try std.testing.expect(none == null);
     // Retention given up part way moves what it held into the union's sets: the same exact count.
     try std.testing.expectEqual((try collect(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true)).hi, tight.hi);
+    // Past the cost gate (strict) the union only runs to retain: given up, it gives no bound at all.
+    var refs: std.ArrayList(Ref) = .empty;
+    for (0..meta.row_groups.items.len) |rg| try refs.append(arena, .{ .file = 0, .rg = rg });
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, true) == null);
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, false) != null);
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, true) == null);
+    const strict = try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, &none, true);
+    defer if (none) |*d| d.deinit(a);
+    try std.testing.expectEqual(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, false), strict);
+    try std.testing.expect(none != null);
 }
 
 test "ndv: allocation failures while retaining a domain leak nothing and never fail the bound" {

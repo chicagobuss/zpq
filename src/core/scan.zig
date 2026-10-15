@@ -1192,6 +1192,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .rg_arena = &rg_decode_arena,
             .timings = &w.timings,
             .budget = w.decode_budget,
+            .region = region,
         });
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             w.pairs_rows +|= @intCast(@max(rg.num_rows, 0));
@@ -1207,6 +1208,13 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     // An armed worker that never moved keeps its table for the usual merge, unless another worker moved (`spilled`).
     if (w.part) |p| if (!w.local.armed and w.blocks == null and w.group_tables.len > 0)
         try p.flush(&w.local, &w.group_tables[w.index]);
+}
+
+fn releaseRegions(workers: []Worker) void {
+    for (workers) |*w| if (w.region) |*r| {
+        r.deinit();
+        w.region = null;
+    };
 }
 
 fn runWorkers(workers: []Worker) void {
@@ -2499,7 +2507,7 @@ fn prepareAggregate(
     const workers = try arena.alloc(Worker, n_workers);
     for (workers) |*w| w.region = null;
     // A process about to exit leaves the regions to it: unmapping them delays the answer.
-    defer if (!args.leave_regions) for (workers) |*w| if (w.region) |*r| r.deinit();
+    defer if (!args.leave_regions) releaseRegions(workers);
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -2669,6 +2677,8 @@ fn prepareAggregate(
     const t_decode_end = nowMonoNs();
     t.decode_wall_ns = @intCast(t_decode_end - t_decode);
     profile.record(prof, .scan, t_decode, t_decode_end, profile.args(.{n_workers}));
+    // The last pass is done: nothing decodes into the regions again, so the merge does not hold them.
+    if (!args.leave_regions) releaseRegions(workers);
     for (workers) |w| if (w.err) |e| return e;
     const merge_span = profile.Span.begin(prof);
     // Once any worker sends pairs every table does, so each key's values meet in one partition.

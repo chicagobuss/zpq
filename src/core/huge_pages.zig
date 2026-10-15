@@ -70,6 +70,8 @@ pub const Region = struct {
     end: usize = 0,
     /// Offset of the newest block, the only one that can grow, shrink or be given back.
     last: usize = 0,
+    /// How far blocks have reached since the last `trim`: pages past `end` up to here may still be resident.
+    touched: usize = 0,
 
     pub fn init(child: std.mem.Allocator, reserve: usize) Region {
         var r: Region = .{ .child = child };
@@ -95,6 +97,17 @@ pub const Region = struct {
     pub fn rewind(self: *Region) void {
         self.end = 0;
         self.last = 0;
+    }
+
+    /// Give back the pages past the newest block: what an earlier phase faulted in and no live block holds, for work
+    /// that is about to allocate elsewhere rather than reuse them. Linux only; elsewhere they stay until `deinit`.
+    pub fn trim(self: *Region) void {
+        const lo = std.mem.alignForward(usize, self.end, std.heap.pageSize());
+        if (builtin.os.tag == .linux and self.touched > lo) {
+            const hi = std.mem.alignForward(usize, self.touched, std.heap.pageSize());
+            _ = std.os.linux.madvise(@alignCast(self.buf.ptr + lo), hi - lo, std.os.linux.MADV.DONTNEED);
+        }
+        self.touched = self.end;
     }
 
     pub fn allocator(self: *Region) std.mem.Allocator {
@@ -124,6 +137,7 @@ pub const Region = struct {
         if (self.buf.len > 0 and start <= self.buf.len and len <= self.buf.len - start) {
             self.last = start;
             self.end = start + len;
+            self.touched = @max(self.touched, self.end);
             return self.buf.ptr + start;
         }
         return self.child.rawAlloc(len, alignment, ret_addr);
@@ -135,6 +149,7 @@ pub const Region = struct {
         if (self.isLast(memory)) {
             if (new_len > self.buf.len - self.last) return false;
             self.end = self.last + new_len;
+            self.touched = @max(self.touched, self.end);
             return true;
         }
         return new_len <= memory.len;
@@ -213,4 +228,29 @@ test "Region carves blocks in order, grows the newest in place, and spills past 
     defer arena.deinit();
     for (0..64) |_| _ = try arena.allocator().alloc(u8, 32 * 1024);
     try std.testing.expect(region.end > 64 * 32 * 1024);
+}
+
+test "Region.trim hands back the pages past the newest block that an earlier phase touched" {
+    var region = Region.init(std.testing.allocator, 4 * huge_page_size);
+    defer region.deinit();
+    if (region.buf.len == 0 or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = region.allocator();
+    const big = try a.alloc(u8, 3 * huge_page_size);
+    @memset(big, 0xa5);
+    region.rewind();
+    const small = try a.alloc(u8, 100);
+    @memset(small, 1);
+    try std.testing.expectEqual(3 * huge_page_size, region.touched);
+    region.trim();
+    try std.testing.expectEqual(region.end, region.touched);
+    // Past the newest block nothing is resident any more, and it reads back as fresh zero pages.
+    const page = std.heap.pageSize();
+    const span = big[huge_page_size..][0..huge_page_size];
+    var vec: [huge_page_size / 4096]u8 = undefined;
+    const rc = std.os.linux.syscall3(.mincore, @intFromPtr(span.ptr), span.len, @intFromPtr(&vec));
+    try std.testing.expectEqual(@as(usize, 0), rc);
+    for (vec[0 .. span.len / page]) |v| try std.testing.expectEqual(@as(u8, 0), v & 1);
+    try std.testing.expectEqual(@as(u8, 0), span[12345]);
+    // The live block keeps its bytes.
+    try std.testing.expectEqual(@as(u8, 1), small[99]);
 }

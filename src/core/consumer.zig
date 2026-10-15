@@ -48,6 +48,7 @@ const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
 const agg_coded = @import("expr/agg_coded.zig");
 const partagg = @import("partagg.zig");
+const huge_pages = @import("huge_pages.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
@@ -1942,6 +1943,9 @@ pub const AggWorkspace = struct {
     timings: *Timings,
     /// Shared by the query's scan workers; null decodes without a bound (tests, callers that budget elsewhere).
     budget: ?*DecodeBudget = null,
+    /// The worker's region under `scratch` and `rg_arena`, which keeps an earlier pass's pages: trimmed before a row
+    /// group decodes sliced or staged on memory of its own, so those pages are not held beside its reservation.
+    region: ?*huge_pages.Region = null,
 };
 
 /// The memory a query's scan workers' decoded row groups may take together (`scan.runMultiAggregate` gives it half of
@@ -2355,6 +2359,7 @@ pub fn scanRGForAgg(
             std.debug.assert(full == keys_only);
         }
         reserved = full;
+        if (full > b.share()) if (ws.region) |r| r.trim();
         // Too big for this worker's share: a slice of rows at a time when every column has a sliced form, else one
         // aggregate's columns at a time.
         if (full > b.share() and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {

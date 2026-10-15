@@ -155,6 +155,12 @@ pub const MultiAggArgs = struct {
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
     part_probe: u64 = 0,
+    /// A plain GROUP BY worker whose table holds `spill_groups` groups or more at fewer than `spill_rows` rows a
+    /// group moves to the partition runs (`partagg.zig`) for the rest of its scan. The CLI clears this from
+    /// `ZPQ_SPILL=0`.
+    spill: bool = true,
+    spill_groups: usize = 1 << 18,
+    spill_rows: u64 = 4,
 };
 
 /// Tuning of `sketchTopK`.
@@ -1019,6 +1025,7 @@ const Worker = struct {
     /// Shared partitioned tables, with this worker's pre-aggregation state. Null keeps today's per-worker table.
     part: ?*partagg.PartAgg = null,
     local: partagg.Local = .{},
+
     /// Grouped count(DISTINCT) as pairs instead of sets (`expr_agg.DistinctPairs`), for this worker's table.
     pairs: ?*expr_agg.DistinctPairs = null,
     /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
@@ -1175,7 +1182,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .budget = w.decode_budget,
         });
     }
-    if (w.part) |p| if (w.blocks == null and w.group_tables.len > 0) try p.flush(&w.group_tables[w.index]);
+    // An armed worker that never moved keeps its table for the usual merge, unless another worker moved (`spilled`).
+    if (w.part) |p| if (!w.local.armed and w.blocks == null and w.group_tables.len > 0)
+        try p.flush(&w.local, &w.group_tables[w.index]);
 }
 
 fn runWorkers(workers: []Worker) void {
@@ -2021,7 +2030,7 @@ const PairFoldTask = struct {
         var n: usize = 0;
         for (t.sinks) |*s| n += s.parts[p].items.len;
         const bytes = n * (@sizeOf(Pair) + @sizeOf(KeyDistinct));
-        const got = t.budget.draw(bytes) orelse return error.ExceededMemoryBudget;
+        const got = t.budget.drawExact(bytes) orelse return error.ExceededMemoryBudget;
         defer t.budget.release(got);
         const all = try t.gpa.alloc(Pair, n);
         defer t.gpa.free(all);
@@ -2512,7 +2521,14 @@ fn prepareAggregate(
     defer if (!leave_tables) merged_table.deinit();
     var part_state: ?partagg.PartAgg = null;
     defer if (!leave_tables) if (part_state) |*p| p.deinit();
-    if (part_on) {
+    // Fixed-width keys fold into an open-addressed table cheap enough that moving near-unique ones to runs cost more
+    // than it saved; string keys, copied into a byte map per worker, gain.
+    const spill_on = !part_on and args.spill and decision.strategy == .plain_hash and !use_blocks and
+        fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null);
+    // A partitioned plan the cost rules chose (long strings, worker-copy pressure) merges into shared partition
+    // tables; `ZPQ_PARTAGG=1` and a worker that moves at run time append to runs.
+    const armed = spill_on;
+    if (part_on or spill_on) {
         part_state = try partagg.PartAgg.init(
             gpa,
             &group_budget,
@@ -2521,7 +2537,11 @@ fn prepareAggregate(
             mergeAccOwned,
             args.part_cap,
             args.part_probe,
+            n_workers,
+            part_on and !args.partagg,
         );
+        part_state.?.spill_groups = args.spill_groups;
+        part_state.?.spill_rows = args.spill_rows;
     }
     const pairs_wanted = switch (args.distinct_pairs) {
         .auto => pairsPay(ndv_stat),
@@ -2570,6 +2590,7 @@ fn prepareAggregate(
             .group_tables = group_tables,
             .part = if (part_state) |*p| p else null,
             .pairs = if (pair_sinks.len > 0) &pair_sinks[wi] else null,
+            .local = .{ .runs = if (part_state) |*p| &p.runs[wi] else null, .armed = armed },
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
@@ -2611,6 +2632,13 @@ fn prepareAggregate(
     const merge_span = profile.Span.begin(prof);
     if (pairs_call) |ai|
         try foldDistinctPairs(gpa, &group_budget, pair_sinks, group_tables, ai, agg_calls.len, n_workers);
+    // Once one worker has moved to the partition runs every table goes there, so each key is in one partition.
+    const spilled = part_on or (armed and part_state.?.spilled.load(.monotonic));
+    if (spilled) {
+        const ps = &part_state.?;
+        if (armed) for (workers) |*w| if (w.local.armed) try ps.flush(&w.local, &group_tables[w.index]);
+        try ps.foldRuns(n_workers);
+    }
 
     // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
@@ -2769,7 +2797,8 @@ fn prepareAggregate(
         var folded = out_tables.len > 1;
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
         // borrowed until the rows are built.
-        if (part_state) |*ps| {
+        if (spilled) {
+            const ps = &part_state.?;
             fillFromPartitions(
                 gpa,
                 arena,
@@ -2828,7 +2857,7 @@ fn prepareAggregate(
             .key_types = key_types,
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
-            .fixed_keys = if (part_state != null) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
+            .fixed_keys = if (spilled) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
         };
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
             order.hidden.len == 0;
@@ -2949,7 +2978,7 @@ fn prepareAggregate(
         .membership = membership_stats,
         .timings = t,
         .output = output,
-        .part_agg = part_on,
+        .part_agg = spilled,
         .distinct_pairs = pairs_call != null,
         .visible_cols = if (args.result_order.hidden.len > 0) args.select_cols.?.len else null,
         .state = .{
@@ -9206,6 +9235,76 @@ test "review round3 count budget and path matrix" {
                     try testing.expectEqual(wr.len, gr.len);
                     for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
                 };
+    }
+}
+
+test "runMultiAggregate: workers that move to partition runs mid-scan answer as the plain fold" {
+    // census_topk's `s`: near-unique 20-byte strings, 8 row groups of 1000. A threshold of 64 groups moves a worker
+    // after its first window; at -j 3 some workers may never move and still join the runs.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const aggregates = [_][]const u8{
+        "count(*) AS c, sum(t) AS st, min(s) AS lo, max(u) AS hi",
+        "count(n) AS c, avg(t) AS av",
+    };
+    const cuts = [_]expr_ast.ResultOrder{
+        .{},
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7 },
+    };
+    for (aggregates) |aggregate| for ([_][]const u8{ "s", "s, n" }) |key| for ([_]usize{ 1, 3 }) |j| for (cuts) |cut| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = aggregate,
+            .group_by = key,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .result_order = cut,
+            .spill = false,
+        };
+        var want = try runMultiAggregate(testing.allocator, arena, args);
+        defer want.deinit(testing.allocator);
+        args.spill = true;
+        args.spill_groups = 64;
+        var got = try runMultiAggregate(testing.allocator, arena, args);
+        defer got.deinit(testing.allocator);
+        try testing.expect(!want.part_agg);
+        try testing.expect(got.part_agg);
+        try want.output.applyResultOrder(testing.allocator, cut);
+        try got.output.applyResultOrder(testing.allocator, cut);
+        const wr = want.output.group_rows.?;
+        const gr = got.output.group_rows.?;
+        try testing.expectEqual(wr.len, gr.len);
+        for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
+    };
+}
+
+test "runMultiAggregate: a budget the plain fold fits in holds every worker's partition runs" {
+    // Each of thousands of runs drawing a shared-budget block once failed a budget the plain fold uses a sliver of.
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]bool{ false, true }) |spill| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(*) AS c, sum(t) AS st",
+            .group_by = "s",
+            .parallelism = 3,
+            .min_bytes_per_worker = 1,
+            .max_memory = 4 << 20,
+            .spill = spill,
+            .spill_groups = 64,
+        });
+        defer res.deinit(testing.allocator);
+        try testing.expectEqual(spill, res.part_agg);
+        try testing.expectEqual(@as(usize, 7997), res.output.group_rows.?.len);
     }
 }
 

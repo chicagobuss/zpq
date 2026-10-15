@@ -3634,6 +3634,16 @@ pub const SharedBudget = struct {
         return self.used.load(.monotonic) >= self.limit - self.limit / 4;
     }
 
+    /// `draw` of exactly `need`, never a block: for holders too many to each strand a block's slack, such as the
+    /// per-partition lists of every worker.
+    pub fn drawExact(self: *SharedBudget, need: usize) ?usize {
+        var cur = self.used.load(.monotonic);
+        while (cur + need <= self.limit) {
+            cur = self.used.cmpxchgWeak(cur, cur + need, .monotonic, .monotonic) orelse return need;
+        }
+        return null;
+    }
+
     pub fn draw(self: *SharedBudget, need: usize) ?usize {
         const first: usize = if (self.tight()) need else @max(need, self.blockSize());
         for ([_]usize{ first, need }) |want| {
@@ -3725,6 +3735,12 @@ pub fn canonicalKey(image: []const u8, buf: *[48]u8) []const u8 {
         }
     }
     return buf[0..d];
+}
+
+/// `key` as a fixed-width table of `stride` stores it: as is when already its image, else expanded into `out`.
+pub fn fixedImage(stride: usize, key: []const u8, out: *[32]u8) ?[]const u8 {
+    if (key.len == stride) return key;
+    return expandFixed(stride, key, out);
 }
 
 fn expandFixed(stride: usize, variable: []const u8, out: *[32]u8) ?[]const u8 {
@@ -4390,6 +4406,33 @@ pub const GroupTable = struct {
         return id;
     }
 
+    /// Grow an empty fixed-width table to hold `groups` groups of `n_calls` accumulators without rehashing, charged
+    /// as `getOrInsertFixed` charges its growth. A table that already has groups is left as it is.
+    pub fn reserveFixed(self: *GroupTable, groups: usize, n_calls: usize) !void {
+        std.debug.assert(self.fixed_stride != 0);
+        if (self.fixed_len != 0 or groups == 0) return;
+        // The load factor `getOrInsertFixed` keeps: more than 3/4 full grows.
+        const slot_cap = std.math.ceilPowerOfTwo(usize, @max(16, groups * 4 / 3 + 1)) catch return error.OutOfMemory;
+        if (slot_cap <= self.fixed_slots.len) return;
+        const key_cap = groups * self.fixed_stride;
+        const projected = key_cap + slot_cap * @sizeOf(FixedSlot) + groups * @sizeOf(u64) +
+            groups * n_calls * @sizeOf(Accumulator) + self.set_objects;
+        errdefer self.allocated_bytes = self.fixedHeld();
+        if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
+        const slots = try self.allocator.alloc(FixedSlot, slot_cap);
+        @memset(slots, .{ .hash = 0, .id = empty_id });
+        if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
+        self.fixed_slots = slots;
+        if (key_cap > self.fixed_keys.len) {
+            const keys = try self.allocator.alloc(u8, key_cap);
+            if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
+            self.fixed_keys = keys;
+        }
+        try self.accumulators.ensureTotalCapacityPrecise(self.allocator, groups * n_calls);
+        try self.first.ensureTotalCapacityPrecise(self.allocator, groups);
+        self.allocated_bytes = self.fixedHeld();
+    }
+
     fn fixedHeld(self: *const GroupTable) usize {
         return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
             self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator) +
@@ -4632,7 +4675,7 @@ pub const DistinctPairs = struct {
         const list = &self.parts[DistinctPairs.partOf(pair)];
         if (list.items.len == list.capacity) {
             const want = @max(list.capacity * 2, 256);
-            const got = self.budget.draw((want - list.capacity) * @sizeOf(Pair)) orelse
+            const got = self.budget.drawExact((want - list.capacity) * @sizeOf(Pair)) orelse
                 return error.ExceededMemoryBudget;
             self.charged += got;
             try list.ensureTotalCapacityPrecise(self.gpa, want);

@@ -2119,12 +2119,13 @@ fn insertRow(
     return table.getOrInsert(scratch.items, calls, pos + row);
 }
 
-/// Abandoned pre-aggregation: one hash per row into the shared partition, under that partition's lock.
+/// Abandoned pre-aggregation: each row appended to this worker's run for its key's partition.
 fn scatterGrouped(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
     g: @FieldType(AggTarget, "grouped"),
     part: *partagg.PartAgg,
+    local: *partagg.Local,
     cols: []filter_eval.Batch.Column,
     lookup: []const ?usize,
     win_sel: *const filter_selection.SelectionVector,
@@ -2147,14 +2148,14 @@ fn scatterGrouped(
     const keyed = win.restrictedTo(win_sel);
     for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(ra, &keyed, lookup, k);
 
-    const which = try ra.alloc(u8, n);
+    const which = try ra.alloc(u16, n);
     var counts: [partagg.n_parts]u32 = @splat(0);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(ra);
     for (0..n) |r| {
         if (!win_sel.isActive(r)) continue;
         const h = try routeRowHash(ra, &scratch, g.table, key_cols, r);
-        const p: u8 = @intCast(part.indexOf(h));
+        const p: u16 = @intCast(part.indexOf(h));
         which[r] = p;
         counts[p] += 1;
     }
@@ -2172,17 +2173,47 @@ fn scatterGrouped(
     const ids = try ra.alloc(u32, n);
     var preps = try expr_agg.prepareGrouped(ra, g.calls, &win, lookup, win_sel);
     defer preps.deinit();
-    for (part.parts, 0..) |*pt, p| {
+    if (part.shared) {
+        for (part.parts, 0..) |*pt, p| {
+            const lo = start[p];
+            const hi = start[p + 1];
+            if (lo == hi) continue;
+            partagg.PartAgg.lock(pt);
+            defer partagg.PartAgg.unlock(pt);
+            for (order[lo..hi]) |r| ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
+            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls);
+        }
+        return;
+    }
+    const runs = local.runs.?;
+    for (runs, 0..) |*run, p| {
         const lo = start[p];
         const hi = start[p + 1];
         if (lo == hi) continue;
-        partagg.PartAgg.lock(pt);
-        defer partagg.PartAgg.unlock(pt);
         for (order[lo..hi]) |r| {
-            ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
+            var image: [32]u8 = undefined;
+            const key = try storedRowKey(ra, &scratch, g.table, key_cols, r, &image);
+            ids[r] = @intCast(try part.append(run, key, pos + r));
         }
-        try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls);
+        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls);
     }
+}
+
+/// The key `row` would be stored under in `table`: its fixed image, or its serialized bytes in `scratch`.
+fn storedRowKey(
+    ra: std.mem.Allocator,
+    scratch: *std.ArrayList(u8),
+    table: *const expr_agg.GroupTable,
+    key_cols: []const filter_eval.Batch.Column,
+    row: usize,
+    image: *[32]u8,
+) ![]const u8 {
+    if (table.fixed_stride != 0) {
+        if (expr_agg.packFixedKey(key_cols, row, image)) |nb| if (nb == table.fixed_stride) return image[0..nb];
+    }
+    try expr_agg.serializeRowKey(scratch, ra, key_cols, row);
+    if (table.fixed_stride == 0) return scratch.items;
+    return expr_agg.fixedImage(table.fixed_stride, scratch.items, image) orelse error.BadGroupKey;
 }
 
 /// Fold `cols` through the worker's local table in windows, flushing into `g.part` when the local table fills or
@@ -2196,6 +2227,8 @@ fn foldGroupedWindows(
     sel: *const filter_selection.SelectionVector,
     consumed: []const bool,
     encoded: bool,
+    /// Charged for a coded composite space past the free one, as the whole-row-group fold is.
+    budget: ?*DecodeBudget,
 ) !void {
     const g = switch (target) {
         .grouped => |grouped| grouped,
@@ -2203,6 +2236,15 @@ fn foldGroupedWindows(
     };
     const part = g.part orelse return;
     const local = g.local orelse return;
+    // An armed worker folds a batch the coded path takes whole, as the plain fold does: in windows, each would
+    // resolve again nearly every code of a large dictionary.
+    if (local.armed and encoded and sel.len > 0) {
+        const whole: filter_eval.Batch = .{ .cols = cols, .num_rows = sel.len };
+        if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget)) {
+            try part.pump(local, g.table, @intCast(sel.count()));
+            return;
+        }
+    }
     var prepared_values = false;
     var off: usize = 0;
     while (off < sel.len) {
@@ -2214,7 +2256,7 @@ fn foldGroupedWindows(
         const pos = g.pos_base + @as(u64, @intCast(off));
         // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
         if (local.abandoned) {
-            try scatterGrouped(ra, gpa, g, part, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
+            try scatterGrouped(ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
             off += n;
             continue;
         }
@@ -2222,7 +2264,7 @@ fn foldGroupedWindows(
             const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, null)) {
+            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -2383,7 +2425,17 @@ pub fn scanRGForAgg(
     switch (target) {
         .grouped => |g| {
             if (g.part != null and !staged) {
-                try foldGroupedWindows(ra, gpa, target, batch_cols.items, lookup, &sel, in.consumed, decode_options.encoded);
+                try foldGroupedWindows(
+                    ra,
+                    gpa,
+                    target,
+                    batch_cols.items,
+                    lookup,
+                    &sel,
+                    in.consumed,
+                    decode_options.encoded,
+                    ws.budget,
+                );
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
@@ -2528,7 +2580,17 @@ fn scanRGSliced(
                 if (g.part != null) {
                     var shifted = target;
                     shifted.grouped.pos_base = g.pos_base + @as(u64, @intCast(done));
-                    try foldGroupedWindows(sa, gpa, shifted, cols, lookup, &sel, in.consumed, decode_options.encoded);
+                    try foldGroupedWindows(
+                        sa,
+                        gpa,
+                        shifted,
+                        cols,
+                        lookup,
+                        &sel,
+                        in.consumed,
+                        decode_options.encoded,
+                        ws.budget,
+                    );
                     continue;
                 }
                 const key_cols = try sa.alloc(filter_eval.Batch.Column, g.keys.len);

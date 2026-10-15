@@ -698,6 +698,40 @@ def main():
             print(f"  FAIL  {label}  {problem}")
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
+    # String-keyed GROUP BY whose workers move to partition runs mid-scan (a tiny ZPQ_SPILL_GROUPS) at several -j,
+    # against the same queries on the plain fold.
+    SPILL = [
+        ("spill_full", "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{fixture}' GROUP BY name "
+         "ORDER BY name"),
+        ("spill_cut", "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{fixture}' GROUP BY nname ORDER BY s DESC, nname "
+         "LIMIT 7"),
+        ("spill_composite", "SELECT name, flag, count(*) AS c FROM '{fixture}' WHERE id > -1000 GROUP BY name, flag "
+         "ORDER BY name, flag"),
+    ]
+    for slabel, s_sql in SPILL:
+        sql = s_sql.format(fixture=fixture)
+        duck_rel = con.execute(sql)
+        lanes = json_lanes(duck_rel)
+        want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in duck_rel.fetchall()]
+        for groups in ("8", "262144"):
+            for j in ("1", "3", "16"):
+                total += 1
+                label = f"spill:{slabel} groups={groups} -j {j}"
+                r = subprocess.run([ZPQ, "query", "-j", j, "--query", sql], capture_output=True, text=True,
+                                   env={**os.environ, "ZPQ_SPILL_GROUPS": groups})
+                try:
+                    if r.returncode != 0:
+                        raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+                    got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq(list(row.values()), lanes)))
+                           for row in read_rows(r.stdout, parse_float=Decimal)]
+                    problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+                except Exception as e:
+                    problem = f"error: {e}"
+                if problem:
+                    fails += 1
+                    print(f"  FAIL  {label}  {problem}")
+                else:
+                    print(f"  OK    {label}  ({len(got)} rows, in order)")
     # Grouped count(DISTINCT), through the pairs path (forced: ZPQ_DISTINCT_PAIRS=1) and through per-group sets (=0),
     # at several -j: NULL values, NULL keys, an expression key, FILTER, a cut on the distinct count.
     DISTINCT = [

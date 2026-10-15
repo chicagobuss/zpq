@@ -628,6 +628,12 @@ fn executeAggregate(
         .profiler = args.profiler,
         .sketch_topk = sketchFromEnv(ctx.env),
         .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
+        .spill = !envDisables(ctx.env, "ZPQ_SPILL"),
+        // Tests: a small threshold makes a small input move to the runs.
+        .spill_groups = if (ctx.env.getPosix("ZPQ_SPILL_GROUPS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch 1 << 18
+        else
+            1 << 18,
         .distinct_pairs = if (envFlag(ctx.env, "ZPQ_DISTINCT_PAIRS"))
             .on
         else if (envDisables(ctx.env, "ZPQ_DISTINCT_PAIRS")) .off else .auto,

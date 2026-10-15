@@ -698,8 +698,8 @@ def main():
             print(f"  FAIL  {label}  {problem}")
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
-    # Grouped count(DISTINCT), through the pairs path and through per-group sets (ZPQ_DISTINCT_PAIRS=0), at several
-    # -j: NULL values, NULL keys, an expression key, FILTER, a cut on the distinct count.
+    # Grouped count(DISTINCT), through the pairs path (forced: ZPQ_DISTINCT_PAIRS=1) and through per-group sets (=0),
+    # at several -j: NULL values, NULL keys, an expression key, FILTER, a cut on the distinct count.
     DISTINCT = [
         ("cd_flag", "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{fixture}' GROUP BY flag "
          "ORDER BY flag"),

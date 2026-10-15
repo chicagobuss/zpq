@@ -144,9 +144,9 @@ pub const MultiAggArgs = struct {
     /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
     /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
     partagg: bool = false,
-    /// Grouped count(DISTINCT) through sorted pairs when it qualifies (`distinctPairsCall`). The CLI clears this
-    /// from `ZPQ_DISTINCT_PAIRS=0`.
-    distinct_pairs: bool = true,
+    /// Grouped count(DISTINCT) through sorted pairs (`distinctPairsCall`): where they pay (`pairsPay`), always, or
+    /// never. The CLI takes `.on` from `ZPQ_DISTINCT_PAIRS=1` and `.off` from `=0`.
+    distinct_pairs: enum { auto, on, off } = .auto,
     /// Disable profitability rules when exercising the legacy cut executors.
     ndv_policy: bool = true,
     /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
@@ -1985,6 +1985,15 @@ fn distinctPairsCall(calls: []const expr_agg.AggCall, fixed_stride: u8) ?usize {
     return found;
 }
 
+/// Whether pairs beat per-group sets: only for a group count the dictionaries bound to at most 2^20, each group
+/// taking 64 rows or more. Near-unique keys keep their few values inline in the sets, cheaper than sorting a pair a
+/// row and looking every group up afterwards; there, and wherever nothing bounds the groups, the sets stay.
+fn pairsPay(stat: ?NdvStat) bool {
+    const st = stat orelse return false;
+    const est = st.estimate orelse return false;
+    return est > 0 and est <= 1 << 20 and st.rows / est >= 64;
+}
+
 /// Per partition: every worker's pairs sorted, then each key's distinct values counted. Sorted by key for lookup.
 const KeyDistinct = struct { k0: u64, k1: u64, count: u64, claimed: std.atomic.Value(bool) = .init(false) };
 
@@ -2514,7 +2523,12 @@ fn prepareAggregate(
             args.part_probe,
         );
     }
-    const pairs_call: ?usize = if (args.distinct_pairs and decision.strategy == .plain_hash and !use_blocks)
+    const pairs_wanted = switch (args.distinct_pairs) {
+        .auto => pairsPay(ndv_stat),
+        .on => true,
+        .off => false,
+    };
+    const pairs_call: ?usize = if (pairs_wanted and decision.strategy == .plain_hash and !use_blocks)
         distinctPairsCall(agg_calls, fixed_stride)
     else
         null;
@@ -9224,11 +9238,11 @@ test "runMultiAggregate: grouped count(DISTINCT) through pairs answers as throug
                 .min_bytes_per_worker = 1,
                 .encoded = encoded,
                 .result_order = cut,
-                .distinct_pairs = false,
+                .distinct_pairs = .off,
             };
             var want = try runMultiAggregate(testing.allocator, arena, args);
             defer want.deinit(testing.allocator);
-            args.distinct_pairs = true;
+            args.distinct_pairs = .on;
             var got = try runMultiAggregate(testing.allocator, arena, args);
             defer got.deinit(testing.allocator);
             try testing.expect(!want.distinct_pairs);
@@ -9257,6 +9271,7 @@ test "runMultiAggregate: count(DISTINCT) pairs fail cleanly when the budget cann
         .parallelism = 3,
         .min_bytes_per_worker = 1,
         .max_memory = 64 * 1024,
+        .distinct_pairs = .on,
     }));
 }
 

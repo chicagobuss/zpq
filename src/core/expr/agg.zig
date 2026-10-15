@@ -4577,6 +4577,7 @@ pub fn prepareGrouped(
 pub const DistinctPairs = struct {
     pub const part_bits = 8;
     pub const N = 1 << part_bits;
+    const recent_bits = 12;
     /// A fixed-width key image of up to 16 bytes, zero-padded, then the value's distinct bits.
     pub const Pair = struct { k0: u64, k1: u64, x: u64 };
 
@@ -4588,6 +4589,9 @@ pub const DistinctPairs = struct {
     agg_idx: usize,
     parts: [N]std.ArrayList(Pair) = @splat(.empty),
     charged: usize = 0,
+    recent: [1 << recent_bits]Pair = undefined,
+    /// Which `recent` slots hold a pair.
+    recent_valid: [(1 << recent_bits) / 64]u64 = @splat(0),
 
     /// Safe to call again.
     pub fn deinit(self: *DistinctPairs) void {
@@ -4615,6 +4619,16 @@ pub const DistinctPairs = struct {
 
     fn add(self: *DistinctPairs, gid: u32, x: u64) !void {
         const pair = pairOf(self.table.keyAt(gid), x);
+        // Skewed input repeats a few pairs most of the time: a small direct-mapped memory of recent ones drops them
+        // before they are stored and sorted. Exact either way, as the sort removes any duplicate it lets through.
+        const h = splitMix64(pair.k0 ^ splitMix64(pair.k1 ^ splitMix64(pair.x)));
+        const at: usize = @intCast(h >> (64 - recent_bits));
+        const bit = @as(u64, 1) << @intCast(at % 64);
+        const slot = &self.recent[at];
+        const valid = self.recent_valid[at / 64] & bit != 0;
+        if (valid and slot.k0 == pair.k0 and slot.k1 == pair.k1 and slot.x == pair.x) return;
+        slot.* = pair;
+        self.recent_valid[at / 64] |= bit;
         const list = &self.parts[DistinctPairs.partOf(pair)];
         if (list.items.len == list.capacity) {
             const want = @max(list.capacity * 2, 256);

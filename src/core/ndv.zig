@@ -464,12 +464,17 @@ fn unionBound(
         else => false,
     };
     if (strict and (retain == null or !int_key)) return null;
-    if (retain != null and int_key) {
+    if (retain != null and int_key) retain: {
+        shared.retain_limit = max_memory / 16;
+        shared.strict = strict;
+        // The translations' index, and each file's first row group in it, charged before either exists.
+        if (!shared.charge(refs.len * @sizeOf([]u32) + metas.len * @sizeOf(usize))) {
+            if (strict) return null;
+            break :retain;
+        }
         shared.trans = try gpa.alloc([]u32, refs.len);
         @memset(shared.trans, &.{});
         shared.dropped = .init(false);
-        shared.retain_limit = max_memory / 16;
-        shared.strict = strict;
         // The largest dictionary is a floor on the domain: its share of it, sized once, spares each map its growth.
         const each: u32 = @intCast(@min(max_entries, agg_dense.max_ids) / P + 64);
         for (&parts) |*p| {
@@ -535,7 +540,7 @@ fn buildDomain(
         at_ref += m.row_groups.items.len;
     }
     std.debug.assert(at_ref == refs.len);
-    var bytes = values.len * @sizeOf(u64);
+    var bytes = values.len * @sizeOf(u64) + trans.len * @sizeOf([]u32) + file_base.len * @sizeOf(usize);
     for (trans, 0..) |_, i| {
         const t = trans[i];
         if (t.len == 0) continue;
@@ -739,6 +744,9 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
         }
         for (seen) |s| try std.testing.expect(s);
         try std.testing.expect(d.forRowGroup(0, meta.row_groups.items.len) == null);
+        // Everything the domain owns is in the bytes the scan charges, its indexing arrays included.
+        try std.testing.expectEqual(d.values.len * 8 + d.entries() * 4 + d.trans.len * @sizeOf([]u32) +
+            d.file_base.len * @sizeOf(usize), d.bytes);
         try std.testing.expect(d.forRowGroup(1, 0) == null);
         var uniq: std.AutoHashMapUnmanaged(u64, void) = .empty;
         for (d.values) |v| try uniq.put(arena, v, {});

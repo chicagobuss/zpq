@@ -158,6 +158,8 @@ pub const MultiAggArgs = struct {
     ndv_union: bool = true,
     /// Keep a lone integer key's union as an exact domain and fold by its ids (`agg_dense`) where the plan allows.
     dense: bool = true,
+    /// Set when the scan took the dense fold, so a budget refusal can run again without it.
+    dense_taken: ?*bool = null,
     /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
@@ -2538,7 +2540,18 @@ fn footerLen(bytes: []const u8) usize {
 /// answer, `MultiAggResult.output`, is gpa-owned; `MultiAggResult.deinit`
 /// frees both.
 pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !MultiAggResult {
-    return prepareAggregate(gpa, arena, args, false);
+    // The dense fold's state is reserved up front, but row groups it cannot take still grow the worker tables beside
+    // it: a budget the established path fits must not fail the query, so a refusal there runs that path again.
+    // Exact because the dense fold reads only inputs held whole (none gated), which a second scan reads again.
+    var taken = false;
+    var first = args;
+    first.dense_taken = &taken;
+    return prepareAggregate(gpa, arena, first, false) catch |e| {
+        if (e != error.ExceededMemoryBudget or !taken) return e;
+        var plain = args;
+        plain.dense = false;
+        return prepareAggregate(gpa, arena, plain, false);
+    };
 }
 
 /// Shares all binding and work sizing with execution, but stops before allocating workers or aggregate tables.
@@ -2815,8 +2828,10 @@ fn prepareAggregate(
     }
     const workers = try arena.alloc(Worker, n_workers);
     for (workers) |*w| w.region = null;
-    // A process about to exit leaves the regions to it: unmapping them delays the answer.
+    // A process about to exit leaves the regions to it: unmapping them delays the answer. A failed scan may be run
+    // again (`runMultiAggregate`), so it gives them back.
     defer if (!args.leave_regions) releaseRegions(workers);
+    errdefer releaseRegions(workers);
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -2874,6 +2889,7 @@ fn prepareAggregate(
     // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
     const leave_tables = args.leave_regions and !std.debug.runtime_safety;
     defer if (!leave_tables) for (all_tables) |*gt| gt.deinit();
+    errdefer if (leave_tables) for (all_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
     merged_table.shared = &group_budget;
@@ -2929,13 +2945,18 @@ fn prepareAggregate(
     var dense_charge: usize = 0;
     defer group_budget.release(dense_charge);
     defer for (dense_lanes) |*l| l.deinit(gpa);
+    // The table the lanes merge into is reserved with them, and handed to it as it is built.
+    var dense_table_charge: usize = 0;
     if (dense_wanted) dense: {
         const d = &domain.?;
         const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls.len);
+        for (args.inputs) |in| if (in.gate != null) break :dense;
         if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
-        dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes) orelse break :dense;
+        dense_table_charge = agg_dense.tableBytes(d.ids(), fixed_stride, agg_calls.len);
+        dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes +| dense_table_charge) orelse break :dense;
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
         for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls };
+        if (args.dense_taken) |taken| taken.* = true;
     }
     if (dense_lanes.len == 0) if (domain) |*d| {
         d.deinit(gpa);
@@ -3022,6 +3043,8 @@ fn prepareAggregate(
     if (dense_lanes.len > 0) {
         const dense_table = &all_tables[n_tables];
         const key = group_by_keys.?[0].col_ref;
+        group_budget.release(dense_table_charge);
+        dense_charge -= dense_table_charge;
         try agg_dense.intoTable(gpa, arena, dense_lanes, key, dense_table, key.col_idx + 1, n_workers);
         if (!leave_tables) {
             for (dense_lanes) |*l| l.deinit(gpa);

@@ -94,6 +94,12 @@ pub fn laneBytes(ids: usize, n_calls: usize) usize {
     return ids *| (@sizeOf(u64) + @sizeOf(Accumulator) *| n_calls);
 }
 
+/// Bytes at most the table `intoTable` fills holds for `ids` groups: what `GroupTable.reserveFixed` charges.
+pub fn tableBytes(ids: usize, stride: usize, n_calls: usize) usize {
+    const slots = std.math.ceilPowerOfTwo(usize, @max(16, ids *| 4 / 3 + 1)) catch std.math.maxInt(usize);
+    return ids *| (stride + @sizeOf(u64) + @sizeOf(Accumulator) *| n_calls) +| slots *| (@sizeOf(u64) + @sizeOf(u32) * 2);
+}
+
 /// One worker's accumulators, `calls.len` per id, and each id's least position. Allocated on the worker's first row
 /// group, so the pages are first touched by the thread that fills them.
 pub const Lanes = struct {
@@ -365,6 +371,8 @@ test "dense fold makes the groups and states grouping by code makes, by value ac
     }
     try intoTable(testing.allocator, a, &lanes, Fixture.key, &got, lookup.len, 2);
     try expectSameGroups(&want, &got, calls.len);
+    // Admission reserves the table beside the lanes (`tableBytes`): it must cover what the table then holds.
+    try testing.expect(got.allocated_bytes <= tableBytes(d.ids(), 9, calls.len));
     // 10, 20, 30 and null: 40 sits only in a filtered row.
     try testing.expectEqual(@as(usize, 4), got.groupCount());
 }

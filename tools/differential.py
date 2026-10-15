@@ -561,6 +561,23 @@ def dense_domain_checks(con, tmp):
                     print(f"  FAIL  {label}  {problem}")
                 else:
                     print(f"  OK    {label}")
+    # Many calls over a small domain: lanes, domain and final table together outgrow a budget the established path
+    # fits. The dense fold must decline or run that path again, never fail the query.
+    many = os.path.join(tmp, "dense_many.parquet")
+    rows = np.arange(196608)
+    pq.write_table(pa.table({"k": pa.array(rows % 1000, pa.int64()), "v": pa.array(rows % 31 - 15, pa.int64())}),
+                   many, row_group_size=8192)
+    # (48 calls at 4M failed before the final table was reserved with the lanes and a refusal ran the scan again.)
+    for n_calls, mem in ((24, "2M"), (48, "4M"), (48, "3500K")):
+        sums = ", ".join(f"sum(v) AS s{i}" for i in range(n_calls))
+        for j in ("1", "3", "16"):
+            outs = [subprocess.run([ZPQ, "query", many, "-j", j, "--group-by", "k", "--aggregate", sums,
+                                    "--max-memory", mem], capture_output=True, text=True,
+                                   env={**os.environ, "ZPQ_DENSE": d}) for d in ("0", "1")]
+            total += 1
+            same_out = outs[0].returncode == 0 and outs[1].returncode == 0 and outs[0].stdout == outs[1].stdout
+            print(f"  {'OK  ' if same_out else 'FAIL'}  dense:many-calls {n_calls} {mem} -j {j} rc={outs[1].returncode}")
+            fails += 0 if same_out else 1
     # Budgets around the lanes' charge: dense or not, the same answer or the same refusal.
     sql = queries[2].replace(paths[0], both)
     for mem in ("2M", "6M", "16M", "64M"):

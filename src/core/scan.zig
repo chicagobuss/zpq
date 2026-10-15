@@ -3991,7 +3991,12 @@ fn mergeResultCutInner(
 /// How many independent partitions the merge is worth. One partition below a few thousand refs, or with one worker:
 /// the hash table is then smaller than the cost of splitting it. Otherwise a power of two, so a key's high bits name
 /// its partition, and no larger than the worker count.
-fn mergePartitionCount(n_workers: usize, n_refs: usize, cut: bool) usize {
+/// Bytes of merge state a full-merge partition aims for: a core's share of its chiplet's L3.
+const merge_part_bytes = 4 << 20;
+const merge_parts_max = 4096;
+
+/// `entry_bytes`: what one reference may add to a partition's map, slots and accumulators.
+fn mergePartitionCount(n_workers: usize, n_refs: usize, cut: bool, entry_bytes: usize) usize {
     if (n_workers < 2 or n_refs < 16) return 1;
     var p: usize = 1;
     while (p * 2 <= n_workers and p < 32) p *= 2;
@@ -4003,7 +4008,16 @@ fn mergePartitionCount(n_workers: usize, n_refs: usize, cut: bool) usize {
         return @min(512, @max(p, cut_parts));
     }
     if (n_refs < 8192) return 1;
-    return p;
+    // A full merge of near-unique keys holds about a group a reference: one partition a worker leaves each map far
+    // larger than cache, and lookups miss. Sized by bytes instead, a partition's state stays cache-resident.
+    const fit = std.math.ceilPowerOfTwoAssert(usize, (n_refs *| entry_bytes) / merge_part_bytes + 1);
+    return @min(merge_parts_max, @max(p, fit));
+}
+
+/// What one merged reference may cost a partition when it starts a group: its map entry, its slot and its
+/// accumulators.
+fn mergeEntryBytes(n_calls: usize) usize {
+    return @sizeOf([]const u8) + @sizeOf(u32) + 1 + @sizeOf(MergedSlot) + n_calls * @sizeOf(expr_agg.Accumulator);
 }
 
 const MergePart = struct {
@@ -4055,7 +4069,7 @@ fn mergeFoldedRefs(
 ) !void {
     const ma = if (cut) |c| c.memory orelse gpa else gpa;
     const split_arena = if (cut) |c| c.memory orelse arena else arena;
-    const nparts = mergePartitionCount(n_workers, refs.len, cut != null);
+    const nparts = mergePartitionCount(n_workers, refs.len, cut != null, mergeEntryBytes(calls.len));
     if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, slots, accs);
 
     // Partitions come from the middle of the hash: the map inside each takes its fingerprint from the top bits and
@@ -9002,7 +9016,7 @@ test "a count cut inside the merge keeps exactly the groups the full sort would,
     var refs: std.ArrayList(MergeGroupRef) = .empty;
     defer refs.deinit(testing.allocator);
     for (&tables, 0..) |*t, ti| for (0..t.groupCount()) |g| try refs.append(testing.allocator, .{ .table = @intCast(ti), .group = @intCast(g) });
-    try testing.expect(mergePartitionCount(8, refs.items.len, true) > 1);
+    try testing.expect(mergePartitionCount(8, refs.items.len, true, mergeEntryBytes(calls.len)) > 1);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -9020,7 +9034,7 @@ test "a count cut inside the merge keeps exactly the groups the full sort would,
         var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
         defer accs.deinit(testing.allocator);
         try mergeFoldedRefs(testing.allocator, arena, &tables, refs.items, &calls, 8, cut, &slots, &accs);
-        if (cut != null) try testing.expectEqual(@as(usize, 25) * mergePartitionCount(8, refs.items.len, true), slots.items.len);
+        if (cut != null) try testing.expectEqual(@as(usize, 25) * mergePartitionCount(8, refs.items.len, true, mergeEntryBytes(calls.len)), slots.items.len);
         const ranked = try arena.alloc(Ranked, slots.items.len);
         for (slots.items, ranked) |s, *r| r.* = .{ .c = accs.items[s.idx].count, .first = s.first, .key = s.key };
         std.sort.pdq(Ranked, ranked, {}, rank);
@@ -9459,6 +9473,19 @@ test "runMultiAggregate: workers judge their sets after a pilot and move them to
         try testing.expectEqual(wr.len, gr.len);
         for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
     };
+}
+
+test "mergePartitionCount sizes a full merge's partitions by their state, never below one a worker" {
+    const entry = mergeEntryBytes(2);
+    // Few references keep one partition a worker; near-unique millions split until a partition's state fits.
+    try testing.expectEqual(@as(usize, 1), mergePartitionCount(16, 4000, false, entry));
+    try testing.expectEqual(@as(usize, 16), mergePartitionCount(16, 16_000, false, entry));
+    const many = mergePartitionCount(16, 27_000_000, false, entry);
+    try testing.expect(many > 16 and many <= merge_parts_max);
+    try testing.expect(27_000_000 * entry / many <= merge_part_bytes);
+    try testing.expectEqual(@as(usize, merge_parts_max), mergePartitionCount(16, 1 << 40, false, entry));
+    // A cut keeps its own rule.
+    try testing.expectEqual(@as(usize, 512), mergePartitionCount(16, 27_000_000, true, entry));
 }
 
 test "runMultiAggregate: a pilot short of rows a group judges again at twice the rows" {

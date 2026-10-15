@@ -3012,6 +3012,13 @@ fn decodeAggColumnHist(
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
     if (firsts) {
         if (dec_kind != null) return null;
+        // The reader declines a key chunk at its first null row, after allocating and folding up to it, and the chunk
+        // then decodes afresh; so only try a nullable column whose statistics count no nulls (a wrong count costs
+        // that retry, never an answer).
+        if (levels.max_def > 0) {
+            const nulls = if (cm.statistics) |st| st.null_count else null;
+            if (nulls == null or nulls.? != 0) return null;
+        }
         switch (cm.type) {
             .INT64, .BYTE_ARRAY => {},
             .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?)) return null,

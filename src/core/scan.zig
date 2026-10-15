@@ -1800,7 +1800,7 @@ fn censusTopK(
     for (item_rows) |n| total_rows += n;
     const sure_need = k + admit_rows;
     const short_need: u64 = if (total_rows > admit_rows and tables.len > 0 and tables[0].fixed_stride != 0)
-        @min(sure_need, 2 * k * total_rows / (total_rows - admit_rows) + 1)
+        @min(sure_need, (2 *| @as(u64, k) *| total_rows) / (total_rows - admit_rows) +| 1)
     else
         sure_need;
     const counted = try arena.dupe(Worker, workers);

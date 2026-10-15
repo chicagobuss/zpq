@@ -720,18 +720,24 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 }
             }
             const max_def: u32 = @intCast(self.levels.max_def);
+            var w = written;
+            // While no page has had a null, pages proven all-present still decode without levels, as `readAll` does
+            // them: at max_def 1 only, where a missing level array means level 1 everywhere to every reader.
+            if (max_def == 1 and def_out == null and self.options.fast_levels) {
+                w += try self.decodeAllPresent(values[w..]);
+                if (w == num_leaves) return .{ .values = values, .has_nulls = self.has_nulls };
+            }
             // Values decode needs expanded levels from here on.
             self.options.fast_levels = false;
             var def_buf = def_out;
             if (max_def > 0 and def_buf == null) {
                 def_buf = try self.arena.alloc(u32, num_leaves);
-                @memset(def_buf.?[0..written], max_def);
+                @memset(def_buf.?[0..w], max_def);
             }
             if (def_buf) |dl| {
                 for (values[0..written], dl[0..written]) |*v, dv| {
                     if (dv < max_def) v.* = defaultValue();
                 }
-                var w = written;
                 while (w < num_leaves) {
                     const n = try self.decodeWithLevels(values[w..], dl[w..]);
                     if (n == 0) break;
@@ -740,7 +746,6 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (w != num_leaves) return error.ShortDecode;
                 return .{ .values = values, .def_levels = dl, .has_nulls = self.has_nulls };
             }
-            var w = written;
             while (w < num_leaves) {
                 const n = try self.decode(values[w..]);
                 if (n == 0) break;
@@ -2255,4 +2260,60 @@ test "readAllHistogram with first leaves unwinds cleanly on every allocation fai
             try testing.expectEqualSlices(u32, &.{ 9, 10, 11, 0 }, got.first.?);
         }
     }.run, .{chunk.items});
+}
+
+test "readAllCodes falling back to values skips levels on all-present pages until a page has a null" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    // 40 entries for 64 leaves: near-unique, so the codes read gives way to values from the first page.
+    var dict_vals: [40]i64 = undefined;
+    for (&dict_vals, 0..) |*d, i| d.* = @as(i64, @intCast(i)) * 11 - 7;
+    const dict = std.mem.asBytes(&dict_vals);
+    const page_len = 16;
+    const Page = struct { levels: [page_len]u32, codes: []const u32 };
+    const all: [page_len]u32 = @splat(1);
+    var with_null = all;
+    with_null[5] = 0;
+    const pages = [_]Page{
+        .{ .levels = all, .codes = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 } },
+        .{ .levels = all, .codes = &.{ 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31 } },
+        .{ .levels = with_null, .codes = &.{ 32, 33, 34, 35, 36, 37, 38, 39, 0, 1, 2, 3, 4, 5, 6 } },
+        .{ .levels = all, .codes = &.{ 39, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24 } },
+    };
+    for ([_]usize{ 2, 4 }) |n_pages| {
+        var chunk: std.ArrayList(u8) = .empty;
+        try appendPageForTest(arena, &chunk, true, dict_vals.len, dict);
+        var want_values: std.ArrayList(i64) = .empty;
+        var want_levels: std.ArrayList(u32) = .empty;
+        for (pages[0..n_pages]) |page| {
+            var body: std.ArrayList(u8) = .empty;
+            const def_bytes = try hybrid_rle.encode(arena, &page.levels, 1);
+            try body.appendSlice(arena, &std.mem.toBytes(@as(u32, @intCast(def_bytes.len))));
+            try body.appendSlice(arena, def_bytes);
+            try body.append(arena, 6);
+            try body.appendSlice(arena, try hybrid_rle.encode(arena, page.codes, 6));
+            try appendPageForTest(arena, &chunk, false, page_len, body.items);
+            var next: usize = 0;
+            for (page.levels) |l| {
+                try want_levels.append(arena, l);
+                if (l == 1) {
+                    try want_values.append(arena, dict_vals[page.codes[next]]);
+                    next += 1;
+                } else try want_values.append(arena, 0);
+            }
+        }
+        const n = n_pages * page_len;
+        const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+        var reader = ColumnChunkReader(i64).init(chunk.items, .UNCOMPRESSED, levels, arena);
+        const got = (try reader.readAllCodes(n)).?.values;
+        try testing.expectEqualSlices(i64, want_values.items, got.values);
+        if (n_pages == 2) {
+            // Every page all-present: no level array at all, meaning level 1 everywhere.
+            try testing.expect(got.def_levels == null);
+        } else {
+            try testing.expectEqualSlices(u32, want_levels.items, got.def_levels.?);
+            try testing.expect(got.has_nulls);
+        }
+    }
 }

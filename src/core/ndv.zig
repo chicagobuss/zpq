@@ -269,9 +269,21 @@ const Worker = struct {
                 ids[at[r]] = @intCast(j);
                 at[r] += 1;
             }
-            for (s.parts, 0..) |*p, pi| {
-                while (p.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            // Workers that walked the partitions in one order queued behind each other on every lock. Start each
+            // dictionary at its own partition and pass over a held lock to come back to it.
+            var done: [P]bool = @splat(false);
+            var left: usize = P;
+            var pi: usize = i % P;
+            while (left > 0) : (pi = (pi + 1) % P) {
+                if (done[pi]) continue;
+                const p = &s.parts[pi];
+                if (p.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
                 defer p.lock.store(false, .release);
+                done[pi] = true;
+                left -= 1;
                 for (ids[starts[pi]..starts[pi + 1]]) |j| {
                     if (ints.len > 0) try p.set.insertU64(s.gpa, ints[j]) else try p.set.insertBytes(s.gpa, strs[j]);
                 }

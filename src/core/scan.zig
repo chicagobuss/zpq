@@ -724,17 +724,19 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const explicit_census = if (in.args.sketch_topk) |cfg| cfg.fuse_census != null else false;
     if (!explicit_census) {
         const looks_unique = plan.dispatch.keys_unique and bail_census and !short_composite;
+        // A fixed-width composite's cells are spread by every combination its marginals make, so they bail far more
+        // often than one key's; counting again after the bail cost more than riding along and being dropped.
+        const fixed_composite = bail_census and !short_composite and keys.len > 1 and
+            expr_agg.fixedGroupStride(keys) != null;
         plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
-        plan.dispatch.census_fused = looks_unique;
+        plan.dispatch.census_fused = looks_unique or fixed_composite;
         plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
-        if (looks_unique) {
-            plan.reasons.insert(.keys_look_unique);
-            plan.reasons.insert(.census_fused);
-        }
+        if (looks_unique) plan.reasons.insert(.keys_look_unique);
+        if (looks_unique or fixed_composite) plan.reasons.insert(.census_fused);
         if (plan.dispatch.strategy == .sketch) {
             if (bail_census) {
                 plan.reasons.insert(if (short_composite) .census_short_string_composite else .census_fixed_width_bail);
@@ -9754,7 +9756,8 @@ test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     in.ndv_stat.?.key_bytes = 18;
     plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy);
-    try testing.expect(plan.dispatch.census_allowed and !plan.dispatch.census_fused);
+    // A fixed-width composite rides its census along the count pass; it is no guess at uniqueness.
+    try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_fused and !plan.dispatch.keys_unique);
     in.args.sketch_topk.?.census = false;
     try testing.expect(!planAggregate(in).dispatch.census_allowed);
     in.args.sketch_topk.?.census = true;

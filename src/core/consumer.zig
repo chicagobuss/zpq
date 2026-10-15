@@ -2386,7 +2386,7 @@ pub fn scanRGForAgg(
     const t_decode_start = nowMonoNs();
     var dec: ChunkDecoder = .{
         .in = in,
-        .uses = try planCodeUses(ra, in, target),
+        .uses = try planCodeUses(ra, in, target, staged),
         .page_indexes = page_indexes,
         .filter_pages = filter_pages,
         .num_rows = num_rows,
@@ -2713,9 +2713,10 @@ const ChunkDecoder = struct {
         const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
             self.target == .scalar;
+        const firsts = self.target == .grouped;
         const hist_col: ?filter_eval.Batch.Column = if (encoded and !levels_only and uses.code[ci] and
             uses.hist_ok[ci] and !uses.value[ci])
-            try decodeAggColumnHist(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows)
+            try decodeAggColumnHist(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows, firsts)
         else
             null;
         var decoded = if (hist_col) |hc|
@@ -2783,7 +2784,7 @@ fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profi
 /// Which columns a coded decode serves (`code`) and which still need materialized values (`value`).
 const CodeUses = struct { code: []bool, value: []bool, levels: []bool, hist_ok: []bool };
 
-fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !CodeUses {
+fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, staged: bool) !CodeUses {
     const n = in.read.len;
     const u: CodeUses = .{
         .code = try ra.alloc(bool, n),
@@ -2797,6 +2798,16 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !Code
     // A column folds straight into a histogram when every row is selected and only unfiltered scalar aggregates
     // read it as a bare argument.
     @memset(u.hist_ok, in.filter == null and target == .scalar);
+    // So does a lone GROUP BY key that only counts read, its groups resolved from the histogram
+    // (`agg_coded.groupedCoded`). A staged, windowed or sketched fold reads codes per row.
+    if (in.filter == null and !staged) switch (target) {
+        .grouped => |g| if (g.part == null and g.table.sketch == null) {
+            if (agg_coded.histGroupKey(g.calls, g.keys)) |key| if (key < n) {
+                u.hist_ok[key] = true;
+            };
+        },
+        .scalar => {},
+    };
     if (target == .scalar) for (target.calls()) |call| {
         if (call.where) |w| markFilterSet(u.hist_ok, w, false);
         if (call.arg) |arg| {
@@ -2977,7 +2988,8 @@ fn codedOrValues(
 }
 
 /// `decodeAggColumnCoded` folded straight into a code histogram, or null when the chunk doesn't qualify (the caller
-/// then decodes it afresh). Decimal and unsigned-INT32 dictionaries convert once per entry.
+/// then decodes it afresh). Decimal and unsigned-INT32 dictionaries convert once per entry. `firsts` (a GROUP BY key,
+/// `agg_coded.histGroupKey`) also notes each entry's first row, for keys typed exactly as their codes decode.
 fn decodeAggColumnHist(
     ra: std.mem.Allocator,
     chunk: []const u8,
@@ -2986,17 +2998,26 @@ fn decodeAggColumnHist(
     decode_options: DecodeOptions,
     scratch: *DecodeScratch,
     num_rows: usize,
+    firsts: bool,
 ) !?filter_eval.Batch.Column {
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     if (levels.max_rep > 0) return null;
     const n_leaves: usize = @intCast(cm.num_values);
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    if (firsts) {
+        if (dec_kind != null) return null;
+        switch (cm.type) {
+            .INT64, .BYTE_ARRAY => {},
+            .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?)) return null,
+            else => return null,
+        }
+    }
     if (dec_kind) |k| {
         return switch (k.physical) {
             inline .INT32, .INT64 => |p| blk: {
                 const T = if (p == .INT32) i32 else i64;
-                const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+                const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch, firsts)) orelse
                     break :blk null;
                 switch (r) {
                     .hist => |h| {
@@ -3021,7 +3042,7 @@ fn decodeAggColumnHist(
     if (schema_elem != null and schema.isFloat16(schema_elem.?)) return null;
     return switch (cm.type) {
         .INT32 => blk: {
-            const r = (try histOf(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+            const r = (try histOf(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch, firsts)) orelse
                 break :blk null;
             const unsigned = schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?);
             switch (r) {
@@ -3050,7 +3071,7 @@ fn decodeAggColumnHist(
                 .DOUBLE => f64,
                 else => []const u8,
             };
-            const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse
+            const r = (try histOf(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch, firsts)) orelse
                 break :blk null;
             const tag = switch (t) {
                 .INT64 => "i64",
@@ -3074,6 +3095,7 @@ fn histCol(comptime T: type, h: anytype, dict: []const T, num_rows: usize) filte
         .hist = h.hist,
         .levels_only_rows = num_rows,
         .has_nulls = h.num_present != num_rows,
+        .hist_first = h.first,
     };
 }
 
@@ -3086,9 +3108,10 @@ fn histOf(
     n_leaves: usize,
     decode_options: DecodeOptions,
     scratch: *DecodeScratch,
+    firsts: bool,
 ) !?column_mod.ColumnChunkReader(T).HistOrValues {
     var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
-    return reader.readAllHistogram(n_leaves);
+    return reader.readAllHistogram(n_leaves, firsts);
 }
 
 /// A column of definition levels only, typed as `decodeAggColumn` would type it so lookups and type checks agree.

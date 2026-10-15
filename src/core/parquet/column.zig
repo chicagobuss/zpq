@@ -515,7 +515,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
             hist: []u64,
             dict: []const T,
             num_present: usize,
+            /// With `track_first`: each entry's first leaf, or `no_leaf` for an entry no leaf holds.
+            first: ?[]const u32 = null,
         };
+
+        pub const no_leaf = std.math.maxInt(u32);
 
         /// Fold the chunk straight into a histogram of dictionary codes, never writing a code or
         /// a value per row. An RLE run of the index stream costs O(1) (`hist[v] += run length`); bit-packed indices
@@ -523,21 +527,35 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// not dictionary-encoded throughout, or the dictionary is near-unique; the caller then decodes afresh.
         pub const HistOrValues = union(enum) { hist: HistLeaves, values: Leaves };
 
-        pub fn readAllHistogram(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?HistOrValues {
+        /// `track_first` also notes each entry's first leaf (a GROUP BY key's group position), and then declines a
+        /// chunk with a null leaf, whose group would need a position too.
+        pub fn readAllHistogram(
+            self: *Self,
+            num_leaves: usize,
+            track_first: bool,
+        ) (Error || error{ShortDecode})!?HistOrValues {
             if (T == bool) {
                 return null;
             } else {
-                return self.readAllHistogramImpl(num_leaves);
+                return self.readAllHistogramImpl(num_leaves, track_first);
             }
         }
 
-        fn readAllHistogramImpl(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!?HistOrValues {
+        fn readAllHistogramImpl(
+            self: *Self,
+            num_leaves: usize,
+            track_first: bool,
+        ) (Error || error{ShortDecode})!?HistOrValues {
             if (self.levels.max_rep > 0) return null;
+            if (track_first and num_leaves > no_leaf) return null;
             self.options.fast_levels = true;
             self.value_budget = num_leaves;
             try self.holdScratch();
             const max_def: u32 = @intCast(self.levels.max_def);
             var hist: []u64 = &.{};
+            var first_leaf: ?[]u32 = null;
+            // Entries with no first leaf yet; once none is left, the rest of the chunk only counts.
+            var unfound: usize = 0;
             var dict_ptr: ?[*]const T = null;
             var written: usize = 0;
             var present_total: usize = 0;
@@ -563,6 +581,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
                         dict_ptr = d.ptr;
                         hist = try self.arena.alloc(u64, d.len);
                         @memset(hist, 0);
+                        if (track_first) {
+                            first_leaf = try self.arena.alloc(u32, d.len);
+                            @memset(first_leaf.?, no_leaf);
+                            unfound = d.len;
+                        }
                     }
                     const want = @min(num_leaves - written, remaining_in_page);
                     var present = want;
@@ -571,14 +594,21 @@ pub fn ColumnChunkReader(comptime T: type) type {
                         present = 0;
                         for (src) |dv| present += @intFromBool(dv == max_def);
                     }
+                    if (track_first and present != want) return null;
                     const idx = &self.active.rle_dict.indices;
                     // Bounded by the buffer allocated, not by whatever dictionary is installed now.
                     const n_dict = hist.len;
                     if (n_dict == 0 or d.len != n_dict) return error.UnexpectedPage;
                     var left = present;
                     while (left > 0) {
+                        // Leaves and present leaves coincide when first leaves are tracked (no nulls).
+                        const leaf: u32 = @intCast(written + (present - left));
                         if (idx.takeRleRun(left) catch return error.UnexpectedPage) |run| {
                             if (run.value >= n_dict) return error.UnexpectedPage;
+                            if (unfound > 0 and first_leaf.?[run.value] == no_leaf) {
+                                first_leaf.?[run.value] = leaf;
+                                unfound -= 1;
+                            }
                             hist[run.value] += run.count;
                             left -= run.count;
                             continue;
@@ -592,6 +622,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
                             hist[@min(k, n_dict - 1)] += 1;
                         }
                         if (oob != 0) return error.UnexpectedPage;
+                        if (unfound > 0) for (buf[0..got], 0..) |k, j| {
+                            if (first_leaf.?[k] == no_leaf) {
+                                first_leaf.?[k] = leaf + @as(u32, @intCast(j));
+                                unfound -= 1;
+                            }
+                        };
                         left -= got;
                     }
                     present_total += present;
@@ -606,7 +642,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (num_leaves == 0) return null;
             const dict = self.dictionary orelse return null;
             const owned: []const T = if (T == []const u8) dict else try self.arena.dupe(T, dict);
-            return .{ .hist = .{ .hist = hist, .dict = owned, .num_present = present_total } };
+            return .{ .hist = .{ .hist = hist, .dict = owned, .num_present = present_total, .first = first_leaf } };
         }
 
         /// Drain only the definition levels (count(col) needs nothing else). Pages are still
@@ -1426,7 +1462,7 @@ test "a second dictionary page, after data or after the first, is a corrupt chun
         try testing.expectError(error.UnexpectedDictionaryPage, values_reader.decode(out[0..n]));
 
         var hist_reader = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, arena);
-        try testing.expectError(error.UnexpectedDictionaryPage, hist_reader.readAllHistogram(n * 8));
+        try testing.expectError(error.UnexpectedDictionaryPage, hist_reader.readAllHistogram(n * 8, false));
     };
 }
 
@@ -2102,7 +2138,7 @@ fn fuzzChunk(_: void, smith: *std.testing.Smith) anyerror!void {
                     } else _ = reader.decode(out) catch return;
                 },
                 .histogram => if (T != bool) {
-                    _ = reader.readAllHistogram(want) catch return;
+                    _ = reader.readAllHistogram(want, smith.value(bool)) catch return;
                 },
                 .codes => if (T != bool) {
                     _ = reader.readAllCodes(want) catch return;
@@ -2128,4 +2164,95 @@ test "fuzz: column chunk bytes decode or fail with an error, never panic" {
         try flbaPageForTest(arena, false, 2, false, &.{ "ab", "cd" }),
     };
     try std.testing.fuzz({}, fuzzChunk, .{ .corpus = &seeds });
+}
+
+test "readAllHistogram notes each entry's first leaf over RLE and bit-packed runs, and declines nulls when it does" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const dict = std.mem.toBytes([6]i32{ 60, 10, 50, 20, 40, 30 });
+    var prng = std.Random.DefaultPrng.init(0x4157);
+    const r = prng.random();
+    // Three pages: a long run of one entry, random codes (bit-packed), then a run of a late newcomer.
+    var codes: [3][]u32 = undefined;
+    for (&codes, [_]usize{ 700, 333, 90 }, 0..) |*page, n, pi| {
+        page.* = try arena.alloc(u32, n);
+        for (page.*) |*c| c.* = switch (pi) {
+            0 => 2,
+            1 => r.uintLessThan(u32, 4),
+            else => 5,
+        };
+    }
+    var chunk: std.ArrayList(u8) = .empty;
+    try appendPageForTest(arena, &chunk, true, 6, &dict);
+    for (codes) |page| {
+        var body: std.ArrayList(u8) = .empty;
+        try body.append(arena, 3);
+        try body.appendSlice(arena, try hybrid_rle.encode(arena, page, 3));
+        try appendPageForTest(arena, &chunk, false, @intCast(page.len), body.items);
+    }
+    const n_leaves = 700 + 333 + 90;
+    var want_hist: [6]u64 = @splat(0);
+    var want_first: [6]u32 = @splat(ColumnChunkReader(i32).no_leaf);
+    var leaf: u32 = 0;
+    for (codes) |page| for (page) |c| {
+        want_hist[c] += 1;
+        if (want_first[c] == ColumnChunkReader(i32).no_leaf) want_first[c] = leaf;
+        leaf += 1;
+    };
+    for ([_]bool{ false, true }) |track| {
+        var reader = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, arena);
+        const got = (try reader.readAllHistogram(n_leaves, track)).?.hist;
+        try testing.expectEqualSlices(u64, &want_hist, got.hist);
+        if (track) {
+            try testing.expectEqualSlices(u32, &want_first, got.first.?);
+        } else try testing.expect(got.first == null);
+    }
+
+    // An OPTIONAL column with one null leaf: counted out without first leaves, declined with them.
+    const levels = [_]u32{ 1, 1, 0, 1 } ++ @as([60]u32, @splat(1));
+    const present = [_]u32{ 1, 3, 1 } ++ @as([60]u32, @splat(0));
+    var body: std.ArrayList(u8) = .empty;
+    const def_bytes = try hybrid_rle.encode(arena, &levels, 1);
+    try body.appendSlice(arena, &std.mem.toBytes(@as(u32, @intCast(def_bytes.len))));
+    try body.appendSlice(arena, def_bytes);
+    try body.append(arena, 3);
+    try body.appendSlice(arena, try hybrid_rle.encode(arena, &present, 3));
+    var nulls: std.ArrayList(u8) = .empty;
+    try appendPageForTest(arena, &nulls, true, 6, &dict);
+    try appendPageForTest(arena, &nulls, false, levels.len, body.items);
+    for ([_]bool{ false, true }) |track| {
+        var reader = ColumnChunkReader(i32).init(nulls.items, .UNCOMPRESSED, .{ .max_def = 1, .max_rep = 0 }, arena);
+        const got = try reader.readAllHistogram(levels.len, track);
+        if (track) {
+            try testing.expect(got == null);
+        } else {
+            try testing.expectEqual(@as(usize, levels.len - 1), got.?.hist.num_present);
+        }
+    }
+}
+
+test "readAllHistogram with first leaves unwinds cleanly on every allocation failure" {
+    const dict = std.mem.toBytes([4]i32{ 1, 2, 3, 4 });
+    var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch_arena.deinit();
+    const sa = scratch_arena.allocator();
+    var chunk: std.ArrayList(u8) = .empty;
+    try appendPageForTest(sa, &chunk, true, 4, &dict);
+    // At least 8 leaves an entry, or the chunk decodes as values.
+    const codes = @as([9]u32, @splat(3)) ++ [_]u32{ 0, 1, 2 } ++ @as([52]u32, @splat(1));
+    var body: std.ArrayList(u8) = .empty;
+    try body.append(sa, 2);
+    try body.appendSlice(sa, try hybrid_rle.encode(sa, &codes, 2));
+    try appendPageForTest(sa, &chunk, false, codes.len, body.items);
+    try std.testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, bytes: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const flat: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+            var reader = ColumnChunkReader(i32).init(bytes, .UNCOMPRESSED, flat, arena.allocator());
+            const got = (try reader.readAllHistogram(64, true)).?.hist;
+            try testing.expectEqualSlices(u32, &.{ 9, 10, 11, 0 }, got.first.?);
+        }
+    }.run, .{chunk.items});
 }

@@ -286,6 +286,8 @@ pub fn ColumnT(comptime T: type) type {
         /// With `hist` set, the column was folded straight into a histogram over `dict` (no levels either).
         levels_only_rows: usize = 0,
         hist: ?[]const u64 = null,
+        /// With `hist`, for a GROUP BY key: each dictionary entry's first row, `maxInt(u32)` for an entry no row holds.
+        hist_first: ?[]const u32 = null,
         /// A DECIMAL column's exact unscaled integers, row for row with `values` (the f64 view filters compare). Only
         /// set on a decoded decimal; anything that moves rows (gather, selection) must move these too or drop them,
         /// and exact decimal evaluation refuses a column without them rather than fall back to the f64 view.
@@ -345,6 +347,12 @@ pub const Batch = struct {
         pub fn hist(self: Column) ?[]const u64 {
             return switch (self) {
                 inline else => |c| c.hist,
+            };
+        }
+
+        pub fn histFirst(self: Column) ?[]const u32 {
+            return switch (self) {
+                inline else => |c| c.hist_first,
             };
         }
 

@@ -451,6 +451,18 @@ fn codeIntRange(comptime T: type, ra: std.mem.Allocator, ic: *filter_eval.Column
     ic.dict = dict;
 }
 
+/// The column of a lone bare GROUP BY key that only counts read (`count(*)`, or `count` of the key itself), which can
+/// then decode straight into a histogram of its codes with each code's first row (`groupedHist`); null otherwise.
+pub fn histGroupKey(calls: []const AggCall, keys: []const expr_ast.Expr) ?usize {
+    if (keys.len != 1 or keys[0] != .col_ref) return null;
+    const key = keys[0].col_ref.col_idx;
+    for (calls) |call| {
+        if (call.func != .count or call.where != null) return null;
+        if (call.arg) |arg| if (arg != .col_ref or arg.col_ref.col_idx != key) return null;
+    }
+    return key;
+}
+
 /// Grouped scan with every GROUP BY key a bare coded column. Fills `group_id_arr` for selected rows and folds every
 /// call. Returns false, having done nothing, when the keys don't qualify.
 pub fn groupedCoded(
@@ -468,6 +480,12 @@ pub fn groupedCoded(
     budget: ?*DecodeBudget,
 ) !bool {
     const num_rows = batch.num_rows;
+    if (keys.len == 1 and keys[0] == .col_ref) if (lookup[keys[0].col_ref.col_idx]) |pos| {
+        if (batch.cols[pos].hist() != null) {
+            try groupedHist(ra, calls, keys[0].col_ref, batch.cols[pos], table, pos_base, lookup.len);
+            return true;
+        }
+    };
     const key_cols = try ra.alloc(Column, keys.len);
     const strides = try ra.alloc(usize, keys.len);
     var space: usize = 1;
@@ -559,6 +577,33 @@ pub fn groupedCoded(
         try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, wide);
     }
     return true;
+}
+
+/// `groupedCoded` for a key decoded as a histogram with first rows (`histGroupKey`): each code a row holds becomes its
+/// group, in code order at its first row, as the per-row composites resolve, and takes its count in one add.
+fn groupedHist(
+    ra: std.mem.Allocator,
+    calls: []const AggCall,
+    key: expr_ast.ColRef,
+    col: Column,
+    table: *agg.GroupTable,
+    pos_base: u64,
+    lookup_len: usize,
+) !void {
+    std.debug.assert(histGroupKey(calls, &.{.{ .col_ref = key }}) != null);
+    const hist = col.hist().?;
+    // A key's histogram always carries first rows, and is declined for a chunk with a null row.
+    const first = col.histFirst() orelse return error.UnsupportedAggType;
+    if (first.len != hist.len or col.dictLen() != hist.len) return error.UnsupportedAggType;
+    const kd = [_]Column{try keyDictColumn(ra, col, key, lookup_len)};
+    var scratch: std.ArrayList(u8) = .empty;
+    for (hist, first, 0..) |n, fr, code| {
+        if (n == 0) continue;
+        if (fr == std.math.maxInt(u32)) return error.UnsupportedAggType;
+        try serializeKeyAt(&scratch, ra, &kd, &.{code});
+        const g = try table.getOrInsert(scratch.items, calls, pos_base + fr);
+        for (table.accumulators.items[g * calls.len ..][0..calls.len]) |*acc| acc.count += n;
+    }
 }
 
 /// The dictionary of a key column as a group-key column: entries 0..n-1, then a null at n.
@@ -1347,5 +1392,57 @@ test "groupedCoded: a lone null-free key groups as when a constant second key is
         const y = pair.accumulators.items[g * calls.len ..][0..calls.len];
         try testing.expectEqual(y[0].count, x[0].count);
         try testing.expectEqual(y[1].sum_i, x[1].sum_i);
+    }
+}
+
+test "groupedCoded over a key histogram with first rows makes the groups, positions and counts its codes make" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 500;
+    const dict = [_][]const u8{ "d", "a", "c", "b", "never" };
+    const codes = try a.alloc(u32, n);
+    for (codes, 0..) |*c, i| c.* = if (i == 431) 0 else @intCast(1 + (i * 7 / 3) % 3);
+    var hist: [5]u64 = @splat(0);
+    var first: [5]u32 = @splat(std.math.maxInt(u32));
+    for (codes, 0..) |c, i| {
+        hist[c] += 1;
+        if (first[c] == std.math.maxInt(u32)) first[c] = @intCast(i);
+    }
+    const coded = [_]Column{.{ .string = .{ .values = &.{}, .codes = codes, .dict = &dict } }};
+    const histed = [_]Column{.{ .string = .{
+        .values = &.{},
+        .dict = &dict,
+        .hist = &hist,
+        .hist_first = &first,
+        .levels_only_rows = n,
+    } }};
+    const lookup = [_]?usize{0};
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .count, .arg = key, .result = .i64, .where = null, .alias = "nk" },
+    };
+    try testing.expectEqual(@as(?usize, 0), histGroupKey(&calls, &.{key}));
+    const sum_call = [_]AggCall{.{ .func = .sum, .arg = key, .result = .i64, .where = null, .alias = "s" }};
+    try testing.expectEqual(@as(?usize, null), histGroupKey(&sum_call, &.{key}));
+    var sel = try Sel.init(a, n);
+    var tables: [2]agg.GroupTable = undefined;
+    for (&tables, [_][]const Column{ &coded, &histed }) |*t, cols| {
+        t.* = agg.GroupTable.init(testing.allocator, 1 << 20);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, t, 7, &batch, &lookup, &sel, null));
+    }
+    defer for (&tables) |*t| t.deinit();
+    try testing.expectEqual(@as(usize, 4), tables[1].groupCount());
+    try testing.expectEqual(tables[0].groupCount(), tables[1].groupCount());
+    try testing.expectEqualSlices(u64, tables[0].first.items, tables[1].first.items);
+    for (0..tables[0].groupCount()) |g| {
+        try testing.expectEqualStrings(tables[0].keys.items[g], tables[1].keys.items[g]);
+        for (0..calls.len) |ai| try testing.expectEqual(
+            tables[0].accumulators.items[g * calls.len + ai].count,
+            tables[1].accumulators.items[g * calls.len + ai].count,
+        );
     }
 }

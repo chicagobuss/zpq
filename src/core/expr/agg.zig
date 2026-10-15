@@ -4125,7 +4125,7 @@ pub const GroupTable = struct {
         if (@alignOf(GroupTable) < 16) @compileError("private distinct sets use bit 3 of this pointer");
     }
 
-    fn freshDistinct(self: *GroupTable) DistinctAcc {
+    pub fn freshDistinct(self: *GroupTable) DistinctAcc {
         if (self.shared) |budget| return .initEmpty(budget);
         return .initPrivate(self);
     }
@@ -4630,6 +4630,8 @@ pub const DistinctPairs = struct {
     table: *const GroupTable,
     /// The one count(DISTINCT) call it serves.
     agg_idx: usize,
+    /// Rows go to the sets until this is set (`drainTable` moves what they hold so far).
+    active: bool = true,
     parts: [N]std.ArrayList(Pair) = @splat(.empty),
     charged: usize = 0,
     recent: [1 << recent_bits]Pair = undefined,
@@ -4644,6 +4646,38 @@ pub const DistinctPairs = struct {
         }
         self.budget.release(self.charged);
         self.charged = 0;
+    }
+
+    /// Move every value the table's count(DISTINCT) sets hold into pairs, leaving the sets empty. Exact: each value
+    /// went into a set through `insertU64` as the pair would have carried it.
+    pub fn drainTable(self: *DistinctPairs, table: *GroupTable) !void {
+        const n_calls = table.accumulators.items.len / @max(table.groupCount(), 1);
+        for (0..table.groupCount()) |g| {
+            const acc = &table.accumulators.items[g * n_calls + self.agg_idx];
+            if (acc.* != .distinct) continue;
+            const d = acc.distinct;
+            if (d.heap()) |ds| try self.drainSet(@intCast(g), ds) else {
+                for (d.raw[1..][0..d.count()]) |v| try self.add(@intCast(g), v);
+            }
+            acc.distinct.deinit(self.gpa);
+            acc.* = .{ .distinct = table.freshDistinct() };
+        }
+    }
+
+    fn drainSet(self: *DistinctPairs, gid: u32, ds: *const DistinctSet) !void {
+        if (ds.parts) |parts| {
+            for (parts) |*p| try self.drainSet(gid, p);
+            return;
+        }
+        switch (ds.val_set) {
+            .none => {},
+            .inline_u64 => |v| for (v.vals[0..v.len]) |x| try self.add(gid, x),
+            .u64 => |m| {
+                var it = m.keyIterator();
+                while (it.next()) |x| try self.add(gid, x.*);
+            },
+            else => return error.UnsupportedAggType,
+        }
     }
 
     pub fn pairOf(key: []const u8, x: u64) Pair {
@@ -4785,7 +4819,8 @@ fn foldDistinctGrouped(
         ),
         .string, .i128 => {
             // The plan sends only fixed-width numeric values to a pair sink; a set here would be counted twice.
-            if (distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr) return error.UnsupportedAggType;
+            if (distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr)
+                return error.UnsupportedAggType;
             var r: usize = 0;
             while (r < sel.len) : (r += 1) {
                 if (!sel.isActive(r)) continue;
@@ -4807,7 +4842,7 @@ fn foldDistinctU64(
     sel: *const filter_selection.SelectionVector,
     comptime bit: fn (@typeInfo(@TypeOf(values)).pointer.child) u64,
 ) Error!void {
-    if (distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr) {
+    if (distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr) {
         if (agg_idx != dp.agg_idx) return error.UnsupportedAggType;
         var r: usize = 0;
         while (r < sel.len) : (r += 1) {

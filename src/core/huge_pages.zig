@@ -100,12 +100,13 @@ pub const Region = struct {
     }
 
     /// Give back the pages past the newest block: what an earlier phase faulted in and no live block holds, for work
-    /// that is about to allocate elsewhere rather than reuse them. Linux only; elsewhere they stay until `deinit`.
+    /// that is about to allocate elsewhere rather than reuse them. They read back as zeros.
     pub fn trim(self: *Region) void {
-        const lo = std.mem.alignForward(usize, self.end, std.heap.pageSize());
-        if (builtin.os.tag == .linux and self.touched > lo) {
-            const hi = std.mem.alignForward(usize, self.touched, std.heap.pageSize());
-            _ = std.os.linux.madvise(@alignCast(self.buf.ptr + lo), hi - lo, std.os.linux.MADV.DONTNEED);
+        const page = std.heap.pageSize();
+        const lo = std.mem.alignForward(usize, self.end, page);
+        if (self.touched > lo) {
+            const hi = @min(std.mem.alignForward(usize, self.touched, page), self.buf.len);
+            release(@alignCast(self.buf[lo..hi]));
         }
         self.touched = self.end;
     }
@@ -167,6 +168,18 @@ pub const Region = struct {
         if (self.isLast(memory)) self.end = self.last;
     }
 };
+
+/// Drop `span`'s pages now. Linux keeps the mapping and its huge-page advice; Darwin's MADV_DONTNEED may keep the
+/// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).
+fn release(span: []align(std.heap.page_size_min) u8) void {
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
+    } else if (builtin.os.tag.isDarwin()) {
+        var flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
+        if (@hasField(std.posix.MAP, "NORESERVE")) flags.NORESERVE = true;
+        _ = std.posix.mmap(span.ptr, span.len, .{ .READ = true, .WRITE = true }, flags, -1, 0) catch {};
+    }
+}
 
 fn advise(block: []u8) void {
     if (builtin.os.tag != .linux) return;
@@ -233,7 +246,7 @@ test "Region carves blocks in order, grows the newest in place, and spills past 
 test "Region.trim hands back the pages past the newest block that an earlier phase touched" {
     var region = Region.init(std.testing.allocator, 4 * huge_page_size);
     defer region.deinit();
-    if (region.buf.len == 0 or builtin.os.tag != .linux) return error.SkipZigTest;
+    if (region.buf.len == 0) return error.SkipZigTest;
     const a = region.allocator();
     const big = try a.alloc(u8, 3 * huge_page_size);
     @memset(big, 0xa5);
@@ -243,14 +256,22 @@ test "Region.trim hands back the pages past the newest block that an earlier pha
     try std.testing.expectEqual(3 * huge_page_size, region.touched);
     region.trim();
     try std.testing.expectEqual(region.end, region.touched);
-    // Past the newest block nothing is resident any more, and it reads back as fresh zero pages.
     const page = std.heap.pageSize();
-    const span = big[huge_page_size..][0..huge_page_size];
-    var vec: [huge_page_size / 4096]u8 = undefined;
-    const rc = std.os.linux.syscall3(.mincore, @intFromPtr(span.ptr), span.len, @intFromPtr(&vec));
-    try std.testing.expectEqual(@as(usize, 0), rc);
-    for (vec[0 .. span.len / page]) |v| try std.testing.expectEqual(@as(u8, 0), v & 1);
-    try std.testing.expectEqual(@as(u8, 0), span[12345]);
-    // The live block keeps its bytes.
+    // Nothing past the newest block is resident any more (Linux reports residency per page through mincore).
+    if (builtin.os.tag == .linux) {
+        const span = big[huge_page_size..][0..huge_page_size];
+        var vec: [huge_page_size / 4096]u8 = undefined;
+        const rc = std.os.linux.syscall3(.mincore, @intFromPtr(span.ptr), span.len, @intFromPtr(&vec));
+        try std.testing.expectEqual(@as(usize, 0), rc);
+        for (vec[0 .. span.len / page]) |v| try std.testing.expectEqual(@as(u8, 0), v & 1);
+    }
+    // Every byte there reads back as a fresh zero page; the live block keeps its bytes.
+    const past = big[std.mem.alignForward(usize, small.len, page)..];
+    for ([_]usize{ 0, 12345, huge_page_size, past.len - 1 }) |i| try std.testing.expectEqual(@as(u8, 0), past[i]);
     try std.testing.expectEqual(@as(u8, 1), small[99]);
+    // The region still allocates over the trimmed span.
+    region.rewind();
+    const again = try a.alloc(u8, 2 * huge_page_size);
+    @memset(again, 3);
+    try std.testing.expectEqual(@as(u8, 3), again[again.len - 1]);
 }

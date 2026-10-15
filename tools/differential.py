@@ -984,6 +984,31 @@ def main():
                 fails += 1
                 print(f"  FAIL  {label}  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr[:90]!r}")
 
+    # A certificate's trial holds memory the exact scan never does (admitted keys' sets, copied across workers to
+    # count them): a budget the exact scan fits must not fail the query when the trial exceeds it. 160 keys with 50
+    # distinct 4000-byte strings outrank 1000 keys of 40 one-string rows.
+    budget_file = os.path.join(tmp, "budget_copy.parquet")
+    import pyarrow as pa_budget  # `pa` is local to main (imported again below), unbound here
+    keys_b = [k for k in range(160) for _ in range(50)] + [k for k in range(160, 1160) for _ in range(40)]
+    vals_b = [f"v-{v:04d}" + "x" * 3994 for v in range(50)] * 160 + ["z"] * 40_000
+    order_b = list(range(len(keys_b)))
+    rnd_err.Random(9113).shuffle(order_b)
+    pq.write_table(pa_budget.table({"k": [keys_b[i] for i in order_b], "s": [vals_b[i] for i in order_b]}),
+                   budget_file, row_group_size=1024, use_dictionary=False)
+    budget_sql = f"SELECT k, count(DISTINCT s) AS d FROM '{budget_file}' GROUP BY k ORDER BY d DESC LIMIT 10"
+    exact = subprocess.run([ZPQ, "query", "-j", "16", "--max-memory", "140MB", "--query", budget_sql],
+                           capture_output=True, text=True, env={**os.environ, "ZPQ_SKETCH_TOPK": "0"})
+    for j in ("3", "16"):
+        total += 1
+        r = subprocess.run([ZPQ, "query", "-j", j, "--max-memory", "140MB", "--query", budget_sql],
+                           capture_output=True, text=True)
+        label = f"cut-budget -j{j}"
+        if exact.returncode == 0 and r.returncode == 0 and r.stdout == exact.stdout:
+            print(f"  OK    {label}  (answers as the exact scan)")
+        else:
+            fails += 1
+            print(f"  FAIL  {label}  rc={r.returncode} exact_rc={exact.returncode} stderr={r.stderr[:90]!r}")
+
     # A full sort holds every row: past its share of --max-memory it fails cleanly instead of running out.
     total += 1
     r = subprocess.run([ZPQ, "query", "--query", f"SELECT * FROM '{fixture}' ORDER BY name", "--max-memory", "300000"],

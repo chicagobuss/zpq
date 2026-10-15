@@ -2101,9 +2101,20 @@ fn censusDistinctTopK(
             s.census = c;
         }
         for (workers) |*w| w.skip = skip;
-        try runPhase(workers, cursor);
+        // The trial's tables and the threshold's copies of their sets are memory the exact scan never holds: a
+        // budget they exceed is the certificate failing, never the query.
+        runPhase(workers, cursor) catch |e| {
+            if (e != error.ExceededMemoryBudget) return e;
+            for (workers) |*w| w.err = null;
+            if (cfg.trace) std.debug.print("census distinct: trial over budget, exact scan\n", .{});
+            break false;
+        };
         restoreCounts(workers, counted);
-        const tau = try kthDistinct(gpa, arena, tables, calls.len, a_idx, k);
+        const tau = kthDistinct(gpa, arena, tables, calls.len, a_idx, k) catch |e| {
+            if (e != error.ExceededMemoryBudget) return e;
+            if (cfg.trace) std.debug.print("census distinct: trial over budget, exact scan\n", .{});
+            break false;
+        };
         if (cfg.trace) std.debug.print("census distinct: repeated={d} omitted={d} admit={d} admit_rows={d} bound={d} kth_distinct={d} admit_ms={d}\n", .{
             items.len, reduced.omitted, hi, admit_rows, bound, tau, @divTrunc(nowMonoNs() - t1, 1_000_000),
         });

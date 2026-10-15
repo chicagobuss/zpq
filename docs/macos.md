@@ -15,13 +15,16 @@ The binaries declare macOS 15.0 as their minimum (Zig 0.17's default).
 tools/macos_bundle.sh            # -> zig-out/macos-check/zpq-macos-check-<rev>.tar.gz
 ```
 
-It builds, for both `aarch64-macos` and `x86_64-macos`, the ReleaseFast `zpq` and the Debug unit-test executables
+It builds the arm64 (`aarch64-macos`) ReleaseFast `zpq` and Debug unit-test executables
 (`zig build -Dtarget=<t> test-bin` installs `zpq-test` and `zpq-lambda-test` without running them), and fails if
 `llvm-objdump` finds a raw `svc`/`syscall` instruction in any of them: macOS code reaches the kernel through libSystem,
 so one would be a Linux syscall that survived. The tarball also holds the unit-test fixtures (`ci/fixtures`,
 `data/parquet-testing`, plus `data/{benchmark_100mb,nested_edges,bench_types}.parquet` when present), generated smoke
 fixtures, and golden CLI outputs recorded by running `macos_check.sh --record` with a native Linux build of the same tree.
-Needs zig 0.17.0 and a python with pyarrow (`.venv`).
+Needs zig 0.17.0 and a python with pyarrow (`.venv`). Set
+`ZPQ_MAC_TARGETS="aarch64-macos x86_64-macos"` to include Intel. For an explicitly partial CLI smoke handoff,
+`ZPQ_MAC_CLI_ONLY=1` omits unit executables and marks `unit_tests=omitted-platform-blocker` in the manifest.
+That mode retains the CLI syscall guard and reports missing unit tests as skips; it cannot establish unit-test acceptance.
 
 ## 2. Run the check (Mac)
 
@@ -33,13 +36,14 @@ ssh <mac-host> 'tar -xzf zpq-macos-check-<rev>.tar.gz && zpq-macos-check-<rev>/m
 `macos_check.sh` picks the build for `uname -m` (`--arch x86_64` runs the Intel build under Rosetta). It runs both
 unit-test executables from the bundle root, failing on any test failure or on more skips than the Linux run had (beyond
 the Linux-only epoll tests). Then it runs a CLI smoke: `schema`/`conform`, aggregates over one file, a file list, a
-directory glob and a cwd glob, GROUP BY at `-j 1/4/16`, a SQL query, `--format csv`/`jsonl` (and into a closed pipe),
+directory glob and a cwd glob, GROUP BY at `-j 1/4/16`, a SQL query, `--format ndjson`/`json` (plus the `jsonl` alias and a closed pipe), footer inspection,
 `-o` with every codec, multi-file writes at several `-j`, a computed select, an aggregate write, and two writes that must
 fail without leaving a file. Every output is compared with the Linux golden; written files are compared through zpq's
-own CSV dump, and, when `python3` can import pyarrow, independently checked for codec and values. It prints one
+own NDJSON dump, and, when `python3` can import pyarrow and duckdb, independently checked for codec and values
+through both readers. It prints one
 `PASS`/`FAIL`/`SKIP` line per check and a summary, and exits 1 on any failure.
 
 Options: `--network` also resolves, connects and TLS-handshakes to real S3 with an anonymous request
 (`S3_NO_SIGN_REQUEST=1`, passing on S3's refusal); with real credentials in the environment and
-`ZPQ_CHECK_S3_URL=s3://bucket/key.parquet` it reads that file too. `--no-python` skips the pyarrow checks, `--keep` keeps
+`ZPQ_CHECK_S3_URL=s3://bucket/key.parquet` it reads that file too. `--no-python` skips the independent reader checks, `--keep` keeps
 the scratch directory.

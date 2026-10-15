@@ -675,6 +675,25 @@ pub fn appendSliceRows(
     return surviving;
 }
 
+/// Append every row of `col`, a passthrough output's rows as `SliceReader.next` reads them, to `buf` (on `arena`),
+/// as `appendSliceRows` would.
+pub fn appendColumnRows(
+    buf: *OutputAggregator.ColumnBuf,
+    col_in: filter_eval.Batch.Column,
+    rows: usize,
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+) !void {
+    if (rows == 0) return;
+    var col = col_in;
+    if (buf.* == .i128 and col == .f64) {
+        const exact = try expr_eval.unscaledView(scratch, col);
+        col = .{ .i128 = exact };
+    }
+    const sel = try filter_selection.SelectionVector.init(scratch, rows);
+    try appendSelected(buf, col, &sel, rows, arena, false, scratch);
+}
+
 /// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
 /// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
 /// slice of values plus a page per column (and a byte-array column's dictionary): fixed-width readers recycle theirs
@@ -694,6 +713,8 @@ pub const SliceReader = struct {
     float16: bool,
     int96: bool,
     left: usize,
+    /// Data pages `skip` passed over without decompressing them.
+    pages_passed: usize = 0,
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -878,11 +899,7 @@ pub const SliceReader = struct {
             if (r.pageValuesLeft() == 0) {
                 _ = self.pages.reset(.retain_capacity);
                 if (!try r.nextPage()) break;
-                if (!self.dict_held) {
-                    // The dictionary page comes first, so it is in by now; it serves every page that follows.
-                    if (r.dictionary) |d| r.dictionary = try copyBytes(self.held, try self.held.dupe([]const u8, d));
-                    self.dict_held = true;
-                }
+                try self.holdDictionary(r);
                 continue;
             }
             const want = @min(values.len - got, r.pageValuesLeft());
@@ -893,6 +910,56 @@ pub const SliceReader = struct {
             got += k;
         }
         return got;
+    }
+
+    /// Copy a byte-array chunk's dictionary off `pages` once it is in, before `pages` is next reset. The dictionary
+    /// page comes first, so once a data page is in there is none to come; it serves every page that follows.
+    fn holdDictionary(self: *SliceReader, r: *column_mod.ColumnChunkReader([]const u8)) !void {
+        if (self.dict_held) return;
+        if (r.dictionary) |d| r.dictionary = try copyBytes(self.held, try self.held.dupe([]const u8, d));
+        self.dict_held = r.dictionary != null or r.data_page_seen;
+    }
+
+    /// Pass over the next `n` rows. A data page whose rows all fall in the skip is passed over by its header, never
+    /// decompressed; within a page the rows decode onto `a` and are dropped. Lets a few rows of a row group be read
+    /// without decoding the pages between them.
+    pub fn skip(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !void {
+        const n = @min(n_want, self.left);
+        self.left -= n;
+        switch (self.raw.*) {
+            inline else => |*r| {
+                const T = @TypeOf(r.*).Value;
+                var left = n;
+                var discard: []T = &.{};
+                var discard_def: []u32 = &.{};
+                while (left > 0) {
+                    if (r.pageValuesLeft() == 0) {
+                        if (T == []const u8) _ = self.pages.reset(.retain_capacity);
+                        const passed = try r.passPageWithin(left);
+                        if (T == []const u8) try self.holdDictionary(r);
+                        if (passed) |rows| {
+                            left -= rows;
+                            self.pages_passed += 1;
+                            continue;
+                        }
+                        if (!try r.nextPage()) return error.ShortDecode;
+                        if (T == []const u8) try self.holdDictionary(r);
+                        continue;
+                    }
+                    const k = @min(left, r.pageValuesLeft(), 4096);
+                    if (discard.len < k) {
+                        discard = try a.alloc(T, k);
+                        if (self.levels.max_def > 0) discard_def = try a.alloc(u32, k);
+                    }
+                    const got = if (self.levels.max_def > 0)
+                        try r.decodeWithLevels(discard[0..k], discard_def[0..k])
+                    else
+                        try r.decode(discard[0..k]);
+                    if (got != k) return error.ShortDecode;
+                    left -= k;
+                }
+            },
+        }
     }
 
     /// Re-point `vals` at one block of `a` holding their bytes.
@@ -6318,4 +6385,55 @@ test "a key chunk whose statistics claim no nulls but holds one declines the fir
         next += 1;
     };
     try testing.expectEqualSlices(i64, &.{ 400, 100, 300, 200 }, got.dict);
+}
+
+test "SliceReader.skip reads the rows after it as decoding every row would, passing whole pages unread" {
+    const testing = std.testing;
+    // V1 and V2 pages of about 40 rows, a dictionary turning PLAIN part-way through `s`, NULLs, NaN, DECIMAL
+    // (tools/gen_topn_gather_fixture.py).
+    for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {
+        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+        const rg = &meta.row_groups.items[1];
+        const picks = [_]usize{ 0, 1, 39, 40, 41, 300, 301, 302, 640, 998, 999 };
+        for (0..rg.columns.items.len) |ci| {
+            var whole = (try SliceReader.init(a, testing.allocator, rg, &meta, src, ci, .{})).?;
+            defer whole.deinit();
+            const all = try whole.next(a, @intCast(rg.num_rows));
+            var sparse = (try SliceReader.init(a, testing.allocator, rg, &meta, src, ci, .{})).?;
+            defer sparse.deinit();
+            var at: usize = 0;
+            for (picks) |p| {
+                try sparse.skip(a, p - at);
+                const one = try sparse.next(a, 1);
+                at = p + 1;
+                switch (all) {
+                    inline else => |want, tag| {
+                        const got = @field(one, @tagName(tag));
+                        const null_want = if (want.def_levels) |d| d[p] < want.max_def else false;
+                        const null_got = if (got.def_levels) |d| d[0] < got.max_def else false;
+                        try testing.expectEqual(null_want, null_got);
+                        if (!null_want) {
+                            const T = @TypeOf(want.values[0]);
+                            if (T == []const u8) {
+                                try testing.expectEqualStrings(want.values[p], got.values[0]);
+                            } else if (T == f64 and std.math.isNan(want.values[p])) {
+                                try testing.expect(std.math.isNan(got.values[0]));
+                            } else try testing.expectEqual(want.values[p], got.values[0]);
+                        }
+                    },
+                }
+            }
+            try testing.expect(sparse.pages_passed > 0);
+        }
+    }
 }

@@ -820,6 +820,32 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return self.advancePage();
         }
 
+        /// With the current page drained, pass over the next data page of this flat chunk by its header alone, never
+        /// decompressing it, when it holds at most `max_rows` rows; a dictionary page in the way is installed first.
+        /// The rows passed over, or null when the next page must be installed to be read (it holds more rows, or the
+        /// chunk is done).
+        pub fn passPageWithin(self: *Self, max_rows: usize) Error!?usize {
+            std.debug.assert(self.levels.max_rep == 0 and self.pageValuesLeft() == 0);
+            try self.holdScratch();
+            self.resetPageState();
+            while (try self.pages.peek()) |p| switch (p.header.type) {
+                .DICTIONARY_PAGE => try self.installDictionary((try self.pages.next()).?),
+                .INDEX_PAGE => self.pages.pass(p),
+                .DATA_PAGE, .DATA_PAGE_V2 => {
+                    // A flat column's leaves are its rows, nulls included.
+                    const rows: usize = if (p.header.data_page_header) |h|
+                        @intCast(h.num_values)
+                    else if (p.header.data_page_header_v2) |h| @intCast(h.num_values) else return error.UnexpectedPage;
+                    if (rows > max_rows) return null;
+                    try self.chargePage(rows);
+                    self.data_page_seen = true;
+                    self.pages.pass(p);
+                    return rows;
+                },
+            };
+            return null;
+        }
+
         fn resetPageState(self: *Self) void {
             self.active = .idle;
             self.current_def_levels = null;

@@ -224,6 +224,29 @@ pub const PageReader = struct {
         return .{ .header = header, .bytes = out };
     }
 
+    pub const Peeked = struct {
+        header: schema.PageHeader,
+        /// Header plus compressed payload: what `pass` moves past.
+        size: usize,
+    };
+
+    /// The next page's header, read without moving past it or decompressing anything. Null at the chunk's end.
+    pub fn peek(self: *const PageReader) Error!?Peeked {
+        if (self.pos >= self.chunk.len) return null;
+        var rdr = thrift.Reader.init(self.chunk[self.pos..]);
+        const header = schema.PageHeader.read(&rdr) catch return error.BadPageHeader;
+        if (header.compressed_page_size < 0 or header.uncompressed_page_size < 0) return error.NegativeSize;
+        try checkCounts(header);
+        const size = rdr.pos + @as(usize, @intCast(header.compressed_page_size));
+        if (size > self.chunk.len - self.pos) return error.UnexpectedEndOfChunk;
+        return .{ .header = header, .size = size };
+    }
+
+    /// Move past a page `peek` returned, unread.
+    pub fn pass(self: *PageReader, p: Peeked) void {
+        self.pos += p.size;
+    }
+
     fn pageArgs(self: *const PageReader, header: schema.PageHeader, in: usize, out: usize) profile.Args {
         const encoding: ?schema.Encoding = switch (header.type) {
             .DATA_PAGE => if (header.data_page_header) |h| h.encoding else null,

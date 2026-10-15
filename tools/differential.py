@@ -1031,14 +1031,17 @@ def main():
             (i * 7919) % 101 AS v, '{name}' AS src FROM range(0, 6000) t(i))
             TO '{tie_dir}/{name}.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""")
     tie_glob = f"{tie_dir}/*.parquet"
-    for order, tail in (("k", "LIMIT 7"), ("k DESC", "LIMIT 9 OFFSET 2"), ("k DESC, v", "LIMIT 11"),
-                        ("k", "LIMIT 3000"), ("k DESC", "LIMIT 5 OFFSET 5990")):
+    # Every -j: workers rank row groups in parallel and share their cutoff; the answer must not depend on how many.
+    for order, tail, j in [(o, t, j) for o, t in (("k", "LIMIT 7"), ("k DESC", "LIMIT 9 OFFSET 2"),
+                                                  ("k DESC, v", "LIMIT 11"), ("k", "LIMIT 3000"),
+                                                  ("k DESC", "LIMIT 5 OFFSET 5990"))
+                           for j in ("1", "3", "16")]:
         total += 1
-        label = f"top-rows:ties {order} {tail}"
+        label = f"top-rows:ties {order} {tail} -j{j}"
         z_sql = f"SELECT src, id, k, v FROM '{tie_glob}' ORDER BY {order} {tail}"
         d_sql = (f"SELECT src, id, k, v FROM read_parquet('{tie_glob}', filename=true, file_row_number=true) "
                  f"ORDER BY {order}, filename, file_row_number {tail}")
-        r = subprocess.run([ZPQ, "query", "--query", z_sql], capture_output=True, text=True)
+        r = subprocess.run([ZPQ, "query", "--query", z_sql, "-j", j], capture_output=True, text=True)
         try:
             if r.returncode != 0:
                 raise RuntimeError((r.stderr or r.stdout).strip()[:90])
@@ -1052,6 +1055,43 @@ def main():
             print(f"  FAIL  {label}  {problem}")
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
+
+    # Winners gathered from row groups of small pages (V1 and V2, a dictionary turning PLAIN mid-chunk), the pages
+    # between them passed over unread: every output column, NULLs, NaN, unsigned and DECIMAL keys, filter gaps.
+    gather_glob = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ci", "fixtures", "parquet",
+                               "topn_gather_*.parquet")
+    for order, where, tail in (("s DESC", "k > 3", "LIMIT 9 OFFSET 4"), ("f", "", "LIMIT 12"),
+                               ("f DESC", "", "LIMIT 12"), ("u DESC", "", "LIMIT 5"), ("dec DESC, id", "", "LIMIT 8"),
+                               ("k DESC, s", "s LIKE 's01%'", "LIMIT 20"), ("ts", "", "LIMIT 1500")):
+        for j in ("1", "16"):
+            total += 1
+            label = f"top-rows:gather {order} {where} {tail} -j{j}"
+            cond = f"WHERE {where} " if where else ""
+            z_sql = f"SELECT * FROM '{gather_glob}' {cond}ORDER BY {order} {tail}"
+            d_sql = (f"SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('{gather_glob}', filename=true, "
+                     f"file_row_number=true) {cond}ORDER BY {order}, filename, file_row_number {tail}")
+            r = subprocess.run([ZPQ, "query", "--query", z_sql, "-j", j], capture_output=True, text=True)
+            try:
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+                duck_rel = con.execute(d_sql)
+                lanes = json_lanes(duck_rel)
+
+                def stored(v):
+                    if isinstance(v, datetime.datetime):
+                        return (v - datetime.datetime(1970, 1, 1)) // datetime.timedelta(milliseconds=1)
+                    return v
+                want = [tuple(canon(stored(v), lanes[k]) for k, v in enumerate(row)) for row in duck_rel.fetchall()]
+                got = [tuple(canon(v, lanes[k]) for k, v in enumerate(from_zpq(list(row.values()), lanes)))
+                       for row in read_rows(r.stdout, parse_float=Decimal)]
+                problem = None if got == want else f"zpq={got[:2]}.. ({len(got)}) duck={want[:2]}.. ({len(want)})"
+            except Exception as e:
+                problem = f"error: {e}"
+            if problem:
+                fails += 1
+                print(f"  FAIL  {label}  {problem}")
+            else:
+                print(f"  OK    {label}  ({len(got)} rows, in order)")
 
     # A computed output that fails on a row whose group statistics would pass it over: the error must stand, as it
     # does reading in input order, whatever the order and pruning a bare-column Top-N may use.

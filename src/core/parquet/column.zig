@@ -723,8 +723,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const max_def: u32 = @intCast(self.levels.max_def);
             var w = written;
             // While no page has had a null, pages proven all-present still decode without levels, as `readAll` does
-            // them: at max_def 1 only, where a missing level array means level 1 everywhere to every reader.
-            if (max_def == 1 and def_out == null and self.options.fast_levels) {
+            // them: at max_def 1 only, where a missing level array means level 1 everywhere to every reader. Fixed
+            // width only: byte-array chunks read this way peaked 23% higher (a long-string count DISTINCT, a LIKE
+            // scan) for no time saved, cause not yet found.
+            if (T != []const u8 and max_def == 1 and def_out == null and self.options.fast_levels) {
                 w += try self.decodeAllPresent(values[w..]);
                 if (w == num_leaves) return .{ .values = values, .has_nulls = self.has_nulls };
             }

@@ -48,6 +48,7 @@ const filter_ast = @import("core/filter/ast.zig");
 const filter_selection = @import("core/filter/selection.zig");
 const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
+const statistics = @import("core/parquet/statistics.zig");
 const membership = @import("core/filter/membership.zig");
 const sbbf = @import("core/parquet/bloom.zig");
 const streaming = @import("core/writer/streaming.zig");
@@ -5066,6 +5067,17 @@ const TopRows = struct {
         if (held > self.budget) return error.ExceededMemoryBudget;
     }
 
+    /// Whether a row group whose rows' first key is at best `best` holds no row the heap would keep: the heap is full
+    /// and `best` sorts strictly after its last row's first key, so every row of the group sorts after that row
+    /// whatever its later keys and position. A tie keeps the group.
+    fn cutsOff(self: *const TopRows, best: SortCell) bool {
+        if (self.h == 0 or self.heap.count() < self.h) return false;
+        const cut = self.heap.peek().?.cells[0];
+        var ord = best.order(cut);
+        if (self.keys[0].descending and best != .null and cut != .null) ord = ord.invert();
+        return ord == .gt;
+    }
+
     fn ownCell(arena: std.mem.Allocator, c: SortCell) !SortCell {
         return if (c == .str) .{ .str = try arena.dupe(u8, c.str) } else c;
     }
@@ -5110,6 +5122,94 @@ const TopRows = struct {
         return out;
     }
 };
+
+/// The best first-key value any row of a row group can have, from the column chunk's statistics: its min ascending, its
+/// max descending, NULL when every row is NULL. Null when the statistics prove nothing: a computed key, bounds missing,
+/// in an order zpq does not read, or of a type whose cell is not plainly the bound. Floats descending prove nothing
+/// either: a NaN sorts first there, and writers leave NaN out of the bounds.
+fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, key: RowSortKey) ?SortCell {
+    const ci = switch (key.spec) {
+        .passthrough => |ci| ci,
+        .computed => return null,
+    };
+    if (ci >= rg.columns.items.len) return null;
+    const cm = rg.columns.items[ci].meta_data orelse return null;
+    const b = statistics.chunkBounds(rg, ci, meta) orelse {
+        const stats = cm.statistics orelse return null;
+        const nulls = stats.null_count orelse return null;
+        return if (rg.num_rows > 0 and nulls == rg.num_rows) .null else null;
+    };
+    const bytes = if (key.descending) b.max else b.min;
+    const elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
+    if (elem.type == null or elem.type.? != cm.type) return null;
+    switch (cm.type) {
+        .INT32, .INT64 => {
+            // DECIMAL, among others, is neither: its cell is not read from the bound here.
+            if (!statistics.signedIntOrder(elem) and !schema.isUnsignedInt(elem)) return null;
+            if (cm.type == .INT32) {
+                if (bytes.len != 4) return null;
+                const v = std.mem.readInt(i32, bytes[0..4], .little);
+                return .{ .int = if (key.unsigned) @as(u32, @bitCast(v)) else v };
+            }
+            if (bytes.len != 8) return null;
+            const v = std.mem.readInt(i64, bytes[0..8], .little);
+            return .{ .int = if (key.unsigned) @as(u64, @bitCast(v)) else v };
+        },
+        .FLOAT, .DOUBLE => {
+            if (key.descending or elem.logical_type != null or elem.converted_type != null) return null;
+            const v: f64 = if (cm.type == .FLOAT) blk: {
+                if (bytes.len != 4) return null;
+                break :blk @as(f32, @bitCast(std.mem.readInt(u32, bytes[0..4], .little)));
+            } else blk: {
+                if (bytes.len != 8) return null;
+                break :blk @as(f64, @bitCast(std.mem.readInt(u64, bytes[0..8], .little)));
+            };
+            return if (std.math.isNan(v)) null else .{ .float = v };
+        },
+        .BYTE_ARRAY => return if (statistics.bytewiseOrder(elem)) .{ .str = bytes } else null,
+        else => return null,
+    }
+}
+
+/// A row group of the plain-row Top-N scan, and the best first key its statistics allow (`rowGroupBest`).
+const RankedRG = struct {
+    file: u32,
+    rg: u32,
+    best: ?SortCell,
+
+    /// Most promising first, so the heap fills with good rows early and its cutoff rules more row groups out. Row groups
+    /// without a bound go first, in input order: they are read whatever the cutoff.
+    fn sooner(key: RowSortKey, a: RankedRG, b: RankedRG) bool {
+        const x = a.best orelse return b.best != null;
+        const y = b.best orelse return false;
+        var ord = x.order(y);
+        if (key.descending and x != .null and y != .null) ord = ord.invert();
+        return ord == .lt;
+    }
+};
+
+/// Every row group of every input, with its first-key bound. Ordered most promising first when every input's bytes
+/// are all in; a gated input is fetched in input order, so there the order stays and only the bounds are used.
+fn rankRowGroups(
+    arena: std.mem.Allocator,
+    inputs: []const scan.Input,
+    metas: []const schema.FileMetaData,
+    key: RowSortKey,
+    bounded: bool,
+) ![]RankedRG {
+    var n: usize = 0;
+    for (metas) |*m| n += m.row_groups.items.len;
+    const out = try arena.alloc(RankedRG, n);
+    var at: usize = 0;
+    for (metas, 0..) |*m, fi| for (m.row_groups.items, 0..) |*rg, ri| {
+        out[at] = .{ .file = @intCast(fi), .rg = @intCast(ri), .best = if (bounded) rowGroupBest(rg, m, key) else null };
+        at += 1;
+    };
+    if (!bounded) return out;
+    for (inputs) |in| if (in.gate != null) return out;
+    std.mem.sort(RankedRG, out, key, RankedRG.sooner);
+    return out;
+}
 
 /// Append row `row` of `src` to `dst`, both built for the same output columns, its strings copied onto `dst`'s arena.
 /// A column whose rows so far carried no definition levels gains them, all present, once one row does.
@@ -5492,22 +5592,31 @@ pub fn runPrintTo(
         const keep = if (limit) |l| offset +| l else std.math.maxInt(usize);
         var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory / 2);
         defer top.deinit();
-        if (limit != 0) for (opened.inputs, metas, 0..) |in, *meta_i, file_i| {
-            for (meta_i.row_groups.items, 0..) |*src_rg, rg_i| {
-                rows_in += @intCast(src_rg.num_rows);
-                if (filter_opt) |f| if (!args.scan_all) {
-                    if (filter_prune.pruneRowGroup(src_rg, f, meta_i) == .skip) {
-                        skipRowGroup(in, rg_i);
-                        continue;
-                    }
-                };
-                if (in.gate) |g| try g.wait(g.ctx, rg_i);
-                defer skipRowGroup(in, rg_i);
-                try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
-                    .file = @intCast(file_i),
-                    .rg = @intCast(rg_i),
-                }, &t.core, .{ .fast_levels = args.fast_levels });
-            }
+        // With a LIMIT, row groups go most promising first, and one whose statistics cannot beat the heap's last row
+        // is passed over. Ties keep their input positions (`RowPos`), so the order read changes no answer.
+        const bounded = limit != null and !args.scan_all;
+        if (limit != 0) for (try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded)) |item| {
+            const in = opened.inputs[item.file];
+            const meta_i = &metas[item.file];
+            const rg_i: usize = item.rg;
+            const src_rg = &meta_i.row_groups.items[rg_i];
+            rows_in += @intCast(src_rg.num_rows);
+            if (filter_opt) |f| if (!args.scan_all) {
+                if (filter_prune.pruneRowGroup(src_rg, f, meta_i) == .skip) {
+                    skipRowGroup(in, rg_i);
+                    continue;
+                }
+            };
+            if (item.best) |best| if (top.cutsOff(best)) {
+                skipRowGroup(in, rg_i);
+                continue;
+            };
+            if (in.gate) |g| try g.wait(g.ctx, rg_i);
+            defer skipRowGroup(in, rg_i);
+            try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
+                .file = item.file,
+                .rg = item.rg,
+            }, &t.core, .{ .fast_levels = args.fast_levels });
         };
         var ranked = try top.ranked(arena);
         const print_span = profile.Span.begin(prof);
@@ -7650,4 +7759,120 @@ test "limited Parquet row sink restores borrowed buffers on every allocation fai
     const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     defer local_fs.close(fd);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{fd});
+}
+
+test "rowGroupBest reads the first key a row group can reach, and only what its statistics prove" {
+    const testing = std.testing;
+    const fixtures = @import("core/parquet/test_fixtures.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const asc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false };
+    const desc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = true, .unsigned = false };
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(i64, &lo, -7, .little);
+    std.mem.writeInt(i64, &hi, 40, .little);
+
+    var c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.INT64), .{ .min_value = &lo, .max_value = &hi });
+    try testing.expectEqual(@as(i128, -7), rowGroupBest(&c.rg, &c.fm, asc).?.int);
+    try testing.expectEqual(@as(i128, 40), rowGroupBest(&c.rg, &c.fm, desc).?.int);
+    const computed: RowSortKey = .{ .spec = .{ .computed = .{ .expr = undefined, .alias = "e" } }, .descending = false, .unsigned = false };
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, computed) == null);
+
+    // Unsigned: the max's bits are a value above every signed one.
+    var uleaf = fixtures.statsLeaf(.INT64);
+    uleaf.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+    const all_ones: [8]u8 = @splat(0xff);
+    c = try fixtures.StatsColumn.init(a, uleaf, .{ .min_value = &lo, .max_value = &all_ones });
+    const udesc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = true, .unsigned = true };
+    try testing.expectEqual(@as(i128, std.math.maxInt(u64)), rowGroupBest(&c.rg, &c.fm, udesc).?.int);
+
+    // DECIMAL is not read; a double proves its min ascending, nothing descending, and a NaN bound nothing.
+    var dec = fixtures.statsLeaf(.INT64);
+    dec.logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 18 } };
+    c = try fixtures.StatsColumn.init(a, dec, .{ .min_value = &lo, .max_value = &hi });
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, asc) == null);
+    var dlo: [8]u8 = undefined;
+    std.mem.writeInt(u64, &dlo, @bitCast(@as(f64, -2.5)), .little);
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.DOUBLE), .{ .min_value = &dlo, .max_value = &dlo });
+    try testing.expectEqual(@as(f64, -2.5), rowGroupBest(&c.rg, &c.fm, asc).?.float);
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, desc) == null);
+    std.mem.writeInt(u64, &dlo, @bitCast(std.math.nan(f64)), .little);
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.DOUBLE), .{ .min_value = &dlo, .max_value = &dlo });
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, asc) == null);
+
+    // Strings in bytewise order; a group of NULLs only is NULL at best; no statistics prove nothing.
+    var sleaf = fixtures.statsLeaf(.BYTE_ARRAY);
+    sleaf.logical_type = .{ .STRING = .{} };
+    c = try fixtures.StatsColumn.init(a, sleaf, .{ .min_value = "apple", .max_value = "pear" });
+    try testing.expectEqualStrings("pear", rowGroupBest(&c.rg, &c.fm, desc).?.str);
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.INT64), .{ .null_count = 100 });
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, asc).? == .null);
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.INT64), .{ .null_count = 3 });
+    try testing.expect(rowGroupBest(&c.rg, &c.fm, asc) == null);
+}
+
+test "TopRows.cutsOff passes over a row group only when its best first key sorts strictly after the last row kept" {
+    const testing = std.testing;
+    inline for (.{ false, true }) |descending| {
+        const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = descending, .unsigned = false }};
+        var top: TopRows = undefined;
+        top.keys = &keys;
+        top.h = 2;
+        top.heap = .empty;
+        top.heap.context = &top;
+        defer top.heap.deinit(testing.allocator);
+        var c5 = [_]SortCell{.{ .int = 5 }};
+        var c9 = [_]SortCell{.{ .int = 9 }};
+        try top.heap.push(testing.allocator, .{ .cells = &c5, .pos = .{ .file = 0, .rg = 3 }, .row = 0 });
+        // Not full yet: nothing is ruled out.
+        try testing.expect(!top.cutsOff(.{ .int = 1000 }));
+        try top.heap.push(testing.allocator, .{ .cells = &c9, .pos = .{ .file = 0, .rg = 1 }, .row = 1 });
+        // The last row kept is 9 ascending, 5 descending. A tie is kept: the group's rows may sit earlier.
+        const last: i128 = if (descending) 5 else 9;
+        const worse: i128 = if (descending) 4 else 10;
+        const better: i128 = if (descending) 6 else 8;
+        try testing.expect(top.cutsOff(.{ .int = worse }));
+        try testing.expect(!top.cutsOff(.{ .int = last }));
+        try testing.expect(!top.cutsOff(.{ .int = better }));
+        // NULL sorts last either way.
+        try testing.expect(top.cutsOff(.null));
+    }
+    // Once the last row kept is NULL, no group sorts strictly after it.
+    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false }};
+    var top: TopRows = undefined;
+    top.keys = &keys;
+    top.h = 1;
+    top.heap = .empty;
+    top.heap.context = &top;
+    defer top.heap.deinit(testing.allocator);
+    var cn = [_]SortCell{.null};
+    try top.heap.push(testing.allocator, .{ .cells = &cn, .pos = .{ .file = 0, .rg = 0 }, .row = 0 });
+    try testing.expect(!top.cutsOff(.null));
+    try testing.expect(!top.cutsOff(.{ .int = 1 }));
+}
+
+test "RankedRG.sooner reads unbounded row groups first in input order, then the most promising, NULL last" {
+    const testing = std.testing;
+    inline for (.{ false, true }) |descending| {
+        const key: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = descending, .unsigned = false };
+        var rgs = [_]RankedRG{
+            .{ .file = 0, .rg = 0, .best = .{ .int = 3 } },
+            .{ .file = 0, .rg = 1, .best = null },
+            .{ .file = 0, .rg = 2, .best = .null },
+            .{ .file = 1, .rg = 0, .best = .{ .int = 7 } },
+            .{ .file = 1, .rg = 1, .best = null },
+            .{ .file = 1, .rg = 2, .best = .{ .int = 3 } },
+        };
+        std.mem.sort(RankedRG, &rgs, key, RankedRG.sooner);
+        const want: [6][2]u32 = if (descending)
+            .{ .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 }, .{ 0, 0 }, .{ 1, 2 }, .{ 0, 2 } }
+        else
+            .{ .{ 0, 1 }, .{ 1, 1 }, .{ 0, 0 }, .{ 1, 2 }, .{ 1, 0 }, .{ 0, 2 } };
+        for (rgs, want) |r, w| {
+            try testing.expectEqual(w[0], r.file);
+            try testing.expectEqual(w[1], r.rg);
+        }
+    }
 }

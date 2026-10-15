@@ -859,6 +859,12 @@ def main():
         ("SELECT name, d FROM '{f}' WHERE id > 0 ORDER BY d DESC LIMIT 5",
          "SELECT name, d FROM read_parquet('{f}', file_row_number=true) WHERE id > 0 ORDER BY d DESC, "
          "file_row_number LIMIT 5"),
+        # Row groups ruled out by their statistics against the heap's last row: floats ascending past NULLs, a DATE
+        # under a filter, strings with NULLs, and a first key whose later keys decide.
+        "SELECT id, amt FROM '{f}' ORDER BY amt LIMIT 5 OFFSET 2",
+        "SELECT id, d FROM '{f}' WHERE flag = true ORDER BY d DESC, id LIMIT 4",
+        "SELECT id, nname FROM '{f}' ORDER BY nname, id LIMIT 5",
+        "SELECT id, ts FROM '{f}' WHERE amt IS NOT NULL ORDER BY ts DESC, id LIMIT 6 OFFSET 1",
     ]
     for i, t_sql in enumerate(TOP_ROWS):
         z_sql, d_sql = t_sql if isinstance(t_sql, tuple) else (t_sql, t_sql)
@@ -901,6 +907,37 @@ def main():
                 print(f"  FAIL  {label}  {problem}  [{z_sql[:60]}]")
             else:
                 print(f"  OK    {label}  ({len(got)} rows, in order)")
+
+    # Two files whose key runs opposite ways, with ties across row groups and files and some NULL keys: row groups
+    # are read most promising first and passed over against the heap, and every tie still goes to the earlier row.
+    tie_dir = os.path.join(tmp, "top_ties")
+    os.makedirs(tie_dir, exist_ok=True)
+    for name, k in (("a", "3 - i // 1500"), ("b", "i // 1500")):
+        con.execute(f"""COPY (SELECT i AS id, (CASE WHEN i % 997 = 0 THEN NULL ELSE {k} END)::BIGINT AS k,
+            (i * 7919) % 101 AS v, '{name}' AS src FROM range(0, 6000) t(i))
+            TO '{tie_dir}/{name}.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""")
+    tie_glob = f"{tie_dir}/*.parquet"
+    for order, tail in (("k", "LIMIT 7"), ("k DESC", "LIMIT 9 OFFSET 2"), ("k DESC, v", "LIMIT 11"),
+                        ("k", "LIMIT 3000"), ("k DESC", "LIMIT 5 OFFSET 5990")):
+        total += 1
+        label = f"top-rows:ties {order} {tail}"
+        z_sql = f"SELECT src, id, k, v FROM '{tie_glob}' ORDER BY {order} {tail}"
+        d_sql = (f"SELECT src, id, k, v FROM read_parquet('{tie_glob}', filename=true, file_row_number=true) "
+                 f"ORDER BY {order}, filename, file_row_number {tail}")
+        r = subprocess.run([ZPQ, "query", "--query", z_sql], capture_output=True, text=True)
+        try:
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip()[:90])
+            want = [tuple(row) for row in con.execute(d_sql).fetchall()]
+            got = [(row["src"], row["id"], row["k"], row["v"]) for row in read_rows(r.stdout)]
+            problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+        except Exception as e:
+            problem = f"error: {e}"
+        if problem:
+            fails += 1
+            print(f"  FAIL  {label}  {problem}")
+        else:
+            print(f"  OK    {label}  ({len(got)} rows, in order)")
 
     # A full sort holds every row: past its share of --max-memory it fails cleanly instead of running out.
     total += 1

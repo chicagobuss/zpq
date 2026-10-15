@@ -18,6 +18,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 OUT_DIR="$(mkdir -p "${1:-zig-out/macos-check}" && cd "${1:-zig-out/macos-check}" && pwd)"
 TARGETS="${ZPQ_MAC_TARGETS:-aarch64-macos}"
+# Explicit partial handoff when the unit-test executable itself has a platform blocker.
+CLI_ONLY="${ZPQ_MAC_CLI_ONLY:-0}"
 PY="${PYTHON:-}"
 if [ -z "$PY" ]; then if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi
 "$PY" -c 'import pyarrow' 2> /dev/null || { echo "need a python with pyarrow (set PYTHON=...)" >&2; exit 2; }
@@ -37,11 +39,16 @@ for t in $TARGETS native; do
   tgt=(); [ "$t" = native ] || tgt=(-Dtarget="$t")
   echo "== building $t" >&2
   zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
-  zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
+  if [ "$CLI_ONLY" != 1 ]; then
+    zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
+  fi
 done
 for t in $TARGETS; do
   mkdir -p "$STAGE/bin/$t"
-  cp "$TMP/build-$t/bin/zpq" "$TMP/build-$t/bin/zpq-test" "$TMP/build-$t/bin/zpq-lambda-test" "$STAGE/bin/$t/"
+  cp "$TMP/build-$t/bin/zpq" "$STAGE/bin/$t/"
+  if [ "$CLI_ONLY" != 1 ]; then
+    cp "$TMP/build-$t/bin/zpq-test" "$TMP/build-$t/bin/zpq-lambda-test" "$STAGE/bin/$t/"
+  fi
 done
 
 # A raw syscall instruction in a Mach-O binary is a Linux syscall that survived the port: macOS code goes through
@@ -121,7 +128,10 @@ linux_only_tests src/lambda > "$STAGE/skips/zpq-lambda-test.linux-only"
   echo "commit=$REV"
   echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "zig=$(zig version)"
-  for t in zpq-test zpq-lambda-test; do
+  echo "cli_only=$CLI_ONLY"
+  tests="zpq-test zpq-lambda-test"
+  if [ "$CLI_ONLY" = 1 ]; then tests=""; echo "unit_tests=omitted-platform-blocker"; fi
+  for t in $tests; do
     log="$TMP/linux-$t.log"
     (cd "$STAGE" && "$TMP/build-native/bin/$t") > "$log" 2>&1 || { cat "$log" >&2; echo "Linux $t failed" >&2; exit 1; }
     "$STAGE/macos_check.sh" --skips "$log" > "$STAGE/skips/$t.linux"

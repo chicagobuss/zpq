@@ -6216,3 +6216,106 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
         }
     }.run, .{});
 }
+
+test "a key chunk whose statistics claim no nulls but holds one declines the first-row histogram and decodes as codes" {
+    const testing = std.testing;
+    const hybrid_rle = @import("parquet/encoding/hybrid_rle.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var file_meta = schema.FileMetaData{
+        .version = 2,
+        .schema = .empty,
+        .num_rows = 64,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try file_meta.schema.append(a, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(a, .{
+        .type = .INT64,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "k",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = 1,
+    });
+
+    // A 4-entry dictionary; 64 leaves, the 40th null. The chunk statistics wrongly count no nulls.
+    const dict = std.mem.toBytes([4]i64{ 400, 100, 300, 200 });
+    var levels: [64]u32 = @splat(1);
+    levels[39] = 0;
+    var codes: [63]u32 = undefined;
+    for (&codes, 0..) |*c, i| c.* = @intCast((i * 5 / 3) % 4);
+    var body: std.ArrayList(u8) = .empty;
+    const def_bytes = try hybrid_rle.encode(a, &levels, 1);
+    try body.appendSlice(a, &std.mem.toBytes(@as(u32, @intCast(def_bytes.len))));
+    try body.appendSlice(a, def_bytes);
+    try body.append(a, 2);
+    try body.appendSlice(a, try hybrid_rle.encode(a, &codes, 2));
+    var chunk: std.ArrayList(u8) = .empty;
+    try chunk.appendSlice(a, try pageForTest(a, .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = dict.len,
+        .compressed_page_size = dict.len,
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = .{ .num_values = 4, .encoding = .PLAIN, .is_sorted = null },
+        .data_page_header_v2 = null,
+    }, &dict));
+    try chunk.appendSlice(a, try pageForTest(a, .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = 64,
+            .encoding = .RLE_DICTIONARY,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    }, body.items));
+
+    var path: schema.StringList = .empty;
+    try path.append(a, "k");
+    const cm: schema.ColumnMetaData = .{
+        .type = .INT64,
+        .encodings = .empty,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+        .num_values = 64,
+        .total_uncompressed_size = @intCast(chunk.items.len),
+        .total_compressed_size = @intCast(chunk.items.len),
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = .{ .null_count = 0 },
+    };
+    var scratch = DecodeScratch.init(a);
+    const declined = try decodeAggColumnHist(a, chunk.items, cm, &file_meta, .{ .encoded = true }, &scratch, 64, true);
+    try testing.expect(declined == null);
+    // The retry the scan then makes: the right codes, and the null row marked.
+    const col = (try decodeAggColumnCoded(a, chunk.items, cm, &file_meta, .{ .encoded = true }, &scratch)).?;
+    const got = col.i64;
+    try testing.expect(got.has_nulls);
+    try testing.expectEqualSlices(u32, &levels, got.def_levels.?);
+    var next: usize = 0;
+    for (levels, 0..) |l, r| if (l == 1) {
+        try testing.expectEqual(codes[next], got.codes.?[r]);
+        next += 1;
+    };
+    try testing.expectEqualSlices(i64, &.{ 400, 100, 300, 200 }, got.dict);
+}

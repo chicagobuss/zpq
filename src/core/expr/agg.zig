@@ -3825,6 +3825,14 @@ pub const CountSketch = struct {
     admit: ?[]const u64 = null,
     /// Set when the cells could not separate the keys: the census decides instead, and `cells` and `admit` are unused.
     census: ?*Census = null,
+    /// Hash byte keys whole rather than sampled (`sketchHash`): a count(DISTINCT) census's bound is only as tight as
+    /// its fingerprints are distinct, and long keys that differ between the samples would share one.
+    whole_keys: bool = false,
+
+    /// The hash a byte key is routed by.
+    pub fn keyHash(self: *const CountSketch, key: []const u8) u64 {
+        return if (self.whole_keys) std.hash.Wyhash.hash(0, key) else sketchHash(key);
+    }
 
     /// A count pass: rows only add to the cells (or the census), and no aggregate needs its inputs.
     pub fn counting(self: *const CountSketch) bool {
@@ -3878,6 +3886,9 @@ pub const Census = struct {
     pub const max_items = 1 << ITEM_BITS;
     /// Rows a worker records before its own cells judge whether the census is needed (`dropped`).
     pub const check_rows = 1 << 18;
+    /// The same for a count(DISTINCT) census (`distinct`): skew shows in far fewer rows, and every row read before an
+    /// abandoned census gives up is wasted.
+    pub const distinct_check_rows = 1 << 16;
 
     gpa: std.mem.Allocator,
     /// Rows recorded while scanning each work item, by item; shared by every worker's census.
@@ -3901,6 +3912,10 @@ pub const Census = struct {
     dropped: ?*std.atomic.Value(bool) = null,
     cut_k: usize = 0,
     admit_n: usize = 0,
+    /// Ranking by count(DISTINCT): the judgment is whether the census is worth finishing, not whether the cells can
+    /// stand in for it. When this worker's `admit_n` fullest cells hold over a quarter of its rows, admitting their
+    /// keys reads most of the input again, so `dropped` abandons the cut and the scan runs as usual.
+    distinct: bool = false,
     check_after: u64 = check_rows,
     /// Tests: the fingerprint bits kept below the partition's, fewer to make keys collide.
     fp_mask: u64 = (1 << 40) - 1,
@@ -3962,13 +3977,18 @@ pub const Census = struct {
         return self.admitted.?.contains(self.fingerprint(hash));
     }
 
-    /// Once, `check_rows` in: drops the census for every worker if this worker's cells already separate the cut.
+    /// Once, `check_rows` in: drops the census for every worker if this worker's cells already separate the cut, or
+    /// for a count(DISTINCT) ranking (`distinct`) show the cut would admit most of the input.
     fn judge(self: *Census, cells: []const u32) !void {
         self.checked = true;
         const ranked = try self.gpa.alloc(u32, self.admit_n + 1);
         defer self.gpa.free(ranked);
         fullestCells(cells, ranked);
-        if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
+        if (self.distinct) {
+            var held: u64 = 0;
+            for (ranked[0..self.admit_n]) |c| held += c;
+            if (held *| 4 <= self.recorded) return;
+        } else if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
         self.dropped.?.store(true, .monotonic);
         self.stop();
     }
@@ -4081,6 +4101,17 @@ fn rawSketchHash(s: []const u8) u64 {
     return sketchMix(l, load64(s, 0), load64(s, l / 2 - 9), load64(s, s.len - 16), load64(s, s.len - 8));
 }
 
+/// The whole-key hash (`CountSketch.whole_keys`) of a lone present string key `s`, given unframed.
+fn wholeRawHash(s: []const u8) u64 {
+    var frame: [5]u8 = undefined;
+    frame[0] = 1;
+    std.mem.writeInt(u32, frame[1..5], @intCast(s.len), .little);
+    var h = std.hash.Wyhash.init(0);
+    h.update(&frame);
+    h.update(s);
+    return h.final();
+}
+
 fn sketchMix(len: usize, a: u64, b: u64, c: u64, d: u64) u64 {
     const x = (a *% 0x9E3779B97F4A7C15) ^ (b *% 0xC2B2AE3D27D4EB4F) ^ (c *% 0x165667B19E3779F9) ^
         (d *% 0xD6E8FEB86659FD93) ^ @as(u64, len);
@@ -4098,6 +4129,8 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
     if (s.census) |c| if (c.admitted == null and !c.off) {
         // Count pass: every row holds a slot naming its hash, which it records and adds to its cell.
         defer c.batch.clearRetainingCapacity();
+        // An abandoned count(DISTINCT) census needs nothing more from this pass: stop mid row group.
+        if (c.distinct) if (c.dropped) |d| if (d.load(.monotonic)) return error.CensusAbandoned;
         for (ids, 0..) |id, r| if (sel.isActive(r)) {
             const hash = c.batch.items[std.math.maxInt(u32) - id];
             if (!c.off) {
@@ -4107,7 +4140,10 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
             s.cells[s.cellOf(hash)] +|= 1;
             sel.set(r, false);
         };
-        if (c.dropped) |d| if (!c.off and d.load(.monotonic)) c.stop();
+        if (c.dropped) |d| if (d.load(.monotonic)) {
+            if (c.distinct) return error.CensusAbandoned;
+            if (!c.off) c.stop();
+        };
         return;
     };
     const floor = CountSketch.sinkId(@intCast(s.cells.len - 1));
@@ -4245,7 +4281,7 @@ pub const GroupTable = struct {
             const image = expandFixed(self.fixed_stride, key, &buf) orelse return hashFixed(key);
             return hashFixed(image);
         }
-        return sketchHash(key);
+        return if (self.sketch) |s| s.keyHash(key) else sketchHash(key);
     }
 
     pub fn findKey(self: *const GroupTable, key: []const u8) ?u32 {
@@ -4261,7 +4297,7 @@ pub const GroupTable = struct {
     pub fn sketchRaw(self: *const GroupTable, raw: []const u8) !?u32 {
         const s = self.sketch.?;
         if (raw.len < 16) return null;
-        const hash = rawSketchHash(raw);
+        const hash = if (s.whole_keys) wholeRawHash(raw) else rawSketchHash(raw);
         if (s.census) |c| if (!c.off) {
             if (c.admitted == null) return try c.slot(hash);
             // Whether a key is early enough to be grouped anyway takes its position, which the usual path has.
@@ -4290,7 +4326,7 @@ pub const GroupTable = struct {
             const image = expandFixed(self.fixed_stride, key, &buf) orelse return error.BadGroupKey;
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
-        if (self.sketch) |s| if (try s.route(sketchHash(key), pos)) |id| return id;
+        if (self.sketch) |s| if (try s.route(s.keyHash(key), pos)) |id| return id;
         if (self.map.get(key)) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
@@ -5824,6 +5860,7 @@ test "short composite keys hash whole: keys differing only between the samples g
     for (lone[5..], 0..) |*c, i| c.* = @intCast('a' + i % 26);
     try std.testing.expect(loneString(&lone));
     try std.testing.expectEqual(rawSketchHash(lone[5..]), sketchHash(&lone));
+    try std.testing.expectEqual(std.hash.Wyhash.hash(0, &lone), wholeRawHash(lone[5..]));
 }
 
 test "GroupKeyResolver: the string memo stops where it does not hit and keys resolve the same either way" {

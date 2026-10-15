@@ -544,8 +544,8 @@ fn executeAggregate(
     //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
     //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
-    // A GROUP BY cut by a plain COUNT first and descending (sketch, census), or by a LIMIT with no ORDER BY (first
-    // keys), reads the input twice: the mapping serves both passes (the first warms the page cache for the second),
+    // A GROUP BY cut by a plain COUNT or a count(DISTINCT) first and descending (sketch, census), or by a LIMIT with
+    // no ORDER BY (first keys), reads the input twice: the mapping serves both passes (the first warms the page cache for the second),
     // where the explicit reader reads each row group once and so rules those cuts out. Even cold, the two cheap
     // passes beat one full grouping; when the cut then declines, the mapping costs little. Only `auto` is steered:
     // an explicit pread/io_uring keeps its exact fallback. What the strategies may cut by is `ResultProgram.cutOrder`
@@ -571,7 +571,7 @@ fn executeAggregate(
             probe_args.column_order = args.column_order;
             switch (scan.cutShape(arena, &meta0, probe_args)) {
                 .count => io_policy.profile = .mmap,
-                .first_keys => if (cfg.census) {
+                .count_distinct, .first_keys => if (cfg.census) {
                     io_policy.profile = .mmap;
                 },
                 .none => {},
@@ -4642,7 +4642,20 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
             try writer.writeAll(",");
             try writeExplainPass(writer, "admit", "discovery_did_not_read_all", a.column_names, a.columns);
         },
-        .sketch => {
+        .sketch => if (d.distinct_census) {
+            // The census rides the count pass; its admit pass reads the keys it admits, unless it gives up first.
+            try writeExplainPass(writer, "census_count", null, a.column_names, a.count_columns.?);
+            try writer.writeAll(",");
+            try writeExplainPass(writer, "admit", "census_admits_few_rows", a.column_names, a.columns);
+            try writer.writeAll(",");
+            try writeExplainPass(
+                writer,
+                "aggregate",
+                "census_abandoned_or_certificate_failed",
+                a.column_names,
+                a.columns,
+            );
+        } else {
             try writeExplainPass(writer, "count", null, a.column_names, a.count_columns.?);
             if (d.census_allowed) {
                 try writer.writeAll(",");

@@ -3467,6 +3467,13 @@ pub const GroupKeyResolver = struct {
     scratch: std.ArrayList(u8),
     memo: std.HashMapUnmanaged(SliceId, u32, SliceIdContext, std.hash_map.default_max_load_percentage),
     fast_path: bool,
+    /// Rows looked up in `memo`, and how many it answered. Strings decoded plain sit at an address of their own
+    /// even when equal, so the memo stops after `memo_trial` rows that it answers fewer than one in eight of.
+    memo_rows: u32 = 0,
+    memo_hits: u32 = 0,
+    memo_on: bool = true,
+
+    const memo_trial = 4096;
 
     const SliceId = struct { ptr: usize, len: usize };
 
@@ -3516,9 +3523,27 @@ pub const GroupKeyResolver = struct {
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
             const s = key_cols[0].string.values[row];
             if (table.sketch != null) if (try table.sketchRaw(s)) |id| return id;
+            if (!self.memo_on) {
+                try serializeRowKey(&self.scratch, allocator, key_cols, row);
+                return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+            }
+            if (self.memo_rows < memo_trial) {
+                self.memo_rows += 1;
+            } else if (self.memo_rows == memo_trial) {
+                self.memo_rows += 1;
+                if (self.memo_hits * 8 < memo_trial) {
+                    self.memo_on = false;
+                    self.memo.clearAndFree(allocator);
+                    try serializeRowKey(&self.scratch, allocator, key_cols, row);
+                    return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+                }
+            }
             const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
             const gop = try self.memo.getOrPut(allocator, id);
-            if (gop.found_existing) return gop.value_ptr.*;
+            if (gop.found_existing) {
+                self.memo_hits +|= 1;
+                return gop.value_ptr.*;
+            }
             // On error the entry just reserved would hold an undefined value.
             errdefer _ = self.memo.remove(id);
             try serializeRowKey(&self.scratch, allocator, key_cols, row);
@@ -5799,4 +5824,38 @@ test "short composite keys hash whole: keys differing only between the samples g
     for (lone[5..], 0..) |*c, i| c.* = @intCast('a' + i % 26);
     try std.testing.expect(loneString(&lone));
     try std.testing.expectEqual(rawSketchHash(lone[5..]), sketchHash(&lone));
+}
+
+test "GroupKeyResolver: the string memo stops where it does not hit and keys resolve the same either way" {
+    const a = std.testing.allocator;
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const n = 3 * GroupKeyResolver.memo_trial;
+    // Dictionary-shaped: 50 distinct slices, each repeated, so the memo answers nearly every row. Plain-shaped: every
+    // row its own copy of one of the same 50 strings, so the memo never answers.
+    var dict: [50][8]u8 = undefined;
+    for (&dict, 0..) |*d, i| _ = std.fmt.bufPrint(d, "key-{d:0>4}", .{i}) catch unreachable;
+    const plain = try a.alloc([8]u8, n);
+    defer a.free(plain);
+    const shared_vals = try a.alloc([]const u8, n);
+    defer a.free(shared_vals);
+    const plain_vals = try a.alloc([]const u8, n);
+    defer a.free(plain_vals);
+    for (0..n) |r| {
+        shared_vals[r] = &dict[r % 50];
+        plain[r] = dict[r % 50];
+        plain_vals[r] = &plain[r];
+    }
+    for ([_][]const []const u8{ shared_vals, plain_vals }, [_]bool{ true, false }) |vals, memo_stays| {
+        var table = GroupTable.init(a, 1 << 30);
+        defer table.deinit();
+        const cols = [_]filter_eval.Batch.Column{.{ .string = .{ .values = vals } }};
+        var resolver = GroupKeyResolver.init(&cols);
+        defer resolver.deinit(a);
+        for (0..n) |r| {
+            const gid = try resolver.resolve(a, &table, &cols, r, &calls, 0);
+            try std.testing.expectEqual(@as(u32, @intCast(r % 50)), gid);
+        }
+        try std.testing.expectEqual(memo_stays, resolver.memo_on);
+        try std.testing.expectEqual(@as(usize, 50), table.groupCount());
+    }
 }

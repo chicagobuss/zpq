@@ -1,8 +1,7 @@
 // Generated for ZPQ vendor/snappy from cmake/config.h.in. Tuned for
 // modern Linux toolchains (clang/gcc 8+). Architecture-specific
-// intrinsics (SSE/BMI2/NEON-CRC32) are deliberately disabled to keep
-// the build target-portable; we get most of the speed from the
-// generic optimizations alone.
+// intrinsics follow the target's CPU features (see below); NEON CRC32
+// stays off.
 
 #ifndef THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_
 #define THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_
@@ -42,7 +41,13 @@
 #define SNAPPY_HAVE_BMI2 0
 #endif
 
+// NEON is mandatory on aarch64, so its byte-shuffle copy paths (decompression only) need no runtime check.
+#if defined(__ARM_NEON)
+#define SNAPPY_HAVE_NEON 1
+#else
 #define SNAPPY_HAVE_NEON 0
+#endif
+// Off: its hash would change the compressed bytes arm64 builds write.
 #define SNAPPY_HAVE_NEON_CRC32 0
 
 #define SNAPPY_IS_BIG_ENDIAN 0

@@ -17,7 +17,8 @@ diffed against upstream here.
 sources.
 
 - `config.h`: the SSSE3, x86 CRC32 and BMI2 code paths follow the target's CPU features (`__SSSE3__`,
-  `__SSE4_2__`, `__BMI2__`) instead of being off; NEON stays off. (`b63f9c4`, `6ca9110`)
+  `__SSE4_2__`, `__BMI2__`) instead of being off; NEON follows `__ARM_NEON` (always set on aarch64), NEON CRC32
+  stays off. (`b63f9c4`, `6ca9110`)
 - `build.zig`: no longer passes `-mno-avx` on x86. (`b63f9c4`)
 - `build.zig`, `root.zig`: `snappy-c.h` is imported through a translate-c step (`snappy_c`) instead of `@cImport`,
   which Zig 0.17 removed; `build.zig.zon` requires Zig 0.17.0.

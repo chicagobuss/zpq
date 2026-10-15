@@ -1626,40 +1626,28 @@ fn statsTyped(arena: std.mem.Allocator, comptime T: type, values: []const T, def
     };
 }
 
+/// Float bounds follow the format's TYPE_DEFINED_ORDER writing rules: NaN never enters min or max (a chunk whose
+/// present values are all NaN gets null_count only), a zero min is written as -0.0 and a zero max as +0.0, so a reader
+/// that trusts the bounds still keeps a chunk holding the other zero.
 fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
     if (values.len == 0) return null;
-    var lo: T = undefined;
-    var hi: T = undefined;
+    var lo: T = std.math.inf(T);
+    var hi: T = -std.math.inf(T);
+    var any = false;
     var null_count: i64 = 0;
-    if (def_levels) |dl| {
-        var first_idx: ?usize = null;
-        for (values, 0..) |_, i| {
-            if (dl[i] >= max_def) {
-                first_idx = i;
-                break;
-            }
+    for (values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) {
             null_count += 1;
+            continue;
         }
-        // All-null column: see statsTyped above.
-        const fi = first_idx orelse return .{ .null_count = null_count };
-        lo = values[fi];
-        hi = values[fi];
-        for (values[fi + 1 ..], fi + 1..) |v, i| {
-            if (dl[i] < max_def) {
-                null_count += 1;
-                continue;
-            }
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-        }
-    } else {
-        lo = values[0];
-        hi = values[0];
-        for (values[1..]) |v| {
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-        }
+        if (std.math.isNan(v)) continue;
+        any = true;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
     }
+    if (!any) return .{ .null_count = null_count };
+    if (lo == 0) lo = -0.0;
+    if (hi == 0) hi = 0.0;
     const Bits = @Int(.unsigned, @bitSizeOf(T));
     const item_size = @sizeOf(T);
     const min_buf = arena.alloc(u8, item_size) catch return null;
@@ -2647,4 +2635,70 @@ test "a FIXED_LEN_BYTE_ARRAY column is written in FLBA's PLAIN form (no lengths)
         .schema_elem = &required,
         .path_in_schema = path,
     }));
+}
+
+fn expectFloatBounds(comptime T: type, stats: ?schema.Statistics, lo: ?T, hi: ?T, nulls: i64) !void {
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
+    const st = stats.?;
+    try testing.expectEqual(nulls, st.null_count.?);
+    if (lo == null) {
+        try testing.expect(st.min == null and st.max == null and st.min_value == null and st.max_value == null);
+        return;
+    }
+    // Compared as bits, so -0.0 and +0.0 differ.
+    try testing.expectEqual(@as(Bits, @bitCast(lo.?)), std.mem.readInt(Bits, st.min_value.?[0..@sizeOf(T)], .little));
+    try testing.expectEqual(@as(Bits, @bitCast(hi.?)), std.mem.readInt(Bits, st.max_value.?[0..@sizeOf(T)], .little));
+    try expectMirroredStats(st);
+}
+
+test "float statistics leave NaN out of the bounds, and write a zero min as -0.0 and a zero max as +0.0" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    inline for (.{ f32, f64 }) |T| {
+        const nan = std.math.nan(T);
+        const inf = std.math.inf(T);
+        const Case = struct { vals: []const T, defs: ?[]const u32 = null, lo: ?T, hi: ?T, nulls: i64 = 0 };
+        const cases = [_]Case{
+            // A NaN first value no longer becomes both bounds.
+            .{ .vals = &.{ nan, 1, -2, 3, nan, 0.5 }, .lo = -2, .hi = 3 },
+            .{ .vals = &.{ 1, nan, -2 }, .lo = -2, .hi = 1 },
+            // Every present value NaN: null_count only, as for an all-null chunk.
+            .{ .vals = &.{ nan, nan }, .lo = null, .hi = null },
+            .{ .vals = &.{ 7, nan, 7, nan }, .defs = &.{ 0, 1, 0, 1 }, .lo = null, .hi = null, .nulls = 2 },
+            .{ .vals = &.{ 7, nan, 5, 0 }, .defs = &.{ 0, 1, 1, 0 }, .lo = 5, .hi = 5, .nulls = 2 },
+            // Zero bounds, whichever zero the chunk holds.
+            .{ .vals = &.{ 0.0, 1, 2 }, .lo = -0.0, .hi = 2 },
+            .{ .vals = &.{ -0.0, -1, -2 }, .lo = -2, .hi = 0.0 },
+            .{ .vals = &.{ 0.0, -0.0 }, .lo = -0.0, .hi = 0.0 },
+            .{ .vals = &.{ -0.0, nan, 0.0 }, .lo = -0.0, .hi = 0.0 },
+            // Infinities are ordinary bounds.
+            .{ .vals = &.{ inf, nan }, .lo = inf, .hi = inf },
+            .{ .vals = &.{ -inf, nan, inf }, .lo = -inf, .hi = inf },
+        };
+        for (cases) |c| {
+            try expectFloatBounds(T, statsTypedFloat(a, T, c.vals, c.defs, 1), c.lo, c.hi, c.nulls);
+        }
+
+        // The dictionary path takes its bounds over its entries: the same rules, NaN among them.
+        const elem = schema.SchemaElement{
+            .type = if (T == f32) .FLOAT else .DOUBLE,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .name = "f",
+            .num_children = 0,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        var vals: [200]T = undefined;
+        for (&vals, 0..) |*v, i| v.* = ([_]T{ nan, 0.0, 2.5 })[i % 3];
+        const enc = try encodeColumn(a, .{
+            .values = @unionInit(filter_eval.Batch.Column, if (T == f32) "f32" else "f64", .{ .values = &vals }),
+            .schema_elem = &elem,
+            .path_in_schema = &.{"f"},
+        });
+        try testing.expect(enc.meta.dictionary_page_offset != null);
+        try expectFloatBounds(T, enc.meta.statistics, -0.0, 2.5, 0);
+    }
 }

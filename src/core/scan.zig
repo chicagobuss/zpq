@@ -147,8 +147,10 @@ pub const MultiAggArgs = struct {
     /// Grouped count(DISTINCT) through sorted pairs (`distinctPairsCall`): where they pay (`pairsPay`), always, or
     /// never. The CLI takes `.on` from `ZPQ_DISTINCT_PAIRS=1` and `.off` from `=0`.
     distinct_pairs: enum { auto, on, off } = .auto,
-    /// Rows a worker reads on sets before judging them (`pairsPayRuntime`) under `.auto`.
+    /// Rows a worker reads on sets before judging them (`pairsPayRuntime`) under `.auto`. A verdict that may still
+    /// turn is taken again at twice the rows, `pairs_rechecks` times at most.
     pairs_pilot_rows: u64 = 1 << 18,
+    pairs_rechecks: u8 = 3,
     /// Disable profitability rules when exercising the legacy cut executors.
     ndv_policy: bool = true,
     /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
@@ -1035,7 +1037,9 @@ const Worker = struct {
     /// Rows this worker read before deciding whether its sets move to pairs, and whether it has decided.
     pairs_rows: u64 = 0,
     pairs_decided: bool = false,
+    /// Rows at which the sets are judged next, and how many more judgments a `.wait` may buy.
     pairs_pilot_rows: u64 = 0,
+    pairs_rechecks: u8 = 0,
     /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
     /// whole through `block_cursor` and folded in order into `group_tables[b]`.
     blocks: ?[]const usize = null,
@@ -1196,13 +1200,20 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         });
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             w.pairs_rows +|= @intCast(@max(rg.num_rows, 0));
-            if (w.pairs_rows >= w.pairs_pilot_rows) {
-                w.pairs_decided = true;
-                if (pairsPayRuntime(gt, dp.agg_idx, w.pairs_rows)) {
+            if (w.pairs_rows >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, w.pairs_rows)) {
+                .pay => {
+                    w.pairs_decided = true;
                     try dp.drainTable(gt);
                     dp.active = true;
-                }
-            }
+                },
+                .wait => if (w.pairs_rechecks > 0) {
+                    w.pairs_rechecks -= 1;
+                    w.pairs_pilot_rows = w.pairs_rows *| 2;
+                } else {
+                    w.pairs_decided = true;
+                },
+                .never => w.pairs_decided = true,
+            };
         };
     }
     // An armed worker that never moved keeps its table for the usual merge, unless another worker moved (`spilled`).
@@ -2036,16 +2047,19 @@ fn pairsPay(stat: ?NdvStat) bool {
 /// Whether a worker's sets, after `rows` rows, are the kind pairs beat: groups of 8 rows or more on average, nearly
 /// every row a value its group has not seen (nine in ten). Near-unique keys keep a few values inline in each set, and
 /// input whose values repeat (skew, or a few huge groups) keeps small or cache-resident sets; the sets win there.
-fn pairsPayRuntime(table: *const expr_agg.GroupTable, agg_idx: usize, rows: u64) bool {
+/// Rows a group gathers only grow, so too few of them is `.wait`: small row groups, or files each holding most of
+/// the keys, reach eight a group only after several items. The share of new values only falls, so too few is final.
+/// The row test runs first: it is free, and walking every set at each check cost near-unique keys ~4%.
+fn pairsPayRuntime(table: *const expr_agg.GroupTable, agg_idx: usize, rows: u64) enum { pay, wait, never } {
     const groups = table.groupCount();
-    if (groups == 0 or rows < 8 * @as(u64, groups)) return false;
+    if (groups == 0 or rows < 8 * @as(u64, groups)) return .wait;
     const n_calls = table.accumulators.items.len / groups;
     var values: u64 = 0;
     for (0..groups) |g| {
         const acc = table.accumulators.items[g * n_calls + agg_idx];
         if (acc == .distinct) values += acc.distinct.count();
     }
-    return 10 * values >= 9 * rows;
+    return if (10 * values >= 9 * rows) .pay else .never;
 }
 
 /// Per partition: every worker's pairs sorted, then each key's distinct values counted. Sorted by key for lookup.
@@ -2640,6 +2654,7 @@ fn prepareAggregate(
             .part = if (part_state) |*p| p else null,
             .pairs = if (pair_sinks.len > 0) &pair_sinks[wi] else null,
             .pairs_pilot_rows = args.pairs_pilot_rows,
+            .pairs_rechecks = args.pairs_rechecks,
             .local = .{ .runs = if (part_state) |*p| &p.runs[wi] else null, .armed = armed },
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
@@ -9439,6 +9454,42 @@ test "runMultiAggregate: workers judge their sets after a pilot and move them to
         var got = try runMultiAggregate(testing.allocator, arena, args);
         defer got.deinit(testing.allocator);
         try testing.expectEqual(moves, got.distinct_pairs);
+        const wr = want.output.group_rows.?;
+        const gr = got.output.group_rows.?;
+        try testing.expectEqual(wr.len, gr.len);
+        for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
+    };
+}
+
+test "runMultiAggregate: a pilot short of rows a group judges again at twice the rows" {
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    // 200 groups of nearly unique values over 1000-row groups: five rows a group after the first row group, ten after
+    // the second. Without re-checks the sets stay; with them every worker reading two row groups or more moves, and at
+    // -j 3 some worker reads three of the eight while another may read one.
+    for ([_]u8{ 0, 3 }) |rechecks| for ([_]usize{ 1, 3 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .ndv_policy = false,
+            .aggregate = "count(DISTINCT u) AS d, count(*) AS c",
+            .group_by = "u / 5000000000 AS b",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .distinct_pairs = .off,
+        };
+        var want = try runMultiAggregate(testing.allocator, arena, args);
+        defer want.deinit(testing.allocator);
+        args.distinct_pairs = .auto;
+        args.pairs_pilot_rows = 1000;
+        args.pairs_rechecks = rechecks;
+        var got = try runMultiAggregate(testing.allocator, arena, args);
+        defer got.deinit(testing.allocator);
+        try testing.expectEqual(rechecks > 0, got.distinct_pairs);
         const wr = want.output.group_rows.?;
         const gr = got.output.group_rows.?;
         try testing.expectEqual(wr.len, gr.len);

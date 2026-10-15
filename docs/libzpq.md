@@ -118,8 +118,8 @@ Windows is not built.
   that replaces `operator new` and `operator delete` will see its replacements used inside libzpq too.
 - The shared library's BoringSSL is compiled from source, position-independent, because the pinned prebuilts the
   CLI and Lambda link are not. That makes the first build slower.
-- `libzpq.a` holds zpq's own objects. A static link must add the codec, BoringSSL and libc++ archives the build
-  produces; prefer the shared library.
+- `libzpq.a` holds zpq's own objects. A static link must add the codec, BoringSSL, liteparser and libc++ archives
+  the build produces; prefer the shared library.
 
 ## The C ABI (`include/zpq.h`)
 

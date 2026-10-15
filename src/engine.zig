@@ -628,6 +628,7 @@ fn executeAggregate(
         .profiler = args.profiler,
         .sketch_topk = sketchFromEnv(ctx.env),
         .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
+        .distinct_pairs = !envDisables(ctx.env, "ZPQ_DISTINCT_PAIRS"),
         .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
     };
     if (args.quiet_diagnostics) if (scan_args.sketch_topk) |*cfg| {

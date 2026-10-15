@@ -651,8 +651,11 @@ fn foldGroupedCall(
     }
 
     const float_sum = (call.func == .sum or call.func == .avg) and call.arg.?.typeOf() == .f64;
+    // A count(DISTINCT) a pair sink answers takes the values fold below, which sends it the pairs; a histogram would
+    // fill the sets the sink stands in for.
+    const to_pairs = call.func == .count_distinct and agg.distinct_pairs != null;
     if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
-        !(wide and float_sum))
+        !(wide and float_sum) and !to_pairs)
     {
         // (composite, code) histogram, then fold each entry once per group.
         const col = arg_col.?;

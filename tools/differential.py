@@ -698,6 +698,44 @@ def main():
             print(f"  FAIL  {label}  {problem}")
         else:
             print(f"  OK    {label}  ({len(got)} rows, in order)")
+    # Grouped count(DISTINCT), through the pairs path and through per-group sets (ZPQ_DISTINCT_PAIRS=0), at several
+    # -j: NULL values, NULL keys, an expression key, FILTER, a cut on the distinct count.
+    DISTINCT = [
+        ("cd_flag", "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{fixture}' GROUP BY flag "
+         "ORDER BY flag"),
+        ("cd_expr_key", "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{fixture}' WHERE id BETWEEN -40 AND 40 "
+         "GROUP BY k ORDER BY k"),
+        ("cd_int_date", "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{fixture}' WHERE id > -1500 "
+         "GROUP BY flag ORDER BY flag"),
+        ("cd_filter", "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{fixture}' GROUP BY flag "
+         "ORDER BY flag"),
+        ("cd_cut", "SELECT flag, count(DISTINCT amt) AS d FROM '{fixture}' WHERE amt IS NULL OR amt < 2000 "
+         "GROUP BY flag ORDER BY d DESC, flag LIMIT 2"),
+    ]
+    for dlabel, d_sql in DISTINCT:
+        sql = d_sql.format(fixture=fixture)
+        duck_rel = con.execute(sql)
+        lanes = json_lanes(duck_rel)
+        want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in duck_rel.fetchall()]
+        for pairs in ("1", "0"):
+            for j in ("1", "3", "16"):
+                total += 1
+                label = f"distinct:{dlabel} pairs={pairs} -j {j}"
+                r = subprocess.run([ZPQ, "query", "-j", j, "--query", sql], capture_output=True, text=True,
+                                   env={**os.environ, "ZPQ_DISTINCT_PAIRS": pairs})
+                try:
+                    if r.returncode != 0:
+                        raise RuntimeError((r.stderr or r.stdout).strip()[:70])
+                    got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq(list(row.values()), lanes)))
+                           for row in read_rows(r.stdout, parse_float=Decimal)]
+                    problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
+                except Exception as e:
+                    problem = f"error: {e}"
+                if problem:
+                    fails += 1
+                    print(f"  FAIL  {label}  {problem}")
+                else:
+                    print(f"  OK    {label}  ({len(got)} rows, in order)")
 
     # HAVING keeps the complete groups it makes TRUE, then ORDER BY / LIMIT cut once: a cut taken before HAVING (count
     # cut, sketch, census, TPUT, ResultCut) would rank the wrong set and underfill. g = floor(sqrt(i)) gives group g

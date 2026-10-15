@@ -144,6 +144,9 @@ pub const MultiAggArgs = struct {
     /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
     /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
     partagg: bool = false,
+    /// Grouped count(DISTINCT) through sorted pairs when it qualifies (`distinctPairsCall`). The CLI clears this
+    /// from `ZPQ_DISTINCT_PAIRS=0`.
+    distinct_pairs: bool = true,
     /// Disable profitability rules when exercising the legacy cut executors.
     ndv_policy: bool = true,
     /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
@@ -488,6 +491,8 @@ pub const MultiAggResult = struct {
     output: AggOutput,
     /// The shared-partition GROUP BY executor ran. False when the query kept the per-worker tables.
     part_agg: bool = false,
+    /// Grouped count(DISTINCT) was answered through pairs (`foldDistinctPairs`).
+    distinct_pairs: bool = false,
     /// How many of each GROUP BY row's leading columns are shown; the rest are hidden ORDER BY inputs
     /// (`ResultOrder.hidden`) the result program drops once it has ranked the rows. Null shows every column.
     visible_cols: ?usize = null,
@@ -1014,6 +1019,8 @@ const Worker = struct {
     /// Shared partitioned tables, with this worker's pre-aggregation state. Null keeps today's per-worker table.
     part: ?*partagg.PartAgg = null,
     local: partagg.Local = .{},
+    /// Grouped count(DISTINCT) as pairs instead of sets (`expr_agg.DistinctPairs`), for this worker's table.
+    pairs: ?*expr_agg.DistinctPairs = null,
     /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
     /// whole through `block_cursor` and folded in order into `group_tables[b]`.
     blocks: ?[]const usize = null,
@@ -1039,6 +1046,8 @@ fn workerRun(w: *Worker) void {
         span.end(.scan_worker, profile.args(.{ w.index, items, u.user_ns, u.sys_ns, u.minor_faults, u.major_faults }));
     };
     w.timings.prof = prof;
+    expr_agg.distinct_pairs = w.pairs;
+    defer expr_agg.distinct_pairs = null;
     workerRunErr(w, prof, &items) catch |e| {
         w.err = e;
         if (w.block_merge) |m| m.fail();
@@ -1956,6 +1965,174 @@ fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
     for (workers) |w| if (w.err) |e| return e;
 }
 
+/// The one count(DISTINCT) call `foldDistinctPairs` can answer: a plain numeric column, the only count(DISTINCT) of
+/// the query, grouped by a fixed-width key of at most 16 bytes. Null otherwise.
+fn distinctPairsCall(calls: []const expr_agg.AggCall, fixed_stride: u8) ?usize {
+    if (fixed_stride == 0 or fixed_stride > 16) return null;
+    var found: ?usize = null;
+    for (calls, 0..) |call, i| {
+        if (call.func != .count_distinct) continue;
+        if (found != null) return null;
+        const arg = call.arg orelse return null;
+        if (arg != .col_ref) return null;
+        switch (arg.col_ref.expr_type) {
+            .i64, .f64 => {},
+            else => return null,
+        }
+        found = i;
+    }
+    return found;
+}
+
+/// Per partition: every worker's pairs sorted, then each key's distinct values counted. Sorted by key for lookup.
+const KeyDistinct = struct { k0: u64, k1: u64, count: u64, claimed: std.atomic.Value(bool) = .init(false) };
+
+const PairFoldTask = struct {
+    gpa: std.mem.Allocator,
+    budget: *expr_agg.SharedBudget,
+    sinks: []expr_agg.DistinctPairs,
+    out: [][]KeyDistinct,
+    cursor: *std.atomic.Value(usize),
+    err: ?anyerror = null,
+
+    fn run(t: *PairFoldTask) void {
+        while (true) {
+            const p = t.cursor.fetchAdd(1, .monotonic);
+            if (p >= expr_agg.DistinctPairs.N) return;
+            t.fold(p) catch |e| {
+                t.err = e;
+                return;
+            };
+        }
+    }
+
+    fn fold(t: *PairFoldTask, p: usize) !void {
+        const Pair = expr_agg.DistinctPairs.Pair;
+        var n: usize = 0;
+        for (t.sinks) |*s| n += s.parts[p].items.len;
+        const bytes = n * (@sizeOf(Pair) + @sizeOf(KeyDistinct));
+        const got = t.budget.draw(bytes) orelse return error.ExceededMemoryBudget;
+        defer t.budget.release(got);
+        const all = try t.gpa.alloc(Pair, n);
+        defer t.gpa.free(all);
+        var at: usize = 0;
+        for (t.sinks) |*s| {
+            @memcpy(all[at..][0..s.parts[p].items.len], s.parts[p].items);
+            at += s.parts[p].items.len;
+            s.parts[p].clearAndFree(t.gpa);
+        }
+        std.mem.sortUnstable(Pair, all, {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                if (a.k0 != b.k0) return a.k0 < b.k0;
+                if (a.k1 != b.k1) return a.k1 < b.k1;
+                return a.x < b.x;
+            }
+        }.lt);
+        var keys: std.ArrayList(KeyDistinct) = .empty;
+        errdefer keys.deinit(t.gpa);
+        var i: usize = 0;
+        while (i < all.len) {
+            var count: u64 = 1;
+            var j = i + 1;
+            while (j < all.len and all[j].k0 == all[i].k0 and all[j].k1 == all[i].k1) : (j += 1) {
+                if (all[j].x != all[j - 1].x) count += 1;
+            }
+            try keys.append(t.gpa, .{ .k0 = all[i].k0, .k1 = all[i].k1, .count = count });
+            i = j;
+        }
+        t.out[p] = try keys.toOwnedSlice(t.gpa);
+    }
+};
+
+const PairApplyTask = struct {
+    tables: []expr_agg.GroupTable,
+    keyed: []const []KeyDistinct,
+    agg_idx: usize,
+    agg_len: usize,
+    gpa: std.mem.Allocator,
+    cursor: *std.atomic.Value(usize),
+
+    fn run(t: *PairApplyTask) void {
+        const Pairs = expr_agg.DistinctPairs;
+        while (true) {
+            const ti = t.cursor.fetchAdd(1, .monotonic);
+            if (ti >= t.tables.len) return;
+            const table = &t.tables[ti];
+            for (0..table.groupCount()) |g| {
+                const probe = Pairs.pairOf(table.keyAt(g), 0);
+                const acc = &table.accumulators.items[g * t.agg_len + t.agg_idx];
+                var n: u64 = 0;
+                // Only the first table to claim a key carries its count, so the usual merge's sum is exact.
+                if (findKeyDistinct(t.keyed[Pairs.partOf(probe)], probe.k0, probe.k1)) |e| {
+                    if (e.claimed.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) n = e.count;
+                }
+                if (acc.* == .distinct) acc.distinct.deinit(t.gpa);
+                acc.* = .{ .count = n };
+            }
+        }
+    }
+};
+
+fn findKeyDistinct(list: []KeyDistinct, k0: u64, k1: u64) ?*KeyDistinct {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const m = &list[mid];
+        if (m.k0 == k0 and m.k1 == k1) return m;
+        if (m.k0 < k0 or (m.k0 == k0 and m.k1 < k1)) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+/// Turn every worker's pairs into exact count(DISTINCT) states on the worker tables: each key's count on the first
+/// table to claim it, 0 on the others. NULL values sent no pair, so a key seen only with them counts 0.
+fn foldDistinctPairs(
+    gpa: std.mem.Allocator,
+    budget: *expr_agg.SharedBudget,
+    sinks: []expr_agg.DistinctPairs,
+    tables: []expr_agg.GroupTable,
+    agg_idx: usize,
+    agg_len: usize,
+    threads: usize,
+) !void {
+    const N = expr_agg.DistinctPairs.N;
+    const keyed = try gpa.alloc([]KeyDistinct, N);
+    @memset(keyed, &.{});
+    defer {
+        for (keyed) |k| gpa.free(k);
+        gpa.free(keyed);
+    }
+    var cursor: std.atomic.Value(usize) = .init(0);
+    const n_tasks = @max(1, @min(threads, N, 64));
+    var folds: [64]PairFoldTask = undefined;
+    for (folds[0..n_tasks]) |*f| f.* = .{
+        .gpa = gpa,
+        .budget = budget,
+        .sinks = sinks,
+        .out = keyed,
+        .cursor = &cursor,
+    };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (n_tasks == 1 or !spawn_util.runTree(PairFoldTask, folds[0..n_tasks], config, PairFoldTask.run)) folds[0].run();
+    for (folds[0..n_tasks]) |f| if (f.err) |e| return e;
+    for (sinks) |*s| s.deinit();
+    // Tasks whose spawn failed leave their share to the ones that started, through the shared cursor.
+    var table_cursor: std.atomic.Value(usize) = .init(0);
+    const n_apply = @max(1, @min(threads, tables.len, 64));
+    var applies: [64]PairApplyTask = undefined;
+    for (applies[0..n_apply]) |*a| a.* = .{
+        .tables = tables,
+        .keyed = keyed,
+        .agg_idx = agg_idx,
+        .agg_len = agg_len,
+        .gpa = gpa,
+        .cursor = &table_cursor,
+    };
+    if (n_apply == 1 or !spawn_util.runTree(PairApplyTask, applies[0..n_apply], config, PairApplyTask.run))
+        applies[0].run();
+}
+
 /// The k-th largest total of the COUNT at `a_idx` over every key of `tables`, 0 with fewer than `k` keys.
 fn kthTotal(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, stride: usize, a_idx: usize, k: usize) !u64 {
     var totals: std.StringArrayHashMapUnmanaged(u64) = .empty;
@@ -2336,6 +2513,18 @@ fn prepareAggregate(
             args.part_probe,
         );
     }
+    const pairs_call: ?usize = if (args.distinct_pairs and decision.strategy == .plain_hash and !use_blocks)
+        distinctPairsCall(agg_calls, fixed_stride)
+    else
+        null;
+    var pair_sinks: []expr_agg.DistinctPairs = &.{};
+    defer for (pair_sinks) |*ps| ps.deinit();
+    if (pairs_call) |ai| {
+        pair_sinks = try arena.alloc(expr_agg.DistinctPairs, n_tables);
+        for (pair_sinks, group_tables) |*ps, *gt| {
+            ps.* = .{ .gpa = gpa, .budget = &group_budget, .table = gt, .agg_idx = ai };
+        }
+    }
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -2365,6 +2554,7 @@ fn prepareAggregate(
             .group_by_keys = group_by_keys,
             .group_tables = group_tables,
             .part = if (part_state) |*p| p else null,
+            .pairs = if (pair_sinks.len > 0) &pair_sinks[wi] else null,
             .blocks = block_bounds,
             .block_cursor = &block_cursor,
             .block_merge = if (block_merge) |*m| m else null,
@@ -2404,6 +2594,8 @@ fn prepareAggregate(
     profile.record(prof, .scan, t_decode, t_decode_end, profile.args(.{n_workers}));
     for (workers) |w| if (w.err) |e| return e;
     const merge_span = profile.Span.begin(prof);
+    if (pairs_call) |ai|
+        try foldDistinctPairs(gpa, &group_budget, pair_sinks, group_tables, ai, agg_calls.len, n_workers);
 
     // 6. Merge per-work-item accumulators into one final slice.
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
@@ -2743,6 +2935,7 @@ fn prepareAggregate(
         .timings = t,
         .output = output,
         .part_agg = part_on,
+        .distinct_pairs = pairs_call != null,
         .visible_cols = if (args.result_order.hidden.len > 0) args.select_cols.?.len else null,
         .state = .{
             .accumulators = accumulators,
@@ -8999,6 +9192,71 @@ test "review round3 count budget and path matrix" {
                     for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
                 };
     }
+}
+
+test "runMultiAggregate: grouped count(DISTINCT) through pairs answers as through sets" {
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    // `t` holds 7 keys, `u` is near unique, `n` is NULL through the first row group: a key's distinct values, ones
+    // only NULL counts, a FILTER, other aggregates beside it, and a cut on the distinct count.
+    const aggregates = [_][]const u8{
+        "count(DISTINCT u) AS d, count(*) AS c",
+        "count(DISTINCT n) AS d, sum(u) AS s",
+        "count(DISTINCT u) FILTER (WHERE n = 1) AS d, min(u) AS lo",
+    };
+    const cuts = [_]expr_ast.ResultOrder{
+        .{},
+        .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+    };
+    for (aggregates) |aggregate| for ([_][]const u8{ "t", "u" }) |key| for ([_]usize{ 1, 3 }) |j| for (cuts) |cut| {
+        for ([_]bool{ false, true }) |encoded| {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .aggregate = aggregate,
+                .group_by = key,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .encoded = encoded,
+                .result_order = cut,
+                .distinct_pairs = false,
+            };
+            var want = try runMultiAggregate(testing.allocator, arena, args);
+            defer want.deinit(testing.allocator);
+            args.distinct_pairs = true;
+            var got = try runMultiAggregate(testing.allocator, arena, args);
+            defer got.deinit(testing.allocator);
+            try testing.expect(!want.distinct_pairs);
+            try testing.expect(got.distinct_pairs);
+            try want.output.applyResultOrder(testing.allocator, cut);
+            try got.output.applyResultOrder(testing.allocator, cut);
+            const wr = want.output.group_rows.?;
+            const gr = got.output.group_rows.?;
+            try testing.expectEqual(wr.len, gr.len);
+            for (wr, gr) |a, b| for (a, b) |av, bv| try testing.expect(sameValue(av, bv));
+        }
+    };
+}
+
+test "runMultiAggregate: count(DISTINCT) pairs fail cleanly when the budget cannot hold them" {
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(error.ExceededMemoryBudget, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "count(DISTINCT u) AS d",
+        .group_by = "t",
+        .parallelism = 3,
+        .min_bytes_per_worker = 1,
+        .max_memory = 64 * 1024,
+    }));
 }
 
 test "count-only: charged bytes equals keys and filter estimate alone" {

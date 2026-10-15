@@ -4571,6 +4571,66 @@ pub fn prepareGrouped(
     return .{ .mem = mem, .arena = arena };
 }
 
+/// Grouped count(DISTINCT) as pairs: instead of a set per group, each row's (key, value) goes to one of `N` lists
+/// by the key's hash, and `scan.foldDistinctPairs` later sorts each list and counts every key's distinct values
+/// exactly. Neither a set per group nor a cross-worker set merge is built. One per worker, for its own table only.
+pub const DistinctPairs = struct {
+    pub const part_bits = 8;
+    pub const N = 1 << part_bits;
+    /// A fixed-width key image of up to 16 bytes, zero-padded, then the value's distinct bits.
+    pub const Pair = struct { k0: u64, k1: u64, x: u64 };
+
+    gpa: std.mem.Allocator,
+    budget: *SharedBudget,
+    /// The table whose accumulators this sink stands in for; its count(DISTINCT) states stay empty.
+    table: *const GroupTable,
+    /// The one count(DISTINCT) call it serves.
+    agg_idx: usize,
+    parts: [N]std.ArrayList(Pair) = @splat(.empty),
+    charged: usize = 0,
+
+    /// Safe to call again.
+    pub fn deinit(self: *DistinctPairs) void {
+        for (&self.parts) |*p| {
+            p.deinit(self.gpa);
+            p.* = .empty;
+        }
+        self.budget.release(self.charged);
+        self.charged = 0;
+    }
+
+    pub fn pairOf(key: []const u8, x: u64) Pair {
+        var buf: [16]u8 = @splat(0);
+        @memcpy(buf[0..key.len], key);
+        return .{
+            .k0 = std.mem.readInt(u64, buf[0..8], .little),
+            .k1 = std.mem.readInt(u64, buf[8..16], .little),
+            .x = x,
+        };
+    }
+
+    pub fn partOf(p: Pair) usize {
+        return @intCast(splitMix64(p.k0 ^ splitMix64(p.k1)) >> (64 - part_bits));
+    }
+
+    fn add(self: *DistinctPairs, gid: u32, x: u64) !void {
+        const pair = pairOf(self.table.keyAt(gid), x);
+        const list = &self.parts[DistinctPairs.partOf(pair)];
+        if (list.items.len == list.capacity) {
+            const want = @max(list.capacity * 2, 256);
+            const got = self.budget.draw((want - list.capacity) * @sizeOf(Pair)) orelse
+                return error.ExceededMemoryBudget;
+            self.charged += got;
+            try list.ensureTotalCapacityPrecise(self.gpa, want);
+        }
+        list.appendAssumeCapacity(pair);
+    }
+};
+
+/// The worker's pair sink while it scans. A thread-local, not a parameter: every grouped count(DISTINCT) fold, coded
+/// or not, reaches `foldDistinctU64` with only the table's accumulators, which identify the table the sink serves.
+pub threadlocal var distinct_pairs: ?*DistinctPairs = null;
+
 /// One column type for the whole batch. i64/i32/f64 stay inline in the accumulator until a group spills.
 fn foldDistinctGrouped(
     persist: std.mem.Allocator,
@@ -4667,6 +4727,8 @@ fn foldDistinctGrouped(
             }.bit,
         ),
         .string, .i128 => {
+            // The plan sends only fixed-width numeric values to a pair sink; a set here would be counted twice.
+            if (distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr) return error.UnsupportedAggType;
             var r: usize = 0;
             while (r < sel.len) : (r += 1) {
                 if (!sel.isActive(r)) continue;
@@ -4688,6 +4750,16 @@ fn foldDistinctU64(
     sel: *const filter_selection.SelectionVector,
     comptime bit: fn (@typeInfo(@TypeOf(values)).pointer.child) u64,
 ) Error!void {
+    if (distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr) {
+        if (agg_idx != dp.agg_idx) return error.UnsupportedAggType;
+        var r: usize = 0;
+        while (r < sel.len) : (r += 1) {
+            if (!sel.isActive(r)) continue;
+            if (def_levels) |dl| if (dl[r] < max_def) continue;
+            try dp.add(group_id_arr[r], bit(values[r]));
+        }
+        return;
+    };
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (!sel.isActive(r)) continue;

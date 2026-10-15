@@ -32,6 +32,9 @@ def test_binding(z):
     check(z.query(f"SELECT count(*) AS n FROM '{FIX}'", parallelism=3) == [{"n": 48000}], "SQL rows")
     check(z.query(f"SELECT * FROM '{FIX}' LIMIT 0") == [], "SQL empty rows")
     check(z.query_raw(f"SELECT a FROM '{FIX}' LIMIT 1") == '{"a":0}\n', "SQL raw bytes")
+    # U+0085 is a Unicode line boundary but stays unescaped in NDJSON strings: rows split only at "\n".
+    check(z.query(f"SELECT 'a\u0085b' AS \"n\u0085m\" FROM '{FIX}' LIMIT 2") == [{"n\u0085m": "a\u0085b"}] * 2,
+          "SQL rows with U+0085")
     prof = z.run({"sql": f"SELECT count(*) AS n FROM '{FIX}'", "profile": True})
     check(prof["ndjson"] == '{"n":48000}\n' and "profile" in prof, "SQL profile")
     # JSON text and bytes work too.

@@ -191,7 +191,12 @@ class Zpq:
 
         The SQL request and response shapes have no stability guarantee. `parallelism` selects workers (0: automatic).
         """
-        return [json.loads(line) for line in self.query_raw(sql, **options).splitlines()]
+        # NDJSON rows end in "\n" alone: str.splitlines() would also split at U+0085 and other line boundaries,
+        # which may appear unescaped inside JSON strings.
+        lines = self.query_raw(sql, **options).split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        return [json.loads(line) for line in lines]
 
     def close(self):
         """Refuse new calls, end those waiting for their memory budget (`ZpqClosed`), wait for the running ones, then

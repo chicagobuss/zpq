@@ -388,6 +388,14 @@ The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. 
 and macOS, each x86_64 and arm64, as `zpq-<linux|macos>-<x86_64|arm64>.tar.gz` (plus a `.sha256`) on the GitHub Release
 and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or `releases/v<version>/`).
 
+For a private local Homebrew rehearsal, pass the release manifest as the generator's positional argument.
+Keep the tarballs beside that manifest and use their directory as the local URL prefix:
+
+```bash
+python3 tools/homebrew_formula.py /absolute/path/to/releases/release.json \
+  --base-url file:///absolute/path/to/releases --out local-tap/Formula/zpq.rb
+```
+
 ## Use as a library
 
 The engine is consumable as a Zig module — the same sans-IO core the binaries use, minus the SQL frontend and its C

@@ -46,7 +46,9 @@ pub fn build(b: *std.Build) void {
     var revision_status: u8 = 0;
     const revision_args: []const []const u8 = &.{ "git", "describe", "--always", "--dirty", "--exclude=*", "--abbrev=12" };
     const revision = b.runAllowFail(revision_args, &revision_status, .ignore) catch "unknown";
-    cli_version.addOption([]const u8, "revision", std.mem.trim(u8, revision, "\r\n"));
+    const artifact_revision = b.option([]const u8, "revision", "Revision recorded in the artifact manifest") orelse
+        std.mem.trim(u8, revision, "\r\n");
+    cli_version.addOption([]const u8, "revision", artifact_revision);
     cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{
         .name = "zpq",

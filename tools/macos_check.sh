@@ -207,7 +207,12 @@ case_out ndjson query 'smoke/part-*.parquet' --format ndjson --filter 'opt IS NU
 case_out jsonl_alias query 'smoke/part-*.parquet' --format jsonl --select "id, qty * 2 AS q2, name || '-' || cat AS nc" --filter 'qty < 3' --limit 300
 case_out json_array query smoke/part-0.parquet --columns id,qty --format json --limit 3
 case_out inspect_json inspect smoke/part-0.parquet --format json
-if (cd "$WORK" && "$ZPQ" query 'smoke/part-*.parquet' --format ndjson 2> /dev/null | head -n 1) > "$WORK/log/ndjson_pipe.out"; then
+if (
+  cd "$WORK" || exit 1
+  "$ZPQ" query 'smoke/part-*.parquet' --format ndjson 2> /dev/null | head -n 1
+  pipe_status=("${PIPESTATUS[@]}")
+  [ "${pipe_status[0]}" -eq 141 ] && [ "${pipe_status[1]}" -eq 0 ]
+) > "$WORK/log/ndjson_pipe.out"; then
   compare ndjson_pipe "$WORK/log/ndjson_pipe.out"
 else
   fail ndjson_pipe "zpq into a closed pipe failed"

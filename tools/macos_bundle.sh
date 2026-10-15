@@ -22,7 +22,7 @@ PY="${PYTHON:-}"
 if [ -z "$PY" ]; then if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi; fi
 "$PY" -c 'import pyarrow' 2> /dev/null || { echo "need a python with pyarrow (set PYTHON=...)" >&2; exit 2; }
 
-REV="$(git describe --always --dirty 2> /dev/null || echo unknown)"
+REV="$(git describe --always --dirty --exclude="*" --abbrev=12 2> /dev/null || echo unknown)"
 NAME="zpq-macos-check-$REV"
 TMP="$(mktemp -d "$OUT_DIR/.stage.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -36,8 +36,8 @@ python3 tools/verify_tls.py
 for t in $TARGETS native; do
   tgt=(); [ "$t" = native ] || tgt=(-Dtarget="$t")
   echo "== building $t" >&2
-  zig build -j"${ZPQ_BUILD_JOBS:-8}" "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
-  zig build -j"${ZPQ_BUILD_JOBS:-8}" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
+  zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
+  zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
 done
 for t in $TARGETS; do
   mkdir -p "$STAGE/bin/$t"

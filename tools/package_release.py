@@ -46,8 +46,15 @@ def main():
         prefix = out / target
         if not args.skip_build:
             subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
-                            "-Dcpu=baseline", "--prefix", str(prefix)], cwd=ROOT, check=True, timeout=1200)
+                            "-Dcpu=baseline", "-Drevision=" + revision, "--prefix", str(prefix)],
+                           cwd=ROOT, check=True, timeout=1200)
         binary = prefix / "bin/zpq"
+        if revision.encode() not in binary.read_bytes():
+            raise SystemExit("binary lacks its manifest revision; refusing to package stale output")
+        if target == "x86_64-linux-musl":
+            version_output = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
+            if revision not in version_output:
+                raise SystemExit("binary --version differs from manifest revision")
         files = {"bin/zpq": binary, "LICENSE": ROOT / "LICENSE",
                  "share/man/man1/zpq.1": ROOT / "packaging/man/zpq.1",
                  "share/bash-completion/completions/zpq": ROOT / "packaging/completions/zpq.bash",

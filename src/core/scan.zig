@@ -3040,13 +3040,23 @@ fn prepareAggregate(
     // the process, when it is about to exit, as the tables do). Row groups no lane took sit in the worker tables, which
     // then merge with it as usual.
     var dense_merged = false;
+    // Left to the exit with the tables, but freed if a later refusal runs the scan again (`runMultiAggregate`).
+    var left_lanes: []agg_dense.Lanes = &.{};
+    var left_domain: ?agg_dense.Domain = null;
+    errdefer {
+        for (left_lanes) |*l| l.deinit(gpa);
+        if (left_domain) |*d| d.deinit(gpa);
+    }
     if (dense_lanes.len > 0) {
         const dense_table = &all_tables[n_tables];
         const key = group_by_keys.?[0].col_ref;
         group_budget.release(dense_table_charge);
         dense_charge -= dense_table_charge;
         try agg_dense.intoTable(gpa, arena, dense_lanes, key, dense_table, key.col_idx + 1, n_workers);
-        if (!leave_tables) {
+        if (leave_tables) {
+            left_lanes = dense_lanes;
+            left_domain = domain;
+        } else {
             for (dense_lanes) |*l| l.deinit(gpa);
             domain.?.deinit(gpa);
         }

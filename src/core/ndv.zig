@@ -224,6 +224,8 @@ const Partition = struct {
     ids: std.HashMapUnmanaged(u64, u32, IntContext, std.hash_map.default_max_load_percentage) = .empty,
     vals: std.ArrayList(u64) = .empty,
     mapped: bool = false,
+    /// Values whose retention is already charged: those the presize paid for, then each one past them.
+    charged: usize = 0,
 
     fn count(p: *const Partition) usize {
         return if (p.mapped) p.vals.items.len else p.set.count();
@@ -398,8 +400,10 @@ fn retainRun(s: *Shared, p: *Partition, pi: u32, ints: []const u64, js: []const 
     }
     const added = p.vals.items.len - before;
     if (s.distinct.fetchAdd(added, .monotonic) + added >= agg_dense.max_ids) return s.drop();
-    // A map entry and its value, kept on the high side.
-    return s.charge(added * 32);
+    // A map entry and its value, kept on the high side; the presized share is paid already.
+    const over = p.vals.items.len -| p.charged;
+    p.charged += over;
+    return s.charge(over * 32);
 }
 
 fn unionBound(
@@ -480,6 +484,7 @@ fn unionBound(
         for (&parts) |*p| {
             p.mapped = true;
             if (!shared.charge(@as(usize, each) * 32)) break;
+            p.charged = each;
             p.ids.ensureTotalCapacity(gpa, each) catch {
                 _ = shared.drop();
                 break;
@@ -751,6 +756,18 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
         var uniq: std.AutoHashMapUnmanaged(u64, void) = .empty;
         for (d.values) |v| try uniq.put(arena, v, {});
         try std.testing.expectEqual(d.values.len, uniq.count());
+    }
+    // Retention costs what the domain holds, its presized map shares charged once: a budget of exactly that keeps it.
+    {
+        var full: ?agg_dense.Domain = null;
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true, &full);
+        const d = &full.?;
+        const need = d.values.len * 32 + d.entries() * 4 + d.trans.len * @sizeOf([]u32) + d.file_base.len * @sizeOf(usize);
+        d.deinit(a);
+        var exact: ?agg_dense.Domain = null;
+        defer if (exact) |*e| e.deinit(a);
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, need * 16, true, &exact);
+        try std.testing.expect(exact != null);
     }
     // Strings and composites keep no domain; a retention budget too small drops it, not the bound.
     var none: ?agg_dense.Domain = null;

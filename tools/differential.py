@@ -955,6 +955,32 @@ def main():
             fails += 1
             print(f"  FAIL  {label}  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr[:90]!r}")
 
+    # Cuts that read only some rows' aggregate inputs must not drop the error another row raises. 160 keys of 30 rows
+    # (q = 1..30) outrank 2000 keys of 23 rows whose q is 0, so a cut certifies without reading those; the full scan
+    # divides by zero. Shuffled, PLAIN keys, so no dictionary bounds the groups.
+    cut_err = os.path.join(tmp, "cut_errors.parquet")
+    import random as rnd_err
+    import pyarrow as pa_cut  # `pa` is local to main (imported again below), unbound here
+    rows_err = [(k, q) for k in range(160) for q in range(1, 31)] + [(k, 0) for k in range(160, 2160) for _ in range(23)]
+    rnd_err.Random(1991).shuffle(rows_err)
+    pq.write_table(pa_cut.table({"k": [r[0] for r in rows_err], "q": [r[1] for r in rows_err]}), cut_err,
+                   row_group_size=8192, use_dictionary=False)
+    CUT_ERRORS = [
+        f"SELECT k, count(DISTINCT 1000000000000 / q) AS d FROM '{cut_err}' GROUP BY k ORDER BY d DESC LIMIT 10",
+        f"SELECT k, count(DISTINCT q) AS d, sum(1000000000000 / q) AS s FROM '{cut_err}' GROUP BY k "
+        "ORDER BY d DESC LIMIT 10",
+    ]
+    for i, sql in enumerate(CUT_ERRORS):
+        for j in ("1", "3", "16"):
+            total += 1
+            r = subprocess.run([ZPQ, "query", "-j", j, "--query", sql], capture_output=True, text=True)
+            label = f"cut-errors:{i} -j{j}"
+            if r.returncode == 1 and not r.stdout and "division by zero" in r.stderr:
+                print(f"  OK    {label}  (fails as the full scan does)")
+            else:
+                fails += 1
+                print(f"  FAIL  {label}  rc={r.returncode} stdout={r.stdout[:60]!r} stderr={r.stderr[:90]!r}")
+
     # A full sort holds every row: past its share of --max-memory it fails cleanly instead of running out.
     total += 1
     r = subprocess.run([ZPQ, "query", "--query", f"SELECT * FROM '{fixture}' ORDER BY name", "--max-memory", "300000"],

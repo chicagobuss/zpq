@@ -17,4 +17,10 @@ for length in (32, 5000, 17000):
     else:
         assert error["message"] == code, (length, error)
     assert p.stdout == "", (length, p.stdout)
+    # Human diagnostics carry the whole path, however long.
+    p = subprocess.run([cli, "query", "--query", f"SELECT * FROM '{path}'"],
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode in (1, 2), (length, p.returncode, p.stderr[-1000:])
+    assert path in p.stderr, (length, p.stderr[-1000:])
+    assert p.stdout == "", (length, p.stdout)
 print("CLI failed-input path lifetime and diagnostic fallback checks passed")

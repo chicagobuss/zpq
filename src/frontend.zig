@@ -5,11 +5,13 @@ const local_fs = zpq.local_fs;
 const s3 = zpq.io.s3;
 const Diag = zpq.core.diag.Diag;
 
+/// Receives each diagnostic, bounded to 16 KiB; a longer one is dropped, so the receiver falls back to the error
+/// name. Unset, diagnostics print to stderr whole.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
 fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
+    const report = diagnostic_fn orelse return std.debug.print(fmt, args);
     var buf: [16 * 1024]u8 = undefined;
-    const message = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    if (diagnostic_fn) |report| report(message) else std.debug.print("{s}", .{message});
+    report(std.fmt.bufPrint(&buf, fmt, args) catch return);
 }
 
 pub fn noSqlMatches(table_name: []const u8) void {

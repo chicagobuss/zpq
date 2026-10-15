@@ -70,10 +70,6 @@ fn captureSqlDiagnostic(message: []const u8) void {
     diagnostic_len += n;
 }
 
-fn captureFrontendDiagnostic(message: []const u8) void {
-    if (machine_diagnostics) captureSqlDiagnostic(message) else std.debug.print("{s}", .{message});
-}
-
 fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
     if (!machine_diagnostics) {
         std.debug.print(fmt, args);
@@ -96,7 +92,8 @@ fn emitError(err: anyerror) !void {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     machine_diagnostics = wantsJsonSummary(init.minimal.args);
-    zpq.frontend.diagnostic_fn = captureFrontendDiagnostic;
+    // Human diagnostics print unbounded; machine ones are captured into the JSON error.
+    if (machine_diagnostics) zpq.frontend.diagnostic_fn = captureSqlDiagnostic;
     defer zpq.frontend.diagnostic_fn = null;
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = iter.next(); // skip program name

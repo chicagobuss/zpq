@@ -601,12 +601,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (n_dict == 0 or d.len != n_dict) return error.UnexpectedPage;
                     var left = present;
                     while (left > 0) {
-                        // Leaves and present leaves coincide when first leaves are tracked (no nulls).
-                        const leaf: u32 = @intCast(written + (present - left));
+                        // Leaves and present leaves coincide when first leaves are tracked (no nulls), and a tracked
+                        // chunk has at most `no_leaf` of them. Untracked, the position can pass u32 and is not used.
+                        const leaf = written + (present - left);
                         if (idx.takeRleRun(left) catch return error.UnexpectedPage) |run| {
                             if (run.value >= n_dict) return error.UnexpectedPage;
                             if (unfound > 0 and first_leaf.?[run.value] == no_leaf) {
-                                first_leaf.?[run.value] = leaf;
+                                first_leaf.?[run.value] = @intCast(leaf);
                                 unfound -= 1;
                             }
                             hist[run.value] += run.count;
@@ -624,7 +625,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                         if (oob != 0) return error.UnexpectedPage;
                         if (unfound > 0) for (buf[0..got], 0..) |k, j| {
                             if (first_leaf.?[k] == no_leaf) {
-                                first_leaf.?[k] = leaf + @as(u32, @intCast(j));
+                                first_leaf.?[k] = @intCast(leaf + j);
                                 unfound -= 1;
                             }
                         };
@@ -2316,4 +2317,22 @@ test "readAllCodes falling back to values skips levels on all-present pages unti
             try testing.expect(got.has_nulls);
         }
     }
+}
+
+test "regression: a histogram past 2^32 leaves counts untracked and is declined tracked" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var chunk: std.ArrayList(u8) = .empty;
+    const dict = std.mem.toBytes([1]i32{7});
+    try appendPageForTest(arena, &chunk, true, 1, &dict);
+    // Bit width 0, then one RLE run of 2^30 (header 2^31 as a varint; a width-0 run has no value byte).
+    const body = [_]u8{ 0, 0x80, 0x80, 0x80, 0x80, 0x08 };
+    for (0..5) |_| try appendPageForTest(arena, &chunk, false, 1 << 30, &body);
+    const n: usize = 5 << 30;
+    const flat: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    var untracked = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, flat, arena);
+    try testing.expectEqual(@as(u64, n), (try untracked.readAllHistogram(n, false)).?.hist.hist[0]);
+    var tracked = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, flat, arena);
+    try testing.expect(try tracked.readAllHistogram(n, true) == null);
 }

@@ -182,7 +182,6 @@ pub const ResultProgram = struct {
     }
 };
 
-
 /// A HAVING number literal, typed by its text: an integer, an exact decimal (unscaled digits and scale), or a double.
 pub const Number = union(enum) {
     int: i128,
@@ -219,6 +218,17 @@ pub const Number = union(enum) {
     }
 };
 
+// LLVM cannot lower i192-to-f64 on ARM; the limb conversion preserves nearest-even rounding.
+fn wideAsFloat(v: i192) f64 {
+    const Limb = std.math.big.Limb;
+    const width = @bitSizeOf(Limb);
+    var limbs: [192 / width]Limb = undefined;
+    const magnitude = @abs(v);
+    for (&limbs, 0..) |*limb, i| limb.* = @truncate(magnitude >> @intCast(i * width));
+    const number: std.math.big.int.Const = .{ .limbs = &limbs, .positive = v >= 0 };
+    return number.toFloat(f64, .nearest_even)[0];
+}
+
 /// How `v` orders against `lit`, or null when the comparison is UNKNOWN: `v` NULL, a NULL literal, or kinds that do
 /// not compare (refused when the query binds, see `checkHaving`). Integers and DECIMALs compare exactly against
 /// integer and decimal literals; anything with a double compares as doubles, NaN above every number as zpq orders
@@ -237,7 +247,7 @@ pub fn compareLiteral(v: scan.AggValue, lit: expr_ast.HavingLiteral) ?std.math.O
         .f => |f| floatOrder(f, num.asF64()),
         .avg => |a| if (a.count == 0 or a.sum == null) null else floatOrder(a.sum.? / @as(f64, @floatFromInt(a.count)), num.asF64()),
         .avg_dec => |a| if (a.count == 0 or a.sum == null) null else floatOrder(
-            @as(f64, @floatFromInt(a.sum.?)) / std.math.pow(f64, 10, @floatFromInt(a.spec.scale)) /
+            wideAsFloat(a.sum.?) / std.math.pow(f64, 10, @floatFromInt(a.spec.scale)) /
                 @as(f64, @floatFromInt(a.count)),
             num.asF64(),
         ),
@@ -510,5 +520,45 @@ test "slab rows: compaction that runs out of memory leaves the rows as they were
         try std.testing.expectError(error.OutOfMemory, out.compactRows(failing.allocator()));
         try std.testing.expectEqual(slab.ptr, out.slab.ptr);
         try std.testing.expectEqual(@as(i128, 7), out.group_rows.?[0][0].i);
+    }
+}
+
+test "wide DECIMAL AVG preserves exact and rounded HAVING comparisons" {
+    const exact: i192 = 1 << 53;
+    try std.testing.expectEqual(@as(f64, 9007199254740992), wideAsFloat(exact));
+    try std.testing.expectEqual(@as(f64, 9007199254740992), wideAsFloat(exact + 1));
+    try std.testing.expectEqual(@as(f64, 9007199254740996), wideAsFloat(exact + 3));
+    try std.testing.expectEqual(@as(f64, -9007199254740992), wideAsFloat(-exact - 1));
+    for ([_]i192{ exact, exact + 1, exact + 3 }) |sum| {
+        const value: scan.AggValue = .{ .avg_dec = .{
+            .sum = sum,
+            .count = 1,
+            .mean = @intCast(sum),
+            .spec = .{ .precision = 38, .scale = 0 },
+        } };
+        const expected: std.math.Order = if (sum == exact + 3) .gt else .eq;
+        try std.testing.expectEqual(@as(?std.math.Order, expected), compareLiteral(value, .{ .number = "9007199254740992" }));
+        // Ordinary DECIMAL remains exact even where AVG's double representation rounds.
+        const decimal: scan.AggValue = .{ .dec = .{
+            .v = @intCast(sum),
+            .spec = .{ .precision = 38, .scale = 0 },
+        } };
+        try std.testing.expectEqual(@as(?std.math.Order, if (sum == exact) .eq else .gt), compareLiteral(decimal, .{ .number = "9007199254740992" }));
+    }
+    if (@import("builtin").cpu.arch == .x86_64) {
+        var rng = std.Random.DefaultPrng.init(0x192f64);
+        for (0..10_000) |_| {
+            const sum = rng.random().int(i192);
+            const legacy: f64 = @floatFromInt(sum);
+            try std.testing.expectEqual(@as(u64, @bitCast(legacy)), @as(u64, @bitCast(wideAsFloat(sum))));
+            const value: scan.AggValue = .{ .avg_dec = .{
+                .sum = sum,
+                .count = 7,
+                .mean = null,
+                .spec = .{ .precision = 38, .scale = 9 },
+            } };
+            const expected = floatOrder(legacy / 1e9 / 7, 1e30);
+            try std.testing.expectEqual(@as(?std.math.Order, expected), compareLiteral(value, .{ .number = "1e30" }));
+        }
     }
 }

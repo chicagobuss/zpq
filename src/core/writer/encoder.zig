@@ -150,6 +150,15 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     const src_max_def = sourceMaxDef(in.values);
     const src_rep_levels = sourceRepLevels(in.values);
     const src_max_rep = sourceMaxRep(in.values);
+    const fixed = phys == .FIXED_LEN_BYTE_ARRAY;
+    // FLBA's PLAIN form is the bare bytes, so a value of another width would shift every value after it.
+    if (fixed and in.values == .string) {
+        const width: usize = @intCast(elem.type_length orelse return error.UnsupportedType);
+        const c = in.values.string;
+        for (c.values, 0..) |v, i| {
+            if (isPresent(c.def_levels, c.max_def, i) and v.len != width) return error.UnsupportedType;
+        }
+    }
 
     // Try dictionary encoding for BYTE_ARRAY first. Within the limits of
     // `tryEncodeDictBytes` (a quarter of the values distinct, 1 MiB of
@@ -193,7 +202,7 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     // Strings the dictionary declined: DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (see `encodeValuesStrings`).
     // Only for flat columns.
     const strings_opt = if (delta_bytes_opt == null and src_max_rep == 0)
-        try encodeValuesStrings(arena, in.values, src_def_levels, src_max_def)
+        try encodeValuesStrings(arena, in.values, src_def_levels, src_max_def, fixed)
     else
         null;
     const values_bytes = if (delta_bytes_opt) |b|
@@ -201,7 +210,7 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     else if (strings_opt) |sv|
         sv.bytes
     else
-        try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def);
+        try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def, fixed);
     const values_encoding: schema.Encoding = if (delta_bytes_opt != null)
         .DELTA_BINARY_PACKED
     else if (strings_opt) |sv|
@@ -519,6 +528,7 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
             const num_present = countPresent(n, c.def_levels, c.max_def);
             if (T != bool and c.max_rep == 0 and num_present >= 64) dict: {
                 const is_string = T == []const u8;
+                const len_prefix: usize = if (in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY) 0 else 4;
                 const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 10;
                 var dict_bytes: usize = 0;
                 const none = std.math.maxInt(u32);
@@ -534,7 +544,7 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
                     if (remap[k] == none) {
                         if (n_entries >= entries.len) break :dict;
                         if (is_string) {
-                            dict_bytes += 4 + c.dict[k].len;
+                            dict_bytes += len_prefix + c.dict[k].len;
                             if (dict_bytes > string_dict_max_bytes) break :dict;
                         }
                         remap[k] = @intCast(n_entries);
@@ -545,18 +555,13 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
                     pos += 1;
                 }
                 const used = entries[0..n_entries];
-                const dict_plain = if (T == []const u8) blk: {
-                    var len: usize = 0;
-                    for (used) |v| len += 4 + v.len;
-                    const out = try arena.alloc(u8, len);
-                    var o: usize = 0;
-                    for (used) |v| {
-                        std.mem.writeInt(u32, out[o..][0..4], @intCast(v.len), .little);
-                        @memcpy(out[o + 4 ..][0..v.len], v);
-                        o += 4 + v.len;
-                    }
-                    break :blk out;
-                } else blk: {
+                if (T == []const u8 and len_prefix == 0) {
+                    const width: usize = @intCast(in.schema_elem.type_length orelse return error.UnsupportedType);
+                    for (used) |v| if (v.len != width) return error.UnsupportedType;
+                }
+                const dict_plain = if (T == []const u8)
+                    try encodePlainBytes(arena, used, null, 0, len_prefix == 0)
+                else blk: {
                     const Bits = @Int(.unsigned, @bitSizeOf(T));
                     const out = try arena.alloc(u8, used.len * @sizeOf(T));
                     for (used, 0..) |v, i| {
@@ -599,6 +604,8 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     const values = string_col.values;
     const def_levels = string_col.def_levels;
     const max_def = string_col.max_def;
+    const fixed = in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY;
+    const len_prefix: usize = if (fixed) 0 else 4;
 
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
@@ -617,7 +624,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
         if (!isPresent(def_levels, max_def, i)) continue;
         const gop = try lookup.getOrPut(v);
         if (!gop.found_existing) {
-            dict_bytes += 4 + v.len;
+            dict_bytes += len_prefix + v.len;
             if (dict_values.items.len >= max_entries or dict_bytes > string_dict_max_bytes) return null;
             const new_idx: u32 = @intCast(dict_values.items.len);
             try dict_values.append(arena, v);
@@ -629,15 +636,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
 
     if (dict_values.items.len == 0) return null;
 
-    var plain_len: usize = 0;
-    for (dict_values.items) |v| plain_len += 4 + v.len;
-    const dict_plain = try arena.alloc(u8, plain_len);
-    var pos: usize = 0;
-    for (dict_values.items) |v| {
-        std.mem.writeInt(u32, dict_plain[pos..][0..4], @intCast(v.len), .little);
-        @memcpy(dict_plain[pos + 4 ..][0..v.len], v);
-        pos += 4 + v.len;
-    }
+    const dict_plain = try encodePlainBytes(arena, dict_values.items, null, 0, fixed);
     const dict_col: filter_eval.Batch.Column = .{ .string = .{ .values = dict_values.items } };
     return try finishDictionaryColumn(arena, in, num_values, dict_plain, dict_col, indices);
 }
@@ -1232,13 +1231,14 @@ fn encodeValuesPlain(
     vals: filter_eval.Batch.Column,
     def_levels: ?[]const u32,
     max_def: u32,
+    fixed: bool,
 ) Error![]u8 {
     return switch (vals) {
         .i32 => |c| try encodePlainTyped(i32, arena, c.values, def_levels, max_def),
         .i64 => |c| try encodePlainTyped(i64, arena, c.values, def_levels, max_def),
         .f32 => |c| try encodePlainTyped(f32, arena, c.values, def_levels, max_def),
         .f64 => |c| try encodePlainTyped(f64, arena, c.values, def_levels, max_def),
-        .string => |c| try encodePlainBytes(arena, c.values, def_levels, max_def),
+        .string => |c| try encodePlainBytes(arena, c.values, def_levels, max_def, fixed),
         .boolean => |c| try encodePlainBool(arena, c.values, def_levels, max_def),
         // encodeColumn sends DECIMAL to encodeDecimalColumn before any PLAIN encoding.
         .i128 => unreachable,
@@ -1304,12 +1304,14 @@ const StringValues = struct { bytes: []u8, encoding: schema.Encoding };
 /// Both keep the bytes contiguous, apart from their lengths: zstd compresses that faster and smaller than PLAIN's
 /// interleaved lengths, and readers decode it faster (DELTA_LENGTH_BYTE_ARRAY fastest of all in Polars, pyarrow and
 /// DuckDB; DELTA_BYTE_ARRAY several times slower in Polars, hence the prefix condition). Returns null for non-string
-/// columns and empty ones (the caller writes PLAIN).
+/// columns and empty ones (the caller writes PLAIN), and for a FIXED_LEN_BYTE_ARRAY column (`fixed`) whose prefixes
+/// do not pay: DELTA_LENGTH_BYTE_ARRAY is defined for BYTE_ARRAY only, and strict readers reject it on FLBA.
 fn encodeValuesStrings(
     arena: std.mem.Allocator,
     vals: filter_eval.Batch.Column,
     def_levels: ?[]const u32,
     max_def: u32,
+    fixed: bool,
 ) Error!?StringValues {
     const col = switch (vals) {
         .string => |c| c,
@@ -1335,6 +1337,7 @@ fn encodeValuesStrings(
         k += 1;
     }
     const prefixes_pay = prefix_total * 4 >= prefix_total + suffix_total;
+    if (!prefixes_pay and fixed) return null;
     if (!prefixes_pay) {
         // The lengths, then the values whole.
         for (prefix_lengths, suffix_lengths) |p, *l| l.* += p;
@@ -1442,27 +1445,29 @@ fn encodePlainTyped(
     return out;
 }
 
-/// PLAIN encoding for BYTE_ARRAY: each present value is `<u32 LE length><bytes>`.
+/// PLAIN encoding for BYTE_ARRAY: each present value is `<u32 LE length><bytes>`. For FIXED_LEN_BYTE_ARRAY (`fixed`)
+/// the bytes alone: the width is the schema's `type_length`, and a length prefix would be read as value bytes.
 fn encodePlainBytes(
     arena: std.mem.Allocator,
     values: []const []const u8,
     def_levels: ?[]const u32,
     max_def: u32,
+    fixed: bool,
 ) Error![]u8 {
+    const len_prefix: usize = if (fixed) 0 else 4;
     var total: usize = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
-        total += 4 + v.len;
+        total += len_prefix + v.len;
     }
 
     const out = try arena.alloc(u8, total);
     var pos: usize = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) continue;
-        const len_u32: u32 = @intCast(v.len);
-        std.mem.writeInt(u32, out[pos..][0..4], len_u32, .little);
-        @memcpy(out[pos + 4 ..][0..v.len], v);
-        pos += 4 + v.len;
+        if (!fixed) std.mem.writeInt(u32, out[pos..][0..4], @intCast(v.len), .little);
+        @memcpy(out[pos + len_prefix ..][0..v.len], v);
+        pos += len_prefix + v.len;
     }
     return out;
 }
@@ -1821,7 +1826,7 @@ test "encodePlainTyped i32 with mixed nulls only emits present values" {
 test "encodePlainBytes round-trip" {
     const arena = testing.allocator;
     const v = [_][]const u8{ "alpha", "", "BETA", "γ" };
-    const encoded = try encodePlainBytes(arena, &v, null, 0);
+    const encoded = try encodePlainBytes(arena, &v, null, 0, false);
     defer arena.free(encoded);
 
     var pos: usize = 0;
@@ -1849,7 +1854,7 @@ test "both string layouts round-trip through their decoders (incl. nulls), chose
         .{ .vals = &unrelated, .want = .DELTA_LENGTH_BYTE_ARRAY },
     }) |case| {
         const col: filter_eval.Batch.Column = .{ .string = .{ .values = case.vals, .def_levels = &dls, .max_def = 1 } };
-        const enc = (try encodeValuesStrings(a, col, &dls, 1)) orelse return error.ExpectedEncoding;
+        const enc = (try encodeValuesStrings(a, col, &dls, 1, false)) orelse return error.ExpectedEncoding;
         try testing.expectEqual(case.want, enc.encoding);
         var out: [5][]const u8 = undefined; // 5 present values
         const n = if (enc.encoding == .DELTA_BYTE_ARRAY) blk: {
@@ -2419,7 +2424,7 @@ test "the string prefix choice is inclusive at a quarter, and skips nulls" {
     }) |case| {
         const vals = [_][]const u8{ "abcd", "a-null-is-not-the-previous-value", case.last };
         const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1 } };
-        const got = (try encodeValuesStrings(a, col, &defs, 1)).?;
+        const got = (try encodeValuesStrings(a, col, &defs, 1, false)).?;
         try testing.expectEqual(case.want, got.encoding);
         const dba = @import("../parquet/encoding/delta_byte_array.zig");
         var out: [2][]const u8 = undefined;
@@ -2500,4 +2505,146 @@ test "the string dictionary limits admit exactly a quarter distinct and exactly 
         try testing.expectEqual(k == 16, hashed.meta.dictionary_page_offset != null);
         try testing.expectEqualSlices(u8, hashed.bytes, coded.bytes);
     }
+}
+
+const TestPage = struct { header: schema.PageHeader, payload: []const u8 };
+
+/// The pages of an UNCOMPRESSED chunk, header and payload each.
+fn testPages(a: std.mem.Allocator, bytes: []const u8) ![]const TestPage {
+    var pages: std.ArrayList(TestPage) = .empty;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        var r = thrift.Reader.init(bytes[off..]);
+        const header = try schema.PageHeader.read(&r);
+        const len: usize = @intCast(header.compressed_page_size);
+        try pages.append(a, .{ .header = header, .payload = bytes[off + r.pos ..][0..len] });
+        off += r.pos + len;
+    }
+    return pages.items;
+}
+
+fn flbaElem(width: i32, repetition: schema.FieldRepetitionType) schema.SchemaElement {
+    return .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = width,
+        .repetition_type = repetition,
+        .name = "u",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+}
+
+test "a FIXED_LEN_BYTE_ARRAY column is written in FLBA's PLAIN form (no lengths), never as DELTA_LENGTH_BYTE_ARRAY" {
+    const consumer = @import("../consumer.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path: []const []const u8 = &.{"u"};
+    const required = flbaElem(16, .REQUIRED);
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    // Distinct values sharing no prefix: no dictionary, no DELTA_BYTE_ARRAY, so PLAIN: the values back to back.
+    var unrelated: [200][]const u8 = undefined;
+    for (&unrelated) |*v| {
+        const b = try a.alloc(u8, 16);
+        rand.bytes(b);
+        v.* = b;
+    }
+    const plain = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &unrelated } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+    });
+    const plain_pages = try testPages(a, plain.bytes);
+    try testing.expectEqual(1, plain_pages.len);
+    try testing.expectEqual(schema.Encoding.PLAIN, plain_pages[0].header.data_page_header.?.encoding);
+    try testing.expectEqualSlices(u8, try std.mem.concat(a, u8, &unrelated), plain_pages[0].payload);
+    try testing.expect(std.mem.indexOfScalar(schema.Encoding, plain.meta.encodings.items, .DELTA_LENGTH_BYTE_ARRAY) ==
+        null);
+    const flat: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    const plain_back = try consumer.decodeFlbaColumn(a, plain.bytes, .UNCOMPRESSED, flat, 200, 16);
+    for (unrelated, plain_back.values) |want, got| try testing.expectEqualSlices(u8, want, got);
+
+    // Nullable: the page ends with the present values alone, after the definition levels.
+    var defs: [200]u32 = undefined;
+    var present: std.ArrayList([]const u8) = .empty;
+    for (&defs, unrelated) |*d, v| {
+        d.* = @intFromBool(rand.boolean());
+        if (d.* == 1) try present.append(a, v);
+    }
+    const optional = flbaElem(16, .OPTIONAL);
+    const nullable = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &unrelated, .def_levels = &defs, .max_def = 1 } },
+        .schema_elem = &optional,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+    });
+    const nullable_pages = try testPages(a, nullable.bytes);
+    try testing.expectEqual(schema.Encoding.PLAIN, nullable_pages[0].header.data_page_header.?.encoding);
+    try testing.expect(std.mem.endsWith(u8, nullable_pages[0].payload, try std.mem.concat(a, u8, present.items)));
+
+    // Three distinct values: the dictionary page holds the bare entries, 16 bytes each, in first-occurrence order; a
+    // coded column (its source dictionary holding an entry no row uses) writes the same bytes.
+    const entries = [_][]const u8{ unrelated[5], unrelated[9], unrelated[2], unrelated[7] };
+    var repeated: [200][]const u8 = undefined;
+    var codes: [200]u32 = undefined;
+    for (&repeated, &codes, 0..) |*v, *c, i| {
+        c.* = @intCast(i % 3);
+        v.* = entries[c.*];
+    }
+    const dict = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &repeated } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+    });
+    const dict_pages = try testPages(a, dict.bytes);
+    try testing.expectEqual(schema.PageType.DICTIONARY_PAGE, dict_pages[0].header.type);
+    try testing.expectEqualSlices(u8, try std.mem.concat(a, u8, entries[0..3]), dict_pages[0].payload);
+    const dict_back = try consumer.decodeFlbaColumn(a, dict.bytes, .UNCOMPRESSED, flat, 200, 16);
+    for (repeated, dict_back.values) |want, got| try testing.expectEqualSlices(u8, want, got);
+    const coded = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &entries } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+    });
+    try testing.expectEqualSlices(u8, dict.bytes, coded.bytes);
+
+    // Shared prefixes keep DELTA_BYTE_ARRAY, which the format defines for FIXED_LEN_BYTE_ARRAY too.
+    var prefixed: [200][]const u8 = undefined;
+    for (&prefixed, 0..) |*v, i| {
+        const b = try a.alloc(u8, 16);
+        @memset(b[0..12], 0);
+        std.mem.writeInt(u32, b[12..16], @intCast(i), .big);
+        v.* = b;
+    }
+    const delta = try encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &prefixed } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+    });
+    const delta_page = (try testPages(a, delta.bytes))[0];
+    try testing.expectEqual(schema.Encoding.DELTA_BYTE_ARRAY, delta_page.header.data_page_header.?.encoding);
+
+    // A value of another width is refused rather than shifting every value after it, by both paths.
+    var bad = unrelated;
+    bad[100] = unrelated[100][0..15];
+    try testing.expectError(error.UnsupportedType, encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &bad } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+    }));
+    var bad_entries = entries;
+    bad_entries[1] = entries[1][0..15];
+    try testing.expectError(error.UnsupportedType, encodeColumn(a, .{
+        .values = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &bad_entries } },
+        .schema_elem = &required,
+        .path_in_schema = path,
+    }));
 }

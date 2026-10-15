@@ -105,6 +105,9 @@ pub const DecodeOptions = struct {
     /// Let an aggregate scan work on dictionary-encoded columns as codes (filters once per dictionary entry,
     /// histogram aggregates, level-only counts) instead of materialising values. Off only to compare against.
     encoded: bool = true,
+    /// Keep codes however near-unique the dictionary: a key folded by a retained domain translates its codes, so
+    /// they never cost per-entry work (`agg_dense`).
+    any_dictionary: bool = false,
 };
 
 /// Hardwood's definition-level test, ported: a page has no nulls iff its
@@ -453,7 +456,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (dict_ptr) |p| {
                         if (p != d.ptr)
                             return .{ .values = try self.finishAsValues(codes, def_out, written, num_leaves) };
-                    } else if (d.len == 0 or d.len > num_leaves / 8) {
+                    } else if (d.len == 0 or (!self.options.any_dictionary and d.len > num_leaves / 8)) {
                         // Near-unique dictionary: codes buy nothing over values, and per-entry work rivals per-row.
                         return .{ .values = try self.finishAsValues(codes, def_out, written, num_leaves) };
                     } else {
@@ -568,7 +571,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (remaining_in_page > 0) {
                     const first = dict_ptr == null;
                     const usable = self.active == .rle_dict and self.dictionary != null and
-                        self.dictionary.?.len != 0 and self.dictionary.?.len <= num_leaves / 8;
+                        self.dictionary.?.len != 0 and
+                        (self.options.any_dictionary or self.dictionary.?.len <= num_leaves / 8);
                     if (first and !usable) {
                         // Nothing folded yet: decode this chunk as values in place instead of starting over.
                         return .{ .values = try self.finishAsValues(&.{}, null, 0, num_leaves) };

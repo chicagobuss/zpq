@@ -47,6 +47,7 @@ const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
 const agg_coded = @import("expr/agg_coded.zig");
+const agg_dense = @import("expr/agg_dense.zig");
 const partagg = @import("partagg.zig");
 const huge_pages = @import("huge_pages.zig");
 
@@ -2003,6 +2004,9 @@ pub const AggTarget = union(enum) {
         /// Set together: fold through shared partitions instead of leaving every group in `table`.
         part: ?*partagg.PartAgg = null,
         local: ?*partagg.Local = null,
+        /// A retained key domain's lanes: a row group whose dictionary the domain translated folds there, by global
+        /// id, instead of into `table`.
+        dense: ?*agg_dense.Lanes = null,
     },
 
     fn calls(self: AggTarget) []const expr_agg.AggCall {
@@ -2527,8 +2531,12 @@ pub fn scanRGForAgg(
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
                 return;
             }
-            if (!staged and decode_options.encoded and
-                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget))
+            const dense = if (g.dense) |d| !staged and decode_options.encoded and
+                try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel)
+            else
+                false;
+            if (dense or (!staged and decode_options.encoded and
+                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget)))
             {
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -2794,7 +2802,11 @@ const ChunkDecoder = struct {
         // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
-        const decode_options = self.decode_options;
+        var decode_options = self.decode_options;
+        decode_options.any_dictionary = switch (self.target) {
+            .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
+            .scalar => false,
+        };
         const scratch = self.ws.scratch;
         const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and

@@ -641,6 +641,7 @@ fn executeAggregate(
             .on
         else if (envDisables(ctx.env, "ZPQ_DISTINCT_PAIRS")) .off else .auto,
         .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
+        .dense = !envDisables(ctx.env, "ZPQ_DENSE"),
     };
     if (args.quiet_diagnostics) if (scan_args.sketch_topk) |*cfg| {
         cfg.trace = false;

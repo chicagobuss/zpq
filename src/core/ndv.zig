@@ -5,6 +5,7 @@ const schema = @import("schema.zig");
 const thrift = @import("thrift.zig");
 const expr = @import("expr/ast.zig");
 const agg = @import("expr/agg.zig");
+const agg_dense = @import("expr/agg_dense.zig");
 const membership = @import("filter/membership.zig");
 const page = @import("parquet/page.zig");
 const plain = @import("parquet/encoding/plain.zig");
@@ -78,6 +79,23 @@ pub fn collect(
     workers: usize,
     max_memory: usize,
     allow_union: bool,
+) !Stat {
+    return collectRetaining(gpa, arena, files, metas, keys, workers, max_memory, allow_union, null);
+}
+
+/// `collect`, also keeping a lone INT32/INT64 key's union as an exact domain in `domain` (owned by the caller, gpa)
+/// when it is complete and small (`agg_dense.Domain`). Retention never changes the bound: it is dropped, not failed,
+/// past `agg_dense.max_ids` values or `max_memory / 16` bytes.
+pub fn collectRetaining(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    files: []const File,
+    metas: []const schema.FileMetaData,
+    keys: []const expr.Expr,
+    workers: usize,
+    max_memory: usize,
+    allow_union: bool,
+    domain: ?*?agg_dense.Domain,
 ) !Stat {
     var stat: Stat = .{};
     var refs: std.ArrayList(Ref) = .empty;
@@ -173,7 +191,9 @@ pub fn collect(
             stat.union_budget_exceeded = true;
         if (allow_union and gated and max_memory >= 1024 * 1024) {
             stat.union_attempted = true;
-            if (try unionBound(gpa, arena, files, metas, refs.items, key.col_ref.col_idx, workers, max_memory)) |n| {
+            const retain = if (domain != null and keys.len == 1) domain else null;
+            const col = key.col_ref.col_idx;
+            if (try unionBound(gpa, arena, files, metas, refs.items, col, workers, max_memory, retain)) |n| {
                 sums[ki] = @min(sums[ki], n + nulls[ki]);
                 // Multiplying marginal cardinalities does not estimate the number of observed tuples.
                 if (keys.len == 1) stat.estimate = @min(stat.rows, n + nulls[ki]);
@@ -195,7 +215,33 @@ const P = agg.NUM_PARTS;
 const Partition = struct {
     lock: std.atomic.Value(bool) align(64) = .init(false),
     set: agg.DistinctSet = .{},
+    /// Retaining: each value's index among this partition's `vals`, in the order workers first inserted them. While
+    /// `mapped`, these stand in for `set`; once retention is given up they move into it (`migrate`).
+    ids: std.HashMapUnmanaged(u64, u32, IntContext, std.hash_map.default_max_load_percentage) = .empty,
+    vals: std.ArrayList(u64) = .empty,
+    mapped: bool = false,
+
+    fn count(p: *const Partition) usize {
+        return if (p.mapped) p.vals.items.len else p.set.count();
+    }
+
+    /// Under the lock: the values retained so far into `set`, which takes every later one.
+    fn migrate(p: *Partition, gpa: std.mem.Allocator) !void {
+        if (!p.mapped) return;
+        for (p.vals.items) |v| try p.set.insertU64(gpa, v);
+        p.mapped = false;
+    }
 };
+const IntContext = struct {
+    pub fn hash(_: IntContext, k: u64) u64 {
+        return std.hash.int(k);
+    }
+    pub fn eql(_: IntContext, a: u64, b: u64) bool {
+        return a == b;
+    }
+};
+/// A retained translation entry before ids are global: the partition in the top bits, its index below.
+const part_shift = 24;
 const Shared = struct {
     gpa: std.mem.Allocator,
     files: []const File,
@@ -206,6 +252,28 @@ const Shared = struct {
     cursor: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
     page_limit: usize,
+    /// Retaining: one translation per ref (gpa), and whether retention was given up (never the union).
+    trans: [][]u32 = &.{},
+    dropped: std.atomic.Value(bool) = .init(true),
+    retained: std.atomic.Value(usize) = .init(0),
+    retain_limit: usize = 0,
+    /// Values all partitions hold, retained past `agg_dense.max_ids` of them by none.
+    distinct: std.atomic.Value(usize) = .init(0),
+
+    fn retaining(s: *const Shared) bool {
+        return !s.dropped.load(.monotonic);
+    }
+
+    /// Charge `bytes` of retained state; false (and retention dropped) past the limit.
+    fn charge(s: *Shared, bytes: usize) bool {
+        if (s.retained.fetchAdd(bytes, .monotonic) + bytes <= s.retain_limit) return true;
+        return s.drop();
+    }
+
+    fn drop(s: *Shared) bool {
+        s.dropped.store(true, .monotonic);
+        return false;
+    }
 };
 const Worker = struct {
     shared: *Shared,
@@ -250,6 +318,12 @@ const Worker = struct {
                 var d = plain.ByteArrayDecoder.init(pg.bytes);
                 if (try d.decode(strs) != n) return error.BadDictionary;
             }
+            // Retaining: a translation per entry, plus the null id, kept beyond this dictionary.
+            var packed_ids: []u32 = &.{};
+            if (ints.len > 0 and s.retaining() and s.charge((n + 1) * @sizeOf(u32))) {
+                packed_ids = try s.gpa.alloc(u32, n + 1);
+                s.trans[i] = packed_ids;
+            }
             const routes = try a.alloc(u8, n);
             var counts: [P]usize = @splat(0);
             for (routes, 0..) |*r, j| {
@@ -284,13 +358,42 @@ const Worker = struct {
                 defer p.lock.store(false, .release);
                 done[pi] = true;
                 left -= 1;
-                for (ids[starts[pi]..starts[pi + 1]]) |j| {
+                const entries = ids[starts[pi]..starts[pi + 1]];
+                if (p.mapped and !(packed_ids.len > 0 and s.retaining() and
+                    retainRun(s, p, @intCast(pi), ints, entries, packed_ids))) try p.migrate(s.gpa);
+                if (!p.mapped) for (entries) |j| {
                     if (ints.len > 0) try p.set.insertU64(s.gpa, ints[j]) else try p.set.insertBytes(s.gpa, strs[j]);
-                }
+                };
             }
         }
     }
 };
+
+/// Under partition `p`'s lock: give each of a dictionary's entries `js` in it its index there, the next free one for
+/// a value not seen before. False, retention given up, on any failure: `vals` then holds every value inserted so far,
+/// so `migrate` loses none and the union stays exact.
+fn retainRun(s: *Shared, p: *Partition, pi: u32, ints: []const u64, js: []const u32, packed_ids: []u32) bool {
+    const before = p.vals.items.len;
+    for (js) |j| {
+        const gop = p.ids.getOrPut(s.gpa, ints[j]) catch return s.drop();
+        if (!gop.found_existing) {
+            if (p.vals.items.len >= agg_dense.max_ids) {
+                p.ids.removeByPtr(gop.key_ptr);
+                return s.drop();
+            }
+            p.vals.append(s.gpa, ints[j]) catch {
+                p.ids.removeByPtr(gop.key_ptr);
+                return s.drop();
+            };
+            gop.value_ptr.* = @intCast(p.vals.items.len - 1);
+        }
+        packed_ids[j] = (pi << part_shift) | gop.value_ptr.*;
+    }
+    const added = p.vals.items.len - before;
+    if (s.distinct.fetchAdd(added, .monotonic) + added >= agg_dense.max_ids) return s.drop();
+    // A map entry and its value, kept on the high side.
+    return s.charge(added * 32);
+}
 
 fn unionBound(
     gpa: std.mem.Allocator,
@@ -301,6 +404,7 @@ fn unionBound(
     col: usize,
     workers: usize,
     max_memory: usize,
+    retain: ?*?agg_dense.Domain,
 ) !?u64 {
     // Binding permits schema evolution across inputs. Raw dictionary images only union safely when their
     // physical/logical interpretation matches; otherwise the sum of per-RG bounds remains valid.
@@ -330,7 +434,11 @@ fn unionBound(
     var budget: agg.SharedBudget = .{ .limit = max_memory / 16, .block = 4096 };
     var parts: [P]Partition = undefined;
     for (&parts) |*p| p.* = .{ .set = .{ .shared = &budget } };
-    defer for (&parts) |*p| p.set.deinit(gpa);
+    defer for (&parts) |*p| {
+        p.set.deinit(gpa);
+        p.ids.deinit(gpa);
+        p.vals.deinit(gpa);
+    };
     var shared: Shared = .{
         .gpa = gpa,
         .files = files,
@@ -340,14 +448,77 @@ fn unionBound(
         .parts = &parts,
         .page_limit = @min(16 * 1024 * 1024, max_memory / 8 / n_workers),
     };
+    const int_key = refs.len > 0 and switch (metas[refs[0].file].row_groups.items[refs[0].rg].columns.items[col].meta_data.?.type) {
+        .INT32, .INT64 => true,
+        else => false,
+    };
+    if (retain != null and int_key) {
+        shared.trans = try gpa.alloc([]u32, refs.len);
+        @memset(shared.trans, &.{});
+        shared.dropped = .init(false);
+        shared.retain_limit = max_memory / 16;
+        for (&parts) |*p| p.mapped = true;
+    }
+    defer if (shared.trans.len > 0) {
+        for (shared.trans) |t| gpa.free(t);
+        gpa.free(shared.trans);
+    };
     const ws = try arena.alloc(Worker, n_workers);
     for (ws) |*w| w.* = .{ .shared = &shared };
     if (ws.len == 1 or !spawn.runTree(Worker, ws, .{ .stack_size = 1 << 20 }, Worker.run)) Worker.run(&ws[0]);
     for (ws) |w| if (w.oom) return error.OutOfMemory;
     if (shared.failed.load(.monotonic)) return null;
     var count: u64 = 0;
-    for (parts) |p| count +|= p.set.count();
+    for (&parts) |*p| count +|= p.count();
+    const kept = for (&parts) |*p| {
+        if (!p.mapped) break false;
+    } else true;
+    if (shared.trans.len > 0 and kept and shared.retaining() and count < agg_dense.max_ids) {
+        retain.?.* = try buildDomain(gpa, metas, refs, col, &parts, shared.trans, @intCast(count));
+        shared.trans = &.{};
+    }
     return count;
+}
+
+/// The retained union as a domain: partitions laid end to end give the global ids, and each translation's packed
+/// (partition, index) entries become those ids. Takes the translations over; on failure frees nothing it was given.
+fn buildDomain(
+    gpa: std.mem.Allocator,
+    metas: []const schema.FileMetaData,
+    refs: []const Ref,
+    col: usize,
+    parts: *const [P]Partition,
+    trans: [][]u32,
+    count: usize,
+) !agg_dense.Domain {
+    var base: [P]u32 = undefined;
+    var at: u32 = 0;
+    for (parts, &base) |*p, *b| {
+        b.* = at;
+        at += @intCast(p.vals.items.len);
+    }
+    std.debug.assert(at == count);
+    const values = try gpa.alloc(u64, count);
+    errdefer gpa.free(values);
+    for (parts, base) |*p, b| @memcpy(values[b..][0..p.vals.items.len], p.vals.items);
+    const file_base = try gpa.alloc(usize, metas.len);
+    errdefer gpa.free(file_base);
+    var at_ref: usize = 0;
+    for (metas, file_base) |m, *fb| {
+        fb.* = at_ref;
+        at_ref += m.row_groups.items.len;
+    }
+    std.debug.assert(at_ref == refs.len);
+    var bytes = values.len * @sizeOf(u64);
+    for (trans, 0..) |_, i| {
+        const t = trans[i];
+        if (t.len == 0) continue;
+        for (t[0 .. t.len - 1]) |*e| e.* = base[e.* >> part_shift] + (e.* & ((1 << part_shift) - 1));
+        t[t.len - 1] = @intCast(count);
+        bytes += t.len * @sizeOf(u32);
+    }
+    const int32 = metas[refs[0].file].row_groups.items[refs[0].rg].columns.items[col].meta_data.?.type == .INT32;
+    return .{ .values = values, .int32 = int32, .trans = trans, .file_base = file_base, .bytes = bytes };
 }
 
 test "ndv: repeated dictionaries tighten an upper bound, including nulls and composites" {
@@ -512,4 +683,83 @@ test "ndv: an empty input has a zero upper bound" {
     const stat = try collect(std.testing.allocator, arena.allocator(), &.{}, &.{}, &keys, 1, 512 << 20, true);
     try std.testing.expectEqual(@as(u64, 0), stat.hi);
     try std.testing.expectEqual(.upper_bound, stat.confidence);
+}
+
+test "ndv: a retained integer domain translates every dictionary entry to a distinct exact value" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const arena = state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const files = [_]File{.{ .bytes = bytes, .local = true }};
+    const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
+    for ([_]usize{ 1, 4 }) |workers| {
+        var domain: ?agg_dense.Domain = null;
+        defer if (domain) |*d| d.deinit(a);
+        const stat = try collectRetaining(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true, &domain);
+        const bound = try collect(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true);
+        try std.testing.expectEqual(bound.hi, stat.hi); // Retention never moves the bound.
+        const d = &(domain orelse return error.TestExpectedEqual);
+        try std.testing.expectEqual(stat.estimate.?, d.values.len + 1); // the key holds nulls
+        const seen = try arena.alloc(bool, d.values.len);
+        @memset(seen, false);
+        for (0..meta.row_groups.items.len) |rg| {
+            const t = d.forRowGroup(0, rg) orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u32, @intCast(d.values.len)), t[t.len - 1]);
+            for (t[0 .. t.len - 1]) |id| seen[id] = true;
+        }
+        for (seen) |s| try std.testing.expect(s);
+        try std.testing.expect(d.forRowGroup(0, meta.row_groups.items.len) == null);
+        try std.testing.expect(d.forRowGroup(1, 0) == null);
+        var uniq: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (d.values) |v| try uniq.put(arena, v, {});
+        try std.testing.expectEqual(d.values.len, uniq.count());
+    }
+    // Strings and composites keep no domain; a retention budget too small drops it, not the bound.
+    var none: ?agg_dense.Domain = null;
+    const str_key = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &str_key, 4, 512 << 20, true, &none);
+    try std.testing.expect(none == null);
+    const pair = [_]expr.Expr{ keys[0], keys[0] };
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &pair, 4, 512 << 20, true, &none);
+    try std.testing.expect(none == null);
+    const tight = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true, &none);
+    try std.testing.expect(tight.union_complete);
+    try std.testing.expect(none == null);
+    // Retention given up part way moves what it held into the union's sets: the same exact count.
+    try std.testing.expectEqual((try collect(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true)).hi, tight.hi);
+}
+
+test "ndv: allocation failures while retaining a domain leak nothing and never fail the bound" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    var meta = try metadata.open(state.allocator(), bytes);
+    meta.row_groups.items = meta.row_groups.items[0..2];
+    const files = [_]File{.{ .bytes = bytes, .local = true }};
+    const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
+    // Retention gives itself up on a failed allocation rather than fail the union, which `checkAllAllocationFailures`
+    // counts as swallowed: so fail each allocation in turn by hand and accept either outcome, but no leak.
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = i });
+        const gpa = failing.allocator();
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        var domain: ?agg_dense.Domain = null;
+        defer if (domain) |*d| d.deinit(gpa);
+        if (collectRetaining(gpa, scratch.allocator(), &files, &.{meta}, &keys, 1, 512 << 20, true, &domain)) |stat| {
+            try std.testing.expect(stat.union_complete);
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        if (!failing.has_induced_failure) {
+            try std.testing.expect(domain != null);
+            break;
+        }
+    }
 }

@@ -33,6 +33,7 @@ const expr_parser = @import("expr/parser.zig");
 const expr_agg = @import("expr/agg.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
+const agg_dense = @import("expr/agg_dense.zig");
 pub const NdvStat = ndv.Stat;
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
@@ -155,6 +156,8 @@ pub const MultiAggArgs = struct {
     ndv_policy: bool = true,
     /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
     ndv_union: bool = true,
+    /// Keep a lone integer key's union as an exact domain and fold by its ids (`agg_dense`) where the plan allows.
+    dense: bool = true,
     /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
@@ -1057,6 +1060,8 @@ const Worker = struct {
 
     /// Grouped count(DISTINCT) as pairs instead of sets (`expr_agg.DistinctPairs`), for this worker's table.
     pairs: ?*expr_agg.DistinctPairs = null,
+    /// This worker's lanes over a retained key domain (`agg_dense`); row groups it cannot translate use the table.
+    dense: ?*agg_dense.Lanes = null,
     /// Rows this worker read before deciding whether its sets move to pairs, and whether it has decided.
     pairs_rows: u64 = 0,
     pairs_decided: bool = false,
@@ -1202,6 +1207,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 .pos_base = expr_agg.firstPosition(idx, 0),
                 .part = w.part,
                 .local = if (w.part != null) &w.local else null,
+                .dense = w.dense,
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
@@ -2757,6 +2763,9 @@ fn prepareAggregate(
         .workers = n_workers,
     };
     var ndv_stat: ?NdvStat = null;
+    // Freed once the dense tables are built, or as soon as the plan cannot use it.
+    var domain: ?agg_dense.Domain = null;
+    defer if (domain) |*d| d.deinit(gpa);
     if (args.ndv_policy) if (group_by_keys) |keys| {
         const files = try arena.alloc(ndv.File, args.inputs.len);
         for (args.inputs, files) |input, *file| file.* = .{
@@ -2766,7 +2775,18 @@ fn prepareAggregate(
         };
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
         const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
-        ndv_stat = try ndv.collect(gpa, arena, files, metas, keys, n_workers, args.max_memory, args.ndv_union and !prefix);
+        const want = args.dense and !explain and agg_dense.shapeOk(agg_calls, keys);
+        ndv_stat = try ndv.collectRetaining(
+            gpa,
+            arena,
+            files,
+            metas,
+            keys,
+            n_workers,
+            args.max_memory,
+            args.ndv_union and !prefix,
+            if (want) &domain else null,
+        );
     };
     plan_inputs.ndv_stat = ndv_stat;
     const scan_plan = planAggregate(plan_inputs);
@@ -2836,11 +2856,14 @@ fn prepareAggregate(
         for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_tables;
         block_bounds = bounds;
     }
-    const group_tables = try arena.alloc(expr_agg.GroupTable, n_tables);
+    // A dense fold (below) needs one table more, after the workers': the one its lanes merge into.
+    const dense_wanted = domain != null and decision.strategy == .plain_hash and !use_blocks and !part_on;
+    const all_tables = try arena.alloc(expr_agg.GroupTable, n_tables + @intFromBool(dense_wanted));
+    const group_tables = all_tables[0..n_tables];
     // Integer and float keys are a fixed-width image: the per-row lookup mixes those bytes in an open-addressed
     // table instead of copying each new key into a string map. String and decimal keys stay on that map.
     const fixed_stride: u8 = if (group_by_keys) |ks| expr_agg.fixedGroupStride(ks) orelse 0 else 0;
-    for (group_tables) |*gt| {
+    for (all_tables) |*gt| {
         // Zero local ceiling: everything is drawn from the shared pool, so an idle table reserves nothing others
         // could use.
         gt.* = expr_agg.GroupTable.init(gpa, 0);
@@ -2850,7 +2873,7 @@ fn prepareAggregate(
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
     // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
     const leave_tables = args.leave_regions and !std.debug.runtime_safety;
-    defer if (!leave_tables) for (group_tables) |*gt| gt.deinit();
+    defer if (!leave_tables) for (all_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
     merged_table.shared = &group_budget;
@@ -2898,6 +2921,26 @@ fn prepareAggregate(
             ps.* = .{ .gpa = gpa, .budget = &group_budget, .table = gt, .agg_idx = ai, .active = pairs_from_start };
         }
     }
+    // A lone integer key whose exact domain the union kept folds by global id when the plan groups it in per-worker
+    // tables: no group lookups per row group and no hash merge. Taken only when walking every worker's lanes costs no
+    // more than the lookups it replaces (one per dictionary entry per row group), and when the domain and every lane
+    // fit the shared budget, drawn before any worker starts.
+    var dense_lanes: []agg_dense.Lanes = &.{};
+    var dense_charge: usize = 0;
+    defer group_budget.release(dense_charge);
+    defer for (dense_lanes) |*l| l.deinit(gpa);
+    if (dense_wanted) dense: {
+        const d = &domain.?;
+        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls.len);
+        if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
+        dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes) orelse break :dense;
+        dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
+        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls };
+    }
+    if (dense_lanes.len == 0) if (domain) |*d| {
+        d.deinit(gpa);
+        domain = null;
+    };
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -2928,6 +2971,7 @@ fn prepareAggregate(
             .group_tables = group_tables,
             .part = if (part_state) |*p| p else null,
             .pairs = if (pair_sinks.len > 0) &pair_sinks[wi] else null,
+            .dense = if (dense_lanes.len > 0) &dense_lanes[wi] else null,
             .pairs_pilot_rows = args.pairs_pilot_rows,
             .pairs_rechecks = args.pairs_rechecks,
             .local = .{ .runs = if (part_state) |*p| &p.runs[wi] else null, .armed = armed },
@@ -2971,6 +3015,24 @@ fn prepareAggregate(
     if (!args.leave_regions) releaseRegions(workers);
     for (workers) |w| if (w.err) |e| return e;
     const merge_span = profile.Span.begin(prof);
+    // The lanes merge by id into the spare table; the lanes and the domain go as soon as it is built (to the OS with
+    // the process, when it is about to exit, as the tables do). Row groups no lane took sit in the worker tables, which
+    // then merge with it as usual.
+    var dense_merged = false;
+    if (dense_lanes.len > 0) {
+        const dense_table = &all_tables[n_tables];
+        const key = group_by_keys.?[0].col_ref;
+        try agg_dense.intoTable(gpa, arena, dense_lanes, key, dense_table, key.col_idx + 1, n_workers);
+        if (!leave_tables) {
+            for (dense_lanes) |*l| l.deinit(gpa);
+            domain.?.deinit(gpa);
+        }
+        dense_lanes = &.{};
+        domain = null;
+        group_budget.release(dense_charge);
+        dense_charge = 0;
+        dense_merged = true;
+    }
     // Once any worker sends pairs every table does, so each key's values meet in one partition.
     var pairs_used = false;
     for (pair_sinks) |*ps| pairs_used = pairs_used or ps.active;
@@ -3040,7 +3102,12 @@ fn prepareAggregate(
         if (result_cut) |*rc| if (rc.ranking_first) {
             rc.memory = cut_memory.allocator();
         };
-        const out_tables: []expr_agg.GroupTable = if (use_blocks) (&merged_table)[0..1] else group_tables;
+        const out_tables: []expr_agg.GroupTable = if (use_blocks)
+            (&merged_table)[0..1]
+        else if (dense_merged) blk: {
+            for (group_tables) |gt| if (gt.groupCount() > 0) break :blk all_tables;
+            break :blk all_tables[n_tables..];
+        } else group_tables;
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         if (result_cut == null or !result_cut.?.ranking_first)
             try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);

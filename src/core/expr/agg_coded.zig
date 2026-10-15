@@ -607,7 +607,7 @@ fn groupedHist(
 }
 
 /// The dictionary of a key column as a group-key column: entries 0..n-1, then a null at n.
-fn keyDictColumn(ra: std.mem.Allocator, col: Column, c: expr_ast.ColRef, lookup_len: usize) !Column {
+pub fn keyDictColumn(ra: std.mem.Allocator, col: Column, c: expr_ast.ColRef, lookup_len: usize) !Column {
     const n = col.dictLen();
     const dl = try ra.alloc(u32, n + 1);
     @memset(dl[0..n], 1);
@@ -631,7 +631,7 @@ fn keyDictColumn(ra: std.mem.Allocator, col: Column, c: expr_ast.ColRef, lookup_
 }
 
 /// `agg.serializeRowKey` with each key column at its own row.
-fn serializeKeyAt(
+pub fn serializeKeyAt(
     list: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     cols: []const Column,
@@ -646,7 +646,7 @@ fn serializeKeyAt(
     }
 }
 
-fn foldGroupedCall(
+pub fn foldGroupedCall(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
     accs: []Accumulator,
@@ -886,11 +886,11 @@ fn foldGroupedCall(
     }
 }
 
-const no_row = std.math.maxInt(u32);
+pub const no_row = std.math.maxInt(u32);
 
 /// Each composite's first row `sel` keeps, or `no_row`. Stops once all `reachable` composites have one: later rows
 /// cannot be anyone's first.
-fn compositeFirstRows(
+pub fn compositeFirstRows(
     ra: std.mem.Allocator,
     comp: []const u32,
     space: usize,

@@ -496,6 +496,83 @@ def writer_wire_checks(con, tmp):
     return total, fails
 
 
+def dense_domain_checks(con, tmp):
+    """A lone integer key folded by its retained dictionary domain (default) answers byte for byte as grouping by code
+    does (ZPQ_DENSE=0), at every -j, and as DuckDB does. Two files share one domain under row-group dictionaries in
+    different orders; the key has NULLs, one row group is near-unique (its dictionary past rows/8), and filters,
+    FILTER, cuts, HAVING and OFFSET all run. Tight --max-memory refuses the lanes: the answer (or the error) stays."""
+    import numpy as np
+    total = fails = 0
+    rng = np.random.default_rng(20261015)
+    paths = []
+    for fi in range(2):
+        n = 24576
+        k = rng.integers(0, 3000, n)
+        k[8192:10240] = rng.permutation(np.arange(100000, 102048))[:2048]  # one row group of distinct keys
+        kmask = rng.random(n) < 0.03
+        v = rng.integers(-1000, 1000, n)
+        vmask = rng.random(n) < 0.05
+        path = os.path.join(tmp, f"dense_{fi}.parquet")
+        pq.write_table(pa.table({
+            "k": pa.array(k, pa.int64(), mask=kmask),
+            "k32": pa.array((k % 2500).astype(np.int32), pa.int32()),
+            "v": pa.array(v, pa.int64(), mask=vmask),
+            "f": pa.array(rng.integers(0, 100, n).astype(np.int32), pa.int32()),
+        }), path, row_group_size=2048)
+        paths.append(path)
+    both = os.path.join(tmp, "dense_*.parquet")
+    queries = []
+    for src in (paths[0], both):
+        for key in ("k", "k32"):
+            queries += [
+                f"SELECT {key}, count(*) AS c FROM '{src}' GROUP BY {key} ORDER BY c DESC LIMIT 7",
+                f"SELECT {key}, count(*) AS c FROM '{src}' WHERE f < 30 GROUP BY {key} ORDER BY c DESC LIMIT 7",
+                f"SELECT {key}, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv "
+                f"FROM '{src}' GROUP BY {key}",
+                f"SELECT {key}, sum(v) AS s FROM '{src}' GROUP BY {key} ORDER BY s DESC LIMIT 9 OFFSET 2",
+                f"SELECT {key}, avg(v) AS a, count(*) FILTER (WHERE f > 50) AS c FROM '{src}' WHERE v IS NOT NULL "
+                f"GROUP BY {key} HAVING count(*) > 3 ORDER BY a DESC LIMIT 5",
+                f"SELECT {key}, min(v) AS lo FROM '{src}' WHERE f = 7 GROUP BY {key}",
+            ]
+    def nulls_first(row):
+        return tuple((x is not None, x if x is not None else 0) for x in row)
+
+    for qi, sql in enumerate(queries):
+        duck = sorted((tuple(r) for r in con.execute(sql).fetchall()), key=nulls_first)
+        base = None
+        for dense in ("0", "1"):
+            for j in ("1", "3", "16"):
+                total += 1
+                label = f"dense:{qi} dense={dense} -j {j}"
+                r = subprocess.run([ZPQ, "query", "-j", j, "--query", sql], capture_output=True, text=True,
+                                   env={**os.environ, "ZPQ_DENSE": dense})
+                problem = None
+                if r.returncode != 0:
+                    problem = (r.stderr or r.stdout).strip()[:90]
+                elif base is None:
+                    base = r.stdout
+                    rows = sorted((tuple(row.values()) for row in read_rows(r.stdout)), key=nulls_first)
+                    if "avg" not in sql and "LIMIT" not in sql and rows != duck:
+                        problem = f"duckdb differs: zpq={rows[:2]} duck={duck[:2]}"
+                elif r.stdout != base:
+                    problem = "answer differs from ZPQ_DENSE=0 -j 1"
+                if problem:
+                    fails += 1
+                    print(f"  FAIL  {label}  {problem}")
+                else:
+                    print(f"  OK    {label}")
+    # Budgets around the lanes' charge: dense or not, the same answer or the same refusal.
+    sql = queries[2].replace(paths[0], both)
+    for mem in ("2M", "6M", "16M", "64M"):
+        outs = [subprocess.run([ZPQ, "query", "-j", "16", "--max-memory", mem, "--query", sql], capture_output=True,
+                               text=True, env={**os.environ, "ZPQ_DENSE": d}) for d in ("0", "1")]
+        total += 1
+        same_out = outs[0].returncode == outs[1].returncode and outs[0].stdout == outs[1].stdout
+        print(f"  {'OK  ' if same_out else 'FAIL'}  dense:budget {mem} rc={outs[1].returncode}")
+        fails += 0 if same_out else 1
+    return total, fails
+
+
 def main():
     self_check()
     con = duckdb.connect()
@@ -1667,6 +1744,9 @@ def main():
     ww_total, ww_fails = writer_wire_checks(con, tmp)
     total += ww_total
     fails += ww_fails
+    dn_total, dn_fails = dense_domain_checks(con, tmp)
+    total += dn_total
+    fails += dn_fails
 
     print(f"\ndifferential: {total - fails}/{total} checks match (strict pyarrow read + DuckDB value diff + order)")
     sys.exit(1 if fails else 0)

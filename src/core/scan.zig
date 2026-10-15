@@ -110,8 +110,8 @@ pub const MultiAggArgs = struct {
     /// flat list of all row groups across all inputs, distributed across
     /// `min(this, total_row_groups)` workers — so one big file uses all cores.
     parallelism: usize = 0,
-    /// Leave each worker's decode region mapped when it finishes, for the process exit to release (see the engine's
-    /// `Context.exit_after`): a worker's unmap otherwise delays its join, and with it the answer.
+    /// Leave each worker's decode region mapped after the scan, for the process exit to release (see the engine's
+    /// `Context.exit_after`): unmapping them otherwise delays the answer.
     leave_regions: bool = false,
     /// `--scan-all`: disable every stats shortcut — no row-group pruning,
     /// no stats-driven column drop, no aggregate stat short-circuit. Forces
@@ -1044,7 +1044,10 @@ const Worker = struct {
     block_merge: ?*BlockMerge = null,
     /// Work items per row group (every row group gets the same number), for `Input.gate`.
     items_per_rg: usize = 1,
-    leave_region: bool = false,
+    /// This worker's decode memory, mapped by its first pass and kept across the passes over `workers` (a sketch's
+    /// count and admit passes, a census), so a later pass reuses faulted pages instead of zeroing fresh ones. Only the
+    /// owning thread touches it during a pass; `prepareAggregate` unmaps it after the last.
+    region: ?huge_pages.Region = null,
     decode_budget: ?*consumer.DecodeBudget = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
@@ -1077,10 +1080,11 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     var release_span: profile.Span = .{ .t = null, .start = 0 };
     defer release_span.end(.worker_release, profile.args(.{w.index}));
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
-    // Both it and the scratch are written front to back and reused, and both live in one huge-page region that a
-    // single unmap releases (see `huge_pages.Region`).
-    var region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
-    defer if (!w.leave_region) region.deinit();
+    // Both it and the scratch are written front to back and reused, and both live in the worker's huge-page region
+    // (see `huge_pages.Region`), rewound here for the next pass once both are released.
+    if (w.region == null) w.region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+    const region = &w.region.?;
+    defer region.rewind();
     var rg_decode_arena = consumer.RowGroupArena.init(region.allocator());
     defer rg_decode_arena.deinit();
     var scratch = consumer.DecodeScratch.init(region.allocator());
@@ -2493,6 +2497,9 @@ fn prepareAggregate(
         };
     }
     const workers = try arena.alloc(Worker, n_workers);
+    for (workers) |*w| w.region = null;
+    // A process about to exit leaves the regions to it: unmapping them delays the answer.
+    defer if (!args.leave_regions) for (workers) |*w| if (w.region) |*r| r.deinit();
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
         .{ .limit = l, .workers = n_workers }
     else
@@ -2631,7 +2638,6 @@ fn prepareAggregate(
             .block_merge = if (block_merge) |*m| m else null,
             .items_per_rg = chunks_per_rg,
             .count_columns = count_columns,
-            .leave_region = args.leave_regions,
             .decode_budget = if (decode_budget) |*b| b else null,
         };
     }

@@ -491,20 +491,29 @@ pub fn groupedCoded(
     }
     defer if (charged > 0) budget.?.release(charged);
 
-    // Composite code per selected row.
-    const comp = try ra.alloc(u32, num_rows);
-    @memset(comp, 0);
-    for (key_cols, strides) |col, stride| {
-        const codes = col.codes().?;
-        const ni = col.nullInfo();
-        const null_slot: u32 = @intCast(col.dictLen());
-        const st: u32 = @intCast(stride);
-        if (ni.def_levels) |dl| {
-            for (comp, codes, dl) |*cp, code, d| cp.* += (if (d < ni.max_def) null_slot else code) * st;
-        } else {
-            for (comp, codes) |*cp, code| cp.* += code * st;
+    // Composites that can occur: a key without null rows never fills its null slot.
+    var reachable: usize = 1;
+    for (key_cols) |col| reachable *= col.dictLen() + @intFromBool(col.nullInfo().def_levels != null);
+    // Composite code per selected row. A lone key without nulls is its own codes, so it neither copies them nor
+    // touches a fresh row-sized buffer.
+    const comp: []const u32 = if (keys.len == 1 and key_cols[0].nullInfo().def_levels == null)
+        key_cols[0].codes().?[0..num_rows]
+    else comp: {
+        const out = try ra.alloc(u32, num_rows);
+        @memset(out, 0);
+        for (key_cols, strides) |col, stride| {
+            const codes = col.codes().?;
+            const ni = col.nullInfo();
+            const null_slot: u32 = @intCast(col.dictLen());
+            const st: u32 = @intCast(stride);
+            if (ni.def_levels) |dl| {
+                for (out, codes, dl) |*cp, code, d| cp.* += (if (d < ni.max_def) null_slot else code) * st;
+            } else {
+                for (out, codes) |*cp, code| cp.* += code * st;
+            }
         }
-    }
+        break :comp out;
+    };
 
     // Resolve each composite that occurs among selected rows, once.
     const gid_of = try ra.alloc(u32, space);
@@ -520,7 +529,7 @@ pub fn groupedCoded(
     // One pass finds each composite's first selected row; only composites that occur get resolved, each at that
     // row, so a new group's position is where it first appears. Resolved in code order: a group keeps the least
     // position it is asked for and the answer orders by that, so the order groups are made in decides nothing.
-    const first_row = try compositeFirstRows(ra, comp, space, sel);
+    const first_row = try compositeFirstRows(ra, comp, space, reachable, sel);
     for (first_row, 0..) |fr, cp| {
         if (fr == no_row) continue;
         var rem: usize = cp;
@@ -834,16 +843,42 @@ fn foldGroupedCall(
 
 const no_row = std.math.maxInt(u32);
 
-/// Each composite's first row `sel` keeps, or `no_row`.
-fn compositeFirstRows(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u32 {
+/// Each composite's first row `sel` keeps, or `no_row`. Stops once all `reachable` composites have one: later rows
+/// cannot be anyone's first.
+fn compositeFirstRows(
+    ra: std.mem.Allocator,
+    comp: []const u32,
+    space: usize,
+    reachable: usize,
+    sel: *const Sel,
+) ![]u32 {
     const first = try ra.alloc(u32, space);
     @memset(first, no_row);
-    forEachActive(sel, comp.len, struct {
-        fn f(ctx: anytype, r: usize) void {
-            const slot = &ctx.first[ctx.comp[r]];
-            if (slot.* == no_row) slot.* = @intCast(r);
+    var found: usize = 0;
+    var w: usize = 0;
+    while (w * 64 < comp.len and found < reachable) : (w += 1) {
+        const word = sel.mask[w];
+        const base = w * 64;
+        if (word == std.math.maxInt(u64) and base + 64 <= comp.len) {
+            for (base..base + 64) |r| {
+                const slot = &first[comp[r]];
+                if (slot.* == no_row) {
+                    slot.* = @intCast(r);
+                    found += 1;
+                }
+            }
+        } else {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const r = base + @ctz(bits);
+                const slot = &first[comp[r]];
+                if (slot.* == no_row) {
+                    slot.* = @intCast(r);
+                    found += 1;
+                }
+            }
         }
-    }.f, .{ .first = first, .comp = comp });
+    }
     return first;
 }
 
@@ -1231,5 +1266,86 @@ test "a composite space past 2^16 groups by code only when its scratch is reserv
         try testing.expectEqual(@as(u64, 2), accs[0].count);
         // Exactly the two values added in row order, as the row path adds them.
         try testing.expectEqual(vals[g] + vals[g + n_keys], accs[1].sum_f.?);
+    }
+}
+
+test "compositeFirstRows matches a full scan, stopping early only once every reachable composite is found" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x7f1a);
+    const r = prng.random();
+    for ([_]usize{ 1, 63, 64, 65, 300, 4096 }) |n| for ([_]u32{ 1, 3, 17 }) |space| {
+        const comp = try a.alloc(u32, n);
+        for (comp) |*c| c.* = r.uintLessThan(u32, space);
+        var sel = try Sel.init(a, n);
+        // Whole words kept and dropped, and words kept in part.
+        for (0..n) |i| if ((i / 64) % 3 == 1 or (i % 7 == 0 and (i / 64) % 3 == 2)) sel.set(i, false);
+        const want = try a.alloc(u32, space);
+        @memset(want, no_row);
+        var present: usize = 0;
+        for (comp, 0..) |c, i| if (sel.isActive(i) and want[c] == no_row) {
+            want[c] = @intCast(i);
+            present += 1;
+        };
+        // Exactly the composites present (early stop), all of them (some absent: no stop), and the whole space.
+        for ([_]usize{ present, space, space + 1 }) |reachable| {
+            if (reachable < present) continue;
+            try testing.expectEqualSlices(u32, want, try compositeFirstRows(a, comp, space, reachable, &sel));
+        }
+    };
+}
+
+test "groupedCoded: a lone null-free key groups as when a constant second key is composed with it" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 1000;
+    const dict = [_]i64{ 40, 10, 30, 20 };
+    const one = [_]i64{7};
+    const codes = try a.alloc(u32, n);
+    const zeros = try a.alloc(u32, n);
+    @memset(zeros, 0);
+    const vals = try a.alloc(i64, n);
+    for (codes, vals, 0..) |*c, *v, i| {
+        // Code 3 first appears late, so the early stop must still reach it; code 2 never does.
+        c.* = if (i == 777) 3 else @intCast((i * 7 / 5) % 2);
+        v.* = @intCast(i);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = &.{}, .codes = codes, .dict = &dict } },
+        .{ .i64 = .{ .values = &.{}, .codes = zeros, .dict = &one } },
+        .{ .i64 = .{ .values = vals } },
+    };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const k0: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const k1: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s" },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    var sel = try Sel.init(a, n);
+    for (0..n) |i| if (i % 5 == 0) sel.set(i, false);
+
+    var lone = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer lone.deinit();
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{k0}, &lone, 0, &batch, &lookup, &sel, null));
+    var pair = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer pair.deinit();
+    const both = [_]expr_ast.Expr{ k0, k1 };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &both, &pair, 0, &batch, &lookup, &sel, null));
+
+    try testing.expectEqual(@as(usize, 3), lone.groupCount());
+    try testing.expectEqual(lone.groupCount(), pair.groupCount());
+    try testing.expectEqualSlices(u64, pair.first.items, lone.first.items);
+    for (0..lone.groupCount()) |g| {
+        const x = lone.accumulators.items[g * calls.len ..][0..calls.len];
+        const y = pair.accumulators.items[g * calls.len ..][0..calls.len];
+        try testing.expectEqual(y[0].count, x[0].count);
+        try testing.expectEqual(y[1].sum_i, x[1].sum_i);
     }
 }

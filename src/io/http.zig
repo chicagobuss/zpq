@@ -85,9 +85,18 @@ pub fn sendRequest(
     conn: *tls.Connection,
     req: Request,
 ) Error!Response {
+    conn.armDeadline(expectedBytes(req));
+    defer conn.disarmDeadline();
     try sendRequestBytes(arena, conn, req);
 
     return try drainResponse(arena, conn, req.method == .HEAD, bodyCap(req));
+}
+
+/// The bytes `req` and its answer move, for the attempt's deadline (`tls.Connection.armDeadline`): its body and the
+/// range it asks for. An unranged answer is a control-plane document, small.
+fn expectedBytes(req: Request) usize {
+    const cap = bodyCap(req);
+    return req.body.len +| (if (cap == max_unranged_body) 0 else cap);
 }
 
 /// The most a response body may carry when its request names no byte range: control-plane answers (an upload's XML, a
@@ -134,6 +143,8 @@ pub fn sendRequestInto(
     target: []u8,
     on_headers: ?OnHeaders,
 ) Error!Response {
+    conn.armDeadline(req.body.len +| target.len);
+    defer conn.disarmDeadline();
     try sendRequestBytes(arena, conn, req);
     return try drainResponseInto(arena, conn, target, on_headers);
 }

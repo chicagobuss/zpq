@@ -49,6 +49,9 @@ pub const Error = error{
     ReadTimeout,
     /// The peer took no byte of what was being sent for `Timeouts.idle_ms`.
     SendTimeout,
+    /// A request and its response took longer in all than `Timeouts.request_ms`, or than their bytes at
+    /// `Timeouts.min_rate` (`Connection.armDeadline`): a peer trickling a byte inside every idle timeout.
+    RequestTimeout,
     /// A test clock's wait hit the wall-clock backstop instead of the virtual deadline. Production never returns it.
     WallClockBackstop,
 } || std.mem.Allocator.Error;
@@ -60,6 +63,8 @@ pub const Error = error{
 ///   handshake_ms   5 000   ZPQ_S3_HANDSHAKE_TIMEOUT_MS    the whole TLS handshake
 ///   first_byte_ms 10 000   ZPQ_S3_FIRST_BYTE_TIMEOUT_MS   from the request sent to the first byte of its response
 ///   idle_ms       10 000   ZPQ_S3_IDLE_TIMEOUT_MS         silence while reading a response or sending a request
+///   request_ms    30 000   ZPQ_S3_REQUEST_TIMEOUT_MS      a request and its response in all, at least; more for a
+///                                                         transfer of more than `request_ms` at `min_rate`
 ///
 /// S3 answers its first byte in tens of milliseconds and moves 8 MiB in about 0.1 s even under Lambda's network
 /// policer, so ten seconds without a byte is a stalled connection, not a slow one; each extra second waited is billed
@@ -69,6 +74,9 @@ pub const Timeouts = struct {
     handshake_ms: u32 = 5_000,
     first_byte_ms: u32 = 10_000,
     idle_ms: u32 = 10_000,
+    request_ms: u32 = 30_000,
+    /// Bytes a second below which a long transfer is cut off: the idle timeout restarts at every byte.
+    min_rate: u32 = 64 * 1024,
     /// Test-only. When set, read and write deadlines use this millisecond clock instead of wall time, and waits
     /// poll so a test can expire a stalled attempt by advancing the clock. Production leaves it null.
     clock_ms: ?*const fn () u64 = null,
@@ -81,6 +89,7 @@ pub const Timeouts = struct {
             .{ "handshake_ms", "ZPQ_S3_HANDSHAKE_TIMEOUT_MS" },
             .{ "first_byte_ms", "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS" },
             .{ "idle_ms", "ZPQ_S3_IDLE_TIMEOUT_MS" },
+            .{ "request_ms", "ZPQ_S3_REQUEST_TIMEOUT_MS" },
         }) |f| {
             if (env.getPosix(f[1])) |v| {
                 const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 0;
@@ -181,6 +190,8 @@ pub const Connection = struct {
     timeouts: Timeouts = .{},
     /// A request has gone out and no byte of its response has come back: a read waits `first_byte_ms`, not `idle_ms`.
     awaiting_response: bool = false,
+    /// When the request being sent or answered must be done (`armDeadline`); null between requests.
+    deadline_ms: ?u64 = null,
     /// The socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, so each is only set again when it changes.
     sock: SockTimeouts = .{},
 
@@ -309,19 +320,49 @@ pub const Connection = struct {
         self.timeouts = t;
     }
 
-    /// Read from the socket, waiting at most `first_byte_ms` for a response's first byte, else `idle_ms`.
+    /// Bound the request about to be sent, and its response, which together move about `bytes`: they must be done
+    /// within `request_ms`, or the time `bytes` take at `min_rate` if longer. Every other timeout restarts at each
+    /// byte, so a peer trickling one inside each could hold an attempt for ever. Until `disarmDeadline`.
+    pub fn armDeadline(self: *Connection, bytes: usize) void {
+        const at_rate = std.math.mul(u64, bytes, std.time.ms_per_s) catch std.math.maxInt(u64);
+        const total = @max(self.timeouts.request_ms, at_rate / @max(1, self.timeouts.min_rate));
+        self.deadline_ms = nowMs(self.timeouts.clock_ms) +| total;
+    }
+
+    pub fn disarmDeadline(self: *Connection) void {
+        self.deadline_ms = null;
+    }
+
+    fn pastDeadline(self: *const Connection) bool {
+        const d = self.deadline_ms orelse return false;
+        return nowMs(self.sock.clock_ms) >= d;
+    }
+
+    /// Read from the socket, waiting at most `first_byte_ms` for a response's first byte, else `idle_ms`, and never
+    /// past `deadline_ms`.
     fn readSocket(self: *Connection, buf: []u8) Error!usize {
         self.sock.clock_ms = self.timeouts.clock_ms;
+        if (self.pastDeadline()) return error.RequestTimeout;
         const wait = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
-        const n = readBy(self.fd, buf, nowMs(self.sock.clock_ms) + wait, &self.sock) catch |err| return self.recvError(err);
+        var until = nowMs(self.sock.clock_ms) + wait;
+        if (self.deadline_ms) |d| until = @min(until, d);
+        const n = readBy(self.fd, buf, until, &self.sock) catch |err| {
+            if (err == error.WouldBlock and self.pastDeadline()) return error.RequestTimeout;
+            return self.recvError(err);
+        };
         if (n > 0) self.awaiting_response = false;
         return n;
     }
 
-    /// Write all of `buf`, failing with `error.SendTimeout` once `idle_ms` pass with no byte taken.
+    /// Write all of `buf`, failing with `error.SendTimeout` once `idle_ms` pass with no byte taken, and never past
+    /// `deadline_ms`.
     fn writeSocket(self: *Connection, buf: []const u8) Error!void {
         self.sock.clock_ms = self.timeouts.clock_ms;
-        writeAllBy(self.fd, buf, self.timeouts.idle_ms, null, &self.sock) catch |err| return sendError(err);
+        if (self.pastDeadline()) return error.RequestTimeout;
+        writeAllBy(self.fd, buf, self.timeouts.idle_ms, self.deadline_ms, &self.sock) catch |err| {
+            if (err == error.WouldBlock and self.pastDeadline()) return error.RequestTimeout;
+            return sendError(err);
+        };
     }
 
     /// A socket read that timed out, named for what it was waiting for.

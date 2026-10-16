@@ -1766,7 +1766,7 @@ test "a ranged GET that stalls before, inside or after its response headers is s
     }
 }
 
-test "a response that keeps arriving is not cut off, however long it takes in all" {
+test "a response that keeps arriving is not cut off by the idle timeout, however slow in all" {
     var fake: fake_s3.FakeS3 = undefined;
     try fake.start(testing.allocator);
     defer fake.deinit();
@@ -1783,6 +1783,39 @@ test "a response that keeps arriving is not cut off, however long it takes in al
     try testing.expect(clock.monoNs() - t0 >= 800 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
     try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+}
+
+test "regression: a response that trickles in past its attempt's deadline is cut off and fetched again" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .trickle;
+    // Eight pieces 120 ms apart, each inside the idle timeout: the attempt went on as long as the server kept it.
+    fake.trickle_ms = 120;
+    var timeouts = test_timeouts;
+    timeouts.request_ms = 300;
+    timeouts.min_rate = 1 << 30;
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = timeouts,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    const url: Url = .{ .bucket = "bkt", .key = "obj" };
+    const range = Range.span(1000, 1000 + 64 * 1024 - 1);
+    const resp = try getViaPool(testing.io, &p, arena_state.allocator(), creds, url, range);
+    try testing.expectEqual(@as(u16, 206), resp.status);
+    try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], resp.body);
+    try testing.expectEqual(@as(u64, 1), p.snapshotStats().timeout_retries);
 }
 
 fn sleepMs(ms: u64) void {

@@ -77,7 +77,10 @@ pub fn classify(err: anyerror, req: Request) Failure {
         error.SendFailed, error.ClosedBeforeResponse => if (!req.idempotent) .fatal else if (req.reused) .stale else .transient,
         error.RecvFailed, error.BodyTruncated, error.BadStatusLine => if (req.idempotent) .transient else .fatal,
         // The request may have reached the server: only an idempotent one is sent again.
-        error.FirstByteTimeout, error.ReadTimeout, error.SendTimeout => if (req.idempotent) .stalled else .fatal,
+        error.FirstByteTimeout, error.ReadTimeout, error.SendTimeout, error.RequestTimeout => if (req.idempotent)
+            .stalled
+        else
+            .fatal,
         else => .fatal,
     };
 }

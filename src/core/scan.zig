@@ -88,6 +88,11 @@ pub const Input = struct {
     /// dictionaries a mapped one does.
     dict_wait: ?ndv.Wait = null,
 
+    /// A local file read in behind gates (`io/local_reader.zig`), its mapping beside it; not an S3 input's window.
+    pub fn readerBacked(self: Input) bool {
+        return self.gate != null and self.plan_bytes != null and !std.mem.startsWith(u8, self.name, "s3://");
+    }
+
     /// Readable again from the start, as a scan run again after a refusal must read it (`runMultiAggregate`).
     pub fn rescannable(self: Input) bool {
         return self.gate == null or self.plan_bytes != null;
@@ -127,6 +132,8 @@ pub const ReadStart = struct {
     start: *const fn (ctx: *anyopaque) anyerror!void,
     /// Stops the reads and gives their buffers back before a scan runs again over the mappings (`runMultiAggregate`).
     abandon: ?*const fn (ctx: *anyopaque) void = null,
+    /// Planning has read every probe it will: what was probed only for planning can go back.
+    planned: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 pub const MultiAggArgs = struct {
@@ -135,6 +142,8 @@ pub const MultiAggArgs = struct {
     start_reads: ?ReadStart = null,
     /// See `DictProbe`.
     dict_probe: ?DictProbe = null,
+    /// Tests: the reader's probe cap in place of `ndv.probeCap`.
+    probe_cap: ?u64 = null,
     /// Optional metadata parsed by the I/O layer. When null, metadata is
     /// parsed from each Input.bytes as before.
     metas: ?[]const schema.FileMetaData = null,
@@ -602,6 +611,8 @@ pub const PlanInputs = struct {
     outputs: ?[]const BoundOutputColumn,
     filter_cols: []const bool,
     workers: usize,
+    /// Some input is read in behind the reader's gates (`Input.readerBacked`), which holds a window of its own.
+    readers: bool = false,
 };
 
 pub const Reason = enum {
@@ -843,7 +854,9 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     // composite products remain bounds only. Execution still enforces the budget on either path.
     const pressure_groups = @max(stat.lo, stat.estimate orelse 0);
     const pressure_copies = (pressure_groups *| per_group) *| plan.dispatch.tables;
-    const memory_pressure = !state_unknown and pressure_copies > in.args.max_memory / 2 and
+    // Not beside a reader: its window takes memory too, and the shared partitions are not held to the budget (their
+    // RSS ran far past it, and slower, on cold reader scans). Reader inputs keep the plain plan they ran before.
+    const memory_pressure = !in.readers and !state_unknown and pressure_copies > in.args.max_memory / 2 and
         single <= in.args.max_memory;
     const partition_ok = in.args.partition_cost and partAggSupported(in.args, in.calls, in.keys != null);
     if ((long_strings or memory_pressure) and partition_ok) {
@@ -2834,34 +2847,57 @@ fn prepareAggregate(
         .outputs = group_outputs,
         .filter_cols = plan.filter_cols,
         .workers = n_workers,
+        .readers = for (args.inputs) |in| {
+            if (in.readerBacked()) break true;
+        } else false,
     };
     var ndv_stat: ?NdvStat = null;
     // Freed once the dense tables are built, or as soon as the plan cannot use it.
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
     if (args.ndv_policy) if (group_by_keys) |keys| {
+        // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
+        const first = planAggregate(plan_inputs).dispatch.strategy;
+        const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
+        // A reader's union is read before its scan can start: only where some choice can turn on it (a cut the bound
+        // can drop, the dense fold's domain, count(DISTINCT) pairs). Mapped inputs union as they always have.
+        const union_matters = first == .sketch or want or for (agg_calls) |c| {
+            if (c.func == .count_distinct) break true;
+        } else false;
+        const allow_union = args.ndv_union and first != .first_keys and (!plan_inputs.readers or union_matters);
+        // Beside a reader the union may be read for the fold alone: then not where the fold would decline it.
+        const fold_only = plan_inputs.readers and first != .sketch and for (agg_calls) |c| {
+            if (c.func == .count_distinct) break false;
+        } else true;
+        const fold: ndv.FoldOnly = if (fold_only) n_workers else null;
+        const ranges = try ndv.probeRanges(arena, metas, keys, args.max_memory, true, allow_union, want, fold);
+        // A reader holds what it probes beside its window, page by page as it reads it: past the cap its inputs plan
+        // from their footers, as they did with no probe. A mapped input reads its dictionaries as it always has.
+        const page = std.heap.pageSize();
+        var probe_bytes: u64 = 0;
+        for (ranges) |r| if (args.inputs[r.file].readerBacked()) {
+            probe_bytes +|= std.mem.alignForward(u64, r.end, page) - std.mem.alignBackward(u64, r.start, page);
+        };
+        const probe_ok = probe_bytes <= args.probe_cap orelse ndv.probeCap(args.max_memory);
         const files = try arena.alloc(ndv.File, args.inputs.len);
         // Dictionaries are read from a mapped file, or from a reader's buffer once its probe of them is in. Explain
-        // reads a reader's input through its mapping, which holds the same bytes the probe would read. Without either
-        // (S3, or a reader no probe was asked of) an input plans from its footer.
+        // reads a reader's input through its mapping, as the probe would read it. Without either (S3, a probe past
+        // its cap, or a reader no probe was asked of) an input plans from its footer.
         for (args.inputs, files) |input, *file| {
-            const probed = input.gate != null and input.dict_wait != null;
-            const bytes = if (probed) input.bytes else input.plan_bytes orelse input.bytes;
-            const readable = input.gate == null or probed or (explain and input.plan_bytes != null);
+            const waits = input.readerBacked() and input.dict_wait != null;
+            const probed = input.readerBacked() and probe_ok and (waits or explain);
+            const bytes = if (waits) input.bytes else input.plan_bytes orelse input.bytes;
             file.* = .{
                 .bytes = bytes,
-                .local = !std.mem.startsWith(u8, input.name, "s3://") and readable and
+                .local = !std.mem.startsWith(u8, input.name, "s3://") and (input.gate == null or probed) and
                     (input.logical_size == 0 or input.logical_size == bytes.len),
-                .wait = if (probed) input.dict_wait else null,
+                .probed = probed,
+                .wait = if (probed and waits) input.dict_wait else null,
             };
         }
-        // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
-        const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
-        const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
-        const allow_union = args.ndv_union and !prefix;
-        if (!explain) if (args.dict_probe) |dp| {
-            for (try ndv.probeRanges(arena, metas, keys, args.max_memory, true, allow_union, want)) |r|
-                try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
+        if (!explain) if (args.dict_probe) |dp| for (ranges) |r| {
+            const in = args.inputs[r.file];
+            if (in.gate == null or (in.readerBacked() and probe_ok)) try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
         };
         // The reader reads the probes first, then streams row groups into its window while the dictionaries union.
         if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
@@ -2876,7 +2912,9 @@ fn prepareAggregate(
             true,
             allow_union,
             if (want) &domain else null,
+            fold_only,
         );
+        if (!explain) if (args.start_reads) |s| if (s.planned) |planned| planned(s.ctx);
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
@@ -9964,7 +10002,8 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
     const distinct_count: ?usize = if (sketch_count == null and sketch_fits and census_fits) if (args.sketch_topk) |cfg|
         if (cfg.census) rankingCall(.count_distinct, cfg, args, in.outputs, in.calls, in.keys orelse &.{}, in.filter_cols, use_blocks, keys_unique or
             filterSmall(in.metas, in.work, in.keys orelse &.{}, in.filter_cols)) else null
-    else null else null;
+    else
+        null else null;
     const census_allowed = (sketch_count != null and args.sketch_topk.?.census and census_fits) or distinct_count != null;
     const fallback: @FieldType(AggregateDispatch, "strategy") = if (in.keys != null) .plain_hash else .scalar;
     return .{
@@ -11221,7 +11260,9 @@ test "runMultiAggregate: a gated input plans from the dictionaries its probe rea
     };
     const buf = try gpa.alloc(u8, bytes.len);
     defer gpa.free(buf);
-    for ([_][]const u8{ "count(*) AS c", "count(*) AS c, sum(n) AS s" }) |aggregate| {
+    // A lone integer key, whose union the dense fold may use: a reader's input reads it only where a choice can turn on
+    // it. Past the probe's cap a reader's input plans from its footer, as it did with no probe.
+    for ([_]?u64{ null, 4096 }) |cap| for ([_][]const u8{ "count(*) AS c", "count(*) AS c, sum(n) AS s" }) |aggregate| {
         @memset(buf, 0);
         var fake: Fake = .{ .src = bytes, .buf = buf };
         var a1 = std.heap.ArenaAllocator.init(gpa);
@@ -11230,7 +11271,7 @@ test "runMultiAggregate: a gated input plans from the dictionaries its probe rea
             .inputs = &.{.{ .name = "m", .bytes = bytes }},
             .metas = &.{meta},
             .aggregate = aggregate,
-            .group_by = "k",
+            .group_by = "n",
             .parallelism = 1,
         });
         defer mapped.deinit(gpa);
@@ -11246,15 +11287,21 @@ test "runMultiAggregate: a gated input plans from the dictionaries its probe rea
             }},
             .metas = &.{meta},
             .aggregate = aggregate,
-            .group_by = "k",
+            .group_by = "n",
             .parallelism = 1,
+            .probe_cap = cap,
             .start_reads = .{ .ctx = &fake, .start = Fake.start },
             .dict_probe = .{ .ctx = &fake, .add = Fake.add },
         });
         defer gated.deinit(gpa);
-        try testing.expect(fake.probes > 0);
         try testing.expect(mapped.reasons.contains(.dictionary_union));
-        try testing.expectEqual(mapped.reasons, gated.reasons);
+        if (cap == null) {
+            try testing.expect(fake.probes > 0);
+            try testing.expectEqual(mapped.reasons, gated.reasons);
+        } else {
+            try testing.expectEqual(@as(usize, 0), fake.probes);
+            try testing.expect(!gated.reasons.contains(.dictionary_union) and gated.reasons.contains(.unknown_ndv));
+        }
         try expectSameAnswer(mapped, gated);
-    }
+    };
 }

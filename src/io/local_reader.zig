@@ -133,6 +133,7 @@ pub fn residentShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_m
 }
 
 pub const Range = struct { start: u64, end: u64 };
+const Probe = struct { rg: u32, r: Range };
 
 /// The runtime base page (64 KiB on some aarch64 Linux): mincore reports, and madvise rounds lengths up to, these.
 fn pageLen() u64 {
@@ -168,8 +169,12 @@ pub const File = struct {
     seg_refs: []std.atomic.Value(u32) = &.{},
     /// Ranges planning reads before any row group (`Reader.probe`), each held by its row group: page-aligned, read by
     /// the first units of all, and never read again by a row group's own.
-    probes: std.ArrayList(struct { rg: u32, r: Range }) = .empty,
+    probes: std.ArrayList(Probe) = .empty,
     probe_left: std.atomic.Value(u32) = .init(0),
+    /// Per row group: no range of its own (pruned), so only its probes are held, for planning alone.
+    rg_pruned: []bool = &.{},
+    /// Per row group: its pages are given back, by `done` or `releasePruned`, whichever comes first.
+    rg_released: []std.atomic.Value(bool) = &.{},
     /// As `rg_ready`, for every probe of the file at once.
     probe_ready: std.atomic.Value(u32) = .init(1),
 
@@ -217,6 +222,12 @@ pub const File = struct {
         // A failed row group may never have been admitted, so it has no charge to give back; its pages, read or
         // not, go with the buffer at teardown.
         if (f.rg_ready[rg].load(.acquire) != 1) return;
+        f.release(rg);
+    }
+
+    /// Give row group `rg`'s pages and window charge back, once.
+    fn release(f: *File, rg: usize) void {
+        if (f.rg_released[rg].swap(true, .acq_rel)) return;
         const rd = f.reader;
         // Segments never straddle a range's ends, so a range is exactly the run of segments starting inside it.
         for (f.ranges.items[f.rg_first[rg]..f.rg_first[rg + 1]]) |r| {
@@ -271,6 +282,9 @@ pub const Reader = struct {
     uring_threads: u32 = 0,
     pread_threads: u32 = 0,
     laid_out: bool = false,
+    /// Probe units not yet read, over every file: no row group's read is admitted before they are all in, so planning's
+    /// small reads never queue at the device behind the window's large ones.
+    probes_out: std.atomic.Value(u32) = .init(0),
 
     fn setDirect(fd: i32) bool {
         const flags = linux.fcntl(fd, linux.F.GETFL, 0);
@@ -338,10 +352,14 @@ pub const Reader = struct {
         f.rg_units_left = try self.gpa.alloc(std.atomic.Value(u32), n);
         f.rg_first = try self.gpa.alloc(u32, n + 1);
         f.rg_bytes = try self.gpa.alloc(u64, n);
+        f.rg_pruned = try self.gpa.alloc(bool, n);
+        f.rg_released = try self.gpa.alloc(std.atomic.Value(bool), n);
         for (ranges_per_rg, 0..) |opt, rg| {
             f.rg_first[rg] = @intCast(f.ranges.items.len);
             f.rg_items_done[rg] = .init(0);
             f.rg_bytes[rg] = 0;
+            f.rg_released[rg] = .init(false);
+            f.rg_pruned[rg] = opt == null;
             const rs = opt orelse continue;
             std.mem.sort(Range, rs, {}, rangeLess);
             try coalesce(self.gpa, &f.ranges, rs, f.size, gap);
@@ -427,6 +445,7 @@ pub const Reader = struct {
             for (m.items) |r| n += try self.addUnits(.{ .file = @intCast(fi), .rg = 0, .off = 0, .len = 0, .probe = true }, r.start, r.end);
             f.probe_left = .init(n);
             f.probe_ready = .init(if (n == 0) 1 else 0);
+            _ = self.probes_out.fetchAdd(n, .monotonic);
         }
         for (files, merged, 0..) |f, m, fi| {
             if (f.rg_first.len == 0) continue;
@@ -436,10 +455,18 @@ pub const Reader = struct {
             errdefer held.deinit(self.gpa);
             var scratch: std.ArrayList(Range) = .empty;
             defer scratch.deinit(self.gpa);
+            // In row-group order, so each row group takes its own probes off the front: linear in the probes.
+            std.mem.sort(Probe, f.probes.items, {}, struct {
+                fn lt(_: void, a: Probe, b: Probe) bool {
+                    return a.rg < b.rg;
+                }
+            }.lt);
+            var next_probe: usize = 0;
             for (0..n) |rg| {
                 scratch.clearRetainingCapacity();
                 try scratch.appendSlice(self.gpa, f.ranges.items[f.rg_first[rg]..f.rg_first[rg + 1]]);
-                for (f.probes.items) |p| if (p.rg == rg) try scratch.append(self.gpa, p.r);
+                while (next_probe < f.probes.items.len and f.probes.items[next_probe].rg == rg) : (next_probe += 1)
+                    try scratch.append(self.gpa, f.probes.items[next_probe].r);
                 std.mem.sort(Range, scratch.items, {}, rangeLess);
                 f.rg_first[rg] = @intCast(held.items.len);
                 try coalesce(self.gpa, &held, scratch.items, f.size, 0);
@@ -536,6 +563,14 @@ pub const Reader = struct {
         }
     }
 
+    /// Planning is done with the probes: a pruned row group, read for planning alone, gives its probed pages back now
+    /// rather than at teardown (the scan never touches it). After the probes are in, before any worker runs.
+    pub fn releasePruned(self: *Reader) void {
+        for (self.files.items) |f| for (f.rg_pruned, 0..) |pruned, rg| {
+            if (pruned and f.rg_ready[rg].load(.acquire) == 1 and f.probe_ready.load(.acquire) == 1) f.release(rg);
+        };
+    }
+
     /// Stops reading and gives every buffered page back, before a scan run again over the files' mappings
     /// (`scan.runMultiAggregate`): that scan is an exact restart, and must not hold this window beside its own. Only
     /// once no worker waits on a gate. `destroy` still tears down.
@@ -563,6 +598,8 @@ pub const Reader = struct {
             self.gpa.free(f.rg_first);
             self.gpa.free(f.rg_bytes);
             self.gpa.free(f.seg_refs);
+            self.gpa.free(f.rg_pruned);
+            self.gpa.free(f.rg_released);
             f.ranges.deinit(self.gpa);
             f.segs.deinit(self.gpa);
             f.probes.deinit(self.gpa);
@@ -582,6 +619,10 @@ pub const Reader = struct {
             if (f.probe_left.fetchSub(1, .acq_rel) == 1) {
                 f.probe_ready.store(1, .release);
                 _ = linux.futex_3arg(&f.probe_ready.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+            }
+            if (self.probes_out.fetchSub(1, .acq_rel) == 1) {
+                _ = self.rel_gen.fetchAdd(1, .release);
+                _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
             }
             return;
         }
@@ -617,6 +658,7 @@ pub const Reader = struct {
     fn admit(self: *Reader, u: Unit) bool {
         if (self.cancel.load(.acquire)) return false;
         if (u.probe) return true;
+        if (self.probes_out.load(.acquire) != 0) return false;
         const next = self.admit_next.load(.acquire);
         if (u.charge == 0) return next > u.ticket;
         if (next != u.ticket) return false;
@@ -856,6 +898,10 @@ test "probed ranges are read first, once, and given back with their row groups" 
             try testing.expectEqualSlices(u8, data[lo .. lo + 10_000], f.bytes()[lo .. lo + 10_000]);
         }
         try testing.expectEqualSlices(u8, data[size - 50 ..], f.bytes()[size - 50 ..]);
+        // Planning is done: the pruned row group's probe pages go back, all but any page another row group covers.
+        rd.releasePruned();
+        const inner = std.mem.alignForward(u64, 2 * q + 100, page) + page;
+        if (inner + page <= 2 * q + 10_100) try testing.expectEqual(@as(u8, 0), f.bytes()[inner]);
         const gate = f.gate();
         for (plans, 0..) |p, g| {
             try gate.wait(gate.ctx, g);

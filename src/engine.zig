@@ -715,13 +715,18 @@ fn executeAggregateOver(
     var starter: ReadStarter = undefined;
     if (reader) |rd| {
         starter = .{ .rd = rd };
-        scan_args.start_reads = .{ .ctx = &starter, .start = ReadStarter.start, .abandon = ReadStarter.abandon };
+        scan_args.start_reads = .{
+            .ctx = &starter,
+            .start = ReadStarter.start,
+            .abandon = ReadStarter.abandon,
+            .planned = ReadStarter.planned,
+        };
     }
     scan_args.inputs = scan_inputs;
     var probe_sink: DictProbeSink = .{ .inputs = scan_inputs, .mmaps = opened.mmaps };
     if (args.group_by != null and allLocal(opened)) {
         probe_sink.cold = try arena.alloc(DictProbeSink.Cold, scan_inputs.len);
-        @memset(probe_sink.cold, @enumFromInt(0));
+        @memset(probe_sink.cold, @fromBackingInt(@intCast(0)));
         scan_args.dict_probe = .{ .ctx = &probe_sink, .add = DictProbeSink.add };
     }
     if (empty_result) {
@@ -3312,8 +3317,9 @@ const DictProbeSink = struct {
         const ptr: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(@constCast(m.bytes.ptr + lo)));
         const c = &self.cold[file];
         if (c.* != .cold and c.* != .warm) {
-            const seen = @intFromEnum(c.*);
-            c.* = if (!allResident(ptr, hi - lo)) .cold else if (seen + 1 == checks) .warm else @enumFromInt(seen + 1);
+            const seen = @backingInt(c.*);
+            const next: Cold = @fromBackingInt(@intCast(seen + 1));
+            c.* = if (!allResident(ptr, hi - lo)) .cold else if (seen + 1 == checks) .warm else next;
         }
         // Advice only: a refusal leaves the pages to fault in as they would have.
         if (c.* == .cold) _ = std.posix.system.madvise(ptr, @intCast(hi - lo), std.posix.MADV.WILLNEED);
@@ -3347,6 +3353,11 @@ const ReadStarter = struct {
     fn abandon(ctx: *anyopaque) void {
         const self: *ReadStarter = @ptrCast(@alignCast(ctx));
         if (@import("builtin").os.tag == .linux) self.rd.abandon();
+    }
+
+    fn planned(ctx: *anyopaque) void {
+        const self: *ReadStarter = @ptrCast(@alignCast(ctx));
+        if (@import("builtin").os.tag == .linux) self.rd.releasePruned();
     }
 };
 
@@ -9319,10 +9330,10 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
 
-test "explainAggregate: local IO and environment knobs preserve dispatch, and every read mode unions dictionaries" {
+test "explainAggregate: local IO and environment knobs preserve dispatch, and every read mode bounds dictionaries" {
     const gpa = std.testing.allocator;
     const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
-    for (modes) |mode| for ([_]bool{ false, true }) |disabled| {
+    for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled| {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const lines = [_:null]?[*:0]const u8{
@@ -9336,10 +9347,11 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
             .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
         });
         try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
-        // A reader's input unions the dictionaries its probe reads first, as a mapped one does, so the plan is the
-        // same whatever the read mode.
+        // A reader's input bounds its key by the dictionary headers its probe reads first, so the plan is the same
+        // whatever the read mode; it unions them only where a choice turns on it (no dense fold or pairs here).
         const reasons = explained.aggregate.plan.reasons;
-        try std.testing.expect(reasons.contains(.small_ndv) and reasons.contains(.dictionary_union));
+        try std.testing.expect(reasons.contains(.small_ndv));
+        try std.testing.expectEqual(i == 0, reasons.contains(.dictionary_union));
         try std.testing.expect(!explained.encoded);
     };
 }

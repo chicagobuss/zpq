@@ -4835,7 +4835,8 @@ fn printCell(
     elem: schema.SchemaElement,
     is_jsonl: bool,
 ) !void {
-    const scale = elem.scale orelse 0;
+    // The scale as resolved: a leaf may carry only the logical type, whose scale the legacy field then lacks.
+    const scale = if (decimal_mod.kindFromSchema(&elem)) |k| k.scale else 0;
     // An unsigned column's lane holds its bits in a signed integer; print the stored value, not the sign bit.
     const unsigned = schema.isUnsignedInt(elem);
     switch (col) {
@@ -6698,6 +6699,34 @@ test "printCell prints an unsigned column's stored value, not its sign bit" {
     try w.writeByte(' ');
     try printCell(&w, .{ .i32 = c32 }, 0, plain, true);
     try testing.expectEqualStrings("3000000000 18000000000000000000 -1294967296", w.buffered());
+}
+
+test "regression: printCell scales a DECIMAL whose leaf carries only the logical type" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var c: consumer.OutputAggregator.TypedBuf(i128) = .{};
+    try c.values.append(a, 125);
+    try c.values.append(a, -350);
+    const elem: schema.SchemaElement = .{
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "d",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 5 } },
+    };
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try printCell(&w, .{ .i128 = c }, 0, elem, true);
+    try w.writeByte(' ');
+    try printCell(&w, .{ .i128 = c }, 1, elem, true);
+    try testing.expectEqualStrings("1.25 -3.50", w.buffered());
 }
 
 test "writeJsonString: escapes, and replaces invalid UTF-8 with U+FFFD per byte" {

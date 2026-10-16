@@ -28,6 +28,10 @@ pub const Stat = struct {
     union_attempted: bool = false,
     union_complete: bool = false,
     union_budget_exceeded: bool = false,
+    /// A lone key's dictionary entries summed over row groups (one more where nulls may be, at most the row group's
+    /// rows), when every row group is covered: from the headers, and what grouping by codes resolves, entry by entry.
+    /// Null otherwise.
+    entries: ?u64 = null,
 };
 
 /// `bytes` is laid out like the file. `probed`: only the ranges `probeRanges` asks for are read, a header from no more
@@ -139,6 +143,24 @@ fn foldDeclined(metas: []const schema.FileMetaData, key: expr.Expr, workers: usi
 }
 
 pub const Probe = struct { file: usize, rg: usize, start: u64, end: u64 };
+
+/// A guess from the footers alone at a lone key's dictionary entries summed over row groups: each dictionary's stored
+/// bytes over its narrowest entry (4 bytes for INT32 and byte arrays, 8 for INT64). Compression can make it low, so
+/// it only decides whether a union is worth reading (`scan.prepareAggregate`), the same in every read mode; null
+/// unless every row group's chunk is dictionary-encoded throughout.
+pub fn footerEntries(metas: []const schema.FileMetaData, keys: []const expr.Expr) ?u64 {
+    if (keys.len != 1 or keys[0] != .col_ref) return null;
+    const col = keys[0].col_ref.col_idx;
+    var n: u64 = 0;
+    for (metas) |*m| for (m.row_groups.items) |*rg| {
+        if (col >= rg.columns.items.len) return null;
+        const cm = rg.columns.items[col].meta_data orelse return null;
+        if (!fullCoverage(&cm)) return null;
+        const len = dictBytes(cm) orelse return null;
+        n +|= len / @as(u64, if (cm.type == .INT64) 8 else 4);
+    };
+    return n;
+}
 
 /// The dictionary bytes `collect` will read with these arguments, from footers alone: every key chunk's whole
 /// dictionary page where its key is unioned, its header otherwise. A reader that reads these first, and `collect`
@@ -330,6 +352,7 @@ pub fn collectRetaining(
     }
     stat.key_bytes = @max(@as(u64, @intCast(keys.len)) * 9, raw_key_bytes / @max(1, stat.rows));
     stat.hi = @min(stat.rows, sum_products);
+    if (known and keys.len == 1 and stat.covered_rows == stat.rows) stat.entries = sums[0];
     if (known) {
         stat.source = .dictionary_headers;
         stat.confidence = .upper_bound;

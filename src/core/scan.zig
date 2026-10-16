@@ -649,6 +649,7 @@ pub const Reason = enum {
     result_cut_float,
     result_cut_unsupported,
     result_cut_fallible_payload,
+    few_dictionary_entries,
 };
 
 pub const AggregateDispatch = struct {
@@ -767,6 +768,18 @@ fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strat
     plan.reasons.insert(.plain_scan);
 }
 
+/// A lone key whose dictionaries, summed over row groups, hold few entries: grouping by their codes is cheap.
+const few_entries = 1 << 23;
+
+/// Grouping a lone key's codes plainly is cheap where they resolve few entries in all and the union proves either a
+/// small domain or keys that recur across row groups (the dense fold's case); a large domain whose keys each sit in
+/// one or two row groups (clustered) pays for a union and declines the fold.
+fn fewEntries(stat: NdvStat, keys: []const expr_ast.Expr) bool {
+    const n = stat.entries orelse return false;
+    if (keys.len != 1 or !stat.union_complete or n > few_entries) return false;
+    return stat.hi <= 1 << 17 or n >= stat.hi *| 8;
+}
+
 fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     plan.ndv_stat = stat;
     if (stat.union_complete) {
@@ -834,7 +847,15 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         }
     }
     if (plan.dispatch.strategy == .partitioned_hash) return; // Explicit force has precedence over profitability.
-    if (plan.dispatch.strategy == .first_keys) return; // Prefix discovery avoids grouping every key, even a cheap one.
+    if (plan.dispatch.strategy == .first_keys) {
+        // Prefix discovery avoids grouping every key, but its admit pass fingerprints every row: where the codes
+        // resolve few dictionary entries in all, grouping them all is cheaper (measured 1.5-3x, card10 to files50).
+        if (fewEntries(stat, keys)) {
+            plainDispatch(plan, .plain_hash);
+            plan.reasons.insert(.few_dictionary_entries);
+        }
+        return;
+    }
     if (small and !bail_census) {
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.small_ndv);
@@ -2864,7 +2885,11 @@ fn prepareAggregate(
         const union_matters = first == .sketch or want or for (agg_calls) |c| {
             if (c.func == .count_distinct) break true;
         } else false;
-        const allow_union = args.ndv_union and first != .first_keys and (!plan_inputs.readers or union_matters);
+        // A global group bound refines nothing for prefix discovery, unless the footers say the codes may resolve few
+        // entries in all: the cost rules may then group plainly (`fewEntries`), and the union decides it.
+        const guess = ndv.footerEntries(metas, keys) orelse std.math.maxInt(u64);
+        const prefix = first == .first_keys and guess > few_entries;
+        const allow_union = args.ndv_union and !prefix and (!plan_inputs.readers or union_matters);
         // Beside a reader the union may be read for the fold alone: then not where the fold would decline it.
         const fold_only = plan_inputs.readers and first != .sketch and for (agg_calls) |c| {
             if (c.func == .count_distinct) break false;
@@ -10655,6 +10680,15 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
         .accumulators = &.{},
     }};
     try testing.expectEqual(.first_keys, planAggregate(in).dispatch.strategy);
+    // Unless the headers prove the codes resolve few entries in all, and the union completed: one plain pass is
+    // then cheaper.
+    in.ndv_stat.?.entries = 29_000;
+    plan = planAggregate(in);
+    try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+    try testing.expect(plan.reasons.contains(.few_dictionary_entries) and !plan.reasons.contains(.first_keys_cut));
+    in.ndv_stat.?.entries = (1 << 23) + 1;
+    try testing.expectEqual(.first_keys, planAggregate(in).dispatch.strategy);
+    in.ndv_stat.?.entries = null;
     in.work = &.{};
     in.metas = &.{};
     in.args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
@@ -11304,4 +11338,36 @@ test "runMultiAggregate: a gated input plans from the dictionaries its probe rea
         }
         try expectSameAnswer(mapped, gated);
     };
+}
+
+test "runMultiAggregate: a LIMIT with no ORDER BY over few dictionary entries groups in one plain pass, same answer" {
+    const gpa = testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", gpa);
+    defer gpa.free(bytes);
+    for ([_]usize{ 1, 4 }) |j| {
+        var arenas = [2]std.heap.ArenaAllocator{ .init(gpa), .init(gpa) };
+        defer for (&arenas) |*a| a.deinit();
+        var answers: [2]MultiAggResult = undefined;
+        for (&answers, &arenas, [_]bool{ false, true }) |*ans, *arena, policy| {
+            ans.* = try runMultiAggregate(gpa, arena.allocator(), .{
+                .inputs = &.{.{ .name = "t", .bytes = bytes }},
+                .aggregate = "count(*) AS c, sum(n) AS s",
+                .group_by = "k",
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .sketch_topk = .{},
+                .result_order = .{ .limit = 5 },
+                // Without the cost rules the first keys are cut as before.
+                .ndv_policy = policy,
+            });
+        }
+        defer for (&answers) |*a| a.deinit(gpa);
+        try testing.expect(answers[0].reasons.contains(.first_keys_cut));
+        try testing.expect(answers[1].reasons.contains(.few_dictionary_entries));
+        // Rows arrive uncut, in first-appearance order: the first five are the cut's.
+        const cut = answers[0].output.group_rows.?;
+        const all = answers[1].output.group_rows.?;
+        try testing.expect(all.len >= cut.len and cut.len >= 5);
+        for (cut[0..5], all[0..5]) |w, g| for (w, g) |a, b| try expectSameAggValue(a, b);
+    }
 }

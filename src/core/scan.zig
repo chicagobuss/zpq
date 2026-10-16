@@ -650,6 +650,7 @@ pub const Reason = enum {
     result_cut_unsupported,
     result_cut_fallible_payload,
     few_dictionary_entries,
+    repeated_dictionary_entries,
 };
 
 pub const AggregateDispatch = struct {
@@ -812,7 +813,11 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const keys = in.keys orelse &.{};
     // Few local dictionary entries make clustered/skewed R1 scans cheap. Composite marginal bounds cannot
     // establish that cost; the census repeat cap can still admit their proven moderate tuple bound.
-    const cheap_r1 = small and (tiny or (keys.len == 1 and (in.calls.len == 1 or
+    // A small domain whose every key recurs across row groups (their dictionaries sum to 8x the union or more) spreads
+    // the sketch's cells evenly, while its codes resolve few entries: one plain pass wins with payloads too (measured
+    // 1.3-1.9x, i32_100k, files50); clustered keys, whose dictionaries barely overlap, keep the sketch.
+    const repeated = small and stat.union_complete and fewEntries(stat, keys) and stat.entries.? >= stat.hi *| 8;
+    const cheap_r1 = small and (tiny or repeated or (keys.len == 1 and (in.calls.len == 1 or
         stat.dictionary_bytes <= (stat.hi *| stat.key_bytes) *| 4)));
     // Short string tuples may have sparse repeats even when their string marginal repeats heavily. Keep
     // payloads and long keys on the existing path; only the runtime sparse-repeat hint can justify this census.
@@ -859,6 +864,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     if (small and !bail_census) {
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.small_ndv);
+        if (repeated) plan.reasons.insert(.repeated_dictionary_entries);
         return;
     }
     if (stat.source == .unknown or stat.covered_rows != stat.rows) {
@@ -10663,6 +10669,7 @@ test "planAggregate: NDV precedence, census evidence and worker-copy pressure" {
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(plan.reasons.contains(.small_ndv));
     try testing.expect(!plan.dispatch.count_columns and !plan.dispatch.census_allowed);
+
     in.args.result_order = .{ .limit = 10 };
     // First-prefix discovery must keep precedence even with a proven tiny upper bound.
     var meta_arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -10820,6 +10827,17 @@ test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     var plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy);
     try testing.expect(plan.dispatch.census_allowed and !plan.dispatch.census_fused);
+    // Barely recurring keys (clustered dictionaries) keep the sketch; keys that recur across row groups, whose codes
+    // resolve few entries in all, group in one plain pass, payload and all.
+    in.ndv_stat.?.entries = 110_000;
+    try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+    in.ndv_stat.?.entries = 2_900_000;
+    plan = planAggregate(in);
+    try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+    try testing.expect(plan.reasons.contains(.repeated_dictionary_entries) and plan.reasons.contains(.small_ndv));
+    in.ndv_stat.?.entries = (1 << 23) + 1;
+    try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+    in.ndv_stat.?.entries = null;
     // Both fit a small global bound, but tiny/skewed/clustered dictionaries make the plain scan cheap.
     for ([_]struct { hi: u64, bytes: u64 }{
         .{ .hi = 1000, .bytes = 233_000 },

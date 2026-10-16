@@ -7936,6 +7936,32 @@ test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column 
     );
 }
 
+test "regression: DELTA_BYTE_ARRAY pages expanding past the budget together are refused, at every -j" {
+    const path = "ci/fixtures/parquet/dba_pages.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // 2.5 KiB: 60 values of 100 kB over 30 pages, each page well inside the budget and the chunk 6 MB past it.
+    for ([_]usize{ 1, 3 }) |j| {
+        try std.testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, .{
+            .inputs = &.{path},
+            .aggregate = "count(*) AS n",
+            .filter = "s = 'x'",
+            .parallelism = j,
+            .max_memory = 2 << 20,
+        }));
+        var res = try runQuery(ctx, .{
+            .inputs = &.{path},
+            .aggregate = "count(*) AS n",
+            .filter = "s = 'x'",
+            .parallelism = j,
+            .max_memory = 64 << 20,
+        });
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+    }
+}
+
 test "regression: a write recompressing a page past its chunk refuses it, as a read does" {
     const path = "ci/fixtures/parquet/page_bomb.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;

@@ -104,6 +104,8 @@ pub const DeltaByteArrayDecoder = struct {
     /// Last fully-emitted value, kept so the next call can reference
     /// its prefix. arena-owned, replaced per value.
     last_value: []u8,
+    /// The bytes the page's values expand to, summed.
+    expanded: usize,
 
     /// `max_values`: as for `DeltaLengthByteArrayDecoder.init`. `expand_limit`: the most bytes the values may
     /// expand to, summed from both length streams before any value is built: each value copies its prefix from the
@@ -150,6 +152,7 @@ pub const DeltaByteArrayDecoder = struct {
             .suffixes = suffixes,
             .cursor = 0,
             .last_value = &[_]u8{},
+            .expanded = expanded,
         };
     }
 

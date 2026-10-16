@@ -267,6 +267,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// charged by each data page's header count before its level buffers are sized from it. RLE runs and bit
         /// width 0 let a few bytes claim any count, so the page's own size can't bound it. Unlimited by default.
         value_budget: usize = std.math.maxInt(usize),
+        /// What the chunk's DELTA_BYTE_ARRAY pages have expanded to so far, against `DecodeOptions.expand_limit`.
+        expanded: usize = 0,
 
         pub fn init(
             chunk_bytes: []const u8,
@@ -1464,9 +1466,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    const limit = self.options.expand_limit;
+                    // The chunk's pages together: each held to the budget alone, a row group of them read whole
+                    // took it many times over.
+                    const limit = self.options.expand_limit -| self.expanded;
                     const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, limit) catch |e|
                         return if (e == error.ExceededMemoryBudget) error.ExceededMemoryBudget else error.UnexpectedPage;
+                    self.expanded += d.expanded;
                     if (!self.fixedLengths(d.prefix_lengths, d.suffixes.lengths)) return error.UnexpectedPage;
                     self.active = .{ .delta_ba = d };
                 },

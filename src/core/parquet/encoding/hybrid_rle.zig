@@ -334,6 +334,33 @@ pub const HybridRleDecoder = struct {
 /// stream in a data page is stripped by the caller — `bytes` here is the
 /// raw RLE stream only. Thin streaming adapter over `HybridRleDecoder`
 /// that emits `bool` rather than `u32`.
+/// Decode `out.len` repetition or definition levels, each checked against `max_level`, the schema's bound: the one
+/// place every reader decodes levels. A level past the bound names no slot; a definition level of 3 under a maximum of
+/// 2 read as a present value, its slot a placeholder.
+pub fn decodeLevels(bytes: []const u8, max_level: u32, out: []u32) LevelError!void {
+    const width: u8 = if (max_level == 0) 0 else @intCast(32 - @clz(max_level));
+    var dec = HybridRleDecoder.init(bytes, width);
+    const got = dec.decode(out) catch return error.CorruptLevels;
+    if (got != out.len) return error.LevelCountMismatch;
+    if (!levelsWithin(out, max_level)) return error.LevelOutOfRange;
+}
+
+pub const LevelError = error{ CorruptLevels, LevelCountMismatch, LevelOutOfRange };
+
+/// Whether no level exceeds `max`. A bound of 2^k - 1 is every value the bit width can hold, so most columns pay
+/// nothing; the others take one vector max over the page.
+pub fn levelsWithin(levels: []const u32, max: u32) bool {
+    if (max & (max +% 1) == 0) return true;
+    const L = 16;
+    const V = @Vector(L, u32);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + L <= levels.len) : (i += L) acc = @max(acc, @as(V, levels[i..][0..L].*));
+    var m = @reduce(.Max, acc);
+    for (levels[i..]) |l| m = @max(m, l);
+    return m <= max;
+}
+
 pub const BooleanRleDecoder = struct {
     inner: HybridRleDecoder,
 
@@ -1082,4 +1109,22 @@ test "encode writes the same bytes as the reference encoder on random runs and w
         }
         try testing.expectEqualSlices(u8, try encodeReference(a, vals, bw), try encode(a, vals, bw));
     }
+}
+
+test "regression: decodeLevels refuses a level past its maximum, whatever the bound's width" {
+    var out: [8]u32 = undefined;
+    // One RLE run of eight 3s at width 2: the most a maximum of 2 encodes in, and one past it.
+    const run3 = [_]u8{ 8 << 1, 3 };
+    try std.testing.expectError(error.LevelOutOfRange, decodeLevels(&run3, 2, &out));
+    const run2 = [_]u8{ 8 << 1, 2 };
+    try decodeLevels(&run2, 2, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 2, 2, 2, 2, 2, 2 }, &out);
+    // At a bound of 2^k - 1 every value the width holds is in range.
+    try decodeLevels(&run3, 3, &out);
+    try std.testing.expect(levelsWithin(&.{ 0, 1, 5, 2 }, 5) and !levelsWithin(&.{ 0, 6, 1 }, 5));
+    var many: [100]u32 = @splat(4);
+    try std.testing.expect(levelsWithin(&many, 4));
+    many[97] = 5;
+    try std.testing.expect(!levelsWithin(&many, 4) and !levelsWithin(&many, 2));
+    try std.testing.expectError(error.LevelCountMismatch, decodeLevels(&run2, 2, &many));
 }

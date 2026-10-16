@@ -7577,6 +7577,18 @@ test "regression: an INT96 past nanoseconds fails the queries reading it, and on
     try std.testing.expectEqual(@as(i128, 8), r.aggregate.output.aggs[0].value.i);
 }
 
+test "regression: a definition level past its column's maximum fails the queries reading it" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "def_level_past_max.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `st.a` (max_def 2) holds definition level 3: its rows read as present zeros, `count(st.a)` 8.
+    const def3: []const []const u8 = &.{dir ++ "def_level_past_max.parquet"};
+    for ([_][]const u8{ "count(st.a) AS n", "sum(st.a) AS n" }) |agg| {
+        try std.testing.expectError(error.LevelOutOfRange, runQuery(ctx, .{ .inputs = def3, .aggregate = agg }));
+    }
+}
+
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

@@ -43,6 +43,8 @@ pub const Error = error{
     /// `column.Error.UnexpectedDictionaryPage`).
     UnexpectedDictionaryPage,
     UnsupportedEncoding,
+    /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
+    LevelOutOfRange,
 } || page_mod.Error || std.mem.Allocator.Error;
 
 /// Maximum FLBA byte width we accept. 16 bytes = i128, which covers
@@ -920,16 +922,11 @@ fn decodeLevels(
     out_buf: ?[]u32,
     start: usize,
 ) Error!void {
-    const out = out_buf orelse return; // No buffer = caller doesn't care.
-    const bit_width = bitWidthFor(max);
-    var dec = hybrid_rle.HybridRleDecoder.init(encoded, bit_width);
-    const got = dec.decode(out[start .. start + expected]) catch return error.ShortDecode;
-    if (got != expected) return error.ShortDecode;
-}
-
-fn bitWidthFor(max: u32) u8 {
-    if (max == 0) return 0;
-    return @intCast(32 - @clz(max));
+    const out = out_buf orelse return;
+    hybrid_rle.decodeLevels(encoded, max, out[start .. start + expected]) catch |err| return switch (err) {
+        error.CorruptLevels, error.LevelCountMismatch => error.ShortDecode,
+        error.LevelOutOfRange => error.LevelOutOfRange,
+    };
 }
 
 // ============================================================

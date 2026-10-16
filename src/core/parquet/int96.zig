@@ -34,6 +34,8 @@ pub const Error = error{
     /// 0001-01-01 and 9999-12-31 sentinels are), or a time of day outside one day. Wrapped, either read as another
     /// instant.
     Int96OutOfRange,
+    /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
+    LevelOutOfRange,
 } || page_mod.Error || std.mem.Allocator.Error;
 
 pub const INT96_WIDTH: usize = 12;
@@ -254,15 +256,10 @@ fn decodeDataPage(
 
 fn decodeLevels(encoded: []const u8, max: u32, expected: usize, out_buf: ?[]u32, start: usize) Error!void {
     const out = out_buf orelse return;
-    const bit_width = bitWidthFor(max);
-    var dec = hybrid_rle.HybridRleDecoder.init(encoded, bit_width);
-    const got = dec.decode(out[start .. start + expected]) catch return error.ShortDecode;
-    if (got != expected) return error.ShortDecode;
-}
-
-fn bitWidthFor(max: u32) u8 {
-    if (max == 0) return 0;
-    return @intCast(32 - @clz(max));
+    hybrid_rle.decodeLevels(encoded, max, out[start .. start + expected]) catch |err| return switch (err) {
+        error.CorruptLevels, error.LevelCountMismatch => error.ShortDecode,
+        error.LevelOutOfRange => error.LevelOutOfRange,
+    };
 }
 
 const testing = std.testing;

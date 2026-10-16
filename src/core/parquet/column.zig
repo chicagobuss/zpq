@@ -52,6 +52,8 @@ pub const Error = error{
     /// A second dictionary page in a chunk, or one after a data page: the format allows one, first. Codes already
     /// checked against the first dictionary would index the second.
     UnexpectedDictionaryPage,
+    /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
+    LevelOutOfRange,
 } || page_mod.Error;
 
 /// Choose the right decoder shape for T at comptime.
@@ -91,6 +93,14 @@ fn ActiveDecoder(comptime T: type) type {
 fn bitWidthFor(max: u32) u8 {
     if (max == 0) return 0;
     return @intCast(32 - @clz(max));
+}
+
+fn levelsInto(bytes: []const u8, max_level: anytype, out: []u32) Error!void {
+    hybrid_rle.decodeLevels(bytes, @intCast(max_level), out) catch |err| return switch (err) {
+        error.CorruptLevels => error.UnexpectedPage,
+        error.LevelCountMismatch => error.DefLevelsMismatch,
+        error.LevelOutOfRange => error.LevelOutOfRange,
+    };
 }
 
 pub const DecodeScratch = page_mod.DecodeScratch;
@@ -1264,9 +1274,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         fn installRepLevels(self: *Self, rep_bytes: []const u8, num_values: usize) Error!void {
             const buf = try self.levelBuffer(.rep, num_values);
-            var dec = hybrid_rle.HybridRleDecoder.init(rep_bytes, bitWidthFor(@intCast(self.levels.max_rep)));
-            const got = dec.decode(buf) catch return error.UnexpectedPage;
-            if (got != num_values) return error.DefLevelsMismatch;
+            try levelsInto(rep_bytes, self.levels.max_rep, buf);
             self.current_rep_levels = buf;
         }
 
@@ -1277,9 +1285,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 return;
             }
             const buf = try self.levelBuffer(.def, num_values);
-            var dec = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
-            const got = dec.decode(buf) catch return error.UnexpectedPage;
-            if (got != num_values) return error.DefLevelsMismatch;
+            try levelsInto(def_bytes, self.levels.max_def, buf);
             self.current_def_levels = buf;
         }
 

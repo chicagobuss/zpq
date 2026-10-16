@@ -60,6 +60,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.INT96ReencodeNotSupported => diagnosticPrint("zpq query: INT96 re-encoding is not supported yet\n", .{}),
+        error.LevelOutOfRange => diagnosticPrint(
+            "zpq query: a page holds a repetition or definition level past its\n" ++
+                "  column's maximum (corrupt file)\n",
+            .{},
+        ),
         error.Int96OutOfRange => diagnosticPrint(
             "zpq query: an INT96 timestamp lies outside 1677-2262, which nanoseconds\n" ++
                 "  cannot hold, or holds a time of day past 24 hours\n",

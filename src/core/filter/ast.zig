@@ -111,15 +111,19 @@ pub const LikeMatch = struct {
 };
 
 /// Backtracking `%`/`_` matcher for the general case. `%` matches any run
-/// (incl. empty); `_` matches exactly one byte. O(n·m) worst case, linear
-/// in practice — the fast kinds skip this entirely.
+/// (incl. empty); `_` matches exactly one UTF-8 character, as SQL means it
+/// (a byte at a time, `_` missed `é` and `a_` missed `aé`). O(n·m) worst
+/// case, linear in practice — the fast kinds skip this entirely.
 pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
     var p: usize = 0;
     var s: usize = 0;
     var star_p: ?usize = null;
     var star_s: usize = 0;
     while (s < str.len) {
-        if (p < pattern.len and (pattern[p] == '_' or pattern[p] == str[s])) {
+        if (p < pattern.len and pattern[p] == '_') {
+            p += 1;
+            s += charLen(str, s);
+        } else if (p < pattern.len and pattern[p] == str[s]) {
             p += 1;
             s += 1;
         } else if (p < pattern.len and pattern[p] == '%') {
@@ -127,13 +131,20 @@ pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
             star_s = s;
             p += 1;
         } else if (star_p) |sp| {
+            // Restart on character boundaries, so a later `_` never starts inside a character.
             p = sp + 1;
-            star_s += 1;
+            star_s += charLen(str, star_s);
             s = star_s;
         } else return false;
     }
     while (p < pattern.len and pattern[p] == '%') p += 1;
     return p == pattern.len;
+}
+
+/// Bytes of the UTF-8 character starting at `str[i]`, by its lead byte; a stray or truncated byte counts as one.
+fn charLen(str: []const u8, i: usize) usize {
+    const n: usize = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+    return @min(n, str.len - i);
 }
 
 /// Whether `needle` occurs in `hay`. The needle's first and last bytes are compared against 32 starting positions at

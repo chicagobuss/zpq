@@ -2094,6 +2094,18 @@ test "likeGlob backtracking matcher" {
     try testing.expect(!ast.likeGlob("end", "the end x"));
 }
 
+test "regression: LIKE `_` matches one UTF-8 character, not one byte" {
+    try testing.expect(ast.likeGlob("_", "é"));
+    try testing.expect(ast.likeGlob("a_", "aé"));
+    try testing.expect(ast.likeGlob("_b_", "€b😀"));
+    try testing.expect(!ast.likeGlob("__", "é"));
+    try testing.expect(!ast.likeGlob("_", "éa"));
+    try testing.expect(ast.likeGlob("%_", "é") and ast.likeGlob("%__", "éa") and !ast.likeGlob("%__", "é"));
+    try testing.expect(ast.likeGlob("%é_", "xxéé") and !ast.likeGlob("%é__", "xxéé"));
+    // Bytes that are no UTF-8 count one apiece, so binary values still match.
+    try testing.expect(ast.likeGlob("__", "\xff\xfe") and ast.likeGlob("_", "\xc3"));
+}
+
 test "parse IS NULL / IS NOT NULL → null_check node (+ NOT negation)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

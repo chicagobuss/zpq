@@ -1967,14 +1967,15 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     // fastpath, which never decodes.)
     if (need_encoder) {
         for (output_specs) |spec| switch (spec) {
+            // From the schema, never a row group: the first input may have none, and the guards with it.
             .passthrough => |ci| {
-                if (ci >= num_leaves or meta0.row_groups.items.len == 0) continue;
-                const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
-                if (cm.type == .INT96)
+                if (ci >= num_leaves) continue;
+                const leaf = tree0.leaves[ci];
+                if (leaf.type == .INT96)
                     return error.INT96ReencodeNotSupported;
-                if (meta0.getColumnLevels(cm.path_in_schema.items).max_rep > 0)
+                if (leaf.max_rep > 0)
                     return error.NestedReencodeNotSupported;
-                if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem| {
+                if (metadata.leafSchemaElement(meta0, ci)) |elem| {
                     if (decimal_mod.kindFromSchema(&elem)) |k| {
                         if (k.physical == .BYTE_ARRAY and k.precision > 38) {
                             Diag.setColumn(args.diag, elem.name);
@@ -2109,14 +2110,11 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
         var has_widened_output = false;
         if (select_items == null and filter_opt != null) {
             for (0..num_leaves) |ci| {
-                if (!kept_arr[ci] or meta0.row_groups.items.len == 0) continue;
-                const cm = meta0.row_groups.items[0].columns.items[ci].meta_data orelse continue;
-                if (meta0.getColumnSchema(cm.path_in_schema.items)) |elem_val| {
-                    var e = elem_val;
-                    if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
-                        has_widened_output = true;
-                        break;
-                    }
+                if (!kept_arr[ci]) continue;
+                const e = metadata.leafSchemaElement(meta0, ci) orelse continue;
+                if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
+                    has_widened_output = true;
+                    break;
                 }
             }
         }
@@ -7413,6 +7411,40 @@ test "a write builds the Bloom filters asked for, in re-encoded and copied row g
         .aggregate = "count(*) AS n",
         .bloom_filters = &.{.{ .column = "id" }},
     }));
+}
+
+test "regression: an input with no row groups first keeps the re-encode guards of the inputs after it" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "empty_first.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+
+    // A LIST column re-encoded drops its repetition levels: refused, as it is for the second input alone.
+    try std.testing.expectError(error.NestedReencodeNotSupported, runQuery(ctx, .{
+        .inputs = &.{ dir ++ "empty_first.parquet", dir ++ "empty_first_list.parquet" },
+        .output = out,
+        .filter = "id > 2",
+    }));
+    // A FLOAT16 column's footer widens to DOUBLE, so a fully matching row group is re-encoded, never copied as FLBA.
+    var w = try runQuery(ctx, .{
+        .inputs = &.{ dir ++ "empty_first_f16.parquet", dir ++ "float16_rows.parquet" },
+        .output = out,
+        .filter = "id > 2",
+    });
+    defer w.deinit(gpa);
+    var want = try runQuery(ctx, .{
+        .inputs = &.{dir ++ "float16_rows.parquet"},
+        .aggregate = "sum(h) AS s",
+        .filter = "id > 2",
+    });
+    defer want.deinit(gpa);
+    var got = try runQuery(ctx, .{ .inputs = &.{out}, .aggregate = "sum(h) AS s" });
+    defer got.deinit(gpa);
+    try std.testing.expectEqual(want.aggregate.output.aggs[0].value.f, got.aggregate.output.aggs[0].value.f);
 }
 
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {

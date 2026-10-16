@@ -414,7 +414,11 @@ pub const MultipartSink = struct {
             self.upload_id = null;
         } else {
             // No part ever flushed → single PutObject for the whole buffer.
-            try singlePut(self.arena, self.creds, self.url, self.buffer.items);
+            var failure: S3Failure = .{ .op = .PutObject, .phase = .request };
+            singlePut(self.io, self.pool, self.arena, self.creds, self.url, self.buffer.items, &failure) catch |err| {
+                self.controlFailed(failure);
+                return err;
+            };
         }
         const t_complete_end = nowMonoNs();
         self.complete_ns +%= @intCast(t_complete_end - t_complete_start);
@@ -920,14 +924,28 @@ fn abortMultipartUpload(
     }
 }
 
+/// The whole output as one PutObject, when it is smaller than a part. A PUT of a whole object is idempotent, so it is
+/// retried as a part is (`s3.requestViaPool`): a 503 SlowDown failed the write. A failure is described in `failure`.
 fn singlePut(
+    io: Io,
+    pool: s3.AnyPool,
     arena: std.mem.Allocator,
     creds: s3.Credentials,
     url: s3.Url,
     body: []const u8,
+    failure: *S3Failure,
 ) !void {
-    const resp = try s3.put(arena, creds, url, body);
-    if (resp.status != 200) return error.PartUploadFailed;
+    const resp = s3.putViaPool(io, pool, arena, creds, url, body) catch |err| {
+        failure.err = err;
+        if (retry.classifyConnect(err) == .transient and err != error.SendFailed and err != error.RecvFailed) {
+            failure.phase = .connect;
+        }
+        return err;
+    };
+    if (resp.status != 200) {
+        noteRefusal(resp, failure);
+        return error.PartUploadFailed;
+    }
 }
 
 // Compile-time reference check: forces type-checking of the public API
@@ -1488,4 +1506,30 @@ test "regression: one refused connect for CompleteMultipartUpload is tried again
     try testing.expectEqual(@as(u32, 3), NthConnect.call);
     try testing.expect(fake.object("out.parquet") != null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
+}
+
+test "regression: a single-PUT output is retried past a 503 SlowDown, as a part is" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.fail = "PUT /bkt/small.parquet";
+    fake.fails_left = 1;
+    // Below one part: close() takes the single PutObject path, which failed the write on the first 503.
+    try writeToPort(fake.port, "small.parquet", &test_payload, .{}, .{});
+    try testing.expectEqual(@as(u32, 1), fake.failed);
+    const obj = fake.object("small.parquet") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(test_payload.len, obj.len);
+
+    // Refused for good: the failure names the operation and S3's answer.
+    fake.fail = "PUT /bkt/never.parquet";
+    fake.fails_left = std.math.maxInt(u32);
+    fake.fail_status = 403;
+    fake.fail_code = "AccessDenied";
+    var diag: Diag = .{};
+    try testing.expectError(error.PartUploadFailed, writeToPort(fake.port, "never.parquet", &test_payload, .{}, .{
+        .diag = &diag,
+    }));
+    var buf: [256]u8 = undefined;
+    const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
+    try testing.expectEqualStrings("PutObject was answered 403 AccessDenied", said);
 }

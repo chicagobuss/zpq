@@ -88,7 +88,7 @@ pub const S3Failure = struct {
     /// Connections tried; only a connect failure is tried again.
     attempts: u8 = 1,
 
-    pub const Op = enum { CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload };
+    pub const Op = enum { CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload, PutObject };
 
     pub const Phase = enum {
         /// Resolving the host, connecting, or the TLS handshake: nothing was sent.

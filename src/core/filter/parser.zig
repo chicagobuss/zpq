@@ -831,18 +831,25 @@ fn scaledLiteral(text: []const u8, scale: i32) Error!struct { floor: i256, inexa
     const dot = std.mem.indexOfScalar(u8, s, '.');
     const int_part = if (dot) |d| s[0..d] else s;
     const frac_part = if (dot) |d| s[d + 1 ..] else "";
-    if (int_part.len + frac_part.len == 0) return error.BadValue;
     var mant: i256 = 0;
     var digits: i64 = 0;
-    for ([_][]const u8{ int_part, frac_part }) |part| for (part) |c| {
+    var any_digit = false;
+    var frac_digits: i64 = 0;
+    for ([_][]const u8{ int_part, frac_part }, 0..) |part, pi| for (part, 0..) |c, i| {
+        // A `_` between digits separates them, as the integer and float lanes read it.
+        if (c == '_' and i > 0 and i + 1 < part.len and
+            std.ascii.isDigit(part[i - 1]) and std.ascii.isDigit(part[i + 1])) continue;
         if (c < '0' or c > '9') return error.BadValue;
+        any_digit = true;
+        frac_digits += @intCast(pi);
         if (mant == 0 and c == '0') continue;
         digits += 1;
         if (digits > 76) return error.BadValue;
         mant = mant * 10 + (c - '0');
     };
+    if (!any_digit) return error.BadValue;
     if (mant == 0) return .{ .floor = 0, .inexact = false };
-    const shift = exp + scale - @as(i64, @intCast(frac_part.len));
+    const shift = exp + scale - frac_digits;
     const huge = pow10Wide(40);
     var q: i256 = undefined;
     var r: i256 = 0;
@@ -1586,6 +1593,7 @@ test "regression: DECIMAL literals bind exactly at the column's scale, a fractio
         .{ .text = "dec >= -0.001", .op = .Gt, .value = -1 },
         .{ .text = "dec >= 25e-3", .op = .Gt, .value = 2 },
         .{ .text = "dec = 0.000", .op = .Eq, .value = 0 },
+        .{ .text = "dec >= 1_000.2_5", .op = .GtEq, .value = 100025 },
         // No stored value equals an inexact literal; past every value, the order alone decides.
         .{ .text = "dec = 1.005", .op = .Gt, .value = max },
         .{ .text = "dec <> 1.005", .op = .LtEq, .value = max },
@@ -1600,7 +1608,8 @@ test "regression: DECIMAL literals bind exactly at the column's scale, a fractio
         try testing.expectEqual(c.value, f.decimal.value);
         try testing.expect(!f.decimal.stored);
     }
-    for ([_][]const u8{ "dec = 1.2.3", "dec = 1e", "dec = abc", "dec = .", "dec = nan", "dec = 1x" }) |text| {
+    const bad = [_][]const u8{ "dec = 1.2.3", "dec = 1e", "dec = abc", "dec = .", "dec = nan", "dec = 1x", "dec = _" };
+    for (bad ++ [_][]const u8{"dec = 1__0"}) |text| {
         try testing.expectError(error.BadValue, parse(a, text, &meta, null));
     }
 }

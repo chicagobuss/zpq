@@ -855,9 +855,22 @@ pub const SliceReader = struct {
         if (self.levels_only) {
             const max_def: u32 = @intCast(self.levels.max_def);
             const def = try a.alloc(u32, n);
-            const got = switch (self.raw.*) {
-                inline else => |*r| try r.readLevels(def),
-            };
+            var got: usize = 0;
+            switch (self.raw.*) {
+                inline else => |*r| while (got < n) {
+                    // As `decodeBytes`: a byte-array reader's drained page goes back before the next comes in, or a
+                    // row group's pages would pile up on `pages`.
+                    if (r.pageValuesLeft() == 0) {
+                        if (@TypeOf(r.*).Value == []const u8) {
+                            _ = self.pages.reset(.retain_capacity);
+                            if (!try r.nextPage()) break;
+                            try self.holdDictionary(r);
+                        } else if (!try r.nextPage()) break;
+                        continue;
+                    }
+                    got += try r.readLevels(def[got..][0..@min(n - got, r.pageValuesLeft())]);
+                },
+            }
             if (got != n) return error.ShortDecode;
             return .{ .i64 = .{
                 .values = &.{},

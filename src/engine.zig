@@ -3284,7 +3284,8 @@ const ReadStarter = struct {
         const self: *ReadStarter = @ptrCast(@alignCast(ctx));
         if (self.started) return;
         self.started = true;
-        try self.rd.start();
+        // Off Linux the reader never exists (`on_linux`), and its io_uring must not be compiled in.
+        if (@import("builtin").os.tag == .linux) try self.rd.start();
     }
 };
 

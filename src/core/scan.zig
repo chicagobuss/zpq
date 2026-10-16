@@ -107,8 +107,18 @@ pub const RowGroupGate = struct {
     done: *const fn (ctx: *anyopaque, rg: usize, items: usize) void,
 };
 
+/// Starts the reads the scan's gates wait on (`Input.gate`). Called once planning has stopped reading the files through
+/// their mappings: a cold file's dictionary pages then come off the disk with the disk to themselves, not queued behind
+/// the reads of the whole file. Idempotent; a scan given none reads as its inputs are.
+pub const ReadStart = struct {
+    ctx: *anyopaque,
+    start: *const fn (ctx: *anyopaque) anyerror!void,
+};
+
 pub const MultiAggArgs = struct {
     inputs: []const Input,
+    /// See `ReadStart`.
+    start_reads: ?ReadStart = null,
     /// Optional metadata parsed by the I/O layer. When null, metadata is
     /// parsed from each Input.bytes as before.
     metas: ?[]const schema.FileMetaData = null,
@@ -2831,6 +2841,7 @@ fn prepareAggregate(
             if (want) &domain else null,
         );
     };
+    if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
     const scan_plan = planAggregate(plan_inputs);
     if (@import("builtin").is_test and !args.partagg and ndv_stat == null)

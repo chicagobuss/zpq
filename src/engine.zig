@@ -665,7 +665,7 @@ fn executeAggregateOver(
     };
     if (explain) {
         if (io_mode != .mmap) {
-            // As `startLocalReader` hands the scan its inputs: gated, with the mapped file beside them.
+            // As `planLocalReader` hands the scan its inputs: gated, with the mapped file beside them.
             const gated = try arena.dupe(scan.Input, opened.inputs);
             for (gated, opened.mmaps) |*in, m| {
                 in.gate = metadataGate();
@@ -689,7 +689,7 @@ fn executeAggregateOver(
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (reader) |rd| rd.destroy();
-    const scan_inputs = if (io_mode == .mmap or empty_result) opened.inputs else try startLocalReader(
+    const scan_inputs = if (io_mode == .mmap or empty_result) opened.inputs else try planLocalReader(
         ctx,
         arena,
         opened,
@@ -712,14 +712,10 @@ fn executeAggregateOver(
         rd.stats.stall_ns.load(.monotonic),
         rd.stats.window_waits.load(.monotonic),
     }));
+    var starter: ReadStarter = undefined;
     if (reader) |rd| {
-        const b = rd.backends();
-        profile.record(prof, .local_backend, t_reader, t_reader, profile.args(.{
-            b.uring_threads,
-            b.pread_threads,
-            b.direct_files,
-            b.buffered_files,
-        }));
+        starter = .{ .rd = rd };
+        scan_args.start_reads = .{ .ctx = &starter, .start = ReadStarter.start };
     }
     scan_args.inputs = scan_inputs;
     if (empty_result) {
@@ -731,6 +727,16 @@ fn executeAggregateOver(
         scan_args.metas = empty_metas;
     }
     var r = try scan.runMultiAggregate(ctx.gpa, arena, scan_args);
+    // Known once the reader has started, which the scan does once it has planned.
+    if (reader) |rd| {
+        const b = rd.backends();
+        profile.record(prof, .local_backend, t_reader, t_reader, profile.args(.{
+            b.uring_threads,
+            b.pread_threads,
+            b.direct_files,
+            b.buffered_files,
+        }));
+    }
     t.parse_ns = r.timings.parse_ns;
     t.core = r.timings.core;
     t.decode_wall_ns = r.timings.decode_wall_ns;
@@ -3239,7 +3245,7 @@ fn planLocalReads(
 
 /// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:
 /// each local one over the reader's buffer, gated per row group.
-fn startLocalReader(
+fn planLocalReader(
     ctx: Context,
     arena: std.mem.Allocator,
     opened: OpenedInputs,
@@ -3265,9 +3271,22 @@ fn startLocalReader(
         in.gate = f.gate();
         in.plan_bytes = m.bytes;
     }
-    try rd.start();
+    // Started by the scan once it has planned (`scan.ReadStart`).
     return inputs;
 }
+
+/// `scan.ReadStart` for the local reader.
+const ReadStarter = struct {
+    rd: *local_reader.Reader,
+    started: bool = false,
+
+    fn start(ctx: *anyopaque) anyerror!void {
+        const self: *ReadStarter = @ptrCast(@alignCast(ctx));
+        if (self.started) return;
+        self.started = true;
+        try self.rd.start();
+    }
+};
 
 /// What the S3 planner fetches from each row group.
 const RangePlan = union(enum) {
@@ -7879,7 +7898,8 @@ test "regression: the local reader reads the file mapped, even once another is r
         var reader: ?*local_reader.Reader = null;
         defer if (reader) |rd| rd.destroy();
         const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-        const read = try startLocalReader(ctx, arena, opened, plan, .{ .mode = mode, .threads = 1 }, &reader);
+        const read = try planLocalReader(ctx, arena, opened, plan, .{ .mode = mode, .threads = 1 }, &reader);
+        try reader.?.start();
         const gate = read[0].gate.?;
         try gate.wait(gate.ctx, 0);
         try std.testing.expectEqualStrings(first, read[0].bytes);

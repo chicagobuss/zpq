@@ -53,6 +53,29 @@ fn dictSlice(file: File, cm: schema.ColumnMetaData) ?[]const u8 {
     return file.bytes[@intCast(start)..][0..@intCast(len)];
 }
 
+/// Ask the kernel to read column `ci`'s dictionary pages in every row group now, together: read below one row group
+/// after another, a cold file's came off the disk one fault at a time while the query waited for its plan, before its
+/// reader started. `.header` reads the page each one opens with, all the headers want; `.whole` the dictionaries, for
+/// a union about to read them.
+fn prefetchDictionaries(
+    files: []const File,
+    metas: []const schema.FileMetaData,
+    refs: []const Ref,
+    ci: usize,
+    extent: enum { header, whole },
+) void {
+    const page_len = std.heap.pageSize();
+    for (refs) |ref| {
+        const rg = &metas[ref.file].row_groups.items[ref.rg];
+        if (ci >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[ci].meta_data orelse continue;
+        const b = dictSlice(files[ref.file], cm) orelse continue;
+        const start = @intFromPtr(b.ptr) & ~(page_len - 1);
+        const end = if (extent == .whole) @intFromPtr(b.ptr) + b.len else @intFromPtr(b.ptr) + @min(b.len, 1);
+        std.posix.madvise(@ptrFromInt(start), end - start, std.posix.MADV.WILLNEED) catch {};
+    }
+}
+
 fn header(bytes: []const u8) ?schema.PageHeader {
     // Bound malformed header work and never cross into the following data page.
     var reader = thrift.Reader.init(bytes[0..@min(bytes.len, 64 * 1024)]);
@@ -109,6 +132,7 @@ pub fn collectRetaining(
         stat.string_keys = stat.string_keys or key.typeOf() == .str;
         if (key != .col_ref) return stat;
     }
+    for (keys) |key| prefetchDictionaries(files, metas, refs.items, key.col_ref.col_idx, .header);
     const sums = try arena.alloc(u64, keys.len);
     const full = try arena.alloc(bool, keys.len);
     const dict_sizes = try arena.alloc(u64, keys.len);
@@ -197,6 +221,7 @@ pub fn collectRetaining(
         if (run) {
             stat.union_attempted = true;
             const col = key.col_ref.col_idx;
+            prefetchDictionaries(files, metas, refs.items, col, .whole);
             if (try unionBound(gpa, arena, files, metas, refs.items, col, workers, max_memory, retain, !gated)) |n| {
                 sums[ki] = @min(sums[ki], n + nulls[ki]);
                 // Multiplying marginal cardinalities does not estimate the number of observed tuples.

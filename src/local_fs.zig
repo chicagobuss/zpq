@@ -73,11 +73,18 @@ pub fn removeFile(path: []const u8) void {
     _ = posix.system.unlink(&path_z);
 }
 
-/// Size of the regular file open at `fd`, whose offset stays at 0. Linux reads it with `lseek(SEEK_END)` (std's
-/// libc layer has no `fstat` there) and lets `mmap`/`read` reject a directory; elsewhere `fstat` rejects anything but a
-/// regular file up front, since Darwin's `mmap` answers a directory with EINVAL, which `std.posix.mmap` treats as
-/// unreachable.
+/// Size of the regular file open at `fd`, whose offset stays at 0, or `error.NotAFile` for anything else. Linux
+/// checks the type with `statx` and reads the size with `lseek(SEEK_END)` (std's libc layer has no `fstat` there);
+/// elsewhere `fstat` does both, since Darwin's `mmap` answers a directory with EINVAL, which `std.posix.mmap` treats
+/// as unreachable.
 pub fn fileSize(fd: fd_t) !usize {
+    if (builtin.os.tag == .linux) {
+        // A directory "seeks" fine and then fails to map with a confusing error; a FIFO has no size at all.
+        const linux = std.os.linux;
+        var st = std.mem.zeroes(linux.Statx);
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
+            !linux.S.ISREG(st.mode)) return error.NotAFile;
+    }
     if (builtin.os.tag != .linux) {
         var st: posix.system.Stat = undefined;
         if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.StatFailed;
@@ -133,8 +140,9 @@ pub const Mapped = struct {
     }
 };
 
+/// Opens `path` without blocking (a FIFO would wait for a writer forever), checks it is a regular file, and maps it.
 pub fn mapFile(path: []const u8) !Mapped {
-    const fd = try openRead(path);
+    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
     defer close(fd);
     const size = try fileSize(fd);
     if (size == 0) return error.EmptyFile;
@@ -237,6 +245,20 @@ test "mapFile rejects an empty file" {
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/empty", .{tmp.sub_path});
     close(try createFile(path));
     try testing.expectError(error.EmptyFile, mapFile(path));
+}
+
+test "regression: mapFile refuses a directory and a FIFO instead of misreporting or blocking" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try testing.expectError(error.NotAFile, mapFile(dir));
+    var fbuf: [256]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fbuf, ".zig-cache/tmp/{s}/pipe", .{tmp.sub_path}, 0);
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0)));
+    try testing.expectError(error.NotAFile, mapFile(fifo));
 }
 
 test "writeAll distinguishes a full device from a broken pipe" {

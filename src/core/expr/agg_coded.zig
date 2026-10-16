@@ -37,8 +37,6 @@ pub fn floatSum(call: AggCall) bool {
 pub fn codedArg(call: AggCall, batch: *const filter_eval.Batch, lookup: []const ?usize) ?Column {
     const arg = call.arg orelse return null;
     if (arg != .col_ref) return null;
-    // A float sum folds row by row (`agg.sumBlocksF64`): a histogram's count × value per entry rounds otherwise.
-    if (floatSum(call)) return null;
     const pos = lookup[arg.col_ref.col_idx] orelse return null;
     const col = batch.cols[pos];
     if (col.codes() == null) return null;
@@ -162,6 +160,21 @@ pub fn updateOneCoded(
     if (call.func == .count_distinct) {
         const dict = try widenDict(arena, col, c);
         try foldDistinctCoded(arena, persist, state, col.codes().?, col.dictLen(), dict, sel);
+        return true;
+    }
+    // A float sum reads its entries row by row, in the order every path sums in: a histogram's count × entry
+    // rounds otherwise.
+    if (floatSum(call)) {
+        const dict = (try widenDict(arena, col, c)).f64.values;
+        const codes = col.codes().?;
+        switch (state.*) {
+            .sum_f => |*t| t.* = agg.sumBlocksCodedF64(t.* orelse 0, codes, dict, sel),
+            .avg => |*a| {
+                a.sum = agg.sumBlocksCodedF64(a.sum, codes, dict, sel);
+                a.count += sel.count();
+            },
+            else => return error.UnsupportedAggType,
+        }
         return true;
     }
     const hist = try histogram(arena, col.codes().?, col.dictLen(), sel);
@@ -543,7 +556,6 @@ pub fn groupedCoded(
 
     // Resolve each composite that occurs among selected rows, once.
     const gid_of = try ra.alloc(u32, space);
-    const unresolved = std.math.maxInt(u32);
     @memset(gid_of, unresolved);
     // Each key's dictionary plus a trailing null entry, widened exactly as the row path widens key values.
     const kd_cols = try ra.alloc(Column, keys.len);
@@ -664,6 +676,24 @@ pub fn serializeKeyAt(
     }
 }
 
+const unresolved = std.math.maxInt(u32);
+
+/// Whether a float sum's partials can start from their groups' sums: every composite that occurs is its own group,
+/// and few enough to check. Two composites of one group (a float key's 0.0 and -0.0 entries) would each start from
+/// the same sum and the second write back would drop the first's rows.
+fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
+    var gids: std.ArrayList(u32) = .empty;
+    defer gids.deinit(ra);
+    for (gid_of) |g| if (g != unresolved) {
+        if (gids.items.len == 4096) return false;
+        try gids.append(ra, g);
+    };
+    if (gids.items.len < 2) return true;
+    std.mem.sortUnstable(u32, gids.items, {}, std.sort.asc(u32));
+    for (gids.items[1..], gids.items[0 .. gids.items.len - 1]) |a, b| if (a == b) return false;
+    return true;
+}
+
 pub fn foldGroupedCall(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -777,7 +807,7 @@ pub fn foldGroupedCall(
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
     const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
-        !float_sum;
+        (!float_sum or try seedable(ra, gid_of));
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
@@ -792,7 +822,15 @@ pub fn foldGroupedCall(
             const is_min = call.func == .min;
             const part = try ra.alloc(f64, space);
             switch (call.func) {
-                .sum, .avg => @memset(part, 0),
+                // Each partial starts from its group's running sum and ends as it, so the rows add in the row fold's
+                // order (`agg.sumBlocksF64`'s grouped form): `seedable` saw one composite to a group.
+                .sum, .avg => for (part, gid_of) |*p, g| {
+                    p.* = if (g == unresolved) 0 else switch (accs[g * agg_len + ai]) {
+                        .sum_f => |t| t orelse 0,
+                        .avg => |a| a.sum,
+                        else => 0,
+                    };
+                },
                 // Each order's identity (`agg.minTotal`/`maxTotal`): NaN for min, -inf for max.
                 .min => @memset(part, std.math.nan(f64)),
                 .max => @memset(part, -std.math.inf(f64)),
@@ -821,9 +859,9 @@ pub fn foldGroupedCall(
                 if (seen[cp] == 0) continue;
                 const st = &accs[gid_of[cp] * agg_len + ai];
                 switch (st.*) {
-                    .sum_f => |*s| s.* = (s.* orelse 0) + part[cp],
+                    .sum_f => |*s| s.* = part[cp],
                     .avg => |*a| {
-                        a.sum += part[cp];
+                        a.sum = part[cp];
                         a.count += seen[cp];
                     },
                     .min_f => |*m| agg.foldExtremeF(true, m, part[cp]),

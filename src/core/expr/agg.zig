@@ -1185,14 +1185,14 @@ fn planStatFold(
     }
     var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
     if (call.func == .sum) {
-        // A float constant's `present × v` rounds once where adding it `present` times (`sumBlocksF64`) rounds at
-        // each step: the answer would hang on whether this row group's statistics were read.
-        if (lane == .float) return null;
         if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
         // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
         // constant.
         plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
         if (lane == .decimal and decimal_mod.statToI128(bounds.min, lane.decimal) == null) return null;
+        // A float constant sums block by block as its rows would (`sumConstantF64`), which needs every row present:
+        // a NULL moves the rows after it within their blocks.
+        if (lane == .float and plan.present != rg.num_rows) return null;
     }
     return plan;
 }
@@ -1282,7 +1282,7 @@ fn foldConstantSumStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            s.* = (s.* orelse 0) + v * @as(f64, @floatFromInt(present));
+            s.* = sumConstantF64(s.* orelse 0, v, @intCast(present));
         },
         else => return error.UnsupportedAggType,
     }
@@ -1381,7 +1381,7 @@ pub fn updateOne(
     switch (call.func) {
         .count => state.count += sel.count(),
         .count_distinct => try foldDistinct(persist, state, values.?, sel),
-        .sum => try foldSum(state, values.?, sel, u64_col, call.offset),
+        .sum => try foldSum(state, values.?, sel, u64_col, call.offset, if (input.gathered_from) |*g| g else null),
         .min => if (call.result == .bytes)
             try foldMinMaxBytes(persist, true, state, values.?, sel)
         else
@@ -1390,7 +1390,7 @@ pub fn updateOne(
             try foldMinMaxBytes(persist, false, state, values.?, sel)
         else
             foldMax(state, values.?, sel, u64_col),
-        .avg => try foldAvg(state, values.?, sel, u64_col),
+        .avg => try foldAvg(state, values.?, sel, u64_col, if (input.gathered_from) |*g| g else null),
     }
 }
 
@@ -1527,6 +1527,9 @@ const PreparedAggInput = struct {
     /// Unsigned INT64 column: the i64 lane holds raw bits; the numeric folds
     /// must reinterpret them as u64 (see ColRef.unsigned_64).
     unsigned_64: bool = false,
+    /// The selection `values` were gathered from (`evalArg`), one value per selected row: a float sum walks it to add
+    /// them in their rows' blocks (`sumBlocksGatheredF64`).
+    gathered_from: ?filter_selection.SelectionVector = null,
 
     fn init(
         arena: std.mem.Allocator,
@@ -1548,9 +1551,10 @@ const PreparedAggInput = struct {
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
             else => {
-                // Gathered, a float sum's rows would leave the row group's blocks (`sumBlocksF64`).
-                in.values = if (rowless and !agg_coded.floatSum(call))
-                    try in.evalArg(arena, batch, column_lookup, arg)
+                // A float sum folds gathered values in their rows' blocks (`gathered_from`), which a NULL found after
+                // the gather would shift: such an argument is evaluated in place, its coded columns materialized.
+                in.values = if (rowless)
+                    try in.evalArg(arena, batch, column_lookup, arg, !(agg_coded.floatSum(call) and arg.mayBeNull()))
                 else
                     try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
                 // A computed value may be NULL (`strlen` of a NULL): skipped, as a bare column's NULLs are.
@@ -1572,6 +1576,7 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         arg: expr_ast.Expr,
+        may_gather: bool,
     ) Error!filter_eval.Batch.Column {
         const refs = try arena.alloc(bool, column_lookup.len);
         defer arena.free(refs);
@@ -1583,7 +1588,7 @@ const PreparedAggInput = struct {
         };
         const sel = self.selection();
         const active = sel.count();
-        const sparse = active * 4 <= batch.num_rows;
+        const sparse = may_gather and active * 4 <= batch.num_rows;
         if (!sparse and !any_coded) return expr_eval.evalExpr(arena, &batch.restrictedTo(sel), column_lookup, arg);
 
         const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
@@ -1598,7 +1603,7 @@ const PreparedAggInput = struct {
         const gathered: filter_eval.Batch = .{ .cols = cols, .num_rows = rows, .sel = if (sparse) null else sel };
         const values = try expr_eval.evalExpr(arena, &gathered, column_lookup, arg);
         if (!sparse) return values;
-        if (self.own_sel) |*s| s.deinit();
+        self.gathered_from = if (self.own_sel) |s| s else try self.outer_sel.cloneAlloc(arena);
         self.own_sel = try filter_selection.SelectionVector.init(arena, active);
         return values;
     }
@@ -1615,6 +1620,7 @@ const PreparedAggInput = struct {
             else => unreachable,
         };
         if (self.own_sel) |*s| s.deinit();
+        if (self.gathered_from) |*s| s.deinit();
         self.* = undefined;
     }
 
@@ -1796,6 +1802,79 @@ pub fn sumBlocksF64(acc: f64, vals: []const f64, sel: *const filter_selection.Se
     return total;
 }
 
+/// `sumBlocksF64` over the rows `sel` selects when their values were gathered, in row order, into `vals`: each block
+/// takes the next values it selects, so the bits are those of summing them in place.
+pub fn sumBlocksGatheredF64(acc: f64, vals: []const f64, sel: *const filter_selection.SelectionVector) f64 {
+    var total = acc;
+    var at: usize = 0;
+    const full_words = sel.len / 64;
+    for (sel.mask[0..(sel.len + 63) / 64], 0..) |mask, w| {
+        const word = if (w < full_words) mask else mask & ((@as(u64, 1) << @intCast(sel.len % 64)) - 1);
+        if (word == 0) continue;
+        const n = @popCount(word);
+        if (word == std.math.maxInt(u64)) {
+            total += fullBlockSum(vals[at..][0..64]);
+        } else {
+            var sum = vals[at];
+            for (vals[at + 1 ..][0 .. n - 1]) |v| sum += v;
+            total += sum;
+        }
+        at += n;
+    }
+    return total;
+}
+
+/// `sumBlocksF64` over a dictionary-coded column, `dict[codes[r]]` for row r: the same blocks, the same bits, without
+/// materializing the values.
+pub fn sumBlocksCodedF64(
+    acc: f64,
+    codes: []const u32,
+    dict: []const f64,
+    sel: *const filter_selection.SelectionVector,
+) f64 {
+    var total = acc;
+    var block: [64]f64 = undefined;
+    var w: usize = 0;
+    while ((w + 1) * 64 <= codes.len) : (w += 1) {
+        const word = sel.mask[w];
+        if (word == 0) continue;
+        const c = codes[w * 64 ..][0..64];
+        if (word == std.math.maxInt(u64)) {
+            for (&block, c) |*b, k| b.* = dict[k];
+            total += fullBlockSum(&block);
+        } else total += partialCodedSum(c, dict, word);
+    }
+    const tail = codes.len - w * 64;
+    if (tail != 0) {
+        const word = sel.mask[w] & ((@as(u64, 1) << @intCast(tail)) - 1);
+        if (word != 0) total += partialCodedSum(codes[w * 64 ..], dict, word);
+    }
+    return total;
+}
+
+inline fn partialCodedSum(codes: []const u32, dict: []const f64, word: u64) f64 {
+    var bits = word;
+    var sum = dict[codes[@ctz(bits)]];
+    bits &= bits - 1;
+    while (bits != 0) : (bits &= bits - 1) sum += dict[codes[@ctz(bits)]];
+    return sum;
+}
+
+/// `sumBlocksF64` over `n` rows all holding `v`, all selected, in O(n / 64): every full block sums to the same value.
+/// Bit for bit what decoding the chunk and summing it gives, so a constant chunk may answer from its statistics.
+pub fn sumConstantF64(acc: f64, v: f64, n: u64) f64 {
+    var total = acc;
+    const block: [64]f64 = @splat(v);
+    const b = fullBlockSum(&block);
+    for (0..n / 64) |_| total += b;
+    if (n % 64 != 0) {
+        var t = v;
+        for (1..n % 64) |_| t += v;
+        total += t;
+    }
+    return total;
+}
+
 const VF16 = @Vector(16, f64);
 
 inline fn fullBlockSum(block: *const [64]f64) f64 {
@@ -1937,6 +2016,7 @@ fn foldSum(
     sel: *const filter_selection.SelectionVector,
     unsigned_64: bool,
     offset: i64,
+    gathered_from: ?*const filter_selection.SelectionVector,
 ) Error!void {
     if (!sel.any()) return; // no values: leave a NULL sum NULL
     switch (state.*) {
@@ -1944,7 +2024,10 @@ fn foldSum(
             const sum = if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
             s.* = (s.* orelse 0) + sum + @as(i128, offset) * sel.count();
         },
-        .sum_f => |*s| s.* = sumBlocksF64(s.* orelse 0, col.f64.values, sel),
+        .sum_f => |*s| s.* = if (gathered_from) |g|
+            sumBlocksGatheredF64(s.* orelse 0, col.f64.values, g)
+        else
+            sumBlocksF64(s.* orelse 0, col.f64.values, sel),
         .sum_d => |*d| d.add(sumExact(col, sel), sel.count()),
         else => return error.UnsupportedAggType,
     }
@@ -2088,6 +2171,7 @@ fn foldAvg(
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
     unsigned_64: bool,
+    gathered_from: ?*const filter_selection.SelectionVector,
 ) Error!void {
     if (state.* == .avg_d) return state.avg_d.add(sumExact(col, sel), sel.count());
     const a = &state.avg;
@@ -2103,7 +2187,10 @@ fn foldAvg(
             };
         },
         .f64 => |c| {
-            a.sum = sumBlocksF64(a.sum, c.values, sel);
+            a.sum = if (gathered_from) |g|
+                sumBlocksGatheredF64(a.sum, c.values, g)
+            else
+                sumBlocksF64(a.sum, c.values, sel);
             a.count += sel.count();
         },
         else => return error.UnsupportedAggType,
@@ -5938,5 +6025,66 @@ test "regression: sumBlocksF64 gives the same bits however a row group is cut in
             }
             try std.testing.expectEqual(@as(u64, @bitCast(whole)), @as(u64, @bitCast(acc)));
         }
+    }
+}
+
+test "regression: sumConstantF64 is sumBlocksF64 over the constant's rows" {
+    const gpa = std.testing.allocator;
+    for ([_]f64{ 0.1, -3.3e-5, 1e300, 7 }) |v| for ([_]u64{ 1, 63, 64, 65, 1000, 64 * 50 }) |n| {
+        const vals = try gpa.alloc(f64, n);
+        defer gpa.free(vals);
+        @memset(vals, v);
+        var sel = try filter_selection.SelectionVector.init(gpa, n);
+        defer sel.deinit();
+        const want = sumBlocksF64(0.25, vals, &sel);
+        try std.testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(sumConstantF64(0.25, v, n))));
+    };
+}
+
+test "regression: sumBlocksCodedF64 is sumBlocksF64 over the column the codes stand for" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(9);
+    const rnd = prng.random();
+    const dict = [_]f64{ 1e16, -3.25, 0.1, 7e-9, -1e16 };
+    const n = 64 * 9 + 13;
+    const codes = try gpa.alloc(u32, n);
+    defer gpa.free(codes);
+    const vals = try gpa.alloc(f64, n);
+    defer gpa.free(vals);
+    for (codes, vals) |*c, *v| {
+        c.* = rnd.uintLessThan(u32, dict.len);
+        v.* = dict[c.*];
+    }
+    for ([_]u32{ 1, 3 }) |keep| {
+        var sel = try filter_selection.SelectionVector.init(gpa, n);
+        defer sel.deinit();
+        for (0..n) |i| sel.set(i, keep == 1 or rnd.uintLessThan(u32, keep) == 0);
+        const want = sumBlocksF64(0, vals, &sel);
+        const got = sumBlocksCodedF64(0, codes, &dict, &sel);
+        try std.testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(got)));
+    }
+}
+
+test "regression: sumBlocksGatheredF64 sums gathered values in their rows' blocks" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const n = 64 * 7 + 29;
+    const vals = try gpa.alloc(f64, n);
+    defer gpa.free(vals);
+    for (vals) |*v| {
+        const magnitude = std.math.pow(f64, 10, @floatFromInt(rnd.intRangeAtMost(i32, -3, 16)));
+        v.* = (rnd.float(f64) - 0.5) * magnitude;
+    }
+    for ([_]u32{ 1, 2, 50 }) |keep| {
+        var sel = try filter_selection.SelectionVector.init(gpa, n);
+        defer sel.deinit();
+        for (0..n) |i| sel.set(i, keep == 1 or rnd.uintLessThan(u32, keep) == 0);
+        var gathered: std.ArrayList(f64) = .empty;
+        defer gathered.deinit(gpa);
+        for (vals, 0..) |v, i| if (sel.isActive(i)) try gathered.append(gpa, v);
+        const want = sumBlocksF64(0, vals, &sel);
+        const got = sumBlocksGatheredF64(0, gathered.items, &sel);
+        try std.testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(got)));
     }
 }

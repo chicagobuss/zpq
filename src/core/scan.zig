@@ -8727,6 +8727,7 @@ test "regression: float sums and avgs keep their bits at every -j, budget, decod
     for ([_]Shape{
         .{ .group_by = null, .filter = null },
         .{ .group_by = null, .filter = "i > 7" },
+        .{ .group_by = null, .filter = "k = 'zeta'" },
         .{ .group_by = "k", .filter = null },
         .{ .group_by = "k", .filter = "i > 7" },
     }) |shape| {
@@ -8738,7 +8739,9 @@ test "regression: float sums and avgs keep their bits at every -j, budget, decod
             for ([_]bool{ true, false }) |encoded| for ([_]bool{ true, false }) |scan_all| {
                 const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
                     .inputs = &inputs,
-                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t",
+                    // Computed arguments over the coded column: one gathered under a sparse filter, one that may be
+                    // NULL and so evaluates in place.
+                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t, sum(CASE WHEN i > 3 THEN x END) AS u",
                     .group_by = shape.group_by,
                     .filter = shape.filter,
                     .parallelism = j,

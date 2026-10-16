@@ -2954,10 +2954,7 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, stage
     for (target.planCalls()) |call| {
         if (call.where) |w| markFilter(u, w);
         if (call.arg) |arg| switch (arg) {
-            // A float sum reads values, in the one row order every path sums in (`agg.sumBlocksF64`).
-            .col_ref => |c| mark(if (call.func == .count and target == .scalar)
-                u.levels
-            else if (agg_coded.floatSum(call)) u.value else u.code, c.col_idx),
+            .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
             // A scalar fold evaluates a computed argument itself, gathering coded columns (`agg_coded.gatherSelected`).
             else => if (target == .scalar) arg.collectColumns(u.code) else markExprValues(u, arg),
         };

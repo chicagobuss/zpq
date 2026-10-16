@@ -56,6 +56,8 @@ pub const Error = error{
     LevelOutOfRange,
     /// A page's values expand past `DecodeOptions.expand_limit`, the query's budget.
     ExceededMemoryBudget,
+    /// An INT32 value outside its column's 8- or 16-bit integer annotation (`IntRange`).
+    IntOutOfRange,
 } || page_mod.Error;
 
 /// Choose the right decoder shape for T at comptime.
@@ -125,16 +127,47 @@ pub const DecodeOptions = struct {
     /// The most bytes one page's DELTA_BYTE_ARRAY values may expand to: the query's memory budget, which a page past
     /// it could only overrun (a few bytes of prefix lengths can ask for a terabyte).
     expand_limit: usize = std.math.maxInt(usize),
+    /// Per chunk (`chunkOptions`): the range an INT32 column's narrow integer annotation allows.
+    int_range: ?IntRange = null,
 };
 
 /// `o` for the chunk `cm` describes: its pages inflate to at most twice what the footer says the chunk holds, plus
 /// slack for writers that count loosely.
-pub fn chunkOptions(o: DecodeOptions, cm: schema.ColumnMetaData) DecodeOptions {
+pub fn chunkOptions(o: DecodeOptions, meta: *const schema.FileMetaData, cm: schema.ColumnMetaData) DecodeOptions {
     var x = o;
     const total = std.math.cast(usize, cm.total_uncompressed_size) orelse std.math.maxInt(usize);
     x.page_bytes_limit = @min(o.page_bytes_limit, total *| 2 +| (1 << 20));
+    if (cm.type == .INT32) if (meta.getColumnSchema(cm.path_in_schema.items)) |se| {
+        x.int_range = IntRange.of(se);
+    };
     return x;
 }
+
+/// The values an INT32 column's 8- or 16-bit integer annotation (INT_8/16, UINT_8/16, or the INTEGER logical type)
+/// allows. A wider physical value is no value of the column: zero-extended it read as 16777423 in a UINT_8 column,
+/// and truncated, as some readers do, as a number no writer wrote.
+pub const IntRange = struct {
+    min: i32,
+    max: i32,
+
+    pub fn of(se: schema.SchemaElement) ?IntRange {
+        const bits: u5, const signed: bool = if (se.logical_type) |lt| switch (lt) {
+            .INTEGER => |it| switch (it.bitWidth) {
+                8, 16 => .{ @intCast(it.bitWidth), it.isSigned },
+                else => return null,
+            },
+            else => return null,
+        } else if (se.converted_type) |ct| switch (ct) {
+            .INT_8 => .{ 8, true },
+            .INT_16 => .{ 16, true },
+            .UINT_8 => .{ 8, false },
+            .UINT_16 => .{ 16, false },
+            else => return null,
+        } else return null;
+        const top = @as(i32, 1) << if (signed) bits - 1 else bits;
+        return if (signed) .{ .min = -top, .max = top - 1 } else .{ .min = 0, .max = top - 1 };
+    }
+};
 
 /// Hardwood's definition-level test, ported: a page has no nulls iff its
 /// def-level stream is a single RLE run at max_def long enough to cover
@@ -1043,13 +1076,38 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn decodePackedFromCurrentPage(self: *Self, dest: []T) Error!usize {
-            return switch (self.active) {
+            const got = switch (self.active) {
                 .idle => 0,
                 inline else => |*d| if (@TypeOf(d.*) == void)
                     unreachable
                 else
-                    d.decode(dest) catch error.UnexpectedPage,
+                    d.decode(dest) catch return error.UnexpectedPage,
             };
+            // A dictionary's codes index entries checked when it was installed.
+            if (T == i32 and self.active != .rle_dict) try self.checkIntRange(dest[0..got]);
+            return got;
+        }
+
+        /// `error.IntOutOfRange` for a value past the column's 8- or 16-bit integer annotation (`IntRange`).
+        fn checkIntRange(self: *const Self, values: []const i32) Error!void {
+            const r = self.options.int_range orelse return;
+            const L = 16;
+            const V = @Vector(L, i32);
+            var lo: V = @splat(r.min);
+            var hi: V = @splat(r.max);
+            var i: usize = 0;
+            while (i + L <= values.len) : (i += L) {
+                const v: V = values[i..][0..L].*;
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+            var min = @reduce(.Min, lo);
+            var max = @reduce(.Max, hi);
+            for (values[i..]) |v| {
+                min = @min(min, v);
+                max = @max(max, v);
+            }
+            if (min < r.min or max > r.max) return error.IntOutOfRange;
         }
 
         /// BYTE_STREAM_SPLIT: transpose the byte-planes back to PLAIN layout
@@ -1211,6 +1269,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     var d = plain.Decoder(T).init(pg.bytes);
                     const n = d.decode(buf) catch return error.UnexpectedPage;
                     if (n != num) return error.UnexpectedPage;
+                    if (T == i32) try self.checkIntRange(buf);
                 },
                 []const u8 => {
                     if (self.type_length > 0) {

@@ -7911,6 +7911,20 @@ test "regression: more local inputs than the open-file limit allows still answer
     }
 }
 
+test "regression: a UINT_8 value past 8 bits is refused, not zero-extended" {
+    const path = "ci/fixtures/parquet/uint8_out_of_range.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    // One `u8` value holds 52314 in its INT32: it read as that, where its 8 bits say 90.
+    for ([_]?[]const u8{ null, "u8 > 0" }) |filter| try std.testing.expectError(
+        error.IntOutOfRange,
+        runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "max(u8) AS m", .filter = filter }),
+    );
+    // The other columns of the file still read.
+    var ok = try runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(*) AS n, max(i32) AS m" });
+    defer ok.deinit(std.testing.allocator);
+}
+
 test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column of empty strings" {
     const path = "ci/fixtures/parquet/flba_length0.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;

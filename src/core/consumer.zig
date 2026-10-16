@@ -576,7 +576,7 @@ fn decodeWriteColumn(
     const chunk_span = profile.Span.begin(prof);
     const col = &rg.columns.items[ci];
     const cm = col.meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
+    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
     const len: usize = @intCast(cm.total_compressed_size);
     // Programmer invariant: the chunk's absolute start is at or past
@@ -718,7 +718,7 @@ pub fn chunkDictionary(
         cm.codec,
         levels,
         a,
-        column_mod.chunkOptions(.{}, cm),
+        column_mod.chunkOptions(.{}, meta, cm),
         null,
     );
     return r.dictionaryOfEveryPage();
@@ -770,7 +770,7 @@ pub const SliceReader = struct {
     ) !?SliceReader {
         if (!supports(rg, meta, ci)) return null;
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-        const decode_options = column_mod.chunkOptions(decode_options_in, cm);
+        const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
         const se = meta.getColumnSchema(cm.path_in_schema.items);
         const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
@@ -1105,7 +1105,7 @@ fn decodeDecimalI128(
     decode_options_in: DecodeOptions,
 ) !filter_eval.ColumnT(i128) {
     const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
+    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
     const len: usize = @intCast(cm.total_compressed_size);
     invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
@@ -1310,7 +1310,7 @@ fn decodeWriteColumnMaybeCoded(
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
     const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
+    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const se = meta.getColumnSchema(cm.path_in_schema.items);
     const converted = if (se) |e| decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e) else false;
@@ -2865,7 +2865,7 @@ const ChunkDecoder = struct {
         // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
-        var decode_options = column_mod.chunkOptions(self.decode_options, cm);
+        var decode_options = column_mod.chunkOptions(self.decode_options, in.meta, cm);
         decode_options.any_dictionary = switch (self.target) {
             .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
             .scalar => false,

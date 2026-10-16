@@ -65,6 +65,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  column's maximum (corrupt file)\n",
             .{},
         ),
+        error.IntOutOfRange => diagnosticPrint(
+            "zpq query: a page holds a value past its column's 8- or 16-bit integer\n" ++
+                "  type (corrupt file)\n",
+            .{},
+        ),
         error.InputChanged => diagnosticPrint(
             "zpq query: an input file was truncated or rewritten while the query read it\n",
             .{},

@@ -7,6 +7,9 @@
  * fields and returns {"ok":true,"ndjson":"..."}, containing the CLI's exact NDJSON rows. SQL request/response
  * shapes are EXPERIMENTAL in 0.5.0, with no stability guarantee. See docs/libzpq.md.
  * Structured requests keep the Lambda response. Query failures return an {"error": ...} document.
+ * An answer returned in the response (SQL rows, GROUP BY rows) is at most the request's "max_result_bytes" bytes,
+ * the larger of the query's budget and 1 GiB by default. Past it the response is {"error":"result_too_large", ...}
+ * naming the cap: raise "max_result_bytes", or write the answer to an "output_url" instead.
  *
  * Ownership: every char * libzpq hands out (a response, an error message) is malloc'd, NUL-terminated, owned by the
  * caller from then on, and freed with zpq_free. zpq_strerror's strings are static: never free them. libzpq keeps no

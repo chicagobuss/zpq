@@ -213,6 +213,11 @@ Outside the ceiling altogether:
   context until `zpq_close`;
 - local inputs, which are memory-mapped: their pages count in the process's resident memory (and in a cgroup's
   memory use) while a query reads them, as page cache the kernel can reclaim.
+- an answer returned in the response (SQL rows, GROUP BY rows), built once, at most the request's
+  `max_result_bytes` bytes: by default the larger of the query's budget and 1 GiB, so a budget sized for the scan
+  does not refuse an answer the host can take. Past it the response is
+  `{"error":"result_too_large","reason":"ResultTooLarge","max_result_bytes":N,"hint":...}`: raise
+  `max_result_bytes`, or write the answer to `output_url`.
 
 ## What libzpq does to the process
 

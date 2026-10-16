@@ -31,6 +31,11 @@
   without `GROUP BY`). Of two equal zeros, `-0` is the lesser. Every path agrees, whatever the order rows and partial
   results meet in: plain and grouped, dictionary-coded or not, and answers from statistics, where a `max` is taken only
   from a chunk known to hold no NaN.
+- An answer returned inline (libzpq and Lambda: SQL rows, GROUP BY rows) is capped by the request's
+  `max_result_bytes`: by default the larger of the query's budget and 1 GiB, and just under the 6 MB a Lambda
+  response may be on Lambda. Past it the response is a `result_too_large` error naming the cap, where an answer past
+  6 MB was posted to the Lambda Runtime API and refused without a reason. Raise `max_result_bytes`, or write the answer
+  to `output_url`. The answer is built once, where it was held three times over.
 
 ### Added
 

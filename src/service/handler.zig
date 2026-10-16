@@ -306,9 +306,13 @@ pub fn handle(
         };
         qa.profiler = profiler;
 
-        // An answer returned inline is built whole, beside the query: no larger than its budget, and on Lambda no
-        // larger than the 6 MB a response may be (a larger one was posted and refused, with no reason given).
-        const result_cap = req.max_result_bytes orelse if (zpq.core.system.onLambda(env)) lambda_result_cap else budget;
+        // An answer returned inline is built whole, beside the query. On Lambda it can be no larger than the 6 MB a
+        // response may be (a larger one was posted and refused, with no reason given). Elsewhere the floor of 1 GiB
+        // keeps every answer an embedding host took before (built three times over then, once now) under a budget
+        // set for the scan, not the answer.
+        const on_lambda = zpq.core.system.onLambda(env);
+        const default_cap = if (on_lambda) lambda_result_cap else @max(budget, default_result_floor);
+        const result_cap: ResultCap = .{ .bytes = req.max_result_bytes orelse default_cap, .lambda = on_lambda };
         if (req.sql) |sql| {
             const response = try runSql(io, allocator, env, pool, qa, sql, result_cap);
             const p = profiler orelse return response;
@@ -359,7 +363,7 @@ fn runSql(
     pool: *PersistentPool,
     options: engine.QueryArgs,
     sql: []const u8,
-    result_cap: usize,
+    result_cap: ResultCap,
 ) ![]u8 {
     if (comptime !@hasDecl(zpq.core.expr.sql_parser, "parseSqlQuery")) {
         return rejectResponse(allocator, "engine", "SqlNotCompiledIn", "message", "SQL is not compiled in");
@@ -377,10 +381,11 @@ fn runSql(
         var diag: Diag = .{};
         var parse_arena = std.heap.ArenaAllocator.init(allocator);
         defer parse_arena.deinit();
-        var capped: Capped = .{ .parent = allocator, .cap = result_cap };
+        var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
         const result_memory = capped.allocator();
         const sql_arena = parse_arena.allocator();
-        return executeSql(io, allocator, result_memory, sql_arena, env, pool, options, sql, &diag) catch |err| {
+        const answer = executeSql(io, allocator, result_memory, sql_arena, env, pool, options, sql, &diag);
+        return result_cap.admit(allocator, answer catch |err| {
             if (capped.hit) return resultTooLarge(allocator, result_cap);
             if (err == error.OutOfMemory) return err;
             zpq.frontend.queryError(err, &diag);
@@ -394,15 +399,36 @@ fn runSql(
             try engine.writeJsonQuoted(&out.writer, message);
             try out.writer.writeByte('}');
             return out.toOwnedSlice();
-        };
+        });
     }
 }
 
 /// The largest response the Lambda Runtime API takes (6 MB), less room for the envelope.
 const lambda_result_cap = 6 * 1000 * 1000 - 64 * 1024;
+/// The least an inline answer may take by default off Lambda (`max_result_bytes` sets it per request).
+const default_result_floor = 1 << 30;
+
+/// The most an inline answer may take, and whether that is Lambda's limit (which `max_result_bytes` cannot raise).
+const ResultCap = struct {
+    bytes: usize,
+    lambda: bool,
+
+    /// What building an answer of `bytes` may hold: a growing buffer has slack past what it holds, and the old and
+    /// the new one both while it moves, so a cap on what is held would refuse answers well under `bytes`.
+    fn memory(self: ResultCap) usize {
+        return self.bytes *| 3;
+    }
+
+    /// `response`, or `resultTooLarge` in its place when it is longer than the cap.
+    fn admit(self: ResultCap, allocator: std.mem.Allocator, response: []u8) ![]u8 {
+        if (response.len <= self.bytes) return response;
+        allocator.free(response);
+        return resultTooLarge(allocator, self);
+    }
+};
 
 /// An allocator that holds at most `cap` bytes at once: an answer built for the response on it fails as too large
-/// (`resultTooLarge`) rather than growing past the query's budget, as one built whole three times over did.
+/// (`resultTooLarge`) rather than growing without bound, as one built whole three times over did.
 const Capped = struct {
     parent: std.mem.Allocator,
     cap: usize,
@@ -453,12 +479,16 @@ const Capped = struct {
     }
 };
 
-fn resultTooLarge(allocator: std.mem.Allocator, cap: usize) ![]u8 {
+fn resultTooLarge(allocator: std.mem.Allocator, cap: ResultCap) ![]u8 {
+    const hint = if (cap.lambda)
+        "a Lambda response holds at most 6 MB: write the answer to output_url"
+    else
+        "raise the request's max_result_bytes (a byte count) past this answer, or write the answer to output_url";
     return std.fmt.allocPrint(
         allocator,
         "{{\"error\":\"result_too_large\",\"reason\":\"ResultTooLarge\",\"max_result_bytes\":{d}," ++
-            "\"hint\":\"write the answer to output_url, or raise max_result_bytes\"}}",
-        .{cap},
+            "\"hint\":\"{s}\"}}",
+        .{ cap.bytes, hint },
     );
 }
 
@@ -498,8 +528,12 @@ fn executeSql(
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
     };
-    var rows: std.Io.Writer.Allocating = .init(result_memory);
-    defer rows.deinit();
+    var out: std.Io.Writer.Allocating = .init(result_memory);
+    defer out.deinit();
+    try out.writer.writeAll("{\"ok\":true,\"ndjson\":\"");
+    // Quoted into the response as they are printed: an NDJSON copy beside it held the answer twice, under one cap.
+    var quote_buf: [4096]u8 = undefined;
+    var rows: JsonQuoting = .init(&out.writer, &quote_buf);
     if (qa.aggregate != null or qa.group_by != null) {
         var result = try engine.runQuery(ctx, qa);
         defer result.deinit(allocator);
@@ -517,13 +551,77 @@ fn executeSql(
             &rows.writer,
         );
     }
-    var out: std.Io.Writer.Allocating = .init(result_memory);
-    defer out.deinit();
-    try out.writer.writeAll("{\"ok\":true,\"ndjson\":");
-    try engine.writeJsonQuoted(&out.writer, rows.written());
-    try out.writer.writeByte('}');
+    try rows.finish();
+    try out.writer.writeAll("\"}");
     return out.toOwnedSlice();
 }
+
+/// A writer that writes what it is given into `inner` as the body of a JSON string (`engine.writeJsonString`). A
+/// UTF-8 sequence split between two writes is held until it is whole, so it is not read as two invalid ones.
+const JsonQuoting = struct {
+    inner: *std.Io.Writer,
+    carry: [4]u8 = undefined,
+    carry_len: usize = 0,
+    writer: std.Io.Writer,
+
+    fn init(inner: *std.Io.Writer, buffer: []u8) JsonQuoting {
+        return .{ .inner = inner, .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    /// Flush, and write a sequence the input ended inside of as the invalid bytes it is.
+    fn finish(self: *JsonQuoting) std.Io.Writer.Error!void {
+        try self.writer.flush();
+        try engine.writeJsonString(self.inner, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *JsonQuoting = @fieldParentPtr("writer", w);
+        try self.escape(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.escape(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.escape(last);
+        return n + last.len * splat;
+    }
+
+    fn escape(self: *JsonQuoting, bytes: []const u8) std.Io.Writer.Error!void {
+        var s = bytes;
+        if (self.carry_len > 0) {
+            const want = sequenceLen(self.carry[0]) - self.carry_len;
+            const take = @min(want, s.len);
+            @memcpy(self.carry[self.carry_len..][0..take], s[0..take]);
+            self.carry_len += take;
+            s = s[take..];
+            if (take < want) return;
+            try engine.writeJsonString(self.inner, self.carry[0..self.carry_len]);
+            self.carry_len = 0;
+        }
+        const whole = wholePrefix(s);
+        try engine.writeJsonString(self.inner, s[0..whole]);
+        @memcpy(self.carry[0 .. s.len - whole], s[whole..]);
+        self.carry_len = s.len - whole;
+    }
+
+    fn sequenceLen(lead: u8) usize {
+        return std.unicode.utf8ByteSequenceLength(lead) catch 1;
+    }
+
+    /// `s` up to a sequence its last bytes begin and do not finish.
+    fn wholePrefix(s: []const u8) usize {
+        for (1..4) |k| {
+            if (k > s.len) break;
+            const b = s[s.len - k];
+            if (b & 0xc0 == 0x80) continue;
+            return if (sequenceLen(b) > k) s.len - k else s.len;
+        }
+        return s.len;
+    }
+};
 
 /// Bytes of the request echoed into a profile's metadata.
 const MAX_PROFILE_QUERY: usize = 4096;
@@ -694,7 +792,7 @@ fn runAggregate(
     env: std.process.Environ,
     pool: *PersistentPool,
     qa: engine.QueryArgs,
-    result_cap: usize,
+    result_cap: ResultCap,
 ) ![]u8 {
     // 1-row S3 output not yet supported (Stage 5b); engine.runQuery
     // gives aggregate precedence over output, so qa.output is ignored.
@@ -717,14 +815,14 @@ fn runAggregate(
     const ar = result.aggregate;
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
-    var capped: Capped = .{ .parent = allocator, .cap = result_cap };
+    var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
     var aw: std.Io.Writer.Allocating = .init(capped.allocator());
     defer aw.deinit();
     aggregateResponse(&aw.writer, ar, total_ms, pool) catch |err| {
         if (capped.hit) return resultTooLarge(allocator, result_cap);
         return err;
     };
-    return aw.toOwnedSlice();
+    return result_cap.admit(allocator, try aw.toOwnedSlice());
 }
 
 /// `runAggregate`'s response for `ar`, onto `w`.
@@ -979,6 +1077,45 @@ test "regression: an inline answer past max_result_bytes fails as too large, bef
         if (c.too_large) {
             try expectStringField(response, "reason", "ResultTooLarge");
         } else try std.testing.expect(std.mem.startsWith(u8, response, "{\"ok\":true"));
+    }
+}
+
+test "regression: max_result_bytes counts the answer once: one of exactly that many bytes is returned" {
+    const a = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    var pool: PersistentPool = .sized(256 << 20);
+    defer pool.deinit();
+    const sql = "{\"sql\":\"SELECT * FROM 'ci/fixtures/parquet/nullable_mix.parquet'\"";
+    const whole = try handle(std.testing.io, a, .empty, sql ++ "}", &pool, null);
+    defer a.free(whole);
+    try std.testing.expect(std.mem.startsWith(u8, whole, "{\"ok\":true"));
+    // The rows and their quoted copy were held under one cap: an answer needed about twice its size.
+    for ([_]usize{ whole.len, whole.len - 1 }) |cap| {
+        const body = try std.fmt.allocPrint(a, "{s},\"max_result_bytes\":{d}}}", .{ sql, cap });
+        defer a.free(body);
+        const response = try handle(std.testing.io, a, .empty, body, &pool, null);
+        defer a.free(response);
+        if (cap == whole.len) try std.testing.expectEqualStrings(whole, response) else {
+            try expectStringField(response, "reason", "ResultTooLarge");
+        }
+    }
+}
+
+test "JsonQuoting escapes as writeJsonString does, a UTF-8 sequence split between writes included" {
+    const a = std.testing.allocator;
+    const text = "a\"b\\ \xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80 \xff end \xe2\x82";
+    var want: std.Io.Writer.Allocating = .init(a);
+    defer want.deinit();
+    try engine.writeJsonString(&want.writer, text);
+    for ([_]usize{ 0, 1, 3 }) |buffer_len| {
+        var got: std.Io.Writer.Allocating = .init(a);
+        defer got.deinit();
+        var buf: [3]u8 = undefined;
+        var q: JsonQuoting = .init(&got.writer, buf[0..buffer_len]);
+        for (text) |c| try q.writer.writeByte(c);
+        try q.finish();
+        try std.testing.expectEqualStrings(want.written(), got.written());
     }
 }
 

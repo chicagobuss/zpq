@@ -148,6 +148,8 @@ pub const File = struct {
     size: u64,
     /// Opened O_DIRECT; false when the mode is pread or the file system refused it.
     direct: bool,
+    /// `fd` is the reader's to close (`Reader.openFile`), not borrowed (`Reader.borrowFile`).
+    owned: bool = false,
     /// Anonymous, laid out like the file; only planned pages are ever written.
     buf: []align(std.heap.page_size_min) u8,
     /// 0 until the row group's reads are in, 1 once they are, 2 when a read failed.
@@ -251,6 +253,13 @@ pub const Reader = struct {
     uring_threads: u32 = 0,
     pread_threads: u32 = 0,
 
+    fn setDirect(fd: i32) bool {
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(flags) != .SUCCESS) return false;
+        const direct: usize = @as(u32, @bitCast(linux.O{ .DIRECT = true }));
+        return linux.errno(linux.fcntl(fd, linux.F.SETFL, flags | direct)) == .SUCCESS;
+    }
+
     pub fn create(gpa: std.mem.Allocator, cfg: Config) !*Reader {
         std.debug.assert(cfg.mode != .mmap);
         const r = try gpa.create(Reader);
@@ -264,16 +273,26 @@ pub const Reader = struct {
         if (path.len >= path_z.len) return error.NameTooLong;
         @memcpy(path_z[0..path.len], path);
         path_z[path.len] = 0;
-        var direct = self.cfg.mode == .uring;
-        var rc = linux.open(@ptrCast(&path_z), .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = direct }, 0);
-        if (direct and linux.errno(rc) == .INVAL) {
-            direct = false;
-            self.direct_refused = true;
-            rc = linux.open(@ptrCast(&path_z), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        }
+        const rc = linux.open(@ptrCast(&path_z), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
         const fd: i32 = @intCast(rc);
         errdefer _ = linux.close(fd);
+        const f = try self.addFile(fd, size);
+        f.owned = true;
+        return f;
+    }
+
+    /// Read the file open on `fd` into a buffer of `size` bytes: the very file the caller opened, whatever its path
+    /// names by now. Borrowed: the caller closes it, after `destroy`.
+    pub fn borrowFile(self: *Reader, fd: i32, size: u64) !*File {
+        return self.addFile(fd, size);
+    }
+
+    fn addFile(self: *Reader, fd: i32, size: u64) !*File {
+        // O_DIRECT set on the descriptor, not at an open, so a borrowed one takes it too. A file system that refuses
+        // it (tmpfs, some FUSE) reads through the page cache.
+        const direct = self.cfg.mode == .uring and setDirect(fd);
+        if (self.cfg.mode == .uring and !direct) self.direct_refused = true;
 
         const f = try self.gpa.create(File);
         errdefer self.gpa.destroy(f);
@@ -428,7 +447,7 @@ pub const Reader = struct {
         for (self.threads.items) |t| t.join();
         for (self.files.items) |f| {
             posix.munmap(f.buf);
-            _ = linux.close(f.fd);
+            if (f.owned) _ = linux.close(f.fd);
             self.gpa.free(f.rg_ready);
             self.gpa.free(f.rg_items_done);
             self.gpa.free(f.rg_units_left);

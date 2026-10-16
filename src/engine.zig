@@ -2486,7 +2486,7 @@ const OpenedInputs = struct {
     /// `error.InputChanged` when a local input was truncated while it was mapped (`local_fs.Mapped.intact`): checked
     /// before an answer is returned or published.
     pub fn intact(self: *const OpenedInputs) error{InputChanged}!void {
-        for (self.inputs, self.mmaps) |in, m_opt| if (m_opt) |m| try m.intact(in.name);
+        for (self.mmaps) |m_opt| if (m_opt) |m| try m.intact();
     }
 
     /// For a query's error path: zeros read past a cut parse as a corrupt page, which is the cut, not the file.
@@ -3244,11 +3244,8 @@ fn startLocalReader(
     const inputs = try arena.dupe(scan.Input, opened.inputs);
     for (inputs, local_plan.files, opened.mmaps) |*in, per_rg, m_opt| {
         const m = m_opt orelse continue;
-        const f = try rd.openFile(in.name, m.bytes.len);
-        // The footer and plan came from the mapping, so the reads must come from the file mapped, not whatever the
-        // path names by now; `intact` covers what changes it after this.
-        const id = local_fs.fdIdentity(f.fd) catch return error.InputChanged;
-        if (!std.meta.eql(id, m.id)) return error.InputChanged;
+        // Through the mapping's own descriptor: the footer and plan came from that file, whatever the path names now.
+        const f = try rd.borrowFile(m.fd, m.bytes.len);
         try rd.planFile(f, per_rg, COALESCE_GAP);
         in.bytes = f.bytes();
         in.gate = f.gate();
@@ -7791,7 +7788,7 @@ test "regression: a DELTA_BYTE_ARRAY value of another length than its FIXED_LEN_
     );
 }
 
-test "regression: the local reader refuses a path that names another file than the one mapped" {
+test "regression: the local reader reads the file mapped, even once another is renamed over its path" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7800,37 +7797,45 @@ test "regression: the local reader refuses a path that names another file than t
     const path = try std.fmt.bufPrintSentinel(&buf, ".zig-cache/tmp/{s}/f.parquet", .{tmp.sub_path}, 0);
     var obuf: [256]u8 = undefined;
     const other = try std.fmt.bufPrintSentinel(&obuf, ".zig-cache/tmp/{s}/g.parquet", .{tmp.sub_path}, 0);
-    for ([_][:0]const u8{ path, other }) |p| {
-        const fd = try local_fs.createFile(p);
-        defer local_fs.close(fd);
-        try local_fs.writeAll(fd, "PAR1 the same size PAR1");
+    const first = "PAR1 the file mapped PAR1";
+    for ([_]local_reader.Mode{ .pread, .uring }) |mode| {
+        for ([_][:0]const u8{ path, other }, [_][]const u8{ first, "PAR1 its replacement PAR1" }) |p, text| {
+            const fd = try local_fs.createFile(p);
+            defer local_fs.close(fd);
+            try local_fs.writeAll(fd, text);
+        }
+        const m = try local_fs.mapFile(path);
+        defer m.unmap();
+        // Between the open that read the footer and the reads, as a tool replaces a file. The reader opened the path
+        // again and read the replacement's bytes against the first file's footer.
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.rename(other, path)));
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const inputs = [_]scan.Input{.{ .name = path, .bytes = m.bytes, .logical_size = m.bytes.len }};
+        const mmaps = [_]?local_fs.Mapped{m};
+        const opened: OpenedInputs = .{
+            .gpa = gpa,
+            .inputs = &inputs,
+            .metas = &.{},
+            .meta_ready = &.{},
+            .mmaps = &mmaps,
+            .owned_pools = &.{},
+            .s3_buffers = &.{},
+        };
+        var whole = [_]local_reader.Range{.{ .start = 0, .end = m.bytes.len }};
+        const per_rg = [_]?[]local_reader.Range{&whole};
+        const plan: LocalPlan = .{ .files = &.{&per_rg}, .planned = m.bytes.len, .total = m.bytes.len };
+        var reader: ?*local_reader.Reader = null;
+        defer if (reader) |rd| rd.destroy();
+        const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+        const read = try startLocalReader(ctx, arena, opened, plan, .{ .mode = mode, .threads = 1 }, &reader);
+        const gate = read[0].gate.?;
+        try gate.wait(gate.ctx, 0);
+        try std.testing.expectEqualStrings(first, read[0].bytes);
+        gate.done(gate.ctx, 0, 1);
+        try opened.intact();
     }
-    const m = try local_fs.mapFile(path);
-    defer m.unmap();
-    // Renamed over between the open that read the footer and the reader's: its reads would come from another file.
-    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.rename(other, path)));
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const inputs = [_]scan.Input{.{ .name = path, .bytes = m.bytes, .logical_size = m.bytes.len }};
-    const mmaps = [_]?local_fs.Mapped{m};
-    const opened: OpenedInputs = .{
-        .gpa = gpa,
-        .inputs = &inputs,
-        .metas = &.{},
-        .meta_ready = &.{},
-        .mmaps = &mmaps,
-        .owned_pools = &.{},
-        .s3_buffers = &.{},
-    };
-    const plan: LocalPlan = .{ .files = &.{&.{}}, .planned = 0, .total = 0 };
-    var reader: ?*local_reader.Reader = null;
-    defer if (reader) |rd| rd.destroy();
-    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    try std.testing.expectError(
-        error.InputChanged,
-        startLocalReader(ctx, arena, opened, plan, .{ .mode = .pread, .threads = 1 }, &reader),
-    );
 }
 
 test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column of empty strings" {

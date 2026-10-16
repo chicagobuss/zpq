@@ -91,6 +91,7 @@ fn emitError(err: anyerror) !void {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    local_fs.raiseOpenFileLimit();
     machine_diagnostics = wantsJsonSummary(init.minimal.args);
     // Human diagnostics print unbounded; machine ones are captured into the JSON error.
     if (machine_diagnostics) zpq.frontend.diagnostic_fn = captureSqlDiagnostic;

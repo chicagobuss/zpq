@@ -69,6 +69,8 @@ pub const Detail = union(enum) {
     like_non_string: struct { type_name: []const u8 },
     /// A filter compares the FLOAT16 column `Diag.column`.
     float16_filter,
+    /// A filter compares the string column `Diag.column` with something other than a literal.
+    non_literal_value,
     /// The S3 request behind the error failed: which one, at what point, and how.
     s3_request: S3Failure,
 };

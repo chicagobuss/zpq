@@ -225,6 +225,11 @@ fn printDetail(diag: *const Diag) void {
             "filter: FLOAT16 column `{s}` is not yet supported for filtering\n",
             .{name},
         ),
+        .non_literal_value => diagnosticPrint(
+            "filter: `{s}` can be compared only with a literal (not a column, an\n" ++
+                "  expression or LIKE ... ESCAPE)\n",
+            .{name},
+        ),
         // The upload logged it to stderr when it happened.
         .s3_request => {},
     }

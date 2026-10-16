@@ -366,8 +366,8 @@ fn parseLike(
 ) Error!ast.Filter {
     const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
-    const pattern = try unquoteLiteral(arena, trimSpace(pat_part));
     const col_idx = try resolveCol(file, col_name, diag);
+    const pattern = try stringValue(arena, file, col_name, trimSpace(pat_part), diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
         const type_name = @tagName(elem.type orelse .BYTE_ARRAY);
@@ -439,7 +439,7 @@ fn parseInList(
         if (v.len == 0) return error.BadValue;
         // The NULL literal is no value to compare with, on a string column as on any other.
         if (isNullLiteral(v)) null_member = true else {
-            try leaves.append(arena, try buildTypedComparison(arena, col_idx, &elem, leaf_op, v, diag));
+            try leaves.append(arena, try buildTypedComparison(arena, file, col_idx, &elem, leaf_op, v, diag));
         }
         start = (comma orelse break) + 1;
     }
@@ -579,8 +579,8 @@ fn parseBetween(
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
     // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
     return ast.join(arena, true, &.{
-        try buildTypedComparison(arena, col_idx, &elem, .GtEq, x_str, diag),
-        try buildTypedComparison(arena, col_idx, &elem, .LtEq, y_str, diag),
+        try buildTypedComparison(arena, file, col_idx, &elem, .GtEq, x_str, diag),
+        try buildTypedComparison(arena, file, col_idx, &elem, .LtEq, y_str, diag),
     });
 }
 
@@ -607,7 +607,7 @@ fn parseComparisonLeaf(
 
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-    return try buildTypedComparison(arena, col_idx, &elem, op, val_str, diag);
+    return try buildTypedComparison(arena, file, col_idx, &elem, op, val_str, diag);
 }
 
 const Comparison = struct { op: ast.Operator, at: usize, len: usize };
@@ -658,6 +658,7 @@ fn findComparison(expr: []const u8) Error!?Comparison {
 /// expansion so both get identical type handling.
 fn buildTypedComparison(
     arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
     col_idx: usize,
     elem: *const schema.SchemaElement,
     op: ast.Operator,
@@ -694,7 +695,7 @@ fn buildTypedComparison(
     }
     const ptype = elem.type orelse return error.UnsupportedType;
     if (ptype == .BYTE_ARRAY or ptype == .FIXED_LEN_BYTE_ARRAY) {
-        const value = try unquoteLiteral(arena, val_str);
+        const value = try stringValue(arena, file, elem.name, val_str, diag);
         return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = value } });
     }
     return markStored(try buildLeafFilter(col_idx, op, val_str, ptype));
@@ -980,6 +981,34 @@ fn unquoteLiteral(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
         if (inner[i] == q and i + 1 < inner.len and inner[i + 1] == q) i += 1;
     }
     return out[0..n];
+}
+
+/// The text a string column `col` is compared with: one quoted literal or, the flag form's back-compat, one bare
+/// word. Anything else (`'a' || 'b'`, `upper('a')`, `'a%' ESCAPE '!'`) is an expression the grammar cannot evaluate,
+/// and a word naming a column (`s = t`, `s = "t"`) is a column comparison: read as text, each matched incorrect rows.
+fn stringValue(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    col: []const u8,
+    val_str: []const u8,
+    diag: ?*Diag,
+) Error![]const u8 {
+    const quoted = val_str[0] == '\'' or val_str[0] == '"';
+    const one_token = if (quoted)
+        try skipQuoted(val_str, 0) == val_str.len
+    else for (val_str) |c| {
+        if (isSpace(c) or c == '(' or c == ')' or c == '\'' or c == '"' or c == '|') break false;
+    } else true;
+    if (!one_token or (val_str[0] != '\'' and namesColumn(file, val_str))) {
+        Diag.set(diag, col, .non_literal_value);
+        return error.BadValue;
+    }
+    return unquoteLiteral(arena, val_str);
+}
+
+fn namesColumn(file: *const schema.FileMetaData, word: []const u8) bool {
+    _ = metadata.resolveColumn(file, metadata.unquoteIdent(word)) catch |err| return err == error.AmbiguousColumn;
+    return true;
 }
 
 fn stripStringQuotes(s: []const u8) []const u8 {
@@ -1483,6 +1512,36 @@ test "parse strips quotes from string literals (sql-style + back-compat)" {
     // Bare/unquoted literal still works (original syntax).
     const bare = try parse(a, "status = active", &meta, null);
     try testing.expectEqualStrings("active", bare.string.value);
+}
+
+test "regression: a string column compares only with one literal, never a column or an expression read as text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const refused = [_][]const u8{
+        "status = id",
+        "status <> \"id\"",
+        "status = 'ab' || 'c'",
+        "status = upper('abc')",
+        "status LIKE 'a%' ESCAPE '!'",
+        "status NOT LIKE 'a%' ESCAPE '!'",
+        "status LIKE id",
+        "status IN ('a', id)",
+        "status BETWEEN 'a' AND score",
+        "status = 'a' 'b'",
+    };
+    for (refused) |text| {
+        var diag: Diag = .{};
+        try testing.expectError(error.BadValue, parse(a, text, &meta, &diag));
+        try testing.expect(diag.detail == .non_literal_value);
+        try testing.expectEqualStrings("status", diag.column.get());
+    }
+    try testing.expectEqualStrings("it's", (try parse(a, "status = 'it''s'", &meta, null)).string.value);
+    try testing.expectEqualStrings("a || b", (try parse(a, "status = 'a || b'", &meta, null)).string.value);
+    try testing.expectEqualStrings("n1", (try parse(a, "status LIKE 'n1%'", &meta, null)).like.operand);
 }
 
 test "parse DATE/TIMESTAMP literals → epoch ints" {

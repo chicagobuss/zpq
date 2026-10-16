@@ -17,9 +17,12 @@
  * zpq_close must be called once per context, and no call on the context may start once zpq_close has begun: it frees
  * the context. To close a context other threads may still be calling, call zpq_shutdown (new calls, and queries
  * waiting for their budget, get ZPQ_ECLOSED), wait until the host's own calls have returned, then call zpq_close.
- * zpq_run does its work on a thread of its own with an 8 MiB stack, so the calling thread needs no particular stack
- * size. Signals: libzpq's sockets never raise SIGPIPE. While any context is open, SIGIO and SIGPIPE have a
- * do-nothing handler unless the host installs its own; closing the last context restores what the host had.
+ * zpq_run does its work on one of the context's own threads, with an 8 MiB stack, so the calling thread needs no
+ * particular stack size. Signals: libzpq's sockets never raise SIGPIPE. While any context is open, SIGIO and SIGPIPE
+ * have a do-nothing handler unless the host installs its own; closing the last context restores what the host had.
+ * While a query has a local input mapped, libzpq handles SIGBUS: a fault in its mapping (the file truncated under it)
+ * fails that query, and any other goes to the handler installed before. When no input is mapped, as after the last
+ * zpq_close, the handler before is back, unless the host has installed its own since.
  *
  * Environment: each zpq_run reads the process environment when it is called (S3 credentials, endpoint, region, as
  * the CLI reads them). Do not change it with setenv while a call is running.

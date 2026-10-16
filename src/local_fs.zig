@@ -164,19 +164,42 @@ pub fn mapFile(path: []const u8) !Mapped {
 /// which killed the process (a libzpq host with it). Mappings register here; the handler maps a zero page over a
 /// faulting address inside one, marks it, and returns, so the read sees zeros and `Mapped.intact` refuses the
 /// answer. A fault anywhere else goes to the handler that was installed before, or kills the process as it did.
-/// Lock-free: the handler reads the table from any thread at any moment.
+/// The handler is in place only while some mapping is: the first one installs it and the last one out puts back
+/// the handler before it, unless the host has installed its own since (a libzpq host gets its SIGBUS back once
+/// its queries are done). The table is lock-free: the handler reads it from any thread at any moment.
 const guard = struct {
     const slots = 512;
     var starts: [slots]std.atomic.Value(usize) = @splat(.init(0));
     var lens: [slots]std.atomic.Value(usize) = @splat(.init(0));
     var faulted: [slots]std.atomic.Value(bool) = @splat(.init(false));
-    var installed: std.atomic.Value(u8) = .init(0);
+    /// Guards `count` and the install: mappings come and go from any thread.
+    var busy: std.atomic.Value(bool) = .init(false);
+    var count: usize = 0;
     var prev: posix.Sigaction = undefined;
 
+    fn lock() void {
+        while (busy.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn unlock() void {
+        busy.store(false, .release);
+    }
+
     fn enter(bytes: []const u8) ?usize {
-        if (posix.Sigaction == void or !install()) return null;
+        if (posix.Sigaction == void) return null;
         for (0..slots) |i| {
             if (lens[i].cmpxchgStrong(0, std.math.maxInt(usize), .acq_rel, .monotonic) != null) continue;
+            lock();
+            if (count == 0) {
+                const act: posix.Sigaction = .{
+                    .handler = .{ .sigaction = onBus },
+                    .mask = posix.sigemptyset(),
+                    .flags = posix.SA.SIGINFO | posix.SA.ONSTACK,
+                };
+                posix.sigaction(.BUS, &act, &prev);
+            }
+            count += 1;
+            unlock();
             faulted[i].store(false, .release);
             starts[i].store(@intFromPtr(bytes.ptr), .release);
             lens[i].store(bytes.len, .release);
@@ -188,26 +211,14 @@ const guard = struct {
     fn leave(i: usize) void {
         starts[i].store(0, .release);
         lens[i].store(0, .release);
-    }
-
-    /// Once per process; true when the handler is in place.
-    fn install() bool {
-        switch (installed.cmpxchgStrong(0, 1, .acq_rel, .acquire) orelse 0) {
-            0 => {},
-            1 => {
-                while (installed.load(.acquire) == 1) std.atomic.spinLoopHint();
-                return installed.load(.acquire) == 2;
-            },
-            else => |state| return state == 2,
-        }
-        const act: posix.Sigaction = .{
-            .handler = .{ .sigaction = onBus },
-            .mask = posix.sigemptyset(),
-            .flags = posix.SA.SIGINFO | posix.SA.ONSTACK,
-        };
-        posix.sigaction(.BUS, &act, &prev);
-        installed.store(2, .release);
-        return true;
+        lock();
+        defer unlock();
+        count -= 1;
+        if (count != 0) return;
+        var cur: posix.Sigaction = undefined;
+        posix.sigaction(.BUS, null, &cur);
+        if (cur.flags & posix.SA.SIGINFO == 0) return;
+        if (cur.handler.sigaction) |f| if (f == &onBus) posix.sigaction(.BUS, &prev, null);
     }
 
     fn onBus(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
@@ -379,6 +390,38 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
     defer again.unmap();
     try testing.expectEqual(page, again.bytes.len);
     try again.intact();
+}
+
+test "regression: the SIGBUS handler is in place only while a mapping is, and yields to one installed since" {
+    if (posix.Sigaction == void) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/m", .{tmp.sub_path});
+    const fd = try createFile(path);
+    try writeAll(fd, "abc");
+    close(fd);
+    var before: posix.Sigaction = undefined;
+    posix.sigaction(.BUS, null, &before);
+    const m = try mapFile(path);
+    var during: posix.Sigaction = undefined;
+    posix.sigaction(.BUS, null, &during);
+    try testing.expect(during.handler.sigaction == &guard.onBus);
+    m.unmap();
+    var after: posix.Sigaction = undefined;
+    posix.sigaction(.BUS, null, &after);
+    try testing.expect(after.handler.handler == before.handler.handler);
+
+    const Host = struct {
+        fn on(_: posix.SIG) callconv(.c) void {}
+    };
+    const mine: posix.Sigaction = .{ .handler = .{ .handler = Host.on }, .mask = posix.sigemptyset(), .flags = 0 };
+    const n = try mapFile(path);
+    posix.sigaction(.BUS, &mine, null);
+    n.unmap();
+    posix.sigaction(.BUS, null, &after);
+    try testing.expect(after.handler.handler == mine.handler.handler);
+    posix.sigaction(.BUS, &before, null);
 }
 
 test "regression: mapFile refuses a directory and a FIFO instead of misreporting or blocking" {

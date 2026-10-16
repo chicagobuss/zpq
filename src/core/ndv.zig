@@ -30,7 +30,9 @@ pub const Stat = struct {
     union_budget_exceeded: bool = false,
 };
 
-pub const File = struct { bytes: []const u8, local: bool };
+/// `cold`: the file is read past its page cache (a reader's input), so its dictionaries are read ahead for the plan
+/// (`prefetchDictionaries`); a file read through its mapping is mostly resident, and asking only costs.
+pub const File = struct { bytes: []const u8, local: bool, cold: bool = false };
 const Ref = struct { file: usize, rg: usize };
 const max_input = 25 * 1024 * 1024;
 
@@ -69,6 +71,7 @@ fn prefetchDictionaries(
         const rg = &metas[ref.file].row_groups.items[ref.rg];
         if (ci >= rg.columns.items.len) continue;
         const cm = rg.columns.items[ci].meta_data orelse continue;
+        if (!files[ref.file].cold) continue;
         const b = dictSlice(files[ref.file], cm) orelse continue;
         const start = @intFromPtr(b.ptr) & ~(page_len - 1);
         const end = if (extent == .whole) @intFromPtr(b.ptr) + b.len else @intFromPtr(b.ptr) + @min(b.len, 1);

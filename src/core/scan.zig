@@ -2824,6 +2824,8 @@ fn prepareAggregate(
                 .bytes = bytes,
                 .local = !std.mem.startsWith(u8, input.name, "s3://") and input.rescannable() and
                     (input.logical_size == 0 or input.logical_size == bytes.len),
+                // A local reader's input: chosen for files mostly out of the page cache.
+                .cold = input.gate != null,
             };
         }
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.

@@ -7558,6 +7558,25 @@ test "regression: arithmetic refuses only the NULLs it would read" {
     }));
 }
 
+test "regression: an INT96 past nanoseconds fails the queries reading it, and only those" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "int96_year1.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `ts` holds 0001-01-01, which wrapped to 1754-08-30.
+    const y1: []const []const u8 = &.{dir ++ "int96_year1.parquet"};
+    try std.testing.expectError(error.Int96OutOfRange, runQuery(ctx, .{ .inputs = y1, .aggregate = "min(ts) AS m" }));
+    try std.testing.expectError(error.Int96OutOfRange, runQuery(ctx, .{
+        .inputs = y1,
+        .aggregate = "count(*) AS n",
+        .filter = "ts < '1700-01-01'",
+    }));
+    // Columns beside it still read.
+    var r = try runQuery(ctx, .{ .inputs = y1, .aggregate = "count(*) AS n, min(dt) AS m" });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 8), r.aggregate.output.aggs[0].value.i);
+}
+
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

@@ -30,6 +30,10 @@ pub const Error = error{
     DictionaryMissing,
     UnsupportedEncoding,
     UnexpectedEndOfChunk,
+    /// A timestamp nanoseconds since the epoch cannot hold in 64 bits (before 1677 or after 2262, as Spark's
+    /// 0001-01-01 and 9999-12-31 sentinels are), or a time of day outside one day. Wrapped, either read as another
+    /// instant.
+    Int96OutOfRange,
 } || page_mod.Error || std.mem.Allocator.Error;
 
 pub const INT96_WIDTH: usize = 12;
@@ -38,11 +42,13 @@ const NANOSECONDS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// 12 little-endian bytes → nanoseconds since the Unix epoch.
 /// Caller guarantees `bytes.len >= 12`. (DuckDB's ImpalaTimestamp math.)
-pub fn int96ToEpochNanos(bytes: []const u8) i64 {
+pub fn int96ToEpochNanos(bytes: []const u8) error{Int96OutOfRange}!i64 {
     const nanos_of_day = std.mem.readInt(i64, bytes[0..8], .little);
     const julian_day = std.mem.readInt(u32, bytes[8..12], .little);
+    if (nanos_of_day < 0 or nanos_of_day >= NANOSECONDS_PER_DAY) return error.Int96OutOfRange;
     const days_since_epoch = @as(i64, julian_day) - JULIAN_TO_UNIX_EPOCH_DAYS;
-    return days_since_epoch *% NANOSECONDS_PER_DAY +% nanos_of_day;
+    const day_ns = std.math.mul(i64, days_since_epoch, NANOSECONDS_PER_DAY) catch return error.Int96OutOfRange;
+    return std.math.add(i64, day_ns, nanos_of_day) catch error.Int96OutOfRange;
 }
 
 /// Decode an INT96 column chunk to a ColumnT(i64) of epoch-nanoseconds.
@@ -80,7 +86,7 @@ pub fn decodeColumnAsI64Nanos(
                 const dict = try arena.alloc(i64, dict_count);
                 for (0..dict_count) |i| {
                     const off = i * INT96_WIDTH;
-                    dict[i] = int96ToEpochNanos(pg.bytes[off .. off + INT96_WIDTH]);
+                    dict[i] = try int96ToEpochNanos(pg.bytes[off .. off + INT96_WIDTH]);
                 }
                 dict_i64 = dict;
             },
@@ -186,7 +192,7 @@ fn decodeDataPage(
                     const idx = written.* + i;
                     if (dl[idx] == levels.max_def) {
                         const off = raw_pos * INT96_WIDTH;
-                        values_out[idx] = int96ToEpochNanos(values_bytes[off .. off + INT96_WIDTH]);
+                        values_out[idx] = try int96ToEpochNanos(values_bytes[off .. off + INT96_WIDTH]);
                         raw_pos += 1;
                     } else {
                         values_out[idx] = 0;
@@ -195,7 +201,7 @@ fn decodeDataPage(
             } else {
                 for (0..page_num_values) |i| {
                     const off = i * INT96_WIDTH;
-                    values_out[written.* + i] = int96ToEpochNanos(values_bytes[off .. off + INT96_WIDTH]);
+                    values_out[written.* + i] = try int96ToEpochNanos(values_bytes[off .. off + INT96_WIDTH]);
                 }
             }
         },
@@ -265,12 +271,32 @@ test "int96ToEpochNanos matches duckdb's reference math" {
     // 1970-01-01 00:00:00 → julian 2440588, 0 nanos-of-day → 0.
     var b: [12]u8 = @splat(0);
     std.mem.writeInt(u32, b[8..12], 2440588, .little);
-    try testing.expectEqual(@as(i64, 0), int96ToEpochNanos(&b));
+    try testing.expectEqual(@as(i64, 0), try int96ToEpochNanos(&b));
 
     // One day later, +1 second into the day.
     std.mem.writeInt(i64, b[0..8], 1_000_000_000, .little); // 1s in nanos
     std.mem.writeInt(u32, b[8..12], 2440589, .little);
-    try testing.expectEqual(@as(i64, 86_400_000_000_000 + 1_000_000_000), int96ToEpochNanos(&b));
+    try testing.expectEqual(@as(i64, 86_400_000_000_000 + 1_000_000_000), try int96ToEpochNanos(&b));
+}
+
+test "regression: an INT96 instant past the nanosecond range, or a time of day outside one day, is refused" {
+    var b: [12]u8 = @splat(0);
+    // 0001-01-01 (julian 1721426) and 9999-12-31 (julian 5373484), Spark's sentinels: wrapped, they read as 1754
+    // and as some other year.
+    for ([_]u32{ 1721426, 5373484, 0, std.math.maxInt(u32) }) |day| {
+        std.mem.writeInt(u32, b[8..12], day, .little);
+        try testing.expectError(error.Int96OutOfRange, int96ToEpochNanos(&b));
+    }
+    std.mem.writeInt(u32, b[8..12], 2440588, .little);
+    for ([_]i64{ -1, NANOSECONDS_PER_DAY }) |tod| {
+        std.mem.writeInt(i64, b[0..8], tod, .little);
+        try testing.expectError(error.Int96OutOfRange, int96ToEpochNanos(&b));
+    }
+    // The last instant i64 nanoseconds hold, 2262-04-11 23:47:16.854775807, still reads.
+    const last_day: u32 = @intCast(@divFloor(std.math.maxInt(i64), NANOSECONDS_PER_DAY) + JULIAN_TO_UNIX_EPOCH_DAYS);
+    std.mem.writeInt(u32, b[8..12], last_day, .little);
+    std.mem.writeInt(i64, b[0..8], @mod(std.math.maxInt(i64), NANOSECONDS_PER_DAY), .little);
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), try int96ToEpochNanos(&b));
 }
 
 /// A chunk of uncompressed pages: `true` a PLAIN dictionary page of `n` entries, `false` a V1 data page of `n`
@@ -309,7 +335,8 @@ test "a second INT96 dictionary page, after data or after the first, is a corrup
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const dict: [24]u8 = @splat(0); // two INT96 entries
+    var dict: [24]u8 = @splat(0); // two INT96 entries: 1970-01-01, a day zpq can read
+    for (0..2) |i| std.mem.writeInt(u32, dict[i * 12 + 8 ..][0..4], 2440588, .little);
     const data = [_]u8{ 1, 2 << 1, 0 }; // two indices, bit width 1, one RLE run of 0
     const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
     const dict_page = .{ true, 2, @as([]const u8, &dict) };

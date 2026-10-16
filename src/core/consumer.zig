@@ -854,7 +854,7 @@ pub const SliceReader = struct {
                 if (T == []const u8 and self.int96) {
                     const out = try a.alloc(i64, n);
                     for (values, out) |b, *o| o.* = if (b.len == int96_mod.INT96_WIDTH)
-                        int96_mod.int96ToEpochNanos(b)
+                        try int96_mod.int96ToEpochNanos(b)
                     else
                         0;
                     const nanos: filter_eval.ColumnT(i64) = .{

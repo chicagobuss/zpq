@@ -7589,6 +7589,27 @@ test "regression: a definition level past its column's maximum fails the queries
     }
 }
 
+test "regression: a dictionary-encoded INT32 or INT64 DECIMAL groups on the coded path as on the plain one" {
+    const fixture = "ci/fixtures/parquet/decimal_int_dictionary.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    for ([_][]const u8{ "p4s4", "p9s2", "p18s4" }) |key| {
+        for ([_]?[]const u8{ null, "id > 100" }) |filter| {
+            var texts: [2][]u8 = undefined;
+            for ([_]bool{ true, false }, &texts) |encoded, *t| t.* = try sortedGroupText(gpa, ctx, .{
+                .inputs = &.{fixture},
+                .aggregate = "count(*) AS n, sum(p9s2) AS s",
+                .group_by = key,
+                .filter = filter,
+                .encoded = encoded,
+            });
+            defer for (texts) |t| gpa.free(t);
+            try std.testing.expectEqualStrings(texts[1], texts[0]);
+        }
+    }
+}
+
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

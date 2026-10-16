@@ -626,7 +626,17 @@ pub fn keyDictColumn(ra: std.mem.Allocator, col: Column, c: expr_ast.ColRef, loo
             const vals = try ra.alloc(T, n + 1);
             @memcpy(vals[0..n], cc.dict);
             vals[n] = std.mem.zeroes(T);
-            const ext_col: @TypeOf(cc) = .{ .values = vals, .def_levels = dl, .max_def = 1, .has_nulls = true };
+            var ext_col: @TypeOf(cc) = .{ .values = vals, .def_levels = dl, .max_def = 1, .has_nulls = true };
+            // A DECIMAL key groups on its exact entries: without them every coded INT32/INT64-backed one was refused.
+            if (cc.dict_unscaled) |du| ext_col.unscaled = switch (du) {
+                inline else => |d, dtag| ext: {
+                    const U = @TypeOf(d[0]);
+                    const u = try ra.alloc(U, n + 1);
+                    @memcpy(u[0..n], d);
+                    u[n] = 0;
+                    break :ext @unionInit(filter_eval.Exact, @tagName(dtag), u);
+                },
+            };
             break :blk @unionInit(Column, @tagName(tag), ext_col);
         },
     };

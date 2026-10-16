@@ -1815,23 +1815,10 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const t_parse_start = nowMonoNs();
     const metas = try materializeMetas(arena, opened, args.diag, prof);
     const meta0 = &metas[0];
-    for (metas[1..], 1..) |*m, i| {
-        if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
-        for (m.schema.items, meta0.schema.items) |a_e, b_e| {
-            // Same name is not enough: a byte-copy concatenation (and a shared
-            // footer) is only valid when the columns are structurally identical.
-            // Differing physical/logical/converted type or repetition produces a
-            // footer that lies about the copied bytes, or a wrong union access on
-            // re-encode.
-            if (!std.ascii.eqlIgnoreCase(a_e.name, b_e.name)) return error.SchemaMismatch;
-            if ((a_e.num_children orelse 0) != (b_e.num_children orelse 0)) return error.SchemaMismatch;
-            if (a_e.type != b_e.type) return error.SchemaMismatch;
-            if (a_e.repetition_type != b_e.repetition_type) return error.SchemaMismatch;
-            if (a_e.converted_type != b_e.converted_type) return error.SchemaMismatch;
-            if (!std.meta.eql(a_e.logical_type, b_e.logical_type)) return error.SchemaMismatch;
-            if (a_e.type_length != b_e.type_length) return error.SchemaMismatch;
-        }
-        _ = i;
+    // Same name is not enough: a byte-copy concatenation (and a shared footer) is only valid when the columns are
+    // structurally identical, or the footer lies about the copied bytes.
+    for (metas[1..]) |*m| {
+        if (metadata.schemaMismatch(meta0.schema.items, m.schema.items, .exact) != null) return error.SchemaMismatch;
     }
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
 
@@ -6264,16 +6251,7 @@ pub fn runPrintSink(
     const meta0 = &metas[0];
 
     for (metas[1..]) |*m| {
-        if (m.schema.items.len != meta0.schema.items.len) return error.SchemaMismatch;
-        for (m.schema.items, meta0.schema.items) |a_e, b_e| {
-            if (!std.ascii.eqlIgnoreCase(a_e.name, b_e.name)) return error.SchemaMismatch;
-            if ((a_e.num_children orelse 0) != (b_e.num_children orelse 0)) return error.SchemaMismatch;
-            if (a_e.type != b_e.type) return error.SchemaMismatch;
-            if (a_e.repetition_type != b_e.repetition_type) return error.SchemaMismatch;
-            if (a_e.converted_type != b_e.converted_type) return error.SchemaMismatch;
-            if (!std.meta.eql(a_e.logical_type, b_e.logical_type)) return error.SchemaMismatch;
-            if (a_e.type_length != b_e.type_length) return error.SchemaMismatch;
-        }
+        if (metadata.schemaMismatch(meta0.schema.items, m.schema.items, .exact) != null) return error.SchemaMismatch;
     }
 
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
@@ -7445,6 +7423,29 @@ test "regression: an input with no row groups first keeps the re-encode guards o
     var got = try runQuery(ctx, .{ .inputs = &.{out}, .aggregate = "sum(h) AS s" });
     defer got.deinit(gpa);
     try std.testing.expectEqual(want.aggregate.output.aggs[0].value.f, got.aggregate.output.aggs[0].value.f);
+}
+
+test "regression: inputs whose legacy DECIMAL scales differ are refused on every path" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "legacy_decimal_s2.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const inputs: []const []const u8 = &.{ dir ++ "legacy_decimal_s2.parquet", dir ++ "legacy_decimal_s4.parquet" };
+
+    const refused = [_]QueryArgs{
+        .{ .inputs = inputs, .aggregate = "sum(value) AS s" },
+        .{ .inputs = inputs, .output = out },
+        .{ .inputs = inputs, .output = out, .filter = "value > 1" },
+    };
+    for (refused) |args| try std.testing.expectError(error.SchemaMismatch, runQuery(ctx, args));
+    // The same file twice still reads as one schema.
+    var r = try runQuery(ctx, .{ .inputs = &.{ inputs[0], inputs[0] }, .aggregate = "count(*) AS n" });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 48), r.aggregate.output.aggs[0].value.i);
 }
 
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {

@@ -2595,24 +2595,18 @@ fn prepareAggregate(
     // mid-2023). Strict-position-strict-name is too strict; full schema
     // evolution is a bigger lift we defer.
     const meta0 = &metas[0];
+    // Columns are bound by leaf index against file 0, so the nesting must match too: the same names in the same order
+    // can still put a leaf under a group in one file and at the top level in another.
     for (metas[1..], 1..) |*m, i| {
-        if (m.schema.items.len != meta0.schema.items.len)
-            return error.SchemaMismatch;
-        for (m.schema.items, meta0.schema.items) |a_elem, b_elem| {
-            // Columns are bound by leaf index against file 0, so the nesting must match too: the same names in the
-            // same order can still put a leaf under a group in one file and at the top level in another.
-            if (!std.ascii.eqlIgnoreCase(a_elem.name, b_elem.name) or
-                (a_elem.num_children orelse 0) != (b_elem.num_children orelse 0))
-            {
-                Diag.setInput(args.diag, args.inputs[i].name, null);
-                Diag.set(args.diag, b_elem.name, .{ .schema_mismatch = .{
-                    .file = i,
-                    .first_input = args.inputs[0].name,
-                    .other = .of(a_elem.name),
-                } });
-                return error.SchemaMismatch;
-            }
-        }
+        const at = metadata.schemaMismatch(meta0.schema.items, m.schema.items, .values) orelse continue;
+        if (at >= m.schema.items.len or at >= meta0.schema.items.len) return error.SchemaMismatch;
+        Diag.setInput(args.diag, args.inputs[i].name, null);
+        Diag.set(args.diag, meta0.schema.items[at].name, .{ .schema_mismatch = .{
+            .file = i,
+            .first_input = args.inputs[0].name,
+            .other = .of(m.schema.items[at].name),
+        } });
+        return error.SchemaMismatch;
     }
 
     // 2. Parse aggregate + filter against meta0 (column indexes resolved

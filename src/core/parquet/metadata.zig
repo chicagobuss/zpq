@@ -18,6 +18,7 @@ const std = @import("std");
 const nowNs = @import("../../clock.zig").monoNs;
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
+const decimal = @import("decimal.zig");
 
 const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 const MAGIC_LEN: usize = MAGIC.len;
@@ -346,6 +347,39 @@ pub fn findColumnIndex(
 
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
+/// How alike two inputs' schemas must be for one query to read both through input 0's binding.
+pub const SchemaMatch = enum {
+    /// Each input is decoded with its own footer (aggregation): the same names (any letter case), nesting and DECIMAL
+    /// scale, which every DECIMAL type in the query is bound at.
+    values,
+    /// One output footer describes every input's rows, byte-copied or re-encoded: every physical and logical attribute.
+    exact,
+};
+
+/// The index of the first schema element at which `other` cannot be read as `first` is under `match`; null when it
+/// can. A legacy DECIMAL carries its scale and precision beside the logical type, so they are compared as resolved:
+/// two such columns compared equal on the logical type alone, and a second file's values came back scaled 100x.
+pub fn schemaMismatch(
+    first: []const schema.SchemaElement,
+    other: []const schema.SchemaElement,
+    match: SchemaMatch,
+) ?usize {
+    if (first.len != other.len) return @min(first.len, other.len);
+    for (first, other, 0..) |*a, *b, i| {
+        if (!std.ascii.eqlIgnoreCase(a.name, b.name)) return i;
+        if ((a.num_children orelse 0) != (b.num_children orelse 0)) return i;
+        const ka = decimal.kindFromSchema(a);
+        const kb = decimal.kindFromSchema(b);
+        if ((ka == null) != (kb == null)) return i;
+        if (ka) |x| if (x.scale != kb.?.scale or (match == .exact and x.precision != kb.?.precision)) return i;
+        if (match == .values) continue;
+        if (a.type != b.type or a.repetition_type != b.repetition_type) return i;
+        if (a.converted_type != b.converted_type or a.type_length != b.type_length) return i;
+        if (!std.meta.eql(a.logical_type, b.logical_type)) return i;
+    }
+    return null;
+}
+
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
     var it: schema.LeafIterator = .init(file.schema.items);
     while (it.next()) |leaf| {

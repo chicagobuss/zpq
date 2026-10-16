@@ -350,14 +350,21 @@ pub fn decodeColumnExact(
             };
         },
         .INT96 => {
-            const raw = try int96.decodeColumnAsI128Nanos(
-                arena,
-                chunk,
-                codec,
-                levels,
-                num_leaves,
-                decode_options.page_bytes_limit,
-            );
+            // 64 bits where every value of the chunk fits, nearly always: the lane INT64 decimals take, which exact
+            // evaluation reads far faster than i128. A chunk holding an instant past 1677-2262 decodes again wider.
+            const limit = decode_options.page_bytes_limit;
+            if (int96.decodeColumnAsI64Nanos(arena, chunk, codec, levels, num_leaves, limit)) |narrow| {
+                const values = try arena.alloc(f64, narrow.values.len);
+                applyScaleSimd(i64, narrow.values, 0, values);
+                return .{
+                    .values = values,
+                    .def_levels = narrow.def_levels,
+                    .max_def = narrow.max_def,
+                    .has_nulls = narrow.has_nulls,
+                    .unscaled = .{ .i64 = narrow.values },
+                };
+            } else |err| if (err != error.Int96OutOfRange) return err;
+            const raw = try int96.decodeColumnAsI128Nanos(arena, chunk, codec, levels, num_leaves, limit);
             const values = try arena.alloc(f64, raw.values.len);
             for (raw.values, values) |v, *o| o.* = @floatFromInt(v);
             return .{

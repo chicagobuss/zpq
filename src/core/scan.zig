@@ -2817,15 +2817,15 @@ fn prepareAggregate(
     defer if (domain) |*d| d.deinit(gpa);
     if (args.ndv_policy) if (group_by_keys) |keys| {
         const files = try arena.alloc(ndv.File, args.inputs.len);
-        // Dictionaries are read from the file as mapped, never from buffers a reader may not have filled yet.
+        // Dictionaries are read from a file read through its mapping. A reader's input, chosen for a file mostly out of
+        // the page cache, is planned from its footer, as an S3 input is: its buffers are not filled yet, and reading
+        // its dictionaries through the mapping instead put a cold read of every row group's in front of the scan.
         for (args.inputs, files) |input, *file| {
             const bytes = input.plan_bytes orelse input.bytes;
             file.* = .{
                 .bytes = bytes,
-                .local = !std.mem.startsWith(u8, input.name, "s3://") and input.rescannable() and
+                .local = !std.mem.startsWith(u8, input.name, "s3://") and input.gate == null and
                     (input.logical_size == 0 or input.logical_size == bytes.len),
-                // A local reader's input: chosen for files mostly out of the page cache.
-                .cold = input.gate != null,
             };
         }
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.

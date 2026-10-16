@@ -9257,7 +9257,7 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
 
-test "explainAggregate: local IO and environment knobs preserve dispatch eligibility" {
+test "explainAggregate: local IO and environment knobs preserve dispatch, and reader inputs plan from footers" {
     const gpa = std.testing.allocator;
     const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
     for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled| {
@@ -9273,9 +9273,11 @@ test "explainAggregate: local IO and environment knobs preserve dispatch eligibi
             .aggregate = "count(*) AS c",
             .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
         });
-        _ = i;
         try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
-        try std.testing.expect(explained.aggregate.plan.reasons.contains(.small_ndv));
+        // A reader's input plans from its footer, as it executes: its dictionaries are read only by the scan. A file
+        // read through its mapping unions them.
+        const reasons = explained.aggregate.plan.reasons;
+        try std.testing.expect(if (i == 0) reasons.contains(.small_ndv) else reasons.contains(.unknown_ndv));
         try std.testing.expect(!explained.encoded);
     };
 }

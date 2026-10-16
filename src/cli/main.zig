@@ -86,7 +86,8 @@ fn emitError(err: anyerror) !void {
     try w.writeAll("{\"type\":\"error\",\"ok\":false,\"code\":\"");
     try writeJsonString(&w, @errorName(err));
     try w.writeAll("\",\"message\":\"");
-    try writeJsonString(&w, if (diagnostic_len > 0) diagnostic_buffer[0..diagnostic_len] else @errorName(err));
+    const said = std.mem.trimEnd(u8, diagnostic_buffer[0..diagnostic_len], "\n");
+    try writeJsonString(&w, if (said.len > 0) said else @errorName(err));
     try w.writeAll("\"}\n");
     try w.flush();
 }

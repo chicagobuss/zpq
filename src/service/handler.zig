@@ -397,7 +397,9 @@ fn runSql(
             defer out.deinit();
             try out.writer.writeAll(base[0 .. base.len - 1]);
             try out.writer.writeAll(",\"message\":");
-            const message = if (sql_message_len > 0) sql_message[0..sql_message_len] else @errorName(err);
+            // A diagnostic ends with the newline the CLI prints it with; a JSON string has no use for it.
+            const said = std.mem.trimEnd(u8, sql_message[0..sql_message_len], "\n");
+            const message = if (said.len > 0) said else @errorName(err);
             try engine.writeJsonQuoted(&out.writer, message);
             try out.writer.writeByte('}');
             return out.toOwnedSlice();
@@ -1138,6 +1140,7 @@ test "regression: an unknown output_codec is refused, and an SQL error names no 
     defer parsed.deinit();
     const message = parsed.value.object.get("message").?.string;
     try std.testing.expect(!std.mem.startsWith(u8, message, "zpq query:"));
+    try std.testing.expect(!std.mem.endsWith(u8, message, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, message, "no/such/file.parquet") != null);
 }
 

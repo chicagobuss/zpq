@@ -34,6 +34,7 @@ const Wire = struct {
     ordered: ?std.json.Value = null,
     max_memory: ?std.json.Value = null,
     budget_wait_ms: ?std.json.Value = null,
+    max_result_bytes: ?std.json.Value = null,
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
     bloom_filters: ?std.json.Value = null,
@@ -64,6 +65,8 @@ pub const Request = struct {
     max_memory: ?MaxMemory = null,
     /// `budget_wait_ms`: how long the query may wait for its memory budget where queries share a ceiling (libzpq).
     budget_wait_ms: ?u64 = null,
+    /// `max_result_bytes`: the largest answer returned inline, in the response; null for the handler's default.
+    max_result_bytes: ?usize = null,
     /// `profile`: return a profile summary in the response.
     profile: bool = false,
     /// `profile_url`: also upload the full Chrome trace to this S3 URL. Implies `profile`.
@@ -150,6 +153,11 @@ pub const Request = struct {
             .float => |x| if (x >= 0 and x < 0x1p64) .{ .bytes = @intFromFloat(x) } else return f.bad("max_memory"),
             .string => |s| .{ .text = s },
             else => return f.bad("max_memory"),
+        };
+        if (parsed.value.max_result_bytes) |v| req.max_result_bytes = switch (v) {
+            .null => null,
+            .integer => |n| if (n > 0) @intCast(n) else return f.bad("max_result_bytes"),
+            else => return f.bad("max_result_bytes"),
         };
         if (parsed.value.budget_wait_ms) |v| req.budget_wait_ms = switch (v) {
             .null => null,

@@ -306,15 +306,18 @@ pub fn handle(
         };
         qa.profiler = profiler;
 
+        // An answer returned inline is built whole, beside the query: no larger than its budget, and on Lambda no
+        // larger than the 6 MB a response may be (a larger one was posted and refused, with no reason given).
+        const result_cap = req.max_result_bytes orelse if (zpq.core.system.onLambda(env)) lambda_result_cap else budget;
         if (req.sql) |sql| {
-            const response = try runSql(io, allocator, env, pool, qa, sql);
+            const response = try runSql(io, allocator, env, pool, qa, sql, result_cap);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
         if (qa.aggregate != null or qa.group_by != null) {
-            const response = try runAggregate(io, allocator, env, pool, qa);
+            const response = try runAggregate(io, allocator, env, pool, qa, result_cap);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
@@ -356,6 +359,7 @@ fn runSql(
     pool: *PersistentPool,
     options: engine.QueryArgs,
     sql: []const u8,
+    result_cap: usize,
 ) ![]u8 {
     if (comptime !@hasDecl(zpq.core.expr.sql_parser, "parseSqlQuery")) {
         return rejectResponse(allocator, "engine", "SqlNotCompiledIn", "message", "SQL is not compiled in");
@@ -373,7 +377,11 @@ fn runSql(
         var diag: Diag = .{};
         var parse_arena = std.heap.ArenaAllocator.init(allocator);
         defer parse_arena.deinit();
-        return executeSql(io, allocator, parse_arena.allocator(), env, pool, options, sql, &diag) catch |err| {
+        var capped: Capped = .{ .parent = allocator, .cap = result_cap };
+        const result_memory = capped.allocator();
+        const sql_arena = parse_arena.allocator();
+        return executeSql(io, allocator, result_memory, sql_arena, env, pool, options, sql, &diag) catch |err| {
+            if (capped.hit) return resultTooLarge(allocator, result_cap);
             if (err == error.OutOfMemory) return err;
             zpq.frontend.queryError(err, &diag);
             const base = try engineError(allocator, err, &diag);
@@ -390,9 +398,74 @@ fn runSql(
     }
 }
 
+/// The largest response the Lambda Runtime API takes (6 MB), less room for the envelope.
+const lambda_result_cap = 6 * 1000 * 1000 - 64 * 1024;
+
+/// An allocator that holds at most `cap` bytes at once: an answer built for the response on it fails as too large
+/// (`resultTooLarge`) rather than growing past the query's budget, as one built whole three times over did.
+const Capped = struct {
+    parent: std.mem.Allocator,
+    cap: usize,
+    held: usize = 0,
+    /// Some allocation was refused for the cap.
+    hit: bool = false,
+
+    fn allocator(self: *Capped) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn admit(self: *Capped, more: usize) bool {
+        if (self.held +| more > self.cap) {
+            self.hit = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (!self.admit(len)) return null;
+        const p = self.parent.rawAlloc(len, alignment, ra) orelse return null;
+        self.held += len;
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.admit(new_len - memory.len)) return false;
+        if (!self.parent.rawResize(memory, alignment, new_len, ra)) return false;
+        self.held = self.held - memory.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.admit(new_len - memory.len)) return null;
+        const p = self.parent.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        self.held = self.held - memory.len + new_len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        self.held -|= memory.len;
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
+fn resultTooLarge(allocator: std.mem.Allocator, cap: usize) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"error\":\"result_too_large\",\"reason\":\"ResultTooLarge\",\"max_result_bytes\":{d}," ++
+            "\"hint\":\"write the answer to output_url, or raise max_result_bytes\"}}",
+        .{cap},
+    );
+}
+
 fn executeSql(
     io: std.Io,
     allocator: std.mem.Allocator,
+    result_memory: std.mem.Allocator,
     arena: std.mem.Allocator,
     env: std.process.Environ,
     pool: *PersistentPool,
@@ -425,7 +498,7 @@ fn executeSql(
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
     };
-    var rows: std.Io.Writer.Allocating = .init(allocator);
+    var rows: std.Io.Writer.Allocating = .init(result_memory);
     defer rows.deinit();
     if (qa.aggregate != null or qa.group_by != null) {
         var result = try engine.runQuery(ctx, qa);
@@ -444,7 +517,7 @@ fn executeSql(
             &rows.writer,
         );
     }
-    var out: std.Io.Writer.Allocating = .init(allocator);
+    var out: std.Io.Writer.Allocating = .init(result_memory);
     defer out.deinit();
     try out.writer.writeAll("{\"ok\":true,\"ndjson\":");
     try engine.writeJsonQuoted(&out.writer, rows.written());
@@ -621,6 +694,7 @@ fn runAggregate(
     env: std.process.Environ,
     pool: *PersistentPool,
     qa: engine.QueryArgs,
+    result_cap: usize,
 ) ![]u8 {
     // 1-row S3 output not yet supported (Stage 5b); engine.runQuery
     // gives aggregate precedence over output, so qa.output is ignored.
@@ -641,13 +715,21 @@ fn runAggregate(
     }, args) catch |err| return engineError(allocator, err, &diag);
     defer result.deinit(allocator);
     const ar = result.aggregate;
-    const answer = ar.output;
     const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
+    var capped: Capped = .{ .parent = allocator, .cap = result_cap };
+    var aw: std.Io.Writer.Allocating = .init(capped.allocator());
     defer aw.deinit();
-    const w = &aw.writer;
-    if (answer.group_rows) |rows| {
+    aggregateResponse(&aw.writer, ar, total_ms, pool) catch |err| {
+        if (capped.hit) return resultTooLarge(allocator, result_cap);
+        return err;
+    };
+    return aw.toOwnedSlice();
+}
+
+/// `runAggregate`'s response for `ar`, onto `w`.
+fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool) !void {
+    if (ar.output.group_rows) |rows| {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
@@ -655,7 +737,7 @@ fn runAggregate(
         for (rows, 0..) |row_vals, row_idx| {
             if (row_idx > 0) try w.writeByte(',');
             try w.writeByte('{');
-            for (answer.group_cols.?, 0..) |col_name, col_idx| {
+            for (ar.output.group_cols.?, 0..) |col_name, col_idx| {
                 if (col_idx > 0) try w.writeByte(',');
                 try engine.writeJsonQuoted(w, col_name);
                 try w.writeByte(':');
@@ -669,7 +751,7 @@ fn runAggregate(
             ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
             ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
         });
-        for (answer.aggs, 0..) |item, i| {
+        for (ar.output.aggs, 0..) |item, i| {
             if (i > 0) try w.writeByte(',');
             try engine.writeJsonQuoted(w, item.alias);
             try w.writeByte(':');
@@ -688,7 +770,6 @@ fn runAggregate(
     try w.writeByte(',');
     try writePoolStats(w, pool.stats());
     try w.writeByte('}');
-    return aw.toOwnedSlice();
 }
 
 /// The write handler — the iceberg-compaction shape (filter + project + write). Same engine path as the CLI's
@@ -873,6 +954,32 @@ test "uploads take permits of their own over the warm pool's connections" {
     try std.testing.expectEqual(permits.len, try pool.inner.permits.get(io, &permits, 0));
     var up: [engine.OutputLane.capacity]usize = undefined;
     try std.testing.expectEqual(up.len, try out.permits.get(io, &up, 0));
+}
+
+test "regression: an inline answer past max_result_bytes fails as too large, before it outgrows the budget" {
+    const a = std.testing.allocator;
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    var pool: PersistentPool = .sized(256 << 20);
+    defer pool.deinit();
+    const Case = struct { body: []const u8, too_large: bool };
+    for ([_]Case{
+        .{ .body = "{\"inputs\":[\"ci/fixtures/parquet/nullable_mix.parquet\"],\"aggregate\":\"count(*) AS n\"," ++
+            "\"group_by\":\"id\",\"max_result_bytes\":64}", .too_large = true },
+        .{
+            .body = "{\"sql\":\"SELECT id FROM 'ci/fixtures/parquet/nullable_mix.parquet'\",\"max_result_bytes\":16}",
+            .too_large = true,
+        },
+        .{ .body = "{\"sql\":\"SELECT id FROM 'ci/fixtures/parquet/nullable_mix.parquet'\"}", .too_large = false },
+        .{ .body = "{\"inputs\":[\"ci/fixtures/parquet/nullable_mix.parquet\"],\"aggregate\":\"count(*) AS n\"," ++
+            "\"group_by\":\"id\"}", .too_large = false },
+    }) |c| {
+        const response = try handle(std.testing.io, a, .empty, c.body, &pool, null);
+        defer a.free(response);
+        if (c.too_large) {
+            try expectStringField(response, "reason", "ResultTooLarge");
+        } else try std.testing.expect(std.mem.startsWith(u8, response, "{\"ok\":true"));
+    }
 }
 
 test "a rejected filter echoes its expression escaped" {

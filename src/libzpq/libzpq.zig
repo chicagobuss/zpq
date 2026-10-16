@@ -234,9 +234,12 @@ export fn zpq_run(
             error.ContextClosed => fail(out_json, .eclosed, "Closed"),
             else => fail(out_json, .einternal, @errorName(err)),
         };
-    defer gpa.free(response);
-    const buf: [*]u8 = @ptrCast(c.malloc(response.len + 1) orelse return @backingInt(Status.enomem));
-    @memcpy(buf[0..response.len], response);
+    // The response is already the C heap's (`gpa` is `c_allocator`): grown by its NUL and handed over, not copied,
+    // so a large answer is not held twice.
+    const buf: [*]u8 = @ptrCast(c.realloc(response.ptr, response.len + 1) orelse {
+        gpa.free(response);
+        return @backingInt(Status.enomem);
+    });
     buf[response.len] = 0;
     out_json.?.* = buf[0..response.len :0].ptr;
     if (out_len) |l| l.* = response.len;

@@ -613,6 +613,7 @@ pub const PlanInputs = struct {
     workers: usize,
     /// Some input is read in behind the reader's gates (`Input.readerBacked`), which holds a window of its own.
     readers: bool = false,
+    filter: ?filter_ast.Filter = null,
 };
 
 pub const Reason = enum {
@@ -651,6 +652,7 @@ pub const Reason = enum {
     result_cut_fallible_payload,
     few_dictionary_entries,
     repeated_dictionary_entries,
+    selective_filter,
 };
 
 pub const AggregateDispatch = struct {
@@ -769,6 +771,25 @@ fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strat
     plan.reasons.insert(.plain_scan);
 }
 
+const selective_share = 0.05;
+
+/// The share of rows the filter passes, estimated from row-group bounds (`filter_prune.passFraction`); 1 without a
+/// filter or rows. An estimate: it only steers a cost rule between exact strategies.
+fn passShare(in: PlanInputs) f64 {
+    const f = in.filter orelse return 1;
+    var rows: f64 = 0;
+    var pass: f64 = 0;
+    for (in.work) |item| {
+        if (item.agg_start != 0) continue;
+        const m = &in.metas[item.file];
+        const rg = &m.row_groups.items[item.rg];
+        const n: f64 = @floatFromInt(@max(0, rg.num_rows));
+        rows += n;
+        pass += n * filter_prune.passFraction(f, rg, m);
+    }
+    return if (rows == 0) 1 else pass / rows;
+}
+
 /// A lone key whose dictionaries, summed over row groups, hold few entries: grouping by their codes is cheap.
 const few_entries = 1 << 23;
 
@@ -860,6 +881,12 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
             plan.reasons.insert(.few_dictionary_entries);
         }
         return;
+    }
+    // A count cut reads the filter and keys twice to skip grouping most rows; a filter its row groups' bounds say
+    // passes few rows leaves little grouping to skip (measured 1.2-2.1x at 1%, while the cut still wins at 30%).
+    if (plan.dispatch.strategy == .sketch and !plan.dispatch.distinct_census and passShare(in) <= selective_share) {
+        plainDispatch(plan, .plain_hash);
+        plan.reasons.insert(.selective_filter);
     }
     if (small and !bail_census) {
         plainDispatch(plan, .plain_hash);
@@ -2874,6 +2901,7 @@ fn prepareAggregate(
         .outputs = group_outputs,
         .filter_cols = plan.filter_cols,
         .workers = n_workers,
+        .filter = filter_opt,
         .readers = for (args.inputs) |in| {
             if (in.readerBacked()) break true;
         } else false,
@@ -11388,4 +11416,57 @@ test "runMultiAggregate: a LIMIT with no ORDER BY over few dictionary entries gr
         try testing.expect(all.len >= cut.len and cut.len >= 5);
         for (cut[0..5], all[0..5]) |w, g| for (w, g) |a, b| try expectSameAggValue(a, b);
     }
+}
+
+test "planAggregate: a filter its row groups' bounds say passes few rows drops a count cut for one plain pass" {
+    const gpa = testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", gpa);
+    defer gpa.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(gpa);
+    defer meta_arena.deinit();
+    const ma = meta_arena.allocator();
+    const meta = try metadata.open(ma, bytes);
+    const work = try ma.alloc(WorkItem, meta.row_groups.items.len);
+    for (work, 0..) |*w, rg| w.* = .{
+        .file = 0,
+        .rg = rg,
+        .agg_start = 0,
+        .agg_len = 1,
+        .columns = .{ .read = &.{}, .consumed = &.{}, .preserve = &.{} },
+        .accumulators = &.{},
+    };
+    var lo: i64 = std.math.maxInt(i64);
+    for (meta.row_groups.items) |*rg| {
+        const b = @import("parquet/statistics.zig").chunkBounds(rg, 1, &meta) orelse return error.SkipZigTest;
+        lo = @min(lo, std.mem.readInt(i64, b.min[0..8], .little));
+    }
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "c" },
+    };
+    var in: PlanInputs = .{
+        .args = .{
+            .inputs = &.{},
+            .aggregate = "count(*)",
+            .sketch_topk = .{},
+            .max_memory = 16 << 30,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        },
+        .metas = &.{meta},
+        .work = work,
+        .calls = &calls,
+        .keys = &keys,
+        .outputs = &outputs,
+        .filter_cols = &.{ false, true },
+        .workers = 4,
+        // Partial coverage keeps a string key's sketch (ClickBench), whatever the filter.
+        .ndv_stat = .{ .rows = 20_000, .covered_rows = 10_000, .encoding_stats_rows = 20_000, .hi = 20_000 },
+        .filter = .{ .int64 = .{ .col_idx = 1, .op = .GtEq, .value = lo } },
+    };
+    try testing.expectEqual(.sketch, planAggregate(in).dispatch.strategy);
+    in.filter = .{ .int64 = .{ .col_idx = 1, .op = .Lt, .value = lo } };
+    const plan = planAggregate(in);
+    try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
+    try testing.expect(plan.reasons.contains(.selective_filter) and !plan.reasons.contains(.sketch_count_cut));
 }

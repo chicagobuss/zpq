@@ -357,6 +357,63 @@ fn synthRowGroupWithStats(
     return rg;
 }
 
+/// An estimate, never a proof, of the share of row group `rg`'s rows `f` passes: each range comparison on an integer
+/// or float column takes its place between the chunk's bounds, as if values spread evenly; AND multiplies, OR adds
+/// (at most 1). A leaf it cannot place (strings, LIKE, nulls, no bounds) passes everything, so a filter it knows
+/// nothing about looks unselective and changes no plan. Only cost rules read it (`scan.applyCostRules`).
+pub fn passFraction(f: ast.Filter, rg: *const schema.RowGroup, file_meta: ?*const schema.FileMetaData) f64 {
+    return switch (f) {
+        .int32 => |l| leafFraction(i32, rg, l, .INT32, file_meta),
+        .int64 => |l| leafFraction(i64, rg, l, .INT64, file_meta),
+        .float => |l| leafFraction(f32, rg, l, .FLOAT, file_meta),
+        .double => |l| leafFraction(f64, rg, l, .DOUBLE, file_meta),
+        .and_filter => |c| blk: {
+            var p: f64 = 1;
+            for (c.children) |child| p *= passFraction(child, rg, file_meta);
+            break :blk p;
+        },
+        .or_filter => |c| blk: {
+            var p: f64 = 0;
+            for (c.children) |child| p += passFraction(child, rg, file_meta);
+            break :blk @min(1, p);
+        },
+        else => 1,
+    };
+}
+
+fn leafFraction(
+    comptime T: type,
+    rg: *const schema.RowGroup,
+    leaf: ast.Leaf(T),
+    parquet_type: schema.Type,
+    file_meta: ?*const schema.FileMetaData,
+) f64 {
+    if (leaf.col_idx >= rg.columns.items.len) return 1;
+    const meta = rg.columns.items[leaf.col_idx].meta_data orelse return 1;
+    if (meta.type != parquet_type) return 1;
+    const b = statistics.chunkBounds(rg, leaf.col_idx, file_meta) orelse return 1;
+    const lo_v = encoded.readFixedLE(T, b.min) orelse return 1;
+    const hi_v = encoded.readFixedLE(T, b.max) orelse return 1;
+    const lo: f64 = if (comptime @typeInfo(T) == .float) lo_v else @floatFromInt(lo_v);
+    const hi: f64 = if (comptime @typeInfo(T) == .float) hi_v else @floatFromInt(hi_v);
+    const v: f64 = if (comptime @typeInfo(T) == .float) leaf.value else @floatFromInt(leaf.value);
+    if (!(lo <= hi) or std.math.isNan(v)) return 1;
+    // Integers hold hi - lo + 1 values; a float range is continuous.
+    const width: f64 = if (comptime @typeInfo(T) == .float) hi - lo else hi - lo + 1;
+    if (width <= 0) return 1;
+    const below = std.math.clamp((v - lo) / width, 0, 1); // share strictly below v, roughly
+    const one: f64 = if (comptime @typeInfo(T) == .float) 0 else 1 / width;
+    return switch (leaf.op) {
+        .Lt => below,
+        .LtEq => @min(1, below + one),
+        .Gt => @max(0, 1 - below - one),
+        .GtEq => 1 - below,
+        // One value of an integer range; a float equality is anyone's guess.
+        .Eq => if (v < lo or v > hi) 0 else if (comptime @typeInfo(T) == .float) 1 else one,
+        .NotEq => 1,
+    };
+}
+
 test "pruneRowGroup keeps when value is in range" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -950,4 +1007,37 @@ fn prunePageBoolean(
 
     const intersects = encoded.rangeIntersectsBytes(if (op == .Eq) .Eq else .NotEq, min, max, &[_]u8{if (value) 1 else 0});
     return if (intersects) .keep else .skip;
+}
+
+test "passFraction places range comparisons between a row group's bounds and knows nothing of other leaves" {
+    const metadata = @import("../parquet/metadata.zig");
+    const a = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const meta = try metadata.open(arena.allocator(), bytes);
+    const rg = &meta.row_groups.items[0];
+    const b = statistics.chunkBounds(rg, 1, &meta) orelse return error.SkipZigTest;
+    const lo = encoded.readFixedLE(i64, b.min).?;
+    const hi = encoded.readFixedLE(i64, b.max).?;
+    const leaf = struct {
+        fn f(op: ast.Operator, v: i64) ast.Filter {
+            return .{ .int64 = .{ .col_idx = 1, .op = op, .value = v } };
+        }
+    }.f;
+    const half = lo + @divTrunc(hi - lo, 2);
+    try std.testing.expectEqual(@as(f64, 0), passFraction(leaf(.Lt, lo), rg, &meta));
+    try std.testing.expectEqual(@as(f64, 1), passFraction(leaf(.LtEq, hi), rg, &meta));
+    try std.testing.expectEqual(@as(f64, 1), passFraction(leaf(.GtEq, lo), rg, &meta));
+    const mid = passFraction(leaf(.Lt, half), rg, &meta);
+    try std.testing.expect(mid > 0.3 and mid < 0.7);
+    try std.testing.expectEqual(@as(f64, 0), passFraction(leaf(.Eq, hi + 1), rg, &meta));
+    // A conjunction multiplies; a disjunction adds, at most 1; a leaf it cannot place passes everything.
+    const both: ast.Filter = .{ .and_filter = .{ .children = &.{ leaf(.Lt, half), leaf(.Lt, half) } } };
+    try std.testing.expectApproxEqAbs(mid * mid, passFraction(both, rg, &meta), 1e-12);
+    const either: ast.Filter = .{ .or_filter = .{ .children = &.{ leaf(.GtEq, lo), leaf(.GtEq, lo) } } };
+    try std.testing.expectEqual(@as(f64, 1), passFraction(either, rg, &meta));
+    const str: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "x" } };
+    try std.testing.expectEqual(@as(f64, 1), passFraction(str, rg, &meta));
 }

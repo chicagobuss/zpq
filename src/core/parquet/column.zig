@@ -1296,12 +1296,16 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 // V2 headers also carry `num_nulls`, which would answer the all-present check without reading a
                 // byte — but that is the writer's claim, in the same class as the statistics this engine makes you
                 // opt into with --trust-stats. The run check reads the levels themselves, so a writer that lies
-                // cannot turn it into a wrong answer.
+                // cannot turn it into an incorrect answer.
                 try self.installDefLevels(pg.bytes[cursor..][0..def_len], num_values);
                 cursor += def_len;
             } else if (def_len != 0) {
                 cursor += def_len;
             }
+            // The claim is still checked once the levels are read: a corrupt run inside a short level stream decodes
+            // values past its bytes as levels, and only the header's count says so. Flat columns only, where every
+            // writer counts a null as a level below max_def.
+            if (self.levels.max_rep == 0 and dph.num_nulls != self.pageNulls()) return error.DefLevelsMismatch;
 
             // V2 with nullable cols: the values hold only the non-null entries, which bounds a PLAIN BOOLEAN stream.
             // The other decoders are streams that consume only what's asked for; decodePageSlice handles the count.
@@ -1316,6 +1320,20 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_def_all_present = false;
             self.current_def_pos = 0;
             self.current_page_num_values = num_values;
+        }
+
+        /// The installed page's levels below max_def.
+        fn pageNulls(self: *const Self) usize {
+            const levels = self.current_def_levels orelse return 0;
+            const max_def: u32 = @intCast(self.levels.max_def);
+            const L = 16;
+            const V = @Vector(L, u32);
+            const top: V = @splat(max_def);
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i + L <= levels.len) : (i += L) n += std.simd.countTrues(@as(V, levels[i..][0..L].*) < top);
+            for (levels[i..]) |d| n += @intFromBool(d < max_def);
+            return n;
         }
 
         fn installRepLevels(self: *Self, rep_bytes: []const u8, num_values: usize) Error!void {

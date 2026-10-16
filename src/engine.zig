@@ -7720,6 +7720,17 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
     );
 }
 
+test "regression: a V2 page whose levels disagree with its null count is refused, not read as extra NULLs" {
+    const path = "ci/fixtures/parquet/v2_def_run_corrupt.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    // One byte of `i64`'s def stream became a bit-packed run longer than the stream: 42 of 271 values read as NULL.
+    for ([_]bool{ false, true }) |fast| try std.testing.expectError(
+        error.DefLevelsMismatch,
+        runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(i64) AS n", .fast_levels = fast }),
+    );
+}
+
 test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column of empty strings" {
     const path = "ci/fixtures/parquet/flba_length0.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;

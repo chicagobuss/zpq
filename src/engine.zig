@@ -5961,7 +5961,7 @@ fn gatherInto(
         .h = h,
         .prune = !args.scan_all,
         .dict_key = dictionaryKey(&metas[0], keys[0], filter),
-        .options = .{ .fast_levels = args.fast_levels },
+        .options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
         .profiler = args.profiler,
         .cursor = .{ .items = items },
         .res = res,
@@ -6042,7 +6042,7 @@ fn gatherInto(
             .metas = metas,
             .group = grp,
             .ci = spec.passthrough,
-            .options = .{ .fast_levels = args.fast_levels },
+            .options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
             .buf = switch (col) {
                 inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
             },
@@ -6091,6 +6091,8 @@ const SlicedPrint = struct {
     /// What the row group's decoded columns may take; past it, it prints in slices.
     budget: usize,
     decode_options: consumer.DecodeOptions,
+    /// Slice even a row group that looks to fit: one whose values expanded past the budget decoded whole.
+    force: bool = false,
 };
 
 /// Print `rg` a slice of rows at a time when its decoded columns would take more than `o.budget`, or a limit is set:
@@ -6121,7 +6123,7 @@ fn printRowGroupSliced(
     if (num_rows == 0) return false;
     // A limit also slices, so a print that wants a few rows decodes about that many.
     const wanted: ?usize = if (o.limit) |lim| lim -| o.total_printed.* else null;
-    if (est <= o.budget and wanted == null) return false;
+    if (est <= o.budget and wanted == null and !o.force) return false;
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
         if (consumer.SliceReader.supports(rg, meta, ci)) continue;
@@ -6506,7 +6508,7 @@ fn runPrintSinkOver(
                 try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
                     .file = item.file,
                     .rg = item.rg,
-                }, &t.core, .{ .fast_levels = args.fast_levels });
+                }, &t.core, .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory });
             }
             break :ranked try top.ranked(arena);
         };
@@ -6562,7 +6564,7 @@ fn runPrintSinkOver(
             );
             if (printed) continue;
 
-            _ = try consumer.appendProjectedRGWithOptions(
+            _ = consumer.appendProjectedRGWithOptions(
                 &agg,
                 ctx.gpa,
                 src_rg,
@@ -6572,8 +6574,27 @@ fn runPrintSinkOver(
                 fetch_arr,
                 output_specs,
                 &t.core,
-                .{ .fast_levels = args.fast_levels },
-            );
+                .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+            ) catch |err| {
+                // Values that expand past the budget held whole may still print a slice of rows at a time.
+                if (err != error.DecodeExceededBudget) return err;
+                consumer.resetAggregator(&agg);
+                var streamed = sliced;
+                streamed.force = true;
+                const ok = try printRowGroupSliced(
+                    ctx.gpa,
+                    &agg,
+                    src_rg,
+                    &meta_const,
+                    rg_src,
+                    filter_opt,
+                    fetch_arr,
+                    output_specs,
+                    streamed,
+                );
+                if (!ok) return err;
+                continue;
+            };
 
             const print_span = profile.Span.begin(prof);
             try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
@@ -7936,29 +7957,52 @@ test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column 
     );
 }
 
-test "regression: DELTA_BYTE_ARRAY pages expanding past the budget together are refused, at every -j" {
+test "regression: DELTA_BYTE_ARRAY values are charged where they decode, and a row group past it streams" {
     const path = "ci/fixtures/parquet/dba_pages.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    // 2.5 KiB: 60 values of 100 kB over 30 pages, each page well inside the budget and the chunk 6 MB past it.
+    // 6.6 KiB: 1500 values of 100 kB over 30 pages of 5 MB each, in a chunk whose footer says 3 MB.
     for ([_]usize{ 1, 3 }) |j| {
-        try std.testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, .{
+        // A page past the whole budget is refused wherever its values decode, and is no GROUP BY's.
+        try std.testing.expectError(error.DecodeExceededBudget, runQuery(ctx, .{
             .inputs = &.{path},
             .aggregate = "count(*) AS n",
             .filter = "s = 'x'",
             .parallelism = j,
             .max_memory = 2 << 20,
         }));
+        for ([_]usize{ 2 << 20, 8 << 20 }) |budget| {
+            // count(s) reads levels alone and never builds a value: it was refused for them.
+            var counted = try runQuery(ctx, .{
+                .inputs = &.{path},
+                .aggregate = "count(s) AS n",
+                .parallelism = j,
+                .max_memory = budget,
+            });
+            defer counted.deinit(gpa);
+            try std.testing.expectEqual(@as(i128, 1500), counted.aggregate.output.aggs[0].value.i);
+        }
+        // Read whole, the chunk's pages together pass the budget; a slice at a time they do not.
         var res = try runQuery(ctx, .{
             .inputs = &.{path},
             .aggregate = "count(*) AS n",
             .filter = "s = 'x'",
             .parallelism = j,
-            .max_memory = 64 << 20,
+            .max_memory = 8 << 20,
         });
         defer res.deinit(gpa);
         try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+    }
+    // Printed rows decode the same values, and took no budget at all.
+    for ([_]usize{ 2 << 20, 64 << 20 }) |budget| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        const print_args: QueryArgs = .{ .inputs = &.{path}, .filter = "s = 'x'", .max_memory = budget };
+        const printed = runPrintSink(ctx, print_args, .jsonl, null, -1, 0, &out.writer);
+        if (budget == 2 << 20) try std.testing.expectError(error.DecodeExceededBudget, printed) else {
+            try std.testing.expectEqual(@as(usize, 0), (try printed).rows);
+        }
     }
 }
 
@@ -8000,7 +8044,7 @@ test "regression: a page inflating past its chunk, or values expanding past the 
     }));
     // 442 bytes of DELTA_BYTE_ARRAY: 60 values of 100 kB, each its predecessor as a prefix.
     const dba: []const []const u8 = &.{dir ++ "dba_expand.parquet"};
-    try std.testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, .{
+    try std.testing.expectError(error.DecodeExceededBudget, runQuery(ctx, .{
         .inputs = dba,
         .aggregate = "count(*) AS n",
         .filter = "s = 'x'",

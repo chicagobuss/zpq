@@ -54,8 +54,8 @@ pub const Error = error{
     UnexpectedDictionaryPage,
     /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
     LevelOutOfRange,
-    /// A page's values expand past `DecodeOptions.expand_limit`, the query's budget.
-    ExceededMemoryBudget,
+    /// A chunk's decoded values expand past `DecodeOptions.expand_limit`, the query's budget.
+    DecodeExceededBudget,
     /// An INT32 value outside its column's 8- or 16-bit integer annotation (`IntRange`).
     IntOutOfRange,
 } || page_mod.Error;
@@ -267,8 +267,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// charged by each data page's header count before its level buffers are sized from it. RLE runs and bit
         /// width 0 let a few bytes claim any count, so the page's own size can't bound it. Unlimited by default.
         value_budget: usize = std.math.maxInt(usize),
-        /// What the chunk's DELTA_BYTE_ARRAY pages have expanded to so far, against `DecodeOptions.expand_limit`.
+        /// What the chunk's DELTA_BYTE_ARRAY pages have expanded to so far, against `DecodeOptions.expand_limit`:
+        /// the pages together, since each held to the budget alone took it many times over in a row group read whole.
         expanded: usize = 0,
+        /// The installed DELTA_BYTE_ARRAY page's expansion, not yet charged to `expanded`: a count(col) that reads
+        /// only its levels never builds the values, and must not be refused for them.
+        pending_expansion: usize = 0,
 
         pub fn init(
             chunk_bytes: []const u8,
@@ -978,6 +982,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         fn resetPageState(self: *Self) void {
             self.active = .idle;
+            self.pending_expansion = 0;
             self.current_def_levels = null;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -1084,6 +1089,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn decodePackedFromCurrentPage(self: *Self, dest: []T) Error!usize {
+            if (self.pending_expansion > 0) try self.chargeExpansion();
             const got = switch (self.active) {
                 .idle => 0,
                 inline else => |*d| if (@TypeOf(d.*) == void)
@@ -1094,6 +1100,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
             // A dictionary's codes index entries checked when it was installed.
             if (T == i32 and self.active != .rle_dict) try self.checkIntRange(dest[0..got]);
             return got;
+        }
+
+        /// The caller gave the pages decoded so far back (their arena reset): what they expanded to is no longer
+        /// held, and is not counted against the next.
+        pub fn releaseExpansion(self: *Self) void {
+            self.expanded = 0;
+        }
+
+        fn chargeExpansion(self: *Self) Error!void {
+            self.expanded +|= self.pending_expansion;
+            self.pending_expansion = 0;
+            if (self.expanded > self.options.expand_limit) return error.DecodeExceededBudget;
         }
 
         /// `error.IntOutOfRange` for a value past the column's 8- or 16-bit integer annotation (`IntRange`).
@@ -1382,6 +1400,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// Page state shared by both data-page versions, set before either parses its levels.
         fn beginPage(self: *Self, num_values: usize) Error!void {
             try self.chargePage(num_values);
+            self.pending_expansion = 0;
             self.current_def_levels = null;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -1466,12 +1485,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    // The chunk's pages together: each held to the budget alone, a row group of them read whole
-                    // took it many times over.
-                    const limit = self.options.expand_limit -| self.expanded;
-                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, limit) catch |e|
-                        return if (e == error.ExceededMemoryBudget) error.ExceededMemoryBudget else error.UnexpectedPage;
-                    self.expanded += d.expanded;
+                    // Charged when its values are decoded (`chargeExpansion`), which levels alone never are.
+                    const unbounded = std.math.maxInt(usize);
+                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, unbounded) catch
+                        return error.UnexpectedPage;
+                    self.pending_expansion = d.expanded;
                     if (!self.fixedLengths(d.prefix_lengths, d.suffixes.lengths)) return error.UnexpectedPage;
                     self.active = .{ .delta_ba = d };
                 },

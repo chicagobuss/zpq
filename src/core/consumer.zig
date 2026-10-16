@@ -967,6 +967,7 @@ pub const SliceReader = struct {
         while (got < values.len) {
             if (r.pageValuesLeft() == 0) {
                 _ = self.pages.reset(.retain_capacity);
+                r.releaseExpansion();
                 if (!try r.nextPage()) break;
                 try self.holdDictionary(r);
                 continue;
@@ -1003,7 +1004,10 @@ pub const SliceReader = struct {
                 var discard_def: []u32 = &.{};
                 while (left > 0) {
                     if (r.pageValuesLeft() == 0) {
-                        if (T == []const u8) _ = self.pages.reset(.retain_capacity);
+                        if (T == []const u8) {
+                            _ = self.pages.reset(.retain_capacity);
+                            r.releaseExpansion();
+                        }
                         const passed = try r.passPageWithin(left);
                         if (T == []const u8) try self.holdDictionary(r);
                         if (passed) |rows| {
@@ -2494,8 +2498,10 @@ pub fn scanRGForAgg(
     var reserved: usize = 0;
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
+    var full_estimate: usize = 0;
     const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
         const full = decodeEstimate(in, in.read, calls, target == .grouped);
+        full_estimate = full;
         if (target == .grouped and target.grouped.table.countOnly()) {
             const keys_only = decodeEstimate(in, in.read, &.{}, true);
             std.debug.assert(full == keys_only);
@@ -2518,7 +2524,8 @@ pub fn scanRGForAgg(
         break :plan null;
     } else null;
     if (ws.budget) |b| try b.acquire(reserved);
-    defer if (ws.budget) |b| b.release(reserved);
+    var held = reserved;
+    defer if (ws.budget) |b| b.release(held);
     // Staged, everything decoded lives on memory of its own, given back with the row group; otherwise on the
     // worker's arena.
     var staged_arena = std.heap.ArenaAllocator.init(gpa);
@@ -2550,7 +2557,20 @@ pub fn scanRGForAgg(
         if (!needed or ci >= in.rg.columns.items.len) continue;
         if (stage_plan) |sp| if (!sp.base[ci]) continue;
         lookup[ci] = batch_cols.items.len;
-        try batch_cols.append(ra, try dec.column(ra, ci, &sel_pre));
+        const col = dec.column(ra, ci, &sel_pre) catch |err| {
+            // Values that expand past the budget read whole (a footer can understate them by any factor) may still
+            // stream a slice at a time. Nothing is aggregated before every column decodes, so the row group starts
+            // over; its reservation and what it decoded go back first.
+            const b = ws.budget orelse return err;
+            if (err != error.DecodeExceededBudget or staged) return err;
+            b.release(held);
+            held = 0;
+            ws.rg_arena.nextRowGroup();
+            if (ws.region) |r| r.trim();
+            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) return;
+            return err;
+        };
+        try batch_cols.append(ra, col);
     }
     const t_decode_end = nowMonoNs();
     ws.timings.decode_ns += @intCast(t_decode_end - t_decode_start);

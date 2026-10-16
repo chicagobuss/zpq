@@ -227,9 +227,10 @@ Outside the ceiling altogether:
   AddressSanitizer, set `ASAN_OPTIONS=use_sigaltstack=0`, or ASan tries to unmap that stack as its own when the
   thread exits.
 - **File descriptors.** A query holds one descriptor per local input until it ends, so it reads the file it opened
-  even if another is renamed over the path, and fails with InputChanged if that file is cut or rewritten in place. A
-  glob of many local files needs as many descriptors: libzpq leaves `RLIMIT_NOFILE` to the host (the CLI raises its
-  soft limit to the hard one).
+  even if another is renamed over the path, and fails with InputChanged if that file is cut or rewritten in place.
+  Once half the soft `RLIMIT_NOFILE` is in use, further inputs give theirs back after mapping and are checked by
+  their path instead, so a glob of any size reads. libzpq leaves the limit to the host; the CLI and the Lambda raise
+  their soft limit to the hard one.
 - **Environment.** Each call reads the process environment as it is called: S3 credentials, endpoint and region, as
   the CLI reads them. Don't change it with `setenv` while a call runs. A cleared environment (`clearenv()`) is an
   empty one.

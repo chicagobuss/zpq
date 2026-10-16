@@ -596,10 +596,12 @@ fn executeAggregateOver(
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
     const all_local = on_linux and allLocal(opened);
-    const resident: f64 = if (all_local and io_policy.profile == .auto) localResidency(ctx.gpa, opened) else 0;
+    // Files mapped when descriptors ran short gave theirs back: read through the mapping unless a mode is asked for.
+    const choose_io = all_local and (io_policy.profile != .auto or opened.descriptorsHeld());
+    const resident: f64 = if (choose_io and io_policy.profile == .auto) localResidency(ctx.gpa, opened) else 0;
     // Anything but the plain mapping needs the footers and the plan here: the explicit modes to read by them, and
     // `auto` over uncached files to weigh how much of them the query reads.
-    const plan_io = all_local and (io_policy.profile == .pread or io_policy.profile == .uring or
+    const plan_io = choose_io and (io_policy.profile == .pread or io_policy.profile == .uring or
         (io_policy.profile == .auto and resident < 0.8));
     var probed = opened.membership;
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
@@ -615,7 +617,7 @@ fn executeAggregateOver(
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
-    const io_mode: local_reader.Mode = if (all_local) io_policy.choose(resident, coverage) else .mmap;
+    const io_mode: local_reader.Mode = if (choose_io) io_policy.choose(resident, coverage) else .mmap;
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         io_policy.profile,
         io_mode,
@@ -2486,7 +2488,13 @@ const OpenedInputs = struct {
     /// `error.InputChanged` when a local input was truncated while it was mapped (`local_fs.Mapped.intact`): checked
     /// before an answer is returned or published.
     pub fn intact(self: *const OpenedInputs) error{InputChanged}!void {
-        for (self.mmaps) |m_opt| if (m_opt) |m| try m.intact();
+        for (self.inputs, self.mmaps) |in, m_opt| if (m_opt) |m| try m.intact(in.name);
+    }
+
+    /// Every local input kept its descriptor (`local_fs.Mapped.fd`).
+    fn descriptorsHeld(self: *const OpenedInputs) bool {
+        for (self.mmaps) |m_opt| if (m_opt) |m| if (m.fd == null) return false;
+        return true;
     }
 
     /// For a query's error path: zeros read past a cut parse as a corrupt page, which is the cut, not the file.
@@ -3245,7 +3253,13 @@ fn startLocalReader(
     for (inputs, local_plan.files, opened.mmaps) |*in, per_rg, m_opt| {
         const m = m_opt orelse continue;
         // Through the mapping's own descriptor: the footer and plan came from that file, whatever the path names now.
-        const f = try rd.borrowFile(m.fd, m.bytes.len);
+        // One that gave it back is opened again, and read only if the path still names that file as it was.
+        const f = if (m.fd) |fd| try rd.borrowFile(fd, m.bytes.len) else blk: {
+            const f = try rd.openFile(in.name, m.bytes.len);
+            const now = local_fs.fdStamp(f.fd) catch return error.InputChanged;
+            if (!std.meta.eql(now, m.stamp)) return error.InputChanged;
+            break :blk f;
+        };
         try rd.planFile(f, per_rg, COALESCE_GAP);
         in.bytes = f.bytes();
         in.gate = f.gate();
@@ -7835,6 +7849,50 @@ test "regression: the local reader reads the file mapped, even once another is r
         try std.testing.expectEqualStrings(first, read[0].bytes);
         gate.done(gate.ctx, 0, 1);
         try opened.intact();
+    }
+}
+
+test "regression: more local inputs than the open-file limit allows still answer" {
+    const posix = std.posix;
+    if (posix.rlimit_resource == void) return error.SkipZigTest;
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const bytes = try metadata.readFileSlice(fixture, gpa);
+    defer gpa.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n = 300;
+    const paths = try arena.alloc([]const u8, n);
+    for (paths, 0..) |*p, i| {
+        p.* = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/f{d}.parquet", .{ tmp.sub_path, i });
+        const fd = try local_fs.createFile(p.*);
+        defer local_fs.close(fd);
+        try local_fs.writeAll(fd, bytes);
+    }
+    // Each mapping held its descriptor to the query's end: past the limit the opens failed, where every file was
+    // read before mappings held them. A host's limit can be this low; libzpq does not raise it.
+    const before = try posix.getrlimit(.NOFILE);
+    defer posix.setrlimit(.NOFILE, before) catch {};
+    try posix.setrlimit(.NOFILE, .{ .cur = 64, .max = before.max });
+    var one = try runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+        .inputs = paths[0..1],
+        .aggregate = "count(*) AS n",
+    });
+    const per_file = one.aggregate.output.aggs[0].value.i;
+    one.deinit(gpa);
+    for ([_][*:0]const u8{ "ZPQ_IO_PROFILE=auto", "ZPQ_IO_PROFILE=mmap" }) |line| {
+        const lines = [_:null]?[*:0]const u8{line};
+        const env: std.process.Environ = .{ .block = .{ .slice = &lines } };
+        var res = try runQuery(.{ .gpa = gpa, .env = env, .io = std.testing.io }, .{
+            .inputs = paths,
+            .aggregate = "count(*) AS n",
+        });
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(per_file * n, res.aggregate.output.aggs[0].value.i);
     }
 }
 

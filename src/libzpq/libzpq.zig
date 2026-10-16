@@ -258,9 +258,10 @@ const request_stack_size = 8 << 20;
 /// reach (a filter nested to its cap takes about 256 KiB). A thread with less hands the request to `Runners`.
 const inline_stack = 4 << 20;
 
-/// The lowest address of this thread's stack, found once per thread (glibc reads /proc/self/maps for the main one);
-/// 0 where the platform does not say, which sends every request to `Runners`.
+/// The bounds of this thread's stack, found once per thread (glibc reads /proc/self/maps for the main one); 0 where
+/// the platform does not say, which sends every request to `Runners`.
 threadlocal var stack_low: usize = 0;
+threadlocal var stack_high: usize = 0;
 threadlocal var stack_known = false;
 
 extern "c" fn pthread_getattr_np(thread: c.pthread_t, attr: *c.pthread_attr_t) c_int;
@@ -277,11 +278,18 @@ fn stackLeft() usize {
             defer _ = pthread_attr_destroy(&attr);
             var addr: ?*anyopaque = null;
             var size: usize = 0;
-            if (pthread_attr_getstack(&attr, &addr, &size) == 0) stack_low = @intFromPtr(addr);
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0) {
+                stack_low = @intFromPtr(addr);
+                stack_high = stack_low +| size;
+            }
         }
     }
     if (stack_low == 0) return 0;
-    return @frameAddress() -| stack_low;
+    // A frame outside the thread's own stack is on one the host switched to (a fiber, a coroutine) whose size
+    // nothing here knows: none is assumed left, and the request goes to a thread of zpq's own.
+    const frame = @frameAddress();
+    if (frame < stack_low or frame >= stack_high) return 0;
+    return frame - stack_low;
 }
 
 /// One request, run on a thread of zpq's own rather than the caller's: a host thread's stack can be far smaller (musl

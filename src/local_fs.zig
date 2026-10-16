@@ -134,9 +134,19 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 /// A read-only private mapping of a whole file.
 pub const Mapped = struct {
     bytes: []align(std.heap.page_size_min) const u8,
+    /// Its entry in `guard`, when one was free.
+    slot: ?usize = null,
 
     pub fn unmap(self: Mapped) void {
+        if (self.slot) |i| guard.leave(i);
         posix.munmap(self.bytes);
+    }
+
+    /// `error.InputChanged` once a read of the mapping went past the file's end: the file was truncated (or
+    /// replaced in place) while mapped, and what the query read of it is not the file it planned against.
+    pub fn intact(self: Mapped) error{InputChanged}!void {
+        const i = self.slot orelse return;
+        if (guard.faulted[i].load(.acquire)) return error.InputChanged;
     }
 };
 
@@ -146,8 +156,99 @@ pub fn mapFile(path: []const u8) !Mapped {
     defer close(fd);
     const size = try fileSize(fd);
     if (size == 0) return error.EmptyFile;
-    return .{ .bytes = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) };
+    const bytes = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+    return .{ .bytes = bytes, .slot = guard.enter(bytes) };
 }
+
+/// A file mapped while another process truncates it raises SIGBUS on the first touch of a page past its new end,
+/// which killed the process (a libzpq host with it). Mappings register here; the handler maps a zero page over a
+/// faulting address inside one, marks it, and returns, so the read sees zeros and `Mapped.intact` refuses the
+/// answer. A fault anywhere else goes to the handler that was installed before, or kills the process as it did.
+/// Lock-free: the handler reads the table from any thread at any moment.
+const guard = struct {
+    const slots = 512;
+    var starts: [slots]std.atomic.Value(usize) = @splat(.init(0));
+    var lens: [slots]std.atomic.Value(usize) = @splat(.init(0));
+    var faulted: [slots]std.atomic.Value(bool) = @splat(.init(false));
+    var installed: std.atomic.Value(u8) = .init(0);
+    var prev: posix.Sigaction = undefined;
+
+    fn enter(bytes: []const u8) ?usize {
+        if (posix.Sigaction == void or !install()) return null;
+        for (0..slots) |i| {
+            if (lens[i].cmpxchgStrong(0, std.math.maxInt(usize), .acq_rel, .monotonic) != null) continue;
+            faulted[i].store(false, .release);
+            starts[i].store(@intFromPtr(bytes.ptr), .release);
+            lens[i].store(bytes.len, .release);
+            return i;
+        }
+        return null;
+    }
+
+    fn leave(i: usize) void {
+        starts[i].store(0, .release);
+        lens[i].store(0, .release);
+    }
+
+    /// Once per process; true when the handler is in place.
+    fn install() bool {
+        switch (installed.cmpxchgStrong(0, 1, .acq_rel, .acquire) orelse 0) {
+            0 => {},
+            1 => {
+                while (installed.load(.acquire) == 1) std.atomic.spinLoopHint();
+                return installed.load(.acquire) == 2;
+            },
+            else => |state| return state == 2,
+        }
+        const act: posix.Sigaction = .{
+            .handler = .{ .sigaction = onBus },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.SIGINFO | posix.SA.ONSTACK,
+        };
+        posix.sigaction(.BUS, &act, &prev);
+        installed.store(2, .release);
+        return true;
+    }
+
+    fn onBus(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+        const addr = faultAddress(info);
+        for (0..slots) |i| {
+            const start = starts[i].load(.acquire);
+            const len = lens[i].load(.acquire);
+            if (start == 0 or len == std.math.maxInt(usize) or addr < start or addr - start >= len) continue;
+            const page = std.heap.pageSize();
+            const at = addr & ~(page - 1);
+            const r = posix.system.mmap(
+                @ptrFromInt(at),
+                page,
+                .{ .READ = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+                -1,
+                0,
+            );
+            // libc answers a pointer (MAP_FAILED is all ones), the raw syscall an errno-coded word.
+            const failed = if (@typeInfo(@TypeOf(r)) == .pointer)
+                @intFromPtr(r) == std.math.maxInt(usize)
+            else
+                posix.errno(r) != .SUCCESS;
+            if (failed) break;
+            faulted[i].store(true, .release);
+            return;
+        }
+        // Not ours: as the handler before would have it.
+        if (prev.flags & posix.SA.SIGINFO != 0) {
+            if (prev.handler.sigaction) |f| return f(sig, info, ctx);
+        } else if (prev.handler.handler) |f| {
+            if (f != posix.SIG.DFL and f != posix.SIG.IGN) return f(sig);
+        }
+        posix.sigaction(.BUS, &prev, null);
+    }
+
+    fn faultAddress(info: *const posix.siginfo_t) usize {
+        if (@hasField(posix.siginfo_t, "fields")) return @intFromPtr(info.fields.sigfault.addr);
+        return @intFromPtr(info.addr);
+    }
+};
 
 /// Names of the entries in `dir_path` that are regular files, symlinks, or of unknown type (a filesystem that does
 /// not report types), in directory order. Names are `arena`-owned.
@@ -247,6 +348,39 @@ test "mapFile rejects an empty file" {
     try testing.expectError(error.EmptyFile, mapFile(path));
 }
 
+test "regression: a mapped file truncated under the reader reads zeros past its end and reports it changed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/shrinks", .{tmp.sub_path});
+    const page = std.heap.pageSize();
+    const fd = try createFile(path);
+    const data = try testing.allocator.alloc(u8, 3 * page);
+    defer testing.allocator.free(data);
+    @memset(data, 0xab);
+    try writeAll(fd, data);
+    close(fd);
+
+    const m = try mapFile(path);
+    defer m.unmap();
+    try m.intact();
+    const wfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    defer close(wfd);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, @intCast(page))));
+    const before: *volatile const u8 = &m.bytes[0];
+    const past: *volatile const u8 = &m.bytes[2 * page + 7];
+    try testing.expectEqual(@as(u8, 0xab), before.*);
+    // Unguarded, this read was SIGBUS.
+    try testing.expectEqual(@as(u8, 0), past.*);
+    try testing.expectError(error.InputChanged, m.intact());
+
+    // A fresh mapping of the file as it now is reads whole.
+    const again = try mapFile(path);
+    defer again.unmap();
+    try testing.expectEqual(page, again.bytes.len);
+    try again.intact();
+}
+
 test "regression: mapFile refuses a directory and a FIFO instead of misreporting or blocking" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
@@ -257,7 +391,8 @@ test "regression: mapFile refuses a directory and a FIFO instead of misreporting
     var fbuf: [256]u8 = undefined;
     const fifo = try std.fmt.bufPrintSentinel(&fbuf, ".zig-cache/tmp/{s}/pipe", .{tmp.sub_path}, 0);
     const linux = std.os.linux;
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0)));
+    const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
     try testing.expectError(error.NotAFile, mapFile(fifo));
 }
 

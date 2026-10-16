@@ -741,6 +741,7 @@ fn executeAggregate(
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
     }
 
+    try opened.intact();
     return .{
         .files_in = r.files_in,
         .rows_in = r.rows_in,
@@ -2276,7 +2277,8 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     t.footer_ns += @intCast(nowMonoNs() - t_footer);
     footer_span.end(.footer_write, profile.args(.{footer_bytes.len + 8}));
 
-    // Publish only after the sink has reported completion.
+    // Publish only after the sink has reported completion, and only what was read of inputs that stayed whole.
+    try opened.intact();
     if (mp_sink) |*ms| {
         try ms.close();
         const mp_stats = ms.snapshotStats();
@@ -2410,6 +2412,12 @@ const OpenedInputs = struct {
     s3_mapped: []const []align(s3_window.page) u8 = &.{},
     /// High-water of retained footer suffixes plus in-flight footer responses, in bytes.
     footer_resident_peak: u64 = 0,
+
+    /// `error.InputChanged` when a local input was truncated while it was mapped (`local_fs.Mapped.intact`): checked
+    /// before an answer is returned or published.
+    pub fn intact(self: *const OpenedInputs) error{InputChanged}!void {
+        for (self.mmaps) |m_opt| if (m_opt) |m| try m.intact();
+    }
 
     pub fn deinit(self: *OpenedInputs) void {
         if (!self.leave_mappings) for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
@@ -6457,6 +6465,7 @@ pub fn runPrintSink(
     }
 
     const finish_start = nowMonoNs();
+    try opened.intact();
     if (format == .json) try stdout_writer.writeAll("]\n");
     if (format == .parquet) try parquet.finish(total_printed);
     try stdout_writer.flush();

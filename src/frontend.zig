@@ -65,6 +65,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  column's maximum (corrupt file)\n",
             .{},
         ),
+        error.InputChanged => diagnosticPrint(
+            "zpq query: an input file was truncated or rewritten while the query read it\n",
+            .{},
+        ),
         error.Int96OutOfRange => diagnosticPrint(
             "zpq query: an INT96 timestamp lies outside 1677-2262, which nanoseconds\n" ++
                 "  cannot hold, or holds a time of day past 24 hours\n",

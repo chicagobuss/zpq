@@ -715,9 +715,15 @@ fn executeAggregateOver(
     var starter: ReadStarter = undefined;
     if (reader) |rd| {
         starter = .{ .rd = rd };
-        scan_args.start_reads = .{ .ctx = &starter, .start = ReadStarter.start };
+        scan_args.start_reads = .{ .ctx = &starter, .start = ReadStarter.start, .abandon = ReadStarter.abandon };
     }
     scan_args.inputs = scan_inputs;
+    var probe_sink: DictProbeSink = .{ .inputs = scan_inputs, .mmaps = opened.mmaps };
+    if (args.group_by != null and allLocal(opened)) {
+        probe_sink.cold = try arena.alloc(DictProbeSink.Cold, scan_inputs.len);
+        @memset(probe_sink.cold, @enumFromInt(0));
+        scan_args.dict_probe = .{ .ctx = &probe_sink, .add = DictProbeSink.add };
+    }
     if (empty_result) {
         const empty_metas = try arena.dupe(schema.FileMetaData, metas.?);
         for (empty_metas) |*m| {
@@ -3270,10 +3276,60 @@ fn planLocalReader(
         in.bytes = f.bytes();
         in.gate = f.gate();
         in.plan_bytes = m.bytes;
+        in.dict_wait = .{ .ctx = f, .wait = local_reader.File.probeWait };
     }
     // Started by the scan once it has planned (`scan.ReadStart`).
     return inputs;
 }
+
+/// `scan.DictProbe` for local inputs: a reader's input reads the range ahead of its row groups; a mapped one whose
+/// first probed range is not all in the page cache (a cut steered to the mapping, no io_uring, a narrow cold read) is
+/// told to read its ranges in now, so its dictionaries come in at once instead of fault by fault. A `mincore` of a few
+/// ranges per file decides: a whole-file residency pass cost a warm short query more than the advice saves, and one
+/// range is not enough, as the first sits in the page the magic read brought in.
+const DictProbeSink = struct {
+    inputs: []const scan.Input,
+    mmaps: []const ?local_fs.Mapped,
+    /// Per file: ranges found resident so far, until `checks`; `cold` once one is not, `warm` after `checks`.
+    cold: []Cold = &.{},
+
+    const Cold = enum(u8) { cold = 0xff, warm = 0xfe, _ };
+    const checks = 4;
+
+    fn add(ctx: *anyopaque, file: usize, rg: usize, start: u64, end: u64) anyerror!void {
+        const self: *DictProbeSink = @ptrCast(@alignCast(ctx));
+        const in = self.inputs[file];
+        if (@import("builtin").os.tag == .linux) if (in.dict_wait) |w| {
+            const f: *local_reader.File = @ptrCast(@alignCast(w.ctx));
+            return f.reader.probe(f, rg, start, end);
+        };
+        if (in.gate != null) return;
+        const m = self.mmaps[file] orelse return;
+        const page = std.heap.pageSize();
+        const lo = std.mem.alignBackward(u64, start, page);
+        const hi = @min(std.mem.alignForward(u64, end, page), std.mem.alignForward(u64, m.bytes.len, page));
+        if (hi <= lo) return;
+        const ptr: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(@constCast(m.bytes.ptr + lo)));
+        const c = &self.cold[file];
+        if (c.* != .cold and c.* != .warm) {
+            const seen = @intFromEnum(c.*);
+            c.* = if (!allResident(ptr, hi - lo)) .cold else if (seen + 1 == checks) .warm else @enumFromInt(seen + 1);
+        }
+        // Advice only: a refusal leaves the pages to fault in as they would have.
+        if (c.* == .cold) _ = std.posix.system.madvise(ptr, @intCast(hi - lo), std.posix.MADV.WILLNEED);
+    }
+
+    /// Whether the range's first pages (up to 64) are all in the page cache; false where it cannot tell (off Linux).
+    fn allResident(ptr: [*]align(std.heap.page_size_min) u8, len: u64) bool {
+        if (@import("builtin").os.tag != .linux) return false;
+        var vec: [64]u8 = undefined;
+        const page = std.heap.pageSize();
+        const pages: usize = @intCast(@min((len + page - 1) / page, vec.len));
+        if (std.os.linux.errno(std.os.linux.mincore(ptr, pages * page, &vec)) != .SUCCESS) return false;
+        for (vec[0..pages]) |v| if (v & 1 == 0) return false;
+        return true;
+    }
+};
 
 /// `scan.ReadStart` for the local reader.
 const ReadStarter = struct {
@@ -3286,6 +3342,11 @@ const ReadStarter = struct {
         self.started = true;
         // Off Linux the reader never exists (`on_linux`), and its io_uring must not be compiled in.
         if (@import("builtin").os.tag == .linux) try self.rd.start();
+    }
+
+    fn abandon(ctx: *anyopaque) void {
+        const self: *ReadStarter = @ptrCast(@alignCast(ctx));
+        if (@import("builtin").os.tag == .linux) self.rd.abandon();
     }
 };
 
@@ -9258,10 +9319,10 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
 
-test "explainAggregate: local IO and environment knobs preserve dispatch, and reader inputs plan from footers" {
+test "explainAggregate: local IO and environment knobs preserve dispatch, and every read mode unions dictionaries" {
     const gpa = std.testing.allocator;
     const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
-    for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled| {
+    for (modes) |mode| for ([_]bool{ false, true }) |disabled| {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const lines = [_:null]?[*:0]const u8{
@@ -9275,10 +9336,10 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and re
             .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
         });
         try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
-        // A reader's input plans from its footer, as it executes: its dictionaries are read only by the scan. A file
-        // read through its mapping unions them.
+        // A reader's input unions the dictionaries its probe reads first, as a mapped one does, so the plan is the
+        // same whatever the read mode.
         const reasons = explained.aggregate.plan.reasons;
-        try std.testing.expect(if (i == 0) reasons.contains(.small_ndv) else reasons.contains(.unknown_ndv));
+        try std.testing.expect(reasons.contains(.small_ndv) and reasons.contains(.dictionary_union));
         try std.testing.expect(!explained.encoded);
     };
 }

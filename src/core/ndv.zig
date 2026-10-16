@@ -30,9 +30,133 @@ pub const Stat = struct {
     union_budget_exceeded: bool = false,
 };
 
-pub const File = struct { bytes: []const u8, local: bool };
+/// `bytes` is laid out like the file. With `wait`, they are still being read in (`io/local_reader.zig`): only the
+/// ranges `probeRanges` asked for are ever read, each after `wait` says its row group's are in.
+pub const File = struct { bytes: []const u8, local: bool, wait: ?Wait = null };
+pub const Wait = struct { ctx: *anyopaque, wait: *const fn (ctx: *anyopaque, rg: usize) anyerror!void };
 const Ref = struct { file: usize, rg: usize };
 const max_input = 25 * 1024 * 1024;
+/// What a header read takes from the start of a dictionary page (`header` reads no further): a page header is tens of
+/// bytes, and one page of them per chunk keeps a probe of thousands of row groups small.
+const header_prefix = 4096;
+
+/// All the dictionary bytes planning reads at most, headers and whole pages together, the same in every read mode:
+/// the reader holds what it probes until the scan is done with its row group, beside the window rather than in it.
+pub fn probeCap(max_memory: usize) u64 {
+    return @min(max_memory / 16, 256 * 1024 * 1024);
+}
+
+/// What `collect` reads, decided from the footers alone so a reader can fetch exactly that before it is read
+/// (`probeRanges`): every covered key chunk's dictionary header, and per key whether its whole pages are unioned.
+pub const Reads = struct { headers: bool, whole: []const bool };
+
+/// The reads a key chunk's dictionary takes, header first; page rounding is charged so the cap holds as read.
+fn chunkCost(len: u64, whole: bool) u64 {
+    return (if (whole) len else @min(len, header_prefix)) +| header_prefix;
+}
+
+fn planReads(
+    arena: std.mem.Allocator,
+    metas: []const schema.FileMetaData,
+    keys: []const expr.Expr,
+    max_memory: usize,
+    allow_headers: bool,
+    allow_union: bool,
+    retain_wanted: bool,
+) !?Reads {
+    if (keys.len == 0) return null;
+    for (keys) |key| if (key != .col_ref) return null;
+    const whole = try arena.alloc(bool, keys.len);
+    var dict_total: u64 = 0;
+    var col_total: u64 = 0;
+    const dict_sizes = try arena.alloc(u64, keys.len);
+    const col_sizes = try arena.alloc(u64, keys.len);
+    for (keys, whole, dict_sizes, col_sizes) |key, *w, *d, *c| {
+        const ci = key.col_ref.col_idx;
+        w.* = true;
+        d.* = 0;
+        c.* = 0;
+        for (metas) |*m| for (m.row_groups.items) |*rg| {
+            if (ci >= rg.columns.items.len) {
+                w.* = false;
+                continue;
+            }
+            const cm = rg.columns.items[ci].meta_data orelse {
+                w.* = false;
+                continue;
+            };
+            const flat = cm.path_in_schema.items.len == 1 and m.getColumnLevels(cm.path_in_schema.items).max_rep == 0;
+            if (!flat) return null;
+            c.* +|= @intCast(@max(0, cm.total_compressed_size));
+            if (dictBytes(cm)) |n| d.* +|= n else w.* = false;
+            if (!fullCoverage(&cm)) w.* = false;
+        };
+        dict_total +|= d.*;
+        col_total +|= c.*;
+    }
+    // Headers first: past the cap even with no whole page, nothing is read and every key plans from its footer.
+    var probed: u64 = 0;
+    for (keys) |key| probed +|= chunksCost(metas, key.col_ref.col_idx, false);
+    const cap = probeCap(max_memory);
+    if (!allow_headers or probed > cap) {
+        @memset(whole, false);
+        return .{ .headers = false, .whole = whole };
+    }
+    const total_gate = dict_total <= max_input or dict_total <= col_total / 20;
+    for (keys, whole, dict_sizes, col_sizes) |key, *w, d, c| {
+        const gated = total_gate and (d <= max_input or d <= c / 20);
+        const retain = retain_wanted and keys.len == 1 and
+            (key.col_ref.physical_type == .INT32 or key.col_ref.physical_type == .INT64);
+        w.* = allow_union and w.* and max_memory >= 1024 * 1024 and (gated or retain);
+        if (!w.*) continue;
+        const more = chunksCost(metas, key.col_ref.col_idx, true) - chunksCost(metas, key.col_ref.col_idx, false);
+        if (probed +| more > cap) w.* = false else probed += more;
+    }
+    return .{ .headers = true, .whole = whole };
+}
+
+/// `chunkCost` over a key column's covered chunks in every row group.
+fn chunksCost(metas: []const schema.FileMetaData, col: usize, whole: bool) u64 {
+    var n: u64 = 0;
+    for (metas) |*m| for (m.row_groups.items) |*rg| {
+        if (col >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[col].meta_data orelse continue;
+        if (!fullCoverage(&cm)) continue;
+        const len = dictBytes(cm) orelse continue;
+        n +|= chunkCost(len, whole);
+    };
+    return n;
+}
+
+pub const Probe = struct { file: usize, rg: usize, start: u64, end: u64 };
+
+/// The dictionary bytes `collect` will read with these arguments, from footers alone: every key chunk's whole
+/// dictionary page where its key is unioned, its header otherwise. A reader that reads these first, and `collect`
+/// waiting for them (`File.wait`), plans from the same facts as a mapping does.
+pub fn probeRanges(
+    arena: std.mem.Allocator,
+    metas: []const schema.FileMetaData,
+    keys: []const expr.Expr,
+    max_memory: usize,
+    allow_headers: bool,
+    allow_union: bool,
+    retain_wanted: bool,
+) ![]const Probe {
+    const reads = try planReads(arena, metas, keys, max_memory, allow_headers, allow_union, retain_wanted) orelse
+        return &.{};
+    if (!reads.headers) return &.{};
+    var out: std.ArrayList(Probe) = .empty;
+    for (metas, 0..) |*m, fi| for (m.row_groups.items, 0..) |*rg, ri| for (keys, reads.whole) |key, w| {
+        const ci = key.col_ref.col_idx;
+        if (ci >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[ci].meta_data orelse continue;
+        if (!fullCoverage(&cm)) continue;
+        const len = dictBytes(cm) orelse continue;
+        const start: u64 = @intCast(cm.dictionary_page_offset.?);
+        try out.append(arena, .{ .file = fi, .rg = ri, .start = start, .end = start + if (w) len else @min(len, header_prefix) });
+    };
+    return out.items;
+}
 
 pub fn fullCoverage(cm: *const schema.ColumnMetaData) bool {
     // The legacy encodings list does not prove coverage; PLAIN can describe the dictionary OR fallback data.
@@ -45,8 +169,10 @@ fn dictBytes(cm: schema.ColumnMetaData) ?u64 {
     return @intCast(cm.data_page_offset - start);
 }
 
-fn dictSlice(file: File, cm: schema.ColumnMetaData) ?[]const u8 {
+fn dictSlice(file: File, rg: usize, cm: schema.ColumnMetaData) ?[]const u8 {
     if (!file.local) return null;
+    // A failed read is reported where the scan reads the row group; here it only leaves the bound unproven.
+    if (file.wait) |w| w.wait(w.ctx, rg) catch return null;
     const len = dictBytes(cm) orelse return null;
     const start: u64 = @intCast(cm.dictionary_page_offset.?);
     if (start > file.bytes.len or len > file.bytes.len - start) return null;
@@ -55,7 +181,7 @@ fn dictSlice(file: File, cm: schema.ColumnMetaData) ?[]const u8 {
 
 fn header(bytes: []const u8) ?schema.PageHeader {
     // Bound malformed header work and never cross into the following data page.
-    var reader = thrift.Reader.init(bytes[0..@min(bytes.len, 64 * 1024)]);
+    var reader = thrift.Reader.init(bytes[0..@min(bytes.len, header_prefix)]);
     const h = schema.PageHeader.read(&reader) catch return null;
     if (h.type != .DICTIONARY_PAGE or h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return null;
     const d = h.dictionary_page_header orelse return null;
@@ -80,7 +206,7 @@ pub fn collect(
     max_memory: usize,
     allow_union: bool,
 ) !Stat {
-    return collectRetaining(gpa, arena, files, metas, keys, workers, max_memory, allow_union, null);
+    return collectRetaining(gpa, arena, files, metas, keys, workers, max_memory, true, allow_union, null);
 }
 
 /// `collect`, also keeping a lone INT32/INT64 key's union as an exact domain in `domain` (owned by the caller, gpa)
@@ -94,6 +220,8 @@ pub fn collectRetaining(
     keys: []const expr.Expr,
     workers: usize,
     max_memory: usize,
+    /// False reads no dictionary at all (a plan the bound cannot change), as `probeRanges` then asks for none.
+    allow_headers: bool,
     allow_union: bool,
     domain: ?*?agg_dense.Domain,
 ) !Stat {
@@ -109,6 +237,10 @@ pub fn collectRetaining(
         stat.string_keys = stat.string_keys or key.typeOf() == .str;
         if (key != .col_ref) return stat;
     }
+    // The footer's half of every read below, shared with `probeRanges` so a reader fetches exactly what this reads.
+    // Null only for a nested key, which returns before any read.
+    const reads: Reads = try planReads(arena, metas, keys, max_memory, allow_headers, allow_union, domain != null) orelse
+        .{ .headers = false, .whole = &.{} };
     const sums = try arena.alloc(u64, keys.len);
     const full = try arena.alloc(bool, keys.len);
     const dict_sizes = try arena.alloc(u64, keys.len);
@@ -155,7 +287,7 @@ pub fn collectRetaining(
             const covers = fullCoverage(&cm);
             if (dictBytes(cm)) |n| dict_sizes[ki] +|= n else full[ki] = false;
             const n: u64 = blk: {
-                if (covers) if (dictSlice(files[ref.file], cm)) |b| if (header(b)) |h| {
+                if (covers and reads.headers) if (dictSlice(files[ref.file], ref.rg, cm)) |b| if (header(b)) |h| {
                     known = true;
                     break :blk @min(rows, @as(u64, @intCast(h.dictionary_page_header.?.num_values)) + nullBound(cm));
                 };
@@ -192,7 +324,7 @@ pub fn collectRetaining(
         // gated, as soon as its values outgrow a domain, so a large key pays for a few dictionaries at most.
         const retain = if (domain != null and keys.len == 1 and
             (key.col_ref.physical_type == .INT32 or key.col_ref.physical_type == .INT64)) domain else null;
-        const run = allow_union and full[ki] and max_memory >= 1024 * 1024 and (gated or retain != null);
+        const run = full[ki] and ki < reads.whole.len and reads.whole[ki];
         if (allow_union and full[ki] and !run) stat.union_budget_exceeded = true;
         if (run) {
             stat.union_attempted = true;
@@ -304,7 +436,7 @@ const Worker = struct {
             const a = scratch.allocator();
             const ref = s.refs[i];
             const cm = s.metas[ref.file].row_groups.items[ref.rg].columns.items[s.col].meta_data.?;
-            const bytes = dictSlice(s.files[ref.file], cm) orelse return error.BadDictionary;
+            const bytes = dictSlice(s.files[ref.file], ref.rg, cm) orelse return error.BadDictionary;
             const h = header(bytes) orelse return error.BadDictionary;
             const n: usize = @intCast(h.dictionary_page_header.?.num_values);
             // Payload plus value views and scatter ids are bounded before any decompression/allocation.
@@ -430,7 +562,7 @@ fn unionBound(
         for (refs) |ref| {
             const cm = metas[ref.file].row_groups.items[ref.rg].columns.items[col].meta_data.?;
             const se = metas[ref.file].getColumnSchema(cm.path_in_schema.items) orelse return null;
-            const bytes = dictSlice(files[ref.file], cm) orelse return null;
+            const bytes = dictSlice(files[ref.file], ref.rg, cm) orelse return null;
             const h = header(bytes) orelse return null;
             page_need = @max(page_need, @as(u64, @intCast(h.uncompressed_page_size)) +|
                 (@as(u64, @intCast(h.dictionary_page_header.?.num_values)) *| 32));
@@ -602,7 +734,10 @@ test "ndv: partial coverage, missing null counts, unavailable pages and probe bu
     const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
     const local = [_]File{.{ .bytes = bytes, .local = true }};
     const budgeted = try collect(a, arena, &local, &.{meta}, &keys, 4, 1024 * 1024, true);
-    try std.testing.expect(budgeted.union_attempted and !budgeted.union_complete);
+    // A 1 MiB budget reads at most 64 KiB of dictionaries, less than 16 row groups' headers: nothing is read, and the
+    // key plans from its footer.
+    try std.testing.expect(!budgeted.union_attempted and !budgeted.union_complete);
+    try std.testing.expectEqual(.unknown, budgeted.source);
     const remote = [_]File{.{ .bytes = &.{}, .local = false }};
     const unavailable = try collect(a, arena, &remote, &.{meta}, &keys, 4, 512 << 20, true);
     try std.testing.expectEqual(.unknown, unavailable.source);
@@ -712,6 +847,71 @@ test "ndv: dictionary headers accept the execution reader's legacy PLAIN_DICTION
     }
 }
 
+test "ndv: a buffer holding only the probed bytes gives the facts the whole file gives, at any cap" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const arena = state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const keys = [_]expr.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } },
+    };
+    const Waits = struct {
+        n: usize = 0,
+        fn wait(ctx: *anyopaque, _: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+        }
+    };
+    const probed = try a.alloc(u8, bytes.len);
+    defer a.free(probed);
+    // From a cap below one header per chunk, through whole pages for one key, to every whole page.
+    for ([_]usize{ 16 * 4096, 1 << 20, 4 << 20, 512 << 20 }) |max_memory| for ([_]bool{ false, true }) |headers| {
+        for ([_]bool{ false, true }) |allow_union| for ([_]usize{ 1, 2 }) |n_keys| {
+            const ks = keys[0..n_keys];
+            @memset(probed, 0);
+            const ranges = try probeRanges(arena, &.{meta}, ks, max_memory, headers, allow_union, false);
+            var total: u64 = 0;
+            for (ranges) |r| {
+                @memcpy(probed[r.start..r.end], bytes[r.start..r.end]);
+                total += r.end - r.start;
+            }
+            try std.testing.expect(total <= probeCap(max_memory));
+            if (!headers) try std.testing.expectEqual(@as(usize, 0), ranges.len);
+            var waits: Waits = .{};
+            const whole = [_]File{.{ .bytes = bytes, .local = true }};
+            const part = [_]File{.{ .bytes = probed, .local = true, .wait = .{ .ctx = &waits, .wait = Waits.wait } }};
+            const want = try collectRetaining(a, arena, &whole, &.{meta}, ks, 4, max_memory, headers, allow_union, null);
+            const got = try collectRetaining(a, arena, &part, &.{meta}, ks, 4, max_memory, headers, allow_union, null);
+            try std.testing.expectEqualDeep(want, got);
+            // Every read waited for the probe, and none was made without one.
+            try std.testing.expectEqual(ranges.len == 0, waits.n == 0);
+        };
+    };
+}
+
+test "ndv: probe ranges allocate only from the arena they are given" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const meta = try metadata.open(state.allocator(), bytes);
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(gpa: std.mem.Allocator, m: *const schema.FileMetaData) !void {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
+            _ = try probeRanges(arena.allocator(), &.{m.*}, &keys, 512 << 20, true, true, true);
+        }
+    }.run, .{&meta});
+}
+
 test "ndv: an empty input has a zero upper bound" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -735,7 +935,7 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
     for ([_]usize{ 1, 4 }) |workers| {
         var domain: ?agg_dense.Domain = null;
         defer if (domain) |*d| d.deinit(a);
-        const stat = try collectRetaining(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true, &domain);
+        const stat = try collectRetaining(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true, true, &domain);
         const bound = try collect(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true);
         try std.testing.expectEqual(bound.hi, stat.hi); // Retention never moves the bound.
         const d = &(domain orelse return error.TestExpectedEqual);
@@ -760,24 +960,24 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
     // Retention costs what the domain holds, its presized map shares charged once: a budget of exactly that keeps it.
     {
         var full: ?agg_dense.Domain = null;
-        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true, &full);
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true, true, &full);
         const d = &full.?;
         const need = d.values.len * 32 + d.entries() * 4 + d.trans.len * @sizeOf([]u32) + d.file_base.len * @sizeOf(usize);
         d.deinit(a);
         var exact: ?agg_dense.Domain = null;
         defer if (exact) |*e| e.deinit(a);
-        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, need * 16, true, &exact);
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, need * 16, true, true, &exact);
         try std.testing.expect(exact != null);
     }
     // Strings and composites keep no domain; a retention budget too small drops it, not the bound.
     var none: ?agg_dense.Domain = null;
     const str_key = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
-    _ = try collectRetaining(a, arena, &files, &.{meta}, &str_key, 4, 512 << 20, true, &none);
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &str_key, 4, 512 << 20, true, true, &none);
     try std.testing.expect(none == null);
     const pair = [_]expr.Expr{ keys[0], keys[0] };
-    _ = try collectRetaining(a, arena, &files, &.{meta}, &pair, 4, 512 << 20, true, &none);
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &pair, 4, 512 << 20, true, true, &none);
     try std.testing.expect(none == null);
-    const tight = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true, &none);
+    const tight = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true, true, &none);
     try std.testing.expect(tight.union_complete);
     try std.testing.expect(none == null);
     // Retention given up part way moves what it held into the union's sets: the same exact count.
@@ -815,7 +1015,7 @@ test "ndv: allocation failures while retaining a domain leak nothing and never f
         defer scratch.deinit();
         var domain: ?agg_dense.Domain = null;
         defer if (domain) |*d| d.deinit(gpa);
-        if (collectRetaining(gpa, scratch.allocator(), &files, &.{meta}, &keys, 1, 512 << 20, true, &domain)) |stat| {
+        if (collectRetaining(gpa, scratch.allocator(), &files, &.{meta}, &keys, 1, 512 << 20, true, true, &domain)) |stat| {
             try std.testing.expect(stat.union_complete);
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         if (!failing.has_induced_failure) {

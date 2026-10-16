@@ -83,6 +83,10 @@ pub const Input = struct {
     /// I/O progress and read mode), and what a scan run again after a fast path's refusal reads, the reader's window
     /// having moved on. Null without a gate, and for S3 inputs.
     plan_bytes: ?[]const u8 = null,
+    /// Beside a gate: the dictionary bytes `MultiAggArgs.dict_probe` asked for are read into `bytes` ahead of every row
+    /// group, and planning reads them there once this says they are in, so a reader's input plans from the same
+    /// dictionaries a mapped one does.
+    dict_wait: ?ndv.Wait = null,
 
     /// Readable again from the start, as a scan run again after a refusal must read it (`runMultiAggregate`).
     pub fn rescannable(self: Input) bool {
@@ -107,18 +111,30 @@ pub const RowGroupGate = struct {
     done: *const fn (ctx: *anyopaque, rg: usize, items: usize) void,
 };
 
-/// Starts the reads the scan's gates wait on (`Input.gate`). Called once planning has stopped reading the files through
-/// their mappings: a cold file's dictionary pages then come off the disk with the disk to themselves, not queued behind
-/// the reads of the whole file. Idempotent; a scan given none reads as its inputs are.
+/// Asks for the bytes planning reads from input `file` (`ndv.probeRanges`) to be read first: the reader reads them ahead
+/// of every row group (`Input.dict_wait`); a mapped file is advised to read them in at once rather than fault them one
+/// by one. Called for every probe range before `ReadStart`.
+pub const DictProbe = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, file: usize, rg: usize, start: u64, end: u64) anyerror!void,
+};
+
+/// Starts the reads the scan's gates wait on (`Input.gate`). Called once every `DictProbe` range is asked for and before
+/// planning reads any of them: planning never reads a reader's input through its mapping, so its reads queue behind
+/// nothing but the probes. Idempotent; a scan given none reads as its inputs are.
 pub const ReadStart = struct {
     ctx: *anyopaque,
     start: *const fn (ctx: *anyopaque) anyerror!void,
+    /// Stops the reads and gives their buffers back before a scan runs again over the mappings (`runMultiAggregate`).
+    abandon: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 pub const MultiAggArgs = struct {
     inputs: []const Input,
     /// See `ReadStart`.
     start_reads: ?ReadStart = null,
+    /// See `DictProbe`.
+    dict_probe: ?DictProbe = null,
     /// Optional metadata parsed by the I/O layer. When null, metadata is
     /// parsed from each Input.bytes as before.
     metas: ?[]const schema.FileMetaData = null,
@@ -540,6 +556,8 @@ pub const MultiAggResult = struct {
     part_agg: bool = false,
     /// Grouped count(DISTINCT) was answered through pairs (`foldDistinctPairs`).
     distinct_pairs: bool = false,
+    /// Why the scan ran as it did (`ScanPlan.reasons`), and what its dictionary bound came from.
+    reasons: std.EnumSet(Reason) = .{},
     /// How many of each GROUP BY row's leading columns are shown; the rest are hidden ORDER BY inputs
     /// (`ResultOrder.hidden`) the result program drops once it has ranked the rows. Null shows every column.
     visible_cols: ?usize = null,
@@ -2586,10 +2604,16 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
         if (taken.contains(.spill)) plain.spill = false;
         if (taken.contains(.pairs)) plain.distinct_pairs = .off;
         if (taken.contains(.partitioned)) plain.partition_cost = false;
+        // The rerun reads the mappings from the start: an exact restart, which reuses none of the reader's bytes and so
+        // must not hold its window beside its own.
+        if (args.start_reads) |s| if (s.abandon) |abandon| abandon(s.ctx);
+        plain.start_reads = null;
+        plain.dict_probe = null;
         const inputs = try arena.dupe(Input, args.inputs);
         for (inputs) |*in| if (in.plan_bytes) |b| {
             in.bytes = b;
             in.gate = null;
+            in.dict_wait = null;
         };
         plain.inputs = inputs;
         return prepareAggregate(gpa, arena, plain, false);
@@ -2817,20 +2841,30 @@ fn prepareAggregate(
     defer if (domain) |*d| d.deinit(gpa);
     if (args.ndv_policy) if (group_by_keys) |keys| {
         const files = try arena.alloc(ndv.File, args.inputs.len);
-        // Dictionaries are read from a file read through its mapping. A reader's input, chosen for a file mostly out of
-        // the page cache, is planned from its footer, as an S3 input is: its buffers are not filled yet, and reading
-        // its dictionaries through the mapping instead put a cold read of every row group's in front of the scan.
+        // Dictionaries are read from a mapped file, or from a reader's buffer once its probe of them is in. Explain
+        // reads a reader's input through its mapping, which holds the same bytes the probe would read. Without either
+        // (S3, or a reader no probe was asked of) an input plans from its footer.
         for (args.inputs, files) |input, *file| {
-            const bytes = input.plan_bytes orelse input.bytes;
+            const probed = input.gate != null and input.dict_wait != null;
+            const bytes = if (probed) input.bytes else input.plan_bytes orelse input.bytes;
+            const readable = input.gate == null or probed or (explain and input.plan_bytes != null);
             file.* = .{
                 .bytes = bytes,
-                .local = !std.mem.startsWith(u8, input.name, "s3://") and input.gate == null and
+                .local = !std.mem.startsWith(u8, input.name, "s3://") and readable and
                     (input.logical_size == 0 or input.logical_size == bytes.len),
+                .wait = if (probed) input.dict_wait else null,
             };
         }
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
         const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
         const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
+        const allow_union = args.ndv_union and !prefix;
+        if (!explain) if (args.dict_probe) |dp| {
+            for (try ndv.probeRanges(arena, metas, keys, args.max_memory, true, allow_union, want)) |r|
+                try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
+        };
+        // The reader reads the probes first, then streams row groups into its window while the dictionaries union.
+        if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
         ndv_stat = try ndv.collectRetaining(
             gpa,
             arena,
@@ -2839,7 +2873,8 @@ fn prepareAggregate(
             keys,
             n_workers,
             args.max_memory,
-            args.ndv_union and !prefix,
+            true,
+            allow_union,
             if (want) &domain else null,
         );
     };
@@ -3468,6 +3503,7 @@ fn prepareAggregate(
         .output = output,
         .part_agg = spilled,
         .distinct_pairs = pairs_used,
+        .reasons = scan_plan.reasons,
         .visible_cols = if (args.result_order.hidden.len > 0) args.select_cols.?.len else null,
         .state = .{
             .accumulators = accumulators,
@@ -11146,4 +11182,79 @@ test "result cut DECIMAL: loser and zero-limit overflow stays observable, payloa
             .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = limit },
         }));
     };
+}
+
+test "runMultiAggregate: a gated input plans from the dictionaries its probe reads first, as a mapped one does" {
+    const gpa = testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", gpa);
+    defer gpa.free(bytes);
+    var meta_arena = std.heap.ArenaAllocator.init(gpa);
+    defer meta_arena.deinit();
+    const meta = try metadata.open(meta_arena.allocator(), bytes);
+    // A reader's buffer: zero until the probe copies what it asks for, the rest once the first gate is waited on.
+    const Fake = struct {
+        src: []const u8,
+        buf: []u8,
+        probes: usize = 0,
+        started: bool = false,
+        filled: bool = false,
+        fn add(ctx: *anyopaque, _: usize, _: usize, lo: u64, hi: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try testing.expect(!self.started);
+            @memcpy(self.buf[lo..hi], self.src[lo..hi]);
+            self.probes += 1;
+        }
+        fn start(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.started = true;
+        }
+        fn probed(ctx: *anyopaque, _: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try testing.expect(self.started);
+        }
+        fn wait(ctx: *anyopaque, _: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.filled) @memcpy(self.buf, self.src);
+            self.filled = true;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {}
+    };
+    const buf = try gpa.alloc(u8, bytes.len);
+    defer gpa.free(buf);
+    for ([_][]const u8{ "count(*) AS c", "count(*) AS c, sum(n) AS s" }) |aggregate| {
+        @memset(buf, 0);
+        var fake: Fake = .{ .src = bytes, .buf = buf };
+        var a1 = std.heap.ArenaAllocator.init(gpa);
+        defer a1.deinit();
+        var mapped = try runMultiAggregate(gpa, a1.allocator(), .{
+            .inputs = &.{.{ .name = "m", .bytes = bytes }},
+            .metas = &.{meta},
+            .aggregate = aggregate,
+            .group_by = "k",
+            .parallelism = 1,
+        });
+        defer mapped.deinit(gpa);
+        var a2 = std.heap.ArenaAllocator.init(gpa);
+        defer a2.deinit();
+        var gated = try runMultiAggregate(gpa, a2.allocator(), .{
+            .inputs = &.{.{
+                .name = "g",
+                .bytes = buf,
+                .gate = .{ .ctx = &fake, .wait = Fake.wait, .done = Fake.done },
+                .plan_bytes = bytes,
+                .dict_wait = .{ .ctx = &fake, .wait = Fake.probed },
+            }},
+            .metas = &.{meta},
+            .aggregate = aggregate,
+            .group_by = "k",
+            .parallelism = 1,
+            .start_reads = .{ .ctx = &fake, .start = Fake.start },
+            .dict_probe = .{ .ctx = &fake, .add = Fake.add },
+        });
+        defer gated.deinit(gpa);
+        try testing.expect(fake.probes > 0);
+        try testing.expect(mapped.reasons.contains(.dictionary_union));
+        try testing.expectEqual(mapped.reasons, gated.reasons);
+        try expectSameAnswer(mapped, gated);
+    }
 }

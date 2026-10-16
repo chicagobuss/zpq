@@ -166,6 +166,12 @@ pub const File = struct {
     /// ranges say nothing about whose pages they are.
     segs: std.ArrayList(Range) = .empty,
     seg_refs: []std.atomic.Value(u32) = &.{},
+    /// Ranges planning reads before any row group (`Reader.probe`), each held by its row group: page-aligned, read by
+    /// the first units of all, and never read again by a row group's own.
+    probes: std.ArrayList(struct { rg: u32, r: Range }) = .empty,
+    probe_left: std.atomic.Value(u32) = .init(0),
+    /// As `rg_ready`, for every probe of the file at once.
+    probe_ready: std.atomic.Value(u32) = .init(1),
 
     pub fn bytes(f: *const File) []const u8 {
         return f.buf[0..@intCast(f.size)];
@@ -175,10 +181,21 @@ pub const File = struct {
         return .{ .ctx = f, .wait = gateWait, .done = gateDone };
     }
 
+    /// What `ndv.File.wait` calls: every probe of the file is in. The row group does not matter, as a row group's own
+    /// units leave out the probed pages of every row group.
+    pub fn probeWait(ctx: *anyopaque, _: usize) anyerror!void {
+        const f: *File = @ptrCast(@alignCast(ctx));
+        try awaitReady(f, &f.probe_ready);
+    }
+
     fn gateWait(ctx: *anyopaque, rg: usize) anyerror!void {
         const f: *File = @ptrCast(@alignCast(ctx));
         if (rg >= f.rg_ready.len) return;
-        const r = &f.rg_ready[rg];
+        try awaitReady(f, &f.rg_ready[rg]);
+        try awaitReady(f, &f.probe_ready);
+    }
+
+    fn awaitReady(f: *File, r: *std.atomic.Value(u32)) !void {
         var v = r.load(.acquire);
         if (v == 1) return;
         const t0 = nowNs();
@@ -222,7 +239,8 @@ pub const File = struct {
 
 /// One read: `len` bytes at `off`. `charge` is the window bytes it accounts for (its row group's on the first unit),
 /// and `ticket` its row group's turn to be admitted.
-const Unit = struct { file: u32, rg: u32, off: u64, len: u32, charge: u64 = 0, ticket: u32 = 0 };
+/// A probe unit (`File.probes`) is outside the window: planning waits on it before any row group can be released.
+const Unit = struct { file: u32, rg: u32, off: u64, len: u32, charge: u64 = 0, ticket: u32 = 0, probe: bool = false };
 
 pub const Stats = struct {
     bytes: std.atomic.Value(u64) = .init(0),
@@ -252,6 +270,7 @@ pub const Reader = struct {
     /// Reader threads by the backend they actually got: a uring thread whose ring setup failed reads with pread.
     uring_threads: u32 = 0,
     pread_threads: u32 = 0,
+    laid_out: bool = false,
 
     fn setDirect(fd: i32) bool {
         const flags = linux.fcntl(fd, linux.F.GETFL, 0);
@@ -311,7 +330,7 @@ pub const Reader = struct {
     }
 
     /// Declare a file's row groups: `ranges_per_rg[rg]` (null when pruned) must be read before the row group is
-    /// scanned. They are sorted and coalesced here.
+    /// scanned. They are sorted and coalesced here, and cut into reads at `start`, after any `probe`.
     pub fn planFile(self: *Reader, f: *File, ranges_per_rg: []const ?[]Range, gap: u64) !void {
         const n = ranges_per_rg.len;
         f.rg_ready = try self.gpa.alloc(std.atomic.Value(u32), n);
@@ -319,67 +338,144 @@ pub const Reader = struct {
         f.rg_units_left = try self.gpa.alloc(std.atomic.Value(u32), n);
         f.rg_first = try self.gpa.alloc(u32, n + 1);
         f.rg_bytes = try self.gpa.alloc(u64, n);
-        const file_idx: u32 = for (self.files.items, 0..) |x, i| {
-            if (x == f) break @intCast(i);
-        } else unreachable;
         for (ranges_per_rg, 0..) |opt, rg| {
             f.rg_first[rg] = @intCast(f.ranges.items.len);
             f.rg_items_done[rg] = .init(0);
             f.rg_bytes[rg] = 0;
-            var units: u32 = 0;
-            const first_unit = self.units.items.len;
-            if (opt) |rs| {
-                std.mem.sort(Range, rs, {}, struct {
-                    fn lt(_: void, a: Range, b: Range) bool {
-                        return a.start < b.start;
-                    }
-                }.lt);
-                var cur: ?Range = null;
-                for (rs) |r| {
-                    const end = @min(r.end, f.size);
-                    if (end <= r.start) continue;
-                    // Whole pages: O_DIRECT needs them, and they make overlaps with other row groups exact.
-                    const clipped: Range = .{
-                        .start = std.mem.alignBackward(u64, r.start, pageLen()),
-                        .end = std.mem.alignForward(u64, end, pageLen()),
-                    };
-                    if (cur) |*c| {
-                        if (clipped.start <= c.end + gap) {
-                            c.end = @max(c.end, clipped.end);
-                            continue;
-                        }
-                        try f.ranges.append(self.gpa, c.*);
-                    }
-                    cur = clipped;
-                }
-                if (cur) |c| try f.ranges.append(self.gpa, c);
-                for (f.ranges.items[f.rg_first[rg]..]) |r| {
-                    var off = r.start;
-                    const end = r.end;
-                    while (off < end) {
-                        const len = @min(self.cfg.block, end - off);
-                        try self.units.append(self.gpa, .{
-                            .file = file_idx,
-                            .rg = @intCast(rg),
-                            .off = off,
-                            .len = @intCast(len),
-                        });
-                        f.rg_bytes[rg] += len;
-                        units += 1;
-                        off += len;
-                    }
-                }
-            }
-            if (units > 0) {
-                self.units.items[first_unit].charge = f.rg_bytes[rg];
-                for (self.units.items[first_unit..]) |*u| u.ticket = self.tickets;
-                self.tickets += 1;
-            }
-            f.rg_units_left[rg] = .init(units);
-            f.rg_ready[rg] = .init(if (units == 0) 1 else 0);
+            const rs = opt orelse continue;
+            std.mem.sort(Range, rs, {}, rangeLess);
+            try coalesce(self.gpa, &f.ranges, rs, f.size, gap);
         }
         f.rg_first[n] = @intCast(f.ranges.items.len);
-        try self.planSegments(f);
+    }
+
+    /// Have `[start, end)` of row group `rg` read before any row group's data, for planning to read through
+    /// `File.probeWait` (dictionary pages, `ndv.probeRanges`). The row group holds the probed pages and gives them back
+    /// with its own; its own reads leave out every probed page of the file. Between `planFile` and `start`.
+    pub fn probe(self: *Reader, f: *File, rg: usize, lo: u64, end: u64) !void {
+        std.debug.assert(!self.laid_out and rg + 1 < f.rg_first.len);
+        const hi = @min(end, f.size);
+        if (hi <= lo) return;
+        try f.probes.append(self.gpa, .{ .rg = @intCast(rg), .r = .{
+            .start = std.mem.alignBackward(u64, lo, pageLen()),
+            .end = std.mem.alignForward(u64, hi, pageLen()),
+        } });
+    }
+
+    fn rangeLess(_: void, a: Range, b: Range) bool {
+        return a.start < b.start;
+    }
+
+    /// Append sorted `rs`, clipped to `size`, to `out` as whole pages (O_DIRECT needs them, and they make overlaps with
+    /// other row groups exact), merging ranges at most `gap` apart.
+    fn coalesce(gpa: std.mem.Allocator, out: *std.ArrayList(Range), rs: []const Range, size: u64, gap: u64) !void {
+        var cur: ?Range = null;
+        for (rs) |r| {
+            const end = @min(r.end, size);
+            if (end <= r.start) continue;
+            const clipped: Range = .{
+                .start = std.mem.alignBackward(u64, r.start, pageLen()),
+                .end = std.mem.alignForward(u64, end, pageLen()),
+            };
+            if (cur) |*c| {
+                if (clipped.start <= c.end + gap) {
+                    c.end = @max(c.end, clipped.end);
+                    continue;
+                }
+                try out.append(gpa, c.*);
+            }
+            cur = clipped;
+        }
+        if (cur) |c| try out.append(gpa, c);
+    }
+
+    /// Append the reads of `[lo, hi)` in blocks.
+    fn addUnits(self: *Reader, u: Unit, lo: u64, hi: u64) !u32 {
+        var off = lo;
+        var n: u32 = 0;
+        while (off < hi) : (n += 1) {
+            const len = @min(self.cfg.block, hi - off);
+            var unit = u;
+            unit.off = off;
+            unit.len = @intCast(len);
+            try self.units.append(self.gpa, unit);
+            off += len;
+        }
+        return n;
+    }
+
+    /// Cut every file's ranges into reads: all probes first, then each row group's ranges less the probed pages, in
+    /// plan order. A row group's ranges take in its probes, so its release gives their pages back.
+    fn layOut(self: *Reader) !void {
+        if (self.laid_out) return;
+        self.laid_out = true;
+        const files = self.files.items;
+        const merged = try self.gpa.alloc(std.ArrayList(Range), files.len);
+        @memset(merged, .empty);
+        defer {
+            for (merged) |*m| m.deinit(self.gpa);
+            self.gpa.free(merged);
+        }
+        for (files, merged, 0..) |f, *m, fi| {
+            if (f.rg_first.len == 0) continue;
+            const rs = try self.gpa.alloc(Range, f.probes.items.len);
+            defer self.gpa.free(rs);
+            for (rs, f.probes.items) |*r, p| r.* = p.r;
+            std.mem.sort(Range, rs, {}, rangeLess);
+            try coalesce(self.gpa, m, rs, f.size, 0);
+            var n: u32 = 0;
+            for (m.items) |r| n += try self.addUnits(.{ .file = @intCast(fi), .rg = 0, .off = 0, .len = 0, .probe = true }, r.start, r.end);
+            f.probe_left = .init(n);
+            f.probe_ready = .init(if (n == 0) 1 else 0);
+        }
+        for (files, merged, 0..) |f, m, fi| {
+            if (f.rg_first.len == 0) continue;
+            const n = f.rg_first.len - 1;
+            // Each row group's ranges again, with its probes taken in.
+            var held: std.ArrayList(Range) = .empty;
+            errdefer held.deinit(self.gpa);
+            var scratch: std.ArrayList(Range) = .empty;
+            defer scratch.deinit(self.gpa);
+            for (0..n) |rg| {
+                scratch.clearRetainingCapacity();
+                try scratch.appendSlice(self.gpa, f.ranges.items[f.rg_first[rg]..f.rg_first[rg + 1]]);
+                for (f.probes.items) |p| if (p.rg == rg) try scratch.append(self.gpa, p.r);
+                std.mem.sort(Range, scratch.items, {}, rangeLess);
+                f.rg_first[rg] = @intCast(held.items.len);
+                try coalesce(self.gpa, &held, scratch.items, f.size, 0);
+                var units: u32 = 0;
+                const first_unit = self.units.items.len;
+                const own: Unit = .{ .file = @intCast(fi), .rg = @intCast(rg), .off = 0, .len = 0 };
+                for (held.items[f.rg_first[rg]..]) |r| {
+                    // The parts of `r` no probe covers; probes are sorted and disjoint.
+                    var lo = r.start;
+                    for (m.items) |p| {
+                        if (p.end <= lo or p.start >= r.end) continue;
+                        if (p.start > lo) {
+                            units += try self.addUnits(own, lo, p.start);
+                            f.rg_bytes[rg] += p.start - lo;
+                        }
+                        lo = @max(lo, p.end);
+                    }
+                    if (lo < r.end) {
+                        units += try self.addUnits(own, lo, r.end);
+                        f.rg_bytes[rg] += r.end - lo;
+                    }
+                }
+                if (units > 0) {
+                    self.units.items[first_unit].charge = f.rg_bytes[rg];
+                    for (self.units.items[first_unit..]) |*u| u.ticket = self.tickets;
+                    self.tickets += 1;
+                }
+                f.rg_units_left[rg] = .init(units);
+                f.rg_ready[rg] = .init(if (units == 0) 1 else 0);
+            }
+            f.rg_first[n] = @intCast(held.items.len);
+            f.ranges.deinit(self.gpa);
+            f.ranges = held;
+            held = .empty;
+            try self.planSegments(f);
+        }
     }
 
     /// Cut the union of `f`'s ranges into segments covered by one fixed set of row groups each (see `File.segs`).
@@ -416,6 +512,7 @@ pub const Reader = struct {
     }
 
     pub fn start(self: *Reader) !void {
+        try self.layOut();
         const n = @max(1, self.cfg.threads);
         // Reserved first: a spawned thread missing from the list would never be joined.
         try self.threads.ensureUnusedCapacity(self.gpa, n);
@@ -439,6 +536,18 @@ pub const Reader = struct {
         }
     }
 
+    /// Stops reading and gives every buffered page back, before a scan run again over the files' mappings
+    /// (`scan.runMultiAggregate`): that scan is an exact restart, and must not hold this window beside its own. Only
+    /// once no worker waits on a gate. `destroy` still tears down.
+    pub fn abandon(self: *Reader) void {
+        self.cancel.store(true, .release);
+        _ = self.rel_gen.fetchAdd(1, .release);
+        _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        for (self.threads.items) |t| t.join();
+        self.threads.clearRetainingCapacity();
+        for (self.files.items) |f| _ = linux.madvise(f.buf.ptr, f.buf.len, linux.MADV.DONTNEED);
+    }
+
     /// Joins the reader threads (abandoning reads not yet made), then unmaps and closes.
     pub fn destroy(self: *Reader) void {
         self.cancel.store(true, .release);
@@ -456,6 +565,7 @@ pub const Reader = struct {
             self.gpa.free(f.seg_refs);
             f.ranges.deinit(self.gpa);
             f.segs.deinit(self.gpa);
+            f.probes.deinit(self.gpa);
             self.gpa.destroy(f);
         }
         self.files.deinit(self.gpa);
@@ -468,6 +578,13 @@ pub const Reader = struct {
         const f = self.files.items[u.file];
         // The file's bytes, not the page padding past its end; the window charge stays page-rounded.
         _ = self.stats.bytes.fetchAdd(@min(u.len, f.size -| u.off), .monotonic);
+        if (u.probe) {
+            if (f.probe_left.fetchSub(1, .acq_rel) == 1) {
+                f.probe_ready.store(1, .release);
+                _ = linux.futex_3arg(&f.probe_ready.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+            }
+            return;
+        }
         if (f.rg_units_left[u.rg].fetchSub(1, .acq_rel) == 1) {
             f.rg_ready[u.rg].store(1, .release);
             _ = linux.futex_3arg(&f.rg_ready[u.rg].raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
@@ -477,12 +594,17 @@ pub const Reader = struct {
     /// A read failed: every row group still waiting fails its workers, and no more reads are made.
     fn failAll(self: *Reader) void {
         self.cancel.store(true, .release);
-        for (self.files.items) |f| for (f.rg_ready) |*r| {
-            if (r.load(.acquire) == 0) {
-                r.store(2, .release);
-                _ = linux.futex_3arg(&r.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
-            }
-        };
+        for (self.files.items) |f| {
+            for (f.rg_ready) |*r| failReady(r);
+            failReady(&f.probe_ready);
+        }
+    }
+
+    fn failReady(r: *std.atomic.Value(u32)) void {
+        if (r.load(.acquire) == 0) {
+            r.store(2, .release);
+            _ = linux.futex_3arg(&r.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        }
     }
 
     /// Whether unit `u` may be read now, taking its row group's window charge if it is the first. First units go
@@ -494,6 +616,7 @@ pub const Reader = struct {
     /// and letting them go before would read a row group the window has no room for.
     fn admit(self: *Reader, u: Unit) bool {
         if (self.cancel.load(.acquire)) return false;
+        if (u.probe) return true;
         const next = self.admit_next.load(.acquire);
         if (u.charge == 0) return next > u.ticket;
         if (next != u.ticket) return false;
@@ -694,6 +817,131 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
         }
         try testing.expectEqual(@as(u64, 0), rd.submitted.load(.monotonic) - rd.released.load(.monotonic));
     };
+}
+
+test "probed ranges are read first, once, and given back with their row groups" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prng = std.Random.DefaultPrng.init(0x9e0b);
+    const size: usize = (2 << 20) + 777;
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    prng.random().bytes(data);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    const page = pageLen();
+    for ([_]Mode{ .pread, .uring }) |mode| for ([_]u64{ 1 << 30, 4096 }) |window| {
+        if (mode == .uring and !uringAvailable()) continue;
+        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 3, .block = 32 << 10, .window = window });
+        defer rd.destroy();
+        const f = try rd.openFile(path, size);
+        // Four row groups of a quarter each, one pruned; each probes the first 10 000 bytes of its quarter (a
+        // dictionary page at the start of a chunk), and the last also a range no row group reads.
+        const q = size / 4;
+        var store: [4][1]Range = undefined;
+        var plans: [4]?[]Range = undefined;
+        for (&store, &plans, 0..) |*st, *p, g| {
+            st[0] = .{ .start = g * q + 100, .end = (g + 1) * q };
+            p.* = if (g == 2) null else st;
+        }
+        try rd.planFile(f, &plans, 0);
+        for (0..4) |g| try rd.probe(f, g, g * q + 100, g * q + 10_100);
+        try rd.probe(f, 3, size - 50, size + 4096);
+        try rd.start();
+        // The probes are read before any row group's data is asked for.
+        try File.probeWait(f, 0);
+        for (0..4) |g| {
+            const lo = g * q + 100;
+            try testing.expectEqualSlices(u8, data[lo .. lo + 10_000], f.bytes()[lo .. lo + 10_000]);
+        }
+        try testing.expectEqualSlices(u8, data[size - 50 ..], f.bytes()[size - 50 ..]);
+        const gate = f.gate();
+        for (plans, 0..) |p, g| {
+            try gate.wait(gate.ctx, g);
+            if (p) |rs| for (rs) |r| {
+                try testing.expectEqualSlices(u8, data[r.start..r.end], f.bytes()[r.start..r.end]);
+            };
+            gate.done(gate.ctx, g, 1);
+        }
+        // Every probed page is read exactly once, by a probe; no row group's own reads take it again.
+        const pages = try testing.allocator.alloc(u8, (size + page - 1) / page);
+        defer testing.allocator.free(pages);
+        @memset(pages, 0);
+        for (rd.units.items) |u| {
+            var off = u.off;
+            while (off < u.off + u.len) : (off += page) pages[off / page] += 1;
+        }
+        for (f.probes.items) |pr| {
+            var off = pr.r.start;
+            while (off < pr.r.end) : (off += page) try testing.expectEqual(@as(u8, 1), pages[off / page]);
+        }
+        try testing.expectEqual(@as(u64, 0), rd.submitted.load(.monotonic) - rd.released.load(.monotonic));
+    };
+}
+
+test "an abandoned reader stops, gives its pages back, and still tears down" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(data);
+    @memset(data, 9);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| {
+        if (mode == .uring and !uringAvailable()) continue;
+        // A one-page window: most row groups wait on releases nobody makes when the reader is abandoned.
+        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 2, .block = 16 << 10, .window = 4096 });
+        defer rd.destroy();
+        const f = try rd.openFile(path, data.len);
+        var store: [8][1]Range = undefined;
+        var plans: [8]?[]Range = undefined;
+        for (&plans, &store, 0..) |*p, *st, g| {
+            st[0] = .{ .start = g * (128 << 10), .end = (g + 1) * (128 << 10) };
+            p.* = st;
+        }
+        try rd.planFile(f, &plans, 0);
+        try rd.probe(f, 0, 0, 100);
+        try rd.start();
+        try File.probeWait(f, 0);
+        const gate = f.gate();
+        try gate.wait(gate.ctx, 0);
+        rd.abandon();
+        try testing.expectEqual(@as(usize, 0), rd.threads.items.len);
+        // The pages are given back: what is left reads as the anonymous mapping's zeros.
+        try testing.expectEqual(@as(u8, 0), f.bytes()[0]);
+    }
+}
+
+test "a failed probe fails planning's wait and every row group's" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(data);
+    @memset(data, 3);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| {
+        if (mode == .uring and !uringAvailable()) continue;
+        // Unit 0 is the first probe's: probes go before every row group's reads.
+        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 2, .block = 16 << 10, .fail_unit = 0 });
+        defer rd.destroy();
+        const f = try rd.openFile(path, data.len);
+        var store: [2][1]Range = undefined;
+        var plans: [2]?[]Range = undefined;
+        for (&plans, &store, 0..) |*p, *st, g| {
+            st[0] = .{ .start = g * (512 << 10), .end = (g + 1) * (512 << 10) };
+            p.* = st;
+        }
+        try rd.planFile(f, &plans, 0);
+        try rd.probe(f, 1, 512 << 10, (512 << 10) + 100);
+        try rd.start();
+        try testing.expectError(error.LocalReadFailed, File.probeWait(f, 1));
+        const gate = f.gate();
+        for (0..2) |g| try testing.expectError(error.LocalReadFailed, gate.wait(gate.ctx, g));
+    }
 }
 
 test "a failed read fails the row groups waiting on it, and teardown neither hangs nor leaks" {

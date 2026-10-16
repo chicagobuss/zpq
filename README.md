@@ -102,8 +102,8 @@ The idle timeout restarts at every byte, so a transfer that keeps moving is cut 
 30 s and its bytes at 64 KiB/s, which a server trickling a byte at a time cannot outlast. A request that
 times out is sent again on a new connection when that is safe (GETs, HEADs, object and part PUTs). The retries are
 charged to its usual retry budget, so a server that keeps stalling fails the query with the timeout instead of
-hanging it. Creating and completing a multipart upload are never sent twice; a Create that could not connect (DNS,
-TCP or the TLS handshake failed, so nothing was sent) is tried again on a new connection within the same budget. When
+hanging it. Creating and completing a multipart upload are never sent twice; one that could not connect (DNS, TCP
+or the TLS handshake failed, so nothing was sent) is tried again on a new connection within the same budget. When
 one of them fails, the error names the request, whether it failed while connecting or after it was sent, and the HTTP
 status and S3 error code it was answered with: on stderr from the CLI, and in the Lambda's error JSON as `"s3"`.
 

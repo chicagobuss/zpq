@@ -35,6 +35,8 @@ const readUleb128 = @import("../../bytes.zig").readUleb128;
 pub const Error = error{
     InvalidBitWidth,
     UnexpectedEndOfStream,
+    /// An RLE run's value does not fit the stream's bit width.
+    CorruptRleValue,
 };
 
 pub const HybridRleDecoder = struct {
@@ -245,7 +247,10 @@ pub const HybridRleDecoder = struct {
             v |= @as(u32, self.bytes[self.pos + i]) << @intCast(i * 8);
         }
         self.pos += value_bytes;
-        return v & self.mask;
+        // A run value wider than the bit width is no value of the stream: masked, a dictionary index of 16 at width 4
+        // read as entry 0 and answered with the incorrect value.
+        if (v & ~self.mask != 0) return error.CorruptRleValue;
+        return v;
     }
 
     fn decodeBitPacked(self: *HybridRleDecoder, dest: []u32) Error!void {
@@ -766,16 +771,17 @@ test "single RLE run of length 5, bit_width=4" {
     for (out[0..5]) |v| try testing.expectEqual(@as(u32, 7), v);
 }
 
-test "RLE value is masked to bit_width" {
-    // bit_width=3, mask=0b111. If we feed 0xFF, we should get 0x07.
+test "regression: an RLE run value wider than the bit width is refused, not masked" {
+    // bit_width=3: 0xFF has bits past the width. Masked it read as 7, a dictionary index the run never named.
     // header: count=2, kind=0 → 0x04
     const bytes = [_]u8{ 0x04, 0xff };
     var dec = HybridRleDecoder.init(&bytes, 3);
     var out: [4]u32 = undefined;
-    const n = try dec.decode(&out);
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(u32, 7), out[0]);
-    try testing.expectEqual(@as(u32, 7), out[1]);
+    try testing.expectError(error.CorruptRleValue, dec.decode(&out));
+    const fits = [_]u8{ 0x04, 0x07 };
+    var ok = HybridRleDecoder.init(&fits, 3);
+    try testing.expectEqual(@as(usize, 2), try ok.decode(&out));
+    try testing.expectEqualSlices(u32, &.{ 7, 7 }, out[0..2]);
 }
 
 test "single bit-packed run, 1 group of 8, bit_width=3" {

@@ -7527,6 +7527,37 @@ test "regression: grouped aggregates skip a computed argument's NULLs, coded or 
     }
 }
 
+test "regression: arithmetic refuses only the NULLs it would read" {
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // NULLs a WHERE or FILTER leaves out are no operand: arithmetic over the rest is well defined.
+    var r = try runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .aggregate = "sum(i32n + 5) AS s, sum(i32n * 2) FILTER (WHERE i32n IS NOT NULL) AS f",
+        .filter = "i32n IS NOT NULL",
+    });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 35), r.aggregate.output.aggs[0].value.i);
+    try std.testing.expectEqual(@as(i128, 30), r.aggregate.output.aggs[1].value.i);
+    var cw = try runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .aggregate = "sum(CASE WHEN i32n IS NOT NULL THEN i32n + 1 ELSE 0 END) AS s",
+    });
+    defer cw.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 19), cw.aggregate.output.aggs[0].value.i);
+    // A NULL that arithmetic would read is refused, a column's or a computed one's.
+    try std.testing.expectError(error.NullableNotSupported, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .aggregate = "sum(i32n * 2) AS s",
+    }));
+    try std.testing.expectError(error.NullableNotSupported, runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .aggregate = "sum(coalesce(a, b) + 1) AS s",
+    }));
+}
+
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

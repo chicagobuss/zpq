@@ -510,7 +510,7 @@ fn evalAs(
     if (target == .f64 and e.typeOf() == .dec) switch (e) {
         .col_ref => |c| {
             const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
-            try rejectNullableOrNested(batch.cols[pos]);
+            try rejectNullableOrNested(batch.cols[pos], batch.sel);
             return .{ .f64 = .{ .values = try widenToF64(arena, batch.cols[pos]) } };
         },
         .literal => |l| {
@@ -521,6 +521,8 @@ fn evalAs(
         else => {},
     };
     const result = try evalExpr(arena, batch, column_lookup, e);
+    // A computed operand may be NULL (`coalesce(a, b)`, CASE): its placeholder is no value to compute with.
+    if (e != .col_ref) try rejectNullableOrNested(result, batch.sel);
     // Only binop operands come through here; an unsigned 64-bit column among them needs the same care as in a key.
     if (e == .col_ref and e.col_ref.unsigned_64) return keyOperandAs(arena, result, e, target);
     if (e.typeOf() == target) return result;
@@ -576,7 +578,7 @@ fn colRefAsColumn(
     const col = batch.cols[pos];
     // Reject OPTIONAL / nested columns up-front. Null-aware arithmetic
     // is a follow-up slice.
-    try rejectNullableOrNested(col);
+    try rejectNullableOrNested(col, batch.sel);
 
     return switch (c.expr_type) {
         .i64 => .{ .i64 = .{ .values = try widenColRefToI64(arena, col, c) } },
@@ -739,14 +741,16 @@ fn decOperand(
     var raw: Batch.Column = undefined;
     if (e == .col_ref and e.typeOf() == .dec) {
         const col = batch.cols[column_lookup[e.col_ref.col_idx] orelse return error.BadColumn];
-        if (!key) try rejectNullableOrNested(col);
+        if (!key) try rejectNullableOrNested(col, batch.sel);
         raw = try exactColumn(col);
     } else if (e == .binop and e.binop.result_type == .dec) {
         raw = try decBinOpLane(arena, batch, column_lookup, e.binop, key);
-    } else raw = if (key)
-        try evalGroupKeyExpr(arena, batch, column_lookup, e)
-    else
-        try evalExpr(arena, batch, column_lookup, e);
+    } else if (key) {
+        raw = try evalGroupKeyExpr(arena, batch, column_lookup, e);
+    } else {
+        raw = try evalExpr(arena, batch, column_lookup, e);
+        if (e != .col_ref) try rejectNullableOrNested(raw, batch.sel);
+    }
     const nulls: ?Batch.Column = if (columnHasNullRows(raw)) raw else null;
     const factor = ast.pow10(scale - e.decSpec().?.scale);
     if (raw == .i64 and !(e == .col_ref and e.col_ref.unsigned_32)) {
@@ -1315,19 +1319,19 @@ fn applyKernel(
     return out;
 }
 
-fn rejectNullableOrNested(col: Batch.Column) Error!void {
-    // Reject nested (LIST/MAP) outright. For def-only OPTIONAL: many
-    // Parquet writers (notably the benchmark fixture's) emit every
-    // column as OPTIONAL even when no rows are actually null. We
-    // accept those by scanning def_levels — if every entry == max_def
-    // there are zero nulls and arithmetic is well-defined. If any
-    // null is present we error: null-aware arithmetic is a follow-up.
+/// Refuse a nested operand, or one NULL in a row the batch wants (`batch.sel`, else every row): arithmetic does not
+/// propagate NULLs yet. Many writers emit every column OPTIONAL with no row null, and a WHERE or FILTER that drops the
+/// NULL rows (`x IS NOT NULL`) leaves well-defined arithmetic; reading the levels of every row instead refused those
+/// queries, and whether one failed hung on how the writer cut its row groups.
+fn rejectNullableOrNested(col: Batch.Column, sel: ?*const selection.SelectionVector) Error!void {
     switch (col) {
         inline else => |c| {
             if (c.max_rep > 0) return error.NestedNotSupported;
-            if (c.def_levels) |dls| {
-                for (dls) |dl| if (dl < c.max_def) return error.NullableNotSupported;
-            }
+            const dls = c.def_levels orelse return;
+            for (dls, 0..) |dl, i| if (dl < c.max_def) {
+                if (sel) |s| if (!s.isActive(i)) continue;
+                return error.NullableNotSupported;
+            };
         },
     }
 }

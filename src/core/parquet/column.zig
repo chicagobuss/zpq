@@ -704,6 +704,35 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return .{ .def_levels = out_opt };
         }
 
+        /// The next `def_out.len` leaves' definition levels, as `readAllLevels` reads them (no value decoded), for a
+        /// reader taken a slice at a time: a count(col) then reads the same pages whichever way its budget cuts the
+        /// row group. Returns the leaves read, fewer only at the chunk's end.
+        pub fn readLevels(self: *Self, def_out: []u32) Error!usize {
+            std.debug.assert(self.levels.max_rep == 0 and self.levels.max_def > 0);
+            self.options.fast_levels = true;
+            if (T == []const u8) self.pages.scratch = self.scratch;
+            try self.holdScratch();
+            const max_def: u32 = @intCast(self.levels.max_def);
+            var written: usize = 0;
+            while (written < def_out.len) {
+                const left = self.pageValuesLeft();
+                if (left > 0) {
+                    const want = @min(def_out.len - written, left);
+                    const dst = def_out[written..][0..want];
+                    if (self.current_def_all_present or self.current_def_levels == null)
+                        @memset(dst, max_def)
+                    else
+                        @memcpy(dst, self.current_def_levels.?[self.current_def_pos..][0..want]);
+                    written += want;
+                    self.current_def_pos += want;
+                    continue;
+                }
+                self.resetPageState();
+                if (!try self.advancePage()) break;
+            }
+            return written;
+        }
+
         /// Indices come from the file: one past the dictionary would be an out-of-bounds read downstream.
         fn checkCodes(self: *Self, out: []const u32) Error!void {
             const dict = self.dictionary.?;

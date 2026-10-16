@@ -730,6 +730,8 @@ pub const SliceReader = struct {
     left: usize,
     /// Data pages `skip` passed over without decompressing them.
     pages_passed: usize = 0,
+    /// Only the levels are read (see `levelsOnly`): a count(col)'s column, read as its whole-chunk path reads it.
+    levels_only: bool = false,
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -823,9 +825,32 @@ pub const SliceReader = struct {
     }
 
     /// The next `n` rows (fewer only at the chunk's end), on `a`.
+    /// Read only definition levels from here on: a column that only count(col) reads, which the whole-chunk path
+    /// counts from its levels without decoding a value (`decodeLevelsOnly`). Sliced the same way, a value that would
+    /// not decode fails the query, or does not, whatever the budget.
+    pub fn levelsOnly(self: *SliceReader) void {
+        // Nested or REQUIRED, the whole-chunk path decodes the values after all (`readAllLevels` declines).
+        if (self.levels.max_def > 0 and self.levels.max_rep == 0) self.levels_only = true;
+    }
+
     pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
         const n = @min(n_want, self.left);
         self.left -= n;
+        if (self.levels_only) {
+            const max_def: u32 = @intCast(self.levels.max_def);
+            const def = try a.alloc(u32, n);
+            const got = switch (self.raw.*) {
+                inline else => |*r| try r.readLevels(def),
+            };
+            if (got != n) return error.ShortDecode;
+            return .{ .i64 = .{
+                .values = &.{},
+                .def_levels = def,
+                .max_def = max_def,
+                .has_nulls = std.mem.indexOfNone(u32, def, &.{max_def}) != null,
+                .levels_only_rows = n,
+            } };
+        }
         switch (self.raw.*) {
             inline else => |*r, tag| {
                 const T = @TypeOf(r.*).Value;
@@ -2639,10 +2664,16 @@ fn scanRGSliced(
     defer for (readers.items) |*r| r.deinit();
     const lookup = try pages.allocator().alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
+    // The columns the whole-chunk path reads as levels only (`decodeLevelsOnly`), read so here too.
+    const uses = try planCodeUses(pages.allocator(), in, target, false);
+    const levels_only = try pages.allocator().alloc(bool, in.read.len);
+    for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
+        uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
-        const r = try SliceReader.init(pages.allocator(), gpa, in.rg, in.meta, in.src, ci, decode_options) orelse
+        var r = try SliceReader.init(pages.allocator(), gpa, in.rg, in.meta, in.src, ci, decode_options) orelse
             return false;
+        if (levels_only[ci]) r.levelsOnly();
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }

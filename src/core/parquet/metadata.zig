@@ -118,6 +118,8 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
     for (meta.schema.items, 0..) |elem, i| {
         if (elem.num_children) |n| if (n < 0) return error.BadSchemaElement;
         if (elem.type_length) |n| if (n < 0) return error.BadSchemaElement;
+        // A DECIMAL holds at least one digit: precision 0 left every width computed from it out of range.
+        if (decimal.kindFromSchema(&elem)) |k| if (k.precision < 1) return error.BadSchemaElement;
         // A primitive can't have children. Some walkers find leaves by type, others by child count; this keeps
         // them agreeing on which element is leaf N. Not the root: every walker starts below it, and some writers
         // (segmentio/parquet-go) give the root a type anyway.

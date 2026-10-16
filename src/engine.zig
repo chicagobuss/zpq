@@ -2324,7 +2324,8 @@ fn coerceByteArrayDecimalLeavesToFlba(items: *std.ArrayListUnmanaged(schema.Sche
         const nc = elem.num_children orelse 0;
         if (nc != 0) continue;
         const k = decimal_mod.kindFromSchema(elem) orelse continue;
-        if (k.physical == .BYTE_ARRAY) {
+        // Past 38 digits no FLBA width holds the value; the writers refuse such a column before it gets here.
+        if (k.physical == .BYTE_ARRAY and k.precision >= 1 and k.precision <= 38) {
             elem.type = .FIXED_LEN_BYTE_ARRAY;
             elem.type_length = decimal_mod.minBytesForPrecision(k.precision);
         }
@@ -6306,6 +6307,13 @@ pub fn runPrintSink(
             const leaf = tree0.leaves[ci];
             if (leaf.type == .INT96) return error.INT96ReencodeNotSupported;
             if (leaf.path.len > 1 or leaf.max_rep > 0) return error.NestedReencodeNotSupported;
+            // As the full write refuses it: no output width holds a BYTE_ARRAY decimal past 38 digits.
+            if (metadata.leafSchemaElement(meta0, ci)) |elem| {
+                if (decimal_mod.kindFromSchema(&elem)) |k| if (k.precision > 38) {
+                    Diag.setColumn(args.diag, elem.name);
+                    return error.UnsupportedDecimalPrecision;
+                };
+            }
         },
         .computed => {},
     };
@@ -6320,9 +6328,11 @@ pub fn runPrintSink(
         .zstd = .{ .lambda = args.compress_priority.lambda() },
         .schema_items = try buildSelectSchema(arena, meta0, output_specs),
     };
-    coerceByteArrayDecimalLeavesToFlba(&parquet.schema_items);
-    coerceFloat16LeavesToDouble(&parquet.schema_items);
-    if (format == .parquet) try parquet.start();
+    if (format == .parquet) {
+        coerceByteArrayDecimalLeavesToFlba(&parquet.schema_items);
+        coerceFloat16LeavesToDouble(&parquet.schema_items);
+        try parquet.start();
+    }
     var stdout_writer = StdoutWriter{
         .fd = fd,
         .sink = sink,
@@ -7617,6 +7627,31 @@ test "regression: a dictionary-encoded INT32 or INT64 DECIMAL groups on the code
             try std.testing.expectEqualStrings(texts[1], texts[0]);
         }
     }
+}
+
+test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for Parquet, and precision 0 is malformed" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "decimal_precision40.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    const p40: []const []const u8 = &.{dir ++ "decimal_precision40.parquet"};
+    // Text output reads the column as a double (`initOutputAggregator`); coercing its schema to FLBA panicked.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const printed = try runPrintSink(ctx, .{ .inputs = p40 }, .jsonl, 3, -1, 0, &out.writer);
+    try std.testing.expectEqual(@as(usize, 3), printed.rows);
+    var bin: std.Io.Writer.Allocating = .init(gpa);
+    defer bin.deinit();
+    var diag: Diag = .{};
+    try std.testing.expectError(
+        error.UnsupportedDecimalPrecision,
+        runPrintSink(ctx, .{ .inputs = p40, .diag = &diag }, .parquet, 3, -1, 0, &bin.writer),
+    );
+    try std.testing.expectEqualStrings("value", diag.column.get());
+    try std.testing.expectError(
+        error.NotParquet,
+        runQuery(ctx, .{ .inputs = &.{dir ++ "decimal_precision0.parquet"}, .aggregate = "count(*) AS n" }),
+    );
 }
 
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {

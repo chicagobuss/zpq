@@ -2647,7 +2647,7 @@ fn scanRGSliced(
         try readers.append(pages.allocator(), r);
     }
     const per_row = @max(1, full / num_rows);
-    const slice_rows = std.math.clamp(budget.share() / per_row, 1, num_rows);
+    const slice_rows = sliceRows(budget.share() / per_row, num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
     defer budget.release(reserved);
@@ -2881,6 +2881,12 @@ fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profi
 }
 
 /// Which columns a coded decode serves (`code`) and which still need materialized values (`value`).
+/// Rows per slice of a row group read `fit` rows at a time: a multiple of 64, so every slice starts on a block of
+/// the float sum order (`agg.sumBlocksF64`) and slicing changes no bit of a float sum or avg.
+fn sliceRows(fit: usize, num_rows: usize) usize {
+    return @min(num_rows, @max(64, fit / 64 * 64));
+}
+
 const CodeUses = struct { code: []bool, value: []bool, levels: []bool, hist_ok: []bool };
 
 fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, staged: bool) !CodeUses {
@@ -2910,15 +2916,17 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, stage
     if (target == .scalar) for (target.calls()) |call| {
         if (call.where) |w| markFilterSet(u.hist_ok, w, false);
         if (call.arg) |arg| {
-            if (call.where != null) markExprSet(u.hist_ok, arg, false);
-            if (arg != .col_ref) markExprSet(u.hist_ok, arg, false);
+            if (call.where != null or arg != .col_ref or agg_coded.floatSum(call)) markExprSet(u.hist_ok, arg, false);
         }
     };
     if (in.filter) |f| markFilter(u, f);
     for (target.planCalls()) |call| {
         if (call.where) |w| markFilter(u, w);
         if (call.arg) |arg| switch (arg) {
-            .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
+            // A float sum reads values, in the one row order every path sums in (`agg.sumBlocksF64`).
+            .col_ref => |c| mark(if (call.func == .count and target == .scalar)
+                u.levels
+            else if (agg_coded.floatSum(call)) u.value else u.code, c.col_idx),
             // A scalar fold evaluates a computed argument itself, gathering coded columns (`agg_coded.gatherSelected`).
             else => if (target == .scalar) arg.collectColumns(u.code) else markExprValues(u, arg),
         };

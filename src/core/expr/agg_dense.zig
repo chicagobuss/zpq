@@ -178,7 +178,7 @@ pub const Lanes = struct {
             l.first[id] = @min(l.first[id], pos_base + fr);
         };
         for (l.calls, 0..) |call, ai| {
-            try agg_coded.foldGroupedCall(ra, gpa, l.accs, trans, comp, space, ai, n_calls, call, batch, lookup, sel, false);
+            try agg_coded.foldGroupedCall(ra, gpa, l.accs, trans, comp, space, ai, n_calls, call, batch, lookup, sel);
         }
         return true;
     }

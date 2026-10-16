@@ -28,9 +28,17 @@ const keyEql = core_bytes.keyEql;
 const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
 
 /// The coded column a bare col_ref argument names, or null when the call can't take the coded path.
+/// A sum or avg of floats: it folds in the one row order every path shares (`agg.sumBlocksF64`, and the row fold for
+/// groups), never through per-composite partials or a histogram, which round in another order.
+pub fn floatSum(call: AggCall) bool {
+    return (call.func == .sum or call.func == .avg) and call.arg != null and call.arg.?.typeOf() == .f64;
+}
+
 pub fn codedArg(call: AggCall, batch: *const filter_eval.Batch, lookup: []const ?usize) ?Column {
     const arg = call.arg orelse return null;
     if (arg != .col_ref) return null;
+    // A float sum folds row by row (`agg.sumBlocksF64`): a histogram's count × value per entry rounds otherwise.
+    if (floatSum(call)) return null;
     const pos = lookup[arg.col_ref.col_idx] orelse return null;
     const col = batch.cols[pos];
     if (col.codes() == null) return null;
@@ -574,7 +582,7 @@ pub fn groupedCoded(
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
         const accs = table.accumulators.items;
-        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, wide);
+        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel);
     }
     return true;
 }
@@ -659,9 +667,6 @@ pub fn foldGroupedCall(
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     outer: *const Sel,
-    /// A space past `MAX_COMPOSITE`: a float SUM/AVG then keeps the per-row fold, its sums added in row order as the
-    /// row path adds them, rather than reassociated through per-composite partials or count × value.
-    wide: bool,
 ) !void {
     // Selection for this call: outer, narrowed by FILTER and the argument's nulls.
     var own: ?Sel = null;
@@ -707,12 +712,12 @@ pub fn foldGroupedCall(
         return;
     }
 
-    const float_sum = (call.func == .sum or call.func == .avg) and call.arg.?.typeOf() == .f64;
+    const float_sum = floatSum(call);
     // A count(DISTINCT) a pair sink answers takes the values fold below, which sends it the pairs; a histogram would
     // fill the sets the sink stands in for.
     const to_pairs = call.func == .count_distinct and if (agg.distinct_pairs) |dp| dp.active else false;
     if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
-        !(wide and float_sum) and !to_pairs)
+        !float_sum and !to_pairs)
     {
         // (composite, code) histogram, then fold each entry once per group.
         const col = arg_col.?;
@@ -762,7 +767,7 @@ pub fn foldGroupedCall(
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
     const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
-        !(wide and float_sum);
+        !float_sum;
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];

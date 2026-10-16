@@ -8712,6 +8712,70 @@ test "ordered GROUP BY: groups as they first appear, and the same float bits at 
     };
 }
 
+test "regression: float sums and avgs keep their bits at every -j, budget, decoder and filter" {
+    const path = "ci/fixtures/parquet/group_order.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{ .{ .name = path, .bytes = bytes }, .{ .name = path, .bytes = bytes } };
+    // 24 row groups of 500 rows, `x` dictionary-encoded and mixing magnitudes from 1e-3 to 1e16: where partial sums
+    // meet changes the bits. A small budget reads each row group in slices; the coded path folds over the
+    // dictionary; a filter leaves blocks partly selected.
+    const Shape = struct { group_by: ?[]const u8, filter: ?[]const u8 };
+    for ([_]Shape{
+        .{ .group_by = null, .filter = null },
+        .{ .group_by = null, .filter = "i > 7" },
+        .{ .group_by = "k", .filter = null },
+        .{ .group_by = "k", .filter = "i > 7" },
+    }) |shape| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var first: ?MultiAggResult = null;
+        defer if (first) |f| freeResult(f);
+        for ([_]usize{ 1, 3, 8 }) |j| for ([_]?usize{ null, 8 << 10, 32 << 10, 128 << 10 }) |budget| {
+            for ([_]bool{ true, false }) |encoded| for ([_]bool{ true, false }) |scan_all| {
+                const res = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                    .inputs = &inputs,
+                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t",
+                    .group_by = shape.group_by,
+                    .filter = shape.filter,
+                    .parallelism = j,
+                    .decode_limit = budget,
+                    .encoded = encoded,
+                    .scan_all = scan_all,
+                    .min_bytes_per_worker = 1,
+                });
+                const f = first orelse {
+                    first = res;
+                    continue;
+                };
+                defer freeResult(res);
+                if (shape.group_by == null) {
+                    for (res.output.aggs, f.output.aggs) |g, w| try expectSameBits(w.value, g.value);
+                } else for (res.output.group_rows.?, f.output.group_rows.?) |r, w| {
+                    for (r, w) |g, x| try expectSameBits(x, g);
+                }
+            };
+        };
+    }
+}
+
+/// `expectSameAggValue`, floats compared bit for bit (a -0 is no 0, and every rounding shows).
+fn expectSameBits(want: AggValue, got: AggValue) !void {
+    switch (want) {
+        .f => |v| try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(got.f))),
+        .avg => |v| {
+            const want_sum: ?u64 = if (v.sum) |x| @bitCast(x) else null;
+            const got_sum: ?u64 = if (got.avg.sum) |x| @bitCast(x) else null;
+            try testing.expectEqual(want_sum, got_sum);
+            try testing.expectEqual(v.count, got.avg.count);
+        },
+        else => try expectSameAggValue(want, got),
+    }
+}
+
 test "GROUP BY hash merge: same groups, counts and string mins at every -j" {
     const path = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {

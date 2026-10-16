@@ -1185,6 +1185,9 @@ fn planStatFold(
     }
     var plan: StatFold = .{ .lane = lane, .physical = cm.type, .bounds = bounds };
     if (call.func == .sum) {
+        // A float constant's `present × v` rounds once where adding it `present` times (`sumBlocksF64`) rounds at
+        // each step: the answer would hang on whether this row group's statistics were read.
+        if (lane == .float) return null;
         if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
         // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
         // constant.
@@ -1545,7 +1548,8 @@ const PreparedAggInput = struct {
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
             else => {
-                in.values = if (rowless)
+                // Gathered, a float sum's rows would leave the row group's blocks (`sumBlocksF64`).
+                in.values = if (rowless and !agg_coded.floatSum(call))
                     try in.evalArg(arena, batch, column_lookup, arg)
                 else
                     try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
@@ -1769,33 +1773,50 @@ fn minMaxU64(
     return if (acc) |u| @as(i128, u) else null;
 }
 
-fn simdSumF64(vals: []const f64, sel: *const filter_selection.SelectionVector) f64 {
-    var acc_v: VF64 = @splat(0);
-    var acc_s: f64 = 0;
-    var word_i: usize = 0;
-    while ((word_i + 1) * 64 <= vals.len) : (word_i += 1) {
-        const w = sel.mask[word_i];
-        const base = word_i * 64;
-        if (w == std.math.maxInt(u64)) {
-            inline for (0..64 / VLANES) |k| {
-                const chunk: VF64 = vals[base + k * VLANES ..][0..VLANES].*;
-                acc_v += chunk;
-            }
-        } else if (w != 0) {
-            var bits = w;
-            while (bits != 0) {
-                const idx: u6 = @intCast(@ctz(bits));
-                acc_s += vals[base + idx];
-                bits &= bits - 1;
-            }
-        }
+/// `acc` plus the selected values, in the one order every float sum and avg folds in, whatever the decode slicing,
+/// the worker count, the decoder (dictionary or plain) or the target: a row group's rows in 64-row blocks aligned
+/// to its first row, the blocks added to `acc` in row order, each block's sum taken alone: over 16 fixed lanes and
+/// a fixed pairwise reduction when all 64 rows are selected, else its selected rows in row order. A slice starts on a
+/// block boundary (see `consumer.sliceRows`) and carries `acc` on, so cutting a row group changes no bit. The lane
+/// count is fixed rather than the target's vector width, so x86_64 and arm64 builds agree too.
+pub fn sumBlocksF64(acc: f64, vals: []const f64, sel: *const filter_selection.SelectionVector) f64 {
+    var total = acc;
+    var w: usize = 0;
+    while ((w + 1) * 64 <= vals.len) : (w += 1) {
+        const word = sel.mask[w];
+        if (word == 0) continue;
+        const block = vals[w * 64 ..][0..64];
+        total += if (word == std.math.maxInt(u64)) fullBlockSum(block) else partialBlockSum(block, word);
     }
-    acc_s += @reduce(.Add, acc_v);
-    const tail_start = word_i * 64;
-    for (tail_start..vals.len) |i| if (sel.isActive(i)) {
-        acc_s += vals[i];
-    };
-    return acc_s;
+    const tail = vals.len - w * 64;
+    if (tail != 0) {
+        const word = sel.mask[w] & ((@as(u64, 1) << @intCast(tail)) - 1);
+        if (word != 0) total += partialBlockSum(vals[w * 64 ..], word);
+    }
+    return total;
+}
+
+const VF16 = @Vector(16, f64);
+
+inline fn fullBlockSum(block: *const [64]f64) f64 {
+    var lanes: VF16 = block[0..16].*;
+    lanes += @as(VF16, block[16..32].*);
+    lanes += @as(VF16, block[32..48].*);
+    lanes += @as(VF16, block[48..64].*);
+    const l: [16]f64 = lanes;
+    var half: [8]f64 = undefined;
+    for (&half, 0..) |*h, i| h.* = l[i] + l[i + 8];
+    var quarter: [4]f64 = undefined;
+    for (&quarter, 0..) |*q, i| q.* = half[i] + half[i + 4];
+    return (quarter[0] + quarter[2]) + (quarter[1] + quarter[3]);
+}
+
+inline fn partialBlockSum(block: []const f64, word: u64) f64 {
+    var bits = word;
+    var sum = block[@ctz(bits)];
+    bits &= bits - 1;
+    while (bits != 0) : (bits &= bits - 1) sum += block[@ctz(bits)];
+    return sum;
 }
 
 /// Generic SIMD min/max reducer. Uses sentinel-init (max-int / min-int
@@ -1910,46 +1931,6 @@ inline fn vMaxTotal(a: VF64, b: VF64) VF64 {
     return @select(f64, take_a == @as(@Vector(VLANES, u1), @splat(1)), a, b);
 }
 
-/// SIMD avg-fold returns (sum, count) so the caller can merge across RGs.
-/// i64 input is widened to f64 lane-by-lane (no @intFromFloat-on-vector
-/// equivalent in 0.16; doing scalar in the SIMD inner loop forfeits the
-/// benefit, so we cast the source slice once).
-fn simdAvgPairF64(
-    vals: []const f64,
-    sel: *const filter_selection.SelectionVector,
-) struct { sum: f64, count: u64 } {
-    var sum_v: VF64 = @splat(0);
-    var sum_s: f64 = 0;
-    var count: u64 = 0;
-    var word_i: usize = 0;
-    while ((word_i + 1) * 64 <= vals.len) : (word_i += 1) {
-        const w = sel.mask[word_i];
-        const base = word_i * 64;
-        if (w == std.math.maxInt(u64)) {
-            count += 64;
-            inline for (0..64 / VLANES) |k| {
-                const chunk: VF64 = vals[base + k * VLANES ..][0..VLANES].*;
-                sum_v += chunk;
-            }
-        } else if (w != 0) {
-            count += @popCount(w);
-            var bits = w;
-            while (bits != 0) {
-                const idx: u6 = @intCast(@ctz(bits));
-                sum_s += vals[base + idx];
-                bits &= bits - 1;
-            }
-        }
-    }
-    sum_s += @reduce(.Add, sum_v);
-    const tail_start = word_i * 64;
-    for (tail_start..vals.len) |i| if (sel.isActive(i)) {
-        sum_s += vals[i];
-        count += 1;
-    };
-    return .{ .sum = sum_s, .count = count };
-}
-
 fn foldSum(
     state: *Accumulator,
     col: filter_eval.Batch.Column,
@@ -1963,9 +1944,7 @@ fn foldSum(
             const sum = if (unsigned_64) sumU64(col.i64.values, sel) else simdSumI64(col.i64.values, sel);
             s.* = (s.* orelse 0) + sum + @as(i128, offset) * sel.count();
         },
-        .sum_f => |*s| {
-            s.* = (s.* orelse 0) + simdSumF64(col.f64.values, sel);
-        },
+        .sum_f => |*s| s.* = sumBlocksF64(s.* orelse 0, col.f64.values, sel),
         .sum_d => |*d| d.add(sumExact(col, sel), sel.count()),
         else => return error.UnsupportedAggType,
     }
@@ -2124,9 +2103,8 @@ fn foldAvg(
             };
         },
         .f64 => |c| {
-            const partial = simdAvgPairF64(c.values, sel);
-            a.sum += partial.sum;
-            a.count += partial.count;
+            a.sum = sumBlocksF64(a.sum, c.values, sel);
+            a.count += sel.count();
         },
         else => return error.UnsupportedAggType,
     }
@@ -5929,5 +5907,36 @@ test "GroupKeyResolver: the string memo stops where it does not hit and keys res
         }
         try std.testing.expectEqual(memo_stays, resolver.memo_on);
         try std.testing.expectEqual(@as(usize, 50), table.groupCount());
+    }
+}
+
+test "regression: sumBlocksF64 gives the same bits however a row group is cut into 64-row-aligned slices" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const n = 64 * 37 + 21;
+    const vals = try gpa.alloc(f64, n);
+    defer gpa.free(vals);
+    for (vals) |*v| {
+        const magnitude = std.math.pow(f64, 10, @floatFromInt(rnd.intRangeAtMost(i32, -3, 16)));
+        v.* = (rnd.float(f64) - 0.5) * magnitude;
+    }
+    for ([_]u32{ 1, 2, 7, 100 }) |keep_one_in| {
+        var sel = try filter_selection.SelectionVector.init(gpa, n);
+        defer sel.deinit();
+        for (0..n) |i| sel.set(i, keep_one_in == 1 or rnd.uintLessThan(u32, keep_one_in) == 0);
+        const whole = sumBlocksF64(0, vals, &sel);
+        for ([_]usize{ 64, 128, 64 * 5, 64 * 36 }) |slice| {
+            var acc: f64 = 0;
+            var lo: usize = 0;
+            while (lo < n) : (lo += slice) {
+                const hi = @min(n, lo + slice);
+                var part = try filter_selection.SelectionVector.init(gpa, hi - lo);
+                defer part.deinit();
+                for (lo..hi) |i| part.set(i - lo, sel.isActive(i));
+                acc = sumBlocksF64(acc, vals[lo..hi], &part);
+            }
+            try std.testing.expectEqual(@as(u64, @bitCast(whole)), @as(u64, @bitCast(acc)));
+        }
     }
 }

@@ -7731,6 +7731,17 @@ test "regression: a V2 page whose levels disagree with its null count is refused
     );
 }
 
+test "regression: a DELTA_BYTE_ARRAY value of another length than its FIXED_LEN_BYTE_ARRAY column is refused" {
+    const path = "ci/fixtures/parquet/dba_flba_len6.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    // One byte of `fb`'s suffix lengths makes a value 6 bytes long in an FLBA(4) column.
+    try std.testing.expectError(
+        error.UnexpectedPage,
+        runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(*) AS n", .filter = "fb != 'abcd'" }),
+    );
+}
+
 test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column of empty strings" {
     const path = "ci/fixtures/parquet/flba_length0.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;

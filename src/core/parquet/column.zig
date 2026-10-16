@@ -1322,6 +1322,19 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_page_num_values = num_values;
         }
 
+        /// Whether a delta byte-array page's values fit the column: a FIXED_LEN_BYTE_ARRAY value is `type_length`
+        /// bytes however it is encoded, and these encodings carry a length per value (`prefixes` empty for
+        /// DELTA_LENGTH_BYTE_ARRAY). Every consumer of the column trusts the width.
+        fn fixedLengths(self: *const Self, prefixes: []const i32, lengths: []const i32) bool {
+            if (self.type_length == 0) return true;
+            const width: i64 = @intCast(self.type_length);
+            for (lengths, 0..) |l, i| {
+                const p: i64 = if (prefixes.len == 0) 0 else prefixes[i];
+                if (p + l != width) return false;
+            }
+            return true;
+        }
+
         /// The installed page's levels below max_def.
         fn pageNulls(self: *const Self) usize {
             const levels = self.current_def_levels orelse return 0;
@@ -1379,17 +1392,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_LENGTH_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    const d = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values);
-                    self.active = .{ .delta_len_ba = d catch return error.UnexpectedPage };
+                    const d = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values) catch
+                        return error.UnexpectedPage;
+                    if (!self.fixedLengths(&.{}, d.lengths)) return error.UnexpectedPage;
+                    self.active = .{ .delta_len_ba = d };
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
                     const limit = self.options.expand_limit;
-                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, limit);
-                    self.active = .{ .delta_ba = d catch |e| return if (e == error.ExceededMemoryBudget)
-                        error.ExceededMemoryBudget
-                    else
-                        error.UnexpectedPage };
+                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, limit) catch |e|
+                        return if (e == error.ExceededMemoryBudget) error.ExceededMemoryBudget else error.UnexpectedPage;
+                    if (!self.fixedLengths(d.prefix_lengths, d.suffixes.lengths)) return error.UnexpectedPage;
+                    self.active = .{ .delta_ba = d };
                 },
                 .RLE => try self.installRleBoolean(values_bytes),
                 .BYTE_STREAM_SPLIT => try self.installByteStreamSplit(values_bytes),

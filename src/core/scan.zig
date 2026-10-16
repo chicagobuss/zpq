@@ -8813,22 +8813,22 @@ fn expectSameBits(want: AggValue, got: AggValue) !void {
 }
 
 test "regression: count(col) answers, or fails, the same at every budget and -j" {
-    const path = "ci/fixtures/parquet/flba_length_zero.parquet";
+    const path = "ci/fixtures/parquet/plain_values_corrupt.parquet";
     const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
         if (err == error.FileNotFound) return error.SkipZigTest;
         return err;
     };
     defer testing.allocator.free(bytes);
     const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
-    // `fb` holds values no decoder reads: count(fb) reads only its levels when the row group decodes whole, and read
-    // the values (and failed) when a small budget sliced it.
+    // One PLAIN length prefix in `s` runs past its page: count(s) reads only its levels when the row group decodes
+    // whole, and read the values (and failed) when a small budget sliced it.
     var want: ?anyerror!i128 = null;
     for ([_]usize{ 1, 3 }) |j| for ([_]?usize{ null, 64 << 10, 4 << 10, 512 }) |budget| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const got: anyerror!i128 = if (runMultiAggregate(testing.allocator, arena_state.allocator(), .{
             .inputs = &inputs,
-            .aggregate = "count(fb) AS n",
+            .aggregate = "count(s) AS n",
             .parallelism = j,
             .decode_limit = budget,
             .min_bytes_per_worker = 1,
@@ -8842,6 +8842,7 @@ test "regression: count(col) answers, or fails, the same at every budget and -j"
         };
         if (w) |v| try testing.expectEqual(v, try got) else |e| try testing.expectError(e, got);
     };
+    try testing.expectEqual(@as(i128, 216), try want.?);
 }
 
 test "GROUP BY hash merge: same groups, counts and string mins at every -j" {

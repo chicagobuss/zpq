@@ -7720,6 +7720,17 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
     );
 }
 
+test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column of empty strings" {
+    const path = "ci/fixtures/parquet/flba_length0.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    // Seven FLBA(4) values whose footer says type_length 0; they read as seven "".
+    try std.testing.expectError(
+        error.NotParquet,
+        runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(*) AS n", .filter = "fb = ''" }),
+    );
+}
+
 test "regression: a page inflating past its chunk, or values expanding past the budget, are refused" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "page_bomb.parquet", .{}) catch return error.SkipZigTest;

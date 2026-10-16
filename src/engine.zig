@@ -7846,6 +7846,23 @@ test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and
     try std.testing.expect(key.logical_type.? == .TIMESTAMP);
 }
 
+test "regression: inputs whose schema roots alone are named apart read together" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "int96_pyarrow_root.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // The same column `a`, under Spark's root `spark_schema` and pyarrow's `schema`: refused as a schema mismatch.
+    const both: []const []const u8 = &.{ dir ++ "int96_from_spark.parquet", dir ++ "int96_pyarrow_root.parquet" };
+    var r = try runQuery(ctx, .{ .inputs = both, .aggregate = "count(*) AS n, count(a) AS m" });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 8), r.aggregate.output.aggs[0].value.i);
+    try std.testing.expectEqual(@as(i128, 6), r.aggregate.output.aggs[1].value.i);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const printed = try runPrintSink(ctx, .{ .inputs = both }, .jsonl, null, -1, 0, &out.writer);
+    try std.testing.expectEqual(@as(usize, 8), printed.rows);
+}
+
 test "regression: a definition level past its column's maximum fails the queries reading it" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "def_level_past_max.parquet", .{}) catch return error.SkipZigTest;

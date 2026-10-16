@@ -368,8 +368,11 @@ pub fn schemaMismatch(
 ) ?usize {
     if (first.len != other.len) return @min(first.len, other.len);
     for (first, other, 0..) |*a, *b, i| {
-        if (!std.ascii.eqlIgnoreCase(a.name, b.name)) return i;
         if ((a.num_children orelse 0) != (b.num_children orelse 0)) return i;
+        // The root is the writer's, not the data's: pyarrow names it `schema` and marks it REQUIRED, Spark names it
+        // `spark_schema`. Only the tree below it is compared.
+        if (i == 0) continue;
+        if (!std.ascii.eqlIgnoreCase(a.name, b.name)) return i;
         const ka = decimal.kindFromSchema(a);
         const kb = decimal.kindFromSchema(b);
         if ((ka == null) != (kb == null)) return i;
@@ -1412,4 +1415,35 @@ test "fuzz: footer bytes open or fail with an error, never panic" {
         try seeds.append(testing.allocator, bytes[bytes.len - 8 - len .. bytes.len - 8]);
     }
     try std.testing.fuzz({}, fuzzFooter, .{ .corpus = seeds.items });
+}
+
+test "regression: schemas whose roots alone are named apart match" {
+    const root = schema.SchemaElement{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var leaf = root;
+    leaf.type = .INT64;
+    leaf.repetition_type = .OPTIONAL;
+    leaf.name = "a";
+    leaf.num_children = null;
+    var spark_root = root;
+    spark_root.name = "spark_schema";
+    spark_root.repetition_type = null;
+    const a = [_]schema.SchemaElement{ root, leaf };
+    const b = [_]schema.SchemaElement{ spark_root, leaf };
+    for ([_]SchemaMatch{ .values, .exact }) |m| {
+        try std.testing.expectEqual(@as(?usize, null), schemaMismatch(&a, &b, m));
+    }
+    // A leaf named apart still differs.
+    var other = leaf;
+    other.name = "b";
+    const c = [_]schema.SchemaElement{ spark_root, other };
+    try std.testing.expectEqual(@as(?usize, 1), schemaMismatch(&a, &c, .values));
 }

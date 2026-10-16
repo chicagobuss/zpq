@@ -97,9 +97,13 @@ Every S3 connection has deadlines, in milliseconds, each overridable from the en
 | first byte of a response, after the request is sent | 10 000 | `ZPQ_S3_FIRST_BYTE_TIMEOUT_MS` |
 | no byte received or sent mid-transfer | 10 000 | `ZPQ_S3_IDLE_TIMEOUT_MS` |
 | a request and its response in all, at least | 30 000 | `ZPQ_S3_REQUEST_TIMEOUT_MS` |
+| the slowest transfer let run, in KiB/s (0: none is bounded by size) | 64 | `ZPQ_S3_MIN_RATE_KIBS` |
+| CompleteMultipartUpload in all | 900 000 | `ZPQ_S3_COMPLETE_TIMEOUT_MS` |
 
-The idle timeout restarts at every byte, so a transfer that keeps moving is cut off only by the last: the longer of
-30 s and its bytes at 64 KiB/s, which a server trickling a byte at a time cannot outlast. A request that
+The idle timeout restarts at every byte, so a transfer that keeps moving is cut off only by the whole-request
+bound: the longer of 30 s and its bytes at the minimum rate, which a server trickling a byte at a time cannot outlast.
+On a link slower than 64 KiB/s, lower the rate. CompleteMultipartUpload has its own bound instead: S3 can take
+minutes over a large object, sending whitespace meanwhile, which keeps the idle timeout from firing. A request that
 times out is sent again on a new connection when that is safe (GETs, HEADs, object and part PUTs). The retries are
 charged to its usual retry budget, so a server that keeps stalling fails the query with the timeout instead of
 hanging it. Creating and completing a multipart upload are never sent twice; one that could not connect (DNS, TCP

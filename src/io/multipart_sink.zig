@@ -676,12 +676,15 @@ fn completeMultipartUpload(
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
+    // S3 may take minutes to assemble a large object, answering 200 at once and whitespace until its result: the
+    // idle timeout bounds that, and only a long whole deadline the rest.
     const resp = try controlSend(arena, &conn, .{
         .method = .POST,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = body.items,
+        .total_ms = conn.timeouts.complete_ms,
     }, failure);
     // S3 can answer 200 and then report an error in the body.
     if (resp.status != 200 or std.mem.indexOf(u8, resp.body, "<Error>") != null) {
@@ -1532,4 +1535,36 @@ test "regression: a single-PUT output is retried past a 503 SlowDown, as a part 
     var buf: [256]u8 = undefined;
     const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
     try testing.expectEqualStrings("PutObject was answered 403 AccessDenied", said);
+}
+
+test "regression: a CompleteMultipartUpload that S3 keeps alive for minutes completes, past the request bound" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    // 200 at once, then a space every 200 ms while the object is assembled. ZPQ_TEST_CMU_MS stretches it (60000 for
+    // a minute); the whole-request bound here is 300 ms, which cut Complete off with the rest.
+    const long_ms: u32 = blk: {
+        const v = std.c.getenv("ZPQ_TEST_CMU_MS") orelse break :blk 3000;
+        break :blk std.fmt.parseInt(u32, std.mem.span(v), 10) catch 3000;
+    };
+    fake.complete_keepalive_ms = long_ms;
+    fake.complete_keepalive_every_ms = 200;
+    const timeouts: tls.Timeouts = .{ .idle_ms = 1000, .request_ms = 300 };
+    const t0 = clock.monoNs();
+    try writeToPort(fake.port, "big.parquet", &test_payload, timeouts, .{ .target_part_size = 1024 });
+    try testing.expect(clock.monoNs() - t0 >= @as(i64, long_ms) * std.time.ns_per_ms);
+    try testing.expect(fake.object("big.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("big.parquet"));
+}
+
+test "regression: a write of several full-size parts completes under the default deadlines" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    const payload = try testing.allocator.alloc(u8, 24 << 20);
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 13);
+    try writeToPort(fake.port, "large.parquet", payload, .{}, .{ .target_part_size = 8 << 20 });
+    const obj = fake.object("large.parquet") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.endsWith(u8, obj.etag, "-3"));
 }

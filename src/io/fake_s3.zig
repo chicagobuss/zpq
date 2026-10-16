@@ -80,6 +80,10 @@ pub const FakeS3 = struct {
     fail_status: u16 = 503,
     fail_code: []const u8 = "SlowDown",
     fails_left: u32 = 1,
+    /// When set, a CompleteMultipartUpload answers 200 at once and then a space every `complete_keepalive_every_ms`
+    /// for this long before its result, as S3 does while it assembles a large object.
+    complete_keepalive_ms: u32 = 0,
+    complete_keepalive_every_ms: u32 = 1000,
     failed: u32 = 0,
     /// CreateMultipartUpload requests received, whatever became of them.
     creates: u32 = 0,
@@ -417,6 +421,26 @@ pub const FakeS3 = struct {
             try self.putObject(key, etag, body.len);
             self.removeUpload(id);
             resp_body = try std.fmt.allocPrint(a, "<CompleteMultipartUploadResult><ETag>\"{s}\"</ETag></CompleteMultipartUploadResult>", .{etag});
+            if (self.complete_keepalive_ms > 0) {
+                // As S3 does for a large object: 200 at once, then whitespace while it assembles, then the result.
+                const total = self.complete_keepalive_ms;
+                const every = self.complete_keepalive_every_ms;
+                locked = false;
+                self.unlock();
+                const opening = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\n";
+                try writeAll(fd, opening);
+                var waited: u32 = 0;
+                while (waited < total) : (waited += every) {
+                    sleepMs(every);
+                    try writeAll(fd, "1\r\n \r\n");
+                }
+                var chunk_buf: [32]u8 = undefined;
+                try writeAll(fd, try std.fmt.bufPrint(&chunk_buf, "{x}\r\n", .{resp_body.len}));
+                try writeAll(fd, resp_body);
+                try writeAll(fd, "\r\n0\r\n\r\n");
+                return true;
+            }
         } else if (std.mem.eql(u8, method, "DELETE") and param(query, "uploadId") != null) {
             self.removeUpload(param(query, "uploadId").?);
             status = 204;

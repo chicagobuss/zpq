@@ -65,6 +65,8 @@ pub const Error = error{
 ///   idle_ms       10 000   ZPQ_S3_IDLE_TIMEOUT_MS         silence while reading a response or sending a request
 ///   request_ms    30 000   ZPQ_S3_REQUEST_TIMEOUT_MS      a request and its response in all, at least; more for a
 ///                                                         transfer of more than `request_ms` at `min_rate`
+///   min_rate      64 KiB/s ZPQ_S3_MIN_RATE_KIBS (KiB/s)   the slowest transfer let run; 0 bounds none by size
+///   complete_ms  900 000   ZPQ_S3_COMPLETE_TIMEOUT_MS     CompleteMultipartUpload in all, in place of the above
 ///
 /// S3 answers its first byte in tens of milliseconds and moves 8 MiB in about 0.1 s even under Lambda's network
 /// policer, so ten seconds without a byte is a stalled connection, not a slow one; each extra second waited is billed
@@ -75,8 +77,12 @@ pub const Timeouts = struct {
     first_byte_ms: u32 = 10_000,
     idle_ms: u32 = 10_000,
     request_ms: u32 = 30_000,
-    /// Bytes a second below which a long transfer is cut off: the idle timeout restarts at every byte.
+    /// Bytes a second below which a long transfer is cut off: the idle timeout restarts at every byte. 0: no bound
+    /// by size, only the idle timeout, for a link slower than any floor.
     min_rate: u32 = 64 * 1024,
+    /// CompleteMultipartUpload's whole deadline. S3 may take minutes over a large object, keeping the connection
+    /// alive with whitespace, which resets the idle timeout.
+    complete_ms: u32 = 15 * 60_000,
     /// Test-only. When set, read and write deadlines use this millisecond clock instead of wall time, and waits
     /// poll so a test can expire a stalled attempt by advancing the clock. Production leaves it null.
     clock_ms: ?*const fn () u64 = null,
@@ -90,11 +96,16 @@ pub const Timeouts = struct {
             .{ "first_byte_ms", "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS" },
             .{ "idle_ms", "ZPQ_S3_IDLE_TIMEOUT_MS" },
             .{ "request_ms", "ZPQ_S3_REQUEST_TIMEOUT_MS" },
+            .{ "complete_ms", "ZPQ_S3_COMPLETE_TIMEOUT_MS" },
         }) |f| {
             if (env.getPosix(f[1])) |v| {
                 const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 0;
                 if (n > 0) @field(t, f[0]) = n;
             }
+        }
+        // KiB a second; 0 is a value here, not unset.
+        if (env.getPosix("ZPQ_S3_MIN_RATE_KIBS")) |v| {
+            if (std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10)) |kib| t.min_rate = kib *| 1024 else |_| {}
         }
         return t;
     }
@@ -333,9 +344,12 @@ pub const Connection = struct {
     /// Bound the request about to be sent, and its response, which together move about `bytes`: they must be done
     /// within `request_ms`, or the time `bytes` take at `min_rate` if longer. Every other timeout restarts at each
     /// byte, so a peer trickling one inside each could hold an attempt for ever. Until `disarmDeadline`.
-    pub fn armDeadline(self: *Connection, bytes: usize) void {
-        const at_rate = std.math.mul(u64, bytes, std.time.ms_per_s) catch std.math.maxInt(u64);
-        const total = @max(self.timeouts.request_ms, at_rate / @max(1, self.timeouts.min_rate));
+    pub fn armDeadline(self: *Connection, bytes: usize, total_ms: ?u32) void {
+        const at_rate = if (self.timeouts.min_rate == 0)
+            std.math.maxInt(u64)
+        else
+            (std.math.mul(u64, bytes, std.time.ms_per_s) catch std.math.maxInt(u64)) / self.timeouts.min_rate;
+        const total: u64 = if (total_ms) |t| t else @max(self.timeouts.request_ms, at_rate);
         var at = nowMs(self.timeouts.clock_ms) +| total;
         const last = invocation_deadline_ms.load(.monotonic);
         if (last != 0 and self.timeouts.clock_ms == null) at = @min(at, last);
@@ -1320,9 +1334,9 @@ test "regression: an attempt's deadline never runs past the invocation's" {
     setInvocationDeadline(100);
     defer setInvocationDeadline(null);
     const before = monoMs();
-    conn.armDeadline(0);
+    conn.armDeadline(0, null);
     try std.testing.expect(conn.deadline_ms.? <= before + 100 + 5);
     setInvocationDeadline(null);
-    conn.armDeadline(0);
+    conn.armDeadline(0, null);
     try std.testing.expect(conn.deadline_ms.? >= before + conn.timeouts.request_ms);
 }

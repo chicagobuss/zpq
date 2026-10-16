@@ -56,6 +56,9 @@ pub const Request = struct {
     path: []const u8,
     headers: []const Header,
     body: []const u8 = "",
+    /// The attempt's whole deadline in milliseconds, in place of the bound by size (`tls.Connection.armDeadline`):
+    /// for a request the server may take minutes over while it keeps the connection alive.
+    total_ms: ?u32 = null,
 };
 
 pub const Response = struct {
@@ -85,7 +88,7 @@ pub fn sendRequest(
     conn: *tls.Connection,
     req: Request,
 ) Error!Response {
-    conn.armDeadline(expectedBytes(req));
+    conn.armDeadline(expectedBytes(req), req.total_ms);
     defer conn.disarmDeadline();
     try sendRequestBytes(arena, conn, req);
 
@@ -143,7 +146,7 @@ pub fn sendRequestInto(
     target: []u8,
     on_headers: ?OnHeaders,
 ) Error!Response {
-    conn.armDeadline(req.body.len +| target.len);
+    conn.armDeadline(req.body.len +| target.len, req.total_ms);
     defer conn.disarmDeadline();
     try sendRequestBytes(arena, conn, req);
     return try drainResponseInto(arena, conn, target, on_headers);

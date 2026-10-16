@@ -1040,17 +1040,22 @@ fn evalCoalesceColLit(
     }
 
     return switch (result_type) {
-        .i64 => .{ .i64 = .{ .values = try coalesceToI64(arena, col, lit) } },
-        .f64 => .{ .f64 = .{ .values = try coalesceToF64(arena, col, lit) } },
-        .str => .{ .string = .{ .values = try coalesceToStr(arena, col, lit) } },
+        .i64 => .{ .i64 = .{
+            .values = try firstPresent(i64, arena, col, try coalesceI64(arena, col, col_ref), &.{try defaultI64(lit)}),
+        } },
+        .f64 => .{ .f64 = .{
+            .values = try firstPresent(f64, arena, col, try coalesceF64(arena, col, col_ref), &.{try defaultF64(lit)}),
+        } },
+        .str => .{ .string = .{
+            .values = try firstPresent([]const u8, arena, col, try coalesceStr(col), &.{try defaultStr(lit)}),
+        } },
         .dec => blk: {
             const spec = c_dec.?;
             const ref: ast.Expr = .{ .col_ref = col_ref };
             const a = try decColumnAt(arena, try exactView(col, ref), ref, spec.scale, batch.sel);
             const one = try literalAsColumn(arena, lit, 1);
             const fallback = try decColumnAt(arena, one, .{ .literal = lit }, spec.scale, null);
-            const out = try arena.alloc(i128, a.values.len);
-            for (a.values, out, 0..) |v, *o, i| o.* = if (rowIsNull(.{ .i128 = a }, i)) fallback.values[0] else v;
+            const out = try firstPresent(i128, arena, .{ .i128 = a }, a.values, fallback.values[0..1]);
             break :blk .{ .i128 = .{ .values = try checkBound(out, spec, batch.sel) } };
         },
     };
@@ -1070,20 +1075,8 @@ fn checkBound(values: []i128, spec: ast.Dec, sel: ?*const selection.SelectionVec
     return values;
 }
 
-/// Two-column coalesce: per row, take col_a's value if present;
-/// otherwise col_b's value if present; otherwise the type-zero for
-/// the result lane (`0`, `0.0`, `""`).
-///
-/// Type-zero on both-null deviates from SQL's "returns NULL" — ZPQ
-/// doesn't emit nullable output columns. Workloads that need strict
-/// SQL semantics on the both-null edge should write
-/// `coalesce(a, b, <literal>)` (multi-arg form, follow-up feature)
-/// or compare against engines using the corresponding 3-arg shape
-/// (e.g., DuckDB `coalesce(a, b, '')`).
-///
-/// Allocation: one output slice (arena-owned). For strings, values
-/// are borrowed from the source batch's existing string allocations
-/// — no per-row copy. Same model as `coalesceToStr`.
+/// Two-column coalesce: per row, col_a's value if present, otherwise col_b's, otherwise NULL.
+/// Strings borrow the source batch's values, which live in the same arena as the output.
 fn evalCoalesceColCol(
     arena: std.mem.Allocator,
     batch: *const Batch,
@@ -1106,23 +1099,88 @@ fn evalCoalesceColCol(
         inline else => |c| if (c.max_rep > 0) return error.NestedNotSupported,
     }
 
+    const levels = try bothNull(arena, col_a, col_b);
+    const has_nulls = levels != null;
     return switch (result_type) {
-        .i64 => .{ .i64 = .{ .values = try coalesceColColToI64(arena, col_a, col_b) } },
-        .f64 => .{ .f64 = .{ .values = try coalesceColColToF64(arena, col_a, col_b) } },
-        .str => .{ .string = .{ .values = try coalesceColColToStr(arena, col_a, col_b) } },
+        .i64 => .{ .i64 = .{
+            .values = try firstPresent(
+                i64,
+                arena,
+                col_a,
+                try coalesceI64(arena, col_a, lhs_ref),
+                try coalesceI64(arena, col_b, rhs_ref),
+            ),
+            .def_levels = levels,
+            .max_def = 1,
+            .has_nulls = has_nulls,
+        } },
+        .f64 => .{ .f64 = .{
+            .values = try firstPresent(
+                f64,
+                arena,
+                col_a,
+                try coalesceF64(arena, col_a, lhs_ref),
+                try coalesceF64(arena, col_b, rhs_ref),
+            ),
+            .def_levels = levels,
+            .max_def = 1,
+            .has_nulls = has_nulls,
+        } },
+        .str => .{ .string = .{
+            .values = try firstPresent([]const u8, arena, col_a, try coalesceStr(col_a), try coalesceStr(col_b)),
+            .def_levels = levels,
+            .max_def = 1,
+            .has_nulls = has_nulls,
+        } },
         .dec => blk: {
             const spec = c_dec.?;
             const ea: ast.Expr = .{ .col_ref = lhs_ref };
             const eb: ast.Expr = .{ .col_ref = rhs_ref };
             const a = try decColumnAt(arena, try exactView(col_a, ea), ea, spec.scale, batch.sel);
             const b = try decColumnAt(arena, try exactView(col_b, eb), eb, spec.scale, batch.sel);
-            const out = try arena.alloc(i128, a.values.len);
-            // Both null takes the lane's zero, as the other lanes do (see above).
-            for (a.values, b.values, out, 0..) |va, vb, *o, i| o.* = if (!rowIsNull(.{ .i128 = a }, i))
-                va
-            else if (!rowIsNull(.{ .i128 = b }, i)) vb else 0;
-            break :blk .{ .i128 = .{ .values = try checkBound(out, spec, batch.sel) } };
+            const out = try firstPresent(i128, arena, .{ .i128 = a }, a.values, b.values);
+            // A both-null row holds col_b's placeholder, which the bound check must not read as a value.
+            const sel = if (levels) |l| try presentRows(arena, l, batch.sel) else batch.sel;
+            break :blk .{ .i128 = .{
+                .values = try checkBound(out, spec, sel),
+                .def_levels = levels,
+                .max_def = 1,
+                .has_nulls = has_nulls,
+            } };
         },
+    };
+}
+
+/// Definition levels (max_def 1) for the rows where both operands are null; null when there are none.
+fn bothNull(arena: std.mem.Allocator, a: Batch.Column, b: Batch.Column) Error!?[]u32 {
+    if (!colHasNulls(a) or !colHasNulls(b)) return null;
+    const rows = colLen(a);
+    var any = false;
+    for (0..rows) |i| if (rowIsNull(a, i) and rowIsNull(b, i)) {
+        any = true;
+        break;
+    };
+    if (!any) return null;
+    const levels = try arena.alloc(u32, rows);
+    for (levels, 0..) |*l, i| l.* = @intFromBool(!(rowIsNull(a, i) and rowIsNull(b, i)));
+    return levels;
+}
+
+/// `sel` narrowed to the rows `levels` holds present.
+fn presentRows(
+    arena: std.mem.Allocator,
+    levels: []const u32,
+    sel: ?*const selection.SelectionVector,
+) Error!*const selection.SelectionVector {
+    const out = try arena.create(selection.SelectionVector);
+    out.* = try selection.SelectionVector.init(arena, levels.len);
+    for (levels, 0..) |l, i| if (l == 0 or (sel != null and !sel.?.isActive(i))) out.set(i, false);
+    return out;
+}
+
+fn colLen(col: Batch.Column) usize {
+    return switch (col) {
+        inline else => |c| c.values.len,
     };
 }
 
@@ -1148,251 +1206,54 @@ fn defaultStr(lit: ast.Literal) Error![]const u8 {
     };
 }
 
-fn coalesceToI64(arena: std.mem.Allocator, col: Batch.Column, lit: ast.Literal) Error![]i64 {
-    const def = try defaultI64(lit);
+/// A coalesce operand in the i64 lane. An unsigned column in the i32 lane zero-extends: sign-extended, a UINT32
+/// value of 2^31 or more came back negative.
+fn coalesceI64(arena: std.mem.Allocator, col: Batch.Column, ref: ast.ColRef) Error![]const i64 {
     return switch (col) {
-        .i32 => |c| try coalesceWiden(arena, i32, i64, c.values, c.def_levels, c.max_def, def, intWiden(i32, i64)),
-        .i64 => |c| try coalesceWiden(arena, i64, i64, c.values, c.def_levels, c.max_def, def, identityI64),
+        .i32, .i64 => widenColRefToI64(arena, col, ref),
         else => error.TypeMismatch,
     };
 }
 
-fn coalesceToF64(arena: std.mem.Allocator, col: Batch.Column, lit: ast.Literal) Error![]f64 {
-    const def = try defaultF64(lit);
+fn coalesceF64(arena: std.mem.Allocator, col: Batch.Column, ref: ast.ColRef) Error![]const f64 {
     return switch (col) {
-        .i32 => |c| try coalesceWiden(arena, i32, f64, c.values, c.def_levels, c.max_def, def, intToFloat(i32)),
-        .i64 => |c| try coalesceWiden(arena, i64, f64, c.values, c.def_levels, c.max_def, def, intToFloat(i64)),
-        .f32 => |c| try coalesceWiden(arena, f32, f64, c.values, c.def_levels, c.max_def, def, floatWiden),
-        .f64 => |c| try coalesceWiden(arena, f64, f64, c.values, c.def_levels, c.max_def, def, identityF64),
-        else => error.TypeMismatch,
-    };
-}
-
-fn coalesceToStr(
-    arena: std.mem.Allocator,
-    col: Batch.Column,
-    lit: ast.Literal,
-) Error![]const []const u8 {
-    const def = try defaultStr(lit);
-    return switch (col) {
-        .string => |c| blk: {
-            const out = try arena.alloc([]const u8, c.values.len);
-            if (c.def_levels) |dls| {
-                for (c.values, dls, 0..) |v, dl, i| out[i] = if (dl >= c.max_def) v else def;
-            } else {
-                @memcpy(out, c.values);
-            }
+        .i32, .i64 => blk: {
+            const ints = try widenColRefToI64(arena, col, ref);
+            const out = try arena.alloc(f64, ints.len);
+            for (ints, out) |v, *o| o.* = @floatFromInt(v);
             break :blk out;
         },
+        .f32 => |c| blk: {
+            const out = try arena.alloc(f64, c.values.len);
+            for (c.values, out) |v, *o| o.* = v;
+            break :blk out;
+        },
+        .f64 => |c| c.values,
         else => error.TypeMismatch,
     };
 }
 
-/// Generic coalesce kernel. `convert` widens a source value into the
-/// result type for non-null rows; null rows fall through to `default`.
-/// PLAIN-encoded OPTIONAL columns store null slots as zeroed values,
-/// so we still must consult def_levels — we cannot trust the values.
-fn coalesceWiden(
-    arena: std.mem.Allocator,
-    comptime SrcT: type,
-    comptime DstT: type,
-    values: []const SrcT,
-    def_levels: ?[]const u32,
-    max_def: u32,
-    default: DstT,
-    convert: *const fn (SrcT) DstT,
-) Error![]DstT {
-    const out = try arena.alloc(DstT, values.len);
-    if (def_levels) |dls| {
-        for (values, dls, 0..) |v, dl, i| out[i] = if (dl >= max_def) convert(v) else default;
-    } else {
-        for (values, 0..) |v, i| out[i] = convert(v);
-    }
-    return out;
-}
-
-// ============================================================
-// Two-column coalesce kernels
-// ============================================================
-// One per result lane. Each dispatches on the two source columns'
-// physical types, then drives a generic walk that picks col_a's
-// value when present, col_b's when present, type-zero otherwise.
-//
-// String special-case: values are borrowed (no per-row copy). The
-// source columns' backing storage lives in the same arena as the
-// output. Numeric values are widened to the result type at copy
-// time per the existing widening helpers.
-
-fn coalesceColColToI64(
-    arena: std.mem.Allocator,
-    col_a: Batch.Column,
-    col_b: Batch.Column,
-) Error![]i64 {
-    return switch (col_a) {
-        .i32 => |a| switch (col_b) {
-            .i32 => |b| try walkColColInt(arena, i32, i32, i64, a, b, 0, intWiden(i32, i64), intWiden(i32, i64)),
-            .i64 => |b| try walkColColInt(arena, i32, i64, i64, a, b, 0, intWiden(i32, i64), identityI64),
-            else => error.TypeMismatch,
-        },
-        .i64 => |a| switch (col_b) {
-            .i32 => |b| try walkColColInt(arena, i64, i32, i64, a, b, 0, identityI64, intWiden(i32, i64)),
-            .i64 => |b| try walkColColInt(arena, i64, i64, i64, a, b, 0, identityI64, identityI64),
-            else => error.TypeMismatch,
-        },
+fn coalesceStr(col: Batch.Column) Error![]const []const u8 {
+    return switch (col) {
+        .string => |c| c.values,
         else => error.TypeMismatch,
     };
 }
 
-fn coalesceColColToF64(
+/// Per row, `a_vals` where `a` is present, else `b_vals` (one element: a literal). Where `b_vals` is a column's null
+/// slot, the caller's levels mark the row NULL. PLAIN-encoded OPTIONAL columns leave null slots as placeholders, so
+/// the def levels decide, never the values.
+fn firstPresent(
+    comptime T: type,
     arena: std.mem.Allocator,
-    col_a: Batch.Column,
-    col_b: Batch.Column,
-) Error![]f64 {
-    return switch (col_a) {
-        .f32 => |a| switch (col_b) {
-            .f32 => |b| try walkColColInt(arena, f32, f32, f64, a, b, 0.0, floatWiden, floatWiden),
-            .f64 => |b| try walkColColInt(arena, f32, f64, f64, a, b, 0.0, floatWiden, identityF64),
-            else => error.TypeMismatch,
-        },
-        .f64 => |a| switch (col_b) {
-            .f32 => |b| try walkColColInt(arena, f64, f32, f64, a, b, 0.0, identityF64, floatWiden),
-            .f64 => |b| try walkColColInt(arena, f64, f64, f64, a, b, 0.0, identityF64, identityF64),
-            else => error.TypeMismatch,
-        },
-        // Mixed int+float at the column level — promote both sides
-        // through the f64 lane. Less common but the parser sets
-        // result_type to f64 when promotion involves a float source.
-        .i32 => |a| switch (col_b) {
-            .f32 => |b| try walkColColInt(arena, i32, f32, f64, a, b, 0.0, intToFloat(i32), floatWiden),
-            .f64 => |b| try walkColColInt(arena, i32, f64, f64, a, b, 0.0, intToFloat(i32), identityF64),
-            else => error.TypeMismatch,
-        },
-        .i64 => |a| switch (col_b) {
-            .f32 => |b| try walkColColInt(arena, i64, f32, f64, a, b, 0.0, intToFloat(i64), floatWiden),
-            .f64 => |b| try walkColColInt(arena, i64, f64, f64, a, b, 0.0, intToFloat(i64), identityF64),
-            else => error.TypeMismatch,
-        },
-        else => error.TypeMismatch,
-    };
-}
-
-fn coalesceColColToStr(
-    arena: std.mem.Allocator,
-    col_a: Batch.Column,
-    col_b: Batch.Column,
-) Error![]const []const u8 {
-    const a = switch (col_a) {
-        .string => |c| c,
-        else => return error.TypeMismatch,
-    };
-    const b = switch (col_b) {
-        .string => |c| c,
-        else => return error.TypeMismatch,
-    };
-    std.debug.assert(a.values.len == b.values.len);
-
-    const out = try arena.alloc([]const u8, a.values.len);
-    // Fast path: col_a is REQUIRED (no def_levels) or all-present.
-    // In either case every row's answer is just col_a's value; no
-    // need to look at col_b at all.
-    if (a.def_levels == null) {
-        @memcpy(out, a.values);
-        return out;
-    }
-    const a_dls = a.def_levels.?;
-
-    if (b.def_levels == null) {
-        // col_b always present — picks up wherever col_a is null.
-        for (a.values, a_dls, b.values, 0..) |va, dla, vb, i| {
-            out[i] = if (dla >= a.max_def) va else vb;
-        }
-        return out;
-    }
-    const b_dls = b.def_levels.?;
-    for (a.values, a_dls, b.values, b_dls, 0..) |va, dla, vb, dlb, i| {
-        out[i] = if (dla >= a.max_def)
-            va
-        else if (dlb >= b.max_def)
-            vb
-        else
-            "";
-    }
+    a: Batch.Column,
+    a_vals: []const T,
+    b_vals: []const T,
+) Error![]T {
+    const out = try arena.alloc(T, a_vals.len);
+    const step: usize = @intFromBool(b_vals.len > 1);
+    for (out, a_vals, 0..) |*o, va, i| o.* = if (!rowIsNull(a, i)) va else b_vals[i * step];
     return out;
-}
-
-/// Walk two columns' (values, def_levels) in parallel, picking the
-/// first non-null per row and falling back to `zero_default` when
-/// both are null. Each value is run through the supplied widening
-/// converter (e.g. i32→i64 or float→f64) at pickup time.
-///
-/// Comptime-specialized on (SrcAT, SrcBT, DstT) — eight numeric
-/// specializations live, all small enough to inline.
-fn walkColColInt(
-    arena: std.mem.Allocator,
-    comptime SrcAT: type,
-    comptime SrcBT: type,
-    comptime DstT: type,
-    a: ColumnT(SrcAT),
-    b: ColumnT(SrcBT),
-    zero_default: DstT,
-    convert_a: *const fn (SrcAT) DstT,
-    convert_b: *const fn (SrcBT) DstT,
-) Error![]DstT {
-    std.debug.assert(a.values.len == b.values.len);
-    const out = try arena.alloc(DstT, a.values.len);
-
-    // Two def_level slots are null → both fully present, so the
-    // answer is always col_a. Saves a per-row branch in the common
-    // "no nulls anywhere" case.
-    if (a.def_levels == null) {
-        for (a.values, 0..) |va, i| out[i] = convert_a(va);
-        return out;
-    }
-    const a_dls = a.def_levels.?;
-    if (b.def_levels == null) {
-        for (a.values, a_dls, b.values, 0..) |va, dla, vb, i| {
-            out[i] = if (dla >= a.max_def) convert_a(va) else convert_b(vb);
-        }
-        return out;
-    }
-    const b_dls = b.def_levels.?;
-    for (a.values, a_dls, b.values, b_dls, 0..) |va, dla, vb, dlb, i| {
-        out[i] = if (dla >= a.max_def)
-            convert_a(va)
-        else if (dlb >= b.max_def)
-            convert_b(vb)
-        else
-            zero_default;
-    }
-    return out;
-}
-
-fn intWiden(comptime SrcT: type, comptime DstT: type) *const fn (SrcT) DstT {
-    return struct {
-        fn f(x: SrcT) DstT {
-            return @intCast(x);
-        }
-    }.f;
-}
-
-fn intToFloat(comptime SrcT: type) *const fn (SrcT) f64 {
-    return struct {
-        fn f(x: SrcT) f64 {
-            return @floatFromInt(x);
-        }
-    }.f;
-}
-
-fn floatWiden(x: f32) f64 {
-    return x;
-}
-
-fn identityI64(x: i64) i64 {
-    return x;
-}
-
-fn identityF64(x: f64) f64 {
-    return x;
 }
 
 /// Hand-coded kernel for binary arithmetic. Comptime-specialized per
@@ -1961,7 +1822,7 @@ test "coalesce: col + col (str) — b fills a's nulls" {
     try testing.expectEqualStrings("us-east-1", out.string.values[2]);
 }
 
-test "coalesce: col + col (str) — both null falls to empty" {
+test "regression: coalesce: col + col (str) is NULL where both are" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1988,7 +1849,8 @@ test "coalesce: col + col (str) — both null falls to empty" {
     const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .str, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualStrings("alpha", out.string.values[0]);
-    try testing.expectEqualStrings("", out.string.values[1]);
+    try testing.expectEqualSlices(u32, &.{ 1, 0 }, out.string.def_levels.?);
+    try testing.expectEqual(1, out.string.max_def);
 }
 
 test "coalesce: col + col (str) — REQUIRED col_a fast-paths to memcpy" {
@@ -2053,7 +1915,7 @@ test "coalesce: col + col (i64) — promotes i32+i64" {
     try testing.expectEqualSlices(i64, &.{ 10, 200, 30 }, out.i64.values);
 }
 
-test "coalesce: col + col (f64) — both null falls to 0.0" {
+test "regression: coalesce: col + col (f64) is NULL where both are" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2079,9 +1941,58 @@ test "coalesce: col + col (f64) — both null falls to 0.0" {
 
     const e: ast.Expr = .{ .call = .{ .func = .coalesce, .args = args, .result_type = .f64, .depth = 2 } };
     const out = try evalExpr(a, &batch, &lookup, e);
-    try testing.expect(@abs(out.f64.values[0] - 1.5) < 1e-9);
-    try testing.expect(@abs(out.f64.values[1] - 0.0) < 1e-9);
-    try testing.expect(@abs(out.f64.values[2] - 3.5) < 1e-9);
+    try testing.expectEqual(1.5, out.f64.values[0]);
+    try testing.expectEqual(3.5, out.f64.values[2]);
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 1 }, out.f64.def_levels.?);
+}
+
+test "regression: coalesce zero-extends UINT32 operands in the i64 and f64 lanes, with a literal or a column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big: i32 = @bitCast(@as(u32, 3_000_000_000));
+    const u_vals = [_]i32{ big, 0, 0 };
+    const u_dls = [_]u32{ 1, 0, 0 };
+    const r_vals = [_]i32{ 0, big, 0 };
+    const r_dls = [_]u32{ 0, 1, 0 };
+    const cols = [_]Batch.Column{
+        .{ .i32 = .{ .values = &u_vals, .def_levels = &u_dls, .max_def = 1 } },
+        .{ .i32 = .{ .values = &r_vals, .def_levels = &r_dls, .max_def = 1 } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{ 0, 1 };
+    var u: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64, .unsigned_32 = true } };
+    var r: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64, .unsigned_32 = true } };
+    var seven: ast.Expr = .{ .literal = .{ .i64 = 7 } };
+    for ([_]ast.Type{ .i64, .f64 }) |lane| {
+        const with_lit = [_]*ast.Expr{ &u, &seven };
+        const lit_out = try evalExpr(a, &batch, &lookup, .{ .call = .{
+            .func = .coalesce,
+            .args = &with_lit,
+            .result_type = lane,
+            .depth = 2,
+        } });
+        const with_col = [_]*ast.Expr{ &u, &r };
+        const col_out = try evalExpr(a, &batch, &lookup, .{ .call = .{
+            .func = .coalesce,
+            .args = &with_col,
+            .result_type = lane,
+            .depth = 2,
+        } });
+        switch (lane) {
+            .i64 => {
+                try testing.expectEqualSlices(i64, &.{ 3_000_000_000, 7, 7 }, lit_out.i64.values);
+                try testing.expectEqualSlices(i64, &.{ 3_000_000_000, 3_000_000_000 }, col_out.i64.values[0..2]);
+                try testing.expectEqualSlices(u32, &.{ 1, 1, 0 }, col_out.i64.def_levels.?);
+            },
+            else => {
+                try testing.expectEqualSlices(f64, &.{ 3e9, 7, 7 }, lit_out.f64.values);
+                try testing.expectEqualSlices(f64, &.{ 3e9, 3e9 }, col_out.f64.values[0..2]);
+                try testing.expectEqualSlices(u32, &.{ 1, 1, 0 }, col_out.f64.def_levels.?);
+            },
+        }
+    }
 }
 
 test "nullable column rejected" {

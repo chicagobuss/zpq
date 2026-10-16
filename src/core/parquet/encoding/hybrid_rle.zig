@@ -328,12 +328,6 @@ pub const HybridRleDecoder = struct {
     }
 };
 
-/// RLE-encoded BOOLEAN values (encoding == RLE). Boolean data is the
-/// hybrid RLE/bit-packed stream at a fixed bit-width of 1; a `1` bit is
-/// `true`. The 4-byte little-endian length prefix that precedes the
-/// stream in a data page is stripped by the caller — `bytes` here is the
-/// raw RLE stream only. Thin streaming adapter over `HybridRleDecoder`
-/// that emits `bool` rather than `u32`.
 /// Decode `out.len` repetition or definition levels, each checked against `max_level`, the schema's bound: the one
 /// place every reader decodes levels. A level past the bound names no slot; a definition level of 3 under a maximum of
 /// 2 read as a present value, its slot a placeholder.
@@ -361,6 +355,12 @@ pub fn levelsWithin(levels: []const u32, max: u32) bool {
     return m <= max;
 }
 
+/// RLE-encoded BOOLEAN values (encoding == RLE). Boolean data is the
+/// hybrid RLE/bit-packed stream at a fixed bit-width of 1; a `1` bit is
+/// `true`. The 4-byte little-endian length prefix that precedes the
+/// stream in a data page is stripped by the caller — `bytes` here is the
+/// raw RLE stream only. Thin streaming adapter over `HybridRleDecoder`
+/// that emits `bool` rather than `u32`.
 pub const BooleanRleDecoder = struct {
     inner: HybridRleDecoder,
 

@@ -347,8 +347,6 @@ pub fn findColumnIndex(
     return resolveColumn(file, column_name) catch null;
 }
 
-/// The schema element of the `leaf_idx`-th primitive leaf, as
-/// `resolveColumn` counts them. Null when the schema has fewer leaves.
 /// How alike two inputs' schemas must be for one query to read both through input 0's binding.
 pub const SchemaMatch = enum {
     /// Each input is decoded with its own footer (aggregation): the same names (any letter case), nesting and DECIMAL
@@ -382,6 +380,8 @@ pub fn schemaMismatch(
     return null;
 }
 
+/// The schema element of the `leaf_idx`-th primitive leaf, as
+/// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
     var it: schema.LeafIterator = .init(file.schema.items);
     while (it.next()) |leaf| {

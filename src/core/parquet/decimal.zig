@@ -45,7 +45,9 @@ pub const Error = error{
     UnsupportedEncoding,
     /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
     LevelOutOfRange,
-} || page_mod.Error || std.mem.Allocator.Error;
+} || int96.Error || page_mod.Error || std.mem.Allocator.Error;
+
+const int96 = @import("int96.zig");
 
 /// Maximum FLBA byte width we accept. 16 bytes = i128, which covers
 /// precision ≤ 38 (the parquet spec's max). Widths > 16 require i192+
@@ -88,6 +90,15 @@ pub const Kind = struct {
 /// Real production data still arrives in legacy form regularly, so we
 /// recognise both. When both are present we prefer the LogicalType
 /// payload (newer writers set both for compat; the LogicalType wins).
+/// `kindFromSchema`, and an INT96 timestamp as the exact integer of nanoseconds it reads as (`int96.int96ToNanos`):
+/// DECIMAL(38, 0), an i128 that no year wraps, printed, compared and aggregated as the DECIMAL lane does. For reading
+/// and typing values only; footer checks, statistics and writers keep INT96 apart (`kindFromSchema`).
+pub fn exactKind(elem: *const schema.SchemaElement) ?Kind {
+    if (kindFromSchema(elem)) |k| return k;
+    if (elem.type == .INT96) return .{ .scale = 0, .precision = 38, .physical = .INT96, .byte_width = 12 };
+    return null;
+}
+
 pub fn kindFromSchema(elem: *const schema.SchemaElement) ?Kind {
     const phys = elem.type orelse return null;
     // A width no decimal can have (precision 38 needs 16 bytes) is not decoded as one.
@@ -338,6 +349,25 @@ pub fn decodeColumnExact(
                 .unscaled = @unionInit(filter_eval.Exact, @typeName(T), raw.values),
             };
         },
+        .INT96 => {
+            const raw = try int96.decodeColumnAsI128Nanos(
+                arena,
+                chunk,
+                codec,
+                levels,
+                num_leaves,
+                decode_options.page_bytes_limit,
+            );
+            const values = try arena.alloc(f64, raw.values.len);
+            for (raw.values, values) |v, *o| o.* = @floatFromInt(v);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = raw.max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = raw.values },
+            };
+        },
         .FIXED_LEN_BYTE_ARRAY => {
             const limit = decode_options.page_bytes_limit;
             const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind, limit);
@@ -453,6 +483,14 @@ pub fn decodeColumnAsI128WithOptions(
             decode_options.page_bytes_limit,
         ),
         .BYTE_ARRAY => try decodeByteArrayBackedI128(arena, chunk, codec, levels, num_leaves, decode_options, null),
+        .INT96 => try int96.decodeColumnAsI128Nanos(
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            decode_options.page_bytes_limit,
+        ),
         else => error.UnsupportedDecimalPhysicalType,
     };
 }

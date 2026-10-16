@@ -4286,7 +4286,11 @@ fn writeGroupedParquet(
             try outs.append(arena, try groupedColumn(f64, arena, sum_name, true, rows, ci, .DOUBLE, false));
             try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
         },
-        .dec => try outs.append(arena, try groupedDecColumn(arena, name, rows, ci, ty.dec.?)),
+        .dec => {
+            // An INT96 source reads as exact nanoseconds on this lane and is written back as a timestamp.
+            const col = try groupedDecColumn(arena, name, rows, ci, ty.dec.?);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, col, src) else col);
+        },
         .avg_dec => {
             const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
             const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
@@ -4336,7 +4340,10 @@ fn writeTypedParquet(
             try outs.append(arena, typedColumn([]f64, try std.fmt.allocPrint(arena, "{s}__sum", .{name}), true, a.sum, .DOUBLE));
             try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
         },
-        .dec => |l| try outs.append(arena, decColumn(name, l, ty.dec.?)),
+        .dec => |l| {
+            const out = decColumn(name, l, ty.dec.?);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, out, src) else out);
+        },
         .avg_dec => |a| {
             try outs.append(arena, decColumn(try std.fmt.allocPrint(arena, "{s}__sum", .{name}), a.sum, ty.dec.?.sum()));
             try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
@@ -4401,6 +4408,7 @@ fn decColumn(name: []const u8, l: scan.TypedAnswer.Lane(i128), spec: expr_ast.De
 /// lane holds; INT96 becomes INT64 TIMESTAMP(NANOS), the value zpq decodes it to; fixed-length bytes stay plain
 /// BYTE_ARRAY.
 fn retypeOutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol, src: schema.SchemaElement) !expr_agg.OutputCol {
+    if (src.type == .INT96) if (out.col == .i128) return int96OutputCol(arena, out);
     if (decimal_mod.kindFromSchema(&src) != null or schema.isFloat16(src)) return out;
     var res = out;
     res.logical_type = src.logical_type;
@@ -4439,6 +4447,24 @@ fn retypeOutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol, src: schem
 }
 
 /// `values` under `src`'s null layout.
+/// An INT96 key or min/max, read as exact nanoseconds, written as INT64 TIMESTAMP(NANOS) as before; one past what
+/// 64 bits of nanoseconds hold has no such column, and is refused rather than wrapped.
+fn int96OutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol) !expr_agg.OutputCol {
+    const c = out.col.i128;
+    const vals = try arena.alloc(i64, c.values.len);
+    for (c.values, vals, 0..) |v, *o, i| {
+        const present = if (c.def_levels) |dl| dl[i] >= c.max_def else true;
+        o.* = if (present) std.math.cast(i64, v) orelse return error.Int96OutOfRange else 0;
+    }
+    var res = out;
+    res.col = .{ .i64 = sameNulls(i64, c, vals) };
+    res.parquet_type = .INT64;
+    res.dec = null;
+    res.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .NANOS = .{} } } };
+    res.converted_type = null;
+    return res;
+}
+
 fn sameNulls(comptime T: type, src: anytype, values: []const T) filter_eval.ColumnT(T) {
     return .{ .values = values, .def_levels = src.def_levels, .max_def = src.max_def, .has_nulls = src.has_nulls };
 }
@@ -7743,23 +7769,81 @@ test "regression: arithmetic refuses only the NULLs it would read" {
     }));
 }
 
-test "regression: an INT96 past nanoseconds fails the queries reading it, and only those" {
+test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and aggregates exactly" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "int96_year1.parquet", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    // `ts` holds 0001-01-01, which wrapped to 1754-08-30.
+    const Want = struct { file: []const u8, aggregate: []const u8, filter: ?[]const u8 = null, values: []const i128 };
+    for ([_]Want{
+        // `ts` holds 0001-01-01 00:00:00.764, which wrapped to 1754-08-30, then was refused.
+        .{ .file = "int96_year1.parquet", .aggregate = "min(ts) AS m, max(ts) AS x", .values = &.{
+            -62135596036000000000, 9223372036000000000,
+        } },
+        .{ .file = "int96_year1.parquet", .aggregate = "count(*) AS n", .filter = "ts < '1700-01-01'", .values = &.{
+            1,
+        } },
+        .{
+            .file = "int96_year1.parquet",
+            .aggregate = "count(*) AS n",
+            .filter = "ts = -62135596036000000000",
+            .values = &.{1},
+        },
+        // Spark's: 9999-12-31 03:00 among 2024 dates, and a day count past any calendar.
+        .{ .file = "int96_from_spark.parquet", .aggregate = "min(a) AS m, max(a) AS x, count(a) AS n", .values = &.{
+            1704070800000000000, 361727810693890448384000, 5,
+        } },
+        .{ .file = "int96_from_spark.parquet", .aggregate = "count(*) AS n", .filter = "a > '2262-12-31'", .values = &.{
+            2,
+        } },
+        // `dt3` holds `dt2`'s seconds as nanoseconds, back to 0000-01-01: 1678 of 1971 rows wrapped.
+        .{ .file = "int96_bug4903.parquet", .aggregate = "sum(dt3) AS s, min(dt3) AS m", .values = &.{
+            -61265237128709000000000, -62167402800000000000,
+        } },
+        .{ .file = "int96_bug4903.parquet", .aggregate = "sum(dt2) AS s, min(dt2) AS m", .values = &.{
+            -61265237128709, -62167402800,
+        } },
+    }) |w| {
+        var buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, dir ++ "{s}", .{w.file});
+        var r = try runQuery(ctx, .{ .inputs = &.{path}, .aggregate = w.aggregate, .filter = w.filter });
+        defer r.deinit(gpa);
+        for (w.values, r.aggregate.output.aggs[0..w.values.len]) |want, got| {
+            const v: i128 = switch (got.value) {
+                .i => |x| x,
+                .dec => |d| d.v,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(want, v);
+        }
+    }
+    // Written out, an INT96 key stays an INT64 TIMESTAMP(NANOS) where 64 bits hold it, and is refused where not.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var obuf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&obuf, ".zig-cache/tmp/{s}/keys.parquet", .{tmp.sub_path});
     const y1: []const []const u8 = &.{dir ++ "int96_year1.parquet"};
-    try std.testing.expectError(error.Int96OutOfRange, runQuery(ctx, .{ .inputs = y1, .aggregate = "min(ts) AS m" }));
     try std.testing.expectError(error.Int96OutOfRange, runQuery(ctx, .{
         .inputs = y1,
+        .group_by = "ts",
         .aggregate = "count(*) AS n",
-        .filter = "ts < '1700-01-01'",
+        .output = out,
     }));
-    // Columns beside it still read.
-    var r = try runQuery(ctx, .{ .inputs = y1, .aggregate = "count(*) AS n, min(dt) AS m" });
-    defer r.deinit(gpa);
-    try std.testing.expectEqual(@as(i128, 8), r.aggregate.output.aggs[0].value.i);
+    var written = try runQuery(ctx, .{
+        .inputs = y1,
+        .group_by = "ts",
+        .aggregate = "count(*) AS n",
+        .filter = "ts >= '1900-01-01' AND ts < '2262-01-01'",
+        .output = out,
+    });
+    written.deinit(gpa);
+    const bytes = try metadata.readFileSlice(out, gpa);
+    defer gpa.free(bytes);
+    var meta = try metadata.open(gpa, bytes);
+    defer meta.deinit(gpa);
+    const key = meta.schema.items[1];
+    try std.testing.expectEqual(schema.Type.INT64, key.type.?);
+    try std.testing.expect(key.logical_type.? == .TIMESTAMP);
 }
 
 test "regression: a definition level past its column's maximum fails the queries reading it" {

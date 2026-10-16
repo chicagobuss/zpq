@@ -202,6 +202,14 @@ pub fn initOutputAggregator(
                 const src_elem = leaf.element.*;
                 paths[i] = try arena.dupe([]const u8, leaf.path);
 
+                // INT96: exact epoch nanoseconds (`decimal.exactKind`) on the integer lane. The schema stays
+                // INT96, whose re-encoding is refused before rows are written.
+                if (src_elem.type == .INT96) {
+                    schemas[i] = src_elem;
+                    cols[i] = .{ .i128 = .{} };
+                    continue;
+                }
+
                 // DECIMAL source columns. INT32/INT64/FLBA-backed take the
                 // lossless integer lane: decode to unscaled i128, keep the
                 // source DECIMAL schema element, re-encode at the same
@@ -594,7 +602,7 @@ fn decodeWriteColumn(
     // DECIMAL columns, whatever their backing: the f64 view, with the exact unscaled values beside it that filters,
     // expressions and aggregates read (`decodeColumnExact`).
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
 
     const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
         .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, null),
@@ -773,7 +781,7 @@ pub const SliceReader = struct {
         const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
         const se = meta.getColumnSchema(cm.path_in_schema.items);
-        const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
+        const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.exactKind(&e) else null;
         if (dec) |k| {
             if (cm.type == .FIXED_LEN_BYTE_ARRAY and
                 (k.byte_width == 0 or k.byte_width > decimal_mod.MAX_FLBA_BYTE_WIDTH))
@@ -1077,6 +1085,12 @@ pub const SliceReader = struct {
                         x.* = 0;
                         continue;
                     }
+                    if (k.physical == .INT96) {
+                        if (b.len != int96_mod.INT96_WIDTH) return error.UnexpectedPage;
+                        x.* = int96_mod.int96ToNanos(b);
+                        o.* = @floatFromInt(x.*);
+                        continue;
+                    }
                     if (b.len > decimal_mod.MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
                     x.* = decimal_mod.flbaToI128(b);
                     o.* = decimal_mod.applyScaleI128(x.*, k.scale);
@@ -1097,7 +1111,7 @@ pub const SliceReader = struct {
 fn decimalKind(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) ?decimal_mod.Kind {
     const cm = rg.columns.items[ci].meta_data orelse return null;
     const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
-    return decimal_mod.kindFromSchema(&se);
+    return decimal_mod.exactKind(&se);
 }
 
 fn decodeDecimalI128(
@@ -1120,7 +1134,7 @@ fn decodeDecimalI128(
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const n_leaves: usize = @intCast(cm.num_values);
     const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
-    const kind = decimal_mod.kindFromSchema(&se) orelse return error.SchemaLookupFailed;
+    const kind = decimal_mod.exactKind(&se) orelse return error.SchemaLookupFailed;
     return decimal_mod.decodeColumnAsI128WithOptions(
         ra,
         chunk,
@@ -1317,7 +1331,7 @@ fn decodeWriteColumnMaybeCoded(
     const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const se = meta.getColumnSchema(cm.path_in_schema.items);
-    const converted = if (se) |e| decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e) else false;
+    const converted = if (se) |e| decimal_mod.exactKind(&e) != null or schema.isFloat16(e) else false;
     if (!decode_options.encoded or converted or levels.max_rep > 0)
         return decodeWriteColumn(ra, rg, meta, src, ci, decode_options, prof);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -2156,7 +2170,7 @@ pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_a
         const n: usize = @intCast(@max(0, cm.num_values));
         const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
         const se = in.meta.getColumnSchema(cm.path_in_schema.items);
-        const decimal = if (se) |e| decimal_mod.kindFromSchema(&e) != null else false;
+        const decimal = if (se) |e| decimal_mod.exactKind(&e) != null else false;
         const lane: usize = switch (cm.type) {
             .BOOLEAN => 1,
             .INT32 => if (decimal) 12 else 8, // a decimal's f64 view beside its integers; unsigned widens to 8
@@ -3103,7 +3117,7 @@ fn decodeAggColumnCoded(
     if (levels.max_rep > 0) return null;
     const n_leaves: usize = @intCast(cm.num_values);
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
     if (dec_kind) |k| {
         return switch (k.physical) {
             inline .INT32, .INT64 => |p| blk: {
@@ -3191,7 +3205,7 @@ fn decodeAggColumnHist(
     if (levels.max_rep > 0) return null;
     const n_leaves: usize = @intCast(cm.num_values);
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
     if (firsts) {
         if (dec_kind != null) return null;
         // The reader declines a key chunk at its first null row, after allocating and folding up to it, and the chunk
@@ -3641,7 +3655,7 @@ fn decodeAggColumn(
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const n_leaves: usize = @intCast(cm.num_values);
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
+    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
 
     if (dec_kind) |k| return .{
         .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, scratch),

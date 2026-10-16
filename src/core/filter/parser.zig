@@ -667,6 +667,8 @@ fn buildTypedComparison(
 ) Error!ast.Filter {
     // Every leaf that compares a stored value is marked `stored` here and nowhere else, so what membership pruning
     // hashes (filter/membership.zig) can never drift from what evaluation compares.
+    // Exact epoch nanoseconds (`decimal.exactKind`), so a literal before 1677 or after 2262 compares as written.
+    if (elem.type == .INT96) return .{ .decimal = try int96Leaf(col_idx, op, val_str) };
     if (decimal_mod.kindFromSchema(elem)) |k| {
         // Compared on the unscaled integers: through f64, values past 2^53 matched their neighbours.
         const lit = try scaledLiteral(val_str, k.scale);
@@ -808,6 +810,14 @@ fn buildTemporalLeaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8, 
     };
     const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
     return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact);
+}
+
+/// An INT96 leaf: a bare integer is nanoseconds since the epoch, as the column reads; anything else a date-time.
+fn int96Leaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8) Error!ast.Leaf(i128) {
+    const val_str = stripStringQuotes(val_str_raw);
+    if (std.fmt.parseInt(i128, val_str, 10)) |ns| return ast.exactLeaf(i128, col_idx, op, ns, false) else |_| {}
+    const lit = try parseDateTimeNs(val_str);
+    return ast.exactLeaf(i128, col_idx, op, lit.ns, lit.sub_ns);
 }
 
 fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact: bool) ast.Filter {

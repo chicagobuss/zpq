@@ -464,7 +464,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             // DECIMAL columns are exact: expressions and aggregates read the unscaled integers the consumer decodes
             // beside the f64 view (see core/parquet/decimal.zig `decodeColumnExact`).
             var dec: ?ast.Dec = null;
-            if (decimal_mod.kindFromSchema(&elem)) |k| {
+            if (decimal_mod.exactKind(&elem)) |k| {
                 if (!ast.Dec.valid(k.precision, k.scale)) return error.InvalidDecimalType;
                 dec = .{ .precision = @intCast(k.precision), .scale = @intCast(k.scale) };
             }

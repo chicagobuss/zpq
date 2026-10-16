@@ -81,8 +81,8 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.Int96OutOfRange => diagnosticPrint(
-            "zpq query: an INT96 timestamp lies outside 1677-2262, which nanoseconds\n" ++
-                "  cannot hold, or holds a time of day past 24 hours\n",
+            "zpq query: an INT96 timestamp outside 1677-2262 cannot be written as\n" ++
+                "  64-bit nanoseconds\n",
             .{},
         ),
         error.UnsupportedDecimalPrecision => diagnosticPrint(

@@ -87,6 +87,11 @@
 
 ### Fixes
 
+- INT96 timestamps read exactly in any year. Values outside 1677-2262, which 64-bit nanoseconds cannot hold, wrapped
+  into another instant: Spark's 0001-01-01 and 9999-12-31 sentinels read as 1754 and as some other date. They now
+  read as the exact count of nanoseconds since the epoch, printed as that integer, and compare, sort, group and
+  aggregate exactly. Values inside the range print as before. Written as a timestamp (`-o` of a GROUP BY key or a
+  min/max), one past the range is refused.
 - An S3 response that stalls no longer hangs the query. A read had no deadline, so a connection the server or the
   network left open but silent blocked its request forever, and with it the whole query: about one in ten Lambda
   rewrites of an 868 MB object stalled until the function timed out. Connecting, the TLS handshake, the first byte of

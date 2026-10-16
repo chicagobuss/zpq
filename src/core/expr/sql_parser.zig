@@ -936,6 +936,17 @@ fn HavingBuilder(comptime Sel: type) type {
 
         /// The result row column a HAVING operand reads: a SELECT column it names, else a hidden term.
         fn term(self: *Self, node: *c.LpNode) !usize {
+            // The tested operand names a result; an integer here is a value, never an ORDER BY-style position
+            // (`HAVING 1 IN (2, 3)` kept the groups whose first column was 2 or 3).
+            switch (node.kind) {
+                c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL,
+                c.LP_EXPR_LITERAL_BOOL, c.LP_EXPR_LITERAL_BLOB,
+                => {
+                    diagnosticPrint("sql: HAVING tests a literal; it compares a result or key with literals\n", .{});
+                    return error.HavingNotSupported;
+                },
+                else => {},
+            }
             if (try orderColumn(self.sel, self.lp_arena, self.select_cols, node)) |i| return i;
             return self.select_cols.len +
                 try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden);
@@ -1183,6 +1194,17 @@ test "regression: sql_parser refuses a comparison that reads a column on its val
         var q = try parseSqlQuery(a, sql);
         q.deinit(a);
     }
+}
+
+test "regression: a HAVING literal operand is a value, not a SELECT position" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 1 BETWEEN 2 AND 3",
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 1 IN (2, 3)",
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 9 IS NULL",
+    }) |sql| try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, sql));
+    var q = try parseSqlQuery(a, "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING c BETWEEN 2 AND 3");
+    q.deinit(a);
 }
 
 test "sql_parser rejects unsupported aggregate shapes" {

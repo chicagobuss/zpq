@@ -212,14 +212,15 @@ pub fn handle(
         // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw" (both LZ4_RAW;
         // nothing compresses to the deprecated LZ4 codec), or "uncompressed" —
         // parity with the CLI's --codec. Absent, re-encoded output is snappy and
-        // byte copies keep the source codec. Anything else is treated as snappy
-        // with no error (strict validation can come with the API-versioning work).
+        // byte copies keep the source codec. Any other name is refused, as the CLI
+        // refuses it: a misspelt "zsdt" wrote snappy.
         const output_codec: ?schema.CompressionCodec = if (req.output_codec) |s| blk: {
             if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;
             if (std.ascii.eqlIgnoreCase(s, "uncompressed")) break :blk .UNCOMPRESSED;
             if (std.ascii.eqlIgnoreCase(s, "gzip")) break :blk .GZIP;
             if (std.ascii.eqlIgnoreCase(s, "lz4") or std.ascii.eqlIgnoreCase(s, "lz4_raw")) break :blk .LZ4_RAW;
-            break :blk .SNAPPY;
+            if (std.ascii.eqlIgnoreCase(s, "snappy")) break :blk .SNAPPY;
+            return rejectResponse(allocator, "bad_json", "BadOutputCodec", "output_codec", s);
         } else null;
 
         // How hard zstd works on the output, as the CLI's --compress-priority. Absent: size (level 3).
@@ -350,7 +351,8 @@ pub fn handle(
 threadlocal var sql_message: [16 * 1024]u8 = undefined;
 threadlocal var sql_message_len: usize = 0;
 
-fn captureSqlMessage(message: []const u8) void {
+fn captureSqlMessage(message_in: []const u8) void {
+    const message = zpq.frontend.withoutCommand(message_in);
     const n = @min(message.len, sql_message.len - sql_message_len);
     @memcpy(sql_message[sql_message_len..][0..n], message[0..n]);
     sql_message_len += n;
@@ -1117,6 +1119,26 @@ test "JsonQuoting escapes as writeJsonString does, a UTF-8 sequence split betwee
         try q.finish();
         try std.testing.expectEqualStrings(want.written(), got.written());
     }
+}
+
+test "regression: an unknown output_codec is refused, and an SQL error names no CLI command" {
+    const a = std.testing.allocator;
+    var pool: PersistentPool = .sized(256 << 20);
+    defer pool.deinit();
+    // A misspelt codec wrote snappy.
+    const codec = try handle(std.testing.io, a, .empty, "{\"inputs\":[\"x.parquet\"],\"output_url\":\"o.parquet\"," ++
+        "\"output_codec\":\"zsdt\"}", &pool, null);
+    defer a.free(codec);
+    try expectStringField(codec, "reason", "BadOutputCodec");
+    try expectStringField(codec, "output_codec", "zsdt");
+    const missing = "{\"sql\":\"SELECT * FROM 'no/such/file.parquet'\"}";
+    const sql = try handle(std.testing.io, a, .empty, missing, &pool, null);
+    defer a.free(sql);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, sql, .{});
+    defer parsed.deinit();
+    const message = parsed.value.object.get("message").?.string;
+    try std.testing.expect(!std.mem.startsWith(u8, message, "zpq query:"));
+    try std.testing.expect(std.mem.indexOf(u8, message, "no/such/file.parquet") != null);
 }
 
 test "a rejected filter echoes its expression escaped" {

@@ -8,6 +8,12 @@ const Diag = zpq.core.diag.Diag;
 /// Receives each diagnostic, bounded to 16 KiB; a longer one is dropped, so the receiver falls back to the error
 /// name. Unset, diagnostics print to stderr whole.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
+/// `message` without the CLI's "zpq query: " prefix, for a machine-readable message: a JSON error or a response.
+pub fn withoutCommand(message: []const u8) []const u8 {
+    const prefix = "zpq query: ";
+    return if (std.mem.startsWith(u8, message, prefix)) message[prefix.len..] else message;
+}
+
 fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
     const report = diagnostic_fn orelse return std.debug.print(fmt, args);
     var buf: [16 * 1024]u8 = undefined;

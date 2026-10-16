@@ -64,7 +64,9 @@ fn wantsJsonSummary(args: std.process.Args) bool {
     return false;
 }
 
-fn captureSqlDiagnostic(message: []const u8) void {
+fn captureSqlDiagnostic(message_in: []const u8) void {
+    // The JSON error is no command's output: as the libzpq and Lambda responses, it names none.
+    const message = zpq.frontend.withoutCommand(message_in);
     const n = @min(message.len, diagnostic_buffer.len - diagnostic_len);
     @memcpy(diagnostic_buffer[diagnostic_len..][0..n], message[0..n]);
     diagnostic_len += n;
@@ -75,8 +77,8 @@ fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
         std.debug.print(fmt, args);
         return;
     }
-    const written = std.fmt.bufPrint(diagnostic_buffer[diagnostic_len..], fmt, args) catch return;
-    diagnostic_len += written.len;
+    var buf: [16 * 1024]u8 = undefined;
+    captureSqlDiagnostic(std.fmt.bufPrint(&buf, fmt, args) catch return);
 }
 
 fn emitError(err: anyerror) !void {

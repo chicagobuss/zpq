@@ -160,7 +160,11 @@ fn parseOptions(text: []const u8) !Parsed {
     const ceiling: ?usize = if (parsed.value.max_memory) |v| switch (v) {
         .null => null,
         .integer => |n| if (n > 0) @intCast(n) else return error.BadMaxMemory,
-        .string => |str| try zpq.core.system.parseSizeString(str),
+        // "0MB" is the 0 the integer form refuses: a ceiling no query fits under.
+        .string => |str| switch (try zpq.core.system.parseSizeString(str)) {
+            0 => return error.BadMaxMemory,
+            else => |n| n,
+        },
         else => return error.BadMaxMemory,
     } else null;
     const wait: ?u64 = if (parsed.value.budget_wait_ms) |v| switch (v) {
@@ -467,6 +471,8 @@ test "zpq_open refuses bad options with a reason, and a NULL out_ctx" {
     try testing.expectEqualStrings("{\"error\":\"invalid_argument\",\"reason\":\"UnknownField\"}", std.mem.span(err.?));
     // No error wanted: the status alone.
     try testing.expectEqual(@as(c_int, -1), zpq_open("{\"max_memory\": 0}", &ctx, null));
+    // Written as a size, the same 0 opened a context no query could run in.
+    try testing.expectEqual(@as(c_int, -1), zpq_open("{\"max_memory\": \"0MB\"}", &ctx, null));
     try testing.expectEqual(@as(c_int, -1), zpq_open(null, null, null));
 }
 
